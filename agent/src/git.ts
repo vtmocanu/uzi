@@ -7263,6 +7263,62 @@ export class GitCache {
     }
   }
 
+  /**
+   * The commit messages a push of `tip` would publish: every commit reachable from `tip` and not
+   * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
+   * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on
+   * any failure to resolve the base, run git or parse its output, so callers fail CLOSED and
+   * refuse to publish rather than treat unreadable history as clean. A commit whose `%e` encoding
+   * is non-empty and not UTF-8 (git re-encodes `--format` output to UTF-8 and such a header can
+   * blank or garble `%B`, so `%e` is the gate), or whose object holds a NUL byte, also yields null.
+   */
+  async publishedCommitMessages(barePath: string, tip: string): Promise<{ sha: string; message: string }[] | null> {
+    try {
+      if (!SHA40_RE.test(tip)) return null;
+      const baseRef = await this.defaultBranchRef(barePath);
+      // Read through the same hardened view verifyRecoveryClosure uses: replacement refs, grafts, a
+      // shallow file and lazy fetches must not change which commits or messages this reads.
+      const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
+        GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+      const read = async (args: string[], input?: string): Promise<string> =>
+        (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
+          { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
+      // git re-encodes `--format` output to UTF-8, and a non-UTF-8 `encoding` header can blank or
+      // garble `%B`, so the `%e` refusal below is the gate: never drop it as redundant. `--format`
+      // output under `--encoding=none` is still not the raw message bytes. `%e` is git's own
+      // per-commit reading of that header (empty when absent), so no framing can be forged in a
+      // message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
+      // (sha, encoding, message) triples. A commit OBJECT can still carry a NUL inside its message
+      // (git hash-object --literally writes one, and %B stops printing at it), which would hide the
+      // text after it; a literal NUL is written as a \u escape (never a raw control byte in source).
+      const out = await read(["log", "--encoding=none", "-z", "--format=%H%x00%e%x00%B", `${baseRef}..${tip}`]);
+      const tokens = out.split("\u0000");
+      // The trailing NUL from `-z` leaves one empty final token.
+      if (tokens.pop() !== "") return null;
+      if (tokens.length % 3 !== 0) return null;
+      const commits: { sha: string; message: string }[] = [];
+      for (let i = 0; i < tokens.length; i += 3) {
+        const sha = tokens[i]!;
+        if (!SHA40_RE.test(sha)) return null;
+        // A declared non-UTF-8 encoding means the message bytes are not text we can scan: refuse.
+        const enc = tokens[i + 1]!.trim();
+        if (enc !== "" && !/^utf-?8$/i.test(enc)) return null;
+        commits.push({ sha, message: tokens[i + 2]! });
+      }
+      // Read each commit object raw: a NUL in its bytes would hide the message text after it from
+      // %B, so fail closed. `cat-file commit` exits non-zero on a missing object, and the content
+      // must open with a tree header; `cat-file --batch` instead answers `<sha> missing` with exit 0,
+      // which a NUL-only check would accept as clean.
+      for (const { sha } of commits) {
+        const raw = await read(["cat-file", "commit", sha]);
+        if (!/^tree [0-9a-f]{40}\n/.test(raw) || raw.includes("\u0000")) return null;
+      }
+      return commits;
+    } catch {
+      return null;
+    }
+  }
+
   /** Pushed workflow blobs must match the fresh default or the current remote target, per path. */
   async branchWorkflowFiles(
     barePath: string,
