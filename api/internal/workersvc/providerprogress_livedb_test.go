@@ -110,7 +110,7 @@ func TestProviderProgressFreshStreakLiveDB(t *testing.T) {
 						t.Fatalf("old replay: applied=%v err=%v", applied, err)
 					}
 					assertProgressStreak(t, e.ppRun(t, id), 1, pgconv.Time(*clock))
-					gen = e.progressReclaim(t, svc, worker, id)
+					e.progressReclaim(t, svc, worker, id)
 					if _, applied, err := svc.SetState(e.ctx, worker, id, req); applied || (disk && !errors.Is(err, ErrStaleClaim)) || (!disk && err != nil) {
 						t.Fatalf("reclaimed replay: applied=%v err=%v", applied, err)
 					}
