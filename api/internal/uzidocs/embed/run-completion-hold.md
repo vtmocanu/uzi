@@ -197,18 +197,20 @@ something goes wrong or a human has touched the request in between:
   Before pushing, it checks the messages of every commit the push would
   publish (relative to the default branch, merge commits included, and again
   on the exact commit about to be pushed) with the same matcher as the
-  body. On a hit, or if the messages can't be read, it pushes nothing, opens
-  or updates no request, rewrites no history, and fails the run naming the
-  offending commit SHA(s); the committed work is preserved for recovery, and
-  fixing the commits needs a history rewrite left to the owner. A new
+  body. On a hit it pushes nothing, opens or updates no request, rewrites no
+  history, and fails the run naming the offending commit SHA(s); if the
+  messages can't be read (including commits whose header declares a
+  non-UTF-8 encoding) it refuses the same way, but names no SHA. The
+  committed work is preserved for recovery, and fixing the commits needs a
+  history rewrite left to the owner. A new
   request's title is the issue title with any closing keyword for the issue
   neutralised (a zero-width space after the keyword's first letter, or the
   fixed `Work on issue #N` if that isn't enough). After the request is
   created or adopted, uzi reads its actual title and retitles it if it
   closes the issue. If the title can't be read, can't be updated, or still
   closes after re-reading, the run fails closed; the request stays open and
-  must not be merged as-is. Runs without a declaration, and owner-partial
-  or scope-capped runs, leave titles and commit messages unchanged.
+  must not be merged as-is. Runs without a declaration, including owner-partial
+  and scope-capped ones, keep today's title and commit behaviour.
 
 ## Not the same as an owner pause
 
