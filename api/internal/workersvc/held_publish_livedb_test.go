@@ -626,8 +626,34 @@ func TestHeldPublishStoredErrorIsSanitizedLiveDB(t *testing.T) {
 			t.Fatalf("stored last_error holds control rune %U: %q", r, got)
 		}
 	}
-	if strings.Contains(got, "[31m") || !strings.Contains(got, "line two") {
-		t.Fatalf("stored last_error = %q: the ANSI sequence must go, the text must stay", got)
+	if strings.Contains(got, "[31m") || !strings.Contains(got, "tworedevilnextendnul") {
+		t.Fatalf("stored last_error = %q: the ANSI sequence must go, the text must stay (controls are deleted and joined, the deleted newline lets the token scrubber absorb the word before it)", got)
+	}
+}
+
+// A refusal that echoes the connection PAT and a family token, each split by an invisible
+// character, must store neither half: the redaction happens after the separator is deleted.
+func TestHeldPublishStoredErrorRedactsSplitSecretsLiveDB(t *testing.T) {
+	f := newHeldFix(t)
+	const wj = "\u2060"
+	cut := len(f.pat) - 20 // inside the uuid part
+	body := strings.Repeat("Zq7m", 5)
+	hostile := "remote: auth " + f.pat[:cut] + wj + f.pat[cut:] + " token glpat-" + body[:10] + wj + body[10:] + " denied"
+	f.fake.sendFn = func(_ context.Context, _ pushbroker.HeldPackOptions) (pushbroker.HeldCreateOutcome, error) {
+		return pushbroker.HeldCreateRefused, fmt.Errorf("%w: %s", pushbroker.ErrHeldCreateRefused, hostile)
+	}
+	if res, err := f.publish(f.req()); err != nil || res.State != "refused" {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	got := f.mustRow().LastError.String
+	uuidPart := f.pat[len("bot-pat-held-"):]
+	for _, leak := range []string{f.pat, f.pat[:cut], f.pat[cut:], uuidPart[:8], uuidPart[len(uuidPart)-8:], body, body[:8], body[10:]} {
+		if strings.Contains(got, leak) {
+			t.Fatalf("stored last_error %q leaks %q", got, leak)
+		}
+	}
+	if !strings.Contains(got, "denied") {
+		t.Fatalf("stored last_error = %q: the surrounding text must stay", got)
 	}
 }
 
@@ -693,10 +719,11 @@ func TestSanitizeHeldText(t *testing.T) {
 	secret := "ghp_" + strings.Repeat("Ab3", 8)
 	for in, want := range map[string]string{
 		"plain text":                   "plain text",
-		"a\nb\r\nc\td":                 "a b c d",
-		"x\x1b[31mred\x1b[0my":         "x red y",
-		"bidi\u202eRLO\u2066iso\u200b": "bidi RLO iso",
-		"c1\u0085\u009bend":            "c1 end",
+		"a\nb\r\nc\td":                 "abcd",
+		"a b  c":                       "a b c",
+		"x\x1b[31mred\x1b[0my":         "xredy",
+		"bidi\u202eRLO\u2066iso\u200b": "bidiRLOiso",
+		"c1\u0085\u009bend":            "c1end",
 		"tok " + secret + " end":       "tok [redacted] end",
 	} {
 		got := sanitizeHeldText(in)

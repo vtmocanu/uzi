@@ -10,6 +10,7 @@ import (
 	"strings"
 	"time"
 	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -349,7 +350,7 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 		case errors.Is(err, pushbroker.ErrTipMissing):
 			return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonTipMissing}
 		}
-		slog.Warn("held publication: pack pre-verify failed", "run", runID, "error", sanitizeHeldText(err.Error()))
+		slog.Warn("held publication: pack pre-verify failed", "run", runID, "error", heldErrText(err, forgeConn.PAT))
 		return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonForgeUnavailable}
 	}
 
@@ -376,7 +377,7 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 		state, next = "create_unknown", s.now().Add(heldUnknownRetryAfter)
 	}
 	if sendErr != nil {
-		lastErr = sanitizeHeldText(sendErr.Error())
+		lastErr = heldErrText(sendErr, forgeConn.PAT)
 	}
 	rec, err := s.heldRecordOutcome(ctx, pub.ID, state, refusal, lastErr, next)
 	if err != nil {
@@ -451,31 +452,46 @@ func (s *Service) heldInvoke(ctx context.Context, wkr store.Worker, runID uuid.U
 // SanitizeHeldText is sanitizeHeldText for callers outside the package (the owner DTOs).
 func SanitizeHeldText(s string) string { return sanitizeHeldText(s) }
 
-var (
-	heldANSIRe = regexp.MustCompile("\x1b(?:\\[[0-9;?]*[ -/]*[@-~]|\\][^\x07\x1b]*(?:\x07|\x1b\\\\)|[@-_])")
-)
+// heldANSIRe matches CSI and OSC escape sequences (same expression as recovery's ansiSeqRe).
+var heldANSIRe = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 
-// sanitizeHeldText makes untrusted text (a remote's ng reason, a transport error) safe to store
-// and to show: ANSI escape sequences, C0/C1 controls (newlines included), bidi and other format
-// characters and line separators are removed, a recognised secret family is scrubbed, runs of
-// whitespace collapse to one space, and the result is bounded. Stripping runs both before and
-// after the scrub so a control character cannot split a token past the scrubber.
-func sanitizeHeldText(s string) string {
-	strip := func(in string) string {
-		in = heldANSIRe.ReplaceAllString(in, " ")
-		var b strings.Builder
-		for _, r := range in {
-			if unicode.IsControl(r) || unicode.Is(unicode.Cf, r) || unicode.Is(unicode.Zl, r) || unicode.Is(unicode.Zp, r) || r == unicode.ReplacementChar {
-				b.WriteByte(' ')
-				continue
-			}
-			b.WriteRune(r)
+// heldDropUnsafe DELETES every ANSI sequence and unsafe rune: invalid UTF-8, C0/C1 controls
+// (newline and tab included), the format (Cf), line and paragraph separator (Zl, Zp) and
+// nonspacing mark (Mn) classes, and the zero-width Hangul fillers. It mirrors
+// recovery.dropUnsafeRunes; it is copied because recovery's in-package tests import workersvc,
+// so importing it here would be a cycle. Deleting, not replacing with a space, is the point: a
+// credential split by an invisible character is rejoined, so the redactors that run next see it
+// whole instead of two pieces each below their minimum length.
+func heldDropUnsafe(s string) string {
+	s = heldANSIRe.ReplaceAllString(s, "")
+	var b strings.Builder
+	for _, r := range s {
+		if r == utf8.RuneError || unicode.IsControl(r) || unicode.In(r, unicode.Cf, unicode.Zl, unicode.Zp, unicode.Mn) ||
+			r == 0x115f || r == 0x1160 || r == 0x3164 || r == 0xffa0 {
+			continue
 		}
-		return strings.Join(strings.Fields(b.String()), " ")
+		b.WriteRune(r)
 	}
-	out := strip(secretscrub.Scrub(strip(s)))
+	return b.String()
+}
+
+// heldRedact makes untrusted text (a remote's ng reason, a transport error) safe to store, log
+// and show. Order matters: unsafe runes and ANSI sequences are deleted first, then the exact
+// connection PAT (itself cleaned the same way; skipped when empty) is replaced with
+// "[redacted]", then secretscrub redacts a recognised secret family, then whitespace runs
+// collapse to one space and the result is bounded to heldLastErrorMax runes.
+func heldRedact(s, pat string) string {
+	out := heldDropUnsafe(s)
+	if p := heldDropUnsafe(pat); p != "" {
+		out = strings.ReplaceAll(out, p, "[redacted]")
+	}
+	out = strings.Join(strings.Fields(secretscrub.Scrub(out)), " ")
 	if r := []rune(out); len(r) > heldLastErrorMax {
 		out = string(r[:heldLastErrorMax])
 	}
 	return out
 }
+
+// sanitizeHeldText is heldRedact without a connection PAT: it removes unsafe characters and
+// scrubs recognised secret families, but cannot know an opaque credential.
+func sanitizeHeldText(s string) string { return heldRedact(s, "") }

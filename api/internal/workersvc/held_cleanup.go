@@ -5,7 +5,6 @@ import (
 	"errors"
 	"fmt"
 	"log/slog"
-	"strings"
 	"time"
 
 	"github.com/jackc/pgx/v5"
@@ -199,15 +198,10 @@ func (s *Service) heldCleanupOne(ctx context.Context, it heldCleanupItem) (n int
 	}
 }
 
-// heldErrText makes err safe to store and log: the connection PAT is replaced wherever it
-// appears, then sanitizeHeldText strips controls and scrubs recognised secret families.
-func heldErrText(err error, pat string) string {
-	msg := err.Error()
-	if pat != "" {
-		msg = strings.ReplaceAll(msg, pat, "[redacted]")
-	}
-	return sanitizeHeldText(msg)
-}
+// heldErrText makes err safe to store and log: heldRedact deletes unsafe characters, replaces
+// the connection PAT (also when a separator split it), scrubs recognised secret families and
+// bounds the length.
+func heldErrText(err error, pat string) string { return heldRedact(err.Error(), pat) }
 
 // heldDefer is the scheduling-only write of a skipped or failed item: next_attempt_at moves out
 // and, when msg is not empty, last_error is recorded. It runs on its own short transaction (a
