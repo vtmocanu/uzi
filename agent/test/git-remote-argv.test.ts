@@ -78,6 +78,29 @@ for (const branch of ["", "-upload-pack=hostile", "bad..branch", "bad:branch", "
   });
 }
 
+it("fetchDefaultTip refreshes a literal plus-leading branch instead of treating it as a force refspec", async () => {
+  const fx = makeFixture();
+  try {
+    git(fx.originPath, "branch", "release");
+    git(fx.originPath, "branch", "+release");
+    const cache = new GitCache(fx.dataDir, nullLogger());
+    const bare = await cache.ensureClone(fx.originPath);
+    const stale = git(bare, "rev-parse", "refs/remotes/origin/+release");
+    git(fx.originPath, "checkout", "+release");
+    git(fx.originPath, "commit", "--allow-empty", "-m", "advance literal plus branch");
+    const fresh = git(fx.originPath, "rev-parse", "refs/heads/+release");
+    assert.notEqual(fresh, stale);
+    const requests: BoundaryProcessRequest[] = [];
+    await cache.withBoundaryProcessSpawner(capture(requests), new AbortController().signal, async () => {
+      assert.equal(await cache.fetchDefaultTip(bare, "+release"), fresh);
+    });
+    assert.equal(git(bare, "rev-parse", "refs/remotes/origin/+release"), fresh);
+    const fetch = remoteCommands(requests).find((r) => r.argv.includes("fetch"));
+    assert.ok(fetch);
+    assert.deepEqual(fetch.argv.slice(fetch.argv.indexOf("fetch")), ["fetch", "--", "origin", "refs/heads/+release"]);
+  } finally { fx.cleanup(); }
+});
+
 for (const branch of ["release/nested", "release/café"]) {
   it(`remote guards accept ${branch} and delimit actual argv, replayed by real Git`, async () => {
     const fx = makeFixture();

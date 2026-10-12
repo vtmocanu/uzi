@@ -31,11 +31,12 @@ function gitIn(dir: string, args: string[]): string {
 }
 
 describe("bareDirName", () => {
-  it("normalizes empty, all-slash, trailing and internal long slash runs exactly", () => {
+  it("normalizes empty, all-slash, trailing and internal slash runs exactly", () => {
     assert.equal(bareDirName(""), "repo.git");
     assert.equal(bareDirName("/".repeat(500_000)), "repo.git");
     assert.equal(bareDirName("org/repo" + "/".repeat(500_000)), "org+repo.git");
-    assert.equal(bareDirName("org" + "/".repeat(500_000) + "repo"), "org+repo.git");
+    // Keep adversarial internal runs in the bounded child below.
+    assert.equal(bareDirName("org" + "/".repeat(128) + "repo"), "org+repo.git");
   });
 
   it("bounds normalization of a long internal slash run in an isolated child", async () => {

@@ -8154,7 +8154,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       onLockAcquired?.();
       if (!(await this.isRemoteBranchName(barePath, defaultBranch))) throw new Error("invalid remote branch");
-      await this.runGit(barePath, ["fetch", "--", "origin", defaultBranch], pat, scope, username);
+      await this.runGit(barePath, ["fetch", "--", "origin", `refs/heads/${defaultBranch}`], pat, scope, username);
       // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
       // fetch updates the remote-tracking ref; read the fresh tip off it.
       let sha = (
