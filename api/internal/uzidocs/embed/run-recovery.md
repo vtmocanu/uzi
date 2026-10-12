@@ -406,7 +406,9 @@ The source is kept in every fail-closed case, but what a later run sees differs:
 - **Journal no longer names the source.** If, when the stop is recorded, the
   journal is absent or already names another source, nothing is written and that
   journal keeps its own routing. Inspect then does not list the kept clone (a
-  narrow race; an already-stale marker for the path is the refused case above).
+  narrow race). If the journal was absent, the next canonical claim on that key
+  frees the path as before; the journal is written before any model runs, so that
+  clone holds only its fresh seed.
 - **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a
   failed write while discovery completes a detachment, fails the run closed with
   "Retained recovery blocked: corrupt journal or unsafe local recovery storage"

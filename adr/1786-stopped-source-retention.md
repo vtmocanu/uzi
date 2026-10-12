@@ -249,8 +249,12 @@ Every case keeps the source. What a later run sees depends on where the failure 
   another source when the stop is recorded, nothing is written and that journal keeps its own
   routing. The kept clone is then not under any journal or marker and inspect does not list it;
   the next claim never reuses the canonical path once the key is in attempt mode, but nothing
-  attributes the clone (a narrow race: custody-held flights return before this call). A stale
-  marker already naming the path is the `mismatch` case above.
+  attributes the clone (a narrow race: custody-held flights return before this call). If the
+  journal was absent, no attempt mode was written either, so the next canonical claim on that
+  key frees the path as before #1786; the journal is written before any model runs, so such a
+  clone holds only its fresh seed. This is the one case where "kept" holds only at stop time. A
+  stale marker already naming the path is the `mismatch` case above when another run's journal
+  names it.
 - **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a failed write
   during the discovery heal, fails the run closed with "Retained recovery blocked: corrupt
   journal or unsafe local recovery storage" (the default `fail_origin`, not
