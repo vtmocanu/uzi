@@ -181,6 +181,8 @@ for group in "${!groups[@]}"; do
         truncated:$truncated,version_truncated:$version_truncated,status:$status,version_status:$version_status,version:$version,version_stderr:$version_stderr,stderr:$stderr}' > "$prefix.meta.json"
     # Invalid JSON, setup failure, skips and incomplete package execution invalidate all
     # selected tests in that run. Exit status supports completeness, never test attribution.
+    # Setup failures use stderr/build/incomplete evidence; arbitrary diagnostic words
+    # (including real race warnings) do not override complete test outcomes.
     if ! jq -s --slurpfile meta "$prefix.meta.json" '
       $meta[0] as $m | . as $events |
       length > 0 and all(.[];
@@ -206,7 +208,7 @@ for group in "${!groups[@]}"; do
        else any(.[]; .Test == null and .Action == "fail") and
             any(.[]; .Test != null and .Action == "fail") end) and
       (any(.[]; .Action == "skip" or
-        ((.Output // "") | test("(?i)(panic:|fatal error:|timed out|DATA RACE|race detector|build failed|setup failed|no required module|toolchain|GOPROXY=off|cannot find package)"))) | not)
+        ((.Output // "") | test("(?m)^(panic:|fatal error:)"))) | not)
     ' "$prefix.jsonl" > "$prefix.valid" 2> "$prefix.parse.stderr"; then
       printf 'false\n' > "$prefix.valid"
     fi

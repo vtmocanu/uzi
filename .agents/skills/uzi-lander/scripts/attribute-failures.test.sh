@@ -97,7 +97,7 @@ any_fail=false
 for name in "${names[@]}"; do
   outcome=fail
   case "$MODE" in
-    introduced|batch|controller|api_root|subselect|no_run_introduced|selected_no_run_introduced|child_no_run_introduced) [[ $sha == "$BASE" ]] && outcome=pass ;;
+    introduced|race_introduced|diagnostic_keywords|batch|controller|api_root|subselect|no_run_introduced|selected_no_run_introduced|child_no_run_introduced) [[ $sha == "$BASE" ]] && outcome=pass ;;
     pass|livedb) outcome=pass ;;
     base_fail) [[ $sha == "$HEAD_SHA" ]] && outcome=pass ;;
     skip) outcome=skip ;;
@@ -111,7 +111,7 @@ for name in "${names[@]}"; do
   case "$MODE" in
     panic) event output "$name" 'panic: fixture crashed' ;;
     timeout) event output "$name" 'panic: test timed out after 10m0s' ;;
-    race_warning) event output "$name" 'WARNING: DATA RACE' ;;
+    race_warning|race_introduced) [[ $outcome != fail ]] || event output "$name" 'WARNING: DATA RACE' ;;
   esac
   if [[ $outcome == fail ]]; then
     any_fail=true
@@ -144,6 +144,8 @@ for name in "${names[@]}"; do
         value=41
         [[ $sha == "$HEAD_SHA" ]] && value=42
         event output "$child" "    a_test.go:$line: expected file.go:$value: got different path"
+      elif [[ $MODE == diagnostic_keywords ]]; then
+        event output "$child" "    a_test.go:$line: expected toolchain/GOPROXY=off/build failed/setup failed/cannot find package/timed out/panic: values unchanged"
       elif [[ $MODE == body_root ]]; then
         event output "$child" "    a_test.go:$line: expected path $root/api/pkg/example"
       else
@@ -243,6 +245,9 @@ verdict() { has "\"$1\""; }
 no_go() { [[ ! -s $WORK/invocations ]] || fail "$MODE unexpectedly ran go"; }
 
 run introduced; verdict pr-introduced
+run race_introduced; verdict pr-introduced
+run diagnostic_keywords; verdict pr-introduced
+run race_warning; verdict pre-existing
 cd "$WORK/repo/api/pkg"
 run introduced; verdict pr-introduced
 cd "$WORK/repo"
@@ -291,7 +296,7 @@ has '\u202e'
 run subtests; verdict inconclusive; has 'different failure'
 run base_fail; verdict inconclusive; has 'base fails, head passes'
 run markers; verdict inconclusive; has 'insufficient assertion'
-for mode in skip livedb missing child_missing build invalid truncated dependency toolchain race_setup panic timeout race_warning contradictory; do
+for mode in skip livedb missing child_missing build invalid truncated dependency toolchain race_setup panic timeout contradictory; do
   run "$mode"; verdict inconclusive
   [[ $(<"$WORK/out") != *'"pre-existing"'* && $(<"$WORK/out") != *'"pr-introduced"'* ]] ||
     fail "$mode overclaimed evidence"
