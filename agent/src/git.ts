@@ -4732,8 +4732,14 @@ export class GitCache {
       this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: "invalid_identity" });
       return;
     }
+    // Pins are kept while the residue-quarantine latch is set; checked again at every commit gate.
+    if (residueQuarantine() !== undefined) {
+      this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: "quarantined" });
+      return;
+    }
     const result = await this.cleanupArchivedRecoveryPin({
-      runId, generation, sourceSha: expectedSha, recoveryPinBareDir: path.basename(barePath), isEligible: () => true,
+      runId, generation, sourceSha: expectedSha, recoveryPinBareDir: path.basename(barePath),
+      isEligible: () => residueQuarantine() === undefined,
     });
     if (result.state === "retained") {
       this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: result.reason });
@@ -4780,8 +4786,11 @@ export class GitCache {
     };
     const activeChildren = new Set<Promise<number>>();
     let consumed = 0;
+    // Directories compare dev/ino/mode/uid/gid only: size, mtime and ctime change whenever a
+    // sibling entry is created or removed, which is not a swap. Files compare in full.
     const identity = (st: Stats): string =>
-      [st.dev, st.ino, st.mode, st.uid, st.gid, st.size, st.mtimeMs, st.ctimeMs].join(":");
+      (st.isDirectory() ? [st.dev, st.ino, st.mode, st.uid, st.gid]
+        : [st.dev, st.ino, st.mode, st.uid, st.gid, st.size, st.mtimeMs, st.ctimeMs]).join(":");
     const safe = (st: Stats): boolean => st.uid === process.getuid?.() && !(st.mode & 0o002) &&
       (!(st.mode & 0o020) || (st.gid === process.getgid?.() && !(uidSplitActive() && st.gid === RUNNER_UID)));
     type Evidence = Map<string, string | null>;
@@ -4956,7 +4965,7 @@ export class GitCache {
         const handle = await fs.open(ancestor, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
         try { check(); if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata"); }
         finally { await handle.close(); }
-        // Parent content may change independently; only identity is relevant for ancestors.
+        // Parent content may change independently; directory identity excludes size and times.
         if (ancestor === root) rootEvidence.set(root, identity(st));
       }
       const rootStat = await remember(root, rootEvidence, true);

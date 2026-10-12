@@ -13869,7 +13869,7 @@ export class RunRunner {
       });
       // issue #1507 — the transient bare pin goes only once a durable replacement exists. An archive
       // upload's pin is deleted by the recovery coordinator itself (cleanupUploadedRecoveryPin, after
-      // verifying the archive proof under the journal lock; the live pass retries it), never here.
+      // verifying the archive proof under the journal lock) once the run is no longer executing (live pass or boot), never here.
       // Only the already-published outcome (head on the forge, nothing archived) is deleted here, and
       // with the pinned head as the expected SHA so a moved ref is retained. On any retain
       // (needs_action) LEAVE it as the durable anchor that keeps the retained source reachable.

@@ -389,6 +389,9 @@ export interface RecoveryCoordinatorOptions {
   liveBackoffBaseMs?: number;
   /** issue #1995: the ceiling of the live re-drive's exponential backoff. */
   liveBackoffCapMs?: number;
+  /** In-process delay before a settled (`deleted` / `already_absent`) archived-pin cleanup is attempted
+   *  again for the same capture (default {@link LIVE_PIN_SETTLE_MS}). A restart re-checks every record once. */
+  livePinSettleMs?: number;
   /** Delays between the bounded retries of {@link RecoveryCoordinator.settleUnadoptedGuardedGeneration}. */
   unadoptedSettleRetryDelaysMs?: readonly number[];
   /** Test seams (never set in production). */
@@ -451,7 +454,7 @@ interface RedundancyBudget { signal: AbortSignal; deadline: number; dispose(): v
 /** Archived-pin cleanup: per-record cap, and the shared boot-sweep budget for all of them. */
 const PIN_CLEANUP_RECORD_MS = 10_000;
 const PIN_CLEANUP_BOOT_MS = 60_000;
-export type UploadedPinCleanupMode = "capture" | "boot" | "live";
+export type UploadedPinCleanupMode = "capture" | "sweep" | "live" | "boot";
 export type UploadedPinCleanupResult =
   | { state: "deleted" | "already_absent" }
   | { state: "retained"; reason: string };
@@ -470,6 +473,7 @@ function archiveProvesPin(r: RecoveryRecord): boolean {
 const LIVE_MAX_PER_PASS = 4;
 const LIVE_BACKOFF_BASE_MS = 30_000;
 const LIVE_BACKOFF_CAP_MS = 15 * 60_000;
+const LIVE_PIN_SETTLE_MS = 6 * 60 * 60_000;
 
 /** Dispositions of a journaled bundle's upload that no retry can change: the api refused the
  *  capture for good, or the local bytes no longer match what was journaled. Written into the
@@ -781,6 +785,7 @@ export class RecoveryCoordinator {
   private readonly liveMaxPerPass: number;
   private readonly liveBackoffBaseMs: number;
   private readonly liveBackoffCapMs: number;
+  private readonly livePinSettleMs: number;
   private readonly testHooks: RecoveryCoordinatorOptions["testHooks"];
   private readonly unadoptedSettleRetryDelaysMs: readonly number[];
   /** In-flight passes (the boot sweep, a live pass): {@link resumeLive} is a no-op while non-empty. */
@@ -813,6 +818,7 @@ export class RecoveryCoordinator {
     this.liveMaxPerPass = opts.liveMaxPerPass ?? LIVE_MAX_PER_PASS;
     this.liveBackoffBaseMs = opts.liveBackoffBaseMs ?? LIVE_BACKOFF_BASE_MS;
     this.liveBackoffCapMs = opts.liveBackoffCapMs ?? LIVE_BACKOFF_CAP_MS;
+    this.livePinSettleMs = opts.livePinSettleMs ?? LIVE_PIN_SETTLE_MS;
     this.testHooks = opts.testHooks;
     this.unadoptedSettleRetryDelaysMs = opts.unadoptedSettleRetryDelaysMs ?? UNADOPTED_SETTLE_RETRY_DELAYS_MS;
     // The MAC key is DERIVED from the (stable) worker join token, so it re-derives
@@ -1900,7 +1906,9 @@ export class RecoveryCoordinator {
     // throws RecordGoneError instead of recreating the removed record.
     const uploaded = await this.writeExistingRecord(current, (cur) => ({ ...cur, state: "uploaded", reason: undefined }));
     if (!uploaded.inventoryGuarded) {
-      await this.cleanupUploadedRecoveryPin(uploaded, { mode: "capture", signal });
+      // A runner-driven settle is still executing, so this usually retains `executing`; the live pass
+      // or boot deletes the pin once the run is no longer executing.
+      await this.cleanupUploadedRecoveryPin(uploaded, { mode, signal });
     }
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
@@ -1969,7 +1977,9 @@ export class RecoveryCoordinator {
       clearTimeout(timer);
     }
     if (result.state === "retained") {
-      this.log.warn("recovery: uploaded record pin retained", { run_id: runId, generation, reason: result.reason, mode: opts.mode });
+      // `executing` is the expected answer while the run is still running: info, not a warning.
+      const level = result.reason === "executing" ? "info" : "warn";
+      this.log[level]("recovery: uploaded record pin retained", { run_id: runId, generation, reason: result.reason, mode: opts.mode });
     } else {
       this.log.info("recovery: uploaded record pin cleanup", { run_id: runId, generation, state: result.state, mode: opts.mode });
     }
@@ -2202,7 +2212,7 @@ export class RecoveryCoordinator {
     const cleanups: RecoveryRecord[] = [];
     for (const snap of records) {
       if (signal?.aborted) return;
-      if (snap.state === "uploaded" && !snap.inventoryGuarded) { cleanups.push(snap); continue; }
+      if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
       // The whole record step runs under the per-capture cycle lock (issue #1995), so a foreground
       // capture or a live pass on the same record cannot interleave with it.
       await runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal));
@@ -2215,8 +2225,10 @@ export class RecoveryCoordinator {
   private async bootPinCleanups(cleanups: RecoveryRecord[], signal?: AbortSignal): Promise<void> {
     if (cleanups.length === 0 || !this.git.cleanupArchivedRecoveryPin) return;
     const deadline = Date.now() + PIN_CLEANUP_BOOT_MS;
+    // Deterministic at boot, when no attempt stamps exist yet: oldest record first.
     const ordered = [...cleanups].sort((a, b) =>
-      (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0));
+      (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0) ||
+      a.createdAt - b.createdAt || (a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : 0));
     let handled = 0;
     for (const snap of ordered.slice(0, this.liveMaxPerPass)) {
       if (signal?.aborted || Date.now() >= deadline) break;
@@ -2445,6 +2457,8 @@ export class RecoveryCoordinator {
 
   private async livePass(opts: ResumeLiveOptions): Promise<void> {
     let transient = false;
+    // A credential-blocked pass whose only work is archived-pin cleanup must not move the upload schedule.
+    let pinOnlyBlocked = false;
     try {
       const credentialsBlocked = this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt;
       // Discovery may materialize uploads; blocked passes only retry persisted local ACKs.
@@ -2477,6 +2491,7 @@ export class RecoveryCoordinator {
         .slice(0, Math.max(0, this.liveMaxPerPass - candidates.length));
       // A blocked pass with no local work must not delay a newer authenticated heartbeat.
       if (credentialsBlocked && candidates.length === 0 && cleanupCandidates.length === 0) return;
+      pinOnlyBlocked = credentialsBlocked && candidates.length === 0;
       let uploadsStopped = credentialsBlocked;
       for (const snap of candidates) {
         if (uploadsStopped && !(snap.inventoryGuarded && (snap.finalAcknowledged || snap.completionReceipt))) continue;
@@ -2502,6 +2517,7 @@ export class RecoveryCoordinator {
       this.log.warn("recovery: live re-drive pass failed", { error: errText(err) });
       transient = true;
     }
+    if (pinOnlyBlocked) return;
     if (transient) {
       this.transientPasses++;
       this.nextPassAt = this.now() + Math.min(this.liveBackoffBaseMs * 2 ** this.transientPasses, this.liveBackoffCapMs);
@@ -2517,7 +2533,12 @@ export class RecoveryCoordinator {
     const record = await this.readRecord(this.recordPath(snap));
     if (!record || record.state !== "uploaded" || record.inventoryGuarded || opts.isExecuting(record.runId)) return;
     const res = await this.cleanupUploadedRecoveryPin(record, { mode: "live", signal: opts.signal });
-    if (res.state === "deleted") { this.pinCleanupBackoff.delete(record.captureId); return; }
+    // A settled record is re-checked in-process only after the long settle interval (no durable marker);
+    // a restart still re-checks it once at boot.
+    if (res.state === "deleted" || res.state === "already_absent") {
+      this.pinCleanupBackoff.set(record.captureId, { failures: 0, nextAt: this.now() + this.livePinSettleMs });
+      return;
+    }
     const failures = (this.pinCleanupBackoff.get(record.captureId)?.failures ?? 0) + 1;
     this.pinCleanupBackoff.set(record.captureId, {
       failures,

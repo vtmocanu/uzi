@@ -7,6 +7,10 @@ import fs from "node:fs/promises";
 import path from "node:path";
 import { GitCache, type ArchivedRecoveryPinCleanup, type BoundaryProcessSpawner } from "../src/git.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
+import { latchResidueQuarantine } from "../src/residue-quarantine.js";
+import { resetResidueQuarantineAfterEach } from "./setup/hermetic-proc.js";
+
+resetResidueQuarantineAfterEach();
 
 const scratch = path.resolve("../.uzi/scratch");
 const runId = "archived-run";
@@ -767,4 +771,65 @@ it("archived cleanup refuses a hard-linked logs/HEAD when HEAD names the pin", a
   assert.deepEqual(result, { state: "retained", reason: "unsafe_metadata" });
   assert.equal(present(), sha);
   assert.equal(await fs.readFile(victim, "utf8"), "ORIGINAL\n");
+});
+
+// Directory evidence is identity only (dev/ino/mode/uid/gid): a sibling entry created or removed in a
+// parent changes its size and times, which is not a swap.
+it("sibling creates and removals in the repos root and its parent do not refuse", async () => {
+  await fs.writeFile(path.join(path.dirname(repos), "sibling-before.txt"), "x");
+  let touched = false;
+  intercept(async (_cwd, args) => {
+    if (touched || !args.includes("cat-file")) return;
+    touched = true;
+    await fs.writeFile(path.join(path.dirname(repos), "sibling-during.txt"), "x");
+    await fs.rm(path.join(path.dirname(repos), "sibling-before.txt"));
+    const added = path.join(repos, "added.git");
+    await fs.mkdir(added);
+    git(added, "init", "--bare");
+  });
+  assert.deepEqual(await cleanup(), { state: "deleted" });
+  assert.equal(touched, true);
+  assert.throws(() => present());
+});
+it("an actual directory swap of a refs directory still refuses", async () => {
+  let swapped = false;
+  intercept(async (_cwd, args) => {
+    if (swapped || !args.includes("cat-file")) return;
+    swapped = true;
+    await fs.cp(path.join(bare, "refs"), path.join(bare, "refs.new"), { recursive: true });
+    await fs.rename(path.join(bare, "refs"), path.join(bare, "refs.old"));
+    await fs.rename(path.join(bare, "refs.new"), path.join(bare, "refs"));
+  });
+  assert.deepEqual(await cleanup(), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(swapped, true);
+  assert.equal(present(), sha);
+});
+
+// A pin is kept while the residue-quarantine latch is set, including a latch landing mid-cleanup.
+it("4-argument deleteRecoveryPin retains a pin while quarantined", async () => {
+  const { logger, lines } = recordingLogger();
+  const logged = new GitCache(path.join(root, "data"), logger, undefined, testGitCacheOptions());
+  latchResidueQuarantine({ cause: "c", runId, site: "terminal_drive" }, nullLogger());
+  await logged.deleteRecoveryPin(bare, runId, 4, sha);
+  assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
+    level: "warn", msg: "recovery: recovery pin retained", bare, run_id: runId, generation: 4, reason: "quarantined",
+  }]);
+  assert.equal(present(), sha);
+});
+it("4-argument deleteRecoveryPin retains a pin when the latch lands before the commit", async () => {
+  const { logger, lines } = recordingLogger();
+  const logged = new GitCache(path.join(root, "data"), logger, undefined, testGitCacheOptions());
+  const seam = logged as unknown as { spawnGit: (...args: any[]) => Promise<any> };
+  const original = seam.spawnGit.bind(logged);
+  mock.method(seam, "spawnGit", async (...args: any[]) => {
+    if (args[1].includes("update-ref") && args[1].includes("--stdin")) {
+      latchResidueQuarantine({ cause: "c", runId, site: "terminal_drive" }, nullLogger());
+    }
+    return original(...args);
+  });
+  await logged.deleteRecoveryPin(bare, runId, 4, sha);
+  assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
+    level: "warn", msg: "recovery: recovery pin retained", bare, run_id: runId, generation: 4, reason: "ineligible",
+  }]);
+  assert.equal(present(), sha);
 });

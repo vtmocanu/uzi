@@ -55,12 +55,13 @@ let archive: Archive;
 let now: number;
 let warnings: Array<{ message: string; fields: unknown }>;
 let infos: Array<{ message: string; fields: unknown }>;
-function coord(producer: RecoveryBundleProducer = cache, isExecuting: (runId: string) => boolean = () => false) {
+function coord(producer: RecoveryBundleProducer = cache, isExecuting: (runId: string) => boolean = () => false,
+  extra: { livePinSettleMs?: number } = {}) {
   const log = nullLogger();
   log.warn = (message, fields) => { warnings.push({ message, fields }); };
   log.info = (message, fields) => { infos.push({ message, fields }); };
   return new RecoveryCoordinator({ client: archive, git: producer, log, recoveryRoot: cache.recoveryRoot,
-    workerToken: TOKEN, now: () => now, isExecuting });
+    workerToken: TOKEN, now: () => now, isExecuting, ...extra });
 }
 /** A producer with no archived-pin cleanup capability: uploads succeed and the pin survives. */
 function withoutCleanup(): RecoveryBundleProducer {
@@ -179,7 +180,7 @@ for (const mode of ["boot", "live"] as const) it(`${mode}: a recreated exact pin
   const record = await journal();
   archive.uploadError = undefined;
   await coord(withoutCleanup()).captureAndUpload({ record, barePath: bare, defaultBranch: "main" });
-  const c = coord();
+  const c = coord(cache, () => false, { livePinSettleMs: 1_000 });
   await retry(c, mode);
   assert.equal(present(4), false);
   assert.equal(await cache.anchorRecoveryHead(bare, RUN, 4, sha), true);
@@ -210,8 +211,10 @@ it("retains while the run is executing, and the live pass cleans it once it is n
   const c = coord(cache, () => executing);
   assert.equal((await c.captureAndUpload({ record, barePath: bare, defaultBranch: "main" })).state, "uploaded");
   assert.equal(present(4), true);
-  const retained = warnings.filter(w => w.message === "recovery: uploaded record pin retained");
+  assert.deepEqual(cleanupLogs(warnings), [], "the expected executing retention is not a warning");
+  const retained = infos.filter(w => w.message === "recovery: uploaded record pin retained");
   assert.equal((retained[0]!.fields as { reason: string }).reason, "executing");
+  assert.equal((retained[0]!.fields as { mode: string }).mode, "capture");
   now += 1_000_000;
   await c.resumeLive({ authenticatedAtMs: now + 1, isExecuting: () => true });
   assert.equal(present(4), true, "live pass skips an executing run");
@@ -219,4 +222,45 @@ it("retains while the run is executing, and the live pass cleans it once it is n
   now += 1_000_000;
   await c.resumeLive({ authenticatedAtMs: now + 1, isExecuting: () => false });
   assert.equal(present(4), false);
+});
+
+it("a settled record is not re-attempted before the settle interval, and is after it", async () => {
+  const record = await journal();
+  archive.uploadError = undefined;
+  await coord(withoutCleanup()).captureAndUpload({ record, barePath: bare, defaultBranch: "main" });
+  const c = coord(cache, () => false, { livePinSettleMs: 10_000_000 });
+  await retry(c, "live");
+  assert.equal(present(4), false);
+  assert.equal(await cache.anchorRecoveryHead(bare, RUN, 4, sha), true);
+  await retry(c, "live"); // 1_000_000 later: inside the settle interval
+  assert.equal(present(4), true, "not re-attempted inside the settle interval");
+  now += 10_000_000;
+  await c.resumeLive({ authenticatedAtMs: now + 1, isExecuting: () => false });
+  assert.equal(present(4), false, "re-attempted once the interval elapsed");
+});
+
+it("boot reaches a proven record behind four or more unproven ones, oldest first", async () => {
+  const record = await journal();
+  archive.uploadError = undefined;
+  await coord(withoutCleanup()).captureAndUpload({ record, barePath: bare, defaultBranch: "main" });
+  const uploaded = await only();
+  for (let i = 0; i < 5; i++) {
+    await raw({ ...uploaded, captureId: `unproven-${i}`, selfContained: false, createdAt: uploaded.createdAt - 1_000 - i });
+  }
+  assert.equal(present(4), true);
+  await coord().resumePending();
+  assert.equal(present(4), false, "the proven record is not starved by unproven ones");
+  assert.deepEqual(cleanupLogs(warnings), [], "unproven records are not re-warned at boot");
+});
+
+it("a credential-blocked pass with only pin cleanup runs it without moving the upload schedule", async () => {
+  const record = await journal();
+  archive.uploadError = undefined;
+  await coord(withoutCleanup()).captureAndUpload({ record, barePath: bare, defaultBranch: "main" });
+  const c = coord();
+  const internals = c as unknown as { credentialBlockedAt?: number; nextPassAt: number };
+  internals.credentialBlockedAt = now + 5;
+  await c.resumeLive({ authenticatedAtMs: now + 1, isExecuting: () => false });
+  assert.equal(present(4), false, "local cleanup still ran while blocked");
+  assert.equal(internals.nextPassAt, 0, "the blocked pass did not delay a newer authenticated heartbeat");
 });
