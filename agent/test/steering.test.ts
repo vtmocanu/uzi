@@ -1175,7 +1175,10 @@ describe("SteeringChannel operator constraints (issue #1660)", () => {
     assert.deepStrictEqual(ch.operatorConstraints(), [], "nothing before any input is routed");
     ch.start();
     try {
-      await tick();
+      // Issue #2810: both poll batches must route first; a fixed 10 ms tick raced them under load.
+      const routed = (): number => ch.operatorConstraints()?.length ?? 0;
+      for (const deadline = Date.now() + 10_000; routed() < 2 && Date.now() < deadline; ) await tick(2);
+      assert.ok(routed() >= 2, `both poll batches routed within 10 s; saw ${JSON.stringify(ch.operatorConstraints())}`);
       assert.deepStrictEqual(ch.operatorConstraints(), ["first", "second"], "trimmed, blanks and other kinds skipped");
       // The lead's delivery is unchanged and does not consume the constraint record.
       assert.strictEqual(ch.pullFollowUp()?.body, "first");
