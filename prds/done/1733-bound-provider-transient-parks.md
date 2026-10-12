@@ -2,7 +2,7 @@
 
 **Issue:** [#1733](https://github.com/vtmocanu/uzi/issues/1733) (also implements [#2361](https://github.com/vtmocanu/uzi/issues/2361))
 **Epic:** [#2746](https://github.com/vtmocanu/uzi/issues/2746)
-**Status:** Implemented with a required web-gate validation blocker (2026-10-12). Acceptance examples 1–3 and rollout controls are evidenced below. This PRD stays active while the required web gate remains blocked; hosted observation is an opportunistic follow-up.
+**Status:** Done (2026-10-12). Acceptance examples 1–3, rollout controls and implementation milestones are evidenced below. Required API and web gates passed on the documentation candidate; prior agent, repo and LiveDB evidence remains attributed to its tested revision. Hosted observation remains an opportunistic follow-up.
 **Execution:** one gated uzi run, one PR. Continue on the published working branch, preserving `ca44b5c1d0b55ac215ba784b10ee7acbbf55e4c3`; merge default revision `e219759078f1d71dae616ee77b7813d21fb9df61` without rewriting history, and never write to `main`. Do not touch `.github/workflows/**` in implementation or validation. M1 needs LiveDB evidence through `./e2e/run-store-it.sh`, so the run needs a Docker-capable worker (this repo's `required_capabilities` already asks for one). #1324 (forge outage at finalize) reuses this PRD's bound in a later PRD and is out of scope here.
 
 ## Problem
@@ -117,9 +117,9 @@ completed behavior from the outstanding required validation blocker:
 - [x] M2: exact Codex `rateLimitExceeded` retry/park path with usage/session negative controls.
 - [x] M3: web, TUI and Slack provider retry/hold presentation and owner actions.
 - [x] Documentation, recorded decision reconciliation and embedded docs sync.
-- [ ] Required `task gate:web` passes without diagnostic timeout changes.
+- [x] Required `task gate:web` passes without diagnostic timeout changes (`b80e69c6`, exit 0).
 
-The unchecked gate keeps this PRD in `prds/`; no move to done is claimed.
+The completed implementation checklist permits moving this PRD to `prds/done/`. Hosted multi-hour observation is outside these milestones.
 
 Acceptance examples 1–3 have handler/LiveDB and executor/runner evidence:
 
@@ -169,7 +169,12 @@ scratch; scratch records are not shipped documentation):
   timeout passed the seven focused route tests as a diagnostic only;
   browser tests passed (14 tests, four files, exit 0). Neither result makes
   the required web gate passed. Web source is unchanged through
-  `e26b8b2e`; this concrete blocker remains.
+  `e26b8b2e`; this was the concrete blocker before the I4 rerun.
+  Required `task gate:web` at `b80e69c6` subsequently passed, exit 0,
+  using the normal timeout settings, including all 14 browser tests.
+  This closes the required web-gate blocker without changing the test.
+  Required `task gate:api` also passed at `b80e69c6`, exit 0,
+  with `UZI_TEST_DATABASE_URL` unset.
 - **Unexecuted:** hosted `codex-refresh-lostreply-e2e` and
   `agent:worker-uid` lanes. Real hosted multi-hour outage observation is
   opportunistic outside this run, to be recorded after merge on #2747;
@@ -178,8 +183,8 @@ scratch; scratch records are not shipped documentation):
 Slack delivery remains best-effort: crash or failed marker persistence can
 duplicate a notification; exactly-once delivery was not proved. Web action
 proof uses mocked components rather than live server/runtime recovery.
-No claim is made that every required gate passed or that hosted recovery
-has been validated. The required web gate and lifecycle closure remain outstanding.
+The required local gates now have passing evidence at the revisions
+recorded above; this does not claim hosted recovery has been validated.
 
 ## Decision Log
 
