@@ -1037,7 +1037,11 @@ describe("m1 non-closing validation", () => {
       assert.ok(JSON.stringify(res).length < 2000);
     }
     const res = await callToolOverJsonRpc(buildSignalMcpServer(), "signal_done", { non_closing: { reason: "  " + "😀".repeat(500) + "  " } });
-    assert.notEqual((res["result"] as { isError?: boolean })?.isError, true);
+    assert.equal(res["error"], undefined, JSON.stringify(res));
+    const accepted = res["result"] as { isError?: boolean } | undefined;
+    assert.ok(accepted, JSON.stringify(res));
+    assert.notEqual(accepted.isError, true);
+    assert.match(JSON.stringify(accepted), /issue runs only/);
   });
 });
 
