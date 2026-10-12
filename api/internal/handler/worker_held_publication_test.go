@@ -394,11 +394,12 @@ func TestWorkerRunHeldPublicationCombinedBudgets(t *testing.T) {
 	srv := heldTransportServer(t, f, base)
 	pr, pw := io.Pipe()
 	start := time.Now()
+	step := heldUploadBudget * 8 / 10 / 10 // captured before the goroutine, see the restore in scaleHeldBudgets
 	go func() {
 		defer func() { _ = pw.Close() }()
 		for i := 0; i < 10; i++ {
 			_, _ = pw.Write([]byte("x"))
-			time.Sleep(heldUploadBudget * 8 / 10 / 10)
+			time.Sleep(step)
 		}
 	}()
 	resp, err := heldPost(t, srv, "/held-publication", pr)
@@ -424,9 +425,11 @@ func TestWorkerRunHeldPublicationStalledUploadTimesOut(t *testing.T) {
 	f := newFakeHeldSvc()
 	srv := heldTransportServer(t, f, base)
 	pr, pw := io.Pipe()
+	stall := heldUploadBudget * 3 // captured before the goroutine: scaleHeldBudgets restores the var at cleanup
+	t.Cleanup(func() { _ = pw.Close() })
 	go func() {
 		_, _ = pw.Write([]byte("x"))
-		time.Sleep(heldUploadBudget * 3)
+		time.Sleep(stall)
 		_ = pw.Close()
 	}()
 	start := time.Now()

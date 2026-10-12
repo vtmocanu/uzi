@@ -250,6 +250,12 @@ func TestWriteHeldConflict(t *testing.T) {
 		!strings.Contains(body.Error, "(delete_unknown)") {
 		t.Fatalf("body = %+v", body)
 	}
+	// The expire advice is scoped to acknowledged refs; other states are settled by the sweeper.
+	if !strings.Contains(body.Error, "acknowledged refs clear at their retention expiry") ||
+		!strings.Contains(body.Error, "any other state") || !strings.Contains(body.Error, "cleanup sweeper") ||
+		strings.Contains(body.Error, "the block lifts when each ref is deleted") {
+		t.Fatalf("error text does not scope expire advice to acknowledged refs: %q", body.Error)
+	}
 	// A raced guard with nothing named still refuses, with an empty (non-null) list and a floor of 1.
 	rec = httptest.NewRecorder()
 	writeHeldConflict(rec, "connection", 0, nil)

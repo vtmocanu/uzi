@@ -24,7 +24,7 @@ import { constants, createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
 
-import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS } from "./protocol.js";
+import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, type HeldFinalRetainedReason } from "./protocol.js";
 import { RequestError, isRunOwnershipLost } from "./client.js";
 import type { Logger } from "./log.js";
 import { residueQuarantine } from "./residue-quarantine.js";
@@ -1406,8 +1406,9 @@ export class RecoveryCoordinator {
       const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
       if (!ack || typeof ack !== "object") return kept("held_publication_unreadable_answer");
       if (ack.retained === true) {
-        const reason = typeof ack.reason === "string" && (HELD_FINAL_RETAINED_REASONS as readonly string[]).includes(ack.reason)
-          ? ack.reason : undefined;
+        const reason: HeldFinalRetainedReason | undefined = typeof ack.reason === "string" &&
+          (HELD_FINAL_RETAINED_REASONS as readonly string[]).includes(ack.reason)
+          ? ack.reason as HeldFinalRetainedReason : undefined;
         if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== false ||
             ack.holds_released !== 0 || reason === undefined) return kept("held_publication_unreadable_answer");
         if (HELD_FINAL_FALLBACK_REASONS.has(reason)) return await clearHeld(reason);
