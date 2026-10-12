@@ -4,28 +4,36 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"fmt"
+	"io"
+	"log/slog"
+	"net/http"
+	neturl "net/url"
+	"os"
+	"reflect"
+	"sort"
+	"strconv"
+	"testing"
+	"time"
+
 	"github.com/vtmocanu/uzi/controller/internal/apiclient"
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	"github.com/vtmocanu/uzi/controller/internal/reconcile"
-	"io"
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
-	"log/slog"
-	"net/http"
-	"os"
-	"reflect"
-	"sort"
-	"testing"
-	"time"
 )
 
 func TestHostedRollRetainedClaimsBridge(t *testing.T) {
 	url := os.Getenv("UZI_ROLL_TEST_API")
 	if url == "" {
 		t.Skip("invoked by API TestHostedRollRetainedClaimsLiveDB")
+	}
+	url, err := hostedRollFixtureURL(url)
+	if err != nil {
+		t.Fatal(err)
 	}
 	ctx := context.Background()
 	key := os.Getenv("UZI_ROLL_TEST_CONTROLLER_KEY")
@@ -198,4 +206,34 @@ func TestHostedRollRetainedClaimsBridge(t *testing.T) {
 		t.Fatalf("fresh HTTP busy count=%d", busy)
 	}
 	t.Log("M2 real HTTP poll/cordon channel + simulated UID/RV-enforcing kube: exactly one canary update, target ImagePullBackOff; retained deployments unchanged beyond 1h deadline; real API claims then Busy=3 without sibling drain")
+}
+
+// The cross-module parent is an httptest server, never an external endpoint.
+// Reconstructing from a fixed host and bounded integer port prevents environment
+// input from changing the request destination or injecting a path/credential.
+func hostedRollFixtureURL(raw string) (string, error) {
+	u, err := neturl.Parse(raw)
+	if err != nil || u.Scheme != "http" || u.Hostname() != "127.0.0.1" || u.User != nil ||
+		u.Path != "" || u.RawQuery != "" || u.Fragment != "" {
+		return "", fmt.Errorf("claim fixture requires an HTTP loopback server")
+	}
+	port, err := strconv.Atoi(u.Port())
+	if err != nil || port < 1 || port > 65535 {
+		return "", fmt.Errorf("claim fixture requires a valid loopback port")
+	}
+	return fmt.Sprintf("http://127.0.0.1:%d", port), nil
+}
+
+func TestHostedRollFixtureURL(t *testing.T) {
+	for _, raw := range []string{"http://127.0.0.1:1", "http://127.0.0.1:65535"} {
+		got, err := hostedRollFixtureURL(raw)
+		if err != nil || got != raw {
+			t.Fatalf("valid fixture %q: %q %v", raw, got, err)
+		}
+	}
+	for _, raw := range []string{"http://example.invalid:80", "http://localhost:80", "https://127.0.0.1:80", "http://127.0.0.1", "http://127.0.0.1:0", "http://127.0.0.1:65536", "http://user@127.0.0.1:80", "http://127.0.0.1:80/path", "http://127.0.0.1:80?query", "http://127.0.0.1:80#fragment"} {
+		if _, err := hostedRollFixtureURL(raw); err == nil {
+			t.Fatalf("unsafe fixture destination accepted: %q", raw)
+		}
+	}
 }
