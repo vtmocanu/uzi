@@ -52,6 +52,7 @@
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
+import { chunkedTimeout } from "../chunked-timeout.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
@@ -1661,6 +1662,8 @@ function firstSkillName(args: unknown): string | undefined {
 
 // ─── Injectable seams (production defaults; tests inject fakes) ──────────────────
 export interface CodexExecutorDeps {
+  /** Monotonic clock for relative deadlines; absolute predicates still use Date.now. */
+  readonly timeoutNow?: () => number;
   /** Initial release budget; defaults to six attempts and a 2000ms base (8000ms cap). */
   readonly initialCredentialAttempts?: number;
   readonly initialCredentialBaseDelayMs?: number;
@@ -2051,17 +2054,17 @@ export class CodexExecutor implements Executor {
       return true;
     }
     if (signal?.aborted || Date.now() >= deadlineAt) return false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof chunkedTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     try {
       return await new Promise<boolean>((resolve) => {
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
-        timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()));
+        timer = chunkedTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()), { now: this.deps.timeoutNow });
         state.promise!.then(() => resolve(!signal?.aborted && Date.now() < deadlineAt));
       });
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      timer?.cancel();
       if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   }
@@ -2085,7 +2088,7 @@ export class CodexExecutor implements Executor {
       return undefined;
     };
     let timer: ReturnType<typeof setInterval> | undefined;
-    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let deadline: ReturnType<typeof chunkedTimeout> | undefined;
     let wake!: () => void;
     const stop = new Promise<void>((resolve) => { wake = resolve; });
     const check = (): void => { if (interrupted()) wake(); };
@@ -2095,7 +2098,7 @@ export class CodexExecutor implements Executor {
       pauseNow.activeTurnTrip = trip;
       pauseNow.vaultLock.activeTurnTrip = trip;
       timer = setInterval(check, 25);
-      deadline = setTimeout(check, Math.max(0, wall.remainingMs));
+      deadline = chunkedTimeout(check, Math.max(0, wall.remainingMs), { now: this.deps.timeoutNow });
       check();
       await Promise.race([state?.promise ?? Promise.resolve(), stop]);
       if (interrupted()) state?.abort.abort();
@@ -2103,7 +2106,7 @@ export class CodexExecutor implements Executor {
       await state?.promise;
     } finally {
       if (timer !== undefined) clearInterval(timer);
-      if (deadline !== undefined) clearTimeout(deadline);
+      deadline?.cancel();
       ctx.signal?.removeEventListener("abort", check);
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
       if (pauseNow.vaultLock.activeTurnTrip === trip) pauseNow.vaultLock.activeTurnTrip = undefined;
@@ -2824,6 +2827,7 @@ export class CodexExecutor implements Executor {
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
+      let declaredNonClosing: { reason: string } | undefined;
       // Latched at a fresh ACK boundary or the legacy done exit when milestones remain.
       // Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
@@ -2861,6 +2865,7 @@ export class CodexExecutor implements Executor {
         // PRD #1798 M2: the lead's PR claims, NOT gated on run kind (as in sdk-executor); OMITTED
         // when none was declared. The runner reads it only where it renders a PR description.
         ...(declaredPrSummary !== undefined ? { prSummary: declaredPrSummary } : {}),
+        ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
       });
       // Clarification checkpoints return through the normal boundary guards without spending
       // another implementation iteration. The round bound spans all such provider epochs.
@@ -3041,6 +3046,9 @@ export class CodexExecutor implements Executor {
             for (const id of result.progress.completed) seenCompletedIds.add(id);
           }
           const hasQuestions = !!result.questions?.length;
+          if (isIssueRun && !hasQuestions && result.nonClosing !== undefined) {
+            declaredNonClosing = result.nonClosing;
+          }
           if (!hasQuestions && result.milestonesCompleted !== undefined) {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
@@ -3717,12 +3725,11 @@ export class CodexExecutor implements Executor {
     // Issue #1600: arm the RUN-WIDE remaining budget, not a fresh per-turn wall; the finally debits
     // this turn's elapsed time. An already-spent budget trips before the turn starts.
     const wallArmedAt = Date.now();
-    let wallTimer: ReturnType<typeof setTimeout> | undefined;
+    let wallTimer: ReturnType<typeof chunkedTimeout> | undefined;
     // A spent budget already tripped REASON_WALL via pendingInterruption above, so only arm it when
     // time remains.
     if (wall.remainingMs > 0) {
-      wallTimer = setTimeout(() => trip(REASON_WALL), wall.remainingMs);
-      wallTimer.unref?.();
+      wallTimer = chunkedTimeout(() => trip(REASON_WALL), wall.remainingMs, { now: this.deps.timeoutNow, unref: true });
     }
 
     reducer.beginTurn();
@@ -3838,7 +3845,7 @@ export class CodexExecutor implements Executor {
       effectsAbort.abort();
       unsubscribeCallbacks();
       if (idleTimer) clearTimeout(idleTimer);
-      if (wallTimer) clearTimeout(wallTimer);
+      wallTimer?.cancel();
       wall.remainingMs -= Date.now() - wallArmedAt;
       if (ctx.signal) ctx.signal.removeEventListener("abort", onCancel);
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;

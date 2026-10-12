@@ -1707,6 +1707,9 @@ export const PR_SUMMARY_GUIDANCE = [
   "dropped or deferred against the ask, including any risk or limit you accepted or",
   "inherited, with the plan line or ADR that accepted it. Leave out anything you cannot",
   "state plainly.",
+  "For issue runs only: when the approved plan permits leaving the issue open and the delivered",
+  "outcome leaves it open, declare `non_closing` with a reason in `signal_done`.",
+  "The worker never infers this declaration from plan prose or `pr_summary.scope_notes`.",
 ].join("\n");
 
 

@@ -1298,10 +1298,12 @@ export interface CompletionBlockInput {
   /** Sections a kind carries after its line (the self_improve evidence, the prompt run's
    *  guard-critical paths), as structured KindSection data that this renderer escapes. */
   kindSections?: readonly (KindSection | undefined)[];
-  /** Render `Closes #N`. An owner partial or a scope-capped run never closes, whatever this says. */
+  /** Render `Closes #N`. Owner partials, scope caps and non-closing declarations suppress it. */
   closes: boolean;
   completionScope?: ClaimConfig["completion_scope"];
   scopeCapped?: { completedCount: number; total?: number };
+  /** Issue-only declaration; the caller redacts the reason before rendering. */
+  nonClosing?: { reason: string };
   /** The run used the repository's own agents (PRD #37 D3b). */
   repoAgents?: boolean;
   gatesUnverified?: readonly string[];
@@ -1351,9 +1353,9 @@ function issueArm(input: CompletionBlockInput): string[] {
   const deferred = input.completionScope?.deferred ?? [];
   const accepted = input.completionScope?.accepted ?? [];
   const isOwnerPartial = deferred.length > 0;
-  // Only the normal arm (last below) can render `Closes #N`: an owner partial (PRD #1227) and an
-  // operator scope cap (PRD #634) never close, whatever `closes` says, structurally here and not only
-  // in the create-then-verify flow.
+  // Only the normal arm (last below) can render `Closes #N`, and a non-closing declaration
+  // suppresses it there too. Owner partials (PRD #1227) and operator scope caps (PRD #634)
+  // never close, whatever `closes` says.
   const lines = isOwnerPartial
     ? [
         `Implements part of #${iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
@@ -1375,8 +1377,13 @@ function issueArm(input: CompletionBlockInput): string[] {
       : [
           // #1801: NOT `Implements issue #N.` (a GitLab closing keyword).
           `Related to #${iid}.`,
-          ...(input.closes ? ["", `Closes #${iid}`] : []),
+          ...(input.closes && !input.nonClosing ? ["", `Closes #${iid}`] : []),
         ];
+  if (input.nonClosing) {
+    const reason = escapeInline(input.nonClosing.reason) || Array.from(input.nonClosing.reason, (c) =>
+      `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
+    lines.push("", `> **Issue remains open.** ${reason}`);
+  }
   if (accepted.length > 0) {
     lines.push(
       "",

@@ -135,22 +135,25 @@ settings](admin-settings.md#run-health) for that setting.
 
 ### How much time a run can have in total
 
-A run's total wall-clock budget is held to 2147483 seconds (24d 20h
-31m 23s), the worker's timer limit. The room left for extensions is that
-limit, minus the larger of the run's frozen wall budget
-(`budget_wall_seconds`), `RUN_TIMEOUT`, `RUN_WALL_CEILING` and 72h (the largest
-`RUN_WALL_CEILING` the configuration accepts), minus the 30-minute finalize
-allowance that Stop grants (or the larger finalize allowance already granted),
-minus what is already extended. A request past that room is refused with a 409
-naming the limit and the room left. Because the room reserves the larger of
-the run's frozen wall and 72h (the maximum `RUN_WALL_CEILING`) for every run,
-a run with no frozen wall included (plan approval can still scale it up to
-the ceiling), it is about 21d 20h (1886483 s) of total extension under any
-validated configuration (`RUN_TIMEOUT` of 72h or less), and a later change to
-`RUN_WALL_CEILING` cannot take a run past the limit. The one uncovered case is an
-operator raising `RUN_TIMEOUT` above 72h later for a run that has no frozen wall
-yet. Chat, judge and interactive-task runs
-never time out, so extending one is refused, and a job is never extended.
+Extension admission retains a 2147483-second limit (24d 20h 31m 23s).
+The room left for extensions is that limit, minus the larger of the run's
+frozen wall budget (`budget_wall_seconds`), current `RUN_TIMEOUT`, current
+`RUN_WALL_CEILING` and 72h (the largest `RUN_WALL_CEILING` the configuration
+accepts), minus the 30-minute finalize allowance that Stop grants (or the
+larger finalize allowance already granted), minus what is already extended.
+A request past that room is refused with a 409 naming the limit and the
+room left. The 72h reserve covers later plan scaling or a ceiling increase,
+including a run with no frozen wall yet. With a frozen wall and current
+configuration no larger than 72h, and the standard finalize reserve, a run
+starts with 1886483 s (about 21d 20h) of extension room.
+
+This is an admission limit, not an absolute cap on the wall total served to
+the worker. A later `RUN_TIMEOUT` increase above 72h can raise the served
+total for a run with no frozen wall; that larger total is honored without
+clamping. The worker schedules long relative deadlines in chunks within the
+native timer range, so exceeding that range no longer fires the timer at
+once. Chat, judge and interactive-task runs never time out, so extending
+one is refused, and a job is never extended.
 
 ## Running out of time
 

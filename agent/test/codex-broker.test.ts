@@ -535,6 +535,25 @@ describe("CodexCallbackBroker: authority is bound to the grant, not the args", (
   });
 });
 
+
+describe("m1 non-closing broker", () => {
+  it("returns a neutral error then accepts a corrected dispatch", async () => {
+    const h = makeBroker();
+    const bad = await h.broker.handleToolCall(rt(), "signal_done", { non_closing: { reason: "PRIVATE".repeat(100) }, summary: "LEAK" }, "root");
+    assertDenied(bad, "invalid_signal");
+    assert.ok(!JSON.stringify(bad).includes("PRIVATE") && !JSON.stringify(bad).includes("LEAK"));
+    const good = await h.broker.handleToolCall(rt(), "signal_done", { non_closing: { reason: " corrected " } }, "root");
+    assert.equal(good.ok, true);
+    if (good.ok) assert.deepEqual(good.output, { done: true, nonClosing: { reason: "corrected" } });
+  });
+  it("rejects child and non-root grants", async () => {
+    for (const [isRoot, origin] of [[true, "child"], [false, "root"]] as const) {
+      const h = makeBroker({ grants: grants({ isRoot }) });
+      assertDenied(await h.broker.handleToolCall(rt(), "signal_done", { non_closing: { reason: "child" } }, origin), "signal_root_only");
+    }
+  });
+});
+
 describe("CodexCallbackBroker: root-only signals", () => {
   it("lets the root latch a signal and returns the parsed signal", async () => {
     const h = makeBroker();

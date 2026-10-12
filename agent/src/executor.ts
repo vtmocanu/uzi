@@ -802,6 +802,8 @@ export interface ExecutorResult {
    *  it on an MR-path completion only. It is never part of any persisted message.
    *  StubExecutor never sets it. */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
    *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
    *  latched from the LAST successful generation of this run. Absent whenever that pass did not

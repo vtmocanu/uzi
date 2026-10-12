@@ -119,6 +119,10 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
         inputSchema: objectSchema({
           summary: STRING,
           report_only: { type: "boolean" },
+          non_closing: {
+            ...objectSchema({ reason: STRING }, ["reason"], false),
+            description: "Issue runs only: declare that this delivery leaves the issue open. Reason must contain 1–500 Unicode code points after trimming. Omit on other run kinds.",
+          },
           milestones_completed: { type: "array", items: STRING },
           prd_done_path: STRING,
           proposal: objectSchema({ title: STRING, body: STRING }, ["title", "body"], false),

@@ -6,6 +6,7 @@ import (
 	"io"
 	"log/slog"
 	"net/http"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
@@ -346,6 +347,8 @@ func (h *Handler) ListRecoveryArchives(w http.ResponseWriter, r *http.Request) {
 
 // DownloadRecoveryArchive streams the decrypted bundle bytes of one owner-owned capture.
 func (h *Handler) DownloadRecoveryArchive(w http.ResponseWriter, r *http.Request) {
+	svc := h.recovery()
+	_ = http.NewResponseController(w).SetWriteDeadline(time.Now().Add(svc.RequestDeadline()))
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
 		httpx.Error(w, http.StatusUnauthorized, "authentication required")
@@ -368,7 +371,7 @@ func (h *Handler) DownloadRecoveryArchive(w http.ResponseWriter, r *http.Request
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	err := h.recovery().Download(r.Context(), w, user.ID, runID, captureID)
+	err := svc.Download(r.Context(), w, user.ID, runID, captureID)
 	if err == nil {
 		return
 	}
