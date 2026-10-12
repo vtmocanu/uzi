@@ -369,8 +369,8 @@ Coverage is also refused, and the clone kept, in these cases:
 - **Docker teardown failed.** The proof scans processes only, so it is skipped
   unless the Docker half was `not_wired` or `docker_unconfirmed`.
 
-Status reads on a kept clone take no optional index locks, so inspecting never
-rewrites the clone's index.
+The coverage proof and the inventory's status reads on a kept clone take no
+optional index locks, so they do not rewrite the clone's index.
 
 A later claim of the issue (a newer generation of the same run, or a different
 run) starts on a fresh path on every worker and leaves the retained clone
@@ -390,13 +390,27 @@ path if the mode landed late. Consequences:
 - The run's final inventory counts marker-kept paths. A missing one makes that
   run's inventory unknown until the source is discarded.
 
-The refusal (`worker_residue_blocked`, message naming the worker-local inspect
-command) remains in these fail-closed cases, and the plain journal is kept with
-the existing routing: persisting the attempt mode or the marker fails, the marker
-evidence is malformed or over its cap, a residue quarantine is latched, the
-journal is not the exact plain one, a detachment cannot be completed at discovery
-(digest mismatch or a failed write), the attempt-mode value is malformed, or the
-fresh seed's quiescence check finds unattributed processes in the key's footprint.
+The source is kept in every fail-closed case, but what a later run sees differs:
+
+- **`worker_residue_blocked`** (message naming the worker-local inspect command),
+  only when marker evidence names the path or the run: the marker evidence is
+  malformed or over its cap, or the journal digest bound to a marker no longer
+  matches. Separately, the fresh seed's existing quiescence check finding
+  unattributed processes in the key's footprint is refused the same way.
+- **Nothing recorded.** If persisting the attempt mode or the marker fails, or
+  the journal is no longer the exact plain one, no marker exists. The clone stays
+  under its plain journal and routes as before: the same run's next claim enters
+  ordinary retained recovery, a different run goes through the existing
+  foreign-journal handling (terminal-orphan handling), and inspect lists it as a
+  marker-less plain-journal leftover.
+- **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a
+  failed write while discovery completes a detachment, fails the run closed with
+  "Retained recovery blocked: corrupt journal or unsafe local recovery storage"
+  (the default failure origin, not `worker_residue_blocked`).
+- **Residue quarantine latched.** The attempt mode and marker are still written
+  and the source is reported retained, but the journal is kept. A quarantined
+  worker claims nothing until its container restarts; the next discovery then
+  completes the detachment.
 
 Recovery parks and terminal-disk exits follow the same coverage rule. The worker
 decides once, when the recovery handler exits, whether the clone is covered, and
@@ -1002,11 +1016,15 @@ actively parked run), a local record gives `resolve_local_record`, and a live
 flight refuses. Otherwise it is `local_discard`. A hold can be released (claim
 released, capture available) or never opened (`paused` and `limit_wait` parks,
 workers with recovery disabled) while the run is still parked, so such a source is
-reclaimable by explicit operator confirmation and loses only the bytes outside the
-last capture. Its discard clears that plain journal, so a later resume seeds fresh.
+reclaimable by explicit operator confirmation and loses every byte not already in a
+capture, published checkpoint or the tracking ref. Its discard clears that plain journal, so a later resume seeds fresh.
 A kept canonical clone with a `uzi-stopped` marker is listed with marker state
 `detached` (no active journal names it), or `bound` while its plain journal is
-still pending.
+still pending. Marker state `mismatch` means an active journal names the path but
+no longer matches the marker's digest; it is always refused (blocker
+`marker_mismatch`). A source with mismatched or malformed marker evidence is kept
+and is not reclaimable through this channel (fail closed): it needs manual
+investigation by the maintainer.
 
 **Discard** is the same invocation with `discard` in place of `inspect` and
 `--confirm <descriptor digest from inspect>` added; pass `--protected` as well for an
@@ -1014,9 +1032,11 @@ episode or protected source. It closes new claims briefly, waits at most 5 s for
 in-flight claims, requires the worker to be idle, reserves the run, then deletes the
 exact source under one lock. It never cancels a run or stops the worker.
 
-- On a Docker-wired worker, discard is also refused unless the Docker teardown
-  reported `docker_unconfirmed` (no container known to mount the clone). A
-  `docker_error` or any other state refuses the request. Discard clears a journal
+- On a Docker-wired worker, discard itself runs the Docker teardown, which
+  force-removes containers that bind-mount the clone (with their anonymous
+  volumes), and is refused unless that teardown reported `docker_unconfirmed` (no
+  container known to mount the clone). A `docker_error` or any other state
+  refuses the request. Discard clears a journal
   only when it still names that source, never a successor's.
 - A busy channel, a drain timeout (claims did not drain in 5 s), a non-idle worker, a
   reserved run, a wrong digest or an unreadable holds read is **refused**, and nothing is

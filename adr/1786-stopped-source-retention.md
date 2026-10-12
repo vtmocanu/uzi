@@ -39,7 +39,8 @@ The artifact is the existing clone; nothing is copied.
   journal (`recovery` or `retainedSources`) is left untouched; it is already protected.
 - **Canonical clone (non-Docker worker):** `GitCache.markStoppedCanonical` (amended 2026-10-12,
   maintainer decision 1) does three things in one bare-lock section, in this order, after every
-  validation has passed with nothing written: it persists the key's attempt mode
+  validation has passed (the only write that can precede them is retiring this run's own stale
+  markers, those whose path is verifiably gone and unnamed): it persists the key's attempt mode
   (`uzi-attemptmode.<key>.enabled`, the existing mechanism used after retained recovery) and
   reads it back; it writes a bounded bare-config marker, `uzi-stopped.<runId>.entry` (JSON with
   `version`, `runId`, `generation`, `branch`, `key`, `clonePath`, `journalDigest`, `reason`,
@@ -118,13 +119,17 @@ Retention needs an explicit reclaim path, including when no server hold exists.
   consumer `run_state:not_known_locally`). A marker-less record is hidden only by evidence
   that names its path: a valid marker by its parsed `clonePath`, a malformed marker whose text
   carries the path not followed by a clone-key character (so a marker for `issue-290` never
-  hides `issue-29`), an overflowing run, or a protected record that owns the path.
+  hides `issue-29`; a malformed marker naming `issue-29.attempt-…` likewise hides the plain
+  `issue-29` record, failing closed), the leftover's own run overflowing the marker cap, or a
+  protected record that owns the path.
 - **`discard`** requires the descriptor digest from inspect (`--confirm`). It closes the claim
   gate under a distinct `retained_ops` owner, waits at most 5 s for in-flight claims to
   drain, requires `Worker.isIdle()`, and holds the run's reservation through disposal. It never
-  cancels a run or stops the worker. On a Docker-wired worker it is refused unless the Docker
-  teardown reported `docker_unconfirmed`; a `docker_error` or any other state refuses the
-  destructive request, since a container may still mount the clone. `--generation none` is accepted for canonical and `gx`
+  cancels a run or stops the worker. On a Docker-wired worker discard itself runs the Docker
+  teardown, which force-removes containers that bind-mount the clone (with their anonymous
+  volumes), and is refused unless that teardown reported `docker_unconfirmed`; a `docker_error`
+  or any other state refuses the destructive request, since a container may still mount the
+  clone. `--generation none` is accepted for canonical and `gx`
   sources only when run and path identity are positively established.
 - **Server holds are read before the bare lock.** The server hold state comes from
   `client.listRecoveryHolds` and is never inferred from local files. The read happens inside
@@ -148,7 +153,8 @@ Retention needs an explicit reclaim path, including when no server hold exists.
   makes no new network call, so it cannot tell more. A hold can be released (claim released,
   capture available) or never opened (`paused` and `limit_wait` parks, recovery-disabled
   workers) while the run is still parked. Such a source is therefore reclaimable by explicit
-  operator confirmation and loses only the bytes outside the last capture.
+  operator confirmation and loses every byte not already in a capture, published checkpoint or
+  the tracking ref.
 - **One bare lock.** The protected discard runs through a private locked core of
   `discardRetainedRecovery` (`discardRetainedRecoveryUnderLock`); the public wrapper is
   `withLock` plus that core. The lock is taken once and held from the descriptor snapshot
@@ -223,19 +229,30 @@ promise another worker can resume it.
 
 ### Fail-closed cases
 
-These keep the source and the existing routing:
+Every case keeps the source. What a later run sees depends on where the failure sits:
 
-- `markStoppedCanonical` returns `unknown` (nothing written, plain journal kept) on a
-  persistence failure, malformed or overflowing marker evidence, a latched residue quarantine,
-  or a journal that is not the exact plain one.
-- A detachment that cannot be completed at discovery (digest mismatch, failed write).
-- Malformed or overflowing marker evidence naming the path or the run.
-- A malformed attempt-mode value.
-- The fresh seed's existing seed-mode quiescence finding unattributed processes in the key's
-  footprint.
-- A latched residue quarantine.
-
-In each case a later run is refused with `worker_residue_blocked`, as before this amendment.
+- **Refused with `worker_residue_blocked`** (`RetainedStoppedSourceError`, only when marker
+  evidence names the path or the run):
+  - malformed or overflowing marker evidence naming the path or the run
+    (`assertNoStoppedMarker`, `refuseMarkedPaths`);
+  - a bound journal whose digest no longer matches the marker (state `mismatch`);
+  - separately, the fresh seed's existing seed-mode quiescence finding unattributed processes
+    in the key's footprint (the #1783 residue rule), which this amendment does not change.
+- **Nothing recorded.** `markStoppedCanonical` returns `unknown` before the marker exists (a
+  persistence failure, malformed or overflowing marker evidence of the run, or a journal that is
+  no longer the exact plain one). The source is kept under its plain journal and routes as
+  before: the same run's next claim enters ordinary retained recovery
+  (`recoverRetainedClaim`), a different run goes through the existing foreign-journal handling
+  (`ForeignCaptureBlockedError`, then terminal-orphan handling), and inspect lists it as a
+  marker-less plain-journal leftover.
+- **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a failed write
+  during the discovery heal, fails the run closed with "Retained recovery blocked: corrupt
+  journal or unsafe local recovery storage" (the default `fail_origin`, not
+  `worker_residue_blocked`). The source is kept.
+- **Latched residue quarantine.** `markStoppedCanonical` still persists the attempt mode,
+  writes the marker and answers `retained`, but keeps the journal (the latch check in
+  `clearBoundJournal`). A quarantined worker claims nothing until its container restarts; the
+  next discovery then finishes the detachment.
 
 ## Alternatives rejected
 
@@ -290,8 +307,10 @@ In each case a later run is refused with `worker_residue_blocked`, as before thi
   later claims of the issue start a fresh model session; the work carries over through the
   tracking ref and checkpoints. While a run's marker exists, that run's later stops are never
   judged covered. A dirty kept clone keeps the run's hold, so its route is `owner_hold_discard`.
-- **Not shipped:** teardown of attributed containers is only requested, not proven
-  (tracked in #2747). The coverage proof scans processes and, on Docker-wired workers, uses
-  the teardown answer; it does not prove a container is gone.
+- **Not shipped:** teardown of attributed containers is not proven by tests or hosted
+  acceptance (tracked in #2747). The teardown code ships (`teardownDocker` force-removes
+  containers mounting the clone and answers `docker_unconfirmed` only after two clean
+  listings), and the coverage proof scans processes and, on Docker-wired workers, uses that
+  answer; no test evidence on a real Docker host shows a container is actually gone.
 - Operator procedure: `docs/run-recovery.md`, "When a run is stopped by a stale or fenced
   claim" and "Retained sources with no open hold (worker-local inspect and discard)".
