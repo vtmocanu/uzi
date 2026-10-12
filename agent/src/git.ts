@@ -4673,10 +4673,16 @@ export class GitCache {
       return;
     }
     const root = path.resolve(this.reposRoot);
-    if (!path.isAbsolute(barePath) || path.resolve(barePath) !== barePath || path.dirname(barePath) !== root) return;
-    await this.cleanupArchivedRecoveryPin({
+    if (!path.isAbsolute(barePath) || path.resolve(barePath) !== barePath || path.dirname(barePath) !== root) {
+      this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: "invalid_identity" });
+      return;
+    }
+    const result = await this.cleanupArchivedRecoveryPin({
       runId, generation, sourceSha: expectedSha, recoveryPinBareDir: path.basename(barePath), isEligible: () => true,
     });
+    if (result.state === "retained") {
+      this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: result.reason });
+    }
   }
 
   /**
@@ -4854,6 +4860,14 @@ export class GitCache {
         if (!await remember(path.join(bare, dir), evidence, true)) { parentMissing = true; break; }
       }
       const loose = parentMissing ? undefined : await metadata(path.join(bare, ref), 1024, evidence);
+      // Git's delete also unlinks the reflog and follows a symlinked intermediate directory, so
+      // the logs chain gets the same nofollow safe-owner admission (absent allowed, stop at the
+      // first absent level) and the reflog file itself must be a regular safe file or absent.
+      let logsMissing = false;
+      for (const dir of ["logs", "logs/refs", "logs/refs/uzi-recovery-pin", `logs/refs/uzi-recovery-pin/${input.runId}`]) {
+        if (!await remember(path.join(bare, dir), evidence, true)) { logsMissing = true; break; }
+      }
+      if (!logsMissing) await remember(path.join(bare, "logs", ref), evidence, false);
       let tip = packedTip;
       if (loose !== undefined) {
         if (!/^[a-f0-9]{40}\n?(?![\s\S])/.test(loose)) refuse("unsafe_metadata");

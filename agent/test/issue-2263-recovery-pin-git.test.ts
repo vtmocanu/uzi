@@ -1,12 +1,12 @@
 import { afterEach, beforeEach, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { constants as fsConstants, existsSync, writeFileSync, type Dir } from "node:fs";
+import { constants as fsConstants, existsSync, symlinkSync, writeFileSync, type Dir } from "node:fs";
 import { Readable } from "node:stream";
 import fs from "node:fs/promises";
 import path from "node:path";
 import { GitCache, type ArchivedRecoveryPinCleanup, type BoundaryProcessSpawner } from "../src/git.js";
-import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 
 const scratch = path.resolve("../.uzi/scratch");
 const runId = "archived-run";
@@ -110,7 +110,7 @@ it("changed target before cleanup refuses", async () => {
 });
 it("CAS rejects changed target immediately before mutation", async () => {
   intercept((_cwd, args) => { if (args.includes("update-ref") && args.includes("--stdin")) git(bare, "update-ref", ref, other); });
-  assert.equal((await cleanup()).state, "retained");
+  assert.deepEqual(await cleanup(), { state: "retained", reason: "git_failure" });
   assert.equal(present(), other);
 });
 it("packed exact pin deletes", async () => {
@@ -546,3 +546,100 @@ it("inherited Git environment redirection cannot reach the cleanup", async () =>
     assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
   });
 }
+
+// Eligibility is consulted before spawn, after prepare, and once more synchronously before commit.
+it("final synchronous eligibility check before commit refuses", async () => {
+  let calls = 0;
+  assert.deepEqual(await cleanup({ isEligible: () => { calls++; return true; } }), { state: "deleted" });
+  assert.equal(calls, 3);
+  git(bare, "update-ref", ref, sha);
+  calls = 0;
+  assert.deepEqual(await cleanup({ isEligible: () => ++calls < 3 }), { state: "retained", reason: "ineligible" });
+  assert.equal(calls, 3);
+  assert.equal(present(), sha);
+  assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
+});
+
+const logsDirs = ["logs", "logs/refs", "logs/refs/uzi-recovery-pin", "logs/refs/uzi-recovery-pin/archived-run"];
+// Each level, when a symlink, would send Git's reflog unlink into the other bare's real pin.
+const logsTarget = (foreign: string, level: string) => ({
+  "logs": foreign, "logs/refs": path.join(foreign, "refs"),
+  "logs/refs/uzi-recovery-pin": path.join(foreign, "refs/uzi-recovery-pin"),
+  "logs/refs/uzi-recovery-pin/archived-run": path.join(foreign, "refs/uzi-recovery-pin/archived-run"),
+} as Record<string, string>)[level]!;
+for (const level of logsDirs) {
+  it("symlinked reflog directory " + level + " refuses at admission", async () => {
+    const foreign = await second();
+    git(foreign, "update-ref", ref, other);
+    const idx = logsDirs.indexOf(level);
+    for (const d of logsDirs.slice(0, idx)) await fs.mkdir(path.join(bare, d));
+    await fs.symlink(logsTarget(foreign, level), path.join(bare, level));
+    assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "retained", reason: "unsafe_metadata" });
+    assert.equal(present(), sha);
+    assert.equal(present(foreign), other);
+  });
+  it("reflog directory " + level + " symlink planted after prepare refuses", async () => {
+    const foreign = await second();
+    git(foreign, "update-ref", ref, other);
+    const idx = logsDirs.indexOf(level);
+    for (const d of logsDirs.slice(0, idx)) await fs.mkdir(path.join(bare, d));
+    let planted = false;
+    assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git", isEligible: () => {
+      if (!planted && existsSync(path.join(bare, ref + ".lock"))) {
+        planted = true;
+        symlinkSync(logsTarget(foreign, level), path.join(bare, level));
+      }
+      return true;
+    } }), { state: "retained", reason: "unsafe_metadata" });
+    assert.equal(planted, true);
+    assert.equal(present(), sha);
+    assert.equal(present(foreign), other);
+    assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
+  });
+}
+it("symlinked reflog file refuses", async () => {
+  const foreign = await second();
+  git(foreign, "update-ref", ref, other);
+  for (const d of logsDirs) await fs.mkdir(path.join(bare, d));
+  await fs.symlink(path.join(foreign, ref), path.join(bare, "logs", ref));
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(present(), sha);
+  assert.equal(present(foreign), other);
+});
+it("symlinked reflog directory to an arbitrary directory leaves its files intact", async () => {
+  const victim = path.join(root, "victim");
+  await fs.mkdir(path.join(victim, runId), { recursive: true });
+  const file = path.join(victim, runId, "4");
+  await fs.writeFile(file, "keep\n");
+  await fs.mkdir(path.join(bare, "logs/refs"), { recursive: true });
+  await fs.symlink(victim, path.join(bare, "logs/refs/uzi-recovery-pin"));
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(await fs.readFile(file, "utf8"), "keep\n");
+  assert.equal(present(), sha);
+});
+it("a real reflog does not block deletion", async () => {
+  git(bare, "update-ref", "-d", ref);
+  git(bare, "-c", "core.logAllRefUpdates=always", "update-ref", ref, sha);
+  assert.equal(existsSync(path.join(bare, "logs", ref)), true);
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "deleted" });
+  assert.throws(() => present());
+});
+it("4-argument deleteRecoveryPin logs a retained result", async () => {
+  const { logger, lines } = recordingLogger();
+  const logged = new GitCache(path.join(root, "data"), logger, undefined, testGitCacheOptions());
+  git(bare, "update-ref", ref, other);
+  await logged.deleteRecoveryPin(bare, runId, 4, sha);
+  assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
+    level: "warn", msg: "recovery: recovery pin retained", bare, run_id: runId, generation: 4, reason: "target_changed",
+  }]);
+  assert.equal(present(), other);
+});
+it("4-argument deleteRecoveryPin logs a path outside the repos root", async () => {
+  const { logger, lines } = recordingLogger();
+  const logged = new GitCache(path.join(root, "data"), logger, undefined, testGitCacheOptions());
+  const outside = path.join(root, "elsewhere.git");
+  await logged.deleteRecoveryPin(outside, runId, 4, sha);
+  assert.deepEqual(lines.filter(l => (l as { level: string }).level === "warn"), [{
+    level: "warn", msg: "recovery: recovery pin retained", bare: outside, run_id: runId, generation: 4, reason: "invalid_identity",
+  }]);
+});
