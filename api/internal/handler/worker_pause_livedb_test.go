@@ -71,6 +71,28 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 	e := setupJobRouteLiveDB(t)
 	ctx := context.Background()
 	conn, repo := uuid.New(), uuid.New()
+	// Parent cleanup follows all subtests and precedes setupJobRouteLiveDB's pool
+	// close. Active fixtures must not remain visible to later retention sweeps.
+	t.Cleanup(func() {
+		cleanupCtx, cancel := context.WithTimeout(context.Background(), 5*time.Second)
+		defer cancel()
+		// This fresh owner has only this fixture's rows; the existing foreign keys
+		// cascade to its runs (and inputs/messages), both workers, connection and repo.
+		if _, err := e.pool.Exec(cleanupCtx, "DELETE FROM users WHERE id=$1", e.user); err != nil {
+			t.Errorf("delete pause fixture owner: %v", err)
+		}
+		var remaining bool
+		if err := e.pool.QueryRow(cleanupCtx, `SELECT
+ EXISTS (SELECT 1 FROM users WHERE id=$1) OR
+ EXISTS (SELECT 1 FROM runs WHERE user_id=$1 OR repo_id=$3) OR
+ EXISTS (SELECT 1 FROM workers WHERE user_id=$1) OR
+ EXISTS (SELECT 1 FROM forge_connections WHERE id=$2 OR user_id=$1) OR
+ EXISTS (SELECT 1 FROM repos WHERE id=$3 OR connection_id=$2)`, e.user, conn, repo).Scan(&remaining); err != nil {
+			t.Errorf("check pause fixture cleanup: %v", err)
+		} else if remaining {
+			t.Error("pause fixture cleanup left owned rows in the database")
+		}
+	})
 	e.exec(t, `INSERT INTO forge_connections (id,user_id,forge_type,base_url,bot_username,bot_forge_user_id,token_ciphertext)
  VALUES ($1,$2,'gitlab','https://forge.e2e','bot',1,$3)`, conn, e.user, []byte{1})
 	e.exec(t, `INSERT INTO repos (id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled)
