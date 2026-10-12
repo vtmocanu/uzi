@@ -1,6 +1,7 @@
 import { it } from "node:test";
 import assert from "node:assert/strict";
 import { spawn, execFileSync } from "node:child_process";
+import path from "node:path";
 import { GitCache, ScratchPublicationError, type BoundaryProcessSpawner } from "../src/git.js";
 import type { BoundaryProcessRequest } from "../src/harness.js";
 import { makeFixture } from "./fixture-repo.js";
@@ -21,10 +22,58 @@ function capture(requests: BoundaryProcessRequest[]): BoundaryProcessSpawner {
   };
 }
 function git(dir: string, ...args: string[]): string {
+  const env: NodeJS.ProcessEnv = {};
+  for (const [k, v] of Object.entries(process.env)) if (!k.startsWith("GIT_")) env[k] = v;
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8",
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    env: { ...env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
   }).trim();
 }
+
+it("local git helper ignores inherited GIT_DIR when branching, checking out and committing", { concurrency: false }, () => {
+  const first = makeFixture();
+  try {
+    const second = makeFixture();
+    const hadGitDir = Object.hasOwn(process.env, "GIT_DIR");
+    const originalGitDir = process.env.GIT_DIR;
+    try {
+      // Observe the fixtures independently of the helper under test, even while poisoned.
+      const env: NodeJS.ProcessEnv = { ...process.env };
+      for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
+      env.GIT_CONFIG_GLOBAL = "/dev/null";
+      env.GIT_CONFIG_SYSTEM = "/dev/null";
+      const inspect = (dir: string, ...args: string[]): string =>
+        execFileSync("git", ["-C", dir, ...args], { encoding: "utf8", env }).trim();
+      const snapshot = (dir: string) => ({
+        head: inspect(dir, "symbolic-ref", "HEAD"),
+        oid: inspect(dir, "rev-parse", "HEAD"),
+        refs: inspect(dir, "for-each-ref", "--format=%(refname) %(objectname)").split("\n").sort(),
+      });
+      const firstBefore = snapshot(first.originPath);
+      const secondBefore = snapshot(second.originPath);
+      const branch = "helper-isolation";
+      const message = "advance only the intended fixture";
+
+      process.env.GIT_DIR = path.join(second.originPath, ".git");
+      git(first.originPath, "branch", branch);
+      git(first.originPath, "checkout", branch);
+      git(first.originPath, "commit", "--allow-empty", "-m", message);
+
+      const firstAfter = snapshot(first.originPath);
+      assert.equal(firstAfter.head, `refs/heads/${branch}`);
+      assert.notEqual(firstAfter.oid, firstBefore.oid);
+      assert.deepEqual(firstAfter.refs, [
+        ...firstBefore.refs, `refs/heads/${branch} ${firstAfter.oid}`,
+      ].sort());
+      assert.equal(inspect(first.originPath, "show", "-s", "--format=%P", "HEAD"), firstBefore.oid);
+      assert.equal(inspect(first.originPath, "show", "-s", "--format=%B", "HEAD"), message);
+      assert.deepEqual(snapshot(second.originPath), secondBefore);
+    } finally {
+      if (hadGitDir) process.env.GIT_DIR = originalGitDir;
+      else delete process.env.GIT_DIR;
+      second.cleanup();
+    }
+  } finally { first.cleanup(); }
+});
 const remoteCommands = (requests: BoundaryProcessRequest[]) =>
   requests.filter((r) => r.argv.some((a) => ["ls-remote", "fetch", "push"].includes(a)));
 
