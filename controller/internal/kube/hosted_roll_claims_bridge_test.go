@@ -260,7 +260,7 @@ func TestHostedPressureClearedClaimsBridge(t *testing.T) {
 	pressureCall := func(phase string) {
 		t.Helper()
 		body, _ := json.Marshal(map[string]string{"id": pressureID, "phase": phase})
-		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/fixture/pressure", bytes.NewReader(body))
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/fixture/pressure", bytes.NewReader(body)) //nolint:gosec // G704: hostedRollFixtureURL reconstructs a fixed loopback host and bounded integer port for the trusted httptest parent.
 		if err != nil {
 			t.Fatal(err)
 		}
