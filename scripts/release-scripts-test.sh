@@ -874,6 +874,7 @@ ghcr_cut_case() {
     org-present) GHCR_KIND=Organization; owner=orgs/test ;;
     kind-fallback-present) GHCR_KIND=''; GHCR_KIND_RC=7 ;;
     identity-rc-present) GHCR_IDENTITY_RC=7 ;;
+    identity-rc-missing) GHCR_IDENTITY_RC=7; GHCR_BASE_OUT=0.2.0 ;;
     unresolved-owner) GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7 ;;
     empty-head-pin)
       sed 's/tag: "0.1.1"/tag: ""/' "$d/deploy/chart/values.yaml" > "$d/values.tmp"
@@ -897,7 +898,7 @@ ghcr_cut_case() {
      [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ]; then
     assert_eq "$name succeeds" 0 "$RC_RC"
     case "$name" in
-      both-error|present-error|unresolved-owner|identity-rc-present)
+      both-error|present-error|unresolved-owner|identity-rc-present|identity-rc-missing)
         assert_contains "$name warning diagnostic" 'warning:' "$out_lower"
         assert_contains "$name publish gate warning" 'publish gate' "$out_lower"
         assert_contains "$name warning selects HEAD pin" 0.1.1 "$RC_OUT"
@@ -909,7 +910,7 @@ ghcr_cut_case() {
       assert_eq "$name keeps main chart" 0.2.0-rc.1 "$(chart_ver "$d")"
       assert_eq "$name clean tree" "" "$(git -C "$d" status --porcelain)"
     else
-      if [ "$name" = unresolved-owner ]; then
+      if [ "$name" = unresolved-owner ] || [ "$name" = identity-rc-present ] || [ "$name" = identity-rc-missing ]; then
         assert_contains "$name identity attempted" 'repo view --json owner,name' "$(cat "$log")"
         ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
       else
@@ -1090,6 +1091,7 @@ ghcr_regressions() {
   ghcr_cut_case org-present default present present
   ghcr_cut_case kind-fallback-present default present present
   ghcr_cut_case identity-rc-present default present present
+  ghcr_cut_case identity-rc-missing default present present
   ghcr_cut_case stable-refusal stable absent present
   ghcr_cut_case stable-present stable present present
   ghcr_cut_case skip-refusal skip-promote absent present
