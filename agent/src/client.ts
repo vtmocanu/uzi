@@ -1613,10 +1613,10 @@ export class WorkerClient {
   }
 
   async submitCodeCrossCheck(runId: string, generation: number,
-    snapshot: { head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
+    snapshot: { head_commit: string; base_commit: string; repo_instructions_commit?: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
     signal?: AbortSignal,
     /** PRD #2170: the consent this submit was built under and, when on, the CLAUDE.md read at
-     *  base_commit. Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
+     *  repo_instructions_commit (base_commit for legacy adapters). Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
     instructions?: CodeCrossCheckInstructions): Promise<CodeCrossCheckStatus> {
     return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
       { stage: "code", claim_generation: generation, ...snapshot, ...instructions },

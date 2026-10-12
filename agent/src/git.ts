@@ -8128,7 +8128,7 @@ export class GitCache {
    * `defaultBranchRef`'s frozen-mirror fallback rungs (N2): those can resolve to a stale
    * `refs/heads/main` mirror fixed at first clone, which is exactly what this method exists
    * to bypass. We read `refs/remotes/origin/<default>` (which this fetch just updated),
-   * falling back to `FETCH_HEAD`, and validate a 40-hex OID before returning.
+   * using an explicit destination refspec, and validate a lowercase 40-hex OID before returning.
    */
   async fetchDefaultTip(
     barePath: string,
@@ -8141,24 +8141,18 @@ export class GitCache {
     const scope = cloneUrl ? httpScopeForUrl(cloneUrl) : undefined;
     return this.withLock(barePath, async () => {
       onLockAcquired?.();
-      await this.runGit(barePath, ["fetch", "origin", defaultBranch], pat, scope, username);
-      // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
-      // fetch updates the remote-tracking ref; read the fresh tip off it.
-      let sha = (
+      if (!defaultBranch || defaultBranch.startsWith("-")) throw new Error("invalid default branch");
+      await this.runGit(barePath, ["check-ref-format", `refs/heads/${defaultBranch}`]);
+      // Explicitly refresh the destination even when remote.origin.fetch does not map it.
+      await this.runGit(barePath, ["fetch", "origin",
+        `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`], pat, scope, username);
+      const sha = (
         await this.runGit(barePath, [
           "rev-parse",
           "--verify",
           `refs/remotes/origin/${defaultBranch}^{commit}`,
         ]).catch(() => "")
       ).trim();
-      if (!/^[0-9a-f]{40}$/.test(sha)) {
-        // Fallback: some server/refspec shapes leave only FETCH_HEAD current.
-        sha = (
-          await this.runGit(barePath, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]).catch(
-            () => "",
-          )
-        ).trim();
-      }
       if (!/^[0-9a-f]{40}$/.test(sha)) {
         throw new Error(
           `fetchDefaultTip: could not resolve a 40-hex tip for origin/${defaultBranch}`,
