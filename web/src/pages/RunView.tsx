@@ -2889,17 +2889,8 @@ export function RunView() {
         status={run.status}
         canSteer={canSteer}
         busy={busy}
-        onStop={() => cancelRun()}
         onSend={(text) => act(() => submit("follow_up", text))}
-        // PRD #1190: the "‖ Pause ▾" menu. The card decides whether to show it (running +
-        // pausable kind + no pause pending); here we only wire the request → refetch.
         run={run}
-        onPause={(mode) =>
-          act(async () => {
-            await api.pauseRun(run.id, mode);
-            await refreshRun();
-          })
-        }
       />
 
       {/* PRD #1391 Run B M3d (D13): the discard-held-outcome confirmation. Opened when a
