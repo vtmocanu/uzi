@@ -72,13 +72,18 @@
 # Completed and cancelled runs capture an exact protected source when one is present,
 # or the kept canonical clone named by a matching uzi-stopped marker; otherwise they
 # are status-only, unless the source search itself could not complete (FAIL).
-# Coverage is fail-closed: when an attributed source is listed but unreadable, a pod's
-# source search is inconclusive after a clone was found (a failed kubectl listing or
-# exec), or an extra source's capture is not verified, the run logs
-# "FAIL ... incomplete coverage: <k> of <m> attributed sources captured" and the script
-# exits 1 (latest not advanced). The artifacts that were captured are kept.
+# Coverage is fail-closed, for a clone capture and a BARE one alike: when an attributed
+# source is listed but unreadable, a source search is inconclusive (a failed kubectl
+# listing or exec, an unparseable marker, an invalid descriptor), or the primary or an
+# extra source's capture is not verified, the run logs
+# "FAIL ... incomplete coverage: <k> of <m> attributed sources captured (<reasons>);
+# latest not advanced, retry" and the script exits 1. <k> counts the verified artifacts;
+# <m> counts the captured sources plus the attributed ones listed but unreadable (deduped
+# by pod and path). The artifacts that were captured are kept. A dir the journal, ledger
+# and marker do not name is not an attributed source: it is never a gap by itself, though
+# on a run that captured nothing it still makes the search inconclusive.
 # Exit: 0 when every active target produced a verified recovery artifact for every
-# attributed source (terminal
+# attributed source (no coverage gap, see above; terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
 # surviving source could not be captured intact, or a bound completed/cancelled run's
 # source search was inconclusive (a failed kubectl listing or exec, an unparseable
@@ -321,7 +326,13 @@ tar cf - -C "$OUT" . 2>/dev/null | gzip -c
 # Source searches run in subshells ($(...), <(...)), so an inconclusive probe (a
 # kubectl listing or exec that did not complete) is recorded in a per-run file, not a
 # variable. A failed run is reported status-only only after a conclusive search.
-probe_inconclusive(){ : > "$PROBE_ERR_FILE"; }
+# It also records a coverage gap: once a source was captured, a search that did not
+# complete may have hidden an attributed one. The one exception is the candidate
+# listing's rc 3 (see select_clone), which touches only PROBE_ERR_FILE.
+probe_inconclusive(){
+  : > "$PROBE_ERR_FILE"
+  mark_gap "the source search was inconclusive (a kubectl listing or exec failed)"
+}
 # mark_gap <reason>: record, in a per-run file (the searches run in subshells), that an
 # attributed source could not be listed or read, so the run's coverage is incomplete.
 mark_gap(){ printf '%s\n' "$1" >> "$GAP_FILE"; }
@@ -436,8 +447,11 @@ aid_newer(){
 
 # select_clone <ns> <pod> <stem> <branch> <rid>: print the identity-verified working
 # clones for run <rid> on this pod, or return 1 when there is none (see the header's
-# "Clone layout"). Line 1 is the primary; each further line is another attributed source
-# (journal-named, marker canonical, or a ledger attempt in state live/reclaimed), deduped.
+# "Clone layout"). Line 1 is this pod's primary, which can be an unattributed fallback
+# (the newest ledger attempt in any state); every further line is an ATTRIBUTED source
+# (journal-named, marker canonical, or a ledger attempt in state live/reclaimed), and the
+# primary repeats there when it is attributed itself. The caller uses line 1 only on the
+# pod that supplies the run's primary (add_sources).
 # A candidate is valid only when (a) the journal or the ledger names it for <rid>
 # (runId equal, clonePath equal, attemptId equal when the entry carries one) and
 # (b) its .git reports <branch>. Journal-named wins; else the newest attemptId
@@ -454,7 +468,10 @@ select_clone(){
   listing="$(kexec_probe "$ns" "$pod" sh -c "$LIST_CANDIDATES" _ "$RUNNER_BASE" "$stem")" || rc=$?
   case "$rc" in
     0) ;;
-    3) probe_inconclusive ;;
+    # Whether an unreadable dir is an attributed source is decided per dir below (it
+    # records a gap only when the journal, ledger or marker names it); the listing's
+    # rc alone is not a coverage gap, but it still keeps a no-capture run from SNAP.
+    3) : > "$PROBE_ERR_FILE" ;;
     *) probe_inconclusive; return 1 ;;
   esac
   [ -n "$listing" ] || return 1
@@ -578,10 +595,12 @@ select_clone(){
       | .[] | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || {
         probe_inconclusive; return 1;
       }
-  elif [ "${terminal_capture:-0}" -eq 2 ]; then
+  fi
+  if [ "${terminal_capture:-0}" -eq 2 ]; then
     # A completed/cancelled run is captured only from protected custody or a valid
-    # stopped marker; the live journal and ledger names are ignored for it.
-    [ -n "$marker_path" ] || return 1
+    # stopped marker; the live journal and ledger names are ignored for it, with or
+    # without a protected descriptor (which validated against protected_ledger above).
+    [ -n "$protected_ok" ] || [ -n "$marker_path" ] || return 1
     journal=""; ledger=""
   fi
   # The journal also keeps canonical predecessors, which have no ledger identity.
@@ -634,12 +653,16 @@ select_clone(){
       [[ "$aid" =~ $ATTEMPT_RE ]] || continue
     fi
     # An unreadable dir (no branch) that the journal or ledger names as THIS run's
-    # clone may hold its work: that is an unfinished search, not absence. An unnamed
-    # unreadable dir (e.g. an empty root-owned attempt) is still skipped silently.
+    # clone may hold its work: that is an unfinished search (and an attributed source
+    # that is not captured: a coverage gap, counted in the total), not absence. An
+    # unnamed unreadable dir (e.g. an empty root-owned attempt) is not attributed to
+    # this run, so it is no gap; the listing's rc 3 already keeps a no-capture run
+    # from SNAP.
     if [ -z "$br" ]; then
       if { printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; } \
          || { [ -n "$aid" ] && printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path"; }; then
-        probe_inconclusive
+        : > "$PROBE_ERR_FILE"
+        printf '%s\t%s\n' "$pod" "$path" >> "$UNREAD_FILE"
         mark_gap "attributed source $path is listed but unreadable"
       fi
       continue
@@ -669,7 +692,7 @@ select_clone(){
   [ -n "$primary" ] || return 1
   printf '%s\n' "$primary"
   while IFS= read -r path; do
-    [ -n "$path" ] && [ "$path" != "$primary" ] && printf '%s\n' "$path"
+    [ -n "$path" ] && printf '%s\n' "$path"
   done <<< "$attributed"
   return 0
 }
@@ -729,14 +752,25 @@ attempt_retirement(){
 
 PROBE_ERR_FILE="$DEST/.probe-inconclusive"
 GAP_FILE="$DEST/.coverage-gap"
+# "<pod>TAB<path>" per attributed source that was listed but unreadable (deduped when counted).
+UNREAD_FILE="$DEST/.unreadable-sources"
 
-# add_sources <ns> <pod> <select_clone-output>: append each printed clone path (primary
-# first) to the SRC_* tuple arrays.
+# add_sources <ns> <pod> <select_clone-output> <skip-first 0|1>: append each printed clone
+# path to the SRC_* tuple arrays, skipping one already added for that pod. select_clone's
+# line 1 is its primary, which may be an unattributed fallback (the newest ledger attempt
+# in any state): it is a source only on the pod that supplies the run's primary, so the
+# caller passes skip-first=1 for every other pod (lines 2+ are always attributed).
 add_sources(){
-  local p
+  local p i dup first="$4"
   while IFS= read -r p; do
     [ -n "$p" ] || continue
-    SRC_NS+=("$1"); SRC_POD+=("$2"); SRC_PATH+=("$p")
+    if [ "$first" -eq 1 ]; then first=0; continue; fi
+    first=0
+    dup=0
+    for i in "${!SRC_PATH[@]}"; do
+      if [ "${SRC_POD[i]}" = "$2" ] && [ "${SRC_NS[i]}" = "$1" ] && [ "${SRC_PATH[i]}" = "$p" ]; then dup=1; fi
+    done
+    [ "$dup" -eq 1 ] || { SRC_NS+=("$1"); SRC_POD+=("$2"); SRC_PATH+=("$p"); }
   done <<< "$3"
 }
 
@@ -826,7 +860,7 @@ capture_one(){
 }
 
 for RID in "${RUNS[@]}"; do
-  rm -f "$PROBE_ERR_FILE" "$GAP_FILE"
+  rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE"
   J="$("$UZI" run get "$RID" --json 2>/dev/null)"
   st="$(printf '%s' "$J" | "$JQ" -r '.status // ""' 2>/dev/null)"
   if [ -z "${st:-}" ]; then
@@ -941,13 +975,13 @@ for RID in "${RUNS[@]}"; do
   # capture; every other attributed path from any pod is captured as an extra source.
   if [ -n "$preferred" ]; then
     out="$(select_clone "${preferred%% *}" "${preferred#* }" "$STEM" "$RUN_BRANCH" "$RID")" || out=""
-    add_sources "${preferred%% *}" "${preferred#* }" "$out"
+    add_sources "${preferred%% *}" "${preferred#* }" "$out" "$((${#SRC_PATH[@]} > 0))"
   fi
   while read -r cns cpod; do
     [ -n "$cpod" ] || continue
     if [ -n "$preferred" ] && [ "$cns $cpod" = "$preferred" ]; then continue; fi
     out="$(select_clone "$cns" "$cpod" "$STEM" "$RUN_BRANCH" "$RID")" || out=""
-    add_sources "$cns" "$cpod" "$out"
+    add_sources "$cns" "$cpod" "$out" "$((${#SRC_PATH[@]} > 0))"
   done < <(list_pods)
   if [ "${#SRC_PATH[@]}" -gt 0 ]; then
     ns="${SRC_NS[0]}"; pod="${SRC_POD[0]}"; CLONE_PATH="${SRC_PATH[0]}"; capture_kind="clone"
@@ -987,7 +1021,11 @@ for RID in "${RUNS[@]}"; do
   fi
 
   captured=0; total=1
-  capture_one "$STEM" "$capture_kind" "$ns" "$pod" "$CLONE_PATH" && captured=1
+  if capture_one "$STEM" "$capture_kind" "$ns" "$pod" "$CLONE_PATH"; then
+    captured=1
+  else
+    mark_gap "primary source ${CLONE_PATH:-$TRACK_REF} not captured intact"
+  fi
   if [ "$capture_kind" = "clone" ]; then
     total="${#SRC_PATH[@]}"
     # Every other attributed source is its own verified artifact: <stem>.source-<N>.tgz.
@@ -1000,16 +1038,18 @@ for RID in "${RUNS[@]}"; do
         mark_gap "extra source ${SRC_PATH[n-1]} on pod ${SRC_POD[n-1]} not captured intact"
       fi
     done
-    # A search that did not complete may have hidden an attributed source.
-    [ ! -e "$PROBE_ERR_FILE" ] || mark_gap "the source search was inconclusive (a kubectl listing or exec failed)"
-    if [ -e "$GAP_FILE" ]; then
-      log "FAIL $RID ($LBL): incomplete coverage: $captured of $total attributed sources captured ($(sort -u "$GAP_FILE" | paste -sd ';' - | sed 's/;/; /g')); latest not advanced, retry"
-      failures=1
-    fi
+  fi
+  # Applies to a BARE capture too: an attributed clone that was listed but unreadable,
+  # a failed capture, or a search that did not complete (probe_inconclusive) is a gap.
+  # Attributed sources that were listed but unreadable are in the total, not captured.
+  if [ -s "$UNREAD_FILE" ]; then total=$((total + $(sort -u "$UNREAD_FILE" | wc -l))); fi
+  if [ -e "$GAP_FILE" ]; then
+    log "FAIL $RID ($LBL): incomplete coverage: $captured of $total attributed sources captured ($(sort -u "$GAP_FILE" | paste -sd ';' - | sed 's/;/; /g')); latest not advanced, retry"
+    failures=1
   fi
 done
 
-rm -f "$PROBE_ERR_FILE" "$GAP_FILE"
+rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE"
 ln -sfn "$DEST" "$OUTROOT/latest-attempt"
 if [ "$failures" -eq 0 ] && [ "$recoverable" -eq 1 ]; then
   ln -sfn "$DEST" "$OUTROOT/latest"

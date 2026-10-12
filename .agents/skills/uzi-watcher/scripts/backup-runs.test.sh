@@ -88,6 +88,25 @@ if [ -n "\${UZI_TEST_EXECFAIL_POD:-}" ]; then
     prev="\$a"
   done
 fi
+# Per-pod filesystem view (UZI_TEST_ALT_POD): on that pod the runner-base paths in the exec
+# args are remapped from UZI_TEST_HOST_BASE to UZI_TEST_ALT_BASE, and the candidate
+# listing's output is mapped back, so two pods can hold different clone dirs.
+if [ -n "\${UZI_TEST_ALT_POD:-}" ] && [ "\${cmd[0]:-}" = sh ]; then
+  prev=""; alt=0
+  for a in "\${args[@]}"; do
+    if [ "\$prev" = exec ] && [ "\$a" = "\$UZI_TEST_ALT_POD" ]; then alt=1; fi
+    prev="\$a"
+  done
+  if [ "\$alt" = 1 ]; then
+    mapped=()
+    for a in "\${cmd[@]}"; do mapped+=("\${a/#\$UZI_TEST_HOST_BASE/\$UZI_TEST_ALT_BASE}"); done
+    if [ "\${cmd[4]:-}" = sh ]; then
+      "\${mapped[@]}" | sed "s#\$UZI_TEST_ALT_BASE#\$UZI_TEST_HOST_BASE#g"
+      exit 0
+    fi
+    exec "\${mapped[@]}"
+  fi
+fi
 if [ "\${cmd[0]:-}" = git ]; then
   # Execute the real bare-repo probes. This covers the public-main read and the
   # missing-clone fallback's show-ref lookup against the local fake worker bare.
@@ -1078,5 +1097,118 @@ grep -q 'incomplete coverage' "$D_FD/latest-attempt/backup.log" \
   || fail "marker-f-d: missing 'incomplete coverage'; got: $(cat "$D_FD/latest-attempt/backup.log")"
 [ -f "$D_FD/latest-attempt/issue-4242.tgz" ] || fail "marker-f-d: primary artifact missing"
 echo "PASS marker-f: every attributed source captured; retired not extra; a coverage gap fails closed"
+
+# --- coverage review fixes (issue 1786) --------------------------------------------
+BADA1="$RB/issue-4242.attempt-$A1"
+# bad_dir <path>: a dir whose .git exists but cannot be read.
+bad_dir() { mkdir -p "$1"; echo 'gitdir: /nonexistent' > "$1/.git"; }
+log_of() { cat "$1/latest-attempt/backup.log"; }
+
+# B1+B2: no readable clone, the ledger names an unreadable attempt live for the run, and
+# the run owns a tracking ref. The BARE artifact is kept, but it is not full coverage:
+# exit 1, latest not advanced, and the unreadable attributed source is in the total.
+reset_layout
+bad_dir "$BADA1"
+ledger "$A1" run-4242 "$BADA1" live
+TRK="$WORK/trk"
+make_clone "$TRK" agent/issue-4242 trk
+git -C "$TRK" -c user.name=t -c user.email=t@example.com commit -q --allow-empty -m work
+git --git-dir="$BARE" fetch -q "$TRK" agent/issue-4242:refs/uzi-runner/agent/issue-4242
+D_B1="$WORK/out.cov-b1"
+rc="$(backup_rc "$D_B1" run-4242)"
+[ "$rc" -eq 1 ] || fail "cov-b1: exit $rc, want 1; log: $(log_of "$D_B1")"
+grep -q 'BARE run-4242' "$D_B1/latest-attempt/backup.log" || fail "cov-b1: BARE artifact not logged"
+[ -f "$D_B1/latest-attempt/issue-4242.tgz" ] || fail "cov-b1: BARE artifact not kept"
+grep -q 'FAIL run-4242 .*incomplete coverage: 1 of 2 attributed sources captured' "$D_B1/latest-attempt/backup.log" \
+  || fail "cov-b1: missing 'incomplete coverage: 1 of 2'; log: $(log_of "$D_B1")"
+[ ! -e "$D_B1/latest" ] || fail "cov-b1: latest advanced despite incomplete coverage"
+git --git-dir="$BARE" update-ref -d refs/uzi-runner/agent/issue-4242
+
+# B2 (clone capture): one captured + one unreadable attributed source is "1 of 2".
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+bad_dir "$BADA1"
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+ledger "$A1" run-4242 "$BADA1" live
+D_B2="$WORK/out.cov-b2"
+rc="$(backup_rc "$D_B2" run-4242)"
+[ "$rc" -eq 1 ] || fail "cov-b2: exit $rc, want 1"
+grep -q 'incomplete coverage: 1 of 2 attributed sources captured' "$D_B2/latest-attempt/backup.log" \
+  || fail "cov-b2: missing '1 of 2'; log: $(log_of "$D_B2")"
+[ -f "$D_B2/latest-attempt/issue-4242.tgz" ] || fail "cov-b2: primary not kept"
+
+# R2: a failed PRIMARY capture also reports the run's incomplete coverage (0 captured).
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+D_R2="$WORK/out.cov-r2"
+rc="$(backup_rc "$D_R2" run-4242 "UZI_TEST_CAPFAIL_PATH=$RB/issue-4242.attempt-$A2")"
+[ "$rc" -eq 1 ] || fail "cov-r2: exit $rc, want 1"
+grep -q 'incomplete coverage: 0 of 1 attributed sources captured' "$D_R2/latest-attempt/backup.log" \
+  || fail "cov-r2: missing 'incomplete coverage: 0 of 1'; log: $(log_of "$D_R2")"
+
+# R3: a completed run with a valid protected descriptor captures the descriptor's
+# source only; a live ledger attempt of the run that the descriptor does not name is
+# not a source.
+reset_layout
+rid=completed-1
+predecessor="$RB/issue-4242"
+make_clone "$predecessor" agent/issue-4242 desc-old-dirty
+make_clone "$RB/issue-4242.attempt-$A3" agent/issue-4242 ledger-only-live
+ledger "$A3" "$rid" "$RB/issue-4242.attempt-$A3" live
+envelope="$(jq -cn --arg rid "$rid" --arg pred "$predecessor" '
+  {runId:$rid,clonePath:$pred} as $source
+  | {version:1,branch:"agent/issue-4242",key:"issue-4242",journal:($source + {retainedSources:[$source]})}')"
+git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$envelope"
+D_R3="$WORK/out.cov-r3"
+rc="$(backup_rc "$D_R3" "$rid")"
+[ "$rc" -eq 0 ] || fail "cov-r3: exit $rc, want 0; log: $(log_of "$D_R3")"
+tar -xOzf "$D_R3/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+desc-old-dirty' \
+  || fail "cov-r3: descriptor source not captured"
+[ ! -e "$D_R3/latest/issue-4242.source-2.tgz" ] || fail "cov-r3: a ledger-only live attempt became source-2 of a terminal run"
+git --git-dir="$BARE" config --unset-all "uzi-retained.$rid.journal"
+
+# N1: an unreadable dir that nothing names is not an attributed source: with the
+# journal-named clone captured, the run is complete.
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+bad_dir "$BADA1"
+D_N1="$WORK/out.cov-n1"
+rc="$(backup_rc "$D_N1" run-4242)"
+[ "$rc" -eq 0 ] || fail "cov-n1: exit $rc, want 0; log: $(log_of "$D_N1")"
+tar -xOzf "$D_N1/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+live-attempt' \
+  || fail "cov-n1: primary not captured"
+! grep -q 'incomplete coverage' "$D_N1/latest-attempt/backup.log" || fail "cov-n1: unnamed unreadable dir reported as a gap"
+
+# N2: on a pod other than the one supplying the primary, only ATTRIBUTED sources are
+# extras. Pod 2 holds a retired ledger attempt (select_clone's own fallback primary
+# there): not captured. Once the ledger marks it live, it is source-2 from pod 2.
+ALT="$WORK/altpod/runner"
+reset_layout
+rm -rf "$WORK/altpod"; mkdir -p "$ALT"
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 pod1-live
+make_clone "$ALT/issue-4242.attempt-$A1" agent/issue-4242 pod2-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+ledger "$A1" run-4242 "$ALT/issue-4242.attempt-$A1" retired
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" retired
+two_pods=("UZI_TEST_PODS=pod/uzi-hw-$WID-test pod/uzi-hw-second-test" "UZI_TEST_ALT_POD=uzi-hw-second-test"
+  "UZI_TEST_ALT_BASE=$ALT" "UZI_TEST_HOST_BASE=$RB")
+D_N2="$WORK/out.cov-n2"
+rc="$(backup_rc "$D_N2" run-4242 "${two_pods[@]}")"
+[ "$rc" -eq 0 ] || fail "cov-n2 retired: exit $rc, want 0; log: $(log_of "$D_N2")"
+tar -xOzf "$D_N2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+pod1-live' \
+  || fail "cov-n2 retired: primary is not pod 1's journal-current clone"
+[ ! -e "$D_N2/latest/issue-4242.source-2.tgz" ] || fail "cov-n2: a retired fallback attempt on pod 2 was captured as an extra"
+ledger "$A1" run-4242 "$RB/issue-4242.attempt-$A1" live
+D_N2B="$WORK/out.cov-n2b"
+rc="$(backup_rc "$D_N2B" run-4242 "${two_pods[@]}")"
+[ "$rc" -eq 0 ] || fail "cov-n2 live: exit $rc, want 0; log: $(log_of "$D_N2B")"
+tar -xOzf "$D_N2B/latest/issue-4242.source-2.tgz" ./issue-4242.source-2.uncommitted.patch | grep -qxF '+pod2-attempt' \
+  || fail "cov-n2 live: pod 2's attributed attempt was not captured as source-2; log: $(log_of "$D_N2B")"
+rm -rf "$WORK/altpod"
+echo "PASS coverage review fixes: bare gap, total, primary failure, terminal descriptor, unnamed dir, per-pod extras"
 
 echo "ALL PASS"
