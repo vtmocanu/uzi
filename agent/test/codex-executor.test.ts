@@ -13570,6 +13570,83 @@ describe("CodexExecutor: run-start environment probe (issue #1866 M2)", () => {
   });
 });
 
+
+for (const mode of ["off", "repair", "stale"] as const) {
+  const optedIn = mode !== "off";
+  it(`U3 D9 CodexExecutor first planning root consent=${optedIn} and resumed repair authority: ${mode}`, async () => {
+    const row: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
+  "stage": "code",
+  "round": 1,
+  "candidate_generation": 7,
+  "base_commit": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+  "head_commit": "bbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbbb",
+  "candidate_digest": "cccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccccc",
+  "checker_run_id": "child",
+  "checker_harness": "codex",
+  "checker_model": "m",
+  "checker_effort": "high",
+  "outcome": "completed",
+  "reason_class": null,
+  "findings": [
+    {
+      "id": "F_1",
+      "severity": "major",
+      "path": "a.ts",
+      "line": 2,
+      "title": "Verify guard",
+      "detail": "untrusted advice"
+    }
+  ],
+  "dispositions": null,
+  "finalized_at": null,
+  "interrupted_at": null,
+  "deadline_at": "2030-01-01T00:00:00Z"
+};
+    const args = { dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] };
+    let active = false, checks = 0, posts = 0;
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(toolCall(10, "report_cross_check_dispositions", args, th, tn, "before"));
+        t.push(toolCall(11, "submit_plan", { plan_md: "the plan" }, th, tn, "plan"));
+        t.push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(toolCall(20, "signal_done", {}, th, tn, "done"));
+        t.push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-1", "tn-3", (t, th, tn) => {
+        t.push(toolCall(30, "report_cross_check_dispositions", args, th, tn, "repair"));
+        t.push(toolCall(31, "signal_done", {}, th, tn, "done"));
+        t.push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async () => ({ kind: "approve", selection: { status: "absent" } }),
+      ...(optedIn ? {
+        claimGeneration: 7,
+        codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => active ? { ...row, candidate_generation: mode === "stale" ? 6 : 7 } : undefined,
+        reportCrossCheckDispositions: async () => { posts++; return row; },
+        codeCrossCheckGate: async () => {
+          active = ++checks === 1;
+          return active ? { action: "repair" as const, followUp: "D9-REPAIR" } : { action: "proceed" as const };
+        },
+      } : {}),
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "D9 planning/repair");
+    const start = rig.epochs[0]!.transport.requests.find(r => r.method === "thread/start")!;
+    assert.equal((rec(start.params).dynamicTools as Array<{ name: string }>).some(t => t.name === "report_cross_check_dispositions"), optedIn);
+    assert.equal(posts, mode === "repair" ? 1 : 0, "stale resumed generation never posts through the runner hook");
+    for (const epoch of rig.epochs.slice(1, optedIn ? 3 : 2)) {
+      assert.ok(epoch.transport.requests.some(r => r.method === "thread/resume"));
+      for (const request of epoch.transport.requests) {
+        assert.equal(rec(request.params).dynamicTools, undefined, request.method);
+        assert.equal(rec(request.params).dynamic_tools, undefined, request.method);
+      }
+    }
+  });
+}
+
 // Issue #1932 m3: the Codex executor consults ctx.secretRemediationGate at the done point, BEFORE
 // the persist / done checkpoint. `remediate` re-prompts the SAME live epoch; `fail` stops.
 describe("CodexExecutor secret remediation gate (issue #1932)", () => {
@@ -13594,6 +13671,120 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
   const REMEDIATE = "REMEDIATE-SECRET-MARKER: rewrite the flagged commit";
 
   for (const interlocked of [false, true]) {
+    it(`code repair recreates epoch with persisted session before both done paths: ${interlocked}`, async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(11, th, tn)]]),
+        script("th-1", [(th, tn) => [done(21, th, tn)]]),
+      ]);
+      let checks = 0;
+      const events: string[] = [];
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: interlocked,
+        secretRemediationGate: async () => { events.push("secret"); return { action: "proceed" }; },
+        checkpoint: async () => { events.push("checkpoint"); },
+        recordCompletionAttempt: async () => { events.push("attempt"); return { unmet: [], attemptCount: 1 }; },
+        codeCrossCheckGate: async () => {
+          assert.ok(rig.sessionOps.persist > 0, "session persisted before gate reaps");
+          events.push("code");
+          return ++checks === 1 ? { action: "repair", followUp: "ONE-CODE-REPAIR-MARKER" } : { action: "proceed" };
+        },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "code repair epochs");
+      assert.equal(checks, 2);
+      assert.equal(rig.providerLaunches(), 2);
+      assert.ok(turnTexts(rig.epochs[1]!.transport)[0]?.includes("ONE-CODE-REPAIR-MARKER"));
+      assert.ok(rig.epochs[1]!.transport.requests.some(r => r.method === "thread/resume"), "same session resumed");
+      assert.deepEqual(events, interlocked
+        ? ["secret", "checkpoint", "attempt", "code", "secret", "checkpoint", "attempt", "code"]
+        : ["secret", "code", "secret", "code"]);
+    });
+  }
+
+  it("unmet completion attempts do not call code until the successful done exit", async () => {
+    const rig = makeMultiEpochRig([
+      script("th-1", [(th, tn) => [done(11, th, tn)]]),
+      script("th-1", [(th, tn) => [done(21, th, tn)]]),
+    ]);
+    const events: string[] = [];
+    let attempts = 0;
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true,
+      checkpoint: async () => { events.push("checkpoint"); },
+      recordCompletionAttempt: async () => {
+        events.push("attempt");
+        return { unmet: ++attempts === 1 ? ["M1"] : [], attemptCount: attempts };
+      },
+      codeCrossCheckGate: async () => { events.push("code"); return { action: "proceed" }; },
+    });
+    await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "unmet completion code gate");
+    assert.equal(rig.epochs.flatMap((epoch) => turnTexts(epoch.transport)).length, 2);
+    assert.deepEqual(events, ["checkpoint", "attempt", "checkpoint", "attempt", "code"]);
+  });
+
+  for (const interlocked of [false, true]) {
+    it(`code advisory wait leaves the local wall disarmed and preserves persist ordering: ${interlocked ? "interlocked" : "legacy"}`, async () => {
+      const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
+      let checks = 0;
+      let persistsBefore = 0;
+      const { ctx } = makeCtx({
+        kind: "issue", completionInterlock: interlocked,
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        parkForWall: async () => { assert.fail("advisory wait cannot wall park"); },
+        codeCrossCheckGate: async () => {
+          checks++;
+          persistsBefore = rig.sessionOps.persist;
+          await new Promise<void>((resolve) => setTimeout(resolve, 300));
+          assert.equal(rig.sessionOps.persist, persistsBefore);
+          return { action: "proceed" };
+        },
+      });
+      rig.deps = { ...rig.deps, wallMs: 200 };
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "code wait");
+      assert.equal(checks, 1);
+      assert.equal(result.walled, undefined);
+      assert.equal(rig.providerLaunches(), 1);
+      assert.ok(persistsBefore > 0, "both paths persist before the gate can reap");
+      assert.equal(rig.sessionOps.persist, persistsBefore, "never persist a potentially reaped home after code gate");
+    });
+  }
+
+  it("Codex forwards its actual report-only completion to the code gate and runner result", async () => {
+    const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [toolCall(11, "signal_done", { report_only: true }, th, tn, "done")]])]);
+    let reportOnly: boolean | undefined;
+    const { ctx } = makeCtx({
+      kind: "issue",
+      codeCrossCheckGate: async (completion) => { reportOnly = completion.reportOnly; return { action: "proceed" }; },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "report only code");
+    assert.equal(reportOnly, true);
+    assert.equal(result.reportOnly, true);
+  });
+
+  for (const interlocked of [false, true]) {
+    it(`code findings on the last allowed iteration publish without a repair turn: ${interlocked ? "interlocked" : "legacy"}`, async () => {
+      const rig = makeMultiEpochRig([
+        script("th-1", [(th, tn) => [done(11, th, tn)]]),
+        script("th-1", [(th, tn) => [done(21, th, tn)]]),
+      ]);
+      const availability: Array<boolean | undefined> = [];
+      const { ctx } = makeCtx({
+        kind: "issue", config: { max_iterations: 1 }, completionInterlock: interlocked,
+        recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+        // Models the real gate: findings lead to a repair only while an iteration remains.
+        codeCrossCheckGate: async (completion) => {
+          availability.push(completion.repairAvailable);
+          return completion.repairAvailable === false || availability.length > 1
+            ? { action: "proceed" } : { action: "repair", followUp: "REPAIR-MARKER" };
+        },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "last iteration code gate");
+      assert.deepEqual(availability, [false]);
+      assert.equal(rig.epochs.flatMap((epoch) => turnTexts(epoch.transport)).length, 1, "no repair turn beyond the budget");
+      assert.equal(result.completionHeld, undefined);
+    });
+  }
+
+  for (const interlocked of [false, true]) {
     const label = interlocked ? "interlocked" : "non-interlocked";
 
     it(`${label}: remediate re-prompts the same live epoch, then proceed completes`, async () => {
@@ -13610,6 +13801,7 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
         config: { max_iterations: 5 },
         recordCompletionAttempt: async () => { attempts++; events.push("attempt"); return { unmet: [], attemptCount: attempts }; },
         checkpoint: async (o) => { events.push(o.reap ? "checkpoint:reap" : "checkpoint"); },
+        codeCrossCheckGate: async () => { events.push("code"); return { action: "proceed" }; },
         secretRemediationGate: async () => {
           events.push("gate");
           persistAtGate.push(rig.sessionOps.persist);
@@ -13625,9 +13817,9 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       assert.deepEqual(persistAtGate, [persistAtGate[0], persistAtGate[0]], "no session persist between the two gate calls");
       if (interlocked) {
         assert.equal(attempts, 1);
-        assert.deepEqual(events, ["gate", "gate", "checkpoint:reap", "attempt"], "the done checkpoint and attempt follow the proceed decision");
+        assert.deepEqual(events, ["gate", "gate", "checkpoint:reap", "attempt", "code"], "code follows secret and successful interlock");
       } else {
-        assert.deepEqual(events, ["gate", "gate"], "no checkpoint or attempt on a non-interlocked run");
+        assert.deepEqual(events, ["gate", "gate", "code"], "no checkpoint or attempt on a non-interlocked run");
       }
     });
 
@@ -13635,18 +13827,21 @@ describe("CodexExecutor secret remediation gate (issue #1932)", () => {
       const rig = makeMultiEpochRig([script("th-1", [(th, tn) => [done(11, th, tn)]])]);
       const checkpoints: unknown[] = [];
       let attempts = 0;
+      let codeCalls = 0;
       const { ctx } = makeCtx({
         kind: "issue",
         ...(interlocked ? { completionInterlock: true } : {}),
         recordCompletionAttempt: async () => { attempts++; return { unmet: [], attemptCount: attempts }; },
         checkpoint: async (o) => { checkpoints.push(o); },
         secretRemediationGate: async () => ({ action: "fail" }),
+        codeCrossCheckGate: async () => { codeCalls++; return { action: "proceed" }; },
       });
       const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "#1932 fail run");
       assert.equal(result.branch, "agent/issue-42", "the run returns a result, no throw");
       assert.equal(turnTexts(rig.epochs[0]!.transport).length, 1, "no further turn");
       assert.equal(checkpoints.length, 0, "no done checkpoint");
       assert.equal(attempts, 0, "no completion attempt");
+      assert.equal(codeCalls, 0, "no code gate after secret failure");
     });
   }
 });

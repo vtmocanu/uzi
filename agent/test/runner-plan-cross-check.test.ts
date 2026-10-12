@@ -17,7 +17,7 @@ import { createHash } from "node:crypto";
 import { PlanRejectedError, type Executor, type RunContext } from "../src/executor.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { MessageBatcher } from "../src/batcher.js";
-import { UsageRecorder } from "../src/usage-recorder.js";
+import { UsageRecorder, type UsageWireRequest } from "../src/usage-recorder.js";
 import type { PlanCrossCheckCandidate, PlanCrossCheckStateRequest } from "../src/client.js";
 import type { PlanVerdict } from "../src/steering.js";
 import { nullLogger } from "./helpers.js";
@@ -1212,30 +1212,58 @@ describe("U2 real runner checked gate", () => {
     assert.equal(api.crossCheckRequests.length, 1);
   });
 
-  it("a real usage 400 irrecoverably loses preparation receipts and terminates before submit", { skip: LINUX_CAPTURE }, async () => {
-    const c = claim();
-    api.usageHandler = () => ({ status: 400, body: { error: "usage refused" } });
-    api.crossCheckHandler = () => { throw new Error("must never submit"); };
-    const { exec, verdicts } = checkedExec(async (ctx) => {
-      const leg = ctx.usage!.startLeg();
-      leg.observeAssistant({ message: { id: "usage-1", model: "claude", usage: { input_tokens: 3 } } });
-      leg.close();
+  for (const usageFirst of [false, true]) {
+    it(`a real usage 400 irrecoverably loses preparation receipts and terminates before submit (${usageFirst ? "usage before preparation" : "preparation before debounce"})`, { skip: LINUX_CAPTURE }, async () => {
+      const c = claim();
+      api.usageHandler = () => ({ status: 400, body: { error: "usage refused" } });
+      api.crossCheckHandler = () => { throw new Error("must never submit"); };
+      const { exec, verdicts } = checkedExec(async (ctx) => {
+        const leg = ctx.usage!.startLeg();
+        const setTimer = globalThis.setTimeout;
+        let debounce!: () => void;
+        let timer!: ReturnType<typeof setTimeout>;
+        // Capture only the synchronously scheduled usage debounce, leaving HTTP timers real.
+        globalThis.setTimeout = ((callback: () => void, delay?: number) => {
+          debounce = callback;
+          timer = setTimer(callback, delay);
+          return timer;
+        }) as typeof setTimeout;
+        try {
+          leg.observeAssistant({ message: { id: "usage-1", model: "claude", usage: { input_tokens: 3 } } });
+          leg.close();
+        } finally { globalThis.setTimeout = setTimer; }
+        clearTimeout(timer);
+        if (usageFirst) {
+          debounce();
+          assert.ok(ctx.usage instanceof UsageRecorder);
+          await ctx.usage.drain();
+          await ctx.usage.drain();
+        }
+      });
+      const condition = "plan cross-check: preparation receipts irrecoverably lost";
+      const emit = MessageBatcher.prototype.emit;
+      let escalations = 0;
+      MessageBatcher.prototype.emit = function (message) {
+        if (JSON.stringify(message.payload).includes(condition)) escalations++;
+        return emit.call(this, message);
+      };
+      try { await start(exec, c); } finally { MessageBatcher.prototype.emit = emit; }
+      terminal(c.run_id, condition);
+      assert.equal(escalations, 1, "one escalation attempt even when the failed reservation rejects it");
+      assert.deepEqual(verdicts, [], "no implementation verdict or fabricated settlement");
+      const requests = api.usageRequests as unknown as UsageWireRequest[];
+      const usageMessages = requests.flatMap((request) => request.messages);
+      assert.equal(usageMessages.length, 1, "the refused usage record is sent exactly once");
+      assert.equal(usageMessages[0]!.message_id, "usage-1");
+      assert.equal(usageMessages[0]!.input_tokens, 3);
+      for (const request of requests.slice(1)) {
+        assert.deepEqual(request.messages, [], "extra requests carry only markers");
+        assert.deepEqual(request.legs, [{ leg_id: usageMessages[0]!.leg_id, closed_through: 1, dropped_records: 1 }]);
+      }
+      assert.equal(api.crossCheckRequests.length, 0);
+      assert.equal(gates(c.run_id).length, 0);
     });
-    const condition = "plan cross-check: preparation receipts irrecoverably lost";
-    const emit = MessageBatcher.prototype.emit;
-    let escalations = 0;
-    MessageBatcher.prototype.emit = function (message) {
-      if (JSON.stringify(message.payload).includes(condition)) escalations++;
-      return emit.call(this, message);
-    };
-    try { await start(exec, c); } finally { MessageBatcher.prototype.emit = emit; }
-    terminal(c.run_id, condition);
-    assert.equal(escalations, 1, "one escalation attempt even when the failed reservation rejects it");
-    assert.deepEqual(verdicts, [], "no implementation verdict or fabricated settlement");
-    assert.equal(api.usageRequests.length, 1);
-    assert.equal(api.crossCheckRequests.length, 0);
-    assert.equal(gates(c.run_id).length, 0);
-  });
+  }
 
   for (const revised of [false, true]) {
     it(`unrecoverable ${revised ? "revised" : "initial"} human ACK uses named terminal failure`, { skip: LINUX_CAPTURE }, async () => {

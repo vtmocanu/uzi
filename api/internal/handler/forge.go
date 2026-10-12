@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -158,15 +160,16 @@ func capsOrEmpty(caps []string) []string {
 // repoToDTO stays here as the store→DTO mapper.
 func repoToDTO(r store.Repo) apitypes.RepoDTO {
 	dto := apitypes.RepoDTO{
-		ID:                  r.ID.String(),
-		ConnectionID:        r.ConnectionID.String(),
-		ForgeProjectID:      r.ForgeProjectID,
-		PathWithNamespace:   r.PathWithNamespace,
-		WebURL:              r.WebUrl,
-		Enabled:             r.Enabled,
-		RepoSkillsEnabled:   r.RepoSkillsEnabled,
-		RepoClaudemdEnabled: r.RepoClaudemdEnabled,
-		RepoDevboxOptIn:     r.RepoDevboxOptIn,
+		ID:                                r.ID.String(),
+		ConnectionID:                      r.ConnectionID.String(),
+		ForgeProjectID:                    r.ForgeProjectID,
+		PathWithNamespace:                 r.PathWithNamespace,
+		WebURL:                            r.WebUrl,
+		Enabled:                           r.Enabled,
+		RepoSkillsEnabled:                 r.RepoSkillsEnabled,
+		RepoClaudemdEnabled:               r.RepoClaudemdEnabled,
+		RepoDevboxOptIn:                   r.RepoDevboxOptIn,
+		CrossCheckRepoInstructionsEnabled: r.CrossCheckRepoInstructionsEnabled,
 		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
 		// owner's improve_uzi backlog + selects the uzi worker directive). Default false.
 		RepoFoldImproveUziBacklog: r.FoldImproveUziBacklog,
@@ -174,6 +177,9 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		// so what the DTO surfaces is always a vocabulary-legal set. Normalized to a
 		// non-nil empty slice ([] over null) so the JSON shape is stable for the web.
 		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
+	}
+	if r.CodeCrossCheckGuidance.Valid {
+		dto.CodeCrossCheckGuidance = &r.CodeCrossCheckGuidance.String
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -1113,6 +1119,8 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 }
 
 type patchRepoRequest struct {
+	CodeCrossCheckGuidance            json.RawMessage `json:"code_cross_check_guidance"`
+	CrossCheckRepoInstructionsEnabled *bool           `json:"cross_check_repo_instructions_enabled"`
 	// RepoSkillsEnabled is the repo-skills opt-in (PRD #16): load skills from the
 	// repo's own .claude/skills at run time. Pointer so an omitted field is a
 	// no-op rather than a silent disable.
@@ -1149,14 +1157,9 @@ func optBoolToPgtype(v *bool) pgtype.Bool {
 	return pgtype.Bool{Bool: *v, Valid: true}
 }
 
-// PatchRepo updates a repo's mutable opt-in settings. Three disjoint paths: the
-// trust flags (repo_skills_enabled and/or repo_claudemd_enabled, PRD #16/#246) —
-// which may be set together or individually in one atomic round-trip
-// (SetRepoTrustFlags) — repo_devbox_opt_in (PRD #18), and required_capabilities (the
-// static per-repo capability hint, PRD #84 M2). Each of the three is its own exclusive
-// path and no two can be combined in one request. At least one field must be present.
-// Authorization: the repo owner (via the owning connection) or an admin. A non-owned,
-// unknown id returns 404 for a non-admin; an admin may target any repo.
+// PatchRepo updates one of five exclusive settings groups for an owner or admin.
+// Guidance and checker-instruction consent form one atomic group. The router
+// mounts this handler under cookie authentication and CSRF enforcement.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -1168,15 +1171,33 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req patchRepoRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	raw, readErr := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	if readErr != nil || len(raw) > 64<<10 || !utf8.Valid(raw) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	guidancePresent := len(req.CodeCrossCheckGuidance) != 0
+	codeSet := guidancePresent || req.CrossCheckRepoInstructionsEnabled != nil
+	var guidance *string
+	if guidancePresent && (json.Unmarshal(req.CodeCrossCheckGuidance, &guidance) != nil || (guidance != nil && (len(*guidance) > 8192 || !utf8.ValidString(*guidance)))) {
+		httpx.Error(w, http.StatusBadRequest, "invalid code cross-check guidance")
 		return
 	}
 	devboxSet := req.RepoDevboxOptIn != nil
 	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
 	capsSet := req.RepoRequiredCapabilities != nil
 	foldSet := req.RepoFoldImproveUziBacklog != nil
-	// Each of the three settings groups is its own exclusive path — at most one per
+	// Each of the five settings groups is its own exclusive path — at most one per
 	// request. b2i counts how many are present so a combined request is rejected
 	// uniformly rather than pairwise.
 	b2i := func(b bool) int {
@@ -1185,18 +1206,24 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		return 0
 	}
-	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet)+b2i(foldSet) > 1 {
-		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet)+b2i(foldSet)+b2i(codeSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet && !capsSet && !foldSet {
-		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one of repo_skills_enabled or repo_claudemd_enabled")
+	if !devboxSet && !trustSet && !capsSet && !foldSet && !codeSet {
+		httpx.Error(w, http.StatusBadRequest, "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag")
 		return
 	}
 
 	var repo store.Repo
 	var err error
 	switch {
+	case codeSet:
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoCodeCrossCheckInputs(r.Context(), store.SetRepoCodeCrossCheckInputsParams{ID: id, GuidancePresent: guidancePresent, Guidance: pgconv.TextPtr(guidance), InstructionsEnabled: optBoolToPgtype(req.CrossCheckRepoInstructionsEnabled)})
+		} else {
+			repo, err = h.q.SetRepoCodeCrossCheckInputsForUser(r.Context(), store.SetRepoCodeCrossCheckInputsForUserParams{ID: id, UserID: user.ID, GuidancePresent: guidancePresent, Guidance: pgconv.TextPtr(guidance), InstructionsEnabled: optBoolToPgtype(req.CrossCheckRepoInstructionsEnabled)})
+		}
 	case trustSet:
 		// One atomic round-trip sets both trust columns; a nil field is left unchanged
 		// by the query's COALESCE, so the master toggle and each sub-toggle share this

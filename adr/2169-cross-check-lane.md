@@ -43,7 +43,7 @@ Owner/admin DTOs separate `active_runs` / `max_concurrent_runs` from `active_cro
 
 ## Proof limits and acceptance
 
-The shipped family direction is Claude lead → Codex plan checker. Codex-lead checking (#2460) and Code cross-check remain outside this implementation.
+The shipped family direction is Claude lead → Codex plan checker. Codex-lead checking (#2460) and Code cross-check remain outside this implementation. Code cross-check has since been implemented by #2170 on the same lane, pinned to the lead's own worker (see [Cross-check](../docs/cross-check.md#code-cross-check)).
 
 The existing checker exposes read-only tools and required checkout-rooted Landlock confinement with private writable grants. This does not prove network isolation or eliminate same-uid process residuals. Hosted uid splitting depends on the configured profile. Lead and checker share pod memory/CPU and OOM risk; default-one headroom is unmeasured. See [worker setup](../docs/worker-setup.md#cross-check-slots) and ADR-2149 for confinement limits.
 

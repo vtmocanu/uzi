@@ -1,3 +1,5 @@
+import { CodeCrossCheckGate, persistedCodeCrossCheckSummary } from "./code-cross-check-gate.js";
+import { readRepoInstructionsAtCommit } from "./repo-instructions-at-commit.js";
 import { ProviderPolicyRefusal, policyRefusalMessage } from "./provider-policy-refusal.js";
 import { TrustedExecutionRefusal, legacyTrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { AsyncResource } from "node:async_hooks";
@@ -8,7 +10,7 @@ import { basename as pathBasename, join, resolve as resolvePath } from "node:pat
 import type { WorkerClient } from "./client.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
-import type { GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
+import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
   gitBasicCredential,
@@ -7665,6 +7667,18 @@ export class RunRunner {
     // The completion block this run writes, with or without `Closes #N` and the unverified banner.
     // mrCompletionBlock's wording; the publisher and the reconcile compose the region and the
     // preserved text around it.
+    // Rebuild persisted evidence at publication as well as session completion: a superseded
+    // completed row must not carry the earlier attempt's counts into a reconciled MR.
+    if (claim.code_cross_check_required === true && result.codeCrossCheckSummary) {
+      try {
+        result.codeCrossCheckSummary = persistedCodeCrossCheckSummary(
+          await this.client.codeCrossCheckStatus(claim.run_id, flight.claimGeneration,
+            AbortSignal.any([boundarySignal ?? new AbortController().signal, AbortSignal.timeout(3000)])),
+          flight.claimGeneration);
+      } catch {
+        result.codeCrossCheckSummary = { incomplete: "status unavailable" };
+      }
+    }
     const runKind = resolveRunKind(claim.kind);
     const declaration = runKind === "issue" ? result.nonClosing : undefined;
     const effectiveNonClosing = declaration ? { reason: flight.redactText(declaration.reason) } : undefined;
@@ -7682,6 +7696,7 @@ export class RunRunner {
         claim.config?.completion_scope,
         bridged,
         opts,
+        result.codeCrossCheckSummary,
         effectiveNonClosing,
       );
     // D17: a refresh run (mr_rework, or a ci_fix adopting an existing branch rather than opening a
@@ -9628,6 +9643,28 @@ export class RunRunner {
     // gate via tryAcquire (so it can never self-deadlock), in QUIET mode (no `running` report) with
     // reap:false semantics, its own cancellation signal, and a sub-scope for the 60s secret scan.
     // See the ctx.checkpoint comment for the reap-before-git and best-effort invariants.
+    let codeSnapshot: { head_commit: string; base_commit: string } | undefined;
+    let codeFreshReceipt: CodeSnapshotFreshReceipt | undefined;
+    let codeGate: CodeCrossCheckGate | undefined;
+    let codeDefaultCommit: string | undefined;
+    let codeEmptyPrompt = false;
+    const captureImportedCodeHead = async (head: string | null): Promise<void> => {
+      codeSnapshot = undefined;
+      if (!barePath || !head || await this.git.branchTip(runnerClone.path, runnerClone.branch) !== head) return;
+      const defaultBranch = claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath);
+      const defaultCommit = defaultBranch ? await this.git.originBranchTip(barePath, defaultBranch) : null;
+      if (!defaultCommit) return;
+      codeDefaultCommit = defaultCommit;
+      codeSnapshot = await this.git.pinCodeSnapshot(barePath, runId, head, defaultCommit, false);
+      codeEmptyPrompt = false;
+      if (claim.kind === "prompt") {
+        const changed = await this.git.readBare(barePath,
+          ["diff", "--no-ext-diff", "--no-textconv", "--no-color", "--name-only", `${codeSnapshot.base_commit}...${head}`],
+          { maxBytes: 1024, signal: steering.lifecycleSignal() });
+        codeEmptyPrompt = !changed.truncated && changed.text === "";
+      }
+    };
+
     const checkpointBody = async (opts: CheckpointBodyOpts): Promise<CheckpointBodyOutcome> => {
       try {
         return await checkpointBodyOnce(opts);
@@ -9696,8 +9733,13 @@ export class RunRunner {
         // iteration can become publish-eligible on a later tip-unmoved iteration).
         // PRD #1809 D8: whether the tracking ref (what the publish packs) holds cloneTip: the tip was
         // unmoved since the last fetch-back, or this fetch-back landed.
+        const codeDoneSnapshot = claim.code_cross_check_required === true && codeGate === undefined
+          && opts.reap && opts.sink === "done_checkpoint";
+        // This read is inside the checkpoint's quiescent boundary, before import and bridging.
+        const originalCodeHead = codeDoneSnapshot ? await this.git.branchTip(runnerClone.path, runnerClone.branch) : null;
+        if (codeDoneSnapshot) codeSnapshot = undefined;
         let fetchedBack: FetchBackOutcome = { kind: "updated" };
-        if (!tipUnmovedSinceFetch) {
+        if (!tipUnmovedSinceFetch || codeDoneSnapshot) {
           // Fetch back, credential-free (#218's helper): brings the committed work into
           // refs/uzi-runner/<branch> where the reseed reads it. Best-effort, never fails.
           fetchedBack = await this.fetchBackBestEffort(
@@ -9717,6 +9759,10 @@ export class RunRunner {
         if (fetchedBack.kind === "refused") {
           bodyOutcome = "no_new_work";
           return;
+        }
+        if (codeDoneSnapshot && fetchedBack.kind === "updated") {
+          try { await captureImportedCodeHead(originalCodeHead); }
+          catch (err) { runLog.warn("code snapshot unavailable", { error: errMessage(err) }); }
         }
         const fetchedTip = await this.requireTrackingOwned(flight, barePath, runnerClone.branch);
 
@@ -10859,11 +10905,83 @@ export class RunRunner {
       checkpoint: (opts) =>
         // issue #1597 M2: gated — waits for (and preempts) an in-flight mid-turn tick.
         this.runGatedSink(flight, async () => {
+          if (opts.reap && opts.sink === "done_checkpoint" && !codeGate) { codeSnapshot = undefined; codeEmptyPrompt = false; }
           await checkpointBody({ reap: opts.reap, progress: opts.progress, sink: opts.sink });
         }),
       // issue #1932 D2: the pre-exit secret remediation gate, serialized with the mid-turn tick.
       secretRemediationGate: () =>
         this.runGatedSink(flight, () => this.runSecretRemediationGate(flight, barePath, runnerClone)),
+      ...(claim.code_cross_check_required === true
+        && isCodePublishingKind(claim.kind ?? "issue") ? {
+        codeCrossCheckGate: async (completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }) => {
+          if (completion.reportOnly || completion.notCode || completion.confirmedEmptyPrompt) return { action: "proceed" as const };
+          const decision = await this.runGatedSink(flight, async () => {
+            codeGate ??= new CodeCrossCheckGate({
+            client: this.client, runId, generation: flight.claimGeneration, signal: steering.lifecycleSignal(),
+            readInstructions: async (baseCommit: string, signal: AbortSignal) => {
+              if (!barePath) return "";
+              const read = await readRepoInstructionsAtCommit(this.git, barePath, baseCommit, { timeoutMs: 15_000, signal });
+              if (!("text" in read)) runLog.warn("code cross-check repository instructions not read", { reason: read.dropped });
+              return "text" in read ? read.text : "";
+            },
+            snapshot: async () => {
+              if (!barePath) return { reason_class: "snapshot_failed" as const };
+              if (!completion.interlocked) {
+                codeSnapshot = undefined;
+                try {
+                  // A local-only checkpoint boundary: no overlay, publication or origin preparation.
+                  await this.reapForSink(executor,
+                    { boundary: "checkpoint", deadlineMs: this.codexBoundaryDeadlineMs, sink: "done_checkpoint" },
+                    async () => {
+                      const original = await this.git.branchTip(runnerClone.path, runnerClone.branch);
+                      const imported = await this.fetchBackBestEffort(barePath!, runnerClone.path, runnerClone.branch, flight, runLog);
+                      if (imported.kind === "updated") await captureImportedCodeHead(original);
+                    }, flight, { keepClone: false });
+                } catch (err) { runLog.warn("code snapshot unavailable", { error: errMessage(err) }); }
+              }
+              if (codeEmptyPrompt) return undefined;
+              if (codeSnapshot && codeDefaultCommit) {
+                try {
+                  const pinned = await this.git.pinCodeSnapshot(barePath, runId, codeSnapshot.head_commit, codeDefaultCommit, true, flight.claimGeneration);
+                  codeFreshReceipt = pinned.freshReceipt;
+                  return { head_commit: pinned.head_commit, base_commit: pinned.base_commit };
+                } catch { return { reason_class: "snapshot_failed" as const }; }
+              }
+              return { reason_class: "snapshot_failed" as const };
+            },
+            });
+            return codeGate.done({ repairAvailable: completion.repairAvailable !== false });
+          });
+          const summary = codeGate?.observed();
+          const record = summary && !("incomplete" in summary) ? summary : undefined;
+          if (codeEmptyPrompt) return { action: "proceed" as const };
+          if (barePath && codeSnapshot && codeFreshReceipt && record && !("result" in record)
+            && record.candidate_generation === flight.claimGeneration
+            && record.outcome !== "pending" && record.checker_run_id === null
+            && record.head_commit === codeSnapshot.head_commit && record.base_commit === codeSnapshot.base_commit) {
+            // Only this invocation's fresh pin receipt plus atomic no-child settlement authorizes retirement.
+            await this.git.deleteCodeSnapshot(barePath, runId, codeSnapshot.head_commit, {
+              sealedOutcome: { persisted: true, sealed: true, stage: "code", leadId: runId,
+                head: codeSnapshot.head_commit, pinGeneration: flight.claimGeneration, outcome: record.outcome },
+              freshNoReader: { receipt: codeFreshReceipt, serverAtomicallyTerminalNoChild: true },
+            })
+              .catch((err) => runLog.warn("code snapshot retained after cleanup error", { error: errMessage(err) }));
+          }
+          // The completion section uses the server row, retaining the original checked identity.
+          batcher.emit({ kind: "status", agent: "worker", payload: {
+            text: record && !("result" in record) ? "Code cross-check advisory result" : "Code cross-check incomplete",
+          } });
+          return decision;
+        },
+        codeCrossCheckRepairActive: () => codeGate?.repairActive() === true,
+        codeCrossCheckRepair: () => this.runGatedSink(flight, async () => codeGate?.repair()),
+        reportCrossCheckDispositions: (batch: import("./code-cross-check-contract.js").CodeCrossCheckDispositionBatch) =>
+          this.runGatedSink(flight, async () => {
+            if (!codeGate) throw new Error("code cross-check repair is not active");
+            return codeGate.report(batch);
+          }),
+        codeCrossCheckSummary: () => this.runGatedSink(flight, async () => codeGate?.persistedSummary()),
+      } : {}),
       // Issue #281: a cheap fingerprint of the runner clone's committed + working-tree
       // state for the executor's no-progress detector — the runner-owned clone's branch
       // tip (committed work) plus `git status --porcelain` (uncommitted changes). Both are
@@ -11019,6 +11137,8 @@ export class RunRunner {
       nowSummary?.start();
       try {
         result = await executor.run(ctx);
+        const codeSummary = await ctx.codeCrossCheckSummary?.();
+        if (codeSummary) result.codeCrossCheckSummary = codeSummary;
       } catch (value) {
         executionRejection.rejected = true;
         executionRejection.value = value;
@@ -16164,7 +16284,7 @@ export class RunRunner {
     // also refuses object alternates, including for Claude. Dissociate either clone at seed.
     // `executor.sandboxesCommands` is set at construction; `executor.safety` is populated
     // only inside run(), so it is still unset here. Ordinary Claude/stub clones pass false.
-    const cloneOpts = { selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true };
+    const cloneOpts = { selfContained: executor.sandboxesCommands === true || claim.plan_cross_check_required === true || claim.code_cross_check_required === true };
     // PRD #983 M4b: the per-kind branch derivations (ci_fix's default-branch vs run-branch
     // choice, self_improve/prompt's fresh-per-cycle run-id branch, task/mr_rework's
     // pre-seeded branch with its loud missing-branch guard) live in RUN_KIND_PROFILES. A
@@ -17217,6 +17337,7 @@ export function mrCompletionBlock(
   // `git merge -s ours <P>` bridge is equally possible.
   bridged = false,
   opts?: MrDescriptionOptions,
+  codeCrossCheckSummary?: import("./code-cross-check-gate.js").CodeCrossCheckSummary,
   nonClosing?: ExecutorResult["nonClosing"],
 ): string {
   // PRD #983 M4b / PRD #1798 D14: a kind's one-line completion sentence lives in
@@ -17231,7 +17352,7 @@ export function mrCompletionBlock(
     issueIid: claim.issue_iid,
     branch,
     kindLine,
-    kindSections: [selfImproveSection, promptGuardSection],
+    kindSections: [selfImproveSection, promptGuardSection, codeCrossCheckSummary ? [{ codeCrossCheck: codeCrossCheckSummary }] : undefined],
     closes: renderCloses,
     completionScope,
     scopeCapped,

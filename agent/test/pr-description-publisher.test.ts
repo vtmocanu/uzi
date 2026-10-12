@@ -1024,6 +1024,99 @@ describe("publisher: refresh runs (D17) and the staleness line (D12)", () => {
   });
 });
 
+// ── Refresh runs and the code cross-check section ─────────────────────────────────────────────
+
+describe("publisher: refresh runs replace only the code cross-check section", () => {
+  const OLD_SECTION = { incomplete: "old run evidence" };
+  const FRESH_SECTION = { incomplete: "fresh run evidence" };
+  const block = (kindLine: string, section: { incomplete: string } | undefined, staleness?: { describedSha: string; headSha: string }): string =>
+    renderCompletionBlock({
+      branch: "agent/issue-7", closes: false, kindLine, staleness,
+      ...(section ? { kindSections: [[{ codeCrossCheck: section }]] } : {}),
+    });
+
+  for (const kindLine of ["Automated MR rework.", "Automated CI fix on the adopted branch."]) {
+    const refresh = (fresh: { incomplete: string } | undefined): PublicationSpec =>
+      makeSpec({ mode: "refresh", completion: (d) => block(kindLine, fresh, d) });
+
+    for (const [name, oldSection, fresh, expected] of [
+      ["swaps the old section for the fresh one", OLD_SECTION, FRESH_SECTION, FRESH_SECTION],
+      ["inserts the fresh section when the old block has none", undefined, FRESH_SECTION, FRESH_SECTION],
+      ["drops a stale old section the fresh run did not redo", OLD_SECTION, undefined, undefined],
+    ] as const) {
+      it(`${kindLine} ${name}; all other completion text is kept`, async () => {
+        const r = rig();
+        api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+        const oldBlock = block(kindLine, oldSection);
+        r.forge.pr.head = H2;
+        r.forge.pr.description = `${OLD_REGION}\n\n${oldBlock}`;
+        const pub = await r.publisher.prepare(refresh(fresh), { headSha: H2, targetBranch: "main" });
+        await pub.publish(MR);
+        const parsed = parseOwnedBlocks(r.forge.pr.description);
+        assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+        const written = parsed.completion!;
+        // Same block as a fresh render for the expected section (the region was refreshed, so no staleness pair).
+        assert.equal(written, block(kindLine, expected));
+        assert.ok(!written.includes("old run evidence"));
+      });
+    }
+  }
+
+  for (const [label, eol] of [["CRLF", "\r\n"], ["lone CR", "\r"]] as const) {
+    for (const [name, oldSection, fresh, expected] of [
+      ["replaces", OLD_SECTION, FRESH_SECTION, FRESH_SECTION],
+      ["inserts", undefined, FRESH_SECTION, FRESH_SECTION],
+      ["removes", OLD_SECTION, undefined, undefined],
+    ] as const) {
+      it(`${label} body: ${name} the section and keeps every other line ending`, async () => {
+        const r = rig();
+        api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+        const withEol = (t: string) => t.replace(/\n/gu, eol);
+        r.forge.pr.head = H2;
+        r.forge.pr.description = `${OLD_REGION}\n\n${withEol(block("Automated MR rework.", oldSection))}`;
+        const spec = makeSpec({ mode: "refresh", completion: (d) => block("Automated MR rework.", fresh, d) });
+        const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+        await pub.publish(MR);
+        const parsed = parseOwnedBlocks(r.forge.pr.description);
+        assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+        assert.equal(parsed.completion, withEol(block("Automated MR rework.", expected)));
+      });
+    }
+  }
+
+  it("a fresh run without a section keeps an old one that names the current head", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const current = `Code cross-check (checked \`${H2.slice(0, 7)}\`, Codex m): no findings`;
+    const oldBlock = renderCompletionBlock({
+      branch: "agent/issue-7", closes: false, kindLine: "Automated MR rework.",
+      kindSections: [[{ fixed: current }]],
+    });
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${OLD_REGION}\n\n${oldBlock}`;
+    const spec = makeSpec({ mode: "refresh", completion: (d) => block("Automated MR rework.", undefined, d) });
+    const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+    assert.equal(parsed.completion, oldBlock);
+  });
+
+  it("a closing-reference completion keeps its Closes text while the section is swapped", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const withSection = (section: { incomplete: string }, staleness?: { describedSha: string; headSha: string }) =>
+      renderCompletionBlock({ issueIid: IID, branch: "agent/issue-7", closes: true, staleness, kindSections: [[{ codeCrossCheck: section }]] });
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${OLD_REGION}\n\n${withSection(OLD_SECTION)}`;
+    const spec = makeSpec({ mode: "refresh", completion: (d) => renderCompletionBlock({ issueIid: IID, branch: "agent/issue-7", closes: false, staleness: d, kindSections: [[{ codeCrossCheck: FRESH_SECTION }]] }) });
+    const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(parseOwnedBlocks(r.forge.pr.description).kind === "ok" && (parseOwnedBlocks(r.forge.pr.description) as { completion?: string }).completion,
+      withSection(FRESH_SECTION));
+  });
+});
+
 // ── The interlock's reconcile ─────────────────────────────────────────────────────────────────
 
 describe("reconcileCompletion (the interlock's read-replace-write)", () => {

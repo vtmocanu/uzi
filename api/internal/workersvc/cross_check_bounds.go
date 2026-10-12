@@ -45,9 +45,39 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 	if err != nil || len(digest) != 32 {
 		return ErrCrossCheckRefused
 	}
+	var guidanceDigest, instructionsDigest []byte
+	instructionsEnabled := false
+	if input.Stage == "code" {
+		if input.RepoInstructionsEnabled != nil {
+			instructionsEnabled = *input.RepoInstructionsEnabled
+		}
+		if input.GuidanceDigest != "" {
+			guidanceDigest, err = hex.DecodeString(input.GuidanceDigest)
+			if err != nil || len(guidanceDigest) != 32 {
+				return ErrCrossCheckRefused
+			}
+		}
+		if input.RepoInstructionsDigest != "" {
+			instructionsDigest, err = hex.DecodeString(input.RepoInstructionsDigest)
+			if err != nil || len(instructionsDigest) != 32 {
+				return ErrCrossCheckRefused
+			}
+		}
+		if input.CustomGuidanceApplied != nil && *input.CustomGuidanceApplied != (input.GuidanceSnapshot != "") {
+			return ErrCrossCheckRefused
+		}
+	} else if input.RepoInstructionsEnabled != nil || input.CustomGuidanceApplied != nil ||
+		input.GuidanceDigest != "" || input.RepoInstructionsDigest != "" || input.RepoInstructionsText != "" {
+		return ErrCrossCheckRefused
+	}
 	_, err = crossCheckCandidateInput(store.CrossCheck{
 		Stage: input.Stage, Round: input.Round, LeadRunID: leadID,
-		PlanMd: pgtype.Text{String: input.PlanMd, Valid: true}, Milestones: input.Milestones,
+		HeadCommit:  pgtype.Text{String: input.HeadCommit, Valid: input.HeadCommit != ""},
+		CodeContext: input.CodeContext, GuidanceSnapshot: pgtype.Text{String: input.GuidanceSnapshot, Valid: true},
+		GuidanceText: pgtype.Text{String: input.GuidanceSnapshot, Valid: true}, GuidanceDigest: guidanceDigest,
+		RepoInstructionsEnabled: instructionsEnabled, RepoInstructionsText: pgtype.Text{String: input.RepoInstructionsText, Valid: true},
+		RepoInstructionsDigest: instructionsDigest,
+		PlanMd:                 pgtype.Text{String: input.PlanMd, Valid: true}, Milestones: input.Milestones,
 		RequiredCapabilities: input.RequiredCapabilities, RequiredTools: input.RequiredTools,
 		SizeClass:       pgtype.Text{String: input.SizeClass, Valid: true},
 		BaseCommit:      pgtype.Text{String: input.BaseCommit, Valid: true},

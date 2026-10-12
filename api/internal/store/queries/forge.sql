@@ -881,3 +881,16 @@ SET labels = COALESCE((SELECT jsonb_agg(value ORDER BY ordinal)
     WHERE value <> to_jsonb(@label::text)), '[]'::jsonb)
 WHERE repo_id = @repo_id AND forge_issue_iid = @forge_issue_iid
 RETURNING *;
+
+-- name: SetRepoCodeCrossCheckInputs :one
+UPDATE repos SET
+ code_cross_check_guidance = CASE WHEN @guidance_present::boolean THEN sqlc.narg('guidance')::text ELSE code_cross_check_guidance END,
+ cross_check_repo_instructions_enabled = COALESCE(sqlc.narg('instructions_enabled')::boolean, cross_check_repo_instructions_enabled)
+WHERE id = @id RETURNING *;
+
+-- name: SetRepoCodeCrossCheckInputsForUser :one
+UPDATE repos SET
+ code_cross_check_guidance = CASE WHEN @guidance_present::boolean THEN sqlc.narg('guidance')::text ELSE code_cross_check_guidance END,
+ cross_check_repo_instructions_enabled = COALESCE(sqlc.narg('instructions_enabled')::boolean, cross_check_repo_instructions_enabled)
+WHERE repos.id = @id AND repos.connection_id IN (SELECT fc.id FROM forge_connections fc WHERE fc.user_id = @user_id)
+RETURNING repos.*;

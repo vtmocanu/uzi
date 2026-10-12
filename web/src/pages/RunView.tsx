@@ -76,6 +76,7 @@ import { RunControls, SteerQueueCard } from "../components/SteerQueueCard";
 import { QuestionPanel, UnreadableQuestion } from "../components/QuestionPanel";
 import { deriveOpenQuestion } from "../lib/runQuestion";
 import { PlanCrossCheck } from "../components/PlanCrossCheck";
+import { CodeCrossCheck } from "../components/CodeCrossCheck";
 import { Markdown } from "../components/Markdown";
 import { JobResultPanel } from "./runView/JobResultPanel";
 import { Alert, Badge, Button, Card, PageHeader, StatusPill, cx, type BadgeTone } from "../components/ui";
@@ -2828,6 +2829,7 @@ export function RunView() {
       {terminal && <JudgePanel run={run} />}
 
       {run.status !== "awaiting_approval" && <PlanCrossCheck run={run} />}
+      {confirmedOwner === true && <CodeCrossCheck run={run} />}
 
       {/* PRD #209 M5: a SEEDED run's plan. It never enters awaiting_approval, so the
           PlanPanel above never renders and run.plan_md has no home on the page. This is

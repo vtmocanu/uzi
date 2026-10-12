@@ -278,6 +278,8 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     cleanupCalls: 0,
     claimResult: "ok" as "ok" | "none" | "throw" | "hang",
     claimReads: [] as Array<Record<string, unknown>>,
+    // when set, the claim read takes this long (a slow repo read)
+    claimDelayMs: undefined as number | undefined,
     // behaviour of the redundancy RPC
     prove: async (): Promise<RecoveryArchiveRedundancyResponse> => ({ capture_id: "", outcome: "retained", reason: "not_ancestor" }),
     // when set, called synchronously from the client method before any await (a client
@@ -353,6 +355,7 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     },
     readRecoveryCoverageClaim: async (_b: string, o: Record<string, unknown>) => {
       state.claimReads.push(o);
+      if (state.claimDelayMs) await new Promise(r => setTimeout(r, state.claimDelayMs));
       if (state.claimResult === "throw") throw new Error("read failed");
       if (state.claimResult === "hang") return new Promise<RecoveryCoverageClaim | undefined>(() => undefined);
       return state.claimResult === "none" ? undefined : { ...cloneClaim, coverageDigest: o.fingerprint as string };
@@ -564,18 +567,31 @@ describe("RecoveryCoordinator redundancy claims", () => {
 
     it("the caller's abort ends the wait as well", async () => {
       const h = await harness();
+      const abort = new AbortController();
+      const timers: NodeJS.Timeout[] = [];
+      const guard = <T extends string>(ms: number, value: T) =>
+        new Promise<T>(resolve => { const t = setTimeout(() => resolve(value), ms); t.unref(); timers.push(t); });
       try {
         const rec = await h.uploaded(false);
-        h.state.prove = () => new Promise<RecoveryArchiveRedundancyResponse>(() => undefined);
-        const abort = new AbortController();
+        // #2782: a claim read slower than any fixed abort timer; abort only once the claim is out
+        h.state.claimDelayMs = 120;
+        let claimStarted!: () => void;
+        const started = new Promise<"started">(resolve => { claimStarted = () => resolve("started"); });
+        h.state.prove = () => { claimStarted(); return new Promise<RecoveryArchiveRedundancyResponse>(() => undefined); };
         const withReceipt = await h.receipted(rec);
         const running = h.coordinator.resumePending(abort.signal, [withReceipt]);
-        setTimeout(() => abort.abort(), 60);
-        const started = Date.now();
-        await running;
-        assert.ok(Date.now() - started < 5_000);
-        assert.equal(h.state.proveCalls[0]!.signal?.aborted, true);
-      } finally { await h.close(); }
+        assert.equal(await Promise.race([started, guard(10_000, "no-claim")]), "started", "the redundancy claim was never sent");
+        abort.abort();
+        const abortedAt = Date.now();
+        const outcome = await Promise.race([running.then(() => "returned" as const), guard(3_000, "hung")]);
+        assert.equal(outcome, "returned", `the caller's abort did not end the wait (${Date.now() - abortedAt}ms)`);
+        assert.equal(h.state.proveCalls.length, 1);
+        assert.equal(h.state.proveCalls[0]!.signal?.aborted, true, "the claim request was given the caller's abort");
+      } finally {
+        for (const t of timers) clearTimeout(t);
+        abort.abort();
+        await h.close();
+      }
     });
     it("a claim read that hangs under the journal lock is cut off by the same deadline and cleanup completes", async () => {
       const h = await harness({ redundancyDeadlineMs: 60 });

@@ -84,6 +84,12 @@ export const mockRepos: Repo[] = [
     repo_devbox_opt_in: true,
     // The uzi repo dogfoods self-improve (PRD #686), so the fold capability is on.
     repo_fold_improve_uzi_backlog: true,
+    // PRD #2170 M3: owner guidance for the code cross-checker, so the Code
+    // cross-check panel opens with text and a byte count under VITE_UZI_MOCK=1.
+    // The checker's CLAUDE.md consent stays off: it is separate from the lead's.
+    code_cross_check_guidance:
+      "Check every new goose migration for a matching down step.\nFlag any handler that reads a cookie without the CSRF guard.",
+    cross_check_repo_instructions_enabled: false,
     pipeline: {
       status: "failed",
       web_url: "https://gitlab.example.com/myorg/uzi/-/pipelines/4242",

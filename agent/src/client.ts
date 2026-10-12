@@ -101,6 +101,8 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -1434,6 +1436,11 @@ export class WorkerClient {
         throw new Error("guarded generation cannot downgrade its claim assertion");
       }
       if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
+      // Legacy lane envelopes may omit the candidate; CrossCheckRunner refuses those
+      // before opening a reader. A present candidate always uses stage-specific validation.
+      if (claim?.kind === "cross_check" && claim.cross_check !== undefined) {
+        claim.cross_check = decodeCrossCheckClaim(claim.cross_check);
+      }
       // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
       // same check as the bind / lookup / ack responses). The warning carries the run id only,
       // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
@@ -1600,32 +1607,37 @@ export class WorkerClient {
     });
   }
 
-  /**
-   * Report a run state and return what the server made of it. Every report —
-   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
-   * limit_wait) alike — is retried with bounded backoff on transient failures: the
-   * server transition is idempotent, so a retried non-terminal report is safe
-   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
-   * server. An "already terminal" server response (409, or a 4xx body mentioning
-   * terminal) does not throw, so a lost ack / duplicate replay is safe. A
-   * 4xx is otherwise fatal.
-   *
-   * A durability-boundary caller supplies its permit signal. It cancels the
-   * in-flight request and any retry backoff, so the boundary awaits real request
-   * settlement without multiplying its own deadline by this retry schedule.
-   *
-   * The RESULT used to be discarded. It is now returned, because `limit_wait`
-   * (PRD #35) is the first report whose consequence is that the caller SKIPS
-   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
-   * Read the warning on StateAck before branching on it: the answer is
-   * `status === "limit_wait"`, never `applied`.
-   *
-   * 200 and 409 are both read for their body rather than routed through
-   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
-   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
-   * so parsing a 409's status back out of the error text would work in tests and
-   * fail on real runs.
-   */
+  async codeCrossCheckStatus(runId: string, generation: number, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    return decodeCodeCrossCheckStatus(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/code/latest?claim_generation=${generation}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal));
+  }
+
+  async submitCodeCrossCheck(runId: string, generation: number,
+    snapshot: { head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
+    signal?: AbortSignal,
+    /** PRD #2170: the consent this submit was built under and, when on, the CLAUDE.md read at
+     *  base_commit. Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
+    instructions?: CodeCrossCheckInstructions): Promise<CodeCrossCheckStatus> {
+    return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
+      { stage: "code", claim_generation: generation, ...snapshot, ...instructions },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+  }
+
+  async reportCodeCrossCheckDispositions(lead: string, generation: number,
+    batch: CodeCrossCheckDispositionBatch, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("invalid code cross-check generation");
+    decodeCodeCrossCheckDispositions(batch);
+    return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${lead}/cross-checks/code/dispositions`,
+      { claim_generation: generation, dispositions: batch }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+  }
+
+  async reportCodeCrossCheckVerdict(runId: string, generation: number,
+    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[] }, signal?: AbortSignal): Promise<void> {
+    decodeCodeFindings(result.findings);
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
+      { claim_generation: generation, ...result }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
   async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal, round = 1): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
@@ -1662,6 +1674,32 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
+  /**
+   * Report a run state and return what the server made of it. Every report —
+   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
+   * limit_wait) alike — is retried with bounded backoff on transient failures: the
+   * server transition is idempotent, so a retried non-terminal report is safe
+   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
+   * server. An "already terminal" server response (409, or a 4xx body mentioning
+   * terminal) does not throw, so a lost ack / duplicate replay is safe. A
+   * 4xx is otherwise fatal.
+   *
+   * A durability-boundary caller supplies its permit signal. It cancels the
+   * in-flight request and any retry backoff, so the boundary awaits real request
+   * settlement without multiplying its own deadline by this retry schedule.
+   *
+   * The RESULT used to be discarded. It is now returned, because `limit_wait`
+   * (PRD #35) is the first report whose consequence is that the caller SKIPS
+   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
+   * Read the warning on StateAck before branching on it: the answer is
+   * `status === "limit_wait"`, never `applied`.
+   *
+   * 200 and 409 are both read for their body rather than routed through
+   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
+   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
+   * so parsing a 409's status back out of the error text would work in tests and
+   * fail on real runs.
+   */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
@@ -2356,6 +2394,11 @@ export class WorkerClient {
       });
     }
     return out;
+  }
+
+  async getCodeSnapshotCleanup(leadId: string, signal?: AbortSignal): Promise<CodeSnapshotCleanup> {
+    return decodeCodeSnapshotCleanup(await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${leadId}/ownership?purpose=code_snapshot`, 3000, 16 * 1024, signal));
   }
 
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive
