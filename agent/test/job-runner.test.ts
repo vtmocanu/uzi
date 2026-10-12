@@ -985,16 +985,22 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
       const clock = overflowClock(t);
       clock.defaultClock();
       let signal: AbortSignal | undefined;
-      const stall = stalled(body.subarray(0, 4));
+      let stream: Readable | undefined;
       const { client, calls } = fakeClient({
-        downloadJobFile: (id, f, g, sink, sig) => {
+        downloadJobFile: async (_id, _f, _g, sink, sig) => {
           signal = sig;
-          return stall(id, f, g, sink, sig);
+          const r = new Readable({ read() {} });
+          stream = r;
+          r.push(body.subarray(0, 4));
+          sig?.addEventListener("abort", () => r.destroy(new Error("The operation was aborted")), { once: true });
+          await sink(r);
         },
       });
       const flag = { ran: false };
       const done = newRunner(client, await tmpJobsRoot(), noSession(flag)).execute(jobClaim({ budget_wall_seconds: BUDGET_S }, { files: [fileEntry()] }));
-      await waitFor(() => signal !== undefined, "the download to start");
+      // Wait for the writer to be consuming the body (error listener attached, first chunk read), not
+      // merely for the call: an abort before then destroys a stream nobody listens to.
+      await waitFor(() => stream !== undefined && stream.listenerCount("error") > 0 && stream.readableLength === 0, "the download body to be consumed");
       await driveWall(clock, () => signal!.aborted, () => calls.states.some((s) => s.body.status === "failed"));
       await done;
       assert.strictEqual(flag.ran, false);
@@ -1028,20 +1034,24 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
       assertWallTimers(clock);
     });
 
-    // Checks cancel-on-finish; it is not a regression guard for the overflow itself.
-    it("a job that completes early leaves no wall chunk pending", async (t) => {
-      const clock = overflowClock(t);
-      clock.defaultClock();
-      const { client, calls } = fakeClient();
-      const qf = scripted(async function* ({ options }) {
-        yield INIT_OK;
-        await callSubmit(options, GOOD_RESULT);
-        yield RESULT_OK;
+    // Checks cancel-on-finish for both deadlines (the download one is armed only when the job has
+    // files); it is not a regression guard for the overflow itself.
+    for (const withFiles of [false, true]) {
+      it(`a job that completes early leaves no wall chunk pending (${withFiles ? "with" : "without"} input files)`, async (t) => {
+        const clock = overflowClock(t);
+        clock.defaultClock();
+        const { client, calls } = fakeClient(withFiles ? { downloadJobFile: send(body) } : {});
+        const qf = scripted(async function* ({ options }) {
+          yield INIT_OK;
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        });
+        await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({ budget_wall_seconds: BUDGET_S }, withFiles ? { files: [fileEntry()] } : {}));
+        assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
+        assert.strictEqual(clock.requests.filter((x) => isWall(x.delay)).length, withFiles ? 2 : 1, "each armed deadline was requested once");
+        assert.deepStrictEqual(wallPending(clock).map((x) => x.delay), []);
       });
-      await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({ budget_wall_seconds: BUDGET_S }));
-      assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
-      assert.deepStrictEqual(wallPending(clock).map((x) => x.delay), []);
-    });
+    }
   });
 });
 
