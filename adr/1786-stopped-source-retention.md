@@ -173,8 +173,13 @@ positive server evidence that its run is terminal; an absent or released hold is
   `GetRunOwnedByWorker` (`WHERE id = @id AND worker_id = @worker_id`). Once the run's
   `worker_id` moves off this worker (a requeue after a released claim, or a claim elsewhere),
   the probe reads 404, so the leftover is refused through the channel indefinitely. It stays
-  kept, its bytes retained, and its only reclaim path is a later run of that branch's
-  terminal-orphan handling on this worker. A read that is not worker-scoped would close this,
+  kept, its bytes retained. While no open hold of this worker on the run covers it, the channel
+  refuses it: an open hold gives `owner_hold_discard` (the owner's server-side hold discard,
+  read in `git.ts` `evaluateRetained`, where the unknown-lifecycle blockers are soft) even
+  when the lifecycle read is unknown, and a cross-worker predecessor's hold can stay open
+  (`specs/human.md`). Its only automatic reclaim is a later run of that branch's
+  terminal-orphan handling on this worker, which quarantines the clone to a `.uzi-residue-*`
+  directory that the retention sweep later deletes. A read that is not worker-scoped would close this,
   but needs a new API and is an open follow-up, not shipped (PRD #1786, Decision Log,
   maintainer decisions 3 and 4).
 - **One bare lock.** The protected discard runs through a private locked core of
@@ -337,7 +342,10 @@ Every case keeps the source. What a later run sees depends on where the failure 
 
 - **Open follow-up (not shipped):** cross-worker reclaim. A marker-less kept canonical clone
   whose run moved off this worker reads 404 on the worker-scoped probe and stays refused
-  through the operator channel; closing it needs a lifecycle read that is not worker-scoped
+  through the operator channel unless an open hold of this worker on the run gives
+  `owner_hold_discard`; its only automatic reclaim is a later run of that branch's
+  terminal-orphan handling on this worker (quarantine to a `.uzi-residue-*` directory that the
+  retention sweep later deletes). Closing it needs a lifecycle read that is not worker-scoped
   (new API). No manual removal procedure is verified or documented as safe.
 - Retention raises ephemeral-storage pressure; existing disk admission still sees the real
   bytes, and there is no TTL or automatic reclaim.

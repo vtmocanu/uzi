@@ -480,14 +480,23 @@ and falling back to the durable bare tracking ref when no clone survives:
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
-  It captures every attributed source of the run on every running worker pod (journal or
-  protected-descriptor sources, the marker clone, and attempt clones whose last ledger entry
-  for the run is `live` or `reclaimed`): the primary keeps `<stem>.tgz` and each additional
-  source is `<stem>.source-N.tgz` (N from 2; members prefixed `<stem>.source-N.`, `meta.txt`
-  names `clone=<path>`) with its own verify and `OK`/`PART` line. If any attributed source is
-  not captured, or a search on any pod is inconclusive, it logs `FAIL ... incomplete coverage:
-  k of m attributed sources captured` and exits 1 (`latest` not advanced; the primary is
-  kept). Completed and cancelled runs still capture only protected or marker sources.
+  For an active run it captures every attributed source on every running worker pod: the
+  primary keeps `<stem>.tgz` (selection unchanged) and each other source is
+  `<stem>.source-N.tgz` (N from 2; members prefixed `<stem>.source-N.`, `meta.txt` names
+  `clone=<path>`) with its own verify and `OK`/`PART` line. Attributed sources are the journal
+  or protected-descriptor sources, the `uzi-stopped` marker canonical, and attempt clones whose
+  last ledger entry for the run is `live` or `reclaimed`; on a pod other than the one supplying
+  the primary only attributed sources are added. Completed and cancelled runs capture only
+  protected-descriptor or marker sources (journal and ledger are ignored). If an attributed
+  source is listed but unreadable, any capture (primary or extra) is not verified, or a probe of
+  the search failed (a kubectl listing or exec, an unreadable bare repository), whether the run
+  was captured from a clone or fell back to the bare tracking ref, it logs
+  `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`,
+  exits 1 and does not advance `latest`; any archive that did verify is kept. An unreadable
+  directory that no journal, ledger or marker names is not an attributed source. Cost: every
+  cycle execs into every Running pod in `UZI_WORKER_NS` for each bound run (a handful of probes
+  per pod), and one pod that cannot be exec'd into fails every live run's cycle until it is
+  fixed or excluded from `UZI_WORKER_NS`.
   A `queued` run without a worker binding gets a status-only `SNAP` and stays in
   the loop. A requeued run can retain its worker and clone; capture that work.
   A `failed` run bound to a worker is captured while its clone or owned tracking ref
@@ -580,7 +589,8 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    clean checkout of TIP alone does not bring over the backup's uncommitted work. Check
    for `<stem>.source-N.tgz` archives beside `<stem>.tgz` and restore each the same way,
    from its own prefixed members; an `incomplete coverage` FAIL means some attributed source
-   was not captured. Keep
+   was not captured or verified (any archive that did verify is kept), so do not treat the
+   backup as complete. Keep
    the ref and the backup until both committed and uncommitted work are verified in the
    successor.
 2. **Cancel normally, then verify the run is terminal** (`uzi run get RUN --json | jq -r

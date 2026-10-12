@@ -1039,8 +1039,7 @@ The disposition follows what the worker can see:
 
 The probe is scoped to the worker: once the run's `worker_id` moves off this worker (a
 requeue after a released claim, or a claim elsewhere) it reads 404, so the leftover is
-refused through this channel. It stays kept, its bytes retained, and its only
-reclaim path is a later run of that branch's terminal-orphan handling on this worker.
+refused through this channel. It stays kept, its bytes retained. While no open hold of this worker on the run covers it, the channel refuses it (an open hold gives `owner_hold_discard`, the owner's server-side hold discard, even when the lifecycle read is unknown, and a cross-worker predecessor's hold can stay open); its only automatic reclaim is a later run of that branch's terminal-orphan handling on this worker, which quarantines the clone to a `.uzi-residue-*` directory that the retention sweep later deletes.
 Cross-worker reclaim needs a lifecycle read that is not worker-scoped (new API); it is
 an open follow-up and is not shipped.
 
@@ -1078,12 +1077,21 @@ exact source under one lock. It never cancels a run or stops the worker.
 > anything you may want before confirming (the `uzi-watcher` skill's `backup-runs.sh`
 > is the existing backup procedure). `backup-runs.sh` attributes a detached kept
 > canonical clone through its exact `uzi-stopped.<runId>.entry` marker (the
-> canonical path only, never an attempt clone), and for an active run it captures every
-> attributed source on every running worker pod: the primary as `<stem>.tgz` and each
-> additional source as `<stem>.source-N.tgz` (N from 2, members prefixed
-> `<stem>.source-N.`, `meta.txt` naming `clone=<path>`). If any attributed source is not
-> captured, or a search on any pod is inconclusive, it logs `FAIL ... incomplete coverage`
-> and exits 1; the primary artifact is still kept.
+> canonical path only, never an attempt clone). For an active run it captures every
+> attributed source on every running worker pod: the primary as `<stem>.tgz` (selection
+> unchanged) and each other source as `<stem>.source-N.tgz` (N from 2, members prefixed
+> `<stem>.source-N.`, `meta.txt` naming `clone=<path>`). Attributed sources are the journal
+> or protected-descriptor sources, the marker canonical, and attempt clones whose last
+> ledger entry for the run is `live` or `reclaimed`; completed and cancelled runs capture
+> only protected-descriptor or marker sources. If an attributed source is listed but
+> unreadable, any capture is not verified, or a probe of the search failed (a kubectl
+> listing or exec, an unreadable bare repository), it logs
+> `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`,
+> exits 1 and does not advance `latest`; any archive that did verify is kept. An
+> unreadable directory that no journal, ledger or marker names is not an attributed
+> source. Cost: every cycle execs into every Running pod in `UZI_WORKER_NS` for each
+> bound run, and one pod that cannot be exec'd into fails every live run's cycle until it
+> is fixed or excluded from `UZI_WORKER_NS`.
 
 What the channel does not promise:
 
