@@ -1646,6 +1646,29 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
     });
   }
 
+  it("M1: unlink ENOENT after the root is swapped for an empty symlink retains the entry", async t => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    await o.journalTerminal("r1", 2, "reviewing", 7, { status: "completed" });
+    const file = path.join(root, "r1", "terminal-2.json");
+    const original = await fs.readFile(file);
+    const saved = path.join(path.dirname(root), "saved");
+    const unlink = fs.unlink.bind(fs);
+    t.mock.method(fs, "unlink", async (selected: Parameters<typeof unlink>[0]) => {
+      if (String(selected) === file) {
+        await fs.rename(root, saved);
+        const target = path.join(path.dirname(root), "target");
+        await fs.mkdir(target);
+        await fs.symlink(target, root);
+      }
+      return unlink(selected);
+    });
+    assert.equal(await o.retireTerminal("r1", 2), false);
+    assert.equal(o.hasPendingTerminal("r1", 2), true);
+    assert.deepEqual(await fs.readFile(path.join(saved, "r1", "terminal-2.json")), original);
+  });
+
   it("M1: retiring an absent generation retains sibling terminal finalize protection", async () => {
     const root = await mkRoot();
     const o = makeOutbox(root);

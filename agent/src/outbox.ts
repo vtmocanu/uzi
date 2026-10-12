@@ -1492,7 +1492,8 @@ export class Outbox {
       try {
         await fs.unlink(path.join(this.runDir(runId), fileName));
       } catch (err) {
-        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT" ||
+            !await this.terminalPositivelyAbsent(runId, fileName)) return false;
       }
       terminals?.delete(claimGeneration);
       return true;
