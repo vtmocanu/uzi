@@ -549,6 +549,32 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     assertRecoverable(r.clone(), late!, "row 8 transient");
   });
 
+  it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is not", async () => {
+    const attempt = transientRig(17928, { dockerHost: true });
+    const canonical = transientRig(17929);
+    const hook = afterVerifiedCapture((wt) => { writeLateChange(wt); });
+    try {
+      await attempt.runner.execute(attempt.claim);
+    } finally {
+      hook.restore();
+    }
+    const hook2 = afterVerifiedCapture((wt) => { writeLateChange(wt); });
+    try {
+      await canonical.runner.execute(canonical.claim);
+    } finally {
+      hook2.restore();
+    }
+    assert.match(path.basename(attempt.clone()), /\.attempt-/);
+    assert.ok(fs.existsSync(attempt.clone()) && fs.existsSync(canonical.clone()), "both parks kept their clone");
+    const result = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false });
+    const ours = result.sources.filter((s) => s.runId === attempt.claim.run_id);
+    assert.equal(ours.length, 1, "the attempt park clone is listed via its ledger entry");
+    assert.equal(ours[0]!.presence, "present");
+    assert.equal(result.sources.filter((s) => s.runId === canonical.claim.run_id).length, 0,
+      "a canonical clone kept under its plain journal is not listed and cannot be discarded through the channel");
+    assert.equal(journalCount(17929), 1, "its plain journal stays for the same run's resume");
+  });
+
   it("a retained attempt clone whose emptyDir path is later deleted is reported missing by inspect, never empty", async () => {
     const iid = 17927;
     const r = transientRig(iid, { dockerHost: true });
@@ -711,6 +737,40 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
     assertRecoverable(g.clone(), writeExpectedAfterWip(late!, g.clone()), "row 6");
     assert.deepEqual(sites.slice(-1), ["terminal_disk_pending_terminal"]);
     assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 0, "no park");
+  });
+
+  it("an interruption propagating out of the handler after a verified capture runs no settle: no stopped-source proof, the clone is kept", async () => {
+    const { f } = diskRig();
+    const sites = spyExitSites(f.runner);
+    let proofs = 0;
+    const quiesce = (f.runner as unknown as { quiesceRun: (...a: unknown[]) => Promise<unknown> }).quiesceRun.bind(f.runner);
+    (f.runner as unknown as { quiesceRun: unknown }).quiesceRun = (flight: unknown, executor: unknown, opts: { site?: string }) => {
+      if (opts?.site === "stopped_source") proofs++;
+      return quiesce(flight, executor, opts);
+    };
+    let late: Expected | undefined;
+    // The capture verifies and the exit is marked release-eligible; a shutdown then arrives with the
+    // post-capture ownership read, so the handler's next terminal-disk check throws.
+    let captured = false;
+    const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt); captured = true; });
+    const own = client.getRunOwnership.bind(client);
+    client.getRunOwnership = async (runId: string) => {
+      const answer = await own(runId);
+      if (captured) (f.runner as unknown as { shuttingDownGlobal: boolean }).shuttingDownGlobal = true;
+      return answer;
+    };
+    try {
+      await f.runner.execute(f.claim);
+    } finally {
+      client.getRunOwnership = own;
+      hook.restore();
+      (f.runner as unknown as { shuttingDownGlobal: boolean }).shuttingDownGlobal = false;
+    }
+    assert.equal(hook.fired(), 1);
+    assert.deepEqual(sites, [], "no settle revalidation ran for the throwing exit");
+    assert.equal(proofs, 0, "no stopped_source proof ran while the interruption propagated");
+    assertRecoverable(f.clone(), writeExpectedAfterWip(late!, f.clone()), "interrupted exit");
+    assert.deepEqual(stopMarkers(f.claim.run_id), []);
   });
 
   it("the degraded {verified:false} stub is never sufficient: a terminal park ACK keeps the unverified clone's bytes", async () => {

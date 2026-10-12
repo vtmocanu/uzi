@@ -150,9 +150,26 @@ The exit decides the representation of a source that is not covered:
 
 Two exits keep their earlier shape. An owner-authorized cancel (a non-credential cancel
 ACK) keeps its normal cleanup, since the owner chose to discard; only the
-credential-deferred captured cancel is revalidated. A `predecessorCapture` flight deletes
-only through its own verified in-place release, which touches no files, so it is not
-revalidated.
+credential-deferred captured cancel is revalidated. A `predecessorCapture` flight is
+released in place (ledger abandoned, journal cleared; no filesystem operation on the
+clone), so it is not revalidated; the clone is removed later by the retention sweep.
+
+Park and terminal exits that keep the clone outright (`credentialHeld`, an unverified
+credential terminal, `receipt_failed`, `ServerWallParkedError`, a confirm `gone` without
+a capture) run no own-mode proof beyond the existing entry kill, as before; only exits
+that become release-eligible run the `stopped_source` proof, once, at the handler's
+cleanup. An interruption propagating out of the handler (shutdown, pause, limit, a codex
+deferral, any throw) skips that cleanup check and leaves the clone kept; the caller
+handles the interruption.
+
+Claims without a claim generation (pre-generation APIs) can never be proven covered, so
+their park and terminal exits keep the clone, and a same-worker reclaim of such a run
+stops silently in retained recovery. Current APIs always send a generation.
+
+An aggregate inspect lists attempt clones through their ledger entry; a canonical clone
+kept by a park or terminal exit under its plain journal is not listed and cannot be
+discarded through the channel (the same run's resume recaptures it, or the next run's
+terminal-orphan handling applies).
 
 Park timing, report count and order, retry timing, `recovery_wait` returning `true` for a
 credential-deferred run, and the accepted cross-worker durability limit are unchanged per

@@ -5164,6 +5164,11 @@ export class RunRunner {
       // already held by the bare. This pre-handler check is the same exit as the recheck rows in
       // handleRecoveryExhausted: another generation records the stopped source, a terminal status
       // keeps the plain journal (no ledger `reclaimed`, no marker).
+      // Both arms keep the guarded inventory closed (stale:true; the moved-generation call omits the
+      // handler argument, which has the same effect): this check ran before any handler work and keeps
+      // the pre-handler posture of no ownership probe or upload after it saw the run move on. The
+      // in-handler terminal recheck (terminal_disk_recheck) passes stale:false for a terminal status
+      // because that exit follows the handler's own capture and publish work, not a bare no-handler stop.
       if (movedGeneration) await this.retainStoppedSource(flight, flight.executor, "terminal_disk_precheck");
       else await this.retainStoppedSource(flight, flight.executor, "terminal_disk_precheck", { memo: false, stale: true, record: "none" });
       await flight.batcher.close().catch(() => undefined);
@@ -14271,6 +14276,7 @@ export class RunRunner {
       flight.preserveSession = true;
       return false;
     };
+    let propagating = false;
     try {
       for (;;) {
         if (opts.terminalDisk) this.terminalDiskInterruption(flight);
@@ -14742,10 +14748,16 @@ export class RunRunner {
     } catch (error) {
       // dispatchFailure reuses this batcher to report the credential recovery notices.
       credentialRedispatch = opts.terminalDisk === true && codexDeferralOf(error) !== undefined;
+      // An interruption (shutdown, pause, limit, codex deferral, any throw) is propagating: the caller
+      // handles it, so this finally runs no process scan or lock wait. Dropping the pending release
+      // leaves the preserve flag as the exit latched it (kept); a flag another disposition cleared
+      // (an owner cancel) stays theirs.
+      propagating = true;
+      pendingRelease = undefined;
       throw error;
     } finally {
       // B2: the one cleanup-time coverage check, after the last possible writer on every return.
-      await settleCloneRelease();
+      if (!propagating) await settleCloneRelease();
       if (!credentialRedispatch) await batcher.close().catch(() => undefined);
     }
   }

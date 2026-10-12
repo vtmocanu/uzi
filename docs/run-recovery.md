@@ -354,11 +354,16 @@ counts as proof. Which record a kept clone leaves depends on the exit:
   and no `reclaimed` entry. A resume on the same worker recaptures bytes written
   after the earlier capture. A kept terminal clone is later moved by the next run's
   terminal-orphan handling, as before.
-- An owner-authorized cancel keeps its normal cleanup.
+- An owner-authorized cancel of a non-credential run keeps its normal cleanup; a credential-deferred captured cancel is revalidated at cleanup, and a retained result keeps the clone.
 
 To find these sources, run an aggregate inspect (see
 [Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)):
-it lists the journaled and protected sources on the worker. Park timing, report
+it lists protected and episode-journaled sources, stopped-source markers and
+attempt-ledger entries. An attempt clone (Docker-wired workers) kept by a park or
+terminal exit is listed through its ledger entry. A canonical clone kept under its
+plain journal is not listed and cannot be discarded through the channel: the same
+run's resume on that worker recaptures it, or the next run's existing
+terminal-orphan handling moves it to retention as before. Park timing, report
 count and order, and retries are unchanged.
 
 This is **local retention only**. It is not a published checkpoint, an archive or
