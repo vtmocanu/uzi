@@ -7268,9 +7268,9 @@ export class GitCache {
    * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
    * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on
    * any failure to resolve the base, run git or parse its output, so callers fail CLOSED and
-   * refuse to publish rather than treat unreadable history as clean. Messages are read with
-   * `--encoding=none` (raw bytes); a commit whose `%e` encoding is non-empty and not UTF-8, or whose
-   * object holds a NUL byte, also yields null.
+   * refuse to publish rather than treat unreadable history as clean. A commit whose `%e` encoding
+   * is non-empty and not UTF-8 (git re-encodes `--format` output to UTF-8 and such a header can
+   * blank `%B`, so `%e` is the gate), or whose object holds a NUL byte, also yields null.
    */
   async publishedCommitMessages(barePath: string, tip: string): Promise<{ sha: string; message: string }[] | null> {
     try {
@@ -7283,10 +7283,11 @@ export class GitCache {
       const read = async (args: string[], input?: string): Promise<string> =>
         (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
           { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
-      // `--encoding=none` prints the raw message bytes with no re-encoding, so a commit labelled with
-      // a non-UTF-8 `encoding` header still shows its ASCII text to the caller's scan. `%e` is git's
-      // own per-commit reading of that header (empty when absent), so no framing can be forged in a
-      // message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
+      // git re-encodes `--format` output to UTF-8, and a non-UTF-8 `encoding` header can blank `%B`
+      // (a UTF-16-labelled `Fixes #12` prints empty), so the `%e` refusal below is the gate: never
+      // drop it as redundant. `--encoding=none` only stops i18n.logOutputEncoding re-encoding the
+      // output. `%e` is git's own per-commit reading of that header (empty when absent), so no
+      // framing can be forged in a message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
       // (sha, encoding, message) triples. A commit OBJECT can still carry a NUL inside its message
       // (git hash-object --literally writes one, and %B stops printing at it), which would hide the
       // text after it; a literal NUL is written as a \u escape (never a raw control byte in source).
