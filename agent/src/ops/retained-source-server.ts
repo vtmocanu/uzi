@@ -11,8 +11,8 @@
 //   4. require Worker.isIdle();
 //   5. enter RunRunner.withRetainedSourceBoundary, which installs the run's execution tail and
 //      inventory reservation (background recovery refuses the run while it is held);
-//   6. INSIDE the boundary and BEFORE GitCache takes the bare lock, read the server's holds for the
-//      run (no network call may run under the lock);
+//   6. INSIDE the boundary and BEFORE GitCache takes the bare lock, read the server's holds and the
+//      run's lifecycle for the run (no network call may run under the lock);
 //   7. GitCache discards under ONE bare-lock section;
 //   8. finally: release the boundary and reopen only the `retained_ops` gate owner.
 //
@@ -29,10 +29,11 @@ import path from "node:path";
 import { ATTEMPT_ID_RE } from "../attempt-path.js";
 import type { DindPruneGate } from "../dind-prune.js";
 import type {
-  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedSourceSelector,
+  GitCache, RetainedDiscardResult, RetainedHoldsSnapshot, RetainedInspectResult, RetainedLifecycleSnapshot, RetainedSourceSelector,
 } from "../git.js";
 import type { Logger } from "../log.js";
-import type { RecoveryHoldsResponse } from "../protocol.js";
+import type { RecoveryHoldsResponse, RunOwnershipResponse } from "../protocol.js";
+import { RUN_TERMINAL_STATUSES } from "../recovery-settlement.js";
 import { errMessage, sleep as realSleep } from "../util.js";
 
 /** Protocol constants. The self-contained client (retained-source.mjs) duplicates them on purpose
@@ -72,7 +73,10 @@ export interface RetainedSourceRunnerPort {
 export interface RetainedSourceServerDeps {
   dataDir: string;
   git: Pick<GitCache, "inspectRetainedSources" | "discardStoppedSource" | "discardProtectedSource">;
-  client: { listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> };
+  client: {
+    listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse>;
+    getRunOwnership(runId: string): Promise<RunOwnershipResponse>;
+  };
   /** Undefined ⇒ every destructive request refuses. */
   gate: DindPruneGate | undefined;
   isIdle: () => boolean;
@@ -331,16 +335,20 @@ export class RetainedSourceServer {
 
   private async inspect(selector: RetainedSourceSelector | undefined): Promise<Record<string, unknown> & { sources?: unknown[] }> {
     // Read-only: the claim gate stays open. Holds are per run, so only a selected source gets them.
-    const holds = selector ? await this.readHolds(selector.runId) : undefined;
+    const [holds, lifecycle] = selector
+      ? await Promise.all([this.readHolds(selector.runId), this.readLifecycle(selector.runId)])
+      : [undefined, undefined];
     const result: RetainedInspectResult = await this.deps.git.inspectRetainedSources({
       ...(selector ? { selector } : {}),
       ...(holds ? { holds } : {}),
+      ...(lifecycle ? { lifecycle } : {}),
       isLivePath: (p) => this.deps.runner.isLiveAttemptPath(p),
     });
     return {
       ok: true, op: "inspect",
       sources: result.sources, partial: result.partial, unreadable: result.unreadable, sampledAt: result.sampledAt,
       ...(holds ? { holdsRead: holds.state } : {}),
+      ...(lifecycle ? { lifecycleRead: lifecycle.state } : {}),
       lastDiscards: this.lastDispositions.filter((d) => !selector || d.runId === selector.runId),
     };
   }
@@ -364,6 +372,32 @@ export class RetainedSourceServer {
       return { state: "read", holds };
     } catch (err) {
       this.deps.log.warn("retained-source: recovery hold read failed", { run_id: runId, error: errMessage(err) });
+      return { state: "unknown" };
+    } finally {
+      if (timer) clearTimeout(timer);
+    }
+  }
+
+  /**
+   * The server's lifecycle verdict for the run via the worker-scoped ownership probe. Only a
+   * terminal status is positive evidence; a 404 (run not held by this worker), any error, a
+   * timeout or a body without a string `status` is `unknown`.
+   */
+  private async readLifecycle(runId: string): Promise<RetainedLifecycleSnapshot> {
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      const response = await Promise.race([
+        this.deps.client.getRunOwnership(runId),
+        new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error("run ownership read timed out")), this.deps.holdsTimeoutMs ?? HOLDS_READ_TIMEOUT_MS);
+        }),
+      ]);
+      const status: unknown = response?.status;
+      if (typeof status !== "string" || status === "") return { state: "unknown" };
+      if (RUN_TERMINAL_STATUSES.has(status)) return { state: "terminal", status: status as "completed" | "failed" | "cancelled" };
+      return { state: "not_terminal", status };
+    } catch (err) {
+      this.deps.log.warn("retained-source: run lifecycle read failed", { run_id: runId, error: errMessage(err) });
       return { state: "unknown" };
     } finally {
       if (timer) clearTimeout(timer);
@@ -449,11 +483,11 @@ export class RetainedSourceServer {
       // 5. Reserve the run through the disposal.
       const boundary = await this.deps.runner.withRetainedSourceBoundary(sel.runId, clonePaths, async (ctx) => {
         // 6. The holds read, inside the reservation and before GitCache takes the bare lock.
-        const holds = await this.readHolds(sel.runId);
+        const [holds, lifecycle] = await Promise.all([this.readHolds(sel.runId), this.readLifecycle(sel.runId)]);
         if (holds.state === "unknown") return this.refusal("holds_unknown");
         if (clientGone()) return this.refusal("client_disconnected");
         const opts = {
-          selector: sel, confirm: req.confirm, holds, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
+          selector: sel, confirm: req.confirm, holds, lifecycle, isLivePath: ctx.isLivePath, quiesce: ctx.quiesce,
           barePath: ev.barePath, signal: this.shutdown.signal,
           ...(this.deps.deadlineMs === undefined ? {} : { deadlineMs: this.deps.deadlineMs }),
         };

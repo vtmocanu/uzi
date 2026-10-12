@@ -1362,6 +1362,14 @@ export interface RetainedSourceEvidence {
   disposition: RetainedDisposition | undefined;
 }
 
+/** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
+ *  inspects or discards. `terminal` is positive evidence; every other state keeps a marker-less
+ *  canonical source. */
+export type RetainedLifecycleSnapshot =
+  | { state: "terminal"; status: "completed" | "failed" | "cancelled" }
+  | { state: "not_terminal"; status: string }
+  | { state: "unknown" };
+
 export interface RetainedInspectOptions {
   /** Restrict to one source. Absent ⇒ an aggregate view (no disposition: holds are per run). */
   selector?: RetainedSourceSelector;
@@ -1369,6 +1377,8 @@ export interface RetainedInspectOptions {
   barePath?: string;
   /** The holds snapshot for the selector's run, read by the caller BEFORE inspecting. */
   holds?: RetainedHoldsSnapshot;
+  /** The run's lifecycle snapshot, read alongside `holds`; absent ⇒ `run_state:not_read` in the aggregate view. */
+  lifecycle?: RetainedLifecycleSnapshot;
   isLivePath: (clonePath: string) => boolean;
   /** Injected clock (ms) and budget; default Date.now and {@link RETAINED_INSPECT_BUDGET_MS}. */
   now?: () => number;
@@ -1391,6 +1401,8 @@ export interface RetainedDiscardOptions {
   /** The descriptor digest inspect reported; the exact value, or nothing is deleted. */
   confirm: string;
   holds: RetainedHoldsSnapshot;
+  /** The run's lifecycle snapshot; absent counts as unknown (a marker-less canonical source is kept). */
+  lifecycle?: RetainedLifecycleSnapshot;
   isLivePath: (clonePath: string) => boolean;
   /** Capture-mode scoped quiescence over every source path and its skills sibling; false refuses. */
   quiesce: (paths: string[]) => Promise<boolean>;
@@ -6484,7 +6496,7 @@ export class GitCache {
    */
   private async evaluateRetained(
     g: GatheredBare, rec: GatheredRecord,
-    ctx: { holds: RetainedHoldsSnapshot | undefined; isLivePath: (p: string) => boolean },
+    ctx: { holds: RetainedHoldsSnapshot | undefined; lifecycle?: RetainedLifecycleSnapshot; isLivePath: (p: string) => boolean },
   ): Promise<{
     blockers: string[]; consumers: string[]; localRecords: RetainedLocalRecord[]; live: Map<string, boolean>;
     holdsView: RetainedSourceEvidence["holds"]; disposition: RetainedDisposition | undefined;
@@ -6535,11 +6547,24 @@ export class GitCache {
     } else if (rec.kind === "canonical") {
       if (rec.markerState === "none") {
         // A canonical source left under its plain journal: no marker, and the journal is plain by
-        // construction. The worker cannot know whether the run is still parked; an open hold, a
-        // local record or a live flight refuses; a released or absent hold makes the source reclaimable
-        // by explicit, digest-confirmed operator action, which loses only bytes outside the last
-        // capture; `run_state:not_known_locally` says so.
-        consumers.push("run_state:not_known_locally");
+        // construction. The worker cannot know locally whether the run is still parked, so the
+        // caller supplies the server's lifecycle verdict. Only a terminal status (absorbing) lets the
+        // source be discarded; a non-terminal or unreadable status (including a 404 for a run this
+        // worker no longer holds) keeps it. The blockers are soft, so an open hold or a local record
+        // still reports its more specific disposition. In the aggregate view (no holds, so no
+        // disposition) the lifecycle is simply not read.
+        const lc = ctx.lifecycle;
+        if (lc === undefined && ctx.holds === undefined) {
+          consumers.push("run_state:not_read");
+        } else if (lc?.state === "terminal") {
+          consumers.push(`run_state:terminal:${lc.status}`);
+        } else if (lc?.state === "not_terminal") {
+          consumers.push(`run_state:${sanitizeForLog(lc.status, 32)}`);
+          blockers.push("run_state_not_terminal");
+        } else {
+          consumers.push("run_state:unknown");
+          blockers.push("run_state_unknown");
+        }
       } else {
         consumers.push(`marker:${rec.markerState}`);
         if (rec.markerState !== "bound" && rec.markerState !== "detached") blockers.push(`marker_${rec.markerState}`);
@@ -6585,7 +6610,8 @@ export class GitCache {
     const holdsView: RetainedSourceEvidence["holds"] = holds === undefined ? { state: "not_read", ids: [] }
       : holds.state === "unknown" ? { state: "unknown", ids: [] } : { state: "read", ids: open.map((h) => h.id).sort() };
     const uniq = [...new Set(blockers)];
-    const soft = (b: string): boolean => b.startsWith("shared_") || b.startsWith("named_by_");
+    const soft = (b: string): boolean => b.startsWith("shared_") || b.startsWith("named_by_") ||
+      b === "run_state_not_terminal" || b === "run_state_unknown";
     let disposition: RetainedDisposition | undefined;
     if (holds === undefined) disposition = undefined;
     else if (holds.state === "unknown") disposition = { kind: "refused", consumers: ["holds_unknown", ...uniq] };
@@ -6703,7 +6729,9 @@ export class GitCache {
                 .slice(0, RETAINED_MAX_DESCRIPTORS + 1);
               for (const { rec } of matching) {
                 const ev = await this.evaluateRetained(g, rec, {
-                  holds: opts.selector === undefined ? undefined : opts.holds, isLivePath: opts.isLivePath,
+                  holds: opts.selector === undefined ? undefined : opts.holds,
+                  ...(opts.selector === undefined || opts.lifecycle === undefined ? {} : { lifecycle: opts.lifecycle }),
+                  isLivePath: opts.isLivePath,
                 });
                 found.push({ g, rec, ev });
               }
@@ -6849,7 +6877,9 @@ export class GitCache {
             const rec = candidates[0]!;
             if (!wantKinds.includes(rec.kind)) return refused("wrong_discard_kind", [rec.kind]);
             if (rec.digest !== opts.confirm) return refused("descriptor_changed");
-            const ev = await this.evaluateRetained(g, rec, { holds: opts.holds, isLivePath: opts.isLivePath });
+            const ev = await this.evaluateRetained(g, rec, {
+              holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
+            });
             const want = mode === "protected" ? "local_protected_discard" : "local_discard";
             if (ev.disposition?.kind !== want) {
               return refused(ev.disposition?.kind ?? "refused",

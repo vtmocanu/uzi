@@ -9,12 +9,12 @@ import { formatAttemptId } from "../src/attempt-path.js";
 import { DindPruneGate } from "../src/dind-prune.js";
 import { GitCache } from "../src/git.js";
 import { RetainedSourceServer, type RetainedSourceServerDeps } from "../src/ops/retained-source-server.js";
-import type { RecoveryHoldsResponse, ClaimResponse } from "../src/protocol.js";
+import type { RecoveryHoldsResponse, ClaimResponse, RunOwnershipResponse } from "../src/protocol.js";
 import type { QuiesceRunOutcome, QuiesceRunRequest } from "../src/run-quiescence.js";
 import { RunRunner } from "../src/runner.js";
 import { Worker } from "../src/worker.js";
 import { loadConfig } from "../src/config.js";
-import type { WorkerClient } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import type { ChatRunner } from "../src/chat-runner.js";
 import type { JudgeRunner } from "../src/judge-runner.js";
 import type { ReviewRunner } from "../src/review-runner.js";
@@ -130,6 +130,8 @@ const QUIESCENT = { process: { state: "quiescent" }, docker: { state: "not_wired
 
 interface RigOptions {
   holds?: (runId: string) => RecoveryHoldsResponse | Promise<RecoveryHoldsResponse>;
+  /** The ownership probe stub (default: the run is `completed`). Throw a RequestError(404) for a run this worker does not hold. */
+  ownership?: (runId: string) => RunOwnershipResponse | Promise<RunOwnershipResponse>;
   idle?: () => boolean;
   quiesce?: (req: QuiesceRunRequest) => Promise<QuiesceRunOutcome>;
   server?: Partial<RetainedSourceServerDeps>;
@@ -220,6 +222,10 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
         events.push("holds_read");
         holdsCalls.push(runId);
         return o.holds ? o.holds(runId) : { run_id: runId, holds: [] };
+      },
+      getRunOwnership: async (runId: string) => {
+        events.push("ownership_read");
+        return o.ownership ? o.ownership(runId) : { status: "completed", claim_generation: 1 };
       },
     },
     isIdle: () => { const v = o.idle ? o.idle() : idle.value; events.push(`idle:${v}`); return v; },
@@ -925,13 +931,44 @@ describe("a canonical source left under its plain journal, through the real sock
     const ev = await inspectOne(rig, { runId: c.runId }, "none");
     assert.deepEqual([ev.kind, ev.markerState, ev.journalState], ["canonical", "none", "plain"]);
     assert.equal(ev.disposition.kind, "local_discard");
-    assert.ok(ev.consumers.includes("run_state:not_known_locally"));
+    assert.ok(ev.consumers.includes("run_state:terminal:completed"), ev.consumers.join());
     const r = await send(rig.sock, { op: "discard", run: c.runId, generation: "none", attempt: "canonical", confirm: ev.descriptor });
     assert.equal(r.ok, true, JSON.stringify(r));
     assert.equal(r.result.kind, "done");
     assert.equal(fs.existsSync(c.path), false);
     assert.equal(journalRaw(c.branch), "");
     assert.equal(rig.gate.claimsClosed(), false);
+  });
+
+  it("a 404 from the ownership probe (a run this worker does not hold) keeps the leftover: inspect and discard refuse and delete nothing", async () => {
+    const c = await plainCanonical("run-404", 2812);
+    const rig = await rigOf({ ownership: async () => { throw new RequestError("GET", "/api/worker/runs/run-404/ownership", 404, "not found"); } });
+    const ev = await inspectOne(rig, { runId: c.runId }, "none");
+    assert.deepEqual(ev.disposition, { kind: "refused", consumers: ["run_state_unknown"] });
+    assert.ok(ev.consumers.includes("blocker:run_state_unknown"), ev.consumers.join());
+    const journal = journalRaw(c.branch);
+    const r = await send(rig.sock, { op: "discard", run: c.runId, generation: "none", attempt: "canonical", confirm: ev.descriptor });
+    assert.equal(r.ok, false);
+    assert.equal(r.result.kind, "refused");
+    assert.deepEqual(r.result.consumers, ["run_state_unknown"]);
+    assert.ok(fs.existsSync(c.path));
+    assert.equal(journalRaw(c.branch), journal);
+    assert.equal(rig.gate.claimsClosed(), false);
+  });
+
+  it("a non-terminal ownership status or a body without a status keeps the leftover", async () => {
+    const c = await plainCanonical("run-paused", 2813);
+    for (const [label, ownership, reason] of [
+      ["paused", () => ({ status: "paused", claim_generation: 2 }), "run_state_not_terminal"],
+      ["malformed", () => ({}) as never, "run_state_unknown"],
+    ] as const) {
+      const rig = await rigOf({ ownership, dataDir: shortDir() });
+      const ev = await inspectOne(rig, { runId: c.runId }, "none");
+      assert.equal((await send(rig.sock, inspectReq({ runId: c.runId }, "none"))).lifecycleRead, label === "paused" ? "not_terminal" : "unknown");
+      const r = await send(rig.sock, { op: "discard", run: c.runId, generation: "none", attempt: "canonical", confirm: ev.descriptor });
+      assert.deepEqual(r.result.consumers, [reason], label);
+      assert.ok(fs.existsSync(c.path), label);
+    }
   });
 
   it("an open server hold means the run is still parked: the discard refuses and deletes nothing", async () => {

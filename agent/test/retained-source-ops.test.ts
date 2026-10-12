@@ -11,6 +11,7 @@ import {
   type AttemptLedgerState,
   type AttemptSeedOptions,
   type RetainedHoldsSnapshot,
+  type RetainedLifecycleSnapshot,
   type RetainedSourceSelector,
 } from "../src/git.js";
 import { RetainedStoppedSourceError, RunResidueBlockedError, latchResidueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
@@ -133,8 +134,11 @@ function selectorOf(a: { runId: string; attemptId?: string }, generation: number
   return { runId: a.runId, generation, attempt: a.attemptId ?? "canonical" };
 }
 
-async function inspectOne(sel: RetainedSourceSelector, holds: RetainedHoldsSnapshot = NO_HOLDS, isLivePath: (p: string) => boolean = notLive) {
-  const r = await git.inspectRetainedSources({ selector: sel, holds, isLivePath, barePath: bare });
+const TERMINAL: RetainedLifecycleSnapshot = { state: "terminal", status: "completed" };
+
+async function inspectOne(sel: RetainedSourceSelector, holds: RetainedHoldsSnapshot = NO_HOLDS, isLivePath: (p: string) => boolean = notLive,
+  lifecycle?: RetainedLifecycleSnapshot) {
+  const r = await git.inspectRetainedSources({ selector: sel, holds, ...(lifecycle ? { lifecycle } : {}), isLivePath, barePath: bare });
   assert.equal(r.sources.length, 1, `exactly one source for ${JSON.stringify(sel)}`);
   return r.sources[0]!;
 }
@@ -1412,6 +1416,8 @@ describe("a canonical source left under its plain journal (no marker)", () => {
     const sel: RetainedSourceSelector = { runId, generation: "none", attempt: "canonical" };
     return { ...c, skills, sel };
   };
+  const leftoverOpts = (sel: RetainedSourceSelector, confirm: string, over: Record<string, unknown> = {}) =>
+    discardOpts(sel, confirm, { lifecycle: TERMINAL, ...over });
 
   it("is listed by the aggregate and selector views, and a terminal leftover with no hold is discardable; the key then seeds fresh", async () => {
     const c = await lone("run-t", 2900);
@@ -1420,14 +1426,14 @@ describe("a canonical source left under its plain journal (no marker)", () => {
     assert.equal(listed.length, 1);
     assert.deepEqual([listed[0]!.kind, listed[0]!.markerState, listed[0]!.journalState, listed[0]!.disposition],
       ["canonical", "none", "plain", undefined]);
-    const ev = await inspectOne(c.sel);
+    const ev = await inspectOne(c.sel, NO_HOLDS, notLive, TERMINAL);
     assert.deepEqual(ev.holds, { state: "read", ids: [] });
     assert.deepEqual(ev.localRecords, []);
-    assert.ok(ev.consumers.includes("run_state:not_known_locally"), ev.consumers.join());
+    assert.ok(ev.consumers.includes("run_state:terminal:completed"), ev.consumers.join());
     assert.equal(ev.consumers.some((x) => x.startsWith("blocker:")), false);
     assert.equal(ev.descriptor, listed[0]!.descriptor);
     assert.deepEqual(ev.disposition, { kind: "local_discard" });
-    const result = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor));
+    const result = await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor));
     assert.deepEqual(result, { kind: "done", sources: [{ clonePath: c.path, outcome: "removed" }], metadata: "retired" });
     assert.equal(fs.existsSync(c.path), false);
     assert.equal(fs.existsSync(c.skills), false);
@@ -1438,18 +1444,58 @@ describe("a canonical source left under its plain journal (no marker)", () => {
     assert.equal(fs.existsSync(path.join(reseed.path, "dirty.txt")), false);
   });
 
+  it("without positive terminal evidence a leftover is kept: unknown, non-terminal and absent lifecycle all refuse and delete nothing", async () => {
+    const c = await lone("run-k", 2909);
+    const journal = journalRaw(c.branch);
+    const ev = await inspectOne(c.sel, NO_HOLDS, notLive, TERMINAL);
+    const cases: Array<[string, RetainedLifecycleSnapshot | undefined, string, string]> = [
+      ["unknown", { state: "unknown" }, "run_state_unknown", "run_state:unknown"],
+      ["not_terminal", { state: "not_terminal", status: "paused" }, "run_state_not_terminal", "run_state:paused"],
+      ["absent", undefined, "run_state_unknown", "run_state:unknown"],
+    ];
+    for (const [label, lifecycle, blocker, consumer] of cases) {
+      const view = await inspectOne(c.sel, NO_HOLDS, notLive, lifecycle);
+      assert.ok(view.consumers.includes(consumer), `${label}: ${view.consumers.join()}`);
+      assert.ok(view.consumers.includes(`blocker:${blocker}`), `${label}: ${view.consumers.join()}`);
+      assert.deepEqual(view.disposition, { kind: "refused", consumers: [blocker] }, label);
+      const r = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, lifecycle ? { lifecycle } : {}));
+      assert.equal(r.kind, "refused", label);
+      assert.deepEqual(r.kind === "refused" && r.consumers, [blocker], label);
+      assert.ok(fs.existsSync(c.path) && fs.existsSync(c.skills), `${label}: nothing deleted`);
+      assert.equal(journalRaw(c.branch), journal, `${label}: the plain journal survives`);
+    }
+    const done = await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor));
+    assert.equal(done.kind, "done");
+    assert.equal(fs.existsSync(c.path), false);
+  });
+
+  it("an open hold or a local record still wins over a non-terminal lifecycle", async () => {
+    const c = await lone("run-w", 2910);
+    const hold: RetainedHoldsSnapshot = { state: "read", holds: [{ id: "hold-9", generation: 1 }] };
+    const ev = await inspectOne(c.sel, hold, notLive, { state: "not_terminal", status: "paused" });
+    assert.deepEqual(ev.disposition, { kind: "owner_hold_discard", holdIds: ["hold-9"] });
+  });
+
+  it("the aggregate view reads no lifecycle and reports run_state:not_read without a blocker", async () => {
+    await lone("run-agg", 2911);
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    const s = all.sources.find((x) => x.runId === "run-agg")!;
+    assert.ok(s.consumers.includes("run_state:not_read"), s.consumers.join());
+    assert.equal(s.consumers.some((x) => x.startsWith("blocker:")), false);
+  });
+
   it("an actively parked source (open hold of the run) is the owner's to discard and a discard deletes nothing", async () => {
     const c = await lone("run-p", 2901);
     const hold: RetainedHoldsSnapshot = { state: "read", holds: [{ id: "hold-5", generation: 1 }] };
     const ev = await inspectOne(c.sel, hold);
     assert.deepEqual(ev.disposition, { kind: "owner_hold_discard", holdIds: ["hold-5"] });
     const journal = journalRaw(c.branch);
-    const refused = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, { holds: hold }));
+    const refused = await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor, { holds: hold }));
     assert.deepEqual([refused.kind, refused.kind === "refused" && refused.disposition?.kind], ["refused", "owner_hold_discard"]);
     assert.ok(fs.existsSync(c.path) && fs.existsSync(c.skills));
     assert.equal(journalRaw(c.branch), journal);
     for (const holds of [{ state: "unknown" } as RetainedHoldsSnapshot]) {
-      assert.equal((await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, { holds }))).kind, "refused");
+      assert.equal((await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor, { holds }))).kind, "refused");
     }
     assert.ok(fs.existsSync(c.path));
   });
@@ -1458,10 +1504,10 @@ describe("a canonical source left under its plain journal (no marker)", () => {
     const c = await lone("run-l", 2902);
     fs.mkdirSync(path.join(fx.dataDir, "recovery", "run-l"), { recursive: true });
     fs.writeFileSync(path.join(fx.dataDir, "recovery", "run-l", "capture-1.json"), JSON.stringify({ generation: 1 }));
-    const ev = await inspectOne(c.sel);
+    const ev = await inspectOne(c.sel, NO_HOLDS, notLive, TERMINAL);
     assert.equal(ev.disposition?.kind, "resolve_local_record");
     assert.deepEqual(ev.localRecords.map((r) => [r.kind, r.name]), [["recovery", "capture-1.json"]]);
-    assert.equal((await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor))).kind, "refused");
+    assert.equal((await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor))).kind, "refused");
     assert.ok(fs.existsSync(c.path));
     assert.notEqual(journalRaw(c.branch), "");
     git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ terminalRecordProtection: async () => true }));
@@ -1473,8 +1519,8 @@ describe("a canonical source left under its plain journal (no marker)", () => {
 
   it("a live flight's clone refuses", async () => {
     const c = await lone("run-v", 2903);
-    const ev = await inspectOne(c.sel);
-    const live = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, { isLivePath: (p: string) => p === c.path }));
+    const ev = await inspectOne(c.sel, NO_HOLDS, notLive, TERMINAL);
+    const live = await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor, { isLivePath: (p: string) => p === c.path }));
     assert.deepEqual([live.kind, live.kind === "refused" && live.consumers.some((x) => x.startsWith("live:"))], ["refused", true]);
     assert.ok(fs.existsSync(c.path));
     assert.equal((await inspectOne(c.sel, NO_HOLDS, (p) => p === c.path)).disposition?.kind, "refused");
@@ -1482,20 +1528,20 @@ describe("a canonical source left under its plain journal (no marker)", () => {
 
   it("a journal that changed between inspect and discard is descriptor_changed", async () => {
     const c = await lone("run-d", 2904);
-    const ev = await inspectOne(c.sel);
+    const ev = await inspectOne(c.sel, NO_HOLDS, notLive, TERMINAL);
     const changed = JSON.stringify({ clonePath: c.path, runId: "run-d" });
     assert.notEqual(changed, journalRaw(c.branch));
     gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, changed]);
-    const r = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor));
+    const r = await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor));
     assert.deepEqual([r.kind, r.kind === "refused" && r.reason], ["refused", "descriptor_changed"]);
     assert.ok(fs.existsSync(c.path));
   });
 
   it("a discard never clears a journal that no longer names that source", async () => {
     const c = await lone("run-s", 2905);
-    const ev = await inspectOne(c.sel);
+    const ev = await inspectOne(c.sel, NO_HOLDS, notLive, TERMINAL);
     const successor = JSON.stringify({ runId: "run-next", clonePath: `${c.path}.attempt-${attemptIdAt(9, 3)}`, attemptId: attemptIdAt(9, 3) });
-    const r = await git.discardStoppedSource(discardOpts(c.sel, ev.descriptor, {
+    const r = await git.discardStoppedSource(leftoverOpts(c.sel, ev.descriptor, {
       quiesce: async () => {
         gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, successor]);
         return true;
@@ -1528,7 +1574,7 @@ describe("a canonical source left under its plain journal (no marker)", () => {
     const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
     assert.equal(all.sources.filter((s) => s.runId === "run-short").length, 1, "the prefix path is still listed");
     const ev = await inspectOne(short.sel);
-    const r = await git.discardStoppedSource(discardOpts(short.sel, ev.descriptor));
+    const r = await git.discardStoppedSource(leftoverOpts(short.sel, ev.descriptor));
     assert.equal(r.kind, "done");
     assert.equal(fs.existsSync(short.path), false);
     assert.ok(fs.existsSync(longer.path), "the longer key's source is untouched");

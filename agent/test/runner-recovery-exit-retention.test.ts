@@ -549,7 +549,7 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     assertRecoverable(r.clone(), late!, "row 8 transient");
   });
 
-  it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is listed too and, with no hold, is discardable", async () => {
+  it("operator inspect pins what a park keeps: an attempt clone is listed through its ledger entry, a canonical clone kept under its plain journal is listed too and is discardable only on a terminal server lifecycle", async () => {
     const attempt = transientRig(17928, { dockerHost: true });
     const canonical = transientRig(17929);
     const hook = afterVerifiedCapture((wt) => { writeLateChange(wt); });
@@ -579,13 +579,17 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     const view = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false, selector: sel, holds: open });
     assert.deepEqual(view.sources[0]!.disposition, { kind: "owner_hold_discard", holdIds: ["hold-1"] }, "an open hold is the owner's to discard");
     const none = { state: "read" as const, holds: [] };
-    const idle = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false, selector: sel, holds: none });
+    const terminal = { state: "terminal" as const, status: "completed" as const };
+    const unread = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false, selector: sel, holds: none });
+    assert.deepEqual(unread.sources[0]!.disposition, { kind: "refused", consumers: ["run_state_unknown"] },
+      "no hold and no terminal evidence keeps a parked canonical clone");
+    const idle = await git.inspectRetainedSources({ barePath: bareOf(), isLivePath: () => false, selector: sel, holds: none, lifecycle: terminal });
     assert.deepEqual(idle.sources[0]!.disposition, { kind: "local_discard" });
-    const refused = await git.discardStoppedSource({ selector: sel, confirm: idle.sources[0]!.descriptor, holds: open, isLivePath: () => false,
+    const refused = await git.discardStoppedSource({ selector: sel, confirm: idle.sources[0]!.descriptor, holds: open, lifecycle: terminal, isLivePath: () => false,
       quiesce: async () => true, barePath: bareOf() });
     assert.equal(refused.kind, "refused");
     assert.ok(fs.existsSync(canonical.clone()), "an open hold deletes nothing");
-    const done = await git.discardStoppedSource({ selector: sel, confirm: idle.sources[0]!.descriptor, holds: none, isLivePath: () => false,
+    const done = await git.discardStoppedSource({ selector: sel, confirm: idle.sources[0]!.descriptor, holds: none, lifecycle: terminal, isLivePath: () => false,
       quiesce: async () => true, barePath: bareOf() });
     assert.equal(done.kind, "done");
     assert.equal(fs.existsSync(canonical.clone()), false);
