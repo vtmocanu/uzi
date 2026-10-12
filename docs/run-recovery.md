@@ -438,8 +438,9 @@ it lists protected and episode-journaled sources, stopped-source markers and
 attempt-ledger entries. An attempt clone (Docker-wired workers) kept by a park or
 terminal exit is listed through its ledger entry. A canonical clone kept under its
 plain journal (no marker) is also listed, with marker state `none`, journal state
-`plain` and consumer `run_state:not_known_locally`, and can be discarded with the
-same digest confirmation. The same run's resume on that worker still recaptures it,
+`plain`, and can be discarded with the same digest confirmation only when the
+server reports the run terminal (`completed`, `failed` or `cancelled`; see the
+disposition notes below). The same run's resume on that worker still recaptures it,
 and the next run's existing terminal-orphan handling still moves it to retention as
 before. Park timing, report count and order, and retries are unchanged.
 
@@ -1014,16 +1015,35 @@ selector) only lists sources, without holds or a disposition:
 | `refused` | Named consumers still use the source. The output lists them. |
 
 A canonical clone kept under its plain journal by a park or terminal exit (marker
-state `none`, journal state `plain`) is listed with the consumer
-`run_state:not_known_locally`. The worker has no authoritative signal that the run
-is still parked and makes no extra network call, so the disposition follows what it
-can see: an open server hold gives `owner_hold_discard` (the refusal for an
-actively parked run), a local record gives `resolve_local_record`, and a live
-flight refuses. Otherwise it is `local_discard`. A hold can be released (claim
-released, capture available) or never opened (`paused` and `limit_wait` parks,
-workers with recovery disabled) while the run is still parked, so such a source is
-reclaimable by explicit operator confirmation and loses every byte not already in a
-capture, published checkpoint or the tracking ref. Its discard clears that plain journal, so a later resume seeds fresh.
+state `none`, journal state `plain`) has no marker, so the worker cannot tell locally
+whether the run is still parked. An absent or released hold does not prove the run is
+terminal: a hold can be released (claim released, capture available) or never opened
+(`paused` and `limit_wait` parks, workers with recovery disabled) while the run is
+still parked. Discard therefore needs positive lifecycle evidence: for a selected
+source inspect and discard read the run's status through the worker's existing
+ownership probe (`GET /api/worker/runs/{id}/ownership`), and it must be `completed`,
+`failed` or `cancelled`. Inspect shows the result as the consumer
+`run_state:terminal:<status>`, `run_state:<status>` (a non-terminal status) or
+`run_state:unknown`, and `lifecycleRead` (`terminal`, `not_terminal` or `unknown`). An
+aggregate inspect reads no lifecycle and shows `run_state:not_read`, with no blocker.
+The disposition follows what the worker can see:
+
+- An open server hold gives `owner_hold_discard` (the refusal for an actively parked
+  run), a local record gives `resolve_local_record`, and a live flight refuses.
+- A status the probe cannot establish (a 404, an error, a timeout or a malformed body)
+  refuses with the blocker `run_state_unknown`; any other status refuses with
+  `run_state_not_terminal`. Nothing is deleted.
+- Otherwise it is `local_discard`, which loses every byte not already in a capture,
+  published checkpoint or the tracking ref and clears that plain journal, so a later
+  resume seeds fresh.
+
+The probe is scoped to the worker: once the run's `worker_id` moves off this worker (a
+requeue after a released claim, or a claim elsewhere) it reads 404, so the leftover is
+refused through this channel. It stays until a later run of that branch's
+terminal-orphan handling on this worker, or until an operator removes it out of band.
+A lifecycle read that is not worker-scoped would close this but needs a new API and is
+not shipped.
+
 A kept canonical clone with a `uzi-stopped` marker is listed with marker state
 `detached` (no active journal names it), or `bound` while its plain journal is
 still pending. Marker state `mismatch` means an active journal names the path but
@@ -1056,7 +1076,10 @@ exact source under one lock. It never cancels a run or stops the worker.
 
 > **Discard destroys possibly unique work.** Inspect first, and export or back up
 > anything you may want before confirming (the `uzi-watcher` skill's `backup-runs.sh`
-> is the existing backup procedure).
+> is the existing backup procedure). `backup-runs.sh` attributes a detached kept
+> canonical clone through its exact `uzi-stopped.<runId>.entry` marker (the
+> canonical path only, never an attempt clone); a live journal clone still wins and a
+> warning names the uncaptured kept clone.
 
 What the channel does not promise:
 

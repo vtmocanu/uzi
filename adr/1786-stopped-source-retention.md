@@ -105,7 +105,9 @@ created them are not treated as worker-only work.
 
 ### Operator channel
 
-Retention needs an explicit reclaim path, including when no server hold exists.
+Retention needs an explicit reclaim path. A canonical clone kept with no marker is reclaimed only on
+positive server evidence that its run is terminal; an absent or released hold is never that evidence
+(maintainer decision 3, 2026-10-12).
 
 - **Transport.** A Unix socket at `<dataDir>/ops/retained-source.sock` (0600, in a worker-owned
   0700 directory), served by the live Worker. No TCP listener, no API endpoint. Setup failure
@@ -114,9 +116,14 @@ Retention needs an explicit reclaim path, including when no server hold exists.
 - **`inspect`** is read-only and content-free, under one 5 s budget; a budget hit reports
   `partial` or `unknown`, never 0. It lists attempt-ledger sources, canonical sources with a
   `uzi-stopped` marker (marker state `bound` while the plain journal is pending, `detached`
-  normally, `mismatch` otherwise), and (maintainer decision 2, 2026-10-12) canonical clones
-  kept under their plain journal with no marker (marker state `none`, journal state `plain`,
-  consumer `run_state:not_known_locally`). A marker-less record is hidden only by evidence
+  normally, `mismatch` otherwise), and (maintainer decisions 2 and 3, 2026-10-12) canonical
+  clones kept under their plain journal with no marker (marker state `none`, journal state
+  `plain`). For a selected source inspect also reads the run's lifecycle through the worker's
+  existing ownership probe and reports consumer `run_state:terminal:<status>`,
+  `run_state:<status>` for a non-terminal status or `run_state:unknown`, the blocker
+  `run_state_not_terminal` or `run_state_unknown`, and `lifecycleRead` (`terminal`,
+  `not_terminal` or `unknown`); the aggregate view reads no lifecycle and reports
+  `run_state:not_read` with no blocker. A marker-less record is hidden only by evidence
   that names its path: a valid marker by its parsed `clonePath`, a malformed marker whose text
   carries the path not followed by a clone-key character (so a marker for `issue-290` never
   hides `issue-29`; a malformed marker naming `issue-29.attempt-…` likewise hides the plain
@@ -147,14 +154,27 @@ Retention needs an explicit reclaim path, including when no server hold exists.
   digest confirmation and three-fact reporting (server holds, local records, terminal
   protection), and its plain journal is cleared (only while its raw value is unchanged and it
   still names exactly that source), so a later resume seeds fresh.
-- **Actively parked, and its gap.** An open hold of the run means the run is still parked, so
-  `owner_hold_discard` refuses and deletes nothing: this is the actively-parked refusal. A
-  local record or a live flight also refuses. The worker has no authoritative parked signal and
-  makes no new network call, so it cannot tell more. A hold can be released (claim released,
-  capture available) or never opened (`paused` and `limit_wait` parks, recovery-disabled
-  workers) while the run is still parked. Such a source is therefore reclaimable by explicit
-  operator confirmation and loses every byte not already in a capture, published checkpoint or
-  the tracking ref.
+- **Actively parked, and the lifecycle evidence for a marker-less source.** An open hold of the
+  run means the run is still parked, so `owner_hold_discard` refuses and deletes nothing: this
+  is the actively-parked refusal. A local record (`resolve_local_record`) or a live flight also
+  refuses. An absent or released hold is not proof the run is terminal: a hold can be released
+  (claim released, capture available) or never opened (`paused` and `limit_wait` parks,
+  recovery-disabled workers) while the run is still parked. Discard of a marker-less canonical
+  source therefore requires positive lifecycle evidence (maintainer decision 3, 2026-10-12): the
+  worker's existing ownership probe (`GET /api/worker/runs/{id}/ownership`, read inside the run
+  reservation and before the bare lock, alongside the holds read, on the same timeout) must
+  report `completed`, `failed` or `cancelled`. A 404, any error, a timeout or a body without a
+  string `status` is `unknown` and refuses with `run_state_unknown`; any other status refuses
+  with `run_state_not_terminal`. Both blockers are soft, so an open hold or a local record still
+  reports its own, more specific disposition. No generation binds the read: a marker-less part
+  carries none, and a terminal status is absorbing. This adds no new endpoint.
+- **Accepted boundary: the probe is worker-scoped.** The ownership read is
+  `GetRunOwnedByWorker` (`WHERE id = @id AND worker_id = @worker_id`). Once the run's
+  `worker_id` moves off this worker (a requeue after a released claim, or a claim elsewhere),
+  the probe reads 404, so the leftover is refused through the channel indefinitely. It stays
+  until a later run of that branch's terminal-orphan handling on this worker, or out-of-band
+  operator removal. A read that is not worker-scoped would close this, but needs a new API and is
+  deferred (PRD #1786, Decision Log, maintainer decision 3).
 - **One bare lock.** The protected discard runs through a private locked core of
   `discardRetainedRecovery` (`discardRetainedRecoveryUnderLock`); the public wrapper is
   `withLock` plus that core. The lock is taken once and held from the descriptor snapshot
@@ -217,9 +237,10 @@ their park and terminal exits keep the clone, and a same-worker reclaim of such 
 stops silently in retained recovery. Current APIs always send a generation.
 
 An aggregate inspect lists attempt clones through their ledger entry. A canonical clone kept
-by a park or terminal exit under its plain journal is also listed (marker state `none`,
-consumer `run_state:not_known_locally`) and can be discarded through the channel once no hold,
-local record or live flight uses it; the same run's resume on that worker still recaptures it,
+by a park or terminal exit under its plain journal is also listed (marker state `none`)
+and can be discarded through the channel only when the server's
+ownership probe reports the run `completed`, `failed` or `cancelled` and no hold, local record
+or live flight uses it (see Operator channel); the same run's resume on that worker still recaptures it,
 and the next run's terminal-orphan handling still applies.
 
 Park timing, report count and order, retry timing, `recovery_wait` returning `true` for a
@@ -279,9 +300,13 @@ Every case keeps the source. What a later run sees depends on where the failure 
   the clone. Persisting attempt mode and clearing the journal lets later runs proceed on a
   fresh path while the marker keeps the clone attributable.
 - **Read park state from the server to decide discard.** Rejected by maintainer decision 2
-  (2026-10-12): it adds a network call to a worker-local operator path, and the answer is
-  still not authoritative for `paused` and `limit_wait` parks. Open-hold refusal plus explicit
-  digest confirmation is used instead.
+  (2026-10-12) on the grounds that it adds a network call to a worker-local operator path and
+  is not authoritative for `paused` and `limit_wait` parks. Superseded by maintainer decision 3
+  (2026-10-12), which adopts a server read for the marker-less canonical case, reading the run's
+  lifecycle (not its park state) through the existing worker-scoped ownership probe. Only a
+  terminal status is accepted, an unreadable answer refuses, and the open-hold refusal and
+  digest confirmation stay. Decision 2's reasoning that an absent or released hold leaves such a
+  source reclaimable by confirmation alone no longer holds.
 - **Keep the active journal for attempt clones.** It routes the next same-run claim into
   `recoverRetainedClaim`, which adopts or fails the run; clearing it lets a successor seed a
   fresh attempt.
