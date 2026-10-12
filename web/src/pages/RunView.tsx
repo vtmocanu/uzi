@@ -48,7 +48,8 @@ import {
 } from "../lib/runBadge";
 import { latestActivity } from "../lib/runActivity";
 import { MilestoneRows } from "../components/RunMilestoneRows";
-import { RunProgressCard } from "../components/RunProgressCard";
+import { stageForMessages } from "../lib/runStage";
+import { RunProgressCard, runProgressCardVisible } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
 import { deriveRunUsage, hasSideUsage } from "../lib/runUsage";
@@ -2103,6 +2104,14 @@ export function RunView() {
   // on the run header block (the titleNode wrapping the breadcrumb, title and status).
   // Inert on every other theme (only Shadow styles them); computed once per render.
   const shadow = shadowSignal(run);
+  const currentActivity = activity ?? run.current_activity ?? null;
+  const stage = run.status === "running" ? stageForMessages(messages) : null;
+  const progressCardShown = runProgressCardVisible(run, currentActivity, usage);
+  const settingsStates = [
+    run.kind !== "job" && canToggleWaitOnLimit(run.status) && run.wait_on_limit ? "waits on limits" : "",
+    canToggleMrRework(run) && !effectiveMrRework(run, mrReworkDefault) ? "auto-rework off" : "",
+  ].filter(Boolean);
+  const settingsLabel = ["Run settings", ...settingsStates].join(" · ");
 
   return (
     <div className="space-y-5">
@@ -2111,13 +2120,13 @@ export function RunView() {
           <details className="relative" onKeyDown={(event) => {
             if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); }
           }}>
-            <summary className="cursor-pointer rounded-md border border-edge px-3 py-1.5 text-sm text-muted">Run settings</summary>
+            <summary className="cursor-pointer rounded-md border border-edge px-3 py-1.5 text-sm text-muted">{settingsLabel}</summary>
             <div className="absolute right-0 z-20 mt-2 grid w-[min(32rem,85vw)] gap-4 rounded-lg border border-edge bg-surface p-4 shadow-xl">
               {!isCredentialDisabledHold(run) && (
                 <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
               )}
 
-      {(run.credential_epochs?.length ?? 0) > 1 && <CredentialEpochList epochs={run.credential_epochs} />}      {run.status === "limit_wait" ? (
+      <CredentialEpochList epochs={run.credential_epochs} />      {run.status === "limit_wait" ? (
         // Parked: keep the full-width countdown card stacked exactly as today (no flex
         // item → no shrinking). MrReworkPanel still self-hides / renders beneath it via
         // the page-wide space-y-5 rhythm, unchanged.
@@ -2365,6 +2374,7 @@ export function RunView() {
               <CIFixRunHeader run={run} terminal={terminal} />
               {/* Run-health warn chip (PRD #47), in the header. */}
               <HealthFlag run={run} />
+              {stage && !progressCardShown && <Badge tone="info">{stage}</Badge>}
               {/* PRD #1189: the conditional Extend action, the way Expedite appears only on a
                   queued run — shown ONLY while the near-timeout ("slow") flag is up, and only when
                   the admin cap allows extending (extendEnabled: a 0 or unknown cap hides it). Owner
@@ -2737,7 +2747,7 @@ export function RunView() {
       )}
 
 
-      <RunProgressCard run={run} activity={activity ?? run.current_activity ?? null} usage={usage} />
+      <RunProgressCard run={run} activity={currentActivity} usage={usage} stage={stage} />
 
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
           parkAnnounce for why the region cannot live inside QuestionPanel. sr-only

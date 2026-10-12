@@ -129,8 +129,13 @@ function Segment({ state, title }: { state: SegState; label: string; title: stri
   );
 }
 
-export function RunProgressCard({ run, activity = null, usage }: {
-  run: CardRun; activity?: RunActivity | null; usage?: RunUsage;
+// Shared presence rule so the header retains the stage only when no card shows it.
+export function runProgressCardVisible(run: CardRun, activity: RunActivity | null, usage?: RunUsage): boolean {
+  return Boolean(run.milestones?.length || (run.progress && ["percent", "waiting", "parked", "queued", "stalled", "planning"].includes(run.progress.state)) || activity || (usage && (usage.hasConfirmed || usage.hasLiveTokens || hasSideUsage(usage))) || tailVisible(run.usage_estimated_tail));
+}
+
+export function RunProgressCard({ run, activity = null, usage, stage = null }: {
+  run: CardRun; activity?: RunActivity | null; usage?: RunUsage; stage?: string | null;
 }) {
   const now = useNow(30_000);
   const p = run.progress;
@@ -139,19 +144,21 @@ export function RunProgressCard({ run, activity = null, usage }: {
   const percent = p?.state === "percent" && typeof p.pct === "number" && Number.isFinite(p.pct)
     ? Math.max(0, Math.min(100, Math.round(p.pct))) : null;
   const active = p?.active_milestone_id;
+  const hasActiveRow = milestones.some(m => m.id === active);
   const terminal = ["completed", "failed", "cancelled"].includes(run.status);
   const live = terminal || run.status === "paused" ? null : activity;
   const note = p?.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
   const completed = new Set(run.milestones_completed ?? []);
   const knownState = p && ["percent", "waiting", "parked", "queued", "stalled", "planning"].includes(p.state);
   const hasUsage = usage && (usage.hasConfirmed || usage.hasLiveTokens || hasSideUsage(usage));
-  if (!milestones.length && !knownState && !live && !hasUsage) return null;
+  if (!runProgressCardVisible(run, live, usage)) return null;
   const nowLine = note ? <p data-progress-now className="my-2 text-sm [overflow-wrap:anywhere]">
     <b>Now: </b>{note}{" "}<span className="ml-2 text-xs text-faint">model summary{p?.now_note?.at && ` · ${formatAgo(p.now_note.at, now)}`}</span>
   </p> : null;
+  const safeStage = run.status === "running" ? stripUnsafeChars(stage ?? "") : "";
   const phaseLine = !terminal && p?.state === "percent" && ["review", "validate", "implement"].includes(p.phase)
     ? <div data-progress-phase className="mt-2 inline-flex rounded bg-raised px-2 py-1 text-xs text-muted" aria-current="step">
-        phase: {p.phase}{(run.iteration_count ?? 0) > 0 && ` · iteration ${run.iteration_count}`}
+        phase: {p.phase}{(run.iteration_count ?? 0) > 0 && ` · iteration ${run.iteration_count}`}{safeStage && ` · run: ${safeStage}`}
       </div> : null;
   const cost = usage ? costDisplay(run.usage?.cost_status ?? "", usage.total.costUsd) : null;
   return <Card className="p-4">
@@ -160,9 +167,10 @@ export function RunProgressCard({ run, activity = null, usage }: {
         {percent !== null ? <span data-progress-pct className="font-mono text-[28px] font-semibold tabular-nums" title="Estimate through the approved plan, not a time estimate"><span aria-hidden>≈</span><span className="sr-only">about </span>{percent}%</span>
           : knownState ? <StateFlag run={run} now={now} /> : null}
         {badge && <span data-progress-what className="text-sm text-muted">{badge.reported ? badge.done : "–"} of {badge.total} {badge.reported ? "reported complete" : "reported"}</span>}
-        {!active && (run.iteration_count ?? 0) > 0 && !terminal && <span className="text-xs text-faint">iteration {run.iteration_count}</span>}
+        {!hasActiveRow && (run.iteration_count ?? 0) > 0 && !terminal && <span className="text-xs text-faint">iteration {run.iteration_count}</span>}
+        {safeStage && (!hasActiveRow || !phaseLine) && <span className="text-xs text-muted">{safeStage}</span>}
       </div>
-      {p?.maybe_blocked_by_run_id && <Link className="text-sm text-info" to={`/runs/${encodeURIComponent(p.maybe_blocked_by_run_id)}`}>may be blocked by {stripUnsafeChars(p.maybe_blocked_by_run_id).slice(0,8)}</Link>}
+      {p?.maybe_blocked_by_run_id && <Link className="text-sm text-info" title="A question mentions this run; this is a hint, not a recorded dependency." to={`/runs/${encodeURIComponent(stripUnsafeChars(p.maybe_blocked_by_run_id))}`}>may be blocked by {stripUnsafeChars(p.maybe_blocked_by_run_id).slice(0,8)}</Link>}
       {milestones.length > 0 && <div role="img" aria-label={`Plan approved; ${badge?.done ?? 0} of ${milestones.length} milestones reported complete`} className="grid gap-1" style={{gridTemplateColumns: `0.6fr repeat(${milestones.length}, minmax(0, 1fr))`}}>
         <Segment state="done" label="plan" title="Plan approved" />
         {milestones.map(m => <Segment key={m.id} label={stripUnsafeChars(m.title)} title={stripUnsafeChars(m.title)} state={completed.has(m.id) ? "done" : m.id === active ? "now" : "pending"} />)}

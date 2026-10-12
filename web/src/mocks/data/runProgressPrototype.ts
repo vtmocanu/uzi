@@ -54,7 +54,8 @@ export function seedProgressPrototype(runs: Map<string, Run>, messages: Map<stri
       finished_at: active || approval ? null : minsAgo(2), status_since: active ? minsAgo(151) : minsAgo(14),
       budget_wall_seconds: 86400, budget_total_seconds: 86400, budget_used_seconds: 9060,
       budget_max_iterations: 8, deadline_at: new Date(Date.now() + 77340_000).toISOString(),
-      credential_epochs: [
+      wait_on_limit: active, mr_rework_enabled: false,
+      credential_epochs: state === "idle" ? [{claim_generation: 1, secret_id: "sec-console", label: "console-key", select_reason: "pinned", applied_at: minsAgo(151)}] : [
         {claim_generation: 1, secret_id: "sec-default", label: "default", select_reason: "default", applied_at: minsAgo(151)},
         {claim_generation: 2, secret_id: "sec-console", label: "console-key", select_reason: "pinned", applied_at: minsAgo(90)},
       ], credential_override: null, credential_switch: null,
