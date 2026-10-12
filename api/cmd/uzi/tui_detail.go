@@ -801,6 +801,11 @@ func (m tuiModel) providerDetailLines() []string {
 	}
 	var rows []string
 	for _, clause := range clauses {
+		// Compact this exact fixed clause so it occupies one row at width 40.
+		// Leave any differing policy text intact.
+		if clause == "clone and session files kept on the worker" {
+			clause = "clone and session files stay on worker"
+		}
 		plain := m.renderer.Plain(clause, len([]rune(clause)))
 		wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
 		for _, row := range strings.Split(wrapped, "\n") {

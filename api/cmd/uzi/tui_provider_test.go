@@ -96,7 +96,7 @@ func TestProviderTUIDetailCopy(t *testing.T) {
 			m.width = 160
 			out := stripANSI(m.renderDetail())
 			requireWorkerCopy(t, out, "provider unavailable: waiting for owner", "no automatic retry deadline",
-				"claim and worker affinity retained", "clone and session files kept on the worker",
+				"claim and worker affinity retained", "clone and session files stay on worker",
 				"recovery depends on the worker or a verified recovery copy", "owner Resume: uzi run resume r1",
 				"Cancel: uzi run cancel r1", tc.want)
 			if tc.scope {
@@ -141,48 +141,75 @@ func TestProviderTUIRetryMetadataAndNegatives(t *testing.T) {
 }
 
 func TestProviderTUIDetailSafetyAndFrame(t *testing.T) {
-	for _, held := range []bool{false, true} {
-		for _, variant := range []string{"plain", "stale deadline", "pending pause"} {
-			for _, width := range []int{40, 100, 160} {
-				for _, height := range []int{24, 70} {
-					t.Run(fmt.Sprintf("hold=%v/%s/width=%d/height=%d", held, variant, width, height), func(t *testing.T) {
-						r := providerRetryFixture()
-						if held {
-							r = providerHoldFixture()
-						}
-						switch variant {
-						case "stale deadline":
-							deadline := time.Now().Add(time.Hour)
-							r.Health, r.DeadlineAt = "slow", &deadline
-						case "pending pause":
-							requested := time.Now().Add(-time.Minute)
-							r.PauseRequestedAt = &requested
-						}
-						r.ID = "r1\x1b[31m\r\n'$(inert)"
-						r.IssueTitle = "title\x1b[31m\r\nfixture"
-						m := tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
-						m = applyDetail(m, r, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one line", time.Now())})
-						m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
-						for _, row := range m.providerDetailLines() {
-							plain := stripANSI(row)
-							if strings.ContainsAny(plain, "\r\n\x1b") || visualWidth(plain) > width {
-								t.Fatalf("unsafe row: %q", row)
+	for _, id := range []struct {
+		name, value string
+	}{
+		{"hostile", "r1\x1b[31m\r\n'$(inert)"},
+		{"UUID", "aaaaaaaa-1111-2222-3333-444444444444"},
+	} {
+		for _, held := range []bool{false, true} {
+			for _, variant := range []string{"plain", "stale deadline", "pending pause"} {
+				for _, width := range []int{40, 100, 160} {
+					for _, height := range []int{24, 70} {
+						t.Run(fmt.Sprintf("%s/hold=%v/%s/width=%d/height=%d", id.name, held, variant, width, height), func(t *testing.T) {
+							r := providerRetryFixture()
+							if held {
+								r = providerHoldFixture()
 							}
-						}
-						out := stripANSI(m.View().Content)
-						if rows := len(strings.Split(out, "\n")); rows != m.height {
-							t.Fatalf("frame has %d rows, want %d", rows, m.height)
-						}
-						if strings.Contains(out, "near timeout") || strings.Contains(out, "stops at") {
-							t.Fatal("provider frame drew stale deadline")
-						}
-						if held && strings.Contains(out, "paused by you") {
-							t.Fatal("provider hold claimed owner pause")
-						}
-						if pending := strings.Contains(out, "pause requested"); pending != (variant == "pending pause" && !held) {
-							t.Fatalf("pending pause presence = %v", pending)
-						}
-					})
+							switch variant {
+							case "stale deadline":
+								deadline := time.Now().Add(time.Hour)
+								r.Health, r.DeadlineAt = "slow", &deadline
+							case "pending pause":
+								requested := time.Now().Add(-time.Minute)
+								r.PauseRequestedAt = &requested
+							}
+							r.ID = id.value
+							r.IssueTitle = "title\x1b[31m\r\nfixture"
+							m := tuiTestModel(t, &uzicli.FakeClient{}, r.ID)
+							m = applyDetail(m, r, []apitypes.MessageDTO{msgDTO(1, "text", "lead", "", "", "one line", time.Now())})
+							m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+							for _, row := range m.providerDetailLines() {
+								plain := stripANSI(row)
+								if strings.ContainsAny(plain, "\r\n\x1b") || visualWidth(plain) > width {
+									t.Fatalf("unsafe row: %q", row)
+								}
+							}
+							out := stripANSI(m.View().Content)
+							if rows := len(strings.Split(out, "\n")); rows != height {
+								t.Fatalf("frame has %d rows, want %d", rows, height)
+							}
+							if held {
+								// Ignore physical wrapping, including breaks inside a UUID.
+								copy := strings.Join(strings.Fields(out), "")
+								commandID := providerCommandID(r.ID)
+								previous := -1
+								for _, want := range []string{"provider unavailable: waiting for owner",
+									"no automatic retry deadline", "issue lock, claim and worker affinity retained",
+									"clone and session files stay on worker",
+									"recovery depends on the worker or a verified recovery copy",
+									"owner Resume: uzi run resume " + commandID,
+									"Cancel: uzi run cancel " + commandID,
+									"Stop: uzi run scope " + commandID + " --through 4",
+									"then, only if scope succeeds, Resume: uzi run resume " + commandID} {
+									at := strings.Index(copy, strings.Join(strings.Fields(want), ""))
+									if at < 0 || at <= previous {
+										t.Fatalf("missing or out-of-order policy clause %q in:\n%s", want, out)
+									}
+									previous = at
+								}
+							}
+							if strings.Contains(out, "near timeout") || strings.Contains(out, "stops at") {
+								t.Fatal("provider frame drew stale deadline")
+							}
+							if held && strings.Contains(out, "paused by you") {
+								t.Fatal("provider hold claimed owner pause")
+							}
+							if pending := strings.Contains(out, "pause requested"); pending != (variant == "pending pause" && !held) {
+								t.Fatalf("pending pause presence = %v", pending)
+							}
+						})
+					}
 				}
 			}
 		}
