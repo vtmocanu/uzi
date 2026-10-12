@@ -89,6 +89,10 @@ mk malformed
 printf 'AGENTS.md\t100\n.claude/rules/a.md\tfifty\n' > "$D/budgets.tsv"
 run malformed 1 "malformed row"
 
+mk bigbudget
+printf 'AGENTS.md\t99999999999999999999\n.claude/rules/a.md\t50\n' > "$D/budgets.tsv"
+run bigbudget 1 "malformed row"
+
 mk notab
 printf 'AGENTS.md 100\n.claude/rules/a.md\t50\n' > "$D/budgets.tsv"
 run notab 1 "malformed row"

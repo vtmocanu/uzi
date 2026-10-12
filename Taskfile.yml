@@ -1374,7 +1374,7 @@ tasks:
     cmds:
       # AGENTS.md is dropped silently at run time when strictly larger than
       # REPO_INSTRUCTIONS_MAX_BYTES (64 KiB, agent/src/repo-instructions.ts); the rules files
-      # are loaded into every run too. scripts/guidance-size-budgets.tsv holds one budget per
+      # are not loaded by worker runs, only by interactive Claude Code sessions. scripts/guidance-size-budgets.tsv holds one budget per
       # file, so growth is a reviewed edit. CLAUDE.md is a symlink to AGENTS.md and is counted
       # once, via AGENTS.md. Excluded: .claude/agents/*.md (upstream-synced roster),
       # .claude/agent-team.md (generated manifest), skills (check:skill-size),

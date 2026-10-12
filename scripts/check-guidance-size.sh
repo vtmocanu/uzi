@@ -4,7 +4,10 @@
 # usage: scripts/check-guidance-size.sh <canary-file> <budgets-file>
 #   e.g. scripts/check-guidance-size.sh scripts/guidance-size-canary.txt scripts/guidance-size-budgets.tsv
 #
-# WHY THIS EXISTS. Every worker run loads AGENTS.md and .claude/rules/*.md into context.
+# WHY THIS EXISTS. A worker run loads only the root CLAUDE.md (= AGENTS.md) into context,
+# via agent/src/repo-instructions.ts; .claude/rules/*.md is never loaded by a worker run
+# (settingSources is empty). The rules files load into interactive Claude Code sessions on
+# this repo, when a matching file is read, so they are budgeted too.
 # AGENTS.md is also subject to a hard runtime cap: a repo-instructions file strictly larger
 # than REPO_INSTRUCTIONS_MAX_BYTES (64 * 1024, agent/src/repo-instructions.ts) is DROPPED
 # SILENTLY ("too_large"). Growth toward that cap is invisible until the drop. Each file gets
@@ -14,7 +17,8 @@
 # BUDGETS FILE. Tab-separated `path<TAB>bytes`; blank lines and `#` comments are allowed.
 # Every in-scope file needs exactly one row.
 #
-# SCOPE. AGENTS.md plus `git ls-files -- '.claude/rules/*.md'`. CLAUDE.md is a symlink to
+# SCOPE. AGENTS.md plus `git ls-files -- '.claude/rules/*.md'` (that pathspec also matches
+# nested subdirectories under .claude/rules/). CLAUDE.md is a symlink to
 # AGENTS.md and is never enumerated, so the content counts once. Excluded on purpose:
 # .claude/agents/*.md (upstream-synced roster), .claude/agent-team.md (generated manifest),
 # skills (check-skill-size.sh), ARCHITECTURE.md and docs/ (not loaded as run guidance).
@@ -111,8 +115,10 @@ while IFS="$TAB" read -r bpath bbytes extra || [ -n "$bpath" ]; do
   case "$bpath" in
     '' | '#'*) continue ;;
   esac
+  # More than 9 digits is malformed: a huge value overflows the shell's integer tests
+  # ([ -gt ] errors, which is false inside if/&&) and the run would print clean.
   case "$bbytes" in
-    '' | *[!0-9]*)
+    '' | *[!0-9]* | ??????????*)
       add "malformed row (need path<TAB>integer bytes): $bpath"
       continue
       ;;
