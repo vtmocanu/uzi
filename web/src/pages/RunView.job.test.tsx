@@ -47,7 +47,8 @@ afterEach(() => {
 
 // Both running and owned, so the toggle row's own conditions (non-terminal status; canSteer
 // with no MR yet) hold for either kind: only the kind gate can hide it.
-const runningJob: Run = { ...mockJobRuns.find((r) => r.id === "run-job-queued")!, status: "running", worker_id: "w-laptop" };
+const queuedJob: Run = mockJobRuns.find((r) => r.id === "run-job-queued")!;
+const runningJob: Run = { ...queuedJob, status: "running", worker_id: "w-laptop" };
 const runningIssue: Run = {
   ...mockRuns.find((r) => r.id === "run-queued")!,
   status: "running",
@@ -157,8 +158,8 @@ describe("M2 header and settings", () => {
     expect(api.pauseRun).toHaveBeenCalledWith(runningIssue.id, "now");
   });
 
-  it("names the real job Stop exactly and retains its pointer without a composer", async () => {
-    await renderPage(runningJob);
+  it.each([queuedJob, runningJob])("names the real $status job Stop exactly and retains its pointer without a composer", async (job) => {
+    await renderPage(job);
     const stop = screen.getByRole("button", { name: "Stop this job" });
     expect(stop.textContent).toBe("Stop this job");
     expect(stop.getAttribute("aria-label")).toBe("Stop this job");

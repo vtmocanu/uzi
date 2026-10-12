@@ -2127,7 +2127,7 @@ export function RunView() {
     <div className="space-y-5">
       <PageHeader
         actionsBesideTitle
-        actions={<>
+        actions={<div className="relative flex flex-wrap items-center gap-2">
           <RunSettingsDisclosure>
             {!isCredentialDisabledHold(run) && (
               <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
@@ -2149,7 +2149,7 @@ export function RunView() {
           </RunSettingsDisclosure>
           <RunControls run={run} busy={busy} canSteer={canSteer} terminal={terminal}
             onStop={() => cancelRun()} onPause={(mode) => act(async () => { await api.pauseRun(run.id, mode); await refreshRun(); })} />
-        </>}
+        </div>}
         titleNode={
           <div
             className="min-w-0 run-head"

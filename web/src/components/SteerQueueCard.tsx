@@ -199,7 +199,7 @@ function PauseMenu({
     : "Drops the turn in flight. Work since the last checkpoint is discarded.";
 
   return (
-    <div className="relative">
+    <div>
       <Button
         variant="secondary"
         disabled={busy}
@@ -212,7 +212,7 @@ function PauseMenu({
       {open && (
         <div
           role="menu"
-          className="absolute left-0 z-10 mt-1 w-72 rounded-md border border-edge bg-raised p-1 shadow-lg"
+          className="absolute right-0 z-10 mt-1 w-72 rounded-md border border-edge bg-raised p-1 shadow-lg"
         >
           {showMilestoneItem && (
             <button
