@@ -949,6 +949,10 @@ describe("nonClosingTitle", () => {
     const out = nonClosingTitle("Fixes #2172", 2172, "org/repo");
     assert.ok(out.includes("#2172"));
     assert.strictEqual(closingDirectiveFor(out, 2172, "org/repo"), false);
+    // Pins the middle tier: neither the unchanged title nor the fixed fallback, only the keyword broken.
+    assert.notStrictEqual(out, "Work on issue #2172");
+    assert.notStrictEqual(out, "Fixes #2172");
+    assert.strictEqual(out.replace(/\u200b/g, ""), "Fixes #2172");
   });
 
   it("uses the fixed fallback when breaking keywords cannot neutralise a markup-split form", () => {

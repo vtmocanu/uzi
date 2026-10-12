@@ -84,4 +84,22 @@ describe("publishedCommitMessages (issue #2779)", () => {
     assert.strictEqual(await gc.publishedCommitMessages(bare, "f".repeat(40)), null);
     assert.strictEqual(await gc.publishedCommitMessages(path.join(fx.dataDir, "no-such-repo"), "a".repeat(40)), null);
   });
+
+  it("returns null for a commit whose message hides text behind a NUL byte", async () => {
+    git(fx.originPath, "checkout", "-b", "work");
+    commit(fx.originPath, "a.txt", "clean one");
+    const parent = git(fx.originPath, "rev-parse", "HEAD");
+    const tree = git(fx.originPath, "rev-parse", "HEAD^{tree}");
+    // A crafted commit object: git log's %B stops at the NUL, so "Fixes #7" would be invisible.
+    const body = Buffer.from(
+      `tree ${tree}\nparent ${parent}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\nhead\u0000Fixes #7\n`,
+    );
+    const crafted = execFileSync("git", ["-C", fx.originPath, "hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+      { env: ENV, input: body, encoding: "utf8" }).trim();
+    git(fx.originPath, "update-ref", "refs/heads/nul", crafted);
+    git(fx.originPath, "checkout", "main");
+    const { bare, tip } = await bareWith("nul");
+    assert.strictEqual(tip, crafted);
+    assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
+  });
 });

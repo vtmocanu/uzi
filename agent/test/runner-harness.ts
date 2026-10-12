@@ -218,18 +218,24 @@ function fakeTransport(
     // Forgejo/GitHub PATCH). Answer 2xx so updateMergeRequestDescription succeeds.
     if (init.method === "PUT" || init.method === "PATCH") {
       const sent = JSON.parse(init.body ?? "{}") as Record<string, unknown>;
-      // A title-only write (a `title` and no description field) never touches the description.
-      if (field in sent || !("title" in sent)) {
-        const status = opts.putStatus ?? 200;
+      // A write carries a description, a title, or both; each field present is applied on its own
+      // (a title-only write never touches the description, a description-only write never the title).
+      const hasDescription = field in sent || !("title" in sent);
+      const hasTitle = "title" in sent;
+      let status = 200;
+      if (hasDescription) {
+        status = opts.putStatus ?? 200;
         if (status >= 200 && status < 300) {
           const next = String(sent[field] ?? "");
           pr.description = next;
           opts.onWrite?.(pr, next);
         }
-        return { status, text: async () => "{}" };
       }
-      const status = opts.titleWriteStatus ?? 200;
-      if (status >= 200 && status < 300) pr.title = String(sent["title"]);
+      if (hasTitle) {
+        const titleStatus = hasDescription ? status : (opts.titleWriteStatus ?? 200);
+        if (titleStatus >= 200 && titleStatus < 300) pr.title = String(sent["title"]);
+        status = titleStatus;
+      }
       return { status, text: async () => "{}" };
     }
     if (opts.existing === undefined) {

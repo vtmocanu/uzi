@@ -131,7 +131,7 @@ import {
   type AnswerVerdict,
   type PlanVerdict,
 } from "./steering.js";
-import { GitLabClient, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
+import { GitLabClient, ForgeError, ForgejoClient, GitHubClient, type ForgeClient } from "./forge.js";
 import { classifyForgeError, withForgeRetry } from "./forge-retry.js";
 import {
   archiveFailureReasonSuffix,
@@ -198,7 +198,7 @@ import {
   repoPathFromUrl,
   type ReconcileResult,
 } from "./pr-description-publisher.js";
-import { renderCompletionBlock, type KindSection } from "./pr-description.js";
+import { closingDirectiveFor, nonClosingTitle, renderCompletionBlock, type KindSection } from "./pr-description.js";
 import type { SummaryRunner } from "./summary-runner.js";
 import { NowSummaryController, holdContextCallbacks, nowSummaryCodexClaim } from "./now-summary.js";
 import { runReadOnlyModelPass } from "./model-pass.js";
@@ -305,6 +305,13 @@ const COMPLETION_INTERLOCK_UNHELD_REASON =
  *  intentional. Content-free, like COMPLETION_INTERLOCK_UNHELD_REASON. */
 const NON_CLOSING_BODY_UNCONFIRMED_REASON =
   "completion interlock: a closing directive could not be removed from a non-closing merge request";
+
+/** Issue #2779: the STATIC failure_reason of a declared non-closing issue run whose PR title still
+ *  carries a closing directive for the issue after the retitle (the title could not be read, the
+ *  rewrite failed, or the re-read did not confirm it). The merge request is already open, so the
+ *  text says so. Content-free, like NON_CLOSING_BODY_UNCONFIRMED_REASON. */
+const NON_CLOSING_TITLE_UNCONFIRMED_REASON =
+  "completion interlock: a closing directive could not be removed from a non-closing merge request's title; the merge request remains open and must not be merged as-is";
 
 /** PRD #1171 m4: a name-based CodexBoundaryError probe. The runner stays HARNESS-AGNOSTIC and
  *  never imports from agent/src/codex/**, so it recognizes the boundary-blocked error — thrown
@@ -815,11 +822,30 @@ class HistoryRewrittenError extends Error {
   }
 }
 
+/** A local publication refusal was already terminally reported; unwind without another push. The
+ *  base of every refusal signal so the finalize unwind sites and the push retry classifier handle
+ *  them alike (issue #2779). */
+class PublicationRefusedSignal extends Error {
+  constructor(message = "publication refused") {
+    super(message);
+    this.name = "PublicationRefusedSignal";
+  }
+}
+
 /** A local workflow refusal was already terminally reported; unwind without another push. */
-class WorkflowScopeBlockedSignal extends Error {
+class WorkflowScopeBlockedSignal extends PublicationRefusedSignal {
   constructor() {
     super("workflow scope blocked");
     this.name = "WorkflowScopeBlockedSignal";
+  }
+}
+
+/** Issue #2779: a declared non-closing run's commit messages close its issue (or could not be read);
+ *  failClosingCommits already terminally reported, so unwind without pushing. */
+class ClosingCommitRefusedSignal extends PublicationRefusedSignal {
+  constructor() {
+    super("closing commit message refused");
+    this.name = "ClosingCommitRefusedSignal";
   }
 }
 
@@ -6540,6 +6566,52 @@ export class RunRunner {
       );
     }
 
+    // Issue #2779: a declared non-closing issue run (result.nonClosing, the same declaration phasePublish
+    // later turns into effectiveNonClosing) must not publish a commit message that closes its issue:
+    // the commit messages reach the default branch in the squash commit and close the issue there.
+    // Scan the messages a push would publish with the SAME matcher the body uses and refuse BEFORE any
+    // push or PR call. No history rewrite is attempted (that is the owner's call); the committed work
+    // stays preserved by the recovery capture the failed terminal report triggers. Any failure to read,
+    // parse or resolve the commit range refuses (null), never passes.
+    const closingGateIid =
+      resolveRunKind(claim.kind) === "issue" && result.nonClosing && typeof claim.issue_iid === "number"
+        ? claim.issue_iid
+        : undefined;
+    const closingBarePath = barePath;
+    const closingRepoPath = repoPathFromUrl(claim.repo.url);
+    /** The SHAs among the commits `tip` would publish whose message closes the issue, or null when
+     *  the range could not be read (tip absent or not a 40-hex OID, git or parse failure). */
+    const closingCommits = async (tip: string | null): Promise<string[] | null> => {
+      if (!tip || closingGateIid === undefined || !closingBarePath) return null;
+      const commits = await this.git.publishedCommitMessages(closingBarePath, tip);
+      if (commits === null) return null;
+      return commits.filter(c => closingDirectiveFor(c.message, closingGateIid, closingRepoPath)).map(c => c.sha);
+    };
+    let closingReported = false;
+    const failClosingCommits = async (shas: string[] | null) => {
+      if (closingReported) return;
+      closingReported = true;
+      const shown = (shas ?? []).slice(0, 5).join(", ");
+      const more = (shas?.length ?? 0) > 5 ? ` and ${shas!.length - 5} more` : "";
+      const failureReason = shas === null
+        ? "non-closing delivery refused: could not read the commit messages to publish; nothing was pushed"
+        : `non-closing delivery refused: commit message(s) close issue #${closingGateIid} (${shown}${more}); nothing was pushed; correcting them needs a history rewrite, left to the owner`;
+      batcher.emit({ kind: "status", agent: "worker", payload: {
+        text: shas === null
+          ? "non-closing delivery refused: the commit messages to publish could not be read; nothing was pushed"
+          : "non-closing delivery refused: a commit message closes the issue; nothing was pushed",
+      } });
+      await closeBatcher();
+      await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
+    };
+    if (closingGateIid !== undefined) {
+      const hits = await closingCommits(publicationOriginalHead);
+      if (hits === null || hits.length > 0) {
+        await failClosingCommits(hits);
+        return;
+      }
+    }
+
     // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
     // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
     // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
@@ -6769,6 +6841,17 @@ export class RunRunner {
               throw new WorkflowScopeBlockedSignal();
             }
           }
+          // Issue #2779: the authoritative commit-message check on the owned candidate about to be
+          // pushed. The finalize bridge can re-parent published checkpoint floors into this
+          // candidate, so a closing commit reworded away from H can come back after the early check.
+          // After the workflow re-check so a workflow refusal keeps its own typed report.
+          if (closingGateIid !== undefined) {
+            const closing = await closingCommits(sourceSha);
+            if (closing === null || closing.length > 0) {
+              await failClosingCommits(closing);
+              throw new ClosingCommitRefusedSignal();
+            }
+          }
           await this.git.pushBranch(
             finalizeBarePath,
             result.branch,
@@ -6782,7 +6865,7 @@ export class RunRunner {
         {
           log: runLog,
           signal: boundarySignal,
-          classify: (error) => (error instanceof ScratchPublicationError || error instanceof WorkflowScopeBlockedSignal) ? "permanent" : classifyForgeError(error),
+          classify: (error) => (error instanceof ScratchPublicationError || error instanceof PublicationRefusedSignal) ? "permanent" : classifyForgeError(error),
         },
       );
     };
@@ -7027,7 +7110,7 @@ export class RunRunner {
           );
         } catch (e) {
           rethrowWorkflowAbort(e);
-          if (e instanceof WorkflowScopeBlockedSignal) throw e;
+          if (e instanceof PublicationRefusedSignal) throw e;
           workflowUnavailable = true;
           runLog.warn("finalize base-align: could not refresh default tip; pushing without aligning", {
             run_id: runId, error: errMessage(e),
@@ -7042,7 +7125,7 @@ export class RunRunner {
           );
         } catch (e) {
           rethrowWorkflowAbort(e);
-          if (e instanceof WorkflowScopeBlockedSignal) throw e;
+          if (e instanceof PublicationRefusedSignal) throw e;
           workflowUnavailable = true;
           runLog.warn(
             "finalize base-align: could not compute the align target; pushing without aligning",
@@ -7061,7 +7144,7 @@ export class RunRunner {
             }
           } catch (e) {
             rethrowWorkflowAbort(e);
-            if (e instanceof WorkflowScopeBlockedSignal) throw e;
+            if (e instanceof PublicationRefusedSignal) throw e;
             workflowUnavailable = true;
             runLog.warn("finalize base-align: workflow eligibility unavailable; pushing without aligning", {
               run_id: runId, error: errMessage(e),
@@ -7157,7 +7240,7 @@ export class RunRunner {
                 );
               } catch (e) {
                 rethrowWorkflowAbort(e);
-                if (e instanceof WorkflowScopeBlockedSignal) throw e;
+                if (e instanceof PublicationRefusedSignal) throw e;
                 runLog.warn(
                   "finalize base-align: unexpected error during align; preserving diff and failing typed",
                   { run_id: runId, strategy, error: errMessage(e) },
@@ -7223,7 +7306,7 @@ export class RunRunner {
                 return false;
               } catch (e) {
                 rethrowWorkflowAbort(e);
-                if (e instanceof WorkflowScopeBlockedSignal) throw e;
+                if (e instanceof PublicationRefusedSignal) throw e;
                 if (e instanceof RunResidueBlockedError) throw e;
                 if (await reportMovedBranchIfVerified(e)) return true;
                 if (e instanceof ScratchPublicationError) throw e;
@@ -7295,7 +7378,7 @@ export class RunRunner {
               );
             } catch (e) {
               rethrowWorkflowAbort(e);
-              if (e instanceof WorkflowScopeBlockedSignal) throw e;
+              if (e instanceof PublicationRefusedSignal) throw e;
               runLog.warn(
                 "finalize base-align: could not import the default tip into the runner clone; preserving diff and failing typed",
                 { run_id: runId, error: errMessage(e) },
@@ -7326,7 +7409,7 @@ export class RunRunner {
                 overlayAligned = res === "aligned"; // the overlay never returns "conflict"
               } catch (e) {
                 rethrowWorkflowAbort(e);
-                if (e instanceof WorkflowScopeBlockedSignal) throw e;
+                if (e instanceof PublicationRefusedSignal) throw e;
                 // (b) the overlay git op threw (a GENUINE unexpected git error) → fall back to
                 // merge/rebase, NOT preserve-and-fail. Distinct message from (c) below.
                 runLog.warn(
@@ -7340,7 +7423,7 @@ export class RunRunner {
                   overlayHandled = true;
                 } catch (e) {
                   rethrowWorkflowAbort(e);
-                  if (e instanceof WorkflowScopeBlockedSignal) throw e;
+                  if (e instanceof PublicationRefusedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: an overlay push rejected by GitHub Push Protection (GH013) is a
                   // secret gitleaks missed — typed push_secret_blocked fail (NO preserved diff:
@@ -7376,7 +7459,7 @@ export class RunRunner {
                   await fetchAndPush();
                 } catch (e) {
                   rethrowWorkflowAbort(e);
-                  if (e instanceof WorkflowScopeBlockedSignal) throw e;
+                  if (e instanceof PublicationRefusedSignal) throw e;
                   if (e instanceof RunResidueBlockedError) throw e;
                   // PRD #974 M2: a merge push rejected by GitHub Push Protection (GH013) is a secret
                   // gitleaks missed — typed push_secret_blocked fail (NO preserved diff: it may
@@ -7445,7 +7528,7 @@ export class RunRunner {
       }
     } catch (e) {
       rethrowWorkflowAbort(e);
-      if (e instanceof WorkflowScopeBlockedSignal) return;
+      if (e instanceof PublicationRefusedSignal) return;
       if (e instanceof ScratchPublicationError) throw e;
       // PRD #1416 M4 (SC3): a bridge that could not be built/validated at a finalize push site was
       // thrown as HistoryRewrittenError; type it history_rewritten — never the generic catch
@@ -7524,7 +7607,7 @@ export class RunRunner {
         await pushToOrigin();
       } catch (e) {
         rethrowWorkflowAbort(e);
-        if (e instanceof WorkflowScopeBlockedSignal) return;
+        if (e instanceof PublicationRefusedSignal) return;
         if (e instanceof RunResidueBlockedError) throw e;
         if (await reportMovedBranchIfVerified(e)) return;
         if (e instanceof ScratchPublicationError) throw e;
@@ -7835,6 +7918,14 @@ export class RunRunner {
     // whose MR actually exists; retrying the whole call re-runs it instead. Create
     // failures stay fatal. Step 2: a new PR is created with the final body.
     steps?.enter("mr_create");
+    // Issue #2779: a declared non-closing issue run opens its PR with a title that cannot close the
+    // issue on a squash merge (the issue title may itself start with "Fixes #N"). Other deliveries
+    // keep the plain title.
+    const declaredNonClosing = !!effectiveNonClosing && scanIid !== undefined;
+    const titleFor = (): string => {
+      const title = mrTitle(claim, result.scopeCapped, claim.config?.completion_scope);
+      return declaredNonClosing ? nonClosingTitle(title, scanIid!, repoPath) : title;
+    };
     const mr = await withForgeRetry(
       () =>
         forge.createMergeRequest({
@@ -7842,7 +7933,7 @@ export class RunRunner {
           pat: claim.secrets.forge_pat,
           sourceBranch: result.branch,
           targetBranch,
-          title: mrTitle(claim, result.scopeCapped, claim.config?.completion_scope),
+          title: titleFor(),
           description: description.initialBody(completionFor(renderCloses)),
         }, boundarySignal),
       { log: runLog, signal: boundarySignal, classify: classifyForgeError },
@@ -7872,6 +7963,54 @@ export class RunRunner {
       });
       await failInterlockedClosed("closing directive remains on a non-closing MR", NON_CLOSING_BODY_UNCONFIRMED_REASON);
       return;
+    }
+
+    // Issue #2779: the PR's ACTUAL title (a created PR's, or an adopted PR's own) must not close the
+    // issue either: a squash merge puts the title in the commit that lands on the default branch.
+    // Read it, retitle when it closes, re-read and require the re-read title to scan clean (byte
+    // equality is not required: a forge may trim, truncate or normalise). A title that is unreadable,
+    // whose rewrite failed, or whose rewrite is not confirmed fails closed, legacy or interlocked
+    // alike (the PR is already open, so the static reason says it must not be merged as-is).
+    if (declaredNonClosing) {
+      const readTitle = async (): Promise<string | undefined> => {
+        const detail = await withForgeRetry(
+          () => forge.getMergeRequest(claim.repo.url, claim.secrets.forge_pat, mr.iid, boundarySignal),
+          { log: runLog, signal: boundarySignal, classify: classifyForgeError },
+        );
+        return typeof detail.title === "string" ? detail.title : undefined;
+      };
+      const writeTitle = (next: string) => withForgeRetry(
+        () => forge.updateMergeRequestTitle(claim.repo.url, claim.secrets.forge_pat, mr.iid, next, boundarySignal),
+        { log: runLog, signal: boundarySignal, classify: classifyForgeError },
+      );
+      const ensureNonClosingTitle = async (): Promise<boolean> => {
+        try {
+          const actual = await readTitle();
+          if (actual === undefined) return false;
+          if (!closingDirectiveFor(actual, scanIid!, repoPath)) return true;
+          const next = nonClosingTitle(actual, scanIid!, repoPath);
+          try {
+            await writeTitle(next);
+          } catch (e) {
+            // A forge may refuse the broken title (e.g. a length cap after the inserted characters);
+            // one retry with the fixed non-closing fallback, anything else fails closed.
+            if (!(e instanceof ForgeError && (e.status === 422 || e.status === 400))) throw e;
+            await writeTitle(`Work on issue #${scanIid}`);
+          }
+          const reread = await readTitle();
+          if (reread === undefined || closingDirectiveFor(reread, scanIid!, repoPath)) return false;
+          if (reread !== next) runLog.info("PR title confirmed non-closing but differs from the written title", { run_id: runId });
+          return true;
+        } catch (e) {
+          rethrowWorkflowAbort(e);
+          runLog.warn("PR title could not be confirmed non-closing", { run_id: runId, error: errMessage(e) });
+          return false;
+        }
+      };
+      if (!await ensureNonClosingTitle()) {
+        await failInterlockedClosed("non-closing PR title could not be confirmed", NON_CLOSING_TITLE_UNCONFIRMED_REASON);
+        return;
+      }
     }
 
     // ── PRD #1226 M4 (D5): PR-head verification (create-then-verify) ────────────

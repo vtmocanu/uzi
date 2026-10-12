@@ -7274,10 +7274,18 @@ export class GitCache {
     try {
       if (!SHA40_RE.test(tip)) return null;
       const baseRef = await this.defaultBranchRef(barePath);
-      // NUL is the one byte git forbids in a commit message, so `-z` with %x00 between %H and %B
-      // yields a flat NUL-delimited stream of (sha, message) pairs a message cannot corrupt. NUL is
-      // written as a printable \u escape (never a raw control byte in source).
-      const out = await this.runGit(barePath, ["log", "-z", "--format=%H%x00%B", `${baseRef}..${tip}`]);
+      // Read through the same hardened view verifyRecoveryClosure uses: replacement refs, grafts and
+      // a shallow file must not change which commits or messages this reads.
+      const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null" };
+      const read = async (args: string[], input?: string): Promise<string> =>
+        (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
+          { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
+      // `-z` with %x00 between %H and %B yields a flat NUL-delimited stream of (sha, message) pairs.
+      // A commit OBJECT can still carry a NUL inside its message (git hash-object --literally writes
+      // one, and %B stops printing at it), which would hide the text after it from this scan. A
+      // literal NUL is written as a \u escape (never a raw control byte in source); the raw-object
+      // check below refuses any such commit.
+      const out = await read(["log", "-z", "--format=%H%x00%B", `${baseRef}..${tip}`]);
       const tokens = out.split("\u0000");
       // The trailing NUL from `-z` leaves one empty final token.
       if (tokens.pop() !== "") return null;
@@ -7287,6 +7295,12 @@ export class GitCache {
         const sha = tokens[i]!;
         if (!SHA40_RE.test(sha)) return null;
         commits.push({ sha, message: tokens[i + 1]! });
+      }
+      if (commits.length > 0) {
+        // `cat-file --batch` prints framing as text, so a NUL anywhere in its output came from a
+        // commit object's own bytes: fail closed rather than trust the truncated %B.
+        const raw = await read(["cat-file", "--batch"], commits.map(c => c.sha).join("\n") + "\n");
+        if (raw.includes("\u0000")) return null;
       }
       return commits;
     } catch {
