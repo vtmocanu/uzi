@@ -1263,6 +1263,14 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 // the bounded multi-valued bare-config marker `uzi-stopped.<runId>.entry` below. The marker grants
 // no capture, adoption or release authority: it only refuses reuse of the path it names.
 
+/** Does `text` contain `p` as a whole path, i.e. not immediately followed by a clone-key character? */
+function namesWholePath(text: string, p: string): boolean {
+  for (let i = text.indexOf(p); i >= 0; i = text.indexOf(p, i + 1)) {
+    if (!/[A-Za-z0-9_-]/.test(text.charAt(i + p.length))) return true;
+  }
+  return false;
+}
+
 function stoppedMarkerKey(runId: string): string {
   return `uzi-stopped.${runId}.entry`;
 }
@@ -6201,8 +6209,9 @@ export class GitCache {
    * `live`/`reclaimed`/`abandoned` entries that no protected record owns), canonical sources (valid
    * stopped markers; `bound` when the active journal names the source with the marker's digest,
    * `detached` when no active journal names its path, which is how a kept canonical source normally
-   * reads once the marker is durable, `mismatch` otherwise), and protected or episode descriptors.
-   * Pure reads. Unreadable evidence is reported as `problems`, never skipped.
+   * reads once the marker is durable, `mismatch` otherwise; plus the marker-less plain-journal
+   * canonical record, a kept clone under its plain journal with no marker), and protected or episode
+   * descriptors. Pure reads. Unreadable evidence is reported as `problems`, never skipped.
    */
   private async gatherRetainedUnderLock(barePath: string): Promise<GatheredBare> {
     await this.assertRecoveryBare(barePath);
@@ -6351,21 +6360,23 @@ export class GitCache {
 
     // Canonical sources left under their PLAIN journal with no marker (a park or terminal exit that
     // kept the clone, retainStoppedSource with record "none"). They need the same explicit reclaim
-    // path as a marked source. Evidence is conservative: any marker that could name the path (valid,
-    // malformed by raw text, or any overflowing run) keeps the record out of this view, and a path
-    // that a protected record owns is that record's.
-    const markerTexts = [...markers.valid.map((x) => x.raw), ...markers.malformed.map((x) => x.raw)];
+    // path as a marked source. Evidence is conservative but exact: a valid marker hides the record
+    // only by its parsed clonePath, a malformed marker when its text carries the path (raw or
+    // JSON-escaped) not followed by a key character (so a marker for issue-290 never hides issue-29,
+    // while unquoted garbage naming the path still does), the journal's own run
+    // overflowing keeps it out, and a path that a protected record owns is that record's.
+    const malformedTexts = markers.malformed.map((x) => x.raw);
     for (const [branch, a] of active) {
       const j = a.journal;
       if (!j || j.attemptId !== undefined || j.recovery || j.retainedSources?.length) continue;
-      if (markers.overflow.size > 0 || owned.has(j.clonePath)) continue;
+      if (markers.overflow.has(j.runId) || owned.has(j.clonePath)) continue;
       const key = path.basename(j.clonePath);
       if (!/^[A-Za-z0-9_-]+$/.test(key)) continue;
       const shape = this.clonePathShape(j.clonePath, this.runnerClonePath(barePath, key));
       if (!shape || shape.attemptId !== undefined) continue;
-      const escaped = JSON.stringify(j.clonePath).slice(1, -1);
+      const forms = [j.clonePath, JSON.stringify(j.clonePath).slice(1, -1)];
       if (markers.valid.some((x) => x.marker.clonePath === j.clonePath) ||
-          markerTexts.some((t) => t.includes(j.clonePath) || t.includes(escaped))) continue;
+          malformedTexts.some((t) => forms.some((f) => namesWholePath(t, f)))) continue;
       const p = await part(j.clonePath, undefined, null);
       records.push({
         kind: "canonical", runId: j.runId, branch, key, parts: [p], journal: j, activeRaw: a.raw,
@@ -6524,8 +6535,10 @@ export class GitCache {
     } else if (rec.kind === "canonical") {
       if (rec.markerState === "none") {
         // A canonical source left under its plain journal: no marker, and the journal is plain by
-        // construction. The worker cannot know whether the run is still parked; the server hold
-        // read decides that (an open hold is the owner's to discard).
+        // construction. The worker cannot know whether the run is still parked; an open hold, a
+        // local record or a live flight refuses; a released or absent hold makes the source reclaimable
+        // by explicit, digest-confirmed operator action, which loses only bytes outside the last
+        // capture; `run_state:not_known_locally` says so.
         consumers.push("run_state:not_known_locally");
       } else {
         consumers.push(`marker:${rec.markerState}`);
@@ -6760,7 +6773,8 @@ export class GitCache {
   /**
    * issue #1786 — operator discard of a PLAIN retained source: an attempt in ledger state `reclaimed`
    * or `abandoned` that no journal names, or a canonical source whose marker is bound to its plain journal or detached
-   * (no active journal names it; a successor's journal is never cleared), or a `gx` attempt (confirmed with generation `none`). See
+   * (no active journal names it; a successor's journal is never cleared), or a marker-less canonical
+   * source left under its plain journal (the journal is cleared with the clone), or a `gx` attempt (confirmed with generation `none`). See
    * {@link discardRetainedSource} for the shared sequence and refusals.
    */
   discardStoppedSource(opts: RetainedDiscardOptions): Promise<RetainedDiscardResult> {

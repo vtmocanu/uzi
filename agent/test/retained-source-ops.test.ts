@@ -590,6 +590,16 @@ describe("verifyStoppedSourceCovered", () => {
     assert.deepEqual(calls, [[[a.path], "before"], [[a.path], "after"]]);
   });
 
+  it("leaves the clone's .git/index bytes unchanged when a tracked file's mtime moved", async () => {
+    const { a, head } = await captured();
+    const when = new Date(Date.now() + 5000);
+    fs.utimesSync(path.join(a.path, "work.txt"), when, when);
+    const idx = path.join(a.path, ".git", "index");
+    const before = fs.readFileSync(idx);
+    assert.equal(await verify(a, head), "covered");
+    assert.ok(before.equals(fs.readFileSync(idx)), "the hardened status did not refresh the index");
+  });
+
   describe("submodules", () => {
     const SUB_IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
     const subGit = (cwd: string, ...args: string[]): string =>
@@ -1498,10 +1508,51 @@ describe("a canonical source left under its plain journal (no marker)", () => {
 
   it("a marker that names the path (valid or malformed text) keeps it out of this view", async () => {
     const c = await lone("run-m", 2906);
-    gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-other.entry", `not json ${c.path}`]);
+    gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-other.entry", `not json ${JSON.stringify(c.path)}`]);
     const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
     assert.equal(all.sources.filter((s) => s.runId === "run-m").length, 0);
     assert.equal((await git.inspectRetainedSources({ selector: c.sel, holds: NO_HOLDS, isLivePath: notLive, barePath: bare })).sources.length, 0);
+  });
+
+  it("malformed text naming the path unquoted still keeps it out of this view (fail closed)", async () => {
+    const c = await lone("run-u", 2907);
+    gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-other2.entry", `garbage ${c.path} trailing`]);
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    assert.equal(all.sources.filter((s) => s.runId === "run-u").length, 0);
+  });
+
+  it("a marker for a longer key (issue-290, valid or malformed) does not hide the issue-29 leftover", async () => {
+    const short = await lone("run-short", 29);
+    const longer = await markedCanonical("run-long", 290, 1);
+    gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-other.entry", `not json ${JSON.stringify(longer.path)}`]);
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    assert.equal(all.sources.filter((s) => s.runId === "run-short").length, 1, "the prefix path is still listed");
+    const ev = await inspectOne(short.sel);
+    const r = await git.discardStoppedSource(discardOpts(short.sel, ev.descriptor));
+    assert.equal(r.kind, "done");
+    assert.equal(fs.existsSync(short.path), false);
+    assert.ok(fs.existsSync(longer.path), "the longer key's source is untouched");
+  });
+
+  it("an unrelated run's marker overflow does not hide another run's leftover", async () => {
+    const c = await lone("run-o", 2907);
+    // Overflow for run-other only: more valid markers than the reader's cap.
+    for (let i = 0; i < 70; i++) {
+      gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-other.entry",
+        JSON.stringify({ runId: "run-other", clonePath: `${c.path}-x${i}`, branch: "agent/issue-1", key: "issue-1", generation: 1, reason: "r", journalDigest: "d" })]);
+    }
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    assert.equal(all.sources.filter((s) => s.runId === "run-o").length, 1);
+  });
+
+  it("the leftover's own run overflowing its markers keeps it out of the view (fail closed)", async () => {
+    const c = await lone("run-self", 2908);
+    for (let i = 0; i < 70; i++) {
+      gitIn(bare, ["config", "--local", "--add", "uzi-stopped.run-self.entry", `junk ${i}`]);
+    }
+    const all = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    assert.equal(all.sources.filter((s) => s.runId === "run-self").length, 0);
+    assert.ok(fs.existsSync(c.path));
   });
 });
 
