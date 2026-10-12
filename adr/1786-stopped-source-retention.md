@@ -167,7 +167,8 @@ positive server evidence that its run is terminal; an absent or released hold is
   string `status` is `unknown` and refuses with `run_state_unknown`; any other status refuses
   with `run_state_not_terminal`. Both blockers are soft, so an open hold or a local record still
   reports its own, more specific disposition. No generation binds the read: a marker-less part
-  carries none, and a terminal status is absorbing. This adds no new endpoint.
+  carries none, and a terminal status is absorbing. This adds no new endpoint. Terminal status
+  only gates explicit operator discard; it is still not preservation proof (see the proof rule).
 - **Accepted boundary: the probe is worker-scoped.** The ownership read is
   `GetRunOwnedByWorker` (`WHERE id = @id AND worker_id = @worker_id`). Once the run's
   `worker_id` moves off this worker (a requeue after a released claim, or a claim elsewhere),

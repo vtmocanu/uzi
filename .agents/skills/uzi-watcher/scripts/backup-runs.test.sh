@@ -952,8 +952,7 @@ rc="$(backup_rc "$D_ME" completed-1)"
 tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
   || fail "marker-e ledger: a ledger attempt displaced the marker-named canonical"
 # A journal-current on-branch attempt of the terminal run is ignored too: the marker
-# canonical wins (kills a mutation that drops the terminal-mode journal clearing; the ledger clearing
-# matters only for an unreadable ledger-named dir, which this case does not stage).
+# canonical wins (kills a mutation that drops the terminal-mode journal clearing).
 reset_layout
 make_clone "$CANON" agent/issue-4242 kept-canon
 make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
@@ -967,6 +966,19 @@ tar -xOzf "$D_ME2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -
   || fail "marker-e journal-current: marker canonical not captured; log: $(cat "$D_ME2/latest-attempt/backup.log")"
 tar -xOzf "$D_ME2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+live-attempt' \
   && fail "marker-e journal-current: the journal-current attempt was captured for a terminal run"
+# A marker whose canonical dir is gone captures nothing: a ledger attempt of the terminal
+# run is never the fallback (kills a mutation that drops the terminal-mode ledger clearing).
+reset_layout
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 ledger-attempt
+ledger "$A2" completed-1 "$RB/issue-4242.attempt-$A2" live
+stopped_marker completed-1 agent/issue-4242 issue-4242 "$CANON"
+D_ME3="$WORK/out.marker-e3"
+rc="$(backup_rc "$D_ME3" completed-1)"
+[ "$rc" -eq 0 ] || fail "marker-e canonical-gone: exit $rc, want 0"
+grep -q 'SNAP completed-1 .*status=completed' "$D_ME3/latest-attempt/backup.log" \
+  || fail "marker-e canonical-gone: expected SNAP; got: $(cat "$D_ME3/latest-attempt/backup.log")"
+[ ! -e "$D_ME3/latest-attempt/issue-4242.tgz" ] \
+  || fail "marker-e canonical-gone: a ledger attempt was captured for a terminal run"
 echo "PASS marker-e: completed run captures the marker-named canonical; journal alone stays status-only"
 
 echo "ALL PASS"
