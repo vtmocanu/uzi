@@ -1,7 +1,7 @@
 # PRD #1786: Retain stopped-generation sources before clone cleanup
 
 **Issues:** [#1786](https://github.com/vtmocanu/uzi/issues/1786), the clone-discard exits of [#1790](https://github.com/vtmocanu/uzi/issues/1790). Overview: [#2746](https://github.com/vtmocanu/uzi/issues/2746).
-**Status:** Implemented on branch agent/issue-1786 (2026-10-12) except two unverified M0/M1 acceptance items noted under those milestones; M2 complete. Draft 2026-10-11, revised after peer and architect review. Maintainer approved the preservation direction and the split (this PRD closes #1786; #1790's park-durability part moves to a later PRD after #1733) on 2026-10-11.
+**Status:** Implemented on branch agent/issue-1786 (2026-10-12) with three acceptance items not directly evidenced in this run (noted under M0, M1 and M2). Draft 2026-10-11, revised after peer and architect review. Maintainer approved the preservation direction and the split (this PRD closes #1786; #1790's park-durability part moves to a later PRD after #1733) on 2026-10-11.
 **Execution:** One gated run and one PR, an operator-channel prefactor followed by two serial vertical slices. No unfinished PRD is a prerequisite. No implementation or validation changes any file under `.github/workflows/**`.
 **Evidence baseline:** `origin/main` at `cc4ed18c68f4e708e214c1da93834a74b81f02dc` (includes #2745). Anchors are symbols, not line numbers. All implementation investigation is repository-local; no open-web lookup is required.
 
@@ -159,11 +159,12 @@ Test inspection and discard at the real GitCache seam and the operator entry poi
   **Gates:** `task gate:agent`, `task gate:repo`.
   **Progress (2026-10-12):** implemented and gated; left unticked because attributed-container teardown at the stale exit is asserted only as a requested Docker teardown (no Docker harness in the unit suite); attributed processes are verified stopped.
 
-- [x] **M2: Recovery-handler exits obey the same source rule without changing parks.**
+- [ ] **M2: Recovery-handler exits obey the same source rule without changing parks.**
   **Blocked by:** M0 and M1.
   Apply the nine-site matrix plus indirect clears to terminal, credential-deferral and terminal-disk exits. Integrate those sources with M0's existing inspect/discard channel; include no-hold reclaim and worker-local count/byte health output. Include guarded and non-guarded source fixtures, park-timing controls, missing emptyDir reporting, real claim-race/channel tests and existing successful-disposition tests. Update the runbook/backup discovery guidance and exact operator commands, and synchronize docs. Record the invariant and rejected alternatives in ADR 1786, retaining ADR-1197's park semantics.
   **Acceptance:** every matrix exit preserves an unpreserved exact source or reports unknown while refusing cleanup; no new stale network operations, park gate, archive prerequisite or retry loop; existing complete disposal/owner-discard authority remains independent; published-checkpoint and archive wording stay distinct; explicit confirmed local discard reclaims an absent/released-hold source inside the live worker's closed-gate idle point, without stopping the container or admitting a racing claim; count/bytes and unknown measurements are inspectable.
   **Gates:** `task gate:agent`, `task gate:repo`.
+  **Progress (2026-10-12):** implemented and gated; left unticked because one class of matrix-exit source diverges from "integrate those sources with M0's inspect/discard channel": a canonical clone kept by a park or terminal exit stays under its plain journal (ADR-1197 posture, so a same-worker resume recaptures it and the next run's terminal-orphan handling retains it), and is neither listed nor discardable through the channel. Attempt clones and stopped-source records are listed. See ADR-1786 "Recovery-handler exits". Every other M2 acceptance item is covered by tests in agent/test/runner-recovery-exit-retention.test.ts.
 
 ## Risks and hosted acceptance handoff
 

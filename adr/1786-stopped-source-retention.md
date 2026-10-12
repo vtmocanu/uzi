@@ -159,8 +159,10 @@ credential terminal, `receipt_failed`, `ServerWallParkedError`, a confirm `gone`
 a capture) run no own-mode proof beyond the existing entry kill, as before; only exits
 that become release-eligible run the `stopped_source` proof, once, at the handler's
 cleanup. An interruption propagating out of the handler (shutdown, pause, limit, a codex
-deferral, any throw) skips that cleanup check and leaves the clone kept; the caller
-handles the interruption.
+deferral, any throw) skips that cleanup check; the preserve flag stays as the
+interrupting arm set it (shutdown, pause and limit keep the clone; an owner cancel takes
+its normal cancel cleanup; a claim fence or stale claim goes to the caller's stopped-source
+arm), and the caller handles the interruption.
 
 Claims without a claim generation (pre-generation APIs) can never be proven covered, so
 their park and terminal exits keep the clone, and a same-worker reclaim of such a run
