@@ -1,6 +1,6 @@
 # PRD #2789: Run page, one progress card for milestones, live work and Now
 
-**Status**: In progress — M1 complete; M2–M4 pending
+**Status**: In progress — M1 and M2 complete; M3–M4 pending
 **Priority**: Medium
 **GitHub issue**: #2789
 **Design mock**: `prds/mockups/2789-run-page-unified-progress-mock.html` (open it in a browser; a Before/After toggle and a run-state switch sit at the top)
@@ -111,18 +111,20 @@ Blocked by: none
 - [x] Docs: `docs/run-activity.md` "Milestones and the now line" and the run-page bullet of "Progress estimate" (about lines 401-440 and 504-515); `task docs:sync`, mirror committed. `CHANGELOG.md` `[Unreleased]` line.
 - [x] Acceptance: examples 1 and 4; mock parity for the progress card.
 
-Evidence: [M1 validation, assertion migrations and deliberate breaks](mockups/2789-m1-validation.md), with light/dark browser comparisons. Source reviewed at `bffcbb77`; web gate passed at `b05cc1b7` (identical source), repository gate and production build passed at `60e5ccc1`. M2–M4 remain pending.
+Evidence: [M1 validation, assertion migrations and deliberate breaks](mockups/2789-m1-validation.md), with light/dark browser comparisons. Source reviewed at `bffcbb77`; web gate passed at `b05cc1b7` (identical source), repository gate and production build passed at `60e5ccc1`. M2–M4 remained pending at that M1 checkpoint.
 
 ### M2: Header shows identity and state; settings and controls move up
 Blocked by: M1 (the iteration count moves into the card first)
 
-- [ ] Header chips: status, health flag, live elapsed/budget (parked: clock stopped), harness and model, one token chip; both token chips only while a switch is pending or released (`RunCredentialOverride.tsx:63-72`). Iteration chip removed; the stage chip removed only where the card shows the stage (kept for runs without a card).
-- [ ] `Run settings ▾` disclosure in the header actions slot (contents per Modules); the inline Token history card and toggle rows leave the page body; the `RunView.tsx:2803-2822` comment updated.
-- [ ] Run controls component extracted and rendered in the header actions slot only; the Steer card keeps composer and queue, drops its Pause and Stop, and points to the header.
-- [ ] `Spinner` (`ui.tsx:590`) honours `prefers-reduced-motion`.
-- [ ] Motion: this PRD adds no new pulsing element; a lane pulses only with a live frame (PRD #1353); every pulse stays neutralised under `prefers-reduced-motion` (`web/src/index.css`).
-- [ ] `CHANGELOG.md` line.
-- [ ] Acceptance: example 1's header clauses; mock parity for the header.
+- [x] Header chips: status, health flag, live elapsed/budget (parked: clock stopped), harness and model, one token chip; both token chips only while a switch is pending or released (`RunCredentialOverride.tsx:63-72`). Iteration chip removed; the stage chip removed only where the card shows the stage (kept for runs without a card).
+- [x] `Run settings ▾` disclosure in the header actions slot (contents per Modules); the inline Token history card and toggle rows leave the page body; the `RunView.tsx:2803-2822` comment updated.
+- [x] Run controls component extracted and rendered in the header actions slot only; the Steer card keeps composer and queue, drops its Pause and Stop, and points to the header.
+- [x] `Spinner` (`ui.tsx:590`) honours `prefers-reduced-motion`.
+- [x] Motion: this PRD adds no new pulsing element; a lane pulses only with a live frame (PRD #1353); every pulse stays neutralised under `prefers-reduced-motion` (`web/src/index.css`).
+- [x] `CHANGELOG.md` line.
+- [x] Acceptance: example 1's header clauses; mock parity for the header.
+
+Evidence: [M2 validation, old → new assertion inventory and deliberate breaks](mockups/2789-m2-validation.md), with light/dark header and mobile disclosure comparisons. Cumulative source review is clean through `e5d39e35`; full web/repository gates and production build passed at that revision. M3–M4 remain pending.
 
 ### M3: What needs you comes first, cost in the card, summary collapses after the gate
 Blocked by: M1 (the cost footer lives in the card)
