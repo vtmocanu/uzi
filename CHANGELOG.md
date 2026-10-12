@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Jobs with a wall budget above Node's timer range no longer abort at once ([#2771](https://github.com/vtmocanu/uzi/issues/2771)).**
+  The job runner's input-download and session deadlines now re-arm in chunks below the native timer limit, as #2761 did for the executors, so a long job budget runs to its full length.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
