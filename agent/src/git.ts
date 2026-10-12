@@ -1875,6 +1875,12 @@ export class GitCache {
     return (await this.tryGit(barePath, ["check-ref-format", `refs/heads/${name}`])) === 0;
   }
 
+  /** Validate a remote branch as a literal ref while preserving Unicode names. */
+  private async isRemoteBranchName(barePath: string, name: string): Promise<boolean> {
+    if (!name || name.startsWith("-")) return false;
+    return (await this.tryGit(barePath, ["check-ref-format", `refs/heads/${name}`])) === 0;
+  }
+
   /** Clone the repo bare if absent, else fetch to refresh. Returns the bare path. */
   async ensureClone(repoUrl: string, pat?: string, username?: string): Promise<string> {
     const barePath = this.barePathFor(repoUrl);
@@ -2079,6 +2085,11 @@ export class GitCache {
     barePath: string, branch: string, group: PublicationCandidate, pat: string,
     scope: string | undefined, username?: string,
   ): Promise<void> {
+    if (!(await this.isRemoteBranchName(barePath, branch))) {
+      throw new ScratchPublicationError("invalid remote branch", undefined, {
+        kind: "floor_unverified", step: "floor_refresh",
+      });
+    }
     const remoteRef = `refs/heads/${branch}`;
     const scratchRef = `refs/uzi-publication-floor/${branch}`;
     const refuse = (kind: ScratchPublicationKind): never => {
@@ -2087,7 +2098,7 @@ export class GitCache {
       });
     };
     const observe = async (): Promise<string | null> => {
-      const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
+      const listed = (await this.runGit(barePath, ["ls-remote", "--", "origin", remoteRef], pat, scope, username)).trim();
       if (!listed) return null;
       const oid = listed.slice(0, 40);
       if (!SHA40_RE.test(oid) || listed !== `${oid}\t${remoteRef}`) refuse("floor_unverified");
@@ -2106,7 +2117,7 @@ export class GitCache {
         if (await observe() !== null) refuse("remote_changed_during_refresh");
         return;
       }
-      await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
+      await this.runGit(barePath, ["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
       const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
         if (error instanceof RunResidueBlockedError || isAbortLike(error)) throw error;
         throw new ScratchPublicationError("cannot verify fresh remote floor", error, {
@@ -7306,12 +7317,12 @@ export class GitCache {
         try {
           if (!(await this.isPlainBranchName(barePath, branch))) return { kind: "unavailable" } as const;
           const remoteRef = `refs/heads/${branch}`;
-          const listed = await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username);
+          const listed = await this.runGit(barePath, ["ls-remote", "--", "origin", remoteRef], pat, scope, username);
           if (listed === "") return { kind: "absent" } as const;
           const match = /^([0-9a-f]{40})\t([^\n]+)\n?$/.exec(listed);
           if (!match || match[2] !== remoteRef) return { kind: "unavailable" } as const;
           await this.runGit(barePath, ["fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
-            "origin", `+${remoteRef}:${tempRef}`], pat, scope, username);
+            "--", "origin", `+${remoteRef}:${tempRef}`], pat, scope, username);
           const sha = await this.resolveCommitStrict(barePath, tempRef);
           return sha === match[1] ? { kind: "present", sha } as const : { kind: "unavailable" } as const;
         } catch (cause) {
@@ -7895,6 +7906,7 @@ export class GitCache {
     branch: string,
     creds?: { pat?: string; cloneUrl?: string; username?: string },
   ): Promise<string | null> {
+    if (!(await this.isRemoteBranchName(barePath, branch))) return null;
     const originRef = `refs/remotes/origin/${branch}`;
     if (!(await this.refExists(barePath, originRef))) {
       // FIRST push: the whole branch is new, so the default branch is the floor.
@@ -7917,7 +7929,7 @@ export class GitCache {
             // `+refs/heads/*:refs/remotes/origin/*` refspec, so this fetch does NOT
             // opportunistically clobber refs/remotes/origin/<branch> (the NON-CLOBBER
             // invariant above) — only the explicit scratch ref is written.
-            ["fetch", "--refmap=", "origin", `+refs/heads/${branch}:${scratchRef}`],
+            ["fetch", "--refmap=", "--", "origin", `+refs/heads/${branch}:${scratchRef}`],
             creds?.pat,
             scope,
             creds?.username,
@@ -8141,7 +8153,8 @@ export class GitCache {
     const scope = cloneUrl ? httpScopeForUrl(cloneUrl) : undefined;
     return this.withLock(barePath, async () => {
       onLockAcquired?.();
-      await this.runGit(barePath, ["fetch", "origin", defaultBranch], pat, scope, username);
+      if (!(await this.isRemoteBranchName(barePath, defaultBranch))) throw new Error("invalid remote branch");
+      await this.runGit(barePath, ["fetch", "--", "origin", defaultBranch], pat, scope, username);
       // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
       // fetch updates the remote-tracking ref; read the fresh tip off it.
       let sha = (
@@ -12210,7 +12223,9 @@ async function isBareRepo(p: string): Promise<boolean> {
  *   /tmp/fx/origin                   -> tmp+fx+origin.git    (local path, hostless)
  */
 export function bareDirName(rawUrl: string): string {
-  const trimmed = rawUrl.replace(/\/+$/, "");
+  let end = rawUrl.length;
+  while (end > 0 && rawUrl[end - 1] === "/") end--;
+  const trimmed = rawUrl.slice(0, end);
   const [host, repoPath] = splitHostAndPath(trimmed);
   const parts: string[] = [];
   const normHost = host.trim().toLowerCase().replaceAll(":", "%3A");
