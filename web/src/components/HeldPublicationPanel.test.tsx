@@ -132,7 +132,7 @@ describe("HeldPublicationPanel", () => {
     const third = render(<HeldPublicationPanel run={aRun()} />);
     expect(await screen.findByText("Published")).toBeTruthy();
     expect(third.container.textContent).toContain("after a fresh secret scan, can be published to a run-scoped ref");
-    expect(third.container.textContent).toContain("Delete it sooner with uzi run held expire");
+    expect(third.container.textContent).toContain("Delete this run's published refs now with uzi run held expire");
   });
 
   it.each(["deleted", "abandoned", "refused"])("hides Expires for a %s row with a past expiry", async (state) => {
@@ -193,7 +193,7 @@ describe("HeldPublicationPanel", () => {
 
   it.each<[string, Partial<HeldPublication>, string]>([
     ["acknowledged", {}, "On the forge; deleted when retention expires."],
-    ["created", {}, "On the forge; waiting for the run's custody to be released."],
+    ["created", {}, "On the forge; uzi either keeps it as the run's held copy or deletes it."],
     ["delete_unknown", {}, "Being removed from the forge."],
     ["deleted", { ref_created_at: ACK }, "Was on the forge; since removed."],
     ["deleted", { acknowledged_at: ACK }, "Was on the forge; since removed."],
@@ -276,5 +276,16 @@ describe("HeldPublicationPanel", () => {
     });
     expect(container.innerHTML).toBe("");
     expect(screen.queryByText("Published")).toBeNull();
+  });
+
+  it("drops the previous run's rendered rows while the next run's fetch is pending", async () => {
+    const OTHER = "11111111-2222-4333-8444-555555555555";
+    vi.spyOn(api, "getRunHeldPublications")
+      .mockResolvedValueOnce({ publications: [pub({ state: "acknowledged" })] })
+      .mockImplementationOnce(() => new Promise(() => {}));
+    const { rerender, container } = render(<HeldPublicationPanel run={aRun()} />);
+    expect(await screen.findByText("Published")).toBeTruthy();
+    rerender(<HeldPublicationPanel run={aRun({ id: OTHER })} />);
+    await waitFor(() => expect(container.innerHTML).toBe(""));
   });
 });

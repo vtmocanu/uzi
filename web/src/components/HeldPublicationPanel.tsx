@@ -10,7 +10,7 @@ import { BranchIcon } from "./icons";
 
 // HeldPublicationPanel is the failed-run page's view of the held-work publication
 // (issue #2545): the failed run's commits and uncommitted work, secret-scanned and published
-// to a run-scoped forge ref before the worker's copy was archived. It sits beside SalvagePanel
+// to a run-scoped forge ref in place of a recovery archive. It sits beside SalvagePanel
 // and shares its visual language and copy discipline.
 //
 // Data comes from the owner route GET /api/runs/{id}/held-publications, fetched only for a
@@ -59,7 +59,7 @@ function leadLine(pub: HeldPublication): string | null {
     case "acknowledged":
       return "On the forge; deleted when retention expires.";
     case "created":
-      return "On the forge; waiting for the run's custody to be released.";
+      return "On the forge; uzi either keeps it as the run's held copy or deletes it.";
     case "delete_unknown":
       return "Being removed from the forge.";
     case "deleted":
@@ -146,7 +146,7 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
         {acknowledged && (
           <>
             {" "}
-            Delete it sooner with{" "}
+            Delete this run's published refs now with{" "}
             <code className="font-mono text-xs">uzi run held expire {stripUnsafeChars(run.id)}</code>.
           </>
         )}
