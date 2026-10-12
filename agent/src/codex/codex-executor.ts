@@ -23,7 +23,8 @@
 // SCOPE (R4): this does NOT clone SdkExecutor's Claude-lane extras (empty-turn retry,
 // plan/intent summary hooks, health/interleave sentinels, interactive OWNER park).
 // Issue #2099 is the one retry that IS in scope: a turn that fails with a transient PROVIDER
-// classification (CodexTurnFailedError: category transport, see isCodexTransientClassification)
+// classification (CodexTurnFailedError: transport or exact rateLimitExceeded token;
+// see isCodexTransientClassification)
 // is retried a bounded number of times in the same thread, then escalates as
 // TransientRecoveryError so the runner parks the run in recovery_wait instead of failing it.
 // It sits on top of Codex's own request/stream retries (config.ts keeps the production retry
@@ -52,6 +53,7 @@
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
+import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "../park-run.js";
 import { chunkedTimeout } from "../chunked-timeout.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
@@ -500,8 +502,8 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
   return `Your questions could not be put to a human on this run:\n\n${questions.map((q) => `- ${q.question}`).join("\n")}\n\nProceed on your best judgment. State the assumption you are making, and do not ask again.`;
 }
 
-function answeredPrompt(questions: AskUserQuestion[], answers: string[]): string {
-  return `The human answered your questions:\n\n${questions.map((q, i) => `Q: ${q.question}\nA: ${answers[i]?.trim() || "(no answer given)"}`).join("\n\n")}\n\nContinue the work with these answers.`;
+function answeredPrompt(questions: AskUserQuestion[], answers: string[], continuation = "Continue the work with these answers."): string {
+  return `The human answered your questions:\n\n${questions.map((q, i) => `Q: ${q.question}\nA: ${answers[i]?.trim() || "(no answer given)"}`).join("\n\n")}\n\n${continuation}`;
 }
 
 
@@ -2585,7 +2587,8 @@ export class CodexExecutor implements Executor {
       const emitIgnoredQuestions = (result: ReducedTurnResult): void => {
         if (result.questions?.length) ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_IGNORED_NOTICE } });
       };
-      const clarify = async (questions: AskUserQuestion[]): Promise<string> => {
+      let clarificationPaused = false;
+      const clarify = async (questions: AskUserQuestion[], parkAt?: { completedCount: number; total?: number }, requestPark = ctx.requestParkRun): Promise<string> => {
         if (!ctx.askUser) {
           ctx.emit({ kind: "status", agent: "worker", payload: { text: QUESTION_UNWIRED_NOTICE } });
           return unansweredPrompt(questions);
@@ -2600,11 +2603,18 @@ export class CodexExecutor implements Executor {
           await ctx.askUser(questions);
           return unansweredPrompt(questions);
         }
-        const verdict = await ctx.askUser(questions);
-        if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
+        let verdict = await ctx.askUser(questions);
         questionBudget.asked++;
+        // The worker callback owns explicit owner retries and their absolute deadline.
+        if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
+          const disposition = await requestPark(parkAt);
+          if (disposition.kind === "paused") { clarificationPaused = true; return ""; }
+          if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
+          verdict = disposition;
+        }
+        if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
         ctx.emit({ kind: "answer", agent: "lead", payload: { answers: verdict.answers } });
-        return answeredPrompt(questions, verdict.answers);
+        return answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined);
       };
       const drivePlan = async (initialPrompt: string) => {
         // issue #2213: a quarantined worker stops a run cleanly at the plan and revise boundaries,
@@ -2625,6 +2635,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: a completed turn proves the home is live and holds newer session state.
           reapedSinceLastPersist = false;
           const result = turn.result;
+          if (result.parkRun) throw new TrustedExecutionRefusal("illicit park_run signal during planning");
           if (result.plan?.trim()) {
             emitIgnoredQuestions(result);
             return turn;
@@ -3061,6 +3072,35 @@ export class CodexExecutor implements Executor {
           if (!hasQuestions && result.prSummary !== undefined) {
             declaredPrSummary = await stampPrSummaryHead(result.prSummary, ctx.worktreePath);
           }
+          const parkAt = { completedCount: served?.completedCount ?? latestProgress?.completed?.length ?? 0, total: milestones?.length };
+          // Idle park waits use the turn's existing wall/hold lifecycle, including generation
+          // consumption and epoch recreation after a refused capture.
+          let idleParkResult: ExecutorResult | undefined;
+          const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
+            let disposition: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
+            const outcome = await this.driveTurnWithWallPark(ctx, epoch!.harness, epoch!.registry, reducer,
+              "implement", nextPrompt, epoch!.resumeSessionId, idleMs, wall, epoch!.buildPhaseBroker,
+              shared.selection.current, at, shared.scrubProjected, beforeReapingSink, pauseNow,
+              recreateEpochAfterReap, completionAttempted, onProgress, undefined, async () => {
+                disposition = await ctx.requestParkRun!(at);
+                return { done: false };
+              });
+            if (outcome.kind === "turn") return disposition!;
+            if (outcome.kind === "walled") idleParkResult = { branch: ctx.branch, agentSelection, walled: { reason: REASON_WALL } };
+            else if (outcome.kind === "held") idleParkResult = { branch: ctx.branch, agentSelection, completionHeld: { reason: outcome.reason } };
+            else { pausedAt = outcome.at; idleParkResult = loopResult(); }
+            return { kind: "paused" };
+          };
+          if (result.parkRun) {
+            if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new TrustedExecutionRefusal("illicit park_run signal");
+            if (clarificationRounds++ >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
+            const disposition = await requestPark(parkAt);
+            if (idleParkResult) return idleParkResult;
+            if (disposition.kind === "paused") { pausedAt = parkAt; return loopResult(); }
+            if (disposition.kind === "cancel") throw new Error(REASON_CANCEL);
+            nextPrompt = disposition.answers.join("\n") + "\n\n" + PARK_RUN_CONTINUATION;
+            continue;
+          }
           if (!result.questions?.length) break;
           if (result.checkpoint) {
             await epoch.persistSession();
@@ -3076,8 +3116,10 @@ export class CodexExecutor implements Executor {
           // With max_iterations=1, clarify inside this same iteration before its budget check.
           if (clarificationRounds >= maxClarificationRounds) throw new TrustedExecutionRefusal("codex clarification rounds exhausted during implementation");
           clarificationRounds++;
-          const followUp = await clarify(result.questions);
-          const continuationBody = `${followUp}\n\nContinue the implementation.`;
+          const followUp = await clarify(result.questions, parkAt, ctx.requestParkRun ? requestPark : undefined);
+          if (idleParkResult) return idleParkResult;
+          if (clarificationPaused) { pausedAt = parkAt; return loopResult(); }
+          const continuationBody = parkRunEnabled(ctx, "implement") ? followUp : `${followUp}\n\nContinue the implementation.`;
           nextPrompt = withMilestoneNote(continuationBody, milestoneNote());
           if (result.checkpoint) {
             clarificationPrompt = continuationBody;
@@ -3964,6 +4006,7 @@ export class CodexExecutor implements Executor {
     completionAttempted = false,
     onProgress: (progress: MilestoneProgress) => void = forwardProgress(ctx),
     onFirstEvent?: () => void,
+    idleOperation?: () => Promise<ReducedTurnResult>,
   ): Promise<
     | { kind: "turn"; result: ReducedTurnResult }
     | { kind: "walled" }
@@ -3979,7 +4022,7 @@ export class CodexExecutor implements Executor {
     let buildPhaseBroker = buildPhaseBrokerIn;
     for (;;) {
       try {
-        const result = await this.driveCodexTurn(
+        const result = idleOperation ? await idleOperation() : await this.driveCodexTurn(
           ctx, harness, registry, reducer, phase, prompt, resumeId, idleMs, wall, buildPhaseBroker, selection, scrubLeadText, onProgress, pauseNow, onFirstEvent,
         );
         // PRD #1497 M2 (CodeRabbit !1504): honor a sticky owner cancel that RACED a REFUSED
@@ -3992,13 +4035,14 @@ export class CodexExecutor implements Executor {
         // the next turn trips at its start and every boundary reconcile defers on the latch.
         return { kind: "turn", result };
       } catch (caught) {
-        let err: unknown = caught;
+        let err: unknown = idleOperation && caught instanceof PauseNowSignal
+          ? new CodexTurnTripError(REASON_PAUSE, pauseNow.capture()) : caught;
         // Issue #1789: a vault-lock latch in force turns the turn's failure into a deferral. Cancel
         // (sticky, or a cancel/shutdown trip) always wins; a pause/wall/idle trip that fired FIRST
         // keeps its existing arm below; anything else (the vault trip, or the turn failing on the
         // refused refresh) defers with NO transient retry (a locked vault is not transient).
         if (pauseNow.vaultLock.latched) {
-          const lockedMsg = caught instanceof Error ? caught.message : "";
+          const lockedMsg = err instanceof Error ? err.message : "";
           if (ctx.cancelRequested?.() || lockedMsg === REASON_CANCEL) throw new Error(REASON_CANCEL);
           if (lockedMsg !== REASON_PAUSE && lockedMsg !== REASON_WALL && lockedMsg !== REASON_IDLE) {
             throw new CodexCredentialDeferredError();
@@ -4034,7 +4078,10 @@ export class CodexExecutor implements Executor {
             if (!stopAfter) continue;
             err = stopAfter;
           } else {
-            throw new TransientRecoveryError(`provider transient error persisted after bounded in-process retries: ${caught.message}`);
+            throw new TransientRecoveryError(
+              `provider transient error persisted after bounded in-process retries: ${caught.message}`,
+              { providerOrigin: true },
+            );
           }
         }
         const msg = err instanceof Error ? err.message : "";
@@ -4392,12 +4439,15 @@ export class CodexExecutor implements Executor {
     const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
+    if (parkRunEnabled(ctx, phase)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
     // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
     // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
     const request: RunTurnRequest = {
       prompt,
       systemPrompt,
       phase,
+      parkRunSupported: ctx.parkRunSupported,
+      nonInteractiveIssue: parkRunEligible(ctx, phase),
       ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,
       leadSkills,

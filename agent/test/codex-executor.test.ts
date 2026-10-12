@@ -1,6 +1,8 @@
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
+import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
+import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
 import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
@@ -193,6 +195,56 @@ interface ResponderCtx {
   turnStartCount: number;
 }
 type Responder = (c: ResponderCtx) => unknown;
+
+describe("M1 dependency wait characterization Codex", () => {
+  it("M1 dependency wait Codex prose exhausts iterations before completion", async (t) => {
+    const leadScript = scriptedDependencyWait("identical");
+    const fixture = dependencyWaitCallbacks();
+    let advertisedTools: unknown;
+    const prompts: string[] = [];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        advertisedTools = rec(c.params).dynamicTools;
+        return { thread: { id: "th-1" } };
+      }
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount;
+      const tn = `tn-wait-${n}`;
+      const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+      prompts.push(continuation);
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        const response = leadScript.next({ continuation, advertisedTools });
+        assert.ok("text" in response, "M1 baseline advertises no dependency-wait control");
+        assert.equal((advertisedTools as { name: string }[]).some((tool) => tool.name === "park_run"), false);
+        c.transport.push(agentMessage(response.text));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeRig({ responder });
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true });
+    const observation = await observeDependencyWait(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+      () => ({ providerCalls: rig.transport.turnStartCount, iterations: fixture.iterations }),
+    );
+    t.diagnostic("M1_WAIT_OBSERVATION " + JSON.stringify({ harness: "codex", ...observation, providerLaunches: rig.providerLaunches() }));
+    assert.equal(observation.paused, false);
+    assert.throws(() => expectDependencyWaitPaused(observation), /dependency waiting must not fail the run/);
+    assert.equal(observation.error, "codex run reached its implement/review iteration budget without completing");
+    assert.equal(observation.providerCalls, 9);
+    assert.deepEqual(fixture.iterations, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+    assert.equal(leadScript.surfaces.length, 7);
+    assert.ok(Array.isArray(advertisedTools), "fixture sees the actual advertised dynamic tools");
+    fixture.assertPreserved();
+  });
+});
 
 class FakeTransport implements CodexTransport {
   requests: { method: string; params: unknown; opts?: { signal?: AbortSignal; deadlineMs?: number } }[] = [];
@@ -10753,6 +10805,24 @@ describe("CodexExecutor milestone progress (issue #1674)", () => {
       assert.match(pr.description, /Approved Codex follow-up remains/);
       assert.equal(m2ClosingDirective(pr.description, 2172, "org/repo"), false);
     });
+    it("m2 non-closing actual broker callback retitles a closing issue title (issue #2779)", async () => {
+      const rig = makeMultiEpochRig([script("th-1", [
+        (th, tn) => [done(2172, th, tn, { non_closing: { reason: "Approved Codex follow-up remains" } })],
+      ])]);
+      const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      const delivery: Executor = { run: async ctx => {
+        commitInTree(ctx.worktreePath, "m2.txt", "delivered work\n");
+        return executor.run(ctx);
+      } };
+      const { gitlab, pr } = m2Runner.fakeGitlab();
+      m2FollowPush(m2Runner.git, pr);
+      const claim = m2Runner.gitlabClaim(2172, { kind: "issue", issue_title: "Fixes #2172", plan_md: "Approved plan permits leaving the issue open", plan_approved: true, plan_source: "seeded" });
+      await m2Runner.runner(delivery, gitlab).execute(claim);
+      assert.ok(m2Runner.api.states.some(s => s.runId === claim.run_id && s.body.status === "completed"),
+        JSON.stringify(m2Runner.api.states.filter(s => s.runId === claim.run_id)));
+      assert.equal(m2ClosingDirective(pr.title, 2172, "org/repo"), false, "the created PR title does not close the issue");
+      assert.ok(pr.title.includes("#2172"));
+    });
     it("m2 non-closing guidance reaches the Codex implement builder", () => {
       const prompt = m1Prompt("persisted", m1Context());
       assert.match(prompt, /issue runs only/i);
@@ -14571,10 +14641,75 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 
 // ================================================================================
 // Issue #2099 — a Codex turn that ends `failed` with a TRANSIENT provider classification (category
-// transport: serverOverloaded, ...) is retried a bounded number of times in the same thread, then
+// transport: serverOverloaded, ...; or exact rateLimitExceeded token) is retried a bounded
+// number of times in the same thread, then
 // escalates as TransientRecoveryError (the runner parks it in recovery_wait) instead of failing the
 // run as agent_failure. Cancel, pause and a spent wall budget always win over the retry and over the
 // escalation; a non-transient classification is never retried.
+describe("CodexExecutor planning settlement (#1733)", () => {
+  it("notifies for a successful Codex plan before approval and for implementation after approval", async () => {
+    const lifecycle: string[] = [];
+    const rig = makeMultiEpochRig([
+      epochResponder("th-plan", "tn-plan", (t, th, tn) => {
+        t.push(toolCall(1, "submit_plan", { plan_md: "# Productive plan" }, th, tn, "c-plan"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      epochResponder("th-impl", "tn-impl", (t, th, tn) => {
+        t.push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx } = makeCtx({
+      planApproved: false,
+      approvedPlan: undefined,
+      onModelTurnSettled: async count => { assert.ok(count > 0); lifecycle.push("settled"); },
+      gatePlan: async plan => {
+        assert.equal(plan, "# Productive plan");
+        lifecycle.push("approval");
+        return { kind: "approve", selection: { status: "ok", selection: { source: "own", exclusions: [] } } } as never;
+      },
+    });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "productive Codex plan");
+    assert.equal(result.branch, ctx.branch);
+    assert.deepEqual(lifecycle, ["settled", "approval", "settled"], "the planning turn counts independently of the implementation turn");
+  });
+
+  for (const info of ["serverOverloaded", "unauthorized"]) {
+    it(`planning settlement excludes a failed Codex plan turn (${info})`, async () => {
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") return { thread: { id: "th-plan" } };
+        if (c.method === "turn/start") {
+          c.transport.push(threadStarted("th-plan"))
+            .push(agentMessage("drafting the plan", "th-plan"))
+            .push(toolCall(1, "submit_plan", { plan_md: "# Failed draft" }, "th-plan", "tn-plan", "c-plan"))
+            .push({
+              kind: "turn_completed", method: "turn/completed", threadId: "th-plan", turnId: "tn-plan", status: "failed",
+              params: { threadId: "th-plan", turn: { id: "tn-plan", status: "failed", error: { codexErrorInfo: info } } },
+            });
+          return { turn: { id: "tn-plan" } };
+        }
+        return {};
+      } });
+      rig.deps = { ...rig.deps, transientRetryMax: 0 };
+      let settled = 0;
+      let gated = 0;
+      const { ctx } = makeCtx({
+        planApproved: false, approvedPlan: undefined,
+        onModelTurnSettled: async () => { settled++; },
+        gatePlan: async () => { gated++; throw new Error("failed plan reached approval"); },
+      });
+      await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, "failed Codex plan"), (err: Error) => {
+        assert.equal(err instanceof TransientRecoveryError, info === "serverOverloaded");
+        assert.match(err.message, new RegExp(info));
+        return true;
+      });
+      assert.equal(rig.transport.turnStartCount, 1, "the failed planning turn actually ran");
+      assert.equal(gated, 0, "a draft submitted on a failed turn never reaches approval");
+      assert.equal(settled, 0, "planning output and submit_plan do not make a failed turn productive");
+    });
+  }
+});
+
 describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   /** A failed `turn/completed` carrying a terminal `turn.error.codexErrorInfo`. */
   function turnCompletedWithError(codexErrorInfo: unknown, threadId = "th-1", turnId = "tn-1"): CodexNotification {
@@ -14616,14 +14751,14 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     rig.deps = { ...rig.deps, transientBackoffBaseMs: 1, ...extra };
   }
 
-  it("(a) serverOverloaded once then success: the run completes in the SAME thread with one retry notice", async () => {
-    const rig = makeRig({ responder: failingThenDone(1, "serverOverloaded") });
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(a) ${info} once then success: the run completes in the SAME thread with one retry notice [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(1, info) });
     tinyBackoff(rig);
     const { ctx, emitted } = makeCtx();
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient then success");
     assert.equal(result.branch, "agent/issue-42", "the run completed");
     assert.equal(rig.transport.turnStartCount, 2);
-    assert.deepEqual(retryNotices(emitted), ["the provider returned a transient error (serverOverloaded); retrying (1/2)…"]);
+    assert.deepEqual(retryNotices(emitted), [`the provider returned a transient error (${info}); retrying (1/2)…`]);
     assert.equal(
       rig.transport.requests.filter((r) => r.method === "thread/start").length,
       1,
@@ -14673,15 +14808,16 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     });
   }
 
-  it("(b) every attempt serverOverloaded: TransientRecoveryError after exactly 1+N turn starts", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b) every attempt ${info}: TransientRecoveryError after exactly 1+N turn starts [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig);
     const { ctx, emitted } = makeCtx();
     await assert.rejects(
       withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient exhausted"),
       (e: Error) => {
         assert.ok(e instanceof TransientRecoveryError, `expected TransientRecoveryError, got ${e.name}: ${e.message}`);
-        assert.match(e.message, /persisted after bounded in-process retries: codex turn failed: failed \(serverOverloaded\)/);
+        assert.equal(e.message, `provider transient error persisted after bounded in-process retries: codex turn failed: failed (${info})`);
+        assert.equal(e.providerOrigin, true);
         return true;
       },
     );
@@ -14690,8 +14826,64 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
-  it("(b2) transientRetryMax bounds the retries", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+  it("rateLimitExceeded exhaustion from the real executor reaches the runner typed provider_outage park", async () => {
+    const api = new FakeApi("rate-limit-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const diagnostics = recordingLog();
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
+    tinyBackoff(rig, { deferRegistryTeardown: true });
+    const client = new WorkerClient(url, "rate-limit-worker", "test", diagnostics.log, {
+      sleep: async () => {}, terminalRetrySchedule: [1, 1],
+    });
+    client.protocolFeatures = ["claim_generation_fence", "recovery_cause_provider_outage"];
+    api.recoveryWaitRequiresRunning = true;
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      claim_generation: 3,
+      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const homeDir = path.join(fx.dataDir, "rate-limit-home");
+    let produced: unknown;
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      try { return await run(ctx); } catch (error) { produced = error; throw error; }
+    };
+    try {
+      await new RunRunner(client, new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions()),
+        () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
+          pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 200,
+          quiesceRun: async () => ({
+            process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+            docker: { state: "not_wired", removed: [], detail: "not wired" },
+          }),
+        }).execute(claim);
+      assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
+      assert.equal(produced.providerOrigin, true);
+      assert.equal(rig.transport.turnStartCount, 3, "the real producer spent exactly two retries");
+      const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
+      assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
+      assert.equal(reports[0]!.body.recovery_cause, "provider_outage");
+      assert.equal(reports[0]!.body.productive_turns, 0, "failed rate-limit attempts are not productive");
+      assert.equal(reports[0]!.body.claim_generation, 3);
+      assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));
+    } finally { await api.close(); fx.cleanup(); }
+  });
+
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b1) the exhausted transient park is marked providerOrigin (PRD #1733) [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
+    tinyBackoff(rig);
+    const { ctx } = makeCtx();
+    await assert.rejects(
+      withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient exhausted"),
+      (e: Error) => e instanceof TransientRecoveryError && e.providerOrigin === true,
+    );
+  });
+
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b2) transientRetryMax bounds the retries [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig, { transientRetryMax: 0 });
     await assert.rejects(
       withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "no retries"),
@@ -14704,6 +14896,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     ["a tagged transport failure with a non-retryable http status", { responseStreamConnectionFailed: { httpStatusCode: 401 } }],
     ["unauthorized", "unauthorized"],
     ["contextWindowExceeded", "contextWindowExceeded"],
+    ["sessionBudgetExceeded", "sessionBudgetExceeded"],
+    ["unknown token", "totallyMadeUp"],
+    ["badRequest", "badRequest"],
   ] as const) {
     it(`(c) ${name} is never retried and never parks`, async () => {
       const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
@@ -14720,9 +14915,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     });
   }
 
-  it("(d) a cancel during the backoff ends the wait at once: run cancelled, no further turn start", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(d) a cancel during the backoff ends the wait at once: run cancelled, no further turn start [${info}]`, async () => {
     const controller = new AbortController();
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig, { transientBackoffBaseMs: 4000, wallMs: 60_000 });
     const { ctx, emitted } = makeCtx({ signal: controller.signal });
     const started = Date.now();
@@ -14738,13 +14933,13 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(rig.transport.turnStartCount, 1, "no provider turn started after the cancel");
   });
 
-  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async (t) => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError [${info}]`, async (t) => {
     for (const wired of [false, true]) {
       await t.test(wired ? "parked wall" : "unwired wall rejection", async (t) => {
         const realSetTimeout = globalThis.setTimeout;
         const realClearTimeout = globalThis.clearTimeout;
         const controller = new AbortController();
-        const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+        const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
         tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
         let wallParks = 0;
         const { ctx, emitted } = makeCtx({
@@ -14863,7 +15058,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   // arrives first and the interruption becomes true only after the live turn can no longer be
   // tripped (its finally), so the in-turn trip path never sees it. Removing the gate turns each into
   // a TransientRecoveryError.
-  it("(e) the final attempt fails with the wall budget already spent by the turn's debit: wall path, not TransientRecoveryError", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(e) the final attempt fails with the wall budget already spent by the turn's debit: wall path, not TransientRecoveryError [${info}]`, async () => {
     const realNow = Date.now.bind(Date);
     let skewMs = 0;
     mock.method(Date, "now", () => realNow() + skewMs);
@@ -14873,7 +15068,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         const rig = makeRig({
           // The clock jumps past the 1s budget as the final failed terminal is delivered, before the
           // 1s wall timer can fire: only the turn's finally debit sees the spent budget.
-          responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) skewMs = 5000; }),
+          responder: failingThenDone(2, info, (n) => { if (n === 2) skewMs = 5000; }),
         });
         tinyBackoff(rig, { transientRetryMax: 1, wallMs: 1000, idleMs: 5000 });
         let wallParks = 0;
@@ -14897,7 +15092,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     }
   });
 
-  it("(f) a pause-now pending at exhaustion parks for the pause, not TransientRecoveryError", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(f) a pause-now pending at exhaustion parks for the pause, not TransientRecoveryError [${info}]`, async () => {
     const controller = new AbortController();
     let onPause: (() => void) | undefined;
     let armed = false;
@@ -14913,7 +15108,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         onPause?.();
       }
     }) as AbortSignal["removeEventListener"];
-    const rig = makeRig({ responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) armed = true; }) });
+    const rig = makeRig({ responder: failingThenDone(2, info, (n) => { if (n === 2) armed = true; }) });
     tinyBackoff(rig, { transientRetryMax: 1 });
     const parks: { completedCount: number }[] = [];
     const { ctx } = makeCtx({
@@ -14931,10 +15126,10 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
   });
 
-  it("(g) a cancel at exhaustion ends the run cancelled, not TransientRecoveryError", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(g) a cancel at exhaustion ends the run cancelled, not TransientRecoveryError [${info}]`, async () => {
     let cancelled = false;
     // The sticky cancel flips as the final failed terminal is delivered; no signal abort.
-    const rig = makeRig({ responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) cancelled = true; }) });
+    const rig = makeRig({ responder: failingThenDone(2, info, (n) => { if (n === 2) cancelled = true; }) });
     tinyBackoff(rig, { transientRetryMax: 1 });
     const { ctx } = makeCtx({ cancelRequested: () => cancelled });
     await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "cancel at exhaustion"), (e: Error) => {
@@ -16175,6 +16370,357 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
     assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
   });
+});
+
+describe("M1 expired wall physical Codex runner", () => {
+  for (const boundary of ["pause", "fallback"] as const) {
+    it(`wall_expired ${boundary} ACK reaches real wall park`, { timeout: 20_000 }, async () => {
+      let calls = 0;
+      await exerciseExpiredWallRunner(boundary, (_ctx, home) => {
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          assert.equal(++calls, 1, "wall ACK cannot start another provider turn");
+          c.transport.push(toolCall(401, "park_run", {}, "th-1", "tn-expired-wall", "park"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-expired-wall"));
+          return { turn: { id: "tn-expired-wall" } };
+        } });
+        return new CodexExecutor(noopLog, home,
+          { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+          { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+      });
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+describe("M4 dependency wait physical Codex runner", () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+    let calls = 0;
+    const custody = await exerciseDependencyWaitRunner((ctx, home) => {
+      let advertisedTools: unknown;
+      const script = scriptedDependencyWait("identical", ({ continuation, advertisedTools: tools }) => {
+        assert.match(continuation, /Continue if these answers give you actionable work/);
+        assert.match(continuation, new RegExp(dependencyWaitAnswer));
+        assert.ok((tools as { name: string }[]).some(tool => tool.name === "park_run"));
+        return { tool: "park_run", input: {} };
+      });
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") {
+          advertisedTools = rec(c.params).dynamicTools;
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        calls++;
+        assert.ok(calls <= 3, "parking cannot start another provider turn");
+        const tn = `tn-physical-${calls}`;
+        if (calls === 1) {
+          commitDependencySlice(ctx.worktreePath);
+          c.transport.push(toolCall(101, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+          c.transport.push(toolCall(201, "checkpoint", {}, "th-1", tn, "checkpoint"));
+        } else if (calls === 2) {
+          c.transport.push(toolCall(302, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+        } else {
+          const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+          const response = script.next({ continuation, advertisedTools });
+          assert.ok("tool" in response);
+          c.transport.push(toolCall(403, response.tool, response.input, "th-1", tn, "park"));
+        }
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      } });
+      return new CodexExecutor(noopLog, home,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+        { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+    });
+    assert.equal(calls, 3);
+    for (const mode of ["now", "after_milestone"] as const) {
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
+    }
+  });
+});
+
+describe("M3 dependency wait paired Codex", () => {
+  it("M3 dependency wait Codex preserves checkpoint and parks", async (t) => {
+    const leadScript = scriptedDependencyWait("identical", ({ continuation, advertisedTools }) => {
+      assert.match(continuation, /Continue if these answers give you actionable work/);
+      assert.doesNotMatch(continuation, /Continue the work with these answers\.|Continue the implementation\./);
+      assert.ok((advertisedTools as { name: string }[]).some((tool) => tool.name === "park_run"));
+      return { tool: "park_run", input: {} };
+    });
+    const parks: unknown[] = [];
+    const fixture = dependencyWaitCallbacks();
+    let advertisedTools: unknown;
+    const prompts: string[] = [];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        advertisedTools = rec(c.params).dynamicTools;
+        return { thread: { id: "th-1" } };
+      }
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount;
+      const tn = `tn-wait-${n}`;
+      const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+      prompts.push(continuation);
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        const response = leadScript.next({ continuation, advertisedTools });
+        assert.ok("tool" in response);
+        c.transport.push(toolCall(400 + n, response.tool, response.input, "th-1", tn, "park"));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeRig({ responder });
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true,
+      parkRunSupported: true, requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; } });
+    const observation = await observeDependencyWait(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+      () => ({ providerCalls: rig.transport.turnStartCount, iterations: fixture.iterations }),
+    );
+    t.diagnostic("M3_WAIT_OBSERVATION " + JSON.stringify({ harness: "codex", ...observation }));
+    expectDependencyWaitPaused(observation);
+    assert.equal(observation.providerCalls, 3);
+    assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+    assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+    assert.equal(leadScript.surfaces.length, 1);
+    assert.ok(Array.isArray(advertisedTools), "fixture sees the actual advertised dynamic tools");
+    fixture.assertPreserved();
+  });
+});
+
+describe("M3 dependency wait Codex", () => {
+  for (const direct of [false, true]) {
+    for (const supported of direct ? [false, true] : [true]) {
+      it(`parks ${direct ? "exact /park without provider" : "negotiated prose"} support=${supported} at max1`, async () => {
+        let advertisedTools: unknown;
+        const script = scriptedDependencyWait("identical", ({ continuation, advertisedTools: tools }) => {
+          assert.match(continuation, /actionable work/);
+          assert.ok((tools as { name: string }[]).some((tool) => tool.name === "park_run"));
+          return { tool: "park_run", input: {} };
+        });
+        const responder: Responder = (c) => {
+          if (c.method === "thread/start") { advertisedTools = rec(c.params).dynamicTools; return { thread: { id: "th-1" } }; }
+          if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          const n = c.turnStartCount, tn = `tn-park-${n}`;
+          if (n === 1) {
+            c.transport.push(toolCall(101, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+            c.transport.push(toolCall(102, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+          } else {
+            const continuation = (c.params as { input: { text: string }[] }).input[0]!.text;
+            const response = script.next({ continuation, advertisedTools });
+            assert.ok("tool" in response);
+            c.transport.push(toolCall(103, response.tool, response.input, "th-1", tn, "park"));
+            c.transport.push(toolCall(104, "signal_done", {}, "th-1", tn, "done"));
+          }
+          c.transport.push(turnCompleted("completed", "th-1", tn));
+          return { turn: { id: tn } };
+        };
+        const rig = makeRig({ responder });
+        const parks: unknown[] = [];
+        const { ctx } = makeCtx({ kind: "issue", parkRunSupported: supported, config: { max_iterations: 1 },
+          frozenMilestones: [{ id: "m1", title: "Independent" }, { id: "m2", title: "Dependency" }],
+          askUser: async () => ({ kind: "answer", answers: [direct ? "/park" : dependencyWaitAnswer] }),
+          requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; },
+          recordCompletionAttempt: async () => assert.fail("park precedes completion"), completionInterlock: true,
+        });
+        const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        assert.deepEqual(result.pausedAt, { completedCount: 1, total: 2 });
+        assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+        assert.equal(rig.transport.turnStartCount, direct ? 1 : 2);
+      });
+    }
+  }
+  for (const disposition of ["answer", "cancel"] as const) {
+    it(`handles park failure-question ${disposition} at max1`, async () => {
+      const prompts: string[] = [];
+      const rig = makeRig({ responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        prompts.push((c.params as { input: { text: string }[] }).input[0]!.text);
+        const tn = `tn-failure-${c.turnStartCount}`;
+        c.transport.push(toolCall(200 + c.turnStartCount, c.turnStartCount === 1 ? "park_run" : "signal_done", {}, "th-1", tn, "control"));
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      } });
+      const { ctx } = makeCtx({ parkRunSupported: true, config: { max_iterations: 1 },
+        requestParkRun: async () => disposition === "cancel" ? { kind: "cancel" } : { kind: "answer", answers: ["Implement the independent slice now"] },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (disposition === "cancel") await assert.rejects(run, /cancel/);
+      else {
+        assert.equal((await run).pausedAt, undefined);
+        assert.match(prompts[1]!, /Implement the independent slice now/);
+      }
+      assert.equal(rig.transport.turnStartCount, disposition === "cancel" ? 1 : 2);
+    });
+  }
+});
+
+
+describe("M3 refused wall retains idle park wait", () => {
+  for (const direct of [false, true]) {
+    it(`resumes ${direct ? "exact answer" : "tool"} wait before any provider turn`, async () => {
+      let mode: "wall" | null = null;
+      let entries = 0, primaryQuestions = 0;
+      let resume!: () => void, release!: () => void;
+      const resumed = new Promise<void>(resolve => { resume = resolve; });
+      const answer = new Promise<void>(resolve => { release = resolve; });
+      const rig = makeMultiEpochRig([
+          epochResponder("th-1", "tn-control", (t, th, tn) => {
+            t.push(toolCall(201, direct ? "ask_user" : "park_run",
+              direct ? { questions: [{ question: "Ready?" }] } : {}, th, tn, "park"));
+            t.push(turnCompleted("completed", th, tn));
+          }),
+          epochResponder("th-1", "tn-guidance", (t, th, tn) => {
+            t.push(toolCall(301, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+          }),
+        ]);
+        const { ctx } = makeCtx({
+        kind: "issue", parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+        pauseModeRequested: () => mode,
+        askUser: async () => { primaryQuestions++; return { kind: "answer", answers: ["/park"] }; },
+        requestParkRun: async () => {
+          if (++entries === 1) { mode = "wall"; throw new PauseNowSignal(); }
+          resume();
+          await answer;
+          return { kind: "answer", answers: ["Implement the independent slice"] };
+        },
+        parkForWall: async () => "refused",
+        clearWallMode: () => { mode = null; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      try {
+        const waiting = await Promise.race([resumed.then(() => true), running.then(() => false)]);
+        assert.equal(waiting, true, "must resume the idle callback, not the provider");
+        assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0), 1);
+        assert.equal(primaryQuestions, direct ? 1 : 0, "consumed primary question is not repeated");
+      } finally { release(); await running; }
+      assert.equal(entries, 2, "callback re-entry resumes the worker-owned question phase");
+      assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0), 2, "guidance resumes provider exactly once");
+    });
+  }
+});
+
+describe("M3 idle park lifecycle precedence", () => {
+  for (const direct of [false, true]) {
+    for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {
+      it(`routes ${direct ? "exact answer" : "tool"} ${control} competing wall`, async () => {
+        let mode: "wall" | null = null;
+        let cancelled = false, parks = 0, walls = 0, pauses = 0, holds = 0;
+        const controlResponder = epochResponder("th-1", "tn-control", (t, th, tn) => {
+          t.push(toolCall(201, direct ? "ask_user" : "park_run",
+            direct ? { questions: [{ question: "Ready?" }] } : {}, th, tn, "park"));
+          t.push(turnCompleted("completed", th, tn));
+        });
+        const rig = makeMultiEpochRig(control === "post-attempt" ? [
+          epochResponder("th-1", "tn-done", (t, th, tn) => {
+            t.push(toolCall(101, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+          }), controlResponder,
+        ] : [controlResponder]);
+        const { ctx } = makeCtx({ kind: "issue", parkRunSupported: true, completionInterlock: true,
+          config: { max_iterations: 3 }, checkpoint: async () => undefined,
+          recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+          pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => { parks++; mode = "wall"; cancelled = control === "cancel"; throw new PauseNowSignal(); },
+          enterCompletionHold: async () => { holds++; return true; },
+          parkForWall: async () => { walls++; return "parked"; },
+          parkForPause: async () => { pauses++; return true; },
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        if (control === "cancel") await assert.rejects(running, /cancel/);
+        else {
+          const result = await running;
+          assert.deepEqual(control === "post-attempt" ? result.completionHeld : result.walled,
+            { reason: "codex run wall-clock timeout" });
+          assert.equal(result.pausedAt, undefined);
+        }
+        assert.equal(parks, 1); assert.equal(pauses, 0);
+        assert.equal(holds, control === "post-attempt" ? 1 : 0);
+        assert.equal(walls, control === "pre-attempt" ? 1 : 0);
+        assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0),
+          control === "post-attempt" ? 2 : 1);
+      });
+    }
+  }
+});
+
+describe("M3 Codex bounded park controls", () => {
+  for (const direct of [false, true]) {
+    for (const finish of ["paused", "answer"] as const) {
+      it(`keeps one ${direct ? "exact answer" : "tool"} callback pending across owner retries then ${finish}`, async () => {
+        let parks = 0;
+        let release!: () => void;
+        let entered!: () => void;
+        let nextRetry = new Promise<void>(resolve => { entered = resolve; });
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          const tn = `tn-${c.turnStartCount}`;
+          c.transport.push(toolCall(400 + c.turnStartCount, c.turnStartCount > 1 ? "signal_done" : direct ? "ask_user" : "park_run",
+            c.turnStartCount === 1 && direct ? { questions: [{ question: "Ready?" }] } : {}, "th-1", tn, "control"));
+          c.transport.push(turnCompleted("completed", "th-1", tn));
+          return { turn: { id: tn } };
+        } });
+        const { ctx } = makeCtx({
+          parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => {
+            parks++;
+            // Model the worker's internal explicit owner retries, with one callback pending.
+            for (let retry = 0; retry < 3; retry++) {
+              await new Promise<void>(resolve => { release = resolve; entered(); });
+            }
+            return finish === "paused" ? { kind: "paused" } : { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        for (let retry = 0; retry < 3; retry++) {
+          await nextRetry;
+          assert.equal(parks, 1);
+          assert.equal(rig.transport.turnStartCount, 1, "no provider turn while callback is pending");
+          nextRetry = new Promise<void>(resolve => { entered = resolve; });
+          release();
+        }
+        const result = await running;
+        assert.equal(!!result.pausedAt, finish === "paused");
+        assert.equal(parks, 1);
+        assert.equal(rig.transport.turnStartCount, finish === "paused" ? 1 : 2);
+      });
+    }
+  }
+  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } }]) {
+    it(`does not advertise or admit illicit park ${JSON.stringify(overrides)}`, async () => {
+      let parks = 0;
+      const rig = makeRig({ responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") {
+          const tools = rec(c.params).dynamicTools as { name: string }[];
+          if (tools) assert.equal(tools.some((tool) => tool.name === "park_run"), false);
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method !== "turn/start") return {};
+        c.transport.push(toolCall(501, "park_run", {}, "th-1", "tn-1", "park"));
+        c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      } });
+      const { ctx } = makeCtx({ parkRunSupported: true, config: { max_iterations: 1 },
+        requestParkRun: async () => { parks++; return { kind: "paused" }; }, ...overrides });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx));
+      assert.equal(parks, 0);
+      const response = rig.transport.responses.find((r) => r.requestId === 501);
+      assert.ok(response, "the illicit tool received a reply");
+      assert.equal(rec(rec(response.response).result).success, false);
+    });
+  }
 });
 
 // M1 uses bounded readiness and selective native delivery; unrelated idle watchdogs do not fire.

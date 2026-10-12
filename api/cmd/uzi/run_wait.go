@@ -79,6 +79,9 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 		if isWorkerRecoveryExhausted(run) && (run.Status != lastStatus || cause != lastRecoveryCause) {
 			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", runID, workerExhaustionLine(run))
 		}
+		if line := providerParkLine(run); line != "" && (run.Status != lastStatus || cause != lastRecoveryCause) {
+			_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), line)
+		}
 		lastRecoveryCause = cause
 
 		// A transition line on every status change, including the first observation, so a
@@ -105,6 +108,9 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			}
 			// PRD #1732 D14: likewise a run held because a credential it needs is disabled. It
 			// resumes by itself once that credential is enabled, so the wait keeps going.
+			if isProviderUnavailableHold(run) {
+				_, _ = fmt.Fprintf(env.Stderr, "run %s: %s\n", cellText(runID), pausedHoldNotice(run))
+			}
 			if isCredentialDisabledHold(run) {
 				_, _ = fmt.Fprintf(env.Stderr,
 					"run %s: held, a credential it needs is disabled; %s\n", runID, credentialDisabledAction(run))
@@ -115,7 +121,7 @@ func runWait(env Env, gf *globalFlags, c uzicli.Client, cmd *cobra.Command, runI
 			// an owner pause or budget_exhausted (PRD #1732 D14), and a later claim can hold
 			// it again. Name the new hold once; the wait keeps going, paused is non-terminal.
 			lastHold = hold
-			_, _ = fmt.Fprintf(env.Stderr, "run %s: now %s\n", runID, pausedHoldNotice(run))
+			_, _ = fmt.Fprintf(env.Stderr, "run %s: now %s\n", cellText(runID), pausedHoldNotice(run))
 		}
 		// A status outside the twelve-value enum means the server is newer than this
 		// binary. Surface it once and keep waiting (it can never be a target — `--until`

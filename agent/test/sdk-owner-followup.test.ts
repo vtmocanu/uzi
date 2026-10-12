@@ -574,8 +574,9 @@ describe("issue #1800: a follow-up is stamped only once the model processed its 
   });
 });
 
+for (const parkEnabled of [false, true]) {
 for (const mode of ["repair", "off", "no findings"] as const) {
-  it(`U3 D9 SDK actual query conditionally registers repair tool and retained handler refuses after pass: ${mode}`, async () => {
+  it(`U3 D9 SDK actual query conditionally registers repair tool and retained handler refuses after pass: ${mode}${parkEnabled ? " with park enabled" : ""}`, async () => {
     const row: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {
   "stage": "code",
   "round": 1,
@@ -608,12 +609,16 @@ for (const mode of ["repair", "off", "no findings"] as const) {
     type Registered = { handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ isError?: boolean; content: unknown }> };
     let retained: Registered | undefined;
     const seen: boolean[] = [];
+    const seenPark: boolean[] = [];
     const scripts = mode === "repair" ? [PLAN, DONE, DONE] : [PLAN, DONE];
     let index = 0;
     const queryFn: SdkQueryFn = params => (async function* () {
       const server = params.options.mcpServers?.uzi as unknown as { instance: { _registeredTools: Record<string, Registered> } };
       const handler = server.instance._registeredTools.report_cross_check_dispositions;
       seen.push(!!handler);
+      seenPark.push(!!server.instance._registeredTools.park_run);
+      assert.equal(!!server.instance._registeredTools.park_run, parkEnabled && index > 0,
+        "planning has no park_run; every implementation refresh retains park_run when enabled");
       if (handler) {
         retained = handler;
         const response = await handler.handler({ dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] }, {});
@@ -622,7 +627,9 @@ for (const mode of ["repair", "off", "no findings"] as const) {
       for await (const _prompt of params.prompt) { /* consume SDK input before scripted response */ }
       for (const message of scripts[index++]!.messages) yield message;
     })();
-    const { ctx } = makeCtx([], mode === "off" ? {} : {
+    const { ctx } = makeCtx([], {
+      parkRunSupported: parkEnabled,
+      ...(mode === "off" ? {} : {
       claimGeneration: 7,
       codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => mode === "no findings" ? { ...row, findings: [] } : active ? row : undefined,
       reportCrossCheckDispositions: async () => { effects++; return row; },
@@ -630,9 +637,11 @@ for (const mode of ["repair", "off", "no findings"] as const) {
         active = mode === "repair" && ++checks === 1;
         return active ? { action: "repair", followUp: "D9-REPAIR" } : { action: "proceed" };
       },
+      }),
     });
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(ctx);
     assert.deepEqual(seen, mode === "repair" ? [false, false, true] : [false, false]);
+    assert.deepEqual(seenPark, mode === "repair" ? [false, parkEnabled, parkEnabled] : [false, parkEnabled]);
     assert.equal(effects, mode === "repair" ? 1 : 0);
     if (retained) {
       const response = await retained.handler({ dispositions: [{ finding_id: "F_1", disposition: "addressed", reason: "verified" }] }, {});
@@ -641,4 +650,5 @@ for (const mode of ["repair", "off", "no findings"] as const) {
       assert.equal(effects, 1);
     }
   });
+}
 }

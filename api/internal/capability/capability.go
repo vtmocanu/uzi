@@ -128,6 +128,9 @@ const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capa
 // server-side at once (ParkRunsAtWall), never failed, so a mixed fleet is handled by construction.
 const WallParkV1 = "wall_park_v1"
 
+// ParkRunV1 negotiates worker-requested ordinary pause and guarded question writes.
+const ParkRunV1 = "park_run_v1"
+
 // InputReceiptsV1 advertises explicit ACK and applied receipts for steering inputs.
 const InputReceiptsV1 = "input_receipts_v1"
 
@@ -246,6 +249,7 @@ var protocolVocabulary = map[string]struct{}{
 	CodexCompletionInterlockV1:     {},
 	CredentialSwitchV1:             {},
 	WallParkV1:                     {},
+	ParkRunV1:                      {},
 	InputReceiptsV1:                {},
 	InputInclusionV1:               {},
 	GateRevisionV1:                 {},
@@ -264,7 +268,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckCodeV1}
+var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckCodeV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

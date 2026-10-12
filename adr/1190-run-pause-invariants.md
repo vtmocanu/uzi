@@ -56,7 +56,7 @@ Every terminal-transition statement (`SetRunCompleted`, `SetRunFailed`, `MarkRun
 
 ### I6 — a failed checkpoint publish means no park, ever (D8)
 
-The worker publishes its checkpoint **before** reporting `paused` (`agent/src/runner.ts`). If the publish fails, the worker reports `pause_failed` instead — a worker **report**, not a status transition — and `ClearPauseRequest` withdraws the pending pause while the run's status is left exactly as it was (`running`). A `--now` pause whose publish fails additionally **restarts** the aborted turn at the next iteration, the same way a cancelled turn is restarted on `revise`. The reason this needs its own line: a paused run whose only copy of its work is one worker's disk is a promise the resume cannot keep if that worker rolls before the resume happens — staying `running` is the honest fallback, never a `paused` row backed by nothing recoverable.
+The worker publishes its checkpoint **before** reporting `paused` (`agent/src/runner.ts`). If the publish fails, the worker reports `pause_failed` instead — a worker **report**, not a status transition — and `ClearPauseRequest` withdraws the pending pause while the run's status is left exactly as it was (`running`). An ordinary owner `--now` pause whose publish fails additionally **restarts** the aborted turn at the next iteration, the same way a cancelled turn is restarted on `revise`. The reason this needs its own line: a paused run whose only copy of its work is one worker's disk is a promise the resume cannot keep if that worker rolls before the resume happens — staying `running` is the ordinary owner-pause fallback, never a `paused` row backed by nothing recoverable. The dependency entry's owner-question fallback is specified in the amendment below.
 
 `pause_failed` intentionally posts **no Slack DM** — the Slack notifier (`api/internal/slacksvc/notifier_state.go`) is driven entirely by *status* transitions, and `pause_failed` is not one (the run's status never leaves `running`). The owner learns why through the run's in-app activity feed instead, via the worker's own feed message (*"Could not pause: the checkpoint could not be published. The run is still running and has restarted the interrupted step."*). A Slack DM for this case would need a reason-carrying seam from the handler into `slacksvc` that does not exist today; it is a deferred follow-up, not an oversight to "fix" by bolting a DM onto an unrelated status-transition hook.
 
@@ -69,6 +69,57 @@ The worker publishes its checkpoint **before** reporting `paused` (`agent/src/ru
 `SetRunPaused` (`api/internal/store/queries/runtime.sql`) carries `AND pause_requested_at IS NOT NULL` beside its positive `status = 'running'` source guard. This is the **entry-side** analog of I3's `<> 'paused'` guards, which protect a *parked* run from being flipped back to `running` by a stale report; this guard instead protects a *still-running* row from being parked by a stale or delayed `paused` report once its pending request is no longer live. Between the worker deciding to park (checkpoint published, I6) and the `SetRunPaused` UPDATE landing, the pending request can have been withdrawn (`CancelPauseInput`), cleared by a failed publish elsewhere on the same run (`ClearPauseRequest`), or the run can have gone terminal (I5) — in every one of those cases the three pause columns are already `NULL`, and without this guard the late `paused` report would still park the run on a request nobody is holding anymore. With the guard, that report is a 0-row no-op, exactly the shape `SetRunLimitWait`'s own positive source guard already gives a re-delivered park report.
 
 What this guard does **not** do: correlate the *specific* pause request the worker is reporting against (call it P1) with whatever request is live when the report lands (P2, if the owner cancelled P1 and issued a fresh pause after the worker had already committed to parking on P1). `pause_requested_at IS NOT NULL` is satisfied by P2 just as it would have been by P1, so a P1-triggered park can land while P2 is the columns' actual owner. Distinguishing P1 from P2 needs a request identity the columns do not currently carry (e.g. a monotonic request id compared server-side, the way `codex_claim_epoch` disambiguates claims). This finer `pause_failed`/`ClearPauseRequest`-style request correlation remains a **deferred follow-up**, not a gap this guard claims to close: it closes the *withdrawn-or-terminal* case (the common one), not the *superseded-by-a-new-request* case.
+
+## Amendment — dependency waits reuse the ordinary pause
+
+A dependency wait is an additional entry into this pause contract, not a
+dependency subsystem or a new state. Both harnesses recognize `/park` only
+in a validated, consumed owner answer to an active implementation
+clarification on a non-interactive issue run. Trim answers, ignore empty
+entries, require a non-empty batch and require each remaining entry to equal
+`/park` exactly (`agent/src/park-run.ts`). Mixed batches and ordinary prose
+return to the lead with conditional continuation when supported: do
+actionable work, or call `park_run` and end the turn when implementation must wait on a
+dependency and no actionable work remains. The Claude hook and Codex broker
+restrict the tool to the root lead in implementation; planning, subagents,
+interactive runs and other kinds have no authority.
+
+Capability negotiation requires an API implementing this protocol and a
+worker advertising `park_run_v1`; the claim's `park_run_supported` is true
+only with that advertisement (absent means false). It is flight-wide
+capability, not plan approval. `RequestWorkerPause`
+(`api/internal/workersvc/park_run.go`) locks the owned row and checks the
+current unreleased claim generation, running non-interactive issue, a
+non-empty approved/auto-approved/seeded plan, remaining scope and wall
+budget, and competing stop, wall or credential-switch conditions. It
+creates an ordinary now-pause request, or retains an existing ordinary
+request's mode, and consumes the delivered pause inputs in that transaction.
+The request ACK grants no checkpoint durability or successful-park claim.
+
+The runner then uses `handlePausePark`: ordinary quiescence checks,
+checkpoint publication before accepted `paused`, and existing custody,
+retention and owner-resume rules (I6/I7). The parked run stops its wall clock
+and frees its run slot. This adds no stronger dependency custody guarantee,
+dependency polling, automatic dependency resume, or new state.
+`uzi run pause <id> --now` remains the compatibility path on a running run
+when either component lacks support.
+
+I6's automatic interrupted-step restart applies to ordinary owner pauses.
+For this dependency entry, a failed publication still reports
+`pause_failed` and clears the pending request, but `requestParkRun`
+reconciles ownership once and, when still authorized, asks one
+reason-carrying worker question. No paid/provider turn or park attempt
+restarts without an explicit owner answer: a consumed `/park` authorizes
+one attempt; prose returns to the lead; cancel wins. The fallback uses
+ordinary `awaiting_input`, whose wait is banked out of the wall budget by
+`SetRunRunning` while its run slot remains occupied. It shares
+`parkQuestion`'s absolute per-run `QUESTION_TIMEOUT_SECONDS` deadline when enabled,
+rather than granting a fresh deadline for each refusal or retry. That
+deadline is worker memory, not durable across worker death. Unattended
+runs needing this owner decision throw `TrustedExecutionRefusal` instead
+of entering the question wait. Ambiguous transport or lost ownership uses
+the existing retained-recovery/stale-claim fences rather than assuming
+authority to ask or resume.
 
 ## Consequences
 

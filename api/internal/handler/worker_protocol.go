@@ -421,6 +421,16 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_data_volume_full"},
+		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
+		// with the optional productive_turns count, stores and counts the typed park, bounds an
+		// unbroken streak of them in elapsed time, and may answer the park with status "paused"
+		// (hold_reason provider_unavailable). Advertised UNCONDITIONALLY (RUN_PROVIDER_PARK_MAX_DURATION=0
+		// only lifts the hold): a worker sends the typed body ONLY after seeing this token, both
+		// because an older api's strict decoder 400s productive_turns and because only a worker
+		// that handles a "paused" ack may receive one.
+		{"recovery_cause_provider_outage"},
+		// Fenced ordinary and disk recovery parks can atomically consume completed-turn evidence.
+		{"provider_progress_on_recovery_park_v1"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
 		// /state limit_wait / recovery_wait / paused reports and the wall-park report) and stores
 		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a
@@ -1395,6 +1405,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrRunWallExpired):
+			ack := h.workerStateAck(r, run)
+			ack["applied"] = false
+			ack["reason"] = "wall_expired"
+			httpx.JSON(w, http.StatusConflict, ack)
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
@@ -1425,10 +1440,20 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
+		ack := h.workerStateAck(r, run)
+		if req.RequireRunning {
+			ack["applied"] = false
+			if run.Status == "running" && run.PauseMode.String == "wall" {
+				ack["reason"] = "wall_pending"
+			}
+		}
+		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
 	ack := h.workerStateAck(r, run)
+	if req.RequireRunning {
+		ack["applied"] = true
+	}
 	if result.CompletedPublicationReceipt != nil {
 		ack["completed_publication_receipt"] = result.CompletedPublicationReceipt
 	}
@@ -1646,7 +1671,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		h.workerCodeSnapshotCleanup(w, r, wkr, runID)
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1669,7 +1694,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded}
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}

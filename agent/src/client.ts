@@ -1255,6 +1255,13 @@ export class WorkerClient {
     this.latestDindMaintenanceValue = undefined;
   }
 
+  /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
+   *  after an api proves it cannot decode a single optional wire field, only that field's gate
+   *  closes and every other negotiated extension stays on. */
+  dropFeature(f: string): void {
+    this.serverFeatures.delete(f);
+  }
+
   async heartbeat(
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
@@ -1702,6 +1709,12 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.require_running === true) {
+      if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
+          (body.claim_generation ?? 0) <= 0)
+        throw new Error("guarded question state requires awaiting_input and positive claim_generation");
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
     // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
@@ -1713,8 +1726,19 @@ export class WorkerClient {
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
     const outbound = { ...body };
+    if (body.provider_progress_turns !== undefined) {
+      const count = body.provider_progress_turns;
+      if (!Number.isInteger(count) || count < 0 || count > 2147483647 ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          body.status !== "recovery_wait" ||
+          (body.recovery_cause !== undefined && body.recovery_cause !== "empty_turn" && body.recovery_cause !== "data_volume_full")) {
+        throw new Error("invalid provider_progress_turns recovery park");
+      }
+    }
+    if (!this.hasFeature("provider_progress_on_recovery_park_v1")) delete outbound.provider_progress_turns;
     if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
+    if (!included) delete outbound.provider_progress_turns;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -1722,17 +1746,48 @@ export class WorkerClient {
     // allocating api still answers with its revision and an older api accepts unchanged.
     const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
     let ack: StateAck;
-    try {
-      ack = await this.withGenerationFallback(included, (includeField) =>
-        this.reportStateOnce(
-          runId,
-          path,
-          includeField ? outbound : { ...outbound, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
-          signal,
-          undefined,
-          evidence,
-        ),
+    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
+      this.reportStateOnce(
+        runId,
+        path,
+        includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
+        signal,
+        undefined,
+        evidence,
       );
+    try {
+      if (outbound.provider_progress_turns !== undefined && included) {
+        // Both attempts retain the fence. A stripped retry refusal propagates without
+        // invoking the older generation fallback or sending a third variant.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.provider_progress_turns;
+          this.dropFeature("provider_progress_on_recovery_park_v1");
+          ack = await sendWith(stripped)(true);
+        }
+      } else if (outbound.recovery_cause === "provider_outage" && included) {
+        // PRD #1733: a typed provider park. An api that predates `productive_turns` answers the
+        // strict-decode 400 `invalid request body`; a current api refuses a bad typed report with
+        // `state must be one of ...`, which is NOT that body and propagates unchanged. The generation
+        // is not stripped first (the generic fallback would send an untyped body without the fence):
+        // re-send once untyped with claim_generation kept, then close only this feature's gate.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const untyped = { ...outbound };
+          delete untyped.recovery_cause;
+          delete untyped.productive_turns;
+          ack = await this.withGenerationFallback(included, sendWith(untyped));
+          this.dropFeature("recovery_cause_provider_outage");
+          this.log.warn("provider-outage park rejected by an api that predates it; re-sent untyped and stopped typing it", {});
+        }
+      } else {
+        ack = await this.withGenerationFallback(included, sendWith(outbound));
+      }
     } catch (err) {
       if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
         throw new StateReportUnappliedError(runId, err);
@@ -2925,6 +2980,31 @@ export class WorkerClient {
     });
   }
 
+  /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
+   * One HTTP attempt, bounded by httpTimeoutMs, with no generation or owner fallback. */
+  async requestWorkerPause(runId: string, claimGeneration: number, signal?: AbortSignal): Promise<StateAck> {
+    if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0)
+      throw new Error("worker pause requires positive claim_generation");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pause`;
+    try {
+      const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
+      if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+      const fields = await readRunAck(res, CROSS_CHECK_RESPONSE_MAX_BYTES);
+      if (fields.status === undefined || fields.applied === undefined)
+        throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
+      const ack: StateAck = { status: fields.status, applied: fields.applied };
+      if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
+      if (fields.reason !== undefined) ack.reason = fields.reason;
+      if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;
+      if (fields.credentialSwitch !== undefined) ack.credentialSwitch = fields.credentialSwitch;
+      if (fields.credentialSwitchReleased !== undefined) ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+      return ack;
+    } catch (err) {
+      if (err instanceof RequestError) throw err;
+      throw new RequestError("POST", path, 0, "worker pause transport failed");
+    }
+  }
+
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
   // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
   // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
@@ -3582,6 +3662,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * applied it.
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
+  applied?: boolean;
   completedPublicationCandidate?: unknown;
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
@@ -3611,6 +3692,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const text = boundedText ?? await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
+      applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
       completed_publication_receipt?: unknown;
@@ -3644,6 +3726,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     };
     const run = parsed?.run;
     const out: {
+      applied?: boolean;
       completedPublicationCandidate?: unknown;
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
@@ -3668,6 +3751,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gateRevision?: number;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
     if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
     const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);
     if (completionReason) out.completedPublicationReason = completionReason;
