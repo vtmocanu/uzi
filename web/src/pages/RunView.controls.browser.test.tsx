@@ -93,6 +93,17 @@ it.each([320, 390, 768, 1024, 1280])("keeps production RunView disclosures withi
   expect(settingsBounds.width).toBeGreaterThan(0);
   expect(settingsBounds.left).toBeGreaterThanOrEqual(0);
   expect(settingsBounds.right).toBeLessThanOrEqual(width);
+  fireEvent.click(screen.getByRole("button", { name: "Switch token" }));
+  const picker = panel.querySelector<HTMLElement>(".w-72")!;
+  const pickerBounds = picker.getBoundingClientRect();
+  expect(pickerBounds.width).toBeGreaterThan(0);
+  expect(pickerBounds.left).toBeGreaterThanOrEqual(settingsBounds.left);
+  expect(pickerBounds.right).toBeLessThanOrEqual(settingsBounds.right);
+  for (const control of picker.querySelectorAll("button, select, input")) {
+    const bounds = control.getBoundingClientRect();
+    expect(bounds.left).toBeGreaterThanOrEqual(pickerBounds.left);
+    expect(bounds.right).toBeLessThanOrEqual(pickerBounds.right);
+  }
   fireEvent.keyDown(settings, { key: "Escape" });
   expect(document.activeElement).toBe(settings);
   expect(settings.getAttribute("aria-expanded")).toBe("false");
