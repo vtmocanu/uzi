@@ -141,7 +141,7 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		t.Fatal(err)
 	}
 	childBin := filepath.Join(t.TempDir(), "kube.test")
-	build := exec.CommandContext(ctx, "go", "test", "-c", "-buildvcs=false", "-race", "-o", childBin, "./internal/kube")
+	build := exec.CommandContext(ctx, "go", "test", "-c", "-buildvcs=false", "-race", "-o", childBin, "./internal/kube") //nolint:gosec // G204: fixed go toolchain and package; the only variable is a t.TempDir output path; no shell.
 	build.Dir = controllerDir
 	if out, err := build.CombinedOutput(); err != nil {
 		t.Fatalf("build controller child: %v\n%s", err, out)
@@ -179,7 +179,7 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		}
 	}
 	raw, _ := json.Marshal(members)
-	cmd := exec.CommandContext(ctx, childBin, "-test.count=1", "-test.v", "-test.run", "^TestHostedRollRetainedClaimsBridge$")
+	cmd := exec.CommandContext(ctx, childBin, "-test.count=1", "-test.v", "-test.run", "^TestHostedRollRetainedClaimsBridge$") //nolint:gosec // G204: runs the test binary this test just built into t.TempDir, with fixed arguments; no shell.
 	cmd.Dir = filepath.Join(controllerDir, "internal", "kube")
 	cmd.Env = append(os.Environ(), "UZI_ROLL_TEST_API="+base, "UZI_ROLL_TEST_CONTROLLER_KEY="+controllerKey, "UZI_ROLL_TEST_MEMBERS="+string(raw))
 	out, err := cmd.CombinedOutput()
