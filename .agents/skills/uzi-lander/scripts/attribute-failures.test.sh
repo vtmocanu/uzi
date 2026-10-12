@@ -154,8 +154,14 @@ for name in "${names[@]}"; do
     fi
     duration=0.01
     [[ $sha == "$HEAD_SHA" ]] && duration=0.09
-    event output "$child" "    --- FAIL: $child (${duration}s)"
-    [[ $MODE == child_missing ]] || event fail "$child"
+    if [[ $MODE == passing_diagnostic ]]; then
+      event output "$child" "    --- PASS: $child (${duration}s)"
+      event pass "$child"
+      event output "$name" 'setup complete'
+    else
+      event output "$child" "    --- FAIL: $child (${duration}s)"
+      [[ $MODE == child_missing ]] || event fail "$child"
+    fi
     event output "$name" "--- FAIL: $name (${duration}s)"
   fi
   [[ $MODE == missing ]] || event "$outcome" "$name"
@@ -242,6 +248,7 @@ run introduced; verdict pr-introduced
 cd "$WORK/repo"
 run pass; verdict not-reproduced
 run matching; verdict pre-existing
+run passing_diagnostic; verdict inconclusive; has 'insufficient assertion'
 HEAD_SHA=$RENAMED_HEAD
 run renamed; verdict inconclusive; has 'different failure'
 HEAD_SHA=$ORIGINAL_HEAD

@@ -245,6 +245,7 @@ for group in "${!groups[@]}"; do
          failed:$failed,diagnostics:$diagnostics,
          # Recognition is independent of normalization sentinels in assertion text.
          assertion:any($events[]; .Action == "output" and
+           (. as $event | any($failed[]; .package == $event.Package and .test == $event.Test)) and
            any((.Output // "" | split("\n"))[]; source_prefix != null))}
       ' "$prefix.jsonl" > "$prefix-$name.result" 2>/dev/null || printf '{"result":"unknown"}\n' > "$prefix-$name.result"
     done
