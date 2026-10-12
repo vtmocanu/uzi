@@ -2219,7 +2219,7 @@ export class GitCache {
       const clonePath = this.runnerClonePath(barePath, key);
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
       try {
-        await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+        await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", "--", barePath, clonePath]);
         await this.disableAutoMaintenance(clonePath, true);
         await this.runGitAsRunner(clonePath, ["checkout", "--detach", baseCommit]);
         await this.materializeRunnerClone(clonePath, [baseCommit]);
@@ -3319,7 +3319,7 @@ export class GitCache {
       // skips populating the stale default so we check the agent branch out at the
       // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
       // A Codex (selfContained) clone is dissociated from the bare after setup, below.
-      await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+      await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", "--", barePath, clonePath]);
       // Issue #134 (production half of #127). ONE detached `git maintenance run --auto
       // --detach` per object-writing command (fetch/commit/push) outlives the git we awaited
       // and keeps writing inside `.git`; it spawns a repack/pack-objects subtree only once
@@ -8758,7 +8758,7 @@ export class GitCache {
     // non-empty dir → a deterministic "already exists" failure (permanent), converting a
     // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
-      await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);
+      await this.runGit(undefined, ["clone", "--bare", "--", repoUrl, dest], pat, scope, username);
       // Convert the mirror refspec to remote-tracking so future fetches write to
       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)

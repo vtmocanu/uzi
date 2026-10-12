@@ -841,6 +841,7 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.

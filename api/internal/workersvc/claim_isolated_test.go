@@ -111,7 +111,7 @@ func TestRunOwnedByWorkerPurposeCheck(t *testing.T) {
 			run.EgressProfileID = bound
 		}
 		s := New(&fakeStore{runOwned: run}, nil, testParams())
-		status, _, gen, err := s.RunOwnership(context.Background(), store.Worker{ID: uuid.New(), IsolatedLane: tc.lane}, run.ID)
+		status, _, gen, _, _, err := s.RunOwnership(context.Background(), store.Worker{ID: uuid.New(), IsolatedLane: tc.lane}, run.ID)
 		switch {
 		case tc.owned && (err != nil || status != "running" || gen != 3):
 			t.Errorf("%s: RunOwnership = %q, %d, %v; want the owned run", name, status, gen, err)

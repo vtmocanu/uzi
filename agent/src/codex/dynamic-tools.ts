@@ -178,6 +178,8 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
           },
         }, [], false),
       };
+    case "park_run":
+      return { description: "Request an owner pause when approved implementation must wait on a dependency. Stop and end your turn.", inputSchema: { type: "object", properties: {}, additionalProperties: false } };
     case "checkpoint":
       return {
         description: "Request a cooperative worker checkpoint at a safe milestone boundary.",

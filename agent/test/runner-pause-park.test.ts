@@ -1,4 +1,8 @@
 import { describe, it } from "node:test";
+import { RequestError } from "../src/client.js";
+import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
+import { isParkAnswer } from "../src/park-run.js";
+import type { AnswerVerdict } from "../src/steering.js";
 import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
@@ -440,5 +444,498 @@ describe("RunRunner — owner-requested pause park (PRD #1190 M2)", () => {
       restore();
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
+  });
+});
+
+describe("RunRunner — M2 explicit park callback", () => {
+  async function exercise(options: {
+    supported?: boolean; empty?: boolean; answer?: string; cancel?: boolean;
+    retry?: boolean; lostAck?: boolean; guardedPause?: boolean; unknown?: boolean;
+    unattended?: boolean; ownership?: "wall" | "released" | "foreign" | "completion";
+    deadlineRetry?: boolean; cancelledBefore?: boolean; legacyGeneration?: boolean;
+    nonissue?: boolean; requestRefused?: boolean; wallPending?: boolean; guardedWall?: boolean;
+    guardedExistingQuestion?: boolean; failedProbe?: boolean; resumeGuardedWall?: boolean;
+    interruptWait?: boolean; publishFailure?: boolean; resumeFence?: "paused" | "foreign";
+    interruptReconcile?: "pause_failed" | "ownership";
+    pauseTransport?: "before" | "after"; questionTransport?: "replay" | "exhausted" | "httpFailure" | "unreadable" | "completionHold" | "refused";
+  } = {}) {
+    const claim = { ...gitlabClaim(2657), claim_generation: options.legacyGeneration ? 0 : 1,
+      ...(options.nonissue ? { kind: "prompt" as const } : {}),
+      park_run_supported: options.supported !== false, auto_approve: options.unattended ?? false };
+    api.parkRunGeneration = options.supported === false ? undefined : 1;
+    if (!options.unknown) api.parkRunOwnership = {
+      status: options.lostAck ? "paused" : "running",
+      claim_generation: 1, hold_reason: null, claim_released: false,
+    };
+    if (options.ownership === "wall") api.parkRunOwnership!.hold_reason = "budget_exhausted";
+    if (options.ownership === "wall") api.parkRunOwnership!.status = "paused";
+    if (options.ownership === "completion") {
+      api.parkRunOwnership!.status = "paused";
+      api.parkRunOwnership!.hold_reason = "completion_blocked";
+    }
+    if (options.ownership === "released") api.parkRunOwnership!.claim_released = true;
+    if (options.ownership === "foreign") api.parkRunOwnership!.claim_generation = 2;
+    if (options.guardedPause) api.guardedQuestionStatus = "paused";
+    if (options.guardedExistingQuestion) api.guardedQuestionStatus = "awaiting_input";
+    api.workerPauseRefused = !!options.requestRefused || !!options.wallPending;
+    if (options.wallPending) api.workerPauseReason = "wall_pending";
+    if (options.guardedWall) {
+      api.guardedQuestionStatus = "running";
+      api.guardedQuestionReason = "wall_pending";
+    }
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-run-"));
+    const publish = spyPublish();
+    const report = client.reportState.bind(client);
+    const awaitAnswer = SteeringChannel.prototype.awaitAnswer;
+    const lifecycleSignal = SteeringChannel.prototype.lifecycleSignal;
+    let seedWall: (() => void) | undefined;
+    let reconcileInterrupted = false;
+    SteeringChannel.prototype.lifecycleSignal = function() {
+      seedWall = () => this.seedPauseRequested("wall");
+      return lifecycleSignal.call(this);
+    };
+    const interruptReconcile = () => {
+      if (reconcileInterrupted) return;
+      assert.ok(seedWall, "the real callback steering channel is active");
+      reconcileInterrupted = true;
+      seedWall();
+    };
+    let waitEntries = 0;
+    if (options.interruptWait) SteeringChannel.prototype.awaitAnswer = function(questionId) {
+      if (++waitEntries === 1) {
+        this.seedPauseRequested("wall");
+        return Promise.reject(new PauseNowSignal());
+      }
+      return awaitAnswer.call(this, questionId);
+    };
+    const publication = client.publishCheckpoint.bind(client);
+    if (options.publishFailure) client.publishCheckpoint = async (...args) => {
+      await publication(...args);
+      return { ok: false, httpStatus: 500 };
+    };
+    const requestPause = client.requestWorkerPause.bind(client);
+    const ownership = client.getRunOwnership.bind(client);
+    const originalFetch = globalThis.fetch;
+    let pauseAttempts = 0;
+    let boundedReads = 0;
+    let clonePath: string | undefined;
+    const questionBodies: string[] = [];
+    client.requestWorkerPause = async (...args) => {
+      pauseAttempts++;
+      if (options.pauseTransport === "before") throw new RequestError("POST", "/pause", 0, "transport failed");
+      const ack = await requestPause(...args);
+      if (options.pauseTransport === "after") throw new RequestError("POST", "/pause", 0, "lost ACK");
+      return ack;
+    };
+    client.getRunOwnership = async (...args) => {
+      const bounded = !!args[1] && "deadline" in args[1];
+      if (bounded) boundedReads++;
+      if (options.failedProbe) throw new TypeError("probe unavailable");
+      const own = await ownership(...args);
+      if (bounded && options.interruptReconcile === "ownership") interruptReconcile();
+      // Keep the empty-checkpoint seam empty until the sink has declined it.
+      if ((options.ownership === "completion" || options.guardedExistingQuestion || ["exhausted", "httpFailure", "unreadable", "completionHold"].includes(options.questionTransport ?? "")) && clonePath) fs.writeFileSync(path.join(clonePath, "DIRTY.txt"), "retained uncommitted work\n");
+      return own;
+    };
+    if (options.questionTransport) globalThis.fetch = async (input, init) => {
+      const body = typeof init?.body === "string" ? JSON.parse(init.body) : undefined;
+      if (!body?.require_running || body.status !== "awaiting_input") return originalFetch(input, init);
+      questionBodies.push(init!.body as string);
+      if (options.questionTransport === "refused") return new Response("refused", { status: 403 });
+      if (options.questionTransport === "exhausted") throw new TypeError("question transport unavailable");
+      if (options.questionTransport === "httpFailure") return new Response("unavailable", { status: 503 });
+      if (options.questionTransport === "unreadable") return new Response("unreadable ACK");
+      if (options.questionTransport === "completionHold") return Response.json({ run: { status: "paused", hold_reason: "completion_blocked" }, applied: false }, { status: 409 });
+      if (questionBodies.length === 1) {
+        await originalFetch(input, init); // Commit the question, then lose the response.
+        throw new TypeError("lost question ACK");
+      }
+      // Model the API no-write replay response; the real client must retry the exact body.
+      return Response.json({ run: { status: "awaiting_input" } });
+    };
+    if (options.lostAck || options.interruptReconcile === "pause_failed") client.reportState = async (...args) => {
+      const ack = await report(...args);
+      if (args[1].status === "pause_failed") interruptReconcile();
+      if (options.lostAck && args[1].status === "paused") throw new Error("lost paused ACK");
+      return ack;
+    };
+    let result: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
+    let turns = 0;
+    let questions = 0;
+    let callbackEntries = 0;
+    let callbackPublications = 0;
+    const questionIds: (string | undefined)[] = [];
+    const timerDelays: number[] = [];
+    let callbackReads = 0;
+    const clockStart = Date.now();
+    api.onState(claim.run_id, (state) => {
+      if (state.status !== "awaiting_input") return;
+      questions++;
+      questionIds.push(state.open_question_id);
+      if (options.interruptWait && questions === 1) return;
+      if (options.deadlineRetry && questions > 1) return;
+      const answer = (options.retry || options.deadlineRetry) && questions === 1 ? " /park " : options.answer ?? "repair the checkpoint";
+      api.setInputs(claim.run_id, [{
+        id: questions, kind: options.cancel ? "cancel" : "answer",
+        body: options.cancel ? null : JSON.stringify({ question_id: state.open_question_id, answers: [answer] }),
+      }]);
+      if (options.retry && questions === 1) api.parkRunOwnership!.status = "paused";
+    });
+    const factory: ExecutorFactory = (runId) => ({
+      homeDir: path.join(homeRoot, runId),
+      executor: { run: async (ctx) => {
+        turns++;
+        clonePath = ctx.worktreePath;
+        if (!options.empty) fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "retained uncommitted work\n");
+        fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
+        assert.equal(ctx.parkRunSupported, options.supported !== false);
+        if (!options.empty) commitInTree(ctx.worktreePath, "WORK.txt", "callback checkpoint\n");
+        if (options.cancelledBefore) {
+          api.setInputs(claim.run_id, [{ id: 99, kind: "cancel", body: null }]);
+          await new Promise<void>((resolve, reject) => {
+            const deadline = Date.now() + 1000;
+            const check = () => {
+              if (ctx.cancelRequested?.()) return resolve();
+              if (Date.now() >= deadline) return reject(new Error("cancel delivery deadline"));
+              setTimeout(check, 5);
+            };
+            check();
+          });
+        }
+        const readsBefore = api.ownershipRequests.length;
+        try {
+          callbackEntries++;
+          try { result = await ctx.requestParkRun!({ completedCount: 1, total: 2 }); }
+          catch (error) {
+            if (!options.resumeGuardedWall || !(error instanceof PauseNowSignal)) throw error;
+            api.guardedQuestionStatus = undefined;
+            api.guardedQuestionReason = undefined;
+            api.setWallParkResponse("running", 409);
+            assert.equal(await ctx.parkForWall!({ completedCount: 1, total: 2 }), "refused");
+            ctx.clearWallMode!();
+            if (options.resumeFence === "paused") api.guardedQuestionStatus = "paused";
+            if (options.resumeFence === "foreign") api.parkRunGeneration = 2;
+            callbackEntries++;
+            result = await ctx.requestParkRun!({ completedCount: 1, total: 2 });
+          }
+        }
+        finally { callbackReads = api.ownershipRequests.length - readsBefore; }
+        callbackPublications = publish.calls.length;
+        if (options.questionTransport === "replay" && result.kind === "answer")
+          commitInTree(ctx.worktreePath, "WORK.txt", "work after recovered guidance\n");
+        return result.kind === "paused"
+          ? { branch: ctx.branch, pausedAt: { completedCount: 1, total: 2 } }
+          : { branch: ctx.branch };
+      } },
+    });
+    try {
+      const { gitlab } = fakeGitlab();
+      const runner = options.deadlineRetry || options.interruptWait
+        ? new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
+            pollMs: 5, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+            now: () => clockStart + (options.interruptWait ? (callbackEntries > 1 ? 200 : 0) : questions * 601),
+            setTimer: (cb, ms) => {
+              timerDelays.push(ms);
+              const timer = setTimeout(cb, ms);
+              timer.unref();
+              return () => clearTimeout(timer);
+            },
+          })
+        : runnerWithGit(factory, gitlab);
+      await runner.execute(claim);
+      const workPreserved = !!clonePath && fs.existsSync(path.join(clonePath, "DIRTY.txt")) &&
+        fs.existsSync(path.join(homeRoot, claim.run_id));
+      return { claim, result, turns, questions, callbackReads, published: publish.calls.length,
+        pauseAttempts, boundedReads, questionBodies, workPreserved, callbackEntries, callbackPublications, questionIds, timerDelays };
+    } finally {
+      client.reportState = report;
+      SteeringChannel.prototype.awaitAnswer = awaitAnswer;
+      SteeringChannel.prototype.lifecycleSignal = lifecycleSignal;
+      client.requestWorkerPause = requestPause;
+      client.getRunOwnership = ownership;
+      globalThis.fetch = originalFetch;
+      publish.restore();
+      api.setWallParkResponse("paused", 200);
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  }
+
+  for (const interruptReconcile of ["pause_failed", "ownership"] as const) {
+    it(`resumes false-pause reconciliation after wall at ${interruptReconcile} without a new attempt`, async () => {
+      const outcome = await exercise({ publishFailure: true, interruptReconcile, resumeGuardedWall: true });
+      assert.equal(outcome.callbackEntries, 2);
+      assert.equal(outcome.pauseAttempts, 1, "a refused wall is not a consumed owner command");
+      assert.equal(outcome.callbackPublications, 2, "one failed pause publication and one wall capture");
+      assert.equal(outcome.boundedReads, 1, "the false pause still requires one bounded diagnostic read");
+      assert.equal(outcome.callbackReads, 2, "one pause diagnostic plus the existing refused-wall probe");
+      assert.equal(outcome.questions, 1);
+      assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    });
+  }
+
+  it("a consumed /park after early reconciliation interruption permits one fresh attempt", async () => {
+    const outcome = await exercise({ empty: true, interruptReconcile: "pause_failed", resumeGuardedWall: true, retry: true });
+    assert.equal(outcome.pauseAttempts, 2);
+    assert.equal(outcome.boundedReads, 1, "the fresh successful pause needs no false-result diagnostic");
+    assert.equal(outcome.questions, 1);
+    assert.deepEqual(outcome.result, { kind: "paused" });
+  });
+
+  for (const resumeFence of ["paused", "foreign"] as const) {
+    it(`early reconciliation continuation cannot authorize a question over ${resumeFence} ownership`, async () => {
+      const outcome = await exercise({ publishFailure: true, interruptReconcile: "ownership", resumeGuardedWall: true, resumeFence });
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.boundedReads, 1);
+      assert.equal(outcome.questions, 0);
+      assert.equal(outcome.result?.kind, resumeFence === "paused" ? "paused" : undefined);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("resumes the failure question after refused wall without another worker pause", async () => {
+    const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true });
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    assert.equal(outcome.callbackEntries, 2);
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.equal(outcome.questions, 1);
+  });
+
+  for (const resumeFence of ["paused", "foreign"] as const) {
+    it(`pending phase does not authorize a question over ${resumeFence} ownership`, async () => {
+      const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true, resumeFence });
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.callbackEntries, 2);
+      assert.equal(outcome.questions, 0, "guard still controls question-write authority");
+      assert.equal(outcome.result?.kind, resumeFence === "paused" ? "paused" : undefined);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("cancel settles the resumed failure question without another worker pause", async () => {
+    const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true, cancel: true });
+    assert.deepEqual(outcome.result, { kind: "cancel" });
+    assert.equal(outcome.pauseAttempts, 1);
+  });
+
+  it("retains an interrupted active question ID and absolute deadline on callback re-entry", async () => {
+    const outcome = await exercise({ empty: true, interruptWait: true, resumeGuardedWall: true });
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.equal(outcome.callbackEntries, 2);
+    assert.equal(outcome.questionIds.length, 2);
+    assert.equal(outcome.questionIds[0], outcome.questionIds[1]);
+    assert.deepEqual(outcome.timerDelays, [600, 400]);
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+  });
+
+  it("does not republish failed work after a refused wall without a fresh command", async () => {
+    const outcome = await exercise({ publishFailure: true, guardedWall: true, resumeGuardedWall: true });
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.equal(outcome.callbackPublications, 2, "one failed pause publication and one wall capture");
+    assert.equal(outcome.result?.kind, "answer");
+  });
+
+  it("a fresh consumed retry after refused wall authorizes exactly one more attempt", async () => {
+    const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true, retry: true });
+    assert.equal(outcome.pauseAttempts, 2);
+    assert.equal(outcome.questions, 1);
+    assert.deepEqual(outcome.result, { kind: "paused" });
+  });
+
+  it("parks through the real checkpoint sink without finalizing", async () => {
+    const outcome = await exercise();
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(outcome.published, 1);
+    assert.deepEqual(api.workerPauseRequests, [{ runId: outcome.claim.run_id, generation: 1 }]);
+    assert.equal(outcome.callbackReads, 0);
+    assert.equal(outcome.questions, 0);
+    assert.ok(!stateStatuses(outcome.claim.run_id).some(s => s === "failed" || s === "completed"));
+  });
+
+  it("empty checkpoint asks a guarded question once and returns actionable guidance", async () => {
+    const outcome = await exercise({ empty: true });
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    assert.equal(outcome.published, 0);
+    assert.equal(outcome.turns, 1);
+    assert.equal(api.workerPauseRequests.length, 1);
+    assert.equal(outcome.callbackReads, 1);
+    assert.equal(api.states.find(s => s.body.status === "awaiting_input")?.body.require_running, true);
+    assert.equal(messageKinds(outcome.claim.run_id).filter(k => k === "pause_failed").length, 1);
+  });
+
+  it("only a consumed /park answer authorizes another attempt after confirmed running settlement", async () => {
+    const outcome = await exercise({ empty: true, retry: true });
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(api.workerPauseRequests.length, 2);
+    assert.equal(outcome.questions, 1);
+    assert.equal(outcome.turns, 1);
+    const statuses = stateStatuses(outcome.claim.run_id);
+    assert.ok(statuses.indexOf("running", statuses.indexOf("awaiting_input")) > statuses.indexOf("awaiting_input"));
+  });
+
+  it("returns an owner cancel without another pause request", async () => {
+    const outcome = await exercise({ empty: true, cancel: true });
+    assert.deepEqual(outcome.result, { kind: "cancel" });
+    assert.equal(api.workerPauseRequests.length, 1);
+  });
+
+  it("reconciles a lost paused ACK using exact unreleased ordinary ownership", async () => {
+    const outcome = await exercise({ lostAck: true });
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(outcome.callbackReads, 1);
+    assert.equal(outcome.questions, 0);
+    assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  for (const options of [
+    { lostAck: true, failedProbe: true },
+    { pauseTransport: "before" as const }, { pauseTransport: "after" as const },
+    { empty: true, questionTransport: "exhausted" as const },
+    { empty: true, questionTransport: "httpFailure" as const },
+    { empty: true, questionTransport: "unreadable" as const },
+  ]) {
+    it(`retains ambiguous park work without failing or retrying: ${JSON.stringify(options)}`, async () => {
+      const outcome = await exercise(options);
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.turns, 1);
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.questions, 0);
+      assert.equal(outcome.workPreserved, true);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+      if (options.questionTransport) assert.equal(outcome.questionBodies.length, options.questionTransport === "unreadable" ? 1 : 3, "bounded client transport attempts");
+    });
+  }
+
+  it("the real client recovers a lost guarded question ACK by replaying the same ID", async () => {
+    const outcome = await exercise({ empty: true, questionTransport: "replay" });
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    assert.equal(outcome.questionBodies.length, 2);
+    assert.equal(outcome.questionBodies[0], outcome.questionBodies[1]);
+    assert.equal(outcome.questions, 1);
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  it("authoritative guarded question HTTP refusal keeps the ordinary failure disposition", async () => {
+    const outcome = await exercise({ empty: true, questionTransport: "refused" });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questionBodies.length, 1);
+    assert.ok(stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  for (const options of [
+    { empty: true, ownership: "completion" as const },
+    { empty: true, questionTransport: "completionHold" as const },
+    { empty: true, guardedExistingQuestion: true },
+  ]) {
+    it(`preserves a concurrent hold or unrelated question: ${JSON.stringify(options)}`, async () => {
+      const outcome = await exercise(options);
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.questions, 0);
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.workPreserved, true);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("guard refusal reporting an ordinary pause returns paused without waiting or terminal failure", async () => {
+    const outcome = await exercise({ empty: true, guardedPause: true });
+    assert.deepEqual(outcome.result, { kind: "paused" });
+    assert.equal(outcome.questions, 0);
+    assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+  });
+
+  it("a refused guarded write cannot wait on an unrelated existing question", async () => {
+    const outcome = await exercise({ empty: true, guardedExistingQuestion: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questions, 0);
+    assert.equal(api.workerPauseRequests.length, 1);
+  });
+
+  it("unsupported server asks an unguarded worker question and never calls pause", async () => {
+    const outcome = await exercise({ supported: false });
+    assert.equal(outcome.result?.kind, "answer");
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.callbackReads, 0);
+    assert.equal(api.states.find(s => s.body.status === "awaiting_input")?.body.require_running, undefined);
+    assert.ok(JSON.stringify(api.messages(outcome.claim.run_id)).includes("uzi run pause"));
+  });
+
+  it("an unsupported generation-zero server still gets a bounded compatibility question", async () => {
+    const outcome = await exercise({ supported: false, legacyGeneration: true });
+    assert.equal(outcome.result?.kind, "answer");
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.questions, 1);
+  });
+
+  it("refuses nonissue callbacks independently of the harness", async () => {
+    const outcome = await exercise({ nonissue: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.questions, 0);
+  });
+
+  it("a running request refusal skips the checkpoint sink before asking", async () => {
+    const outcome = await exercise({ requestRefused: true });
+    assert.equal(outcome.result?.kind, "answer");
+    assert.equal(outcome.published, 0);
+    assert.equal(outcome.questions, 1);
+  });
+
+  for (const options of [{ wallPending: true }, { empty: true, guardedWall: true }]) {
+    it(`a pending wall control wins at ${options.wallPending ? "request" : "question"} boundary`, async () => {
+      const outcome = await exercise(options);
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.questions, 0);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("unknown ownership ends once without a question or another attempt", async () => {
+    const outcome = await exercise({ empty: true, unknown: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(api.workerPauseRequests.length, 1);
+    assert.equal(outcome.callbackReads, 1);
+    assert.equal(outcome.questions, 0);
+  });
+
+  it("unattended refusal never enters awaiting_input", async () => {
+    const outcome = await exercise({ empty: true, unattended: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questions, 0);
+    assert.equal(api.workerPauseRequests.length, 1);
+  });
+
+  it("reuses the absolute question deadline across explicit retries", async () => {
+    const outcome = await exercise({ empty: true, deadlineRetry: true });
+    assert.equal(outcome.result, undefined);
+    assert.equal(outcome.questions, 2);
+    assert.equal(api.workerPauseRequests.length, 2);
+    assert.ok(JSON.stringify(api.messages(outcome.claim.run_id)).includes("timed out"));
+  });
+
+  it("a sticky cancel wins before requesting any pause", async () => {
+    const outcome = await exercise({ cancelledBefore: true });
+    assert.deepEqual(outcome.result, { kind: "cancel" });
+    assert.equal(api.workerPauseRequests.length, 0);
+    assert.equal(outcome.published, 0);
+  });
+
+  for (const ownership of ["wall", "released", "foreign"] as const) {
+    it(`preserves the existing ${ownership} ownership disposition without asking`, async () => {
+      const outcome = await exercise({ empty: true, ownership });
+      assert.equal(outcome.result, undefined);
+      assert.equal(outcome.questions, 0);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("recognizes only exact trimmed nonempty park answers", () => {
+    const verdicts: Array<[AnswerVerdict, boolean]> = [
+      [{ kind: "cancel" }, false], [{ kind: "answer", answers: [] }, false],
+      [{ kind: "answer", answers: [" ", " /park ", "/park"] }, true],
+      [{ kind: "answer", answers: ["/park", "continue"] }, false],
+      [{ kind: "answer", answers: ["/park later"] }, false],
+    ];
+    for (const [verdict, expected] of verdicts) assert.equal(isParkAnswer(verdict), expected);
   });
 });

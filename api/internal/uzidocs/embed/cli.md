@@ -353,8 +353,9 @@ A few worth knowing:
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
   milestone (or turn) already in flight, pushes a checkpoint, then parks;
-  `--now` drops the turn in flight and parks on the last checkpoint instead,
-  discarding whatever changed since; `--cancel` withdraws a pending request
+  `--now` interrupts the turn and attempts to checkpoint current work before
+  parking; preservation can fail or publish an older checkpoint (see the
+  activity feed). `--cancel` withdraws a pending request
   and leaves the run running. `--now` and `--cancel` are mutually exclusive.
   None of the three is synchronous — the park lands on the worker's next
   report, so watch `uzi run get <id>`. Owner-only, and valid only on a
@@ -362,7 +363,8 @@ A few worth knowing:
   run already parks between turns, an interactive task parks after every
   turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
-  naming the reason.
+  naming the reason. This existing command is also the compatibility path
+  when dependency parking requires an API or worker upgrade.
 - **`run resume <id>`** resumes a run the owner paused: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
   remaining budget (the clock stopped while paused, so resuming does not
@@ -405,6 +407,20 @@ A few worth knowing:
   past is rejected rather than applied to the current one, and calling it
   against a run that isn't currently parked fails outright instead of
   queuing.
+  During approved, non-interactive issue implementation, use
+  `uzi run answer <id> --message /park` to request a dependency pause.
+  After validation and consumption, trimmed non-empty answers must each be
+  exactly `/park`; a mixed batch is ordinary guidance to the lead.
+  With API and worker support, prose lets the lead continue actionable work
+  or call its lead-only `park_run` tool when no actionable work remains.
+  Planning, subagents, interactive runs and other run kinds are excluded.
+  Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
+  A failed publication instead asks a worker question in `awaiting_input`
+  (wall wait banked, slot held), with no provider turn or park retry until
+  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  An unattended run needing that decision stops with a trusted refusal.
+  See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
+  for compatibility, checkpoint and retention limits.
   **The CLI's derivation is narrower than the web's**: it always answers the
   *newest* question message in the feed, where the web additionally checks
   whether a newer `answer` has already closed it. That gap is real for one

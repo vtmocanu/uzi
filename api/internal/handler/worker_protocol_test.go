@@ -1276,6 +1276,44 @@ func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
 	}
 }
 
+func TestWorkerRunOwnershipPauseDisposition(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hold     string
+		released bool
+	}{{"ordinary", "", false}, {"wall", "budget_exhausted", true}, {"released", "", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			run := store.Run{ID: runID, Status: "paused", ClaimGeneration: 7}
+			if tc.hold != "" {
+				run.HoldReason = pgtype.Text{String: tc.hold, Valid: true}
+			}
+			if tc.released {
+				run.ClaimReleasedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+			}
+			h := newProtocolHandler(t, &protocolStore{ownedRun: run})
+			rec := httptest.NewRecorder()
+			h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+			var got struct {
+				Status          string  `json:"status"`
+				ClaimGeneration int64   `json:"claim_generation"`
+				HoldReason      *string `json:"hold_reason"`
+				ClaimReleased   *bool   `json:"claim_released"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != 200 || got.Status != "paused" || got.ClaimGeneration != 7 ||
+				got.ClaimReleased == nil || *got.ClaimReleased != tc.released {
+				t.Fatalf("ownership: %d %s", rec.Code, rec.Body.String())
+			}
+			if (got.HoldReason == nil) != (tc.hold == "") || (got.HoldReason != nil && *got.HoldReason != tc.hold) {
+				t.Fatalf("hold: %s", rec.Body.String())
+			}
+		})
+	}
+}
+
 // TestWorkerRunOwnershipReclaimedReturns404 pins the reclaim signal: a run no
 // longer owned by this worker (GetRunOwnedByWorker → ErrNoRows) is a definitive
 // 404, which the worker treats as a NOT-OWNED reclaim and fails the turn early.

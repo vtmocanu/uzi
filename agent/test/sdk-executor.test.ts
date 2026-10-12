@@ -4,7 +4,9 @@ import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { dependencyWaitQuestion, dependencyWaitAnswer, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
 
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
@@ -13,7 +15,7 @@ import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
 import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
-import { CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
+import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
 import { mrCompletionBlock } from "../src/runner.js";
@@ -1075,6 +1077,55 @@ describe("SdkExecutor implement/review loop", () => {
 // an unchanged worktree fingerprint, no subagent activity, and verbatim-identical lead
 // text. Any progress resets the streak, and the whole detector is inert unless the runner
 // wired `worktreeFingerprint` (the stub/chat/non-issue executors leave it absent).
+describe("M1 dependency wait characterization Claude", () => {
+  for (const wording of ["identical", "reworded"] as const) {
+    it(`M1 dependency wait Claude ${wording} fails before completion`, async (t) => {
+      const leadScript = scriptedDependencyWait(wording);
+      const fixture = dependencyWaitCallbacks();
+      let providerCalls = 0;
+      const prompts: string[] = [];
+      const queryFn: SdkQueryFn = (params) => (async function* () {
+        let continuation = "";
+        for await (const p of params.prompt) {
+          const content = (p as { message?: { content?: unknown } }).message?.content;
+          continuation = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        prompts.push(continuation);
+        providerCalls++;
+        if (providerCalls === 1) {
+          yield reportProgress(["m1"], []);
+          yield checkpointSignal();
+        } else if (providerCalls === 2) {
+          yield askUserTurn(dependencyWaitQuestion);
+        } else {
+          const server = params.options.mcpServers?.["uzi"] as { instance?: { _registeredTools?: Record<string, unknown> } } | undefined;
+          const advertisedTools = server?.instance?._registeredTools;
+          assert.ok(advertisedTools, "fixture sees the actual registered MCP tools");
+          const response = leadScript.next({ continuation, advertisedTools });
+          assert.ok("text" in response, "M1 baseline advertises no dependency-wait control");
+          yield assistantText(response.text);
+        }
+        yield resultSuccess();
+      })();
+      const probe = makeCtx({ ...fixture.callbacks, sessionId: "sess-1", kind: "issue", completionInterlock: true });
+      const observation = await observeDependencyWait(
+        new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+        () => ({ providerCalls, iterations: fixture.iterations }),
+      );
+      t.diagnostic("M1_WAIT_OBSERVATION " + JSON.stringify({ harness: "claude", wording, ...observation }));
+      assert.equal(observation.paused, false);
+      assert.throws(() => expectDependencyWaitPaused(observation), /dependency waiting must not fail the run/);
+      assert.match(observation.error!, wording === "identical" ? /the lead declined the task and made no progress/ : /milestone-scaled implement\/review iteration budget/);
+      assert.equal(providerCalls, wording === "identical" ? 5 : 9);
+      assert.deepEqual(fixture.iterations, wording === "identical" ? [1, 2, 2, 3, 4] : [1, 2, 2, 3, 4, 5, 6, 7, 8]);
+      assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+      assert.ok(leadScript.surfaces.every((s) => !s.continuation.includes("questions could not")));
+      assert.equal(probe.gated.length, 0, "already-approved plan is not gated again");
+      fixture.assertPreserved();
+    });
+  }
+});
+
 describe("SdkExecutor no-progress detection (issue #281)", () => {
   it("trips early on a repeated refusal with an unchanged tree", async () => {
     // Planning turn, then a loop turn that repeats the same refusal verbatim. The tree
@@ -2174,10 +2225,9 @@ describe("SdkExecutor guardrail options", () => {
       assert.ok((o.disallowedTools ?? []).includes(t), `${t} must be disallowed`);
     }
 
-    // Four PreToolUse matchers: Bash, the file tools, the Agent guard, and the
-    // SendMessage lead→main alias.
+    // PreToolUse matchers: Bash, file tools, Agent guard, SendMessage alias, and park admission.
     const matchers = (o.hooks?.PreToolUse ?? []).map((m) => m.matcher);
-    assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", "Agent", "SendMessage"]);
+    assert.deepStrictEqual(matchers, ["Bash", "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep", "Agent", "SendMessage", "mcp__uzi__park_run"]);
 
     // The SendMessage alias hook is wired and rewrites a lead-alias recipient to main.
     const sendHook = o.hooks!.PreToolUse![3]!.hooks[0]!;
@@ -6521,5 +6571,382 @@ describe("SdkExecutor wall default", () => {
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.ok(timer.mock.calls.some((call) => call.arguments[1] === 6 * 60 * 60 * 1000),
       "the run wall watchdog must arm with the server's six-hour default");
+  });
+});
+
+describe("M1 expired wall physical Claude runner", () => {
+  for (const boundary of ["pause", "fallback"] as const) {
+    it(`wall_expired ${boundary} ACK reaches real wall park`, { timeout: 20_000 }, async () => {
+      let calls = 0;
+      await exerciseExpiredWallRunner(boundary, (_ctx, home) => {
+        const queryFn: SdkQueryFn = () => (async function* () {
+          assert.equal(++calls, 1, "wall ACK cannot start another provider turn");
+          yield { type: "assistant", session_id: "sess-1",
+            message: { content: [{ type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} }] } } as unknown as SDKMessage;
+          yield resultSuccess();
+        })();
+        return new SdkExecutor(nullLogger(), home, { queryFn, installDeps: async () => ({ results: [], truncated: false }) });
+      });
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+describe("M4 dependency wait physical Claude runner", () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+    let calls = 0;
+    const custody = await exerciseDependencyWaitRunner((ctx, home) => {
+      const script = scriptedDependencyWait("reworded", ({ continuation, advertisedTools }) => {
+        assert.match(continuation, /Continue if these answers give you actionable work/);
+        assert.match(continuation, new RegExp(dependencyWaitAnswer));
+        assert.ok((advertisedTools as Record<string, unknown>)["park_run"]);
+        return { tool: "park_run", input: {} };
+      });
+      const queryFn: SdkQueryFn = params => (async function* () {
+        let continuation = "";
+        for await (const p of params.prompt) {
+          const content = (p as { message?: { content?: unknown } }).message?.content;
+          continuation = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        calls++;
+        assert.ok(calls <= 3, "parking cannot start another provider turn");
+        if (calls === 1) {
+          commitDependencySlice(ctx.worktreePath);
+          yield reportProgress(["m1"], []);
+          yield checkpointSignal();
+        } else if (calls === 2) {
+          yield askUserTurn(dependencyWaitQuestion);
+        } else {
+          const server = params.options.mcpServers?.["uzi"] as unknown as { instance: { _registeredTools: Record<string, unknown> } };
+          const response = script.next({ continuation, advertisedTools: server.instance._registeredTools });
+          assert.ok("tool" in response);
+          yield { type: "assistant", session_id: "sess-1",
+            message: { content: [{ type: "tool_use", id: "park", name: "mcp__uzi__" + response.tool, input: response.input }] } } as unknown as SDKMessage;
+        }
+        yield resultSuccess();
+      })();
+      return new SdkExecutor(nullLogger(), home, { queryFn, installDeps: async () => ({ results: [], truncated: false }) });
+    });
+    assert.equal(calls, 3);
+    for (const mode of ["now", "after_milestone"] as const) {
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
+    }
+  });
+});
+
+describe("M3 dependency wait paired Claude", () => {
+  for (const wording of ["identical", "reworded"] as const) {
+    it(`M3 dependency wait Claude ${wording} preserves checkpoint and parks`, async (t) => {
+      const leadScript = scriptedDependencyWait(wording, ({ continuation, advertisedTools }) => {
+        assert.match(continuation, /Continue if these answers give you actionable work/);
+        assert.doesNotMatch(continuation, /Continue the work with these answers\.|Continue the implementation\./);
+        assert.ok((advertisedTools as Record<string, unknown>)["park_run"]);
+        return { tool: "park_run", input: {} };
+      });
+      const parks: unknown[] = [];
+      const fixture = dependencyWaitCallbacks();
+      let providerCalls = 0;
+      const prompts: string[] = [];
+      const queryFn: SdkQueryFn = (params) => (async function* () {
+        let continuation = "";
+        for await (const p of params.prompt) {
+          const content = (p as { message?: { content?: unknown } }).message?.content;
+          continuation = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        prompts.push(continuation);
+        providerCalls++;
+        if (providerCalls === 1) {
+          yield reportProgress(["m1"], []);
+          yield checkpointSignal();
+        } else if (providerCalls === 2) {
+          yield askUserTurn(dependencyWaitQuestion);
+        } else {
+          const server = params.options.mcpServers?.["uzi"] as { instance?: { _registeredTools?: Record<string, unknown> } } | undefined;
+          const advertisedTools = server?.instance?._registeredTools;
+          assert.ok(advertisedTools, "fixture sees the actual registered MCP tools");
+          const response = leadScript.next({ continuation, advertisedTools });
+          assert.ok("tool" in response);
+          yield { type: "assistant", session_id: "sess-1",
+            message: { content: [{ type: "tool_use", id: "park", name: "mcp__uzi__" + response.tool, input: response.input }] } } as unknown as SDKMessage;
+        }
+        yield resultSuccess();
+      })();
+      const probe = makeCtx({ ...fixture.callbacks, sessionId: "sess-1", kind: "issue", completionInterlock: true,
+        parkRunSupported: true, requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; } });
+      const observation = await observeDependencyWait(
+        new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx),
+        () => ({ providerCalls, iterations: fixture.iterations }),
+      );
+      t.diagnostic("M3_WAIT_OBSERVATION " + JSON.stringify({ harness: "claude", wording, ...observation }));
+      expectDependencyWaitPaused(observation);
+      assert.equal(providerCalls, 3);
+      assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+      assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+      assert.ok(leadScript.surfaces.every((s) => !s.continuation.includes("questions could not")));
+      assert.equal(probe.gated.length, 0, "already-approved plan is not gated again");
+      fixture.assertPreserved();
+    });
+  }
+});
+
+describe("M3 dependency wait Claude", () => {
+  const park = (): SDKMessage => ({ type: "assistant", session_id: "sess-1",
+    message: { content: [{ type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} }] } }) as unknown as SDKMessage;
+  for (const direct of [false, true]) {
+    for (const supported of direct ? [false, true] : [true]) {
+      it(`parks ${direct ? "exact /park without provider" : "negotiated prose"} support=${supported} at max1`, async () => {
+        let calls = 0;
+        const script = scriptedDependencyWait("reworded", ({ continuation, advertisedTools }) => {
+          assert.match(continuation, /actionable work/);
+          assert.ok((advertisedTools as Record<string, unknown>)["park_run"]);
+          return { tool: "park_run", input: {} };
+        });
+        const queryFn: SdkQueryFn = (params) => (async function* () {
+          calls++;
+          let continuation = "";
+          for await (const message of params.prompt) continuation = String((message as { message: { content: unknown } }).message.content);
+          if (calls === 1) {
+            yield reportProgress(["m1"], []);
+            yield askUserTurn(dependencyWaitQuestion);
+          } else {
+            const server = params.options.mcpServers?.["uzi"] as unknown as { instance: { _registeredTools: Record<string, unknown> } };
+            const response = script.next({ continuation, advertisedTools: server.instance._registeredTools });
+            assert.ok("tool" in response);
+            yield park();
+            yield signalDone(); // park wins even against completion in the same turn
+          }
+          yield resultSuccess();
+        })();
+        const parks: unknown[] = [];
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved",
+          kind: "issue", sessionId: "sess-1", parkRunSupported: supported,
+          config: { max_iterations: 1 }, completionInterlock: true,
+          frozenMilestones: [{ id: "m1", title: "Independent" }, { id: "m2", title: "Dependency" }],
+          askUser: async () => ({ kind: "answer", answers: [direct ? " /park " : dependencyWaitAnswer] }),
+          requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; },
+          recordCompletionAttempt: async () => assert.fail("park precedes completion"),
+        });
+        const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+        assert.deepEqual(result.pausedAt, { completedCount: 1, total: 2 });
+        assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+        assert.equal(calls, direct ? 1 : 2);
+        assert.deepEqual(probe.iterations, direct ? [1] : [1, 1]);
+      });
+    }
+  }
+  it("actionable failure-question guidance completes within the same iteration", async () => {
+    let calls = 0;
+    const prompts: string[] = [];
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      for await (const message of params.prompt) prompts.push(String((message as { message: { content: unknown } }).message.content));
+      calls++;
+      yield calls === 1 ? park() : signalDone();
+      yield resultSuccess();
+    })();
+    const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+      parkRunSupported: true, config: { max_iterations: 1 },
+      requestParkRun: async () => ({ kind: "answer", answers: ["Implement the independent slice now"] }),
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.equal(result.pausedAt, undefined);
+    assert.equal(calls, 2);
+    assert.match(prompts[1]!, /Implement the independent slice now/);
+    assert.deepEqual(probe.iterations, [1, 1]);
+  });
+  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false }]) {
+    it(`rejects illicit park admission ${JSON.stringify(overrides)}`, async () => {
+      let parks = 0;
+      const queryFn: SdkQueryFn = (params) => (async function* () {
+        const server = params.options.mcpServers?.["uzi"] as unknown as { instance: { _registeredTools: Record<string, unknown> } };
+        assert.equal(server.instance._registeredTools["park_run"], undefined);
+        const hook = params.options.hooks?.PreToolUse?.find((h) => h.matcher === "mcp__uzi__park_run")?.hooks[0];
+        assert.ok(hook);
+        const decision = await hook({ hook_event_name: "PreToolUse", tool_name: "mcp__uzi__park_run", tool_input: {}, tool_use_id: "park", session_id: "sess-1", transcript_path: "", cwd: "/" }, "park", { signal: new AbortController().signal });
+        assert.equal((decision as { hookSpecificOutput?: { permissionDecision?: string } }).hookSpecificOutput?.permissionDecision, "deny");
+        yield park();
+        yield resultSuccess();
+      })();
+      const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", parkRunSupported: true,
+        requestParkRun: async () => { parks++; return { kind: "paused" }; }, ...overrides });
+      await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx), /illicit park_run/);
+      assert.equal(parks, 0);
+    });
+  }
+  it("ordinary clarification succeeds at max_iterations=1", async () => {
+    const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1", config: { max_iterations: 1 },
+      askUser: async () => ({ kind: "answer", answers: ["Use the existing endpoint"] }) });
+    const script = fakeTurns([[askUserTurn("Which endpoint?"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    await new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+    assert.deepEqual(probe.iterations, [1, 1]);
+  });
+});
+
+
+describe("M3 refused wall retains idle park wait", () => {
+  for (const direct of [false, true]) {
+    for (const interruption of ["wall", "credential"] as const) {
+      it(`resumes ${direct ? "exact answer" : "tool"} ${interruption} wait before any provider turn`, async () => {
+        let mode: "wall" | null = null;
+        let entries = 0, primaryQuestions = 0;
+        let resume!: () => void, release!: () => void;
+        const resumed = new Promise<void>(resolve => { resume = resolve; });
+        const answer = new Promise<void>(resolve => { release = resolve; });
+        const park = { type: "assistant", session_id: "sess-1", message: { content: [
+          { type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} },
+        ] } } as unknown as SDKMessage;
+        const script = fakeTurns([[direct ? askUserTurn("Ready?") : park, resultSuccess()], [signalDone(), resultSuccess()]]);
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+          kind: "issue", parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          pauseModeRequested: () => mode,
+          askUser: async () => { primaryQuestions++; return { kind: "answer", answers: ["/park"] }; },
+          requestParkRun: async () => {
+            if (++entries === 1) {
+              if (interruption === "credential") throw new CredentialSwitchSignal();
+              mode = "wall"; throw new PauseNowSignal();
+            }
+            resume();
+            await answer;
+            return { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+          attemptCredentialSwitch: async () => "gave_up",
+          parkForWall: async () => "refused",
+          clearWallMode: () => { mode = null; },
+        });
+        const running = new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+        try {
+          const waiting = await Promise.race([resumed.then(() => true), running.then(() => false)]);
+          assert.equal(waiting, true, "must resume the idle callback, not the provider");
+          assert.equal(script.turns.length, 1);
+          assert.equal(primaryQuestions, direct ? 1 : 0, "consumed primary question is not repeated");
+        } finally { release(); await running; }
+        assert.equal(entries, 2, "callback re-entry resumes the worker-owned question phase");
+        assert.equal(script.turns.length, 2, "guidance resumes provider exactly once");
+      });
+    }
+  }
+});
+
+describe("M3 idle park lifecycle precedence", () => {
+  for (const direct of [false, true]) {
+    for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {
+      it(`routes ${direct ? "exact answer" : "tool"} ${control} competing wall`, async () => {
+        let mode: "wall" | null = null;
+        let cancelled = false, parks = 0, walls = 0, pauses = 0, holds = 0;
+        const park = { type: "assistant", session_id: "sess-1", message: { content: [
+          { type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} },
+        ] } } as unknown as SDKMessage;
+        const controls = [direct ? askUserTurn("Ready?") : park, resultSuccess()];
+        const script = fakeTurns(control === "post-attempt"
+          ? [[signalDone(), resultSuccess()], controls] : [controls]);
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+          kind: "issue", parkRunSupported: true, completionInterlock: true, config: { max_iterations: 3 },
+          checkpoint: async () => undefined,
+          recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+          pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => { parks++; mode = "wall"; cancelled = control === "cancel"; throw new PauseNowSignal(); },
+          enterCompletionHold: async () => { holds++; return true; },
+          parkForWall: async () => { walls++; return "parked"; },
+          parkForPause: async () => { pauses++; return true; },
+        });
+        const running = new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+        if (control === "cancel") await assert.rejects(running, /cancel/);
+        else {
+          const result = await running;
+          assert.deepEqual(control === "post-attempt" ? result.completionHeld : result.walled,
+            { reason: "run exceeded its wall-clock timeout" });
+          assert.equal(result.pausedAt, undefined);
+        }
+        assert.equal(parks, 1); assert.equal(pauses, 0);
+        assert.equal(holds, control === "post-attempt" ? 1 : 0);
+        assert.equal(walls, control === "pre-attempt" ? 1 : 0);
+        assert.equal(script.turns.length, control === "post-attempt" ? 2 : 1);
+      });
+    }
+  }
+});
+
+describe("M3 Claude bounded park controls", () => {
+  it("denies a subagent at the actual hook and never folds its park signal", async () => {
+    let parks = 0;
+    const queryFn: SdkQueryFn = (params) => (async function* () {
+      const hook = params.options.hooks?.PreToolUse?.find((h) => h.matcher === "mcp__uzi__park_run")?.hooks[0];
+      assert.ok(hook);
+      const r = await hook({ hook_event_name: "PreToolUse", tool_name: "mcp__uzi__park_run", tool_input: {}, tool_use_id: "park", session_id: "sess-1", transcript_path: "", cwd: "/", agent_id: "child-1" }, "park", { signal: new AbortController().signal });
+      assert.equal((r as { hookSpecificOutput: { permissionDecision: string } }).hookSpecificOutput.permissionDecision, "deny");
+      yield { type: "assistant", session_id: "sess-1", parent_tool_use_id: "child-1", subagent_type: "coder",
+        message: { content: [{ type: "tool_use", name: "mcp__uzi__park_run", input: {} }] } } as unknown as SDKMessage;
+      yield signalDone();
+      yield resultSuccess();
+    })();
+    const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1", parkRunSupported: true,
+      requestParkRun: async () => { parks++; return { kind: "paused" }; } });
+    assert.equal((await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx)).pausedAt, undefined);
+    assert.equal(parks, 0);
+  });
+  for (const direct of [false, true]) {
+    for (const finish of ["paused", "answer"] as const) {
+      it(`keeps one ${direct ? "exact answer" : "tool"} callback pending across owner retries then ${finish}`, async () => {
+        let parks = 0;
+        let release!: () => void;
+        let entered!: () => void;
+        let nextRetry = new Promise<void>(resolve => { entered = resolve; });
+        const park = { type: "assistant", session_id: "sess-1", message: { content: [
+          { type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} },
+        ] } } as unknown as SDKMessage;
+        const script = fakeTurns([[direct ? askUserTurn("Ready?") : park, resultSuccess()], [signalDone(), resultSuccess()]]);
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+          parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => {
+            parks++;
+            // Model the worker's internal explicit owner retries, with one callback pending.
+            for (let retry = 0; retry < 3; retry++) {
+              await new Promise<void>(resolve => { release = resolve; entered(); });
+            }
+            return finish === "paused" ? { kind: "paused" } : { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+        });
+        const running = new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+        for (let retry = 0; retry < 3; retry++) {
+          await nextRetry;
+          assert.equal(parks, 1);
+          assert.equal(script.turns.length, 1, "no provider turn while callback is pending");
+          nextRetry = new Promise<void>(resolve => { entered = resolve; });
+          release();
+        }
+        const result = await running;
+        assert.equal(!!result.pausedAt, finish === "paused");
+        assert.equal(parks, 1);
+        assert.equal(script.turns.length, finish === "paused" ? 1 : 2);
+      });
+    }
+  }
+  for (const supported of [undefined, false]) {
+    it(`M3 optional park callback preserves legacy clarification support=${supported}`, async () => {
+      const script = fakeTurns([
+        [askUserTurn("Ready?"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const probe = makeCtx({
+        planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+        kind: "issue", parkRunSupported: supported, requestParkRun: undefined,
+        config: { max_iterations: 1 },
+        askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+      });
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+      assert.equal(result.pausedAt, undefined);
+      assert.equal(script.turns.length, 2);
+      assert.deepEqual(probe.iterations, [1, 1]);
+    });
+  }
+  it("cancels through the existing clarification handling", async () => {
+    const script = fakeTurns([[askUserTurn("Ready?"), resultSuccess()]]);
+    const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+      parkRunSupported: true, askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+      requestParkRun: async () => ({ kind: "cancel" }) });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx), /cancelled while awaiting clarification/);
+    assert.equal(script.turns.length, 1);
   });
 });
