@@ -224,7 +224,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		rows = append(rows, []string{"PRD_PATCH_SETTLED_AT", r.PrdPatchSettledAt.UTC().Format(time.RFC3339)})
 	}
 	// Milestone progress + effective budget (PRD #122 M5), the CLI twin of the web's
-	// MilestoneChecklist / MilestoneBadge. Both blocks are conditional so a run with no
+	// RunProgressCard / MilestoneRows. Both blocks are conditional so a run with no
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
 	if row := progressRow(r); row != nil {
@@ -799,9 +799,9 @@ func pauseRequestedLine(r apitypes.RunDTO, width int) string {
 // milestoneRows renders a milestone-structured run's progress block for `uzi run get`
 // (PRD #122 M5): a `{done}/{total} reported complete` summary followed by one indented
 // row per milestone in FROZEN order, marked done / in progress / left. It is the CLI twin
-// of the web's MilestoneChecklist, so both surfaces show the same state off the same fields.
+// of the web's RunProgressCard / MilestoneRows; both read the same row-state fields.
 // PRD #390 M4: a run that NEVER reported progress (MilestonesCompleted == nil) renders a
-// NEUTRAL `–/{total}` numerator instead of `0/{total}`, matching the web badge's `M–/N`
+// NEUTRAL `–/{total}` numerator instead of `0/{total}`; the web card reads `– of M reported`
 // (see the summary branch below for the null-vs-`[]` contract).
 //
 // Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run is
@@ -813,7 +813,7 @@ func pauseRequestedLine(r apitypes.RunDTO, width int) string {
 // milestones_completed is a monotone union that can still name a milestone dropped after
 // it was ticked, and counting those would let the summary read 8/7. Iterating the frozen
 // list (rather than reducing over the completed set) also makes the count immune to a
-// duplicate id, matching the web's milestoneBadge exactly.
+// duplicate id, matching milestoneBadge's count for the web card's `k of M reported complete`.
 //
 // Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone), so each goes through
 // cellText — the same newline-fold, tab-fold and 200-char cap the ANTHROPIC_TOKEN row

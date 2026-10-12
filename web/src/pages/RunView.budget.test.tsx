@@ -312,7 +312,7 @@ describe("RunView — progress card (PRD #2602 M2)", () => {
     { id: "m1", title: "First" },
     { id: "m2", title: "Second" },
   ];
-  it("renders the card from run.progress, above the milestone checklist", async () => {
+  it("renders the card from run.progress with the sole frozen list", async () => {
     const { container } = renderPage(
       budgeted({
         milestones: ms,
@@ -330,10 +330,12 @@ describe("RunView — progress card (PRD #2602 M2)", () => {
     );
     await screen.findByText("Add rate limiting");
     expect(container.querySelector("[data-progress-pct]")?.textContent).toBe("≈about 55%");
-    expect(screen.getByText("milestone 2 of 2 · Second")).toBeTruthy();
+    expect(screen.getByText("1 of 2 reported complete")).toBeTruthy();
     const cardEl = container.querySelector("[data-run-progress-card]") as HTMLElement;
-    const checklist = screen.getByText("Milestones (reported complete)");
-    expect(cardEl.compareDocumentPosition(checklist) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+    const rows = cardEl.querySelector("ul");
+    expect(rows).not.toBeNull();
+    expect(container.querySelectorAll("ul")).toHaveLength(1);
+    expect(rows?.textContent).toContain("Second");
   });
 
   it("renders no card without progress", async () => {

@@ -684,7 +684,7 @@ func activityLabel(act *apitypes.RunActivity) string {
 }
 
 // renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
-// MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
+// RunProgressCard / MilestoneRows and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
 // summary and one row per milestone in FROZEN order — done ✓, not started ○, and the
 // in-progress milestone as a faint ◕ ⇄ ○ half-circle blink (milestoneRowCell; PRD #1136 D4/D5).
 //
@@ -695,9 +695,10 @@ func activityLabel(act *apitypes.RunActivity) string {
 // The count says neither "verified" nor "complete" (PRD #122 Decision 6): the worker only
 // REPORTS a milestone done and nothing in uzi has verified it, so the bare N/M and the ✓
 // glyph must not imply verification. A run that has reported nothing shows `–/N`, not a
-// `0/N` that reads as failure (matching the web's `–/N` treatment). `done` counts frozen
+// `0/N` that reads as failure (the web card reads `– of M reported`). `done` counts frozen
 // members present in the completed set, immune to a duplicate id and to a completed id
-// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses.
+// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses
+// for the web card's `k of M reported complete`; CLI/TUI retain their compact count and layout.
 //
 // Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone.Title), so each goes
 // through renderer.Plain — the D7 obligation the lane rail's Role/Label already carry, and

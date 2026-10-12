@@ -106,3 +106,12 @@ describe("RunView job gates (PRD #1908)", () => {
     expect(mockApi.listRepos).not.toHaveBeenCalled();
   });
 });
+
+// M1 retains the header stage for any run without a progress card.
+describe("header stage fallback", () => {
+  it.each(["job", "chat"] as const)("keeps the live stage for a %s run without a card", async kind => {
+    const {container} = await renderPage({...runningJob, kind, milestones: null, progress: null, current_activity: null, usage: null, usage_estimated_tail: null});
+    expect(container.querySelector("[data-run-progress-card]")).toBeNull();
+    expect(screen.getByText("Starting up")).toBeTruthy();
+  });
+});

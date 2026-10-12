@@ -1482,8 +1482,9 @@ func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
 }
 
 // The factory floor shows a milestone micro-bar on a milestone-structured run (milestoneMarker,
-// the web MilestoneBadge twin) — ▰ per done, ▱ per remaining — and NOTHING on a run with no
-// frozen list. A run that reported nothing has done=0, so it draws an all-empty ▱ bar (graphical 0/N).
+// sharing reported counts with web RunProgressCard / MilestoneRows) — ▰ per done,
+// ▱ per remaining — and NOTHING on a run with no frozen list. A run that reported nothing
+// has done=0, so it draws an all-empty ▱ bar (graphical 0/N).
 func TestTUIBoardMilestoneBadge(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "structured",

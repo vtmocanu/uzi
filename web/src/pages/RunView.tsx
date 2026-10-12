@@ -13,7 +13,6 @@ import {
   isTerminalRun,
   type Repo,
   type Run,
-  type RunActivity,
   type Worker,
 } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -39,7 +38,6 @@ import {
   healthFlagLabel,
   isStoppedRun,
   milestoneBadge,
-  milestoneBadgeText,
   mrChipState,
   mrChipSuffix,
   mrChipTitle,
@@ -47,7 +45,6 @@ import {
   shouldShowHealthFlag,
 } from "../lib/runBadge";
 import { latestActivity } from "../lib/runActivity";
-import { MilestoneRows } from "../components/RunMilestoneRows";
 import { stageForMessages } from "../lib/runStage";
 import { RunProgressCard, runProgressCardVisible } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
@@ -331,28 +328,6 @@ export function HealthFlag({ run }: { run: Run }) {
       </span>
     </>
   );
-}
-
-// MilestoneBadge is the compact `M{done}/{total}` pill (PRD #122), rendered beside the
-// header's iteration badge on a milestone-structured run. It reads milestoneBadge, so it
-// renders NOTHING for a run with no frozen milestone list — a pre-#122 run keeps only its
-// iteration badge. Exported for a direct render test (the page needs a live stream to mount).
-export function MilestoneBadge({ run }: { run: Run }) {
-  const progress = milestoneBadge(run);
-  if (!progress) return null;
-  // PRD #265 M2: render "not reported" (M–/N) apart from a genuine 0/N via the shared
-  // helper, so the header pill matches the board and a done run never reads as failed.
-  const badge = milestoneBadgeText(progress);
-  return (
-    <Badge tone="info" title={badge.title}>
-      {badge.label}
-    </Badge>
-  );
-}
-
-// Prototype compatibility wrapper; the implementation run will migrate its tests.
-export function MilestoneChecklist({ run, activity = null }: { run: Run; activity?: RunActivity | null }) {
-  return <MilestoneRows run={run} activity={activity} />;
 }
 
 // CompletionStatePanel renders the HONEST completion-interlock detail (PRD #1226 M5, D8):

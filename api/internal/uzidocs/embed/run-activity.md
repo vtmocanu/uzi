@@ -401,36 +401,50 @@ chip tells you whether it *fired*.
 ## Milestones and the now line
 
 On a milestone-structured issue run (see [Stopping or narrowing a
-run](#stopping-or-narrowing-a-run) below), the web run view marks each
-approved milestone `✓` reported complete, `◐` reported in progress, or
-`○` not started; `uzi run get` shows the same three states as text
-(`done` / `in progress` / `left`). **"Reported complete" is exactly what
-it says** — uzi shows what the worker reported and hasn't itself verified
-the work, so the wording never says "done" or "verified".
+run](#stopping-or-narrowing-a-run) below), one progress card in the web run
+view lists the frozen milestones once, in approved order. The rows render
+even when `progress` is null, `none` or an unknown state, without needing
+a percent. Each row reads `milestones_completed` and
+`milestones_in_progress` for its mark: `✓` reported complete,
+`◐` reported in progress, or `○` not started. `uzi run get` shows
+the same three states as text (`done` / `in progress` / `left`).
+**"Reported complete" is exactly what it says** — uzi shows what the worker
+reported and hasn't itself verified the work.
 
-The in-progress milestone is also where the **now line** attaches: the
-active lane's role, its task label, its last tool, and how long ago it
-last spoke — e.g. `● coder  Decouple ci_fix detector from branch naming ·
-Edit api/internal/poller/ci_autofix.go  40s ago`. Those words come from the
-run's newest `tool_use` frame, never from raw tool input: a file path for
-`Read`/`Edit`/`Write`/`MultiEdit`, the dispatch description for `Agent` or
-`Bash` — a `Bash` command itself is never shown. When one or more
-in-progress milestones have an agent attributed — the exact
-`subagent_type` the lead dispatched, plus an optional label — **every**
-attributed in-progress milestone shows the agent working it: its declared
-role and label; an in-progress milestone the lead did **not** attribute
-keeps its plain in-progress mark, with no now line. The live tool and the
-"how long ago it last spoke" piece still attach to at most one milestone:
-the one whose declared agent uniquely matches the run's current activity.
-Two lanes sharing a role can't be told apart without the invocation id the
-lead doesn't have, so when a role repeats, live tool/age is withheld from
-every attributed milestone rather than guessed onto the wrong lane — role
-and label alone still show on each. When **no** in-progress milestone is
-attributed — nothing declared, or every declaration dropped or stale — the
-now line attaches to the first in-progress milestone by the approved
-order; the rest still show their plain in-progress mark. A run with
-activity but nothing declared in progress shows an unattached now line
-under the milestone header instead.
+The card's count is `k of M reported complete`, counting reported
+completed members of the frozen list. When no completion report exists,
+it reads `– of M reported`, rather than claiming zero. That does not
+remove or recompute the server's percent: a running run with no report
+can still show `≈11%`.
+
+Live lanes from `milestones_live` are the authoritative activity display
+under in-progress rows: each lane shows its role, task, last tool and age.
+A declared owner already present as a live lane is shown once. An owner
+with no attributed live lane gets a quiet
+`Assigned owner: <role> · <task>` strip. That means no live activity was
+attributed to that owner; it does not mean the owner is idle. Owner and
+lane strips pulse only when backed by a live frame; the card adds no new
+pulsing elements.
+
+For older runs without live lanes, declarations in `milestones_agents`
+show the role and task under their in-progress rows. Live tool and age
+enrich a declaration only when its role uniquely matches the current
+activity; repeated roles suppress that enrichment instead of guessing.
+An in-progress row without a declaration keeps its plain mark in this
+attributed path. With no effective attribution, activity attaches to the first in-progress
+milestone in frozen order. Activity with no in-progress milestone sits
+unattached under the card head. Tool details come from the newest
+`tool_use` frame: a file path for `Read`/`Edit`/`Write`/`MultiEdit`,
+or the dispatch description for `Agent` or `Bash`; a Bash command itself
+is not shown.
+
+The model **Now** note and its age, plus `phase: <phase> · iteration <n>`,
+attach to the row named by `progress.active_milestone_id`, independently
+of the fields that set the row marks. When no row matches, the note and
+context sit under the card head. A run-wide stage is labelled
+`run: <stage>` on the active row, or in the head when no row is active.
+Terminal runs retain their frozen rows and reported count, with no Now
+note or live lanes.
 
 **On the TUI**, the in-progress milestone shows up two ways. In the crew
 rail's milestone checklist it's a `◕` that blinks `◕`/`○` on a half-second
@@ -501,30 +515,32 @@ Where it appears:
 The run page and the TUI run detail show the estimate in more depth. The two
 differ in what they carry; the run page has more.
 
-- **Run page**: a progress card under the budget facts. It shows the percent
-  large (`≈70%`), then `milestone k of M · <active milestone title>` (or
-  `N of M milestones done` when no milestone is active), and a segmented plan
-  track: one segment for planning plus one per milestone, each marked done, in
-  progress or pending. While the run is progressing with a known role, it also
-  shows the **phase** steps `review`, `validate` and `implement`, with the
-  current one marked `▸`. The phase is mapped from the active role:
-  `reviewer`, `auditor`, `fact-checker`, `architect`, `web-ux`, `tui-ux` and
-  `dba` are `review`, `tester` is `validate`, and any other role is
-  `implement`. It is the phase right now, not a history. An **Active role**
-  line shows only while the run is progressing or stalled. The flags from the
-  table above replace the number when it would mislead: `◼ stalled · since
-  HH:MM`, `● waits on you · plan gate|question|follow-up since HH:MM`, the park
-  word (`limit wait`, `paused`, ...), `queued`, and `planning · no
-  milestones frozen yet`. A parked card adds `resumes HH:MM` only for a
-  usage-limit or recovery wait whose resume time is known and in the future.
-  There is no card when the run has no estimate.
+- **Run page**: one progress card under the budget facts. It shows the
+  server percent large (`≈70%`) beside `k of M reported complete`
+  (or `– of M reported` before any completion report). A segmented track
+  has one planning segment plus one per frozen milestone, with an
+  accessible text equivalent and no visible duplicate segment labels.
+  The frozen rows, live lanes, phase, iteration and model Now note appear
+  together as described [above](#milestones-and-the-now-line). With no
+  frozen rows, a live activity line carries the role and task (or tool).
+  The flags from the table above replace the number when it would mislead:
+  `◼ stalled · since HH:MM`,
+  `● waits on you · plan gate|question|follow-up since HH:MM`, the park
+  word (`limit wait`, `paused`, ...), `queued`, and
+  `planning · no milestones frozen yet`. A parked card adds
+  `resumes HH:MM` only for a usage-limit or recovery wait whose resume time
+  is known and in the future. A `may be blocked by <run>` link remains a
+  hint, not a recorded dependency. Frozen rows can render without a
+  percent or supported progress state; the card is absent only when there
+  are no frozen rows, activity, supported progress state or usage
+  (including an estimated tail).
 - **TUI run detail**: a compact `PROGRESS` block above `MILESTONES` in the
   rail: a `PROGRESS ≈70% · 3/4` line, plus `phase ▸ implement` while the run is
   progressing. The flags are shown as `◼ stalled` with `since HH:MM`,
   `● waits on you` with `plan gate|question|follow-up since HH:MM`,
   `⏸ <park word>` (no resume time), `queued`, and `planning` with
-  `no milestones frozen yet`. It does not show the active-role line or the
-  resume time; use the run page for those.
+  `no milestones frozen yet`. It does not show a resume time; use the run
+  page for resume times.
 
 ### Now summary
 
@@ -533,8 +549,9 @@ sentence (at most 120 characters) saying what the active lane is doing, and
 the progress card, the TUI detail and `uzi run get` show it next to the
 estimate. It is **on by default**; see [Turning it off](#turning-the-now-summary-off).
 
-- **Run page**: a `Now: <text> · model summary · <age>` line under the phase
-  chip.
+- **Run page**: a `Now: <text> · model summary · <age>` line under the row
+  named by `progress.active_milestone_id`, alongside its phase and iteration
+  context; under the card head when no frozen row matches that id.
 - **TUI run detail**: a `now <text> · model summary · 2m ago` line in the
   `PROGRESS` block. The text wraps under the `now` label; the
   `model summary · <age>` marking moves to its own row when it does not fit.

@@ -749,7 +749,7 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
   // NOT by reducing over milestones_completed. Both clamp to frozen membership, but
   // iterating frozen also makes `done` immune to a duplicate id in the completed set
   // (which would otherwise let the badge read M8/7): each frozen id is counted at most
-  // once by construction, matching MilestoneChecklist's counter (its single source).
+  // once by construction. RunProgressCard uses this count as its single source.
   // PRD #265 M2: null (or absent) ⇒ nothing was ever reported; an array (even []) ⇒ a
   // real reported count. `?? []` still drives the `done` tally, but `reported` keeps the
   // null-vs-[] distinction the wire already carries (apitypes nil → JSON null) instead of
@@ -761,13 +761,13 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
 }
 
 // milestoneBadgeText renders the compact pill's label + tooltip from a MilestoneProgress,
-// so the board (Dashboard/RunsList) and the run header stay in lockstep (PRD #265 M2). A
+// so the board (Dashboard/RunsList) stays in lockstep (PRD #265 M2). A
 // reported run shows `M{done}/{total}`; an unreported one shows an en-dash numerator and
 // says so in the tooltip, never a `0/N` that reads as failure on a done run.
 //
 // PRD #1064 M3: `inProgress` appends a `◐` in-progress marker to the label when the run
 // has at least one milestone in progress — the same "something is happening now" signal
-// the run-view checklist header and the TUI carry. It defaults to false so every existing
+// the run-view row marks and the TUI carry. It defaults to false so every existing
 // caller (and the not-in-progress case) renders exactly the pre-#1064 label.
 export function milestoneBadgeText(
   p: MilestoneProgress,
@@ -808,7 +808,7 @@ export function firstInProgressMilestoneId(run: {
 //
 // The completed re-filter mirrors the Go/TUI helper (api/cmd/uzi/tui_detail_rail.go
 // effectiveMilestoneAgents, which likewise excludes `completed[ma.ID]`) and the render's OWN
-// done-precedence: MilestoneChecklist marks a milestone ✓ done whenever its id is in
+// done-precedence: MilestoneRows marks a milestone ✓ done whenever its id is in
 // milestones_completed, ahead of in-progress. The server validates milestones_completed and
 // milestones_in_progress INDEPENDENTLY, so an id can be reported in BOTH — and a done milestone
 // must never show a live "now working" strip. Excluding completed ids here keeps that suppression

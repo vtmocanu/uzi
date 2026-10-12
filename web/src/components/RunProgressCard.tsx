@@ -105,12 +105,12 @@ function StateFlag({ run, now }: { run: CardRun; now: number }) {
 
 type SegState = "done" | "now" | "pending";
 
-function Segment({ state, title }: { state: SegState; label: string; title: string }) {
+function Segment({ state, title, plan = false }: { state: SegState; title: string; plan?: boolean }) {
   const bar: CSSProperties | undefined =
     state === "now"
       ? {
           backgroundImage:
-            "repeating-linear-gradient(90deg, rgb(var(--brand)) 0 3px, transparent 3px 6px)",
+            "repeating-linear-gradient(135deg, rgb(var(--brand)) 0 3px, transparent 3px 6px)",
         }
       : undefined;
   return (
@@ -119,7 +119,7 @@ function Segment({ state, title }: { state: SegState; label: string; title: stri
         style={bar}
         className={cx(
           "h-2.5 rounded-[3px] border",
-          state === "done" && "border-brand bg-brand",
+          state === "done" && (plan ? "border-plan bg-plan" : "border-brand bg-brand"),
           state === "now" && "border-brand",
           state === "pending" && "border-edge bg-raised",
         )}
@@ -147,36 +147,38 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
   const hasActiveRow = milestones.some(m => m.id === active);
   const terminal = ["completed", "failed", "cancelled"].includes(run.status);
   const live = terminal || run.status === "paused" ? null : activity;
-  const note = p?.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
+  const note = !terminal && p?.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
   const completed = new Set(run.milestones_completed ?? []);
   const knownState = p && ["percent", "waiting", "parked", "queued", "stalled", "planning"].includes(p.state);
   const hasUsage = usage && (usage.hasConfirmed || usage.hasLiveTokens || hasSideUsage(usage));
   if (!runProgressCardVisible(run, live, usage)) return null;
-  const nowLine = note ? <p data-progress-now className="my-2 text-sm [overflow-wrap:anywhere]">
-    <b>Now: </b>{note}{" "}<span className="ml-2 text-xs text-faint">model summary{p?.now_note?.at && ` · ${formatAgo(p.now_note.at, now)}`}</span>
+  const nowLine = note ? <p data-progress-now className="my-2 rounded-md bg-raised px-2 py-1 text-sm [overflow-wrap:anywhere]">
+    <b>Now: </b>{note}{" "}<span className="ml-2 text-xs text-faint">· model summary{p?.now_note?.at && ` · ${formatAgo(p.now_note.at, now)}`}</span>
   </p> : null;
   const safeStage = run.status === "running" ? stripUnsafeChars(stage ?? "") : "";
-  const phaseLine = !terminal && p?.state === "percent" && ["review", "validate", "implement"].includes(p.phase)
-    ? <div data-progress-phase className="mt-2 inline-flex rounded bg-raised px-2 py-1 text-xs text-muted" aria-current="step">
-        phase: {p.phase}{(run.iteration_count ?? 0) > 0 && ` · iteration ${run.iteration_count}`}{safeStage && ` · run: ${safeStage}`}
-      </div> : null;
+  const phase = !terminal && p?.state === "percent" && ["review", "validate", "implement"].includes(p.phase) ? p.phase : "";
+  const iteration = !terminal && (run.iteration_count ?? 0) > 0 ? `iteration ${run.iteration_count}` : "";
+  const contextLine = [phase && `phase: ${stripUnsafeChars(phase)}`, iteration, safeStage && `run: ${safeStage}`].filter(Boolean).join(" · ");
+  const phaseLine = contextLine ? <div data-progress-context data-progress-phase={phase ? "" : undefined} className="mt-2 inline-flex rounded bg-raised px-2 py-1 text-xs text-muted" aria-current={phase ? "step" : undefined}>{contextLine}</div> : null;
+  const trackLabel = badge ? `Plan approved; ${badge.reported ? `${badge.done} of ${badge.total} milestones reported complete` : `– of ${badge.total} reported; no milestone completion reported`}${active ? `; active milestone: ${stripUnsafeChars(milestones.find(m => m.id === active)?.title ?? active)}` : ""}` : "";
   const cost = usage ? costDisplay(run.usage?.cost_status ?? "", usage.total.costUsd) : null;
   return <Card className="p-4">
-    <section aria-label="Run progress" data-run-progress-card={p?.state ?? "history"} className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
-      <div className="flex flex-wrap items-baseline gap-3">
+    <section aria-label="Run progress" data-run-progress-card={stripUnsafeChars(p?.state ?? "history")} className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
+      <div data-progress-head className="flex flex-wrap items-baseline gap-3">
         {percent !== null ? <span data-progress-pct className="font-mono text-[28px] font-semibold tabular-nums" title="Estimate through the approved plan, not a time estimate"><span aria-hidden>≈</span><span className="sr-only">about </span>{percent}%</span>
           : knownState ? <StateFlag run={run} now={now} /> : null}
-        {badge && <span data-progress-what className="text-sm text-muted">{badge.reported ? badge.done : "–"} of {badge.total} {badge.reported ? "reported complete" : "reported"}</span>}
-        {!hasActiveRow && (run.iteration_count ?? 0) > 0 && !terminal && <span className="text-xs text-faint">iteration {run.iteration_count}</span>}
-        {safeStage && (!hasActiveRow || !phaseLine) && <span className="text-xs text-muted">{safeStage}</span>}
+        {percent !== null && badge && <span aria-hidden="true">·</span>}
+        {p?.state === "planning" && !badge && <span className="text-sm text-muted">no milestones frozen yet</span>}
+        {badge && <span data-progress-what title={badge.reported ? "Milestones reported complete of the approved plan" : "No milestone completion reported for this run"} className="min-w-0 text-sm text-muted [overflow-wrap:anywhere]">{badge.reported ? badge.done : "–"} of {badge.total} {badge.reported ? "reported complete" : "reported"}</span>}
+        {!hasActiveRow && phaseLine}
       </div>
-      {p?.maybe_blocked_by_run_id && <Link className="text-sm text-info" title="A question mentions this run; this is a hint, not a recorded dependency." to={`/runs/${encodeURIComponent(stripUnsafeChars(p.maybe_blocked_by_run_id))}`}>may be blocked by {stripUnsafeChars(p.maybe_blocked_by_run_id).slice(0,8)}</Link>}
-      {milestones.length > 0 && <div role="img" aria-label={`Plan approved; ${badge?.done ?? 0} of ${milestones.length} milestones reported complete`} className="grid gap-1" style={{gridTemplateColumns: `0.6fr repeat(${milestones.length}, minmax(0, 1fr))`}}>
-        <Segment state="done" label="plan" title="Plan approved" />
-        {milestones.map(m => <Segment key={m.id} label={stripUnsafeChars(m.title)} title={stripUnsafeChars(m.title)} state={completed.has(m.id) ? "done" : m.id === active ? "now" : "pending"} />)}
+      {p?.maybe_blocked_by_run_id && <Link className="text-sm text-info" title="A question mentions this run; this is a hint, not a recorded dependency." to={`/runs/${encodeURIComponent(stripUnsafeChars(p.maybe_blocked_by_run_id))}`}><span aria-hidden="true">⧗</span>may be blocked by {stripUnsafeChars(p.maybe_blocked_by_run_id).slice(0,8)}</Link>}
+      {milestones.length > 0 && <div role="img" aria-label={trackLabel} className="grid gap-1" style={{gridTemplateColumns: `minmax(0, 0.6fr) repeat(${milestones.length}, minmax(0, 1fr))`}}>
+        <Segment state="done" title="Plan approved" plan />
+        {milestones.map(m => <Segment key={m.id} title={`${stripUnsafeChars(m.title)} · ${completed.has(m.id) ? "reported complete" : m.id === active ? "in progress" : "not started"}`} state={completed.has(m.id) ? "done" : m.id === active ? "now" : "pending"} />)}
       </div>}
-      {milestones.length > 0 ? <MilestoneRows run={terminal ? {...run, milestones_live: [], milestones_agents: []} : run} activity={live} activeContent={<>{phaseLine}{nowLine}</>} />
-        : live && run.status === "running" && !run.is_planning && <p className="text-sm text-muted">{stripUnsafeChars(live.agent)} · {stripUnsafeChars(live.agent_label || live.tool)}</p>}
+      {milestones.length > 0 ? <MilestoneRows run={run} activity={live} activeContent={<>{phaseLine}{nowLine}</>} />
+        : live && (run.status === "running" || ["limit_wait", "pool_wait", "recovery_wait"].includes(run.status)) && !run.is_planning && p?.state !== "planning" && <p data-progress-activity className="text-sm text-muted">{stripUnsafeChars(live.agent)} · {stripUnsafeChars(live.agent_label || live.tool)}</p>}
       {!milestones.some(m => m.id === active) && nowLine}
       {(hasUsage || tailVisible(run.usage_estimated_tail)) && <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-edge pt-3 text-xs text-muted">
         {usage?.hasConfirmed && cost ? <><span className="font-semibold text-fg">{costHeadline(cost)}</span><span>{costSubLabel(cost, run.harness)}</span><span>{formatTokens(usage.total.fresh + usage.total.cached)} in ({cacheDisplayPct(usage.total)}% cached)</span><span>{formatTokens(usage.total.out)} out</span></>

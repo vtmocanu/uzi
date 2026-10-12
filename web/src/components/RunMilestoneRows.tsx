@@ -87,12 +87,12 @@ function MilestoneNowStrip({
         : "border-ok/50";
   const accent = waiting ? "text-warning" : isLive ? "text-ok" : "text-muted";
   const dotBg = waiting ? "bg-warning" : isLive ? "bg-ok" : "bg-faint";
-  const dotPulse = waiting || isLive;
+  const dotPulse = isLive;
   return (
     <div className={cx("mt-1.5 flex items-center gap-2 border-l-2 py-1 pl-3 text-xs", border)}>
       <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full", dotBg, dotPulse && "animate-pulse")} />
-      <span className={cx("shrink-0 font-medium", accent)}>{!isLive && "Assigned owner: "}{safeRole}</span>
-      {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{!isLive && "· "}{safeLabel}</span>}
+      <span className={cx("shrink-0 font-medium", accent)}>{!isLive && <span>Assigned owner: </span>}<span>{safeRole}</span></span>
+      {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{!isLive && <span> · </span>}<span>{safeLabel}</span></span>}
       {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}
       <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
         {waiting ? `${waitingLabel}${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}
@@ -101,7 +101,7 @@ function MilestoneNowStrip({
   );
 }
 
-// Rows moved from the checklist for the prototype. Keep the existing attribution
+// Frozen milestone rows for the unified run progress card. Keep the existing attribution
 // precedence: live lanes, uniquely matched declared owners, then the activity fallback.
 // Every display field is untrusted plain text. Completion is reported, not verified.
 export function MilestoneRows({ run, activity = null, activeContent }: { run: Pick<Run, "status" | "milestones" | "milestones_completed" | "milestones_in_progress" | "milestones_agents" | "milestones_live" | "progress">; activity?: RunActivity | null; activeContent?: ReactNode }) {
@@ -111,6 +111,8 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   const now = useNow(30_000);
   const milestones = run.milestones ?? [];
   if (milestones.length === 0) return null;
+  const terminal = ["completed", "failed", "cancelled"].includes(run.status);
+  if (terminal || run.status === "paused") activity = null;
   const completed = new Set(run.milestones_completed ?? []);
   const inProgress = new Set(run.milestones_in_progress ?? []);
   // Fallback activity attaches to the first in-progress milestone in frozen order.
@@ -119,7 +121,7 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   // is CURRENTLY in progress, in frozen order. ONLY a non-empty list activates per-milestone
   // rendering; null / [] / stale-only fall back to the pre-#1224 render below (the M4
   // baseline guards that path). We branch on this LENGTH, never on milestones_agents != null.
-  const effective = effectiveMilestoneAgents(run);
+  const effective = terminal ? [] : effectiveMilestoneAgents(run);
   const attributed = effective.length > 0;
   const effectiveById = new Map(effective.map((e) => [e.id, e]));
   // D3: live tool/age enriches a strip ONLY when EXACTLY ONE effective attribution's declared
@@ -133,8 +135,8 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   // strip renders per lane, keyed by agent_instance so distinct subagents (reviewer×2) show
   // as distinct lines. We branch on PRESENCE of a lane (D5 back-compat), never on a nil test —
   // null / [] / all-empty-lanes ALL fall through to the pre-#1353 render below, byte-for-byte.
-  const milestonesLiveById = new Map((run.milestones_live ?? []).map((e) => [e.milestone_id, e.lanes]));
-  const hasLanes = (run.milestones_live ?? []).some((e) => e.lanes.length > 0);
+  const milestonesLiveById = new Map((terminal ? [] : run.milestones_live ?? []).map((e) => [e.milestone_id, e.lanes]));
+  const hasLanes = (terminal ? [] : run.milestones_live ?? []).some((e) => e.lanes.length > 0);
   return (
     <div className="min-w-0">
       {/* Unattached strip: a milestone run with activity but nothing declared in progress
@@ -165,7 +167,7 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
           const laneList = milestonesLiveById.get(m.id) ?? [];
           const ownerIsLive = attribution ? laneList.some((l) => l.agent === attribution.agent) : false;
           return (
-            <li key={m.id} className="text-sm">
+            <li key={m.id} className={cx("text-sm", !terminal && m.id === run.progress?.active_milestone_id && "rounded-md bg-brand/5 px-3 py-2")}>
               <div className="flex items-center gap-2">
                 <MilestoneMark state={state} />
                 <span

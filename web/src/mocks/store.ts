@@ -5,7 +5,7 @@
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
-import { seedProgressPrototype } from "./data/runProgressPrototype";
+import { seedUnifiedProgress } from "./data/unifiedProgress";
 import { deriveMockProgress } from "./runProgress";
 import {
   mockAdmin,
@@ -153,7 +153,7 @@ function seed(): MockState {
   // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
-  seedProgressPrototype(runs, messages);
+  seedUnifiedProgress(runs, messages);
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
@@ -327,7 +327,7 @@ function syncCards(runId: string, patch: Partial<Run>): void {
 // Fields whose change asks the run view to RE-READ the run over REST, exactly as a real
 // run-updated WS frame does (a "state" frame carries no authoritative data — it only
 // triggers refreshRun; runStream.ts). A status change already qualifies; PRD #1064 M3
-// adds the milestone + current_activity fields, because the run view's MilestoneChecklist
+// adds the milestone + current_activity fields, because the run view's MilestoneRows
 // (and its "now" strip) render from run.milestones / milestones_in_progress, which the
 // mid-implement freeze mutates WITHOUT a status change. Without this broadcast that freeze
 // updated the store but never reached the run view, so the strip never appeared live.

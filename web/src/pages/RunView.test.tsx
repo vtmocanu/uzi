@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { MilestoneRows } from "../components/RunMilestoneRows";
+import { RunProgressCard } from "../components/RunProgressCard";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   act,
@@ -16,8 +18,6 @@ import {
   AgentRosterSummary,
   JudgePanel,
   JUDGE_POLL_MAX_TRIES,
-  MilestoneBadge,
-  MilestoneChecklist,
   CompletionStatePanel,
   CompletionDecisionPanel,
   RunHeading,
@@ -1740,8 +1740,8 @@ describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190
       updated_at: "2026-01-01T03:42:00Z",
     });
     await screen.findByText("Add rate limiting");
-    // The checklist still renders (milestones are present) …
-    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    // The frozen rows still render while paused.
+    expect(container.querySelector("[data-run-progress-card] ul")).not.toBeNull();
     // … but the live "now" strip is gone (nothing runs while paused).
     expect(nowStrip(container)).toBeNull();
   });
@@ -5637,30 +5637,33 @@ describe("RunView park announcement — paused (PRD #1190, a11y)", () => {
   });
 });
 
-// PRD #122: the milestone header badge, the checklist, and the plan-gate candidate list.
-describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
+// Count checks exercise the real card; row-only checks use MilestoneRows directly.
+function ProgressCountCard({ run }: { run: Run }) {
+  return <RunProgressCard run={{...run, progress: null}} />;
+}
+describe("RunProgressCard reported counts (PRD #122)", () => {
   const ms = (n: number) =>
     Array.from({ length: n }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` }));
 
-  it("renders M{done}/{total} for a milestone-structured run", () => {
-    render(<MilestoneBadge run={run({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] })} />);
-    expect(screen.getByText("M3/7")).toBeTruthy();
+  it("renders reported counts for a milestone-structured run", () => {
+    render(<ProgressCountCard run={run({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] })} />);
+    expect(screen.getByText("3 of 7 reported complete")).toBeTruthy();
   });
 
   it("renders NOTHING for a run with no milestones — the iteration badge stands alone", () => {
-    const { container } = render(<MilestoneBadge run={run({ milestones: null })} />);
+    const { container } = render(<ProgressCountCard run={run({ milestones: null })} />);
     expect(container.textContent).toBe("");
   });
 
-  it("renders M–/N (not a 0/N) when the tracker was never reported (PRD #265 M2)", () => {
-    render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
-    expect(screen.getByText("M–/4")).toBeTruthy();
-    expect(screen.queryByText("M0/4")).toBeNull();
+  it("renders – of N reported (not a reported zero) when the tracker was never reported (PRD #265 M2)", () => {
+    render(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: null })} />);
+    expect(screen.getByText("– of 4 reported")).toBeTruthy();
+    expect(screen.queryByText("0 of 4 reported complete")).toBeNull();
   });
 
-  it("still renders M0/N when an empty completion set WAS reported (genuine zero)", () => {
-    render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
-    expect(screen.getByText("M0/4")).toBeTruthy();
+  it("still renders 0 of N reported complete when an empty completion set WAS reported (genuine zero)", () => {
+    render(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    expect(screen.getByText("0 of 4 reported complete")).toBeTruthy();
   });
 
   // PRD #390 D5 / M4. The two cases above assert the visible LABEL; the tooltip that tells the
@@ -5668,16 +5671,16 @@ describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
   // that handed the neutral state the "reported complete" wording (or the reverse) would slip
   // past them. Assert the attribute on both states directly.
   it("carries the 'not reported' tooltip on the neutral state and 'reported complete' on a genuine zero (PRD #390 D5)", () => {
-    const { rerender } = render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
-    const neutral = screen.getByText("M–/4");
+    const { rerender } = render(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: null })} />);
+    const neutral = screen.getByText("– of 4 reported");
     expect(neutral.getAttribute("title")).toBe("No milestone completion reported for this run");
-    rerender(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
-    const zero = screen.getByText("M0/4");
+    rerender(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    const zero = screen.getByText("0 of 4 reported complete");
     expect(zero.getAttribute("title")).toBe("Milestones reported complete of the approved plan");
   });
 });
 
-describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
+describe("ProgressCountCard (done / in-progress / left, PRD #122)", () => {
   const milestones = [
     { id: "a", title: "First milestone" },
     { id: "b", title: "Second milestone" },
@@ -5686,12 +5689,12 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
 
   it("renders every title with a done / in-progress / left indicator", () => {
     render(
-      <MilestoneChecklist run={run({ milestones, milestones_completed: ["a"], milestones_in_progress: ["b"] })} />,
+      <MilestoneRows run={run({ milestones, milestones_completed: ["a"], milestones_in_progress: ["b"] })} />,
     );
     expect(screen.getByText("First milestone")).toBeTruthy();
     expect(screen.getByText("Second milestone")).toBeTruthy();
     expect(screen.getByText("Third milestone")).toBeTruthy();
-    expect(screen.getByLabelText("done")).toBeTruthy();
+    expect(screen.getByLabelText("reported complete")).toBeTruthy();
     expect(screen.getByLabelText("in progress")).toBeTruthy();
     expect(screen.getByLabelText("not started")).toBeTruthy();
   });
@@ -5699,38 +5702,38 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
   // PRD Decision 6: the worker REPORTS completion; nothing in uzi verified it, so the
   // copy must not say "verified". This is the header-wording guard.
   it("says 'reported complete' and NEVER implies verification", () => {
-    const { container } = render(<MilestoneChecklist run={run({ milestones, milestones_completed: ["a"] })} />);
-    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    const { container } = render(<ProgressCountCard run={run({ milestones, milestones_completed: ["a"] })} />);
+    expect(screen.getByText("1 of 3 reported complete")).toBeTruthy();
     expect(container.textContent?.toLowerCase()).not.toContain("verified");
   });
 
   it("shows a done/total count that is clamped to frozen membership", () => {
-    render(<MilestoneChecklist run={run({ milestones, milestones_completed: ["a", "b", "gone"] })} />);
+    render(<ProgressCountCard run={run({ milestones, milestones_completed: ["a", "b", "gone"] })} />);
     // "gone" is not a frozen member, so the count clamps to 2/3, never 3/3.
-    expect(screen.getByText("2/3")).toBeTruthy();
+    expect(screen.getByText("2 of 3 reported complete")).toBeTruthy();
   });
 
   it("renders NOTHING for a run with no milestones", () => {
-    const { container } = render(<MilestoneChecklist run={run({ milestones: null })} />);
+    const { container } = render(<ProgressCountCard run={run({ milestones: null })} />);
     expect(container.textContent).toBe("");
   });
 
   it("shows '–/N' (not '0/N') in the header when completion was never reported (PRD #265 M2)", () => {
-    render(<MilestoneChecklist run={run({ milestones, milestones_completed: null })} />);
-    expect(screen.getByText("–/3")).toBeTruthy();
-    expect(screen.queryByText("0/3")).toBeNull();
+    render(<ProgressCountCard run={run({ milestones, milestones_completed: null })} />);
+    expect(screen.getByText("– of 3 reported")).toBeTruthy();
+    expect(screen.queryByText("0 of 3 reported complete")).toBeNull();
     // Every milestone still renders as not-started — honest, just no longer a failure-look.
     expect(screen.getAllByLabelText("not started")).toHaveLength(3);
   });
 
   it("shows a genuine '0/3' when an empty completion set WAS reported", () => {
-    render(<MilestoneChecklist run={run({ milestones, milestones_completed: [] })} />);
-    expect(screen.getByText("0/3")).toBeTruthy();
+    render(<ProgressCountCard run={run({ milestones, milestones_completed: [] })} />);
+    expect(screen.getByText("0 of 3 reported complete")).toBeTruthy();
   });
 
   it("renders an untrusted title as PLAIN text, never a Markdown link", () => {
     const { container } = render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones: [{ id: "x", title: "[pwn](http://evil.test)" }], milestones_completed: [] })}
       />,
     );
