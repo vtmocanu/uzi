@@ -13867,12 +13867,14 @@ export class RunRunner {
         forgeUsername: claim.secrets.forge_username,
         signal,
       });
-      // issue #1507 — a durable replacement now exists on the SUCCESS outcomes (the bundle is
-      // archived, or the head was already forge-published — both surface state "uploaded"), so the
-      // transient bare pin can go. On any retain (needs_action) LEAVE it as the durable anchor that
-      // keeps the retained source's exact head reachable in the bare.
-      if (outcome.state === "uploaded") {
-        await this.git.deleteRecoveryPin(barePath, claim.run_id, generation);
+      // issue #1507 — the transient bare pin goes only once a durable replacement exists. An archive
+      // upload's pin is deleted by the recovery coordinator itself (cleanupUploadedRecoveryPin, after
+      // verifying the archive proof under the journal lock; the live pass retries it), never here.
+      // Only the already-published outcome (head on the forge, nothing archived) is deleted here, and
+      // with the pinned head as the expected SHA so a moved ref is retained. On any retain
+      // (needs_action) LEAVE it as the durable anchor that keeps the retained source reachable.
+      if (outcome.state === "uploaded" && outcome.reason === "already_published") {
+        await this.git.deleteRecoveryPin(barePath, claim.run_id, generation, record.sourceSha);
       }
       runLog.info("recovery: park/early-terminal disposition outcome", {
         run_id: claim.run_id,
