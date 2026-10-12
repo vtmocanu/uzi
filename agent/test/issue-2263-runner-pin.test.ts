@@ -20,7 +20,11 @@ resetResidueQuarantineAfterEach();
 // (the recovery coordinator does, once the run is not executing); only the already-published outcome
 // deletes it here, and only with the pinned head as the expected SHA.
 
-const GIT_ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+// Inherited repository-location variables (a git hook exports them) override `-C` and would point
+// these fixture commands, update-ref included, at the caller's repository; drop them.
+const GIT_ENV: NodeJS.ProcessEnv = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+for (const k of ["GIT_DIR", "GIT_WORK_TREE", "GIT_INDEX_FILE", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES",
+  "GIT_COMMON_DIR", "GIT_NAMESPACE", "GIT_CEILING_DIRECTORIES", "GIT_PREFIX"]) delete GIT_ENV[k];
 const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
 const WORKER_TOKEN = "issue-2263-runner-worker-token-0123456789";
 const rd = (cwd: string, ...args: string[]) =>
