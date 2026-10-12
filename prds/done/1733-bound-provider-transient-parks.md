@@ -110,8 +110,8 @@ worker custody/CLI (I0/I1), exact Codex throttle classification (I2),
 web owner surfaces (I3a), and Slack/TUI (I3b). This records branch
 implementation, not release publication or completed final validation.
 Documentation and recorded decisions now describe the implemented contract;
-embedded docs are synced by `task docs:sync`. The checklist distinguishes
-completed behavior from the outstanding required validation blocker:
+embedded docs are synced by `task docs:sync`. The checklist records
+completed implementation and required validation:
 
 - [x] M1: typed, counted and elapsed-bounded provider parks; safe hold, resets, CLI and rollout controls.
 - [x] M2: exact Codex `rateLimitExceeded` retry/park path with usage/session negative controls.
