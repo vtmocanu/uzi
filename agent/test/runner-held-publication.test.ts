@@ -7,7 +7,7 @@ import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
 import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
-  JOIN_TOKEN, PUBLICATION_ID, redrive, watchFreezes, assertCustodyRetained, bare, command, commit, failedStates, failingWork, frozenRecords,
+  HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, redrive, watchFreezes, assertCustodyRetained, bare, command, commit, failedStates, failingWork, frozenRecords,
   heldServer, packObjects, recoveryOf, skipCheckpoints, type Work,
 } from "./runner-held-publication-fixture.js";
 
@@ -19,7 +19,7 @@ installHarness();
 // the failed ACK, and the guarded hold stays open until the FINAL is ACKed.
 
 describe("held publication of a failed run", () => {
-  it("dispatch failure: publishes WIP and commits at the frozen record's tip, FINAL ACKed, no archive", async () => {
+  it("dispatch failure: publishes WIP and commits at the frozen record's tip, FINAL ACKed, no archive", { skip: HELD_LINUX_ONLY }, async () => {
     const claim = gitlabClaim(2545, { claim_generation: 41, inventory_guarded: true });
     const { gitlab } = fakeGitlab();
     const server = heldServer(claim);
@@ -101,7 +101,7 @@ describe("held publication of a failed run", () => {
     assert.equal(command(bare(), ["rev-parse", "--verify", `${call!.tip}^{commit}`]), call!.tip);
   });
 
-  it("publish phase: a failed finalization is held, not archived, on the same record", async () => {
+  it("publish phase: a failed finalization is held, not archived, on the same record", { skip: HELD_LINUX_ONLY }, async () => {
     const claim = gitlabClaim(2546, { claim_generation: 42, inventory_guarded: true });
     const { gitlab } = fakeGitlab();
     const server = heldServer(claim);
@@ -133,7 +133,7 @@ describe("held publication of a failed run", () => {
     assert.equal(server.finals[0]!.disposition?.kind, "held_publication");
   });
 
-  it("permanent message failure: the hook's failed send is held, not archived", async () => {
+  it("permanent message failure: the hook's failed send is held, not archived", { skip: HELD_LINUX_ONLY }, async () => {
     const claim = gitlabClaim(2547, { claim_generation: 43, inventory_guarded: true });
     const { gitlab } = fakeGitlab();
     const server = heldServer(claim);

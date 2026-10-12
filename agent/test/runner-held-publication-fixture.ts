@@ -18,6 +18,8 @@ export const HELD_FEATURES = ["recovery_inventory_v1", "recovery_held_publicatio
 export const PUBLICATION_ID = "7c1f0d2e-5b8a-4c39-9d41-0a6e2b7f3c15";
 export const SERVER_CAPTURE_ID = "00000000-0000-4000-8000-000000002545";
 export const JOIN_TOKEN = "held-publication-journal-key";
+/** Held cases whose redrive FINAL is attributed through Linux process attribution; the runner refuses non-Linux hosts. */
+export const HELD_LINUX_ONLY = process.platform !== "linux" && "physical source FINAL proof requires Linux process attribution";
 
 export function command(dir: string, args: string[]): string {
   return execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
