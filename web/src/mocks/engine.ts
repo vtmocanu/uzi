@@ -16,7 +16,8 @@ import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putPropo
 const MOCK_MAX_TOTAL_WALL_SECONDS = 2147483;
 const MOCK_RUN_TIMEOUT_SECONDS = 6 * 3600;
 // The server reserves the maximum validated RUN_WALL_CEILING (72h) for every run, not the current
-// setting, so a later ceiling raise cannot push extension admission past the technical limit (#2735).
+// setting, so a later ceiling raise cannot push an already-admitted total past the extension-admission
+// limit (#2735).
 const MOCK_MAX_RUN_WALL_CEILING_SECONDS = 72 * 3600;
 const MOCK_MIN_FINALIZE_SECONDS = 1800;
 

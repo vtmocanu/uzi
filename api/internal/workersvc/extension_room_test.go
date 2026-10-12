@@ -45,8 +45,9 @@ func TestExtensionRoomSeconds(t *testing.T) {
 	}
 }
 
-// TestMaxRunWallSecondsKeepsTimerInRange: the constant is the largest whole-second wall whose
-// millisecond value still fits the worker's setTimeout range (2^31-1 ms).
+// TestMaxRunWallSecondsKeepsTimerInRange: the extension-admission limit keeps its value, the largest
+// whole-second wall whose millisecond value fits 2^31-1 ms (the native timer range the worker now
+// re-arms within in chunks, #2761).
 func TestMaxRunWallSecondsKeepsTimerInRange(t *testing.T) {
 	if MaxRunWallSeconds != 2147483 {
 		t.Fatalf("MaxRunWallSeconds = %d, want 2147483", MaxRunWallSeconds)

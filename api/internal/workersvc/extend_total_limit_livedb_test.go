@@ -11,11 +11,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #2735: the worker arms its wall timer in milliseconds with setTimeout, which clamps a delay
-// above 2^31-1 ms to 1 ms. The served total (Config.RunTimeoutSeconds = coalesce(wall, RUN_TIMEOUT) +
-// extension + finalize) must therefore stay at or under MaxRunWallSeconds whichever order the owner
-// extends, approves the plan (which scales the wall up to the ceiling) and Stops. These tests drive
-// the real service paths and read the served value out of the real claim assembly.
+// Issue #2735: extension admission reserves room under the extension-admission limit
+// MaxRunWallSeconds, so a total built from admitted extensions (Config.RunTimeoutSeconds =
+// coalesce(wall, RUN_TIMEOUT) + extension + finalize) stays at or under it whichever order the owner
+// extends, approves the plan (which scales the wall up to the ceiling) and Stops. The limit is not an
+// absolute cap on served totals: since #2761 the worker re-arms its wall timer in chunks, so a
+// configuration-driven total above it is honored. These tests drive the real service paths and read
+// the served value out of the real claim assembly.
 
 // sealClaimSecrets reseals the fixture's forge connection and adds a default Anthropic token so the
 // real claim assembly can run (seedCodexInfra stores an undecryptable placeholder).
@@ -45,8 +47,8 @@ func (f *wallParkExtendFixture) servedWallSeconds(t *testing.T, id uuid.UUID) in
 	return payload.Config.RunTimeoutSeconds
 }
 
-// assertTimerInRange fails when the served wall, in milliseconds, exceeds the int32 range Node's
-// setTimeout accepts.
+// assertTimerInRange fails when the served wall exceeds the extension-admission limit
+// MaxRunWallSeconds (2^31-1 ms in whole seconds).
 func assertTimerInRange(t *testing.T, served int) {
 	t.Helper()
 	if int64(served)*1000 > math.MaxInt32 {
@@ -94,7 +96,7 @@ func (f *wallParkExtendFixture) stopAndServe(t *testing.T, id uuid.UUID) int {
 
 // (a) A NULL-wall run at the plan gate is extended to fill its room, then approved with a
 // multi-milestone plan: the approve scales the wall up to the ceiling. The reserve for that scale-up
-// made the extension stop short, so the served total still fits the timer.
+// made the extension stop short, so the served total stays within the extension-admission limit.
 func TestExtendThenApproveScaledWallStaysInTimerRangeLiveDB(t *testing.T) {
 	f := newWallParkExtendFixture(t, 604800)
 	f.sealClaimSecrets(t)
@@ -136,7 +138,7 @@ func TestExtendThenApproveScaledWallStaysInTimerRangeLiveDB(t *testing.T) {
 }
 
 // (b) A run extended to fill its room, wall-parked and Stopped: the one-time finalize allowance Stop
-// adds was reserved up front, so the served total fits the timer.
+// adds was reserved up front, so the served total stays within the extension-admission limit.
 func TestExtendFillThenWallParkStopStaysInTimerRangeLiveDB(t *testing.T) {
 	f := newWallParkExtendFixture(t, 604800)
 	f.sealClaimSecrets(t)
@@ -188,8 +190,8 @@ func TestPersistedWallAboveCeilingRoomAndStopLiveDB(t *testing.T) {
 
 // Issue #2735 review finding: a NULL-wall run is extended to fill its room under a 8h ceiling,
 // then the operator raises RUN_WALL_CEILING (to the 72h maximum) before the plan freezes its wall.
-// The room reserved MaxRunWallCeiling up front, so the larger scaled wall still fits the timer
-// whichever approval path freezes it: the owner's approve_plan input, or an autopilot run's own
+// The room reserved MaxRunWallCeiling up front, so the larger scaled wall stays within the
+// extension-admission limit whichever approval path freezes it: the owner's approve_plan input, or an autopilot run's own
 // self-contained running report.
 func TestExtendThenCeilingRaisedThenApproveStaysInTimerRangeLiveDB(t *testing.T) {
 	const sixMilestones = `[{"id":"a","title":"A"},{"id":"b","title":"B"},{"id":"c","title":"C"},{"id":"d","title":"D"},{"id":"e","title":"E"},{"id":"f","title":"F"}]`
