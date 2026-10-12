@@ -89,7 +89,7 @@ What each part is doing:
   effect the moment the command returns.
 - **`-c cli_auth_credentials_store=file`** forces the login to write a
   file-based `auth.json`. Without it, macOS may use the OS keyring instead
-  (see the [Codex auth docs](https://developers.openai.com/codex/auth)),
+  (see the [Codex auth docs](https://learn.chatgpt.com/docs/auth)),
   which would leave nothing at `$CODEX_HOME/auth.json` for the next step to
   read.
 - The **`jq -e` check** verifies the isolated login actually produced a
