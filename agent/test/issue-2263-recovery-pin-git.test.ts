@@ -353,7 +353,7 @@ it("discovery entry cap refuses an otherwise matching pin", async () => {
   mock.method(seam, "spawnGit", async (...args: any[]) => {
     const flags = args[1] as string[];
     if (flags.includes("--name-only") || flags.includes("--is-bare-repository")) {
-      return { stdout: Readable.from([flags.includes("--name-only") ? "" : "true\n"]),
+      return { stdout: Readable.from([flags.includes("--name-only") ? "" : args[0] + "\n" + args[0] + "\ntrue\n"]),
         exited: Promise.resolve(0), cancel: () => {} };
     }
     return spawn(...args);
@@ -456,4 +456,31 @@ for (const symbolic of [false, true]) it("prepared cleanup inside supervised bou
     assert.throws(() => present());
   }
 });
+
+for (const redirect of [".git", "commondir"]) it("refuses Git repository redirect " + redirect, async () => {
+  const foreign = await second();
+  git(foreign, "update-ref", ref, sha);
+  await fs.writeFile(path.join(bare, redirect), redirect === ".git" ? "gitdir: " + foreign + "\n" : foreign + "\n");
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(await fs.readFile(path.join(bare, ref), "utf8"), sha + "\n");
+  assert.equal(present(foreign), sha);
+});
+it("late Git redirect cannot send a prepared deletion to another bare", async () => {
+  const foreign = await second();
+  git(foreign, "update-ref", ref, sha);
+  intercept(async (_cwd, args) => {
+    if (args.includes("update-ref") && args.includes("--stdin")) {
+      await fs.writeFile(path.join(bare, ".git"), "gitdir: " + foreign + "\n");
+    }
+  });
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(await fs.readFile(path.join(bare, ref), "utf8"), sha + "\n");
+  assert.equal(present(foreign), sha);
+});
+for (const key of ["extensions.refStorage", "extensions.worktreeConfig"]) it("refuses unsupported repository metadata " + key, async () => {
+  git(bare, "config", key, key.endsWith("refStorage") ? "files" : "false");
+  assert.deepEqual(await cleanup(), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(await fs.readFile(path.join(bare, ref), "utf8"), sha + "\n");
+});
+
 

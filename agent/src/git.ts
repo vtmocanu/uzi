@@ -4765,9 +4765,11 @@ export class GitCache {
     };
     const probe = async (cwd: string, args: string[], stdin?: string): Promise<string> => {
       check();
-      const child = await this.spawnGit(cwd, ["--no-replace-objects", ...args], stdin, {
+      const isBareProbe = cwd !== root;
+      const child = await this.spawnGit(cwd,
+        [...(isBareProbe ? ["--git-dir", cwd] : []), "--no-replace-objects", ...args], stdin, {
         timeoutMs: deadline - Date.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
-        env: { GIT_CONFIG_GLOBAL: "/dev/null" },
+        env: { GIT_CONFIG_GLOBAL: "/dev/null", ...(isBareProbe ? { GIT_COMMON_DIR: cwd } : {}) },
       });
       activeChildren.add(child.exited);
       let bytes = 0;
@@ -4814,12 +4816,21 @@ export class GitCache {
       if (await bounded(fs.realpath(bare)) !== bare) refuse("unsafe_metadata");
       const config = await metadata(path.join(bare, "config"), 1024 * 1024, evidence);
       if (config === undefined) refuse("unsafe_metadata");
+      // A cached bare must not redirect Git to another repository or common ref store.
+      // Record absence so a redirect planted while a transaction starts also refuses.
+      for (const redirect of [".git", "commondir"]) {
+        if (await remember(path.join(bare, redirect), evidence, false)) refuse("unsafe_metadata");
+      }
       // Parse admitted bytes without includes BEFORE any repository probe can read config.
       const keys = await probe(root, ["config", "--file", "-", "--no-includes", "--name-only", "--list"], config);
-      if (keys.split("\n").some(k => /^(include\.|includeif\.|core\.(worktree|hookspath|sshcommand)$)/i.test(k))) {
+      if (keys.split("\n").some(k => /^(include\.|includeif\.|core\.(worktree|hookspath|sshcommand)$|extensions\.(refstorage|worktreeconfig)$)/i.test(k))) {
         refuse("unsafe_metadata");
       }
-      if ((await probe(bare, ["rev-parse", "--is-bare-repository"])).trim() !== "true") refuse("unsafe_metadata");
+      const gitIdentity = (await probe(bare,
+        ["rev-parse", "--absolute-git-dir", "--git-common-dir", "--is-bare-repository"])).trimEnd().split("\n");
+      if (gitIdentity.length !== 3 || gitIdentity[0] !== bare || gitIdentity[1] !== bare || gitIdentity[2] !== "true") {
+        refuse("unsafe_metadata");
+      }
       const packed = await metadata(path.join(bare, "packed-refs"), 16 * 1024 * 1024, evidence);
       let packedTip: string | undefined;
       for (const line of packed?.split("\n") ?? []) {
@@ -4866,7 +4877,7 @@ export class GitCache {
         if (ancestor === root) rootEvidence.set(root, identity(st));
       }
       const rootStat = await remember(root, rootEvidence, true);
-      if (!rootStat || await bounded(fs.realpath(root)) !== root) refuse("unsafe_metadata");
+      if (!rootStat || await bounded(fs.realpath(root)) !== root) return refuse("unsafe_metadata");
       const key = JSON.stringify([root, rootStat.dev, rootStat.ino, ref]);
       return recoveryPinAttributionLocks.withLock(key, async () => {
         check();
@@ -4912,10 +4923,11 @@ export class GitCache {
           check();
           // Git's old-SHA comparison can resolve a symbolic ref even with no-deref.
           // Prepare holds the exact ref lock while we independently prove directness.
-          const child = await this.spawnGit(chosen.bare, ["--no-replace-objects", "update-ref", "--stdin"],
+          const child = await this.spawnGit(chosen.bare, ["--git-dir", chosen.bare, "--no-replace-objects", "update-ref", "--stdin"],
             `option no-deref\ndelete ${ref} ${input.sourceSha}\nprepare\n`, {
               keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()),
-              stderrMaxBytes: 65536, cancelOnAbandon: true, env: { GIT_CONFIG_GLOBAL: "/dev/null" },
+              stderrMaxBytes: 65536, cancelOnAbandon: true,
+              env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_COMMON_DIR: chosen.bare },
             }).catch(() => refuse("git_failure"));
           activeChildren.add(child.exited);
           const onAbort = () => child.cancel();
