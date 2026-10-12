@@ -83,7 +83,8 @@ it("credentialFree capture keeps a verified local restore point without publishi
     flight.secretRemediation = { attempts: 0, flaggedCommits: [sha] };
     const result = await subject.captureRecoveryRestorePoint(gitlabClaim(1964), flight, flight.runLog,
       "recovery_capture", { credentialFree: true });
-    assert.deepEqual(result, { verified: true, published: false });
+    // capturedHead is the head the verify compared (#1786 M2 revalidates coverage against exactly it).
+    assert.deepEqual(result, { verified: true, published: false, capturedHead: sha });
     assert.equal(uploads, 0);
     assert.equal(await git.trackingTip(String(flight.barePath), ctx.branch), sha);
   });
@@ -167,7 +168,7 @@ it("rewrite/clean controls and reap policy: cleanTip restricts boundary publishe
     f.checkpointFloor = flagged;
     f.secretRemediation = { attempts: 0, flaggedCommits: [flagged], everKnown: true, cleanTip: clean };
     assert.deepEqual(await r.captureRecoveryRestorePoint(gitlabClaim(1964), f, f.runLog,
-      "recovery_capture", { credentialFree: true }), { verified: true, published: false });
+      "recovery_capture", { credentialFree: true }), { verified: true, published: false, capturedHead: clean });
     // The published flag was bridged back into the candidate above; prove that post-bridge ancestry holds.
     assert.equal(await git.ancestry(String(f.barePath), flagged, (await git.trackingTip(String(f.barePath), ctx.branch))!), "ancestor");
     // Remove the durable floor only for this clean control; no bridge is requested by the common seam.
@@ -235,7 +236,7 @@ it("recovery/credential-switch and shared hold/wall captures retain local verifi
     f.secretRemediation = { attempts: 0, flaggedCommits: [sha] };
     for (const site of ["recovery_capture", "credential_switch"]) {
       assert.deepEqual(await r.captureRecoveryRestorePoint(gitlabClaim(1964), f, f.runLog, site),
-        { verified: true, published: false });
+        { verified: true, published: false, capturedHead: sha });
     }
     assert.deepEqual(await r.captureHoldContext(gitlabClaim(1964), f, f.runLog),
       { verified: true, published: false, mode: "same_worker_only", head: sha });
@@ -291,7 +292,7 @@ it("deterministic gate finding on S requests remediation and holds every followi
     assert.equal((await ctx.secretRemediationGate!()).action, "remediate");
     assert.equal(f.secretRemediation?.everKnown, true);
     assert.deepEqual(await r.captureRecoveryRestorePoint(gitlabClaim(1964), f, f.runLog,
-      "recovery_capture", { credentialFree: true }), { verified: true, published: false });
+      "recovery_capture", { credentialFree: true }), { verified: true, published: false, capturedHead: sha });
     assert.equal(tips.length, 0);
   });
 });
@@ -303,10 +304,10 @@ it("real gitleaks gate finding on S also holds credentialFree capture", async (t
   (git as unknown as { gitleaksBin: string }).gitleaksBin = real;
   const tips = spyUploads();
   await withFlight(async (ctx, f, r) => {
-    commit(ctx.worktreePath, "TOKEN=" + "gh" + "p_" + "a1b2c3d4e5f6".repeat(3) + "\n");
+    const sha = commit(ctx.worktreePath, "TOKEN=" + "gh" + "p_" + "a1b2c3d4e5f6".repeat(3) + "\n");
     assert.equal((await ctx.secretRemediationGate!()).action, "remediate");
     assert.deepEqual(await r.captureRecoveryRestorePoint(gitlabClaim(1964), f, f.runLog,
-      "recovery_capture", { credentialFree: true }), { verified: true, published: false });
+      "recovery_capture", { credentialFree: true }), { verified: true, published: false, capturedHead: sha });
     assert.equal(tips.length, 0);
   });
 });

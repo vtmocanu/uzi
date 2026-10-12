@@ -154,6 +154,30 @@ function retainedReasons(lines: unknown[]): string[] {
     .filter((l) => l.msg === "stopped source retained on this worker; inspect it with the operator channel before any disposal")
     .map((l) => String(l.reason));
 }
+/** Exits that kept the source WITHOUT a stopped-source record (park and terminal exits keep the plain
+ *  journal, the ADR-1197 posture: a resume recaptures the bytes). */
+function keptReasons(lines: unknown[]): string[] {
+  return (lines as Array<{ msg?: string; reason?: string }>)
+    .filter((l) => l.msg === "source kept without a stopped-source record (park or terminal exit); a resume recaptures it")
+    .map((l) => String(l.reason));
+}
+/** What `handleRecoveryExhausted` returned (true = parked), per call. */
+function spyHandlerResults(runner: RunRunner): boolean[] {
+  const results: boolean[] = [];
+  const impl = (runner as unknown as { handleRecoveryExhausted: (...a: unknown[]) => Promise<boolean> }).handleRecoveryExhausted.bind(runner);
+  (runner as unknown as { handleRecoveryExhausted: unknown }).handleRecoveryExhausted = async (...a: unknown[]) => {
+    const result = await impl(...a);
+    results.push(result);
+    return result;
+  };
+  return results;
+}
+function ledgerStates(iid: number): string[] {
+  return cfgAll(bareOf(), `uzi-attempts.${branchOf(iid)}.entry`).map((raw) => (JSON.parse(raw) as { state: string }).state);
+}
+function journalCount(iid: number): number {
+  return cfgAll(bareOf(), `uzi-recovery.${branchOf(iid)}.clone`).length;
+}
 function coveredReasons(lines: unknown[]): string[] {
   return (lines as Array<{ msg?: string; reason?: string }>)
     .filter((l) => typeof l.msg === "string" && l.msg.startsWith("stopped source: clean and already held"))
@@ -194,11 +218,11 @@ interface CredRig {
   seedHead: () => string;
 }
 
-function credRig(iid: number, o: { generation?: number; extra?: Record<string, unknown> } = {}): CredRig {
+function credRig(iid: number, o: { generation?: number; extra?: Record<string, unknown>; claim?: Record<string, unknown> } = {}): CredRig {
   const { gitlab } = fakeGitlab();
   client.protocolFeatures = [VAULT_FEATURE];
   const rig = codexRig({ vaultLocked: () => true });
-  const claim = gitlabClaim(iid, { claim_generation: o.generation ?? 5 });
+  const claim = gitlabClaim(iid, { claim_generation: o.generation ?? 5, ...o.claim });
   let facts: Expected | undefined;
   let clone = "";
   let seedHead = "";
@@ -288,6 +312,7 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     const iid = 17904;
     const r = credRig(iid);
     let late: Expected | undefined;
+    const parked = spyHandlerResults(r.runner);
     const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt); });
     try {
       await r.runner.execute(r.claim);
@@ -297,8 +322,11 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assert.equal(hook.fired(), 1, "the hook ran after the verified capture");
     assert.equal(parkReports(r.claim.run_id).length, 1, "the park is reported exactly once, as before");
     assertRecoverable(r.clone(), late!, "row 7");
-    assert.deepEqual(retainedReasons(r.lines), ["recovery_park_ack"]);
-    assert.equal(stopMarkers(r.claim.run_id).length, 1);
+    assert.deepEqual(parked, [true], "the handler still reports the run parked");
+    // A park exit keeps the plain journal: no stopped-source marker, so the resume recaptures the bytes.
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(retainedReasons(r.lines), []);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
   it("row 7 control: a capture still current and anchored at the exit lets the clone go; the park is unchanged", async () => {
@@ -307,8 +335,10 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     let waits = 0;
     const waitRetry = (r.runner as unknown as { waitRecoveryRetry: (...a: unknown[]) => Promise<void> }).waitRecoveryRetry.bind(r.runner);
     (r.runner as unknown as { waitRecoveryRetry: unknown }).waitRecoveryRetry = (...a: unknown[]) => { waits++; return waitRetry(...a); };
+    const parked = spyHandlerResults(r.runner);
     await r.runner.execute(r.claim);
     assert.equal(fs.existsSync(r.clone()), false, "covered: normal teardown");
+    assert.deepEqual(parked, [true]);
     assert.deepEqual(api.states.filter((s) => s.runId === r.claim.run_id).map((s) => s.body.status),
       ["running", "running", "running", "recovery_wait"], "the same park reports in the same order");
     assert.equal(waits, 0, "no new waits");
@@ -335,7 +365,8 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     }
     assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "shared tracking move");
     assert.equal(parkReports(r.claim.run_id).length, 1);
-    assert.deepEqual(retainedReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
   it("row 8: a park ACK with a terminal status keeps a source that changed after the capture (no new report)", async () => {
@@ -354,7 +385,8 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
       client.reportState = report;
     }
     assertRecoverable(r.clone(), late!, "row 8");
-    assert.deepEqual(retainedReasons(r.lines), ["recovery_park_ack_terminal"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack_terminal"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), [], "a terminal exit keeps the plain journal");
   });
 
   it("row 9: a StaleClaimError on the park report keeps the source and reports nothing further", async () => {
@@ -399,7 +431,8 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     const want = writeExpectedAfterWip(late!, r.clone());
     assertRecoverable(r.clone(), want, "keepUnlessCaptured");
     assert.equal(parkReports(r.claim.run_id).length, 0);
-    assert.deepEqual(retainedReasons(r.lines), ["recovery_terminal_status"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_terminal_status"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 });
 
@@ -421,9 +454,9 @@ interface TransientRig {
   seedHead: () => string;
 }
 
-function transientRig(iid: number, o: { dockerHost?: boolean } = {}): TransientRig {
+function transientRig(iid: number, o: { dockerHost?: boolean; claim?: Record<string, unknown> } = {}): TransientRig {
   const { gitlab } = fakeGitlab();
-  const claim = gitlabClaim(iid, { claim_generation: 1 });
+  const claim = gitlabClaim(iid, { claim_generation: 1, ...o.claim });
   let clone = "";
   let facts: Expected | undefined;
   let seedHead = "";
@@ -452,6 +485,7 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     it(`a ${kind === "all" ? "new commit, tracked edit and untracked file" : kind === "commit" ? "new commit" : kind === "tracked" ? "modified tracked file" : "new untracked file"} after the verified capture keeps the clone at the park exit`, async () => {
       const iid = 17920 + ["all", "commit", "tracked", "untracked"].indexOf(kind);
       const r = transientRig(iid);
+      const parked = spyHandlerResults(r.runner);
       let late: Expected | undefined;
       const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt, kind); });
       try {
@@ -461,8 +495,10 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
       }
       assert.equal(api.states.filter((s) => s.runId === r.claim.run_id && s.body.status === "recovery_wait").length, 1, "one park report");
       assertRecoverable(r.clone(), writeExpectedAfterWip(late!, r.clone()), `transient ${kind}`);
-      assert.ok(retainedReasons(r.lines).includes("recovery_capture_verified") || retainedReasons(r.lines).includes("recovery_park_ack"),
-        `retained at the capture or the park exit: ${JSON.stringify(retainedReasons(r.lines))}`);
+      assert.deepEqual(parked, [true]);
+      // The one revalidation runs at the handler's cleanup, after the park ACK; a park keeps the plain journal.
+      assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+      assert.deepEqual(stopMarkers(r.claim.run_id), []);
     });
   }
 
@@ -480,7 +516,8 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
       client.reportState = report;
     }
     assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "transient shared tracking");
-    assert.deepEqual(retainedReasons(r.lines).slice(-1), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
   it("control: a capture still current and anchored lets the clone go; one park report, no wait", async () => {
@@ -529,7 +566,10 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
     assert.equal(ours.length, 1, "the retained attempt is enumerated from the ledger");
     assert.equal(ours[0]!.presence, "missing");
     assert.equal(ours[0]!.allocatedBytes, 0);
-    assert.equal(ours[0]!.ledgerState, "reclaimed");
+    // A park keeps the plain journal and the live attempt: no ledger `reclaimed` (that is for a stopped generation).
+    assert.equal(ours[0]!.ledgerState, "live");
+    assert.ok(!ledgerStates(iid).includes("reclaimed"));
+    assert.equal(journalCount(iid), 1, "the journal survives for the resume");
   });
 });
 
@@ -574,6 +614,7 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
     }
     assertRecoverable(f.clone(), worked(), "row 3");
     assert.deepEqual(sites, ["recovery_probe_gone"]);
+    assert.deepEqual(stopMarkers(f.claim.run_id), [], "missing authority keeps the plain journal");
     assert.equal(api.states.filter((s) => s.body.status === "failed" || s.body.status === "recovery_wait").length, 0);
   });
 
@@ -588,6 +629,7 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
     }
     assertRecoverable(f.clone(), worked(), "row 4");
     assert.deepEqual(sites, ["recovery_terminal_status"]);
+    assert.deepEqual(stopMarkers(f.claim.run_id), [], "a terminal status keeps the plain journal");
     assert.equal(api.states.some((s) => s.body.status === "failed"), false);
   });
 
@@ -602,6 +644,7 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
     }
     assertRecoverable(f.clone(), worked(), "row 2 terminal disk");
     assert.deepEqual(sites, ["recovery_other_generation"]);
+    assert.equal(stopMarkers(f.claim.run_id).length, 1, "a superseded generation is recorded as stopped");
     assert.equal(api.states.some((s) => s.body.status === "failed"), false);
     assert.equal(api.states.filter((s) => s.body.status === "recovery_wait").length, 0);
   });
@@ -613,6 +656,8 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
       await f.runner.execute(f.claim);
       assertRecoverable(f.clone(), worked(), `precheck ${name}`);
       assert.deepEqual(sites, ["terminal_disk_precheck"]);
+      // Another generation is a stopped source (marker); a terminal status keeps the plain journal.
+      assert.equal(stopMarkers(f.claim.run_id).length, name === "another generation" ? 1 : 0);
       assert.equal(api.states.filter((s) => s.body.status === "failed" || s.body.status === "recovery_wait").length, 0);
     });
   }
@@ -699,4 +744,327 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
     // The fixture's own sentinel files sit beside the writeWorkerState bytes; the binary and untracked file are the claim.
     assertRecoverable(f.clone(), { ...worked!, head: gitIn(f.clone(), "rev-parse", "HEAD") }, "degraded stub");
   });
+});
+
+// --- review rework: B2 (revalidate at EVERY return), B3 (cancel semantics), N1 (representation) --------
+
+/** After the first recovery_wait park report is sent, bytes land in the clone (a writer the capture-time
+ *  check never saw), then `answer` is the server's reply. */
+function lateWriteAtPark(r: TransientRig, answer: (body: StateRequest) => unknown): { late: () => Expected | undefined; restore: () => void } {
+  const report = client.reportState.bind(client);
+  let late: Expected | undefined;
+  let sent = 0;
+  client.reportState = async (runId, body, signal) => {
+    if (body.status === "recovery_wait" && ++sent === 1) {
+      late = writeLateChange(r.clone());
+      return answer(body) as never;
+    }
+    return report(runId, body, signal);
+  };
+  return { late: () => late, restore: () => { client.reportState = report; } };
+}
+
+describe("RunRunner #1786 M2 rework — no return path of the handler releases a source written after the capture", () => {
+  const exits = [
+    { name: "PROBE-B: a live non-terminal park ACK (paused)", iid: 17930 },
+    { name: "PROBE-C: a statusless ACK, then an ownership 404", iid: 17931 },
+    { name: "a statusless ACK, then a live non-running ownership status", iid: 17932 },
+    { name: "a statusless ACK, then a worker shutdown at the loop top", iid: 17933 },
+  ];
+  for (const exit of exits) {
+    it(`${exit.name}: the bytes written after the capture-time check are kept; no marker`, async () => {
+      const r = transientRig(exit.iid);
+      const parked = spyHandlerResults(r.runner);
+      const own = client.getRunOwnership.bind(client);
+      let written = false;
+      const hook = lateWriteAtPark(r, () => {
+        written = true;
+        if (exit.iid === 17933) r.runner.shutdown();
+        return exit.iid === 17930 ? { applied: true, status: "paused" } : { applied: true };
+      });
+      client.getRunOwnership = async (runId: string) => {
+        if (written && exit.iid === 17931) throw new RequestError("GET", "/ownership", 404, "not found");
+        if (written && exit.iid === 17932) return { status: "paused", claim_generation: 1 } as never;
+        return own(runId);
+      };
+      try {
+        await r.runner.execute(r.claim);
+      } finally {
+        hook.restore();
+        client.getRunOwnership = own;
+      }
+      assert.ok(hook.late(), "bytes were written after the capture-time point");
+      assert.deepEqual(parked, [false], "the handler did not park");
+      assertRecoverable(r.clone(), hook.late()!, exit.name);
+      assert.deepEqual(stopMarkers(r.claim.run_id), []);
+      assert.deepEqual(keptReasons(r.lines).length, 1, "one cleanup-time check, which kept the source");
+    });
+  }
+
+  it("control: the same exits with nothing written after the capture let the covered clone go", async () => {
+    const r = transientRig(17934);
+    const parked = spyHandlerResults(r.runner);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) =>
+      (body.status === "recovery_wait" ? ({ applied: true, status: "paused" } as never) : report(runId, body, signal));
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+    }
+    assert.deepEqual(parked, [false]);
+    assert.equal(fs.existsSync(r.clone()), false, "covered at cleanup: normal teardown");
+    assert.deepEqual(coveredReasons(r.lines).length, 1);
+  });
+
+  it("PROBE-A: a transient park retained at cleanup on a canonical worker does not block the same run's next claim; the late bytes reach it", async () => {
+    const iid = 17935;
+    const r = transientRig(iid);
+    // The real park ACK is wanted: write the late bytes after the capture-time point, then reach the server.
+    const report = client.reportState.bind(client);
+    let late: Expected | undefined;
+    let sent = 0;
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait" && ++sent === 1) late = writeLateChange(r.clone());
+      return report(runId, body, signal);
+    };
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+    }
+    assert.ok(late);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), [], "no uzi-stopped marker on a park");
+    assertRecoverable(r.clone(), late!, "the parked clone");
+
+    // The same run's next claim (generation 2) resumes on this worker: it recaptures, never worker_residue_blocked.
+    let seen: { head: string; blob: Buffer; late: string; committed: string } | undefined;
+    const { gitlab } = fakeGitlab();
+    const resumed = runnerWith(() => ({
+      executor: {
+        run: async (ctx: RunContext): Promise<ExecutorResult> => {
+          seen = {
+            head: gitIn(ctx.worktreePath, "rev-parse", "HEAD"),
+            blob: fs.readFileSync(path.join(ctx.worktreePath, "assets", "blob.bin")),
+            late: fs.readFileSync(path.join(ctx.worktreePath, "late-untracked.txt"), "utf8"),
+            committed: fs.readFileSync(path.join(ctx.worktreePath, "late.txt"), "utf8"),
+          };
+          return { branch: ctx.branch };
+        },
+      },
+    }), gitlab, undefined, undefined, { recoveryRetryMs: 5 });
+    api.setOwnershipStatus(r.claim.run_id, "running", 2);
+    await resumed.execute({ ...r.claim, claim_generation: 2 });
+    assert.ok(!statuses(r.claim.run_id).includes("failed"), `the resumed claim did not fail: ${JSON.stringify(api.states.filter((s) => s.runId === r.claim.run_id).map((s) => [s.body.status, s.body.failure_reason]))}`);
+    assert.ok(seen, "the second claim reached its executor");
+    assert.deepEqual(seen!.blob, late!.blob, "the tracked edit written after the capture");
+    assert.equal(seen!.late, LATE_UNTRACKED, "the untracked file written after the capture");
+    assert.equal(seen!.committed, "late committed work\n", "the commit written after the capture");
+  });
+
+  it("an attempt-clone park keeps its journal and live ledger entry (no `reclaimed`)", async () => {
+    const iid = 17936;
+    const r = transientRig(iid, { dockerHost: true });
+    const hook = afterVerifiedCapture((wt) => { writeLateChange(wt); });
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      hook.restore();
+    }
+    assert.match(path.basename(r.clone()), /\.attempt-/);
+    assert.ok(fs.existsSync(r.clone()));
+    assert.ok(!ledgerStates(iid).includes("reclaimed"));
+    assert.equal(journalCount(iid), 1);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+  });
+
+  it("the captured head is bound: shared tracking moves to the seed head and the clone is reset to it after the capture, so the captured head is no longer anchored and the clone is kept", async () => {
+    const iid = 17937;
+    const r = transientRig(iid);
+    const parked = spyHandlerResults(r.runner);
+    const report = client.reportState.bind(client);
+    let moved = false;
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait" && !moved) {
+        moved = true;
+        // After the capture verified: another run's fetch-back moves the shared tracking ref to the seed head
+        // (this run's owed pins are gone), and the clone is reset to that head with nothing untracked left.
+        // The clone is then clean at a head the bare holds, but not at the head the capture covered.
+        moveSharedTrackingAway(r.claim.run_id, iid, r.seedHead());
+        gitIn(r.clone(), "reset", "--hard", r.seedHead());
+        gitIn(r.clone(), "clean", "-fdx");
+      }
+      return report(runId, body, signal);
+    };
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+    }
+    assert.ok(moved);
+    assert.deepEqual(parked, [true]);
+    assert.ok(fs.existsSync(r.clone()), "kept: the captured head is no longer anchored");
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+  });
+
+  it("guarded (inventory_guarded) park row: the late bytes are kept and no marker is written", async () => {
+    const iid = 17938;
+    const r = transientRig(iid, { claim: { inventory_guarded: true } });
+    let late: Expected | undefined;
+    const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt); });
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      hook.restore();
+    }
+    assertRecoverable(r.clone(), writeExpectedAfterWip(late!, r.clone()), "guarded park");
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+  });
+});
+
+describe("RunRunner #1786 M2 rework — credential-deferred terminal exits and the stale row keep the representation they own", () => {
+  it("recovery_confirm_terminal: a terminal ACK on the confirming report keeps a source that changed after its capture; no marker, no report", async () => {
+    const r = credRig(17940);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => (body.status === "running" && r.ran()
+      ? ({ applied: true, status: "completed" } as never) : report(runId, body, signal));
+    const parked = spyHandlerResults(r.runner);
+    let late: Expected | undefined;
+    const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt, "untracked"); });
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      hook.restore();
+      client.reportState = report;
+    }
+    assert.equal(hook.fired(), 1);
+    assertRecoverable(r.clone(), writeExpectedAfterWip(late!, r.clone()), "confirm_terminal");
+    assert.deepEqual(parked, [false]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_confirm_terminal"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+    assert.equal(parkReports(r.claim.run_id).length, 0);
+  });
+
+  it("recovery_receipt_failed: a given-up input receipt keeps a source that changed after its capture and still reports the failure", async () => {
+    const r = credRig(17941);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "running" && r.ran()) throw Object.assign(new Error("input receipt given up"), { name: "InputReceiptError" });
+      return report(runId, body, signal);
+    };
+    let late: Expected | undefined;
+    const hook = afterVerifiedCapture((wt) => { late = writeLateChange(wt, "untracked"); });
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      hook.restore();
+      client.reportState = report;
+    }
+    assert.equal(hook.fired(), 1);
+    assertRecoverable(r.clone(), writeExpectedAfterWip(late!, r.clone()), "receipt_failed");
+    assert.deepEqual(keptReasons(r.lines), ["recovery_receipt_failed"]);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+  });
+
+  it("recovery_confirm_gone: a 404 on the confirmation keeps the uncaptured source; no marker", async () => {
+    const r = credRig(17942);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "running" && r.ran()) throw new Error("transport down");
+      return report(runId, body, signal);
+    };
+    const own = client.getRunOwnership.bind(client);
+    client.getRunOwnership = async (runId: string) => {
+      if (r.ran()) throw new RequestError("GET", "/ownership", 404, "not found");
+      return own(runId);
+    };
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+      client.getRunOwnership = own;
+    }
+    assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "confirm_gone");
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+    assert.equal(parkReports(r.claim.run_id).length, 0);
+  });
+
+  it("guarded (inventory_guarded) stale row: the stop is recorded as a stopped source, nothing is written through the stale claim", async () => {
+    const iid = 17943;
+    const r = credRig(iid, { claim: { inventory_guarded: true } });
+    api.failStateWhen(r.claim.run_id, (b) => b.status === "running" && r.ran(), { runStatus: "running", disposition: "stale_claim" });
+    await r.runner.execute(r.claim);
+    assertRecoverable(r.clone(), r.worked(), "guarded stale");
+    assert.deepEqual(retainedReasons(r.lines), ["recovery_confirm_stop"]);
+    assert.equal(stopMarkers(r.claim.run_id).length, 1);
+    noTrackingWrite(iid);
+  });
+});
+
+describe("RunRunner #1786 M2 rework — the cancel ACK keeps owner-authorized discard semantics (PRD Module 1)", () => {
+  function cancelMirror(runId: string): { stop: () => void } {
+    // Mirror Service.SetState: the consumed cancel input stamped stop_kind, and the worker's failed report cancels.
+    let stopRequested = false;
+    api.onState(runId, (body) => {
+      const status = body.status === "failed" && stopRequested ? "cancelled" : body.status;
+      api.setOwnershipStatus(runId, status);
+      api.overrideStateStatus(runId, status);
+    });
+    return { stop: () => { stopRequested = true; api.setInputs(runId, [{ id: 1, kind: "cancel" }]); } };
+  }
+
+  it("non-credential owner cancel during failed capture retries: normal cleanup even though the clone is not covered (claim_generation 1)", async () => {
+    const r = transientRig(17950);
+    const mirror = cancelMirror(r.claim.run_id);
+    let reached!: () => void;
+    const failed = new Promise<void>((resolve) => { reached = resolve; });
+    git.commitWipMarker = async () => { reached(); return false; };
+    const execution = r.runner.execute(r.claim);
+    await Promise.race([failed, execution.then(() => { throw new Error("capture path not reached"); })]);
+    mirror.stop();
+    await execution;
+    assert.ok(api.states.some((s) => s.runId === r.claim.run_id && s.body.status === "failed" && s.body.failure_reason === "run cancelled"));
+    assert.equal(fs.existsSync(r.clone()), false, "explicit cancellation keeps normal cleanup");
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+    assert.deepEqual(retainedReasons(r.lines), []);
+  });
+
+  for (const changed of [true, false]) {
+    it(`credential-deferred cancel after a verified capture: revalidated at cleanup (${changed ? "bytes written after the capture are kept" : "a covered clone goes"})`, async () => {
+      const iid = changed ? 17951 : 17952;
+      const r = credRig(iid);
+      const mirror = cancelMirror(r.claim.run_id);
+      const report = client.reportState.bind(client);
+      let late: Expected | undefined;
+      let sent = 0;
+      client.reportState = async (runId, body, signal) => {
+        if (body.status === "recovery_wait") {
+          // Statusless until the consumed cancel is seen by the handler's loop (the poller is asynchronous).
+          if (++sent === 1) {
+            if (changed) late = writeLateChange(r.clone());
+            mirror.stop();
+          }
+          return { applied: true } as never;
+        }
+        return report(runId, body, signal);
+      };
+      try {
+        await r.runner.execute(r.claim);
+      } finally {
+        client.reportState = report;
+      }
+      assert.ok(api.states.some((s) => s.runId === r.claim.run_id && s.body.status === "failed" && s.body.failure_reason === "run cancelled"),
+        `cancel was reported: ${JSON.stringify(api.states.filter((s) => s.runId === r.claim.run_id).map((s) => [s.body.status, s.body.failure_reason]))}`);
+      if (changed) {
+        assertRecoverable(r.clone(), late!, "cancel ack kept");
+        assert.deepEqual(keptReasons(r.lines), ["recovery_cancel_ack"]);
+      } else {
+        assert.equal(fs.existsSync(r.clone()), false);
+        assert.deepEqual(coveredReasons(r.lines), ["recovery_cancel_ack"]);
+      }
+      assert.deepEqual(stopMarkers(r.claim.run_id), []);
+    });
+  }
 });
