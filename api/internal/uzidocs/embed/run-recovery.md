@@ -921,8 +921,8 @@ open until an archive final disposition is acknowledged:
   or `UZI_HELD_PUBLICATION` is off;
 - the release step gives a definitive refusal: `held_publication_unsupported`,
   `held_publication_ref_missing`, `held_publication_ref_mismatch` or
-  `held_publication_not_eligible`, or a 400 from an older API that does not know
-  the held release.
+  `held_publication_not_eligible`, or a 400 (from an older API that does not know
+  the held release, or a request the API rejects as malformed).
 
 A transient answer to the release step (`held_publication_unavailable`, a
 transport error or a lost ACK) does not archive: the journaled release is kept,
