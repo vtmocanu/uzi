@@ -817,21 +817,27 @@ cookie-only, at most 8 KiB) is appended to the checker's trusted brief after
 the locked base brief, so it can add checks but not remove required ones or
 change the output format or read-only rules. Repository instructions are a
 separate consent (`repos.cross_check_repo_instructions_enabled`): the worker
-reads the root `CLAUDE.md` from the **base commit** (the merge base with the
-default branch) out of its bare repository, never the run's worktree, and
-hands it to the checker as fenced advisory data. A run therefore cannot
-author or rewrite the instructions it is checked against; the accepted limit
-is that a run forked from an older default-branch commit is checked against
-that older file, or none. See the amendment in
-[ADR-246](adr/0246-trusted-repo-instructions.md). Guidance and the instruction
-text are frozen into the check row, with digests the worker verifies on claim.
+freshly fetches the configured default-branch tip and freezes it once as
+`repo_instructions_commit` when the check starts, after fresh lead quiescence
+within the held worker boundary and before the durable local pin. The previously captured default-branch
+commit remains the merge-base diff input. Consent on reads root `CLAUDE.md`
+at the instruction pin with the existing 64 KiB, 8-hop, repository-root,
+`.git/`, regular-blob, import-stripping and advisory-fencing protections;
+consent off pins without reading. A consent retry keeps the same pin; existing
+checks reuse frozen inputs. Guidance and instruction text are frozen into the check row,
+with digests the worker verifies on claim; a present pin binds candidate
+identity even with consent off. Legacy NULL provenance is not backfilled.
+See [Code cross-check instructions](docs/cross-check.md#owner-guidance-and-repository-instructions)
+and [ADR-246](adr/0246-trusted-repo-instructions.md) for details.
 
 The local snapshot ref is deleted once the checker has settled. A boot sweep
 deletes leftovers only on positive server evidence matching the lead id and,
 when a check row exists, its claim generation and head, and only when the lead is finished or not held by that
 worker (for a lead with no check row, additionally only when the ref was never
-read), and keeps the ref on any doubt. Roll out the api and migrations 00324 to 00327 before workers
-that advertise `cross_check_code_v1`.
+read), and keeps the ref on any doubt. Roll out the api and migrations 00324 to 00328 before upgraded workers
+that advertise `cross_check_code_v1`. Roll back workers before the api, retaining
+00328's column, stored pins and digests; its Down destructively removes provenance.
+See [rollout details](docs/cross-check.md#rolling-out-code-cross-check).
 
 ### Run lifecycle
 
