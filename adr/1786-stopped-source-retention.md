@@ -162,7 +162,7 @@ cleanup. An interruption propagating out of the handler (shutdown, pause, limit,
 deferral, any throw) skips that cleanup check; the preserve flag stays as the
 interrupting arm set it (shutdown, pause and limit keep the clone; an owner cancel takes
 its normal cancel cleanup; a claim fence or stale claim goes to the caller's stopped-source
-arm), and the caller handles the interruption.
+arm; a codex deferral or any other throw keeps the clone as latched), and the caller handles the interruption.
 
 Claims without a claim generation (pre-generation APIs) can never be proven covered, so
 their park and terminal exits keep the clone, and a same-worker reclaim of such a run
