@@ -131,6 +131,156 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 			t.Fatalf("pause = %d %s; want %d applied=%v status=%s", rec.Code, rec.Body.String(), code, applied, status)
 		}
 	}
+	// These expiry fixtures model an attended run with a seeded approved plan.
+	// Keep the ordinary fixtures auto-approved for their existing refusal cases.
+	newAttendedRun := func(t *testing.T, started time.Time) uuid.UUID {
+		t.Helper()
+		id := newRun(t)
+		e.exec(t, "UPDATE runs SET auto_approve=false,plan_source='seeded',started_at=$2 WHERE id=$1", id, started)
+		return id
+	}
+	snapshot := func(t *testing.T, id uuid.UUID) string {
+		t.Helper()
+		var value string
+		if err := e.pool.QueryRow(ctx, `SELECT jsonb_build_object(
+ 'run',to_jsonb(r), 'messages',(SELECT jsonb_agg(m ORDER BY seq) FROM run_messages m WHERE run_id=r.id),
+ 'inputs',(SELECT jsonb_agg(i ORDER BY id) FROM run_user_inputs i WHERE run_id=r.id))::text FROM runs r WHERE id=$1`, id).Scan(&value); err != nil {
+			t.Fatal(err)
+		}
+		return value
+	}
+	useClock := func(t *testing.T, clock *time.Time, beforeLock func()) {
+		t.Helper()
+		svc := workersvc.New(q, newHandlerTestBox(t), workersvc.Params{})
+		svc.SetClock(func() time.Time { return *clock })
+		svc.SetTxBeginner(pauseTestBeginner{pool: e.pool, beforeLock: beforeLock})
+		h := &Handler{q: q, wsvc: svc, now: func() time.Time { return *clock }}
+		previous := e.router
+		e.router = h.WorkerRoutes(mw.NewLimiter(1000, time.Minute, nil))
+		t.Cleanup(func() { e.router = previous })
+	}
+	assertUnchanged := func(t *testing.T, id uuid.UUID, before string) {
+		t.Helper()
+		if snapshot(t, id) != before {
+			t.Fatal("refusal changed run, question, accounting, messages or inputs")
+		}
+		run, err := q.GetRunByID(ctx, id)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if run.Status != "running" || run.OpenQuestionID.Valid || run.PauseRequestedAt.Valid ||
+			run.PauseMode.Valid || run.PauseAfterCount.Valid {
+			t.Fatalf("refusal persisted question or pause: %+v", run)
+		}
+		var count int
+		if err := e.pool.QueryRow(ctx, "SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='pause'", id).Scan(&count); err != nil || count != 0 {
+			t.Fatalf("pause inputs=%d err=%v", count, err)
+		}
+	}
+	assertExpired := func(t *testing.T, rec *httptest.ResponseRecorder) {
+		t.Helper()
+		assertPause(t, rec, http.StatusConflict, false, "running")
+		var ack struct {
+			Applied *bool  `json:"applied"`
+			Reason  string `json:"reason"`
+			Run     struct {
+				ID uuid.UUID `json:"id"`
+			} `json:"run"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &ack); err != nil {
+			t.Fatal(err)
+		}
+		if ack.Applied == nil || *ack.Applied || ack.Reason != "wall_expired" || ack.Run.ID == uuid.Nil {
+			t.Fatalf("expiry ACK=%s", rec.Body.String())
+		}
+	}
+	const guardedQuestion = `{"status":"awaiting_input","claim_generation":4,"require_running":true,"open_question_id":"expired-question"}`
+	started := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	for _, elapsed := range []time.Duration{time.Hour, time.Hour + time.Second} {
+		for _, endpoint := range []string{"pause", "state"} {
+			t.Run(fmt.Sprintf("expiry_before_%s_%s", endpoint, elapsed), func(t *testing.T) {
+				id := newAttendedRun(t, started)
+				clock := started.Add(elapsed)
+				useClock(t, &clock, nil)
+				before := snapshot(t, id)
+				body := guardedQuestion
+				if endpoint == "pause" {
+					body = `{"claim_generation":4}`
+				}
+				assertExpired(t, call(t, id, endpoint, body, e.worker))
+				assertUnchanged(t, id, before)
+			})
+		}
+	}
+	t.Run("expiry_between_scope_pause_refusal_and_question", func(t *testing.T) {
+		id := newAttendedRun(t, started)
+		e.exec(t, `UPDATE runs SET scope_ceiling=1,milestones_completed='["m1"]',
+ milestones_frozen='[{"id":"m1","title":"one"},{"id":"m2","title":"two"}]' WHERE id=$1`, id)
+		clock := started.Add(time.Hour - time.Second)
+		useClock(t, &clock, nil)
+		before := snapshot(t, id)
+		rec := call(t, id, "pause", `{"claim_generation":4}`, e.worker)
+		assertPause(t, rec, http.StatusConflict, false, "running")
+		if strings.Contains(rec.Body.String(), "wall_expired") {
+			t.Fatal("scope refusal classified as expiry before deadline")
+		}
+		assertUnchanged(t, id, before)
+		clock = started.Add(time.Hour)
+		assertExpired(t, call(t, id, "state", guardedQuestion, e.worker))
+		assertUnchanged(t, id, before)
+	})
+	t.Run("expiry_after_unlocked_snapshot", func(t *testing.T) {
+		id := newAttendedRun(t, started)
+		clock := started.Add(time.Hour - time.Second)
+		useClock(t, &clock, func() {
+			// Begin follows the unlocked ownership snapshot. Change the persisted
+			// start so only the locked row has an elapsed wall.
+			e.exec(t, "UPDATE runs SET started_at=$2 WHERE id=$1", id, started.Add(-time.Second))
+		})
+		e.exec(t, "UPDATE runs SET started_at=$2 WHERE id=$1", id, started.Add(-time.Second))
+		expiredSnapshot := snapshot(t, id)
+		e.exec(t, "UPDATE runs SET started_at=$2 WHERE id=$1", id, started)
+		assertExpired(t, call(t, id, "state", guardedQuestion, e.worker))
+		assertUnchanged(t, id, expiredSnapshot)
+	})
+	for _, change := range []string{"claim_generation=5", "claim_released_at=now()"} {
+		for _, endpoint := range []string{"pause", "state"} {
+			t.Run("expired_"+endpoint+"_"+change, func(t *testing.T) {
+				id := newAttendedRun(t, started)
+				e.exec(t, "UPDATE runs SET "+change+" WHERE id=$1", id)
+				clock := started.Add(2 * time.Hour)
+				useClock(t, &clock, nil)
+				before := snapshot(t, id)
+				body := guardedQuestion
+				if endpoint == "pause" {
+					body = `{"claim_generation":4}`
+				}
+				rec := call(t, id, endpoint, body, e.worker)
+				if rec.Code != http.StatusConflict || !strings.Contains(rec.Body.String(), `"disposition":"stale_claim"`) ||
+					strings.Contains(rec.Body.String(), "wall_expired") {
+					t.Fatalf("stale precedence=%d %s", rec.Code, rec.Body.String())
+				}
+				assertUnchanged(t, id, before)
+			})
+		}
+	}
+	t.Run("accepted_question_replay_after_elapsed_wall", func(t *testing.T) {
+		id := newAttendedRun(t, started)
+		clock := started.Add(time.Minute)
+		useClock(t, &clock, nil)
+		assertPause(t, call(t, id, "state", guardedQuestion, e.worker), http.StatusOK, true, "awaiting_input")
+		run, err := q.GetRunByID(ctx, id)
+		if err != nil || run.OpenQuestionID.String != "expired-question" || run.BudgetWallSeconds.Int32 != 3600 ||
+			run.AutoApprove || run.PauseRequestedAt.Valid {
+			t.Fatalf("accepted question: run=%+v err=%v", run, err)
+		}
+		before := snapshot(t, id)
+		clock = started.Add(2 * time.Hour)
+		assertPause(t, call(t, id, "state", guardedQuestion, e.worker), http.StatusOK, true, "awaiting_input")
+		if snapshot(t, id) != before {
+			t.Fatal("elapsed accepted replay changed question, accounting, messages or inputs")
+		}
+	})
 	t.Run("request_duplicate_ACK_delayed_question_owner_resume", func(t *testing.T) {
 		id := newRun(t)
 		assertPause(t, call(t, id, "pause", `{"claim_generation":4}`, e.worker), 200, true, "running")

@@ -86,10 +86,12 @@ var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cance
 
 // Sentinel errors mapped to HTTP status codes by the handlers.
 var (
-	ErrRunNotFound   = errors.New("run not found")
-	ErrRunNotOwned   = errors.New("run not owned by worker")
-	ErrRepoNotFound  = errors.New("repo not found")
-	ErrIssueNotFound = errors.New("issue not found")
+	ErrRunNotFound = errors.New("run not found")
+	ErrRunNotOwned = errors.New("run not owned by worker")
+	// ErrRunWallExpired refuses an ordinary pause or guarded question at the run deadline.
+	ErrRunWallExpired = errors.New("run wall deadline expired")
+	ErrRepoNotFound   = errors.New("repo not found")
+	ErrIssueNotFound  = errors.New("issue not found")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
 	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
 	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
@@ -2275,6 +2277,15 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	}
 }
 
+// SetClock overrides the service clock for deterministic deadline checks. Configure
+// it before serving requests; a nil clock restores time.Now.
+func (s *Service) SetClock(now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	s.now = now
+}
+
 // -------------------------------------------------------------------------
 // Worker protocol
 // -------------------------------------------------------------------------
@@ -4281,6 +4292,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}
 			if locked.Status != "running" {
 				return locked, false, nil
+			}
+			deadline := RunDeadline(locked.StartedAt, locked.BudgetWallSeconds, locked.BudgetPausedSeconds, locked.Kind, locked.Interactive, locked.Status, s.p.RunTimeout, locked.BudgetExtensionSeconds, locked.BudgetFinalizeSeconds)
+			if deadline != nil && !s.now().Before(*deadline) {
+				return locked, false, ErrRunWallExpired
 			}
 		}
 		// Locked and current: the arms below mutate through the tx, and the lock is held

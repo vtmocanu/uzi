@@ -47,9 +47,22 @@ func (s *Service) RequestWorkerPause(ctx context.Context, wkr store.Worker, runI
 	if !slices.Contains(wkr.ProtocolCapabilities, capability.ParkRunV1) ||
 		run.ClaimGeneration != generation || run.ClaimReleasedAt.Valid ||
 		run.Status != "running" || run.Kind != runkind.Issue || run.Interactive ||
-		!run.PlanMd.Valid || strings.TrimSpace(run.PlanMd.String) == "" ||
 		run.PauseMode.String == "wall" || run.StopKind.Valid || run.BudgetFinalizeSeconds > 0 ||
 		PendingCredentialSwitchSignal(run) != nil {
+		return run, false, nil
+	}
+	stopped, err := q.WorkerPauseHasStopInput(ctx, runID)
+	if err != nil {
+		return store.Run{}, false, err
+	}
+	if stopped {
+		return run, false, nil
+	}
+	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, run.BudgetExtensionSeconds, run.BudgetFinalizeSeconds)
+	if deadline != nil && !s.now().Before(*deadline) {
+		return run, false, ErrRunWallExpired
+	}
+	if !run.PlanMd.Valid || strings.TrimSpace(run.PlanMd.String) == "" {
 		return run, false, nil
 	}
 	completed, err := DecodeMilestoneIDs(run.MilestonesCompleted)
@@ -59,22 +72,11 @@ func (s *Service) RequestWorkerPause(ctx context.Context, wkr store.Worker, runI
 	if run.ScopeCeiling.Valid && int(run.ScopeCeiling.Int32) <= len(completed) {
 		return run, false, nil
 	}
-	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, run.Status, s.p.RunTimeout, run.BudgetExtensionSeconds, run.BudgetFinalizeSeconds)
-	if deadline != nil && !s.now().Before(*deadline) {
-		return run, false, nil
-	}
 	rc, err := q.GetRunClaimContext(ctx, runID)
 	if err != nil {
 		return store.Run{}, false, err
 	}
 	if !run.AutoApprove && !rc.HumanPlanApproved && run.PlanSource != planSourceSeeded {
-		return run, false, nil
-	}
-	stopped, err := q.WorkerPauseHasStopInput(ctx, runID)
-	if err != nil {
-		return store.Run{}, false, err
-	}
-	if stopped {
 		return run, false, nil
 	}
 	if !run.PauseRequestedAt.Valid {

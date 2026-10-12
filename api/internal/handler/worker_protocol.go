@@ -1395,6 +1395,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrRunWallExpired):
+			ack := h.workerStateAck(r, run)
+			ack["applied"] = false
+			ack["reason"] = "wall_expired"
+			httpx.JSON(w, http.StatusConflict, ack)
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
