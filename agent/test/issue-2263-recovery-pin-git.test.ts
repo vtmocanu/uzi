@@ -722,3 +722,26 @@ it("3-argument deleteRecoveryPin deletes a packed-only pin", async () => {
   await cache.deleteRecoveryPin(bare, runId, 4);
   assert.throws(() => present());
 });
+it("3-argument deleteRecoveryPin refuses a symlinked logs/HEAD when HEAD names the pin", async () => {
+  const victim = path.join(root, "victim.txt");
+  await fs.writeFile(victim, "ORIGINAL\n");
+  git(bare, "symbolic-ref", "HEAD", ref);
+  await fs.mkdir(path.join(bare, "logs"), { recursive: true });
+  symlinkSync(victim, path.join(bare, "logs", "HEAD"));
+  await cache.deleteRecoveryPin(bare, runId, 4);
+  assert.equal(present(), sha);
+  assert.equal(await fs.readFile(victim, "utf8"), "ORIGINAL\n");
+});
+it("archived cleanup refuses a symlinked logs/HEAD when HEAD names the pin", async () => {
+  const victim = path.join(root, "victim.txt");
+  await fs.writeFile(victim, "ORIGINAL\n");
+  git(bare, "symbolic-ref", "HEAD", ref);
+  await fs.mkdir(path.join(bare, "logs"), { recursive: true });
+  symlinkSync(victim, path.join(bare, "logs", "HEAD"));
+  const result = await cache.cleanupArchivedRecoveryPin({
+    runId, generation: 4, sourceSha: sha, recoveryPinBareDir: path.basename(bare), isEligible: () => true,
+  });
+  assert.deepEqual(result, { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(present(), sha);
+  assert.equal(await fs.readFile(victim, "utf8"), "ORIGINAL\n");
+});

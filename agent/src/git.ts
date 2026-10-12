@@ -4670,12 +4670,16 @@ export class GitCache {
   private async recoveryPinMetadataSafe(barePath: string, pinRef: string): Promise<boolean> {
     // A repository redirect would point Git's ref store at another repository entirely, and a
     // symlinked packed-refs would let Git rewrite another repository's file through its lock.
-    for (const redirect of [".git", "commondir", "gitdir"]) {
+    for (const redirect of [".git", "commondir", "gitdir", "reftable"]) {
       try { await fs.lstat(path.join(barePath, redirect)); return false; }
       catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
     }
-    try { if (!(await fs.lstat(path.join(barePath, "packed-refs"))).isFile()) return false; }
-    catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    // packed-refs is rewritten through its lock, and logs/HEAD is appended to when HEAD names the
+    // pin: each must be a regular file (never a symlink) or absent.
+    for (const file of ["packed-refs", "logs/HEAD"]) {
+      try { if (!(await fs.lstat(path.join(barePath, file))).isFile()) return false; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    }
     const parts = pinRef.split("/");
     for (const top of ["logs", ""]) {
       let cur = barePath;
@@ -4697,9 +4701,9 @@ export class GitCache {
 
   /**
    * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
-   * replacement exists (the bundle was archived, or the head is already forge-published). Never
-   * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
-   * never-deleted posture `refs/uzi-runner` already carries, PRD #218).
+   * replacement exists (the bundle was archived, or the head is already forge-published). A failed
+   * cleanup only leaves a harmless ref on the long-lived bare (the same never-deleted posture
+   * `refs/uzi-runner` already carries, PRD #218); only a Git boundary abort propagates.
    */
   async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
     if (expectedSha === undefined) {
@@ -4912,10 +4916,14 @@ export class GitCache {
       // the logs chain gets the same nofollow safe-owner admission (absent allowed, stop at the
       // first absent level) and the reflog file itself must be a regular safe file or absent.
       let logsMissing = false;
+      let logsLevel = 0;
       for (const dir of ["logs", "logs/refs", "logs/refs/uzi-recovery-pin", `logs/refs/uzi-recovery-pin/${input.runId}`]) {
         if (!await remember(path.join(bare, dir), evidence, true)) { logsMissing = true; break; }
+        logsLevel++;
       }
       if (!logsMissing) await remember(path.join(bare, "logs", ref), evidence, false);
+      // A HEAD naming the pin makes Git append a HEAD reflog entry through logs/HEAD.
+      if (logsLevel > 0) await remember(path.join(bare, "logs/HEAD"), evidence, false);
       let tip = packedTip;
       if (loose !== undefined) {
         if (!/^[a-f0-9]{40}\n?(?![\s\S])/.test(loose)) refuse("unsafe_metadata");
