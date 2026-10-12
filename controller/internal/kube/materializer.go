@@ -634,9 +634,10 @@ func (m *Materializer) Reconcile(ctx context.Context, desired []protocol.Desired
 // size-drift arm, {Nix, Data} for legacy disk pressure. DinD is handled by its
 // separately fenced lifecycle; legacy deletion refuses selectors containing it.
 type recycleVolumes struct {
-	Nix  bool
-	Data bool
-	DinD bool
+	Pressure bool
+	Nix      bool
+	Data     bool
+	DinD     bool
 }
 
 // recycleWorkerVolumes stops a worker and tears selected PVC(s) down so the
@@ -678,7 +679,7 @@ func (m *Materializer) recycleWorkerVolumes(ctx context.Context, w protocol.Desi
 	if w.Busy && !rollDespiteBusy {
 		if w.DrainingSince == nil || (rollFrom(ctx, w.ID) != nil && !imageRollDrain(w)) {
 			if m.cordoner != nil {
-				if err := m.requestWorkerDrain(ctx, w); err != nil {
+				if err := m.requestRecycleDrain(ctx, w, vols); err != nil {
 					m.log.Warn("cordon request failed; deferring recycle (fail-safe)", "worker_id", w.ID, "error", err)
 					if e := rollFrom(ctx, w.ID); e != nil && e.marker != nil {
 						return fmt.Errorf("image-roll recycle cordon unconfirmed; re-poll required: %w", err)
@@ -904,7 +905,7 @@ func (m *Materializer) reconcileWorkerWithLegacy(ctx context.Context, w protocol
 			m.log.Info(fmt.Sprintf("disk-recycle-skipped-cooldown worker=%s", w.ID))
 			// display-only capacity-warn: fall through to normal reconcile; do NOT return.
 		default:
-			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true})
+			return m.recycleWorkerVolumes(ctx, w, obs, ns, recycleVolumes{Nix: true, Data: true, Pressure: true})
 		}
 	}
 

@@ -205,7 +205,111 @@ func TestHostedRollRetainedClaimsBridge(t *testing.T) {
 	if busy != 3 {
 		t.Fatalf("fresh HTTP busy count=%d", busy)
 	}
+
 	t.Log("M2 real HTTP poll/cordon channel + simulated UID/RV-enforcing kube: exactly one canary update, target ImagePullBackOff; retained deployments unchanged beyond 1h deadline; real API claims then Busy=3 without sibling drain")
+}
+
+func TestHostedPressureClearedClaimsBridge(t *testing.T) {
+	url := os.Getenv("UZI_ROLL_TEST_API")
+	if url == "" {
+		t.Skip("invoked by API TestHostedRollRetainedClaimsLiveDB")
+	}
+	url, err := hostedRollFixtureURL(url)
+	if err != nil {
+		t.Fatal(err)
+	}
+	ctx := context.Background()
+	key := os.Getenv("UZI_ROLL_TEST_CONTROLLER_KEY")
+	client := apiclient.New(url, key, 10*time.Second, nil, slog.New(slog.NewTextHandler(io.Discard, nil)))
+	var members []struct {
+		ID  string `json:"id"`
+		UID string `json:"uid"`
+	}
+	if json.Unmarshal([]byte(os.Getenv("UZI_ROLL_TEST_MEMBERS")), &members) != nil || len(members) != 4 {
+		t.Fatal("invalid member input")
+	}
+	resp, err := client.Poll(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	var pressureWorker protocol.DesiredWorker
+	for _, w := range resp.Workers {
+		for _, member := range members {
+			if w.ID == member.ID && w.Busy && w.DrainingSince == nil && w.DrainingReason == nil {
+				pressureWorker = w
+				break
+			}
+		}
+		if pressureWorker.ID != "" {
+			break
+		}
+	}
+	pressureID := pressureWorker.ID
+	if pressureWorker.ID == "" {
+		t.Fatal("pressure worker missing from initial poll")
+	}
+	cfg := testConfig()
+	cfg.RollTargetVersion = "" // A bare image tag provides no exact roll version.
+	pressureMat, pressureKube := newMatWithDrain(t, client, DrainPolicy{Deadline: time.Hour}, RenderDeployment(cfg, pressureWorker, testSpec(t, pressureWorker.Template, pressureWorker.Size)))
+	pressureMat.cfg = cfg
+	for _, pvc := range RenderPVCs(cfg, pressureWorker, testSpec(t, pressureWorker.Template, pressureWorker.Size)) {
+		if err := pressureKube.Tracker().Create(corev1.SchemeGroupVersion.WithResource("persistentvolumeclaims"), pvc, pvc.Namespace); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pressureCall := func(phase string) {
+		t.Helper()
+		body, _ := json.Marshal(map[string]string{"id": pressureID, "phase": phase})
+		req, err := http.NewRequestWithContext(ctx, http.MethodPost, url+"/fixture/pressure", bytes.NewReader(body))
+		if err != nil {
+			t.Fatal(err)
+		}
+		req.Header.Set("Authorization", "Bearer "+key)
+		r, err := http.DefaultClient.Do(req)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := r.Body.Close(); err != nil {
+			t.Fatal(err)
+		}
+		if r.StatusCode != 204 {
+			t.Fatalf("pressure callback %s status=%d", phase, r.StatusCode)
+		}
+	}
+	pressureTick := func() {
+		t.Helper()
+		p, err := client.Poll(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		var selected []protocol.DesiredWorker
+		for _, w := range p.Workers {
+			if w.ID == pressureID {
+				selected = append(selected, w)
+			}
+		}
+		if len(selected) != 1 {
+			t.Fatal("pressure worker missing")
+		}
+		obs, err := pressureMat.Observe(ctx)
+		if err != nil {
+			t.Fatal(err)
+		}
+		if err := pressureMat.Reconcile(ctx, selected, obs); err != nil {
+			t.Fatal(err)
+		}
+	}
+	pressureCall("begin")
+	pressureTick()
+	pressureCall("denied")
+	pressureTick()
+	pressureCall("success")
+	for _, action := range pressureKube.Actions() {
+		if action.GetVerb() == "delete" {
+			t.Fatal("cleared pressure replay destroyed an object")
+		}
+	}
+	t.Log("real pressure routes: two reconcile ticks, new unassigned claim denied then succeeded after reason-owned release")
 }
 
 // The cross-module parent is an httptest server, never an external endpoint.

@@ -71,7 +71,7 @@ func decodePoll(resp *http.Response) (protocol.PollResponse, error) {
 			return reject()
 		}
 		seen[id] = true
-		if w.DrainingReason != nil && *w.DrainingReason != "image_roll" {
+		if w.DrainingReason != nil && *w.DrainingReason != "image_roll" && *w.DrainingReason != "pressure_recycle" {
 			return reject()
 		}
 		if e := w.RollEvidence; e != nil {

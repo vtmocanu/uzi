@@ -44,21 +44,22 @@ type rollMarker struct {
 	Completed       bool         `json:"completed"`
 }
 type rollEntry struct {
-	w          protocol.DesiredWorker
-	o          reconcile.ObservedWorker
-	target     *appsv1.Deployment
-	dep        *appsv1.Deployment
-	marker     *rollMarker
-	pods       []corev1.Pod
-	volumeRefs map[string]bool
-	sets       map[string]appsv1.ReplicaSet
-	coverage   rollCoverage
-	ns         string
-	drift      bool
-	admitted   bool
-	blocked    string
-	recovery   bool
-	claim      *corev1.PersistentVolumeClaim
+	w              protocol.DesiredWorker
+	o              reconcile.ObservedWorker
+	target         *appsv1.Deployment
+	dep            *appsv1.Deployment
+	marker         *rollMarker
+	pods           []corev1.Pod
+	volumeRefs     map[string]bool
+	sets           map[string]appsv1.ReplicaSet
+	coverage       rollCoverage
+	ns             string
+	drift          bool
+	admitted       bool
+	blocked        string
+	recovery       bool
+	claim          *corev1.PersistentVolumeClaim
+	rawReservation bool
 }
 type rollTick struct {
 	entries   map[string]*rollEntry
@@ -146,6 +147,21 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 	}
 	pools := map[string][]*rollEntry{}
 	for _, e := range t.entries {
+		m.releasePressureHold(ctx, t, e)
+		if firstProvision(e) {
+			e.admitted = true
+			t.outcomes[e.w.ID].State = "completed"
+			continue
+		}
+		// An unchanged busy worker can acquire its independent pressure cordon
+		// without an exact image-roll version. This admits no replacement.
+		if t.outcomes[e.w.ID].TargetVersion == "" && e.blocked == "" && e.dep != nil &&
+			!e.drift && e.marker == nil && !e.rawReservation && e.w.Busy && e.w.DiskPressure &&
+			e.w.DrainingSince == nil && e.w.DrainingReason == nil && !e.w.CustodyHeld && !maintenanceActive(e.w) {
+			e.admitted = true
+			t.outcomes[e.w.ID].State = "completed"
+			continue
+		}
 		coverage, ok := coverageOf(e.w, e.ns)
 		if e.marker != nil {
 			if !ok || e.marker.Coverage.Owner != coverage.Owner || e.marker.Coverage.Lane != e.ns {
@@ -157,6 +173,9 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 		e.coverage = coverage
 		if !ok && e.blocked == "" {
 			e.blocked = "API coverage evidence unavailable; explicit recovery required"
+		}
+		if e.dep == nil && e.marker == nil && !independentRebuild(e) && e.blocked == "" {
+			e.blocked = "missing deployment lacks first-provision evidence; explicit recovery required"
 		}
 		if t.outcomes[e.w.ID].TargetVersion == "" {
 			e.blocked = "target version unknown; configure exact override"
@@ -178,7 +197,7 @@ func (m *Materializer) planRoll(ctx context.Context, desired []protocol.DesiredW
 			}
 			// API skew must not prevent first provisioning or independent maintenance
 			// of an unchanged template. No drift or reservation is admitted here.
-			if e.blocked == "API coverage evidence unavailable; explicit recovery required" && e.marker == nil && !e.drift && t.outcomes[e.w.ID].TargetVersion != "" && (!e.o.HasDeployment || e.dep != nil) {
+			if e.blocked == "API coverage evidence unavailable; explicit recovery required" && e.marker == nil && !e.drift && t.outcomes[e.w.ID].TargetVersion != "" && e.dep != nil {
 				e.admitted = true
 				e.blocked = ""
 			}
@@ -653,7 +672,7 @@ func (m *Materializer) releaseRollHold(ctx context.Context, t *rollTick, e *roll
 	}
 }
 func (m *Materializer) confirmAdmission(ctx context.Context, t *rollTick, e *rollEntry) error {
-	if e.coverage.Owner == "" || e.marker != nil || m.drain.ForceRoll || (e.dep != nil && !e.drift) {
+	if firstProvision(e) || e.coverage.Owner == "" || e.marker != nil || m.drain.ForceRoll || (e.dep != nil && !e.drift) {
 		return nil
 	}
 	p := t.outcomes[e.w.ID]
@@ -676,6 +695,38 @@ func (m *Materializer) confirmAdmission(ctx context.Context, t *rollTick, e *rol
 		return nil
 	}
 	return m.reserveRoll(ctx, e, r)
+}
+
+// firstProvision requires positive API history evidence and a complete cluster snapshot.
+func firstProvision(e *rollEntry) bool {
+	p := e.w.RollEvidence
+	return e.blocked == "" && p != nil && p.NeverRegistered != nil && *p.NeverRegistered && !p.Registered &&
+		e.dep == nil && !e.o.HasDeployment && len(e.pods) == 0 && !e.rawReservation && e.marker == nil &&
+		e.w.DrainingSince == nil && e.w.DrainingReason == nil && !e.w.CustodyHeld && !maintenanceActive(e.w)
+}
+
+// Each tick attempts at most one reason-owned release per worker. Failure leaves
+// ownership intact for the next poll and does not prevent sibling releases.
+func (m *Materializer) releasePressureHold(ctx context.Context, t *rollTick, e *rollEntry) {
+	w := e.w
+	if e.blocked != "" || e.dep == nil || e.drift || e.marker != nil || e.rawReservation ||
+		w.DrainingSince == nil || w.DrainingReason == nil || *w.DrainingReason != "pressure_recycle" ||
+		w.DiskPressure || w.CustodyHeld || maintenanceActive(w) || e.dep.DeletionTimestamp != nil ||
+		e.dep.Spec.Replicas == nil || *e.dep.Spec.Replicas != 1 {
+		return
+	}
+	spec, err := m.resolver.Resolve(w.Template, w.Size)
+	if err != nil || !e.o.HasNixPVC || e.o.NixPVCSize == nil || e.o.NixPVCSize.Cmp(spec.NixSize) < 0 ||
+		!e.o.HasDataPVC || !e.o.DataPVCLive || (w.Docker && (!e.o.HasDinDDataPVC || !e.o.DinDPVCLive)) {
+		return
+	}
+	c, ok := m.cordoner.(rollCordoner)
+	if !ok {
+		return
+	}
+	if err := c.ClearDrainWithReason(ctx, w.ID, "pressure_recycle"); err != nil {
+		t.errors = append(t.errors, fmt.Errorf("pressure release unconfirmed for %s: %w", w.ID, err))
+	}
 }
 
 func independentRebuild(e *rollEntry) bool {
@@ -711,6 +762,17 @@ func (m *Materializer) rollDrain(ctx context.Context, id string) error {
 		return fmt.Errorf("image-roll drain channel unavailable")
 	}
 	return c.RequestDrainWithReason(ctx, id, "image_roll")
+}
+func (m *Materializer) requestRecycleDrain(ctx context.Context, w protocol.DesiredWorker, vols recycleVolumes) error {
+	e := rollFrom(ctx, w.ID)
+	if vols.Pressure && e != nil && !e.drift && e.marker == nil && !e.rawReservation {
+		c, ok := m.cordoner.(rollCordoner)
+		if !ok {
+			return fmt.Errorf("pressure drain channel unavailable")
+		}
+		return c.RequestDrainWithReason(ctx, w.ID, "pressure_recycle")
+	}
+	return m.requestWorkerDrain(ctx, w)
 }
 func (m *Materializer) requestWorkerDrain(ctx context.Context, w protocol.DesiredWorker) error {
 	if e := rollFrom(ctx, w.ID); e != nil && !w.Ephemeral && (e.drift || (e.marker != nil && !e.marker.Completed)) {
@@ -1116,12 +1178,18 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 	// The retained /data claim carries the same bounded immutable reservation
 	// during a Deployment recycle. No separate journal or new kube object is used.
 	claims := map[string]*corev1.PersistentVolumeClaim{}
+	rawReservations := map[string]bool{}
 	err = maintenancePages(ctx, "roll retained claims", func(opt metav1.ListOptions) (int, string, error) {
 		page, err := m.client.CoreV1().PersistentVolumeClaims(ns).List(ctx, opt)
 		if err != nil {
 			return 0, "", err
 		}
 		for _, p := range page.Items {
+			if id, ours := IsOurs(p.Labels); ours {
+				if _, present := p.Annotations[annotationRoll]; present {
+					rawReservations[id] = true
+				}
+			}
 			if id, ours := IsOurs(p.Labels); ours && p.Name == dataPVCName(id) {
 				claims[id] = p.DeepCopy()
 			}
@@ -1132,6 +1200,7 @@ func (m *Materializer) rollSnapshot(ctx context.Context, ns string, entries []*r
 		return err
 	}
 	for _, e := range entries {
+		e.rawReservation = rawReservations[e.w.ID]
 		e.dep = deps[e.w.ID]
 		e.claim = claims[e.w.ID]
 		if e.dep == nil && e.claim != nil && e.claim.Annotations[annotationRoll] != "" {

@@ -35,6 +35,27 @@ func newMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientse
 
 func token(s string) *string { return &s }
 
+// newWorkerFixture explicitly represents API-confirmed first provisioning.
+func newWorkerFixture(w protocol.DesiredWorker) protocol.DesiredWorker {
+	yes := true
+	w.RollEvidence = &protocol.RollEvidence{NeverRegistered: &yes}
+	return w
+}
+
+// retainedReplacementFixture carries the reservation left by an admitted replacement
+// on /data. It is not first-provision history for a previously registered worker.
+func retainedReplacementFixture(t *testing.T, client *fake.Clientset, w protocol.DesiredWorker) {
+	t.Helper()
+	p, err := client.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVCName(w.ID), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Annotations = markedDeployment(t, testConfig(), w, false).Annotations
+	if _, err := client.CoreV1().PersistentVolumeClaims(p.Namespace).Update(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
+
 // assertNoSecretReads is THE gate on Decision 1's load-bearing line: the controller
 // holds create/delete on Secrets and nothing more, because k8s has no
 // existence-only verb and a get/list would let a compromised controller harvest
@@ -70,7 +91,7 @@ func secretVerbs(client *fake.Clientset) []string {
 
 func TestReconcileCreatesTheWholeObjectSetForANewWorker(t *testing.T) {
 	m, client := newMat(t)
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")}
+	w := newWorkerFixture(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")})
 
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -113,7 +134,7 @@ func TestUnknownNamesSkipRenderingAndNEVERTearDownTheirObjects(t *testing.T) {
 			m, client := newMat(t, existing, pvcFor("w1", "data"), pvcFor("w1", "nix"))
 
 			skewed := protocol.DesiredWorker{ID: "w1", Template: tc.template, Size: tc.size}
-			healthy := protocol.DesiredWorker{ID: "w2", Template: "base", Size: "m", JoinToken: token("uzw_t")}
+			healthy := newWorkerFixture(protocol.DesiredWorker{ID: "w2", Template: "base", Size: "m", JoinToken: token("uzw_t")})
 			observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, SpecHash: "some-hash", HasDataPVC: true, HasNixPVC: true}}
 
 			// It must not crash the loop: one unknown name must never stall the fleet.
@@ -152,7 +173,7 @@ func TestUnknownNamesSkipRenderingAndNEVERTearDownTheirObjects(t *testing.T) {
 // only the first is the contract.
 func TestANullJoinTokenTouchesTheSecretNotAtAll(t *testing.T) {
 	m, client := newMat(t)
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: nil}
+	w := newWorkerFixture(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: nil})
 
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -174,7 +195,7 @@ func TestANullJoinTokenTouchesTheSecretNotAtAll(t *testing.T) {
 // as success. That is the whole of it.
 func TestASecondReconcileTreatsAlreadyExistsAsSuccess(t *testing.T) {
 	m, client := newMat(t)
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")}
+	w := newWorkerFixture(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")})
 
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err != nil {
 		t.Fatalf("first Reconcile: %v", err)
@@ -502,7 +523,7 @@ func TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation(t *testin
 
 	// Fresh docker worker: all three claims created.
 	m, client := newDockerMat(t)
-	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+	dock := newWorkerFixture(protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")})
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{dock}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -515,7 +536,7 @@ func TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation(t *testin
 
 	// Fresh PLAIN worker on the same (docker-capable) controller: two claims, no third.
 	m, client = newDockerMat(t)
-	plain := protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")}
+	plain := newWorkerFixture(protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")})
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{plain}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -620,8 +641,8 @@ func pvcForNS(id, kind, ns string) *corev1.PersistentVolumeClaim {
 func TestReconcilePlacesDockerAndPlainWorkersInSeparateNamespaces(t *testing.T) {
 	m, client := newDockerMat(t)
 	ctx := context.Background()
-	plain := protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")}
-	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+	plain := newWorkerFixture(protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")})
+	dock := newWorkerFixture(protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")})
 
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{plain, dock}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1361,6 +1382,8 @@ func TestNixSizeDriftRecyclesThenReMintsAtNewSize(t *testing.T) {
 		t.Fatalf("after the recycle, observed = %+v; want {HasDeployment:false HasNixPVC:false NixPVCSize:nil HasDataPVC:true}", o)
 	}
 
+	w = evidence(w, time.Now())
+	retainedReplacementFixture(t, client, w)
 	client.ClearActions()
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
 		t.Fatalf("tick 2 Reconcile: %v", err)
@@ -1491,6 +1514,9 @@ func TestNixLiveAtDesiredSizeWithoutDeploymentRecreatesDeployment(t *testing.T) 
 	}
 
 	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+	w = evidence(w, time.Now())
+	retainedReplacementFixture(t, client, w)
+	client.ClearActions()
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -1553,23 +1579,25 @@ func TestNixSizeDriftBusyWorkerIsCordonedNotRecycled(t *testing.T) {
 func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	ctx := context.Background()
 	ns := testConfig().Namespace
-	hash := currentHash(t, "w1", 0)
+	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", DiskPressure: true}, time.Now())
+	dep := markedDeployment(t, testConfig(), w, false)
+	zero := int32(0)
+	dep.Spec.Replicas = &zero
 	m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
 		RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
-		deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		dep, pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
 
 	observed, err := m.Observe(ctx)
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
 	// Idle worker reporting disk pressure; the pod holds its token, so join_token is nil.
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, JoinToken: nil}
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
 		t.Fatalf("tick 1 Reconcile: %v", err)
 	}
 	del := deletedSet(client)
-	if !del["deployments/uzi-hw-w1"] {
-		t.Errorf("tick 1 must delete the Deployment for the disk-pressure recycle; got %v", keysOf(del))
+	if del["deployments/uzi-hw-w1"] {
+		t.Error("tick 1 must retain replacement metadata at zero replicas")
 	}
 	if !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
 		t.Errorf("tick 1 must delete the nix PVC; got %v", keysOf(del))
@@ -1589,7 +1617,7 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	}
 	assertNoSecretReads(t, client)
 
-	// --- Tick 2: re-mint. Re-Observe the fake (Deployment + both PVCs now gone). The
+	// --- Tick 2: re-mint. Both PVCs are gone; replacement metadata remains. The
 	// worker is no longer under pressure — once its pod is torn down it stops reporting a
 	// disk metric, so the api's stale pressure signal clears, which is what lets the
 	// reprovision proceed (the disk-pressure arm is gated on DiskPressure). ---
@@ -1597,14 +1625,14 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-Observe between ticks: %v", err)
 	}
-	// Deployment + BOTH PVCs gone, and the Secret is never observed — so NOTHING remains
-	// stamped for this worker. It reprovisions off the DESIRED set (Reconcile iterates
-	// desired, not observed), the whole point of the recycle being a full re-mint.
-	if len(observed2) != 0 {
-		t.Fatalf("after recycling both volumes + the Deployment, observed = %+v; want nothing left for the worker", observed2)
+	// The admitted replacement retains its zero-replica Deployment. Both volumes
+	// must still be re-minted, and the delivered Secret must remain untouched.
+	if len(observed2) != 1 || !observed2[0].HasDeployment || observed2[0].HasDataPVC || observed2[0].HasNixPVC {
+		t.Fatalf("after recycling both volumes + the Deployment, observed = %+v; want retained Deployment only", observed2)
 	}
 	client.ClearActions()
-	w2 := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: false, JoinToken: nil}
+	w2 := w
+	w2.DiskPressure = false
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w2}, observed2); err != nil {
 		t.Fatalf("tick 2 Reconcile: %v", err)
 	}
@@ -1613,8 +1641,17 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	if !equalStrings(created, []string{"uzi-hw-w1-data", "uzi-hw-w1-nix"}) {
 		t.Fatalf("tick 2 pvc creates = %v, want BOTH re-minted [uzi-hw-w1-data uzi-hw-w1-nix]", created)
 	}
-	if got := createdDeploymentNames(client); !equalStrings(got, []string{"uzi-hw-w1"}) {
-		t.Errorf("tick 2 deployment creates = %v, want exactly [uzi-hw-w1]", got)
+	// Observe the re-minted volumes before restarting the retained Deployment.
+	observed3, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w2}, observed3); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.AppsV1().Deployments(ns).Get(ctx, deploymentName(w.ID), metav1.GetOptions{})
+	if err != nil || got.Spec.Replicas == nil || *got.Spec.Replicas != 1 {
+		t.Fatalf("observed volumes did not restart retained replacement: %v", err)
 	}
 	if _, err := client.AppsV1().Deployments(ns).Get(ctx, "uzi-hw-w1", metav1.GetOptions{}); err != nil {
 		t.Errorf("the Deployment must be recreated on tick 2: %v", err)

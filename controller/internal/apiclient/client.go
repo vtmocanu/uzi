@@ -172,11 +172,14 @@ func (c *Client) reportStatus(ctx context.Context, report protocol.StatusReport,
 // running, never hard-killed; deferring costs a tick, hard-killing costs a run.
 func (c *Client) RequestDrainWithReason(ctx context.Context, workerID string, reason ...string) error {
 	var body []byte
+	if len(reason) > 1 {
+		return fmt.Errorf("apiclient: invalid drain reason")
+	}
 	if len(reason) > 0 && reason[0] != "" {
-		if len(reason) != 1 || reason[0] != "image_roll" {
+		if len(reason) != 1 || (reason[0] != "image_roll" && reason[0] != "pressure_recycle") {
 			return fmt.Errorf("apiclient: invalid drain reason")
 		}
-		body = []byte(`{"reason":"image_roll"}`)
+		body, _ = json.Marshal(map[string]string{"reason": reason[0]})
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/workers/"+workerID+"/drain", bytes.NewReader(body))
 	if err != nil {
@@ -244,15 +247,19 @@ func (c *Client) ConfirmImageRollDrain(ctx context.Context, workerID string) (pr
 //     holds, so treating 404 as an error would be inverted from cordon for no reason and
 //     would inject a spurious per-tick error for a condition that is already correct.
 //
-// Only OTHER non-2xx (5xx store errors) and transport/build errors are returned as
-// errors; the caller logs and retries next tick.
+// A pressure_recycle release requires an accepted control write, so its 404 is
+// returned as an error. Legacy and image_roll clears retain the 404 behavior above.
+// Other non-2xx and transport/build errors are returned for retry next tick.
 func (c *Client) ClearDrainWithReason(ctx context.Context, workerID string, reason ...string) error {
 	var body []byte
+	if len(reason) > 1 {
+		return fmt.Errorf("apiclient: invalid drain reason")
+	}
 	if len(reason) > 0 && reason[0] != "" {
-		if len(reason) != 1 || reason[0] != "image_roll" {
+		if len(reason) != 1 || (reason[0] != "image_roll" && reason[0] != "pressure_recycle") {
 			return fmt.Errorf("apiclient: invalid drain reason")
 		}
-		body = []byte(`{"reason":"image_roll"}`)
+		body, _ = json.Marshal(map[string]string{"reason": reason[0]})
 	}
 	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/controller/workers/"+workerID+"/drain", bytes.NewReader(body))
 	if err != nil {
@@ -266,10 +273,8 @@ func (c *Client) ClearDrainWithReason(ctx context.Context, workerID string, reas
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// 204 is the documented success; a 404 means the worker already is not draining —
-	// both are the desired "not cordoned" end state (see doc comment). Everything else
-	// (5xx) is a real error worth retrying next tick.
-	if resp.StatusCode == http.StatusNotFound {
+	// Legacy and image_roll releases tolerate 404; pressure_recycle requires 2xx.
+	if resp.StatusCode == http.StatusNotFound && (len(reason) == 0 || reason[0] != "pressure_recycle") {
 		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {

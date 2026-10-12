@@ -78,7 +78,7 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		return data, resp.StatusCode, err
 	}
 	var base string
-	claimErrors := make(chan error, 1)
+	claimErrors := make(chan error, 4)
 	mux := http.NewServeMux()
 	mux.Handle("/api/", router)
 	mux.HandleFunc("/fixture/claim-retained", func(w http.ResponseWriter, r *http.Request) {
@@ -126,6 +126,75 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 				fail(fmt.Errorf("retained worker cordoned"))
 				return
 			}
+		}
+		claimErrors <- nil
+		w.WriteHeader(204)
+	})
+	// Pressure callbacks mutate only this fixture's worker/run state; all drain,
+	// poll and claim decisions still cross the real authenticated production routes.
+	var pressureRun uuid.UUID
+	mux.HandleFunc("/fixture/pressure", func(w http.ResponseWriter, r *http.Request) {
+		if r.Header.Get("Authorization") != "Bearer "+controllerKey {
+			w.WriteHeader(401)
+			return
+		}
+		var input struct {
+			ID    string `json:"id"`
+			Phase string `json:"phase"`
+		}
+		if json.NewDecoder(r.Body).Decode(&input) != nil || keys[input.ID] == "" {
+			w.WriteHeader(400)
+			return
+		}
+		fail := func(err error) { claimErrors <- err; w.WriteHeader(500) }
+		id := uuid.MustParse(input.ID)
+		switch input.Phase {
+		case "begin":
+			if _, err := f.pool.Exec(ctx, "UPDATE workers SET stats_disk_pressure_streak=2 WHERE id=$1", id); err != nil {
+				fail(err)
+				return
+			}
+		case "denied":
+			// Settle the previous assignment so a genuinely new, unassigned run tests
+			// drain admission independently of slot occupancy or resume affinity.
+			if _, err := f.pool.Exec(ctx, "UPDATE runs SET status='failed' WHERE worker_id=$1 AND status='claimed'", id); err != nil {
+				fail(err)
+				return
+			}
+			iid := f.iid + 10
+			if _, err := f.pool.Exec(ctx, `INSERT INTO issues(repo_id,forge_issue_iid,title,state,labels,web_url,has_prd_link,forge_updated_at,synced_at) VALUES($1,$2,'pressure issue','opened','["PRD","uzi"]'::jsonb,'https://example.com',true,now(),now())`, f.repoID, iid); err != nil {
+				fail(err)
+				return
+			}
+			run, err := q.CreateRun(ctx, store.CreateRunParams{Harness: "claude", UserID: f.owner, RepoID: f.repoID, IssueIid: pgconv.Int8Ptr(&iid), IssueTitle: "pressure", IssueDescription: "pressure", PlanSource: "agent", TriggerSource: "manual"})
+			if err != nil || run.WorkerID.Valid {
+				fail(fmt.Errorf("new pressure run not unassigned: %v", err))
+				return
+			}
+			pressureRun = run.ID
+			_, status, err := call(base, "/api/worker/runs/claim", keys[input.ID], map[string]any{"active_snapshot": workersvc.ActiveSnapshot{RegisterNonce: nonces[input.ID], SnapshotEpoch: 3, Active: []workersvc.ActiveRunEntry{}}})
+			held, loadErr := q.GetRunByID(ctx, pressureRun)
+			wk, workerErr := q.GetWorkerByID(ctx, id)
+			if err != nil || status != 204 || loadErr != nil || held.WorkerID.Valid || held.Status != "queued" || workerErr != nil || !wk.DrainingSince.Valid || wk.DrainingReason.String != "pressure_recycle" {
+				fail(fmt.Errorf("pressure claim deny status=%d transport=%v run=%s", status, err, held.Status))
+				return
+			}
+			if _, err := f.pool.Exec(ctx, "UPDATE workers SET stats_disk_pressure_streak=0 WHERE id=$1", id); err != nil {
+				fail(err)
+				return
+			}
+		case "success":
+			raw, status, err := call(base, "/api/worker/runs/claim", keys[input.ID], map[string]any{"active_snapshot": workersvc.ActiveSnapshot{RegisterNonce: nonces[input.ID], SnapshotEpoch: 4, Active: []workersvc.ActiveRunEntry{}}})
+			var payload workersvc.ClaimPayload
+			run, loadErr := q.GetRunByID(ctx, pressureRun)
+			wk, workerErr := q.GetWorkerByID(ctx, id)
+			if err != nil || status != 200 || json.Unmarshal(raw, &payload) != nil || payload.RunID != pressureRun.String() || loadErr != nil || !run.WorkerID.Valid || uuid.UUID(run.WorkerID.Bytes) != id || run.Status != "claimed" || workerErr != nil || wk.DrainingSince.Valid || wk.DrainingReason.Valid {
+				fail(fmt.Errorf("pressure claim success status=%d transport=%v", status, err))
+				return
+			}
+		default:
+			w.WriteHeader(400)
+			return
 		}
 		claimErrors <- nil
 		w.WriteHeader(204)
@@ -179,29 +248,38 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		}
 	}
 	raw, _ := json.Marshal(members)
-	cmd := exec.CommandContext(ctx, childBin, "-test.count=1", "-test.v", "-test.run", "^TestHostedRollRetainedClaimsBridge$") //nolint:gosec // G204: runs the test binary this test just built into t.TempDir, with fixed arguments; no shell.
+	cmd := exec.CommandContext(ctx, childBin, "-test.count=1", "-test.v", "-test.run", "^(TestHostedRollRetainedClaimsBridge|TestHostedPressureClearedClaimsBridge)$") //nolint:gosec // G204: runs the test binary this test just built into t.TempDir, with fixed arguments; no shell.
 	cmd.Dir = filepath.Join(controllerDir, "internal", "kube")
 	cmd.Env = append(os.Environ(), "UZI_ROLL_TEST_API="+base, "UZI_ROLL_TEST_CONTROLLER_KEY="+controllerKey, "UZI_ROLL_TEST_MEMBERS="+string(raw))
 	out, err := cmd.CombinedOutput()
 	t.Logf("controller child:\n%s", out)
 	if err != nil {
-		select {
-		case claimErr := <-claimErrors:
-			t.Logf("claim callback: %v", claimErr)
-		default:
+		for i := 0; i < 4; i++ {
+			select {
+			case claimErr := <-claimErrors:
+				t.Logf("claim callback: %v", claimErr)
+			default:
+			}
 		}
 		t.Fatalf("controller child exit: %v", err)
 	}
-	if !strings.Contains(string(out), "--- PASS: TestHostedRollRetainedClaimsBridge") || strings.Contains(string(out), "--- SKIP:") {
+	if !strings.Contains(string(out), "--- PASS: TestHostedRollRetainedClaimsBridge") ||
+		!strings.Contains(string(out), "--- PASS: TestHostedPressureClearedClaimsBridge") || strings.Contains(string(out), "--- SKIP:") {
 		t.Fatal("child positive control missing")
 	}
-	select {
-	case err := <-claimErrors:
-		if err != nil {
-			t.Fatal(err)
+	for i := 0; i < 4; i++ {
+		select {
+		case err := <-claimErrors:
+			if err != nil {
+				t.Fatal(err)
+			}
+		default:
+			t.Fatal("real claim/pressure callback never ran")
 		}
-	default:
-		t.Fatal("real claim callback never ran")
 	}
+	if len(claimErrors) != 0 {
+		t.Fatal("unexpected extra claim/pressure callback")
+	}
+	t.Log("PG pressure proof: busy unchanged worker cordoned on tick one; new unassigned run denied; cleared pressure released on tick two; same run claimed and SQL assignment verified")
 	t.Log("PG proof: N=4, N-1=3 retained old workers each claimed a real queued compatible owner run after controller deadline; SQL assignments verified; post-claim fresh HTTP Busy=3, no retained API cordon")
 }
