@@ -157,7 +157,8 @@ func TestWorkerRunOwnershipReportsProviderHoldLiveDB(t *testing.T) {
 		VALUES ($1,$2,$3,'issue',$4,'t','d','running',$5,1)`, running, e.owner.ID, e.repoID, e.iid, e.worker)
 	if body := probe(running); body["status"] != "running" {
 		t.Fatalf("running probe = %v", body)
-	} else if _, present := body["hold_reason"]; present {
-		t.Fatalf("a running run's probe carries hold_reason: %v", body)
+	} else if body["hold_reason"] != nil {
+		// main's ownership body always carries hold_reason (null without a hold).
+		t.Fatalf("a running run's probe carries a hold_reason: %v", body)
 	}
 }
