@@ -15829,8 +15829,8 @@ export class RunRunner {
    * Order: (1) with a clone, latch `preserveRecoveryClone` SYNCHRONOUSLY, before any await, so no
    * teardown path can dispose of it while the rest runs; (2) prove the run's processes and
    * attributed containers quiet (`own` mode, forced process scan), which kills only attributed
-   * processes; (3) when the proof holds and the clone is clean at a head the bare's tracking ref
-   * already holds under this run's committed ownership, hand teardown back its normal retire
+   * processes; (3) when the proof holds and the clone is clean at a head the worker bare already
+   * holds (this run's committed tracking tip, an owed pin, or the default branch), hand teardown back its normal retire
    * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
    * local ref, in every namespace, to be reachable from that head or from a ref of the worker bare,
    * and the absence of a stash); otherwise (4) record
@@ -15907,7 +15907,7 @@ export class RunRunner {
           if (covered === "covered") {
             flight.preserveRecoveryClone = priorPreserve;
             flight.stoppedSourceKept = false;
-            log.info("stopped source: clean and fully held by the worker's tracking ref; teardown proceeds", { clone: clonePath, reason });
+            log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
             return "covered";
           }
         }

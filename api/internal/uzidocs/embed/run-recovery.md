@@ -322,12 +322,17 @@ the stopped claim, and records the source as retained:
 - **Canonical clone:** a `uzi-stopped` marker is written and the journal is kept.
 
 A clean clone whose HEAD is already anchored still tears down: the anchor is a
-tracking tip this run and generation owns, or an owed pin of this run, and every
+tracking tip this run and generation owns, an owed pin of this run, or a commit
+already on the worker bare's default branch (a flight that never committed past
+its seed base), and every
 local ref of the clone, in any namespace, must point at a commit reachable from
 that HEAD or from a ref of the worker's bare repository, with no stash entry. A
 commit that only the clone holds (on another local branch, under a tag or under
 `refs/remotes/`) or a stash entry keeps the clone. Gitignored files are not covered by any capture, so they do not
-keep a clone that is otherwise anchored.
+keep a clone that is otherwise anchored. Accepted residuals: commits reachable
+only from the reflog (for example after an agent's `git reset --hard`) are not
+counted as source, and a bare ref that justified coverage can later move (a
+forge force-push, pin settlement).
 
 What a successor sees depends on the worker. On a Docker-wired (attempt-path)
 worker, a successor for the same run starts in a fresh attempt and leaves the

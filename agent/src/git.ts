@@ -5549,7 +5549,9 @@ export class GitCache {
   }
 
   /** Is `head` an ancestor of the bare's default-branch ref (`refs/remotes/origin/<default>` or the mirror-layout
-   *  `refs/heads/<default>`)? Caller holds the bare lock. Any failed read is `false`. */
+   *  `refs/heads/<default>`)? Caller holds the bare lock. Any failed read is `false`.
+   *  Residual: the default ref can move after the lock (forge force-push, fetch, gc); low impact, since the
+   *  commit came from the forge. Commits reachable only from the reflog are out of scope. */
   private async headOnDefaultUnderLock(barePath: string, head: string): Promise<boolean> {
     try {
       const db = await this.defaultBranchName(barePath);
@@ -5583,7 +5585,7 @@ export class GitCache {
    * refs, but after the lock a justifying bare ref (another run's tracking ref, a settled pin, a
    * pruned `refs/remotes/`) can move and its objects be garbage-collected. Side refs accept ANY
    * bare ref (the forge or other flows keep their own copy), whereas the head anchor in
-   * {@link verifyStoppedSourceCovered} must be owned by this run and generation, or be an owed pin.
+   * {@link verifyStoppedSourceCovered} must be owned by this run and generation, be an owed pin, or be an ancestor of the bare's default-branch ref.
    */
   private async localRefsReachableFrom(barePath: string, cwd: string, head: string): Promise<boolean> {
     try {
