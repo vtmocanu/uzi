@@ -230,6 +230,39 @@ for (const mode of ["boot", "live"] as const) it(`${mode}: an already-uploaded s
   assert.deepEqual(await fs.readFile(file(old as RecoveryRecord)), bytes);
 });
 
+// Both authenticated directory fields reach the primitive independently, so a disagreement between
+// them is refused there (invalid_identity) instead of one silently winning.
+for (const mode of ["boot", "live"] as const) it(`${mode}: an uploaded record whose recoveryPinBareDir and bareDir disagree retains its pin`, async () => {
+  const uploaded = await survivor();
+  const { recoveryPinBareDir: _p, bareDir: _b, ...rest } = uploaded;
+  const conflicting = { ...rest, recoveryPinBareDir: NAME, bareDir: "forge.example+org+other.git" } as RecoveryRecord;
+  await raw(conflicting);
+  const bytes = await fs.readFile(file(conflicting));
+  await retry(coord(), mode);
+  assert.equal(present(4), true, "the pin is retained");
+  assert.equal(git(bare, "rev-parse", "--verify", ref(4)), sha, "the ref is untouched");
+  assert.equal(present(9), true);
+  assert.deepEqual(cleanupLogs(infos), []);
+  assert.deepEqual(cleanupLogs(warnings).map(l => (l.fields as { reason: string }).reason), ["invalid_identity"]);
+  assert.deepEqual(await fs.readFile(file(conflicting)), bytes, "nothing is written to the journal");
+});
+
+for (const [shape, dirs] of [
+  ["agreeing recoveryPinBareDir and bareDir", { recoveryPinBareDir: NAME, bareDir: NAME }],
+  ["bareDir only", { bareDir: NAME }],
+  ["recoveryPinBareDir only", { recoveryPinBareDir: NAME }],
+] as const) for (const mode of ["boot", "live"] as const) it(`${mode}: an uploaded record with ${shape} loses its surviving pin`, async () => {
+  const uploaded = await survivor();
+  const { recoveryPinBareDir: _p, bareDir: _b, ...rest } = uploaded;
+  const record = { ...rest, ...dirs } as RecoveryRecord;
+  await raw(record);
+  await retry(coord(), mode);
+  assert.equal(present(4), false);
+  assert.equal(present(9), true);
+  assert.deepEqual(cleanupLogs(infos).map(l => (l.fields as { state: string }).state), ["deleted"]);
+  assert.deepEqual(cleanupLogs(warnings), []);
+});
+
 it("retains and warns when the archive proof does not hold (not self-contained)", async () => {
   const record = await journal();
   archive.uploadError = undefined;

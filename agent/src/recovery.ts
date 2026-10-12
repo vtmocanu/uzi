@@ -1958,12 +1958,13 @@ export class RecoveryCoordinator {
         }
         if (residueQuarantine() !== undefined) return retained("quarantined");
         if (this.isExecuting(runId)) return retained("executing");
-        const pinDir = cur.recoveryPinBareDir ?? cur.bareDir;
+        // Forward each authenticated directory independently: the primitive refuses a disagreement.
         const out = await cleanup.call(this.git, {
           runId,
           generation,
           sourceSha: cur.sourceSha,
-          ...(pinDir ? (cur.recoveryPinBareDir ? { recoveryPinBareDir: pinDir } : { bareDir: pinDir }) : {}),
+          ...(cur.recoveryPinBareDir ? { recoveryPinBareDir: cur.recoveryPinBareDir } : {}),
+          ...(cur.bareDir ? { bareDir: cur.bareDir } : {}),
           signal,
           deadline,
           isEligible: () => residueQuarantine() === undefined && !this.isExecuting(runId) && !signal.aborted,
