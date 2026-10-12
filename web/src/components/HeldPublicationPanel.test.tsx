@@ -117,7 +117,7 @@ describe("HeldPublicationPanel", () => {
     serve([pub({ state: "refused", refusal_reason: "create_refused" })]);
     const { container, unmount } = render(<HeldPublicationPanel run={aRun()} />);
     expect(await screen.findByText("Not published")).toBeTruthy();
-    expect(container.textContent).toContain("not kept on the forge");
+    expect(container.textContent).toContain("not published to the forge");
     expect(container.textContent).not.toContain("published to a run-scoped ref");
     expect(container.textContent).not.toContain("uzi run held expire");
     unmount();
@@ -180,5 +180,96 @@ describe("HeldPublicationPanel", () => {
     } finally {
       vi.useRealTimers();
     }
+  });
+
+  const ACK = "2026-01-01T00:05:00Z";
+
+  it.each(["deleted", "abandoned"])("says the work was removed from the forge for a %s row that was acknowledged", async (state) => {
+    serve([pub({ state, acknowledged_at: ACK })]);
+    const { container } = render(<HeldPublicationPanel run={aRun()} />);
+    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
+    expect(container.textContent).toContain("has since been removed from the forge");
+    expect(container.textContent).not.toContain("not published to the forge");
+    expect(container.textContent).not.toContain("uzi run held expire");
+  });
+
+  it.each(["invoked", "create_unknown"])("says the forge has not confirmed a %s publication", async (state) => {
+    serve([pub({ state })]);
+    const { container } = render(<HeldPublicationPanel run={aRun()} />);
+    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
+    expect(container.textContent).toContain("The forge has not confirmed this publication yet");
+    expect(container.textContent).not.toContain("not published to the forge");
+  });
+
+  it("counts delete_unknown as on the forge", async () => {
+    serve([pub({ state: "delete_unknown", acknowledged_at: ACK })]);
+    const { container } = render(<HeldPublicationPanel run={aRun()} />);
+    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
+    expect(container.textContent).toContain("were secret-scanned and published to a run-scoped ref");
+    expect(container.textContent).not.toContain("since been removed");
+    expect(container.textContent).not.toContain("uzi run held expire");
+  });
+
+  it("does not start the next poll while a request is pending", async () => {
+    vi.useFakeTimers();
+    try {
+      let release: (v: { publications: HeldPublication[] }) => void = () => {};
+      const spy = vi
+        .spyOn(api, "getRunHeldPublications")
+        .mockResolvedValueOnce({ publications: [pub({ state: "invoked" })] })
+        .mockImplementationOnce(() => new Promise((res) => (release = res)))
+        .mockResolvedValue({ publications: [pub({ state: "acknowledged" })] });
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(120_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      await act(async () => {
+        release({ publications: [pub({ state: "invoked" })] });
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(3);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling after 30 re-fetches while a row stays in progress", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = serve([pub({ state: "create_unknown" })]);
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(40 * 20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(31);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("clears the previous run's rows when the run changes", async () => {
+    const OTHER = "11111111-2222-4333-8444-555555555555";
+    let release: (v: { publications: HeldPublication[] }) => void = () => {};
+    vi.spyOn(api, "getRunHeldPublications")
+      .mockResolvedValueOnce({ publications: [pub()] })
+      .mockImplementationOnce(() => new Promise((res) => (release = res)));
+    const { rerender, container } = render(<HeldPublicationPanel run={aRun()} />);
+    expect(await screen.findByText("Published")).toBeTruthy();
+    rerender(<HeldPublicationPanel run={aRun({ id: OTHER })} />);
+    await waitFor(() => expect(container.innerHTML).toBe(""));
+    await act(async () => {
+      release({ publications: [] });
+    });
+    expect(container.innerHTML).toBe("");
   });
 });

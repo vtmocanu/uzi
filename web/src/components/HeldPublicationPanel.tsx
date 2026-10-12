@@ -50,6 +50,8 @@ const ON_FORGE_STATES = new Set(["acknowledged", "created", "delete_unknown"]);
 // States that settle on their own: the panel re-fetches while any row is in one.
 const IN_PROGRESS_STATES = new Set(["created", "invoked", "create_unknown", "delete_unknown"]);
 const REFRESH_MS = 20_000;
+// About ten minutes of polling per mount.
+const MAX_POLLS = 30;
 
 function safeHeldRef(runId: string, pub: HeldPublication): string | null {
   const ref = pub.ref;
@@ -61,51 +63,49 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
   const failed = run.status === "failed";
   const [pubs, setPubs] = useState<HeldPublication[]>([]);
 
-  const inProgress = pubs.some((p) => IN_PROGRESS_STATES.has(p.state));
-
+  // One chain per (failed, run.id): fetch, then, while a row is still settling, schedule the
+  // next fetch only after this one has settled, so requests never overlap and an older response
+  // cannot overwrite a newer one. The chain stops after MAX_POLLS re-fetches (create_unknown is
+  // never terminal by design), at the first settled answer, on unmount and on a run change.
   useEffect(() => {
-    if (!failed) {
-      setPubs([]);
-      return;
-    }
+    setPubs([]);
+    if (!failed) return;
     let live = true;
-    api
-      .getRunHeldPublications(run.id)
-      .then((r) => {
-        if (live) setPubs(Array.isArray(r?.publications) ? r.publications : []);
-      })
-      .catch(() => {
-        if (live) setPubs([]);
-      });
-    return () => {
-      live = false;
-    };
-  }, [failed, run.id]);
-
-  // While a publication is still settling, re-fetch so the badge does not stay stale. The poll
-  // stops as soon as no row is in progress, and is cleared on unmount or a run change.
-  useEffect(() => {
-    if (!failed || !inProgress) return;
-    let live = true;
-    const timer = setInterval(() => {
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    let polls = 0;
+    const load = () => {
       api
         .getRunHeldPublications(run.id)
         .then((r) => {
-          if (live) setPubs(Array.isArray(r?.publications) ? r.publications : []);
+          if (!live) return;
+          const rows = Array.isArray(r?.publications) ? r.publications : [];
+          setPubs(rows);
+          schedule(rows.some((p) => IN_PROGRESS_STATES.has(p.state)));
         })
         .catch(() => {
-          // Keep the last known rows; the next tick retries.
+          if (!live) return;
+          // Keep the last known rows on a poll failure; the first load failing leaves none.
+          if (polls === 0) setPubs([]);
+          schedule(polls > 0);
         });
-    }, REFRESH_MS);
+    };
+    const schedule = (again: boolean) => {
+      if (!again || polls >= MAX_POLLS) return;
+      polls += 1;
+      timer = setTimeout(load, REFRESH_MS);
+    };
+    load();
     return () => {
       live = false;
-      clearInterval(timer);
+      if (timer !== undefined) clearTimeout(timer);
     };
-  }, [failed, inProgress, run.id]);
+  }, [failed, run.id]);
 
   if (!failed || pubs.length === 0) return null;
   const onForge = pubs.some((p) => ON_FORGE_STATES.has(p.state));
   const acknowledged = pubs.some((p) => p.state === "acknowledged");
+  const everAcknowledged = pubs.some((p) => !!p.acknowledged_at);
+  const unconfirmed = pubs.some((p) => p.state === "invoked" || p.state === "create_unknown");
 
   return (
     <Card id="held-publication" className="scroll-mt-20 space-y-3 p-4">
@@ -119,8 +119,15 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
             This failed run's commits and uncommitted changes were secret-scanned and published to a
             run-scoped ref.
           </>
+        ) : everAcknowledged ? (
+          <>
+            This failed run's held work was published to a run-scoped ref and has since been removed
+            from the forge.
+          </>
+        ) : unconfirmed ? (
+          <>The forge has not confirmed this publication yet; the worker kept this run's recovery archive.</>
         ) : (
-          <>This failed run's held work was not kept on the forge; its recovery archive applies.</>
+          <>This failed run's held work was not published to the forge; its recovery archive applies.</>
         )}
         {acknowledged && (
           <>
