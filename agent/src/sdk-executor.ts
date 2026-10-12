@@ -734,6 +734,7 @@ interface DriveState {
    *  prompt and the first implement prompt. */
   environmentFacts: EnvFacts;
   baseConfig: ClaudeTurnConfig;
+  enableImplementationSignals: () => void;
   initialWallMs: number;
   // PRD #1189 M1 (D6): the LARGEST served wall (ms) applied so far — the monotonic
   // upward-only re-arm high-water mark that replaced the one-shot wall-scaling latch. Each
@@ -1430,8 +1431,9 @@ export class SdkExecutor implements Executor {
     // Issue #2083: the decisions memo is a memo-kind run with the server-side feature on.
     const decisionsMemoOn =
       ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind));
-    const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
-      [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
+    let signalParkRun = false;
+    const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
+      buildSignalMcpServer({
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -1447,7 +1449,16 @@ export class SdkExecutor implements Executor {
         reportOnly: isIssueRun,
         // Issue #2083: decisions_memo on signal_done, only when the memo is enabled.
         decisionsMemo: decisionsMemoOn,
-      }),
+        parkRun: signalParkRun,
+        ...(codeCrossCheck ? { codeCrossCheck } : {}),
+      });
+    // Fresh options bind each server's repair access; retained handlers still revalidate it.
+    const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
+      [SIGNAL_SERVER_NAME]: buildRunSignalServer(),
+    };
+    const enableImplementationSignals = (): void => {
+      signalParkRun = parkRunEnabled(ctx, "implement");
+      mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer();
     };
     if (this.client) {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
@@ -1577,14 +1588,10 @@ export class SdkExecutor implements Executor {
       ...(ctx.codeCrossCheckGate && ctx.codeCrossCheckRepairActive && ctx.codeCrossCheckRepair && ctx.reportCrossCheckDispositions && ctx.claimGeneration ? {
         refreshCodeCrossCheckTools: async () => {
           const row = await ctx.codeCrossCheckRepair!();
-          mcpServers[SIGNAL_SERVER_NAME] = buildSignalMcpServer({
-            prdDonePath: isIssueRun, milestones: isIssueRun, progress: isIssueRun, checkpoint: isIssueRun,
-            reportOnly: isIssueRun, decisionsMemo: decisionsMemoOn,
-            ...(row && row.findings.length > 0 ? { codeCrossCheck: {
-              generation: ctx.claimGeneration!, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive!, codeCrossCheckRepair: ctx.codeCrossCheckRepair!,
-              reportCrossCheckDispositions: ctx.reportCrossCheckDispositions!,
-            } } : {}),
-          });
+          mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer(row && row.findings.length > 0 ? {
+            generation: ctx.claimGeneration!, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive!, codeCrossCheckRepair: ctx.codeCrossCheckRepair!,
+            reportCrossCheckDispositions: ctx.reportCrossCheckDispositions!,
+          } : undefined);
         },
       } : {}),
       skillsSelected: runSkills.length > 0,
@@ -1666,6 +1673,7 @@ export class SdkExecutor implements Executor {
       isIssueRun,
       environmentFacts,
       baseConfig,
+      enableImplementationSignals,
       initialWallMs,
       maxServedWallMs,
       state,
@@ -2424,6 +2432,7 @@ export class SdkExecutor implements Executor {
       // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
       // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
+      drive.enableImplementationSignals();
       const implementConfig: ClaudeTurnConfig = {
         ...baseConfig,
         agents: selectedSubagents,
@@ -2434,11 +2443,7 @@ export class SdkExecutor implements Executor {
           harness: "claude",
         }),
         preToolUse: preToolUse(selectedNames, true),
-        mcpServers: { ...baseConfig.mcpServers, [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
-          prdDonePath: isIssueRun, milestones: isIssueRun, progress: isIssueRun, checkpoint: isIssueRun,
-          reportOnly: isIssueRun, decisionsMemo: ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind)),
-          parkRun: parkRunEnabled(ctx, "implement"),
-        }) },
+        mcpServers: baseConfig.mcpServers,
       };
       ctx.emit({
         kind: "status",
