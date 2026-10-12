@@ -1045,7 +1045,7 @@ lifecycle read is unknown, and a cross-worker predecessor's hold can stay open; 
 record gives `resolve_local_record`. With neither, the lifecycle read decides. Its only
 automatic reclaim is a later run of that branch's terminal-orphan handling on this
 worker, which moves the clone to `<dataDir>/runner-quarantine/` (retained, never deleted
-automatically; the retention sweep only deletes `.uzi-residue-*` directories) and frees
+automatically; the retention sweep never touches `runner-quarantine/`) and frees
 the canonical path; a protected source or an attempt clone is kept in place instead.
 Cross-worker reclaim needs a lifecycle read that is not worker-scoped (new API); it is
 an open follow-up and is not shipped.
@@ -1104,7 +1104,7 @@ exact source under one lock. It never cancels a run or stops the worker.
 > unreadable directory that no journal, ledger or marker names is not an attributed
 > source. Cost: every cycle execs into every Running pod in `UZI_WORKER_NS` for each
 > bound run, and one pod that cannot be exec'd into fails every live run's cycle until it
-> is fixed or excluded from `UZI_WORKER_NS`.
+> is fixed or its namespace is dropped from `UZI_WORKER_NS` (which lists namespaces, not pods).
 
 What the channel does not promise:
 

@@ -179,7 +179,7 @@ positive server evidence that its run is terminal; an absent or released hold is
   when the lifecycle read is unknown, and a cross-worker predecessor's hold can stay open
   (`specs/human.md`). Its only automatic reclaim is a later run of that branch's
   terminal-orphan handling on this worker, which moves the clone to `<dataDir>/runner-quarantine/` (retained, never
-  deleted automatically; the retention sweep only deletes `.uzi-residue-*` directories) and frees
+  deleted automatically; the retention sweep never touches `runner-quarantine/`) and frees
   the canonical path, while a protected source or an attempt clone is kept in place. A read that is not worker-scoped would close this,
   but needs a new API and is an open follow-up, not shipped (PRD #1786, Decision Log,
   maintainer decisions 3 and 4).
