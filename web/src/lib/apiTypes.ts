@@ -3557,6 +3557,7 @@ export interface CodeCrossCheckSummary {
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;
   repo_instructions_digest?: string;
+  repo_instructions_commit?: string | null;
   usage?: RunUsage | null;
   stage: string;
   round: number;

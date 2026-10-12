@@ -270,6 +270,7 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 			ADD COLUMN IF NOT EXISTS repo_instructions_enabled boolean NOT NULL DEFAULT false,
 			ADD COLUMN IF NOT EXISTS repo_instructions_text text,
 			ADD COLUMN IF NOT EXISTS repo_instructions_digest bytea,
+			ADD COLUMN IF NOT EXISTS repo_instructions_commit text,
 			ADD COLUMN IF NOT EXISTS dispositions jsonb,
 			ADD COLUMN IF NOT EXISTS finalized_at timestamptz`,
 	} {

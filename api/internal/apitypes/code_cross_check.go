@@ -9,6 +9,7 @@ import (
 type CodeCrossCheck struct {
 	CustomGuidanceApplied   bool            `json:"custom_guidance_applied"`
 	GuidanceDigest          string          `json:"guidance_digest"`
+	RepoInstructionsCommit  *string         `json:"repo_instructions_commit"`
 	RepoInstructionsEnabled bool            `json:"repo_instructions_enabled"`
 	RepoInstructionsDigest  string          `json:"repo_instructions_digest"`
 	Stage                   string          `json:"stage"`

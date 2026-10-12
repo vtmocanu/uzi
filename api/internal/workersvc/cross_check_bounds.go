@@ -8,6 +8,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -66,7 +67,7 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		if input.CustomGuidanceApplied != nil && *input.CustomGuidanceApplied != (input.GuidanceSnapshot != "") {
 			return ErrCrossCheckRefused
 		}
-	} else if input.RepoInstructionsEnabled != nil || input.CustomGuidanceApplied != nil ||
+	} else if input.RepoInstructionsCommit != nil || input.RepoInstructionsEnabled != nil || input.CustomGuidanceApplied != nil ||
 		input.GuidanceDigest != "" || input.RepoInstructionsDigest != "" || input.RepoInstructionsText != "" {
 		return ErrCrossCheckRefused
 	}
@@ -76,8 +77,8 @@ func ValidateCrossCheckClaim(payload *ClaimPayload) error {
 		CodeContext: input.CodeContext, GuidanceSnapshot: pgtype.Text{String: input.GuidanceSnapshot, Valid: true},
 		GuidanceText: pgtype.Text{String: input.GuidanceSnapshot, Valid: true}, GuidanceDigest: guidanceDigest,
 		RepoInstructionsEnabled: instructionsEnabled, RepoInstructionsText: pgtype.Text{String: input.RepoInstructionsText, Valid: true},
-		RepoInstructionsDigest: instructionsDigest,
-		PlanMd:                 pgtype.Text{String: input.PlanMd, Valid: true}, Milestones: input.Milestones,
+		RepoInstructionsCommit: pgconv.TextPtr(input.RepoInstructionsCommit), RepoInstructionsDigest: instructionsDigest,
+		PlanMd: pgtype.Text{String: input.PlanMd, Valid: true}, Milestones: input.Milestones,
 		RequiredCapabilities: input.RequiredCapabilities, RequiredTools: input.RequiredTools,
 		SizeClass:       pgtype.Text{String: input.SizeClass, Valid: true},
 		BaseCommit:      pgtype.Text{String: input.BaseCommit, Valid: true},
