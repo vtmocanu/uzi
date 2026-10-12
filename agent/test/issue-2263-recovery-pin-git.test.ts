@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { constants as fsConstants, existsSync, symlinkSync, writeFileSync, type Dir } from "node:fs";
+import { chmodSync, chownSync, constants as fsConstants, existsSync, renameSync, statSync, symlinkSync, writeFileSync, type Dir } from "node:fs";
 import { Readable } from "node:stream";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -193,7 +193,7 @@ it("cancelling right after the prepared spawn never strands the ref lock", async
     if (args[1].includes("update-ref") && args[1].includes("--stdin")) stop.abort();
     return child;
   });
-  for (let i = 0; i < 20; i++) {
+  for (let i = 0; i < 100; i++) {
     stop = new AbortController();
     assert.deepEqual(await cleanup({ signal: stop.signal }), { state: "retained", reason: "cancelled" }, "iteration " + i);
     assert.equal(existsSync(path.join(bare, ref + ".lock")), false, "stale lock at iteration " + i);
@@ -460,7 +460,12 @@ for (const symbolic of [false, true]) it("prepared cleanup inside supervised bou
       transaction = true;
       if (symbolic) git(bare, "symbolic-ref", ref, "refs/heads/main");
     }
-    assert.ok(request.timeoutMs && request.timeoutMs > 0 && request.timeoutMs <= 35_000); // 30 s deadline plus the 5 s abort grace backstop
+    // Probes keep the plain 30 s deadline; only the update-ref transaction adds the 5 s abort grace backstop.
+    if (request.argv.includes("update-ref") && request.argv.includes("--stdin")) {
+      assert.ok(request.timeoutMs && request.timeoutMs > 30_000 && request.timeoutMs <= 35_000, "transaction timeout " + request.timeoutMs);
+    } else {
+      assert.ok(request.timeoutMs && request.timeoutMs > 0 && request.timeoutMs <= 30_000, "probe timeout " + request.timeoutMs);
+    }
     timeouts.push(request.timeoutMs!);
     const child = spawn(request.argv[0]!, request.argv.slice(1), {
       cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"],
@@ -819,6 +824,63 @@ it("an actual directory swap of a refs directory still refuses", async () => {
   assert.deepEqual(await cleanup(), { state: "retained", reason: "unsafe_metadata" });
   assert.equal(swapped, true);
   assert.equal(present(), sha);
+});
+
+// Directory identity is dev/ino/mode/uid/gid. Each mutation below happens AFTER Git holds the
+// ref lock, so only the post-prepare evidence comparison can notice it.
+const pinDirs = ["refs", "refs/uzi-recovery-pin", "refs/uzi-recovery-pin/archived-run"];
+function plantOnce(mutate: () => void) {
+  let done = false;
+  return {
+    isEligible: () => {
+      if (!done && existsSync(path.join(bare, ref + ".lock"))) { done = true; mutate(); }
+      return true;
+    },
+    get planted() { return done; },
+  };
+}
+function copySwap(dir: string) {
+  return () => {
+    const live = path.join(bare, dir);
+    execFileSync("cp", ["-a", live, live + ".new"]);
+    renameSync(live, live + ".old");
+    renameSync(live + ".new", live);
+  };
+}
+for (const dir of pinDirs) it("after-prepare copy-swap of " + dir + " refuses and keeps the pin", async () => {
+  const hook = plantOnce(copySwap(dir));
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git", isEligible: hook.isEligible }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(hook.planted, true);
+  assert.equal(present(), sha);
+  assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
+});
+it("after-prepare copy-swap of a logs level refuses and keeps the pin", async () => {
+  await fs.mkdir(path.join(bare, "logs/refs/uzi-recovery-pin/archived-run"), { recursive: true });
+  const hook = plantOnce(copySwap("logs/refs"));
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git", isEligible: hook.isEligible }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(hook.planted, true);
+  assert.equal(present(), sha);
+});
+for (const dir of [...pinDirs, "logs/refs"]) it("after-prepare chmod of " + dir + " to another safe mode refuses", async () => {
+  await fs.mkdir(path.join(bare, "logs/refs/uzi-recovery-pin/archived-run"), { recursive: true });
+  const hook = plantOnce(() => {
+    const live = path.join(bare, dir);
+    chmodSync(live, (statSync(live).mode & 0o777) === 0o700 ? 0o750 : 0o700);
+  });
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git", isEligible: hook.isEligible }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(hook.planted, true);
+  assert.equal(present(), sha);
+  assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
+});
+const otherGid = process.getgroups?.().find(g => g !== process.getgid?.());
+for (const dir of [...pinDirs, "logs/refs"]) it("after-prepare chgrp of " + dir + " to another group refuses",
+  { skip: otherGid === undefined ? "the process has no second group to chgrp to" : false }, async () => {
+  await fs.mkdir(path.join(bare, "logs/refs/uzi-recovery-pin/archived-run"), { recursive: true });
+  const hook = plantOnce(() => chownSync(path.join(bare, dir), process.getuid!(), otherGid!));
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git", isEligible: hook.isEligible }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(hook.planted, true);
+  assert.equal(present(), sha);
+  assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
 });
 
 // A pin is kept while the residue-quarantine latch is set, including a latch landing mid-cleanup.

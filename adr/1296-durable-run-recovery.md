@@ -523,6 +523,22 @@ this new field, while the new worker reads old field-absent journals. Rollback r
 inspection and adoption by returning to a compatible worker; refusal erases neither bytes nor pins.
 No server rollout is required.
 
+### Issue #2263: uploaded-record pin cleanup
+
+Supersedes, for non-guarded records, the #2021 sentence "A crash between the uploaded write and cleanup may leave the pin indefinitely: no retry or cleanup scheduler is added." The coordinator now deletes a surviving transient pin (`generation ?? 0`) of an `uploaded` record, closing two leaks: bundles installed before #2021 (no `recoveryPinBareDir`; bounded discovery of up to 256 bares, ambiguity refused) and a crash after the authenticated `uploaded` write.
+
+**Archive proof.** Deletion requires an authenticated, non-guarded `uploaded` record with server capture id, checksum and size, `selfContained === true` and explicit empty `prerequisiteShas`. A thin archive keeps its pin. Consequence: a park made with forge credentials usually bundles forge prerequisites, so its pin is now kept, where the runner deleted it unconditionally after upload. This was a reviewer requirement at plan approval.
+
+**Eligibility** is decided under the journal lock, held across a bounded, fail-closed journal read and the delete (lock order journal, attribution, bare): no inventory-guarded record in the run, every same pin-generation record uploaded, residue quarantine clear, run not executing; execution and quarantine are rechecked synchronously before the Git commit. `GitCache.cleanupArchivedRecoveryPin` makes one bounded attempt (30 s): bare identity (no `.git`/`commondir`/`gitdir` redirects, unsafe config keys, symlinked or hard-linked reflog paths including `logs/HEAD`), a bounded `cat-file -t` that must print `commit`, then `update-ref --stdin` prepare/commit compare-and-delete. Every failure retains the pin with a reason; an uncommitted transaction is aborted gracefully (5 s grace) so no ref lock is stranded.
+
+**Paths.** Upload path: retains `executing` while the run is still executing (normal for the runner's own settle); the live pass deletes later. Boot sweep: after uploads, archive-proven records only, least recently attempted first, capped per pass, 60 s budget. Live pass: leftover upload slots only, per-record exponential backoff on refusal (the live re-drive base and cap), a 6-hour in-process settle interval after deleted or already-absent, and it runs while credentials are blocked (local work, no credential needed; it does not move the upload schedule).
+
+**No completion marker is persisted.** A pin recreated by `anchorRecoveryHead` is caught at the next boot or settle interval; a marker would hide it.
+
+**Runner and plain delete.** The runner's unconditional post-upload delete is removed. Its already-published path deletes with an expected-SHA compare-and-delete and honours the residue quarantine. Guarded custody release and settlement cleanup are unchanged, but the plain three-argument `deleteRecoveryPin` now refuses symlinked ref and reflog paths, repository redirects, a symlinked `packed-refs` and a symlinked or hard-linked `logs/HEAD`.
+
+**Accepted residuals.** A symlink planted between the last check and Git's own unlink is not detectable in userspace. A v1 run (no claim generation) whose journal is removed at completed-run release before the live pass runs keeps its pin. The already-published delete gets one attempt.
+
 ## Amendment 2026-10-09 — #2507: synchronous completed-publication release
 
 **Status**: Implemented in API and worker; this amendment records the maintainer
