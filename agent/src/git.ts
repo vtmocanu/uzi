@@ -4686,6 +4686,8 @@ export class GitCache {
   async cleanupArchivedRecoveryPin(input: ArchivedRecoveryPinCleanup): Promise<ArchivedRecoveryPinCleanupResult> {
     type Reason = Extract<ArchivedRecoveryPinCleanupResult, { state: "retained" }>["reason"];
     const refuse = (reason: Reason): never => { throw new Error(reason); };
+    const unsafeNameChar = (name: string): boolean =>
+      [...name].some(c => c === "\\" || c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f);
     if (!CODE_ID.test(input.runId) || !codeGeneration(input.generation) || !CODE_SHA.test(input.sourceSha) ||
         typeof input.isEligible !== "function" ||
         (input.deadline !== undefined && !Number.isFinite(input.deadline))) {
@@ -4763,13 +4765,18 @@ export class GitCache {
         return buffer.subarray(0, bytes).toString("utf8");
       } finally { await handle.close(); }
     };
-    const probe = async (cwd: string, args: string[], stdin?: string): Promise<string> => {
+    // `pinCommonDir` is false only for the identity probe: Git 2.54 reports
+    // `--is-bare-repository` as false whenever GIT_COMMON_DIR is set, so that probe relies on
+    // `--git-dir` plus the admitted absence of a `commondir` file. gitEnv() is a replacement
+    // environment, so GIT_DIR/GIT_OBJECT_DIRECTORY/GIT_ALTERNATE_OBJECT_DIRECTORIES from the
+    // process cannot reach any probe or mutation.
+    const probe = async (cwd: string, args: string[], stdin?: string, pinCommonDir = true): Promise<string> => {
       check();
       const isBareProbe = cwd !== root;
       const child = await this.spawnGit(cwd,
         [...(isBareProbe ? ["--git-dir", cwd] : []), "--no-replace-objects", ...args], stdin, {
         timeoutMs: deadline - Date.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
-        env: { GIT_CONFIG_GLOBAL: "/dev/null", ...(isBareProbe ? { GIT_COMMON_DIR: cwd } : {}) },
+        env: { GIT_CONFIG_GLOBAL: "/dev/null", ...(isBareProbe && pinCommonDir ? { GIT_COMMON_DIR: cwd } : {}) },
       });
       activeChildren.add(child.exited);
       let bytes = 0;
@@ -4809,7 +4816,7 @@ export class GitCache {
     const rootEvidence: Evidence = new Map();
     const candidate = async (name: string): Promise<{ bare: string; tip?: string; packedTip?: string; evidence: Evidence }> => {
       if (!name || name !== path.basename(name) || name === "." || name === ".." ||
-          /[\\\x00-\x1f\x7f]/.test(name)) refuse("invalid_identity");
+          unsafeNameChar(name)) refuse("invalid_identity");
       const bare = path.join(root, name);
       const evidence: Evidence = new Map(rootEvidence);
       if (!await remember(bare, evidence, true)) refuse("unsafe_metadata");
@@ -4818,7 +4825,7 @@ export class GitCache {
       if (config === undefined) refuse("unsafe_metadata");
       // A cached bare must not redirect Git to another repository or common ref store.
       // Record absence so a redirect planted while a transaction starts also refuses.
-      for (const redirect of [".git", "commondir"]) {
+      for (const redirect of [".git", "commondir", "gitdir"]) {
         if (await remember(path.join(bare, redirect), evidence, false)) refuse("unsafe_metadata");
       }
       // Parse admitted bytes without includes BEFORE any repository probe can read config.
@@ -4827,7 +4834,7 @@ export class GitCache {
         refuse("unsafe_metadata");
       }
       const gitIdentity = (await probe(bare,
-        ["rev-parse", "--absolute-git-dir", "--git-common-dir", "--is-bare-repository"])).trimEnd().split("\n");
+        ["rev-parse", "--absolute-git-dir", "--git-common-dir", "--is-bare-repository"], undefined, false)).trimEnd().split("\n");
       if (gitIdentity.length !== 3 || gitIdentity[0] !== bare || gitIdentity[1] !== bare || gitIdentity[2] !== "true") {
         refuse("unsafe_metadata");
       }
@@ -4859,7 +4866,7 @@ export class GitCache {
     // selected candidate is re-read directly while that lock is already held.
     const discoverCandidate = async (name: string) => {
       if (!name || name !== path.basename(name) || name === "." || name === ".." ||
-          /[\\\x00-\x1f\x7f]/.test(name)) refuse("invalid_identity");
+          unsafeNameChar(name)) refuse("invalid_identity");
       return this.withLock(path.join(root, name), () => candidate(name), stop.signal);
     };
     const attempt = async (): Promise<ArchivedRecoveryPinCleanupResult> => {
@@ -4914,9 +4921,14 @@ export class GitCache {
           if (current.tip !== chosen.tip) refuse("target_changed");
           if (current.tip === undefined) return { state: "already_absent" };
           if (current.tip !== input.sourceSha) refuse("target_changed");
-          if ((await probe(chosen.bare, ["rev-parse", "--verify", `${input.sourceSha}^{commit}`])).trim() !== input.sourceSha) {
-            refuse("target_changed");
-          }
+          // Type only: a bounded header read, never a commit decode. Trees, blobs, tags and missing
+          // objects (non-zero exit) all retain the pin.
+          // A missing object makes cat-file exit non-zero, which surfaces as Git's own stream error.
+          const objectType = await probe(chosen.bare, ["cat-file", "-t", input.sourceSha]).catch((error: unknown): string => {
+            if (["cancelled", "deadline", "unsafe_metadata"].includes((error as Error).message)) throw error;
+            return "";
+          });
+          if (objectType !== "commit\n") refuse("target_changed");
           await revalidate(current.evidence);
           check();
           if (!input.isEligible()) refuse("ineligible");
@@ -4949,6 +4961,11 @@ export class GitCache {
               response += buffer.toString("utf8");
             }
             if (response !== "prepare: ok\n") refuse("git_failure");
+            // Last caller decision before the redirect/evidence re-check, so anything planted while
+            // eligibility ran is still caught before commit.
+            check();
+            if (!input.isEligible()) refuse("ineligible");
+            check();
             // Parent directories may acquire new lock entries; their inode/ownership must
             // still match admission. File evidence (except the raced ref) must match fully.
             for (const [p, expected] of current.evidence) {
@@ -4972,6 +4989,7 @@ export class GitCache {
             if (loose === undefined) {
               if (current.packedTip !== input.sourceSha) refuse("target_changed");
             } else if (loose !== input.sourceSha && loose !== input.sourceSha + "\n") refuse("target_changed");
+            // Synchronous final recheck: nothing is awaited between it and the commit write.
             check();
             if (!input.isEligible()) refuse("ineligible");
             check();

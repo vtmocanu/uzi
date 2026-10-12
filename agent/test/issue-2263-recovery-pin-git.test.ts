@@ -1,7 +1,7 @@
 import { afterEach, beforeEach, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import { execFileSync, spawn } from "node:child_process";
-import { constants as fsConstants, existsSync, type Dir } from "node:fs";
+import { constants as fsConstants, existsSync, writeFileSync, type Dir } from "node:fs";
 import { Readable } from "node:stream";
 import fs from "node:fs/promises";
 import path from "node:path";
@@ -161,9 +161,18 @@ it("late prepared transaction spawn after cancellation never commits", async () 
   });
   const stop = new AbortController();
   const result = cleanup({ signal: stop.signal });
-  await entered.promise; stop.abort();
+  // Racing the result keeps a regression that settles before the prepare spawn from hanging here.
+  assert.equal(await Promise.race([entered.promise.then(() => "entered"), result.then(() => "settled")]), "entered");
+  stop.abort();
   assert.deepEqual(await result, { state: "retained", reason: "cancelled" });
-  release.resolve(); await drained.promise;
+  release.resolve();
+  let drainTimer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    assert.equal(await Promise.race([
+      drained.promise.then(() => "drained"),
+      new Promise<string>(r => { drainTimer = setTimeout(() => r("timeout"), 10_000); }),
+    ]), "drained");
+  } finally { clearTimeout(drainTimer); }
   assert.equal(present(), sha);
   assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
 });
@@ -275,7 +284,8 @@ it("blocked attribution waiter cancels without later mutation", async () => {
     if (!held && args.includes("--is-bare-repository")) { held = true; entered.resolve(); await release.promise; }
   });
   const holder = cleanup({ isEligible: () => false });
-  await entered.promise;
+  // If the holder settles before reaching the held probe, fail fast instead of hanging.
+  assert.equal(await Promise.race([entered.promise.then(() => "entered"), holder.then(r => JSON.stringify(r))]), "entered");
   const stop = new AbortController();
   const waiter = cleanup({ signal: stop.signal });
   stop.abort();
@@ -457,10 +467,12 @@ for (const symbolic of [false, true]) it("prepared cleanup inside supervised bou
   }
 });
 
-for (const redirect of [".git", "commondir"]) it("refuses Git repository redirect " + redirect, async () => {
+const redirectBody = (redirect: string, foreign: string) =>
+  redirect === ".git" ? "gitdir: " + foreign + "\n" : foreign + "\n";
+for (const redirect of [".git", "commondir", "gitdir"]) it("refuses Git repository redirect " + redirect, async () => {
   const foreign = await second();
   git(foreign, "update-ref", ref, sha);
-  await fs.writeFile(path.join(bare, redirect), redirect === ".git" ? "gitdir: " + foreign + "\n" : foreign + "\n");
+  await fs.writeFile(path.join(bare, redirect), redirectBody(redirect, foreign));
   assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git" }), { state: "retained", reason: "unsafe_metadata" });
   assert.equal(await fs.readFile(path.join(bare, ref), "utf8"), sha + "\n");
   assert.equal(present(foreign), sha);
@@ -484,3 +496,53 @@ for (const key of ["extensions.refStorage", "extensions.worktreeConfig"]) it("re
 });
 
 
+for (const redirect of [".git", "commondir", "gitdir"]) it("redirect " + redirect + " planted after prepare refuses before commit", async () => {
+  const foreign = await second();
+  git(foreign, "update-ref", ref, sha);
+  let planted = false;
+  assert.deepEqual(await cleanup({ recoveryPinBareDir: "one.git", isEligible: () => {
+    if (!planted && existsSync(path.join(bare, ref + ".lock"))) {
+      planted = true;
+      writeFileSync(path.join(bare, redirect), redirectBody(redirect, foreign));
+    }
+    return true;
+  } }), { state: "retained", reason: "unsafe_metadata" });
+  assert.equal(planted, true);
+  assert.equal(await fs.readFile(path.join(bare, ref), "utf8"), sha + "\n");
+  assert.equal(present(foreign), sha);
+  assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
+});
+it("inherited Git environment redirection cannot reach the cleanup", async () => {
+  const foreign = await second();
+  git(foreign, "update-ref", ref, sha);
+  const names = ["GIT_DIR", "GIT_COMMON_DIR", "GIT_OBJECT_DIRECTORY", "GIT_ALTERNATE_OBJECT_DIRECTORIES", "GIT_WORK_TREE", "GIT_INDEX_FILE"];
+  const saved = names.map(n => [n, process.env[n]] as const);
+  Object.assign(process.env, {
+    GIT_DIR: foreign, GIT_COMMON_DIR: foreign, GIT_OBJECT_DIRECTORY: path.join(foreign, "objects"),
+    GIT_ALTERNATE_OBJECT_DIRECTORIES: path.join(foreign, "objects"), GIT_WORK_TREE: foreign,
+    GIT_INDEX_FILE: path.join(foreign, "index"),
+  });
+  let result;
+  try { result = await cleanup({ recoveryPinBareDir: "one.git" }); }
+  finally { for (const [n, v] of saved) { if (v === undefined) delete process.env[n]; else process.env[n] = v; } }
+  assert.deepEqual(result, { state: "deleted" });
+  assert.throws(() => present());
+  assert.equal(present(foreign), sha);
+});
+{
+  const objectCases: Array<[string, () => string]> = [
+    ["tree", () => git(bare, "rev-parse", sha + "^{tree}")],
+    ["blob", () => execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"], {
+      input: "blob\n", encoding: "utf8", env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null" },
+    }).trim()],
+    ["annotated tag", () => { git(bare, "-c", "user.name=f", "-c", "user.email=f@example.invalid", "tag", "-a", "-m", "t", "pintag", sha); return git(bare, "rev-parse", "refs/tags/pintag"); }],
+    ["missing object", () => "1".repeat(40)],
+  ];
+  for (const [kind, make] of objectCases) it("pin at a non-commit target retains: " + kind, async () => {
+    const target = make();
+    await fs.writeFile(path.join(bare, ref), target + "\n");
+    assert.deepEqual(await cleanup({ sourceSha: target }), { state: "retained", reason: "target_changed" });
+    assert.equal(await fs.readFile(path.join(bare, ref), "utf8"), target + "\n");
+    assert.equal(existsSync(path.join(bare, ref + ".lock")), false);
+  });
+}
