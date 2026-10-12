@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **Provider outages have a bounded automatic recovery streak ([#1733](https://github.com/vtmocanu/uzi/issues/1733)).**
-  Feature-negotiated worker parks are counted separately. After 24 hours without progress, the next provider park holds the run for its owner without failing it; the duration is configurable and 0 disables the hold. Owner Resume clears the streak while retaining the run's work and worker affinity.
+  Claude and Codex provider outages now retry under a separate elapsed streak, including Codex’s exact `rateLimitExceeded` token (#2361). After the default 24 hours, the next qualifying park waits for the owner without failing the run; `0` disables the hold. Completed model turns restart the streak, and owner Resume clears it. CLI, TUI, web and Slack distinguish automatic retries from owner attention, with Resume, Cancel and eligible Stop-then-Resume actions. Work remains on the assigned worker, subject to storage and recovery-copy availability; the hold has no automatic expiry.
 
 - **`uzi tui` restarts itself after "Update now".**
   Once the Homebrew upgrade from the startup update prompt is verified, the TUI starts again on the new version with the same arguments, instead of asking you to rerun `uzi tui`. If the restart fails, the command exits nonzero and says the update itself succeeded.

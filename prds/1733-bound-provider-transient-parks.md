@@ -2,10 +2,12 @@
 
 **Issue:** [#1733](https://github.com/vtmocanu/uzi/issues/1733) (also implements [#2361](https://github.com/vtmocanu/uzi/issues/2361))
 **Epic:** [#2746](https://github.com/vtmocanu/uzi/issues/2746)
-**Status:** Draft 2026-10-11, revised after one peer review and one architect review. Maintainer decision recorded on #1733 (2026-10-11). Facts read on `main` `3e9c620c`; re-checked against `cc4ed18` (#2745 does not touch these seams).
-**Execution:** one gated uzi run, one PR. Use current `main` and a new working branch, never write to `main`. Do not touch `.github/workflows/**` in implementation or validation. M1 needs LiveDB evidence through `./e2e/run-store-it.sh`, so the run needs a Docker-capable worker (this repo's `required_capabilities` already asks for one). #1324 (forge outage at finalize) reuses this PRD's bound in a later PRD and is out of scope here.
+**Status:** Implemented with a required web-gate validation blocker (2026-10-12). Acceptance examples 1–3 and rollout controls are evidenced below. This PRD stays active while the required web gate remains blocked; hosted observation is an opportunistic follow-up.
+**Execution:** one gated uzi run, one PR. Continue on the published working branch, preserving `ca44b5c1d0b55ac215ba784b10ee7acbbf55e4c3`; merge default revision `e219759078f1d71dae616ee77b7813d21fb9df61` without rewriting history, and never write to `main`. Do not touch `.github/workflows/**` in implementation or validation. M1 needs LiveDB evidence through `./e2e/run-store-it.sh`, so the run needs a Docker-capable worker (this repo's `required_capabilities` already asks for one). #1324 (forge outage at finalize) reuses this PRD's bound in a later PRD and is out of scope here.
 
 ## Problem
+
+The following records the pre-implementation behavior, read on `main` `3e9c620c` and re-checked against `cc4ed18`. It is historical context, superseded by the implementation/evidence section below.
 
 A provider error the harness classifies as transient parks the run in `recovery_wait` with no lifetime cap.
 
@@ -50,13 +52,13 @@ Acceptance examples:
 - An accepted `paused` / `provider_unavailable` ack is a successful park disposition: preserve clone and HOME before settlement, retire the finalize record with the same reason as an accepted `recovery_wait`, return true, and never route through generic failure or ordinary teardown. A lost ack followed by ownership confirmation produces the same result. Call settlement only after positive pre-report reap/quiescence proof. `settleRecoveryGeneration` is not inherently credential-free: its legacy branch fetches with the forge PAT. Explicitly select a credential-free guarded path, or retain custody without settlement when that path is unavailable. A false or unknown reap result never permits settlement or cleanup. Apply the same proof bookkeeping to the `recovery_wait` ack without re-reaping a poisoned or disposed provider.
 
 **3. Server park accounting (`api/internal/workersvc`, `runtime.sql`).**
-- One migration (draft number above the live head `00321`, renumbered at landing) adds `provider_park_count integer NOT NULL DEFAULT 0` and `provider_park_streak_started_at timestamptz NULL`.
+- Migration `00323_provider_park_streak.sql` (renumbered above the merged default migration `00322_recovery_archive_redundancy.sql`) adds `provider_park_count integer NOT NULL DEFAULT 0` and `provider_park_streak_started_at timestamptz NULL`.
 - A typed provider park is routed to a dedicated arm, shaped like `parkDataVolumeFull` (a transaction that locks the run row, re-checks the exact `SetRunRecoveryWait` fence, then writes with `RETURNING`), with `@now` passed from `s.now()` so tests cross the bound without sleeping. From that one locked snapshot it computes:
   - streak: a new streak (start = now, count = 1) when none is open or `productive_turns > 0`; otherwise count + 1, saturating at the column maximum;
   - outcome: if the bound is enabled and `now - streak_started_at >= bound`, the hold; else the ordinary `recovery_wait` park with the stored cause `provider_outage` and today's backoff.
 - **The hold** mirrors the worker wall park `SetRunWallPark`, not the server sweep: `status='paused'`, `hold_reason='provider_unavailable'`, `claim_released_at` stays NULL, `worker_id` is kept, no `worker_active_runs` rows are deleted (a verified but unpublished capture may exist only on that worker, and releasing the claim would null `worker_id` on resume). It clears the `pause_*` columns and, in the same statement, settles **every** unapplied `kind='pause'` input (any body: `wall`, `now`, `milestone`), extending `SetRunWallPark`'s `consumed_wall` pattern, so a resumed flight is never handed a stale abort or re-parked. The hold counts as the owner's pending pause being satisfied: the run is already stopped and waiting for the owner. This departs from `SetRunPaused`'s documented rule that involuntary parks keep `pause_*`, because here the involuntary park is itself an owner-facing pause. It does not require a pending pause request (the hold is involuntary).
 - A fenced-out, stale or duplicate park report changes nothing, including the counters. Typed accounting requires a positive claim generation on the report; the nil-generation compatibility path must never become authority for a new streak or a progress reset.
-- **Never failed by a late report:** add `provider_unavailable` to the `NOT (status='paused' AND hold_reason IN ('budget_exhausted','completion_blocked'))` guards in `runtime.sql` (`SetRunFailed`, `SupersedeRunByWorker` and their two sibling sites).
+- **Never failed by a late report:** protect `provider_unavailable` while paused and through the resumed queued interval in the failure, supersession and question/follow-up guards in `runtime.sql`. Fresh claim clears the marker and advances the generation; a late report from the old worker must not overwrite the owner-resumed run.
 - **Resume:** `ResumePausedRun` already resumes any paused run; for `provider_unavailable` it also clears both streak columns. `SetRunRunning` clears `hold_reason` on the next claim, as today. Cancel uses the existing paused-run cancel path. **Stop is the existing two-step:** the owner sets the run's scope ceiling with `uzi run stop` (milestone mode, applying the existing completed-work scope and authorization rules), then resumes; the worker finalizes at the ceiling under the existing completion-permit and budget rules. No new atomic Stop path is added; the hold's surfaces show the two-step, and a run kind that cannot be scoped shows why Stop is unavailable. Stop is offered only when at least one milestone is complete (mirroring `ErrWallParkStopUnavailable`); otherwise the surfaces explain why. If the finalize after Stop itself needs the provider and hits another outage, it parks again with a fresh streak: accepted behaviour. Test the two-step through the real endpoints. A refused resume leaves every column unchanged. Update `TestPromoteRecoveryWaitNowMirrorsSweepPass` to permit only the owner-driven streak reset as an explicit exception while still pinning every pre-existing common mutation and preserved column; automatic promotion and vault-unlock promotion preserve provider streak state. An owner credential change that promotes a parked run early (`PromoteRecoveryWaitRunNow`, the set-token path) and a **credential switch** during a streak both clear the streak (an owner action is a fresh attempt).
 - **Precedence with the wall clock:** a provider park on a run already past its wall becomes `provider_unavailable`, not `budget_exhausted`; the owner's Resume then skips the budget check as for any non-budget hold, and the worker's own wall still applies to the resumed flight. Accepted: the owner is asked either way.
 - **Bound evaluation timing:** at the next qualifying park, not at the exact deadline. Detection can lag by backoff plus jitter, queue and claim delay and the next attempt; no maximum overshoot is promised.
@@ -70,7 +72,7 @@ Acceptance examples:
 - CLI and TUI: `api/cmd/uzi/run.go` hold constants, `run_get.go`, `run_render.go` recovery suffix, `run_wait.go`, `tui_board.go`, `tui_board_rows.go`, `tui_detail.go`, `tui_render.go`.
 - Web: `web/src/lib/runBadge.ts`, `web/src/pages/RunView.tsx`, `web/src/components/LastRun.tsx`, `web/src/mocks/data/runs.ts`.
 - Slack: `api/internal/slacksvc/notifier_state.go` (`recovery_wait` and paused cases).
-- Docs: `docs/run-recovery-wait.md` (it currently says the park is uncapped), `docs/run-pause.md`, `docs/cli.md`, `docs/run-health.md`, then `task docs:sync`.
+- Docs: `docs/run-recovery-wait.md` (qualify the former uncapped wording to empty-turn and resumed-gate recovery), `docs/run-pause.md`, `docs/cli.md`, `docs/run-health.md`, then `task docs:sync`.
 
 Resource bounds: the one new input is `StateRequest.ProductiveTurns *int32` (`api/internal/workersvc/service.go`; the decoder uses `DisallowUnknownFields`, so the field must be declared). It is accepted only with `status=recovery_wait` and `recovery_cause=provider_outage` and answered 400 otherwise; a negative value is rejected, not clamped; the cause is validated against `recoveryWaitCauses` as today. The bound itself is the resource limit this PRD adds.
 
@@ -99,6 +101,85 @@ Badge and RunView wording for `provider_outage` parks (count, streak start, next
 Acceptance: render and notifier tests; mock-mode RunView shows both states.
 
 A real multi-hour provider outage cannot be produced on demand; once this merges, an opportunistic line is added to the hosted acceptance issue #2747. Not a milestone.
+
+## Implementation and evidence lifecycle
+
+I0–I3b code is committed and reviewed on the current branch through
+`e26b8b2e696bebceadadf0a248041708250981d9`: server accounting/hold and
+worker custody/CLI (I0/I1), exact Codex throttle classification (I2),
+web owner surfaces (I3a), and Slack/TUI (I3b). This records branch
+implementation, not release publication or completed final validation.
+Documentation and recorded decisions now describe the implemented contract;
+embedded docs are synced by `task docs:sync`. The checklist distinguishes
+completed behavior from the outstanding required validation blocker:
+
+- [x] M1: typed, counted and elapsed-bounded provider parks; safe hold, resets, CLI and rollout controls.
+- [x] M2: exact Codex `rateLimitExceeded` retry/park path with usage/session negative controls.
+- [x] M3: web, TUI and Slack provider retry/hold presentation and owner actions.
+- [x] Documentation, recorded decision reconciliation and embedded docs sync.
+- [ ] Required `task gate:web` passes without diagnostic timeout changes.
+
+The unchecked gate keeps this PRD in `prds/`; no move to done is claimed.
+
+Acceptance examples 1–3 have handler/LiveDB and executor/runner evidence:
+
+- **Examples 1 and 2:** `api/internal/workersvc/providerpark_livedb_test.go`
+  drives real service/database transitions in
+  `TestProviderParkTypedStoresCauseAndCountsLiveDB`,
+  `TestProviderParkPastBoundHoldsLiveDB` and
+  `TestProviderParkProductiveTurnsStartNewStreakLiveDB`.
+  `TestProviderHoldResumeClearsStreakLiveDB` and
+  `TestProviderParkOwnerPromoteClearsAutomaticPreservesLiveDB` exercise
+  resets. `api/internal/handler/provider_hold_stop_livedb_test.go` drives
+  real handlers in `TestProviderHoldStopThenResumeLiveDB` and
+  `TestProviderHoldStopWithoutCompletedMilestone409LiveDB`.
+- **Both harnesses:** `agent/test/runner-provider-outage-park.test.ts`
+  runs Claude and Codex cases for typed reports with productive turns,
+  positive-proof settlement, refused reap, paused acknowledgements,
+  clone/HOME retention and lost-ack ownership confirmation. It also covers
+  untyped empty-turn/gate controls, feature absence, strict-decoder fallback
+  and current-API validation refusal. These use simulated API/transport and
+  quiescence evidence, not a live hosted outage.
+  `agent/test/sdk-executor.test.ts` covers “marks a sustained provider
+  outage providerOrigin” and “notifies onModelTurnSettled once per COMPLETED
+  turn: the failed provider attempt is not counted”.
+  `agent/test/codex-executor.test.ts` covers planning settlement (#1733)
+  and failed planning turns not counting as productive.
+- **Example 3:** `agent/test/codex-executor.test.ts` includes
+  “rateLimitExceeded exhaustion from the real executor reaches the runner
+  typed provider_outage park”, exact retry/exhaustion cases and unchanged
+  usage/session token controls. The classifier discrimination and retry
+  path are exercised; this is not exhaustive hosted interruption proof.
+
+Recorded validation (completion handoffs I2, I3a and I3b under local
+scratch; scratch records are not shipped documentation):
+
+- **API and repo:** required gates passed at `e26b8b2e`, exit 0.
+  Full LiveDB harness at that ref passed **2631 PASS, zero skips**, exit 0,
+  including provider accounting/hold, custody, Stop/Resume and
+  `TestGetSlackRunContextProviderParkLiveDB`. The harness used
+  `GOFLAGS=-timeout=20m` for its package-wide timeout, without stretching
+  individual assertions.
+- **Agent:** required gate passed at `de6db2e6`, exit 0; agent source
+  remains unchanged through `e26b8b2e`. This is prior evidence, not an
+  agent gate rerun at the latest ref.
+- **Web:** required full gate **failed** at `8d791fb5`, exit 201, on
+  `App.routes`' `beforeAll` 10s hook timeout. The same focused failure
+  reproduced on base `de6db2e6`. A scratch configuration with a 30s hook
+  timeout passed the seven focused route tests as a diagnostic only;
+  browser tests passed (14 tests, four files, exit 0). Neither result makes
+  the required web gate passed. Web source is unchanged through
+  `e26b8b2e`; this concrete blocker remains.
+- **Unexecuted:** hosted `codex-refresh-lostreply-e2e` and
+  `agent:worker-uid` lanes. Real hosted multi-hour outage observation is
+  opportunistic outside this run, to be recorded after merge on #2747;
+  it is not a completed milestone or acceptance observation.
+
+Slack delivery remains best-effort: crash or failed marker persistence can
+duplicate a notification; exactly-once delivery was not proved. Web action
+proof uses mocked components rather than live server/runtime recovery.
+No claim is made that every required gate passed or that hosted recovery
+has been validated. The required web gate and lifecycle closure remain outstanding.
 
 ## Decision Log
 
