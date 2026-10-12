@@ -7263,6 +7263,37 @@ export class GitCache {
     }
   }
 
+  /**
+   * The commit messages a push of `tip` would publish: every commit reachable from `tip` and not
+   * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
+   * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on
+   * any failure to resolve the base, run git or parse its output, so callers fail CLOSED and
+   * refuse to publish rather than treat unreadable history as clean.
+   */
+  async publishedCommitMessages(barePath: string, tip: string): Promise<{ sha: string; message: string }[] | null> {
+    try {
+      if (!SHA40_RE.test(tip)) return null;
+      const baseRef = await this.defaultBranchRef(barePath);
+      // NUL is the one byte git forbids in a commit message, so `-z` with %x00 between %H and %B
+      // yields a flat NUL-delimited stream of (sha, message) pairs a message cannot corrupt. NUL is
+      // written as a printable \u escape (never a raw control byte in source).
+      const out = await this.runGit(barePath, ["log", "-z", "--format=%H%x00%B", `${baseRef}..${tip}`]);
+      const tokens = out.split("\u0000");
+      // The trailing NUL from `-z` leaves one empty final token.
+      if (tokens.pop() !== "") return null;
+      if (tokens.length % 2 !== 0) return null;
+      const commits: { sha: string; message: string }[] = [];
+      for (let i = 0; i < tokens.length; i += 2) {
+        const sha = tokens[i]!;
+        if (!SHA40_RE.test(sha)) return null;
+        commits.push({ sha, message: tokens[i + 1]! });
+      }
+      return commits;
+    } catch {
+      return null;
+    }
+  }
+
   /** Pushed workflow blobs must match the fresh default or the current remote target, per path. */
   async branchWorkflowFiles(
     barePath: string,

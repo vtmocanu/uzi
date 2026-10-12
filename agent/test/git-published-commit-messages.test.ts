@@ -1,0 +1,87 @@
+import { afterEach, beforeEach, describe, it } from "node:test";
+import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
+import fs from "node:fs";
+import path from "node:path";
+import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { GitCache } from "../src/git.js";
+
+// issue #2779 — GitCache.publishedCommitMessages over REAL repos: the commit messages a push of
+// a tip would publish, read from the worker bare against its default ref. Any failure to read the
+// range is null (callers refuse), never an empty list.
+
+const ENV = { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_TERMINAL_PROMPT: "0" };
+const IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+
+function git(cwd: string, ...args: string[]): string {
+  return execFileSync("git", ["-C", cwd, ...args], { env: ENV, encoding: "utf8" }).trim();
+}
+
+function commit(repo: string, file: string, message: string): string {
+  fs.writeFileSync(path.join(repo, file), `${message}\n${Math.random()}\n`);
+  git(repo, "add", ".");
+  git(repo, ...IDENT, "commit", "-m", message);
+  return git(repo, "rev-parse", "HEAD");
+}
+
+let fx: Fixture;
+let gc: GitCache;
+
+beforeEach(() => {
+  fx = makeFixture();
+  gc = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions());
+});
+afterEach(() => fx.cleanup());
+
+/** Bare clone of origin, then pull `branch` from origin into a throwaway ref and return its tip. */
+async function bareWith(branch: string): Promise<{ bare: string; tip: string }> {
+  const bare = await gc.ensureClone(fx.originPath);
+  execFileSync("git", ["-C", bare, "fetch", "--refmap=", "origin", `+refs/heads/${branch}:refs/uzi-test/${branch}`], { env: ENV });
+  return { bare, tip: git(bare, "rev-parse", `refs/uzi-test/${branch}`) };
+}
+
+describe("publishedCommitMessages (issue #2779)", () => {
+  it("returns every branch commit with its full multi-line message, newest first", async () => {
+    git(fx.originPath, "checkout", "-b", "work");
+    const a = commit(fx.originPath, "a.txt", "first subject\n\nbody line one\n\nbody para two\nFixes #2172");
+    const b = commit(fx.originPath, "b.txt", "second subject");
+    git(fx.originPath, "checkout", "main");
+    const { bare, tip } = await bareWith("work");
+    const out = await gc.publishedCommitMessages(bare, tip);
+    assert.ok(out);
+    assert.deepStrictEqual(out.map((c) => c.sha), [b, a]);
+    assert.ok(out[1]!.message.startsWith("first subject\n\nbody line one\n\nbody para two\nFixes #2172"));
+    assert.ok(out[0]!.message.startsWith("second subject"));
+  });
+
+  it("includes a merge commit's own message", async () => {
+    git(fx.originPath, "checkout", "-b", "work");
+    const w1 = commit(fx.originPath, "w.txt", "work one");
+    git(fx.originPath, "checkout", "-b", "side", "main");
+    const s1 = commit(fx.originPath, "s.txt", "side one");
+    git(fx.originPath, "checkout", "work");
+    git(fx.originPath, ...IDENT, "merge", "--no-ff", "-m", "Merge side\n\nCloses #2172", "side");
+    const merge = git(fx.originPath, "rev-parse", "HEAD");
+    git(fx.originPath, "checkout", "main");
+    const { bare, tip } = await bareWith("work");
+    const out = await gc.publishedCommitMessages(bare, tip);
+    assert.ok(out);
+    assert.deepStrictEqual(new Set(out.map((c) => c.sha)), new Set([merge, w1, s1]));
+    assert.ok(out.find((c) => c.sha === merge)!.message.includes("Closes #2172"));
+  });
+
+  it("returns [] (not null) for an empty range", async () => {
+    const bare = await gc.ensureClone(fx.originPath);
+    const tip = git(bare, "rev-parse", "refs/remotes/origin/main");
+    assert.deepStrictEqual(await gc.publishedCommitMessages(bare, tip), []);
+  });
+
+  it("returns null for an invalid tip, an absent object, and an unresolvable repo", async () => {
+    const bare = await gc.ensureClone(fx.originPath);
+    assert.strictEqual(await gc.publishedCommitMessages(bare, "not-a-sha"), null);
+    assert.strictEqual(await gc.publishedCommitMessages(bare, "refs/heads/main"), null);
+    assert.strictEqual(await gc.publishedCommitMessages(bare, "f".repeat(40)), null);
+    assert.strictEqual(await gc.publishedCommitMessages(path.join(fx.dataDir, "no-such-repo"), "a".repeat(40)), null);
+  });
+});
