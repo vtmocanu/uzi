@@ -37,17 +37,26 @@ The artifact is the existing clone; nothing is copied.
   and names exactly this source. A same-run successor therefore finds no retained journal,
   seeds a fresh attempt and is neither adopted into nor failed by the old clone. An episode
   journal (`recovery` or `retainedSources`) is left untouched; it is already protected.
-- **Canonical clone (non-Docker worker):** `GitCache.markStoppedCanonical` writes a bounded
-  bare-config marker, `uzi-stopped.<runId>.entry` (JSON with `version`, `runId`, `generation`,
-  `branch`, `key`, `clonePath`, `journalDigest`, `reason`, `at`), bound to the sha256 of the
-  exact canonical journal, and keeps the plain journal. The marker grants no capture,
-  adoption or release authority; it only refuses reuse. Discovery and seeding throw
-  `RetainedStoppedSourceError` (a `RunResidueBlockedError`, reason `worker_residue_blocked`)
-  instead of adopting the stale tip. Because the canonical path is shared per issue, any later
-  run of that issue on that worker fails once with that error until the source is discarded.
-- A malformed value, a value over 4 KiB, more than 64 values per run, a persistence failure or
-  a latched residue quarantine yields `unknown`: nothing is written or truncated and the source
-  stays.
+- **Canonical clone (non-Docker worker):** `GitCache.markStoppedCanonical` (amended 2026-10-12,
+  maintainer decision 1) does three things in one bare-lock section, in this order, after every
+  validation has passed with nothing written: it persists the key's attempt mode
+  (`uzi-attemptmode.<key>.enabled`, the existing mechanism used after retained recovery) and
+  reads it back; it writes a bounded bare-config marker, `uzi-stopped.<runId>.entry` (JSON with
+  `version`, `runId`, `generation`, `branch`, `key`, `clonePath`, `journalDigest`, `reason`,
+  `at`), bound at write time to the sha256 of the exact plain journal, and reads it back; and
+  it clears that exact plain journal, only while its raw value is still the one the digest was
+  computed from. The marker, not the journal, now attributes and protects the kept source. The
+  marker grants no capture, adoption or release authority. Later claims of the issue (a newer
+  generation of the same run, or a different run) see attempt mode and seed a fresh attempt
+  path, so the kept clone is untouched, attributable and listed by inspect (marker state
+  `detached`). Discovery heals a half-done detachment (a bound plain journal plus a valid
+  marker whose digest matches) by persisting the mode and clearing that journal. The claim
+  re-reads attempt mode right before seeding and retries once on a fresh path. The run's FINAL
+  inventory counts marker-kept paths, so a missing one makes that run's inventory unknown until
+  discard. Discard clears a journal only when it still names that source, never a successor's.
+- A malformed value, a value over 4 KiB or more than 64 values per run yields `unknown`:
+  nothing is written or truncated and the source stays. See Fail-closed cases below for the
+  full list.
 - Neither path calls `/state`, publishes, archives, finalizes, touches credentials or writes
   `refs/uzi-runner/*`. `RunRunner.retainStoppedSource` first latches
   `preserveRecoveryClone` before any await, then runs own-mode quiescence with a forced
@@ -71,7 +80,20 @@ Recovery-handler exits below). It returns `covered` only if all of these hold:
   its seed base);
 - every local ref of the clone, in any namespace, points at a commit reachable from `HEAD` or
   from a ref of the bare; there is no stash entry; and no linked worktree exists;
-- a capture-mode proof was quiescent before and after the reads.
+- a capture-mode proof was quiescent before and after the reads;
+- there is no populated submodule: `status` runs with `--ignore-submodules=none`, and a
+  `.git/modules` store or an index gitlink whose path holds anything but nothing or an empty
+  directory is `not_covered`, including under `ignore=all` (set in `.gitmodules` or config),
+  since the parent proof says nothing about a submodule's own files, commits or refs;
+- the final process proof reaped no writer: a writer reaped by the "after" scan existed after
+  the byte checks ran, so they do not cover what it wrote. The residual is a writer that
+  writes and exits between the status read and that proof;
+- the stopped-source proof's Docker half was `not_wired` or `docker_unconfirmed`. A failed
+  Docker teardown (`docker_error`) skips the coverage check and keeps the clone, because the
+  proof scans processes only.
+
+Status reads on a kept clone run with `GIT_OPTIONAL_LOCKS=0`, so they never rewrite its
+index stat cache.
 
 Anything else (unknown, changed, unanchored, unreadable, blocked) is `not_covered` and the
 source is retained. The accepted residuals are stated in `docs/run-recovery.md`: gitignored
@@ -89,11 +111,20 @@ Retention needs an explicit reclaim path, including when no server hold exists.
   is logged and non-fatal. Requests are NDJSON, at most 8 KiB in and 64 KiB out, with one
   destructive request at a time (a concurrent one gets `busy`).
 - **`inspect`** is read-only and content-free, under one 5 s budget; a budget hit reports
-  `partial` or `unknown`, never 0.
+  `partial` or `unknown`, never 0. It lists attempt-ledger sources, canonical sources with a
+  `uzi-stopped` marker (marker state `bound` while the plain journal is pending, `detached`
+  normally, `mismatch` otherwise), and (maintainer decision 2, 2026-10-12) canonical clones
+  kept under their plain journal with no marker (marker state `none`, journal state `plain`,
+  consumer `run_state:not_known_locally`). A marker-less record is hidden only by evidence
+  that names its path: a valid marker by its parsed `clonePath`, a malformed marker whose text
+  carries the path not followed by a clone-key character (so a marker for `issue-290` never
+  hides `issue-29`), an overflowing run, or a protected record that owns the path.
 - **`discard`** requires the descriptor digest from inspect (`--confirm`). It closes the claim
   gate under a distinct `retained_ops` owner, waits at most 5 s for in-flight claims to
   drain, requires `Worker.isIdle()`, and holds the run's reservation through disposal. It never
-  cancels a run or stops the worker. `--generation none` is accepted for canonical and `gx`
+  cancels a run or stops the worker. On a Docker-wired worker it is refused unless the Docker
+  teardown reported `docker_unconfirmed`; a `docker_error` or any other state refuses the
+  destructive request, since a container may still mount the clone. `--generation none` is accepted for canonical and `gx`
   sources only when run and path identity are positively established.
 - **Server holds are read before the bare lock.** The server hold state comes from
   `client.listRecoveryHolds` and is never inferred from local files. The read happens inside
@@ -104,9 +135,20 @@ Retention needs an explicit reclaim path, including when no server hold exists.
 - **Local custody records are independent consumers.** `recovery/<runId>` records,
   `recovery-settlement/<runId>` records and physical terminal protection are each named and
   resolved through their own existing path. `inspect` reports one disposition:
-  `owner_hold_discard <id>`, `resolve_local_record`, `local_protected_discard` (only when
-  the server read succeeded and lists no hold, no local record is unresolved, and every
-  source is exclusively attributable), or `refused` naming the consumers.
+  `owner_hold_discard <id>`, `resolve_local_record`, `local_discard` /
+  `local_protected_discard` (only when the server read succeeded and lists no hold, no local
+  record is unresolved, and every source is exclusively attributable), or `refused` naming the
+  consumers. A plain-journal canonical record confirmed for discard is deleted with the same
+  digest confirmation and three-fact reporting (server holds, local records, terminal
+  protection), and its plain journal is cleared (only while its raw value is unchanged and it
+  still names exactly that source), so a later resume seeds fresh.
+- **Actively parked, and its gap.** An open hold of the run means the run is still parked, so
+  `owner_hold_discard` refuses and deletes nothing: this is the actively-parked refusal. A
+  local record or a live flight also refuses. The worker has no authoritative parked signal and
+  makes no new network call, so it cannot tell more. A hold can be released (claim released,
+  capture available) or never opened (`paused` and `limit_wait` parks, recovery-disabled
+  workers) while the run is still parked. Such a source is therefore reclaimable by explicit
+  operator confirmation and loses only the bytes outside the last capture.
 - **One bare lock.** The protected discard runs through a private locked core of
   `discardRetainedRecovery` (`discardRetainedRecoveryUnderLock`); the public wrapper is
   `withLock` plus that core. The lock is taken once and held from the descriptor snapshot
@@ -168,15 +210,32 @@ Claims without a claim generation (pre-generation APIs) can never be proven cove
 their park and terminal exits keep the clone, and a same-worker reclaim of such a run
 stops silently in retained recovery. Current APIs always send a generation.
 
-An aggregate inspect lists attempt clones through their ledger entry; a canonical clone
-kept by a park or terminal exit under its plain journal is not listed and cannot be
-discarded through the channel (the same run's resume recaptures it, or the next run's
-terminal-orphan handling applies).
+An aggregate inspect lists attempt clones through their ledger entry. A canonical clone kept
+by a park or terminal exit under its plain journal is also listed (marker state `none`,
+consumer `run_state:not_known_locally`) and can be discarded through the channel once no hold,
+local record or live flight uses it; the same run's resume on that worker still recaptures it,
+and the next run's terminal-orphan handling still applies.
 
 Park timing, report count and order, retry timing, `recovery_wait` returning `true` for a
 credential-deferred run, and the accepted cross-worker durability limit are unchanged per
 ADR-1197. A local-only park retains its original clone; that is source retention, not a
 promise another worker can resume it.
+
+### Fail-closed cases
+
+These keep the source and the existing routing:
+
+- `markStoppedCanonical` returns `unknown` (nothing written, plain journal kept) on a
+  persistence failure, malformed or overflowing marker evidence, a latched residue quarantine,
+  or a journal that is not the exact plain one.
+- A detachment that cannot be completed at discovery (digest mismatch, failed write).
+- Malformed or overflowing marker evidence naming the path or the run.
+- A malformed attempt-mode value.
+- The fresh seed's existing seed-mode quiescence finding unattributed processes in the key's
+  footprint.
+- A latched residue quarantine.
+
+In each case a later run is refused with `worker_residue_blocked`, as before this amendment.
 
 ## Alternatives rejected
 
@@ -187,6 +246,15 @@ promise another worker can resume it.
   stopped claim has no authority to do.
 - **Mark the attempt `abandoned`, TTL deletion or FIFO eviction.** A cap cannot authorize
   deleting the last unverified copy.
+- **Keep the plain journal on a canonical clone and refuse every later run of the issue**
+  (the earlier shape of this ADR). Rejected by maintainer decision 1 (2026-10-12): a worker
+  with no Docker host would fail each later run of the issue once until an operator discards
+  the clone. Persisting attempt mode and clearing the journal lets later runs proceed on a
+  fresh path while the marker keeps the clone attributable.
+- **Read park state from the server to decide discard.** Rejected by maintainer decision 2
+  (2026-10-12): it adds a network call to a worker-local operator path, and the answer is
+  still not authoritative for `paused` and `limit_wait` parks. Open-hold refusal plus explicit
+  digest confirmation is used instead.
 - **Keep the active journal for attempt clones.** It routes the next same-run claim into
   `recoverRetainedClaim`, which adopts or fails the run; clearing it lets a successor seed a
   fresh attempt.
@@ -218,5 +286,12 @@ promise another worker can resume it.
 - Local retention is not a checkpoint, archive or server hold. Same-pod process restart keeps
   the clone; pod replacement loses an `emptyDir` clone while the ledger or marker survives
   (reported missing, never empty); PVC teardown loses both.
+- A key whose canonical clone was kept stays in attempt mode on that worker permanently, so
+  later claims of the issue start a fresh model session; the work carries over through the
+  tracking ref and checkpoints. While a run's marker exists, that run's later stops are never
+  judged covered. A dirty kept clone keeps the run's hold, so its route is `owner_hold_discard`.
+- **Not shipped:** teardown of attributed containers is only requested, not proven
+  (tracked in #2747). The coverage proof scans processes and, on Docker-wired workers, uses
+  the teardown answer; it does not prove a container is gone.
 - Operator procedure: `docs/run-recovery.md`, "When a run is stopped by a stale or fenced
   claim" and "Retained sources with no open hold (worker-local inspect and discard)".
