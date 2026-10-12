@@ -116,7 +116,15 @@ there is no maximum overshoot promise or deadline-triggered sweep to a hold.
 A provider park reporting positive `productive_turns` starts a new streak
 at that park with count 1. These are completed, error-free model turns in
 the current flight, including planning, implementation and review; claiming
-the run or becoming `running` does not count as progress. Owner Resume,
+the run or becoming `running` does not count as progress. Progress is not
+limited to provider parks: a flight that completed turns and then parks for
+another reason, an ordinary (untyped or `empty_turn`) or a disk
+(`data_volume_full`) recovery park, reports them as `provider_progress_turns`,
+and the API clears an open streak in the same statement that applies that
+park. Missing or zero evidence leaves the streak untouched, and the report
+must carry a positive `claim_generation`; the generation, status and release
+fences reject stale or replayed evidence, so it cannot reset a streak twice.
+Owner Resume,
 early credential-driven promotion and credential switching clear the streak.
 Automatic and vault-unlock promotion preserve it.
 
@@ -146,6 +154,17 @@ rollback, a positively identified older strict decoder's unknown-field
 refusal triggers one untyped resend and disables the cached feature;
 ordinary validation errors do not. Recognizing `paused` alone does not
 make rollback safe: older APIs lack the provider hold's late-failure guards.
+
+`provider_progress_turns` is gated separately by the negotiated
+`provider_progress_on_recovery_park_v1` feature. A worker sends it only after
+seeing that feature, only with a positive claim generation, and only on an
+ordinary or disk recovery park. If the API refuses it as an unknown field
+(a positively identified strict-decoder refusal after a rollback), the worker
+drops the cached feature and re-sends the same park once without the field,
+keeping the fence; a refusal of that retry propagates, and there is no third
+variant. An old worker or an old API therefore sends no progress evidence and
+the streak is preserved, the conservative direction: the bound may fire
+earlier than it would have, never later.
 
 ## Bounded retained-source recovery
 

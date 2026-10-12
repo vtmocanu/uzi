@@ -2698,7 +2698,8 @@ belongs to the current streak, separately from the recovery backoff count.
 The default elapsed bound is 24h from the first park; operators can change
 `RUN_PROVIDER_PARK_MAX_DURATION` or use `0` to disable the hold while
 typing/counting remain enabled. Positive completed `productive_turns` on
-a provider park starts a new streak. Owner Resume, early credential-driven
+a provider park starts a new streak; the same evidence on an ordinary or
+disk recovery park (`provider_progress_turns`) clears an open streak. Owner Resume, early credential-driven
 promotion and credential switching clear it; automatic and vault-unlock
 promotion preserve it. Detection is at the next qualifying park, with no
 maximum overshoot promised.
