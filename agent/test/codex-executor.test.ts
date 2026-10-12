@@ -14359,14 +14359,14 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     rig.deps = { ...rig.deps, transientBackoffBaseMs: 1, ...extra };
   }
 
-  it("(a) serverOverloaded once then success: the run completes in the SAME thread with one retry notice", async () => {
-    const rig = makeRig({ responder: failingThenDone(1, "serverOverloaded") });
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(a) ${info} once then success: the run completes in the SAME thread with one retry notice [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(1, info) });
     tinyBackoff(rig);
     const { ctx, emitted } = makeCtx();
     const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient then success");
     assert.equal(result.branch, "agent/issue-42", "the run completed");
     assert.equal(rig.transport.turnStartCount, 2);
-    assert.deepEqual(retryNotices(emitted), ["the provider returned a transient error (serverOverloaded); retrying (1/2)…"]);
+    assert.deepEqual(retryNotices(emitted), [`the provider returned a transient error (${info}); retrying (1/2)…`]);
     assert.equal(
       rig.transport.requests.filter((r) => r.method === "thread/start").length,
       1,
@@ -14416,15 +14416,16 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     });
   }
 
-  it("(b) every attempt serverOverloaded: TransientRecoveryError after exactly 1+N turn starts", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b) every attempt ${info}: TransientRecoveryError after exactly 1+N turn starts [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig);
     const { ctx, emitted } = makeCtx();
     await assert.rejects(
       withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "transient exhausted"),
       (e: Error) => {
         assert.ok(e instanceof TransientRecoveryError, `expected TransientRecoveryError, got ${e.name}: ${e.message}`);
-        assert.match(e.message, /persisted after bounded in-process retries: codex turn failed: failed \(serverOverloaded\)/);
+        assert.equal(e.message, `provider transient error persisted after bounded in-process retries: codex turn failed: failed (${info})`);
+        assert.equal(e.providerOrigin, true);
         return true;
       },
     );
@@ -14433,8 +14434,54 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(retryNotices(emitted).length, 2);
   });
 
-  it("(b1) the exhausted transient park is marked providerOrigin (PRD #1733)", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+  it("rateLimitExceeded exhaustion from the real executor reaches the runner typed provider_outage park", async () => {
+    const api = new FakeApi("rate-limit-worker");
+    const url = await api.listen();
+    const fx = makeFixture();
+    const diagnostics = recordingLog();
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "rateLimitExceeded") });
+    tinyBackoff(rig, { deferRegistryTeardown: true });
+    const client = new WorkerClient(url, "rate-limit-worker", "test", diagnostics.log, {
+      sleep: async () => {}, terminalRetrySchedule: [1, 1],
+    });
+    client.protocolFeatures = ["claim_generation_fence", "recovery_cause_provider_outage"];
+    api.recoveryWaitRequiresRunning = true;
+    const claim = makeClaim({
+      repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
+      claim_generation: 3,
+      plan_approved: true, plan_source: "agent", plan_md: "approved plan",
+      secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
+    });
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const homeDir = path.join(fx.dataDir, "rate-limit-home");
+    let produced: unknown;
+    const run = executor.run.bind(executor);
+    executor.run = async ctx => {
+      try { return await run(ctx); } catch (error) { produced = error; throw error; }
+    };
+    try {
+      await new RunRunner(client, new GitCache(fx.dataDir, diagnostics.log, undefined, testGitCacheOptions()),
+        () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
+          pollMs: 5, recoveryRetryMs: 5, codexBoundaryDeadlineMs: 200,
+          quiesceRun: async () => ({
+            process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+            docker: { state: "not_wired", removed: [], detail: "not wired" },
+          }),
+        }).execute(claim);
+      assert.ok(produced instanceof TransientRecoveryError, diagnostics.lines.join("\n"));
+      assert.equal(produced.providerOrigin, true);
+      assert.equal(rig.transport.turnStartCount, 3, "the real producer spent exactly two retries");
+      const reports = api.states.filter(s => s.runId === claim.run_id && s.body.status === "recovery_wait");
+      assert.equal(reports.length, 1, diagnostics.lines.join("\n"));
+      assert.equal(reports[0]!.body.recovery_cause, "provider_outage");
+      assert.equal(reports[0]!.body.productive_turns, 0, "failed rate-limit attempts are not productive");
+      assert.equal(reports[0]!.body.claim_generation, 3);
+      assert.ok(!api.states.some(s => s.body.status === "failed" || s.body.status === "limit_wait"));
+    } finally { await api.close(); fx.cleanup(); }
+  });
+
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b1) the exhausted transient park is marked providerOrigin (PRD #1733) [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig);
     const { ctx } = makeCtx();
     await assert.rejects(
@@ -14443,8 +14490,8 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     );
   });
 
-  it("(b2) transientRetryMax bounds the retries", async () => {
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(b2) transientRetryMax bounds the retries [${info}]`, async () => {
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig, { transientRetryMax: 0 });
     await assert.rejects(
       withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(makeCtx().ctx), 3000, "no retries"),
@@ -14457,6 +14504,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     ["a tagged transport failure with a non-retryable http status", { responseStreamConnectionFailed: { httpStatusCode: 401 } }],
     ["unauthorized", "unauthorized"],
     ["contextWindowExceeded", "contextWindowExceeded"],
+    ["sessionBudgetExceeded", "sessionBudgetExceeded"],
+    ["unknown token", "totallyMadeUp"],
+    ["badRequest", "badRequest"],
   ] as const) {
     it(`(c) ${name} is never retried and never parks`, async () => {
       const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
@@ -14473,9 +14523,9 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     });
   }
 
-  it("(d) a cancel during the backoff ends the wait at once: run cancelled, no further turn start", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(d) a cancel during the backoff ends the wait at once: run cancelled, no further turn start [${info}]`, async () => {
     const controller = new AbortController();
-    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+    const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
     tinyBackoff(rig, { transientBackoffBaseMs: 4000, wallMs: 60_000 });
     const { ctx, emitted } = makeCtx({ signal: controller.signal });
     const started = Date.now();
@@ -14491,13 +14541,13 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(rig.transport.turnStartCount, 1, "no provider turn started after the cancel");
   });
 
-  it("(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError", async (t) => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(d2) a wall budget spent during the backoff takes the wall path, never TransientRecoveryError [${info}]`, async (t) => {
     for (const wired of [false, true]) {
       await t.test(wired ? "parked wall" : "unwired wall rejection", async (t) => {
         const realSetTimeout = globalThis.setTimeout;
         const realClearTimeout = globalThis.clearTimeout;
         const controller = new AbortController();
-        const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, "serverOverloaded") });
+        const rig = makeRig({ responder: failingThenDone(Number.MAX_SAFE_INTEGER, info) });
         tinyBackoff(rig, { transientBackoffBaseMs: 1000, wallMs: 300, idleMs: 5000 });
         let wallParks = 0;
         const { ctx, emitted } = makeCtx({
@@ -14616,7 +14666,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
   // arrives first and the interruption becomes true only after the live turn can no longer be
   // tripped (its finally), so the in-turn trip path never sees it. Removing the gate turns each into
   // a TransientRecoveryError.
-  it("(e) the final attempt fails with the wall budget already spent by the turn's debit: wall path, not TransientRecoveryError", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(e) the final attempt fails with the wall budget already spent by the turn's debit: wall path, not TransientRecoveryError [${info}]`, async () => {
     const realNow = Date.now.bind(Date);
     let skewMs = 0;
     mock.method(Date, "now", () => realNow() + skewMs);
@@ -14626,7 +14676,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         const rig = makeRig({
           // The clock jumps past the 1s budget as the final failed terminal is delivered, before the
           // 1s wall timer can fire: only the turn's finally debit sees the spent budget.
-          responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) skewMs = 5000; }),
+          responder: failingThenDone(2, info, (n) => { if (n === 2) skewMs = 5000; }),
         });
         tinyBackoff(rig, { transientRetryMax: 1, wallMs: 1000, idleMs: 5000 });
         let wallParks = 0;
@@ -14650,7 +14700,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     }
   });
 
-  it("(f) a pause-now pending at exhaustion parks for the pause, not TransientRecoveryError", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(f) a pause-now pending at exhaustion parks for the pause, not TransientRecoveryError [${info}]`, async () => {
     const controller = new AbortController();
     let onPause: (() => void) | undefined;
     let armed = false;
@@ -14666,7 +14716,7 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
         onPause?.();
       }
     }) as AbortSignal["removeEventListener"];
-    const rig = makeRig({ responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) armed = true; }) });
+    const rig = makeRig({ responder: failingThenDone(2, info, (n) => { if (n === 2) armed = true; }) });
     tinyBackoff(rig, { transientRetryMax: 1 });
     const parks: { completedCount: number }[] = [];
     const { ctx } = makeCtx({
@@ -14684,10 +14734,10 @@ describe("CodexExecutor: transient provider retry (issue #2099)", () => {
     assert.equal(rig.transport.turnStartCount, 2, "no further turn start");
   });
 
-  it("(g) a cancel at exhaustion ends the run cancelled, not TransientRecoveryError", async () => {
+  for (const info of ["serverOverloaded", "rateLimitExceeded"]) it(`(g) a cancel at exhaustion ends the run cancelled, not TransientRecoveryError [${info}]`, async () => {
     let cancelled = false;
     // The sticky cancel flips as the final failed terminal is delivered; no signal abort.
-    const rig = makeRig({ responder: failingThenDone(2, "serverOverloaded", (n) => { if (n === 2) cancelled = true; }) });
+    const rig = makeRig({ responder: failingThenDone(2, info, (n) => { if (n === 2) cancelled = true; }) });
     tinyBackoff(rig, { transientRetryMax: 1 });
     const { ctx } = makeCtx({ cancelRequested: () => cancelled });
     await assert.rejects(withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 3000, "cancel at exhaustion"), (e: Error) => {
