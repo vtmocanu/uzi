@@ -480,23 +480,30 @@ and falling back to the durable bare tracking ref when no clone survives:
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
-  For an active run it captures every attributed source on every running worker pod: the
+  For an active or failed run it captures every attributed source on every running worker pod: the
   primary keeps `<stem>.tgz` (selection unchanged) and each other source is
   `<stem>.source-N.tgz` (N from 2; members prefixed `<stem>.source-N.`, `meta.txt` names
   `clone=<path>`) with its own verify and `OK`/`PART` line. Attributed sources are the journal
   or protected-descriptor sources, the `uzi-stopped` marker canonical, and attempt clones whose
-  last ledger entry for the run is `live` or `reclaimed`; on a pod other than the one supplying
+  last ledger entry for the run is `live` or `reclaimed` (an unreadable attempt clone counts only on that evidence or when a journal names it); on a pod other than the one supplying
   the primary only attributed sources are added. Completed and cancelled runs capture only
   protected-descriptor or marker sources (journal and ledger are ignored). If an attributed
   source is listed but unreadable, any capture (primary or extra) is not verified, or a probe of
   the search failed (a kubectl listing or exec, an unreadable bare repository), whether the run
   was captured from a clone or fell back to the bare tracking ref, it logs
-  `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`,
-  exits 1 and does not advance `latest`; any archive that did verify is kept. An unreadable
-  directory that no journal, ledger or marker names is not an attributed source. Cost: every
+  `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`
+  (`<m>` counts the sources found, clones or the tracking ref the run tried to capture, plus
+  attributed unreadable ones), exits 1 and does not advance `latest`; any archive that did verify
+  is kept. When nothing is captured at all (no readable clone and no owned tracking ref), a failed
+  search instead logs `FAIL <run> (<label>) status=<st>: status saved, but the source search was
+  inconclusive (a kubectl listing or exec failed); retry` (still exit 1, `latest` not advanced). An unreadable
+  directory that no journal, ledger or marker names is not an attributed source, but on a run that
+  captures nothing an unreadable `.git` in any same-stem directory, even an unattributed one, still
+  makes the search inconclusive (FAIL, retry): a known limitation. Cost: every
   cycle execs into every Running pod in `UZI_WORKER_NS` for each bound run (a handful of probes
   per pod), and one pod that cannot be exec'd into fails every live run's cycle until it is
-  fixed or excluded from `UZI_WORKER_NS`.
+  fixed, or its whole namespace is dropped from `UZI_WORKER_NS` (it lists namespaces, so
+  excluding a pod means excluding its namespace).
   A `queued` run without a worker binding gets a status-only `SNAP` and stays in
   the loop. A requeued run can retain its worker and clone; capture that work.
   A `failed` run bound to a worker is captured while its clone or owned tracking ref
