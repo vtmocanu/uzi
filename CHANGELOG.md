@@ -41,8 +41,6 @@ through `[0.52.0]`.)
 - **Long run walls no longer time out immediately when they exceed the native timer range ([#2761](https://github.com/vtmocanu/uzi/issues/2761)).**
   Shared chunked relative timers honor larger served totals without clamping for the SDK wall, Codex turn wall and both install waits, and isolated wall. Each arm fixes its deadline using a monotonic clock (`performance.now()` by default, injectable for tests) and schedules native chunks of at most 2147483646 ms against that deadline. Extension admission retains the 2147483 s room limit and its frozen-wall/72h, finalize and existing-extension reserves; later configuration increases can serve totals above it. Existing executor `Date.now()` elapsed accounting and absolute-time predicates are unchanged, so this fix does not make all budget accounting monotonic.
 
-### Fixed
-
 - **Recovery archive downloads use their configured transfer deadline.**
   Downloads set the socket write deadline from the recovery service's normalized request limit before metadata lookup, allowing complete transfers past the server's shorter base write timeout while retaining a bounded socket deadline.
 
