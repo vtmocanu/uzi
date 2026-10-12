@@ -136,7 +136,7 @@ func TestPressureRecycleRouteClaimsLiveDB(t *testing.T) {
 	deadline := time.Now().Add(5 * time.Second)
 	waiting := false
 	for time.Now().Before(deadline) {
-		if err := f.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1::int=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE '%GetWorkerForUpdate%')", int32(pid)).Scan(&waiting); err != nil {
+		if err := f.pool.QueryRow(ctx, "SELECT EXISTS(SELECT 1 FROM pg_stat_activity WHERE $1::bigint=ANY(pg_blocking_pids(pid)) AND wait_event_type='Lock' AND query LIKE '%GetWorkerForUpdate%')", int64(pid)).Scan(&waiting); err != nil {
 			t.Fatal(err)
 		}
 		if waiting {
