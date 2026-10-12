@@ -627,7 +627,7 @@ func TestHeldPublishStoredErrorIsSanitizedLiveDB(t *testing.T) {
 		}
 	}
 	if strings.Contains(got, "[31m") || !strings.Contains(got, "tworedevilnextendnul") {
-		t.Fatalf("stored last_error = %q: the ANSI sequence must go, the text must stay (controls are deleted and joined, the deleted newline lets the token scrubber absorb the word before it)", got)
+		t.Fatalf("stored last_error = %q: the ANSI sequence must go, the text must stay (controls are deleted and joined, the deleted newline lets the token scrubber absorb the word after the token)", got)
 	}
 }
 
@@ -654,6 +654,25 @@ func TestHeldPublishStoredErrorRedactsSplitSecretsLiveDB(t *testing.T) {
 	}
 	if !strings.Contains(got, "denied") {
 		t.Fatalf("stored last_error = %q: the surrounding text must stay", got)
+	}
+}
+
+// An ordinary, unsplit connection PAT echoed in a forge refusal is redacted by the exact-PAT
+// step: it matches no recognised secret family, so only PublishHeld passing the PAT catches it.
+func TestHeldPublishStoredErrorRedactsEchoedPATLiveDB(t *testing.T) {
+	f := newHeldFix(t)
+	f.fake.sendFn = func(_ context.Context, _ pushbroker.HeldPackOptions) (pushbroker.HeldCreateOutcome, error) {
+		return pushbroker.HeldCreateRefused, fmt.Errorf("%w: remote: bad credential %s denied", pushbroker.ErrHeldCreateRefused, f.pat)
+	}
+	if res, err := f.publish(f.req()); err != nil || res.State != "refused" {
+		t.Fatalf("result = %+v, %v", res, err)
+	}
+	got := f.mustRow().LastError.String
+	if strings.Contains(got, f.pat) || strings.Contains(got, f.pat[len("bot-pat-held-"):]) {
+		t.Fatalf("stored last_error %q leaks the connection PAT", got)
+	}
+	if !strings.Contains(got, "[redacted] denied") {
+		t.Fatalf("stored last_error = %q: want the PAT replaced in place", got)
 	}
 }
 

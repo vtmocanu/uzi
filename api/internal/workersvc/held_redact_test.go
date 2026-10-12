@@ -11,8 +11,8 @@ import (
 // invisibleSeparators are characters that render as nothing (or as a break) and that a hostile
 // remote can slip into the middle of a credential to dodge a redactor.
 var invisibleSeparators = map[string]string{
-	"word-joiner U+2060":      "⁠",
-	"zero-width-space U+200B": "​",
+	"word-joiner U+2060":      "\u2060",
+	"zero-width-space U+200B": "\u200b",
 	"NUL":                     "\x00",
 	"newline":                 "\n",
 	"ESC CSI":                 "\x1b[0m",
@@ -75,7 +75,7 @@ func TestHeldRedactOpaquePAT(t *testing.T) {
 		}
 	})
 	t.Run("pat itself carries an invisible character", func(t *testing.T) {
-		out := heldErrText(errors.New("refused: "+pat+" no"), pat[:10]+"⁠"+pat[10:])
+		out := heldErrText(errors.New("refused: "+pat+" no"), pat[:10]+"\u2060"+pat[10:])
 		if strings.Contains(out, pat[:8]) {
 			t.Fatalf("heldErrText = %q", out)
 		}

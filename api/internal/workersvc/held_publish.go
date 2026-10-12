@@ -455,7 +455,7 @@ func SanitizeHeldText(s string) string { return sanitizeHeldText(s) }
 // heldANSIRe matches CSI and OSC escape sequences (same expression as recovery's ansiSeqRe).
 var heldANSIRe = regexp.MustCompile("\x1b\\[[0-?]*[ -/]*[@-~]|\x1b\\][^\x07\x1b]*(?:\x07|\x1b\\\\)")
 
-// heldDropUnsafe DELETES every ANSI sequence and unsafe rune: invalid UTF-8, C0/C1 controls
+// heldDropUnsafe DELETES every CSI and OSC escape sequence and unsafe rune: invalid UTF-8, C0/C1 controls
 // (newline and tab included), the format (Cf), line and paragraph separator (Zl, Zp) and
 // nonspacing mark (Mn) classes, and the zero-width Hangul fillers. It mirrors
 // recovery.dropUnsafeRunes; it is copied because recovery's in-package tests import workersvc,
@@ -479,7 +479,9 @@ func heldDropUnsafe(s string) string {
 // and show. Order matters: unsafe runes and ANSI sequences are deleted first, then the exact
 // connection PAT (itself cleaned the same way; skipped when empty) is replaced with
 // "[redacted]", then secretscrub redacts a recognised secret family, then whitespace runs
-// collapse to one space and the result is bounded to heldLastErrorMax runes.
+// collapse to one space and the result is bounded to heldLastErrorMax runes. A PAT split by an
+// invisible or control rune is rejoined and replaced; one split by a visible character (a space)
+// or by a CSI whose final byte consumes one of its characters is not.
 func heldRedact(s, pat string) string {
 	out := heldDropUnsafe(s)
 	if p := heldDropUnsafe(pat); p != "" {

@@ -199,7 +199,7 @@ func (s *Service) heldCleanupOne(ctx context.Context, it heldCleanupItem) (n int
 }
 
 // heldErrText makes err safe to store and log: heldRedact deletes unsafe characters, replaces
-// the connection PAT (also when a separator split it), scrubs recognised secret families and
+// the connection PAT (also when an invisible or control rune split it), scrubs recognised secret families and
 // bounds the length.
 func heldErrText(err error, pat string) string { return heldRedact(err.Error(), pat) }
 
