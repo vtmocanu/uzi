@@ -604,7 +604,7 @@ func providerHold(rc store.GetSlackRunContextRow) bool {
 // never inherits provider wording from counters or a worker-supplied failure reason.
 func providerStateDetail(rc store.GetSlackRunContextRow) string {
 	hold := providerHold(rc)
-	if !hold && !(rc.Status == "recovery_wait" && rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == "provider_outage") {
+	if !hold && (rc.Status != "recovery_wait" || !rc.RecoveryWaitCause.Valid || rc.RecoveryWaitCause.String != "provider_outage") {
 		return ""
 	}
 	var parts []string
