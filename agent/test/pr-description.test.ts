@@ -902,7 +902,7 @@ describe("m2 non-closing deterministic rendering", () => {
   }
   it("m2 non-closing mrCompletionBlock guards ci_fix issue-arm fallback", () => {
     const issue = makeClaim({ kind: "issue", issue_iid: 7 });
-    const args = [issue, "b", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, undefined, { reason: "Follow-up remains" }];
+    const args = [issue, "b", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, undefined, undefined, { reason: "Follow-up remains" }];
     const body = Reflect.apply(mrCompletionBlock, undefined, args) as string;
     assert.match(body, /Follow-up remains/);
     assert.equal(closingDirectiveFor(body, 7, "org/repo"), false);
