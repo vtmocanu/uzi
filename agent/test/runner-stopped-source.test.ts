@@ -85,8 +85,13 @@ interface Facts {
 }
 
 /** Write the three kinds of worker-only state into `wt`. */
-function writeWorkerOnlyState(wt: string, opts: { cleanTree?: boolean } = {}): Facts {
+function writeWorkerOnlyState(wt: string, opts: { cleanTree?: boolean; seedOnly?: "clean" | "untracked" } = {}): Facts {
   const baseHead = gitIn(wt, "rev-parse", "HEAD");
+  if (opts.seedOnly) {
+    // A flight stopped before it committed anything: HEAD is still the seed base.
+    if (opts.seedOnly === "untracked") fs.writeFileSync(path.join(wt, "untracked.txt"), UNTRACKED);
+    return { clonePath: wt, commit: baseHead, baseHead };
+  }
   fs.mkdirSync(path.join(wt, "assets"), { recursive: true });
   fs.writeFileSync(path.join(wt, "assets", "blob.bin"), BIN_V1);
   gitIn(wt, "add", "assets/blob.bin");
@@ -125,6 +130,8 @@ function assertRecoverableFromExport(facts: Facts, label: string): void {
 interface RigOptions {
   guarded?: boolean;
   cleanTree?: boolean;
+  /** No commit: the flight stops at the seed base head, clean or with one untracked file. */
+  seedOnly?: "clean" | "untracked";
   recovery?: RecoveryCoordinator;
   log?: Logger;
   runnerOpts?: Record<string, unknown>;
@@ -165,7 +172,7 @@ function stopRig(iid: number, flavor: Flavor, trigger: Trigger, o: RigOptions = 
   let runner!: RunRunner;
   const stopper: Executor = {
     run: async (ctx: RunContext): Promise<ExecutorResult> => {
-      const facts = writeWorkerOnlyState(ctx.worktreePath, { cleanTree: o.cleanTree });
+      const facts = writeWorkerOnlyState(ctx.worktreePath, { cleanTree: o.cleanTree, ...(o.seedOnly ? { seedOnly: o.seedOnly } : {}) });
       all.push(facts);
       if (o.withHome) fs.mkdirSync(path.join(homeDir, ctx.runId), { recursive: true });
       await o.beforeStop?.(ctx, facts);
@@ -456,6 +463,25 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     assert.equal(fs.existsSync(facts.clonePath), false, "refs the bare holds do not keep a fully fetched clone");
     assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
   });
+
+  // A flight stopped while planning never committed past its seed base: HEAD is an ancestor of the
+  // bare's default branch, so there is no tracking ref to anchor and no worker-only commit either.
+  for (const flavor of ["canonical", "attempt"] as const) {
+    it(`${flavor} clone, clean at the seed base head already on the bare's default branch: teardown proceeds, nothing retained`, async () => {
+      const rig = stopRig(17970 + (flavor === "attempt" ? 1 : 0), flavor, "stale", { seedOnly: "clean" });
+      await rig.runner.execute(rig.claim);
+      const facts = rig.facts();
+      assert.equal(fs.existsSync(facts.clonePath), false, "nothing worker-only: the clone is retired");
+      assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
+    });
+
+    it(`${flavor} clone, seed base head but an untracked file: retained`, async () => {
+      const rig = stopRig(17972 + (flavor === "attempt" ? 1 : 0), flavor, "stale", { seedOnly: "untracked" });
+      await rig.runner.execute(rig.claim);
+      const facts = rig.facts();
+      assert.equal(fs.readFileSync(path.join(facts.clonePath, "untracked.txt"), "utf8"), UNTRACKED, "the untracked file survives");
+    });
+  }
 
   it("clean clone at the owned tracking tip holding a commit only under refs/remotes/ is retained", async () => {
     const rig = stopRig(17961, "canonical", "stale", {

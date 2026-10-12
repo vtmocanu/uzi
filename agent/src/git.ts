@@ -5495,7 +5495,7 @@ export class GitCache {
    * local ref (branches, tags, remotes, any other namespace) is reachable from `capturedHead` or
    * from a ref of the worker bare, and no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
    * under committed tracking ownership that still names `owner.runId` and `owner.generation`, or
-   * by an owed pin of the run; `quiesce` answered true both before and after the reads. Anything
+   * by an owed pin of the run, or by being an ancestor of the bare's default-branch ref; `quiesce` answered true both before and after the reads. Anything
    * else, a thrown error included, is `not_covered` and the caller retains the source.
    */
   async verifyStoppedSourceCovered(
@@ -5530,6 +5530,10 @@ export class GitCache {
           anchored = (await this.committedTrackingOwnershipUnderLock(barePath, branch, owner.runId, capturedHead, owner.generation)).kind === "owned";
         }
         if (!anchored) anchored = await this.hasOwedAnchorUnderLock(barePath, owner.runId, capturedHead);
+        // A clean head that is already an ancestor of the bare's default-branch ref (a flight that never
+        // committed past its seed base, e.g. one stopped while planning) holds no worker-only commit:
+        // the forge's default branch has it, as in resolveRestartSource's `on_default`.
+        if (!anchored) anchored = await this.headOnDefaultUnderLock(barePath, capturedHead);
         if (!anchored) return "not_covered";
         // The same source is still the one that was read: same identity, journal and quiescence.
         if (!(await this.realCloneDir(src.clonePath))) return "not_covered";
@@ -5542,6 +5546,20 @@ export class GitCache {
       this.log.warn("stopped source coverage could not be revalidated; it is retained", { clone: source.clonePath, error: gitErrorMessage(err) });
       return "not_covered";
     }
+  }
+
+  /** Is `head` an ancestor of the bare's default-branch ref (`refs/remotes/origin/<default>` or the mirror-layout
+   *  `refs/heads/<default>`)? Caller holds the bare lock. Any failed read is `false`. */
+  private async headOnDefaultUnderLock(barePath: string, head: string): Promise<boolean> {
+    try {
+      const db = await this.defaultBranchName(barePath);
+      if (db === undefined || !(await this.isPlainBranchName(barePath, db))) return false;
+      for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
+        if (!(await this.refExists(barePath, ref))) continue;
+        if ((await this.tryGit(barePath, ["merge-base", "--is-ancestor", head, ref])) === 0) return true;
+      }
+    } catch { /* not provable */ }
+    return false;
   }
 
   /**
