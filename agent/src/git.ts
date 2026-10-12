@@ -19,6 +19,7 @@ import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, u
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
 import { withForgeRetry } from "./forge-retry.js";
+import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
   attemptClonePath,
@@ -886,6 +887,8 @@ interface SpawnGitOptions {
   /** Trusted verifier traversal environment; never sourced from repository config. */
   env?: NodeJS.ProcessEnv;
   cancelOnAbandon?: boolean;
+  /** Private ref transactions write prepare first and commit only after locked inspection. */
+  keepStdinOpen?: boolean;
 }
 
 /** PRD #1798 M5: a bounded read's stdout, and whether the bound cut it. */
@@ -945,6 +948,25 @@ function settlementPinBase(runId: string, holdId: string): string | null {
   if (rid === "" || hid === "") return null;
   return `${SETTLE_PIN_PREFIX}${rid}/${hid}/`;
 }
+/** Authenticated archived-record callers only; generation must already be normalized. */
+export interface ArchivedRecoveryPinCleanup {
+  runId: string;
+  generation: number;
+  sourceSha: string;
+  recoveryPinBareDir?: string;
+  bareDir?: string;
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline in milliseconds. */
+  deadline?: number;
+  /** Synchronous journal/execution eligibility check, called immediately before mutation. */
+  isEligible: () => boolean;
+}
+export type ArchivedRecoveryPinCleanupResult =
+  | { state: "deleted" | "already_absent" }
+  | { state: "retained"; reason: "invalid_identity" | "unsafe_metadata" | "ambiguous" |
+      "scan_limit" | "target_changed" | "ineligible" | "cancelled" | "deadline" | "git_failure" };
+const recoveryPinAttributionLocks = new RunDiskLocks();
+
 function recoveryPinRef(runId: string, generation: number): string {
   const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
   return `${RECOVERY_PIN_PREFIX}${rid}/${generation}`;
@@ -4454,14 +4476,19 @@ export class GitCache {
     if (!/^[0-9a-f]{40}$/.test(sha)) return false;
     const pinRef = recoveryPinRef(runId, generation);
     try {
-      return await this.withLock(barePath, async () => {
-        const present = (
-          await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
-        ).trim();
-        if (present !== sha) return false;
-        await this.runGit(barePath, ["update-ref", pinRef, sha]);
-        return true;
-      });
+      const root = await fs.realpath(this.reposRoot);
+      const rootStat = await fs.lstat(root);
+      return await recoveryPinAttributionLocks.withLock(
+        JSON.stringify([root, rootStat.dev, rootStat.ino, pinRef]),
+        () => this.withLock(barePath, async () => {
+          const present = (
+            await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
+          ).trim();
+          if (present !== sha) return false;
+          await this.runGit(barePath, ["update-ref", pinRef, sha]);
+          return true;
+        }),
+      );
     } catch (err) {
       this.log.warn("recovery: could not anchor the verified restore-point head in the trusted bare", {
         bare: barePath,
@@ -4640,8 +4667,341 @@ export class GitCache {
    * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
    * never-deleted posture `refs/uzi-runner` already carries, PRD #218).
    */
-  async deleteRecoveryPin(barePath: string, runId: string, generation: number): Promise<void> {
-    await this.tryGit(barePath, ["update-ref", "-d", recoveryPinRef(runId, generation)]);
+  async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
+    if (expectedSha === undefined) {
+      await this.tryGit(barePath, ["update-ref", "-d", recoveryPinRef(runId, generation)]);
+      return;
+    }
+    const root = path.resolve(this.reposRoot);
+    if (!path.isAbsolute(barePath) || path.resolve(barePath) !== barePath || path.dirname(barePath) !== root) return;
+    await this.cleanupArchivedRecoveryPin({
+      runId, generation, sourceSha: expectedSha, recoveryPinBareDir: path.basename(barePath), isEligible: () => true,
+    });
+  }
+
+  /**
+   * One attempt, no retries or backfill. Attribution precedes the bare lock; failures retain the
+   * pin. Metadata limits are admission limits, not isolation of Git's internal resource use.
+   */
+  async cleanupArchivedRecoveryPin(input: ArchivedRecoveryPinCleanup): Promise<ArchivedRecoveryPinCleanupResult> {
+    type Reason = Extract<ArchivedRecoveryPinCleanupResult, { state: "retained" }>["reason"];
+    const refuse = (reason: Reason): never => { throw new Error(reason); };
+    if (!CODE_ID.test(input.runId) || !codeGeneration(input.generation) || !CODE_SHA.test(input.sourceSha) ||
+        typeof input.isEligible !== "function" ||
+        (input.deadline !== undefined && !Number.isFinite(input.deadline))) {
+      return { state: "retained", reason: "invalid_identity" };
+    }
+    const deadline = Math.min(Date.now() + 30_000, input.deadline ?? Infinity);
+    const stop = new AbortController();
+    const abort = () => stop.abort();
+    input.signal?.addEventListener("abort", abort, { once: true });
+    if (input.signal?.aborted) abort();
+    const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+    const check = (): void => {
+      if (input.signal?.aborted) refuse("cancelled");
+      if (Date.now() >= deadline || stop.signal.aborted) refuse("deadline");
+    };
+    // Racing only bounds the caller's wait. Every continuation checks again, so a late filesystem
+    // completion cannot enter a Git mutation. Locks remain held until that continuation settles.
+    const bounded = async <T>(work: Promise<T>): Promise<T> => {
+      try { check(); }
+      catch (error) { void work.catch(() => undefined); throw error; }
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(new Error(input.signal?.aborted ? "cancelled" : "deadline"));
+        stop.signal.addEventListener("abort", onAbort, { once: true });
+        if (stop.signal.aborted) onAbort();
+      });
+      try { const result = await Promise.race([work, cancelled]); check(); return result; }
+      finally { stop.signal.removeEventListener("abort", onAbort); }
+    };
+    const activeChildren = new Set<Promise<number>>();
+    let consumed = 0;
+    const identity = (st: Stats): string =>
+      [st.dev, st.ino, st.mode, st.uid, st.gid, st.size, st.mtimeMs, st.ctimeMs].join(":");
+    const safe = (st: Stats): boolean => st.uid === process.getuid?.() && !(st.mode & 0o002) &&
+      (!(st.mode & 0o020) || (st.gid === process.getgid?.() && !(uidSplitActive() && st.gid === RUNNER_UID)));
+    type Evidence = Map<string, string | null>;
+    const remember = async (p: string, evidence: Evidence, directory: boolean): Promise<Stats | undefined> => {
+      check();
+      let st: Stats;
+      try { st = await bounded(fs.lstat(p)); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        evidence.set(p, null); return undefined;
+      }
+      if (st.isSymbolicLink() || !safe(st) || (directory ? !st.isDirectory() : !st.isFile())) refuse("unsafe_metadata");
+      const handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
+        (directory ? fsConstants.O_DIRECTORY : fsConstants.O_NONBLOCK));
+      try {
+        check();
+        if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata");
+      } finally { await handle.close(); }
+      evidence.set(p, identity(st));
+      return st;
+    };
+    const metadata = async (p: string, limit: number, evidence: Evidence): Promise<string | undefined> => {
+      const st = await remember(p, evidence, false);
+      if (!st) return undefined;
+      if (st.size > limit || consumed + st.size > 32 * 1024 * 1024) refuse("unsafe_metadata");
+      const handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      try {
+        check();
+        if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata");
+        // Read at most limit+1, never readFile: growth cannot turn an admitted file into an
+        // unbounded allocation. Account every byte read across all candidates and revalidation.
+        const buffer = Buffer.alloc(Math.min(limit + 1, 32 * 1024 * 1024 - consumed + 1));
+        let bytes = 0;
+        while (bytes < buffer.length) {
+          const read = await bounded(handle.read(buffer, bytes, buffer.length - bytes, bytes));
+          if (!read.bytesRead) break;
+          bytes += read.bytesRead;
+        }
+        consumed += bytes;
+        if (bytes > limit || consumed > 32 * 1024 * 1024 ||
+            identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata");
+        return buffer.subarray(0, bytes).toString("utf8");
+      } finally { await handle.close(); }
+    };
+    const probe = async (cwd: string, args: string[], stdin?: string): Promise<string> => {
+      check();
+      const child = await this.spawnGit(cwd, ["--no-replace-objects", ...args], stdin, {
+        timeoutMs: deadline - Date.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
+        env: { GIT_CONFIG_GLOBAL: "/dev/null" },
+      });
+      activeChildren.add(child.exited);
+      let bytes = 0;
+      const chunks: Buffer[] = [];
+      const onAbort = () => child.cancel();
+      stop.signal.addEventListener("abort", onAbort, { once: true });
+      if (stop.signal.aborted) onAbort();
+      try {
+        for await (const chunk of child.stdout) {
+          check();
+          const b = Buffer.from(chunk);
+          bytes += b.length;
+          if (bytes > 65536) { child.cancel(); refuse("unsafe_metadata"); }
+          chunks.push(b);
+        }
+        if (await child.exited !== 0) refuse("git_failure");
+        check();
+        return Buffer.concat(chunks).toString("utf8");
+      } finally {
+        stop.signal.removeEventListener("abort", onAbort);
+        child.cancel();
+        await child.exited;
+        activeChildren.delete(child.exited);
+      }
+    };
+    const revalidate = async (evidence: Evidence): Promise<void> => {
+      for (const [p, expected] of evidence) {
+        check();
+        let current: Stats | undefined;
+        try { current = await bounded(fs.lstat(p)); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if ((current ? identity(current) : null) !== expected) refuse("unsafe_metadata");
+      }
+    };
+    const root = path.resolve(this.reposRoot);
+    const ref = recoveryPinRef(input.runId, input.generation);
+    const rootEvidence: Evidence = new Map();
+    const candidate = async (name: string): Promise<{ bare: string; tip?: string; packedTip?: string; evidence: Evidence }> => {
+      if (!name || name !== path.basename(name) || name === "." || name === ".." ||
+          /[\\\x00-\x1f\x7f]/.test(name)) refuse("invalid_identity");
+      const bare = path.join(root, name);
+      const evidence: Evidence = new Map(rootEvidence);
+      if (!await remember(bare, evidence, true)) refuse("unsafe_metadata");
+      if (await bounded(fs.realpath(bare)) !== bare) refuse("unsafe_metadata");
+      const config = await metadata(path.join(bare, "config"), 1024 * 1024, evidence);
+      if (config === undefined) refuse("unsafe_metadata");
+      // Parse admitted bytes without includes BEFORE any repository probe can read config.
+      const keys = await probe(root, ["config", "--file", "-", "--no-includes", "--name-only", "--list"], config);
+      if (keys.split("\n").some(k => /^(include\.|includeif\.|core\.(worktree|hookspath|sshcommand)$)/i.test(k))) {
+        refuse("unsafe_metadata");
+      }
+      if ((await probe(bare, ["rev-parse", "--is-bare-repository"])).trim() !== "true") refuse("unsafe_metadata");
+      const packed = await metadata(path.join(bare, "packed-refs"), 16 * 1024 * 1024, evidence);
+      let packedTip: string | undefined;
+      for (const line of packed?.split("\n") ?? []) {
+        if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+        const parts = line.split(" ");
+        if (parts.length !== 2 || !CODE_SHA.test(parts[0])) refuse("unsafe_metadata");
+        if (parts[1] === ref) {
+          if (packedTip !== undefined) refuse("unsafe_metadata");
+          packedTip = parts[0];
+        }
+      }
+      let parentMissing = false;
+      for (const dir of ["refs", "refs/uzi-recovery-pin", `refs/uzi-recovery-pin/${input.runId}`]) {
+        if (!await remember(path.join(bare, dir), evidence, true)) { parentMissing = true; break; }
+      }
+      const loose = parentMissing ? undefined : await metadata(path.join(bare, ref), 1024, evidence);
+      let tip = packedTip;
+      if (loose !== undefined) {
+        if (!/^[a-f0-9]{40}\n?(?![\s\S])/.test(loose)) refuse("unsafe_metadata");
+        tip = loose.trim();
+      }
+      await revalidate(evidence);
+      return { bare, tip, packedTip, evidence };
+    };
+    // Discovery admission and probes use the same bare lock as the selected mutation. The
+    // selected candidate is re-read directly while that lock is already held.
+    const discoverCandidate = async (name: string) => {
+      if (!name || name !== path.basename(name) || name === "." || name === ".." ||
+          /[\\\x00-\x1f\x7f]/.test(name)) refuse("invalid_identity");
+      return this.withLock(path.join(root, name), () => candidate(name), stop.signal);
+    };
+    const attempt = async (): Promise<ArchivedRecoveryPinCleanupResult> => {
+      check();
+      // Ancestors are opened nofollow too; ownership restrictions apply to the private root.
+      let ancestor = path.parse(root).root;
+      for (const part of root.slice(ancestor.length).split(path.sep)) {
+        ancestor = path.join(ancestor, part);
+        const st = await bounded(fs.lstat(ancestor));
+        if (!st.isDirectory() || st.isSymbolicLink()) refuse("unsafe_metadata");
+        const handle = await fs.open(ancestor, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+        try { check(); if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata"); }
+        finally { await handle.close(); }
+        // Parent content may change independently; only identity is relevant for ancestors.
+        if (ancestor === root) rootEvidence.set(root, identity(st));
+      }
+      const rootStat = await remember(root, rootEvidence, true);
+      if (!rootStat || await bounded(fs.realpath(root)) !== root) refuse("unsafe_metadata");
+      const key = JSON.stringify([root, rootStat.dev, rootStat.ino, ref]);
+      return recoveryPinAttributionLocks.withLock(key, async () => {
+        check();
+        const explicit = input.recoveryPinBareDir ?? input.bareDir;
+        if (input.recoveryPinBareDir !== undefined && input.bareDir !== undefined &&
+            input.recoveryPinBareDir !== input.bareDir) refuse("invalid_identity");
+        let selected: Awaited<ReturnType<typeof candidate>> | undefined;
+        if (explicit !== undefined) selected = await discoverCandidate(explicit);
+        else {
+          const directory = await fs.opendir(root);
+          try {
+            check();
+            let count = 0;
+            // Stream to completion: failure, cap, or any unsafe sibling refuses the whole proof.
+            for (;;) {
+              const entry = await bounded(directory.read());
+              if (!entry) break;
+              if (++count > 256) refuse("scan_limit");
+              const found = await discoverCandidate(entry.name);
+              if (found.tip !== undefined) {
+                if (selected) refuse("ambiguous");
+                selected = found;
+              }
+            }
+          } finally { await directory.close(); }
+          await revalidate(rootEvidence);
+        }
+        if (!selected) return { state: "already_absent" };
+        const chosen = selected;
+        return this.withLock(chosen.bare, async () => {
+          check();
+          await revalidate(chosen.evidence);
+          const current = await candidate(path.basename(chosen.bare));
+          if (current.tip !== chosen.tip) refuse("target_changed");
+          if (current.tip === undefined) return { state: "already_absent" };
+          if (current.tip !== input.sourceSha) refuse("target_changed");
+          if ((await probe(chosen.bare, ["rev-parse", "--verify", `${input.sourceSha}^{commit}`])).trim() !== input.sourceSha) {
+            refuse("target_changed");
+          }
+          await revalidate(current.evidence);
+          check();
+          if (!input.isEligible()) refuse("ineligible");
+          check();
+          // Git's old-SHA comparison can resolve a symbolic ref even with no-deref.
+          // Prepare holds the exact ref lock while we independently prove directness.
+          const child = await this.spawnGit(chosen.bare, ["--no-replace-objects", "update-ref", "--stdin"],
+            `option no-deref\ndelete ${ref} ${input.sourceSha}\nprepare\n`, {
+              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()),
+              stderrMaxBytes: 65536, cancelOnAbandon: true, env: { GIT_CONFIG_GLOBAL: "/dev/null" },
+            }).catch(() => refuse("git_failure"));
+          activeChildren.add(child.exited);
+          const onAbort = () => child.cancel();
+          stop.signal.addEventListener("abort", onAbort, { once: true });
+          if (stop.signal.aborted) onAbort();
+          let committed = false;
+          try {
+            check();
+            if (!child.stdin) refuse("git_failure");
+            const output = child.stdout[Symbol.asyncIterator]();
+            let response = "";
+            let bytes = 0;
+            while (!response.includes("\n")) {
+              const chunk = await bounded(output.next());
+              if (chunk.done) refuse("git_failure");
+              const buffer = Buffer.from(chunk.value);
+              bytes += buffer.length;
+              if (bytes > 65536) refuse("git_failure");
+              response += buffer.toString("utf8");
+            }
+            if (response !== "prepare: ok\n") refuse("git_failure");
+            // Parent directories may acquire new lock entries; their inode/ownership must
+            // still match admission. File evidence (except the raced ref) must match fully.
+            for (const [p, expected] of current.evidence) {
+              if (p === path.join(chosen.bare, ref)) continue;
+              let st: Stats | undefined;
+              try { st = await bounded(fs.lstat(p)); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+              if (expected === null) {
+                if (st && (!st.isDirectory() || ![
+                  path.join(chosen.bare, "refs"), path.join(chosen.bare, "refs/uzi-recovery-pin"),
+                  path.join(chosen.bare, `refs/uzi-recovery-pin/${input.runId}`),
+                ].includes(p))) refuse("unsafe_metadata");
+              } else if (!st || (st.isDirectory()
+                ? identity(st).split(":").slice(0, 5).join(":") !== expected.split(":").slice(0, 5).join(":")
+                : identity(st) !== expected)) refuse("unsafe_metadata");
+            }
+            for (const dir of ["refs", "refs/uzi-recovery-pin", `refs/uzi-recovery-pin/${input.runId}`]) {
+              if (!await remember(path.join(chosen.bare, dir), new Map(), true)) refuse("unsafe_metadata");
+            }
+            const loose = await metadata(path.join(chosen.bare, ref), 1024, new Map());
+            if (loose === undefined) {
+              if (current.packedTip !== input.sourceSha) refuse("target_changed");
+            } else if (loose !== input.sourceSha && loose !== input.sourceSha + "\n") refuse("target_changed");
+            check();
+            if (!input.isEligible()) refuse("ineligible");
+            check();
+            child.stdin!.end("commit\n");
+            committed = true;
+            response = "";
+            for (;;) {
+              const chunk = await bounded(output.next());
+              if (chunk.done) break;
+              const buffer = Buffer.from(chunk.value);
+              bytes += buffer.length;
+              if (bytes > 65536) refuse("git_failure");
+              response += buffer.toString("utf8");
+            }
+            if (response !== "commit: ok\n" || await child.exited !== 0) refuse("git_failure");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "";
+            if (["unsafe_metadata", "target_changed", "ineligible", "cancelled", "deadline", "git_failure"].includes(message)) throw error;
+            refuse("git_failure");
+          } finally {
+            stop.signal.removeEventListener("abort", onAbort);
+            if (!committed) child.stdin?.end("abort\n");
+            child.cancel();
+            await child.exited;
+            activeChildren.delete(child.exited);
+          }
+          return { state: "deleted" };
+        }, stop.signal);
+      }, stop.signal);
+    };
+    try { return await bounded(attempt()); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      const reasons: Reason[] = ["invalid_identity", "unsafe_metadata", "ambiguous", "scan_limit",
+        "target_changed", "ineligible", "cancelled", "deadline", "git_failure"];
+      return { state: "retained", reason: input.signal?.aborted ? "cancelled" :
+        Date.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
+    } finally {
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", abort);
+      await Promise.all(activeChildren);
+    }
   }
 
   /**
@@ -9553,7 +9913,7 @@ export class GitCache {
     args: string[],
     stdin?: string,
     opts: SpawnGitOptions = {},
-  ): Promise<{ child?: ChildProcess; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
+  ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
     const env = { ...gitEnv(), ...opts.env };
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
@@ -9608,14 +9968,15 @@ export class GitCache {
       // A child that exits before reading its stdin (e.g. its repo vanished) must not surface an
       // uncaught EPIPE; the exit status already errors the stream with the failure.
       process.stdin?.on("error", () => undefined);
-      process.stdin?.end(stdin ?? "");
+      if (opts.keepStdinOpen) process.stdin?.write(stdin ?? "");
+      else process.stdin?.end(stdin ?? "");
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
       if (recovery?.signal.aborted) abortRecovery();
       const exited = process.completed.then(({ code }) => code, () => -1).finally(async () => {
         recovery?.signal.removeEventListener("abort", abortRecovery);
         await cancellation;
       });
-      return { stdout: gated.out, exited, cancel: abortRecovery };
+      return { stdin: opts.keepStdinOpen ? process.stdin ?? undefined : undefined, stdout: gated.out, exited, cancel: abortRecovery };
     }
     const child = spawn("git", withDir(cwd, args), { env });
     let killTimer: ReturnType<typeof setTimeout> | undefined;
@@ -9670,9 +10031,10 @@ export class GitCache {
     });
     if (child.stdin) {
       child.stdin.on("error", () => undefined); // see the scoped branch above
-      child.stdin.end(stdin ?? "");
+      if (opts.keepStdinOpen) child.stdin.write(stdin ?? "");
+      else child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: gated.out, exited, cancel: abortRecovery };
+    return { child, stdin: opts.keepStdinOpen ? child.stdin ?? undefined : undefined, stdout: gated.out, exited, cancel: abortRecovery };
   }
 
   /**
