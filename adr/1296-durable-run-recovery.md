@@ -636,6 +636,8 @@ still-journaled held FINAL falls back to capturing an archive on the same frozen
 record; a transient step-B answer keeps the journaled FINAL and the open hold,
 with no archive, and retries. A local failure to journal the held FINAL after a
 created step A (an unreadable or lost journal write) likewise keeps custody
-without an archive until a later settle pass. Retention for the held ref runs from
+without an archive until the worker's live re-drive or boot sweep, which replays
+a FINAL that did land or otherwise captures the archive on the same record.
+Retention for the held ref runs from
 acknowledgement for `UZI_RECOVERY_READY_RETENTION`. #2544 quota and #2506 failed
 thin release remain excluded.
