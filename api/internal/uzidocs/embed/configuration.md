@@ -406,6 +406,7 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_WORKER_TOKEN` | — (required, unless `_FILE` is set) | The join token from Settings → Workers, sent as a Bearer credential on every worker call. |
 | `UZI_WORKER_TOKEN_FILE` | — (optional, preferred) | Path to a file containing the join token; the worker reads it once at startup. The bundled compose profile mounts it as a read-only compose file secret at `/run/secrets/worker_token`, which the root-started entrypoint forces to `0400 worker`-owned so the cap-less `runner` uid cannot read it (PRD #51; a restricted-namespace non-root single-uid start runs without the split — the PRD #58 posture); the post-read unlink no-ops on the read-only mount, so the file persists and the uid boundary — not removal — is the close. Takes precedence over `UZI_WORKER_TOKEN` when set. Keeps the token out of every process's `/proc/<pid>/environ`; see [proc-hardening.md](proc-hardening.md). A hosted worker's controller sets it; on OpenShift the Secret mounts elsewhere (`workers.secretMountPath`, see [openshift.md](openshift.md)) and the entrypoint's ownership check and the guardrails follow this path. |
 | `UZI_DATA_DIR` | `/data` | Persistent storage: the bare-clone cache, per-run git worktrees, and the pinned Claude Agent SDK session directory. Must be a durable volume for resume-after-restart to work. In the bundled compose profile this is **hardcoded** to `/data` (matching the `agentdata` volume mount), not read from `.env`; it's only a real knob for a standalone `docker run` or a compose override. |
+| `UZI_RECOVERY_DECODED_LIMIT_BYTES` | `8589934592` (8 GiB) | Cumulative delivered decoded object-content limit per recovery operation; nested operations share the counter and repeated reads count again. Positive decimal bytes, fixed ceiling `68719476736` (64 GiB); invalid values reject worker startup. Parsed once; restart required. Worker/operator setting, not a RAM limit. Bundled hosted Helm chart and docker-compose do not expose it yet and use the default. See [Recovery decoded-history limit](#recovery-decoded-history-limit). |
 | `UZI_WORKER_NAME` | container hostname | Display name shown in Settings → Workers / Admin. |
 | `UZI_AGENT_VERSION` | — (baked into the image at build) | The release this worker image was built from. CI's `publish:agent` stamps it from the release tag as `<release>+g<short-sha>` and the templates bake it into image `ENV` with a leading `v` stripped. It therefore matches the worker image tag (`workers.image.tag`, independent of `appVersion` since ADR-422) **up to the `+g…` build metadata**: a worker on the `0.11.7` image reports `0.11.7+g1a2b3c4`, not `0.11.7`. The suffix names the commit the image was built from, and SemVer excludes build metadata from precedence, so every version comparison still treats the two as the same release — but the strings differ, which is expected and not a sign that the wrong image is deployed. Reported **at register only** — the api discards the `version` a heartbeat carries and never reads the `X-Client-Version` header, so a running worker's stored value does not change until it re-registers. Unset on a locally built or MR-validation image, and deliberately so: the worker then reports no version at all (`-` in `uzi worker list`) rather than a placeholder a version comparison could not tell apart from a real report. Shown in Settings → Workers and `uzi worker list`. |
 | `UZI_EXECUTOR` | `sdk` | `sdk` runs real Claude Agent SDK turns (the product path); `stub` is a no-AI executor the project's own tests use — leave at `sdk` for real use. |
@@ -430,6 +431,55 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_LOG_LEVEL` | `info` | Worker log verbosity: `debug`/`info`/`warn`/`error`. At `debug` the worker also writes every raw run event (each `tool_use`, `tool_result`, status, etc.) to its stdout as it is emitted, so `docker logs uzi-agent-1` becomes the full-frame debug surface. Secrets are redacted before logging. `info` stays terse (no per-event lines). |
 
 Duration values accept the same Go-style strings used server-side (`15s`, `3s`, `500ms`, `2h`) or a bare integer read as milliseconds.
+
+### Recovery decoded-history limit
+
+`UZI_RECOVERY_DECODED_LIMIT_BYTES` bounds delivered decoded object contents
+cumulatively within a recovery operation. The default is **8589934592 bytes
+(8 GiB)**; the fixed ceiling is **68719476736 bytes (64 GiB)**. An unset
+variable uses the default. A set value is trimmed and must contain decimal
+digits representing a positive safe integer in `1..68719476736`. Leading
+zeroes are accepted. Blank or malformed values, fractions, exponent notation,
+signs, zero, negatives, nonfinite values, unsafe integers and values above the
+ceiling reject worker startup. The startup error names the variable and valid
+range without echoing the raw value.
+
+The worker parses this once at startup and keeps it in its GitCache instance;
+restart the worker to change it. This is an operator setting on the worker
+container, not a server/API setting or repository/model input. The bundled
+hosted Helm chart and docker-compose **do not expose it yet**: those workers
+use the 8 GiB default. Setting it in `.env`, the API or controller alone does
+not inject it into the worker. No chart or compose wiring ships in #2743.
+
+For a standalone worker, add `-e UZI_RECOVERY_DECODED_LIMIT_BYTES=17179869184`
+to the [standalone docker run command](./worker-setup.md#3-run-the-worker)
+before its image argument to select 16 GiB. Alternatively, explicitly inject
+the variable through an operator-managed container environment override.
+Preserve the worker's existing token delivery, volume and security options.
+
+The finite ceiling is eight times the default, allowing larger histories
+while retaining exact arithmetic and existing deadlines; it is not a memory
+guarantee. Verification still hashes the full reachable history, including
+prerequisites, and refuses missing or corrupt objects. Repeated reads count
+again; nested operations share the delivered-byte counter. There is no
+deduplication or history exclusion. Cap exhaustion fails closed with local
+work and custody retained. Cancellation, deadlines, encoded archive caps and
+storage quotas are unchanged.
+
+Object contents stream through a pipe chunk and bounded header without
+content buffers proportional to the cap. Metadata listings retain the 64 MiB
+output cap (`GIT_MAX_BUFFER`), with object arrays bounded by that listing.
+The cap is **not a RAM limit** and does not bound Git-internal delta
+decompression. Sibling runs share worker resources; the residual exhaustion
+risk accepted under ADR-1197 #2512 remains deferred.
+
+Errors report exact cap bytes, adding GiB for caps of at least 1 GiB.
+An already blocked recovery journal stays blocked after restart or a cap
+increase; its reason reports previous decoded verification exhaustion, the
+current cap and "prior cap not recorded". See
+[Retained-source failure and local proof](./run-recovery.md#retained-source-failure-and-local-proof)
+and [ADR-1197's amendment](../adr/1197-transient-recovery-park.md#amendment-2026-10-11--2743)
+for the reported offline measurement and policy history.
 
 ### Worker disk safety (PRD #1809)
 

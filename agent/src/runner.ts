@@ -9,7 +9,7 @@ import os from "node:os";
 import { basename as pathBasename, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
 import { RequestError, StateReportUnappliedError, isRunOwnershipLost } from "./client.js";
-import { RecoveryClosureLimitError } from "./recovery-closure.js";
+import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
   CheckpointSoftDeadlineError,
@@ -16086,7 +16086,11 @@ export class RunRunner {
         persistence = "; blocker persistence unavailable";
       }
       this.retainedLifecycleGuard(flight);
-      const detail = blocker === "decoded_history_limit" ? "reachable recovery history exceeds the 1 GiB decoded verification limit" : blocker.replaceAll("_", " ");
+      const detail = blocker === "decoded_history_limit"
+        ? source.recovery?.stage === "blocked"
+          ? `previous decoded verification exhaustion; current cap ${formatRecoveryDecodedLimit(this.git.recoveryDecodedLimitBytes)}; prior cap not recorded`
+          : recoveryClosureLimitDetail(this.git.recoveryDecodedLimitBytes)
+        : blocker.replaceAll("_", " ");
       const reason = `Retained recovery blocked: ${detail}${persistence}; local work and custody retained`;
       flight.runLog.warn(reason, { blocker });
       await this.reportGenericFailure(claim, flight,

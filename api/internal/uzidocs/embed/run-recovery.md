@@ -120,20 +120,35 @@ A verified thin bundle within the cap, with its needed prerequisites locally
 available and verified, permits local adoption and model execution even
 when remote publication is unknown. Nonempty prerequisites alone do not
 block it. Local verification reads reachable history and checks object hashes.
-Decoded history above 1 GiB fails closed with work and custody retained, even
-when the thin archive is below 64 MiB. `uzi run recovery` and the worker log
-show the recorded blocker. Local proof does not establish independent recovery
+Decoded history above the worker's configured cap (default **8 GiB**, or
+8589934592 bytes) fails closed with work and custody retained, even when the
+thin archive is below 64 MiB. Verification covers the full reachable history,
+including prerequisite history, and refuses missing or corrupt objects.
+`uzi run recovery` and the worker log show the recorded blocker. Local proof does not establish independent recovery
 or remote durability and does not release custody: predecessor sources, pins, journals
 and descriptors remain until the existing verified final disposition or
 explicit discard. The guarded prerequisite-free archive/empty-inventory
 release conditions below remain unchanged.
 
-The 1 GiB budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads. The delivered-byte
-cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
-does not isolate this verifier from sibling runs. The resulting residual
-resource-exhaustion risk is deferred scope, as authorized by the human
-review on 2026-10-09 (#2512).
+The configured budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads; nested operations
+share the same delivered-byte counter. Object contents stream through a pipe
+chunk and bounded header, without content buffers proportional to the cap.
+Metadata listings retain the existing 64 MiB output cap (`GIT_MAX_BUFFER`);
+object arrays remain bounded by that listing. The delivered-byte cap is **not a
+RAM limit** and does **not** bound Git-internal delta decompression memory. The
+deadline limits duration, and the shared worker cgroup does not isolate this
+verifier from sibling runs. The resulting residual resource-exhaustion risk
+remains deferred scope, as authorized by the human review on 2026-10-09 (#2512).
+
+Operators can set `UZI_RECOVERY_DECODED_LIMIT_BYTES` at worker startup; see
+[Recovery decoded-history limit](./configuration.md#recovery-decoded-history-limit).
+The blocker shows exact cap bytes, plus GiB for caps of at least 1 GiB. A
+previously blocked journal remains blocked after restart or a cap increase:
+its reason reports previous decoded verification exhaustion, the current cap,
+and that the prior cap was not recorded. This changes neither the 64 MiB
+encoded archive cap nor archive storage quotas, and adds no deduplication or
+history exclusion. Cancellation and existing deadlines still apply.
 
 A healthy run with an unknown publish outcome continues in the same claim
 generation, retaining its tip, owed roots and publication time gate.

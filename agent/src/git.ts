@@ -31,7 +31,7 @@ import {
 } from "./attempt-path.js";
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { sanitizeForLog } from "./run-quiescence.js";
-import { RECOVERY_DECODED_LIMIT, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
+import { RECOVERY_DECODED_LIMIT, validateRecoveryDecodedLimitBytes, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
 
 import {
@@ -611,6 +611,8 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** Cumulative decoded object bytes per recovery operation. */
+  recoveryDecodedLimitBytes?: number;
   /** Physical terminal custody, rooted at the configured outbox by the caller. */
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
   /** The gitleaks executable. Default `"gitleaks"` (PATH outside a boundary scope, the image's
@@ -1642,6 +1644,7 @@ export class GitCache {
     budget?.signal.throwIfAborted();
     if (budget && Date.now() >= budget.deadline) throw new Error("report proof deadline");
   }
+  readonly recoveryDecodedLimitBytes: number;
   private readonly recoveryOperations = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; closureBudget: ClosureBudget }>();
 
   /** Local recovery clock, including queued locks and actual child settlement. */
@@ -1654,7 +1657,7 @@ export class GitCache {
     if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
     try {
       combined.throwIfAborted();
-      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: this.recoveryOperations.getStore()?.closureBudget ?? { delivered: 0, limit: RECOVERY_DECODED_LIMIT } }, () => action(combined));
+      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes } }, () => action(combined));
     } finally { clearTimeout(timer); }
   }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
@@ -1688,6 +1691,7 @@ export class GitCache {
     private readonly retry?: { schedule?: number[]; sleep?: (ms: number) => Promise<void> },
     opts: GitCacheOptions = {},
   ) {
+    this.recoveryDecodedLimitBytes = validateRecoveryDecodedLimitBytes(opts.recoveryDecodedLimitBytes === undefined ? RECOVERY_DECODED_LIMIT : opts.recoveryDecodedLimitBytes);
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
     this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
@@ -5073,7 +5077,7 @@ export class GitCache {
     const operation = this.recoveryOperations.getStore();
     operation?.signal.throwIfAborted();
     if (!SHA40_RE.test(tip)) return false;
-    const budget = operation?.closureBudget ?? { delivered: 0, limit: RECOVERY_DECODED_LIMIT };
+    const budget = operation?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes };
     // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
     const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
       GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
@@ -5100,7 +5104,7 @@ export class GitCache {
         if (!match || match[1] !== oids[i]) return false;
         const size = Number(match[3]);
         if (!Number.isSafeInteger(size) || size > budget.limit - budget.delivered - declared) {
-          throw new RecoveryClosureLimitError();
+          throw new RecoveryClosureLimitError(budget.limit);
         }
         declared += size;
         objects.push({ oid: match[1]!, type: match[2]!, size });
