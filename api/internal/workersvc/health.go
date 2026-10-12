@@ -81,10 +81,11 @@ type Settings interface {
 	// HealthNudgeCooldownSeconds bounds how often a single run may DM its owner
 	// (PRD #47 M4). 0 means no cooldown (nudge on every ok→flagged transition).
 	HealthNudgeCooldownSeconds(ctx context.Context) (int, error)
-	// RunExtensionCapSeconds is the TOTAL extra wall-clock time an owner may grant a run
-	// through Extend (PRD #1189 M1); 0 disables extending. It rides this run-health-card
+	// RunExtensionCapSeconds is the PER-REQUEST maximum of extra wall-clock time an owner may
+	// grant a run in one Extend (PRD #1189 M1, #2735; the total is bounded only by
+	// MaxRunWallSeconds); 0 disables extending. It rides this run-health-card
 	// reader (the setting lives in that admin card and is served by the same *settings.Cache)
-	// so the `extend` SubmitInput branch can enforce the cap; the health detector itself does
+	// so the `extend` SubmitInput branch can enforce the maximum; the health detector itself does
 	// not read it.
 	RunExtensionCapSeconds(ctx context.Context) (int, error)
 }
@@ -1203,6 +1204,16 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	if run, rerr := s.q.GetRunByID(ctx, r.ID); rerr != nil {
 		slog.Error("health: read cross-check requirement", "run_id", r.ID, "error", rerr)
 	} else if run.PlanCrossCheckRequired || run.Kind == "cross_check" {
+		// Code children have strict local affinity, even after the plan grace.
+		// Use their persisted stage before interpreting the plan protocol query.
+		if run.Kind == "cross_check" {
+			if q, ok := s.q.(*store.Queries); ok {
+				cc, err := q.GetCrossCheckByChild(ctx, pgconv.UUID(run.ID))
+				if err == nil && cc.Stage == "code" {
+					return reasonNoCrossCheckWorker
+				}
+			}
+		}
 		requiredProtocol := capability.CrossCheckV1
 		protocolAvailable := true
 		if run.Kind == "cross_check" {

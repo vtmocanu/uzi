@@ -42,6 +42,7 @@ import {
   isRecognizedCodexTool,
   type RunGrants,
 } from "./broker.js";
+import { CODE_DISPOSITIONS_TOOL } from "../code-cross-check-tools.js";
 import { MEMORY_SERVER_NAME, memoryToolNames } from "../memory-tools.js";
 import { reportIncidentalIssueToolName } from "../findings-tools.js";
 import { forgeToolNames } from "../forge-tools.js";
@@ -207,6 +208,7 @@ type MutableDiagnostics = CodexRenderDiagnostic[];
  *  unconditional `disallowedTools` agents.ts puts on every subagent: no nested
  *  spawn/delegation, no workflow signals, no cross-run memory writes. */
 function isSubagentForbidden(canonical: string): boolean {
+  if (canonical === CODE_DISPOSITIONS_TOOL) return true;
   if (CODEX_DELEGATE_TOOLS.has(canonical)) return true;
   if (CODEX_SIGNAL_TOOLS.has(canonical)) return true;
   return canonical.startsWith(`mcp__${MEMORY_SERVER_NAME}__`);
@@ -445,8 +447,11 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   const leadGrants: RunGrants = {
     role: LEAD_ROLE,
     phase: request.phase,
-    allowedTools: sortedSet(fullVocabulary(true).filter((tool) => tool !== "park_run"
-      || (request.phase === "implement" && request.parkRunSupported === true && request.nonInteractiveIssue === true))),
+    allowedTools: sortedSet([
+      ...fullVocabulary(true).filter((tool) => tool !== "park_run"
+        || (request.phase === "implement" && request.parkRunSupported === true && request.nonInteractiveIssue === true)),
+      ...(request.codeCrossCheck ? [CODE_DISPOSITIONS_TOOL] : []),
+    ]),
     parkRunSupported: request.parkRunSupported,
     nonInteractiveIssue: request.nonInteractiveIssue,
     allowedSkills: buildAllowedSkills(request.leadSkills, LEAD_ROLE, diagnostics),

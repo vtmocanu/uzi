@@ -993,6 +993,71 @@ describe("report_progress tools/call with an omitted field (issue #1555)", () =>
   });
 });
 
+
+describe("m1 non-closing validation", () => {
+  for (const reason of [" x ", " 😀 ", "  " + "😀".repeat(500) + "  "]) {
+    it("trims valid Unicode reason " + Array.from(reason.trim()).length, () => {
+      assert.deepEqual((scanSignals(toolUse("mcp__uzi__signal_done", { non_closing: { reason } })) as unknown as { nonClosing: unknown }).nonClosing, { reason: reason.trim() });
+    });
+  }
+  for (const value of [null, [], "bad", {}, { reason: 1 }, { reason: " " }, { reason: "😀".repeat(501) }]) {
+    it("rejects malformed raw done " + JSON.stringify(value).slice(0, 40), () => {
+      const scanned = scanSignals(toolUse("mcp__uzi__signal_done", {
+        non_closing: value, summary: "LEAK", prd_done_path: "LEAK", milestones_completed: ["m1"],
+        report_only: true, proposal: { title: "LEAK", body: "LEAK" }, pr_summary: { what: "LEAK" }, decisions_memo: "LEAK",
+      })) as unknown as Record<string, unknown>;
+      for (const key of ["done", "summary", "prdDonePath", "milestonesCompleted", "reportOnly", "proposal", "prSummary", "decisionsMemo", "nonClosing"])
+        assert.equal(scanned[key], undefined, key + " must not leak");
+      assert.equal(typeof scanned["signalDiagnostic"], "string");
+    });
+  }
+  it("keeps unrelated and accepted blocks independent of rejection and omission", () => {
+    const blocks = [
+      toolUse("mcp__uzi__signal_done", { non_closing: { reason: "first" }, summary: "good" }),
+      toolUse("mcp__uzi__signal_done", { non_closing: null, summary: "LEAK" }),
+      toolUse("mcp__uzi__signal_done", {}),
+      toolUse("mcp__uzi__report_progress", { completed: ["m1"] }),
+    ] as Array<{ message: { content: unknown[] } }>;
+    const scanned = scanSignals({ type: "assistant", message: { content: blocks.flatMap(b => b.message.content) } }) as unknown as Record<string, unknown>;
+    assert.deepEqual(scanned["nonClosing"], { reason: "first" });
+    assert.equal(scanned["summary"], "good");
+    assert.deepEqual(scanned["progress"], { completed: ["m1"], in_progress: [] });
+  });
+  it("rejects child declarations", () => {
+    assert.deepEqual(scanSignals(subagentToolUse("mcp__uzi__signal_done", { non_closing: { reason: "child" } })), {});
+  });
+
+  it("validates the Claude handler even when schema validation is bypassed", async () => {
+    const server = buildSignalMcpServer() as unknown as {
+      instance: { _registeredTools: Record<string, { handler(input: unknown): Promise<{ isError?: boolean; content: unknown }> }> };
+    };
+    const handler = server.instance._registeredTools["signal_done"]!.handler;
+    const bad = await handler({ non_closing: { reason: "PRIVATE".repeat(100) } });
+    assert.equal(bad.isError, true);
+    assert.ok(!JSON.stringify(bad).includes("PRIVATE"));
+    assert.ok(JSON.stringify(bad).length < 500);
+    const good = await handler({ non_closing: { reason: " valid " } });
+    assert.notEqual(good.isError, true);
+    assert.match(JSON.stringify(good), /issue runs only/);
+  });
+
+  it("returns neutral Claude JSON-RPC errors and accepts a corrected call", async () => {
+    for (const non_closing of [null, [], {}, { reason: " " }, { reason: "PRIVATE".repeat(100) }]) {
+      const res = await callToolOverJsonRpc(buildSignalMcpServer(), "signal_done", { non_closing });
+      const result = res["result"] as { isError?: boolean };
+      assert.equal(result?.isError, true, JSON.stringify(res));
+      assert.ok(!JSON.stringify(res).includes("PRIVATE"));
+      assert.ok(JSON.stringify(res).length < 2000);
+    }
+    const res = await callToolOverJsonRpc(buildSignalMcpServer(), "signal_done", { non_closing: { reason: "  " + "😀".repeat(500) + "  " } });
+    assert.equal(res["error"], undefined, JSON.stringify(res));
+    const accepted = res["result"] as { isError?: boolean } | undefined;
+    assert.ok(accepted, JSON.stringify(res));
+    assert.notEqual(accepted.isError, true);
+    assert.match(JSON.stringify(accepted), /issue runs only/);
+  });
+});
+
 describe("scanSignals checkpoint (PRD #122 M6)", () => {
   const CHECKPOINT = "mcp__uzi__checkpoint";
 
@@ -1059,6 +1124,24 @@ describe("isSignalToolName", () => {
     assert.strictEqual(isSignalToolName("Bash"), false);
     assert.strictEqual(isSignalToolName(undefined), false);
   });
+});
+
+
+it("U3 D9 SDK signal registration is conditional and live guard returns a fixed error", async () => {
+  type Registered = { handler: (args: Record<string, unknown>, extra: unknown) => Promise<{ isError?: boolean; content: unknown }> };
+  const tools = (server: unknown) => (server as { instance: { _registeredTools: Record<string, Registered> } }).instance._registeredTools;
+  assert.equal(tools(buildSignalMcpServer()).report_cross_check_dispositions, undefined);
+  let posts = 0;
+  const server = buildSignalMcpServer({ codeCrossCheck: {
+    generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
+    reportCrossCheckDispositions: async () => { posts++; throw new Error("PRIVATE"); },
+  } });
+  const handler = tools(server).report_cross_check_dispositions;
+  assert.ok(handler);
+  const response = await handler.handler({ dispositions: [] }, {});
+  assert.equal(response.isError, true);
+  assert.deepEqual(response.content, [{ type: "text", text: "Code repair is not active or dispositions are invalid." }]);
+  assert.equal(posts, 0);
 });
 
 describe("buildSignalMcpServer", () => {

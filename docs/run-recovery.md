@@ -52,7 +52,10 @@ reaches a final status. Each retained capture is in one of these six states:
   storage limit was hit); the source stays retained. Retries depend on the
   recovery path's budget; terminal retained-source failure does not cycle
   automatically or offer Resume.
-- **Expired** — uzi purged the bytes, for example when the ready download window passed. The record stays for audit and no longer counts toward the per-owner capture limit.
+- **Expired** — uzi purged the bytes, either when the ready download window passed or
+  early, after proving the archive redundant with your published branch (see
+  [Early expiry of a published archive](#early-expiry-of-a-published-archive)). The
+  record stays for audit and no longer counts toward the per-owner capture limit.
 - **Discarded** — the archive was explicitly discarded and its bytes deleted.
 
 When a run has **no** retained captures at all, the section reports one of
@@ -117,20 +120,35 @@ A verified thin bundle within the cap, with its needed prerequisites locally
 available and verified, permits local adoption and model execution even
 when remote publication is unknown. Nonempty prerequisites alone do not
 block it. Local verification reads reachable history and checks object hashes.
-Decoded history above 1 GiB fails closed with work and custody retained, even
-when the thin archive is below 64 MiB. `uzi run recovery` and the worker log
-show the recorded blocker. Local proof does not establish independent recovery
+Decoded history above the worker's configured cap (default **8 GiB**, or
+8589934592 bytes) fails closed with work and custody retained, even when the
+thin archive is below 64 MiB. Verification covers the full reachable history,
+including prerequisite history, and refuses missing or corrupt objects.
+`uzi run recovery` and the worker log show the recorded blocker. Local proof does not establish independent recovery
 or remote durability and does not release custody: predecessor sources, pins, journals
 and descriptors remain until the existing verified final disposition or
 explicit discard. The guarded prerequisite-free archive/empty-inventory
 release conditions below remain unchanged.
 
-The 1 GiB budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads. The delivered-byte
-cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
-does not isolate this verifier from sibling runs. The resulting residual
-resource-exhaustion risk is deferred scope, as authorized by the human
-review on 2026-10-09 (#2512).
+The configured budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads; nested operations
+share the same delivered-byte counter. Object contents stream through a pipe
+chunk and bounded header, without content buffers proportional to the cap.
+Metadata listings retain the existing 64 MiB output cap (`GIT_MAX_BUFFER`);
+object arrays remain bounded by that listing. The delivered-byte cap is **not a
+RAM limit** and does **not** bound Git-internal delta decompression memory. The
+deadline limits duration, and the shared worker cgroup does not isolate this
+verifier from sibling runs. The resulting residual resource-exhaustion risk
+remains deferred scope, as authorized by the human review on 2026-10-09 (#2512).
+
+Operators can set `UZI_RECOVERY_DECODED_LIMIT_BYTES` at worker startup; see
+[Recovery decoded-history limit](./configuration.md#recovery-decoded-history-limit).
+The blocker shows exact cap bytes, plus GiB for caps of at least 1 GiB. A
+previously blocked journal remains blocked after restart or a cap increase:
+its reason reports previous decoded verification exhaustion, the current cap,
+and that the prior cap was not recorded. This changes neither the 64 MiB
+encoded archive cap nor archive storage quotas, and adds no deduplication or
+history exclusion. Cancellation and existing deadlines still apply.
 
 A healthy run with an unknown publish outcome continues in the same claim
 generation, retaining its tip, owed roots and publication time gate.
@@ -234,7 +252,7 @@ operator-configurable environment variable on the API:
 | Max bundle size | 64 MiB | A larger archive is refused, not truncated. Guarded capture may fall back to a capped thin bundle; if capture still fails, the source stays retained. Historical oversized captures are not automatically reproduced. |
 | Ready payload per owner | 1 GiB | Your available archive bytes plus preparing/uploading reservations. |
 | Instance byte quota | 4 GiB | Available archive bytes plus preparing/uploading reservations across the deployment; a refusal retains the affected source. |
-| Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. |
+| Ready-artifact retention | 7 days | Normal ready-download window. Earlier non-final and legacy captures count from readiness; a selected final guarded archive is protected while its local worker exists, then gets this window renewed on physical worker deletion. A completed run's archive can expire earlier, only after uzi proves its commits are already on the published branch. |
 | Automatic upload-retry window | 24 hours | How long uzi keeps retrying a stalled upload before it needs your attention. |
 | Captures per claim | 16 | Distinct capture attempts one worker claim can accumulate. |
 | Retained captures per owner | 256 | Captures on file that are neither discarded nor expired (preparing, uploading, available, needs action; any other state also counts). Expired tombstones stay for audit but free their slot. |
@@ -414,11 +432,14 @@ pending is not safe terminal release or permission to reclaim the source.
 The **selected final archive** is protected from automatic expiry while its
 local worker row exists. Physical worker deletion renews its configured
 normal ready-retention window (7 days by default) and clears the server's
-local-replica marker; protection is not perpetual. Local acknowledgment
+local-replica marker (a published-redundancy early expiry also clears it);
+protection is not perpetual. Local acknowledgment
 cleanup leaves that marker and the archive's expiry unchanged. Earlier
 non-final and legacy ready captures keep their existing TTL, including thin
 captures. Custody itself does not expire when a download expires. Size limits,
-quotas, owner-only access and explicit discard behavior are unchanged.
+quotas, owner-only access and explicit discard behavior are unchanged. The exception to the retention
+rules above is the proven early expiry of a completed run's archive, described
+below.
 
 Operational rollout: deploy the API's prerequisite-release guard before deploying
 the worker producer that can emit guarded thin archives.
@@ -444,11 +465,50 @@ existing rules. Healthy completion release needs no heartbeat prerequisite.
 
 A successful receipt needs no capture, WIP commit, frozen inventory or
 clean-source proof. Existing available, thin or needs-action captures do not
-block it, and retained archives keep their existing retention policy.
+block it. Retained archives keep their existing retention policy unless uzi
+proves them redundant, as described in the next subsection.
 Unavailable forge evidence, missing or mismatched identities, inconclusive
 ancestry or identity drift keeps custody open with a bounded reason.
 Replaying the exact original completion returns the stored receipt without
 depending on current forge or mutable run state.
+
+#### Early expiry of a published archive
+
+After a completed run's custody is released, its worker can ask the API to
+expire the run's guarded archive early. The API does not trust the worker: it
+checks through the forge, against the current head of the run's published
+branch, that every root, the archive's captured head and every prerequisite
+the server recorded for it is already an ancestor of that head. For an archive
+of parked uncommitted work, the published branch must carry a commit with the
+same tree as the archive plus every parent of the captured head; the worker
+only offers the run's delivered final commit as that commit. The claim is
+bound to the exact hold, generation, coverage digest and source commit, and
+needs a released, completed hold stamped with the completion identity and MR.
+
+When the proof succeeds the archive becomes **Expired** with reason
+`published_redundant` and its bytes are deleted at once, instead of at the end
+of the 7-day window. When any part is missing, mismatched or inconclusive (the
+branch is gone, its head differs, the forge cannot answer), the archive simply
+keeps its normal retention. A refusal caused by forge answers, including timeouts and inconclusive
+answers, is not retried for an hour. The worker sends these claims from its
+completion cleanup and its covering final-acknowledgement cleanup, once
+per archive in practice, and a missed or failed claim never blocks cleanup; it
+only leaves the normal window in place. Failed, cancelled and parked runs (the API refuses a run that did not
+complete as `not_completed`), and archives without a complete proof, are unchanged, and an explicit discard
+behaves as before.
+
+**Durability risk you accept.** The proof is made against the published branch
+as it is at that moment. After the archive expires early, uzi no longer
+protects those commits: if the published branch (or the merge request's source
+branch) is later deleted or force-rewritten, the commits may be lost. The
+forge's own merge request refs may still hold them, but that is not
+guaranteed. This is the same after-publication risk as the automatic custody
+release above.
+
+**Quota effect.** Early expiry returns the archive's bytes to your ready
+payload and the instance byte quota, and, because an expired archive no longer
+counts toward the per-owner capture limit (#2744), it also frees that slot. The
+database may reuse the freed space, but its file size does not shrink at once.
 
 When its existing outbox can journal the terminal report, the worker saves
 the original completion before archive preparation. A valid receipt skips that preparation and must be persisted and read back in an

@@ -318,7 +318,7 @@ type fakeHealthSettings struct {
 	stall, nearTimeoutPct, queued, approval, cooldown int
 	// toolCall is the long-tool-call threshold (issue #2046); 0 (the default) disables it.
 	toolCall int
-	// PRD #1189: the per-run extension cap the `extend` SubmitInput branch reads. Zero (the
+	// PRD #1189, #2735: the per-request extension maximum the `extend` SubmitInput branch reads. Zero (the
 	// default) means extending is disabled, so a test opts in with a non-zero cap.
 	runExtensionCap int
 }

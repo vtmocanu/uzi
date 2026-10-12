@@ -379,6 +379,24 @@ const (
 	ReviewCommentSummary = "summary"
 )
 
+// MRComment ID namespaces. A forge draws comment ids from several distinct
+// sequences, so an id is ordered only within its namespace; the identity of a
+// comment is (IDNamespace, ID). A driver sets exactly one of these per comment.
+const (
+	// CommentNSIssueComment is a PR/issue-level conversation comment (GitHub issue
+	// comments, Forgejo issue comments).
+	CommentNSIssueComment = "issue_comment"
+	// CommentNSReviewComment is an inline review (diff) comment (GitHub pull
+	// review comments, Forgejo pull review comments).
+	CommentNSReviewComment = "review_comment"
+	// CommentNSReview is a review-summary body, keyed by the review id (GitHub and
+	// Forgejo pull reviews).
+	CommentNSReview = "review"
+	// CommentNSNote is a GitLab note: one notes sequence covers inline and
+	// top-level notes alike (discussions only group notes).
+	CommentNSNote = "note"
+)
+
 // MRComment is one comment on a merge request as ListMergeRequestComments returns
 // it oldest-first (PRD #700): a human or third-party review-bot comment, with the
 // forge's own system notes filtered out driver-side (mirroring IssueComment's D2/
@@ -394,12 +412,15 @@ const (
 // discussion id; on Forgejo ReplyID is the review-comment id and ResolveID is
 // empty (Forgejo cannot resolve — see ErrResolveUnsupported).
 type MRComment struct {
-	// ID is the forge's monotonic numeric comment/note id: monotonic within one
-	// MR's comment stream; the high-water mark (PRD #700 M3) keys on it. NOTE:
-	// GitHub sources inline-comment, issue-comment and review ids from distinct
-	// sequences, so cross-type ordering is best-effort — M3 must treat the id as an
-	// advance-only high-water, not a total order.
-	ID                int64     // monotonic forge comment/note id (see note above)
+	// ID is the forge's numeric comment/note id. It is monotonic only within its
+	// IDNamespace: different namespaces draw from distinct sequences, so ids are
+	// not comparable across them. The MR-rework ledger keeps one advance-only
+	// watermark per namespace (ADR-1199).
+	ID int64
+	// IDNamespace is the forge-defined id namespace (one of the CommentNS*
+	// constants). Comment identity is (IDNamespace, ID); ids are ordered only
+	// within one namespace.
+	IDNamespace       string
 	AuthorForgeUserID int64     // stable forge user id of the comment author
 	AuthorUsername    string    // author login, may be empty
 	Body              string    // comment body (untrusted)
@@ -778,7 +799,8 @@ type Forge interface {
 	// snapshot layer does that against the connection's own bot id, so a
 	// third-party review bot (CodeRabbit) stays readable. Bodies are untrusted free
 	// text. GitHub stitches three REST sources with a GraphQL reviewThreads read to
-	// supply both anchors (Resolved facts). No caller until PRD #700's plumbing.
+	// supply both anchors (Resolved facts). Every comment carries its IDNamespace
+	// (CommentNS*): ids are ordered only within one namespace.
 	ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error)
 	// ReplyMergeRequestComment posts a reply in the thread keyed on replyID (an
 	// MRComment.ReplyID: the GitLab discussion id, the GitHub REST databaseId, or

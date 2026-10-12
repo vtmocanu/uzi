@@ -154,7 +154,7 @@ function CaptureRow({
   showExportHint: boolean;
 }) {
   const now = useNow(60_000);
-  const view = captureView(capture.state);
+  const view = captureView(capture.state, capture.reason);
   // The copyable CLI equivalent of the "Export archive" download, for the needs_landing
   // recovery path. run id and capture id are server UUIDs (safe — not worker-authored, and
   // used as element ids / React keys elsewhere in this component), so they are rendered as

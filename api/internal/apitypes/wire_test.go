@@ -46,7 +46,7 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "plan_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
+		"autopilot_enabled", "plan_cross_check_enabled", "code_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
 		// issue #916: the per-user AI-attribution opt-out. Default true (current
 		// behavior); when false the worker suppresses the Co-Authored-By trailer.
 		"attribution_enabled",
@@ -88,9 +88,11 @@ var runDTOKeys = []string{
 	// issue #321: server-computed planning-phase display flag, always on the wire (bool,
 	// false for every non-planning and pre-feature run). Derived, not stored.
 	"is_planning",
+	// issues #750/#2760: server-derived plan-revise flag, always on the wire (bool).
+	"is_revising",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve", "plan_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
+	"auto_approve", "plan_cross_check_required", "code_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
 	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
 	// (DEFAULT 'manual') so always on the wire.
 	"trigger_source",
@@ -358,9 +360,8 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// PRD #1497 M1: worker_name is now on RunDTO too, so it is in runDTOKeys — RunListItemDTO's own
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
-	// is_revising (issue #750) is on RunListItemDTO only, deliberately NOT on RunDTO —
-	// so it is listed here, not in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count", "is_revising")
+	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
+	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -831,6 +832,7 @@ func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
 		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		"code_cross_check_guidance", "cross_check_repo_instructions_enabled",
 		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
 		// improve_uzi backlog + selects the uzi worker directive). Default false.
 		"repo_fold_improve_uzi_backlog",

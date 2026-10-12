@@ -40,6 +40,42 @@ func TestSettingsDecodeCrossCheckPins(t *testing.T) {
 	}
 }
 
+func TestSettingsDecodeFourCellsAndLegacy(t *testing.T) {
+	for _, four := range []bool{false, true} {
+		t.Run(map[bool]string{false: "legacy", true: "four"}[four], func(t *testing.T) {
+			payload := `[{"stage":"plan","harness":"claude","model":null,"effort":null,"active":true},{"stage":"plan","harness":"codex","model":null,"effort":null,"active":false}`
+			if four {
+				payload += `,{"stage":"code","harness":"claude","model":null,"effort":"low","resolved_model":null,"resolved_effort":"low","model_source":"worker default","effort_source":"pin","active":false},{"stage":"code","harness":"codex","model":"code-only","effort":null,"worker_default_model":"code-worker","resolved_model":"code-only","resolved_effort":"medium","model_source":"pin","effort_source":"worker default","active":true}`
+			}
+			payload += "]"
+			srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+				_, _ = w.Write([]byte(`{"settings":{"cross_check_pins":` + payload + `}}`))
+			}))
+			defer srv.Close()
+			s, err := newTestClient(srv).GetMySettings(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			want := 2
+			if four {
+				want = 4
+			}
+			if len(s.CrossCheckPins) != want {
+				t.Fatalf("cells: %+v", s.CrossCheckPins)
+			}
+			if four {
+				c, d := s.CrossCheckPins[2], s.CrossCheckPins[3]
+				if c.Stage != "code" || c.Harness != "claude" || c.Model != nil || c.ResolvedModel != nil || c.Active || c.Effort == nil || *c.Effort != "low" || c.ModelSource != "worker default" || c.EffortSource != "pin" {
+					t.Fatalf("Claude: %+v", c)
+				}
+				if d.Stage != "code" || d.Harness != "codex" || d.Model == nil || *d.Model != "code-only" || d.Effort != nil || d.WorkerDefaultModel == nil || *d.WorkerDefaultModel != "code-worker" || d.ResolvedModel == nil || *d.ResolvedModel != "code-only" || d.ResolvedEffort != "medium" || d.ModelSource != "pin" || d.EffortSource != "worker default" || !d.Active {
+					t.Fatalf("Codex: %+v", d)
+				}
+			}
+		})
+	}
+}
+
 func TestRunDecodeCrossCheckSources(t *testing.T) {
 	for _, tc := range []struct {
 		name, fields string

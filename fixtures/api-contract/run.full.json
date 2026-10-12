@@ -29,6 +29,7 @@
   "requeue_count": 1,
   "iteration_count": 1,
   "is_planning": true,
+  "is_revising": true,
   "progress": {
     "state": "x",
     "pct": 1,
@@ -47,6 +48,7 @@
     "x"
   ],
   "issue_input_reason": "x",
+  "code_cross_check_required": true,
   "plan_cross_check_required": true,
   "plan_cross_check_gate_reason": "x",
   "plan_cross_check_diff_refusal": "x",
@@ -79,6 +81,37 @@
       "cost_status": "x"
     },
     "historical": true
+  },
+  "code_cross_check_summary": {
+    "custom_guidance_applied": true,
+    "guidance_digest": "x",
+    "repo_instructions_enabled": true,
+    "repo_instructions_digest": "x",
+    "stage": "x",
+    "round": 1,
+    "candidate_generation": 1,
+    "base_commit": "x",
+    "head_commit": "x",
+    "candidate_digest": "x",
+    "checker_run_id": "x",
+    "checker_harness": "x",
+    "checker_model": "x",
+    "checker_effort": "x",
+    "outcome": "x",
+    "reason_class": "x",
+    "findings": {},
+    "dispositions": {},
+    "interrupted_at": "2020-01-02T03:04:05Z",
+    "finalized_at": "2020-01-02T03:04:05Z",
+    "deadline_at": "2020-01-02T03:04:05Z",
+    "usage": {
+      "input_tokens": 1,
+      "cache_read_tokens": 1,
+      "cache_creation_tokens": 1,
+      "output_tokens": 1,
+      "cost_usd": 1.5,
+      "cost_status": "x"
+    }
   },
   "trigger_source": "x",
   "milestones": [

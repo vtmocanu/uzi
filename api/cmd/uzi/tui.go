@@ -1876,7 +1876,12 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// dismissal degrades to session-only.
 			m.brew = env.Brew
 			m.executable = env.Executable
-			m.installedVersion = env.InstalledVersion
+			if probe := env.InstalledCLI; probe != nil {
+				m.installedVersion = func(formula string) (string, error) {
+					cli, err := probe(formula)
+					return cli.Version, err
+				}
+			}
 			m.store = env.Store
 			if s, serr := resolveSettings(env, gf); serr == nil {
 				m.serverURL = s.URL

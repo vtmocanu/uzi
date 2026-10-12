@@ -62,7 +62,7 @@ written after reading the unvetted bodies) is refused terminally at claim
 (`guardrail_blocked`) rather than resumed. The version is the review lane's own constant, not an alias of
 the issue lane's, so bumping one lane never re-versions the other.
 
-**Pending set.** Unknown actionable comments at or below a new high-water mark
+**Pending set.** (The scalar mark and bare ids described here are superseded in part by [ADR-1199](1199-mr-comment-identity.md): marks and pending keys are now per comment-id namespace.) Unknown actionable comments at or below a new high-water mark
 would be skipped forever once the mark moves. Their ids are kept in
 `mr_rework_ledger.pending_unknown_ids`, merged in SQL, a consumed id never
 re-added, and trigger once their author is eligible. The set holds one id per
@@ -70,7 +70,7 @@ unverified author, that author's newest unknown actionable comment id that is
 above the previous mark (and at or below the new one) or already pending, capped at 10,000 entries; on overflow the oldest ids are kept,
 so a flood arriving after a finding cannot displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. An author's older id is dropped only when its newer representative is retained in the same atomic merge (a stale writer whose add is rejected, or whose replacement another writer removed, leaves the older id in place); a retained replacement takes the older id's place in the cap order within that merge. Both the watcher and the on-demand path read the ledger before listing the comments, so a pending id missing from the listing is treated as deleted. The set accumulates across fires, so displacement needs it to exceed 10,000
 entries (one per unverified author; documented residual). A concurrent ledger
-writer that moves the mark past a new representative id can drop it, but the older id then stays pending (narrow; overlaps the scalar-mark limitation). If an author deletes their own representative (newest) comment while
+writer that moves the mark past a new representative id can drop it, but the older id then stays pending (narrow; overlaps the scalar-mark limitation; superseded in part by [ADR-1199](1199-mr-comment-identity.md), which keeps pending ids as per-namespace keys and marks). If an author deletes their own representative (newest) comment while
 older unknown ones remain, those older ones fall back to human review. An id the
 snapshot caps evict is dropped (human review is the fallback), including on a
 tick that creates no run.
@@ -165,7 +165,9 @@ this bound but is never dropped or suppressed.
   cannot reply or resolve.
 - An outsider promoted to collaborator is recognized within 6 hours.
 - The scalar high-water mark and GitHub's and Forgejo's distinct id sequences
-  (existing limitation) also apply to pending-id capture.
+  (existing limitation) also apply to pending-id capture. (Superseded in part by
+  [ADR-1199](1199-mr-comment-identity.md): comment identity is now
+  `(namespace, id)` with per-namespace marks and pending keys.)
 - Two forges on one host under different paths share an allowlist key.
 - A stale GitHub REST listing can cost a queue position; that affects fairness
   only, never who is trusted.

@@ -427,7 +427,7 @@ func TestCrossCheckCodexLeadConjunctPresentInEverySQLCopy(t *testing.T) {
 	}
 	src := string(raw)
 	base := regexp.MustCompile(`'cross_check_v1' = ANY\(`).FindAllStringIndex(src, -1)
-	conj := regexp.MustCompile(`AND \(NOT \((\w+)\.kind = 'cross_check' AND \w+\.harness = 'claude'\)\s+OR 'cross_check_codex_lead_v1' = ANY\(`).FindAllStringSubmatchIndex(src, -1)
+	conj := regexp.MustCompile(`AND \(NOT \((\w+)\.kind = 'cross_check' AND \w+\.harness = 'claude' AND EXISTS \(SELECT 1 FROM cross_checks pc WHERE pc.checker_run_id = \w+\.id AND pc.stage = 'plan'\)\)\s+OR 'cross_check_codex_lead_v1' = ANY\(`).FindAllStringSubmatchIndex(src, -1)
 	if len(base) != 6 {
 		t.Fatalf("cross_check_v1 copies = %d, want 6 (claim, peer mirror, count, capability gap, two saturation arms)", len(base))
 	}

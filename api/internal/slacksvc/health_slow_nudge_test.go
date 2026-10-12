@@ -117,19 +117,17 @@ func TestHealthNudgeBlocksSlowShowsExtendCommandWhenCapHasRoom(t *testing.T) {
 	}
 }
 
-func TestHealthNudgeBlocksSlowExtendFitsRemainingAllowance(t *testing.T) {
-	// With less than 2h of allowance left, the nudge must NOT suggest the fixed `--by 2h`
-	// (the server 409s an over-cap extend); it renders the remaining allowance floored to
-	// whole minutes instead. cap 7200, already extended 3601 → 3599s (59m 59s) remain, so the
-	// command is `--by 59m` (3540s, within the remainder and above the 60s extend floor). The
-	// unfixed renderer emitted `--by 2h` whenever extension < cap and would fail the first check.
+func TestHealthNudgeBlocksSlowExtendFitsMaxExtension(t *testing.T) {
+	// With a per-request maximum under 2h for this run, the nudge must NOT suggest the fixed
+	// `--by 2h` (the server 409s it); it renders the maximum floored to whole minutes instead.
+	// maxExtend 3599s (59m 59s) → `--by 59m` (3540s, within the maximum and above the 60s floor).
 	rc := slowRow()
 	rc.BudgetExtensionSeconds = 3601
-	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 7200, slowNow)
+	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 3599, slowNow)
 	ctx := contextText(blocks)
 
 	if strings.Contains(ctx, "--by 2h") {
-		t.Fatalf("slow context = %q, must NOT suggest --by 2h with only 3599s of allowance left (it would 409)", ctx)
+		t.Fatalf("slow context = %q, must NOT suggest --by 2h with a 3599s maximum (it would 409)", ctx)
 	}
 	want := "Extend: `uzi run extend " + rc.ID.String() + " --by 59m`"
 	if !strings.Contains(ctx, want) {
@@ -138,28 +136,26 @@ func TestHealthNudgeBlocksSlowExtendFitsRemainingAllowance(t *testing.T) {
 }
 
 func TestHealthNudgeBlocksSlowOmitsExtendWhenRemainderBelowFloor(t *testing.T) {
-	// A remaining allowance under the 60s extend floor cannot be extended, so the line is
-	// omitted rather than suggesting a `--by 0m` the server rejects. cap 7200, extended 7159 →
-	// 41s left. The unfixed renderer (extension < cap) still emitted a command here.
+	// A maximum under the 60s extend floor cannot be extended, so the line is omitted rather
+	// than suggesting a `--by 0m` the server rejects. maxExtend 41s.
 	rc := slowRow()
-	rc.BudgetExtensionSeconds = 7159
-	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 7200, slowNow)
+	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 41, slowNow)
 	if strings.Contains(contextText(blocks), "uzi run extend") {
-		t.Fatalf("slow context carries the extend command though only 41s (< 60s floor) of allowance remain")
+		t.Fatalf("slow context carries the extend command though the 41s maximum is under the 60s floor")
 	}
 }
 
-func TestHealthNudgeBlocksSlowOmitsExtendCommandAtCap(t *testing.T) {
-	// extension_seconds >= cap: no room left, so the DM never suggests a command that
-	// would 409. The boundary (equal) is the omit case.
+func TestHealthNudgeBlocksSlowOmitsExtendCommandWithNoRoom(t *testing.T) {
+	// maxExtend 0 (the run is at the total-run-time limit): no room left, so the DM never
+	// suggests a command that would 409.
 	rc := slowRow()
 	rc.BudgetExtensionSeconds = 7200
-	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 7200, slowNow)
+	blocks, _ := healthNudgeBlocks(healthSlow, "", "https://uzi.example", rc, slowDeadline(), 0, slowNow)
 	if strings.Contains(contextText(blocks), "uzi run extend") {
-		t.Fatalf("slow context carries the extend command though extension (7200) >= cap (7200)")
+		t.Fatalf("slow context carries the extend command though no extension room is left")
 	}
 	if got := countContextBlocks(blocks); got != 1 {
-		t.Fatalf("at cap, slow blocks carry %d context blocks, want 1 (🔗 link only)", got)
+		t.Fatalf("with no room, slow blocks carry %d context blocks, want 1 (🔗 link only)", got)
 	}
 }
 
@@ -293,6 +289,63 @@ func TestNotifierSlowNudgeOmitsExtendWhenCapReaderReportsDisabled(t *testing.T) 
 	}
 	if !strings.Contains(fp.blocks[0].sectionText, "Stops at <!date^") {
 		t.Fatalf("nudge section missing the deadline (independent of the cap): %q", fp.blocks[0].sectionText)
+	}
+}
+
+// TestNotifierSlowNudgeExtendIsPerRequestNotCumulative: a run already extended past the cap in
+// total (#2735) still gets the extend command, sized to the per-request cap (2h), because the
+// cap no longer bounds the cumulative extension.
+func TestNotifierSlowNudgeExtendIsPerRequestNotCumulative(t *testing.T) {
+	rc := baseRun("running")
+	rc.Kind = "issue"
+	rc.Health = healthSlow
+	rc.StartedAt = pgtype.Timestamptz{Time: time.Now().Add(-(6*time.Hour + 55*time.Minute)), Valid: true}
+	rc.BudgetWallSeconds = pgtype.Int4{Int32: int32((8 * time.Hour).Seconds()), Valid: true}
+	rc.BudgetExtensionSeconds = 60000 // above the 57600 per-request cap
+
+	fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}}
+	fp := &fakePoster{dmChannel: "D1"}
+	n := NewNotifier(fs, fp, fixedBase, nil,
+		WithRunTimeout(2*time.Hour),
+		WithRunWallCeiling(8*time.Hour),
+		WithExtensionCap(func(context.Context) (int, error) { return 57600, nil }))
+	n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: healthSlow, reason: "", nudge: true})
+	if len(fp.blocks) != 1 {
+		t.Fatalf("want one threaded nudge post: %+v", fp.blocks)
+	}
+	if want := "uzi run extend " + rc.ID.String() + " --by 2h"; !strings.Contains(fp.blocks[0].contextText, want) {
+		t.Fatalf("nudge context missing %q though the cap is per request: %q", want, fp.blocks[0].contextText)
+	}
+}
+
+// TestNotifierSlowNudgeExtendFitsTotalRoom: when the run's remaining total-time room is smaller
+// than the per-request cap, the suggested duration fits the room; with no room left the
+// command is omitted.
+func TestNotifierSlowNudgeExtendFitsTotalRoom(t *testing.T) {
+	room := func(ext int32) (*fakePoster, string) {
+		rc := baseRun("running")
+		rc.Kind = "issue"
+		rc.Health = healthSlow
+		rc.StartedAt = pgtype.Timestamptz{Time: time.Now().Add(-(6*time.Hour + 55*time.Minute)), Valid: true}
+		rc.BudgetWallSeconds = pgtype.Int4{Int32: int32((8 * time.Hour).Seconds()), Valid: true}
+		rc.BudgetExtensionSeconds = ext
+		fs := &fakeNotifStore{rc: rc, delivery: txt("U1"), msg: store.SlackRunMessage{RunID: rc.ID, ChannelID: "D1", RootTs: "ts1"}}
+		fp := &fakePoster{dmChannel: "D1"}
+		n := NewNotifier(fs, fp, fixedBase, nil,
+			WithRunTimeout(2*time.Hour),
+			WithRunWallCeiling(8*time.Hour),
+			WithExtensionCap(func(context.Context) (int, error) { return 57600, nil }))
+		n.handleHealth(context.Background(), healthEvent{runID: rc.ID, health: healthSlow, reason: "", nudge: true})
+		return fp, rc.ID.String()
+	}
+	// Room = 2147483 - 259200 (the 72h maximum ceiling) - 1800 - ext; ext leaving 1800s of room -> 30m.
+	fp, id := room(2147483 - 259200 - 1800 - 1800)
+	if len(fp.blocks) != 1 || !strings.Contains(fp.blocks[0].contextText, "uzi run extend "+id+" --by 30m") {
+		t.Fatalf("want a 30m fitted command, got %+v", fp.blocks)
+	}
+	fp, _ = room(2147483 - 259200 - 1800)
+	if len(fp.blocks) != 1 || strings.Contains(fp.blocks[0].contextText, "uzi run extend") {
+		t.Fatalf("no room left: want no extend command, got %+v", fp.blocks)
 	}
 }
 

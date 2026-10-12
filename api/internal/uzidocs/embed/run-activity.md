@@ -473,7 +473,7 @@ mislead:
 | Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI and TUI board say which: `limit wait`, `pool wait`, `recovery wait` or `paused` (the board abbreviates to `⏸ limit`, `⏸ pool`, `⏸ recov`, `⏸ paused`). On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
 | Queued | The run has not started yet (on the web, the status pill says it and the cell adds only screen-reader text) |
 | Stalled | The run's health is stalled or looping. The web row (`◼ stalled` over a `since HH:MM` line, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
-| Planning | The run is planning and has no frozen milestone list yet (on the web, the status pill says it and the cell adds only screen-reader text) |
+| Planning | The run is planning and has no frozen milestone list yet, or is re-planning after a revise: it stays awaiting approval while the lead re-plans, but nothing waits on you until the new plan lands. On the web the status pill says `planning` or `revising`, and the cell adds only screen-reader text |
 
 When there is no estimate at all, the web cell shows `—`, the TUI board cell
 is blank and `uzi run get` omits the row.

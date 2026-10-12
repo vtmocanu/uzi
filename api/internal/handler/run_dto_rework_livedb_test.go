@@ -60,7 +60,7 @@ func TestRunReworkAutoCyclesDTOOwnerOnlyLiveDB(t *testing.T) {
 		 VALUES ($1, $2, $3, 'issue', 5501, 't', 'd', 'agent/issue-5501', 5501, 'opened', 'completed')`,
 		openRun, owner, repoID)
 	cliMustExec(t, pool,
-		`INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water) VALUES ($1, 'agent/issue-5501', 5, 200)`,
+		`INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, comment_marks) VALUES ($1, 'agent/issue-5501', 5, 200, '{}')`,
 		repoID)
 
 	// Owner view: both fields populated — 5 cycles spent, cap 5 (the settings default in this

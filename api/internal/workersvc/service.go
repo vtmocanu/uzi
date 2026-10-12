@@ -180,16 +180,20 @@ var (
 	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
 	// invalid mode fall through to the 500 default arm.
 	ErrInvalidPauseMode = errors.New("invalid pause mode")
-	// The four `extend` sentinels (PRD #1189 M1). ErrInvalidExtension rejects a body that is
+	// The `extend` sentinels (PRD #1189 M1, #2735). ErrInvalidExtension rejects a body that is
 	// not a whole number of seconds >= 60 → 400. ErrExtendDisabled is the admin off-switch
-	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the per-run cap gate,
-	// whose message names the remaining allowance → 409. ErrExtendNotTimed rejects a run of a
-	// kind that never times out (chat/judge/interactive) → 409. The last two are disambiguated
-	// from a 0-row CreateExtendInput by extendRefusalReason over the already-fetched run.
-	ErrInvalidExtension     = errors.New("invalid extension")
-	ErrExtendDisabled       = errors.New("extending runs is turned off")
-	ErrExtensionCapExceeded = errors.New("extension cap exceeded")
-	ErrExtendNotTimed       = errors.New("this run has no wall-clock timeout to extend")
+	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the PER-REQUEST gate: one
+	// request may not exceed run_extension_cap_seconds (the cumulative total is not capped by it),
+	// → 409. ErrExtensionLimitReached is the admission gate: the request must fit the room
+	// under MaxRunWallSeconds after wall, extension and finalize reserves, → 409. ErrExtendNotTimed
+	// rejects a run of a kind that never times out (chat/judge/interactive) → 409. The last three
+	// are disambiguated from a 0-row CreateExtendInput by extendRefusalReason over the
+	// already-fetched run.
+	ErrInvalidExtension      = errors.New("invalid extension")
+	ErrExtendDisabled        = errors.New("extending runs is turned off")
+	ErrExtensionCapExceeded  = errors.New("extension cap exceeded")
+	ErrExtensionLimitReached = errors.New("total run time limit reached")
+	ErrExtendNotTimed        = errors.New("this run has no wall-clock timeout to extend")
 	// ErrWallParkStopUnavailable (PRD #1497 M1, D9) rejects a `stop` on a budget_exhausted wall park
 	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
 	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
@@ -492,11 +496,15 @@ type Store interface {
 	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
-	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error)
+	RemoveMRReworkPendingKeys(ctx context.Context, arg store.RemoveMRReworkPendingKeysParams) error
 	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
-	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
-	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance). It returns
+	// the rows written; 0 means the row is legacy (ADR-1199) and nothing was written.
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) (int64, error)
+	// BootstrapMRReworkLedgerMarks upgrades a legacy ledger row to the namespaced state once
+	// (Service.BootstrapReviewLedger); 0 rows means the row moved or was already upgraded.
+	BootstrapMRReworkLedgerMarks(ctx context.Context, arg store.BootstrapMRReworkLedgerMarksParams) (int64, error)
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
@@ -1374,6 +1382,7 @@ type Params struct {
 	PlanCrossCheckMaxRevisions int32
 	// Presence distinguishes an explicitly disabled budget from an unwired service.
 	PlanCrossCheckMaxRevisionsSet bool
+	CodeCrossCheckTimeout         time.Duration
 	PlanCrossCheckTimeout         time.Duration
 	RunTimeout                    time.Duration
 	RunWallCeiling                time.Duration
@@ -2202,6 +2211,25 @@ func (s *Service) notify(runID uuid.UUID, status string) {
 
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
+
+// MaxRunWallSeconds is the retained extension-admission limit in seconds (about 24.8 days).
+// Extend room subtracts the reserved wall, existing extensions and finalize allowance from it.
+// It is not an absolute cap on served totals: later configuration increases are honored without
+// clamping by the worker's shared chunked monotonic relative timers (#2761). Native chunks are
+// at most 2147483646 ms; executor elapsed accounting and absolute-time predicates are unchanged.
+const MaxRunWallSeconds = math.MaxInt32 / 1000
+
+// MaxRunWallCeiling is the largest RUN_WALL_CEILING the configuration can ever have: the
+// config.Load validator refuses an explicit value above it, and the derived default is capped at
+// it. The extend bound reserves max(frozen wall, it) for every run, because plan approval can
+// scale a NULL wall up to a ceiling raised after the extension was granted.
+// TestMaxRunWallCeilingMatchesConfigValidator keeps it equal to that validator's bound.
+const MaxRunWallCeiling = 72 * time.Hour
+
+// WallParkFinalizeSeconds is the one-time finalize allowance StopWallPark grants (SQL literal
+// budget_finalize_seconds = 1800). Extension admission reserves it before Stop grants it;
+// a LiveDB test pins it against the SQL. This reserve does not cap later served totals.
+const WallParkFinalizeSeconds = 1800
 
 // defaultDispatchGrace is the undispatched-task-run reaper window (issue #1367): a
 // kind='task' (handoff) run may sit queued+undispatched this long before the sweep

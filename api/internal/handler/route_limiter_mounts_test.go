@@ -860,6 +860,12 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/reconcile", noLimiter},
+	// Issue #2625: the archive redundancy claim. Worker-authenticated; a claim that passes the
+	// local checks spends the OWNER's forge quota (a summary, a branch head and one compare per
+	// distinct commit), so it rides proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback
+	// mount), which this per-USER probe reads as noLimiter, like /settle below. A refused claim is
+	// also memoized for an hour, so a looping worker is answered without any forge call.
+	{"POST", "/api/worker/runs/{id}/archives/{captureID}/redundancy", noLimiter},
 	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated; a call that
 	// reaches the proof spends the OWNER's forge quota (one branch-head read plus up to three
 	// compares, up to six on Forgejo, which compares both directions per candidate), so it
@@ -890,8 +896,12 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
-	// Worker-authenticated, generation-fenced plan cross-check protocol.
+	// Worker-authenticated, generation-fenced, stage-dispatched cross-check protocol.
 	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
+	// Owned-worker dispositions are bounded and write-once, like the verdict callback.
+	{"POST", "/api/worker/runs/{id}/cross-checks/code/dispositions", noLimiter},
+	// Owned-worker status polling spends no provider or forge quota, like plan status.
+	{"GET", "/api/worker/runs/{id}/cross-checks/code/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/{round}", noLimiter},
 	{"POST", "/api/worker/runs/{id}/cross-check-verdict", noLimiter},

@@ -31,6 +31,8 @@ import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
 import type {
   CompletedPublicationReceipt,
+  RecoveryArchiveRedundancyRequest,
+  RecoveryArchiveRedundancyResponse,
   RecoveryReconcileRequest,
   RecoveryReconcileResponse,
   RecoveryFinalDisposition,
@@ -44,7 +46,7 @@ import type {
   RecoveryUploadManifest,
   RunKind,
 } from "./protocol.js";
-import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
+import { readRecoveryBundleHeader, RECOVERY_CHUNK_BYTES, RecoveryBundleTooLargeError, type RecoveryBundleResult, type PositiveOwedCandidateContext, type OwedCandidate, type RecoveryCoverage, type RecoveryCoverageClaim, type FetchAgentBranchOptions, type TrackingUpdateResult, type GitCache } from "./git.js";
 
 /** The six forge-finalizing run kinds that reach code publication (PRD #1296 In-scope).
  *  `chat` and `judge` never publish code, so they never open a custody hold and never
@@ -228,6 +230,9 @@ export interface RecoveryArchiveClient {
     releaseEvidence?: string,
     finalDisposition?: RecoveryFinalDisposition,
   ): Promise<RecoveryReleaseResponse>;
+  /** Issue #2625: claim a completed run's archive is redundant with its published branch. Optional
+   *  and gated on `recovery_archive_redundancy_v1`; the answer is only ever logged. */
+  proveRecoveryArchiveRedundancy?(runId: string, captureId: string, req: RecoveryArchiveRedundancyRequest, signal?: AbortSignal): Promise<RecoveryArchiveRedundancyResponse>;
   getRunOwnership?(runId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
   /** The worker's own open custody holds on a run — the post-clone generation-exact inventory
    *  (PRD #1349 M1/M2, D3). */
@@ -248,6 +253,13 @@ export interface RecoveryBundleProducer {
   discoverOwedCandidates?(): ReturnType<GitCache["discoverOwedCandidates"]>;
   retainCurrentOwedCandidate?(barePath: string, options: FetchAgentBranchOptions): Promise<TrackingUpdateResult>;
   buildRecoveryCoverage?(barePath: string, context: PositiveOwedCandidateContext, roots: string[], currentSha: string): Promise<RecoveryCoverage>;
+  /** Issue #2625: read-only redundancy claim for a previously built coverage aggregate. */
+  readRecoveryCoverageClaim?(barePath: string, opts: {
+    sourceSha: string; fingerprint: string; roots: string[]; currentSha: string; witnessHead?: string;
+  }): Promise<RecoveryCoverageClaim | undefined>;
+  /** Runs `action` under a local recovery clock: every git child and queued repo lock inside it
+   *  is clipped to `deadline` and aborted with `signal` ({@link GitCache.withRecoveryOperation}). */
+  withRecoveryOperation?<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T>;
   produceRecoveryBundle(
     barePath: string,
     opts: { sourceSha: string; outPath: string; forgeTip?: string; guardedDefaultBranch?: string; maxBytes?: number },
@@ -383,6 +395,8 @@ export interface RecoveryCoordinatorOptions {
     /** Awaited by {@link RecoveryCoordinator.pin} between its unlocked record observation and
      *  its locked re-read, so a test can interleave a capture there. */
     afterPinObserve?: () => Promise<void>;
+    /** Overrides {@link REDUNDANCY_DEADLINE_MS}, the one deadline for all redundancy claims of a cleanup. */
+    redundancyDeadlineMs?: number;
   };
 }
 
@@ -399,6 +413,39 @@ export interface ResumeLiveOptions {
 const EMPTY_INVENTORY_DIGEST = "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
 /** Delays before each retry of the unadopted-generation settled release (bounded: len + 1 attempts). */
 const UNADOPTED_SETTLE_RETRY_DELAYS_MS: readonly number[] = [500, 2_000, 8_000];
+
+/** Issue #2625: one deadline bounds every redundancy claim a single cleanup submits. */
+const REDUNDANCY_DEADLINE_MS = 30_000;
+
+/** Runs `start` and resolves with its result, or with undefined once `signal` aborts, whichever is
+ *  first. The abort wait is armed BEFORE `start` runs: a callee that aborts synchronously would
+ *  otherwise fire the event unheard, and an aborted signal never fires again. A rejection of
+ *  `start` propagates; a late one after abort is swallowed. */
+async function withinBudget<T>(signal: AbortSignal, start: () => Promise<T>): Promise<T | undefined> {
+  if (signal.aborted) return undefined;
+  let onAbort: (() => void) | undefined;
+  const expired = new Promise<undefined>(resolve => {
+    onAbort = () => resolve(undefined);
+    signal.addEventListener("abort", onAbort, { once: true });
+  });
+  try {
+    const pending = start();
+    pending.catch(() => undefined);
+    return await Promise.race([pending, expired]);
+  } finally {
+    if (onAbort) signal.removeEventListener("abort", onAbort);
+  }
+}
+/** Retained reasons that say nothing final about the archive: a later cleanup may claim again. */
+const TRANSIENT_REDUNDANCY_REASONS: ReadonlySet<string> = new Set([
+  "ancestry_unknown", "forge_timeout", "cooling_down", "invalid_response",
+]);
+
+/** A claim built under the journal lock and submitted after it is released. */
+interface PendingRedundancyClaim { runId: string; generation: number; captureId: string; request: RecoveryArchiveRedundancyRequest }
+/** Issue #2625: the ONE deadline for a cleanup's redundancy work, started before claims are built
+ *  so building (under the journal lock) and submitting (after it) share it. */
+interface RedundancyBudget { signal: AbortSignal; deadline: number; dispose(): void }
 
 const LIVE_MAX_PER_PASS = 4;
 const LIVE_BACKOFF_BASE_MS = 30_000;
@@ -725,6 +772,8 @@ export class RecoveryCoordinator {
   /** Set by any 401: a live pass runs only for a heartbeat sent after it. */
   private credentialBlockedAt: number | undefined;
   private readonly lastAttemptAt = new Map<string, number>();
+  /** serverCaptureIds whose redundancy claim got a final answer (expired, or a non-transient retained). */
+  private readonly redundancySettled = new Set<string>();
 
   constructor(opts: RecoveryCoordinatorOptions) {
     this.withInventorySourceBoundary = opts.withInventorySourceBoundary;
@@ -1397,11 +1446,11 @@ export class RecoveryCoordinator {
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting): Promise<RecoveryOutcome | void> {
     if (record.completionReceipt) {
-      await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting);
+      await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
       return;
     }
     if (record.finalAcknowledged) {
-      await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting);
+      await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting, signal);
       return;
     }
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged || !(await this.inactiveInventory(record))) return;
@@ -2407,10 +2456,16 @@ export class RecoveryCoordinator {
       () => this.forgetGenerationWithinCycle(runId, generation));
   }
 
-  /** Receipt cleanup visits only this authenticated generation. No archive ancestry or capture RPC.
+  /** Receipt cleanup visits only this authenticated generation. No archive ancestry or capture RPC
+   * gates it: the issue #2625 redundancy claims are built under the journal lock from the records
+   * read there, but submitted only after the lock is released, bounded by one deadline, and their
+   * answers are logged and otherwise ignored, so no refusal, error or timeout changes the cleanup.
    * One attempt per existing sweep; any failed proof stops this generation and retains authority. */
-  private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean): Promise<void> {
+  private async forgetCompletedGeneration(runId: string, generation: number, isExecuting: (runId: string) => boolean,
+    signal?: AbortSignal): Promise<void> {
     if (!this.withCompletionSourceBoundary || isExecuting(runId) || this.isExecuting(runId)) return;
+    let claims: PendingRedundancyClaim[] = [];
+    const budget = this.startRedundancyBudget(signal);
     await this.withJournalLock(runId, async () => {
       const records = await this.checkedRecords(runId);
       const selected = records.filter(r => r.generation === generation);
@@ -2422,6 +2477,7 @@ export class RecoveryCoordinator {
           (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
       const bare = await this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath));
       if (bare !== ctx.barePath) return;
+      claims = await this.buildRedundancyClaims(selected, generation, bare, budget, authority.completionReceipt!.final_head);
       const bundles = new Set<string>();
       for (const record of selected) {
         if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
@@ -2462,12 +2518,17 @@ export class RecoveryCoordinator {
         await fs.rmdir(this.runDir(runId)).catch(() => undefined);
       });
     });
+    await this.submitRedundancyClaims(claims, budget);
   }
 
   /** Caller owns the generation cycle. The journal lock spans selection and every destructive
    * step, excluding delayed journal writers. One pass, no internal retries; failure keeps the
    * covering ACK and the bounded boot/live passes retry it independently of upload eligibility. */
-  private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting): Promise<void> {
+  private async forgetGenerationWithinCycle(runId: string, generation: number, isExecuting = this.isExecuting,
+    signal?: AbortSignal): Promise<void> {
+    // Issue #2625: claims are built under the journal lock and submitted after it, as in forgetCompletedGeneration.
+    let claims: PendingRedundancyClaim[] = [];
+    const budget = this.startRedundancyBudget(signal);
     await this.withJournalLock(runId, async () => {
       // Keep legacy exact-release cleanup (including opaque sibling retention) unchanged.
       // Classify under the journal lock and generation cycle so a new guarded writer cannot
@@ -2490,6 +2551,7 @@ export class RecoveryCoordinator {
       if (!open() || !ack.coverageContext || !ack.bareDir) return;
       const bare = await this.git.resolveRecoveryBareDir?.(ack.bareDir);
       if (bare !== ack.coverageContext.barePath) return;
+      claims = await this.buildRedundancyClaims(selected, generation, bare, budget);
       const bundles = new Set<string>();
       // Positive ownership is the canonical capture filename, not an arbitrary MAC-covered path.
       // Validate every path before changing refs; an unknown journal path retains all authority.
@@ -2529,6 +2591,97 @@ export class RecoveryCoordinator {
       await unlink(this.recordPath(ack));
       await fs.rmdir(this.runDir(runId)).catch(() => undefined);
     });
+    await this.submitRedundancyClaims(claims, budget);
+  }
+
+  /**
+   * Issue #2625: one claim per uploaded, non-settled guarded record of `generation`, read from the
+   * local bare repo. The caller holds the journal lock and passes the records it read there. A
+   * failure for one record drops only that claim; nothing here can change a cleanup decision.
+   * `witnessHead` is the completed run's delivered head (receipt path only).
+   */
+  private async buildRedundancyClaims(selected: RecoveryRecord[], generation: number, bare: string,
+    budget: RedundancyBudget, witnessHead?: string): Promise<PendingRedundancyClaim[]> {
+    const out: PendingRedundancyClaim[] = [];
+    try {
+      if (!this.client.hasFeature?.("recovery_archive_redundancy_v1") || !this.client.proveRecoveryArchiveRedundancy ||
+          !this.git.readRecoveryCoverageClaim) return out;
+      for (const r of selected) {
+        if (!r.inventoryGuarded || r.generation !== generation || r.state !== "uploaded" || !r.serverCaptureId ||
+            !r.coverageDigest || r.coverageDigest === EMPTY_INVENTORY_DIGEST || !r.inventoryCurrentSha ||
+            !r.originalSourceSha || !r.coverageContext || r.finalRequest?.disposition.kind === "settled" ||
+            this.redundancySettled.has(r.serverCaptureId)) continue;
+        try {
+          const roots = [...new Set([...(r.originalRoots ?? []).map(x => x.sha), r.originalSourceSha])].sort();
+          if (budget.signal.aborted) break;
+          // The reads run under the journal lock: bound them (git children and the repo-lock wait)
+          // by the same deadline as submission, and race them so even a hung reader gives up.
+          const opts = {
+            sourceSha: r.sourceSha, fingerprint: r.coverageDigest, roots, currentSha: r.inventoryCurrentSha,
+            ...(witnessHead === undefined ? {} : { witnessHead }),
+          };
+          const read = () => this.git.readRecoveryCoverageClaim!(bare, opts);
+          const claim = await withinBudget(budget.signal, () =>
+            this.git.withRecoveryOperation ? this.git.withRecoveryOperation(budget.signal, budget.deadline, read) : read());
+          if (!claim) continue;
+          out.push({ runId: r.runId, generation, captureId: r.serverCaptureId, request: {
+            generation, coverage_digest: claim.coverageDigest, roots: claim.roots, current_sha: claim.currentSha,
+            tree: claim.tree, aggregate_objects: claim.aggregateObjects, current_object: claim.currentObject,
+            ...(claim.witnessObject === undefined ? {} : { wip: { witness_object: claim.witnessObject } }),
+          } });
+        } catch (err) {
+          this.log.debug("recovery: archive redundancy claim not built", { run_id: r.runId, generation, error: errText(err) });
+        }
+      }
+    } catch (err) {
+      this.log.debug("recovery: archive redundancy claims not built", { generation, error: errText(err) });
+    }
+    return out;
+  }
+
+  /** Sequential, best effort, never throws, and returns by the one deadline (30 s, plus any caller
+   *  abort) even when a request hangs. Answers are logged; only final ones are remembered. */
+  /** Starts the one cleanup deadline (30 s, plus any caller abort). The timer is unref'd and
+   *  cleared by {@link submitRedundancyClaims}, which every path reaching the lock body calls. */
+  private startRedundancyBudget(signal?: AbortSignal): RedundancyBudget {
+    const ms = this.testHooks?.redundancyDeadlineMs ?? REDUNDANCY_DEADLINE_MS;
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), ms);
+    timer.unref?.();
+    return {
+      signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
+      deadline: Date.now() + ms,
+      dispose: () => clearTimeout(timer),
+    };
+  }
+
+  /** Sequential, best effort, never throws, and returns by the one deadline even when a request
+   *  hangs. Answers are logged; only final ones are remembered. */
+  private async submitRedundancyClaims(claims: PendingRedundancyClaim[], budget: RedundancyBudget): Promise<void> {
+    try {
+      if (!claims.length || !this.client.proveRecoveryArchiveRedundancy) return;
+      for (const claim of claims) {
+        if (budget.signal.aborted) break;
+        try {
+          const res = await withinBudget(budget.signal, () =>
+            this.client.proveRecoveryArchiveRedundancy!(claim.runId, claim.captureId, claim.request, budget.signal));
+          if (!res) break;
+          this.log.info("recovery: archive redundancy claim answered", {
+            run_id: claim.runId, generation: claim.generation, capture_id: claim.captureId,
+            outcome: res.outcome, ...(res.reason === undefined ? {} : { reason: res.reason }),
+          });
+          if (res.outcome === "expired" || (res.outcome === "retained" && !TRANSIENT_REDUNDANCY_REASONS.has(res.reason ?? ""))) {
+            this.redundancySettled.add(claim.captureId);
+          }
+        } catch (err) {
+          this.log.info("recovery: archive redundancy claim failed", {
+            run_id: claim.runId, generation: claim.generation, capture_id: claim.captureId, error: errText(err),
+          });
+        }
+      }
+    } finally {
+      budget.dispose();
+    }
   }
 
   /** All AUTHENTICATED records for a run (a tampered/unreadable record is omitted, never

@@ -1214,12 +1214,29 @@ export interface ClaimPlanCrossCheck {
   planning_diff: string;
 }
 
+export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+  stage: "code";
+  head_commit: string;
+  code_context: unknown;
+  guidance_snapshot: string;
+  /** Frozen repository-instructions consent and text (PRD #2170); text is "" unless enabled. */
+  repo_instructions_enabled?: boolean;
+  repo_instructions_text?: string;
+  custom_guidance_applied?: boolean;
+  /** sha256 hex of guidance_snapshot / repo_instructions_text, verified by decodeCrossCheckClaim. */
+  guidance_digest?: string;
+  repo_instructions_digest?: string;
+  /** Worker-produced bounded evidence, never accepted from the server. */
+  code_diff?: string;
+  planning_diff?: string;
+}
+
 export interface ClaimResponse {
   /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
   park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
-  cross_check?: ClaimPlanCrossCheck;
+  cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
@@ -1293,6 +1310,8 @@ export interface ClaimResponse {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** Independent code-check consent snapshot. Absent on older APIs means disabled. */
+  code_cross_check_required?: boolean;
   /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's
    *  checked-plan submission. Absent on older servers, so a Codex lead parks as
    *  codex_lead_unsupported instead of submitting to an api that would refuse it. */
@@ -2936,6 +2955,27 @@ export interface RecoveryReconcileResponse {
   outcome: "accepted" | "replaceable" | "retained";
   final_receipt?: RecoveryFinalDisposition;
   release_evidence?: string;
+  reason?: string;
+}
+
+/** Claim that a completed run's guarded archive is redundant with its published branch (issue
+ *  #2625). Mirrors api/internal/apitypes/recovery_archive_redundancy.go; sent only when the server
+ *  advertises recovery_archive_redundancy_v1. Objects are standard padded base64 of raw commit bodies. */
+export interface RecoveryArchiveRedundancyRequest {
+  generation: number;
+  coverage_digest: string;
+  roots: string[];
+  current_sha: string;
+  tree: string;
+  aggregate_objects: string[];
+  current_object: string;
+  wip?: { witness_object: string };
+}
+
+/** The api's answer. reason is a bounded server token, or a local token when the reply was malformed. */
+export interface RecoveryArchiveRedundancyResponse {
+  capture_id: string;
+  outcome: "expired" | "retained";
   reason?: string;
 }
 

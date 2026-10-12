@@ -648,7 +648,8 @@ func TestUpdatePromptDismissPersists(t *testing.T) {
 
 func TestRunPendingUpgradeCallsSeamForeground(t *testing.T) {
 	b := &brewRec{}
-	env := Env{Stdout: io.Discard, Stderr: io.Discard, Brew: b.fn, InstalledVersion: func(string) (string, error) { return "v0.85.0", nil }}
+	env := Env{Stdout: io.Discard, Stderr: io.Discard, Brew: b.fn, InstalledCLI: func(string) (installedCLI, error) { return installedCLI{Version: "v0.85.0"}, nil },
+		Exec: func(string, []string, []string) error { return nil }}
 	if err := runPendingUpgrade(env, []string{"upgrade", "vtmocanu/tap/uzi-cli"}, "v0.85.0"); err != nil {
 		t.Fatalf("runPendingUpgrade: %v", err)
 	}

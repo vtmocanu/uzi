@@ -1183,6 +1183,7 @@ const BRIDGE_SENTENCE =
  */
 export type KindSectionLine =
   | { fixed: string }
+  | { codeCrossCheck: import("./code-cross-check-gate.js").CodeCrossCheckSummary }
   | { path: string }
   | { check: { name: string; status: CheckStatus; detail: string } };
 
@@ -1207,6 +1208,7 @@ function renderFixedLine(s: string): string {
 }
 
 function renderKindSectionLine(line: KindSectionLine): string {
+  if ("codeCrossCheck" in line) return renderCodeCrossCheck(line.codeCrossCheck);
   if ("path" in line) return `> - ${codeSpan(line.path)}`;
   if ("check" in line) {
     const c = line.check;
@@ -1214,6 +1216,65 @@ function renderKindSectionLine(line: KindSectionLine): string {
     return `- ${checkEmoji(status)} ${escapeInline(c.name)} — ${status} (${escapeInline(c.detail)})`;
   }
   return renderFixedLine(line.fixed);
+}
+
+/** Fixed wording for every `reason_class` a failed code cross-check row can carry (the
+ *  cross_checks_reason_class_check allowlist for stage 'code'); anything else is escaped raw. */
+const CODE_CROSS_CHECK_REASON_PROSE: ReadonlyMap<string, string> = new Map([
+  ["worker_unsupported", "worker unsupported"],
+  ["snapshot_failed", "snapshot failed"],
+  ["malformed", "checker output malformed"],
+  ["model_error", "checker model error"],
+  ["model_timeout", "checker model timed out"],
+  ["checker_unavailable", "no local checker"],
+  ["confinement_failed", "checker confinement failed"],
+  ["timed_out", "timed out"],
+  ["superseded", "superseded by a later change"],
+]);
+
+/** Code data occupies escaped value slots only; the 4 KiB budget drops finding lines first. */
+function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").CodeCrossCheckSummary): string {
+  const value = (s: string | null | undefined, cap = 256): string => {
+    // Strip complete ANSI sequences before dropping the remaining invisible controls.
+    // eslint-disable-next-line no-control-regex -- Literal ESC/BEL matching removes hostile ANSI sequences.
+    const clean = (s ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, "");
+    let bounded = "";
+    for (const rune of clean) {
+      if (Buffer.byteLength(bounded + rune) > cap) break;
+      bounded += rune;
+    }
+    return escapeInline(bounded);
+  };
+  if ("incomplete" in summary) return `Code cross-check incomplete: ${value(summary.incomplete)}`;
+  if (summary.interrupted_at !== null || summary.reason_class === "interrupted") return "Code cross-check incomplete: interrupted";
+  if (summary.outcome !== "completed") {
+    const reason = summary.reason_class;
+    return `Code cross-check incomplete: ${reason === null ? "not finished" : CODE_CROSS_CHECK_REASON_PROSE.get(reason) ?? value(reason)}`;
+  }
+  if (!summary.head_commit || !summary.base_commit) return "Code cross-check incomplete: snapshot failed";
+  const dispositions = new Map((summary.dispositions ?? []).map(d => [d.finding_id, d]));
+  let addressed = 0, declined = 0, missing = 0;
+  const findings = summary.findings.map(f => {
+    const d = dispositions.get(f.id);
+    const disposition = d?.disposition ?? "not_reported";
+    if (disposition === "addressed") addressed++;
+    else if (disposition === "declined") declined++;
+    else missing++;
+    return `- ${codeSpan(f.id)} · ${value(f.severity)} · ${value(f.path)}:${f.line} · ${value(f.title)} — ${disposition === "not_reported" ? "not reported" : value(disposition)}${d?.reason ? `: ${value(d.reason, 1024)}` : ""}`;
+  });
+  const family = summary.checker_harness === "codex" ? "Codex" : summary.checker_harness === "claude" ? "Claude" : value(summary.checker_harness);
+  const identity = `Code cross-check (checked ${codeSpan(summary.head_commit.slice(0, 7))}, ${family} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
+  const counts = summary.findings.length === 0
+    ? `${identity}: no findings`
+    : `${identity}\n${summary.findings.length} ${summary.findings.length === 1 ? "finding" : "findings"}: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+  // The digest is the frozen guidance's sha256; only its first 12 hex characters are shown.
+  const guidance = summary.custom_guidance_applied
+    ? [`custom guidance applied${summary.guidance_digest ? ` (sha256 ${codeSpan(summary.guidance_digest.slice(0, 12))})` : ""}`]
+    : [];
+  const footer = "**Changes after the check were not cross-checked.**";
+  const render = () => [counts, ...guidance, ...findings, footer].join("\n");
+  while (findings.length && Buffer.byteLength(render()) > 4096) findings.pop();
+  return render();
 }
 
 /** A kind section as markdown, leading and trailing blank lines dropped; "" when it has no text. */
@@ -1237,10 +1298,12 @@ export interface CompletionBlockInput {
   /** Sections a kind carries after its line (the self_improve evidence, the prompt run's
    *  guard-critical paths), as structured KindSection data that this renderer escapes. */
   kindSections?: readonly (KindSection | undefined)[];
-  /** Render `Closes #N`. An owner partial or a scope-capped run never closes, whatever this says. */
+  /** Render `Closes #N`. Owner partials, scope caps and non-closing declarations suppress it. */
   closes: boolean;
   completionScope?: ClaimConfig["completion_scope"];
   scopeCapped?: { completedCount: number; total?: number };
+  /** Issue-only declaration; the caller redacts the reason before rendering. */
+  nonClosing?: { reason: string };
   /** The run used the repository's own agents (PRD #37 D3b). */
   repoAgents?: boolean;
   gatesUnverified?: readonly string[];
@@ -1290,9 +1353,9 @@ function issueArm(input: CompletionBlockInput): string[] {
   const deferred = input.completionScope?.deferred ?? [];
   const accepted = input.completionScope?.accepted ?? [];
   const isOwnerPartial = deferred.length > 0;
-  // Only the normal arm (last below) can render `Closes #N`: an owner partial (PRD #1227) and an
-  // operator scope cap (PRD #634) never close, whatever `closes` says, structurally here and not only
-  // in the create-then-verify flow.
+  // Only the normal arm (last below) can render `Closes #N`, and a non-closing declaration
+  // suppresses it there too. Owner partials (PRD #1227) and operator scope caps (PRD #634)
+  // never close, whatever `closes` says.
   const lines = isOwnerPartial
     ? [
         `Implements part of #${iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
@@ -1314,8 +1377,13 @@ function issueArm(input: CompletionBlockInput): string[] {
       : [
           // #1801: NOT `Implements issue #N.` (a GitLab closing keyword).
           `Related to #${iid}.`,
-          ...(input.closes ? ["", `Closes #${iid}`] : []),
+          ...(input.closes && !input.nonClosing ? ["", `Closes #${iid}`] : []),
         ];
+  if (input.nonClosing) {
+    const reason = escapeInline(input.nonClosing.reason) || Array.from(input.nonClosing.reason, (c) =>
+      `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
+    lines.push("", `> **Issue remains open.** ${reason}`);
+  }
   if (accepted.length > 0) {
     lines.push(
       "",
@@ -1357,9 +1425,10 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
     paras.push(issueArm(input).join("\n"));
   }
   if (input.repoAgents) paras.push(REPO_AGENTS_LINE);
-  if (input.kindLine !== undefined) {
+  {
     for (const section of input.kindSections ?? []) {
-      const t = section ? renderKindSection(section) : "";
+      const visible = input.kindLine === undefined ? section?.filter(line => "codeCrossCheck" in line) : section;
+      const t = visible ? renderKindSection(visible) : "";
       if (t) paras.push(t);
     }
   }
@@ -1370,6 +1439,46 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
   }
   paras.push(`---\n${completionFooter(input.branch)}`);
   return [COMPLETION_START, paras.join("\n\n"), COMPLETION_END].join("\n");
+}
+
+const CODE_CROSS_CHECK_PARAGRAPH_RE = /^Code cross-check (?:\(checked |incomplete: )/u;
+
+/**
+ * Refresh-mode swap of ONLY the code cross-check paragraph (renderCodeCrossCheck's output, which
+ * never contains a blank line) inside an existing completion block. The fresh block's paragraph
+ * replaces the old one in place; with no old one it is inserted before the bridge sentence, the
+ * staleness pair or the footer, whichever comes first; with no fresh one the old paragraph is
+ * dropped unless it names `headSha` as the commit it checked (an earlier run's evidence for another
+ * head, or an incomplete note, must not outlive its run). Every other
+ * paragraph, the closing-reference text included, is returned byte-for-byte.
+ */
+export function swapCodeCrossCheckSection(oldCompletion: string, freshCompletion: string, headSha: string): string {
+  // Paragraphs are separated by a blank line in any of CommonMark's line endings; the separators
+  // are kept (odd indexes) so every untouched byte, its own line endings included, is preserved.
+  // A CR directly before an LF is half of one CRLF, never a line ending of its own.
+  const BLANK = /((?:\r\n|\r(?!\n)|\n)(?:\r\n|\r|\n))/u;
+  const parts = oldCompletion.split(BLANK);
+  const eol = /\r\n|\r|\n/u.exec(oldCompletion)?.[0] ?? "\n";
+  const fresh = freshCompletion.split(BLANK).find((p, k) => k % 2 === 0 && CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  const at = parts.findIndex((p, k) => k % 2 === 0 && CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  if (fresh === undefined) {
+    if (at < 0) return oldCompletion;
+    const checked = /^Code cross-check \(checked `([0-9a-f]{7})`/u.exec(parts[at]!)?.[1];
+    if (checked !== undefined && headSha.startsWith(checked)) return oldCompletion;
+    // The footer always follows the section, so drop the paragraph with the separator after it.
+    parts.splice(at, 2);
+    return parts.join("");
+  }
+  // The fresh block is LF-rendered: write its paragraph in the old body's line ending.
+  const written = fresh.replace(/\r\n|\r|\n/gu, eol);
+  if (at >= 0) {
+    parts[at] = written;
+    return parts.join("");
+  }
+  const anchor = parts.findIndex((p, k) => k % 2 === 0 && (p === BRIDGE_SENTENCE || p.includes(STALENESS_START) || /^---(?:\r\n|\r|\n)/u.test(p)));
+  if (anchor < 0) return oldCompletion;
+  parts.splice(anchor, 0, written, parts[1] ?? eol + eol);
+  return parts.join("");
 }
 
 // ── Parsing and composing a body (D10, D15) ─────────────────────────────────────────────────

@@ -14,6 +14,7 @@ import (
 	"github.com/jackc/pgx/v5/pgxpool"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // This file is the live-DB half of PRD #1497 M1's wall-park store surface: it EXECUTES the new
@@ -353,7 +354,7 @@ func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 	wkr := fx.worker("w", wpWorker{})
 	extend := func(id uuid.UUID, secs, capv int32) (store.ExtendAndResumeWallParkRow, error) {
 		return fx.q.ExtendAndResumeWallPark(fx.ctx, store.ExtendAndResumeWallParkParams{
-			ID: id, UserID: fx.userID, Secs: secs, Cap: capv, GlobalTimeoutSeconds: 7200,
+			ID: id, UserID: fx.userID, Secs: secs, Cap: capv, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, GlobalTimeoutSeconds: 7200,
 			Body: pgtype.Text{String: "extend+resume", Valid: true}})
 	}
 	// deadline = started_at + (base + ext + finalize + paused). We assert it is ~3600s from now.
@@ -387,14 +388,27 @@ func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 		}
 	})
 
-	t.Run("honours the cap (refuses when ext + secs > cap)", func(t *testing.T) {
-		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600), budgetExtension: 50000})
-		_, err := extend(id, 10000, 57600) // 50000 + 10000 > 57600
-		if !errors.Is(err, pgx.ErrNoRows) {
-			t.Fatalf("cap-exceeded extend err = %v, want pgx.ErrNoRows (no row extended)", err)
+	t.Run("the cap is per request: extends past the old cumulative cap and banks to exactly secs", func(t *testing.T) {
+		// 50000 + 10000 > 57600 was the old cumulative refusal. started 20h ago against a 3600+50000
+		// budget (14.9h) so the run genuinely overran and the extension buys exactly 10000s.
+		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600),
+			budgetExtension: 50000, startedAgo: 20 * time.Hour})
+		row, err := extend(id, 10000, 57600)
+		if err != nil {
+			t.Fatalf("extend past the old cumulative cap = %v, want it applied (the cap is per request)", err)
 		}
-		if fx.status(id) != "paused" {
-			t.Fatal("a cap-refused extend must leave the run paused")
+		if row.BudgetExtensionSeconds != 60000 {
+			t.Fatalf("returned post-update extension = %d, want 60000", row.BudgetExtensionSeconds)
+		}
+		if fx.status(id) != "queued" {
+			t.Fatalf("status = %q, want queued (resumed)", fx.status(id))
+		}
+		if d := deadlineFromNow(id); d < 9990 || d > 10010 {
+			t.Fatalf("deadline is %.0fs from now, want ~10000 (overrun banked past the old cap)", d)
+		}
+		var audits int
+		if err := fx.pool.QueryRow(fx.ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind IN ('extend','resume')`, id).Scan(&audits); err != nil || audits != 2 {
+			t.Fatalf("extend+resume audit rows = %d (err %v), want 2", audits, err)
 		}
 	})
 
@@ -427,9 +441,28 @@ func TestExtendAndResumeWallParkLiveDB(t *testing.T) {
 		}
 	}
 
-	t.Run("cap refusal returns no row and writes nothing", func(t *testing.T) {
+	t.Run("a request above the per-request cap returns no row and writes nothing", func(t *testing.T) {
 		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600), budgetExtension: 50000})
-		refusedLeavesNothing(t, id, 10000, 57600, "paused", 50000)
+		refusedLeavesNothing(t, id, 57660, 57600, "paused", 50000) // 57660 > 57600 per request
+	})
+
+	t.Run("room fencepost: exactly filling the room applies, +60 is refused and writes nothing", func(t *testing.T) {
+		// 3600s of room left: 1886483 (fresh room for a small wall under the test params) - 3600 used.
+		const used = extendTestFreshRoom - 3600
+		id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted", budgetWall: p32(3600),
+			budgetExtension: used, startedAgo: 2 * time.Hour})
+		refusedLeavesNothing(t, id, 3660, 604800, "paused", used)
+		row, err := extend(id, 3600, 604800)
+		if err != nil {
+			t.Fatalf("extend exactly filling the room = %v, want applied", err)
+		}
+		if row.BudgetExtensionSeconds != extendTestFreshRoom {
+			t.Fatalf("post-update extension = %d, want %d", row.BudgetExtensionSeconds, extendTestFreshRoom)
+		}
+		// Re-arm the hold: with no room left even +60 is refused and nothing changes.
+		mustExec(fx.ctx, t, fx.pool, `DELETE FROM run_user_inputs WHERE run_id=$1 AND kind IN ('extend','resume','pause')`, id)
+		mustExec(fx.ctx, t, fx.pool, `UPDATE runs SET status='paused', hold_reason='budget_exhausted' WHERE id=$1`, id)
+		refusedLeavesNothing(t, id, 60, 604800, "paused", extendTestFreshRoom)
 	})
 
 	t.Run("status-changed refusal (owner-paused, no budget_exhausted hold) returns no row and writes nothing", func(t *testing.T) {
@@ -722,7 +755,7 @@ func TestWallParkClaimFenceRaceLiveDB(t *testing.T) {
 
 	// Owner Extend-and-resume: the row moves paused -> queued, worker_id NULL, released pair preserved.
 	if _, err := fx.q.ExtendAndResumeWallPark(fx.ctx, store.ExtendAndResumeWallParkParams{
-		ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, GlobalTimeoutSeconds: 7200,
+		ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, GlobalTimeoutSeconds: 7200,
 		Body: pgtype.Text{String: "extend+resume", Valid: true}}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)
 	}
@@ -767,7 +800,7 @@ func TestWallParkReleasedWorkerReRegisterLiveDB(t *testing.T) {
 	}
 	// Resume (owner extends): worker_id NULL, released pair preserved (nonce-old).
 	if _, err := fx.q.ExtendAndResumeWallPark(fx.ctx, store.ExtendAndResumeWallParkParams{
-		ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, GlobalTimeoutSeconds: 7200,
+		ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, GlobalTimeoutSeconds: 7200,
 		Body: pgtype.Text{String: "x", Valid: true}}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)
 	}
@@ -820,7 +853,7 @@ func TestWallParkPairCapturedAtParkLiveDB(t *testing.T) {
 	mustExec(fx.ctx, t, fx.pool, `UPDATE workers SET snapshot_register_nonce='nonce-B', last_heartbeat_at=now() WHERE id=$1`, w)
 	// Owner extends (server-parked → worker_id NULL, released pair preserved at nonce-A).
 	if _, err := fx.q.ExtendAndResumeWallPark(fx.ctx, store.ExtendAndResumeWallParkParams{
-		ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, GlobalTimeoutSeconds: 7200,
+		ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, GlobalTimeoutSeconds: 7200,
 		Body: pgtype.Text{String: "x", Valid: true}}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)
 	}
@@ -1012,7 +1045,7 @@ func TestWallInputSettlementLiveDB(t *testing.T) {
 		armWall(id) // an unconsumed wall input left over
 		// Settle it via a resume-style extend, then confirm the drain hands no wall.
 		if _, err := fx.q.ExtendAndResumeWallPark(fx.ctx, store.ExtendAndResumeWallParkParams{
-			ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, GlobalTimeoutSeconds: 7200, Body: pgtype.Text{String: "x", Valid: true}}); err != nil {
+			ID: id, UserID: fx.userID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, GlobalTimeoutSeconds: 7200, Body: pgtype.Text{String: "x", Valid: true}}); err != nil {
 			t.Fatalf("ExtendAndResumeWallPark: %v", err)
 		}
 		rows, err := fx.q.ConsumeRunInputs(fx.ctx, id)
@@ -1069,7 +1102,7 @@ func TestWallParkOwnerGuardRefusalsLiveDB(t *testing.T) {
 	t.Run("CreateExtendInput on a running wall row clears the columns and consumes the input", func(t *testing.T) {
 		id := fx.run(wpRun{worker: &w, budgetWall: p32(3600), pauseMode: "wall"})
 		armWall(id)
-		if _, err := fx.q.CreateExtendInput(fx.ctx, store.CreateExtendInputParams{ID: id, Secs: 3600, Cap: 57600, Body: pgconvText("+1h")}); err != nil {
+		if _, err := fx.q.CreateExtendInput(fx.ctx, store.CreateExtendInputParams{ID: id, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: pgconvText("+1h")}); err != nil {
 			t.Fatalf("CreateExtendInput: %v", err)
 		}
 		r := fx.mustRun(id)
@@ -1429,5 +1462,23 @@ func TestGetSlackRunContextWallParkLiveDB(t *testing.T) {
 	}
 	if row.BudgetFinalizeSeconds != 1800 {
 		t.Fatalf("budget_finalize_seconds = %d, want 1800", row.BudgetFinalizeSeconds)
+	}
+}
+
+// TestStopWallParkGrantsWallParkFinalizeSecondsLiveDB pins workersvc.WallParkFinalizeSeconds (the
+// finalize reserve the extend bound counts, #2735) against the allowance the StopWallPark SQL
+// actually grants, so changing either literal alone reddens here.
+func TestStopWallParkGrantsWallParkFinalizeSecondsLiveDB(t *testing.T) {
+	fx := newWPFixture(t)
+	wkr := fx.worker("w", wpWorker{})
+	id := fx.run(wpRun{worker: &wkr, status: "paused", holdReason: "budget_exhausted",
+		milestonesCompleted: `["m1"]`, startedAgo: 2 * time.Hour})
+	if _, err := fx.q.StopWallPark(fx.ctx, store.StopWallParkParams{
+		ID: id, UserID: fx.userID, ScopeCeiling: 1, GlobalTimeoutSeconds: 7200,
+		Body: pgtype.Text{String: "stop at wall", Valid: true}}); err != nil {
+		t.Fatalf("StopWallPark: %v", err)
+	}
+	if got := fx.mustRun(id).BudgetFinalizeSeconds; got != workersvc.WallParkFinalizeSeconds {
+		t.Fatalf("StopWallPark granted budget_finalize_seconds = %d, workersvc.WallParkFinalizeSeconds = %d", got, workersvc.WallParkFinalizeSeconds)
 	}
 }

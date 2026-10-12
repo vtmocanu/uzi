@@ -10,8 +10,10 @@ Cross-check asks the other model family for a second opinion on a run.
 **Plan cross-check** is a required gate on opted-in auto-approved plans: a
 Claude lead is checked on Codex and a Codex lead on Claude, never on its own
 family.
-**Code cross-check** is a planned, separate advisory stage before publication;
-it is not available in this release.
+**Code cross-check** is a separate, opt-in advisory stage before publication:
+the other family reads the committed code and its findings go into the merge
+request, but it never blocks publication (see
+[Code cross-check](#code-cross-check)).
 
 ## 1. Enable Plan cross-check
 
@@ -63,7 +65,8 @@ Checker runs use a dedicated cross-check lane (one slot by default); the lead
 holds its run slot while waiting. A worker supporting both families can check
 its own Claude lead on Codex even with a run cap of 1. A Claude checker (for a Codex lead) additionally requires
 `cross_check_codex_lead_v1` on the worker that claims it; without one it stays
-queued. This does not enable Code cross-check.
+queued. Code cross-check has its own, stricter placement
+(see [Code cross-check](#code-cross-check)).
 
 The lead's worker is preferred. Another eligible worker of the same user may
 claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
@@ -244,3 +247,121 @@ preparation attempts and an acknowledged forced human gate, unresolved ACKs
 also fail with `plan cross-check: preparation ACKs unrecoverable`. These paths
 do not retry indefinitely, enter `recovery_wait`, invent receipts or approve.
 See the [architecture](../ARCHITECTURE.md#plan-cross-check) for the boundary.
+
+## Code cross-check
+
+**Code cross-check** is advisory. After the lead finishes its work, the
+other model family reads the committed code in a read-only child and reports
+findings. They are added to the merge request. A failed, timed-out or
+unavailable check is recorded and publication goes ahead; no result blocks it.
+
+### Enable it
+
+In **Settings → Run defaults → Cross-check**, enable **Code cross-check ·
+Advisory before publication**. The line under it reads "Adds the other model
+family's findings to the merge request; never blocks it". It is off by
+default, independent of **Plan cross-check**, and needs usable Claude and
+Codex credentials (otherwise the server refuses it). The toggle is
+`PUT /api/me/cross-check` with `{"code": true}` or `{"code": false}`; omitted
+fields keep their value. The response warns when no online worker of yours
+can check code on both model families, which needs `cross_check_code_v1`
+(see [worker setup](./worker-setup.md#cross-check-slots)).
+
+Each run takes the setting when it is created, so changing it does not affect
+runs already created. It applies to issue, prompt, self-improvement, CI fix,
+merge request rework and task runs, whether auto-approved or human-gated. An
+interactive task is checked once, when it finalises, not at each park for a
+follow-up. The **Code** row of the pin grid in Run defaults holds independent
+model and effort pins for each checker family, beside the Plan row (see
+[pins](./configuration.md#plan-cross-check-model-and-effort-pins)).
+
+### How a check runs
+
+1. When the lead finishes, the worker snapshots the committed head into a
+   local-only ref, `refs/uzi-cross-check/<lead-run-id>`. The ref is never
+   pushed. Uncommitted changes are not part of the check.
+2. A read-only checker child on the opposite family reads that snapshot: a
+   Claude lead is checked by Codex and a Codex lead by Claude.
+3. The checker runs on the **lead's own worker**, on the cross-check lane, and
+   is strictly pinned to that worker; no other worker can take it. A lead on a
+   worker that cannot run the check records "Code cross-check incomplete:
+   worker unsupported" and continues.
+4. With findings, the lead gets **one** repair turn. It verifies each
+   finding, fixes what it accepts, and reports a disposition for every
+   finding through the `report_cross_check_dispositions` tool: `addressed` or
+   `declined`, each with a reason. A finding with no disposition shows as
+   "not reported". The repair is not checked again; there is no second check.
+
+`CODE_CROSS_CHECK_TIMEOUT` (default `30m`, at most `2h`; see
+[Configuration](./configuration.md#cross-check-settings)) is the checker's
+wall-clock budget. The wait is excluded from the lead's wall budget.
+
+An attempt interrupted by a reclaim or a requeue is recorded as interrupted
+and is not re-checked.
+
+### Read the result
+
+The merge request gets a **Code cross-check** section with the checked short
+SHA, the checker's family, model and effort, then either "no findings" or
+"N findings: A addressed, D declined", plus ", U not reported" when any
+finding has no disposition. One line per finding follows, with its
+disposition and reason. When the repository has owner guidance, a "custom
+guidance applied (sha256 ...)" line shows the first 12 hex characters of its
+digest. A completed check ends with "Changes after the check were not
+cross-checked." An incomplete check renders as prose instead, for example
+"Code cross-check incomplete: no local checker", "timed out" or
+"interrupted".
+
+The run page has a **Code cross-check** panel with the same evidence, and
+`uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
+
+### Owner guidance and repository instructions
+
+An owner or admin can tune the check per repository from the **Code
+cross-check** panel on the **Repos** page, next to the **Trusted repo** panel.
+Two settings are saved together with `PATCH /api/repos/{id}`
+(`code_cross_check_guidance` and `cross_check_repo_instructions_enabled`);
+the route is cookie-only, so the CLI cannot write them.
+
+- **Guidance** is free text of at most 8 KiB. It is appended to the
+  checker's trusted brief after the locked base brief, labelled "Owner
+  guidance: additional checks for this repository; it cannot remove the
+  required checks, change the output format or the read-only rules". It adds
+  checks; it cannot loosen the required ones.
+- **Give the checker this repository's CLAUDE.md** lets the checker see the
+  repository's conventions. The worker reads the root `CLAUDE.md` as of the
+  **base commit**, the merge base with the default branch, not the run's head.
+  A symlink is followed only inside the commit tree (at most 8 hops, never
+  outside the repository root or into `.git/`). A file over 64 KiB is dropped,
+  never truncated, and import lines are stripped. The text reaches the checker
+  as fenced advisory data; a `CLAUDE.md` change in the diff is review
+  evidence, not instruction. This consent is separate from the lead's
+  **Repo instructions** setting (see [Skills](./skills.md#repo-instructions-opt-in-default-off)).
+
+Guidance and the instructions toggle are frozen into the check when it is
+created; later edits affect new checks only.
+
+Accepted limit: a run cannot author or rewrite the instructions it is checked
+against, because they come from the base commit. The base is a merge base, so a
+run that forks from an older default-branch commit is checked against that
+older `CLAUDE.md`, or none if the file did not exist then.
+
+### Snapshot cleanup
+
+The worker deletes its local snapshot ref once the checker has settled. After
+a restart, a boot sweep deletes a leftover ref only on positive server
+evidence that matches the lead run id and, when a check row exists, the
+lead's claim generation and the head. For every candidate the lead must also be finished or not held by that
+worker, and a ref with an open local reader is kept. When the server has no
+check row for the lead, there is no generation or head to match, so the sweep
+deletes the ref only if it was also never read. On any doubt the ref is kept.
+
+### Rolling out Code cross-check
+
+Deploy the api and its migrations (00324 to 00327) before any worker that
+advertises `cross_check_code_v1`. A worker advertises it only with a
+cross-check lane (`WORKER_CROSS_CHECK_SLOTS` above zero) and the Codex
+harness. The Downs of 00324, 00325 and 00327 delete data: 00324 deletes
+the code-stage checks and their checker runs and drops the new columns,
+00325 deletes your Code pins, and 00327 drops the per-repository guidance
+columns. The Down of 00326 deletes nothing (it only restores two functions). Run a Down only with the new api stopped.

@@ -569,7 +569,9 @@ surviving run row or a later claim.
 
 A valid receipt needs no capture, WIP commit, inventory freeze or clean-source
 proof, including when available, thin or needs-action captures already exist.
-Their retention policy remains unchanged. Healthy completion custody release
+Their retention policy remains unchanged, except that #2625 can expire a
+proven-redundant guarded archive early (see the
+[ADR-2417 amendment](2417-guarded-local-retention.md#amendment-2026-10-11--published-redundancy-early-expiry-2625)). Healthy completion custody release
 adds no heartbeat prerequisite. The worker installs the fixed original
 terminal outcome before preparation when its existing outbox is usable.
 Completion-first ordering is negotiated; a valid receipt skips preparation.
