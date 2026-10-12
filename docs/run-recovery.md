@@ -342,6 +342,25 @@ message names the worker-local inspect command. That refusal applies to any late
 run of the same issue on that worker, not only the stopped run: each such run
 fails once until an operator discards the retained clone.
 
+Recovery parks and terminal-disk exits follow the same coverage rule. The worker
+decides once, when the recovery handler exits, whether the clone is covered, and
+tears it down only if it is; a capture taken earlier, remembered or degraded, never
+counts as proof. Which record a kept clone leaves depends on the exit:
+
+- **Exits that stop the flight** (a stopped confirm, another generation, a stale
+  park report) record the source as retained, as above.
+- **Parks** (`recovery_wait`, a live non-terminal status, shutdown) and **terminal
+  exits** keep the clone and its plain recovery journal with no `uzi-stopped` marker
+  and no `reclaimed` entry. A resume on the same worker recaptures bytes written
+  after the earlier capture. A kept terminal clone is later moved by the next run's
+  terminal-orphan handling, as before.
+- An owner-authorized cancel keeps its normal cleanup.
+
+To find these sources, run an aggregate inspect (see
+[Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)):
+it lists the journaled and protected sources on the worker. Park timing, report
+count and order, and retries are unchanged.
+
 This is **local retention only**. It is not a published checkpoint, an archive or
 server custody, and nothing about it appears in the feed or in `uzi run recovery`
 as a hold:

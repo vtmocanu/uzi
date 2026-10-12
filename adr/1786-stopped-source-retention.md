@@ -58,8 +58,9 @@ The artifact is the existing clone; nothing is copied.
 ### Coverage: when a stopped clone may still be torn down
 
 `GitCache.verifyStoppedSourceCovered` runs under the bare lock, with the flight's execution
-tail excluding same-run successors, and is evaluated when the exit cleans up, not when a
-capture was taken. It returns `covered` only if all of these hold:
+tail excluding same-run successors, and is evaluated at the exit's cleanup, not when a
+capture was taken (the recovery handler evaluates it once, at its own exit; see
+Recovery-handler exits below). It returns `covered` only if all of these hold:
 
 - the journal (and, for a canonical clone, the digest-bound marker) still names exactly this
   source, and the path is a real directory with a real `.git` directory;
@@ -125,15 +126,38 @@ Retention needs an explicit reclaim path, including when no server hold exists.
 
 ### Recovery-handler exits (M2)
 
-Each site in `handleRecoveryExhausted` that cleared `preserveRecoveryClone` on `captured`,
-`cancelCaptured` or a cached `capture` instead calls `verifyStoppedSourceCovered` with the
-capture's `capturedHead` and clears the flag only on `covered`; otherwise it calls
-`retainStoppedSource`. A memo without a `capturedHead`, including the degraded
-`{ verified: false }` stub, is `not_covered`. Parks are unchanged per ADR-1197: park timing,
-report count and order, retry timing, `recovery_wait` returning `true` for a
-credential-deferred run, and the accepted cross-worker durability limit. A local-only park
-retains its original clone; that is source retention, not a promise another worker can resume
-it.
+`handleRecoveryExhausted` no longer clears `preserveRecoveryClone` at a capture or at an exit
+site. A site only marks release as eligible (`markReleaseEligible`) or keeps the clone
+(`keepClone`); the handler's `finally` runs `settleCloneRelease` once, after the last
+possible writer on every return path, and that is the only place the clone can be released.
+It calls `retainStoppedSource` with the capture's `capturedHead`, and the clone goes only
+when `verifyStoppedSourceCovered` returns `covered` then. A remembered capture result, a
+memo without a `capturedHead` (including the degraded `{ verified: false }` stub) and a
+check that throws are all `not_covered`: the clone is kept.
+
+The exit decides the representation of a source that is not covered:
+
+- **Stops this generation** (a `stop` confirm, an ownership read showing another
+  generation, the terminal-disk recheck or the pre-handler precheck showing another
+  generation, a stale park report, plus the M1 stale and fenced arms): the stopped-source
+  record, as in M1 (attempt ledger `reclaimed` and the journal cleared; canonical
+  `uzi-stopped` marker).
+- **Park exits** (`recovery_wait`, a live non-terminal status, shutdown) and **terminal
+  exits** (a terminal status or a terminal-disk recheck showing a terminal status): the
+  existing ADR-1197 plain-journal posture. The clone and journal are kept and no marker or
+  `reclaimed` entry is written, so a same-worker resume recaptures bytes written after the
+  capture, and a later run's existing terminal-orphan handling applies.
+
+Two exits keep their earlier shape. An owner-authorized cancel (a non-credential cancel
+ACK) keeps its normal cleanup, since the owner chose to discard; only the
+credential-deferred captured cancel is revalidated. A `predecessorCapture` flight deletes
+only through its own verified in-place release, which touches no files, so it is not
+revalidated.
+
+Park timing, report count and order, retry timing, `recovery_wait` returning `true` for a
+credential-deferred run, and the accepted cross-worker durability limit are unchanged per
+ADR-1197. A local-only park retains its original clone; that is source retention, not a
+promise another worker can resume it.
 
 ## Alternatives rejected
 
