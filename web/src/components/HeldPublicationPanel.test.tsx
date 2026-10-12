@@ -263,6 +263,94 @@ describe("HeldPublicationPanel", () => {
     }
   });
 
+  it("keeps polling past an empty first answer and renders the publication once it appears", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = vi
+        .spyOn(api, "getRunHeldPublications")
+        .mockResolvedValueOnce({ publications: [] })
+        .mockResolvedValue({ publications: [pub({ state: "created" })] });
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+      expect(screen.queryByText("Held work")).toBeNull();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Held work")).toBeTruthy();
+      expect(screen.getByText("Publishing")).toBeTruthy();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling once every row is terminal", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = vi
+        .spyOn(api, "getRunHeldPublications")
+        .mockResolvedValueOnce({ publications: [] })
+        .mockResolvedValue({ publications: [pub({ state: "acknowledged" })] });
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Published")).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(10 * 20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops after 30 re-fetches when the list stays empty and renders nothing", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = serve([]);
+      const { unmount, container } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(40 * 20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(31);
+      expect(container.innerHTML).toBe("");
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("keeps polling while a row is prepared and settles when it is published", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = vi
+        .spyOn(api, "getRunHeldPublications")
+        .mockResolvedValueOnce({ publications: [pub({ state: "prepared" })] })
+        .mockResolvedValue({ publications: [pub({ state: "acknowledged" })] });
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("Held")).toBeTruthy();
+      expect(spy).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Published")).toBeTruthy();
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
   it("clears the previous run's rows when the run changes and ignores its late response", async () => {
     const OTHER = "11111111-2222-4333-8444-555555555555";
     let releaseOld: (v: { publications: HeldPublication[] }) => void = () => {};

@@ -45,11 +45,21 @@ const GENERIC_VIEW: StateView = { badge: "Held", tone: "neutral" };
 // Only these states can have a ref on the forge worth fetching.
 const FETCHABLE_STATES = new Set(["acknowledged", "created"]);
 
-// States that settle on their own: the panel re-fetches while any row is in one.
+// States that settle on their own: the panel re-fetches while any row is in one. A prepared
+// row (not yet vetted or published) and an empty list (the server marks the run failed before
+// the worker scans and uploads, so the first answer is normally empty) are also still
+// settling; see stillSettling.
 const IN_PROGRESS_STATES = new Set(["created", "invoked", "create_unknown", "delete_unknown"]);
 const REFRESH_MS = 20_000;
 // About ten minutes of polling per mount.
 const MAX_POLLS = 30;
+
+// stillSettling reports whether a failed run's publication list can still change on its own:
+// nothing has appeared yet, a row is prepared, or a row is in an in-progress state. Only
+// all-terminal rows (acknowledged, deleted, refused, abandoned, or an unknown state) end polling.
+function stillSettling(rows: HeldPublication[]): boolean {
+  return rows.length === 0 || rows.some((p) => p.state === "prepared" || IN_PROGRESS_STATES.has(p.state));
+}
 
 // leadLine is the per-row, state-keyed sentence beside the badge. It states only what that
 // row's state establishes; the panel makes no aggregate claim across rows. Unknown and
@@ -87,10 +97,12 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
   const [pubs, setPubs] = useState<HeldPublication[]>([]);
   const [pollsExhausted, setPollsExhausted] = useState(false);
 
-  // One chain per (failed, run.id): fetch, then, while a row is still settling, schedule the
-  // next fetch only after this one has settled, so requests never overlap and an older response
-  // cannot overwrite a newer one. The chain stops after MAX_POLLS re-fetches (create_unknown is
-  // never terminal by design), at the first settled answer, on unmount and on a run change.
+  // One chain per (failed, run.id): fetch, then, while the list is empty or a row is still
+  // settling (stillSettling), schedule the next fetch only after this one has settled, so
+  // requests never overlap and an older response cannot overwrite a newer one. The chain stops
+  // after MAX_POLLS re-fetches (create_unknown is never terminal by design), at the first
+  // answer whose rows are all terminal, on unmount and on a run change. A failed first fetch
+  // (an older server answering 404) stops at once.
   useEffect(() => {
     setPubs([]);
     setPollsExhausted(false);
@@ -105,7 +117,7 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
           if (!live) return;
           const rows = Array.isArray(r?.publications) ? r.publications : [];
           setPubs(rows);
-          schedule(rows.some((p) => IN_PROGRESS_STATES.has(p.state)));
+          schedule(stillSettling(rows));
         })
         .catch(() => {
           if (!live) return;
@@ -132,7 +144,7 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
 
   if (!failed || pubs.length === 0) return null;
   const acknowledged = pubs.some((p) => p.state === "acknowledged");
-  const capped = pollsExhausted && pubs.some((p) => IN_PROGRESS_STATES.has(p.state));
+  const capped = pollsExhausted && stillSettling(pubs);
 
   return (
     <Card id="held-publication" className="scroll-mt-20 space-y-3 p-4">
