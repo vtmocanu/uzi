@@ -73,7 +73,7 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		if err != nil {
 			return nil, 0, err
 		}
-		defer resp.Body.Close()
+		defer func() { _ = resp.Body.Close() }()
 		data, err := io.ReadAll(resp.Body)
 		return data, resp.StatusCode, err
 	}

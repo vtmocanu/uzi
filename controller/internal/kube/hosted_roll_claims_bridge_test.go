@@ -180,7 +180,9 @@ func TestHostedRollRetainedClaimsBridge(t *testing.T) {
 	if err != nil {
 		t.Fatal(err)
 	}
-	r.Body.Close()
+	if err := r.Body.Close(); err != nil {
+		t.Fatal(err)
+	}
 	if r.StatusCode != 204 {
 		t.Fatalf("real API retained claims status=%d", r.StatusCode)
 	}

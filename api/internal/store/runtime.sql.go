@@ -2228,7 +2228,7 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
 WITH candidates AS (
-SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason,
+SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason, rh.phase,
        (w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= $1)::boolean AS heartbeat_recent,
        (run.egress_profile_id IS NULL)::boolean AS diagnostic_lane,
        (run.kind <> 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
@@ -2359,6 +2359,9 @@ SELECT count(*) FILTER (WHERE heartbeat_recent AND online AND affinity AND stric
        max(draining_since) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
        , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
        , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
+       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll
+                             AND heartbeat_recent AND online AND draining_since IS NOT NULL
+                             AND pacing->>'state' = 'active' AND phase = 'settled')::bigint AS diagnostic_draining_only
        , (SELECT jsonb_build_object('pacing', c.pacing, 'observed_at', c.pacing_observed_at, 'blocking_reason', c.blocking_reason)
           FROM candidates c WHERE c.diagnostic_lane AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.through_roll
           ORDER BY (c.pacing->>'state' = 'held') DESC, c.id LIMIT 1)::jsonb AS diagnostic_roll_context
@@ -2388,6 +2391,7 @@ type CountOnlineWorkersClaimableForRunRow struct {
 	LatestSuitableDrainingSince pgtype.Timestamptz `json:"latest_suitable_draining_since"`
 	DiagnosticSuitable          int64              `json:"diagnostic_suitable"`
 	DiagnosticRolling           int64              `json:"diagnostic_rolling"`
+	DiagnosticDrainingOnly      int64              `json:"diagnostic_draining_only"`
 	DiagnosticRollContext       []byte             `json:"diagnostic_roll_context"`
 }
 
@@ -2438,6 +2442,7 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		&i.LatestSuitableDrainingSince,
 		&i.DiagnosticSuitable,
 		&i.DiagnosticRolling,
+		&i.DiagnosticDrainingOnly,
 		&i.DiagnosticRollContext,
 	)
 	return i, err

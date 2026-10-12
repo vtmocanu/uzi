@@ -2,10 +2,12 @@ package workersvc
 
 import (
 	"strings"
-
-	"github.com/google/uuid"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 func TestHealthPacingStaticAndFenceLiveDB(t *testing.T) {
@@ -200,5 +202,74 @@ func TestHealthPacingOfflineLiveDB(t *testing.T) {
 	e.exec(t, "UPDATE workers SET status='offline',last_heartbeat_at=$2 WHERE id=$1", peer, now.Add(-time.Hour))
 	if got := svc.queuedReason(e.ctx, now, row); got != reasonNoWorker {
 		t.Fatalf("unexplained offline %q", got)
+	}
+}
+
+// Active healthy drain-only waits retain the exact stored exemption. Held,
+// evidence-blocked and replacement-gap waits remain genuine queue waits.
+func TestHealthPacingDrainOnlyLiveDB(t *testing.T) {
+	for _, tc := range []struct {
+		name, state, phase     string
+		offline, mixed, legacy bool
+	}{
+		{"active-drain-only", "active", PhaseSettled, false, false, true},
+		{"held-drain", "held", PhaseSettled, false, false, false},
+		{"missing-evidence", "waiting_evidence", PhaseSettled, false, false, false},
+		{"replacement-gap", "active", PhaseRolling, false, false, false},
+		{"offline-replacement", "active", PhaseSettled, true, false, false},
+		{"drain-and-offline-replacement", "active", PhaseSettled, false, true, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc := e.permitService(t)
+			run := e.seedQueuedRun(t, nil, []string{"gpu"})
+			w := e.seedHeartbeatWorker(t, nil)
+			now := time.Now().UTC().Truncate(time.Second)
+			e.exec(t, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base',capabilities='{gpu}',status='online',last_heartbeat_at=$2,draining_since=$3,draining_reason='image_roll',max_concurrent_runs=1 WHERE id=$1", w, now, now.Add(-time.Hour))
+			e.seedActiveRunOwnedBy(t, w)
+			e.exec(t, "UPDATE runs SET created_at=$2,status_since=$2 WHERE id=$1", run, now.Add(-time.Hour))
+			if tc.offline {
+				e.exec(t, "UPDATE workers SET status='offline',last_heartbeat_at=$2 WHERE id=$1", w, now.Add(-time.Hour))
+			}
+			if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: w, Kind: "fleet", Phase: tc.phase, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: tc.state, TargetImage: "repo:new"}}); err != nil {
+				t.Fatal(err)
+			}
+			if tc.mixed {
+				peer := e.seedHeartbeatWorker(t, nil)
+				e.exec(t, "UPDATE workers SET kind='hosted',hosted_size='m',template_declared='base',capabilities='{gpu}',status='offline',last_heartbeat_at=$2 WHERE id=$1", peer, now.Add(-time.Hour))
+				if _, err := svc.RecordRollHealth(e.ctx, RollHealthReport{WorkerID: peer, Kind: "fleet", Phase: PhaseRolling, ObservedAt: now, ControllerReportedAt: now, Pacing: &PacingReport{State: "active", TargetImage: "repo:new"}}); err != nil {
+					t.Fatal(err)
+				}
+			}
+			got := svc.queuedReason(e.ctx, now, e.healthRowFor(t, run))
+			if tc.legacy && got != ReasonWorkersUpgrading {
+				t.Fatalf("active drain-only exemption lost: %q", got)
+			}
+			if !tc.legacy && !strings.Contains(got, "worker roll") {
+				t.Fatalf("replacement/held wait incorrectly exempted: %q", got)
+			}
+			svc.healthSettings = defaultHealthSettings()
+			svc.detectRunHealth(e.ctx, now)
+			stored := e.healthRowFor(t, run)
+			if stored.Health != healthWaitingWorker || stored.HealthReason.String != got {
+				t.Fatalf("stored reason differs: %+v", stored)
+			}
+			owners, err := e.q.ListOwnersWaitingNoCapacity(e.ctx, store.ListOwnersWaitingNoCapacityParams{HeartbeatCutoff: pgtype.Timestamptz{Time: now.Add(-45 * time.Second), Valid: true}, RollReason: ReasonWorkersUpgrading})
+			if err != nil {
+				t.Fatal(err)
+			}
+			found := false
+			for _, row := range owners {
+				if row.RunID == run {
+					found = true
+					if row.HasRollReason != tc.legacy {
+						t.Fatalf("capacity exemption=%v want=%v", row.HasRollReason, tc.legacy)
+					}
+				}
+			}
+			if !found {
+				t.Fatal("stored wait absent from capacity query")
+			}
+		})
 	}
 }

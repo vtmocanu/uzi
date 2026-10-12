@@ -16,6 +16,12 @@ func rollWaitReason(now time.Time, counts store.CountOnlineWorkersClaimableForRu
 	if counts.DiagnosticSuitable == 0 || counts.DiagnosticSuitable != counts.DiagnosticRolling {
 		return ""
 	}
+	// An entirely healthy active drain is still the existing upgrade wait:
+	// queue/capacity policy confirms its exact stored reason and finite drain.
+	// Held/evidence waits and any actual replacement gap do not get that exemption.
+	if counts.DiagnosticDrainingOnly == counts.DiagnosticSuitable {
+		return ""
+	}
 	var context struct {
 		Pacing         json.RawMessage `json:"pacing"`
 		ObservedAt     time.Time       `json:"observed_at"`

@@ -231,10 +231,7 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 			keys = append(keys, key)
 		}
 		slices.Sort(keys)
-		coverage := make([]string, 0, min(len(keys), 8))
-		for _, key := range keys[:min(len(keys), 8)] {
-			coverage = append(coverage, key)
-		}
+		coverage := keys[:min(len(keys), 8)]
 		if len(coverage) == 0 {
 			coverage = append(coverage, "none confirmed")
 		}
