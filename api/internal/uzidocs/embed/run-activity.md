@@ -522,6 +522,18 @@ in their attention panel. Effective nondefault toggle states remain neutral
 header chips. The settings panel stays within narrow viewports, and Spinner
 uses a static frame under reduced motion.
 
+The run page puts approval, questions, holds and outcomes immediately below
+its header, followed by issue-input history and progress. These panels keep
+their existing owner controls. The run summary is expanded at plan approval
+and collapsed afterwards unless you saved a choice for that run; its collapsed
+form keeps a plain intent excerpt.
+
+The progress footer shares the full usage panel's totals and cost-status rules.
+Confirmed totals include summary spend once. Before a confirmed result, recorded
+summary spend uses its own cost status, while live input stays provisional with
+no billed output or cost. Estimated tails remain separate; an unpriced tail
+reads `+ unpriced tail`. The Full usage link appears only when the panel exists.
+
 The run page and the TUI run detail show the estimate in more depth. The two
 differ in what they carry; the run page has more.
 

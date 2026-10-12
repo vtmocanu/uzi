@@ -46,6 +46,7 @@ import {
 } from "../lib/runBadge";
 import { latestActivity } from "../lib/runActivity";
 import { stageForMessages } from "../lib/runStage";
+import { PlainMarkdownExcerpt } from "../components/PlainMarkdownExcerpt";
 import { RunProgressCard, runProgressCardVisible } from "../components/RunProgressCard";
 import { forgeNounLower, mrAbbrev, mrRefSymbol } from "../lib/forgeNoun";
 import { useRunStream } from "../lib/useRunStream";
@@ -496,7 +497,7 @@ export function RunSummary({ run }: { run: Run }) {
     <Card className="space-y-4 p-4">
       <div className="flex items-center justify-between gap-2">
         <div className="min-w-0"><h2 className="text-sm font-semibold text-fg">Run summary</h2>
-          {collapsed && <p className="mt-1 truncate text-xs text-muted">{stripUnsafeChars(intent.replace(/\[([^\]]+)\]\([^)]*\)/g, "$1").replace(/[#*_`>]/g, "")).slice(0, 150)}</p>}</div>
+          {collapsed && <p className="mt-1 truncate text-xs text-muted"><PlainMarkdownExcerpt content={intent} /></p>}</div>
         <button
           type="button"
           onClick={toggle}
@@ -2707,6 +2708,8 @@ export function RunView() {
       )}
 
 
+      <IssueInputHistory run={run} />
+
       <RunProgressCard run={run} activity={currentActivity} usage={usage} stage={stage} />
 
       {/* PRD #88: ALWAYS MOUNTED, empty until a park announces itself — see the note at
@@ -2717,8 +2720,6 @@ export function RunView() {
       <div className="sr-only" role="status" aria-live="polite">
         {resumeAnnounce || parkAnnounce}
       </div>
-
-      <IssueInputHistory run={run} />
 
       {/* PRD #1391 Run B M3d (D13): a finished outcome is held on the run's worker because
           the api could not land it. Surface it near the status so the owner knows why the

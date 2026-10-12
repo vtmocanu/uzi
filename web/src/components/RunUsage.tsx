@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { AgentUsage, RunUsage } from "../lib/runUsage";
-import { cacheDisplayPct, hasSideUsage, hasSpend } from "../lib/runUsage";
+import { cacheDisplayPct, usagePanelVisible, sideUsage, hasSpend } from "../lib/runUsage";
 import type { CostStatus, Harness, UsageTail } from "../lib/api";
 import { coverageReasonText, tailCostText, tailVisible } from "../lib/usageTail";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -152,7 +152,7 @@ export function RunUsagePanel({
   costStatus: CostStatus | "";
   harness?: Harness | null;
 }) {
-  if (!usage.hasLiveTokens && !usage.hasConfirmed && !hasSideUsage(usage)) return null;
+  if (!usagePanelVisible(usage)) return null;
   const { hasConfirmed, hasLiveTokens, total, noteTotal, summaryTotal, model, phases, agents, agentTotal, agentModels } = usage;
   const { liveByModel, liveByAgent, liveTotal } = usage;
   const cost = costDisplay(costStatus, total.costUsd);
@@ -160,12 +160,7 @@ export function RunUsagePanel({
   // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
   const cachePct = cacheDisplayPct(total);
   const tokensIn = total.fresh + total.cached;
-  const sideRows = [
-    { label: "Now summaries", t: noteTotal },
-    { label: "Intent, plan & PR summaries", t: summaryTotal },
-  ].filter((r) => hasSpend(r.t));
-  const sideStatus: CostStatus | "" =
-    sideRows.length === 0 || sideRows.some((r) => r.t.costStatus !== sideRows[0]!.t.costStatus) ? "" : sideRows[0]!.t.costStatus;
+  const { rows: sideRows, status: sideStatus } = sideUsage(usage);
 
   return (
     <div>

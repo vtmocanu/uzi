@@ -597,6 +597,22 @@ export function hasSideUsage(usage: RunUsage): boolean {
   return hasSpend(usage.noteTotal) || hasSpend(usage.summaryTotal);
 }
 
+/** Shared by the full panel and its progress-card link. Tails alone have no panel. */
+export function usagePanelVisible(usage: RunUsage): boolean {
+  return usage.hasConfirmed || usage.hasLiveTokens || hasSideUsage(usage);
+}
+
+/** The side-only table and footer use the same rows and status, including mixed unknowns. */
+export function sideUsage(usage: RunUsage) {
+  const rows = [
+    { label: "Now summaries", t: usage.noteTotal },
+    { label: "Intent, plan & PR summaries", t: usage.summaryTotal },
+  ].filter(r => hasSpend(r.t));
+  const status = rows.length === 0 || rows.some(r => r.t.costStatus !== rows[0]!.t.costStatus)
+    ? "" : rows[0]!.t.costStatus;
+  return { rows, status };
+}
+
 /**
  * Reduce a run's message list into its usage surfaces. Pure: same messages (and
  * `opts`) → same result, so React just re-runs it as the stream grows (Decision 9

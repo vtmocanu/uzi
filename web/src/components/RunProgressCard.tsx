@@ -9,7 +9,7 @@ import { useNow } from "../lib/useNow";
 import { stallTitle, waitReason } from "./RunProgressCell";
 import { MilestoneRows } from "./RunMilestoneRows";
 import { milestoneBadge } from "../lib/runBadge";
-import { cacheDisplayPct, hasSideUsage, type RunUsage } from "../lib/runUsage";
+import { cacheDisplayPct, hasSideUsage, sideUsage, usagePanelVisible, type RunUsage } from "../lib/runUsage";
 import { costDisplay, costHeadline, costSubLabel } from "../lib/costStatus";
 import { formatTokens } from "../lib/formatTokens";
 import { tailCostText, tailVisible } from "../lib/usageTail";
@@ -150,7 +150,7 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
   const note = !terminal && p?.state === "percent" ? stripUnsafeChars(p.now_note?.text ?? "").trim() : "";
   const completed = new Set(run.milestones_completed ?? []);
   const knownState = p && ["percent", "waiting", "parked", "queued", "stalled", "planning"].includes(p.state);
-  const hasUsage = usage && (usage.hasConfirmed || usage.hasLiveTokens || hasSideUsage(usage));
+  const hasUsage = usage && usagePanelVisible(usage);
   if (!runProgressCardVisible(run, live, usage)) return null;
   const nowLine = note ? <p data-progress-now className="my-2 rounded-md bg-raised px-2 py-1 text-sm [overflow-wrap:anywhere]">
     <b>Now: </b>{note}{" "}<span className="ml-2 text-xs text-faint">· model summary{p?.now_note?.at && ` · ${formatAgo(p.now_note.at, now)}`}</span>
@@ -161,7 +161,8 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
   const contextLine = [phase && `phase: ${stripUnsafeChars(phase)}`, iteration, safeStage && `run: ${safeStage}`].filter(Boolean).join(" · ");
   const phaseLine = contextLine ? <div data-progress-context data-progress-phase={phase ? "" : undefined} className="mt-2 inline-flex rounded bg-raised px-2 py-1 text-xs text-muted" aria-current={phase ? "step" : undefined}>{contextLine}</div> : null;
   const trackLabel = badge ? `Plan approved; ${badge.reported ? `${badge.done} of ${badge.total} milestones reported complete` : `– of ${badge.total} reported; no milestone completion reported`}${active ? `; active milestone: ${stripUnsafeChars(milestones.find(m => m.id === active)?.title ?? active)}` : ""}` : "";
-  const cost = usage ? costDisplay(run.usage?.cost_status ?? "", usage.total.costUsd) : null;
+  const hasRecorded = usage && (usage.hasConfirmed || hasSideUsage(usage));
+  const cost = usage ? costDisplay(usage.hasConfirmed ? run.usage?.cost_status ?? "" : sideUsage(usage).status, usage.total.costUsd) : null;
   return <Card className="p-4">
     <section aria-label="Run progress" data-run-progress-card={stripUnsafeChars(p?.state ?? "history")} className="grid min-w-0 grid-cols-[minmax(0,1fr)] gap-4">
       <div data-progress-head className="flex flex-wrap items-baseline gap-3">
@@ -180,10 +181,10 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
       </div>}
       {milestones.length > 0 ? <MilestoneRows run={run} activity={live} activeContent={<>{phaseLine}{nowLine}</>} />
         : live && (run.status === "running" || ["limit_wait", "pool_wait", "recovery_wait"].includes(run.status)) && !run.is_planning && p?.state !== "planning" && <p data-progress-activity className="text-sm text-muted">{stripUnsafeChars(live.agent)} · {stripUnsafeChars(live.agent_label || live.tool)}</p>}
-      {(hasUsage || tailVisible(run.usage_estimated_tail)) && <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-edge pt-3 text-xs text-muted">
-        {usage?.hasConfirmed && cost ? <><span className="font-semibold text-fg">{costHeadline(cost)}</span><span>{costSubLabel(cost, run.harness)}</span><span>{formatTokens(usage.total.fresh + usage.total.cached)} in ({cacheDisplayPct(usage.total)}% cached)</span><span>{formatTokens(usage.total.out)} out</span></>
-          : hasUsage && <span>Usage in flight; confirmed total not yet recorded</span>}
-        {tailVisible(run.usage_estimated_tail) && <span>+ {tailCostText(run.usage_estimated_tail.cost_usd, run.usage_estimated_tail.cost_status)} unrecorded</span>}
+      {(hasUsage || tailVisible(run.usage_estimated_tail)) && <div data-progress-usage className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-edge pt-3 text-xs text-muted">
+        {hasRecorded && usage && cost && <>{!usage.hasConfirmed && <span>Summary usage</span>}<span className="font-semibold text-fg">{costHeadline(cost)}</span><span>{costSubLabel(cost, run.harness)}</span><span>{formatTokens(usage.total.fresh + usage.total.cached)} in ({cacheDisplayPct(usage.total)}% cached)</span><span>{formatTokens(usage.total.out)} out</span></>}
+        {usage?.hasLiveTokens && !usage.hasConfirmed && <span>In-flight tokens · live, not billed yet: {formatTokens(usage.liveTotal.fresh + usage.liveTotal.cached)} in ({cacheDisplayPct(usage.liveTotal)}% cached) · provisional input</span>}
+        {tailVisible(run.usage_estimated_tail) && <span>{run.usage_estimated_tail.cost_status === "unpriced" ? "+ unpriced tail" : `+ ${tailCostText(run.usage_estimated_tail.cost_usd, run.usage_estimated_tail.cost_status)} unrecorded`}</span>}
         {hasUsage && <a href="#run-full-usage" className="ml-auto text-brand hover:underline">Full usage</a>}
       </div>}
     </section>
