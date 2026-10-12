@@ -1,6 +1,8 @@
 import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { describe, it, mock } from "node:test";
+import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
+import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
 import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
@@ -193,6 +195,56 @@ interface ResponderCtx {
   turnStartCount: number;
 }
 type Responder = (c: ResponderCtx) => unknown;
+
+describe("M1 dependency wait characterization Codex", () => {
+  it("M1 dependency wait Codex prose exhausts iterations before completion", async (t) => {
+    const leadScript = scriptedDependencyWait("identical");
+    const fixture = dependencyWaitCallbacks();
+    let advertisedTools: unknown;
+    const prompts: string[] = [];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        advertisedTools = rec(c.params).dynamicTools;
+        return { thread: { id: "th-1" } };
+      }
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount;
+      const tn = `tn-wait-${n}`;
+      const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+      prompts.push(continuation);
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        const response = leadScript.next({ continuation, advertisedTools });
+        assert.ok("text" in response, "M1 baseline advertises no dependency-wait control");
+        assert.equal((advertisedTools as { name: string }[]).some((tool) => tool.name === "park_run"), false);
+        c.transport.push(agentMessage(response.text));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeRig({ responder });
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true });
+    const observation = await observeDependencyWait(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+      () => ({ providerCalls: rig.transport.turnStartCount, iterations: fixture.iterations }),
+    );
+    t.diagnostic("M1_WAIT_OBSERVATION " + JSON.stringify({ harness: "codex", ...observation, providerLaunches: rig.providerLaunches() }));
+    assert.equal(observation.paused, false);
+    assert.throws(() => expectDependencyWaitPaused(observation), /dependency waiting must not fail the run/);
+    assert.equal(observation.error, "codex run reached its implement/review iteration budget without completing");
+    assert.equal(observation.providerCalls, 9);
+    assert.deepEqual(fixture.iterations, [1, 2, 3, 4, 5, 6, 7, 8]);
+    assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+    assert.equal(leadScript.surfaces.length, 7);
+    assert.ok(Array.isArray(advertisedTools), "fixture sees the actual advertised dynamic tools");
+    fixture.assertPreserved();
+  });
+});
 
 class FakeTransport implements CodexTransport {
   requests: { method: string; params: unknown; opts?: { signal?: AbortSignal; deadlineMs?: number } }[] = [];
@@ -16300,6 +16352,357 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
     assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
   });
+});
+
+describe("M1 expired wall physical Codex runner", () => {
+  for (const boundary of ["pause", "fallback"] as const) {
+    it(`wall_expired ${boundary} ACK reaches real wall park`, { timeout: 20_000 }, async () => {
+      let calls = 0;
+      await exerciseExpiredWallRunner(boundary, (_ctx, home) => {
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          assert.equal(++calls, 1, "wall ACK cannot start another provider turn");
+          c.transport.push(toolCall(401, "park_run", {}, "th-1", "tn-expired-wall", "park"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-expired-wall"));
+          return { turn: { id: "tn-expired-wall" } };
+        } });
+        return new CodexExecutor(noopLog, home,
+          { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+          { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+      });
+      assert.equal(calls, 1);
+    });
+  }
+});
+
+describe("M4 dependency wait physical Codex runner", () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+    let calls = 0;
+    const custody = await exerciseDependencyWaitRunner((ctx, home) => {
+      let advertisedTools: unknown;
+      const script = scriptedDependencyWait("identical", ({ continuation, advertisedTools: tools }) => {
+        assert.match(continuation, /Continue if these answers give you actionable work/);
+        assert.match(continuation, new RegExp(dependencyWaitAnswer));
+        assert.ok((tools as { name: string }[]).some(tool => tool.name === "park_run"));
+        return { tool: "park_run", input: {} };
+      });
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") {
+          advertisedTools = rec(c.params).dynamicTools;
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        calls++;
+        assert.ok(calls <= 3, "parking cannot start another provider turn");
+        const tn = `tn-physical-${calls}`;
+        if (calls === 1) {
+          commitDependencySlice(ctx.worktreePath);
+          c.transport.push(toolCall(101, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+          c.transport.push(toolCall(201, "checkpoint", {}, "th-1", tn, "checkpoint"));
+        } else if (calls === 2) {
+          c.transport.push(toolCall(302, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+        } else {
+          const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+          const response = script.next({ continuation, advertisedTools });
+          assert.ok("tool" in response);
+          c.transport.push(toolCall(403, response.tool, response.input, "th-1", tn, "park"));
+        }
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      } });
+      return new CodexExecutor(noopLog, home,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+        { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+    });
+    assert.equal(calls, 3);
+    for (const mode of ["now", "after_milestone"] as const) {
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
+    }
+  });
+});
+
+describe("M3 dependency wait paired Codex", () => {
+  it("M3 dependency wait Codex preserves checkpoint and parks", async (t) => {
+    const leadScript = scriptedDependencyWait("identical", ({ continuation, advertisedTools }) => {
+      assert.match(continuation, /Continue if these answers give you actionable work/);
+      assert.doesNotMatch(continuation, /Continue the work with these answers\.|Continue the implementation\./);
+      assert.ok((advertisedTools as { name: string }[]).some((tool) => tool.name === "park_run"));
+      return { tool: "park_run", input: {} };
+    });
+    const parks: unknown[] = [];
+    const fixture = dependencyWaitCallbacks();
+    let advertisedTools: unknown;
+    const prompts: string[] = [];
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        advertisedTools = rec(c.params).dynamicTools;
+        return { thread: { id: "th-1" } };
+      }
+      if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+      if (c.method !== "turn/start") return {};
+      const n = c.turnStartCount;
+      const tn = `tn-wait-${n}`;
+      const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+      prompts.push(continuation);
+      if (n === 1) {
+        c.transport.push(toolCall(100 + n, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+        c.transport.push(toolCall(200 + n, "checkpoint", {}, "th-1", tn, "checkpoint"));
+      } else if (n === 2) {
+        c.transport.push(toolCall(300 + n, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+      } else {
+        const response = leadScript.next({ continuation, advertisedTools });
+        assert.ok("tool" in response);
+        c.transport.push(toolCall(400 + n, response.tool, response.input, "th-1", tn, "park"));
+      }
+      c.transport.push(turnCompleted("completed", "th-1", tn));
+      return { turn: { id: tn } };
+    };
+    const rig = makeRig({ responder });
+    const { ctx } = makeCtx({ ...fixture.callbacks, kind: "issue", completionInterlock: true,
+      parkRunSupported: true, requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; } });
+    const observation = await observeDependencyWait(
+      makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx),
+      () => ({ providerCalls: rig.transport.turnStartCount, iterations: fixture.iterations }),
+    );
+    t.diagnostic("M3_WAIT_OBSERVATION " + JSON.stringify({ harness: "codex", ...observation }));
+    expectDependencyWaitPaused(observation);
+    assert.equal(observation.providerCalls, 3);
+    assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+    assert.match(prompts[2]!, new RegExp(dependencyWaitAnswer));
+    assert.equal(leadScript.surfaces.length, 1);
+    assert.ok(Array.isArray(advertisedTools), "fixture sees the actual advertised dynamic tools");
+    fixture.assertPreserved();
+  });
+});
+
+describe("M3 dependency wait Codex", () => {
+  for (const direct of [false, true]) {
+    for (const supported of direct ? [false, true] : [true]) {
+      it(`parks ${direct ? "exact /park without provider" : "negotiated prose"} support=${supported} at max1`, async () => {
+        let advertisedTools: unknown;
+        const script = scriptedDependencyWait("identical", ({ continuation, advertisedTools: tools }) => {
+          assert.match(continuation, /actionable work/);
+          assert.ok((tools as { name: string }[]).some((tool) => tool.name === "park_run"));
+          return { tool: "park_run", input: {} };
+        });
+        const responder: Responder = (c) => {
+          if (c.method === "thread/start") { advertisedTools = rec(c.params).dynamicTools; return { thread: { id: "th-1" } }; }
+          if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          const n = c.turnStartCount, tn = `tn-park-${n}`;
+          if (n === 1) {
+            c.transport.push(toolCall(101, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+            c.transport.push(toolCall(102, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+          } else {
+            const continuation = (c.params as { input: { text: string }[] }).input[0]!.text;
+            const response = script.next({ continuation, advertisedTools });
+            assert.ok("tool" in response);
+            c.transport.push(toolCall(103, response.tool, response.input, "th-1", tn, "park"));
+            c.transport.push(toolCall(104, "signal_done", {}, "th-1", tn, "done"));
+          }
+          c.transport.push(turnCompleted("completed", "th-1", tn));
+          return { turn: { id: tn } };
+        };
+        const rig = makeRig({ responder });
+        const parks: unknown[] = [];
+        const { ctx } = makeCtx({ kind: "issue", parkRunSupported: supported, config: { max_iterations: 1 },
+          frozenMilestones: [{ id: "m1", title: "Independent" }, { id: "m2", title: "Dependency" }],
+          askUser: async () => ({ kind: "answer", answers: [direct ? "/park" : dependencyWaitAnswer] }),
+          requestParkRun: async (at) => { parks.push(at); return { kind: "paused" }; },
+          recordCompletionAttempt: async () => assert.fail("park precedes completion"), completionInterlock: true,
+        });
+        const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        assert.deepEqual(result.pausedAt, { completedCount: 1, total: 2 });
+        assert.deepEqual(parks, [{ completedCount: 1, total: 2 }]);
+        assert.equal(rig.transport.turnStartCount, direct ? 1 : 2);
+      });
+    }
+  }
+  for (const disposition of ["answer", "cancel"] as const) {
+    it(`handles park failure-question ${disposition} at max1`, async () => {
+      const prompts: string[] = [];
+      const rig = makeRig({ responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        prompts.push((c.params as { input: { text: string }[] }).input[0]!.text);
+        const tn = `tn-failure-${c.turnStartCount}`;
+        c.transport.push(toolCall(200 + c.turnStartCount, c.turnStartCount === 1 ? "park_run" : "signal_done", {}, "th-1", tn, "control"));
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      } });
+      const { ctx } = makeCtx({ parkRunSupported: true, config: { max_iterations: 1 },
+        requestParkRun: async () => disposition === "cancel" ? { kind: "cancel" } : { kind: "answer", answers: ["Implement the independent slice now"] },
+      });
+      const run = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      if (disposition === "cancel") await assert.rejects(run, /cancel/);
+      else {
+        assert.equal((await run).pausedAt, undefined);
+        assert.match(prompts[1]!, /Implement the independent slice now/);
+      }
+      assert.equal(rig.transport.turnStartCount, disposition === "cancel" ? 1 : 2);
+    });
+  }
+});
+
+
+describe("M3 refused wall retains idle park wait", () => {
+  for (const direct of [false, true]) {
+    it(`resumes ${direct ? "exact answer" : "tool"} wait before any provider turn`, async () => {
+      let mode: "wall" | null = null;
+      let entries = 0, primaryQuestions = 0;
+      let resume!: () => void, release!: () => void;
+      const resumed = new Promise<void>(resolve => { resume = resolve; });
+      const answer = new Promise<void>(resolve => { release = resolve; });
+      const rig = makeMultiEpochRig([
+          epochResponder("th-1", "tn-control", (t, th, tn) => {
+            t.push(toolCall(201, direct ? "ask_user" : "park_run",
+              direct ? { questions: [{ question: "Ready?" }] } : {}, th, tn, "park"));
+            t.push(turnCompleted("completed", th, tn));
+          }),
+          epochResponder("th-1", "tn-guidance", (t, th, tn) => {
+            t.push(toolCall(301, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+          }),
+        ]);
+        const { ctx } = makeCtx({
+        kind: "issue", parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+        pauseModeRequested: () => mode,
+        askUser: async () => { primaryQuestions++; return { kind: "answer", answers: ["/park"] }; },
+        requestParkRun: async () => {
+          if (++entries === 1) { mode = "wall"; throw new PauseNowSignal(); }
+          resume();
+          await answer;
+          return { kind: "answer", answers: ["Implement the independent slice"] };
+        },
+        parkForWall: async () => "refused",
+        clearWallMode: () => { mode = null; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      try {
+        const waiting = await Promise.race([resumed.then(() => true), running.then(() => false)]);
+        assert.equal(waiting, true, "must resume the idle callback, not the provider");
+        assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0), 1);
+        assert.equal(primaryQuestions, direct ? 1 : 0, "consumed primary question is not repeated");
+      } finally { release(); await running; }
+      assert.equal(entries, 2, "callback re-entry resumes the worker-owned question phase");
+      assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0), 2, "guidance resumes provider exactly once");
+    });
+  }
+});
+
+describe("M3 idle park lifecycle precedence", () => {
+  for (const direct of [false, true]) {
+    for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {
+      it(`routes ${direct ? "exact answer" : "tool"} ${control} competing wall`, async () => {
+        let mode: "wall" | null = null;
+        let cancelled = false, parks = 0, walls = 0, pauses = 0, holds = 0;
+        const controlResponder = epochResponder("th-1", "tn-control", (t, th, tn) => {
+          t.push(toolCall(201, direct ? "ask_user" : "park_run",
+            direct ? { questions: [{ question: "Ready?" }] } : {}, th, tn, "park"));
+          t.push(turnCompleted("completed", th, tn));
+        });
+        const rig = makeMultiEpochRig(control === "post-attempt" ? [
+          epochResponder("th-1", "tn-done", (t, th, tn) => {
+            t.push(toolCall(101, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+          }), controlResponder,
+        ] : [controlResponder]);
+        const { ctx } = makeCtx({ kind: "issue", parkRunSupported: true, completionInterlock: true,
+          config: { max_iterations: 3 }, checkpoint: async () => undefined,
+          recordCompletionAttempt: async () => ({ unmet: ["m2"], attemptCount: 1 }),
+          pauseModeRequested: () => mode, cancelRequested: () => cancelled,
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => { parks++; mode = "wall"; cancelled = control === "cancel"; throw new PauseNowSignal(); },
+          enterCompletionHold: async () => { holds++; return true; },
+          parkForWall: async () => { walls++; return "parked"; },
+          parkForPause: async () => { pauses++; return true; },
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        if (control === "cancel") await assert.rejects(running, /cancel/);
+        else {
+          const result = await running;
+          assert.deepEqual(control === "post-attempt" ? result.completionHeld : result.walled,
+            { reason: "codex run wall-clock timeout" });
+          assert.equal(result.pausedAt, undefined);
+        }
+        assert.equal(parks, 1); assert.equal(pauses, 0);
+        assert.equal(holds, control === "post-attempt" ? 1 : 0);
+        assert.equal(walls, control === "pre-attempt" ? 1 : 0);
+        assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0),
+          control === "post-attempt" ? 2 : 1);
+      });
+    }
+  }
+});
+
+describe("M3 Codex bounded park controls", () => {
+  for (const direct of [false, true]) {
+    for (const finish of ["paused", "answer"] as const) {
+      it(`keeps one ${direct ? "exact answer" : "tool"} callback pending across owner retries then ${finish}`, async () => {
+        let parks = 0;
+        let release!: () => void;
+        let entered!: () => void;
+        let nextRetry = new Promise<void>(resolve => { entered = resolve; });
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          const tn = `tn-${c.turnStartCount}`;
+          c.transport.push(toolCall(400 + c.turnStartCount, c.turnStartCount > 1 ? "signal_done" : direct ? "ask_user" : "park_run",
+            c.turnStartCount === 1 && direct ? { questions: [{ question: "Ready?" }] } : {}, "th-1", tn, "control"));
+          c.transport.push(turnCompleted("completed", "th-1", tn));
+          return { turn: { id: tn } };
+        } });
+        const { ctx } = makeCtx({
+          parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          askUser: async () => ({ kind: "answer", answers: ["/park"] }),
+          requestParkRun: async () => {
+            parks++;
+            // Model the worker's internal explicit owner retries, with one callback pending.
+            for (let retry = 0; retry < 3; retry++) {
+              await new Promise<void>(resolve => { release = resolve; entered(); });
+            }
+            return finish === "paused" ? { kind: "paused" } : { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+        });
+        const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+        for (let retry = 0; retry < 3; retry++) {
+          await nextRetry;
+          assert.equal(parks, 1);
+          assert.equal(rig.transport.turnStartCount, 1, "no provider turn while callback is pending");
+          nextRetry = new Promise<void>(resolve => { entered = resolve; });
+          release();
+        }
+        const result = await running;
+        assert.equal(!!result.pausedAt, finish === "paused");
+        assert.equal(parks, 1);
+        assert.equal(rig.transport.turnStartCount, finish === "paused" ? 1 : 2);
+      });
+    }
+  }
+  for (const overrides of [{ parkRunSupported: undefined }, { parkRunSupported: false }, { interactive: true }, { kind: "ci_fix" as const }, { planApproved: false, approvedPlan: undefined, gatePlan: async () => { assert.fail("illicit park must never reach plan approval"); } }]) {
+    it(`does not advertise or admit illicit park ${JSON.stringify(overrides)}`, async () => {
+      let parks = 0;
+      const rig = makeRig({ responder: (c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") {
+          const tools = rec(c.params).dynamicTools as { name: string }[];
+          if (tools) assert.equal(tools.some((tool) => tool.name === "park_run"), false);
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method !== "turn/start") return {};
+        c.transport.push(toolCall(501, "park_run", {}, "th-1", "tn-1", "park"));
+        c.transport.push(turnCompleted("completed", "th-1", "tn-1"));
+        return { turn: { id: "tn-1" } };
+      } });
+      const { ctx } = makeCtx({ parkRunSupported: true, config: { max_iterations: 1 },
+        requestParkRun: async () => { parks++; return { kind: "paused" }; }, ...overrides });
+      await assert.rejects(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx));
+      assert.equal(parks, 0);
+      const response = rig.transport.responses.find((r) => r.requestId === 501);
+      assert.ok(response, "the illicit tool received a reply");
+      assert.equal(rec(rec(response.response).result).success, false);
+    });
+  }
 });
 
 // M1 uses bounded readiness and selective native delivery; unrelated idle watchdogs do not fire.

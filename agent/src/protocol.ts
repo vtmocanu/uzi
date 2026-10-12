@@ -1232,6 +1232,8 @@ export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" |
 }
 
 export interface ClaimResponse {
+  /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
+  park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
@@ -2335,6 +2337,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
+  require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
   completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
@@ -2835,6 +2839,11 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  /** Same-row park classification; omission cannot prove an ordinary owner pause. PRD #1733: the
+   *  worker reads a `paused` + `provider_unavailable` pair as an accepted provider-outage park whose
+   *  ack was lost; an absent field (an api that does not expose it) is never read as that pair. */
+  hold_reason?: string | null;
+  claim_released?: boolean;
   inventory_guarded?: boolean;
   status: string;
   /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
@@ -2849,10 +2858,6 @@ export interface RunOwnershipResponse {
    *  stamp; absent otherwise (an older api, or a non-parked run) ⇒ the feed event falls back
    *  to "retry after backoff". */
   recovery_retry_not_before?: string;
-  /** PRD #1733: the run's `hold_reason`, when the api exposes it on the probe. The worker reads a
-   *  `paused` + `provider_unavailable` pair as an accepted provider-outage park whose ack was lost;
-   *  absent (an api that does not expose it) is never read as that pair. */
-  hold_reason?: string;
 }
 
 /** PRD #1391 Run B M3 (D3): one missing seq range in a run's message trace, as the message-gaps

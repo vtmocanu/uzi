@@ -14,6 +14,7 @@ import type { ReviewRunner } from "../src/review-runner.js";
 import type { ChatClaimResponse, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger } from "./helpers.js";
 import type { Logger } from "../src/log.js";
+import type { TerminalRejectionCoordinator } from "../src/terminal-rejections.js";
 import { sleep } from "../src/util.js";
 
 // Issue #1512: shared rig for the heartbeat terminal-sweep tests. A real Outbox on a tmp dir, a
@@ -82,6 +83,7 @@ export function startSweepWorker(opts: {
   activeRuns?: ActiveRunRegistry;
   runner?: Partial<RunRunner>;
   log?: Logger;
+  terminalRejections?: TerminalRejectionCoordinator;
 }): { stop: () => Promise<void> } {
   const controller = new AbortController();
   const runner = {
@@ -102,6 +104,8 @@ export function startSweepWorker(opts: {
     opts.outbox,
     new Map(),
     opts.activeRuns,
+    undefined, undefined, undefined, undefined, undefined, undefined, undefined, undefined,
+    opts.terminalRejections,
   );
   const done = worker.run(controller.signal);
   return {

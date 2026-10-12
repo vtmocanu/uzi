@@ -86,10 +86,12 @@ var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cance
 
 // Sentinel errors mapped to HTTP status codes by the handlers.
 var (
-	ErrRunNotFound   = errors.New("run not found")
-	ErrRunNotOwned   = errors.New("run not owned by worker")
-	ErrRepoNotFound  = errors.New("repo not found")
-	ErrIssueNotFound = errors.New("issue not found")
+	ErrRunNotFound = errors.New("run not found")
+	ErrRunNotOwned = errors.New("run not owned by worker")
+	// ErrRunWallExpired refuses an ordinary pause or guarded question at the run deadline.
+	ErrRunWallExpired = errors.New("run wall deadline expired")
+	ErrRepoNotFound   = errors.New("repo not found")
+	ErrIssueNotFound  = errors.New("issue not found")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
 	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
 	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
@@ -2294,6 +2296,15 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 	}
 }
 
+// SetClock overrides the service clock for deterministic deadline checks. Configure
+// it before serving requests; a nil clock restores time.Now.
+func (s *Service) SetClock(now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	s.now = now
+}
+
 // -------------------------------------------------------------------------
 // Worker protocol
 // -------------------------------------------------------------------------
@@ -3693,6 +3704,8 @@ func branchMovedStopReason(reason *string) string {
 // column and the M2 worker client); the Go field stays
 // `State` to avoid churn in the switch below.
 type StateRequest struct {
+	// RequireRunning fences a question write against a flight that has already parked.
+	RequireRunning bool `json:"require_running,omitempty"`
 	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
 	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
 	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
@@ -4075,6 +4088,9 @@ func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uu
 }
 
 func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
+	if req.RequireRunning && (req.State != "awaiting_input" || req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
+		return store.Run{}, false, fmt.Errorf("%w: require_running requires awaiting_input and positive claim_generation", ErrInvalidState)
+	}
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
@@ -4256,7 +4272,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.ClaimGeneration == nil && stateUsesForUpdateFence(req.State, owned) && owned.ClaimReleasedAt.Valid {
 		return owned, false, ErrStaleClaim
 	}
-	if req.ClaimGeneration != nil && stateUsesForUpdateFence(req.State, owned) {
+	if req.ClaimGeneration != nil && (req.RequireRunning || stateUsesForUpdateFence(req.State, owned)) {
 		if s.txBeginner == nil {
 			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
 		}
@@ -4291,6 +4307,31 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// released this claim. Return the LOCKED row so the handler can render it beside the
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
+		}
+		if req.RequireRunning {
+			if locked.PauseMode.String == "wall" || PendingCredentialSwitchSignal(locked) != nil {
+				return locked, false, nil
+			}
+			if locked.Status == "awaiting_input" {
+				var qid string
+				if req.OpenQuestionID != nil {
+					clean, _ := stripNUL(*req.OpenQuestionID)
+					qid = strings.TrimSpace(clean)
+				}
+				// The same accepted question can be replayed after a lost ACK. Return
+				// under the lock without repeating accounting or transition fan-out.
+				if qid != "" && len([]rune(qid)) <= maxQuestionIDRunes && locked.OpenQuestionID.Valid && locked.OpenQuestionID.String == qid {
+					return locked, true, nil
+				}
+				return locked, false, nil
+			}
+			if locked.Status != "running" {
+				return locked, false, nil
+			}
+			deadline := RunDeadline(locked.StartedAt, locked.BudgetWallSeconds, locked.BudgetPausedSeconds, locked.Kind, locked.Interactive, locked.Status, s.p.RunTimeout, locked.BudgetExtensionSeconds, locked.BudgetFinalizeSeconds)
+			if deadline != nil && !s.now().Before(*deadline) {
+				return locked, false, ErrRunWallExpired
+			}
 		}
 		// Locked and current: the arms below mutate through the tx, and the lock is held
 		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the
@@ -5696,12 +5737,11 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 // (#559) uses the status to detect a mid-turn reclaim or terminal transition early, and the
 // forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
 // outcome after a transport failure — so a reconciled park can still quote its retry time. The
-// stamp is nil for a run that is not recovery-parked; holdReason is nil unless the run is paused
-// with a hold reason.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, err error) {
+// stamp is nil for a run that is not recovery-parked.
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, err error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return "", nil, 0, nil, err
+		return "", nil, 0, nil, false, err
 	}
 	var retry *time.Time
 	if run.RecoveryRetryNotBefore.Valid {
@@ -5712,16 +5752,13 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 	// (additive), so the run-lane claim router can proceed ONLY on a claimed/running row AT
 	// the claim's generation and end the attempt on a DIFFERENT generation. It already lives
 	// on the store.Run this read returns — no new query.
-	//
-	// PRD #1733: hold_reason rides the probe (additive) ONLY for a paused row with a non-NULL
-	// reason, so a worker whose provider-park ack was lost can tell a provider hold from any other
-	// pause. nil for every other row.
-	var hold *string
-	if run.Status == "paused" && run.HoldReason.Valid {
-		h := run.HoldReason.String
-		hold = &h
+	// The explicit pause caller must distinguish an ordinary pause from a wall
+	// hold or released claim after a lost ACK. All fields come from this same read.
+	if run.HoldReason.Valid {
+		reason := run.HoldReason.String
+		holdReason = &reason
 	}
-	return run.Status, retry, run.ClaimGeneration, hold, nil
+	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {

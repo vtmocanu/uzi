@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { isParkAnswer, parkRunEnabled, parkRunEligible, PARK_RUN_CONTINUATION } from "./park-run.js";
 import { chunkedTimeout } from "./chunked-timeout.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "./checked-plan.js";
@@ -579,6 +580,7 @@ interface TurnResult {
    *  Latched (last-wins/latch within the turn, like `done`): once seen it stays set, and
    *  the loop reaps + fetches the committed milestone work back durably before continuing. */
   checkpoint?: boolean;
+  parkRun?: boolean;
   /** issue #279: the `summary` the lead passed to signal_done this turn, if any. Last-wins
    *  within the turn (like prdDonePath); persisted as report_md on a report-only completion. */
   summary?: string;
@@ -645,12 +647,13 @@ function questionMax(config: ClaimConfig | null): number {
 function answeredPrompt(
   questions: AskUserQuestion[],
   answers: string[],
+  continuation = "Continue the work with these answers.",
 ): string {
   const lines = questions.map((q, i) => {
     const a = answers[i]?.trim();
     return `Q: ${q.question}\nA: ${a && a.length > 0 ? a : "(no answer given)"}`;
   });
-  return `The human answered your question${questions.length > 1 ? "s" : ""}:\n\n${lines.join("\n\n")}\n\nContinue the work with these answers.`;
+  return `The human answered your question${questions.length > 1 ? "s" : ""}:\n\n${lines.join("\n\n")}\n\n${continuation}`;
 }
 
 /** Issue #281: normalize a turn's lead text for verbatim-repeat comparison — trim and
@@ -730,12 +733,14 @@ interface DriveState {
   subagentCanWrite: ReturnType<typeof subagentWriteCapabilities>;
   preToolUse: (
     allowedSubagents: string[],
+    implementation?: boolean,
   ) => NonNullable<SdkOptions["hooks"]>["PreToolUse"];
   isIssueRun: boolean;
   /** issue #1866 M2: the run-start environment facts (runEnvProbe), rendered into the plan
    *  prompt and the first implement prompt. */
   environmentFacts: EnvFacts;
   baseConfig: ClaudeTurnConfig;
+  enableImplementationSignals: () => void;
   initialWallMs: number;
   // PRD #1189 M1 (D6): the LARGEST served wall (ms) applied so far — the monotonic
   // upward-only re-arm high-water mark that replaced the one-shot wall-scaling latch. Each
@@ -1393,6 +1398,7 @@ export class SdkExecutor implements Executor {
     const pathHook = buildPathGuardHook(ctx.worktreePath, this.log, this.secretPaths, { sdkHomeDir: this.homeDir });
     const preToolUse = (
       allowedSubagents: string[],
+      implementation = false,
     ): NonNullable<SdkOptions["hooks"]>["PreToolUse"] => [
       { matcher: "Bash", hooks: [bashHook] },
       {
@@ -1408,6 +1414,13 @@ export class SdkExecutor implements Executor {
         matcher: SEND_MESSAGE_TOOL,
         hooks: [buildSendMessageAliasHook(allowedSubagents, this.log)],
       },
+      { matcher: "mcp__uzi__park_run", hooks: [async (input) => {
+        if (!parkRunEnabled(ctx, implementation ? "implement" : "plan")
+          || ("agent_id" in input && input.agent_id !== undefined)) {
+          return { hookSpecificOutput: { hookEventName: "PreToolUse" as const, permissionDecision: "deny" as const, permissionDecisionReason: "park_run requires supported root issue implementation" } };
+        }
+        return {};
+      }] },
     ];
 
     // In-process MCP servers the LEAD (full toolset) reaches. The dep-free signal
@@ -1424,8 +1437,9 @@ export class SdkExecutor implements Executor {
     // Issue #2083: the decisions memo is a memo-kind run with the server-side feature on.
     const decisionsMemoOn =
       ctx.decisionsMemoEnabled === true && isDecisionsMemoKind(resolveRunKind(ctx.kind));
-    const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
-      [SIGNAL_SERVER_NAME]: buildSignalMcpServer({
+    let signalParkRun = false;
+    const buildRunSignalServer = (codeCrossCheck?: NonNullable<Parameters<typeof buildSignalMcpServer>[0]>["codeCrossCheck"]): McpSdkServerConfigWithInstance =>
+      buildSignalMcpServer({
         prdDonePath: isIssueRun,
         // PRD #122 M1: milestones on submit_plan for issue runs only (Decision 13),
         // gated on the same isIssueRun discriminator as prd_done_path.
@@ -1441,7 +1455,16 @@ export class SdkExecutor implements Executor {
         reportOnly: isIssueRun,
         // Issue #2083: decisions_memo on signal_done, only when the memo is enabled.
         decisionsMemo: decisionsMemoOn,
-      }),
+        parkRun: signalParkRun,
+        ...(codeCrossCheck ? { codeCrossCheck } : {}),
+      });
+    // Fresh options bind each server's repair access; retained handlers still revalidate it.
+    const mcpServers: Record<string, McpSdkServerConfigWithInstance> = {
+      [SIGNAL_SERVER_NAME]: buildRunSignalServer(),
+    };
+    const enableImplementationSignals = (): void => {
+      signalParkRun = parkRunEnabled(ctx, "implement");
+      mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer();
     };
     if (this.client) {
       mcpServers[MEMORY_SERVER_NAME] = buildMemoryServer({
@@ -1571,14 +1594,10 @@ export class SdkExecutor implements Executor {
       ...(ctx.codeCrossCheckGate && ctx.codeCrossCheckRepairActive && ctx.codeCrossCheckRepair && ctx.reportCrossCheckDispositions && ctx.claimGeneration ? {
         refreshCodeCrossCheckTools: async () => {
           const row = await ctx.codeCrossCheckRepair!();
-          mcpServers[SIGNAL_SERVER_NAME] = buildSignalMcpServer({
-            prdDonePath: isIssueRun, milestones: isIssueRun, progress: isIssueRun, checkpoint: isIssueRun,
-            reportOnly: isIssueRun, decisionsMemo: decisionsMemoOn,
-            ...(row && row.findings.length > 0 ? { codeCrossCheck: {
-              generation: ctx.claimGeneration!, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive!, codeCrossCheckRepair: ctx.codeCrossCheckRepair!,
-              reportCrossCheckDispositions: ctx.reportCrossCheckDispositions!,
-            } } : {}),
-          });
+          mcpServers[SIGNAL_SERVER_NAME] = buildRunSignalServer(row && row.findings.length > 0 ? {
+            generation: ctx.claimGeneration!, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive!, codeCrossCheckRepair: ctx.codeCrossCheckRepair!,
+            reportCrossCheckDispositions: ctx.reportCrossCheckDispositions!,
+          } : undefined);
         },
       } : {}),
       skillsSelected: runSkills.length > 0,
@@ -1660,6 +1679,7 @@ export class SdkExecutor implements Executor {
       isIssueRun,
       environmentFacts,
       baseConfig,
+      enableImplementationSignals,
       initialWallMs,
       maxServedWallMs,
       state,
@@ -2418,6 +2438,7 @@ export class SdkExecutor implements Executor {
       // `selectedSubagents` is pre-strip on both sources (own: assembled defs unchanged;
       // repo: freshly-mapped repo defs), which is exactly M1's "implement-turn defs".
       const selectedCanWrite = subagentWriteCapabilities(selectedSubagents);
+      drive.enableImplementationSignals();
       const implementConfig: ClaudeTurnConfig = {
         ...baseConfig,
         agents: selectedSubagents,
@@ -2427,7 +2448,8 @@ export class SdkExecutor implements Executor {
           repoInstructions: repoInstructionsBlock,
           harness: "claude",
         }),
-        preToolUse: preToolUse(selectedNames),
+        preToolUse: preToolUse(selectedNames, true),
+        mcpServers: baseConfig.mcpServers,
       };
       ctx.emit({
         kind: "status",
@@ -2572,6 +2594,7 @@ export class SdkExecutor implements Executor {
       // branch, or the `now` pause caught around driveTurn below). Hoisted like scopeCapped so it
       // survives the `break` into the ExecutorResult assembly. ANY kind (NOT gated on isIssueRun).
       let pausedAt: { completedCount: number; total?: number } | undefined;
+      let clarificationRounds = 0;
       // PRD #1247 M5b (data-integrity fix): latched TRUE when a held-state credential switch RELEASED
       // the claim IN PLACE (ctx.attemptCredentialSwitch → "released") from a live implement turn, an
       // ask_user question, or an interactive follow-up wait. Hoisted like pausedAt/scopeCapped so it
@@ -2881,9 +2904,150 @@ export class SdkExecutor implements Executor {
         // On a park take, break; else (the checkpoint could not be published, so the server
         // cleared the request) CONTINUE — the aborted turn restarts on the next iteration, exactly
         // as a cancelled-then-revised turn does. A non-pause error rethrows to the normal path.
+        // Both provider interruptions and idle park waits use the same lifecycle precedence.
+        const handlePauseNow = async (at: { completedCount: number; total?: number }): Promise<boolean> => {
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (ctx.pauseModeRequested?.() === "wall") {
+            if (completionAttempted && await routeCompletionHold(ctx, REASON_WALL, completionAttempted)) {
+              completionHeld = { reason: REASON_WALL };
+              return true;
+            }
+            const outcome = await this.parkForWall(ctx, at);
+            if (outcome === "parked" || outcome === "undeliverable") {
+              walled = { reason: REASON_WALL };
+              return true;
+            }
+            if (outcome === "cancelled" || ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+            if (outcome === "refused") ctx.clearWallMode?.();
+          } else if (await this.requestPause(ctx, at)) {
+            pausedAt = at;
+            return true;
+          }
+          state.tripReason = undefined;
+          throwIfDiskStop(ctx);
+          return false;
+        };
+        const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
+          const step = await this.runThroughSwitch(ctx, state, async () => {
+            // Re-entry resumes the runner's pending question, with its original deadline.
+            // Only a settled owner answer permits another attempt; lifecycle refusals keep waiting.
+            for (;;) {
+              try { return await ctx.requestParkRun!(at); }
+              catch (error) {
+                if (!(error instanceof PauseNowSignal)) throw error;
+                if (await handlePauseNow(at)) return { kind: "paused" } as const;
+              }
+            }
+          });
+          if ("released" in step) { switchReleased = true; return { kind: "paused" }; }
+          return step.value;
+        };
         let turn: TurnResult;
         try {
           turn = await turnPromise;
+          resumeId = turn.sessionId ?? resumeId;
+          if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
+          // PRD #265 M1: latch the finished-milestone declaration the same way, so it
+          // survives the terminating turn's `break` into the completed report.
+          if (turn.milestonesCompleted !== undefined) {
+            declaredMilestonesCompleted = turn.milestonesCompleted;
+            for (const id of turn.milestonesCompleted) seenCompletedIds.add(id);
+          }
+          // issue #279: latch report_only true (like done) and take the last-wins summary
+          // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
+          // the final ExecutorResult after the break below.
+          if (turn.reportOnly) declaredReportOnly = true;
+          if (turn.summary !== undefined) declaredSummary = turn.summary;
+          // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
+          // the terminating turn reaches the final ExecutorResult after the break below.
+          if (turn.proposal !== undefined) declaredProposal = turn.proposal;
+          // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the turn
+          // that CARRIED the claims, so a later bare signal_done (an interlock rework, an interactive
+          // follow-up) keeps the earlier claims with the sha they were made at. A turn carrying
+          // claims is always a done turn: scanSignals extracts pr_summary only inside the
+          // signal_done branch that latches `done`. A HEAD read failure leaves verifiedAtSha absent
+          // and never throws.
+          if (turn.prSummary !== undefined) {
+            declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
+          }
+          if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
+          if (isIssueRun && turn.nonClosing !== undefined) declaredNonClosing = turn.nonClosing;
+          // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
+          // `running` report. Only overwrite when the turn reported something, so a quiet
+          // turn keeps the last known progress rather than blanking it.
+          if (turn.progress) {
+            latestProgress = turn.progress;
+            for (const id of turn.progress.completed) seenCompletedIds.add(id);
+          }
+          const parkAt = { completedCount: lastServedScope?.completedCount ?? latestProgress?.completed?.length ?? 0, total: (frozenMilestones ?? ctx.frozenMilestones)?.length };
+          if (turn.parkRun) {
+            if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
+            if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
+            // The worker callback owns explicit owner retries and their absolute deadline.
+            const disposition = await requestPark(parkAt);
+            if (switchReleased || walled || completionHeld || pausedAt) break;
+            if (disposition.kind === "paused") { pausedAt = parkAt; break; }
+            if (disposition.kind === "cancel") throw new PlanRejectedError("run cancelled while awaiting clarification");
+            followUp = disposition.answers.join("\n") + "\n\n" + (parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : "");
+            iteration--;
+            resetStallState();
+            continue;
+          }
+          // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
+          // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
+          // human cannot trip REASON_IDLE. That property is free by construction here,
+          // not something the park has to defend.
+          //
+          // The answer is fed to the next turn as an ordinary user turn (via followUp)
+          // rather than returned as the tool's result — the lead was told to end its
+          // turn after asking, so there is no tool call still open to return into. The
+          // resumed session keeps full context, so nothing is replayed.
+          //
+          // `iteration` is deliberately NOT advanced for the answer round-trip: a
+          // clarification is not an implement/review iteration, and counting it would
+          // let a talkative lead burn the loop budget on questions. The `continue`
+          // re-enters the loop, which increments — so the decrement below keeps the
+          // clarification turn free.
+          const asked = turn.questions;
+          if (asked?.length) {
+            if (turn.checkpoint) await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
+            // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
+            // credential switch can trip while awaiting the answer (steering rejects the answer waiter
+            // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
+            // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
+            // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
+            // askUserOrContinue — keep waiting), never a terminal failure.
+            const askStep = await this.runThroughSwitch(ctx, state, () =>
+              this.askUserOrContinue(ctx, asked, budget.asked, parkAt, ctx.requestParkRun ? requestPark : undefined),
+            );
+            if ("released" in askStep) {
+              switchReleased = true;
+              break;
+            }
+            const verdict = askStep.value;
+            if (switchReleased || walled || completionHeld || pausedAt) break;
+            if (verdict.runPaused) { pausedAt = parkAt; break; }
+            if (verdict.parked) {
+              budget.asked += verdict.questionsUsed ?? 1;
+              if (verdict.cancelled)
+                throw new PlanRejectedError(
+                  "run cancelled while awaiting clarification",
+                );
+              followUp = verdict.followUp;
+              iteration--;
+              resetStallState(); // a clarification park is not a refusal turn → breaks the streak
+              continue;
+            }
+            // Not parked: the cap is spent, or no askUser is wired. Either way the run
+            // continues on the lead's judgment; the notice is already on the feed.
+            followUp = verdict.followUp;
+            iteration--;
+            resetStallState(); // a clarification turn is not a refusal → breaks the streak
+            continue;
+          }
+
         } catch (err) {
           // PRD #1247 M5b (data-integrity fix): a held-state credential switch tripped this
           // implement turn (the SDK abort / re-armable interrupt → driveTurn throws
@@ -2917,63 +3081,10 @@ export class SdkExecutor implements Executor {
           }
           if (err instanceof PauseNowSignal) {
             const at = {
-              // The server's fresh completed count off THIS iteration's ACK, matching the
-              // loop-top branch; fall back to the worker's own live progress if the ACK carried
-              // none (e.g. a run with no reportIteration budget).
-              completedCount:
-                served?.completedCount ?? latestProgress?.completed.length ?? 0,
+              completedCount: served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
-            // PRD #1809 D4 (hard layer): a worker-local `disk` stop rides the same PauseNowSignal.
-            // It is not an owner pause and never a completion hold: the runner reaps the tree,
-            // captures what is committed and parks the run (data_volume_full, counted).
-            throwIfDiskStop(ctx);
-            // PRD #1497 M2: a `wall` pause (the sweep's system-authored wall-clock park) rides the
-            // SAME PauseNowSignal that drops the turn but carries no mode; branch on getPauseMode.
-            if (ctx.pauseModeRequested?.() === "wall") {
-              // D6/D14: the completion hold WINS the race. A `wall` pause arriving after the FIRST
-              // completion attempt routes to routeCompletionHold FIRST and never reaches the wall
-              // seam — the completion hold's server write (SetRunCompletionHold) settles both the
-              // wall columns and the wall input. routeCompletionHold returns true only when the hold
-              // was entered; false (no attempt yet, or the hold could not enter) falls through to the
-              // wall seam so the wall NEVER becomes a terminal failure (D2/D17).
-              if (
-                completionAttempted &&
-                (await routeCompletionHold(ctx, REASON_WALL, completionAttempted))
-              ) {
-                completionHeld = { reason: REASON_WALL };
-                break;
-              }
-              const outcome = await this.parkForWall(ctx, at);
-              if (outcome === "parked" || outcome === "undeliverable") {
-                walled = { reason: REASON_WALL };
-                break;
-              }
-              if (outcome === "cancelled") throw new Error(REASON_CANCELLED);
-              // "refused" (the owner extended) / "undefined" (no seam wired): the run CONTINUES.
-              // Clear the sticky wall mode on a refusal, then restart the aborted turn (the
-              // declined-`now` path below): the wall lifts from the next reportIteration's total.
-              if (outcome === "refused") ctx.clearWallMode?.();
-              state.tripReason = undefined;
-              throwIfDiskStop(ctx);
-              continue;
-            }
-            if (await this.requestPause(ctx, at)) {
-              pausedAt = at;
-              break;
-            }
-            // The checkpoint could not be published (Decision 8): the server cleared the request
-            // and the run CONTINUES. Clear the sticky REASON_PAUSE_NOW trip so the restarted turn
-            // is not immediately re-thrown by driveTurn's top guard — the shared cancel controller
-            // stays aborted, but its onSignal is once:true and already fired, and each turn gets a
-            // fresh currentAbort, so the next turn runs cleanly. The consumed controller can no
-            // longer deliver a later steering signal, so both are re-checked WITHOUT it (PRD #1190
-            // rework N2): a cancel arriving after this point is honored by the loop-top cancel
-            // re-check (ctx.cancelRequested) on the next iteration, and a SECOND `now` pause drops
-            // the restarted turn via the re-armable ctx.onPauseNow interrupt (which trips this same
-            // REASON_PAUSE_NOW). Both were silently dropped before this rework.
-            state.tripReason = undefined;
-            throwIfDiskStop(ctx);
+            if (await handlePauseNow(at)) break;
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -3020,40 +3131,7 @@ export class SdkExecutor implements Executor {
           }
           throw err;
         }
-        resumeId = turn.sessionId ?? resumeId;
-        if (turn.prdDonePath !== undefined) declaredPrdPath = turn.prdDonePath;
-        // PRD #265 M1: latch the finished-milestone declaration the same way, so it
-        // survives the terminating turn's `break` into the completed report.
-        if (turn.milestonesCompleted !== undefined) {
-          declaredMilestonesCompleted = turn.milestonesCompleted;
-          for (const id of turn.milestonesCompleted) seenCompletedIds.add(id);
-        }
-        // issue #279: latch report_only true (like done) and take the last-wins summary
-        // (like prdDonePath), so a report-only signal_done on the terminating turn reaches
-        // the final ExecutorResult after the break below.
-        if (turn.reportOnly) declaredReportOnly = true;
-        if (turn.summary !== undefined) declaredSummary = turn.summary;
-        // PRD #929 M2: take the last-wins proposal (like summary), so a proposal declared on
-        // the terminating turn reaches the final ExecutorResult after the break below.
-        if (turn.proposal !== undefined) declaredProposal = turn.proposal;
-        // PRD #1798 M2: last-wins like proposal. Stamped with the worktree HEAD only on the turn
-        // that CARRIED the claims, so a later bare signal_done (an interlock rework, an interactive
-        // follow-up) keeps the earlier claims with the sha they were made at. A turn carrying
-        // claims is always a done turn: scanSignals extracts pr_summary only inside the
-        // signal_done branch that latches `done`. A HEAD read failure leaves verifiedAtSha absent
-        // and never throws.
-        if (turn.prSummary !== undefined) {
-          declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
-        }
-        if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
-        if (isIssueRun && turn.nonClosing !== undefined) declaredNonClosing = turn.nonClosing;
-        // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
-        // `running` report. Only overwrite when the turn reported something, so a quiet
-        // turn keeps the last known progress rather than blanking it.
-        if (turn.progress) {
-          latestProgress = turn.progress;
-          for (const id of turn.progress.completed) seenCompletedIds.add(id);
-        }
+        clarificationRounds = 0;
         // PRD #122 M6 (Decision 10): the lead cooperatively checkpointed a completed
         // milestone. Reap + fetch-back durably, then continue — it ended its turn and will
         // be re-prompted for the next milestone. A turn that is BOTH done and checkpoint
@@ -3447,56 +3525,6 @@ export class SdkExecutor implements Executor {
         // `continue`d above). Fetch-back WITHOUT reaping — a backgrounded dev server the
         // lead means to reuse next iteration must survive (Decision 10b). Best-effort.
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
-
-        // PRD #88 clarification park. Deliberately OUTSIDE driveTurn, exactly like the
-        // plan gate: the idle watchdog only runs inside a turn, so a run waiting on a
-        // human cannot trip REASON_IDLE. That property is free by construction here,
-        // not something the park has to defend.
-        //
-        // The answer is fed to the next turn as an ordinary user turn (via followUp)
-        // rather than returned as the tool's result — the lead was told to end its
-        // turn after asking, so there is no tool call still open to return into. The
-        // resumed session keeps full context, so nothing is replayed.
-        //
-        // `iteration` is deliberately NOT advanced for the answer round-trip: a
-        // clarification is not an implement/review iteration, and counting it would
-        // let a talkative lead burn the loop budget on questions. The `continue`
-        // re-enters the loop, which increments — so the decrement below keeps the
-        // clarification turn free.
-        const asked = turn.questions;
-        if (asked?.length) {
-          // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
-          // credential switch can trip while awaiting the answer (steering rejects the answer waiter
-          // with a CredentialSwitchSignal, raised out of ctx.askUser inside askUserOrContinue). Handle
-          // it IN PLACE: "released" surfaces switchReleased and ends the run (the release requeued it);
-          // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
-          // askUserOrContinue — keep waiting), never a terminal failure.
-          const askStep = await this.runThroughSwitch(ctx, state, () =>
-            this.askUserOrContinue(ctx, asked, budget.asked),
-          );
-          if ("released" in askStep) {
-            switchReleased = true;
-            break;
-          }
-          const verdict = askStep.value;
-          if (verdict.parked) {
-            budget.asked++;
-            if (verdict.cancelled)
-              throw new PlanRejectedError(
-                "run cancelled while awaiting clarification",
-              );
-            followUp = verdict.followUp;
-            iteration--;
-            resetStallState(); // a clarification park is not a refusal turn → breaks the streak
-            continue;
-          }
-          // Not parked: the cap is spent, or no askUser is wired. Either way the run
-          // continues on the lead's judgment; the notice is already on the feed.
-          followUp = verdict.followUp;
-          iteration--;
-          resetStallState(); // a clarification turn is not a refusal → breaks the streak
-          continue;
-        }
 
         // Issue #1800: the system text this turn carried is spent. Queued owner follow-ups are
         // pulled at the next loop top (FIFO, one per turn), immediately before the prompt that
@@ -3938,7 +3966,9 @@ export class SdkExecutor implements Executor {
     ctx: RunContext,
     questions: AskUserQuestion[],
     questionsAsked: number,
-  ): Promise<{ parked: boolean; cancelled?: boolean; followUp: string }> {
+    parkAt?: { completedCount: number; total?: number },
+    requestPark = ctx.requestParkRun,
+  ): Promise<{ parked: boolean; runPaused?: boolean; cancelled?: boolean; questionsUsed?: number; followUp: string }> {
     const headers = questions.map((q) => q.header || q.question).join("; ");
     if (!ctx.askUser) {
       ctx.emit({
@@ -3959,7 +3989,16 @@ export class SdkExecutor implements Executor {
       });
       return { parked: false, followUp: unansweredPrompt(questions) };
     }
-    const verdict = await ctx.askUser(questions);
+    let verdict = await ctx.askUser(questions);
+    const questionsUsed = 1;
+    // Only a validated answer to an active implementation question is a command.
+    // The worker callback consumes owner retries internally; only the model question uses budget.
+    if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
+      const disposition = await requestPark(parkAt);
+      if (disposition.kind === "paused") return { parked: true, runPaused: true, followUp: "" };
+      if (disposition.kind === "cancel") return { parked: true, cancelled: true, followUp: "" };
+      verdict = disposition;
+    }
     if (verdict.kind === "cancel")
       return { parked: true, cancelled: true, followUp: "" };
     ctx.emit({
@@ -3969,7 +4008,8 @@ export class SdkExecutor implements Executor {
     });
     return {
       parked: true,
-      followUp: answeredPrompt(questions, verdict.answers),
+      questionsUsed,
+      followUp: answeredPrompt(questions, verdict.answers, parkAt && parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : undefined),
     };
   }
 
@@ -4053,6 +4093,14 @@ export class SdkExecutor implements Executor {
       // resume/abort/spawn per turn.
       if (phase === "implement") await state.refreshCodeCrossCheckTools?.();
       this.harness.prepareTurn(turnConfig, state.currentChild);
+      if (parkRunEnabled(ctx, phase)) {
+        // buildImplementPrompt's later-turn opening must also allow dependency waiting.
+        prompt = prompt.replace(
+          /^Continue the implementation\. Address any remaining review findings, keep\niterating between your subagents until the review passes\./,
+          PARK_RUN_CONTINUATION,
+        );
+        if (!prompt.startsWith(PARK_RUN_CONTINUATION)) prompt += "\n\n" + PARK_RUN_CONTINUATION;
+      }
       const request: RunTurnRequest = {
         prompt,
         // The neutral fields below are carried as-is; the placeholders
@@ -4080,6 +4128,7 @@ export class SdkExecutor implements Executor {
           }
         }
         if (event.kind === "frame") {
+          if (event.signals?.parkRun && !parkRunEnabled(ctx, phase)) throw new Error("illicit park_run signal");
           for (const item of event.items) {
             if (item.kind !== "tool" || item.id === undefined) continue;
             if (item.phase === "started" && item.signal === undefined) {
