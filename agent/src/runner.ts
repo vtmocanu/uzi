@@ -10179,6 +10179,9 @@ export class RunRunner {
         : undefined;
     // PRD #2603: a poll that flips the setting re-syncs the controller at once (clears a shown note).
     if (nowSummary) steering.onNowSummaryChange(() => nowSummary.observeSetting());
+    // Survives lifecycle interruptions after a completed pause attempt, including reconciliation.
+    let parkContinuation: "attempt" | "reconcile" | "question" = "attempt";
+    let parkOwnershipProbe: Promise<RunOwnershipResponse> | undefined;
     const ctx: RunContext = {
       runId,
       claimGeneration: claim.claim_generation,
@@ -10903,6 +10906,8 @@ export class RunRunner {
           steering.lifecycleSignal().throwIfAborted();
         };
         const retainPause = async () => {
+          parkContinuation = "attempt";
+          parkOwnershipProbe = undefined;
           flight.parked = true;
           await this.pinRecoveryGeneration(claim, flight, await this.currentRestorePointHead(flight))
             .catch((error) => runLog.warn("recovery: pause generation-evidence pin failed (custody retained)", {
@@ -10926,7 +10931,7 @@ export class RunRunner {
         for (;;) {
           if (steering.isCancelled()) return { kind: "cancel" };
           checkLifecycle();
-          if (supported) {
+          if (supported && parkContinuation === "attempt") {
             let requested: StateAck;
             try {
               requested = await this.client.requestWorkerPause(runId, flight.claimGeneration!, steering.lifecycleSignal());
@@ -10942,16 +10947,22 @@ export class RunRunner {
               throw new TrustedExecutionRefusal("park run request refused");
             const parked = requested.applied && requested.status === "running" &&
               await this.runGatedSink(flight, () => this.handlePausePark(claim, flight, pausedAt));
+            // Remember the completed false result before lifecycle reconciliation can interrupt.
+            if (!parked) parkContinuation = "reconcile";
             if (steering.isCancelled()) return { kind: "cancel" };
             checkLifecycle();
             if (parked) return { kind: "paused" };
+          }
+          if (supported && parkContinuation === "reconcile") {
             // One diagnostic read, bounded in wall time. It grants no question-write authority.
+            // Keep the same probe across interruptions, including an unknown transport result.
             let ownership: RunOwnershipResponse;
             try {
-              ownership = await this.client.getRunOwnership(runId, {
+              parkOwnershipProbe ??= this.client.getRunOwnership(runId, {
                 signal: AbortSignal.any([steering.lifecycleSignal(), AbortSignal.timeout(5000)]),
                 deadline: Date.now() + 5000,
               });
+              ownership = await parkOwnershipProbe;
             } catch (error) {
               checkLifecycle();
               if (isRunOwnershipLost(error, runId)) throw new StaleClaimError();
@@ -10973,6 +10984,8 @@ export class RunRunner {
             if (ownership.status !== "running")
               throw new TrustedExecutionRefusal("park run ownership refused");
           }
+          parkContinuation = "question";
+          parkOwnershipProbe = undefined;
           if (claim.auto_approve)
             throw new TrustedExecutionRefusal("park run needs an owner decision after refusal");
           let verdict: AnswerVerdict;
@@ -10990,6 +11003,9 @@ export class RunRunner {
             if (error instanceof OrdinaryOwnerPaused) return retainPause();
             throw error;
           }
+          // parkQuestion confirms running settlement before a consumed /park can authorize an attempt.
+          parkContinuation = "attempt";
+          parkOwnershipProbe = undefined;
           if (!isParkAnswer(verdict)) return verdict;
         }
       },

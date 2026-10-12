@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import { RequestError } from "../src/client.js";
+import { PauseNowSignal, SteeringChannel } from "../src/steering.js";
 import { isParkAnswer } from "../src/park-run.js";
 import type { AnswerVerdict } from "../src/steering.js";
 import assert from "node:assert/strict";
@@ -453,7 +454,9 @@ describe("RunRunner — M2 explicit park callback", () => {
     unattended?: boolean; ownership?: "wall" | "released" | "foreign" | "completion";
     deadlineRetry?: boolean; cancelledBefore?: boolean; legacyGeneration?: boolean;
     nonissue?: boolean; requestRefused?: boolean; wallPending?: boolean; guardedWall?: boolean;
-    guardedExistingQuestion?: boolean; failedProbe?: boolean;
+    guardedExistingQuestion?: boolean; failedProbe?: boolean; resumeGuardedWall?: boolean;
+    interruptWait?: boolean; publishFailure?: boolean; resumeFence?: "paused" | "foreign";
+    interruptReconcile?: "pause_failed" | "ownership";
     pauseTransport?: "before" | "after"; questionTransport?: "replay" | "exhausted" | "httpFailure" | "unreadable" | "completionHold" | "refused";
   } = {}) {
     const claim = { ...gitlabClaim(2657), claim_generation: options.legacyGeneration ? 0 : 1,
@@ -483,10 +486,38 @@ describe("RunRunner — M2 explicit park callback", () => {
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-run-"));
     const publish = spyPublish();
     const report = client.reportState.bind(client);
+    const awaitAnswer = SteeringChannel.prototype.awaitAnswer;
+    const lifecycleSignal = SteeringChannel.prototype.lifecycleSignal;
+    let seedWall: (() => void) | undefined;
+    let reconcileInterrupted = false;
+    SteeringChannel.prototype.lifecycleSignal = function() {
+      seedWall = () => this.seedPauseRequested("wall");
+      return lifecycleSignal.call(this);
+    };
+    const interruptReconcile = () => {
+      if (reconcileInterrupted) return;
+      assert.ok(seedWall, "the real callback steering channel is active");
+      reconcileInterrupted = true;
+      seedWall();
+    };
+    let waitEntries = 0;
+    if (options.interruptWait) SteeringChannel.prototype.awaitAnswer = function(questionId) {
+      if (++waitEntries === 1) {
+        this.seedPauseRequested("wall");
+        return Promise.reject(new PauseNowSignal());
+      }
+      return awaitAnswer.call(this, questionId);
+    };
+    const publication = client.publishCheckpoint.bind(client);
+    if (options.publishFailure) client.publishCheckpoint = async (...args) => {
+      await publication(...args);
+      return { ok: false, httpStatus: 500 };
+    };
     const requestPause = client.requestWorkerPause.bind(client);
     const ownership = client.getRunOwnership.bind(client);
     const originalFetch = globalThis.fetch;
     let pauseAttempts = 0;
+    let boundedReads = 0;
     let clonePath: string | undefined;
     const questionBodies: string[] = [];
     client.requestWorkerPause = async (...args) => {
@@ -497,8 +528,11 @@ describe("RunRunner — M2 explicit park callback", () => {
       return ack;
     };
     client.getRunOwnership = async (...args) => {
+      const bounded = !!args[1] && "deadline" in args[1];
+      if (bounded) boundedReads++;
       if (options.failedProbe) throw new TypeError("probe unavailable");
       const own = await ownership(...args);
+      if (bounded && options.interruptReconcile === "ownership") interruptReconcile();
       // Keep the empty-checkpoint seam empty until the sink has declined it.
       if ((options.ownership === "completion" || options.guardedExistingQuestion || ["exhausted", "httpFailure", "unreadable", "completionHold"].includes(options.questionTransport ?? "")) && clonePath) fs.writeFileSync(path.join(clonePath, "DIRTY.txt"), "retained uncommitted work\n");
       return own;
@@ -519,19 +553,26 @@ describe("RunRunner — M2 explicit park callback", () => {
       // Model the API no-write replay response; the real client must retry the exact body.
       return Response.json({ run: { status: "awaiting_input" } });
     };
-    if (options.lostAck) client.reportState = async (...args) => {
+    if (options.lostAck || options.interruptReconcile === "pause_failed") client.reportState = async (...args) => {
       const ack = await report(...args);
-      if (args[1].status === "paused") throw new Error("lost paused ACK");
+      if (args[1].status === "pause_failed") interruptReconcile();
+      if (options.lostAck && args[1].status === "paused") throw new Error("lost paused ACK");
       return ack;
     };
     let result: Awaited<ReturnType<NonNullable<RunContext["requestParkRun"]>>> | undefined;
     let turns = 0;
     let questions = 0;
+    let callbackEntries = 0;
+    let callbackPublications = 0;
+    const questionIds: (string | undefined)[] = [];
+    const timerDelays: number[] = [];
     let callbackReads = 0;
     const clockStart = Date.now();
     api.onState(claim.run_id, (state) => {
       if (state.status !== "awaiting_input") return;
       questions++;
+      questionIds.push(state.open_question_id);
+      if (options.interruptWait && questions === 1) return;
       if (options.deadlineRetry && questions > 1) return;
       const answer = (options.retry || options.deadlineRetry) && questions === 1 ? " /park " : options.answer ?? "repair the checkpoint";
       api.setInputs(claim.run_id, [{
@@ -562,8 +603,24 @@ describe("RunRunner — M2 explicit park callback", () => {
           });
         }
         const readsBefore = api.ownershipRequests.length;
-        try { result = await ctx.requestParkRun!({ completedCount: 1, total: 2 }); }
+        try {
+          callbackEntries++;
+          try { result = await ctx.requestParkRun!({ completedCount: 1, total: 2 }); }
+          catch (error) {
+            if (!options.resumeGuardedWall || !(error instanceof PauseNowSignal)) throw error;
+            api.guardedQuestionStatus = undefined;
+            api.guardedQuestionReason = undefined;
+            api.setWallParkResponse("running", 409);
+            assert.equal(await ctx.parkForWall!({ completedCount: 1, total: 2 }), "refused");
+            ctx.clearWallMode!();
+            if (options.resumeFence === "paused") api.guardedQuestionStatus = "paused";
+            if (options.resumeFence === "foreign") api.parkRunGeneration = 2;
+            callbackEntries++;
+            result = await ctx.requestParkRun!({ completedCount: 1, total: 2 });
+          }
+        }
         finally { callbackReads = api.ownershipRequests.length - readsBefore; }
+        callbackPublications = publish.calls.length;
         if (options.questionTransport === "replay" && result.kind === "answer")
           commitInTree(ctx.worktreePath, "WORK.txt", "work after recovered guidance\n");
         return result.kind === "paused"
@@ -573,26 +630,116 @@ describe("RunRunner — M2 explicit park callback", () => {
     });
     try {
       const { gitlab } = fakeGitlab();
-      const runner = options.deadlineRetry
+      const runner = options.deadlineRetry || options.interruptWait
         ? new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
             pollMs: 5, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
-            now: () => clockStart + questions * 601,
+            now: () => clockStart + (options.interruptWait ? (callbackEntries > 1 ? 200 : 0) : questions * 601),
+            setTimer: (cb, ms) => {
+              timerDelays.push(ms);
+              const timer = setTimeout(cb, ms);
+              timer.unref();
+              return () => clearTimeout(timer);
+            },
           })
         : runnerWithGit(factory, gitlab);
       await runner.execute(claim);
       const workPreserved = !!clonePath && fs.existsSync(path.join(clonePath, "DIRTY.txt")) &&
         fs.existsSync(path.join(homeRoot, claim.run_id));
       return { claim, result, turns, questions, callbackReads, published: publish.calls.length,
-        pauseAttempts, questionBodies, workPreserved };
+        pauseAttempts, boundedReads, questionBodies, workPreserved, callbackEntries, callbackPublications, questionIds, timerDelays };
     } finally {
       client.reportState = report;
+      SteeringChannel.prototype.awaitAnswer = awaitAnswer;
+      SteeringChannel.prototype.lifecycleSignal = lifecycleSignal;
       client.requestWorkerPause = requestPause;
       client.getRunOwnership = ownership;
       globalThis.fetch = originalFetch;
       publish.restore();
+      api.setWallParkResponse("paused", 200);
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
   }
+
+  for (const interruptReconcile of ["pause_failed", "ownership"] as const) {
+    it(`resumes false-pause reconciliation after wall at ${interruptReconcile} without a new attempt`, async () => {
+      const outcome = await exercise({ publishFailure: true, interruptReconcile, resumeGuardedWall: true });
+      assert.equal(outcome.callbackEntries, 2);
+      assert.equal(outcome.pauseAttempts, 1, "a refused wall is not a consumed owner command");
+      assert.equal(outcome.callbackPublications, 2, "one failed pause publication and one wall capture");
+      assert.equal(outcome.boundedReads, 1, "the false pause still requires one bounded diagnostic read");
+      assert.equal(outcome.callbackReads, 2, "one pause diagnostic plus the existing refused-wall probe");
+      assert.equal(outcome.questions, 1);
+      assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    });
+  }
+
+  it("a consumed /park after early reconciliation interruption permits one fresh attempt", async () => {
+    const outcome = await exercise({ empty: true, interruptReconcile: "pause_failed", resumeGuardedWall: true, retry: true });
+    assert.equal(outcome.pauseAttempts, 2);
+    assert.equal(outcome.boundedReads, 1, "the fresh successful pause needs no false-result diagnostic");
+    assert.equal(outcome.questions, 1);
+    assert.deepEqual(outcome.result, { kind: "paused" });
+  });
+
+  for (const resumeFence of ["paused", "foreign"] as const) {
+    it(`early reconciliation continuation cannot authorize a question over ${resumeFence} ownership`, async () => {
+      const outcome = await exercise({ publishFailure: true, interruptReconcile: "ownership", resumeGuardedWall: true, resumeFence });
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.boundedReads, 1);
+      assert.equal(outcome.questions, 0);
+      assert.equal(outcome.result?.kind, resumeFence === "paused" ? "paused" : undefined);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("resumes the failure question after refused wall without another worker pause", async () => {
+    const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true });
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+    assert.equal(outcome.callbackEntries, 2);
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.equal(outcome.questions, 1);
+  });
+
+  for (const resumeFence of ["paused", "foreign"] as const) {
+    it(`pending phase does not authorize a question over ${resumeFence} ownership`, async () => {
+      const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true, resumeFence });
+      assert.equal(outcome.pauseAttempts, 1);
+      assert.equal(outcome.callbackEntries, 2);
+      assert.equal(outcome.questions, 0, "guard still controls question-write authority");
+      assert.equal(outcome.result?.kind, resumeFence === "paused" ? "paused" : undefined);
+      assert.ok(!stateStatuses(outcome.claim.run_id).includes("failed"));
+    });
+  }
+
+  it("cancel settles the resumed failure question without another worker pause", async () => {
+    const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true, cancel: true });
+    assert.deepEqual(outcome.result, { kind: "cancel" });
+    assert.equal(outcome.pauseAttempts, 1);
+  });
+
+  it("retains an interrupted active question ID and absolute deadline on callback re-entry", async () => {
+    const outcome = await exercise({ empty: true, interruptWait: true, resumeGuardedWall: true });
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.equal(outcome.callbackEntries, 2);
+    assert.equal(outcome.questionIds.length, 2);
+    assert.equal(outcome.questionIds[0], outcome.questionIds[1]);
+    assert.deepEqual(outcome.timerDelays, [600, 400]);
+    assert.deepEqual(outcome.result, { kind: "answer", answers: ["repair the checkpoint"] });
+  });
+
+  it("does not republish failed work after a refused wall without a fresh command", async () => {
+    const outcome = await exercise({ publishFailure: true, guardedWall: true, resumeGuardedWall: true });
+    assert.equal(outcome.pauseAttempts, 1);
+    assert.equal(outcome.callbackPublications, 2, "one failed pause publication and one wall capture");
+    assert.equal(outcome.result?.kind, "answer");
+  });
+
+  it("a fresh consumed retry after refused wall authorizes exactly one more attempt", async () => {
+    const outcome = await exercise({ empty: true, guardedWall: true, resumeGuardedWall: true, retry: true });
+    assert.equal(outcome.pauseAttempts, 2);
+    assert.equal(outcome.questions, 1);
+    assert.deepEqual(outcome.result, { kind: "paused" });
+  });
 
   it("parks through the real checkpoint sink without finalizing", async () => {
     const outcome = await exercise();

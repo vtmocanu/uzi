@@ -16031,6 +16031,50 @@ describe("M3 dependency wait Codex", () => {
 });
 
 
+describe("M3 refused wall retains idle park wait", () => {
+  for (const direct of [false, true]) {
+    it(`resumes ${direct ? "exact answer" : "tool"} wait before any provider turn`, async () => {
+      let mode: "wall" | null = null;
+      let entries = 0, primaryQuestions = 0;
+      let resume!: () => void, release!: () => void;
+      const resumed = new Promise<void>(resolve => { resume = resolve; });
+      const answer = new Promise<void>(resolve => { release = resolve; });
+      const rig = makeMultiEpochRig([
+          epochResponder("th-1", "tn-control", (t, th, tn) => {
+            t.push(toolCall(201, direct ? "ask_user" : "park_run",
+              direct ? { questions: [{ question: "Ready?" }] } : {}, th, tn, "park"));
+            t.push(turnCompleted("completed", th, tn));
+          }),
+          epochResponder("th-1", "tn-guidance", (t, th, tn) => {
+            t.push(toolCall(301, "signal_done", {}, th, tn, "done")).push(turnCompleted("completed", th, tn));
+          }),
+        ]);
+        const { ctx } = makeCtx({
+        kind: "issue", parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+        pauseModeRequested: () => mode,
+        askUser: async () => { primaryQuestions++; return { kind: "answer", answers: ["/park"] }; },
+        requestParkRun: async () => {
+          if (++entries === 1) { mode = "wall"; throw new PauseNowSignal(); }
+          resume();
+          await answer;
+          return { kind: "answer", answers: ["Implement the independent slice"] };
+        },
+        parkForWall: async () => "refused",
+        clearWallMode: () => { mode = null; },
+      });
+      const running = makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx);
+      try {
+        const waiting = await Promise.race([resumed.then(() => true), running.then(() => false)]);
+        assert.equal(waiting, true, "must resume the idle callback, not the provider");
+        assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0), 1);
+        assert.equal(primaryQuestions, direct ? 1 : 0, "consumed primary question is not repeated");
+      } finally { release(); await running; }
+      assert.equal(entries, 2, "callback re-entry resumes the worker-owned question phase");
+      assert.equal(rig.epochs.reduce((n, e) => n + e.transport.turnStartCount, 0), 2, "guidance resumes provider exactly once");
+    });
+  }
+});
+
 describe("M3 idle park lifecycle precedence", () => {
   for (const direct of [false, true]) {
     for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {

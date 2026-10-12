@@ -2870,6 +2870,45 @@ export class SdkExecutor implements Executor {
         // On a park take, break; else (the checkpoint could not be published, so the server
         // cleared the request) CONTINUE — the aborted turn restarts on the next iteration, exactly
         // as a cancelled-then-revised turn does. A non-pause error rethrows to the normal path.
+        // Both provider interruptions and idle park waits use the same lifecycle precedence.
+        const handlePauseNow = async (at: { completedCount: number; total?: number }): Promise<boolean> => {
+          if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+          throwIfDiskStop(ctx);
+          if (ctx.pauseModeRequested?.() === "wall") {
+            if (completionAttempted && await routeCompletionHold(ctx, REASON_WALL, completionAttempted)) {
+              completionHeld = { reason: REASON_WALL };
+              return true;
+            }
+            const outcome = await this.parkForWall(ctx, at);
+            if (outcome === "parked" || outcome === "undeliverable") {
+              walled = { reason: REASON_WALL };
+              return true;
+            }
+            if (outcome === "cancelled" || ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
+            if (outcome === "refused") ctx.clearWallMode?.();
+          } else if (await this.requestPause(ctx, at)) {
+            pausedAt = at;
+            return true;
+          }
+          state.tripReason = undefined;
+          throwIfDiskStop(ctx);
+          return false;
+        };
+        const requestPark: NonNullable<RunContext["requestParkRun"]> = async (at) => {
+          const step = await this.runThroughSwitch(ctx, state, async () => {
+            // Re-entry resumes the runner's pending question, with its original deadline.
+            // Only a settled owner answer permits another attempt; lifecycle refusals keep waiting.
+            for (;;) {
+              try { return await ctx.requestParkRun!(at); }
+              catch (error) {
+                if (!(error instanceof PauseNowSignal)) throw error;
+                if (await handlePauseNow(at)) return { kind: "paused" } as const;
+              }
+            }
+          });
+          if ("released" in step) { switchReleased = true; return { kind: "paused" }; }
+          return step.value;
+        };
         let turn: TurnResult;
         try {
           turn = await turnPromise;
@@ -2911,9 +2950,8 @@ export class SdkExecutor implements Executor {
             if (!parkRunEnabled(ctx, "implement") || !ctx.requestParkRun) throw new Error("illicit park_run signal");
             if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
             // The worker callback owns explicit owner retries and their absolute deadline.
-            const parkStep = await this.runThroughSwitch(ctx, state, () => ctx.requestParkRun!(parkAt));
-            if ("released" in parkStep) { switchReleased = true; break; }
-            const disposition = parkStep.value;
+            const disposition = await requestPark(parkAt);
+            if (switchReleased || walled || completionHeld || pausedAt) break;
             if (disposition.kind === "paused") { pausedAt = parkAt; break; }
             if (disposition.kind === "cancel") throw new PlanRejectedError("run cancelled while awaiting clarification");
             followUp = disposition.answers.join("\n") + "\n\n" + (parkRunEnabled(ctx, "implement") ? PARK_RUN_CONTINUATION : "");
@@ -2947,13 +2985,14 @@ export class SdkExecutor implements Executor {
             // "gave_up" re-presents the question on the OLD token (runThroughSwitch re-runs
             // askUserOrContinue — keep waiting), never a terminal failure.
             const askStep = await this.runThroughSwitch(ctx, state, () =>
-              this.askUserOrContinue(ctx, asked, budget.asked, parkAt),
+              this.askUserOrContinue(ctx, asked, budget.asked, parkAt, requestPark),
             );
             if ("released" in askStep) {
               switchReleased = true;
               break;
             }
             const verdict = askStep.value;
+            if (switchReleased || walled || completionHeld || pausedAt) break;
             if (verdict.runPaused) { pausedAt = parkAt; break; }
             if (verdict.parked) {
               budget.asked += verdict.questionsUsed ?? 1;
@@ -3006,65 +3045,11 @@ export class SdkExecutor implements Executor {
             throw err;
           }
           if (err instanceof PauseNowSignal) {
-            if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
             const at = {
-              // The server's fresh completed count off THIS iteration's ACK, matching the
-              // loop-top branch; fall back to the worker's own live progress if the ACK carried
-              // none (e.g. a run with no reportIteration budget).
-              completedCount:
-                served?.completedCount ?? latestProgress?.completed.length ?? 0,
+              completedCount: served?.completedCount ?? latestProgress?.completed.length ?? 0,
               total: frozenMilestones?.length,
             };
-            // PRD #1809 D4 (hard layer): a worker-local `disk` stop rides the same PauseNowSignal.
-            // It is not an owner pause and never a completion hold: the runner reaps the tree,
-            // captures what is committed and parks the run (data_volume_full, counted).
-            throwIfDiskStop(ctx);
-            // PRD #1497 M2: a `wall` pause (the sweep's system-authored wall-clock park) rides the
-            // SAME PauseNowSignal that drops the turn but carries no mode; branch on getPauseMode.
-            if (ctx.pauseModeRequested?.() === "wall") {
-              // D6/D14: the completion hold WINS the race. A `wall` pause arriving after the FIRST
-              // completion attempt routes to routeCompletionHold FIRST and never reaches the wall
-              // seam — the completion hold's server write (SetRunCompletionHold) settles both the
-              // wall columns and the wall input. routeCompletionHold returns true only when the hold
-              // was entered; false (no attempt yet, or the hold could not enter) falls through to the
-              // wall seam so the wall NEVER becomes a terminal failure (D2/D17).
-              if (
-                completionAttempted &&
-                (await routeCompletionHold(ctx, REASON_WALL, completionAttempted))
-              ) {
-                completionHeld = { reason: REASON_WALL };
-                break;
-              }
-              const outcome = await this.parkForWall(ctx, at);
-              if (outcome === "parked" || outcome === "undeliverable") {
-                walled = { reason: REASON_WALL };
-                break;
-              }
-              if (outcome === "cancelled") throw new Error(REASON_CANCELLED);
-              // "refused" (the owner extended) / "undefined" (no seam wired): the run CONTINUES.
-              // Clear the sticky wall mode on a refusal, then restart the aborted turn (the
-              // declined-`now` path below): the wall lifts from the next reportIteration's total.
-              if (outcome === "refused") ctx.clearWallMode?.();
-              state.tripReason = undefined;
-              throwIfDiskStop(ctx);
-              continue;
-            }
-            if (await this.requestPause(ctx, at)) {
-              pausedAt = at;
-              break;
-            }
-            // The checkpoint could not be published (Decision 8): the server cleared the request
-            // and the run CONTINUES. Clear the sticky REASON_PAUSE_NOW trip so the restarted turn
-            // is not immediately re-thrown by driveTurn's top guard — the shared cancel controller
-            // stays aborted, but its onSignal is once:true and already fired, and each turn gets a
-            // fresh currentAbort, so the next turn runs cleanly. The consumed controller can no
-            // longer deliver a later steering signal, so both are re-checked WITHOUT it (PRD #1190
-            // rework N2): a cancel arriving after this point is honored by the loop-top cancel
-            // re-check (ctx.cancelRequested) on the next iteration, and a SECOND `now` pause drops
-            // the restarted turn via the re-armable ctx.onPauseNow interrupt (which trips this same
-            // REASON_PAUSE_NOW). Both were silently dropped before this rework.
-            state.tripReason = undefined;
-            throwIfDiskStop(ctx);
+            if (await handlePauseNow(at)) break;
             continue;
           }
           // PRD #1226 M3 (D3): a POST-attempt WALL/IDLE trip routes to the completion hold (M4)
@@ -3927,6 +3912,7 @@ export class SdkExecutor implements Executor {
     questions: AskUserQuestion[],
     questionsAsked: number,
     parkAt?: { completedCount: number; total?: number },
+    requestPark = ctx.requestParkRun,
   ): Promise<{ parked: boolean; runPaused?: boolean; cancelled?: boolean; questionsUsed?: number; followUp: string }> {
     const headers = questions.map((q) => q.header || q.question).join("; ");
     if (!ctx.askUser) {
@@ -3952,8 +3938,8 @@ export class SdkExecutor implements Executor {
     const questionsUsed = 1;
     // Only a validated answer to an active implementation question is a command.
     // The worker callback consumes owner retries internally; only the model question uses budget.
-    if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && ctx.requestParkRun) {
-      const disposition = await ctx.requestParkRun(parkAt);
+    if (parkAt && parkRunEligible(ctx, "implement") && isParkAnswer(verdict) && requestPark) {
+      const disposition = await requestPark(parkAt);
       if (disposition.kind === "paused") return { parked: true, runPaused: true, followUp: "" };
       if (disposition.kind === "cancel") return { parked: true, cancelled: true, followUp: "" };
       verdict = disposition;

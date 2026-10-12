@@ -6682,6 +6682,50 @@ describe("M3 dependency wait Claude", () => {
 });
 
 
+describe("M3 refused wall retains idle park wait", () => {
+  for (const direct of [false, true]) {
+    for (const interruption of ["wall", "credential"] as const) {
+      it(`resumes ${direct ? "exact answer" : "tool"} ${interruption} wait before any provider turn`, async () => {
+        let mode: "wall" | null = null;
+        let entries = 0, primaryQuestions = 0;
+        let resume!: () => void, release!: () => void;
+        const resumed = new Promise<void>(resolve => { resume = resolve; });
+        const answer = new Promise<void>(resolve => { release = resolve; });
+        const park = { type: "assistant", session_id: "sess-1", message: { content: [
+          { type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} },
+        ] } } as unknown as SDKMessage;
+        const script = fakeTurns([[direct ? askUserTurn("Ready?") : park, resultSuccess()], [signalDone(), resultSuccess()]]);
+        const probe = makeCtx({ planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+          kind: "issue", parkRunSupported: true, config: { max_iterations: 1, question_max: 1 },
+          pauseModeRequested: () => mode,
+          askUser: async () => { primaryQuestions++; return { kind: "answer", answers: ["/park"] }; },
+          requestParkRun: async () => {
+            if (++entries === 1) {
+              if (interruption === "credential") throw new CredentialSwitchSignal();
+              mode = "wall"; throw new PauseNowSignal();
+            }
+            resume();
+            await answer;
+            return { kind: "answer", answers: ["Implement the independent slice"] };
+          },
+          attemptCredentialSwitch: async () => "gave_up",
+          parkForWall: async () => "refused",
+          clearWallMode: () => { mode = null; },
+        });
+        const running = new SdkExecutor(nullLogger(), homeDir, { queryFn: script.queryFn }).run(probe.ctx);
+        try {
+          const waiting = await Promise.race([resumed.then(() => true), running.then(() => false)]);
+          assert.equal(waiting, true, "must resume the idle callback, not the provider");
+          assert.equal(script.turns.length, 1);
+          assert.equal(primaryQuestions, direct ? 1 : 0, "consumed primary question is not repeated");
+        } finally { release(); await running; }
+        assert.equal(entries, 2, "callback re-entry resumes the worker-owned question phase");
+        assert.equal(script.turns.length, 2, "guidance resumes provider exactly once");
+      });
+    }
+  }
+});
+
 describe("M3 idle park lifecycle precedence", () => {
   for (const direct of [false, true]) {
     for (const control of ["post-attempt", "pre-attempt", "cancel"] as const) {
