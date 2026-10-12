@@ -210,15 +210,5 @@ type RollEvidence struct {
 	ValidUntil         time.Time  `json:"valid_until"`
 }
 
-// Pacing is separate from the pod-derived phase. Persistence and production
-// of these observations belong to subsequent milestones.
-type Pacing struct {
-	State            string  `json:"state"`
-	TargetImage      string  `json:"target_image"`
-	TargetVersion    string  `json:"target_version"`
-	CanaryID         *string `json:"canary_id,omitempty"`
-	BlockingWorkerID *string `json:"blocking_worker_id,omitempty"`
-	BlockingReason   *string `json:"blocking_reason,omitempty"`
-	RetainedImage    *string `json:"retained_image,omitempty"`
-	RetainedVersion  *string `json:"retained_version,omitempty"`
-}
+// Pacing is separate from the pod-derived phase.
+type Pacing = workersvc.PacingReport

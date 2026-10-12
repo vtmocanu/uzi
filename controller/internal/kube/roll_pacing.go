@@ -9,6 +9,7 @@ import (
 	"sort"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	appsv1 "k8s.io/api/apps/v1"
 	corev1 "k8s.io/api/core/v1"
@@ -221,9 +222,11 @@ func pacingText(s string) *string {
 		}
 		return r
 	}, s)
-	runes := []rune(s)
-	if len(runes) > 192 {
-		s = string(runes[:192])
+	if len(s) > 192 {
+		s = s[:192]
+		for !utf8.ValidString(s) {
+			s = s[:len(s)-1]
+		}
 	}
 	return &s
 }

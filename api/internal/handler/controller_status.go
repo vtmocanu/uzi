@@ -124,7 +124,14 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 				"worker_id", ws.ID, "phase", sanitizeSelfReported(ws.Phase, maxSelfReportedBytes))
 			continue
 		}
+		pacing, err := workersvc.NormalizePacingReport(ws.Pacing)
+		if err != nil {
+			dropped++
+			continue
+		}
 		n, err := h.wsvc.RecordRollHealth(r.Context(), workersvc.RollHealthReport{
+			Kind:                 req.Kind,
+			Pacing:               pacing,
 			WorkerID:             id,
 			Phase:                ws.Phase,
 			PhaseSince:           ws.PhaseSince,

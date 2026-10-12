@@ -1550,4 +1550,6 @@ type WorkerUpgradeReport struct {
 	WorkerImageTag       pgtype.Text        `json:"worker_image_tag"`
 	CreatedAt            pgtype.Timestamptz `json:"created_at"`
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
+	Pacing               []byte             `json:"pacing"`
+	PacingObservedAt     pgtype.Timestamptz `json:"pacing_observed_at"`
 }

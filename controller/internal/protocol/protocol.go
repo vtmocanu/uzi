@@ -232,8 +232,8 @@ type RollEvidence struct {
 	ValidUntil         time.Time  `json:"valid_until"`
 }
 
-// Pacing is separate from the pod-derived phase. Persistence and production
-// of these observations belong to subsequent milestones.
+// Pacing is a receipt-timed API diagnostic separate from the pod-derived phase.
+// The controller derives admission from Kubernetes and registration evidence.
 type Pacing struct {
 	State            string  `json:"state"`
 	TargetImage      string  `json:"target_image"`
