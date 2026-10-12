@@ -6,7 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { dependencyWaitQuestion, dependencyWaitAnswer, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import { realProcfsSkip } from "./real-procfs.js";
-import { commitDependencySlice, exerciseDependencyWaitRunner } from "./dependency-wait-runner-fixture.js";
+import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
 
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
@@ -6572,6 +6572,24 @@ describe("SdkExecutor wall default", () => {
     assert.ok(timer.mock.calls.some((call) => call.arguments[1] === 6 * 60 * 60 * 1000),
       "the run wall watchdog must arm with the server's six-hour default");
   });
+});
+
+describe("M1 expired wall physical Claude runner", () => {
+  for (const boundary of ["pause", "fallback"] as const) {
+    it(`wall_expired ${boundary} ACK reaches real wall park`, { timeout: 20_000 }, async () => {
+      let calls = 0;
+      await exerciseExpiredWallRunner(boundary, (_ctx, home) => {
+        const queryFn: SdkQueryFn = () => (async function* () {
+          assert.equal(++calls, 1, "wall ACK cannot start another provider turn");
+          yield { type: "assistant", session_id: "sess-1",
+            message: { content: [{ type: "tool_use", id: "park", name: "mcp__uzi__park_run", input: {} }] } } as unknown as SDKMessage;
+          yield resultSuccess();
+        })();
+        return new SdkExecutor(nullLogger(), home, { queryFn, installDeps: async () => ({ results: [], truncated: false }) });
+      });
+      assert.equal(calls, 1);
+    });
+  }
 });
 
 describe("M4 dependency wait physical Claude runner", () => {

@@ -2,7 +2,7 @@ import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-cloc
 import { describe, it, mock } from "node:test";
 import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
-import { commitDependencySlice, exerciseDependencyWaitRunner } from "./dependency-wait-runner-fixture.js";
+import { commitDependencySlice, exerciseDependencyWaitRunner, exerciseExpiredWallRunner } from "./dependency-wait-runner-fixture.js";
 import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
@@ -16227,6 +16227,28 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
     assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
   });
+});
+
+describe("M1 expired wall physical Codex runner", () => {
+  for (const boundary of ["pause", "fallback"] as const) {
+    it(`wall_expired ${boundary} ACK reaches real wall park`, { timeout: 20_000 }, async () => {
+      let calls = 0;
+      await exerciseExpiredWallRunner(boundary, (_ctx, home) => {
+        const rig = makeRig({ responder: c => {
+          if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+          if (c.method !== "turn/start") return {};
+          assert.equal(++calls, 1, "wall ACK cannot start another provider turn");
+          c.transport.push(toolCall(401, "park_run", {}, "th-1", "tn-expired-wall", "park"));
+          c.transport.push(turnCompleted("completed", "th-1", "tn-expired-wall"));
+          return { turn: { id: "tn-expired-wall" } };
+        } });
+        return new CodexExecutor(noopLog, home,
+          { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+          { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+      });
+      assert.equal(calls, 1);
+    });
+  }
 });
 
 describe("M4 dependency wait physical Codex runner", () => {

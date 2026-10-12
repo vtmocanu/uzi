@@ -11043,7 +11043,7 @@ export class RunRunner {
           if (ack.credentialSwitch) steering.tripCredentialSwitch(ack.credentialSwitch.generation);
           if (ack.status === "paused" && ack.holdReason === "budget_exhausted") throw new ServerWallParkedError();
           if (ack.staleClaim || ack.credentialSwitchReleased) throw new StaleClaimError();
-          if (ack.reason === "wall_pending") steering.seedPauseRequested("wall");
+          if (ack.reason === "wall_pending" || ack.reason === "wall_expired") steering.seedPauseRequested("wall");
           checkLifecycle();
         };
         if (resolveRunKind(claim.kind) !== "issue" || claim.interactive ||
@@ -17032,12 +17032,15 @@ export class RunRunner {
       this.openQuestionIds.set(runId, questionId);
     }
 
-    batcher.emit({
+    const emitQuestion = () => batcher.emit({
       kind: "question",
       agent: emitAgent,
       payload: { question_id: questionId, questions, ...extraPayload },
     });
-    // Durable before the park is announced — see the doc comment.
+    // Guarded park fallback questions become visible only after the running-state
+    // transition is accepted; a wall refusal must not publish an unanswerable question.
+    if (!options.requireRunning) emitQuestion();
+    // Flush existing messages before the state request; unguarded questions are included.
     await batcher.flush().catch(() => undefined);
 
     // Read the ACK, and read it the way PRD #35 established for its own park:
@@ -17083,7 +17086,7 @@ export class RunRunner {
     if (options.requireRunning && parked === undefined) throw new RetainedRecoveryStop();
     if (parked !== "awaiting_input" || (options.requireRunning && !(ack as StateAck).applied)) {
       this.openQuestionIds.delete(runId);
-      if (options.requireRunning && (ack as StateAck).reason === "wall_pending") {
+      if (options.requireRunning && ((ack as StateAck).reason === "wall_pending" || (ack as StateAck).reason === "wall_expired")) {
         steering.seedPauseRequested("wall");
         throw new PauseNowSignal();
       }
@@ -17096,6 +17099,10 @@ export class RunRunner {
       throw new TrustedExecutionRefusal(
         `${REASON_QUESTION_NOT_PARKED} (server reports ${parked ?? "an unreadable status"})`,
       );
+    }
+    if (options.requireRunning) {
+      emitQuestion();
+      await batcher.flush().catch(() => undefined);
     }
     runLog.info("clarification: awaiting answer", {
       run_id: runId,
