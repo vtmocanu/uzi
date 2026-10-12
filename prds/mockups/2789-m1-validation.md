@@ -10,14 +10,15 @@ Reviewer, tester and auditor scoped source reviews returned clean at this head a
 
 Every break used a fresh git archive of the exact code SHA under the worker scratch directory, with the identical provisioned web package lock/dependencies. The canonical worktree and its tests were never mutated. Each counted break passed npm run typecheck (exit 0), then a focused Vitest selection failed (exit 1) with named assertions. The unmodified selection passed (exit 0).
 
-A temporary AST-based collector in the exports wrapped existing assertion statements in try/catch solely to collect all failing predicates; an afterEach hook failed the test when any original assertion failed. The assertion conditions stayed unchanged. Canonical fail-fast suites were also run separately. This avoids counting a test's first failure as evidence for later assertions that never executed.
+A temporary AST-based collector in the exports wrapped existing assertion statements in try/catch solely to collect all failing predicates; each caught predicate failure recorded an expect.soft failure immediately. Normal cleanup hooks were left unchanged; no throwing afterEach collector was used. The assertion conditions stayed unchanged. Canonical fail-fast suites were also run separately. This avoids counting a test's first failure as evidence for later assertions that never executed.
 
-The failed experiment that made the fallback branch statically false did not typecheck and was excluded; its corrected dynamic wrong-destination break is counted. A bad excerpt anchor stopped one pass, and four budget-page assertions required broadening the selection; neither incomplete pass was claimed complete. Final proof: 37 valid breaks; 65 replacement assertions covered, no uncovered inventory entries.
+The earlier throwing-afterEach evidence was invalidated by the tester because it prevented cleanup; all coverage maps were discarded and all 37 breaks rerun using the corrected method. The failed experiment that made the fallback branch statically false did not typecheck and was excluded; its corrected dynamic wrong-destination break is counted. A bad excerpt anchor stopped one pass, and four budget-page assertions required broadening the selection; neither incomplete pass was claimed complete. Final proof: 37 valid breaks; 65 replacement assertions covered, no uncovered inventory entries.
 
 Selected commands: npm run typecheck; npm exec -- vitest run <the affected count, row, attribution, preference, control, summary and stage files> -t <the named M1/legacy suites>. Tests used TZ=UTC, Node 24 and Vitest 4. The selection explicitly includes RunView's progress-card page cases; it does not run the full web suite per mutant.
 
 | Deliberate break | Typecheck | Focused test |
 | --- | --- | --- |
+| count-offset | 0 | 1 (expected failure) |
 | unreported-positive | 0 | 1 (expected failure) |
 | unreported-negative | 0 | 1 (expected failure) |
 | count-foreign-members | 0 | 1 (expected failure) |
@@ -25,6 +26,9 @@ Selected commands: npm run typecheck; npm exec -- vitest run <the affected count
 | mark-in-progress | 0 | 1 (expected failure) |
 | mark-unattached-negative | 0 | 1 (expected failure) |
 | fallback-sibling-negative | 0 | 1 (expected failure) |
+| fallback-first-positive | 0 | 1 (expected failure) |
+| rows-missing | 0 | 1 (expected failure) |
+| rows-duplicate | 0 | 1 (expected failure) |
 | track-accessibility | 0 | 1 (expected failure) |
 | track-titles | 0 | 1 (expected failure) |
 | activity-label | 0 | 1 (expected failure) |
@@ -41,7 +45,6 @@ Selected commands: npm run typecheck; npm exec -- vitest run <the affected count
 | activity-clean-label | 0 | 1 (expected failure) |
 | preference-absence | 0 | 1 (expected failure) |
 | summary-collapse-body | 0 | 1 (expected failure) |
-| fallback-first-positive | 0 | 1 (expected failure) |
 | summary-collapse-excerpt | 0 | 1 (expected failure) |
 | summary-collapse-persistence | 0 | 1 (expected failure) |
 | summary-expanded-body | 0 | 1 (expected failure) |
@@ -52,9 +55,6 @@ Selected commands: npm run typecheck; npm exec -- vitest run <the affected count
 | control-owner-terminal | 0 | 1 (expected failure) |
 | control-busy | 0 | 1 (expected failure) |
 | stage-prototype | 0 | 1 (expected failure) |
-| count-offset | 0 | 1 (expected failure) |
-| rows-missing | 0 | 1 (expected failure) |
-| rows-duplicate | 0 | 1 (expected failure) |
 
 ## Exhaustive changed-assertion inventory
 
@@ -88,18 +88,18 @@ expect(screen.queryByText("Body plan.")).toBeNull();
 expect(screen.queryByText("Body delta.")).toBeNull();
 ```
 
-- web/src/pages/RunView.test.tsx:834 failed under sanitizer-inert-reversal, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:834 failed under summary-expanded-body; unmodified selection passed.
 - web/src/pages/RunView.test.tsx:835 failed under summary-expanded-body; unmodified selection passed.
 - web/src/pages/RunView.test.tsx:836 failed under summary-expanded-body; unmodified selection passed.
 - web/src/pages/RunView.test.tsx:837 failed under summary-expanded-body; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:839 failed under summary-collapse-body, summary-collapse-excerpt; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:840 failed under summary-collapse-body; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:841 failed under summary-collapse-body; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:842 failed under summary-collapse-body; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:846 failed under summary-collapse-body, summary-collapse-excerpt; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:847 failed under summary-collapse-body, summary-collapse-persistence; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:848 failed under summary-collapse-body, summary-collapse-persistence; unmodified selection passed.
-- web/src/pages/RunView.test.tsx:849 failed under summary-collapse-body, summary-collapse-persistence; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:839 failed under summary-collapse-body, summary-collapse-excerpt, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:840 failed under summary-collapse-body, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:841 failed under summary-collapse-body, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:842 failed under summary-collapse-body, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:846 failed under summary-collapse-body, summary-collapse-excerpt, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:847 failed under summary-collapse-body, summary-collapse-persistence, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:848 failed under summary-collapse-body, summary-collapse-persistence, summary-expanded-body; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:849 failed under summary-collapse-body, summary-collapse-persistence, summary-expanded-body; unmodified selection passed.
 
 ### M1-A02 — web/src/pages/RunView.test.tsx
 
@@ -174,7 +174,7 @@ New:
 expect(screen.getByText("0 of 4 reported complete")).toBeTruthy();
 ```
 
-- web/src/pages/RunView.test.tsx:5689 failed under count-offset, unreported-negative; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:5689 failed under count-offset; unmodified selection passed.
 
 ### M1-A06 — web/src/pages/RunView.test.tsx
 
@@ -228,7 +228,7 @@ New:
 expect(screen.getByText("2 of 3 reported complete")).toBeTruthy();
 ```
 
-- web/src/pages/RunView.test.tsx:5736 failed under count-foreign-members; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:5736 failed under count-offset, count-foreign-members; unmodified selection passed.
 
 ### M1-A09 — web/src/pages/RunView.test.tsx
 
@@ -267,7 +267,7 @@ New:
 expect(screen.getByText("0 of 3 reported complete")).toBeTruthy();
 ```
 
-- web/src/pages/RunView.test.tsx:5754 failed under count-offset, unreported-negative; unmodified selection passed.
+- web/src/pages/RunView.test.tsx:5754 failed under count-offset; unmodified selection passed.
 
 ### M1-A11 — web/src/pages/RunView.baseline.test.tsx
 
@@ -289,8 +289,8 @@ expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByText("co
 ```
 
 - web/src/pages/RunView.baseline.test.tsx:169 failed under mark-in-progress, rows-missing, row-id; unmodified selection passed.
-- web/src/pages/RunView.baseline.test.tsx:171 failed under mark-in-progress, fallback-sibling-negative, rows-missing, row-id; unmodified selection passed.
-- web/src/pages/RunView.baseline.test.tsx:172 failed under mark-in-progress, rows-missing, row-id, fallback-first-positive; unmodified selection passed.
+- web/src/pages/RunView.baseline.test.tsx:171 failed under fallback-sibling-negative, rows-missing, row-id; unmodified selection passed.
+- web/src/pages/RunView.baseline.test.tsx:172 failed under fallback-first-positive, rows-missing, row-id; unmodified selection passed.
 
 ### M1-A12 — web/src/pages/RunView.nowline.test.tsx
 
@@ -326,7 +326,7 @@ New:
 expect(screen.queryByLabelText("in progress")).toBeNull();
 ```
 
-- web/src/pages/RunView.nowline.test.tsx:132 failed under mark-unattached-negative, fallback-sibling-negative, activity-label, row-id, fallback-first-positive; unmodified selection passed.
+- web/src/pages/RunView.nowline.test.tsx:132 failed under mark-unattached-negative; unmodified selection passed.
 
 ### M1-A14 — web/src/pages/RunView.nowline.test.tsx
 
@@ -344,7 +344,7 @@ New:
 expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByLabelText("in progress")).toBeTruthy();
 ```
 
-- web/src/pages/RunView.nowline.test.tsx:145 failed under mark-in-progress, mark-unattached-negative, fallback-sibling-negative, rows-missing, activity-label, row-id, fallback-first-positive; unmodified selection passed.
+- web/src/pages/RunView.nowline.test.tsx:145 failed under mark-in-progress, rows-missing, row-id; unmodified selection passed.
 
 ### M1-A15 — web/src/pages/RunView.nowline.test.tsx
 
@@ -365,9 +365,9 @@ expect(within(screen.getByText("m3").closest("li") as HTMLElement).queryByText("
 expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByText("coder")).toBeTruthy();
 ```
 
-- web/src/pages/RunView.nowline.test.tsx:183 failed under mark-in-progress, mark-unattached-negative, fallback-sibling-negative, rows-missing, activity-label, row-id, fallback-first-positive; unmodified selection passed.
-- web/src/pages/RunView.nowline.test.tsx:184 failed under mark-in-progress, mark-unattached-negative, fallback-sibling-negative, rows-missing, activity-label, row-id, fallback-first-positive; unmodified selection passed.
-- web/src/pages/RunView.nowline.test.tsx:185 failed under mark-in-progress, mark-unattached-negative, fallback-sibling-negative, rows-missing, activity-label, row-id, fallback-first-positive; unmodified selection passed.
+- web/src/pages/RunView.nowline.test.tsx:183 failed under mark-in-progress, rows-missing, row-id; unmodified selection passed.
+- web/src/pages/RunView.nowline.test.tsx:184 failed under fallback-sibling-negative, rows-missing, row-id; unmodified selection passed.
+- web/src/pages/RunView.nowline.test.tsx:185 failed under fallback-first-positive, rows-missing, row-id; unmodified selection passed.
 
 ### M1-A16 — web/src/pages/RunView.budget.test.tsx
 
@@ -472,7 +472,7 @@ New:
 expect(cur.textContent).toBe(`phase: ${phase}`);
 ```
 
-- web/src/components/RunProgressCard.test.tsx:103 failed under count-offset, rows-missing, phase-text; unmodified selection passed.
+- web/src/components/RunProgressCard.test.tsx:103 failed under rows-missing, phase-text; unmodified selection passed.
 
 ### M1-A20 — web/src/components/RunProgressCard.test.tsx
 
@@ -490,7 +490,7 @@ New:
 expect(within(cur).queryByText(/phase: (review|validate|implement)/)?.textContent).toBe(`phase: ${phase}`);
 ```
 
-- web/src/components/RunProgressCard.test.tsx:105 failed under count-offset, rows-missing, phase-text; unmodified selection passed.
+- web/src/components/RunProgressCard.test.tsx:105 failed under rows-missing, phase-text; unmodified selection passed.
 
 ### M1-A21 — web/src/components/RunProgressCard.test.tsx
 
@@ -511,7 +511,7 @@ expect(screen.queryByText(/phase: implement/)).toBeNull();
 ```
 
 - web/src/components/RunProgressCard.test.tsx:113 failed under unknown-phase-negative; unmodified selection passed.
-- web/src/components/RunProgressCard.test.tsx:114 failed under count-offset, phase-text, unknown-phase-negative; unmodified selection passed.
+- web/src/components/RunProgressCard.test.tsx:114 failed under unknown-phase-negative; unmodified selection passed.
 
 ### M1-A22 — web/src/components/RunProgressCard.test.tsx
 
@@ -606,7 +606,7 @@ expect(container.querySelector("[data-progress-pct]")).toBeNull();
 ```
 
 - web/src/components/RunProgressCard.test.tsx:259 failed under rows-missing, rows-duplicate; unmodified selection passed.
-- web/src/components/RunProgressCard.test.tsx:260 failed under count-offset, missing-percent-negative; unmodified selection passed.
+- web/src/components/RunProgressCard.test.tsx:260 failed under count-offset; unmodified selection passed.
 - web/src/components/RunProgressCard.test.tsx:261 failed under missing-percent-negative; unmodified selection passed.
 
 ### M1-A27 — web/src/components/RunProgressCard.test.tsx
@@ -666,7 +666,7 @@ New:
 expect(screen.getByRole("img").getAttribute("aria-label")).toContain(`active milestone: ${clean}`);
 ```
 
-- web/src/components/RunProgressCard.test.tsx:320 failed under missing-percent-negative, hint-tooltip, sanitizer-inert-reversal, active-track-title; unmodified selection passed.
+- web/src/components/RunProgressCard.test.tsx:320 failed under sanitizer-inert-reversal, active-track-title; unmodified selection passed.
 
 ### M1-A30 — web/src/components/RunProgressCard.test.tsx
 
@@ -702,7 +702,7 @@ New:
 expect(screen.getByRole("img").getAttribute("aria-label")).toContain("active milestone: ghost");
 ```
 
-- web/src/components/RunProgressCard.test.tsx:343 failed under rows-missing, rows-duplicate, track-titles, activity-label, row-tooltip, missing-percent-negative, hint-tooltip, sanitizer-inert-reversal, segment-visible-copy, active-track-title, activity-clean-label; unmodified selection passed.
+- web/src/components/RunProgressCard.test.tsx:343 failed under sanitizer-inert-reversal, active-track-title; unmodified selection passed.
 
 ### M1-A32 — web/src/lib/prefs.test.ts
 
@@ -781,6 +781,9 @@ expect(summaryCollapse.getCollapsed("run-1")).toBeUndefined();
 - RunView reported-count tooltip case: neutral locator M–/4 -> – of 4 reported; zero locator M0/4 -> 0 of 4 reported complete. The unchanged title predicates separately failed under tooltip-neutral and tooltip-zero, with unmodified success.
 - Row-only checklist renders/imports -> production MilestoneRows in RunView attribution, baseline and nowline suites; count and combined-surface cases -> production RunProgressCard. No fabricated checklist header or fake button was introduced. Unchanged attribution/sanitisation predicates were retained; owner-dedup, repeated-role and sanitizer-inert-reversal breaks detected their corresponding failures.
 
+Historical setup-only worker record (its no-mutation wording describes that earlier delegation, not the completed proof above):
+
+
 Scope: only the five authorized test paths; RunView.test.tsx edits only inside RunSummary (PRD #362 M4). No production edits, commits, installs, full suites, gates, builds, or mutation proof. This maintains seeded behavior; no milestone completion is claimed. M2/M3 product hardening and new scenarios remain pending.
 
 ## Every assertion / selector migration
@@ -841,7 +844,7 @@ Combined affected-scope evidence: 119 passing tests (18 prefs + 48 SteerQueueCar
 
 ## Gate failure comparison and remaining integration work
 
-The first full web gate on 986e2178 returned exit 201: 19 failed, 6625 passed. Its five failing files concerned the seeded prototype's controls and summary preference/body defaults. A narrowed equivalent selection failed five tests on that candidate and passed six on default-branch base 2bf9a00e (same lockfile, dependencies and TZ). These were task-owned branch regressions, not unrelated failures. Test-only maintenance preserved the behaviors on the already-seeded components. The final full gate must pass before M1 is marked complete.
+The first full web gate on 986e2178 returned exit 201: 19 failed, 6625 passed. Its five failing files concerned the seeded prototype's controls and summary preference/body defaults. A narrowed equivalent selection failed five tests on that candidate and passed six on default-branch base 2bf9a00e (same lockfile, dependencies and TZ). These were task-owned branch regressions, not unrelated failures. Test-only maintenance preserved the behaviors on the already-seeded components. The final full task gate:web passed at b05cc1b7 (source identical to the code SHA above), exit 0, including browser tests (14 tests across four files). Repo and bundler gates remain pending.
 
 Focused lead checks passed, including 34 stage/row regressions and the docs-mirror drift test with -count=1; gofmt -l returned no paths for the four comment-only Go files. Later full-gate results supersede focused totals rather than implying those totals were full-suite results.
 
