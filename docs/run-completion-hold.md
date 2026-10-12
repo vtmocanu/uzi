@@ -209,8 +209,12 @@ something goes wrong or a human has touched the request in between:
   created or adopted, uzi reads its actual title and retitles it if it
   closes the issue. If the title can't be read, can't be updated, or still
   closes after re-reading, the run fails closed; the request stays open and
-  must not be merged as-is. Runs without a declaration, including owner-partial
-  and scope-capped ones, keep today's title and commit behaviour.
+  must not be merged as-is. Owner-partial and scope-capped deliveries get the
+  same title neutralisation and fail-closed title confirmation, because they
+  never close their issue either. Only declared runs get the commit-message
+  refusal, so on those partial runs a closing keyword in a commit message can
+  still close the issue via a merge commit or squash body. Full deliveries keep
+  today's title.
 
 ## Not the same as an owner pause
 

@@ -11,6 +11,7 @@ import type { Executor } from "../src/executor.js";
 import type { SDKMessage } from "@anthropic-ai/claude-agent-sdk";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
+import { followSuccessfulPush } from "./publication-fixture.js";
 import {
   api,
   client,
@@ -69,6 +70,9 @@ describe("Issue #1514: scope-capped signal_done delivers a non-closing partial",
     api.setInputs(claim.run_id, [input("approve_plan")]);
     api.setStateAckScope(claim.run_id, { scope_ceiling: 3, milestones_completed: ["m1", "m2"] });
     const forge = fakeGitlab();
+    // Issue #2815: a scope-capped run now reads the PR title back to confirm it is non-closing; the
+    // forge detail needs the pushed head (a real forge reports it), so follow the successful push.
+    followSuccessfulPush(git, forge.pr);
     const r = runnerWith(
       () => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn: planThenDoneDeclaringThree() }) }),
       forge.gitlab,

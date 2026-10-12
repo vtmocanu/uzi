@@ -7818,7 +7818,8 @@ export class RunRunner {
     const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
     // The ONE non-closing-delivery predicate: this delivery must leave its issue open, so no
     // body it writes may close the issue, verified head or not. It gates the closing-directive scans,
-    // strips and fail-closed paths below (the publisher's non-closing scan via createCloses, the
+    // strips and fail-closed paths below, and the PR title neutralisation and fail-closed title
+    // confirm (issues #2779, #2815) (the publisher's non-closing scan via createCloses, the
     // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
     // rendered Closes line itself is decided by renderCloses/withCloses going into the renderer's
     // issueArm (agent/src/pr-description.ts), whose partial arms never write it. Any new partial or
@@ -7932,13 +7933,16 @@ export class RunRunner {
     // whose MR actually exists; retrying the whole call re-runs it instead. Create
     // failures stay fatal. Step 2: a new PR is created with the final body.
     steps?.enter("mr_create");
-    // Issue #2779: a declared non-closing issue run opens its PR with a title that cannot close the
-    // issue on a squash merge (the issue title may itself start with "Fixes #N"). Other deliveries
-    // keep the plain title.
-    const declaredNonClosing = !!effectiveNonClosing && scanIid !== undefined;
+    // Issues #2779 and #2815: a non-closing issue delivery (declared, owner-partial or scope-capped)
+    // opens its PR with a title that cannot close the issue on a squash merge (the issue title may
+    // itself start with "Fixes #N"; mrTitle's "[partial] " prefix does not neutralise it). Full
+    // deliveries keep the plain title. The closing-commit refusal (closingGateIid) stays keyed on the
+    // explicit declaration only: owner-partial and scope-capped runs are not chosen by the agent, so
+    // they are not refused for a closing commit message (see #2815).
+    const nonClosingTitleDelivery = nonClosingDelivery && scanIid !== undefined;
     const titleFor = (): string => {
       const title = mrTitle(claim, result.scopeCapped, claim.config?.completion_scope);
-      return declaredNonClosing ? nonClosingTitle(title, scanIid!, repoPath) : title;
+      return nonClosingTitleDelivery ? nonClosingTitle(title, scanIid!, repoPath) : title;
     };
     const mr = await withForgeRetry(
       () =>
@@ -7979,13 +7983,13 @@ export class RunRunner {
       return;
     }
 
-    // Issue #2779: the PR's ACTUAL title (a created PR's, or an adopted PR's own) must not close the
+    // Issues #2779 and #2815: the PR's ACTUAL title (a created PR's, or an adopted PR's own) must not close the
     // issue either: a squash merge puts the title in the commit that lands on the default branch.
     // Read it, retitle when it closes, re-read and require the re-read title to scan clean (byte
     // equality is not required: a forge may trim, truncate or normalise). A title that is unreadable,
     // whose rewrite failed, or whose rewrite is not confirmed fails closed, legacy or interlocked
     // alike (the PR is already open, so the static reason says it must not be merged as-is).
-    if (declaredNonClosing) {
+    if (nonClosingTitleDelivery) {
       const readTitle = async (): Promise<string | undefined> => {
         const detail = await withForgeRetry(
           () => forge.getMergeRequest(claim.repo.url, claim.secrets.forge_pat, mr.iid, boundarySignal),

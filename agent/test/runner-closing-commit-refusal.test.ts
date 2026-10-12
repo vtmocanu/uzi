@@ -46,7 +46,7 @@ function originHasBranch(): boolean {
 
 /** StubExecutor plus one extra commit carrying `message`; records that commit's SHA. `file` is the
  *  path the commit writes (a `.github/workflows/` path models a disallowed workflow blob). */
-function committing(message: string, obs: { sha?: string }, declare: boolean, file = "closing.txt"): Executor {
+function committing(message: string, obs: { sha?: string }, declare: boolean, file = "closing.txt", extra: Partial<ExecutorResult> = {}): Executor {
   return new class extends StubExecutor {
     override async run(ctx: RunContext): Promise<ExecutorResult> {
       const result = await super.run(ctx);
@@ -55,7 +55,7 @@ function committing(message: string, obs: { sha?: string }, declare: boolean, fi
       gitIn(ctx.worktreePath, ["add", file]);
       gitIn(ctx.worktreePath, [...IDENT, "commit", "-m", message]);
       obs.sha = gitIn(ctx.worktreePath, ["rev-parse", "HEAD"]);
-      return { ...result, ...(declare ? { nonClosing: { reason: "Approved follow-up remains" } } : {}) };
+      return { ...result, ...(declare ? { nonClosing: { reason: "Approved follow-up remains" } } : {}), ...extra };
     }
   }(nullLogger());
 }
@@ -179,5 +179,28 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     assert.ok((failureReason(claim.run_id) ?? "").includes(floor), "names the floor commit");
     assert.equal(gitIn(fx.originPath, ["rev-parse", `refs/heads/${BRANCH}`]), floor, "origin branch untouched");
     assert.equal(all.length, 0);
+  });
+  // Issue #2815: the refusal stays keyed on the explicit declaration only. Owner-partial and
+  // scope-capped runs are not chosen by the agent, so a closing commit message does not refuse them.
+  it("an owner-partial run (no declaration) with a closing commit message is not refused", async () => {
+    const { gitlab } = fakeGitlab();
+    const obs: { sha?: string } = {};
+    const claim = gitlabClaim(2172, {
+      config: { completion_scope: { deferred: [{ milestone_id: "m2", title: "Later", reason: "owner deferred" }] } },
+    });
+    await runner(committing("Fixes #2172", obs, false), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(statuses(claim.run_id)));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+    assert.equal(originHasBranch(), true);
+  });
+
+  it("a scope-capped run (no declaration) with a closing commit message is not refused", async () => {
+    const { gitlab } = fakeGitlab();
+    const obs: { sha?: string } = {};
+    const claim = gitlabClaim(2172);
+    await runner(committing("Fixes #2172", obs, false, "closing.txt", { scopeCapped: { completedCount: 1, total: 2 } }), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(statuses(claim.run_id)));
+    assert.ok(!statuses(claim.run_id).includes("failed"));
+    assert.equal(originHasBranch(), true);
   });
 });
