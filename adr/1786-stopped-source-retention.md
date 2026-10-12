@@ -173,9 +173,10 @@ positive server evidence that its run is terminal; an absent or released hold is
   `GetRunOwnedByWorker` (`WHERE id = @id AND worker_id = @worker_id`). Once the run's
   `worker_id` moves off this worker (a requeue after a released claim, or a claim elsewhere),
   the probe reads 404, so the leftover is refused through the channel indefinitely. It stays
-  until a later run of that branch's terminal-orphan handling on this worker, or out-of-band
-  operator removal. A read that is not worker-scoped would close this, but needs a new API and is
-  deferred (PRD #1786, Decision Log, maintainer decision 3).
+  kept, its bytes retained, and its only reclaim path is a later run of that branch's
+  terminal-orphan handling on this worker. A read that is not worker-scoped would close this,
+  but needs a new API and is an open follow-up, not shipped (PRD #1786, Decision Log,
+  maintainer decisions 3 and 4).
 - **One bare lock.** The protected discard runs through a private locked core of
   `discardRetainedRecovery` (`discardRetainedRecoveryUnderLock`); the public wrapper is
   `withLock` plus that core. The lock is taken once and held from the descriptor snapshot
@@ -334,6 +335,10 @@ Every case keeps the source. What a later run sees depends on where the failure 
 
 ## Consequences
 
+- **Open follow-up (not shipped):** cross-worker reclaim. A marker-less kept canonical clone
+  whose run moved off this worker reads 404 on the worker-scoped probe and stays refused
+  through the operator channel; closing it needs a lifecycle read that is not worker-scoped
+  (new API). No manual removal procedure is verified or documented as safe.
 - Retention raises ephemeral-storage pressure; existing disk admission still sees the real
   bytes, and there is no TTL or automatic reclaim.
 - Local retention is not a checkpoint, archive or server hold. Same-pod process restart keeps

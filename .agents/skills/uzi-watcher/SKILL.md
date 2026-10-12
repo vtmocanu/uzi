@@ -480,6 +480,14 @@ and falling back to the durable bare tracking ref when no clone survives:
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
+  It captures every attributed source of the run on every running worker pod (journal or
+  protected-descriptor sources, the marker clone, and attempt clones whose last ledger entry
+  for the run is `live` or `reclaimed`): the primary keeps `<stem>.tgz` and each additional
+  source is `<stem>.source-N.tgz` (N from 2; members prefixed `<stem>.source-N.`, `meta.txt`
+  names `clone=<path>`) with its own verify and `OK`/`PART` line. If any attributed source is
+  not captured, or a search on any pod is inconclusive, it logs `FAIL ... incomplete coverage:
+  k of m attributed sources captured` and exits 1 (`latest` not advanced; the primary is
+  kept). Completed and cancelled runs still capture only protected or marker sources.
   A `queued` run without a worker binding gets a status-only `SNAP` and stays in
   the loop. A requeued run can retain its worker and clone; capture that work.
   A `failed` run bound to a worker is captured while its clone or owned tracking ref
@@ -569,7 +577,10 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    `recover/issue-N`. Before publishing the seed, account for every dirty and untracked
    file in the backup. Put substantive unpublished work in a verified recovery commit,
    or restore it into the successor through the recovery procedure before it runs: a
-   clean checkout of TIP alone does not bring over the backup's uncommitted work. Keep
+   clean checkout of TIP alone does not bring over the backup's uncommitted work. Check
+   for `<stem>.source-N.tgz` archives beside `<stem>.tgz` and restore each the same way,
+   from its own prefixed members; an `incomplete coverage` FAIL means some attributed source
+   was not captured. Keep
    the ref and the backup until both committed and uncommitted work are verified in the
    successor.
 2. **Cancel normally, then verify the run is terminal** (`uzi run get RUN --json | jq -r

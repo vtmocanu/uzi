@@ -1039,10 +1039,10 @@ The disposition follows what the worker can see:
 
 The probe is scoped to the worker: once the run's `worker_id` moves off this worker (a
 requeue after a released claim, or a claim elsewhere) it reads 404, so the leftover is
-refused through this channel. It stays until a later run of that branch's
-terminal-orphan handling on this worker, or until an operator removes it out of band.
-A lifecycle read that is not worker-scoped would close this but needs a new API and is
-not shipped.
+refused through this channel. It stays kept, its bytes retained, and its only
+reclaim path is a later run of that branch's terminal-orphan handling on this worker.
+Cross-worker reclaim needs a lifecycle read that is not worker-scoped (new API); it is
+an open follow-up and is not shipped.
 
 A kept canonical clone with a `uzi-stopped` marker is listed with marker state
 `detached` (no active journal names it), or `bound` while its plain journal is
@@ -1078,8 +1078,12 @@ exact source under one lock. It never cancels a run or stops the worker.
 > anything you may want before confirming (the `uzi-watcher` skill's `backup-runs.sh`
 > is the existing backup procedure). `backup-runs.sh` attributes a detached kept
 > canonical clone through its exact `uzi-stopped.<runId>.entry` marker (the
-> canonical path only, never an attempt clone); a live journal clone still wins and a
-> warning names the uncaptured kept clone.
+> canonical path only, never an attempt clone), and for an active run it captures every
+> attributed source on every running worker pod: the primary as `<stem>.tgz` and each
+> additional source as `<stem>.source-N.tgz` (N from 2, members prefixed
+> `<stem>.source-N.`, `meta.txt` naming `clone=<path>`). If any attributed source is not
+> captured, or a search on any pod is inconclusive, it logs `FAIL ... incomplete coverage`
+> and exits 1; the primary artifact is still kept.
 
 What the channel does not promise:
 
