@@ -137,6 +137,8 @@ interface RigOptions {
   /** A directory (default: a fresh short one) used as the worker data dir of the ops socket. */
   dataDir?: string;
   noGate?: boolean;
+  /** Extra RunRunner options (e.g. a Docker endpoint). */
+  runnerOpts?: Record<string, unknown>;
 }
 
 interface Rig {
@@ -188,6 +190,7 @@ async function makeRig(o: RigOptions = {}): Promise<Rig> {
       events.push("quiesce");
       return o.quiesce ? o.quiesce(req) : QUIESCENT;
     },
+    ...o.runnerOpts,
   });
   const gate = new DindPruneGate();
   const realClose = gate.close.bind(gate);
@@ -446,6 +449,23 @@ describe("discard through the real socket", () => {
     assert.equal(r.result.reason, "not_quiescent");
     assert.equal(fs.existsSync(a.path), true);
     assert.equal(rig.gate.claimsClosed(), false);
+  });
+
+  it("a Docker-wired discard is refused when the Docker teardown errored, and proceeds when it is merely unconfirmed", async () => {
+    const dockerOf = (state: string) => async () => ({ process: { state: "quiescent" }, docker: { state, removed: [], detail: "" } }) as unknown as QuiesceRunOutcome;
+    const a = await retainedAttempt("run-dk", 1);
+    const bad = await rigOf({ quiesce: dockerOf("docker_error"), runnerOpts: { dockerHost: "unix:///nonexistent/uzi-test-docker.sock" } });
+    const ev = await inspectOne(bad, a);
+    const refused = await send(bad.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev.descriptor });
+    assert.equal(refused.ok, false, JSON.stringify(refused));
+    assert.equal(refused.result.reason, "not_quiescent");
+    assert.equal(fs.existsSync(a.path), true, "nothing was deleted");
+    assert.ok(bad.quiesceRequests.every((q) => q.dockerHost !== undefined), "the Docker teardown was requested");
+    const ok = await rigOf({ quiesce: dockerOf("docker_unconfirmed"), runnerOpts: { dockerHost: "unix:///nonexistent/uzi-test-docker.sock" } });
+    const ev2 = await inspectOne(ok, a);
+    const done = await send(ok.sock, { op: "discard", run: a.runId, generation: 1, attempt: a.attemptId, confirm: ev2.descriptor });
+    assert.equal(done.result.kind, "done", JSON.stringify(done));
+    assert.equal(fs.existsSync(a.path), false);
   });
 
   it("a held cache or maintenance blocker stays closed after retained_ops reopens", async () => {

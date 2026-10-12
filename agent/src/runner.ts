@@ -2806,6 +2806,9 @@ export class RunRunner {
           site: "retained_ops",
         });
         if (outcome.process?.state !== "quiescent" || !open()) return false;
+        // Docker-wired: a container may still mount the clone, so teardown must be unconfirmed (no
+        // container known to hold it); `docker_error` (or any other state) refuses the destructive request.
+        if (this.dockerHost && outcome.docker.state !== "docker_unconfirmed") return false;
       }
       return true;
     };
@@ -16125,7 +16128,7 @@ export class RunRunner {
       try {
         const head = handler?.memo === true ? handler.capturedHead! : await this.git.worktreeHead(clonePath);
         if (head !== null) {
-          const quiesce = async (paths: string[]): Promise<boolean> => {
+          const quiesce = async (paths: string[], phase: "before" | "after"): Promise<boolean> => {
             if (process.platform !== "linux") return false;
             const outcome = await this.quiesceImpl({
               mode: "own", attempt: flight.attempt, cloneKey: cloneKeyOf(clonePath).cloneKey, targetPaths: paths,
@@ -16133,7 +16136,11 @@ export class RunRunner {
               otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),
               site: "stopped_source:covered",
             });
-            return outcome.process?.state === "quiescent";
+            if (outcome.process?.state !== "quiescent") return false;
+            // A writer reaped by the "after" scan existed after the byte checks ran, so those checks
+            // do not cover what it wrote: not provable, the source is retained.
+            if (phase === "after" && (outcome.process.killed?.length ?? 0) > 0) return false;
+            return true;
           };
           const covered = await this.git.verifyStoppedSourceCovered(
             barePath, branch, key,

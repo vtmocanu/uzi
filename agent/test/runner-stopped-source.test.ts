@@ -401,6 +401,41 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     });
   }
 
+  for (const flavor of ["canonical", "attempt"] as const) {
+    it(`${flavor} clone, clean and fully fetched, but the final proof reaps a late writer: the clone is retained with the late bytes and the record is written`, async () => {
+      const iid = 17890 + (flavor === "attempt" ? 1 : 0);
+      const LATE = "written after the byte checks\n";
+      let coveredCalls = 0;
+      let latePath = "";
+      let writerPid = 0;
+      const rig = stopRig(iid, flavor, "stale", {
+        cleanTree: true,
+        beforeStop: async (ctx) => {
+          await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
+        },
+        runnerOpts: {
+          quiesceRun: async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+            if (req.site !== "stopped_source:covered") return quiescentOutcome();
+            coveredCalls++;
+            if (coveredCalls < 2) return quiescentOutcome();
+            // The "after" proof: a writer landed a file after the status read and is reaped here.
+            latePath = path.join(req.targetPaths[0]!, "late.txt");
+            fs.writeFileSync(latePath, LATE);
+            writerPid = 4242;
+            return { process: { state: "quiescent", processes: [], killed: [writerPid], detail: "reaped 1 process(es)" }, docker: { state: "not_wired", removed: [], detail: "" } };
+          },
+        },
+      });
+      await rig.runner.execute(rig.claim);
+      const facts = rig.facts();
+      assert.equal(coveredCalls, 2, "the coverage proof asked before and after");
+      assert.ok(fs.existsSync(facts.clonePath), "the clone is kept");
+      assert.equal(fs.readFileSync(latePath, "utf8"), LATE, "the late file survives");
+      if (flavor === "attempt") assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed");
+      else assert.equal(markers(rig.bare, rig.runId).length, 1, "the retention record is written");
+    });
+  }
+
   // The reviewer probe: HEAD equals the run's owned tracking tip and the tree is clean, but the
   // clone also holds a commit on another local branch, or a stash entry. Neither is in any capture.
   for (const flavor of ["canonical", "attempt"] as const) {
@@ -454,7 +489,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
         gitIn(wt, "add", "main-moved.txt");
         gitIn(wt, ...IDENT, "commit", "-q", "-m", "main moved on");
         gitIn(wt, "tag", "off-branch-release");
-        gitIn(bare, "fetch", "-q", wt, "refs/heads/newer-main:refs/remotes/origin/newer-main", "refs/tags/off-branch-release:refs/tags/off-branch-release");
+        gitIn(bare, "fetch", "-q", "--", wt, "refs/heads/newer-main:refs/remotes/origin/newer-main", "refs/tags/off-branch-release:refs/tags/off-branch-release");
         gitIn(wt, "checkout", "-q", "--detach", facts.commit);
       },
     });
@@ -666,7 +701,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     git.markStoppedCanonical = (async (...a: Parameters<typeof real>) => {
       const clone = a[3].clonePath;
       fs.renameSync(clone, `${clone}.moved-by-test`);
-      execFileSync("git", ["clone", "-q", "--no-hardlinks", rig.bare, clone], { env: GIT_ENV, stdio: "pipe" });
+      execFileSync("git", ["clone", "-q", "--no-hardlinks", "--", rig.bare, clone], { env: GIT_ENV, stdio: "pipe" });
       fs.writeFileSync(path.join(clone, "newer.txt"), "the successor's own bytes\n");
       replacement = clone;
       successorJournal = JSON.stringify({ runId: "successor-run", clonePath: clone, branch: rig.branch });

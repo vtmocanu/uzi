@@ -5877,7 +5877,7 @@ export class GitCache {
    * local ref (branches, tags, remotes, any other namespace) is reachable from `capturedHead` or
    * from a ref of the worker bare, and no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
    * under committed tracking ownership that still names `owner.runId` and `owner.generation`, or
-   * by an owed pin of the run, or by being an ancestor of the bare's default-branch ref; `quiesce` answered true both before and after the reads. Anything
+   * by an owed pin of the run, or by being an ancestor of the bare's default-branch ref; `quiesce` answered true both before (`"before"`) and after (`"after"`) the reads. The caller's "after" answer must also be false when that scan found and reaped a writer, because the byte checks ran before it. Residual: a writer that writes and exits between the status read and the "after" proof is invisible to both. Anything
    * else, a thrown error included, is `not_covered` and the caller retains the source.
    */
   async verifyStoppedSourceCovered(
@@ -5885,7 +5885,7 @@ export class GitCache {
     source: { runId: string; clonePath: string; attemptId?: string },
     capturedHead: string | undefined,
     owner: { runId: string; generation: number },
-    quiesce: (paths: string[]) => Promise<boolean>,
+    quiesce: (paths: string[], phase: "before" | "after") => Promise<boolean>,
   ): Promise<"covered" | "not_covered"> {
     if (capturedHead === undefined || !SHA40_RE.test(capturedHead) || owner.runId !== source.runId ||
         !Number.isSafeInteger(owner.generation) || owner.generation <= 0) return "not_covered";
@@ -5903,7 +5903,7 @@ export class GitCache {
         if (markers.valid.some((m) => m.marker.runId === src.runId || m.marker.clonePath === src.clonePath) ||
             markers.malformed.some((m) => m.runId === src.runId) || markers.overflow.has(src.runId)) return "not_covered";
         if (!(await this.realCloneDir(src.clonePath))) return "not_covered";
-        if (!(await quiesce([src.clonePath]))) return "not_covered";
+        if (!(await quiesce([src.clonePath], "before"))) return "not_covered";
         if ((await this.worktreeHead(src.clonePath)) !== capturedHead) return "not_covered";
         if (!(await this.worktreeCleanHardened(src.clonePath))) return "not_covered";
         if (!(await this.localRefsReachableFrom(barePath, src.clonePath, capturedHead))) return "not_covered";
@@ -5921,7 +5921,7 @@ export class GitCache {
         if (!(await this.realCloneDir(src.clonePath))) return "not_covered";
         const again = await this.readRecoveryCapture(barePath, branch);
         if (!again || !sameRecoverySource(again, src)) return "not_covered";
-        if (!(await quiesce([src.clonePath]))) return "not_covered";
+        if (!(await quiesce([src.clonePath], "after"))) return "not_covered";
         return "covered";
       });
     } catch (err) {
@@ -6015,7 +6015,9 @@ export class GitCache {
    * indirection cannot be blanket-disabled); and `core.ignorecase` set true in any form git parses as true. What IS still trusted:
    * the ignore rules of the tree's `.gitignore` files and of `.git/info/exclude`, which define the
    * scope the WIP capture's `git add -A` honours too, so an ignored file is outside both. Any
-   * such flag, any status entry, or any failed read is `false`.
+   * such flag, any status entry, or any failed read is `false`. Submodules: `status` runs with
+   * `--ignore-submodules=none`, and a `.git/modules` store or a populated (non-empty or non-directory)
+   * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
    */
   private async worktreeCleanHardened(cwd: string): Promise<boolean> {
     const hardened = [
@@ -6047,7 +6049,30 @@ export class GitCache {
         if (v === "true" || v === "yes" || v === "on") return false;
         if (/^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v)) return false;
       }
-      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain"], NO_REPLACE);
+      // Submodules: `.gitmodules` / config `ignore = all` would hide a dirty or newer submodule from
+      // `status`, so it runs with `--ignore-submodules=none`. The parent proof still says nothing about
+      // a populated submodule's own files, commits or refs, so any trace of one is not provable: a
+      // `.git/modules` store, or an index gitlink (mode 160000) whose worktree path holds anything but
+      // nothing or an empty real directory (an uninitialized submodule).
+      const modules = await fs.lstat(path.join(cwd, ".git", "modules")).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      });
+      if (modules) return false;
+      const staged = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], NO_REPLACE);
+      for (const entry of staged.split("\0")) {
+        const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
+        if (!m) continue;
+        const gitlink = path.join(cwd, m[1]!);
+        const st = await fs.lstat(gitlink).catch((err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return undefined;
+          throw err;
+        });
+        if (st === undefined) continue;
+        if (!st.isDirectory() || st.isSymbolicLink()) return false;
+        if ((await fs.readdir(gitlink)).length > 0) return false;
+      }
+      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], NO_REPLACE);
       if (status.split("\n").some((l) => l.length > 0)) return false;
       const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], NO_REPLACE);
       for (const entry of flags.split("\0")) {

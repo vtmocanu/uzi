@@ -422,14 +422,78 @@ describe("verifyStoppedSourceCovered", () => {
     assert.equal(gitIn(bare, ["rev-parse", `refs/uzi-owed/${a.runId}/${head}`]), head, "the fetch pinned the head as owed");
     return { a, head };
   }
-  const verify = (a: Attempt, head: string | undefined, quiesce: (p: string[]) => Promise<boolean> = quiet, generation = 1) =>
+  const verify = (a: Attempt, head: string | undefined, quiesce: (p: string[], phase: "before" | "after") => Promise<boolean> = quiet, generation = 1) =>
     git.verifyStoppedSourceCovered(bare, a.branch, a.key, { runId: a.runId, clonePath: a.path, attemptId: a.attemptId }, head, { runId: a.runId, generation }, quiesce);
 
   it("is covered for an unchanged, anchored source, and asks for quiescence before and after", async () => {
     const { a, head } = await captured();
-    const calls: string[][] = [];
-    assert.equal(await verify(a, head, async (p) => { calls.push(p); return true; }), "covered");
-    assert.deepEqual(calls, [[a.path], [a.path]]);
+    const calls: Array<[string[], string]> = [];
+    assert.equal(await verify(a, head, async (p, phase) => { calls.push([p, phase]); return true; }), "covered");
+    assert.deepEqual(calls, [[[a.path], "before"], [[a.path], "after"]]);
+  });
+
+  describe("submodules", () => {
+    const SUB_IDENT = ["-c", "user.email=t@t", "-c", "user.name=t", "-c", "commit.gpgsign=false"];
+    const subGit = (cwd: string, ...args: string[]): string =>
+      gitIn(cwd, [...SUB_IDENT, "-c", "protocol.file.allow=always", ...args]);
+
+    /** A captured clone that also carries a committed, initialized submodule with `ignore = all`. */
+    async function withSubmodule() {
+      const a = await seedAttempt("run-sm", 1);
+      const upstream = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-sub-up-"));
+      fs.chmodSync(upstream, 0o700);
+      subGit(upstream, "init", "-q", "-b", "main");
+      fs.writeFileSync(path.join(upstream, "lib.txt"), "lib\n");
+      subGit(upstream, "add", "lib.txt");
+      subGit(upstream, "commit", "-q", "-m", "lib");
+      subGit(a.path, "submodule", "add", "-q", "--", upstream, "sub");
+      subGit(a.path, "config", "-f", ".gitmodules", "submodule.sub.ignore", "all");
+      subGit(a.path, "add", ".gitmodules", "sub");
+      subGit(a.path, "commit", "-q", "-m", "add submodule");
+      await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+      const head = gitIn(a.path, ["rev-parse", "HEAD"]);
+      return { a, head, upstream };
+    }
+
+    it("a populated submodule hiding a dirty or untracked file behind ignore=all is not covered", async () => {
+      const { a, head, upstream } = await withSubmodule();
+      try {
+        assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "precondition: plain status is empty");
+        fs.writeFileSync(path.join(a.path, "sub", "scratch.txt"), "only here\n");
+        fs.appendFileSync(path.join(a.path, "sub", "lib.txt"), "dirty\n");
+        assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "precondition: ignore=all hides the submodule bytes");
+        assert.equal(await verify(a, head), "not_covered");
+        assert.ok(fs.existsSync(path.join(a.path, "sub", "scratch.txt")));
+      } finally {
+        fs.rmSync(upstream, { recursive: true, force: true });
+      }
+    });
+
+    it("a populated submodule hiding a newer commit behind ignore=all is not covered", async () => {
+      const { a, head, upstream } = await withSubmodule();
+      try {
+        fs.appendFileSync(path.join(a.path, "sub", "lib.txt"), "newer\n");
+        subGit(path.join(a.path, "sub"), "commit", "-q", "-am", "newer inside submodule");
+        assert.equal(gitIn(a.path, ["status", "--porcelain"]), "", "precondition: ignore=all hides the moved submodule");
+        assert.equal(await verify(a, head), "not_covered");
+      } finally {
+        fs.rmSync(upstream, { recursive: true, force: true });
+      }
+    });
+
+    it("an uninitialized submodule (an empty directory at the gitlink) stays covered when the rest holds", async () => {
+      const a = await seedAttempt("run-su", 1);
+      fs.writeFileSync(path.join(a.path, ".gitmodules"), '[submodule "sub"]\n\tpath = sub\n\turl = ./nowhere\n');
+      gitIn(a.path, ["update-index", "--add", "--cacheinfo", `160000,${gitIn(a.path, ["rev-parse", "HEAD"])},sub`]);
+      gitIn(a.path, ["add", ".gitmodules"]);
+      gitIn(a.path, ["commit", "-m", "declare submodule"]);
+      fs.mkdirSync(path.join(a.path, "sub"));
+      await fixtureFetchTracking(git, bare, a.path, a.branch, a.runId, 1);
+      const head = gitIn(a.path, ["rev-parse", "HEAD"]);
+      assert.equal(await verify(a, head), "covered");
+      fs.writeFileSync(path.join(a.path, "sub", "stray.txt"), "x\n");
+      assert.equal(await verify(a, head), "not_covered", "a file in the gitlink directory is not provable");
+    });
   });
 
   it("is covered through an owed pin alone when the shared tracking ref has moved on", async () => {
@@ -526,7 +590,7 @@ describe("verifyStoppedSourceCovered", () => {
   it("is covered when the clone's local default branch sits ahead of an older resumed head and the bare holds it (seed shape)", async () => {
     const { a, head } = await captured();
     const ahead = commitOffBranch(a, head, "refs/heads/main", "ahead.txt");
-    gitIn(bare, ["fetch", "-q", a.path, "refs/heads/main:refs/remotes/origin/ahead"]);
+    gitIn(bare, ["fetch", "-q", "--", a.path, "refs/heads/main:refs/remotes/origin/ahead"]);
     assert.equal(gitIn(bare, ["rev-parse", "refs/remotes/origin/ahead"]), ahead);
     assert.equal(gitIn(a.path, ["status", "--porcelain"]), "");
     assert.equal(await verify(a, head), "covered", "a local ref the bare already holds loses nothing");
@@ -535,7 +599,7 @@ describe("verifyStoppedSourceCovered", () => {
   it("is covered when an off-branch tag exists in both the clone and the bare", async () => {
     const { a, head } = await captured();
     commitOffBranch(a, head, "refs/tags/release", "release.txt");
-    gitIn(bare, ["fetch", "-q", a.path, "refs/tags/release:refs/tags/release"]);
+    gitIn(bare, ["fetch", "-q", "--", a.path, "refs/tags/release:refs/tags/release"]);
     assert.equal(await verify(a, head), "covered");
   });
 
