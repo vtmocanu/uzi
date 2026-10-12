@@ -91,8 +91,8 @@ function MilestoneNowStrip({
   return (
     <div className={cx("mt-1.5 flex items-center gap-2 border-l-2 py-1 pl-3 text-xs", border)}>
       <span aria-hidden className={cx("h-1.5 w-1.5 shrink-0 rounded-full", dotBg, dotPulse && "animate-pulse")} />
-      <span className={cx("shrink-0 font-medium", accent)}>{safeRole}</span>
-      {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{safeLabel}</span>}
+      <span className={cx("shrink-0 font-medium", accent)}>{!isLive && "Assigned owner: "}{safeRole}</span>
+      {safeLabel && <span className="min-w-0 flex-1 truncate italic text-muted">{!isLive && "· "}{safeLabel}</span>}
       {toolText && <span className="min-w-0 shrink truncate font-mono text-faint">{toolText}</span>}
       <span className="ml-auto shrink-0 whitespace-nowrap font-mono tabular-nums text-faint">
         {waiting ? `${waitingLabel}${age ? ` · ${age}` : ""}` : age ? `${age} ago` : ""}

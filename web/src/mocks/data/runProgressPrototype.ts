@@ -20,7 +20,7 @@ export function seedProgressPrototype(runs: Map<string, Run>, messages: Map<stri
     const active = state === "running" || state === "idle";
     const approval = state === "approval";
     const run: Run = {
-      ...base, id, issue_iid: 2789, issue_title: "Publish held work safely, then release custody",
+      ...base, id, issue_iid: 2789, issue_title: state === "idle" ? "Assigned owner, other agents active" : "Publish held work safely, then release custody",
       status: approval ? "awaiting_approval" : active ? "running" : state,
       is_planning: false, is_revising: false, auto_approve: false, iteration_count: active ? 4 : 0,
       health: "ok", health_since: null, health_reason: null,
@@ -36,7 +36,7 @@ export function seedProgressPrototype(runs: Map<string, Run>, messages: Map<stri
       milestones: approval ? null : frozen, milestones_candidate: approval ? frozen : null,
       milestones_completed: approval ? null : state === "completed" ? frozen.map(m => m.id) : ["m6", "m7", "m8"],
       milestones_in_progress: active || state === "failed" ? ["m9"] : [],
-      milestones_agents: active ? [{id: "m9", agent: state === "idle" ? "architect" : "documenter", agent_label: state === "idle" ? "Assigned: coordinate the final review" : "Run-recovery and CLI docs"}] : [],
+      milestones_agents: active ? [{id: "m9", agent: state === "idle" ? "architect" : "documenter", agent_label: state === "idle" ? "Coordinate the final review" : "Run-recovery and CLI docs"}] : [],
       milestones_live: active ? [{milestone_id: "m9", lanes: [
         {agent: "documenter", agent_instance: "proto-doc", agent_label: "Run-recovery and CLI docs", tool: "Bash", detail: "Check CLI guidance", at: secsAgo(3)},
         {agent: "spec-keeper", agent_instance: "proto-spec", agent_label: "ADR and spec supersessions", tool: "Edit", detail: "Update the durable decision", at: secsAgo(6)},
