@@ -598,7 +598,9 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 		}
 		if e.marker != nil {
 			usable = usable || m.promoted(t, e) || m.currentUsable(t, e)
-		} else if !e.admitted || m.currentUsable(t, e) {
+		} else if !e.admitted || (!e.drift && m.currentUsable(t, e)) {
+			// Planning precedes reservation writes. Current proof for a drifted,
+			// already admitted old template is not its future replacement.
 			usable = usable || m.currentUsable(t, e) || m.oldUsable(t, e)
 		}
 	}
@@ -612,7 +614,7 @@ func (m *Materializer) remainingCoverage(t *rollTick, pool []*rollEntry, candida
 		if e.ns != candidate.ns || !covers(e.w, candidate.coverage) || e.blocked != "" {
 			continue
 		}
-		if e == candidate || (e.admitted && !m.currentUsable(t, e) && !m.promoted(t, e)) {
+		if e == candidate || (e.admitted && (e.drift || (!m.currentUsable(t, e) && !m.promoted(t, e)))) {
 			continue
 		}
 		if e.marker != nil {

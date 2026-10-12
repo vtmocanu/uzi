@@ -269,6 +269,29 @@ func TestSerialSameImageLegacyTemplateCapacity(t *testing.T) {
 	matrixNoSibling(t, c)
 }
 
+func TestSerialAdmittedSameImageAcrossPools(t *testing.T) {
+	var objects []runtime.Object
+	var workers []protocol.DesiredWorker
+	for i, id := range []string{"w1", "w2"} {
+		w := evidence(desired(id), m5Now)
+		w.RollEvidence.SchedulingCapabilities = []string{fmt.Sprintf("cap%d", i)}
+		d := RenderDeployment(testConfig(), w, testSpec(t, w.Template, w.Size))
+		d.UID, d.ResourceVersion = types.UID("current-"+id), "1"
+		objects = append(objects, d)
+		workers = append(workers, w)
+	}
+	m, c := newMatWithDrain(t, &fakeCordoner{}, DrainPolicy{Deadline: time.Hour}, objects...)
+	for i := range workers {
+		currentProof(t, c, &workers[i], m5Now)
+		workers[i].RollEvidence.SchedulingCapabilities = []string{fmt.Sprintf("cap%d", i)}
+		workers[i].Generation++
+	}
+	rollTickTest(t, m, workers)
+	if len(templatePatches(c)) != 1 {
+		t.Fatalf("same-image independent pools removed all lane providers: %v", templatePatches(c))
+	}
+}
+
 func TestSerialEffectiveDockerCoverage(t *testing.T) {
 	a, b := evidence(desired("a"), m5Now), evidence(desired("b"), m5Now)
 	a.Docker, b.Docker = true, true
