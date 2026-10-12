@@ -84,3 +84,12 @@ test("Claude neutral subagent frame without instance id remains child", async ()
   assert.equal(out.contextRequests, 0);
   assert.equal(out.result.subagentActivity, true);
 });
+
+test("M3 park signal folds only from the main assistant", async () => {
+  const frame = (markers: Record<string, unknown> = {}) => ({
+    type: "assistant", ...markers,
+    message: { content: [{ type: "tool_use", name: "mcp__uzi__park_run", input: {} }] },
+  });
+  assert.equal((await reduceRaw([frame({ parent_tool_use_id: "child" })])).result.parkRun, undefined);
+  assert.equal((await reduceRaw([frame()])).result.parkRun, true);
+});

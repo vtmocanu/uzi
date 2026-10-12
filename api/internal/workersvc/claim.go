@@ -116,8 +116,11 @@ type ClaimPayload struct {
 	// monotone milestones_completed. PausePending is (pause_requested_at IS NOT NULL);
 	// PauseMode passes the mode through ('milestone'|'now'), empty/omitted when none is
 	// pending. Additive on the wire — an old worker ignores both keys.
-	PausePending bool   `json:"pause_pending"`
-	PauseMode    string `json:"pause_mode,omitempty"`
+	// ParkRunSupported negotiates the protocol for the entire flight; endpoint
+	// authorization independently checks its current phase and persisted plan.
+	ParkRunSupported bool   `json:"park_run_supported,omitempty"`
+	PausePending     bool   `json:"pause_pending"`
+	PauseMode        string `json:"pause_mode,omitempty"`
 	// BaseBranch is the source ref a task run was branched from (PRD #400 M2),
 	// meaningful only for kind='task'. It is carried for context/review — the worker
 	// works the pre-seeded, server-named Branch (uzi/task/<run-id>), not this ref —
