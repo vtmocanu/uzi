@@ -22,6 +22,7 @@
 // (testing-credentials policy). The plan/done signals are observed from that
 // stream (see signals.ts), so a scripted fake proves them without a live SDK.
 
+import { chunkedTimeout } from "./chunked-timeout.js";
 import { TrustedExecutionRefusal } from "./trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "./checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "./worker-spawn-mark.js";
@@ -413,6 +414,8 @@ interface IntentFlight {
 }
 
 export interface SdkExecutorOptions {
+  /** Monotonic clock for relative deadline scheduling; budget accounting still uses Date.now. */
+  timeoutNow?: () => number;
   /** Override the SDK entrypoint (tests inject a fake transport here). */
   queryFn?: SdkQueryFn;
   /** Spawn the SDK CLI (default = detached spawn). Injected in tests. */
@@ -586,6 +589,8 @@ interface TurnResult {
   prSummary?: PrSummaryClaim;
   /** Issue #2083: forwarded as ExecutorResult.decisionsMemo (last-wins). */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
   /** Issue #281: the lead's own text emitted this turn, concatenated in order — the
    *  input to the repeated-refusal check. Absent when the lead emitted no text. */
   finalText?: string;
@@ -668,12 +673,13 @@ function unansweredPrompt(questions: AskUserQuestion[]): string {
  *  The first-truthy-session-id latch moved into the per-run reducer (harness-
  *  reducer.ts); the owner delivers ctx.onSessionId from its `firstSessionId`. */
 interface RunDrive {
+  refreshCodeCrossCheckTools?: () => Promise<void>;
   tripReason?: string;
   currentAbort?: AbortController;
   currentChild: { pid?: number };
   wallRemainingMs: number;
   wallArmedAt?: number;
-  wallTimer?: NodeJS.Timeout;
+  wallTimer?: ReturnType<typeof chunkedTimeout>;
   /** issue #1888: the run selected at least one skill, so a skills plugin that reports load
    *  errors at init fails the run closed (REASON_SKILLS_PLUGIN_LOAD_FAILED). */
   skillsSelected: boolean;
@@ -751,6 +757,7 @@ export class SdkExecutor implements Executor {
   /** Issue #1604: see Executor.resumesAtGate — the plan gate reads a resumed claim's pending
    *  inputs (takeResumedGateEvent) and re-presents an awaiting_approval claim's plan. */
   readonly resumesAtGate = true;
+  private readonly timeoutNow?: () => number;
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
@@ -838,6 +845,7 @@ export class SdkExecutor implements Executor {
     private readonly homeDir: string,
     opts: SdkExecutorOptions = {},
   ) {
+    this.timeoutNow = opts.timeoutNow;
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
@@ -1554,6 +1562,19 @@ export class SdkExecutor implements Executor {
     const state: RunDrive = {
       currentChild: {},
       wallRemainingMs: initialWallMs,
+      ...(ctx.codeCrossCheckGate && ctx.codeCrossCheckRepairActive && ctx.codeCrossCheckRepair && ctx.reportCrossCheckDispositions && ctx.claimGeneration ? {
+        refreshCodeCrossCheckTools: async () => {
+          const row = await ctx.codeCrossCheckRepair!();
+          mcpServers[SIGNAL_SERVER_NAME] = buildSignalMcpServer({
+            prdDonePath: isIssueRun, milestones: isIssueRun, progress: isIssueRun, checkpoint: isIssueRun,
+            reportOnly: isIssueRun, decisionsMemo: decisionsMemoOn,
+            ...(row && row.findings.length > 0 ? { codeCrossCheck: {
+              generation: ctx.claimGeneration!, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive!, codeCrossCheckRepair: ctx.codeCrossCheckRepair!,
+              reportCrossCheckDispositions: ctx.reportCrossCheckDispositions!,
+            } } : {}),
+          });
+        },
+      } : {}),
       skillsSelected: runSkills.length > 0,
       pluginWarned: false,
     };
@@ -2468,6 +2489,7 @@ export class SdkExecutor implements Executor {
       // follow-up). A non-interactive run never parks, so this stays false and its `first`
       // behaviour is byte-identical to before.
       let hasParked = false;
+      let finalizing = false;
       // PRD #390 M3 (D2/D4): mid-run milestone-reporting enforcement state. progressMissedLastTurn
       // escalates the NEXT turn's prompt; consecutiveMisses counts work turns that left the tracker
       // with no milestone in progress. Bounded, feed-only, never fails the run.
@@ -2526,6 +2548,7 @@ export class SdkExecutor implements Executor {
       let declaredPrSummary: PrSummaryClaim | undefined;
       // Issue #2083: hoisted for the same reason; last-wins across signal_done turns.
       let declaredDecisionsMemo: string | undefined;
+      let declaredNonClosing: { reason: string } | undefined;
       // Issue #2083: latched once the memo block rode an implement prompt (an ask_user turn
       // re-enters the first-turn branch, so the first-turn test alone would re-send it).
       let decisionsMemoImplementInjected = false;
@@ -2580,7 +2603,7 @@ export class SdkExecutor implements Executor {
         // apply the server-served effective budget. The cap only ever RISES (a scaled run
         // gets more turns; a single/zero-milestone run's ACK carries none, so this is
         // inert and REASON_MAX_ITERATIONS still trips at the default — the regression gate).
-        const served = await ctx.reportIteration?.(iteration, latestProgress);
+        const served = finalizing ? undefined : await ctx.reportIteration?.(iteration, latestProgress);
         if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
         const boundaryCap = isIssueRun ? scopeCapAtBoundary({
           served, frozen: frozenMilestones ?? ctx.frozenMilestones,
@@ -3017,6 +3040,7 @@ export class SdkExecutor implements Executor {
           declaredPrSummary = await stampPrSummaryHead(turn.prSummary, ctx.worktreePath);
         }
         if (turn.decisionsMemo !== undefined) declaredDecisionsMemo = turn.decisionsMemo;
+        if (isIssueRun && turn.nonClosing !== undefined) declaredNonClosing = turn.nonClosing;
         // PRD #122 M2: carry this turn's reported progress into the NEXT iteration's
         // `running` report. Only overwrite when the turn reported something, so a quiet
         // turn keeps the last known progress rather than blanking it.
@@ -3080,7 +3104,7 @@ export class SdkExecutor implements Executor {
           // session on the next follow-up. Guarded on ctx.interactive AND a wired
           // awaitFollowUp, so a non-interactive run (and any executor that did not wire the
           // callback) breaks to the normal finalize below, byte-identical to today.
-          if (ctx.interactive && ctx.awaitFollowUp) {
+          if (ctx.interactive && ctx.awaitFollowUp && !finalizing) {
             // Issue #1800: defensive, not reachable through the public seams today: a turn that
             // reaches signal_done has model evidence, which empties the slot. If an owner follow-up
             // is still held (pulled, never evidenced) it has not reached the model yet. Parking would
@@ -3196,6 +3220,7 @@ export class SdkExecutor implements Executor {
               // stamped stop_kind='cancelled' to CancelRunByWorker.
               throw new Error(REASON_CANCELLED);
             }
+            finalizing = true;
             // outcome.reason === "idle" (no follow-up arrived within the idle bound) and
             // outcome.reason === "stopped" (PRD #517 M4: a graceful `uzi run stop` — the
             // steering `stop` input the poll loop consumed and routed) BOTH finalize normally
@@ -3236,7 +3261,7 @@ export class SdkExecutor implements Executor {
             //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
             //    reap:true is the same reap-before-git ordering the done/interactive-park paths
             //    use; the session transcript survives on disk so the SAME session resumes.
-            await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
             // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
             //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
             //    fingerprint is unresolvable — then head is null too, which the server accepts).
@@ -3262,7 +3287,16 @@ export class SdkExecutor implements Executor {
             completionAttempted = true;
             // 4. Every frozen milestone is declared complete → break to the normal finalize path
             //    (phasePublish); M4 adds the permit + PR-head verification there.
-            if (unmet.length === 0) break;
+            if (unmet.length === 0) {
+              const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
+              if (codeDecision?.action === "repair") {
+                followUp = codeDecision.followUp;
+                turn.done = false;
+                resetStallState();
+                continue;
+              }
+              break;
+            }
             // 5. Unmet non-empty. The completion fingerprint (sorted unmet ids, head, worktree)
             //    is DISTINCT from the #281 prose fingerprint but shares STALL_LIMIT. An identical
             //    fingerprint across consecutive attempts advances the streak; any change resets it
@@ -3355,6 +3389,13 @@ export class SdkExecutor implements Executor {
             followUp = buildCompletionReworkFollowUp(unmet, frozenMilestones);
             resetStallState(); // a completion rework is new input → breaks any #281 refusal streak
             turn.done = false;
+            continue;
+          }
+          const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: false, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
+          if (codeDecision?.action === "repair") {
+            followUp = codeDecision.followUp;
+            turn.done = false;
+            resetStallState();
             continue;
           }
           // Issue #1514: the loop-top scope gate only fires on a further iteration, so a lead that
@@ -3547,6 +3588,8 @@ export class SdkExecutor implements Executor {
         agentSelection: { source: selection.source, agents: selectedNames },
         toolEnv,
       };
+      const codeSummary = await ctx.codeCrossCheckSummary?.();
+      if (codeSummary) result.codeCrossCheckSummary = codeSummary;
       // PRD #72 M4: forward the declared PRD path on `issue` runs only, clamped to
       // length. TRANSPORT HYGIENE ONLY — no path-shape checks here. The api owns
       // the grammar (api/internal/prdpath), and a second implementation of it would
@@ -3618,6 +3661,7 @@ export class SdkExecutor implements Executor {
       // OMITTED-not-undefined like the siblings above.
       if (declaredPrSummary !== undefined) result.prSummary = declaredPrSummary;
       if (declaredDecisionsMemo !== undefined) result.decisionsMemo = declaredDecisionsMemo;
+      if (declaredNonClosing !== undefined) result.nonClosing = declaredNonClosing;
       // PRD #1798 M2: the last plan summary + deltas the api accepted this run, if any. Absent
       // on a resume past the gate or when the advisory pass never succeeded.
       if (this.latestPlanSummary !== undefined) {
@@ -4001,6 +4045,7 @@ export class SdkExecutor implements Executor {
       // or implement, computed by phaseSetup/phaseRunLoop, agents.ts used as-is) plus
       // the current-child sink; the adapter assembles the SdkOptions and finalizes
       // resume/abort/spawn per turn.
+      if (phase === "implement") await state.refreshCodeCrossCheckTools?.();
       this.harness.prepareTurn(turnConfig, state.currentChild);
       const request: RunTurnRequest = {
         prompt,
@@ -4585,17 +4630,17 @@ export class SdkExecutor implements Executor {
       return;
     }
     state.wallArmedAt = Date.now();
-    state.wallTimer = setTimeout(
+    state.wallTimer = chunkedTimeout(
       () => this.trip(state, REASON_WALL),
       state.wallRemainingMs,
+      { now: this.timeoutNow, unref: true },
     );
-    state.wallTimer.unref?.();
   }
 
   /** Pause the wall budget, debiting the elapsed active time. */
   private disarmWall(state: RunDrive): void {
     if (!state.wallTimer) return;
-    clearTimeout(state.wallTimer);
+    state.wallTimer.cancel();
     state.wallTimer = undefined;
     if (state.wallArmedAt !== undefined) {
       state.wallRemainingMs -= Date.now() - state.wallArmedAt;

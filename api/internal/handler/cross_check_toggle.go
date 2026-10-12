@@ -9,8 +9,7 @@ import (
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 )
 
-// SetCrossCheck updates the current user's plan-stage consent. An omitted plan
-// field preserves its value, leaving room for other stages on this route.
+// SetCrossCheck updates owner consent. Omitted fields preserve their values.
 func (h *Handler) SetCrossCheck(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -19,12 +18,13 @@ func (h *Handler) SetCrossCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Plan *bool `json:"plan"`
+		Code *bool `json:"code"`
 	}
 	if err := httpx.DecodeJSONStrict(r, &req); err != nil {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
-	if req.Plan != nil && *req.Plan {
+	if (req.Plan != nil && *req.Plan) || (req.Code != nil && *req.Code) {
 		usable, err := h.wsvc.BothHarnessesUsable(r.Context(), user.ID)
 		if err != nil {
 			slog.Error("check cross-check credentials", "error", err)
@@ -38,10 +38,11 @@ func (h *Handler) SetCrossCheck(w http.ResponseWriter, r *http.Request) {
 	}
 	// The returned value comes from the same statement that applies the optional
 	// update; no setter is generated for this column in the current store slice.
-	var enabled bool
+	var enabled, codeEnabled bool
 	err := h.pool.QueryRow(r.Context(), `UPDATE users
-SET plan_cross_check_enabled = COALESCE($2::boolean, plan_cross_check_enabled)
-WHERE id = $1 RETURNING plan_cross_check_enabled`, user.ID, req.Plan).Scan(&enabled)
+SET plan_cross_check_enabled = COALESCE($2::boolean, plan_cross_check_enabled),
+    code_cross_check_enabled = COALESCE($3::boolean, code_cross_check_enabled)
+WHERE id = $1 RETURNING plan_cross_check_enabled, code_cross_check_enabled`, user.ID, req.Plan, req.Code).Scan(&enabled, &codeEnabled)
 	if err != nil {
 		if err == pgx.ErrNoRows {
 			httpx.Error(w, http.StatusNotFound, "user not found")
@@ -57,7 +58,7 @@ WHERE id = $1 RETURNING plan_cross_check_enabled`, user.ID, req.Plan).Scan(&enab
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	response := map[string]any{"user": toDTO(updated)}
+	response := map[string]any{"user": toDTO(updated), "code": codeEnabled}
 	if enabled && !updated.EphemeralWorkersEnabled {
 		// Both directions need cross_check_v1: a Claude lead is checked on Codex (a
 		// codex_harness_v1 worker), and a Codex lead on Claude (PRD #2460, a worker that
@@ -80,6 +81,25 @@ AND 'cross_check_v1' = ANY(protocol_capabilities)`, user.ID).Scan(&codexCheckerA
 			response["warning"] = "No online worker can run Codex plan cross-checks; enable ephemeral workers or upgrade a worker."
 		case !claudeCheckerAvailable:
 			response["warning"] = "No online worker can run Claude plan cross-checks for Codex-lead runs; enable ephemeral workers or upgrade a worker."
+		}
+	}
+	if codeEnabled {
+		var available bool
+		err = h.pool.QueryRow(r.Context(), `SELECT EXISTS (
+SELECT 1 FROM workers WHERE user_id=$1 AND status='online'
+AND draining_since IS NULL AND NOT isolated_lane AND NOT maintenance_fenced
+AND max_cross_check_slots > 0
+AND 'cross_check_code_v1'=ANY(protocol_capabilities)
+AND 'cross_check_lane_v1'=ANY(protocol_capabilities)
+AND 'codex_harness_v1'=ANY(protocol_capabilities)
+AND 'codex_runtime_v2'=ANY(protocol_capabilities))`, user.ID).Scan(&available)
+		if err != nil {
+			slog.Error("check code cross-check workers", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		if !available {
+			response["code_warning"] = "No online worker can check code locally on both model families; upgrade the worker that runs your lead. Code checks require that same worker and never block publication."
 		}
 	}
 	httpx.JSON(w, http.StatusOK, response)

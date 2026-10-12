@@ -1,5 +1,9 @@
 import { it, afterEach, type TestContext } from "node:test";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
+import { loadConfig } from "../src/config.js";
+import { GitCache } from "../src/git.js";
+import { RunRunner } from "../src/runner.js";
+import { portableTeardownTestDeps } from "./teardown-fixtures.js";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
@@ -10,11 +14,11 @@ import { quiesceRunAttempt } from "../src/run-quiescence.js";
 import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
-import { deflateSync } from "node:zlib";
+
 import { Readable } from "node:stream";
 import type { ExecutorFactory } from "../src/runner.js";
 import { Outbox } from "../src/outbox.js";
-import { noProofReseed, nullLogger, recordingLogger } from "./helpers.js";
+import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
@@ -378,7 +382,24 @@ function command(cwd: string, ...args: string[]): string {
     encoding: "utf8", stdio: "pipe",
   }).trim();
 }
-async function seed(iid = 2512, large = false) {
+function configuredCache(limit: number): GitCache {
+  const config = loadConfig({ UZI_API_URL: "http://api:8080", UZI_WORKER_TOKEN: "fixture-token",
+    UZI_RECOVERY_DECODED_LIMIT_BYTES: String(limit) });
+  return new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({
+    recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
+    gitleaksBin: (git as any).gitleaksBin,
+  }));
+}
+
+function configuredRunner(cache: GitCache, makeExecutor: ExecutorFactory,
+  log = nullLogger(), joinToken?: string): RunRunner {
+  return new RunRunner(client, cache, makeExecutor, log, 20, joinToken, {
+    pollMs: 5, planApprovalTimeoutMs: 0, questionTimeoutMs: 600, prDescriptionHeadLagMs: 0,
+    gitlab: fakeGitlab().gitlab, teardownTestDeps: portableTeardownTestDeps, recoveryRetryMs: 1,
+  });
+}
+
+async function seed(iid = 2512, large = false, cache = git) {
   const claim = gitlabClaim(iid, { claim_generation: 2, session_id: "predecessor-session" });
   if (large) {
     command(fx.originPath, "config", "user.name", "fixture");
@@ -387,11 +408,11 @@ async function seed(iid = 2512, large = false) {
     command(fx.originPath, "add", "large-public");
     command(fx.originPath, "commit", "-m", "public history");
   }
-  const bare = await git.ensureClone(fx.originPath);
+  const bare = await cache.ensureClone(fx.originPath);
   fs.chmodSync(path.dirname(bare), 0o700);
   fs.chmodSync(bare, 0o700);
-  const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
-  await git.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
+  const clone = await cache.createOrAttachRunnerClone(bare, iid, noProofReseed, claim.run_id);
+  await cache.markRecoveryCapture(bare, clone.path, clone.branch, claim.run_id);
   fs.writeFileSync(path.join(clone.path, "retained.txt"), "only local dirty work\n");
   api.setOwnershipStatus(claim.run_id, "running", 2);
   return { claim, bare, clone, key: `issue-${iid}` };
@@ -1709,89 +1730,89 @@ for (const rejects of [false, true]) {
   });
 }
 
-it("verified guarded thin fallback permits local adoption despite unknown upload and keeps every source", async () => {
-  const { claim, bare, clone } = await seed(2512, true);
-  claim.inventory_guarded = true;
-  const feature = client.hasFeature.bind(client);
-  client.hasFeature = name => name === "recovery_inventory_v1" || feature(name);
-  client.getRunOwnership = async () => ({ status: "running", claim_generation: 2, inventory_guarded: true });
-  client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: [{
-    hold_id: "fixture-hold", generation: 2, inventory_guarded: true, has_available_capture: false,
-  }] });
-  client.reserveRecoveryCapture = async () => ({ capture_id: "00000000-0000-4000-8000-000000002512", state: "preparing" });
-  client.uploadRecoveryBundle = async (_run, _capture, manifest, stream) => {
-    for await (const chunk of stream) assert.ok(chunk.length);
-    assert.ok(manifest.prerequisite_shas!.length > 0);
-    throw new Error("upload response unknown");
-  };
-  client.getRecoveryCaptureStatus = async () => { throw new Error("status unavailable"); };
-  let releases = 0, models = 0, productions = 0, publications = 0;
-  client.publishCheckpoint = async (_run, _tip, stream) => {
-    publications++;
-    for await (const chunk of stream) assert.ok(chunk.length);
-    throw new Error("checkpoint publication response unknown");
-  };
-  client.releaseRecoveryCustody = async () => { releases++; throw new Error("must keep custody"); };
-  const produce = git.produceRecoveryBundle.bind(git);
-  git.produceRecoveryBundle = async (p, opts) => {
-    productions++;
-    // Lower only the cap: the real guarded self-contained -> thin producer still runs.
-    return produce(p, { ...opts, maxBytes: 8 * 1024 });
-  };
-  const { gitlab } = fakeGitlab();
-  const log = recordingLogger();
-  const r = runnerWith(factory(async ctx => {
-    models++;
-    assert.equal(productions, 1, JSON.stringify(log.lines));
-    assert.equal(readJournal(bare, clone.branch).recovery.attempts, 1);
-    assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
-    assert.notEqual(ctx.worktreePath, clone.path);
-    await ctx.onModelTurnSettled!(1);
-    throw new Error("fixture model stops");
-  }), gitlab, "fixture-journal-key", log.logger, { recoveryRetryMs: 1 });
-  await r.execute(claim);
-  assert.equal(models, 1, JSON.stringify({ logs: log.lines, states: api.states, journal: readJournal(bare, clone.branch), records: await r.snapshotBootRecoveries() }));
-  // The model interruption can create another terminal archive after model admission.
-  assert.ok(productions >= 1);
-  assert.ok(publications > 0);
-  assert.equal(releases, 0);
-  const records = await r.snapshotBootRecoveries();
-  const thin = records.find(record => record.selfContained === false && record.prerequisiteShas!.length > 0);
-  assert.ok(thin);
-  const localProof = (r as unknown as { recovery: { verifiedLocalCapture: (
-    record: typeof thin, signal?: AbortSignal,
-  ) => Promise<unknown> } }).recovery;
-  assert.equal(await localProof.verifiedLocalCapture(thin, AbortSignal.abort()), undefined,
-    "cancelled local integrity proof cannot grant adoption authority");
-  assert.ok(fs.existsSync(thin.bundlePath!), "cancellation retains the archive bytes");
-  const journal = readJournal(bare, clone.branch);
-  assert.equal(journal.recovery, undefined);
-  assert.ok(fs.existsSync(clone.path));
-  assert.ok(fs.existsSync(journal.clonePath));
-  assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
-});
+for (const archiveFailure of ["reserve", "upload"] as const) {
+  it(`configured below-cap guarded thin fallback permits adoption despite ${archiveFailure} failure and keeps every source`, async () => {
+    const git = configuredCache(1024 * 1024);
+    const { claim, bare, clone } = await seed(2512, true, git);
+    claim.inventory_guarded = true;
+    const feature = client.hasFeature.bind(client);
+    client.hasFeature = name => name === "recovery_inventory_v1" || feature(name);
+    client.getRunOwnership = async () => ({ status: "running", claim_generation: 2, inventory_guarded: true });
+    client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: [{
+      hold_id: "fixture-hold", generation: 2, inventory_guarded: true, has_available_capture: false,
+    }] });
+    client.reserveRecoveryCapture = async () => {
+      if (archiveFailure === "reserve") throw new Error("archive reservation unavailable");
+      return { capture_id: "00000000-0000-4000-8000-000000002512", state: "preparing" };
+    };
+    client.uploadRecoveryBundle = async (_run, _capture, manifest, stream) => {
+      for await (const chunk of stream) assert.ok(chunk.length);
+      assert.ok(manifest.prerequisite_shas!.length > 0);
+      throw new Error("upload response unknown");
+    };
+    client.getRecoveryCaptureStatus = async () => { throw new Error("status unavailable"); };
+    let releases = 0, models = 0, productions = 0, publications = 0;
+    client.publishCheckpoint = async (_run, _tip, stream) => {
+      publications++;
+      for await (const chunk of stream) assert.ok(chunk.length);
+      throw new Error("checkpoint publication response unknown");
+    };
+    client.releaseRecoveryCustody = async () => { releases++; throw new Error("must keep custody"); };
+    const produce = git.produceRecoveryBundle.bind(git);
+    git.produceRecoveryBundle = async (p, opts) => {
+      productions++;
+      // Lower only the cap: the real guarded self-contained -> thin producer still runs.
+      return produce(p, { ...opts, maxBytes: 8 * 1024 });
+    };
+    const log = recordingLogger();
+    const r = configuredRunner(git, factory(async ctx => {
+      models++;
+      assert.equal(git.recoveryDecodedLimitBytes, 1048576);
+      assert.equal(productions, 1, JSON.stringify(log.lines));
+      assert.equal(readJournal(bare, clone.branch).recovery.attempts, 1);
+      assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
+      assert.notEqual(ctx.worktreePath, clone.path);
+      await ctx.onModelTurnSettled!(1);
+      throw new Error("fixture model stops");
+    }), log.logger, "fixture-journal-key");
+    await r.execute(claim);
+    assert.equal(models, 1, JSON.stringify({ logs: log.lines, states: api.states, journal: readJournal(bare, clone.branch), records: await r.snapshotBootRecoveries() }));
+    // The model interruption can create another terminal archive after model admission.
+    assert.ok(productions >= 1);
+    assert.ok(publications > 0);
+    assert.equal(releases, 0);
+    const records = await r.snapshotBootRecoveries();
+    const thin = records.find(record => record.selfContained === false && record.prerequisiteShas!.length > 0);
+    assert.ok(thin);
+    const localProof = (r as unknown as { recovery: { verifiedLocalCapture: (
+      record: typeof thin, signal?: AbortSignal,
+    ) => Promise<unknown> } }).recovery;
+    assert.equal(await localProof.verifiedLocalCapture(thin, AbortSignal.abort()), undefined,
+      "cancelled local integrity proof cannot grant adoption authority");
+    assert.ok(fs.existsSync(thin.bundlePath!), "cancellation retains the archive bytes");
+    const journal = readJournal(bare, clone.branch);
+    assert.equal(journal.recovery, undefined);
+    assert.ok(fs.existsSync(clone.path));
+    assert.ok(fs.existsSync(journal.clonePath));
+    assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+  });
 
-it("real production declared overflow blocks runner with decoded_history_limit and retains source custody", async () => {
-  const { claim, bare, clone } = await seed();
+}
+
+it("real production configured overflow blocks runner with decoded_history_limit and retains source custody", async () => {
+  const cache = configuredCache(1);
+  const { claim, bare, clone } = await seed(2512, false, cache);
   claim.inventory_guarded = false;
   let models = 0, releases = 0, proofs = 0;
   const log = recordingLogger();
   client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
-  const record = git.recordRecoveryCapture.bind(git);
-  git.recordRecoveryCapture = async (...args) => {
-    proofs++;
-    const tip = args[5];
-    const oid = command(bare, "rev-parse", tip + ":retained.txt");
-    const objectPath = path.join(bare, "objects", oid.slice(0, 2), oid.slice(2));
-    fs.mkdirSync(path.dirname(objectPath), { recursive: true });
-    if (fs.existsSync(objectPath)) fs.chmodSync(objectPath, 0o600);
-    // Capture is complete; tamper before the real metadata proof, without allocating the declared body.
-    fs.writeFileSync(objectPath, deflateSync(Buffer.from("blob 1073741825\0")));
-    assert.equal(command(bare, "cat-file", "-s", oid), "1073741825");
-    return record(...args);
-  };
-  await runnerWith(factory(async () => { models++; throw new Error("must not model"); }),
-    fakeGitlab().gitlab, undefined, log.logger, { recoveryRetryMs: 1 }).execute(claim);
+  const record = cache.recordRecoveryCapture.bind(cache);
+  cache.recordRecoveryCapture = async (...args) => { proofs++; return record(...args); };
+  let successors = 0;
+  const prepare = cache.prepareRecoverySuccessor.bind(cache);
+  cache.prepareRecoverySuccessor = async (...args) => { successors++; return prepare(...args); };
+  await configuredRunner(cache, factory(async () => { models++; throw new Error("must not model"); }), log.logger).execute(claim);
+  assert.equal(successors, 0);
   assert.equal(proofs, 1);
   assert.equal(models, 0);
   assert.equal(releases, 0);
@@ -1805,8 +1826,73 @@ it("real production declared overflow blocks runner with decoded_history_limit a
   assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
   assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
   assert.ok(api.states.some(s => s.body.status === "failed" &&
-    s.body.failure_reason?.includes("1 GiB decoded verification limit")));
-  assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 GiB decoded verification limit")));
+    s.body.failure_reason?.includes("1 bytes decoded verification limit")));
+  assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 bytes decoded verification limit")));
+});
+
+it("configured repeated real closure reads exhaust cumulatively, retain pins, and changed-cap restart stays blocked", async () => {
+  const limit = 4096;
+  const cache = configuredCache(limit);
+  const { claim, bare, clone } = await seed(2512, false, cache);
+  claim.inventory_guarded = false;
+  let models = 0, releases = 0, successors = 0, reads = 0;
+  let pinnedTip = "";
+  let beforeBudget: any;
+  client.releaseRecoveryCustody = async () => { releases++; throw new Error("must retain custody"); };
+  const record = cache.recordRecoveryCapture.bind(cache);
+  cache.recordRecoveryCapture = async (...args) => {
+    const scope = (cache as any).recoveryOperations.getStore();
+    beforeBudget = scope.closureBudget;
+    assert.equal(beforeBudget.limit, limit, "runner operation uses parsed configured cap");
+    const tip = args[5];
+    const sizes = command(bare, "rev-list", "--objects", "--no-object-names", tip).split("\n")
+      .map(oid => Number(command(bare, "cat-file", "-s", oid)));
+    assert.ok(sizes.reduce((sum, size) => sum + size, 0) < limit, "individual closure is below cap");
+    await record(...args);
+    pinnedTip = tip;
+    // At most limit+1 reads: each successful nonempty closure charges at least one byte.
+    // The first refusal propagates and prevents successor admission.
+    for (let i = 0; i <= limit; i++) {
+      reads++;
+      await cache.withRecoveryOperation(scope.signal, scope.deadline, async () => {
+        assert.equal((cache as any).recoveryOperations.getStore().closureBudget, beforeBudget);
+        assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
+      });
+    }
+    throw new Error("fixture failed to exhaust cumulative budget");
+  };
+  const prepare = cache.prepareRecoverySuccessor.bind(cache);
+  cache.prepareRecoverySuccessor = async (...args) => { successors++; return prepare(...args); };
+  const log = recordingLogger();
+  await configuredRunner(cache, factory(async () => { models++; throw new Error("must not model"); }), log.logger).execute(claim);
+  assert.equal(models, 0);
+  assert.equal(successors, 0);
+  assert.equal(releases, 0);
+  assert.ok(reads > 1, "individually admissible repeated reads consumed the cumulative budget");
+  assert.ok(beforeBudget.delivered > 0 && beforeBudget.delivered <= limit);
+  const blocked = readJournal(bare, clone.branch);
+  assert.equal(blocked.recovery.stage, "blocked");
+  assert.equal(blocked.recovery.blocker, "decoded_history_limit");
+  assert.equal(blocked.clonePath, clone.path);
+  assert.equal(command(bare, "rev-parse", `refs/uzi-recovery-episode/${claim.run_id}/${pinnedTip}`), pinnedTip);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  assert.ok(api.states.some(s => s.body.failure_reason?.includes("4096 bytes decoded verification limit")));
+
+  // A larger cap does not reopen an exhausted journal or claim that its closure exceeds the new cap.
+  const restarted = configuredCache(8192);
+  let restartedProofs = 0;
+  restarted.verifyRecoveryClosure = async () => { restartedProofs++; throw new Error("blocked journal must not reverify"); };
+  const restartLog = recordingLogger();
+  await configuredRunner(restarted, factory(async () => { models++; throw new Error("must not model"); }), restartLog.logger).execute(claim);
+  assert.equal(restartedProofs, 0);
+  assert.equal(models, 0);
+  assert.equal(releases, 0);
+  assert.deepEqual(readJournal(bare, clone.branch), blocked);
+  assert.equal(command(bare, "rev-parse", `refs/uzi-recovery-episode/${claim.run_id}/${pinnedTip}`), pinnedTip);
+  assert.ok(fs.existsSync(clone.path));
+  const messages = restartLog.lines.map(line => JSON.stringify(line)).join("\n");
+  assert.match(messages, /previous decoded verification exhaustion; current cap 8192 bytes; prior cap not recorded/);
+  assert.doesNotMatch(messages, /history exceeds/);
 });
 
 for (const failure of ["cap", "timeout", "interruption"] as const) {
@@ -1880,8 +1966,8 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
         assert.equal(journal.recovery.deadline, persisted.deadline);
       }
       if (failure === "cap") {
-        assert.ok(api.states.some(s => s.body.failure_reason?.includes("1 GiB decoded verification limit")));
-        assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 GiB decoded verification limit")));
+        assert.ok(api.states.some(s => s.body.failure_reason?.includes("8589934592 bytes (8 GiB) decoded verification limit")));
+        assert.ok(log.lines.some(line => JSON.stringify(line).includes("8589934592 bytes (8 GiB) decoded verification limit")));
         assert.equal(journal.recovery.attempts, 1);
       }
     });

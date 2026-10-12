@@ -348,8 +348,8 @@ void _releaseCheckStatusFull;
 
 // ── RunListItem ─────────────────────────────────────────────────────────────
 // RunListItem extends Run, so its extra keys inherit the same drift fields; its
-// own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count,
-// is_revising) match. Same six ZeroOf exemptions, inherited from Run.
+// own fields (repo_path, worker_name, owner_email, judge_verdict, judge_todo_count)
+// match. Same six ZeroOf exemptions, inherited from Run.
 {
   const _runListItemMissing: never = null as unknown as Exclude<keyof RunListItem, keyof typeof runListItemFull>;
   const _runListItemExtra: never = null as unknown as Exclude<keyof typeof runListItemFull, keyof RunListItem>;

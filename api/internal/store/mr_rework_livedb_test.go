@@ -248,7 +248,7 @@ func TestMRReworkLiveDB(t *testing.T) {
 	// still incrementing the counter.
 	up := func(hw int64) {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7", HighWater: hw}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: "agent/issue-7", HighWater: hw}); err != nil {
 			t.Fatalf("UpsertMRReworkLedger(%d): %v", hw, err)
 		}
 	}
@@ -445,9 +445,9 @@ func TestMRReworkLedgerLifetimeLiveDB(t *testing.T) {
 		exec("INSERT INTO runs (id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,branch,mr_iid,mr_state,status,created_at) VALUES ($1,$2,$3,$4,$5,'t','d',$6,55,'opened','completed','2020-01-01')", id, owner, repoID, kind, issueIID, ref)
 		return id
 	}
-	seedLedger := func(repoID uuid.UUID, ref string) store.MrReworkLedger {
+	seedLedger := func(repoID uuid.UUID, ref string) store.GetMRReworkLedgerRow {
 		t.Helper()
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: ref, HighWater: 120}); err != nil {
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{RepoID: repoID, Ref: ref, HighWater: 120}); err != nil {
 			t.Fatal(err)
 		}
 		if err := q.SetMRReworkHaltNotified(ctx, store.SetMRReworkHaltNotifiedParams{RepoID: repoID, Ref: ref}); err != nil {
@@ -466,7 +466,7 @@ func TestMRReworkLedgerLifetimeLiveDB(t *testing.T) {
 			t.Fatalf("eviction rows=%d err=%v, want %d", got, err, want)
 		}
 	}
-	retained := func(want store.MrReworkLedger) {
+	retained := func(want store.GetMRReworkLedgerRow) {
 		t.Helper()
 		got, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: want.RepoID, Ref: want.Ref})
 		if err != nil || !reflect.DeepEqual(got, want) {

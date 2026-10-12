@@ -2504,3 +2504,12 @@ describe("issue #2593: lead gate-sequencing append", () => {
     assert.ok(!def.prompt.includes("Integration-gate sequencing and failed-gate triage"));
   });
 });
+
+
+it("m2 non-closing guidance reaches the SDK implement builder", () => {
+  const prompt = buildImplementPrompt({ branch: "b", subagentNames: [], first: true, iteration: 1 });
+  assert.match(prompt, /issue runs only/i);
+  assert.match(prompt, /approved plan.*open/);
+  assert.match(prompt, /non_closing/);
+  assert.match(prompt, /never infers.*scope_notes/);
+});

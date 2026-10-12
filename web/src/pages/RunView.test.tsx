@@ -5380,6 +5380,70 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
   });
 });
 
+// Issue #2760: a run re-planning after a revise stays awaiting_approval, but the server
+// derives is_revising + progress.state "planning", so the header pill and the progress card
+// must not say the run waits on the owner.
+describe("RunView — a revising run does not read as waiting on the owner (issue #2760)", () => {
+  const PROGRESS_BASE = {
+    pct: null,
+    milestone_done: 0,
+    milestone_total: 0,
+    active_milestone_id: "",
+    phase: "",
+  } as const;
+  const extra = mockApi as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows no 'awaiting approval' pill and no 'waits on you' while revising", async () => {
+    renderPage({
+      status: "awaiting_approval",
+      is_revising: true,
+      progress: { ...PROGRESS_BASE, state: "planning" },
+    });
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText(/awaiting approval/i)).toBeNull();
+    expect(screen.queryByText(/waits on you/i)).toBeNull();
+    expect(screen.getAllByText(/revising/i).length).toBeGreaterThan(0);
+  });
+
+  it("still reads waiting on the owner for a plan gate that is not revising", async () => {
+    renderPage({
+      status: "awaiting_approval",
+      is_revising: false,
+      progress: { ...PROGRESS_BASE, state: "waiting" },
+    });
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByText(/awaiting approval/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/waits on you/i)).toBeTruthy();
+  });
+});
+
 // Issue #1197 (a11y): recovery_wait is a self-resuming park with NO ActivityFeed message
 // backup (unlike limit_wait, whose run message the feed's polite region narrates) and
 // RecoveryWaitPanel mounts in the same tick as its content — so, exactly like pool_wait,

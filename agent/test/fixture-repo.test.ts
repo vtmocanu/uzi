@@ -6,6 +6,8 @@ import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
 import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { GitCache } from "../src/git.js";
+import { createLogger } from "../src/log.js";
 
 const SELF = fileURLToPath(import.meta.url);
 const GUARD = path.resolve(path.dirname(SELF), "../../scripts/tmpdir-leak-guard.sh");
@@ -137,11 +139,141 @@ function poisonedChild(scenario: PoisonScenario): void {
   assert.deepEqual(fs.readdirSync(outer), [], "child teardown leaves its private TMPDIR empty");
 }
 
-if (process.env.UZI_FIXTURE_REPO_CHILD === "1") {
+async function permissionsChild(): Promise<void> {
+  const outer = process.env.TMPDIR!;
+  const parent = fs.statSync(outer);
+  assert.equal(parent.gid, Number(process.env.UZI_FIXTURE_PARENT_GID));
+  assert.equal(parent.mode & 0o7777, Number(process.env.UZI_FIXTURE_PARENT_MODE));
+  process.umask(Number(process.env.UZI_FIXTURE_UMASK));
+  let fx: Fixture | undefined;
+  try {
+    fx = makeFixture();
+    const base = path.dirname(fx.dataDir);
+    const cache = new GitCache(fx.dataDir, createLogger("error"));
+    let bare: string | undefined;
+    let cloneError: unknown;
+    try { bare = await cache.ensureClone(fx.originPath); }
+    catch (error) { cloneError = error; }
+    const metadata: Array<{ path: string; mode: number; uid: number; gid: number }> = [];
+    // Read the whole tree before any fixture assertion, including a failed clone's partial state.
+    function collect(target: string): void {
+      const stat = fs.lstatSync(target);
+      metadata.push({ path: path.relative(base, target), mode: stat.mode & 0o7777, uid: stat.uid, gid: stat.gid });
+      if (stat.isDirectory()) {
+        for (const entry of fs.readdirSync(target)) collect(path.join(target, entry));
+      }
+    }
+    collect(base);
+    console.log(JSON.stringify({ parent: { gid: parent.gid, mode: parent.mode & 0o7777 }, metadata }));
+    assert.equal(metadata[0]!.mode, 0o700, "fixture root clears all special bits");
+    for (const entry of metadata) {
+      assert.equal(entry.uid, process.getuid!(), entry.path + " uid");
+      assert.equal(entry.gid, process.getgid!(), entry.path + " gid");
+      assert.equal(entry.mode & 0o002, 0, entry.path + " world write");
+    }
+    assert.ifError(cloneError);
+    assert.ok(bare);
+    for (const target of [fx.dataDir, path.join(fx.dataDir, "repos"), bare]) {
+      assert.ok(metadata.some(entry => entry.path === path.relative(base, target)), target);
+    }
+    const after = fs.statSync(outer);
+    assert.deepEqual([after.uid, after.gid, after.mode], [parent.uid, parent.gid, parent.mode], "parent ownership and mode remain unchanged");
+  } finally { fx?.cleanup(); }
+}
+
+function normalizationFailureChild(): void {
+  const operation = process.env.UZI_FIXTURE_NORMALIZATION_FAILURE as "chownSync" | "chmodSync";
+  const originals = { chownSync: fs.chownSync, chmodSync: fs.chmodSync };
+  const failure = new Error("injected fixture normalization failure");
+  let target: fs.PathLike | undefined;
+  let caught: unknown;
+  try {
+    // Both filesystem operations receive the root as their first argument.
+    const fail = (root: fs.PathLike): never => { target = root; throw failure; };
+    if (operation === "chownSync") fs.chownSync = fail;
+    else fs.chmodSync = fail;
+    try { makeFixture(); } catch (error) { caught = error; }
+  } finally {
+    if (operation === "chownSync") fs.chownSync = originals.chownSync;
+    else fs.chmodSync = originals.chmodSync;
+  }
+  assert.equal(fs[operation], originals[operation]);
+  assert.equal(caught, failure, "preserves the exact normalization error");
+  assert.ok(target);
+  assert.equal(fs.existsSync(target), false);
+  const lines = readLedger(process.env.UZI_TMPDIR_GUARD_LEDGER!);
+  assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target], ["removed", target]]);
+  assert.deepEqual(fs.readdirSync(process.env.TMPDIR!), ["ledger"]);
+}
+
+if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+  await permissionsChild();
+} else if (process.env.UZI_FIXTURE_NORMALIZATION_FAILURE) {
+  normalizationFailureChild();
+} else if (process.env.UZI_FIXTURE_REPO_CHILD === "1") {
   child();
 } else if (process.env.UZI_FIXTURE_REPO_POISON_CHILD) {
   poisonedChild(process.env.UZI_FIXTURE_REPO_POISON_CHILD as PoisonScenario);
 } else {
+  describe("makeFixture root permissions", () => {
+    const supported = process.platform !== "win32" && !!process.getgid && !!process.getuid && !!process.getgroups;
+    const foreignGid = supported ? process.getgroups!().find(gid => gid !== process.getgid!()) : undefined;
+    const parents = [
+      { name: "plain", gid: supported ? process.getgid!() : 0, mode: 0o770 },
+      { name: "own-group setgid", gid: supported ? process.getgid!() : 0, mode: 0o2770 },
+      { name: "foreign-group setgid", gid: foreignGid, mode: 0o2770 },
+    ];
+    for (const parent of parents) {
+      for (const mask of [0o002, 0o022]) {
+        it(`normalizes ${parent.name} parent with umask ${mask.toString(8)}`, {
+          skip: !supported ? "POSIX identity unavailable" : parent.gid === undefined ? "foreign supplementary group unavailable" : false,
+        }, () => {
+          const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-permissions-"));
+          try {
+            // After selecting a group, a setup or verification failure is a real failure.
+            fs.chownSync(outer, process.getuid!(), parent.gid!);
+            fs.chmodSync(outer, parent.mode);
+            const stat = fs.statSync(outer);
+            assert.equal(stat.gid, parent.gid);
+            assert.equal(stat.mode & 0o7777, parent.mode);
+            const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: outer, TSX_DISABLE_CACHE: "1",
+              UZI_FIXTURE_PERMISSIONS_CHILD: "1", UZI_FIXTURE_PARENT_GID: String(parent.gid),
+              UZI_FIXTURE_PARENT_MODE: String(parent.mode), UZI_FIXTURE_UMASK: String(mask) };
+            for (const key of Object.keys(childEnv)) {
+              if (key.startsWith("GIT_") || key === "UZI_TMPDIR_GUARD_LEDGER" ||
+                  key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
+                  key === "UZI_FIXTURE_NORMALIZATION_FAILURE") delete childEnv[key];
+            }
+            const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
+              cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 60_000,
+            });
+            assert.ifError(r.error);
+            assert.equal(r.status, 0, r.stdout + r.stderr);
+            assert.deepEqual(fs.readdirSync(outer), []);
+          } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+        });
+      }
+    }
+    for (const operation of ["chownSync", "chmodSync"]) {
+      it(`cleans up and records a failed root ${operation}`, { skip: !supported }, () => {
+        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-normalization-"));
+        try {
+          const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: outer, TSX_DISABLE_CACHE: "1",
+            UZI_FIXTURE_NORMALIZATION_FAILURE: operation, UZI_TMPDIR_GUARD_LEDGER: path.join(outer, "ledger") };
+          for (const key of Object.keys(childEnv)) {
+            if (key.startsWith("GIT_") || key === "UZI_FIXTURE_PERMISSIONS_CHILD" ||
+                key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD") delete childEnv[key];
+          }
+          const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
+            cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 60_000,
+          });
+          assert.ifError(r.error);
+          assert.equal(r.status, 0, r.stdout + r.stderr);
+        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+      });
+    }
+  });
+
   describe("makeFixture inherited Git environment isolation", () => {
     for (const scenario of POISON_SCENARIOS) {
       it(`isolates ${scenario} without mutating the child environment or poison repo`, () => {

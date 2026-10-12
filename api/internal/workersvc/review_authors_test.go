@@ -1,6 +1,7 @@
 package workersvc_test
 
 import (
+	"cmp"
 	"context"
 	"encoding/json"
 	"errors"
@@ -78,8 +79,26 @@ func newLookup() *lookupFake {
 	}
 }
 
+// raNS is the comment namespace the single-namespace assessor tests use (a GitLab note stream).
+const raNS = forge.CommentNSNote
+
+// raState is the ledger state with one mark in raNS and the given pending ids in raNS.
+func raState(mark int64, pending ...int64) workersvc.ReviewLedgerState {
+	return workersvc.ReviewLedgerState{Marks: map[string]int64{raNS: mark}, Pending: raKeys(pending...)}
+}
+
+func raKey(id int64) workersvc.CommentKey { return workersvc.CommentKey{Namespace: raNS, ID: id} }
+
+func raKeys(ids ...int64) []workersvc.CommentKey {
+	out := make([]workersvc.CommentKey, 0, len(ids))
+	for _, id := range ids {
+		out = append(out, raKey(id))
+	}
+	return out
+}
+
 func inline(id, author int64, name, body string, at time.Time) forge.MRComment {
-	return forge.MRComment{ID: id, AuthorForgeUserID: author, AuthorUsername: name, Body: body, CreatedAt: at, HeadSHA: "head", ReviewState: forge.ReviewCommentInline}
+	return forge.MRComment{ID: id, IDNamespace: raNS, AuthorForgeUserID: author, AuthorUsername: name, Body: body, CreatedAt: at, HeadSHA: "head", ReviewState: forge.ReviewCommentInline}
 }
 
 func summary(id, author int64, name, body string, at time.Time) forge.MRComment {
@@ -220,7 +239,7 @@ func TestTrustedBotSummaryNeverTriggers(t *testing.T) {
 		t.Fatal("an allowlisted bot's summary note must never trigger, whatever it says")
 	}
 	res := as.Snapshot(context.Background())
-	if plan := res.Plan(0, nil); plan.HasNew || plan.MaxActionableID != 0 {
+	if plan := res.Plan(raState(0)); plan.HasNew || plan.MaxActionableID != 0 {
 		t.Fatalf("plan = %+v, want nothing new", plan)
 	}
 	// It is still context: the note rides the snapshot of a run that fires for another reason.
@@ -345,7 +364,7 @@ func TestBeginLooksUpCandidatesOnlyAndSnapshotTheRest(t *testing.T) {
 		inline(5, 44, "old-timer", "already consumed", raT0),
 		inline(30, memberID, "carol", "new", raT0.Add(time.Minute)),
 	)
-	p.HighWater = 10
+	p.Ledger = raState(10)
 	as, err := h.assessor().Begin(context.Background(), p)
 	if err != nil || as == nil {
 		t.Fatalf("Begin = %v, %v", as, err)
@@ -454,17 +473,17 @@ func TestPlan(t *testing.T) {
 		inline(15, flakyID, "flaky", "d", raT0.Add(3*time.Second)),
 	))
 
-	plan := res.Plan(0, nil)
+	plan := res.Plan(raState(0))
 	if !plan.HasNew || plan.MaxActionableID != 12 || plan.UnknownNew != 2 {
 		t.Fatalf("plan = %+v, want new, mark 12, two unknown new", plan)
 	}
 	// Unknown ids at or below the NEW mark ride to the ledger; 15 is above 12 and is not moved past.
-	if !slices.Equal(plan.PendingAdd, []int64{5}) || len(plan.PendingRemove) != 0 {
+	if !slices.Equal(plan.PendingAdd, raKeys(5)) || len(plan.PendingRemove) != 0 {
 		t.Fatalf("pending add/remove = %v/%v, want [5]/[]", plan.PendingAdd, plan.PendingRemove)
 	}
 
 	// Mark already at 12: the member's comment is consumed; nothing is new.
-	plan = res.Plan(12, nil)
+	plan = res.Plan(raState(12))
 	if plan.HasNew {
 		t.Fatalf("plan = %+v, want nothing new at the mark", plan)
 	}
@@ -481,12 +500,12 @@ func TestPlan(t *testing.T) {
 		inline(5, flakyID, "flaky", "a", raT0),
 		inline(12, memberID, "carol", "c", raT0.Add(time.Second)),
 	))
-	plan = res2.Plan(12, []int64{5, 6, 99})
+	plan = res2.Plan(raState(12, 5, 6, 99))
 	if !plan.HasNew || plan.MaxActionableID != 12 {
 		t.Fatalf("plan = %+v, want the pending id to count as new", plan)
 	}
-	slices.Sort(plan.PendingRemove)
-	if !slices.Equal(plan.PendingRemove, []int64{5, 6, 99}) {
+	slices.SortFunc(plan.PendingRemove, func(a, b workersvc.CommentKey) int { return cmp.Compare(a.ID, b.ID) })
+	if !slices.Equal(plan.PendingRemove, raKeys(5, 6, 99)) {
 		t.Fatalf("pending remove = %v, want the consumed 5 and the vanished 6 and 99", plan.PendingRemove)
 	}
 
@@ -494,14 +513,14 @@ func TestPlan(t *testing.T) {
 	h3 := newHarness()
 	h3.lookup.answers[flakyID] = forge.AuthorNotEligible
 	res3 := h3.snapshot(t, h3.params(inline(5, flakyID, "flaky", "a", raT0)))
-	plan = res3.Plan(12, []int64{5})
-	if plan.HasNew || !slices.Equal(plan.PendingRemove, []int64{5}) {
+	plan = res3.Plan(raState(12, 5))
+	if plan.HasNew || !slices.Equal(plan.PendingRemove, raKeys(5)) {
 		t.Fatalf("plan = %+v, want pending 5 dropped without firing", plan)
 	}
 
 	// Still unknown: stays pending, not removed.
 	res4 := h.snapshot(t, h.params(inline(5, flakyID, "flaky", "a", raT0)))
-	plan = res4.Plan(12, []int64{5})
+	plan = res4.Plan(raState(12, 5))
 	if len(plan.PendingRemove) != 0 || plan.UnknownNew != 1 {
 		t.Fatalf("plan = %+v, want pending 5 kept and counted as unknown new", plan)
 	}

@@ -10,6 +10,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/forge"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -67,13 +68,13 @@ func (l *mrwLive) exec(t *testing.T, sql string, args ...any) {
 // seedLedger writes the ledger as an earlier consumed cycle left it.
 func (l *mrwLive) seedLedger(t *testing.T, attempts int, highWater int64) {
 	t.Helper()
-	if err := l.q.UpsertMRReworkLedger(l.ctx, store.UpsertMRReworkLedgerParams{RepoID: l.repo, Ref: mrwRef, HighWater: highWater}); err != nil {
+	if _, err := l.q.UpsertMRReworkLedger(l.ctx, store.UpsertMRReworkLedgerParams{RepoID: l.repo, Ref: mrwRef, HighWater: highWater, Marks: []byte(fmt.Sprintf(`{"review_comment":%d}`, highWater)), PendingAdd: []string{}, PendingRemove: []string{}, PendingSuperseded: []string{}, PendingSupersededBy: []string{}}); err != nil {
 		t.Fatal(err)
 	}
 	l.exec(t, "UPDATE mr_rework_ledger SET attempt_count=$3 WHERE repo_id=$1 AND ref=$2", l.repo, mrwRef, attempts)
 }
 
-func (l *mrwLive) ledger(t *testing.T) store.MrReworkLedger {
+func (l *mrwLive) ledger(t *testing.T) store.GetMRReworkLedgerRow {
 	t.Helper()
 	got, err := l.q.GetMRReworkLedger(l.ctx, store.GetMRReworkLedgerParams{RepoID: l.repo, Ref: mrwRef})
 	if err != nil {
@@ -106,7 +107,7 @@ func TestMRReworkAutoDoesNotReconsumeACompletedManualCycleLiveDB(t *testing.T) {
 	f.onList = func() {
 		f.onList = nil
 		snap := &workersvc.ReviewCommentsSnapshot{Comments: []workersvc.ReviewCommentSnapshot{{ID: 190, AuthorUsername: "human", Body: "please tighten this", ReviewState: "inline"}}}
-		if _, err := l.svc.CreateManualMRReworkRun(l.ctx, l.owner, l.repo, mrwRef, mrwMrIID, l.source, "t", "d", snap, workersvc.ReviewPlan{MaxActionableID: 190}, nil); err != nil {
+		if _, err := l.svc.CreateManualMRReworkRun(l.ctx, l.owner, l.repo, mrwRef, mrwMrIID, l.source, "t", "d", snap, workersvc.ReviewPlan{MaxActionableID: 190, MaxActionable: map[string]int64{forge.CommentNSReviewComment: 190}}, nil); err != nil {
 			t.Error(err)
 			return
 		}
@@ -135,7 +136,7 @@ func TestMRReworkAutoRespectsACapSpentDuringTheListingLiveDB(t *testing.T) {
 	f.onList = func() {
 		f.onList = nil
 		// The other cycle: its run came and went, and it advanced the count to the cap.
-		l.exec(t, "UPDATE mr_rework_ledger SET attempt_count=2, high_water=190 WHERE repo_id=$1 AND ref=$2", l.repo, mrwRef)
+		l.exec(t, "UPDATE mr_rework_ledger SET attempt_count=2, high_water=190, comment_marks='{\"review_comment\":190}' WHERE repo_id=$1 AND ref=$2", l.repo, mrwRef)
 	}
 
 	l.detect(2, f)

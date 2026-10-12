@@ -185,6 +185,9 @@ func New(st Store, pool DB, box *secretbox.Box, limits Limits, now func() time.T
 	}
 }
 
+// RequestDeadline returns the normalized upload/download request limit.
+func (s *Service) RequestDeadline() time.Duration { return s.limits.RequestDeadline }
+
 // acquire takes one slot from sem or fails when ctx is done (deadline/cancel). It never
 // blocks unboundedly: the request deadline the caller applies bounds the wait.
 func acquire(ctx context.Context, sem chan struct{}) error {

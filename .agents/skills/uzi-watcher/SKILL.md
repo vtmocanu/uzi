@@ -546,14 +546,15 @@ budget_exhausted`, not `failed` (PRD #1497).** It no longer has a
 longer comes from the wall. Extend it (`uzi run extend RUN --by 2h`, which
 resumes it in one step) or recover it the same way you would any other
 non-terminal park. After an extend, confirm with `uzi run get` that the run left
-`paused`: an extend refused at the cumulative cap can still print success
-(#2734).
+`paused` (a refused extend is a 409 naming the reason, #2734).
 
-### Continue a run in a successor run (extension cap spent, or a harness switch)
+### Continue a run in a successor run (technical total limit reached, or a harness switch)
 
-A run's harness is frozen at create. Until #2735 ships, an extend past the cumulative
-`budget_extension_cap_seconds` cannot add time; once it ships, the cap applies per
-request and this cap case goes away. To continue such a run, start a successor run. The successor is
+A run's harness is frozen at create. The admin's `run_extension_cap_seconds` now limits
+one extend request, not a run's lifetime total (#2735), so the old cumulative-cap case is
+gone; a run can be extended repeatedly. A successor run remains the way to switch harness,
+or to continue a run that has reached the technical total wall limit (2147483 s, the
+worker's timer limit; an over-limit extend is a 409 naming the room left). The successor is
 seeded from `origin/agent/issue-N` if that branch exists, otherwise from main. It never
 adopts another run's checkpoint, and `run create` has no base flag. `uzi handoff --base`
 gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.

@@ -6,6 +6,7 @@ import type { Run, RunMessage } from "../lib/api";
 import { usageLimitPhrase } from "../lib/limitWait";
 import { formatTokens } from "../lib/formatTokens";
 import { prefs } from "../lib/prefs";
+import { isRevisingRun } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { deriveRunUsage, type PhaseUsage } from "../lib/runUsage";
 import { useReconnectingBanner, useTailOnAppend } from "../lib/useFollowScroll";
@@ -261,8 +262,11 @@ function crewStateFor(
   // does — the lead is stopped between turns and nothing else can proceed — so it joins
   // the gate arm rather than falling through to the recency split, which would age every
   // lane to `idle` while a human is simply thinking.
+  // Issue #2760: a revising run (awaiting_approval + is_revising) is the lead re-planning,
+  // not the owner being asked, so it skips the plan-gate arm and falls through to the
+  // active-speaker ladder below.
   if (
-    run.status === "awaiting_approval" ||
+    (run.status === "awaiting_approval" && !isRevisingRun(run)) ||
     run.status === "awaiting_input" ||
     // PRD #517: a follow-up park blocks the whole crew the same way — the lead is
     // stopped between turns awaiting the user's next follow-up and nothing else can
@@ -664,7 +668,7 @@ export function ActivityFeed({
   const newestAgent = newestMsg ? (newestMsg.agent ?? LEAD) : undefined;
   const newestLane = newestMsg ? laneKeyOf(newestMsg) : undefined;
   const live =
-    !terminal && (run.status === "running" || run.status === "claimed");
+    !terminal && (run.status === "running" || run.status === "claimed" || isRevisingRun(run));
   const liveSpeaker = live ? newestAgent : undefined;
   const liveLane = live ? newestLane : undefined;
   // activeAgent drives RunEventRow's running-tool spinner; keep it running-only (the

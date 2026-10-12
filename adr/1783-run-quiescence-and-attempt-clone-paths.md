@@ -749,6 +749,19 @@ journal and the persistent attempt-mode marker.
 
 ## Amendment 2026-10-09 — #2512: verification resource limit
 
+**Historical cap policy:** the 1 GiB limit below is superseded by
+[ADR-1197's Amendment 2026-10-11 — #2743](1197-transient-recovery-park.md#amendment-2026-10-11--2743).
+The current delivered decoded-history cap is worker-configurable through
+`UZI_RECOVERY_DECODED_LIMIT_BYTES`, default 8589934592 bytes (8 GiB), with a fixed
+ceiling of 68719476736 bytes (64 GiB). The linked amendment records the reported
+offline measurement, startup validation, cumulative repeated-read accounting,
+restart behavior and deployment exposure boundary. Full reachable-history hash
+verification, prerequisites, custody, cancellation, deadlines and archive
+quotas remain unchanged. The cap is not a RAM limit: streaming content buffers
+are independent of it, metadata listings retain the 64 MiB `GIT_MAX_BUFFER`
+output cap, and Git-internal delta decompression and sibling-worker exhaustion
+remain the accepted #2512 residual risk.
+
 Human review authorizes a 1 GiB delivered decoded-history limit for reachable
 object integrity verification, even for a thin archive below 64 MiB. The
 worker verifies hashes under the existing deadline, records a visible blocker

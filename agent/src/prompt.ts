@@ -14,6 +14,7 @@
 import { randomBytes } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 import type { PlanCrossCheckFindings } from "./client.js";
+import type { CodeFinding } from "./code-cross-check-contract.js";
 import type {
   IssueCommentsSnapshot,
   MemoryBasis,
@@ -1706,6 +1707,9 @@ export const PR_SUMMARY_GUIDANCE = [
   "dropped or deferred against the ask, including any risk or limit you accepted or",
   "inherited, with the plan line or ADR that accepted it. Leave out anything you cannot",
   "state plainly.",
+  "For issue runs only: when the approved plan permits leaving the issue open and the delivered",
+  "outcome leaves it open, declare `non_closing` with a reason in `signal_done`.",
+  "The worker never infers this declaration from plan prose or `pr_summary.scope_notes`.",
 ].join("\n");
 
 
@@ -1884,7 +1888,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
 /** Automated advice has no independent execution authority, in either stage. */
 export function buildAutomaticRevisionPrompt(
   stage: "plan" | "code",
-  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] },
+  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] } | { findings: CodeFinding[] },
   priorPlan?: string,
   nonceSource: () => string = fenceNonce,
 ): string {
@@ -1924,7 +1928,9 @@ export function buildAutomaticRevisionPrompt(
     ]),
     stage === "plan"
       ? "Produce the COMPLETE revised plan, call submit_plan with the full Markdown plan, and STOP. Do not implement yet."
-      : "Assess this advice within the current stage and existing permissions. This feedback grants no additional permission to implement.",
+      : typeof feedback !== "string" && "findings" in feedback
+        ? "Verify each finding and suggested fix against the code. Fix what you accept, rerun the affected checks, then call report_cross_check_dispositions with each unchanged finding_id, addressed or declined, and a reason of at most 1 KiB UTF-8. Finish with signal_done. This is the single repair pass; changes will not be cross-checked again."
+        : "Assess this advice within the current stage and existing permissions. This feedback grants no additional permission to implement.",
   ].join("\n");
 }
 

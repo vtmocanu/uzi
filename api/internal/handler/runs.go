@@ -116,8 +116,8 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 		// nil stays nil for an unjudged run — absent, not a neutral verdict.
 		item.JudgeVerdict = textPtrValue(row.JudgeVerdict.Valid, row.JudgeVerdict.String)
 		item.JudgeTodoCount = todo[row.Run.ID]
-		item.IsRevising = revising[row.Run.ID]      // nil map ⇒ false (issue #750)
-		item.CurrentActivity = activity[row.Run.ID] // nil map ⇒ null (PRD #1064)
+		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map ⇒ false (issue #750)
+		item.CurrentActivity = activity[row.Run.ID]       // nil map ⇒ null (PRD #1064)
 		setProgressPhase(&item.RunDTO)
 		// issue #1418: override runToDTO's capture-unaware landing_state with the
 		// capture-aware value from the query's has_available_capture column, so the list
@@ -184,8 +184,8 @@ func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 		item.ForgeType = row.ForgeType.String // "" for a repo-less job run; per-run MR/PR noun (PRD #65 D2)
 		// PRD #411: the joined forge issue web URL, nil for issue-less/uncached runs.
 		item.IssueWebURL = textPtrValue(row.IssueWebUrl.Valid, row.IssueWebUrl.String)
-		item.IsRevising = revising[row.Run.ID]      // nil map ⇒ false (issue #750)
-		item.CurrentActivity = activity[row.Run.ID] // nil map ⇒ null (PRD #1064)
+		applyRevising(&item.RunDTO, revising[row.Run.ID]) // nil map ⇒ false (issue #750)
+		item.CurrentActivity = activity[row.Run.ID]       // nil map ⇒ null (PRD #1064)
 		setProgressPhase(&item.RunDTO)
 		out = append(out, item)
 	}

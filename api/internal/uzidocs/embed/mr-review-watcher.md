@@ -157,19 +157,24 @@ permission unknown` with reason `permission_unknown`, the count and how many
 lookups it attempted, and an on-demand rework returns a 409 whose message
 says the new comments' authors couldn't be verified yet and to try again
 shortly or give guidance. This is a transient state: uzi keeps the unknown
-comment ids on the MR's ledger and fires the rework on a later tick once
-their author checks out as eligible. The ledger keeps **one id per unverified
-author**: that author's newest unknown actionable comment that is above the
-previous high-water mark (and at or below the new one) or already pending,
-capped at 10,000 entries. On overflow the **oldest** ids are
-kept, so a flood that arrives after a finding can't displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. An author's older id is dropped only when its newer representative is retained in the same atomic merge (a stale writer whose add is rejected, or whose replacement another writer removed, leaves the older id in place); a retained replacement takes the older id's place in the cap order within that merge. Both the watcher and the on-demand path read the ledger before listing the comments, so a pending id missing from the listing is treated as deleted. A comment
+comment keys on the MR's ledger and fires the rework on a later tick once
+their author checks out as eligible. A comment is identified by its
+namespace and id, because GitHub and Forgejo number PR conversation comments,
+inline review comments and review summaries separately (GitLab has one `note`
+sequence), so the ledger keeps a consumed mark **per namespace** and
+the pending entries as `<namespace>:<id>` keys. The ledger keeps **one key per
+unverified author**: that author's newest unknown actionable comment that is
+above its namespace's previous mark (and at or below the new one) or already
+pending, capped at 10,000 entries in admission order. On overflow the
+**oldest-admitted** keys are kept, so a flood that arrives after a finding can't displace it. Near the cap, when superseding could not be guaranteed to fit, an author's older id is kept (so an author may briefly hold two entries) rather than risk losing both. An author's older id is dropped only when its newer representative is retained in the same atomic merge (a stale writer whose add is rejected, or whose replacement another writer removed, leaves the older id in place); a retained replacement takes the older id's place in the cap order within that merge. Both the watcher and the on-demand path read the ledger before listing the comments, so a pending id missing from the listing is treated as deleted. A comment
 whose author turns out not to be eligible is dropped and never fires. Two
 residuals fall back to a human noticing the comment in review: an author who
 deletes their own newest (representative) comment while older unknown ones
 remain, and an id the snapshot caps push out. A concurrent ledger writer that
 moves the mark past a new representative id can also drop it, but the older id
-then stays pending; this is narrow and overlaps the scalar-mark limitation under
-[Known limitations](#known-limitations).
+then stays pending; this is narrow. See
+[Comment identity and upgrading](#comment-identity-and-upgrading) for how
+existing ledgers are upgraded.
 
 ### Fair progress under an outsider flood
 
@@ -238,9 +243,7 @@ Ticks that don't count never move anyone ahead of *X*.
 > in [ADR-2347](../adr/2347-review-comment-author-trust.md).
 
 Smaller residuals: an outsider later promoted to collaborator is recognized
-within 6 hours (the cached verdict's lifetime); the cross-type comment-id
-limitation under [Known limitations](#known-limitations) also applies to
-remembered unknown ids; the ledger's 10,000-account cap is a documented residual (the pending set accumulates across fires, one entry per unverified author, and displacement needs it to exceed 10,000 entries); and a stale GitHub collaborator listing can cost a
+within 6 hours (the cached verdict's lifetime); the ledger's 10,000-account cap is a documented residual (the pending set accumulates across fires, one entry per unverified author, and displacement needs it to exceed 10,000 entries); and a stale GitHub collaborator listing can cost a
 queue position, which affects fairness only, never who is trusted.
 
 ## Enablement
@@ -444,16 +447,102 @@ resolve anchors unresolved.** The reply still goes through for every
 finding; it's specifically the resolve step that can miss a thread past
 that count.
 
+## Comment identity and upgrading
+
+A review comment is identified by `(namespace, id)`, not a bare id. The
+namespaces are:
+
+| Forge | Namespaces |
+|---|---|
+| GitHub | `issue_comment` (PR conversation comments), `review_comment` (inline), `review` (review-summary bodies) |
+| Forgejo | the same three |
+| GitLab | `note` (one notes sequence covers inline and top-level notes) |
+
+For each MR, uzi stores the highest consumed id per namespace (it only moves
+forward) and the pending permission-unknown comments as `<namespace>:<id>`
+keys. The legacy `high_water` column is still advanced so it stays readable
+for a rollback, but it is not compared on an upgraded row.
+Design rationale and rejected alternatives: [ADR-1199](../adr/1199-mr-comment-identity.md).
+
+**Existing MRs upgrade automatically, with no manual step.** A ledger row
+written before the upgrade is bootstrapped on the first successful comment
+listing: the next watcher tick that lists the comments (green head pipeline,
+MR not halted at the cap) or the next on-demand rework. Only a complete listing
+counts; a failed listing leaves the row as it was and the tick does nothing,
+as before. Each namespace's mark becomes the highest id seen in that namespace
+at or below the old single mark, comments above the old mark keep their
+eligibility, and each old pending id becomes a key in every namespace that has
+a comment with that id (an id with no comment in the listing is dropped). In a
+rare id collision this can replay one already-consumed comment once, within the
+cap. If another change lands while the upgrade runs, the watcher skips the
+tick and retries on the next one, and an on-demand rework answers 409 "the
+review comment state changed while this request ran; try again".
+
+### Upgrade refused: ledger too large
+
+If the old pending set would expand to more than 10,000 keys, nothing is
+written and the MR is not upgraded or reworked: the watcher logs one Warn per
+MR per tick with reason `bootstrap_overflow` and the counts, and an on-demand
+rework answers 409 "this merge request's review ledger is too large to upgrade
+automatically; an operator must reset it (see docs/mr-review-watcher.md)". An operator resets it with one of
+these statements against the database (`<repo uuid>` is the repository id,
+`<branch>` the MR's source branch):
+
+1. **Clear the old pending set** (preferred):
+
+   ```sql
+   UPDATE mr_rework_ledger SET pending_unknown_ids = '{}'
+   WHERE repo_id = '<repo uuid>' AND ref = '<branch>' AND comment_marks IS NULL;
+   ```
+
+   The next watcher tick that lists the comments (green head pipeline, MR not
+   halted at the cap), or the next on-demand rework, upgrades the row with
+   marks only. The comments that were
+   pending fall back to human review (the owner can run `uzi run rework` with
+   guidance). The automatic cycle count is kept.
+
+2. **Delete the row:**
+
+   ```sql
+   DELETE FROM mr_rework_ledger WHERE repo_id = '<repo uuid>' AND ref = '<branch>';
+   ```
+
+   This resets the automatic cycle count and all marks to zero, so every
+   eligible actionable comment on the MR counts as new once, bounded by the
+   cap. It also gives up the pending set.
+
+### Rollout and rollback
+
+During a mixed-version rollout an old binary ignores the new columns and
+updates only the legacy columns (`high_water`, `pending_unknown_ids`,
+`attempt_count`, `halt_notified`). After the upgrade the legacy
+`pending_unknown_ids` column is frozen, and a rolled-back or mixed-version old
+binary still treats those frozen ids as pending, so it may replay a comment
+the new code already consumed, once within the cap (a bare id can also match a
+comment in another namespace). A comment it consumed on an already-upgraded
+row may replay once within the cap, and its writes can leave the namespace marks and pending
+keys stale relative to the legacy state.
+
+Rolling the binary back without a database downgrade leaves the marks and
+pending keys stored. The old binary ignores them, so pending keys added since
+the upgrade are not acted on while it runs; those comments fall back to human
+review. They are not lost merely by changing binaries, and on re-upgrade an
+already-upgraded row is not bootstrapped again: it resumes from its retained,
+possibly stale, marks and keys. Running the migration's Down is different: it
+drops the new columns, so marks and keys are gone and a later re-upgrade
+bootstraps again from the old single mark (findings skipped before it stay
+skipped, as above).
+
 ## Known limitations
 
-- **The consumed-comment tracker is a single running high-water mark, not a
-  true ordering across every comment type.** GitHub and Forgejo assign
-  comment ids from more than one internal sequence (inline review comments,
-  issue-style notes, review summaries), so in a rare cross-type ordering
-  case a genuinely new comment can be skipped by the tracker. This is a
-  deliberate fail-safe, not a bug: a skipped comment simply falls back to a
-  human noticing it in review, and the rework loop never makes a wrong
-  write because of it.
+- **Consumed comments are tracked per id namespace, and findings skipped
+  before the upgrade stay skipped.** A comment is identified by its
+  namespace and id, and ids are compared only within a namespace, so a
+  higher-numbered top-level comment no longer hides a newer inline finding on
+  GitHub and Forgejo. A finding that was skipped before the upgrade, at or
+  below its namespace's bootstrap mark, stays skipped; it falls back to a human
+  noticing it in review, or you can run `uzi run rework` with guidance. See
+  [Comment identity and upgrading](#comment-identity-and-upgrading).
 - **Comments from authors without repository access never reach the
   rework.** That includes most review bots until an admin
   [allowlists](#trusted-review-bots) them, and an author whose access can't be

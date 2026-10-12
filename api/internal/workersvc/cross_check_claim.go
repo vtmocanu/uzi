@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"crypto/sha256"
 	"encoding/hex"
 	"encoding/json"
 	"errors"
@@ -19,13 +20,21 @@ import (
 // ClaimPlanCrossCheck carries the stored candidate only. Credentials stay in the
 // existing child claim's worker-owned secret envelope, never in this model input.
 type ClaimPlanCrossCheck struct {
-	ModelSource     *string   `json:"model_source,omitempty"`
-	EffortSource    *string   `json:"effort_source,omitempty"`
-	Stage           string    `json:"stage"`
-	LeadRunID       string    `json:"lead_run_id"`
-	Round           int32     `json:"round"`
-	CandidateDigest string    `json:"candidate_digest"`
-	DeadlineAt      time.Time `json:"deadline_at"`
+	GuidanceDigest          string          `json:"guidance_digest,omitempty"`
+	RepoInstructionsEnabled *bool           `json:"repo_instructions_enabled,omitempty"`
+	RepoInstructionsText    string          `json:"repo_instructions_text,omitempty"`
+	RepoInstructionsDigest  string          `json:"repo_instructions_digest,omitempty"`
+	CustomGuidanceApplied   *bool           `json:"custom_guidance_applied,omitempty"`
+	HeadCommit              string          `json:"head_commit,omitempty"`
+	CodeContext             json.RawMessage `json:"code_context,omitempty"`
+	GuidanceSnapshot        string          `json:"guidance_snapshot,omitempty"`
+	ModelSource             *string         `json:"model_source,omitempty"`
+	EffortSource            *string         `json:"effort_source,omitempty"`
+	Stage                   string          `json:"stage"`
+	LeadRunID               string          `json:"lead_run_id"`
+	Round                   int32           `json:"round"`
+	CandidateDigest         string          `json:"candidate_digest"`
+	DeadlineAt              time.Time       `json:"deadline_at"`
 	PlanCrossCheckCandidate
 }
 
@@ -39,6 +48,34 @@ func crossCheckClaimInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
 // crossCheckCandidateInput validates only wire shape and candidate identity.
 // Stored-attempt admission additionally requires the immutable budget snapshot.
 func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error) {
+	if cc.Stage == "code" {
+		if cc.Round != 1 || !cc.HeadCommit.Valid || !cc.BaseCommit.Valid ||
+			!validCodeSHA(cc.HeadCommit.String) || !validCodeSHA(cc.BaseCommit.String) ||
+			len(cc.CandidateDigest) != 32 || !cc.DeadlineAt.Valid || len(cc.CodeContext) == 0 ||
+			!json.Valid(cc.CodeContext) || !cc.GuidanceSnapshot.Valid {
+			return nil, ErrCrossCheckRefused
+		}
+		guidanceHash := sha256.Sum256([]byte(cc.GuidanceSnapshot.String))
+		instructionsHash := sha256.Sum256([]byte(cc.RepoInstructionsText.String))
+		if cc.GuidanceText.Valid && cc.GuidanceText.String != cc.GuidanceSnapshot.String ||
+			(len(cc.GuidanceDigest) != 0 && !bytes.Equal(guidanceHash[:], cc.GuidanceDigest)) ||
+			(len(cc.RepoInstructionsDigest) != 0 && !bytes.Equal(instructionsHash[:], cc.RepoInstructionsDigest)) {
+			return nil, ErrCrossCheckRefused
+		}
+		custom := cc.GuidanceSnapshot.String != ""
+		digest, err := codeCandidateDigest(cc)
+		if err != nil || !bytes.Equal(digest, cc.CandidateDigest) {
+			return nil, ErrCrossCheckRefused
+		}
+		return &ClaimPlanCrossCheck{Stage: "code", LeadRunID: cc.LeadRunID.String(), Round: 1,
+			CandidateDigest: hex.EncodeToString(cc.CandidateDigest), DeadlineAt: cc.DeadlineAt.Time,
+			GuidanceDigest: hex.EncodeToString(guidanceHash[:]), RepoInstructionsEnabled: &cc.RepoInstructionsEnabled,
+			RepoInstructionsText: cc.RepoInstructionsText.String, RepoInstructionsDigest: hex.EncodeToString(instructionsHash[:]), CustomGuidanceApplied: &custom,
+			HeadCommit: cc.HeadCommit.String, CodeContext: cc.CodeContext, GuidanceSnapshot: cc.GuidanceSnapshot.String,
+			PlanCrossCheckCandidate: PlanCrossCheckCandidate{BaseCommit: cc.BaseCommit.String, PlanMd: cc.PlanMd.String,
+				Milestones: cc.Milestones, RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools, SizeClass: cc.SizeClass.String},
+			ModelSource: textPtr(cc.CheckerModelSource), EffortSource: textPtr(cc.CheckerEffortSource)}, nil
+	}
 	c := PlanCrossCheckCandidate{PlanMd: cc.PlanMd.String, Milestones: cc.Milestones,
 		RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools,
 		SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
@@ -87,8 +124,17 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	}
 	defer func() { _ = tx.Rollback(ctx) }()
 	q := store.New(tx)
-	_, err = q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
-		ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
+	persisted, err := q.GetCrossCheckByChild(ctx, pgconv.UUID(run.ID))
+	if err != nil {
+		return ErrCrossCheckRefused
+	}
+	if persisted.Stage == "code" {
+		_, err = q.LockCodeCrossCheckLeadForVerdict(ctx, store.LockCodeCrossCheckLeadForVerdictParams{
+			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
+	} else {
+		_, err = q.LockPlanCrossCheckLeadForVerdict(ctx, store.LockPlanCrossCheckLeadForVerdictParams{
+			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration})
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCrossCheckRefused
 	}
@@ -110,10 +156,18 @@ func (s *Service) assemblePlanCrossCheckInput(ctx context.Context, worker store.
 	if len(resolutions) > 0 && resolutions[0] != nil {
 		modelSource, effortSource = &resolutions[0].ModelSource, &resolutions[0].EffortSource
 	}
-	cc, err := q.RecordPlanCrossCheckClaim(ctx, store.RecordPlanCrossCheckClaimParams{
-		ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration,
-		CheckerModel: pgconv.TextPtr(payload.Config.DefaultModel), CheckerEffort: pgconv.TextPtr(payload.Config.DefaultEffort),
-		CheckerModelSource: pgconv.TextPtr(modelSource), CheckerEffortSource: pgconv.TextPtr(effortSource)})
+	var cc store.CrossCheck
+	if persisted.Stage == "code" {
+		cc, err = q.RecordCodeCrossCheckClaim(ctx, store.RecordCodeCrossCheckClaimParams{
+			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration,
+			CheckerModel: pgconv.TextPtr(payload.Config.DefaultModel), CheckerEffort: pgconv.TextPtr(payload.Config.DefaultEffort),
+			CheckerModelSource: pgconv.TextPtr(modelSource), CheckerEffortSource: pgconv.TextPtr(effortSource)})
+	} else {
+		cc, err = q.RecordPlanCrossCheckClaim(ctx, store.RecordPlanCrossCheckClaimParams{
+			ChildID: run.ID, WorkerID: pgconv.UUID(worker.ID), ClaimGeneration: run.ClaimGeneration,
+			CheckerModel: pgconv.TextPtr(payload.Config.DefaultModel), CheckerEffort: pgconv.TextPtr(payload.Config.DefaultEffort),
+			CheckerModelSource: pgconv.TextPtr(modelSource), CheckerEffortSource: pgconv.TextPtr(effortSource)})
+	}
 	if errors.Is(err, pgx.ErrNoRows) {
 		return ErrCrossCheckRefused
 	}

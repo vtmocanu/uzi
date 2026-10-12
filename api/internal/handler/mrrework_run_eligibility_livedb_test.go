@@ -6,6 +6,7 @@ import (
 	"fmt"
 	"net/http"
 	"net/http/httptest"
+	"slices"
 	"strings"
 	"sync/atomic"
 	"testing"
@@ -123,7 +124,7 @@ func (r *reworkRig) reworkRuns(t *testing.T) int {
 }
 
 func rcomment(id, author int64, body string) forge.MRComment {
-	return forge.MRComment{ID: id, AuthorForgeUserID: author, AuthorUsername: fmt.Sprintf("u%d", author), Body: body,
+	return forge.MRComment{ID: id, IDNamespace: forge.CommentNSReviewComment, AuthorForgeUserID: author, AuthorUsername: fmt.Sprintf("u%d", author), Body: body,
 		CreatedAt: time.Now().Add(-time.Hour), HeadSHA: "head", ReviewState: forge.ReviewCommentInline}
 }
 
@@ -199,13 +200,13 @@ func TestOnDemandReworkProceedsWithAnEligibleOnlySnapshotLiveDB(t *testing.T) {
 			t.Fatalf("stored snapshot lacks %q: %s", want, stored)
 		}
 	}
-	var hw int64
-	var pending []int64
-	if err := rig.pool.QueryRow(context.Background(), `SELECT high_water, pending_unknown_ids FROM mr_rework_ledger WHERE repo_id = $1 AND ref = $2`, rig.repoID, reworkRef).Scan(&hw, &pending); err != nil {
+	var marks string
+	var pending []string
+	if err := rig.pool.QueryRow(context.Background(), `SELECT comment_marks::text, pending_unknown_keys FROM mr_rework_ledger WHERE repo_id = $1 AND ref = $2`, rig.repoID, reworkRef).Scan(&marks, &pending); err != nil {
 		t.Fatal(err)
 	}
-	if hw != 121 || len(pending) != 0 {
-		t.Fatalf("ledger high_water %d pending %v, want 121 and none (the unknown id is above the mark)", hw, pending)
+	if marks != `{"review_comment": 121}` || len(pending) != 0 {
+		t.Fatalf("ledger comment_marks %s pending keys %v, want review_comment 121 and none (the unknown id is above the mark)", marks, pending)
 	}
 }
 
@@ -217,14 +218,15 @@ func TestOnDemandReworkLeavesAConcurrentlyStoredPendingIDAloneLiveDB(t *testing.
 	rig.f.answers[11] = forge.AuthorEligible
 	q := store.New(rig.pool)
 	ctx := context.Background()
-	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-		RepoID: rig.repoID, Ref: reworkRef, HighWater: 150,
+	if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+		RepoID: rig.repoID, Ref: reworkRef, HighWater: 150, Marks: []byte(`{"review_comment":150}`),
 	}); err != nil {
 		t.Fatal(err)
 	}
 	rig.f.onList = func() {
-		if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-			RepoID: rig.repoID, Ref: reworkRef, HighWater: 165, PendingAdd: []int64{170},
+		if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+			RepoID: rig.repoID, Ref: reworkRef, HighWater: 165, Marks: []byte(`{"review_comment":165}`),
+			PendingAdd: []string{"review_comment:170"},
 		}); err != nil {
 			t.Error(err)
 		}
@@ -235,14 +237,11 @@ func TestOnDemandReworkLeavesAConcurrentlyStoredPendingIDAloneLiveDB(t *testing.
 	if rec.Code != http.StatusCreated {
 		t.Fatalf("status %d body %s, want 201", rec.Code, rec.Body.String())
 	}
-	var pending []int64
-	if err := rig.pool.QueryRow(ctx, `SELECT pending_unknown_ids FROM mr_rework_ledger WHERE repo_id = $1 AND ref = $2`, rig.repoID, reworkRef).Scan(&pending); err != nil {
+	var pending []string
+	if err := rig.pool.QueryRow(ctx, `SELECT pending_unknown_keys FROM mr_rework_ledger WHERE repo_id = $1 AND ref = $2`, rig.repoID, reworkRef).Scan(&pending); err != nil {
 		t.Fatal(err)
 	}
-	found := false
-	for _, id := range pending {
-		found = found || id == 170
-	}
+	found := slices.Contains(pending, "review_comment:170")
 	if !found {
 		t.Fatalf("pending = %v, want 170 kept: the listing never saw it", pending)
 	}
@@ -257,8 +256,8 @@ func TestOnDemandReworkStaleBareRequestDoesNotReconsumeLiveDB(t *testing.T) {
 	rig.f.answers[11] = forge.AuthorEligible
 	q := store.New(rig.pool)
 	ctx := context.Background()
-	if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
-		RepoID: rig.repoID, Ref: reworkRef, HighWater: 150,
+	if _, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+		RepoID: rig.repoID, Ref: reworkRef, HighWater: 150, Marks: []byte(`{"review_comment":150}`),
 	}); err != nil {
 		t.Fatal(err)
 	}

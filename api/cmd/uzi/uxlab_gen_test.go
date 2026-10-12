@@ -644,7 +644,7 @@ func boardRevising(dark bool, now time.Time) string {
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111-2222-3333-444444444444", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute)}},
-		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "awaiting_approval", IssueTitle: "Re-plan webhook delivery retries after steer", CreatedAt: now.Add(-90 * time.Second)}, IsRevising: true},
+		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "awaiting_approval", IssueTitle: "Re-plan webhook delivery retries after steer", CreatedAt: now.Add(-90 * time.Second), IsRevising: true}},
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
 	}})
 	return m.View().Content

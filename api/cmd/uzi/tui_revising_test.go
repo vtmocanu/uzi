@@ -82,7 +82,7 @@ func TestRunBandRevising(t *testing.T) {
 // NEEDS YOU → ON THE FLOOR → DONE concatenation puts the revising run after the gate run.
 func TestBandOrderPlacesRevisingOnFloor(t *testing.T) {
 	runs := []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "revising-1", Kind: "issue", Status: "awaiting_approval"}, IsRevising: true},
+		{RunDTO: apitypes.RunDTO{ID: "revising-1", Kind: "issue", Status: "awaiting_approval", IsRevising: true}},
 		{RunDTO: apitypes.RunDTO{ID: "gate-1", Kind: "issue", Status: "awaiting_approval"}},
 	}
 	out := bandOrder(runs)
@@ -104,7 +104,7 @@ func TestBandOrderPlacesRevisingOnFloor(t *testing.T) {
 // row draws ⚑ / "plan gate", so the ↻ / "revising" assertions fail.
 func TestBoardRendersRevisingGlyphTwin(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "awaiting_approval", IssueTitle: "replanning one"}, IsRevising: true},
+		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "awaiting_approval", IssueTitle: "replanning one", IsRevising: true}},
 	}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})

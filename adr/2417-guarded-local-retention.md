@@ -61,7 +61,8 @@ Failure before step 4 retains the covering ACK for a later bounded boot or live
 pass. Successful earlier deletions are idempotent, including already-absent
 files. The ACK is retry authority, not a new durable local receipt. After its
 deletion, the API's durable disposition remains authoritative and the selected
-server archive remains available under its existing retention policy.
+server archive remains available under its existing retention policy (qualified by
+[Amendment 2026-10-11](#amendment-2026-10-11--published-redundancy-early-expiry-2625): a proven-redundant archive may expire early).
 
 Archive coverage is not remote publication proof. Local recovery cleanup does
 not reconcile a head as forge-published or erase referenced publication identity.
@@ -130,9 +131,11 @@ still in the future. The trigger raises before an expiry update can remove the
 selected archive, rolling back the statement's chunk deletion too.
 
 Physical worker deletion is the operation that renews the selected capture's
-configured ready-retention window and clears `local_replica_worker_id`. Local
+configured ready-retention window and clears `local_replica_worker_id` (a
+published-redundancy early expiry, #2625, also clears it). Local
 ACK cleanup leaves that marker and expiry unchanged, even after its local
-bundles and journals are gone. No server archive retention policy is changed.
+bundles and journals are gone. No server archive retention policy is changed by this decision; #2625 later
+adds one narrow early-expiry path ([Amendment 2026-10-11](#amendment-2026-10-11--published-redundancy-early-expiry-2625)).
 
 ## Consequences and boundaries
 
@@ -225,3 +228,84 @@ Quarantine can permit the existing custody release exception but blocks
 physical destruction. Bad-MAC terminal cleanup remains its separate policy.
 No intent, endpoint, discovery, driver or E2E mechanism is added; #2544,
 #2545 and #2506 remain outside this change.
+
+## Amendment 2026-10-11 — published-redundancy early expiry (#2625)
+
+**Status**: Implemented in API and worker, per maintainer decision #2625.
+This records implemented behavior, not live or deployment acceptance. It
+qualifies the statements above that the selected server archive "remains
+available under its existing retention policy" and that "No server archive
+retention policy is changed": a completed run's guarded archive can now expire
+early, but only on a complete server-side proof. Everything without one keeps
+its existing retention.
+
+### The proof
+
+`POST /api/worker/runs/{id}/archives/{captureID}/redundancy`
+(`WorkerRecoveryArchiveRedundancy`; prover `archive_redundancy.go` in
+`api/internal/workersvc`; protocol token `recovery_archive_redundancy_v1`)
+takes a worker claim but trusts nothing it says about publication. The API
+proves through the forge, against the live head of the run's published branch
+(the anchor from `proveCompletedPublication`, the #2507/#2598 proof), that
+every root, the captured head and every server-recorded prerequisite (the
+thin-bundle closure) is an ancestor of that head. For parked WIP, the captured
+head is replaced by a witness commit with the same tree plus every parent of
+the captured head.
+
+The claim is bound to the exact hold, generation, `coverage_digest` and
+`source_sha`, and requires a released, completed, identity-stamped hold (a
+completion identity that carries the MR). On success the API expires the
+`available` capture with reason `published_redundant`, records a
+`redundancy_proof` and deletes its payload chunks. A refusal keeps the archive
+on its existing retention with one bounded reason; a forge-evidence refusal is
+memoized for 1 hour per capture and digest.
+
+The ADR-2417 capture guard (migration `00322_recovery_archive_redundancy.sql`)
+skips its protected-final raise, the local-replica or unexpired-window
+protection, only for a proof matching the capture, its released hold and the
+completed run. Without a proof the original protection is unchanged.
+
+### Worker claims
+
+Both guarded cleanup paths submit claims: receipt cleanup
+(`forgetCompletedGeneration`) and covering-FINAL-ACK cleanup
+(`forgetGenerationWithinCycle`). The worker builds the claims under the
+journal lock, from the records read for cleanup and before any destructive
+step, and submits them after the lock is released, sequentially under one
+30-second deadline. Results are logged and never gate cleanup. Only uploaded,
+guarded, non-empty, non-settled records claim.
+
+The WIP witness exists on the receipt path only and is exactly the receipt's
+delivered `final_head`. When `final_head` already contains the captured head, the claim is sent with
+no witness. Only when it does not (divergent) is the witness attached, and
+only if its tree equals the archive tree and every parent of the captured head
+is its ancestor; if those checks fail or ancestry is unknown, no claim is sent
+(fail-closed, with no broader search). The ACK path sends no witness.
+Cleanup usually removes the local source in the same pass, so each archive
+effectively gets one attempt; a missed or failed claim leaves the normal TTL.
+
+### Durability policy
+
+Publication is proved against the live branch head at proof time. **Accepted
+risk**: after early expiry, later deletion or force-rewrite of the published
+branch (or the MR source branch) is not protected by uzi. Forge-side MR refs
+may still hold the commits, but that is not guaranteed. This is the same
+post-publication risk #2598 accepts for custody release. A missing branch, a
+head mismatch or any inconclusive answer keeps the TTL, as does anything
+without complete proof.
+
+### Quota and storage
+
+Early expiry frees payload bytes, so the per-owner ready payload and instance
+byte quotas recover. The capture stays `expired`, and since #2744 the per-owner
+count (`MaxCapturesPerOwner`, `UZI_RECOVERY_MAX_CAPTURES_PER_OWNER`) counts every
+state except `discarded` and `expired`, so an early-expired capture also frees its
+count slot. The per-claim ceiling still counts it.
+PostgreSQL can reuse the freed pages; no immediate reduction in database file
+size is promised.
+
+### Boundaries
+
+Explicit discard semantics are unchanged, as is failed, cancelled and parked
+run handling. Only the completed, identity-stamped, released-hold case above
+can expire early.

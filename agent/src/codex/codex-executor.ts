@@ -52,6 +52,7 @@
 // post-run sinks and the runner disposes it via `safety.dispose` after the last sink (F1);
 // STANDALONE, run()'s finally backstops the registry teardown itself.
 
+import { chunkedTimeout } from "../chunked-timeout.js";
 import { TrustedExecutionRefusal } from "../trusted-execution-refusal.js";
 import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBundle } from "../checked-plan.js";
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
@@ -149,6 +150,7 @@ import {
   type ChildThreadController,
   type StartChildTurnSpec,
 } from "./delegation.js";
+import { CODE_DISPOSITIONS_TOOL, reportCodeDispositions, type CodeCrossCheckToolAccess } from "../code-cross-check-tools.js";
 import { buildCodexRunPlan } from "./run-builder.js";
 import { CodexUsageAccountant } from "./token-accounting.js";
 import { CodexSessionStore } from "./session-state.js";
@@ -1297,7 +1299,14 @@ export class FailClosedExecutor implements Executor {
 }
 
 // ─── the production MCP/forge/memory/findings/skill tool-handler map ────────────
+function codeCrossCheckAccess(ctx: RunContext): CodeCrossCheckToolAccess | undefined {
+  if (!ctx.codeCrossCheckGate || !ctx.codeCrossCheckRepairActive || !ctx.codeCrossCheckRepair || !ctx.reportCrossCheckDispositions || !ctx.claimGeneration) return undefined;
+  return { generation: ctx.claimGeneration, codeCrossCheckRepairActive: ctx.codeCrossCheckRepairActive, codeCrossCheckRepair: ctx.codeCrossCheckRepair,
+    reportCrossCheckDispositions: ctx.reportCrossCheckDispositions };
+}
+
 export interface CodexToolHandlerDeps {
+  readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly client: WorkerClient;
   readonly runId: string;
   readonly log: Logger;
@@ -1332,6 +1341,10 @@ export interface CodexToolHandlerDeps {
 export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<string, ToolHandler> {
   const { client, runId, log, emit, skills } = deps;
   const map = new Map<string, ToolHandler>();
+  if (deps.codeCrossCheck) map.set(CODE_DISPOSITIONS_TOOL, async args => {
+    await reportCodeDispositions(deps.codeCrossCheck!, args);
+    return { content: [{ type: "text", text: "Code cross-check dispositions recorded." }] };
+  });
 
   // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
   // allowedTools gate stops a subagent reaching this handler regardless).
@@ -1649,6 +1662,8 @@ function firstSkillName(args: unknown): string | undefined {
 
 // ─── Injectable seams (production defaults; tests inject fakes) ──────────────────
 export interface CodexExecutorDeps {
+  /** Monotonic clock for relative deadlines; absolute predicates still use Date.now. */
+  readonly timeoutNow?: () => number;
   /** Initial release budget; defaults to six attempts and a 2000ms base (8000ms cap). */
   readonly initialCredentialAttempts?: number;
   readonly initialCredentialBaseDelayMs?: number;
@@ -2039,17 +2054,17 @@ export class CodexExecutor implements Executor {
       return true;
     }
     if (signal?.aborted || Date.now() >= deadlineAt) return false;
-    let timer: ReturnType<typeof setTimeout> | undefined;
+    let timer: ReturnType<typeof chunkedTimeout> | undefined;
     let onAbort: (() => void) | undefined;
     try {
       return await new Promise<boolean>((resolve) => {
         onAbort = () => resolve(false);
         signal?.addEventListener("abort", onAbort, { once: true });
-        timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()));
+        timer = chunkedTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now()), { now: this.deps.timeoutNow });
         state.promise!.then(() => resolve(!signal?.aborted && Date.now() < deadlineAt));
       });
     } finally {
-      if (timer !== undefined) clearTimeout(timer);
+      timer?.cancel();
       if (onAbort) signal?.removeEventListener("abort", onAbort);
     }
   }
@@ -2073,7 +2088,7 @@ export class CodexExecutor implements Executor {
       return undefined;
     };
     let timer: ReturnType<typeof setInterval> | undefined;
-    let deadline: ReturnType<typeof setTimeout> | undefined;
+    let deadline: ReturnType<typeof chunkedTimeout> | undefined;
     let wake!: () => void;
     const stop = new Promise<void>((resolve) => { wake = resolve; });
     const check = (): void => { if (interrupted()) wake(); };
@@ -2083,7 +2098,7 @@ export class CodexExecutor implements Executor {
       pauseNow.activeTurnTrip = trip;
       pauseNow.vaultLock.activeTurnTrip = trip;
       timer = setInterval(check, 25);
-      deadline = setTimeout(check, Math.max(0, wall.remainingMs));
+      deadline = chunkedTimeout(check, Math.max(0, wall.remainingMs), { now: this.deps.timeoutNow });
       check();
       await Promise.race([state?.promise ?? Promise.resolve(), stop]);
       if (interrupted()) state?.abort.abort();
@@ -2091,7 +2106,7 @@ export class CodexExecutor implements Executor {
       await state?.promise;
     } finally {
       if (timer !== undefined) clearInterval(timer);
-      if (deadline !== undefined) clearTimeout(deadline);
+      deadline?.cancel();
       ctx.signal?.removeEventListener("abort", check);
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
       if (pauseNow.vaultLock.activeTurnTrip === trip) pauseNow.vaultLock.activeTurnTrip = undefined;
@@ -2407,6 +2422,7 @@ export class CodexExecutor implements Executor {
         log: this.log,
         emit: (msg) => ctx.emit(msg),
         skills: ctx.skills ?? [],
+        codeCrossCheck: codeCrossCheckAccess(ctx),
       });
 
       // The low-level effect launcher, boundary seams and per-sink reconcile/eviction closures —
@@ -2807,9 +2823,11 @@ export class CodexExecutor implements Executor {
       // Issue #1674 (PRD #265 M1 parity): the latched signal_done declaration, so the terminating
       // turn's milestones_completed reaches the ExecutorResult after the loop breaks.
       let declaredMilestonesCompleted: string[] | undefined;
+      let declaredReportOnly = false;
       // PRD #1798 M2 (D4, D13 parity with sdk-executor): the latched signal_done pr_summary,
       // stamped with the worktree HEAD on the done turn that declared it.
       let declaredPrSummary: PrSummaryClaim | undefined;
+      let declaredNonClosing: { reason: string } | undefined;
       // Latched at a fresh ACK boundary or the legacy done exit when milestones remain.
       // Issue runs only.
       let scopeCapped: { completedCount: number; total?: number } | undefined;
@@ -2840,12 +2858,14 @@ export class CodexExecutor implements Executor {
         ...(completionHeld ? { completionHeld } : {}),
         ...(pausedAt ? { pausedAt } : {}),
         ...(isIssueRun && scopeCapped ? { scopeCapped } : {}),
+        ...(isIssueRun && declaredReportOnly ? { reportOnly: true } : {}),
         // Issue #1674 (PRD #265 M1 parity): forward the declared finished-milestone ids on issue
         // runs only, OMITTED when nothing was declared, as sdk-executor does; runner.ts reads it.
         ...(isIssueRun && declaredMilestonesCompleted !== undefined ? { milestonesCompleted: declaredMilestonesCompleted } : {}),
         // PRD #1798 M2: the lead's PR claims, NOT gated on run kind (as in sdk-executor); OMITTED
         // when none was declared. The runner reads it only where it renders a PR description.
         ...(declaredPrSummary !== undefined ? { prSummary: declaredPrSummary } : {}),
+        ...(declaredNonClosing !== undefined ? { nonClosing: declaredNonClosing } : {}),
       });
       // Clarification checkpoints return through the normal boundary guards without spending
       // another implementation iteration. The round bound spans all such provider epochs.
@@ -3026,6 +3046,9 @@ export class CodexExecutor implements Executor {
             for (const id of result.progress.completed) seenCompletedIds.add(id);
           }
           const hasQuestions = !!result.questions?.length;
+          if (isIssueRun && !hasQuestions && result.nonClosing !== undefined) {
+            declaredNonClosing = result.nonClosing;
+          }
           if (!hasQuestions && result.milestonesCompleted !== undefined) {
             declaredMilestonesCompleted = result.milestonesCompleted;
             for (const id of result.milestonesCompleted) seenCompletedIds.add(id);
@@ -3082,6 +3105,7 @@ export class CodexExecutor implements Executor {
           continue;
         }
         if (result.done) {
+          if (isIssueRun && result.reportOnly) declaredReportOnly = true;
           // Issue #1932: consult the secret-remediation gate BEFORE the persist/done checkpoint
           // publishes the branch. `remediate` re-prompts the SAME live epoch (no persist, no
           // recreate); `fail` stops (the runner already recorded the blocked state).
@@ -3094,6 +3118,17 @@ export class CodexExecutor implements Executor {
             if (secretDecision?.action === "fail") break;
           }
           if (!interlockedIssue) {
+            if (ctx.codeCrossCheckGate) {
+              await epoch.persistSession();
+              reapedSinceLastPersist = true;
+              epochNeedsRecreate = true;
+              const codeDecision = await ctx.codeCrossCheckGate({ interlocked: false, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
+              if (codeDecision.action === "repair") {
+                epochNeedsRecreate = true;
+                completionFollowUp = codeDecision.followUp;
+                continue;
+              }
+            }
             // Issue #1514: same done-exit scope cap as sdk-executor's legacy done exit.
             if (isIssueRun) {
               const cap = scopeCapAtDone({
@@ -3124,7 +3159,15 @@ export class CodexExecutor implements Executor {
             declared: result.milestonesCompleted ?? [], head, worktreeFingerprint,
           });
           completionAttempted = true;
-          if (unmet.length === 0) break;
+          if (unmet.length === 0) {
+            const codeDecision = await ctx.codeCrossCheckGate?.({ interlocked: true, reportOnly: declaredReportOnly, repairAvailable: iteration < maxIterations });
+            if (codeDecision?.action === "repair") {
+              epochNeedsRecreate = true;
+              completionFollowUp = codeDecision.followUp;
+              continue;
+            }
+            break;
+          }
           const fingerprint = completionAttemptFingerprint(unmet, head, worktreeFingerprint);
           completionStallStreak = updateCompletionStreak(fingerprint, lastCompletionFingerprint, completionStallStreak);
           lastCompletionFingerprint = fingerprint;
@@ -3181,7 +3224,10 @@ export class CodexExecutor implements Executor {
         await ctx.checkpoint?.({ reap: false, progress: latestProgress });
       }
 
-      return loopResult();
+      const completed = loopResult();
+      const codeSummary = await ctx.codeCrossCheckSummary?.();
+      if (codeSummary) completed.codeCrossCheckSummary = codeSummary;
+      return completed;
     } finally {
       await settleInstall();
       ctx.signal?.removeEventListener("abort", forwardInstallAbort);
@@ -3417,6 +3463,7 @@ export class CodexExecutor implements Executor {
           fileop,
           worktreePath,
           grants: runPlan.lead.grants,
+          codeCrossCheck: codeCrossCheckAccess(ctx),
           delegate: delegationRunner.toDelegateSeam(),
           toolHandlers,
           allowedRoles: runPlan.allowedRoles,
@@ -3678,12 +3725,11 @@ export class CodexExecutor implements Executor {
     // Issue #1600: arm the RUN-WIDE remaining budget, not a fresh per-turn wall; the finally debits
     // this turn's elapsed time. An already-spent budget trips before the turn starts.
     const wallArmedAt = Date.now();
-    let wallTimer: ReturnType<typeof setTimeout> | undefined;
+    let wallTimer: ReturnType<typeof chunkedTimeout> | undefined;
     // A spent budget already tripped REASON_WALL via pendingInterruption above, so only arm it when
     // time remains.
     if (wall.remainingMs > 0) {
-      wallTimer = setTimeout(() => trip(REASON_WALL), wall.remainingMs);
-      wallTimer.unref?.();
+      wallTimer = chunkedTimeout(() => trip(REASON_WALL), wall.remainingMs, { now: this.deps.timeoutNow, unref: true });
     }
 
     reducer.beginTurn();
@@ -3799,7 +3845,7 @@ export class CodexExecutor implements Executor {
       effectsAbort.abort();
       unsubscribeCallbacks();
       if (idleTimer) clearTimeout(idleTimer);
-      if (wallTimer) clearTimeout(wallTimer);
+      wallTimer?.cancel();
       wall.remainingMs -= Date.now() - wallArmedAt;
       if (ctx.signal) ctx.signal.removeEventListener("abort", onCancel);
       if (pauseNow.activeTurnTrip === trip) pauseNow.activeTurnTrip = undefined;
@@ -4346,10 +4392,13 @@ export class CodexExecutor implements Executor {
     const systemPrompt = buildLeadSystemPrompt(leadBody, { kind: ctx.kind, harness: "codex", repoSourced }).append;
     const leadSkills = (ctx.skills ?? []).map((s) => s.name);
     const effort = codexEffort(ctx);
+    // Lead wiring must carry this worker-owned access into root-thread registration and the broker.
+    // Presence is consent: runner only supplies the gate/hooks for strictly opted-in publishing runs.
     const request: RunTurnRequest = {
       prompt,
       systemPrompt,
       phase,
+      ...(codeCrossCheckAccess(ctx) ? { codeCrossCheck: codeCrossCheckAccess(ctx) } : {}),
       agents,
       leadSkills,
       signal,

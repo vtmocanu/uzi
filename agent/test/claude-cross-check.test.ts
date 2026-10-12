@@ -4,7 +4,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import type { HookCallbackMatcher, HookInput, HookJSONOutput, Options as SdkOptions, SDKAssistantMessageError } from "@anthropic-ai/claude-agent-sdk";
 import { buildClaudeCrossCheckOptions, ClaudeCrossCheck, stubClaudeCrossCheckQueryFn } from "../src/claude-cross-check.js";
@@ -18,6 +17,9 @@ import type { GitCache } from "../src/git.js";
 import type { Logger } from "../src/log.js";
 import type { WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
+
+const TEST_SCRATCH = path.resolve(import.meta.dirname, "../../.uzi/scratch");
+fs.mkdirSync(TEST_SCRATCH, { recursive: true });
 
 const TOKEN = "fixture-anthropic-token-abc123";
 const APPROVE = JSON.stringify({ verdict: "approve", summary: "Anchors checked", items: [] });
@@ -70,7 +72,7 @@ function rig(frames: unknown[], opts: { claim?: ClaimResponse; kill?: (pid: numb
 }
 
 function scratch(): { root: string; checkout: string; home: string } {
-  const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "claude-checker-"));
+  const root = fs.mkdtempSync(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "claude-checker-"));
   const checkout = path.join(root, "checkout");
   const home = path.join(root, "home");
   fs.mkdirSync(checkout); fs.mkdirSync(home);
@@ -421,7 +423,7 @@ describe("ClaudeCrossCheck.run", () => {
 
 describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)", () => {
   async function exercise(claim: ClaimResponse, deps: { model?: boolean; claudeText?: string | Error } = {}) {
-    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "runner-claude-"));
+    const root = fs.mkdtempSync(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "runner-claude-"));
     const decisions: any[] = [];
     const states: any[] = [];
     const calls = { codex: 0, claude: 0 };
@@ -472,7 +474,7 @@ describe("CrossCheckRunner dispatch on the claim's credential family (PRD #2460)
   });
 
   it("with the real Claude checker, a missing token settles checker unavailable and a confinement refusal settles confinement_failed", async () => {
-    const root = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "runner-claude-real-"));
+    const root = fs.mkdtempSync(path.join(path.resolve(import.meta.dirname, "../../.uzi/scratch"), "runner-claude-real-"));
     try {
       for (const [claim, frames, reason] of [
         [claudeClaim({ secrets: { forge_pat: "" } as ClaimResponse["secrets"] }), [initFrame(), resultFrame(APPROVE)], "invalid"],

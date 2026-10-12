@@ -726,6 +726,16 @@ var knownInstructions = []knownInstruction{
 			"read itself is exercised in TestRunInputsScopeDisposition (the scope row's disposition " +
 			"renders). Not executed against a booted API.",
 	},
+	{
+		command:  "uzi tui",
+		evidence: evidenceNotExecuted,
+		reason: "`uzi tui` is the full-screen interactive board: it needs a terminal and a " +
+			"reachable server, and runs until the user quits. No Go test or e2e row drives the " +
+			"command itself; tests drive the tuiModel directly.",
+		note: "RUNTIME: runPendingUpgrade's failure when the post-upgrade restart cannot exec " +
+			"(tui_update_prompt.go), telling the user to start the TUI by hand. The failure path " +
+			"is asserted in TestPendingUpgradeRelaunchFailure.",
+	},
 }
 
 // instructionRE lifts a candidate from a printed string: either backtick-quoted, or a line

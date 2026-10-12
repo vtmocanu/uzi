@@ -14,6 +14,21 @@ function grants(allowedTools: readonly string[]): RunGrants {
   };
 }
 
+
+describe("m1 non-closing dynamic schema", () => {
+  it("requires a string reason structurally without a raw maxLength cap", () => {
+    const spec = buildCodexDynamicTools(grants(["signal_done"])).find(s => s.name === "signal_done")!;
+    const props = spec.inputSchema.properties as Record<string, Record<string, unknown>>;
+    const declaration = props["non_closing"]!;
+    assert.equal(declaration.type, "object");
+    assert.deepEqual(declaration.required, ["reason"]);
+    assert.equal(declaration.additionalProperties, false);
+    assert.deepEqual(declaration.properties, { reason: { type: "string" } });
+    assert.match(String(declaration.description), /Issue runs only/);
+    assert.ok(!(spec.inputSchema.required as string[] | undefined)?.includes("non_closing"));
+  });
+});
+
 describe("buildCodexDynamicTools: worker-owned app-server callback surface", () => {
   it("registers the deterministic granted subset and hides code-mode lifecycle callback names", () => {
     const specs = buildCodexDynamicTools(grants([
@@ -86,4 +101,17 @@ describe("buildCodexDynamicTools: report_progress milestone attribution (issue #
     assert.equal(item["additionalProperties"], false);
     assert.equal(spec?.inputSchema.additionalProperties, false, "the top-level schema stays closed");
   });
+});
+
+it("U3 D9 disposition wire tool has a closed authority-neutral schema", () => {
+  assert.equal(buildCodexDynamicTools(grants([])).some(t => t.name === "report_cross_check_dispositions"), false);
+  const spec = buildCodexDynamicTools(grants(["mcp__uzi__report_cross_check_dispositions"])).find(t => t.name === "report_cross_check_dispositions")!;
+  assert.ok(spec);
+  assert.equal(spec.inputSchema.additionalProperties, false);
+  assert.deepEqual(spec.inputSchema.required, ["dispositions"]);
+  assert.deepEqual(Object.keys(spec.inputSchema.properties as object), ["dispositions"]);
+  const batch = (spec.inputSchema.properties as Record<string, { items: Record<string, unknown> }>).dispositions!;
+  assert.equal(batch.items.additionalProperties, false);
+  assert.deepEqual(Object.keys(batch.items.properties as object).sort(), ["disposition", "finding_id", "reason"]);
+  assert.deepEqual(batch.items.required, ["finding_id", "disposition", "reason"]);
 });

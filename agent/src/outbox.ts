@@ -1471,13 +1471,52 @@ export class Outbox {
     if (this.disabled) return false;
     return this.withRunLock(runId, async () => {
       if (!this.validRunId(runId)) return false;
-      if (!await this.readTerminalAuthed(runId, claimGeneration)) return false;
+      // inspectTerminal can observe ENOENT below an unsafe root; that is not safe absence.
       try {
-        await fs.unlink(path.join(this.runDir(runId), this.runs.get(runId)?.terminals.get(claimGeneration)?.fileName ?? terminalFileName(claimGeneration)));
-      } catch { return false; }
-      this.runs.get(runId)?.terminals.delete(claimGeneration);
+        const root = await fs.lstat(this.root);
+        if (!root.isDirectory() || root.isSymbolicLink()) return false;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false;
+      }
+      const terminals = this.runs.get(runId)?.terminals;
+      const pending = terminals?.get(claimGeneration);
+      const fileName = pending?.fileName ?? terminalFileName(claimGeneration);
+      const { observation, record } = await this.inspectTerminal(runId, claimGeneration, fileName);
+      if (observation.kind === "absent") {
+        // "absent" also covers ENOENT from ancestry inspection; re-prove it before dropping bookkeeping.
+        if (!pending || !await this.terminalPositivelyAbsent(runId, fileName)) return false;
+        terminals?.delete(claimGeneration);
+        return true;
+      }
+      if (!record || observation.kind !== "authenticated") return false;
+      try {
+        await fs.unlink(path.join(this.runDir(runId), fileName));
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT" ||
+            !await this.terminalPositivelyAbsent(runId, fileName)) return false;
+      }
+      terminals?.delete(claimGeneration);
       return true;
     });
+  }
+
+  /** Positive absence of one terminal journal: a missing root or run directory, or a safe run
+   *  directory whose journal lstat reports ENOENT. Unsafe ancestry and every other error fail closed. */
+  private async terminalPositivelyAbsent(runId: string, fileName: string): Promise<boolean> {
+    try {
+      const root = await fs.lstat(this.root);
+      if (!root.isDirectory() || root.isSymbolicLink()) return false;
+    } catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
+    try {
+      await fs.lstat(this.runDir(runId));
+    } catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
+    try {
+      if (!await this.terminalDirectorySafe(runId)) return false;
+    } catch { return false; }
+    try {
+      await fs.lstat(path.join(this.runDir(runId), fileName));
+      return false;
+    } catch (err) { return (err as NodeJS.ErrnoException).code === "ENOENT"; }
   }
 
   /** Positive absence proof for a successful unjournaled send, under the same run lock. */

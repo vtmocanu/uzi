@@ -139,7 +139,7 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 | After a small local fix | the buddy's `APPROVE` of the fixed head, plus green CI; a fix too big for that goes to `uzi run rework` (step 4) |
 | CodeRabbit rate-limited | live reset ≤ 15 min: wait for CodeRabbit; otherwise a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too, a small PR takes the buddy alone |
 | Bot skipped or absent | the buddy |
-| Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
+| Skill or script maintenance (`[skip-cr]`) | the buddy; the lander and the buddy land it, no user review |
 | Rebase, merge of `main`, or renumber only | the buddy's `APPROVE` of the range-diff (for a merge, the conflict resolution) on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
 | Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too, as a skim (a brief naming the diff range and the risky seams; a verdict pinned to the SHA). The bot does the full read |
 | Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
@@ -537,6 +537,10 @@ and they precede every merge (step 6):
   merging. File the regression with both results; queue it per the on-deck *Filing default*.
   Compare failing-test sets, not counts. A worker's Go can be older than CI's `setup-go`:
   gofmt with CI's Go before trusting a worker's `fmt-check`.
+  For Go test failures, use
+  `S/attribute-failures.sh --log <gate-log-file> --base <ref> --head <ref>`;
+  attribute other failures by hand, and a `pre-existing` verdict still needs the
+  user's call before merging.
 - **Pin every local review to the immutable head.** The buddy is the default reviewer
   for small/mechanical non-Renovate diffs. For Renovate-class work, record the
   explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
@@ -598,9 +602,10 @@ wrapper always completes with 0.
 - Other behaviour changes, new scripts and new rules are batched into **one
   end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
   silently.
-- A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by the buddy
-  (or a local buddy) and by the user. Re-run `agnix` on `SKILL.md` after editing;
-  `task check:skill-size` gates the size; the reply budget for a long buddy loop is in *Buddy*.
+- A skill-maintenance PR is titled with `[skip-cr]` (no bot review) and is reviewed by the
+  buddy (or a local buddy); the lander and the buddy land it without a user review.
+  Re-run `agnix` on `SKILL.md` after editing; `task check:skill-size` gates the size;
+  the reply budget for a long buddy loop is in *Buddy*.
 
 ## Files
 
