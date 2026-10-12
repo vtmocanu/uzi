@@ -9,9 +9,11 @@ import (
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 	appsv1 "k8s.io/api/apps/v1"
+	corev1 "k8s.io/api/core/v1"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
 	"k8s.io/apimachinery/pkg/types"
+	k8stesting "k8s.io/client-go/testing"
 )
 
 func TestSerialCompletedPeerDrift(t *testing.T) {
@@ -289,6 +291,24 @@ func TestSerialAdmittedSameImageAcrossPools(t *testing.T) {
 	rollTickTest(t, m, workers)
 	if len(templatePatches(c)) != 1 {
 		t.Fatalf("same-image independent pools removed all lane providers: %v", templatePatches(c))
+	}
+}
+
+func TestSerialConfirmedMirrorDoesNotRequireNoopRevision(t *testing.T) {
+	m, c, workers, _ := matrixFixture(t, 2)
+	d := markedDeployment(t, testConfig(), workers[0], false)
+	r, err := decodeRoll(d.Annotations[annotationRoll])
+	if err != nil {
+		t.Fatal(err)
+	}
+	p := &corev1.PersistentVolumeClaim{ObjectMeta: metav1.ObjectMeta{Name: "retained-data", Namespace: m.cfg.Namespace, UID: "claim-uid", ResourceVersion: "8", Annotations: map[string]string{annotationRoll: d.Annotations[annotationRoll]}}}
+	c.PrependReactor("patch", "persistentvolumeclaims", func(k8stesting.Action) (bool, runtime.Object, error) {
+		// The real apiserver may return an unchanged revision for a no-op.
+		return true, p.DeepCopy(), nil
+	})
+	e := &rollEntry{w: workers[0], ns: m.cfg.Namespace, marker: r, claim: p}
+	if err := m.retainRollReservation(context.Background(), e); err != nil {
+		t.Fatalf("committed unchanged mirror stalled maintenance: %v", err)
 	}
 }
 

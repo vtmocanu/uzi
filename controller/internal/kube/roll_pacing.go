@@ -794,6 +794,11 @@ func (m *Materializer) mirrorRoll(ctx context.Context, e *rollEntry, marker *rol
 			return fmt.Errorf("retained reservation exceeds bound")
 		}
 		value = string(raw)
+		// A complete fresh LIST already confirms this exact durable marker.
+		// Do not demand a new revision from an idempotent apiserver no-op.
+		if p.Annotations[annotationRoll] == value {
+			return nil
+		}
 	}
 	body, err := json.Marshal(map[string]any{"metadata": map[string]any{"uid": p.UID, "resourceVersion": p.ResourceVersion, "annotations": map[string]any{annotationRoll: value}}})
 	if err != nil {
