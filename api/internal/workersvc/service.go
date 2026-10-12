@@ -200,6 +200,10 @@ var (
 	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
 	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
 	ErrWallParkStopUnavailable = errors.New("this parked run has nothing to finalize; extend it to keep working, or cancel it")
+	// ErrProviderHoldStopUnavailable (PRD #1733) rejects a `stop` on a provider_unavailable hold with
+	// no completed milestone: the stop is the scope-ceiling write, and a ceiling of 0 would resume
+	// the run only to finalize nothing. It names the choices that remain: resume or cancel. → 409.
+	ErrProviderHoldStopUnavailable = errors.New("this run has no completed milestone to finalize; resume it to try again, or cancel it")
 	// ErrWallParkChanged rejects an `extend` on a budget_exhausted wall park whose run changed
 	// between the owner's read and the extend statement (resumed, paused by its owner, finished,
 	// or otherwise no longer held at its time budget). Nothing was extended or resumed. → 409.
@@ -902,6 +906,11 @@ type Store interface {
 	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A
 	// 0-row result is a raced no-op (409).
 	PromoteRecoveryWaitRunNow(ctx context.Context, arg store.PromoteRecoveryWaitRunNowParams) (int64, error)
+	// LockRunForCredentialSwitch and ResetProviderParkStreakForOwner are SetRunCredential's
+	// single-transaction pieces (PRD #1733): the row lock that detects a raced run, and the
+	// fenced streak clear for the statuses whose promote does not fold it in.
+	LockRunForCredentialSwitch(ctx context.Context, arg store.LockRunForCredentialSwitchParams) (store.LockRunForCredentialSwitchRow, error)
+	ResetProviderParkStreakForOwner(ctx context.Context, arg store.ResetProviderParkStreakForOwnerParams) (int64, error)
 	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
 	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
 	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
@@ -1581,6 +1590,12 @@ type Params struct {
 	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
 	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
 	RunDiskParkMax int
+	// RunProviderParkMaxDuration (PRD #1733), mirrored from config RUN_PROVIDER_PARK_MAX_DURATION.
+	// The elapsed-time bound on an unbroken streak of typed provider_outage parks: the first
+	// such park at or past it becomes a paused 'provider_unavailable' owner hold instead of a
+	// recovery_wait (parkProviderOutage). It never fails a run. The ZERO VALUE disables the hold
+	// (typing and counting stay on); the 24h default lives in config.go.
+	RunProviderParkMaxDuration time.Duration
 
 	// RunGateRefusalMax (PRD #1795 M1), mirrored from config RUN_GATE_REFUSAL_MAX. The refusal
 	// cap on plan-gate re-presentation: a refused awaiting_approval report counts once per claim
@@ -1868,6 +1883,10 @@ type Service struct {
 	// leaseAtOverride pins Claim's @lease_at admission instant. TEST-ONLY: unexported, zero in
 	// production (Valid false), so Claim always reads LeaseClockNow. See claimLeaseAt.
 	leaseAtOverride pgtype.Timestamptz
+	// beforeCredentialSwitchTx runs in setCredentialAndPromote after SetRunCredential's unlocked
+	// read and before its transaction begins. TEST-ONLY: unexported and nil in production; a test
+	// uses it to move the run in that window and prove the switch is refused.
+	beforeCredentialSwitchTx func()
 	// leaseClaimProbe, when set by a test, is told the outcome of every claim that ran through a
 	// lease: whether ClaimRun admitted a run through it and whether the rebind applied. TEST-ONLY:
 	// nil in production.
@@ -3963,6 +3982,18 @@ type StateRequest struct {
 	// (validateDiskParkPreventive). httpx.DecodeJSON rejects unknown fields, so a worker sends it
 	// only once the api advertises the recovery_cause_data_volume_full feature.
 	DiskParkPreventive *bool `json:"disk_park_preventive"`
+	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
+	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
+	// is progress and starts a new provider-park streak at this park; zero or absent continues
+	// the open streak. Only valid with status recovery_wait and that cause, and never negative:
+	// SetState rejects anything else as ErrInvalidState (400, never a decode error) before any
+	// SQL (validateProviderPark), so a worker can tell this api's validation refusal from an older
+	// api's strict-decode refusal of the unknown field. httpx.DecodeJSON rejects unknown fields,
+	// so a worker sends it only once the api advertises the recovery_cause_provider_outage feature.
+	ProductiveTurns *int32 `json:"productive_turns"`
+
+	// ProviderProgressTurns consumes completed turns only with a fenced ordinary or disk park.
+	ProviderProgressTurns *int32 `json:"provider_progress_turns"`
 	// CheckpointContainsLatest is the worker's durability report on a PARK (PRD #1809 M6, D8):
 	// true when the checkpoint the park published contains the run's latest committed work, false
 	// when it does not (the recovery pin or the fetch-back failed, so the only copy of the latest
@@ -4063,9 +4094,10 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
-	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
-	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
-	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
+	// legacy untyped park). forge_unreachable and provider_outage use dedicated park
+	// transactions below; provider_outage carries its own streak accounting (PRD #1733).
+	// empty_turn remains reserved (D9) and takes the ordinary untyped park, which writes
+	// cause NULL. vault_locked (issue #1766 M2) takes the same
 	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
 	// own counted park transaction; disk_park_preventive is valid only alongside it.
 	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable &&
@@ -4088,6 +4120,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		return store.Run{}, false, err
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
+		return store.Run{}, false, err
+	}
+	if err := validateProviderPark(req); err != nil {
 		return store.Run{}, false, err
 	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
@@ -4343,6 +4378,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// terminal and scope-directed: 'applied' if the re-read carries stop_kind scope_capped,
 	// 'declined' otherwise.
 	var settleScopeDisposition string
+	// providerHeld marks a typed provider park that parkProviderOutage turned into the paused hold (PRD #1733).
+	var providerHeld bool
 	switch req.State {
 	case "running":
 		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
@@ -4814,6 +4851,19 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			}
 			break
 		}
+		// PRD #1733: the TYPED provider-transient park is its own locked transaction too, because
+		// the streak and the hold decision need one snapshot. Only the typed cause routes here;
+		// an untyped or empty-turn park falls through to setRecoveryWait below, which clears the
+		// streak only on positive fenced progress evidence. A held outcome leaves the run 'paused',
+		// so its durability report is stored against that status below.
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseProviderOutage {
+			var prun store.Run
+			prun, rows, providerHeld, err = s.parkProviderOutage(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return prun, false, err
+			}
+			break
+		}
 		rows, err = s.setRecoveryWait(ctx, s.q, recoveryCauseStored(req.RecoveryCause), owned, wkr, req, sessionID)
 	case "paused":
 		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard
@@ -4991,7 +5041,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// PRD #1809 M6 (D8): an applied park records its checkpoint-durability report before the
 	// re-read, so the returned run carries it.
 	if rows > 0 {
-		s.recordCheckpointDurability(ctx, wkr, owned, req)
+		if providerHeld {
+			// The bounded provider park left the run 'paused', not 'recovery_wait': store the
+			// durability report against the status the run actually holds.
+			s.setCheckpointDurability(ctx, wkr, owned, "paused", req.CheckpointContainsLatest)
+		} else {
+			s.recordCheckpointDurability(ctx, wkr, owned, req)
+		}
 	}
 	// Re-read so the worker sees the authoritative status. Ownership already
 	// held above, so 0 rows means the transition was not applied under either branch

@@ -272,6 +272,18 @@ FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
+-- The set-token verb's run lock (PRD #1733). SetRunCredential reads a run unlocked, validates the
+-- override, then takes the owner's secret mutation lock; this re-reads the run FOR UPDATE under
+-- that lock so the verb can refuse (ErrCredentialSwitchRaced) when the run is no longer the row it
+-- observed: its status, status_since (any park or re-park restamps it) or claim_generation moved.
+-- Owner-scoped. Comparing status_since as well as status is what catches a run that left and
+-- re-entered the same status in between.
+-- name: LockRunForCredentialSwitch :one
+SELECT id, status, status_since, claim_generation
+FROM runs
+WHERE id = @id AND user_id = @user_id
+FOR UPDATE;
+
 -- Promoter step (3a): the recorded worker's Anthropic binding, the requirement source for an
 -- ordinary Claude run without a per-run override. Owner-scoped. holds_affinity mirrors
 -- ClaimRun's affinity pin on a queued run's own worker: the row exists and is draining or

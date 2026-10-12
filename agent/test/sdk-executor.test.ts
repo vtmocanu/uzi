@@ -5878,6 +5878,69 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
     assert.doesNotMatch(err.message, /success/, "never the self-contradictory 'success'");
   });
 
+  // PRD #1733: the runner types the park from this marker alone.
+  it("marks a sustained provider outage providerOrigin (final attempt failed with the provider error)", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)], [resultApiError(529, OVERLOADED_529)]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(makeCtx().ctx));
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.strictEqual(err.providerOrigin, true);
+  });
+
+  it("does NOT mark a positively-empty exhaustion providerOrigin", async () => {
+    const { queryFn } = fakeTurns([[resultEmpty()], [resultEmpty()]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(makeCtx().ctx));
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.strictEqual(err.providerOrigin, false);
+  });
+
+  it("does NOT mark providerOrigin when an earlier attempt hit the provider error but the final one was empty", async () => {
+    const { queryFn } = fakeTurns([[resultApiError(529, OVERLOADED_529)], [resultEmpty()]]);
+    const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(makeCtx().ctx));
+    assert.ok(err instanceof TransientRecoveryError);
+    assert.strictEqual(err.providerOrigin, false);
+    assert.doesNotMatch(err.message, /529/, "the message does not blame a provider error the final attempt did not see");
+  });
+
+  it("notifies onModelTurnSettled once per COMPLETED turn: the failed provider attempt is not counted", async () => {
+    const { queryFn } = fakeTurns([
+      [resultApiError(529, OVERLOADED_529)], // failed attempt: never reaches the hook
+      [submitPlan("# The Plan"), resultSuccess()], // planning turn
+      [assistantText("impl"), signalDone(), resultSuccess()], // implement turn
+    ]);
+    let settled = 0;
+    const probe = makeCtx({ agents: [lead, coder, reviewer], onModelTurnSettled: async count => {
+      assert.ok(count > 0);
+      settled++;
+    } });
+    const approvePlan = probe.ctx.gatePlan!;
+    probe.ctx.gatePlan = async (...args) => {
+      assert.strictEqual(settled, 1, "the successful planning retry settles before approval; its failed attempt did not count");
+      return approvePlan(...args);
+    };
+    await new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx);
+    assert.deepStrictEqual(probe.gated, ["# The Plan"]);
+    assert.strictEqual(settled, 2, "plan + implement; the 529 attempt is excluded");
+  });
+
+  for (const status of [529, 401]) {
+    it(`planning settlement excludes a failed SDK plan turn (${status})`, async () => {
+      const { queryFn, turns } = fakeTurns([
+        [assistantText("drafting the plan"), submitPlan("# Failed draft"), resultApiError(status, `API Error: ${status}`)],
+      ]);
+      let settled = 0;
+      const probe = makeCtx({
+        agents: [lead, coder, reviewer],
+        onModelTurnSettled: async () => { settled++; },
+      });
+      const err = await rejection(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(probe.ctx));
+      assert.ok(err instanceof Error);
+      assert.equal(err instanceof TransientRecoveryError, status === 529);
+      assert.strictEqual(turns.length, 1, "the failed planning query actually ran");
+      assert.deepStrictEqual(probe.gated, [], "a submitted draft on a failed query never reaches approval");
+      assert.strictEqual(settled, 0, "planning output and submit_plan do not make a failed turn productive");
+    });
+  }
+
   it("does NOT over-park a permanent 401 — it fails, labelled with 401 and never 'success'", async () => {
     const { queryFn, turns } = fakeTurns([[resultApiError(401, "API Error: 401 Unauthorized")]]);
     const err = await rejection(

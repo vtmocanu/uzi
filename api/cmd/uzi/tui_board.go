@@ -164,7 +164,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup + a Codex relogin_required hold + a credential_disabled hold — the only rows a human must act on
+	bandNeedsYou = iota // owner-action states and typed holds requiring a human decision
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait/pool_wait/recovery_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -198,10 +198,11 @@ func runBand(status string, isRevising bool) int {
 // alone: a run held on its Codex account that needs the owner to re-log in (PRD #1590
 // relogin_required) is the owner's turn, so it bands into NEEDS YOU. Every other Codex hold
 // action resolves without the owner and stays ON THE FLOOR. A run held on credential_disabled
-// (PRD #1732 D14) resumes only on the owner's Enable or token switch, so it is NEEDS YOU too. Every band decision on the board
+// (PRD #1732 D14) resumes only on the owner's Enable or token switch. Provider unavailable
+// holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isWorkerRecoveryExhausted(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isWorkerRecoveryExhausted(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -210,6 +211,12 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 // runStateWord is the human status word the board row draws for r (runStateToken's word),
 // which the `/` filter matches alongside the effective status.
 func runStateWord(r apitypes.RunListItemDTO) string {
+	if isProviderUnavailableHold(r.RunDTO) {
+		return providerHoldWord
+	}
+	if providerParkLine(r.RunDTO) != "" {
+		return providerRetryWord
+	}
 	if codexReloginHold(r.RunDTO) {
 		return codexReloginWord
 	}
@@ -1106,19 +1113,17 @@ func (m tuiModel) syncedScrollAt(capacity int) int {
 
 // boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ⊘ N · ▲ N · <total> runs.
 // Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
-// over m.board.runs so it does not shrink under a filter. Every park in the NEEDS YOU
-// band gets a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
-// awaiting_input, and the Codex relogin_required hold (PRD #1590, ⚿) — so no run that is
-// the owner's turn is invisible in the summary line. The credential_disabled hold (PRD #1732,
-// ⊘) is counted the same way.
+// over m.board.runs so it does not shrink under a filter. Approval, input, follow-up
+// and Codex relogin each have a segment. The ⊘ segment counts credential-disabled
+// and provider-unavailable owner holds; their rows distinguish the typed reason.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, followups, relogins, credOff, warn := 0, 0, 0, 0, 0, 0
+	approvals, inputs, followups, relogins, ownerHolds, warn := 0, 0, 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isCredentialDisabledHold(r.RunDTO) {
-			credOff++
+		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+			ownerHolds++
 		}
 		switch r.Status {
 		case "awaiting_approval":
@@ -1135,7 +1140,7 @@ func (m tuiModel) boardSummary() string {
 			followups++
 		}
 		// Match the recovery row's token: health frozen while parked needs no attention.
-		if r.Status != statusRecoveryWait && stalledHealth[r.Health] {
+		if r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
 			warn++
 		}
 	}
@@ -1152,8 +1157,8 @@ func (m tuiModel) boardSummary() string {
 	if relogins > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, codexReloginGlyph+" "+itoa(relogins)))
 	}
-	if credOff > 0 {
-		segs = append(segs, paintSeg(m.pal.amber, nil, false, credDisabledGlyph+" "+itoa(credOff)))
+	if ownerHolds > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, credDisabledGlyph+" "+itoa(ownerHolds)))
 	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))

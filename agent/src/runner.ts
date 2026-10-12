@@ -530,6 +530,9 @@ interface ExecutionRejection {
   value?: unknown;
 }
 
+/** PRD #1733: the `hold_reason` of a run held after repeated provider outages. */
+const PROVIDER_HOLD_REASON = "provider_unavailable";
+
 type RecoveryParkCause =
   | { kind: "transient" }
   | { kind: "vault_locked" | "refresh_unknown" | "account_unavailable" | "credential_release_unavailable" }
@@ -1834,6 +1837,15 @@ interface RunFlight {
   jsDepsInstalling?: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
+  /** Successful model turns settled since this flight started. Sent as `productive_turns` on
+   *  a typed provider-outage park, or as negotiated `provider_progress_turns` on a fenced
+   *  nonprovider ordinary/disk recovery park so the api durably clears the old outage streak.
+   *  A fresh flight starts at zero; undefined reads as 0. */
+  productiveTurns?: number;
+  /** PRD #1733: a provider-outage park was accepted without positive proof that this generation's
+   *  provider was reaped (the reap returned false, or was never run). Settlement and the finally's
+   *  cache drop are skipped, and the clone, HOME and custody stay as they are. */
+  providerParkUnproven?: boolean;
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
    *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
   attempt: RunAttempt | undefined;
@@ -4171,7 +4183,7 @@ export class RunRunner {
       // failed pause expects a quick same-worker re-claim, so its warm caches are kept. Claude
       // runs only (no `executor.safety`): a Codex run's caches sit on its own per-run volume
       // (PRD #1809, Codex caches). Never throws: dropRunCaches logs and swallows its failures.
-      if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety) {
+      if (runHome && preserveResumeArtifacts && flight.parked && !executor.safety && !flight.providerParkUnproven) {
         // "Only a park that ended the run's processes drops": the park's process-group reap misses
         // what the agent backgrounded (the pinned CLI runs each Bash command detached, in its own
         // session and group), so a detached `go test &` could still be writing the caches this
@@ -10493,6 +10505,9 @@ export class RunRunner {
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
       onModelTurnSettled: async (processedEvents) => {
+        // PRD #1733: counted before the retained-episode early return below; a failed turn never
+        // reaches this hook (both executors fire it on a success outcome only).
+        flight.productiveTurns = (flight.productiveTurns ?? 0) + 1;
         if (!flight.retainedEpisode || !flight.barePath || !flight.branch || !flight.worktreePath || !flight.attemptId) return;
         try {
           await this.requireRetainedOwnership(flight);
@@ -14450,6 +14465,13 @@ export class RunRunner {
     // terminal report); false = a blocked/failed reap (RETAIN the hold, still report the cancel).
     let cancelReap: boolean | undefined;
     let cancelDisposition: "released" | "retained" | undefined;
+    // PRD #1733: this park is provider-origin (the final in-process attempt failed with a provider
+    // error). Whether it is TYPED on the wire is decided per report below. `providerReap` is the
+    // proof from the single pre-report reap (undefined = not attempted); `providerTypedSent` is set
+    // once a typed body has gone out, so a lost ack can be reconciled against the ownership probe.
+    const providerOrigin = cause.kind === "transient" && err instanceof TransientRecoveryError && err.providerOrigin;
+    let providerReap: boolean | undefined;
+    let providerTypedSent = false;
     const terminal = TERMINAL_RUN_STATUSES;
     // Issue #1766: credential-deferral park progress. A transient park starts with both latched.
     let confirmedRunning = !credentialDeferred;
@@ -14582,9 +14604,11 @@ export class RunRunner {
         // execution and its steering poller active while retrying, and stop once
         // ownership or a real terminal state changes underneath it.
         let status: string;
+        let holdReason: string | undefined;
         try {
           const own = await this.client.getRunOwnership(flight.runId);
           status = own.status;
+          holdReason = own.hold_reason ?? undefined;
           if ((credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
               own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
             // An authoritative successor claim keeps the existing stale-claim cleanup convention.
@@ -14612,6 +14636,12 @@ export class RunRunner {
         if (status !== "running") {
           // A terminal ACK/ownership read is reporting evidence only, never a clone proof.
           if (cancelDisposition !== undefined) return status === "recovery_wait";
+          // PRD #1733: the typed provider park landed and only its ack was lost.
+          if (providerTypedSent && !credentialDeferred &&
+              (status === "recovery_wait" || (status === "paused" && holdReason === PROVIDER_HOLD_REASON))) {
+            await this.dispositionProviderPark(claim, flight, runLog, providerReap, status);
+            return true;
+          }
           if (credentialDeferred && status !== "recovery_wait") {
             if (terminal.has(status)) {
               keepUnlessCaptured(await captureForCredentialExit(false));
@@ -14854,15 +14884,34 @@ export class RunRunner {
             return false;
           }
         }
+        // PRD #1733: type the park only for a provider-origin transient park, an api that advertised
+        // the cause, and a fenced (positive-generation) report. The reap is NOT a typing input: a
+        // refused or failed reap is recorded as proof and gates only the later settlement/cleanup.
+        const providerTyped = providerOrigin && !credentialDeferred && cause.kind === "transient" &&
+          this.client.protocolFeatures.includes("recovery_cause_provider_outage") &&
+          (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation);
+        // Reap this generation's provider BEFORE the report, while the run is still actively
+        // claimed: a Codex reap is refused once the run is `paused` (codexActivelyClaimedStatuses),
+        // and a paused park cannot be told apart from a recovery_wait one until the ack. Once only.
+        if (providerTyped && providerReap === undefined) {
+          providerReap = await this.reapRecoveryProviderForSettle(claim, flight, runLog, "shutdown").catch(() => false);
+        }
         try {
           const parkBody: StateRequest = {
-            ...(cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
+            ...(providerTyped
+              ? { status: "recovery_wait", recovery_cause: "provider_outage", productive_turns: flight.productiveTurns ?? 0 }
+              : cause.kind === "vault_locked" && this.client.protocolFeatures.includes("recovery_cause_vault_locked")
               ? { status: "recovery_wait", recovery_cause: "vault_locked" }
               : cause.kind === "account_unavailable" && this.client.protocolFeatures.includes("recovery_cause_codex_account_unavailable")
                 ? { status: "recovery_wait", recovery_cause: "codex_account_unavailable" }
                 : disk
                 ? this.diskParkBody(claim, disk.preventive)
                 : { status: "recovery_wait" }),
+            ...(!providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
+              (flight.productiveTurns ?? 0) > 0 &&
+              this.client.protocolFeatures.includes("provider_progress_on_recovery_park_v1") &&
+              (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation)
+              ? { provider_progress_turns: flight.productiveTurns } : {}),
             // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before
             // the publish packed it, so a checkpoint published here holds the latest committed work.
             // Nothing published: the field is omitted (the work is on this worker only).
@@ -14871,7 +14920,30 @@ export class RunRunner {
           // Issue #2014: the usage tail lands before the park report (flush drains the usage recorder
           // first, bounded by USAGE_DRAIN_DEADLINE_MS); the batcher stays open for the park's feed lines.
           await batcher.flush().catch(() => undefined);
+          if (providerTyped) providerTypedSent = true;
           const ack = await reportState(parkBody);
+          if (providerTyped && (ack.status === "recovery_wait" || (ack.status === "paused" && ack.holdReason === PROVIDER_HOLD_REASON))) {
+            const held = ack.status === "paused";
+            runLog.info(held ? "run held after repeated provider outages" : "run parked for a provider outage", {
+              detail: err.message,
+              cause: "provider_outage",
+              productive_turns: parkBody.productive_turns,
+              reaped: providerReap,
+            });
+            batcher.emit({
+              kind: "status",
+              agent: "worker",
+              payload: {
+                text: held
+                  ? "paused after repeated provider outages without progress; the work is kept on this worker and the run waits for its owner to resume it"
+                  : capture.published
+                    ? "paused to recover from a provider outage; the recovery checkpoint is published and it resumes automatically"
+                    : "paused to recover from a provider outage; the recovery checkpoint is saved on this worker and it resumes automatically",
+              },
+            });
+            await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status);
+            return true;
+          }
           if (ack.status === "recovery_wait" && disk) {
             runLog.info("run parked mid-run for its data volume; its caches are dropped and it resumes automatically", {
               run_id: flight.runId,
@@ -14984,6 +15056,36 @@ export class RunRunner {
     } finally {
       if (!credentialRedispatch) await batcher.close().catch(() => undefined);
     }
+  }
+
+  /**
+   * PRD #1733: what an ACCEPTED typed provider-outage park (recovery_wait, or paused with hold
+   * `provider_unavailable`) does to this flight's local state. The productive-turn count restarts.
+   * Settlement runs only on positive proof that the provider was reaped; without it (the reap
+   * returned false, or never ran) the clone, HOME and custody stay untouched and the finally's
+   * cache drop is skipped, while the park itself still stands. A held (paused) run keeps its clone
+   * for the owner's resume, and settles only a guarded claim: the guarded path is credential-free,
+   * the legacy path fetches with the forge PAT and so keeps custody without settling.
+   */
+  private async dispositionProviderPark(
+    claim: ClaimResponse,
+    flight: RunFlight,
+    runLog: Logger,
+    reaped: boolean | undefined,
+    status: string,
+  ): Promise<void> {
+    flight.productiveTurns = 0;
+    const held = status === "paused";
+    // The same guards as reapRecoveryProviderForSettle: with no clone, no recovery harness or a
+    // non-publishing kind there is nothing to settle and nothing a missing proof would endanger.
+    const settleApplies = this.recovery.enabled && isCodePublishingKind(resolveRunKind(claim.kind)) && flight.barePath !== undefined;
+    if (held || (settleApplies && reaped !== true)) flight.preserveRecoveryClone = true;
+    if (!settleApplies) return;
+    if (reaped !== true) {
+      flight.providerParkUnproven = true;
+      return;
+    }
+    if (!held || claim.inventory_guarded === true) await this.settleRecoveryGeneration(claim, flight, runLog);
   }
 
   private async waitRecoveryRetry(

@@ -509,6 +509,9 @@ export const RUN_STATUS_TONES: Record<
    *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
    *  work until the credential is enabled. Label below. */
   credential_disabled: { tone: "warning" },
+  // Provider holds are parked: owner attention and outage retry share a static warning.
+  provider_unavailable: { tone: "warning" },
+  provider_outage: { tone: "warning" },
   completed: { tone: "ok" },
   /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
    *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
@@ -559,6 +562,9 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_blocked: "Completion blocked",
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
+  // Kept in step with runBadge's parked wording by the label-agreement test.
+  provider_unavailable: "provider unavailable: owner hold",
+  provider_outage: "waiting for provider",
 };
 
 export function StatusPill({ status }: { status: string }) {

@@ -30,6 +30,20 @@ import { RUN_STATUS_TONES } from "../components/ui";
 import { isTerminalRun, TERMINAL_RUN_STATUSES } from "./runStatus";
 import type { LatestRun, Run, RunStatus, StopKind } from "./api";
 
+it("provider hold badge uses projection hold reason without a retry promise", () => {
+  const badge = runBadge(run({ status: "paused", hold_reason: "provider_unavailable" }), 0);
+  expect(badge).toMatchObject({ label: "provider unavailable: owner hold", tone: "warning", pulse: false });
+  expect(runStatusTone("provider_unavailable", null)).toBe("warning");
+  expect(needsHumanAttention("provider_unavailable")).toBe(true);
+  expect(needsHumanAttention("provider_outage")).toBe(false);
+  expect(badge.kind === "badge" && badge.title).toContain("waits for its owner");
+});
+it("provider recovery badge only names provider when cause is available", () => {
+  expect(runBadge({ ...run({ status: "recovery_wait" }), recovery_wait_cause: "provider_outage" }, 0))
+    .toMatchObject({ label: "waiting for provider", pulse: false });
+  expect(runBadge(run({ status: "recovery_wait" }), 0)).toMatchObject({ label: "recovery wait" });
+});
+
 // run builds a LatestRun with sane defaults, overridable per test.
 function run(over: Partial<LatestRun> = {}): LatestRun {
   return {

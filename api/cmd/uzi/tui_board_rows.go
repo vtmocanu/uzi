@@ -520,18 +520,33 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 	return out + paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", empty))
 }
 
-// boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
-// D4): a non-terminal run with a server-derived current_activity, a run held on its Codex
-// account (PRD #1590), whose second line is the account action, a vault_locked park (issue
-// #1766), whose second line is the vault park sentence, a data_volume_full park (PRD #1809),
-// whose second line is the disk park sentence, or a run held on credential_disabled
-// (PRD #1732), whose second line is its next step. It has no milestone
-// precondition (D5) — the board reads current_activity directly. Used both by the row window
-// math (which must reserve a physical line for it) and by renderBoard.
+// providerBoardLine keeps owner actions at the front of the compact row; the detail
+// carries the full commands, Stop eligibility and retained-work limits.
+func providerBoardLine(r apitypes.RunDTO) string {
+	if isProviderUnavailableHold(r) {
+		stop := "Stop unavailable: see detail"
+		if r.CanStopAtProviderHold {
+			stop = "Stop: scope + Resume"
+		}
+		return "owner Resume/Cancel · " + stop + " · provider unavailable"
+	}
+	if providerParkLine(r) != "" {
+		retry := "unknown"
+		if r.RecoveryRetryNotBefore != nil {
+			retry = r.RecoveryRetryNotBefore.Local().Format("15:04")
+		}
+		return fmt.Sprintf("provider outage · parks %d · retry %s", r.ProviderParkCount, retry)
+	}
+	return ""
+}
+
+// boardShowSecondLine reserves the selected row's activity or typed park/hold
+// guidance. It has no milestone precondition; window math and rendering share it.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isWorkerRecoveryExhausted(r.RunDTO)
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isWorkerRecoveryExhausted(r.RunDTO) ||
+		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -552,6 +567,14 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
+	if line := providerBoardLine(r.RunDTO); line != "" {
+		ink := m.pal.wait
+		if isProviderUnavailableHold(r.RunDTO) {
+			ink = m.pal.amber
+		}
+		out := prefix + paintSeg(ink, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	if isWorkerRecoveryExhausted(r.RunDTO) {
 		allowance := "allowance unknown"
 		if w := r.WorkerRecovery; w != nil {

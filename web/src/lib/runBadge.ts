@@ -152,6 +152,8 @@ const PARK_LABELS = {
   worker_requeue_exhausted: "recovery needs decision",
   paused: "paused",
   credential_disabled: "waiting: credential disabled",
+  provider_unavailable: "provider unavailable: owner hold",
+  provider_outage: "waiting for provider",
   completion_blocked: "Completion blocked",
 } as const;
 
@@ -181,6 +183,8 @@ export function effectiveRunStatus(
     recovery_wait_cause?: string | null;
   },
 ): string {
+  if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
   // PRD #1226 M5 (D8): completion_phase is a SINGLE server-computed field — render it,
@@ -321,7 +325,7 @@ export function runStatusTone(
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
-  if (status === "credential_disabled") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "provider_outage") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -574,6 +578,12 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     // PRD #1732 D14: held because a credential it needs is disabled. Static warn, like the
     // other holds; the label is StatusPill's RUN_STATUS_LABELS word, so the pill and the
     // board badge agree (asserted by the ui.test.tsx label-agreement loop).
+    case "provider_unavailable":
+      return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
+        title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
+    case "provider_outage":
+      return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
+        title: "Provider outage. Open the run for park count, streak start and next retry." };
     case "credential_disabled":
       return {
         kind: "badge",
@@ -917,6 +927,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingApproval(status) ||
     isAwaitingInput(status) ||
     isAwaitingFollowup(status) ||
-    status === "worker_requeue_exhausted"
+    status === "worker_requeue_exhausted" ||
+    status === "provider_unavailable"
   );
 }
