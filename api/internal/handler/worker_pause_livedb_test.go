@@ -9,6 +9,7 @@ import (
 	"net/http/httptest"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/go-chi/chi/v5"
 	"github.com/google/uuid"
@@ -16,6 +17,7 @@ import (
 	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgxpool"
 
+	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	mw "github.com/vtmocanu/uzi/api/internal/middleware"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -161,6 +163,138 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 		}
 		if run.Status != "queued" || run.PauseRequestedAt.Valid {
 			t.Fatalf("resume status=%s pending=%v", run.Status, run.PauseRequestedAt)
+		}
+	})
+	t.Run("ordinary_pause_preserves_wall_allowance_and_resume_banks_once", func(t *testing.T) {
+		for _, pausedSeconds := range []int{120, 7200} {
+			t.Run(fmt.Sprintf("paused_%ds", pausedSeconds), func(t *testing.T) {
+				id := newRun(t)
+				const tip = "0123456789abcdef0123456789abcdef01234567"
+				e.exec(t, `UPDATE runs SET budget_paused_seconds=60,session_id='kept-session',
+ branch='agent/park-budget',checkpoint_tip=$2,checkpoint_tip_at=now() WHERE id=$1`, id, tip)
+				before, err := q.GetRunByID(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertPause(t, call(t, id, "pause", `{"claim_generation":4}`, e.worker), 200, true, "running")
+				ack := call(t, id, "state", `{"status":"paused","claim_generation":4}`, e.worker)
+				if ack.Code != http.StatusOK {
+					t.Fatalf("pause ACK=%d %s", ack.Code, ack.Body.String())
+				}
+				assertKept := func(run store.Run) {
+					t.Helper()
+					if run.WorkerID != before.WorkerID || run.SessionID != before.SessionID ||
+						run.Branch != before.Branch || run.CheckpointTip != before.CheckpointTip ||
+						run.CheckpointTipAt != before.CheckpointTipAt || run.ClaimGeneration != 4 ||
+						run.ClaimReleasedAt.Valid || run.HoldReason.Valid || run.FinishedAt.Valid {
+						t.Fatal("ordinary pause/resume changed affinity, session, checkpoint, claim or hold")
+					}
+				}
+				parked, err := q.GetRunByID(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertKept(parked)
+				if parked.Status != "paused" || parked.BudgetPausedSeconds != 60 ||
+					parked.StartedAt != before.StartedAt || parked.PauseRequestedAt.Valid ||
+					parked.PauseMode.Valid || parked.PauseAfterCount.Valid {
+					t.Fatal("pause ACK changed accounting or left pending pause")
+				}
+
+				// PostgreSQL now() is fixed within this transaction: ResumePausedRun
+				// sees exactly pausedSeconds, without sleeping or rounding tolerance.
+				tx, err := e.pool.Begin(ctx)
+				if err != nil {
+					t.Fatal(err)
+				}
+				defer func() { _ = tx.Rollback(ctx) }()
+				var resumeAt time.Time
+				if err := tx.QueryRow(ctx, "SELECT now()").Scan(&resumeAt); err != nil {
+					t.Fatal(err)
+				}
+				parkAt := resumeAt.Add(-time.Duration(pausedSeconds) * time.Second)
+				startedAt := parkAt.Add(-600 * time.Second)
+				if _, err := tx.Exec(ctx, `UPDATE runs SET started_at=$2,status_since=$3 WHERE id=$1`, id, startedAt, parkAt); err != nil {
+					t.Fatal(err)
+				}
+				tq := store.New(tx)
+				clock := parkAt
+				svc := workersvc.New(tq, newHandlerTestBox(t), workersvc.Params{})
+				svc.SetTxBeginner(e.pool)
+				h := &Handler{q: tq, wsvc: svc,
+					now: func() time.Time { return clock }}
+				route := chi.NewRouter()
+				route.Get("/api/runs/{id}", h.GetRun)
+				route.Post("/api/runs/{id}/resume-now", h.ResumeRunNow)
+				ownerCall := func(method, suffix string) *httptest.ResponseRecorder {
+					t.Helper()
+					req := httptest.NewRequest(method, "/api/runs/"+id.String()+suffix, nil)
+					req = req.WithContext(mw.ContextWithUser(req.Context(), store.User{ID: e.user}))
+					rec := httptest.NewRecorder()
+					route.ServeHTTP(rec, req)
+					return rec
+				}
+				assertBudget := func(rec *httptest.ResponseRecorder, status string) {
+					t.Helper()
+					var body struct {
+						Run apitypes.RunDTO `json:"run"`
+					}
+					if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+						t.Fatal(err)
+					}
+					if rec.Code != http.StatusOK || body.Run.Status != status ||
+						body.Run.BudgetTotalSeconds == nil || *body.Run.BudgetTotalSeconds != 3600 ||
+						body.Run.BudgetUsedSeconds == nil || *body.Run.BudgetUsedSeconds != 540 ||
+						body.Run.DeadlineAt != nil {
+						t.Fatalf("budget at %s = %d %s; want %s total=3600 used=540 remaining=3060 no deadline",
+							clock, rec.Code, rec.Body.String(), status)
+					}
+				}
+				assertBudget(ownerCall(http.MethodGet, ""), "paused")
+				clock = resumeAt
+				assertBudget(ownerCall(http.MethodGet, ""), "paused")
+				clock = resumeAt.Add(24 * time.Hour)
+				assertBudget(ownerCall(http.MethodGet, ""), "paused")
+				clock = resumeAt
+				assertBudget(ownerCall(http.MethodPost, "/resume-now"), "queued")
+				resumed, err := tq.GetRunByID(ctx, id)
+				if err != nil {
+					t.Fatal(err)
+				}
+				assertKept(resumed)
+				if resumed.BudgetPausedSeconds != int32(60+pausedSeconds) ||
+					!resumed.StartedAt.Time.Equal(startedAt) || !resumed.StatusSince.Time.Equal(resumeAt) ||
+					resumed.BudgetWallSeconds != before.BudgetWallSeconds ||
+					resumed.BudgetExtensionSeconds != 0 || resumed.BudgetFinalizeSeconds != 0 {
+					t.Fatalf("resume accounting: banked=%d started=%v since=%v", resumed.BudgetPausedSeconds, resumed.StartedAt, resumed.StatusSince)
+				}
+				snapshot := func() string {
+					t.Helper()
+					var value string
+					if err := tx.QueryRow(ctx, `SELECT to_jsonb(r)::text FROM runs r WHERE id=$1`, id).Scan(&value); err != nil {
+						t.Fatal(err)
+					}
+					return value
+				}
+				firstResume := snapshot()
+				if rec := ownerCall(http.MethodPost, "/resume-now"); rec.Code != http.StatusConflict {
+					t.Fatalf("duplicate resume=%d %s", rec.Code, rec.Body.String())
+				}
+				if snapshot() != firstResume {
+					t.Fatal("duplicate resume changed the run or banked the pause twice")
+				}
+				assertBudget(ownerCall(http.MethodGet, ""), "queued")
+				var audits int
+				if err := tx.QueryRow(ctx, `SELECT count(*) FROM run_user_inputs WHERE run_id=$1 AND kind='resume'`, id).Scan(&audits); err != nil {
+					t.Fatal(err)
+				}
+				if audits != 1 {
+					t.Fatalf("resume audits=%d; want exactly one", audits)
+				}
+				if err := tx.Commit(ctx); err != nil {
+					t.Fatal(err)
+				}
+			})
 		}
 	})
 	cases := []struct{ name, sql string }{

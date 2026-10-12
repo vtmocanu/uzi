@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { dependencyWaitQuestion, dependencyWaitAnswer, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { commitDependencySlice, exerciseDependencyWaitRunner } from "./dependency-wait-runner-fixture.js";
 
 const HAS_PROCFS = process.platform === "linux";
 import type { Options as SdkOptions, SDKMessage, HookInput } from "@anthropic-ai/claude-agent-sdk";
@@ -6531,6 +6532,49 @@ describe("SdkExecutor wall default", () => {
     await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
     assert.ok(timer.mock.calls.some((call) => call.arguments[1] === 6 * 60 * 60 * 1000),
       "the run wall watchdog must arm with the server's six-hour default");
+  });
+});
+
+describe("M4 dependency wait physical Claude runner", () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+    let calls = 0;
+    const custody = await exerciseDependencyWaitRunner((ctx, home) => {
+      const script = scriptedDependencyWait("reworded", ({ continuation, advertisedTools }) => {
+        assert.match(continuation, /Continue if these answers give you actionable work/);
+        assert.match(continuation, new RegExp(dependencyWaitAnswer));
+        assert.ok((advertisedTools as Record<string, unknown>)["park_run"]);
+        return { tool: "park_run", input: {} };
+      });
+      const queryFn: SdkQueryFn = params => (async function* () {
+        let continuation = "";
+        for await (const p of params.prompt) {
+          const content = (p as { message?: { content?: unknown } }).message?.content;
+          continuation = typeof content === "string" ? content : JSON.stringify(content);
+        }
+        calls++;
+        assert.ok(calls <= 3, "parking cannot start another provider turn");
+        if (calls === 1) {
+          commitDependencySlice(ctx.worktreePath);
+          yield reportProgress(["m1"], []);
+          yield checkpointSignal();
+        } else if (calls === 2) {
+          yield askUserTurn(dependencyWaitQuestion);
+        } else {
+          const server = params.options.mcpServers?.["uzi"] as unknown as { instance: { _registeredTools: Record<string, unknown> } };
+          const response = script.next({ continuation, advertisedTools: server.instance._registeredTools });
+          assert.ok("tool" in response);
+          yield { type: "assistant", session_id: "sess-1",
+            message: { content: [{ type: "tool_use", id: "park", name: "mcp__uzi__" + response.tool, input: response.input }] } } as unknown as SDKMessage;
+        }
+        yield resultSuccess();
+      })();
+      return new SdkExecutor(nullLogger(), home, { queryFn, installDeps: async () => ({ results: [], truncated: false }) });
+    });
+    assert.equal(calls, 3);
+    for (const mode of ["now", "after_milestone"] as const) {
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
+    }
   });
 });
 

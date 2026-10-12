@@ -1,6 +1,7 @@
 import { describe, it, mock } from "node:test";
 import { dependencyWaitQuestion, dependencyWaitAnswer, dependencyWaitProgress, scriptedDependencyWait, dependencyWaitCallbacks, observeDependencyWait, expectDependencyWaitPaused } from "./dependency-wait-fixture.js";
 import assert from "node:assert/strict";
+import { commitDependencySlice, exerciseDependencyWaitRunner } from "./dependency-wait-runner-fixture.js";
 import { PassThrough } from "node:stream";
 import { createHash, randomUUID } from "node:crypto";
 import { getEventListeners } from "node:events";
@@ -15904,6 +15905,54 @@ describe("CodexExecutor: residue quarantine (issue #2213)", () => {
     );
     assert.equal(rig.epochs[1]!.transport.turnStartCount, 0, "the implementation turn/start was never sent");
     assert.equal(rig.providerLaunches(), 2, "no retry launched another epoch");
+  });
+});
+
+describe("M4 dependency wait physical Codex runner", () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+    let calls = 0;
+    const custody = await exerciseDependencyWaitRunner((ctx, home) => {
+      let advertisedTools: unknown;
+      const script = scriptedDependencyWait("identical", ({ continuation, advertisedTools: tools }) => {
+        assert.match(continuation, /Continue if these answers give you actionable work/);
+        assert.match(continuation, new RegExp(dependencyWaitAnswer));
+        assert.ok((tools as { name: string }[]).some(tool => tool.name === "park_run"));
+        return { tool: "park_run", input: {} };
+      });
+      const rig = makeRig({ responder: c => {
+        if (c.method === "thread/start") {
+          advertisedTools = rec(c.params).dynamicTools;
+          return { thread: { id: "th-1" } };
+        }
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        calls++;
+        assert.ok(calls <= 3, "parking cannot start another provider turn");
+        const tn = `tn-physical-${calls}`;
+        if (calls === 1) {
+          commitDependencySlice(ctx.worktreePath);
+          c.transport.push(toolCall(101, "report_progress", dependencyWaitProgress, "th-1", tn, "progress"));
+          c.transport.push(toolCall(201, "checkpoint", {}, "th-1", tn, "checkpoint"));
+        } else if (calls === 2) {
+          c.transport.push(toolCall(302, "ask_user", { questions: [{ question: dependencyWaitQuestion }] }, "th-1", tn, "ask"));
+        } else {
+          const continuation = (c.params as { input?: { text?: string }[] }).input?.[0]?.text ?? "";
+          const response = script.next({ continuation, advertisedTools });
+          assert.ok("tool" in response);
+          c.transport.push(toolCall(403, response.tool, response.input, "th-1", tn, "park"));
+        }
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      } });
+      return new CodexExecutor(noopLog, home,
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
+        { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
+    });
+    assert.equal(calls, 3);
+    for (const mode of ["now", "after_milestone"] as const) {
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
+    }
   });
 });
 

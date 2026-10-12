@@ -22,6 +22,10 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Park dependency-blocked issue runs without exhausting their iteration budget ([#2657](https://github.com/vtmocanu/uzi/issues/2657)).** Answer an implementation question with `/park`, or let the lead call `park_run`, to request an ordinary checkpoint-backed pause when both API and worker support it. Successful pauses stop the wall clock and free the execution slot until owner resume. Publication failure asks for instructions instead of spending further provider turns; `uzi run pause <id> --now` remains the compatibility path.
+
 ### Fixed
 
 - **Cancelling a paused run now cancels it ([#1969](https://github.com/vtmocanu/uzi/issues/1969)).**
