@@ -1612,6 +1612,40 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
     });
   }
 
+  for (const failure of ["canonical-path ENOENT", "root swapped to an empty symlink mid-inspection"] as const) {
+    it("M1: inspection ENOENT is not journal absence: " + failure, async t => {
+      const root = await mkRoot();
+      const o = makeOutbox(root);
+      await o.init();
+      await o.journalTerminal("r1", 2, "reviewing", 7, { status: "completed" });
+      const original = await fs.readFile(path.join(root, "r1", "terminal-2.json"));
+      const saved = path.join(path.dirname(root), "saved");
+      let retainedRoot = root;
+      if (failure === "canonical-path ENOENT") {
+        t.mock.method(o as unknown as { realpath: (file: string) => Promise<string> }, "realpath", async () => {
+          throw Object.assign(new Error("canonical path unavailable"), { code: "ENOENT" });
+        });
+      } else {
+        const lstat = fs.lstat.bind(fs);
+        let rootLstats = 0;
+        t.mock.method(fs, "lstat", async (...args: Parameters<typeof lstat>) => {
+          // The second root lstat is inspection's; swap the root before it answers.
+          if (String(args[0]) === root && ++rootLstats === 2) {
+            await fs.rename(root, saved);
+            const target = path.join(path.dirname(root), "target");
+            await fs.mkdir(target);
+            await fs.symlink(target, root);
+          }
+          return lstat(...args);
+        });
+        retainedRoot = saved;
+      }
+      assert.equal(await o.retireTerminal("r1", 2), false);
+      assert.equal(o.hasPendingTerminal("r1", 2), true);
+      assert.deepEqual(await fs.readFile(path.join(retainedRoot, "r1", "terminal-2.json")), original);
+    });
+  }
+
   it("M1: retiring an absent generation retains sibling terminal finalize protection", async () => {
     const root = await mkRoot();
     const o = makeOutbox(root);
