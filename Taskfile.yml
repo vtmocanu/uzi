@@ -406,6 +406,9 @@ tasks:
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
       # `scan:secrets` too. Belongs in gate:repo, not a component gate.
       - task: check:skill-size
+      # Per-file byte budgets on loaded agent guidance (AGENTS.md, .claude/rules/*.md), so
+      # growth toward the 64 KiB runtime cap is a reviewed edit. Sub-second, tree-fact.
+      - task: check:guidance-size
       # /api/v1 backward-compatibility gate (PRD #1908 Decision 11): oasdiff diffs the spec on
       # origin/main against the tree's and fails on any breaking change. It sits here, not in
       # gate:api, because CI's lint-repo job already runs `task gate:repo` (so no
@@ -1365,6 +1368,19 @@ tasks:
       # register as over a tiny threshold, or it exits 2 (instrument broken); the explicit
       # canary arg makes this echo show what is scanned. See the script header.
       - ./scripts/check-skill-size.sh scripts/skill-size-canary.txt .agents/skills
+
+  check:guidance-size:
+    desc: AGENTS.md and .claude/rules/*.md stay within per-file byte budgets (AGENTS.md at or under the 64 KiB runtime cap), with a canary proving the detector fired
+    cmds:
+      # AGENTS.md is dropped silently at run time when strictly larger than
+      # REPO_INSTRUCTIONS_MAX_BYTES (64 KiB, agent/src/repo-instructions.ts); the rules files
+      # are loaded into every run too. scripts/guidance-size-budgets.tsv holds one budget per
+      # file, so growth is a reviewed edit. CLAUDE.md is a symlink to AGENTS.md and is counted
+      # once, via AGENTS.md. Excluded: .claude/agents/*.md (upstream-synced roster),
+      # .claude/agent-team.md (generated manifest), skills (check:skill-size),
+      # ARCHITECTURE.md and docs/. The hermetic test runs first, then the real tree.
+      - ./scripts/check-guidance-size.test.sh
+      - ./scripts/check-guidance-size.sh scripts/guidance-size-canary.txt scripts/guidance-size-budgets.tsv
 
   check:token-literals:
     desc: no NEW complete provider-token-shaped literal in tracked source (even with an inline //gitleaks:allow), with canaries proving the detector fired

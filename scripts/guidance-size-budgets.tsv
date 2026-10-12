@@ -1,0 +1,13 @@
+# Per-file byte budgets for loaded agent guidance, checked by scripts/check-guidance-size.sh.
+# Format: <repo-relative path><TAB><max bytes>. Blank lines and # comments are allowed.
+# Scope: AGENTS.md plus the tracked .claude/rules/*.md files. Every in-scope file needs a row.
+# Each budget is the size when the ratchet landed, rounded up to the next 4096-byte multiple.
+# Raising a budget is a reviewed edit to this file. The AGENTS.md budget must stay at or
+# below 65536, the REPO_INSTRUCTIONS_MAX_BYTES runtime cap in agent/src/repo-instructions.ts.
+AGENTS.md	45056
+.claude/rules/agent.md	8192
+.claude/rules/go.md	28672
+.claude/rules/prds.md	8192
+.claude/rules/stack.md	16384
+.claude/rules/tui.md	4096
+.claude/rules/web.md	12288
