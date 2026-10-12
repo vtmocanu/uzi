@@ -98,6 +98,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       continueCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
       partialCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
       acceptCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
+      // Issue #2545: the failed-run held-work panel fetches its own list; empty renders nothing.
+      getRunHeldPublications: vi.fn().mockResolvedValue({ publications: [] }),
       // PRD #1296 M5: the run page's Recovery archives section fetches its own summary.
       // Defaulted to a supported-but-empty aggregate so a full-page render settles and the
       // section renders nothing (no archive, no open hold) on these non-recovery fixtures.

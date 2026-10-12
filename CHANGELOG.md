@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A failed run's unpublished work is now published to the forge as `refs/uzi-held/<run-id>/<generation>` instead of only an archive ([#2545](https://github.com/vtmocanu/uzi/issues/2545)).**
+  A run that ends `failed` (other than `push_secret_blocked` or `worker_residue_blocked`) uploads its held work, commits since the last checkpoint plus work in progress, freshly secret-scanned; the api publishes it create-only with the run's stored forge connection and then releases the custody hold, so the work can be fetched with plain `git fetch origin refs/uzi-held/<run-id>/<generation>`. Any other outcome falls back to the recovery archive, and cancelled and parked runs keep the archive path. Owners list a run's held refs with `uzi run held <run-id> [--json]` and end the retention early with `uzi run held expire <run-id> [--yes]`; a ref is deleted after `UZI_RECOVERY_READY_RETENTION` (default 7 days). The new `UZI_HELD_PUBLICATION` api switch (default on) gates new publication only: off, the api stops advertising `recovery_held_publication_v1` so workers take the archive path, while refs already published are still cleaned up. A set-but-unparseable value aborts boot.
+
 ### Changed
 
 - **A newer inline review finding is no longer skipped after a higher-numbered top-level comment was consumed on GitHub or Forgejo ([#1199](https://github.com/vtmocanu/uzi/issues/1199)).**

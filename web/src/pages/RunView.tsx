@@ -63,6 +63,7 @@ import { statusSinceIso } from "../lib/statusSince";
 import { firstStartIso } from "../lib/runDuration";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
+import { HeldPublicationPanel } from "../components/HeldPublicationPanel";
 import { SalvagePanel } from "../components/SalvagePanel";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
@@ -3109,6 +3110,7 @@ export function RunView() {
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run
           whose detail read carries a salvage_state; nothing otherwise. */}
       <SalvagePanel run={run} />
+      <HeldPublicationPanel run={run} />
 
       {/* Run retrospective (PRD #46 M4): the LLM judge's verdict + recommendations,
           shown once a run is finished. The panel fetches its own review and owns the

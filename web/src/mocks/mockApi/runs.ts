@@ -1017,6 +1017,29 @@ export const runsApi = {
       60,
     );
   },
+  // Issue #2545: one acknowledged held-work publication for the failed mock run
+  // run-workflow-scope; every other run has none.
+  getRunHeldPublications: async (id: string) => {
+    const r = getRun(id);
+    if (!r) throw new ApiError(404, "run not found");
+    const publications =
+      id === "run-workflow-scope" && r.status === "failed"
+        ? [
+            {
+              id: "pub-mock-1",
+              run_id: id,
+              generation: 1,
+              ref: `refs/uzi-held/${id}/1`,
+              tip: "7c1d90ab34e25f68a1b3c4d5e6f708192a3b4c5d",
+              state: "acknowledged",
+              created_at: new Date(Date.now() - 3_600_000).toISOString(),
+              acknowledged_at: new Date(Date.now() - 3_000_000).toISOString(),
+              expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
+            },
+          ]
+        : [];
+    return delay({ publications }, 80);
+  },
   // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
   // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
   // alert self-hides and the other demos stay clean.

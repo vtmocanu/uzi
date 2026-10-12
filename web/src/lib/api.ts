@@ -97,6 +97,7 @@ import type {
   PrivilegeReport,
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
+  HeldPublications,
   RecoveryArchiveSummary,
   RecoveryCustodyHolds,
   ReleaseCheckStatus,
@@ -1224,6 +1225,10 @@ const realApi = {
   // attachment link, see runArchiveDownloadUrl.
   getRunArchives: (id: string) =>
     request<RecoveryArchiveSummary>("GET", `/runs/${id}/archives`),
+  // A failed run's held-work publications (issue #2545): RequireUser owner route. A server
+  // without it answers 404; the run-page panel treats any failure as "nothing to show".
+  getRunHeldPublications: (id: string) =>
+    request<HeldPublications>("GET", `/runs/${id}/held-publications`),
   // Owner custody holds (PRD #1349 M5/M6, D7/D8; #1371): the owner-wide hold listing plus the
   // aggregate safety-slot/decision/blocked counts that drive the board alert and the
   // Workers resolution surface. RequireUser (session cookie OR owner CLI Bearer), so it is

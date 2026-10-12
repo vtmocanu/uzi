@@ -1230,7 +1230,7 @@ func writeHeldConflict(w http.ResponseWriter, what string, count int64, rows []h
 	httpx.JSON(w, http.StatusConflict, map[string]any{
 		"error": fmt.Sprintf("this %s has %d held-work publication(s) of failed runs still on the forge%s; "+
 			"acknowledged refs clear at their retention expiry (or sooner with `uzi run held expire <run-id>`); refs in any other state "+
-			"(still being created, reconciled or deleted) clear only when the cleanup sweeper settles them against the forge. "+
+			"(still being created, reconciled or deleted) clear as their pending create, reconcile or delete settles against the forge. "+
 			"Remove the %s after the block lifts", what, count, named, what),
 		"held_refs":  refs,
 		"held_count": count,

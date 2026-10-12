@@ -4916,6 +4916,33 @@ export interface RecoveryCustodyAggregate {
   blocked_runs: number;
 }
 
+// HeldPublication is one held-work publication of a failed run (issue #2545), mirroring
+// apitypes.HeldPublicationDTO. state is a server enum (prepared, invoked, created,
+// create_unknown, refused, acknowledged, delete_unknown, deleted, abandoned); treat an
+// unknown value as opaque. Every optional field is omitted by the server when unset.
+export interface HeldPublication {
+  id: string;
+  run_id: string;
+  generation: number;
+  ref: string;
+  tip: string;
+  state: string;
+  created_at: string;
+  ref_created_at?: string;
+  acknowledged_at?: string;
+  expires_at?: string;
+  owner_expired_at?: string;
+  deleted_at?: string;
+  last_error?: string;
+  refusal_reason?: string;
+}
+
+// HeldPublications is the owner GET /api/runs/{id}/held-publications response. publications
+// is always an array on the wire, never null.
+export interface HeldPublications {
+  publications: HeldPublication[];
+}
+
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the
 // endpoint; the shape is frozen in M1). holds is ALWAYS an array on the wire, never null.
 export interface RecoveryCustodyHolds {
