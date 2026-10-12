@@ -9,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -777,6 +778,38 @@ func (m tuiModel) detailHeaderLines() []string {
 	return []string{clampVisual(left, m.width)}
 }
 
+// providerDetailLines uses the CLI's policy clauses without clipping away action
+// hints. Sanitize before wrapping: each returned element is one physical row.
+// Work is bounded by the fixed policy copy plus the renderer's 240-rune ID cap.
+func (m tuiModel) providerDetailLines() []string {
+	r := m.detail.run
+	var clauses []string
+	ink := m.pal.wait
+	if isProviderUnavailableHold(r) {
+		ink = m.pal.amber
+		// The full command ID is terminal-safe and shell-quoted by providerHoldAction.
+		// Cap its display before building copy so malformed IDs cannot expand the frame.
+		r.ID = m.renderer.Plain(r.ID, 240)
+		clauses = strings.Split(providerHoldAction(r), "; ")
+		// Compact only the fixed owner-wait clause; preserve any differing policy text.
+		if clauses[0] == "waiting for the owner" {
+			clauses[0] = "waiting for owner"
+		}
+		clauses[0] = "provider unavailable: " + clauses[0]
+	} else if line := providerParkLine(r); line != "" {
+		clauses = strings.Split(line, "; ")
+	}
+	var rows []string
+	for _, clause := range clauses {
+		plain := m.renderer.Plain(clause, len([]rune(clause)))
+		wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+		for _, row := range strings.Split(wrapped, "\n") {
+			rows = append(rows, lipgloss.NewStyle().Foreground(ink).Render(row))
+		}
+	}
+	return rows
+}
+
 func (m tuiModel) renderDetail() string {
 	if m.detail.answer.open {
 		return m.renderAnswerDetail()
@@ -835,12 +868,16 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
 
+	for _, line := range m.providerDetailLines() {
+		sb.WriteString(line + "\n")
+	}
+
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
 	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the
 	// stall colour that matches the ▲ token above. fitNearTimeoutLine sheds clauses to
 	// m.width so it stays one physical row (the #379 invariant); it returns "" when the run
 	// carries no near-timeout deadline, so the row is silent for every other run.
-	if line := fitNearTimeoutLine(d.run, time.Now(), m.width); line != "" {
+	if line := fitNearTimeoutLine(d.run, time.Now(), m.width); line != "" && !isProviderUnavailableHold(d.run) && providerParkLine(d.run) == "" {
 		sb.WriteString(m.pal.state(crewStalled).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
@@ -860,10 +897,10 @@ func (m tuiModel) renderDetail() string {
 		// PRD #1732 D14: a credential_disabled hold is a server park, not an owner pause, so it
 		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
-	} else if d.run.Status == statusPaused {
+	} else if d.run.Status == statusPaused && !isProviderUnavailableHold(d.run) {
 		line := pausedLine(d.run, time.Now(), m.width)
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
-	} else if d.run.PauseRequestedAt != nil {
+	} else if d.run.PauseRequestedAt != nil && !isProviderUnavailableHold(d.run) {
 		line := pauseRequestedLine(d.run, m.width)
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
 	}

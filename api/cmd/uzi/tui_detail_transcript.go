@@ -445,7 +445,11 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 		return strings.Count(s, "\n") + 1
 	}
 	chrome := len(workerExhaustionTUILines(m.detail.run)) + len(m.detailHeaderLines()) // the priority header: always 1 row (detailHeaderLines)
-	if limitWaitLine(m.detail.run, time.Now()) != "" || nearTimeoutLine(m.detail.run, time.Now()) != "" ||
+	// Wrapped provider copy: each element is one physical row.
+	chrome += len(m.providerDetailLines())
+	providerHold := isProviderUnavailableHold(m.detail.run)
+	if limitWaitLine(m.detail.run, time.Now()) != "" ||
+		(nearTimeoutLine(m.detail.run, time.Now()) != "" && !providerHold && providerParkLine(m.detail.run) == "") ||
 		codexAccountActionLine(m.detail.run) != "" || vaultParkLine(m.detail.run) != "" ||
 		diskParkLine(m.detail.run) != "" {
 		chrome++ // the park / limit-wait line, the Codex account hold line (PRD #1590), the
@@ -456,8 +460,8 @@ func (m tuiModel) transcriptBudgetWithoutCard() int {
 		// so together they add at most one physical row that renderDetail must be charged for.
 		// The width-shed fitNearTimeoutLine draws the same single row; presence is width-free.
 	}
-	if credentialDisabledLine(m.detail.run) != "" || m.detail.run.Status == statusPaused ||
-		m.detail.run.PauseRequestedAt != nil {
+	if credentialDisabledLine(m.detail.run) != "" ||
+		(!providerHold && (m.detail.run.Status == statusPaused || m.detail.run.PauseRequestedAt != nil)) {
 		chrome++ // the pause row-2 slot (PRD #1190 M4 paused / pause-requested, PRD #1732 credential
 		// hold): its own row in renderDetail, independent of the park slot above, so a parked run
 		// with a pending pause (limit_wait + pause_requested_at) is charged two rows. The three
