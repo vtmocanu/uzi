@@ -32,6 +32,26 @@ func (q *Queries) CordonHostedWorkerImageRoll(ctx context.Context, id uuid.UUID)
 	return result.RowsAffected(), nil
 }
 
+const cordonHostedWorkerPressureRecycle = `-- name: CordonHostedWorkerPressureRecycle :execrows
+UPDATE workers
+SET draining_reason = CASE WHEN draining_since IS NULL AND NOT maintenance_fenced AND NOT maintenance_owns_drain
+                            AND maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+                          THEN 'pressure_recycle' ELSE draining_reason END,
+    draining_since = COALESCE(draining_since, now()),
+    lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL,
+    updated_at = now()
+WHERE workers.id = $1 AND kind = 'hosted'
+`
+
+// Take ownership only of a new drain. Existing legacy/maintenance drains keep their owner.
+func (q *Queries) CordonHostedWorkerPressureRecycle(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, cordonHostedWorkerPressureRecycle, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const stampWorkerRollHeartbeat = `-- name: StampWorkerRollHeartbeat :one
 UPDATE workers SET roll_heartbeat_at = now()
 WHERE id = $1 AND kind = 'hosted' AND registered_pod_uid IS NOT NULL
@@ -75,6 +95,34 @@ WHERE w.id = $1 AND kind = 'hosted'
 // Release only this reason; custody and active maintenance retain their independent fence.
 func (q *Queries) UncordonHostedWorkerImageRoll(ctx context.Context, id uuid.UUID) (int64, error) {
 	result, err := q.db.Exec(ctx, uncordonHostedWorkerImageRoll, id)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const uncordonHostedWorkerPressureRecycle = `-- name: UncordonHostedWorkerPressureRecycle :execrows
+UPDATE workers w
+SET draining_since = CASE WHEN draining_reason = 'pressure_recycle'
+                           AND stats_disk_pressure_streak < 2 AND dind_pressure_streak < 2
+                           AND NOT maintenance_fenced AND NOT maintenance_owns_drain
+                           AND maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+                           AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
+                         THEN NULL ELSE draining_since END,
+    draining_reason = CASE WHEN draining_reason = 'pressure_recycle'
+                           AND stats_disk_pressure_streak < 2 AND dind_pressure_streak < 2
+                           AND NOT maintenance_fenced AND NOT maintenance_owns_drain
+                           AND maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+                           AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
+                         THEN NULL ELSE draining_reason END,
+    updated_at = now()
+WHERE w.id = $1 AND kind = 'hosted'
+`
+
+// Caller acquired GetWorkerForUpdate in a prior statement of a READ COMMITTED transaction.
+// Release only this reason; custody and active maintenance retain their independent fence.
+func (q *Queries) UncordonHostedWorkerPressureRecycle(ctx context.Context, id uuid.UUID) (int64, error) {
+	result, err := q.db.Exec(ctx, uncordonHostedWorkerPressureRecycle, id)
 	if err != nil {
 		return 0, err
 	}

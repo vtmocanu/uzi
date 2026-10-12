@@ -38,11 +38,12 @@ func samplePollResponse() PollResponse {
 	version := "0.11.7"
 	pod := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
 	reason := "image_roll"
+	never, previously := true, false
 	livenessUntil := at.Add(60 * time.Second)
 	return PollResponse{Workers: []DesiredWorker{
 		{
 			RollEvidence: &RollEvidence{
-				Version: 1, OwnerID: owner, Registered: true,
+				NeverRegistered: &previously, Version: 1, OwnerID: owner, Registered: true,
 				SchedulingCapabilities: []string{"docker"}, ProtocolCapabilities: []string{"cross_check_v1", "cross_check_lane_v1"},
 				OrdinaryCoverage: false, CheckerCoverage: true, RegisteredVersion: &version,
 				RegisterNonce: &nonce, PodUID: &pod, HeartbeatAt: &at, EvaluatedAt: at, ValidUntil: at.Add(45 * time.Second),
@@ -78,7 +79,7 @@ func samplePollResponse() PollResponse {
 			JoinToken:   &token,
 		},
 		{
-			RollEvidence:   &RollEvidence{Version: 1, OwnerID: owner, SchedulingCapabilities: []string{}, ProtocolCapabilities: []string{}, EvaluatedAt: at, ValidUntil: at},
+			RollEvidence:   &RollEvidence{NeverRegistered: &never, Version: 1, OwnerID: owner, SchedulingCapabilities: []string{}, ProtocolCapabilities: []string{}, EvaluatedAt: at, ValidUntil: at},
 			DrainingReason: &reason,
 			ID:             "22222222-2222-2222-2222-222222222222",
 			Template:       "jvm",

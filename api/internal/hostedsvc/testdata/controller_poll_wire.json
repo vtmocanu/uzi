@@ -2,6 +2,7 @@
   "workers": [
     {
       "roll_evidence": {
+        "never_registered": false,
         "version": 1,
         "owner_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "registered": true,
@@ -41,6 +42,7 @@
     },
     {
       "roll_evidence": {
+        "never_registered": true,
         "version": 1,
         "owner_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
         "registered": false,

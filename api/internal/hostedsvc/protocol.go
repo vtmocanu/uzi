@@ -188,9 +188,11 @@ type WorkerStatus struct {
 }
 
 // RollEvidence is API-evaluated registration evidence, independent of pod readiness.
-// Presence distinguishes a supporting API from an older API; Registered=false
-// explicitly describes a worker that has not registered.
+// Registered reports nonce-backed registration; false alone does not exclude legacy registration.
+// NeverRegistered is positive evidence of an offline row with no registration history.
+// An omitted or null NeverRegistered field from older APIs is unknown.
 type RollEvidence struct {
+	NeverRegistered        *bool    `json:"never_registered,omitempty"`
 	Version                int      `json:"version"`
 	OwnerID                string   `json:"owner_id"`
 	Registered             bool     `json:"registered"`

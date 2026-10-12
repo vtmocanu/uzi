@@ -6,6 +6,7 @@ import (
 	"io"
 	"net/http"
 
+	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/httpx"
 )
 
@@ -78,7 +79,36 @@ func (h *Handler) ControllerUncordonWorker(w http.ResponseWriter, r *http.Reques
 	if !ok {
 		return
 	}
-	found, err := h.hsvc.Uncordon(r.Context(), id, reason)
+	var found bool
+	var err error
+	if reason == "pressure_recycle" {
+		if h.pool == nil {
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		tx, beginErr := h.pool.BeginTx(r.Context(), pgx.TxOptions{IsoLevel: pgx.ReadCommitted})
+		if beginErr != nil {
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		defer func() { _ = tx.Rollback(r.Context()) }()
+		qtx := h.q.WithTx(tx)
+		// Match ClaimRun's worker-first lock order. The separate release statement gets
+		// a fresh READ COMMITTED snapshot after any custody writer ahead of us commits.
+		_, err = qtx.GetWorkerForUpdate(r.Context(), id)
+		if errors.Is(err, pgx.ErrNoRows) {
+			httpx.Error(w, http.StatusNotFound, "no such hosted worker")
+			return
+		}
+		if err == nil {
+			found, err = h.hsvc.WithStore(qtx).Uncordon(r.Context(), id, reason)
+		}
+		if err == nil {
+			err = tx.Commit(r.Context())
+		}
+	} else {
+		found, err = h.hsvc.Uncordon(r.Context(), id, reason)
+	}
 	if err != nil {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
@@ -105,7 +135,7 @@ func controllerDrainReason(w http.ResponseWriter, r *http.Request) (string, bool
 		httpx.Error(w, http.StatusBadRequest, "invalid drain request")
 		return "", false
 	}
-	if req.Reason != "" && req.Reason != "image_roll" {
+	if req.Reason != "" && req.Reason != "image_roll" && req.Reason != "pressure_recycle" {
 		httpx.Error(w, http.StatusBadRequest, "invalid drain reason")
 		return "", false
 	}

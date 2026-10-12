@@ -49,6 +49,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	if evidence.Version != 1 || evidence.OwnerID != "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" || !evidence.Registered {
 		t.Fatalf("registered evidence identity = %+v", evidence)
 	}
+	if evidence.NeverRegistered == nil || *evidence.NeverRegistered {
+		t.Fatal("registered worker lost explicit negative registration evidence")
+	}
 	if !slices.Equal(evidence.SchedulingCapabilities, []string{"docker"}) ||
 		!slices.Equal(evidence.ProtocolCapabilities, []string{"cross_check_v1", "cross_check_lane_v1"}) ||
 		evidence.OrdinaryCoverage || !evidence.CheckerCoverage {
@@ -133,6 +136,9 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	// — so the pointer type must survive the round trip rather than collapsing to "".
 	noToken := resp.Workers[1]
 	unregistered := noToken.RollEvidence
+	if unregistered == nil || unregistered.NeverRegistered == nil || !*unregistered.NeverRegistered {
+		t.Fatal("positive never-registered evidence missing")
+	}
 	if unregistered == nil {
 		t.Fatal("second worker lost unregistered roll evidence")
 	}

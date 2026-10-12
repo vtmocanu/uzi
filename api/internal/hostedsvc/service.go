@@ -65,6 +65,13 @@ func New(q Store, box *secretbox.Box, now func() time.Time, heartbeatStale time.
 	return &Service{q: q, box: box, now: now, heartbeatStale: heartbeatStale}
 }
 
+// WithStore binds the service to the caller's transaction while preserving its configuration.
+func (s *Service) WithStore(q Store) *Service {
+	copy := *s
+	copy.q = q
+	return &copy
+}
+
 // tokenAAD is the additional authenticated data every pending join token is
 // sealed under (secretbox.SealWithAAD, whose doc names exactly this use: "so a
 // DB-write operator cannot swap a ciphertext onto a different owner/kind and have
@@ -204,6 +211,9 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			OrdinaryCoverage:       row.OrdinaryCoverage, CheckerCoverage: row.CheckerCoverage,
 			EvaluatedAt: evaluatedAt, ValidUntil: evaluatedAt,
 		}
+		never := row.Status == "offline" && !row.LastHeartbeatAt.Valid && !row.Version.Valid &&
+			!row.SnapshotRegisterNonce.Valid && !row.RegisteredPodUid.Valid && !row.RollHeartbeatAt.Valid
+		evidence.NeverRegistered = &never
 		if row.Version.Valid {
 			v := row.Version.String
 			evidence.RegisteredVersion = &v
@@ -305,6 +315,16 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 // worker has that id — the handler answers 404 — so a controller cordoning a worker
 // the api has since dropped gets a clean, actionable negative rather than a 500.
 func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID, reason ...string) (bool, error) {
+	if len(reason) > 0 && reason[0] == "pressure_recycle" {
+		q, ok := s.q.(interface {
+			CordonHostedWorkerPressureRecycle(context.Context, uuid.UUID) (int64, error)
+		})
+		if !ok {
+			return false, fmt.Errorf("hostedsvc: pressure recycle drain unavailable")
+		}
+		rows, err := q.CordonHostedWorkerPressureRecycle(ctx, workerID)
+		return rows > 0, err
+	}
 	if len(reason) > 0 && reason[0] == "image_roll" {
 		q, ok := s.q.(interface {
 			CordonHostedWorkerImageRoll(context.Context, uuid.UUID) (int64, error)
@@ -338,6 +358,16 @@ func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID, reason ...stri
 // hosted worker has that id — the handler answers 404 — so a controller uncordoning a
 // worker the api has since dropped gets a clean, actionable negative rather than a 500.
 func (s *Service) Uncordon(ctx context.Context, workerID uuid.UUID, reason ...string) (bool, error) {
+	if len(reason) > 0 && reason[0] == "pressure_recycle" {
+		q, ok := s.q.(interface {
+			UncordonHostedWorkerPressureRecycle(context.Context, uuid.UUID) (int64, error)
+		})
+		if !ok {
+			return false, fmt.Errorf("hostedsvc: pressure recycle clear unavailable")
+		}
+		rows, err := q.UncordonHostedWorkerPressureRecycle(ctx, workerID)
+		return rows > 0, err
+	}
 	if len(reason) > 0 && reason[0] == "image_roll" {
 		q, ok := s.q.(interface {
 			UncordonHostedWorkerImageRoll(context.Context, uuid.UUID) (int64, error)
