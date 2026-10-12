@@ -133,6 +133,19 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 	server := httptest.NewServer(mux)
 	defer server.Close()
 	base = server.URL
+	// Build the controller child before minting registration/heartbeat evidence: that
+	// evidence is fresh for one minute, and a cold build (module download plus -race
+	// compile) can outlast it, so the child would see expired heartbeats and admit nothing.
+	controllerDir, err := filepath.Abs("../../../controller")
+	if err != nil {
+		t.Fatal(err)
+	}
+	childBin := filepath.Join(t.TempDir(), "kube.test")
+	build := exec.CommandContext(ctx, "go", "test", "-c", "-buildvcs=false", "-race", "-o", childBin, "./internal/kube")
+	build.Dir = controllerDir
+	if out, err := build.CombinedOutput(); err != nil {
+		t.Fatalf("build controller child: %v\n%s", err, out)
+	}
 	for _, m := range members {
 		raw, status, err := call(base, "/api/worker/register", keys[m.ID], map[string]any{"name": "uzi-pod:" + m.UID, "version": "0.1.0", "template": "base"})
 		if err != nil || status != 200 {
@@ -166,12 +179,8 @@ func TestHostedRollRetainedClaimsLiveDB(t *testing.T) {
 		}
 	}
 	raw, _ := json.Marshal(members)
-	controllerDir, err := filepath.Abs("../../../controller")
-	if err != nil {
-		t.Fatal(err)
-	}
-	cmd := exec.CommandContext(ctx, "go", "test", "-buildvcs=false", "-race", "-count=1", "-v", "./internal/kube", "-run", "^TestHostedRollRetainedClaimsBridge$")
-	cmd.Dir = controllerDir
+	cmd := exec.CommandContext(ctx, childBin, "-test.count=1", "-test.v", "-test.run", "^TestHostedRollRetainedClaimsBridge$")
+	cmd.Dir = filepath.Join(controllerDir, "internal", "kube")
 	cmd.Env = append(os.Environ(), "UZI_ROLL_TEST_API="+base, "UZI_ROLL_TEST_CONTROLLER_KEY="+controllerKey, "UZI_ROLL_TEST_MEMBERS="+string(raw))
 	out, err := cmd.CombinedOutput()
 	t.Logf("controller child:\n%s", out)
