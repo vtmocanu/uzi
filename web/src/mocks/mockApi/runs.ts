@@ -929,7 +929,11 @@ export const runsApi = {
     if (!run) throw new ApiError(404, "run not found");
     if (run.status !== "paused" && run.status !== "pool_wait")
       throw new ApiError(409, `run is ${run.status}`);
-    patchRun(id, { status: "queued", updated_at: new Date().toISOString() });
+    patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(run.hold_reason === "provider_unavailable" ? {
+        provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
+      } : {}),
+    });
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
@@ -1090,7 +1094,7 @@ export const runsApi = {
     if (kind === "approve_plan" && overrideCapabilities) {
       patchRun(id, { required_capabilities: [] });
     }
-    return delay({ server_side: false }, 150);
+    return delay({ server_side: kind === "scope" }, 150);
   },
 
   adminListRuns: mockAdminListRuns,

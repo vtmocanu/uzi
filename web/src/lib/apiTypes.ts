@@ -3217,8 +3217,8 @@ export interface Run {
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
    *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
-   *  "empty_turn"/"provider_outage"
-   *  are reserved. Render an unrecognised value honestly (a
+   *  "provider_outage" is a counted provider interruption with a scheduled retry;
+   *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
@@ -3348,7 +3348,9 @@ export interface Run {
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
-   *  wall-clock park (PRD #1497). Render an unrecognised value honestly.
+   *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
    *  must NOT be shown as cross-worker durable.
@@ -3369,6 +3371,8 @@ export interface Run {
    *  a completed milestone and the finalize allowance unused). Both OPTIONAL for rollout skew. */
   worker_name?: string | null;
   can_stop_at_wall?: boolean;
+  /** Server authorization/eligibility hint for scoped Stop at a provider hold; absent or
+   *  false must never be treated as permission. Scope success precedes owner Resume. */
   can_stop_at_provider_hold: boolean;
   completion_phase?: "checking" | "reworking" | "blocked" | "";
   /** PRD #1227 M1: the owner-decision contract projection — contract-derived (no extra DB read),
@@ -4471,6 +4475,8 @@ export type RunInputKind =
   | "reject_plan"
   | "revise_plan"
   | "cancel"
+  /** Server-side milestone ceiling; body is the completed milestone count. */
+  | "scope"
   | "answer"
   /** PRD #1190: an owner's pause request (`pause`, body = the mode "milestone"|"now")
    *  and its withdrawal (`pause_cancel`), both POSTed to /runs/{id}/inputs. `resume` is

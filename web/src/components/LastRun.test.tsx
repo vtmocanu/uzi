@@ -6,16 +6,110 @@
 // pause branch is discriminating in both directions. Issue #1543 adds the
 // ineligible_matched note and the generic (no raise-the-cap) cap-hint copy.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { LastFireDetail, LastRunOutcome } from "./LastRun";
-import type { LastFire, LastFireSkip, Schedule } from "../lib/api";
+import { api, ApiError, type LastFire, type LastFireSkip, type Schedule } from "../lib/api";
+import { mockRuns } from "../mocks/data/runs";
+vi.mock("../lib/api", async (original) => {
+  const actual = await original<typeof import("../lib/api")>();
+  return { ...actual, api: { ...actual.api, getRun: vi.fn().mockRejectedValue(new actual.ApiError(404, "Not found")) } };
+});
 
 // LastFireDetail reads useAuth().uziLabel for the cap hint; a minimal stub keeps it out of
 // an AuthProvider.
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ uziLabel: "uzi" }) }));
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.mocked(api.getRun).mockClear(); });
+
+function startedFire(id: string): LastFire {
+  return { ...fire([]), matched: 1, started: [{ run_id: id, issue_iid: 1, title: "Snapshot title",
+    web_url: null, selector_label: "scheduled", label_removed: true, label_remove_failed: false }] };
+}
+function pendingRun() {
+  let resolve!: (value: Awaited<ReturnType<typeof api.getRun>>) => void;
+  const promise = new Promise<Awaited<ReturnType<typeof api.getRun>>>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+it("LastRun reads only displayed started runs and preserves immutable fire snapshot", async () => {
+  const snapshot = startedFire("A");
+  const saved = JSON.stringify(snapshot);
+  vi.mocked(api.getRun).mockResolvedValueOnce({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: "provider_unavailable" } });
+  const collapsed = render(<MemoryRouter><LastRunOutcome fire={snapshot} expanded={false} onToggle={() => {}} panelId="panel" /></MemoryRouter>);
+  expect(api.getRun).not.toHaveBeenCalled();
+  collapsed.unmount();
+  renderDetail(snapshot);
+  await act(async () => {});
+  expect(api.getRun).toHaveBeenCalledExactlyOnceWith("A");
+  expect(screen.getByText("Current: provider unavailable: owner hold")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "View owner actions" }).getAttribute("href")).toBe("/runs/A");
+  expect(screen.getByText("Snapshot title")).toBeTruthy();
+  expect(JSON.stringify(snapshot)).toBe(saved);
+});
+it.each([404, 403])("LastRun current read refusal %s stays unknown without retries", async (status) => {
+  vi.mocked(api.getRun).mockRejectedValueOnce(new ApiError(status, "Refused"));
+  renderDetail(startedFire("A"));
+  expect(screen.getByText("Loading current state…")).toBeTruthy();
+  await act(async () => {});
+  expect(screen.getByText("Current state unavailable")).toBeTruthy();
+  expect(api.getRun).toHaveBeenCalledOnce();
+});
+it("LastRun stale guard ignores replaced expansion responses and new run loading identity", async () => {
+  const old = pendingRun();
+  const newer = pendingRun();
+  vi.mocked(api.getRun).mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+  const view = renderDetail(startedFire("A"));
+  view.rerender(<MemoryRouter><LastFireDetail s={sched()} fire={startedFire("B")} /></MemoryRouter>);
+  await act(async () => newer.resolve({ run: { ...mockRuns[0], id: "B", status: "running" } }));
+  expect(screen.getByText("Current: running")).toBeTruthy();
+  await act(async () => old.resolve({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: "provider_unavailable" } }));
+  expect(screen.getByText("Current: running")).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "View owner actions" })).toBeNull();
+});
+it("LastRun ignores response identity mismatch and retires read on unmount", async () => {
+  const pending = pendingRun();
+  vi.mocked(api.getRun).mockReturnValueOnce(pending.promise);
+  const view = renderDetail(startedFire("A"));
+  await act(async () => pending.resolve({ run: { ...mockRuns[0], id: "B", status: "paused" } }));
+  expect(screen.getByText("Loading current state…")).toBeTruthy();
+  view.unmount();
+  expect(api.getRun).toHaveBeenCalledOnce();
+});
+
+it("LastRun bounds reads to displayed started siblings and never polls", async () => {
+  vi.useFakeTimers();
+  try {
+    const snapshot = startedFire("A");
+    snapshot.started.push({ ...snapshot.started[0], run_id: "B" });
+    snapshot.skips.push({ issue_iid: 9, title: "Skipped", reason: "already_running", web_url: null });
+    vi.mocked(api.getRun).mockRejectedValueOnce(new ApiError(403, "Refused"))
+      .mockResolvedValueOnce({ run: { ...mockRuns[0], id: "B", status: "recovery_wait", recovery_wait_cause: "provider_outage" } });
+    const view = renderDetail(snapshot);
+    await act(async () => {});
+    expect(vi.mocked(api.getRun).mock.calls.map(([id]) => id)).toEqual(["A", "B"]);
+    expect(screen.getByText("Current state unavailable")).toBeTruthy();
+    expect(screen.getByText("Current: waiting for provider")).toBeTruthy();
+    view.rerender(<MemoryRouter><LastFireDetail s={sched()} fire={snapshot} /></MemoryRouter>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+    expect(api.getRun).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("LastRun collapse retires pending read and re-expansion reads once afresh", async () => {
+  const old = pendingRun();
+  const newer = pendingRun();
+  vi.mocked(api.getRun).mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+  const view = renderDetail(startedFire("A"));
+  view.unmount();
+  renderDetail(startedFire("A"));
+  await act(async () => newer.resolve({ run: { ...mockRuns[0], id: "A", status: "running" } }));
+  await act(async () => old.resolve({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: "provider_unavailable" } }));
+  expect(screen.getByText("Current: running")).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "View owner actions" })).toBeNull();
+  expect(api.getRun).toHaveBeenCalledTimes(2);
+});
 
 function sched(over: Partial<Schedule> = {}): Schedule {
   return {

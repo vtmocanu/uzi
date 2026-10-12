@@ -13,6 +13,7 @@ import {
 } from "react";
 import { Link } from "react-router-dom";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
+import { parkLabel } from "../lib/runBadge";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
   return parts.filter(Boolean).join(" ");
@@ -509,6 +510,9 @@ export const RUN_STATUS_TONES: Record<
    *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
    *  work until the credential is enabled. Label below. */
   credential_disabled: { tone: "warning" },
+  // Provider holds are parked: owner attention and outage retry share a static warning.
+  provider_unavailable: { tone: "warning" },
+  provider_outage: { tone: "warning" },
   completed: { tone: "ok" },
   /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
    *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
@@ -559,6 +563,9 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_blocked: "Completion blocked",
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
+  // Reuse the parked wording that runBadge and the progress readers already display.
+  provider_unavailable: parkLabel({ status: "provider_unavailable" }),
+  provider_outage: parkLabel({ status: "provider_outage" }),
 };
 
 export function StatusPill({ status }: { status: string }) {

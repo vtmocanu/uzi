@@ -2036,6 +2036,14 @@ export const mockRuns: Run[] = [
 // from the owner-paused fixture above so every other field stays realistic.
 const pausedBase = mockRuns.find((r) => r.id === "run-paused")!;
 mockRuns.push(
+  { ...pausedBase, id: "run-provider-hold", hold_reason: "provider_unavailable",
+    provider_park_count: 12, provider_park_streak_started_at: daysAgo(2),
+    can_stop_at_provider_hold: true },
+  { ...pausedBase, id: "run-provider-recovery", status: "recovery_wait", hold_reason: null,
+    recovery_wait_cause: "provider_outage", provider_park_count: 3,
+    provider_park_streak_started_at: minsAgo(90), recovery_retry_not_before: minsAhead(5) },
+);
+mockRuns.push(
   {
     // A Claude issue run pinned (per-run override) to the disabled token old-laptop: the
     // panel offers "Enable old-laptop" AND "Run with another token" (the lane accepts an
