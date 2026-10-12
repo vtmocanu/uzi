@@ -56,9 +56,9 @@ if [[ $1 == version ]]; then
   if [[ $MODE == toolchain ]]; then echo 'go: toolchain unavailable offline' >&2; exit 1; fi
   if [[ $MODE == oversized_version* ]]; then
     if [[ $MODE == oversized_version_stderr ]]; then
-      head -c 16777217 /dev/zero >&2
+      head -c 16777217 /dev/zero | tr '\000' x >&2
     else
-      head -c 16777217 /dev/zero
+      head -c 16777217 /dev/zero | tr '\000' x
     fi
     exit 0
   fi
@@ -70,8 +70,8 @@ fi
 [[ $module == "$EXPECTED_MODULE" || $MODE == multi ]] || exit 97
 package="fixture/$module/${7#./}"
 if [[ $MODE == oversized_stdout || $MODE == oversized_stderr ]]; then
-  if [[ $MODE == oversized_stderr ]]; then head -c 16777217 /dev/zero >&2
-  else head -c 16777217 /dev/zero; fi
+  if [[ $MODE == oversized_stderr ]]; then head -c 16777217 /dev/zero | tr '\000' x >&2
+  else head -c 16777217 /dev/zero | tr '\000' x; fi
   exit 1
 fi
 if [[ $MODE == invalid ]]; then printf 'not JSON\n'; exit 1; fi
