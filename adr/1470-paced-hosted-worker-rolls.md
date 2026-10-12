@@ -1,6 +1,6 @@
 # ADR-1470: Paced hosted worker rolls use singleton admission and incarnation proof
 
-**Status**: Accepted; M2 implemented, M3 integration and maintainer hosted verification open
+**Status**: Accepted; maintainer hosted verification remains open
 **Date**: 2026-10-12
 **Deciders**: approved issue #1470 plan, PRD Decision Log 1–17
 **Related**: [PRD #1470](../prds/1470-paced-hosted-worker-rolls.md), [ADR-422](0422-decouple-worker-version.md), [ADR-1720](1720-agent-runtime-base.md), [ADR-1759](1759-dind-data-metering-and-prune.md)
@@ -31,6 +31,11 @@ uses Recreate. Disabled hosting/controller remains supported, and zero replicas
 stops reconciliation. Extra controllers outside the chart are unsupported:
 optimistic writes are fencing for a singleton's delayed work, not leader election
 or multi-replica coordination. Worker Deployments also retain Recreate.
+
+The existing `ck_workers_isolated_lane` constraint (migration 00274) requires
+isolated workers to be hosted and ephemeral. Those workers retain their existing
+provisioning health reasons and are excluded from pacing; this change does not
+relax that isolation invariant to create a persistent isolated pool.
 
 ### D2 — Freeze owner-specific coverage, not resource shape
 
@@ -151,12 +156,11 @@ that steady pin. New-controller/old-API missing proof fails closed; an old
 controller with the new API remains unpaced. Downgrading an active roll is unsafe.
 
 The API holds no Kubernetes credential. Diagnostics remain read-only and report
-publication errors do not govern claims or controller admission. Approved M3
-integration distinguishes authoritative `Kind: fleet` reports from partial
+publication errors do not govern claims or controller admission. Reports distinguish authoritative `Kind: fleet` reports from partial
 `Kind: readiness` receipts, preserves pacing with an API receipt TTL independent
 of pod phase, and retains suitable owner/lane/capability/binding health checks.
 Healthy retained busy workers remain busy; stale evidence falls back to existing
-health logic. This M3 behavior is pending integration, not asserted shipped here.
+health logic. Local implementation and execution evidence are recorded in the PRD.
 
 Preserve `workersvc.ReasonWorkersUpgrading` as the exact drain-only queue-wait
 exemption with finite eligible timestamps. Held/offline new waits are genuine
@@ -174,11 +178,11 @@ of 31,900,920 bytes (about 32 MB); this is not a maximum live-heap guarantee.
 
 ## Verification boundary
 
-The PRD records local M1/M2 fake-client, race and PostgreSQL evidence. Real
+The PRD records local fake-client, race and PostgreSQL evidence. Real
 API-server ordering/conflict rejection and hosted retained-fleet availability
-remain **open**. M3 API health/report persistence and retained-N-1 claim replay
-are still in progress; independent package work must not be presented as shipped.
+remain **open**. Local health/report persistence and retained-N-1 claim replay
+checks do not establish real API-server behavior or production availability.
 The existing KinD smoke disables the controller and covers the envelope only.
-No hosted test was executed by this documentation change. The
+The
 [maintainer runbook](../docs/hosted-worker-roll-verification.md) defines the open
 bad-tag/good-tag, restart, delayed-write, nonce and recovery checks.

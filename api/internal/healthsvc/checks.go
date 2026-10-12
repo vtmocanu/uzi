@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -169,6 +171,81 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		return c
 	}
 
+	// Pacing has its own API receipt. A readiness report cannot renew a hold.
+	var pacing *workersvc.PacingReport
+	var pacingID uuid.UUID
+	retained := map[string]struct{}{}
+	for _, w := range hosted {
+		p := workersvc.ParseFreshPacingReport(w.RollPacing, w.RollPacingObservedAt, now)
+		if p == nil {
+			continue
+		}
+		rank := func(state string) int {
+			switch state {
+			case "held":
+				return 3
+			case "override":
+				return 2
+			default:
+				return 1
+			}
+		}
+		if pacing == nil || rank(p.State) > rank(pacing.State) ||
+			(rank(p.State) == rank(pacing.State) && w.Worker.ID.String() < pacingID.String()) {
+			pacing, pacingID = p, w.Worker.ID
+		}
+	}
+	if pacing != nil && (pacing.State == "held" || pacing.State == "override") {
+		for _, w := range hosted {
+			p := workersvc.ParseFreshPacingReport(w.RollPacing, w.RollPacingObservedAt, now)
+			if p == nil || p.TargetImage != pacing.TargetImage || p.TargetVersion != pacing.TargetVersion ||
+				(p.RetainedImage == nil && p.RetainedVersion == nil) {
+				continue
+			}
+			image, version := "", ""
+			if p.RetainedImage != nil {
+				image = *p.RetainedImage
+			}
+			if p.RetainedVersion != nil {
+				version = *p.RetainedVersion
+			}
+			retained[safe(image+" / "+version)] = struct{}{}
+		}
+		c.Severity = sevWarn
+		cause := "waiting for replacement evidence"
+		if pacing.BlockingReason != nil && *pacing.BlockingReason != "" {
+			cause = safe(*pacing.BlockingReason)
+		} else {
+			for _, w := range hosted {
+				if w.Worker.ID == pacingID && w.RollBlockingReason.Valid {
+					cause = safe(w.RollBlockingReason.String)
+				}
+			}
+		}
+		c.Summary = fmt.Sprintf("Worker roll held at %s: %s.", safe(pacing.TargetImage), cause)
+		if pacing.State == "override" {
+			c.Summary = fmt.Sprintf("Worker roll override to %s: pacing protection bypassed; retained capacity is at risk.", safe(pacing.TargetImage))
+		}
+		keys := make([]string, 0, len(retained))
+		for key := range retained {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		coverage := make([]string, 0, min(len(keys), 8))
+		for _, key := range keys[:min(len(keys), 8)] {
+			coverage = append(coverage, key)
+		}
+		if len(coverage) == 0 {
+			coverage = append(coverage, "none confirmed")
+		}
+		c.Evidence = []apitypes.HealthEvidenceDTO{
+			{Label: "Target image", Value: safe(pacing.TargetImage)},
+			{Label: "Blocking reason", Value: cause},
+			{Label: "Retained image / version coverage", Value: safe(strings.Join(coverage, "; "))},
+		}
+		return c
+	}
+
 	var (
 		failed          int
 		anyFreshSignal  bool
@@ -220,6 +297,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	if failed == 0 {
 		c.Severity = sevOK
 		c.Summary = fmt.Sprintf("All %d hosted workers are rolling cleanly.", len(hosted))
+		if pacing != nil {
+			c.Summary = fmt.Sprintf("Worker roll %s to %s; waiting for replacement evidence.", pacing.State, safe(pacing.TargetImage))
+		}
 		return c
 	}
 

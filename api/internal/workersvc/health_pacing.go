@@ -1,0 +1,39 @@
+package workersvc
+
+import (
+	"encoding/json"
+	"fmt"
+	"time"
+
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
+)
+
+// rollWaitReason requires every suitable candidate to be unavailable through a roll.
+// The context comes from one eligible worker; no other owner's canary is consulted.
+func rollWaitReason(now time.Time, counts store.CountOnlineWorkersClaimableForRunRow) string {
+	if counts.DiagnosticSuitable == 0 || counts.DiagnosticSuitable != counts.DiagnosticRolling {
+		return ""
+	}
+	var context struct {
+		Pacing         json.RawMessage `json:"pacing"`
+		ObservedAt     time.Time       `json:"observed_at"`
+		BlockingReason string          `json:"blocking_reason"`
+	}
+	if len(counts.DiagnosticRollContext) > 8192 || json.Unmarshal(counts.DiagnosticRollContext, &context) != nil {
+		return ""
+	}
+	p := ParseFreshPacingReport(context.Pacing, pgtype.Timestamptz{Time: context.ObservedAt, Valid: true}, now)
+	if p == nil {
+		return ""
+	}
+	reason := termsafe.SanitizeBounded(termsafe.CellText(context.BlockingReason), 192)
+	if p.BlockingReason != nil && *p.BlockingReason != "" {
+		reason = *p.BlockingReason
+	}
+	if reason == "" {
+		reason = "waiting for replacement registration and heartbeat"
+	}
+	return fmt.Sprintf("waiting for worker roll (%s) to %s: %s", p.State, p.TargetImage, reason)
+}

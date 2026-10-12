@@ -2228,21 +2228,37 @@ func (q *Queries) CountOnlineEligibleWorkersForRepo(ctx context.Context, arg Cou
 
 const countOnlineWorkersClaimableForRun = `-- name: CountOnlineWorkersClaimableForRun :one
 WITH candidates AS (
-SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
+SELECT w.id, rh.pacing, rh.pacing_observed_at, rh.blocking_reason,
+       (w.last_heartbeat_at IS NOT NULL AND w.last_heartbeat_at >= $1)::boolean AS heartbeat_recent,
+       (run.egress_profile_id IS NULL)::boolean AS diagnostic_lane,
+       (run.kind <> 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
+        OR run.updated_at < $2::timestamptz)::boolean AS diagnostic_affinity,
+       (w.kind = 'hosted' AND rh.pacing_observed_at <= $3::timestamptz
+        AND rh.pacing_observed_at >= ($3::timestamptz) - interval '60 seconds'
+        AND rh.pacing->>'state' IN ('held','active','waiting_evidence','override')
+        AND NOT w.maintenance_fenced AND NOT w.maintenance_owns_drain
+        AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+        AND w.stats_disk_pressure_streak < 2 AND w.dind_pressure_streak < 2
+        AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
+        AND (w.draining_since IS NULL OR w.draining_reason = 'image_roll')
+        AND (w.status <> 'online' OR w.last_heartbeat_at IS NULL OR w.last_heartbeat_at < $1
+             OR (w.draining_since IS NOT NULL AND w.draining_reason = 'image_roll')
+             OR rh.phase IN ('rolling','stuck'))) IS TRUE AS through_roll,
+       CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','ready','stopping','recycling') THEN COALESCE(w.draining_since, w.maintenance_activity_floor) ELSE w.draining_since END AS draining_since,
        (w.status = 'online') AS online,
-       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', 'plan', $1::timestamptz, $2::timestamptz)
+       (CASE WHEN run.kind = 'cross_check' THEN fn_cross_check_child_eligible(w, run, true, 'any', 'plan', $3::timestamptz, $2::timestamptz)
              ELSE w.max_concurrent_runs IS NULL OR wa.active < w.max_concurrent_runs END) AS free_slot,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              $3::interval, now(),
+              $4::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $4::boolean, run.repo_id, run.kind, run.egress_profile_id, $5::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $5::boolean, run.repo_id, run.kind, run.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false)))) AS advisory_binding,
        (run.kind = 'cross_check' OR NOT w.ephemeral OR w.ephemeral_run_id = run.id OR (
            (fn_ephemeral_lease_admits(
               w.lease_since, w.lease_repo_id, w.lease_branch, w.draining_since IS NOT NULL,
-              $3::interval, now(),
+              $4::interval, now(),
               run.repo_id, run.kind, run.branch, run.pipeline_ref, run.issue_iid, run.failure_snapshot, run.egress_profile_id)
-                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $4::boolean, run.repo_id, run.kind, run.egress_profile_id, $5::uuid[]) OR COALESCE(w.docker_enabled, false)))
+                   AND (NOT fn_ephemeral_docker_preference_applies(owner.ephemeral_docker_enabled, $5::boolean, run.repo_id, run.kind, run.egress_profile_id, $6::uuid[]) OR COALESCE(w.docker_enabled, false)))
            AND NOT EXISTS (SELECT 1 FROM workers bw WHERE bw.ephemeral AND bw.ephemeral_run_id = run.id)
            AND NOT EXISTS (SELECT 1 FROM recovery_custody_holds ch WHERE ch.live_worker_id = w.id AND ch.state = 'open')
        )) AS strict_binding,
@@ -2251,7 +2267,7 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
        (run.kind = 'cross_check' OR run.worker_id IS NULL OR run.worker_id = w.id
         OR NOT EXISTS (SELECT 1 FROM workers ow WHERE ow.id = run.worker_id
                        AND (ow.draining_since IS NOT NULL OR ow.maintenance_phase IN ('requested','ready','stopping','recycling') OR ow.maintenance_fenced OR
-                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $6)
+                            (ow.last_heartbeat_at IS NOT NULL AND ow.last_heartbeat_at >= $1)
                             -- #2705 pin P, mirroring ClaimRun's stale-requeue grace arm.
                             OR (run.kind <> 'cross_check'
                                 AND run.stale_requeue_generation = run.claim_generation
@@ -2260,6 +2276,7 @@ SELECT CASE WHEN w.maintenance_fenced OR w.maintenance_phase IN ('requested','re
 FROM runs run
 JOIN users owner ON owner.id = run.user_id
 JOIN workers w ON w.user_id = run.user_id
+LEFT JOIN worker_upgrade_reports rh ON rh.worker_id = w.id
 CROSS JOIN LATERAL (
     SELECT count(*) AS active FROM runs pr
     WHERE pr.worker_id = w.id
@@ -2267,12 +2284,10 @@ CROSS JOIN LATERAL (
       AND pr.kind <> 'chat' AND NOT pr.cross_check_lane
 ) wa
 WHERE run.id = $9
-  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', $1::timestamptz, $2::timestamptz))
-  AND w.last_heartbeat_at IS NOT NULL
-  AND w.last_heartbeat_at >= $6
+  AND (run.kind <> 'cross_check' OR fn_cross_check_child_eligible(w, run, false, 'any', 'plan', $3::timestamptz, $2::timestamptz))
   AND fn_worker_can_claim(
         COALESCE(w.docker_enabled, false),
-        $5::uuid[],
+        $6::uuid[],
         run.repo_id,
         run.kind,
         COALESCE(w.capabilities, '{}')::text[],
@@ -2336,22 +2351,27 @@ WHERE run.id = $9
        OR run.released_worker_id <> w.id
        OR run.released_worker_nonce IS DISTINCT FROM w.snapshot_register_nonce)
 )
-SELECT count(*) FILTER (WHERE online AND affinity AND strict_binding)::bigint AS strict_eligible,
-       count(*) FILTER (WHERE (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
-       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
-       count(*) FILTER (WHERE online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
-       count(*) FILTER (WHERE online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
-       max(draining_since) FILTER (WHERE online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+SELECT count(*) FILTER (WHERE heartbeat_recent AND online AND affinity AND strict_binding)::bigint AS strict_eligible,
+       count(*) FILTER (WHERE heartbeat_recent AND (draining_since IS NULL OR own_worker) AND free_slot AND advisory_binding)::bigint AS claimable,
+       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::bigint AS draining_eligible,
+       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NULL AND affinity AND strict_binding)::bigint AS non_draining_eligible,
+       count(*) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND own_worker AND affinity AND strict_binding)::bigint AS suitable_own_draining,
+       max(draining_since) FILTER (WHERE heartbeat_recent AND online AND draining_since IS NOT NULL AND persistent AND NOT COALESCE(own_worker, false) AND affinity AND strict_binding)::timestamptz AS latest_suitable_draining_since
+       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding)::bigint AS diagnostic_suitable
+       , count(*) FILTER (WHERE diagnostic_lane AND diagnostic_affinity AND affinity AND strict_binding AND through_roll)::bigint AS diagnostic_rolling
+       , (SELECT jsonb_build_object('pacing', c.pacing, 'observed_at', c.pacing_observed_at, 'blocking_reason', c.blocking_reason)
+          FROM candidates c WHERE c.diagnostic_lane AND c.diagnostic_affinity AND c.affinity AND c.strict_binding AND c.through_roll
+          ORDER BY (c.pacing->>'state' = 'held') DESC, c.id LIMIT 1)::jsonb AS diagnostic_roll_context
 FROM candidates
 `
 
 type CountOnlineWorkersClaimableForRunParams struct {
-	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
+	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	CrossCheckAffinityCutoff pgtype.Timestamptz `json:"cross_check_affinity_cutoff"`
+	CrossCheckEvaluatedAt    pgtype.Timestamptz `json:"cross_check_evaluated_at"`
 	EphemeralLease           pgtype.Interval    `json:"ephemeral_lease"`
 	WorkerDockerEnabled      bool               `json:"worker_docker_enabled"`
 	DockerRepoAllowlist      []uuid.UUID        `json:"docker_repo_allowlist"`
-	HeartbeatCutoff          pgtype.Timestamptz `json:"heartbeat_cutoff"`
 	StaleRequeueCutoff       pgtype.Timestamptz `json:"stale_requeue_cutoff"`
 	AffinityCutoff           pgtype.Timestamptz `json:"affinity_cutoff"`
 	RunID                    uuid.UUID          `json:"run_id"`
@@ -2366,6 +2386,9 @@ type CountOnlineWorkersClaimableForRunRow struct {
 	NonDrainingEligible         int64              `json:"non_draining_eligible"`
 	SuitableOwnDraining         int64              `json:"suitable_own_draining"`
 	LatestSuitableDrainingSince pgtype.Timestamptz `json:"latest_suitable_draining_since"`
+	DiagnosticSuitable          int64              `json:"diagnostic_suitable"`
+	DiagnosticRolling           int64              `json:"diagnostic_rolling"`
+	DiagnosticRollContext       []byte             `json:"diagnostic_roll_context"`
 }
 
 // PRD #1497 M1 (D19): how many of the run's owner's workers could ACTUALLY claim THIS ONE run right
@@ -2393,12 +2416,12 @@ type CountOnlineWorkersClaimableForRunRow struct {
 // eligibility. Static requirements compose on ONE candidate; strict counts ignore slots.
 func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg CountOnlineWorkersClaimableForRunParams) (CountOnlineWorkersClaimableForRunRow, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersClaimableForRun,
-		arg.CrossCheckEvaluatedAt,
+		arg.HeartbeatCutoff,
 		arg.CrossCheckAffinityCutoff,
+		arg.CrossCheckEvaluatedAt,
 		arg.EphemeralLease,
 		arg.WorkerDockerEnabled,
 		arg.DockerRepoAllowlist,
-		arg.HeartbeatCutoff,
 		arg.StaleRequeueCutoff,
 		arg.AffinityCutoff,
 		arg.RunID,
@@ -2413,6 +2436,9 @@ func (q *Queries) CountOnlineWorkersClaimableForRun(ctx context.Context, arg Cou
 		&i.NonDrainingEligible,
 		&i.SuitableOwnDraining,
 		&i.LatestSuitableDrainingSince,
+		&i.DiagnosticSuitable,
+		&i.DiagnosticRolling,
+		&i.DiagnosticRollContext,
 	)
 	return i, err
 }

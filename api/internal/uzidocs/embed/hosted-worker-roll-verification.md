@@ -7,9 +7,8 @@ audience: contributor
 # Verify paced hosted worker rolls
 
 This is the maintainer's **open verification procedure**, not an executed test
-report. M2 is implemented; M3 API health/report integration and the retained-N-1
-claim replay remain in progress. The lead owns generated documentation mirrors
-and final availability checks. Record actual results before closing
+report. Local implementation and checks are recorded in the PRD; they do not
+complete this hosted verification. Record actual results before closing
 [PRD #1470](../prds/1470-paced-hosted-worker-rolls.md); local fake-client and
 PostgreSQL evidence there does not establish hosted availability or real
 API-server optimistic-write ordering. Design: [ADR-1470](../adr/1470-paced-hosted-worker-rolls.md).
@@ -187,7 +186,7 @@ managed template/image change when replacement is needed, then verify the new
 incarnation. Returning to a known-good pin is an operator action, not automatic
 rollback, and still requires reconciliation of the active cohort's evidence.
 
-## Diagnostic checks pending M3 integration
+## Diagnostic checks
 
 Once the API package work lands, verify authoritative `Kind: fleet` pacing and
 partial `Kind: readiness` receipts do not erase each other. Verify API receipt

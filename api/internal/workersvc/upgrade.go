@@ -566,6 +566,32 @@ func NormalizePacingReport(in *PacingReport) (*PacingReport, error) {
 	return &out, nil
 }
 
+// ParseFreshPacingReport reads diagnostic pacing using only the API receipt time.
+// Readiness reports cannot extend this independent receipt's lifetime.
+func ParseFreshPacingReport(data []byte, receipt pgtype.Timestamptz, now time.Time) *PacingReport {
+	if !receipt.Valid || receipt.InfinityModifier != pgtype.Finite || receipt.Time.After(now) ||
+		now.Sub(receipt.Time) > DefaultControllerSignalTTL || len(data) == 0 || len(data) > 4096 {
+		return nil
+	}
+	var report PacingReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		return nil
+	}
+	reportCopy, err := NormalizePacingReport(&report)
+	if err != nil {
+		return nil
+	}
+	reportCopy.TargetImage = termsafe.CellText(reportCopy.TargetImage)
+	reportCopy.TargetVersion = termsafe.CellText(reportCopy.TargetVersion)
+	for _, field := range []**string{&reportCopy.BlockingReason, &reportCopy.RetainedImage, &reportCopy.RetainedVersion} {
+		if *field != nil {
+			value := termsafe.CellText(**field)
+			*field = &value
+		}
+	}
+	return reportCopy
+}
+
 // RollHealthReport is one validated, sanitized entry from a controller report, ready
 // to persist. The handler does the decoding, enum validation and sanitizing; this
 // layer also validates pacing for callers that do not use the handler.

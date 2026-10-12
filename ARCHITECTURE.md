@@ -2244,8 +2244,8 @@ forces admission and no automatic rollback is added.
 Deploy API first, then the singleton controller/chart with the worker pin steady,
 verify evidence/report support, then change the pin. An old controller with a new
 API remains unpaced; active-roll downgrade is unsafe. Controller diagnostics
-remain read-only at the API boundary, which holds no kube credentials. M3 API
-health/report persistence and retained-fleet claim replay remain in progress;
+remain read-only at the API boundary, which holds no kube credentials. Local health/report persistence and retained-fleet claim replay checks are
+recorded in the PRD;
 hosted real-apiserver verification remains open. See
 [ADR-1470](adr/1470-paced-hosted-worker-rolls.md),
 [PRD #1470](prds/1470-paced-hosted-worker-rolls.md) and the
