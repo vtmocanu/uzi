@@ -2316,14 +2316,18 @@ func providerCommandID(id string) string {
 
 func providerHoldAction(r apitypes.RunDTO) string {
 	id := providerCommandID(r.ID)
-	action := "waiting for the owner; no automatic retry deadline; issue lock and worker affinity retained; clone and session files kept on the worker; recovery depends on the worker or a verified recovery copy; owner Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id
+	retention := "claim and worker affinity retained"
+	if r.Kind == "issue" {
+		retention = "issue lock, claim and worker affinity retained"
+	}
+	action := "waiting for the owner; no automatic retry deadline; " + retention + "; clone and session files kept on the worker; recovery depends on the worker or a verified recovery copy; owner Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id
 	done, total, _ := milestoneProgress(r)
 	if r.CanStopAtProviderHold {
 		return action + "; Stop: uzi run scope " + id + " --through " + itoa(done) + "; then, only if scope succeeds, Resume: uzi run resume " + id
 	}
 	reason := "server does not permit Stop (including interactive or otherwise refused runs)"
 	if r.Kind != "issue" || total == 0 {
-		reason = "non-milestone issue run"
+		reason = "requires a milestone issue run"
 	} else if done == 0 {
 		reason = "no completed milestone"
 	}

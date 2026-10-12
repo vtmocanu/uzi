@@ -95,6 +95,26 @@ func TestProviderCLIResumedMarkerIsNotAnOwnerHold(t *testing.T) {
 	}
 }
 
+func TestProviderCLINonIssueHoldRetention(t *testing.T) {
+	for _, kind := range []string{"task", "prompt"} {
+		t.Run(kind, func(t *testing.T) {
+			r := providerHoldFixture()
+			r.Kind = kind
+			r.CanStopAtProviderHold = false
+			r.Milestones, r.MilestonesCompleted = nil, nil
+			fc := &uzicli.FakeClient{RunByID: map[string]apitypes.RunDTO{"r1": r}}
+			out, stderr, code := runCLI(t, fakeEnv(fc), "run", "get", "r1")
+			if code != 0 {
+				t.Fatalf("exit=%d: %s", code, stderr)
+			}
+			requireWorkerCopy(t, out, "claim and worker affinity retained", "Stop unavailable: requires a milestone issue run", "uzi run resume r1", "uzi run cancel r1")
+			if strings.Contains(out, "issue lock") {
+				t.Fatalf("non-issue hold claims an issue lock: %s", out)
+			}
+		})
+	}
+}
+
 func TestProviderCLIHoldStopGate(t *testing.T) {
 	for _, tc := range []struct {
 		name   string
@@ -105,7 +125,7 @@ func TestProviderCLIHoldStopGate(t *testing.T) {
 		{"eligible", func(r *apitypes.RunDTO) {}, "uzi run scope r1 --through 4; then, only if scope succeeds, Resume: uzi run resume r1", true},
 		{"server refused", func(r *apitypes.RunDTO) { r.CanStopAtProviderHold = false }, "server does not permit Stop", false},
 		{"no completed", func(r *apitypes.RunDTO) { r.CanStopAtProviderHold = false; r.MilestonesCompleted = nil }, "no completed milestone", false},
-		{"non milestone", func(r *apitypes.RunDTO) { r.CanStopAtProviderHold = false; r.Milestones = nil }, "non-milestone issue run", false},
+		{"non milestone", func(r *apitypes.RunDTO) { r.CanStopAtProviderHold = false; r.Milestones = nil }, "requires a milestone issue run", false},
 		{"interactive refused", func(r *apitypes.RunDTO) { r.CanStopAtProviderHold = false; r.Interactive = true }, "server does not permit Stop", false},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -116,7 +136,7 @@ func TestProviderCLIHoldStopGate(t *testing.T) {
 			if code != 0 {
 				t.Fatalf("exit=%d: %s", code, stderr)
 			}
-			requireWorkerCopy(t, out, "provider unavailable", "waiting for the owner", "no automatic retry deadline", "issue lock and worker affinity retained", "clone and session files kept on the worker; recovery depends on the worker or a verified recovery copy", "uzi run resume r1", "uzi run cancel r1", tc.want)
+			requireWorkerCopy(t, out, "provider unavailable", "waiting for the owner", "no automatic retry deadline", "issue lock, claim and worker affinity retained", "clone and session files kept on the worker; recovery depends on the worker or a verified recovery copy", "uzi run resume r1", "uzi run cancel r1", tc.want)
 			if strings.Contains(out, "uzi run scope") != tc.scope {
 				t.Fatalf("Stop gate ignored: %s", out)
 			}
