@@ -110,6 +110,8 @@ type recoveryWaitWriter interface {
 func (s *Service) setRecoveryWait(ctx context.Context, writer recoveryWaitWriter, cause pgtype.Text, run store.Run, wkr store.Worker, req StateRequest, sessionID pgtype.Text) (int64, error) {
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 	return writer.SetRunRecoveryWait(ctx, store.SetRunRecoveryWaitParams{
+		ResetProviderStreak: req.ProviderProgressTurns != nil && *req.ProviderProgressTurns > 0 &&
+			(req.RecoveryCause == nil || *req.RecoveryCause == "empty_turn"),
 		RecoveryCause:  cause,
 		RetryNotBefore: pgconv.Time(retryNotBefore),
 		SessionID:      sessionID,

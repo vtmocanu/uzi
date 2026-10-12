@@ -1808,9 +1808,10 @@ interface RunFlight {
   jsDepsInstalling?: boolean;
   /** Retain the only copy of unverified recovery work; never guard non-filesystem cleanup. */
   preserveRecoveryClone: boolean;
-  /** PRD #1733: model turns this flight settled since its last accepted provider-outage park. Sent
-   *  as `productive_turns` on the next typed park so the api can tell a streak of unproductive
-   *  outages from one that made progress in between. Undefined reads as 0. */
+  /** Successful model turns settled since this flight started. Sent as `productive_turns` on
+   *  a typed provider-outage park, or as negotiated `provider_progress_turns` on a fenced
+   *  nonprovider ordinary/disk recovery park so the api durably clears the old outage streak.
+   *  A fresh flight starts at zero; undefined reads as 0. */
   productiveTurns?: number;
   /** PRD #1733: a provider-outage park was accepted without positive proof that this generation's
    *  provider was reaped (the reap returned false, or was never run). Settlement and the finally's
@@ -14628,6 +14629,11 @@ export class RunRunner {
                 : disk
                 ? this.diskParkBody(claim, disk.preventive)
                 : { status: "recovery_wait" }),
+            ...(!providerOrigin && !credentialDeferred && (cause.kind === "transient" || disk) &&
+              (flight.productiveTurns ?? 0) > 0 &&
+              this.client.protocolFeatures.includes("provider_progress_on_recovery_park_v1") &&
+              (claim.claim_generation ?? 0) > 0 && this.client.stampsClaimGeneration(claim.claim_generation)
+              ? { provider_progress_turns: flight.productiveTurns } : {}),
             // PRD #1809 D8: a verified capture fetched the clone's HEAD into the tracking ref before
             // the publish packed it, so a checkpoint published here holds the latest committed work.
             // Nothing published: the field is omitted (the work is on this worker only).

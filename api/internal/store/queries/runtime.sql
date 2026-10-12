@@ -3020,6 +3020,14 @@ UPDATE runs SET
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
     recovery_wait_cause       = sqlc.narg('recovery_cause')::text,
+    provider_park_count = CASE WHEN sqlc.arg('reset_provider_streak')::boolean
+        AND sqlc.narg('claim_generation')::bigint > 0
+        AND claim_generation = sqlc.narg('claim_generation')::bigint
+        THEN 0 ELSE provider_park_count END,
+    provider_park_streak_started_at = CASE WHEN sqlc.arg('reset_provider_streak')::boolean
+        AND sqlc.narg('claim_generation')::bigint > 0
+        AND claim_generation = sqlc.narg('claim_generation')::bigint
+        THEN NULL ELSE provider_park_streak_started_at END,
     recovery_retry_not_before = @retry_not_before,
     session_id                = COALESCE(sqlc.narg('session_id'), session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
@@ -3121,6 +3129,14 @@ UPDATE runs SET
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
     recovery_wait_cause       = 'data_volume_full',
+    provider_park_count = CASE WHEN sqlc.arg('reset_provider_streak')::boolean
+        AND sqlc.narg('claim_generation')::bigint > 0
+        AND claim_generation = sqlc.narg('claim_generation')::bigint
+        THEN 0 ELSE provider_park_count END,
+    provider_park_streak_started_at = CASE WHEN sqlc.arg('reset_provider_streak')::boolean
+        AND sqlc.narg('claim_generation')::bigint > 0
+        AND claim_generation = sqlc.narg('claim_generation')::bigint
+        THEN NULL ELSE provider_park_streak_started_at END,
     disk_park_count           = disk_park_count + CASE WHEN sqlc.arg('counted')::boolean THEN 1 ELSE 0 END,
     recovery_retry_not_before = @retry_not_before,
     session_id                = COALESCE(sqlc.narg('session_id'), session_id),

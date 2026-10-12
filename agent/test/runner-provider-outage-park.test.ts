@@ -5,6 +5,7 @@ import os from "node:os";
 import path from "node:path";
 import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
 import type { ExecutorFactory, RunRunner } from "../src/runner.js";
+import { DiskParkSignal } from "../src/cache-cap.js";
 import { CodexBoundaryError } from "../src/codex/safety.js";
 import { SdkExecutor, TransientRecoveryError } from "../src/sdk-executor.js";
 import { followSuccessfulPush } from "./publication-fixture.js";
@@ -30,12 +31,15 @@ installRecoveryRootCleanup();
 // stub executor and a Codex executor over the real execution-safety facade.
 
 const FEATURES = ["claim_generation_fence", "recovery_cause_provider_outage"];
+const PROGRESS = "provider_progress_on_recovery_park_v1";
 const HOLD = "provider_unavailable";
 
 type Harness = "claude" | "codex";
 const HARNESSES: Harness[] = ["claude", "codex"];
 
 interface Scenario {
+  /** Distinguish committed work on a fresh flight of the same run. */
+  work?: string;
   /** Model turns that settle (reach onModelTurnSettled) before the executor throws. */
   turns?: number;
   /** The error the executor throws; default a provider-origin TransientRecoveryError. */
@@ -59,7 +63,7 @@ function rigFor(harness: Harness, scenario: Scenario, homeRoot: string): Rig {
   const behavior = async (ctx: RunContext): Promise<ExecutorResult> => {
     fs.mkdirSync(runHome, { recursive: true });
     fs.writeFileSync(path.join(runHome, "session"), "transcript", "utf8");
-    commitInTree(ctx.worktreePath, "WORK.txt", "work before the outage\n");
+    commitInTree(ctx.worktreePath, "WORK.txt", scenario.work ?? "work before the outage\n");
     for (let i = 0; i < (scenario.turns ?? 0); i++) await ctx.onModelTurnSettled?.(1);
     thrown = true;
     throw error();
@@ -107,6 +111,70 @@ async function withHome(fn: (homeRoot: string) => Promise<void>): Promise<void> 
 }
 
 const parks = (runId: string) => api.states.filter((s) => s.runId === runId && s.body.status === "recovery_wait").map((s) => s.body);
+
+describe("RunRunner recovery parks consume this flight's provider progress", () => {
+  for (const harness of HARNESSES) {
+    for (const kind of ["ordinary", "disk counted", "disk preventive"] as const) {
+      for (const turns of [0, 2]) {
+        it(`${harness}: ${kind}, ${turns} successful turns, then a fresh zero-progress provider flight`, async () => {
+          await withHome(async (homeRoot) => {
+            client.protocolFeatures = [...FEATURES, PROGRESS, "recovery_cause_data_volume_full"];
+            const first = rigFor(harness, { turns, error: () => kind === "ordinary"
+              ? new TransientRecoveryError() : new DiskParkSignal(kind === "disk preventive") }, homeRoot);
+            const claim = gitlabClaim(3320, { claim_generation: 3 });
+            await first.runner.execute(claim);
+            const [park] = parks(claim.run_id);
+            assert.ok(park);
+            assert.equal(parks(claim.run_id).length, 1);
+            assert.equal(park.provider_progress_turns, turns || undefined);
+            assert.equal(park.claim_generation, 3);
+            assert.equal(park.recovery_cause, kind === "ordinary" ? undefined : "data_volume_full");
+            assert.equal(park.disk_park_preventive, kind === "disk preventive" ? true : undefined);
+            assert.equal(park.productive_turns, undefined);
+
+            api.setOwnershipStatus(claim.run_id, "running", 4);
+            const next = rigFor(harness, { work: "fresh flight before failure\n" }, homeRoot);
+            await next.runner.execute({ ...claim, claim_generation: 4 });
+            const sent = parks(claim.run_id);
+            assert.equal(sent.length, 2);
+            assert.equal(sent[1]!.recovery_cause, "provider_outage");
+            assert.equal(sent[1]!.productive_turns, 0, "prior flight success never leaks into a fresh flight");
+            assert.equal(sent[1]!.provider_progress_turns, undefined);
+            assert.equal(sent[1]!.claim_generation, 4);
+          });
+        });
+      }
+    }
+    for (const scenario of [
+      { name: "feature absent", features: FEATURES, generation: 3 },
+      { name: "zero generation", features: [...FEATURES, PROGRESS], generation: 0 },
+      { name: "unfenced generation", features: [PROGRESS], generation: 3 },
+    ]) {
+      it(`${harness}: ordinary progress omitted with ${scenario.name}`, async () => {
+        await withHome(async (homeRoot) => {
+          client.protocolFeatures = scenario.features;
+          const rig = rigFor(harness, { turns: 1, error: () => new TransientRecoveryError() }, homeRoot);
+          const claim = gitlabClaim(3321, { claim_generation: scenario.generation });
+          await rig.runner.execute(claim);
+          assert.equal(parks(claim.run_id).length, 1);
+          assert.equal(parks(claim.run_id)[0]!.provider_progress_turns, undefined);
+        });
+      });
+    }
+  }
+  it("credential deferral without its cause feature stays untyped and carries no progress", async () => {
+    await withHome(async (homeRoot) => {
+      client.protocolFeatures = [...FEATURES, PROGRESS];
+      const rig = rigFor("codex", { turns: 2, error: () =>
+        new CodexBoundaryError("reconcile", [], undefined, "vault_locked") }, homeRoot);
+      const claim = gitlabClaim(3322, { claim_generation: 3 });
+      await rig.runner.execute(claim);
+      assert.equal(parks(claim.run_id).length, 1);
+      assert.equal(parks(claim.run_id)[0]!.recovery_cause, undefined);
+      assert.equal(parks(claim.run_id)[0]!.provider_progress_turns, undefined);
+    });
+  });
+});
 
 describe("RunRunner #1733 — a provider outage parks typed provider_outage", () => {
   for (const harness of HARNESSES) {

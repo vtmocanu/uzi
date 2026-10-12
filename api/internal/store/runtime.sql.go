@@ -13094,27 +13094,36 @@ UPDATE runs SET
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
     recovery_wait_cause       = 'data_volume_full',
-    disk_park_count           = disk_park_count + CASE WHEN $1::boolean THEN 1 ELSE 0 END,
-    recovery_retry_not_before = $2,
-    session_id                = COALESCE($3, session_id),
+    provider_park_count = CASE WHEN $1::boolean
+        AND $2::bigint > 0
+        AND claim_generation = $2::bigint
+        THEN 0 ELSE provider_park_count END,
+    provider_park_streak_started_at = CASE WHEN $1::boolean
+        AND $2::bigint > 0
+        AND claim_generation = $2::bigint
+        THEN NULL ELSE provider_park_streak_started_at END,
+    disk_park_count           = disk_park_count + CASE WHEN $3::boolean THEN 1 ELSE 0 END,
+    recovery_retry_not_before = $4,
+    session_id                = COALESCE($5, session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at                = now()
-WHERE id = $4 AND worker_id = $5
+WHERE id = $6 AND worker_id = $7
   AND status = 'running'
   AND kind NOT IN ('judge', 'job', 'cross_check')
   AND claim_released_at IS NULL
-  AND ($6::bigint IS NULL
-       OR claim_generation = $6::bigint)
+  AND ($2::bigint IS NULL
+       OR claim_generation = $2::bigint)
 RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at
 `
 
 type ParkRunDataVolumeFullParams struct {
-	Counted         bool               `json:"counted"`
-	RetryNotBefore  pgtype.Timestamptz `json:"retry_not_before"`
-	SessionID       pgtype.Text        `json:"session_id"`
-	ID              uuid.UUID          `json:"id"`
-	WorkerID        pgtype.UUID        `json:"worker_id"`
-	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
+	ResetProviderStreak bool               `json:"reset_provider_streak"`
+	ClaimGeneration     pgtype.Int8        `json:"claim_generation"`
+	Counted             bool               `json:"counted"`
+	RetryNotBefore      pgtype.Timestamptz `json:"retry_not_before"`
+	SessionID           pgtype.Text        `json:"session_id"`
+	ID                  uuid.UUID          `json:"id"`
+	WorkerID            pgtype.UUID        `json:"worker_id"`
 }
 
 // PRD #1809 M5 (D6): the DATA-VOLUME-FULL park writer, the typed sibling of
@@ -13141,12 +13150,13 @@ type ParkRunDataVolumeFullParams struct {
 // park still holds custody).
 func (q *Queries) ParkRunDataVolumeFull(ctx context.Context, arg ParkRunDataVolumeFullParams) (Run, error) {
 	row := q.db.QueryRow(ctx, parkRunDataVolumeFull,
+		arg.ResetProviderStreak,
+		arg.ClaimGeneration,
 		arg.Counted,
 		arg.RetryNotBefore,
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
-		arg.ClaimGeneration,
 	)
 	var i Run
 	err := row.Scan(
@@ -19530,11 +19540,19 @@ UPDATE runs SET
     status_since              = now(),
     recovery_wait_count       = recovery_wait_count + 1,
     recovery_wait_cause       = $1::text,
-    recovery_retry_not_before = $2,
-    session_id                = COALESCE($3, session_id),
+    provider_park_count = CASE WHEN $2::boolean
+        AND $3::bigint > 0
+        AND claim_generation = $3::bigint
+        THEN 0 ELSE provider_park_count END,
+    provider_park_streak_started_at = CASE WHEN $2::boolean
+        AND $3::bigint > 0
+        AND claim_generation = $3::bigint
+        THEN NULL ELSE provider_park_streak_started_at END,
+    recovery_retry_not_before = $4,
+    session_id                = COALESCE($5, session_id),
     health = 'ok', health_reason = NULL, health_since = NULL,
     updated_at                = now()
-WHERE id = $4 AND worker_id = $5
+WHERE id = $6 AND worker_id = $7
   AND status = 'running'
   AND kind NOT IN ('judge', 'job', 'cross_check')
   -- PRD #1247 M5a-1 rework (reviewer NB1): the per-query generation fence, identical to
@@ -19546,17 +19564,18 @@ WHERE id = $4 AND worker_id = $5
   -- PRD #1497 M1 (D16): claim_released_at IS NULL is a STANDALONE conjunct, so a released claim is
   -- rejected even for a generation-less (legacy) report; a live claim still honours a NULL generation.
   AND claim_released_at IS NULL
-  AND ($6::bigint IS NULL
-       OR claim_generation = $6::bigint)
+  AND ($3::bigint IS NULL
+       OR claim_generation = $3::bigint)
 `
 
 type SetRunRecoveryWaitParams struct {
-	RecoveryCause   pgtype.Text        `json:"recovery_cause"`
-	RetryNotBefore  pgtype.Timestamptz `json:"retry_not_before"`
-	SessionID       pgtype.Text        `json:"session_id"`
-	ID              uuid.UUID          `json:"id"`
-	WorkerID        pgtype.UUID        `json:"worker_id"`
-	ClaimGeneration pgtype.Int8        `json:"claim_generation"`
+	RecoveryCause       pgtype.Text        `json:"recovery_cause"`
+	ResetProviderStreak bool               `json:"reset_provider_streak"`
+	ClaimGeneration     pgtype.Int8        `json:"claim_generation"`
+	RetryNotBefore      pgtype.Timestamptz `json:"retry_not_before"`
+	SessionID           pgtype.Text        `json:"session_id"`
+	ID                  uuid.UUID          `json:"id"`
+	WorkerID            pgtype.UUID        `json:"worker_id"`
 }
 
 // Park a run in the TRANSIENT-RECOVERY hold (issue #1197). running -> recovery_wait,
@@ -19615,11 +19634,12 @@ type SetRunRecoveryWaitParams struct {
 func (q *Queries) SetRunRecoveryWait(ctx context.Context, arg SetRunRecoveryWaitParams) (int64, error) {
 	result, err := q.db.Exec(ctx, setRunRecoveryWait,
 		arg.RecoveryCause,
+		arg.ResetProviderStreak,
+		arg.ClaimGeneration,
 		arg.RetryNotBefore,
 		arg.SessionID,
 		arg.ID,
 		arg.WorkerID,
-		arg.ClaimGeneration,
 	)
 	if err != nil {
 		return 0, err

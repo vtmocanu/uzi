@@ -240,9 +240,9 @@ func TestProviderParkCountSaturatesLiveDB(t *testing.T) {
 	}
 }
 
-// TestProviderParkUntypedParksNeverTouchStreakLiveDB: an untyped park and an empty_turn park keep
-// today's ordinary behaviour (cause NULL) and leave an open streak exactly as it was.
-func TestProviderParkUntypedParksNeverTouchStreakLiveDB(t *testing.T) {
+// TestProviderParkUntypedWithoutProgressPreservesStreakLiveDB: without progress evidence,
+// untyped and empty_turn parks keep cause NULL and preserve the open provider streak.
+func TestProviderParkUntypedWithoutProgressPreservesStreakLiveDB(t *testing.T) {
 	for name, cause := range map[string]*string{"untyped": nil, "empty_turn": strPtr("empty_turn")} {
 		t.Run(name, func(t *testing.T) {
 			e := setupInterlockLiveDB(t)

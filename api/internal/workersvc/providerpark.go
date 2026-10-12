@@ -28,6 +28,14 @@ import (
 // strict-decode refusal of the unknown productive_turns field and re-send untyped only for the
 // latter. It runs with SetState's other cause validation, before any SQL.
 func validateProviderPark(req StateRequest) error {
+	if req.ProviderProgressTurns != nil {
+		allowed := req.RecoveryCause == nil ||
+			*req.RecoveryCause == "empty_turn" || *req.RecoveryCause == recoveryCauseDataVolumeFull
+		if req.State != "recovery_wait" || !allowed || *req.ProviderProgressTurns < 0 ||
+			req.ClaimGeneration == nil || *req.ClaimGeneration <= 0 {
+			return fmt.Errorf("%w: provider_progress_turns requires a non-negative count and positive generation on an ordinary or disk recovery park", ErrInvalidState)
+		}
+	}
 	typed := req.State == "recovery_wait" && req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseProviderOutage
 	if req.ProductiveTurns != nil {
 		if !typed {

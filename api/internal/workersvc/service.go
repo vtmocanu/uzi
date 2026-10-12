@@ -3978,6 +3978,9 @@ type StateRequest struct {
 	// api's strict-decode refusal of the unknown field. httpx.DecodeJSON rejects unknown fields,
 	// so a worker sends it only once the api advertises the recovery_cause_provider_outage feature.
 	ProductiveTurns *int32 `json:"productive_turns"`
+
+	// ProviderProgressTurns consumes completed turns only with a fenced ordinary or disk park.
+	ProviderProgressTurns *int32 `json:"provider_progress_turns"`
 	// CheckpointContainsLatest is the worker's durability report on a PARK (PRD #1809 M6, D8):
 	// true when the checkpoint the park published contains the run's latest committed work, false
 	// when it does not (the recovery pin or the fetch-back failed, so the only copy of the latest
@@ -4809,9 +4812,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		// PRD #1733: the TYPED provider-transient park is its own locked transaction too, because
 		// the streak and the hold decision need one snapshot. Only the typed cause routes here;
-		// an untyped or empty-turn park falls through to setRecoveryWait below and never touches
-		// the streak. A held outcome leaves the run 'paused', so its durability report is stored
-		// against that status below.
+		// an untyped or empty-turn park falls through to setRecoveryWait below, which clears the
+		// streak only on positive fenced progress evidence. A held outcome leaves the run 'paused',
+		// so its durability report is stored against that status below.
 		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseProviderOutage {
 			var prun store.Run
 			prun, rows, providerHeld, err = s.parkProviderOutage(ctx, wkr, owned, req, sessionID)

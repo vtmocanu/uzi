@@ -429,6 +429,8 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// because an older api's strict decoder 400s productive_turns and because only a worker
 		// that handles a "paused" ack may receive one.
 		{"recovery_cause_provider_outage"},
+		// Fenced ordinary and disk recovery parks can atomically consume completed-turn evidence.
+		{"provider_progress_on_recovery_park_v1"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
 		// /state limit_wait / recovery_wait / paused reports and the wall-park report) and stores
 		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a
