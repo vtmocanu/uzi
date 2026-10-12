@@ -4677,8 +4677,11 @@ export class GitCache {
     // packed-refs is rewritten through its lock, and logs/HEAD is appended to when HEAD names the
     // pin: each must be a regular file (never a symlink) or absent.
     for (const file of ["packed-refs", "logs/HEAD"]) {
-      try { if (!(await fs.lstat(path.join(barePath, file))).isFile()) return false; }
-      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+      try {
+        const st = await fs.lstat(path.join(barePath, file));
+        // logs/HEAD is appended through, so a hard link to another file is refused as well.
+        if (!st.isFile() || (file === "logs/HEAD" && st.nlink !== 1)) return false;
+      } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
     }
     const parts = pinRef.split("/");
     for (const top of ["logs", ""]) {
@@ -4923,7 +4926,10 @@ export class GitCache {
       }
       if (!logsMissing) await remember(path.join(bare, "logs", ref), evidence, false);
       // A HEAD naming the pin makes Git append a HEAD reflog entry through logs/HEAD.
-      if (logsLevel > 0) await remember(path.join(bare, "logs/HEAD"), evidence, false);
+      // Git appends through it rather than replacing it, so a hard link to another file refuses too.
+      if (logsLevel > 0 && ((await remember(path.join(bare, "logs/HEAD"), evidence, false))?.nlink ?? 1) !== 1) {
+        refuse("unsafe_metadata");
+      }
       let tip = packedTip;
       if (loose !== undefined) {
         if (!/^[a-f0-9]{40}\n?(?![\s\S])/.test(loose)) refuse("unsafe_metadata");
