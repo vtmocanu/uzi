@@ -36,7 +36,7 @@ const STATE_VIEWS: Record<string, StateView> = {
   delete_unknown: { badge: "Removing", tone: "neutral" },
   deleted: { badge: "Removed", tone: "neutral" },
   refused: { badge: "Not published", tone: "warning" },
-  abandoned: { badge: "Gone", tone: "neutral" },
+  abandoned: { badge: "Not ours", tone: "neutral" },
 };
 
 // An unknown (or not yet vetted, such as prepared) state gets a neutral generic badge.
@@ -44,6 +44,12 @@ const GENERIC_VIEW: StateView = { badge: "Held", tone: "neutral" };
 
 // Only these states can have a ref on the forge worth fetching.
 const FETCHABLE_STATES = new Set(["acknowledged", "created"]);
+
+// Mirrors the CLI's onForge: a row in one of these states may still have its ref on the forge.
+const ON_FORGE_STATES = new Set(["acknowledged", "created", "delete_unknown"]);
+// States that settle on their own: the panel re-fetches while any row is in one.
+const IN_PROGRESS_STATES = new Set(["created", "invoked", "create_unknown", "delete_unknown"]);
+const REFRESH_MS = 20_000;
 
 function safeHeldRef(runId: string, pub: HeldPublication): string | null {
   const ref = pub.ref;
@@ -54,6 +60,8 @@ function safeHeldRef(runId: string, pub: HeldPublication): string | null {
 export function HeldPublicationPanel({ run }: { run: Run }) {
   const failed = run.status === "failed";
   const [pubs, setPubs] = useState<HeldPublication[]>([]);
+
+  const inProgress = pubs.some((p) => IN_PROGRESS_STATES.has(p.state));
 
   useEffect(() => {
     if (!failed) {
@@ -74,7 +82,30 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
     };
   }, [failed, run.id]);
 
+  // While a publication is still settling, re-fetch so the badge does not stay stale. The poll
+  // stops as soon as no row is in progress, and is cleared on unmount or a run change.
+  useEffect(() => {
+    if (!failed || !inProgress) return;
+    let live = true;
+    const timer = setInterval(() => {
+      api
+        .getRunHeldPublications(run.id)
+        .then((r) => {
+          if (live) setPubs(Array.isArray(r?.publications) ? r.publications : []);
+        })
+        .catch(() => {
+          // Keep the last known rows; the next tick retries.
+        });
+    }, REFRESH_MS);
+    return () => {
+      live = false;
+      clearInterval(timer);
+    };
+  }, [failed, inProgress, run.id]);
+
   if (!failed || pubs.length === 0) return null;
+  const onForge = pubs.some((p) => ON_FORGE_STATES.has(p.state));
+  const acknowledged = pubs.some((p) => p.state === "acknowledged");
 
   return (
     <Card id="held-publication" className="scroll-mt-20 space-y-3 p-4">
@@ -83,10 +114,22 @@ export function HeldPublicationPanel({ run }: { run: Run }) {
         <SectionTitle>Held work</SectionTitle>
       </div>
       <p className="text-sm text-muted">
-        This failed run's commits and uncommitted work were secret-scanned and published to a
-        run-scoped ref. The ref is deleted when retention expires; run{" "}
-        <code className="font-mono text-xs">uzi run held expire {stripUnsafeChars(run.id)}</code> to
-        delete it sooner.
+        {onForge ? (
+          <>
+            This failed run's commits and uncommitted changes were secret-scanned and published to a
+            run-scoped ref.
+          </>
+        ) : (
+          <>This failed run's held work was not kept on the forge; its recovery archive applies.</>
+        )}
+        {acknowledged && (
+          <>
+            {" "}
+            The ref is deleted when retention expires; run{" "}
+            <code className="font-mono text-xs">uzi run held expire {stripUnsafeChars(run.id)}</code>{" "}
+            to delete it sooner.
+          </>
+        )}
       </p>
       <ul className="space-y-3">
         {pubs.map((p) => (
@@ -125,7 +168,7 @@ function PublicationRow({ runId, pub }: { runId: string; pub: HeldPublication })
           </span>
         )}
       </div>
-      {expiresAbs && expiresAt && (
+      {pub.state === "acknowledged" && expiresAbs && expiresAt && (
         <p className="text-xs text-faint">
           Expires:{" "}
           <span className="text-muted">

@@ -1,4 +1,5 @@
 // @vitest-environment jsdom
+import { act } from "react";
 import { afterEach, describe, expect, it, vi } from "vitest";
 import { cleanup, render, screen, waitFor } from "@testing-library/react";
 import { HeldPublicationPanel } from "./HeldPublicationPanel";
@@ -74,7 +75,7 @@ describe("HeldPublicationPanel", () => {
     ["delete_unknown", "Removing"],
     ["deleted", "Removed"],
     ["refused", "Not published"],
-    ["abandoned", "Gone"],
+    ["abandoned", "Not ours"],
     ["from_the_future", "Held"],
   ])("state %s shows the badge %s", async (state, badge) => {
     serve([pub({ state })]);
@@ -110,5 +111,74 @@ describe("HeldPublicationPanel", () => {
     const { container } = render(<HeldPublicationPanel run={aRun()} />);
     await waitFor(() => expect(spy).toHaveBeenCalled());
     expect(container.innerHTML).toBe("");
+  });
+
+  it("shows the published sentence and expire hint only when the rows warrant them", async () => {
+    serve([pub({ state: "refused", refusal_reason: "create_refused" })]);
+    const { container, unmount } = render(<HeldPublicationPanel run={aRun()} />);
+    expect(await screen.findByText("Not published")).toBeTruthy();
+    expect(container.textContent).toContain("not kept on the forge");
+    expect(container.textContent).not.toContain("published to a run-scoped ref");
+    expect(container.textContent).not.toContain("uzi run held expire");
+    unmount();
+
+    serve([pub({ state: "created" })]);
+    const second = render(<HeldPublicationPanel run={aRun()} />);
+    expect(await screen.findByText("Publishing")).toBeTruthy();
+    expect(second.container.textContent).toContain("uncommitted changes were secret-scanned and published");
+    expect(second.container.textContent).not.toContain("uzi run held expire");
+  });
+
+  it.each(["deleted", "abandoned", "refused"])("hides Expires for a %s row with a past expiry", async (state) => {
+    serve([pub({ state, expires_at: "2020-01-01T00:00:00Z" })]);
+    render(<HeldPublicationPanel run={aRun()} />);
+    await waitFor(() => expect(screen.getByText("Held work")).toBeTruthy());
+    expect(screen.queryByText(/Expires:/)).toBeNull();
+  });
+
+  it("re-fetches every 20s while a row is in progress and stops once settled", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = vi
+        .spyOn(api, "getRunHeldPublications")
+        .mockResolvedValueOnce({ publications: [pub({ state: "invoked" })] })
+        .mockResolvedValue({ publications: [pub({ state: "acknowledged" })] });
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      expect(screen.getByText("Confirming")).toBeTruthy();
+      expect(spy).toHaveBeenCalledTimes(1);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(20_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      expect(screen.getByText("Published")).toBeTruthy();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(2);
+      unmount();
+    } finally {
+      vi.useRealTimers();
+    }
+  });
+
+  it("stops polling on unmount", async () => {
+    vi.useFakeTimers();
+    try {
+      const spy = serve([pub({ state: "created" })]);
+      const { unmount } = render(<HeldPublicationPanel run={aRun()} />);
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(0);
+      });
+      unmount();
+      await act(async () => {
+        await vi.advanceTimersByTimeAsync(60_000);
+      });
+      expect(spy).toHaveBeenCalledTimes(1);
+    } finally {
+      vi.useRealTimers();
+    }
   });
 });

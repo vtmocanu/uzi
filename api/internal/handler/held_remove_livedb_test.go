@@ -250,9 +250,9 @@ func TestWriteHeldConflict(t *testing.T) {
 		!strings.Contains(body.Error, "(delete_unknown)") {
 		t.Fatalf("body = %+v", body)
 	}
-	// The expire advice is scoped to acknowledged refs; other states clear as their pending forge operation settles.
+	// The expire advice is scoped to acknowledged refs; other states settle against the forge first.
 	if !strings.Contains(body.Error, "acknowledged refs clear at their retention expiry") ||
-		!strings.Contains(body.Error, "any other state") || !strings.Contains(body.Error, "pending create, reconcile or delete settles") ||
+		!strings.Contains(body.Error, "any other state") || !strings.Contains(body.Error, "settle against the forge first") || !strings.Contains(body.Error, "then acknowledged follows the retention rule") ||
 		strings.Contains(body.Error, "the block lifts when each ref is deleted") {
 		t.Fatalf("error text does not scope expire advice to acknowledged refs: %q", body.Error)
 	}
