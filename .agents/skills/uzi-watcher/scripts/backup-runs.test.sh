@@ -1181,6 +1181,16 @@ rc="$(backup_rc "$D_N1" run-4242)"
 tar -xOzf "$D_N1/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+live-attempt' \
   || fail "cov-n1: primary not captured"
 ! grep -q 'incomplete coverage' "$D_N1/latest-attempt/backup.log" || fail "cov-n1: unnamed unreadable dir reported as a gap"
+# An unreadable dir the ledger names only as a RETIRED (or abandoned) attempt of the run
+# is not an attributed source either: no gap. Named live, it is one.
+ledger "$A1" run-4242 "$BADA1" retired
+rc="$(backup_rc "$D_N1" run-4242)"
+[ "$rc" -eq 0 ] || fail "cov-n1 retired: exit $rc, want 0; log: $(log_of "$D_N1")"
+! grep -q 'incomplete coverage' "$D_N1/latest-attempt/backup.log" || fail "cov-n1 retired: an unreadable retired attempt reported as a gap"
+ledger "$A1" run-4242 "$BADA1" live
+rc="$(backup_rc "$D_N1" run-4242)"
+[ "$rc" -eq 1 ] || fail "cov-n1 live: exit $rc, want 1"
+grep -q 'incomplete coverage: 1 of 2' "$D_N1/latest-attempt/backup.log" || fail "cov-n1 live: missing gap; log: $(log_of "$D_N1")"
 
 # N2: on a pod other than the one supplying the primary, only ATTRIBUTED sources are
 # extras. Pod 2 holds a retired ledger attempt (select_clone's own fallback primary

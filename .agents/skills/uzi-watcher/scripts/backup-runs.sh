@@ -78,8 +78,8 @@
 # extra source's capture is not verified, the run logs
 # "FAIL ... incomplete coverage: <k> of <m> attributed sources captured (<reasons>);
 # latest not advanced, retry" and the script exits 1. <k> counts the verified artifacts;
-# <m> counts the captured sources plus the attributed ones listed but unreadable (deduped
-# by pod and path). The artifacts that were captured are kept. A dir the journal, ledger
+# <m> counts the sources found (the clones or tracking ref the run tried to capture) plus
+# the attributed ones listed but unreadable (deduped by pod and path). The artifacts that were captured are kept. A dir the journal, ledger
 # and marker do not name is not an attributed source: it is never a gap by itself, though
 # on a run that captured nothing it still makes the search inconclusive.
 # Exit: 0 when every active target produced a verified recovery artifact for every
@@ -652,15 +652,15 @@ select_clone(){
       case "$name" in "$stem".attempt-*) aid="${name#"$stem".attempt-}" ;; *) continue ;; esac
       [[ "$aid" =~ $ATTEMPT_RE ]] || continue
     fi
-    # An unreadable dir (no branch) that the journal or ledger names as THIS run's
-    # clone may hold its work: that is an unfinished search (and an attributed source
+    # An unreadable dir (no branch) that the journal names, or the ledger names as a
+    # live or reclaimed attempt of THIS run, may hold its work: that is an unfinished search (and an attributed source
     # that is not captured: a coverage gap, counted in the total), not absence. An
     # unnamed unreadable dir (e.g. an empty root-owned attempt) is not attributed to
     # this run, so it is no gap; the listing's rc 3 already keeps a no-capture run
     # from SNAP.
     if [ -z "$br" ]; then
       if { printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; } \
-         || { [ -n "$aid" ] && printf '%s\n' "$ledger_ok" | grep -qxF -- "$aid$tab$path"; }; then
+         || { [ -n "$aid" ] && printf '%s\n' "$ledger_live" | grep -qxF -- "$aid$tab$path"; }; then
         : > "$PROBE_ERR_FILE"
         printf '%s\t%s\n' "$pod" "$path" >> "$UNREAD_FILE"
         mark_gap "attributed source $path is listed but unreadable"
