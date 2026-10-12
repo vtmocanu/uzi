@@ -63,6 +63,9 @@ function journalRaw(branch: string): string {
     return "";
   }
 }
+function attemptModeOn(key: string): boolean {
+  return cfgAll(`uzi-attemptmode.${key}.enabled`).length === 1;
+}
 function configBytes(): Buffer {
   return fs.readFileSync(path.join(bare, "config"));
 }
@@ -96,6 +99,21 @@ async function seedCanonical(runId: string, iid = 2600): Promise<{ branch: strin
   const clone = await git.createOrAttachRunnerClone(bare, iid, noProofReseed, runId);
   await git.markRecoveryCapture(bare, clone.path, branch, runId);
   return { branch, key: `issue-${iid}`, runId, path: clone.path };
+}
+
+/** A kept canonical source: real clone, a dirty file, and the marker written (journal cleared). */
+async function markedCanonical(runId: string, iid: number, generation: number | null) {
+  const c = await seedCanonical(runId, iid);
+  fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
+  const journal = journalRaw(c.branch);
+  assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId, clonePath: c.path, generation, reason: "stale_claim" }), "retained");
+  return { ...c, journal };
+}
+
+/** The state a crash between the marker write and the journal clear leaves: bound journal, no mode. */
+function crashWindow(c: { branch: string; key: string; journal: string }): void {
+  gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, c.journal]);
+  gitIn(bare, ["config", "--local", "--unset-all", `uzi-attemptmode.${c.key}.enabled`]);
 }
 
 /** A planted attempt dir (no git inside) with its skills sibling and a ledger value. */
@@ -271,11 +289,12 @@ describe("markStoppedCanonical and the marker refusal", () => {
   async function marked(generation: number | null = 3) {
     const c = await seedCanonical("run-c");
     fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
+    const journal = journalRaw(c.branch);
     assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation, reason: "stale_claim" }), "retained");
-    return c;
+    return { ...c, journal };
   }
 
-  it("writes one exact-shape marker bound to the journal digest and keeps the journal", async () => {
+  it("writes one exact-shape marker bound to the journal digest, persists the attempt mode and clears the bound journal", async () => {
     const c = await marked(3);
     const values = cfgAll(`uzi-stopped.${c.runId}.entry`);
     assert.equal(values.length, 1);
@@ -284,22 +303,69 @@ describe("markStoppedCanonical and the marker refusal", () => {
     assert.equal(m.generation, 3);
     assert.equal(m.clonePath, c.path);
     assert.match(m.journalDigest, /^[0-9a-f]{64}$/);
-    assert.notEqual(journalRaw(c.branch), "", "the plain journal is kept");
+    assert.notEqual(c.journal, "", "precondition: the plain journal existed");
+    assert.equal(journalRaw(c.branch), "", "the journal the digest was computed from is cleared");
+    assert.equal(attemptModeOn(c.key), true, "the key now seeds fresh attempt paths");
     assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 3, reason: "stale_claim" }), "retained");
     assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 1, "idempotent");
+    assert.equal(journalRaw(c.branch), "");
   });
 
-  it("discovery, the canonical seed and the attempt seed throw RetainedStoppedSourceError and touch nothing", async () => {
+  it("completes a crash window on a repeat: a still-bound journal is cleared and the mode persisted", async () => {
     const c = await marked(3);
-    const config = configBytes();
-    const calls: Array<[string, () => Promise<unknown>]> = [
-      ["discoverRetainedRecovery", () => git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, c.runId)],
-      ["canonical seed, same run", () => git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, c.runId)],
-      ["canonical seed, another run", () => git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, "run-other")],
-      ["attempt seed", () => git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, c.runId, false, undefined, seedOpts(attemptIdAt(5, 4)))],
-    ];
-    for (const [label, call] of calls) {
-      await assert.rejects(call(), (err: unknown) => {
+    crashWindow(c);
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 3, reason: "stale_claim" }), "retained");
+    assert.equal(journalRaw(c.branch), "");
+    assert.equal(attemptModeOn(c.key), true);
+    assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 1);
+  });
+
+  it("keeps the journal when a residue latch lands during the marker write, but still answers retained", async () => {
+    const c = await seedCanonical("run-c");
+    const journal = journalRaw(c.branch);
+    const seam = git as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const real = seam.runGit.bind(git);
+    seam.runGit = async (cwd, args, ...rest) => {
+      const out = await real(cwd, args, ...rest);
+      if (args.includes("--add") && args.some((x) => x.startsWith("uzi-stopped."))) latchResidueQuarantine({ cause: "test", site: "test" });
+      return out;
+    };
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 1, reason: "stale_claim" }), "retained");
+    assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 1, "the marker is durable");
+    assert.equal(journalRaw(c.branch), journal, "the latch keeps the journal");
+  });
+
+  it("clears the journal only while its raw is still the one the digest was computed from", async () => {
+    const c = await seedCanonical("run-c");
+    const seam = git as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const real = seam.runGit.bind(git);
+    const successor = JSON.stringify({ runId: "successor", clonePath: c.path, branch: c.branch });
+    seam.runGit = async (cwd, args, ...rest) => {
+      const out = await real(cwd, args, ...rest);
+      // A same-run rewrite lands right after the marker, before the clear.
+      if (args.includes("--add") && args.some((x) => x.startsWith("uzi-stopped."))) {
+        await real(cwd, ["config", "--local", `uzi-recovery.${c.branch}.clone`, successor]);
+      }
+      return out;
+    };
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 1, reason: "stale_claim" }), "retained");
+    assert.equal(journalRaw(c.branch), successor, "another journal is never cleared");
+  });
+
+  it("an identity-changed journal writes nothing at all: no marker and no attempt mode", async () => {
+    const c = await seedCanonical("run-c");
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, JSON.stringify({ runId: "run-new", clonePath: c.path })]);
+    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 1, reason: "stale_claim" }), "unknown");
+    assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 0);
+    assert.equal(attemptModeOn(c.key), false);
+  });
+
+  it("the canonical seed refuses the kept path, discovery finds no journal, and the attempt seed gets a fresh path; the kept bytes never change", async () => {
+    const c = await marked(3);
+    const dirty = fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8");
+    assert.equal(await git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, c.runId), undefined, "no journal to adopt or capture");
+    for (const [label, runId] of [["same run", c.runId], ["another run", "run-other"]] as const) {
+      await assert.rejects(git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, runId), (err: unknown) => {
         assert.ok(err instanceof RetainedStoppedSourceError, label);
         assert.ok(err instanceof RunResidueBlockedError, `${label}: follows the residue-blocked handling`);
         assert.match(err.message, /^worker_residue_blocked: /);
@@ -308,13 +374,78 @@ describe("markStoppedCanonical and the marker refusal", () => {
         return true;
       }, label);
     }
-    assert.deepEqual(configBytes(), config, "the marker, journal and ledger are unchanged");
+    const fresh = await git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, "run-other", false, undefined, seedOpts(attemptIdAt(5, 4)));
+    assert.notEqual(fresh.path, c.path);
+    assert.ok(fresh.path.includes(".attempt-"));
+    assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), dirty);
+    assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 1, "the marker is untouched");
+  });
+
+  it("in the crash window (bound journal, no mode) the seeds still refuse and touch nothing, and only discovery heals", async () => {
+    const c = await marked(3);
+    crashWindow(c);
+    const config = configBytes();
+    const calls: Array<[string, () => Promise<unknown>]> = [
+      ["canonical seed, same run", () => git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, c.runId)],
+      ["canonical seed, another run", () => git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, "run-other")],
+      ["attempt seed", () => git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, c.runId, false, undefined, seedOpts(attemptIdAt(5, 4)))],
+    ];
+    for (const [label, call] of calls) await assert.rejects(call(), RetainedStoppedSourceError, label);
+    assert.deepEqual(configBytes(), config, "nothing was written");
+    assert.equal(await git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, "run-other"), undefined, "healed for any claimant");
+    assert.equal(journalRaw(c.branch), "", "the exact bound journal is cleared");
+    assert.equal(attemptModeOn(c.key), true, "and the marker key's mode is persisted");
     assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n");
+    assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 1);
+  });
+
+  it("heal refuses (today's refusal) for a digest mismatch, a malformed marker, an overflow, a latch and a non-plain journal", async () => {
+    const mk = async (iid: number) => {
+      const c = await seedCanonical(`run-h${iid}`, iid);
+      const journal = journalRaw(c.branch);
+      assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId: c.runId, clonePath: c.path, generation: 1, reason: "stale_claim" }), "retained");
+      crashWindow({ ...c, journal });
+      return { ...c, journal };
+    };
+    const refused = async (c: { branch: string; key: string; runId: string; journal: string }, label: string) => {
+      const config = configBytes();
+      await assert.rejects(git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, c.runId), RetainedStoppedSourceError, label);
+      assert.deepEqual(configBytes(), config, `${label}: nothing written`);
+    };
+    const a = await mk(2701);
+    gitIn(bare, ["config", "--local", `uzi-recovery.${a.branch}.clone`, JSON.stringify({ clonePath: JSON.parse(a.journal).clonePath, runId: a.runId })]);
+    await refused(a, "digest mismatch");
+    const b = await mk(2702);
+    gitIn(bare, ["config", "--local", "--add", `uzi-stopped.${b.runId}.entry`, "{"]);
+    await refused(b, "malformed marker");
+    const o = await mk(2703);
+    for (let i = 0; i < 64; i++) gitIn(bare, ["config", "--local", "--add", `uzi-stopped.${o.runId}.entry`, `{"n":${i}}`]);
+    await refused(o, "overflow");
+    const l = await mk(2704);
+    latchResidueQuarantine({ cause: "test", site: "test" });
+    await refused(l, "latched quarantine");
+    resetResidueQuarantineForTests();
+    const e = await mk(2705);
+    gitIn(bare, ["config", "--local", `uzi-recovery.${e.branch}.clone`, JSON.stringify({ ...JSON.parse(e.journal), retainedSources: [{ runId: e.runId, clonePath: JSON.parse(e.journal).clonePath }] })]);
+    await refused(e, "episode journal");
+  });
+
+  it("heal with a failed attempt-mode write throws and keeps the journal", async () => {
+    const c = await marked(3);
+    crashWindow(c);
+    const seam = git as unknown as { runGit: (cwd: string, args: string[], ...rest: unknown[]) => Promise<string> };
+    const real = seam.runGit.bind(git);
+    seam.runGit = async (cwd, args, ...rest) => {
+      if (args.some((x) => x.startsWith("uzi-attemptmode."))) throw new Error("ENOSPC: injected");
+      return real(cwd, args, ...rest);
+    };
+    await assert.rejects(git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, c.runId), /ENOSPC/);
+    assert.equal(journalRaw(c.branch), c.journal, "the journal stays");
   });
 
   it("names a missing generation as none", async () => {
     const c = await marked(null);
-    await assert.rejects(git.discoverRetainedRecovery(fx.originPath, c.branch, c.key, c.runId), /generation none/);
+    await assert.rejects(git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, c.runId), /generation none/);
   });
 
   it("refuses without writing for a successor journal, an episode journal, a replaced path or a wrong key", async () => {
@@ -402,10 +533,37 @@ describe("markStoppedCanonical and the marker refusal", () => {
 
   it("a stale marker (journal gone, path gone) protects nothing and is ignored by the seed", async () => {
     const c = await marked(1);
-    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, ""]);
     fs.rmSync(c.path, { recursive: true, force: true });
+    gitIn(bare, ["config", "--local", "--unset-all", `uzi-attemptmode.${c.key}.enabled`]);
     const reseeded = await git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, "run-next");
     assert.ok(fs.existsSync(reseeded.path));
+    assert.equal(cfgAll(`uzi-stopped.${c.runId}.entry`).length, 0, "the stale marker is retired");
+  });
+});
+
+describe("FINAL inventory of a kept canonical source", () => {
+  it("lists the kept clone through its marker once the journal is cleared, for its own run only", async () => {
+    const c = await markedCanonical("run-inv", 2800, 3);
+    assert.equal(journalRaw(c.branch), "", "precondition: no journal names the kept clone");
+    const own = await git.readInventoryCloneHeads(bare, "run-inv");
+    assert.equal(own.kind, "verified");
+    if (own.kind !== "verified") return;
+    assert.deepEqual(own.clones.map((x) => [x.clonePath, x.branch, x.runId]), [[c.path, c.branch, "run-inv"]]);
+    assert.deepEqual(own.heads, [gitIn(c.path, ["rev-parse", "HEAD"])]);
+    const other = await git.readInventoryCloneHeads(bare, "run-other");
+    assert.equal(other.kind, "verified");
+    if (other.kind !== "verified") return;
+    assert.deepEqual(other.clones, [], "another run does not inventory it");
+    assert.deepEqual(other.foreignOwners, ["run-inv"]);
+  });
+
+  it("a missing kept clone makes its own run's inventory unknown, as a journaled missing path does", async () => {
+    const c = await markedCanonical("run-inv", 2801, 3);
+    fs.rmSync(c.path, { recursive: true, force: true });
+    const own = await git.readInventoryCloneHeads(bare, "run-inv");
+    assert.equal(own.kind, "unknown");
+    assert.equal((own as { cause?: string }).cause, "clone_path_invalid");
+    assert.equal((await git.readInventoryCloneHeads(bare, "run-other")).kind, "verified");
   });
 });
 
@@ -723,7 +881,8 @@ describe("inspect and the plain discard", () => {
     assert.equal(fs.existsSync(gx.dir), false);
   });
 
-  it("reclaims a marked canonical source with its generation or none, clearing journal and marker, and the key seeds again", async () => {
+  it("reclaims a kept canonical source (marker detached, no journal) with its generation or none, and the key seeds a fresh attempt path", async () => {
+    let n = 40;
     for (const generation of [4, null] as const) {
       const run = generation === null ? "run-none" : "run-four";
       const c = await seedCanonical(run, generation === null ? 2601 : 2602);
@@ -734,17 +893,68 @@ describe("inspect and the plain discard", () => {
       assert.equal((await git.inspectRetainedSources({ selector: wrong, holds: NO_HOLDS, isLivePath: notLive, barePath: bare })).sources.length, 0, "a different generation is a different source");
       const ev = await inspectOne(sel);
       assert.equal(ev.kind, "canonical");
-      assert.equal(ev.markerState, "bound");
-      assert.equal(ev.journalState, "plain");
+      assert.equal(ev.markerState, "detached");
+      assert.equal(ev.journalState, "none");
       assert.deepEqual(ev.disposition, { kind: "local_discard" });
       const result = await git.discardStoppedSource(discardOpts(sel, ev.descriptor));
       assert.equal(result.kind, "done");
       assert.equal(fs.existsSync(c.path), false);
-      assert.equal(journalRaw(c.branch), "", "the journal is cleared with the source");
-      assert.equal(cfgAll(`uzi-stopped.${run}.entry`).length, 0, "and so is the marker");
-      const reseed = await git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, "run-next");
+      assert.equal(cfgAll(`uzi-stopped.${run}.entry`).length, 0, "the marker is retired with the source");
+      const reseed = await git.runnerCloneForBranch(bare, c.branch, c.key, noProofReseed, "run-next", false, undefined, seedOpts(attemptIdAt(n++)));
       assert.ok(fs.existsSync(reseed.path), "the key is usable again");
     }
+  });
+
+  it("a marker still bound to its plain journal (crash window) is bound, and its discard clears exactly that journal", async () => {
+    const c = await markedCanonical("run-c", 2603, 2);
+    crashWindow(c);
+    const sel: RetainedSourceSelector = { runId: "run-c", generation: 2, attempt: "canonical" };
+    const ev = await inspectOne(sel);
+    assert.equal(ev.markerState, "bound");
+    assert.equal(ev.journalState, "plain");
+    assert.deepEqual(ev.disposition, { kind: "local_discard" });
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor))).kind, "done");
+    assert.equal(journalRaw(c.branch), "", "the bound journal is cleared with the source");
+    assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0);
+  });
+
+  it("a detached marker's discard never clears a successor's active journal, and the descriptor ignores it", async () => {
+    const c = await markedCanonical("run-c", 2604, 2);
+    const sel: RetainedSourceSelector = { runId: "run-c", generation: 2, attempt: "canonical" };
+    const before = await inspectOne(sel);
+    const successor = JSON.stringify({ runId: "run-next", clonePath: `${c.path}.attempt-${attemptIdAt(9, 3)}`, attemptId: attemptIdAt(9, 3) });
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, successor]);
+    const ev = await inspectOne(sel);
+    assert.equal(ev.markerState, "detached");
+    assert.equal(ev.descriptor, before.descriptor, "a successor's journal is not part of the descriptor");
+    assert.deepEqual(ev.disposition, { kind: "local_discard" });
+    assert.equal((await git.discardStoppedSource(discardOpts(sel, ev.descriptor))).kind, "done");
+    assert.equal(journalRaw(c.branch), successor, "the successor's journal is untouched");
+    assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0);
+  });
+
+  it("a detached marker whose path is missing is discardable: the marker is retired", async () => {
+    const c = await markedCanonical("run-c", 2605, 2);
+    fs.rmSync(c.path, { recursive: true, force: true });
+    const sel: RetainedSourceSelector = { runId: "run-c", generation: 2, attempt: "canonical" };
+    const ev = await inspectOne(sel);
+    assert.equal(ev.presence, "missing");
+    assert.equal(ev.markerState, "detached");
+    assert.deepEqual(ev.disposition, { kind: "local_discard" });
+    const result = await git.discardStoppedSource(discardOpts(sel, ev.descriptor));
+    assert.equal(result.kind, "done");
+    assert.deepEqual(result.kind === "done" && result.sources.map((x) => x.outcome), ["missing"]);
+    assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0);
+  });
+
+  it("a non-plain journal naming the marker's path refuses (journal_not_plain), a journal elsewhere does not", async () => {
+    const c = await markedCanonical("run-c", 2606, 2);
+    const sel: RetainedSourceSelector = { runId: "run-c", generation: 2, attempt: "canonical" };
+    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, JSON.stringify({ runId: "run-c", clonePath: c.path, retainedSources: [{ runId: "run-c", clonePath: c.path }] })]);
+    const ev = await inspectOne(sel);
+    assert.equal(ev.markerState, "mismatch");
+    assert.equal(ev.disposition?.kind, "refused");
+    assert.ok(ev.consumers.includes("blocker:journal_not_plain"), ev.consumers.join());
   });
 
   it("an open server hold of any generation is the owner's to discard; a failed read refuses", async () => {
@@ -1251,17 +1461,11 @@ describe("rework: local custody, holds and stale markers", () => {
     assert.ok(fs.existsSync(a.path));
   });
 
-  async function markedCanonical(runId: string, iid: number, generation: number | null) {
-    const c = await seedCanonical(runId, iid);
-    fs.writeFileSync(path.join(c.path, "dirty.txt"), "unpreserved\n");
-    assert.equal(await git.markStoppedCanonical(bare, c.branch, c.key, { runId, clonePath: c.path, generation, reason: "stale_claim" }), "retained");
-    return c;
-  }
 
   it("a marker whose journal and path are gone is retired by the next seed, so a later discovery does not throw", async () => {
     const c = await markedCanonical("run-c", 2600, 3);
-    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, ""]);
     fs.rmSync(c.path, { recursive: true, force: true });
+    gitIn(bare, ["config", "--local", "--unset-all", `uzi-attemptmode.${c.key}.enabled`]);
     const next = await git.createOrAttachRunnerClone(bare, 2600, noProofReseed, "run-next");
     assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0, "the stale marker was retired where it was evaluated");
     await git.markRecoveryCapture(bare, next.path, c.branch, "run-next");
@@ -1271,8 +1475,8 @@ describe("rework: local custody, holds and stale markers", () => {
 
   it("a stale generation-1 marker cannot rebind to the same run's generation-2 source at the same path", async () => {
     const c = await markedCanonical("run-c", 2600, 1);
-    gitIn(bare, ["config", "--local", `uzi-recovery.${c.branch}.clone`, ""]);
     fs.rmSync(c.path, { recursive: true, force: true });
+    gitIn(bare, ["config", "--local", "--unset-all", `uzi-attemptmode.${c.key}.enabled`]);
     const c2 = await seedCanonical("run-c", 2600);
     fs.writeFileSync(path.join(c2.path, "gen2.txt"), "generation two work\n");
     assert.equal(cfgAll("uzi-stopped.run-c.entry").length, 0, "the old marker is gone");
@@ -1298,11 +1502,16 @@ describe("rework: local custody, holds and stale markers", () => {
   it("retire, remove and detach refuse a path a valid marker names, and keep everything", async () => {
     const c = await markedCanonical("run-c", 2600, 3);
     const before = configBytes();
-    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), RetainedStoppedSourceError);
+    // The journal is cleared: retire fails closed on the missing pair, remove and detach on the marker.
+    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), /different clone path/);
     await assert.rejects(git.removeRunnerClone(c.path, c.runId), RetainedStoppedSourceError);
-    await assert.rejects(git.detachTerminalRetained(bare, c.branch, c.key, JSON.parse(journalRaw(c.branch))), RetainedStoppedSourceError);
+    await assert.rejects(git.detachTerminalRetained(bare, c.branch, c.key, JSON.parse(c.journal)), RetainedStoppedSourceError);
     assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n");
-    assert.deepEqual(configBytes(), before, "journal, marker and ledger are untouched");
+    assert.deepEqual(configBytes(), before, "marker and ledger are untouched");
+    // With the bound journal back (the crash window) the marker itself refuses the retire.
+    crashWindow(c);
+    await assert.rejects(git.retireRunnerClone(bare, c.path, c.branch, c.runId, { discard: true }), RetainedStoppedSourceError);
+    assert.equal(fs.readFileSync(path.join(c.path, "dirty.txt"), "utf8"), "unpreserved\n");
     // An unmarked canonical clone is still retired normally.
     const plain = await seedCanonical("run-plain", 2610);
     await git.retireRunnerClone(bare, plain.path, plain.branch, plain.runId, { discard: true });
@@ -1353,7 +1562,7 @@ describe("rework: local custody, holds and stale markers", () => {
     assert.deepEqual(left, [long.path], "the other source's marker survives");
     assert.ok(fs.existsSync(long.path));
     const other = await inspectOne({ runId: "run-m", generation: 2, attempt: "canonical" });
-    assert.equal(other.markerState, "bound");
+    assert.equal(other.markerState, "detached");
   });
 
   it("a journal naming another run is labelled other, not episode", async () => {

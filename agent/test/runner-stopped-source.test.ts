@@ -1,5 +1,6 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { createHash } from "node:crypto";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -69,6 +70,28 @@ function ledgerStates(bare: string, branch: string): Map<string, string> {
 }
 function markers(bare: string, runId: string): string[] {
   return cfgAll(bare, `uzi-stopped.${runId}.entry`);
+}
+function attemptModeOn(bare: string, key: string): boolean {
+  return cfgAll(bare, `uzi-attemptmode.${key}.enabled`).length === 1;
+}
+/** Every entry under `root` (the .git directory included): type, mode and content hash or link target. */
+function snapshotTree(root: string): Record<string, string> {
+  const out: Record<string, string> = {};
+  const walk = (dir: string): void => {
+    for (const name of fs.readdirSync(dir).sort()) {
+      const p = path.join(dir, name);
+      const st = fs.lstatSync(p);
+      const rel = path.relative(root, p);
+      const mode = (st.mode & 0o7777).toString(8);
+      if (st.isSymbolicLink()) out[rel] = `link:${mode}:${fs.readlinkSync(p)}`;
+      else if (st.isDirectory()) {
+        out[rel] = `dir:${mode}`;
+        walk(p);
+      } else out[rel] = `file:${mode}:${createHash("sha256").update(fs.readFileSync(p)).digest("hex")}`;
+    }
+  };
+  walk(root);
+  return out;
 }
 function reportsFor(runId: string): string[] {
   return api.states.filter((s) => s.runId === runId).map((s) => s.body.status as string);
@@ -277,8 +300,8 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
           assert.equal(journalRaw(rig.bare, rig.branch), "", "the plain journal is cleared (ledger first)");
           assert.deepEqual(markers(rig.bare, rig.runId), [], "no canonical marker");
         } else {
-          const journal = JSON.parse(journalRaw(rig.bare, rig.branch)) as { runId: string; clonePath: string };
-          assert.equal(journal.clonePath, facts.clonePath, "the canonical journal is kept");
+          assert.equal(journalRaw(rig.bare, rig.branch), "", "the bound canonical journal is cleared once the marker is durable");
+          assert.equal(attemptModeOn(rig.bare, `issue-${iid}`), true, "the key's attempt mode is persisted");
           const ms = markers(rig.bare, rig.runId).map((m) => JSON.parse(m) as { clonePath: string; generation: number | null; reason: string });
           assert.equal(ms.length, 1, "exactly one stopped-source marker");
           assert.equal(ms[0]!.clonePath, facts.clonePath);
@@ -383,6 +406,9 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
       const rl = recordingLogger();
       const rig = stopRig(17883 + (flavor === "attempt" ? 1 : 0), flavor, "stale", {
         cleanTree: true, log: rl.logger,
+        // A Docker-wired flight's coverage proof needs a Docker half that is not `docker_error`; the
+        // unit tests have no daemon, so the proof is injected (see the Docker-state test below).
+        ...(flavor === "attempt" ? { runnerOpts: { quiesceRun: async () => quiescentOutcome() } } : {}),
         beforeStop: async (ctx) => {
           await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
         },
@@ -503,7 +529,10 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   // bare's default branch, so there is no tracking ref to anchor and no worker-only commit either.
   for (const flavor of ["canonical", "attempt"] as const) {
     it(`${flavor} clone, clean at the seed base head already on the bare's default branch: teardown proceeds, nothing retained`, async () => {
-      const rig = stopRig(17970 + (flavor === "attempt" ? 1 : 0), flavor, "stale", { seedOnly: "clean" });
+      const rig = stopRig(17970 + (flavor === "attempt" ? 1 : 0), flavor, "stale", {
+        seedOnly: "clean",
+        ...(flavor === "attempt" ? { runnerOpts: { quiesceRun: async () => quiescentOutcome() } } : {}),
+      });
       await rig.runner.execute(rig.claim);
       const facts = rig.facts();
       assert.equal(fs.existsSync(facts.clonePath), false, "nothing worker-only: the clone is retired");
@@ -566,22 +595,123 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     assertRecoverableFromExport(rig.facts(), "retained successor stopped by a stale claim");
   });
 
-  it("a NEW run of the same issue on the same worker, after a retained stale stop, fails once with worker_residue_blocked and starts no model", async () => {
-    let modelled = false;
+  /** What the kept canonical source must still read as after a later run went through the worker. */
+  async function assertKeptCanonicalIntact(rig: Rig, before: Record<string, string>, label: string): Promise<void> {
+    const kept = rig.facts();
+    assert.deepEqual(snapshotTree(kept.clonePath), before, `${label}: every byte, mode and .git entry of the kept clone is unchanged`);
+    const ms = markers(rig.bare, rig.runId).map((m) => JSON.parse(m) as { runId: string; clonePath: string; generation: number | null });
+    assert.equal(ms.length, 1, `${label}: the marker is kept`);
+    assert.deepEqual([ms[0]!.runId, ms[0]!.clonePath, ms[0]!.generation], [rig.runId, kept.clonePath, 2], `${label}: and still attributes it`);
+    const holds = (list: Array<{ id: string; generation: number }>) => ({ state: "read" as const, holds: list });
+    const aggregate = (await git.inspectRetainedSources({ isLivePath: () => false })).sources.filter((x) => x.runId === rig.runId);
+    assert.equal(aggregate.length, 1, `${label}: the aggregate view lists it`);
+    assert.deepEqual([aggregate[0]!.kind, aggregate[0]!.presence, aggregate[0]!.markerState], ["canonical", "present", "detached"]);
+    const selector = { runId: rig.runId, generation: 2, attempt: "canonical" };
+    const free = await git.inspectRetainedSources({ selector, barePath: aggregate[0]!.barePath, isLivePath: () => false, holds: holds([]) });
+    assert.deepEqual(free.sources.map((x) => x.disposition), [{ kind: "local_discard" }], `${label}: no hold gives a local discard`);
+    const held = await git.inspectRetainedSources({ selector, barePath: aggregate[0]!.barePath, isLivePath: () => false, holds: holds([{ id: OPEN_HOLD, generation: 2 }]) });
+    assert.deepEqual(held.sources.map((x) => x.disposition), [{ kind: "owner_hold_discard", holdIds: [OPEN_HOLD] }], `${label}: an open hold is the owner's to discard`);
+  }
+
+  it("a NEW run of the same issue on a worker with no Docker host proceeds on a fresh attempt path; the kept canonical clone is untouched and attributable", async () => {
+    let freshPath = "";
+    const stub = new StubExecutor(nullLogger());
     const rig = stopRig(17963, "canonical", "stale", {
-      executorFor: (n) => (n === 0 ? undefined : { run: async () => { modelled = true; throw new Error("the new run must not model"); } }),
+      executorFor: (n) => (n === 0 ? undefined : { run: (ctx: RunContext) => { freshPath = ctx.worktreePath; return stub.run(ctx); } }),
     });
     await rig.runner.execute(rig.claim);
     const first = rig.facts();
+    const before = snapshotTree(first.clonePath);
+    assert.ok(before["untracked.txt"] !== undefined && before["assets/blob.bin"] !== undefined, "precondition: the dirty and untracked files are in the snapshot");
     const newRunId = "22222222-0000-4000-8000-000000001963";
     await rig.runner.execute({ ...rig.claim, run_id: newRunId, claim_generation: 1 });
-    const failed = api.states.filter((st) => st.runId === newRunId && st.body.status === "failed");
-    assert.equal(failed.length, 1, `the new run fails once: ${reportsFor(newRunId).join(",")}`);
-    assert.equal(failed[0]!.body.fail_origin, "worker_residue_blocked");
-    assert.match(String(failed[0]!.body.failure_reason), /^worker_residue_blocked: retained stopped work: run /);
-    assert.equal(modelled, false, "no model started");
-    assertRecoverableFromExport(first, "the retained source of the stopped run");
-    assert.equal(markers(rig.bare, rig.runId).length, 1, "the marker is kept");
+    assert.match(path.basename(freshPath), /\.attempt-/, `the new run ran in a fresh attempt clone: ${freshPath}`);
+    assert.notEqual(freshPath, first.clonePath);
+    const states = reportsFor(newRunId);
+    assert.ok(!states.includes("failed"), `the new run did not fail: ${states.join(",")}`);
+    assert.ok(states.includes("completed"), `the new run completed: ${states.join(",")}`);
+    await assertKeptCanonicalIntact(rig, before, "new run");
+  });
+
+  it("a crash-window leftover (marker and bound journal, no attempt mode) is healed by the next claim, which proceeds on a fresh path", async () => {
+    let freshPath = "";
+    let journalBefore = "";
+    let rig!: Rig;
+    const stub = new StubExecutor(nullLogger());
+    rig = stopRig(17964, "canonical", "stale", {
+      beforeStop: async () => { journalBefore = journalRaw(rig.bare, rig.branch); },
+      executorFor: (n) => (n === 0 ? undefined : { run: (ctx: RunContext) => { freshPath = ctx.worktreePath; return stub.run(ctx); } }),
+    });
+    await rig.runner.execute(rig.claim);
+    const first = rig.facts();
+    assert.notEqual(journalBefore, "", "precondition: the plain journal existed while the flight ran");
+    gitIn(rig.bare, "config", "--local", `uzi-recovery.${rig.branch}.clone`, journalBefore);
+    gitIn(rig.bare, "config", "--local", "--unset-all", "uzi-attemptmode.issue-17964.enabled");
+    const before = snapshotTree(first.clonePath);
+    await rig.runner.execute({ ...rig.claim, run_id: "22222222-0000-4000-8000-000000001964", claim_generation: 1 });
+    assert.match(path.basename(freshPath), /\.attempt-/, "the next claim ran in a fresh attempt clone");
+    assert.ok(!reportsFor("22222222-0000-4000-8000-000000001964").includes("failed"));
+    assert.equal(attemptModeOn(rig.bare, "issue-17964"), true, "the heal persisted the mode");
+    assert.deepEqual(snapshotTree(first.clonePath), before, "the kept clone is untouched");
+    assert.equal(markers(rig.bare, rig.runId).length, 1);
+  });
+
+  it("admission race: the mode read in discovery was false but a stop marked the key before the seed; the claim re-reads and seeds a fresh path with no refused attempt", async () => {
+    let freshPath = "";
+    const stub = new StubExecutor(nullLogger());
+    const rig = stopRig(17965, "canonical", "stale", {
+      executorFor: (n) => (n === 0 ? undefined : { run: (ctx: RunContext) => { freshPath = ctx.worktreePath; return stub.run(ctx); } }),
+    });
+    await rig.runner.execute(rig.claim);
+    const first = rig.facts();
+    const before = snapshotTree(first.clonePath);
+    // Model "mode read false, then marked": the mode is gone when discovery's read happens and lands
+    // right after discovery, before the seed.
+    gitIn(rig.bare, "config", "--local", "--unset-all", "uzi-attemptmode.issue-17965.enabled");
+    const realDiscover = git.discoverRetainedRecovery.bind(git);
+    git.discoverRetainedRecovery = (async (...a: Parameters<typeof realDiscover>) => {
+      const out = await realDiscover(...a);
+      gitIn(rig.bare, "config", "--local", "uzi-attemptmode.issue-17965.enabled", "true");
+      return out;
+    }) as typeof git.discoverRetainedRecovery;
+    const seeds: unknown[] = [];
+    const priv = rig.runner as unknown as { runnerCloneForClaim: (...a: unknown[]) => Promise<unknown> };
+    const realSeed = priv.runnerCloneForClaim.bind(rig.runner);
+    priv.runnerCloneForClaim = async (...a: unknown[]) => { seeds.push(a[4]); return realSeed(...a); };
+    await rig.runner.execute({ ...rig.claim, run_id: "22222222-0000-4000-8000-000000001965", claim_generation: 1 });
+    assert.equal(seeds.length, 1, "one seed call: the re-read chose the attempt path up front, no refusal and retry");
+    assert.ok(seeds[0] !== undefined, "an attempt seed was handed to the git layer");
+    assert.match(path.basename(freshPath), /\.attempt-/);
+    assert.ok(!reportsFor("22222222-0000-4000-8000-000000001965").includes("failed"));
+    assert.deepEqual(snapshotTree(first.clonePath), before);
+  });
+
+  it("admission race: the mode lands inside the seed call itself; the refused canonical seed is retried once on a fresh attempt path", async () => {
+    let freshPath = "";
+    const stub = new StubExecutor(nullLogger());
+    const rig = stopRig(17966, "canonical", "stale", {
+      executorFor: (n) => (n === 0 ? undefined : { run: (ctx: RunContext) => { freshPath = ctx.worktreePath; return stub.run(ctx); } }),
+    });
+    await rig.runner.execute(rig.claim);
+    const first = rig.facts();
+    const before = snapshotTree(first.clonePath);
+    gitIn(rig.bare, "config", "--local", "--unset-all", "uzi-attemptmode.issue-17966.enabled");
+    const seeds: unknown[] = [];
+    const priv = rig.runner as unknown as { runnerCloneForClaim: (...a: unknown[]) => Promise<unknown> };
+    const realSeed = priv.runnerCloneForClaim.bind(rig.runner);
+    priv.runnerCloneForClaim = async (...a: unknown[]) => {
+      seeds.push(a[4]);
+      // Another flight's stop persists the mode after this claim chose the canonical seed.
+      if (seeds.length === 1) gitIn(rig.bare, "config", "--local", "uzi-attemptmode.issue-17966.enabled", "true");
+      return realSeed(...a);
+    };
+    await rig.runner.execute({ ...rig.claim, run_id: "22222222-0000-4000-8000-000000001966", claim_generation: 1 });
+    assert.equal(seeds.length, 2, "the canonical seed was refused once and retried once");
+    assert.equal(seeds[0], undefined);
+    assert.ok(seeds[1] !== undefined, "the retry carries an attempt seed");
+    assert.match(path.basename(freshPath), /\.attempt-/);
+    assert.ok(!reportsFor("22222222-0000-4000-8000-000000001966").includes("failed"));
+    assert.deepEqual(snapshotTree(first.clonePath), before);
   });
 
   // Coverage needs an anchor this run and generation owns, or an owed pin of this run.
@@ -662,7 +792,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     assert.equal(mine[0]!.kind, "canonical");
     assert.equal(mine[0]!.presence, "present");
     assert.equal(mine[0]!.generation, 2);
-    assert.equal(mine[0]!.markerState, "bound");
+    assert.equal(mine[0]!.markerState, "detached", "no active journal names the kept clone");
   });
 
   for (const flavor of ["canonical", "attempt"] as const) {
@@ -754,23 +884,87 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(first.clonePath)), "reclaimed", "the old attempt is still reclaimed");
   });
 
-  it("same-worker canonical successor: the next claim of the run is refused with the residue-blocked outcome, never an adoption", async () => {
-    let modelled = false;
+  it("same-worker canonical successor: a newer claim generation of the same run proceeds on a fresh attempt path, never adopting or capturing the kept clone", async () => {
+    let secondPath = "";
+    const stub = new StubExecutor(nullLogger());
     const rig = stopRig(17898, "canonical", "fence", {
-      executorFor: (n) => (n === 0 ? undefined : { run: async () => { modelled = true; throw new Error("the successor must not model"); } }),
+      executorFor: (n) => (n === 0 ? undefined : { run: (ctx: RunContext) => { secondPath = ctx.worktreePath; return stub.run(ctx); } }),
     });
     await rig.runner.execute(rig.claim);
     const first = rig.facts();
+    const before = snapshotTree(first.clonePath);
     await rig.next(3);
-    const failed = api.states.filter((s) => s.runId === rig.runId && s.body.status === "failed");
-    assert.equal(failed.length, 1, `the successor claim fails once: ${reportsFor(rig.runId).join(",")}`);
-    assert.match(String(failed[0]!.body.failure_reason), /^worker_residue_blocked: retained stopped work: run /);
-    assert.match(String(failed[0]!.body.failure_reason), /inspect it with the worker-local retained-source command/);
-    assert.equal(failed[0]!.body.fail_origin, "worker_residue_blocked");
-    assert.equal(modelled, false, "no model started on the successor");
-    assertRecoverableFromExport(first, "the stopped canonical source");
-    assert.equal(markers(rig.bare, rig.runId).length, 1, "the marker is kept");
+    assert.match(path.basename(secondPath), /\.attempt-/, "the next claim ran in a fresh attempt clone");
+    assert.notEqual(secondPath, first.clonePath);
+    const states = reportsFor(rig.runId);
+    assert.ok(!states.includes("failed"), `the newer claim did not fail: ${states.join(",")}`);
+    assert.ok(states.includes("completed"), `the newer claim completed: ${states.join(",")}`);
+    await assertKeptCanonicalIntact(rig, before, "newer generation");
   });
+
+  it("discarding the kept canonical source while the successor runs never clears the successor's active journal", async () => {
+    let discarded = "";
+    let successorJournal = "";
+    let rig!: Rig;
+    const stub = new StubExecutor(nullLogger());
+    rig = stopRig(17967, "canonical", "stale", {
+      executorFor: (n) => (n === 0 ? undefined : {
+        run: async (ctx: RunContext) => {
+          successorJournal = journalRaw(rig.bare, rig.branch);
+          const selector = { runId: rig.runId, generation: 2, attempt: "canonical" };
+          const ev = (await git.inspectRetainedSources({
+            selector, barePath: rig.bare, isLivePath: () => false, holds: { state: "read", holds: [] },
+          })).sources[0]!;
+          const result = await git.discardStoppedSource({
+            selector, confirm: ev.descriptor, barePath: rig.bare,
+            holds: { state: "read", holds: [] }, isLivePath: () => false, quiesce: async () => true,
+          });
+          discarded = result.kind;
+          assert.equal(journalRaw(rig.bare, rig.branch), successorJournal, "the successor's journal is untouched by the discard");
+          return stub.run(ctx);
+        },
+      }),
+    });
+    await rig.runner.execute(rig.claim);
+    const first = rig.facts();
+    await rig.runner.execute({ ...rig.claim, run_id: "22222222-0000-4000-8000-000000001967", claim_generation: 1 });
+    assert.equal(discarded, "done");
+    assert.match(successorJournal, /\.attempt-/, "the journal the discard left alone names the successor's attempt path");
+    assert.equal(fs.existsSync(first.clonePath), false, "the kept source was discarded");
+    assert.deepEqual(markers(rig.bare, rig.runId), [], "and its marker retired");
+    assert.ok(!reportsFor("22222222-0000-4000-8000-000000001967").includes("failed"));
+  });
+
+  for (const dockerState of ["docker_error", "docker_unconfirmed"] as const) {
+    it(`attempt clone, clean and fully fetched, Docker half ${dockerState}: ${dockerState === "docker_error" ? "the coverage check is skipped and the clone is retained" : "the coverage check runs and the clone is retired"}`, async () => {
+      const requests: QuiesceRunRequest[] = [];
+      const rig = stopRig(dockerState === "docker_error" ? 17968 : 17969, "attempt", "stale", {
+        cleanTree: true,
+        beforeStop: async (ctx) => {
+          await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
+        },
+        runnerOpts: {
+          quiesceRun: async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+            requests.push(req);
+            const out = quiescentOutcome();
+            return req.site === "stopped_source" ? { ...out, docker: { state: dockerState, removed: [], detail: "" } } : out;
+          },
+        },
+      });
+      await rig.runner.execute(rig.claim);
+      const facts = rig.facts();
+      assert.ok(requests.some((r) => r.site === "stopped_source" && r.dockerHost === DOCKER), "the first proof asked for the Docker teardown");
+      const coverageProofs = requests.filter((r) => r.site === "stopped_source:covered").length;
+      if (dockerState === "docker_error") {
+        assert.equal(coverageProofs, 0, "no coverage proof ran");
+        assert.ok(fs.existsSync(facts.clonePath), "the clone is kept");
+        assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed", "and recorded");
+      } else {
+        assert.equal(coverageProofs, 2, "the coverage proof ran before and after");
+        assert.equal(fs.existsSync(facts.clonePath), false, "a covered clone is retired by the normal teardown");
+      }
+    });
+  }
 
   it("the successor run's guarded settle is not wedged by a reclaimed dirty stale attempt", async () => {
     const rc = guardedRecovery("open");

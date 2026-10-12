@@ -1335,9 +1335,13 @@ export interface RetainedSourceEvidence {
   attempt: string;
   ledgerState: AttemptLedgerState | "none";
   journalState: "none" | "plain" | "other" | "episode" | "descriptor" | "episode_and_descriptor";
-  markerState: "none" | "bound" | "mismatch" | "malformed";
+  /** `bound`: the active journal names this source and matches the marker's digest. `detached`: no
+   *  active journal names the marker's path (the normal state of a kept canonical source: the journal
+   *  was cleared when the marker was written). `mismatch`: an active journal names the path with
+   *  another digest, or a non-plain journal names it. */
+  markerState: "none" | "bound" | "detached" | "mismatch" | "malformed";
   presence: "present" | "missing" | "unsafe";
-  /** sha256 over the exact ledger value, or journal+marker, or journal+descriptor, plus lstat dev:ino. */
+  /** sha256 over the exact ledger value, or marker (+ the active journal only when bound), or journal+descriptor, plus lstat dev:ino. */
   descriptor: string;
   allocatedBytes: number | null;
   bytesState: "measured" | "partial" | "unknown";
@@ -5234,14 +5238,52 @@ export class GitCache {
     if (!await this.pathPresent(barePath)) return undefined;
     await this.assertRecoveryBare(barePath);
     return this.withLock(barePath, async () => {
-      const journal = await this.readRecoveryCapture(barePath, branch);
-      if (!journal) return undefined;
+      const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+      if (!stored) return undefined;
+      const journal = stored.journal;
+      // issue #1786: a pending plain journal that a VALID marker names exactly (same run and path,
+      // digest of this very raw value) is a stopped canonical source whose journal clear never landed
+      // (a crash after the marker write). Heal it: persist the key's attempt mode, then clear that
+      // exact journal. The kept clone is not touched, adopted or captured.
+      if (await this.healBoundStoppedJournal(barePath, branch, stored)) return undefined;
       // issue #1786: a retained stopped canonical clone is never adopted or captured.
       await this.assertNoStoppedMarker(barePath, journal.clonePath, journal);
       if (journal.runId !== runId) throw new ForeignRetainedRecoveryError();
       await this.checkedRecovery(barePath, branch, key, journal);
       return { barePath, journal };
     });
+  }
+
+  /**
+   * Under the bare lock: finish a stopped canonical source's retention whose journal clear never
+   * landed. Heals only when ALL hold: the journal is plain and canonical-shaped (no attempt id, no
+   * recovery episode, no retained sources); a VALID marker names exactly its run, branch and clone
+   * path with `journalDigest === sha256(raw)`; the marker's run has no malformed or overflowing
+   * marker evidence; and no residue latch is set. It then persists the marker key's attempt mode
+   * (read back) and clears that exact raw journal value. Returns true only when the journal is
+   * cleared. A failed write throws, keeping everything, so the caller's refusal is never relaxed.
+   */
+  private async healBoundStoppedJournal(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string }): Promise<boolean> {
+    const { journal, raw } = stored;
+    if (journal.attemptId !== undefined || journal.recovery || journal.retainedSources?.length) return false;
+    if (residueQuarantine() !== undefined) return false;
+    const markers = await this.readStoppedMarkers(barePath);
+    const named = JSON.stringify(journal.clonePath).slice(1, -1);
+    if (markers.overflow.has(journal.runId) ||
+        markers.malformed.some((m) => m.runId === journal.runId || m.raw.includes(named))) return false;
+    const digest = sha256Hex(raw);
+    const bound = markers.valid.find(({ marker }) => marker.runId === journal.runId && marker.branch === branch &&
+      marker.clonePath === journal.clonePath && marker.journalDigest === digest);
+    if (!bound) return false;
+    const key = bound.marker.key;
+    if (!(await this.readRecoveryAttemptMode(barePath, key))) {
+      await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+    }
+    if (!(await this.readRecoveryAttemptMode(barePath, key))) throw new Error("attempt mode persistence failed");
+    if (residueQuarantine() !== undefined) return false;
+    if ((await this.readRecoveryCaptureRaw(barePath, branch)) !== raw) return false;
+    await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+    return true;
   }
 
   /** Precharge one of three total iterations before capture. Legacy journals start at zero.
@@ -5812,10 +5854,21 @@ export class GitCache {
 
   /**
    * issue #1786 — retain a stopped CANONICAL clone (no attempt identity) with a bounded marker
-   * bound by digest to the exact plain journal. The plain journal must name exactly `(runId,
-   * clonePath)` with no attempt id; the journal is kept. Any mismatch (a successor journal, an
-   * episode journal, a replaced path), malformed or overflowing marker evidence, or a persistence
-   * failure returns `unknown` and writes nothing. Idempotent for the same journal.
+   * bound by digest to the exact plain journal, in ONE bare-lock section. The plain journal must
+   * name exactly `(runId, clonePath)` with no attempt id. Order: (1) every validation (journal
+   * identity, path shape, a real clone directory, malformed or overflowing marker evidence, the
+   * per-run cap) with nothing written; (2) the key's attempt mode `uzi-attemptmode.<key>.enabled`
+   * is persisted and read back, so no later run of the key seeds this canonical path again (an
+   * unwired worker then falls back to a fresh attempt path); (3) the marker is written and read
+   * back; (4) a residue latch that landed during the awaits above keeps the journal (the marker is
+   * already durable: `retained`); (5) the active journal is cleared, but only while its raw value
+   * is still exactly the one the digest was computed from. The marker, not the journal, now
+   * attributes and protects the kept source. A failed clear leaves the journal (the next discovery
+   * heals it, see {@link discoverRetainedRecovery}) and still answers `retained`. Any mismatch (a
+   * successor journal, an episode journal, a replaced path), malformed or overflowing marker
+   * evidence, or a failure before the marker is durable returns `unknown` and writes no marker.
+   * Idempotent: the same marker completes steps 2 and 5 when the journal is still bound, and an
+   * already-cleared journal with this exact marker is `retained`.
    */
   async markStoppedCanonical(
     barePath: string, branch: string, key: string,
@@ -5829,17 +5882,47 @@ export class GitCache {
         if (source.clonePath !== this.runnerClonePath(barePath, key)) return "unknown";
         if (input.generation !== null && (!Number.isSafeInteger(input.generation) || input.generation < 0)) return "unknown";
         const current = await this.readRecoveryCaptureWithRaw(barePath, branch);
-        if (!current || current.journal.attemptId !== undefined || current.journal.recovery || current.journal.retainedSources?.length ||
-            !sameRecoverySource(current.journal, source)) return "unknown";
+        if (current && (current.journal.attemptId !== undefined || current.journal.recovery || current.journal.retainedSources?.length ||
+            !sameRecoverySource(current.journal, source))) return "unknown";
         if (!(await this.realCloneDir(source.clonePath))) return "unknown";
         const markers = await this.readStoppedMarkers(barePath);
         if (markers.overflow.has(input.runId) || markers.malformed.some((m) => m.runId === input.runId)) return "unknown";
-        const digest = sha256Hex(current.raw);
         let mine = markers.valid.filter((m) => m.marker.runId === input.runId);
         const same = mine.find((m) => m.marker.clonePath === source.clonePath);
+        const persistMode = async (): Promise<void> => {
+          if (!(await this.readRecoveryAttemptMode(barePath, key))) {
+            await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+          }
+          if (!(await this.readRecoveryAttemptMode(barePath, key))) throw new Error("attempt mode persistence failed");
+        };
+        // Steps 4 and 5. Only the journal whose raw the marker's digest was computed from is cleared.
+        const clearBoundJournal = async (raw: string): Promise<void> => {
+          // issue #2213: a latch that landed during the awaits above keeps the journal.
+          if (residueQuarantine() !== undefined) return;
+          try {
+            if ((await this.readRecoveryCaptureRaw(barePath, branch)) !== raw) return;
+            await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+          } catch (err) {
+            this.log.warn("could not clear the journal of a marked canonical source; it is kept and heals at the next discovery", {
+              clone: input.clonePath, error: gitErrorMessage(err),
+            });
+          }
+        };
         // An existing marker of this path binds the generation it was written for: a different one
         // is another stopped source's marker, never inherited or rewritten here.
-        if (same) return same.marker.journalDigest === digest && same.marker.generation === input.generation ? "retained" : "unknown";
+        if (same) {
+          if (same.marker.generation !== input.generation || same.marker.key !== key || same.marker.branch !== branch) return "unknown";
+          if (current === undefined) {
+            await persistMode();
+            return "retained";
+          }
+          if (same.marker.journalDigest !== sha256Hex(current.raw)) return "unknown";
+          await persistMode();
+          await clearBoundJournal(current.raw);
+          return "retained";
+        }
+        if (!current) return "unknown";
+        const digest = sha256Hex(current.raw);
         // Markers of this run whose path is verifiably gone and unnamed protect nothing: retire them.
         for (const m of mine) {
           if (await this.stoppedMarkerIsStale(barePath, m.marker.clonePath)) {
@@ -5854,9 +5937,12 @@ export class GitCache {
         };
         const value = JSON.stringify(marker);
         await this.parseStoppedMarker(barePath, input.runId, value); // the writer obeys the reader
+        await persistMode();
         await this.runGit(barePath, ["config", "--local", "--add", stoppedMarkerKey(input.runId), value]);
         const readback = await this.readStoppedMarkers(barePath);
-        return readback.valid.some((m) => m.raw === value) ? "retained" : "unknown";
+        if (!readback.valid.some((m) => m.raw === value)) return "unknown";
+        await clearBoundJournal(current.raw);
+        return "retained";
       });
     } catch (err) {
       this.log.warn("could not mark a stopped canonical source; it and its journal are kept", {
@@ -6111,8 +6197,10 @@ export class GitCache {
   /**
    * Gather every retained record of one bare, under the caller's bare lock: attempt sources (ledger
    * `live`/`reclaimed`/`abandoned` entries that no protected record owns), canonical sources (valid
-   * stopped markers), and protected or episode descriptors. Pure reads. Unreadable evidence is
-   * reported as `problems`, never skipped.
+   * stopped markers; `bound` when the active journal names the source with the marker's digest,
+   * `detached` when no active journal names its path, which is how a kept canonical source normally
+   * reads once the marker is durable, `mismatch` otherwise), and protected or episode descriptors.
+   * Pure reads. Unreadable evidence is reported as `problems`, never skipped.
    */
   private async gatherRetainedUnderLock(barePath: string): Promise<GatheredBare> {
     await this.assertRecoveryBare(barePath);
@@ -6237,10 +6325,13 @@ export class GitCache {
       });
     }
 
-    // Canonical sources: one record per valid marker.
+    // Canonical sources: one record per valid marker. A kept canonical source normally has NO active
+    // journal (markStoppedCanonical clears it once the marker is durable): that is `detached`. The
+    // active journal matters only when it names the marker's path.
     for (const { marker, raw } of markers.valid) {
       const a = active.get(marker.branch);
-      const plainShaped = a?.journal !== undefined && !a.journal.recovery && !a.journal.retainedSources?.length;
+      const named = a?.journal !== undefined && this.recoverySources(a.journal).some((s) => s.clonePath === marker.clonePath);
+      const plainShaped = named && !a.journal!.recovery && !a.journal!.retainedSources?.length;
       const plain = plainShaped && a.journal!.attemptId === undefined &&
         sameRecoverySource(a.journal!, { runId: marker.runId, clonePath: marker.clonePath });
       const bound = plain && sha256Hex(a.raw) === marker.journalDigest;
@@ -6248,10 +6339,11 @@ export class GitCache {
       records.push({
         kind: "canonical", runId: marker.runId, branch: marker.branch, key: marker.key, parts: [p],
         journal: plain ? a.journal : undefined, activeRaw: a?.raw, descriptorRaw: undefined, descriptorSnapshot: undefined,
-        journalState: a?.journal === undefined ? "none" : plain ? "plain" : plainShaped ? "other" : "episode",
-        markerState: bound ? "bound" : "mismatch", markerRaw: raw, ledgerRaw: undefined,
+        journalState: !named ? "none" : plain ? "plain" : plainShaped ? "other" : "episode",
+        markerState: bound ? "bound" : named ? "mismatch" : "detached", markerRaw: raw, ledgerRaw: undefined,
         problems: runProblems(marker.runId), namers,
-        digest: sha256Hex(["retained-source-v1", "canonical", raw, a?.raw ?? "", p.devIno].join("\n")),
+        // The active journal's bytes are part of the descriptor only when it is this source's own.
+        digest: sha256Hex(["retained-source-v1", "canonical", raw, bound ? a!.raw : "", p.devIno].join("\n")),
       });
     }
 
@@ -6403,8 +6495,10 @@ export class GitCache {
       }
     } else if (rec.kind === "canonical") {
       consumers.push(`marker:${rec.markerState}`);
-      if (rec.markerState !== "bound") blockers.push(`marker_${rec.markerState}`);
-      if (rec.journalState !== "plain") blockers.push("journal_not_plain");
+      if (rec.markerState !== "bound" && rec.markerState !== "detached") blockers.push(`marker_${rec.markerState}`);
+      // Only an active journal that names this source can be wrong about it; a successor's journal
+      // elsewhere on the branch is not this source's journal.
+      if (rec.journalState !== "none" && rec.journalState !== "plain") blockers.push("journal_not_plain");
       try {
         if ((await this.classifyOwnerClonePath(g.barePath, rec.branch, rec.key, rec.runId, rec.parts[0]!.clonePath)) !== "canonical") {
           blockers.push("attribution_unknown");
@@ -6630,8 +6724,8 @@ export class GitCache {
 
   /**
    * issue #1786 — operator discard of a PLAIN retained source: an attempt in ledger state `reclaimed`
-   * or `abandoned` that no journal names, or a canonical source whose plain journal and marker are
-   * digest-bound, or a `gx` attempt (confirmed with generation `none`). See
+   * or `abandoned` that no journal names, or a canonical source whose marker is bound to its plain journal or detached
+   * (no active journal names it; a successor's journal is never cleared), or a `gx` attempt (confirmed with generation `none`). See
    * {@link discardRetainedSource} for the shared sequence and refusals.
    */
   discardStoppedSource(opts: RetainedDiscardOptions): Promise<RetainedDiscardResult> {
@@ -6770,7 +6864,9 @@ export class GitCache {
                 recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
                   ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) }), snapshot);
             } else if (rec.kind === "canonical") {
-              if ((await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
+              // Only a journal that names exactly this source (bound) is cleared, and only while its
+              // raw is unchanged; a detached marker never touches a successor's journal.
+              if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
                 await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
               }
             }
@@ -6900,6 +6996,14 @@ export class GitCache {
         for (const entry of (await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgers(barePath))).values()) {
           if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
           paths.set(entry.clonePath, { branch: entry.branch, runId });
+        }
+        // issue #1786: a kept canonical clone is attributed by its stopped marker once the journal is
+        // cleared, so a valid marker of this run names its path exactly as the plain journal did
+        // (a missing path is the same physical failure as a journaled missing one).
+        for (const { marker } of (await atFailure("git_or_filesystem_error", () => this.readStoppedMarkers(barePath, entries))).valid) {
+          if (marker.runId !== runId) { foreignOwners.add(marker.runId); continue; }
+          ownRetainedPaths.add(marker.clonePath);
+          paths.set(marker.clonePath, { branch: marker.branch, runId });
         }
         const heads = new Set<string>();
         const clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }> = [];

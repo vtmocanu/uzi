@@ -460,6 +460,7 @@ describe("discard through the real socket", () => {
     assert.equal(refused.ok, false, JSON.stringify(refused));
     assert.equal(refused.result.reason, "not_quiescent");
     assert.equal(fs.existsSync(a.path), true, "nothing was deleted");
+    assert.ok(bad.quiesceRequests.length > 0, "a quiescence proof was requested");
     assert.ok(bad.quiesceRequests.every((q) => q.dockerHost !== undefined), "the Docker teardown was requested");
     const ok = await rigOf({ quiesce: dockerOf("docker_unconfirmed"), runnerOpts: { dockerHost: "unix:///nonexistent/uzi-test-docker.sock" } });
     const ev2 = await inspectOne(ok, a);

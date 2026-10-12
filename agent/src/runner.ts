@@ -2776,7 +2776,8 @@ export class RunRunner {
    * or background recovery for the run sees the run as executing until `action` settles. `open()` is
    * true while the tail is still ours, no residue latch is set and none of `clonePaths` is a live
    * attempt. `quiesce` is a capture-mode scoped quiescence over the paths GitCache is about to
-   * delete; it is true only when every path is proven quiescent.
+   * delete; it is true only when every path is proven quiescent and, on a Docker-wired worker, the
+   * Docker teardown answered `docker_unconfirmed` (a `docker_error` or any other state is false).
    */
   async withRetainedSourceBoundary<T>(
     runId: string,
@@ -9195,6 +9196,13 @@ export class RunRunner {
     }
     // issue #1783 M2: a Docker-wired worker mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
+    // issue #1786: the mode read in discovery is stale by now (ensureClone ran since, and discovery
+    // itself may have healed a stopped canonical source and persisted the mode, or a concurrently
+    // stopping flight may have), so it is re-read right before the seed is chosen. A kept canonical
+    // clone on a no-Docker worker then sends this claim to a fresh attempt path.
+    if (typeof this.git.recoveryAttemptMode === "function") {
+      flight.effectiveAttemptPaths ||= await this.git.recoveryAttemptMode(claim.repo.clone_url, coordinates.key);
+    }
     if (flight.effectiveAttemptPaths) flight.attemptId = mintAttemptId(claim.claim_generation, new Date(this.now()));
     let attemptSeed = this.attemptSeedOptions(claim, flight);
     const refreshAttemptSeed = async () => {
@@ -9203,49 +9211,64 @@ export class RunRunner {
       attemptSeed = this.attemptSeedOptions(claim, flight);
     };
     const reseed = this.canonicalReseedOptions(flight);
-    try {
-      const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
-      flight.worktreePath = runnerClone.path;
-      flight.branch = runnerClone.branch;
-    } catch (err) {
-      if (err instanceof PendingRecoveryCaptureError) {
-        // The git layer stopped BEFORE rm. Capture this same run's retained source
-        // clone with the ordinary recovery loop; never start a model on it first.
-        flight.worktreePath = err.clonePath;
-        flight.branch = err.branch;
-        flight.preserveRecoveryClone = true;
-        flight.preserveSession = true;
-        flight.retainedLocalCustody = true;
-        flight.retainedEpisodeCustody = true;
-        flight.keepGuardedInventoryOpen = true;
-        await discoverRetained(true, err.branch);
-        if (!retainedJournal) throw new RetainedRecoveryMissingJournalError();
-        await this.recoverRetainedClaim(claim, flight, coordinates.key, retainedJournal);
-        return;
-      } else if (err instanceof ForeignCaptureBlockedError) {
-        // issue #1315/#1319 Case B: the canonical clone is journaled to ANOTHER run's
-        // retained capture (a matched canonical pair). The authoritative owner-derived
-        // validation decides — a TERMINAL owner in the same repo whose derived branch +
-        // canonical path match the journal is reclaimed (residue quarantined, RETAINED),
-        // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
-        // 404'd on a worker move (Gap 2).
-        await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
-        await refreshAttemptSeed();
+    // issue #1786: a canonical seed refused because the key now has a kept stopped canonical source
+    // (or recovered attempt mode) is retried ONCE on a fresh attempt path when the re-read mode says
+    // so: the mode can land between the read above and the seed under the bare lock.
+    for (let freshRetry = false; ; ) {
+      try {
         const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
         flight.worktreePath = runnerClone.path;
         flight.branch = runnerClone.branch;
-      } else if (err instanceof CapturePathMismatchError) {
-        // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
-        // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
-        // The SAME owner-derived validation decides; any unmet predicate fails closed.
-        await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
-        await refreshAttemptSeed();
-        const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
-        flight.worktreePath = runnerClone.path;
-        flight.branch = runnerClone.branch;
-      } else {
-        throw err;
+      } catch (err) {
+        if (!freshRetry && !flight.effectiveAttemptPaths &&
+            (err instanceof RetainedStoppedSourceError || (err instanceof Error && err.message === "recovered key requires a fresh attempt path"))) {
+          freshRetry = true;
+          await refreshAttemptSeed();
+          if (flight.effectiveAttemptPaths) {
+            flight.runLog.info("a kept stopped source or recovered attempt mode appeared during admission; seeding a fresh attempt path");
+            continue;
+          }
+        }
+        if (err instanceof PendingRecoveryCaptureError) {
+          // The git layer stopped BEFORE rm. Capture this same run's retained source
+          // clone with the ordinary recovery loop; never start a model on it first.
+          flight.worktreePath = err.clonePath;
+          flight.branch = err.branch;
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          flight.retainedLocalCustody = true;
+          flight.retainedEpisodeCustody = true;
+          flight.keepGuardedInventoryOpen = true;
+          await discoverRetained(true, err.branch);
+          if (!retainedJournal) throw new RetainedRecoveryMissingJournalError();
+          await this.recoverRetainedClaim(claim, flight, coordinates.key, retainedJournal);
+          return;
+        } else if (err instanceof ForeignCaptureBlockedError) {
+          // issue #1315/#1319 Case B: the canonical clone is journaled to ANOTHER run's
+          // retained capture (a matched canonical pair). The authoritative owner-derived
+          // validation decides — a TERMINAL owner in the same repo whose derived branch +
+          // canonical path match the journal is reclaimed (residue quarantined, RETAINED),
+          // else fail closed. Replaces the old worker-scoped getRunOwnership probe, which
+          // 404'd on a worker move (Gap 2).
+          await this.reclaimTerminalOrphan(barePath, claim, flight, err.clonePath, err.branch, err.ownerRunId, err);
+          await refreshAttemptSeed();
+          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
+          flight.worktreePath = runnerClone.path;
+          flight.branch = runnerClone.branch;
+        } else if (err instanceof CapturePathMismatchError) {
+          // issue #1319 Case A: a claimant-relative clone-path mismatch (the cross-kind slug
+          // divergence, e.g. an issue owner's `issue-N` vs this mr_rework's `agent-issue-N`).
+          // The SAME owner-derived validation decides; any unmet predicate fails closed.
+          await this.reclaimTerminalOrphan(barePath, claim, flight, err.journaledPath, err.branch, err.ownerRunId, err);
+          await refreshAttemptSeed();
+          const runnerClone = (flight.runnerClone = await this.runnerCloneForClaim(barePath, claim, reseed, flight.executor, attemptSeed));
+          flight.worktreePath = runnerClone.path;
+          flight.branch = runnerClone.branch;
+        } else {
+          throw err;
+        }
       }
+      break;
     }
 
     // PRD #1416 M1: record the published floor P ONCE at claim — the branch's forge tip as of
@@ -16062,7 +16085,10 @@ export class RunRunner {
    * and the absence of a stash); otherwise (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
-   * clone. Step 4 runs whatever the proof said; it only protects. A blocked or throwing proof, an
+   * clone (which also persists the key's attempt mode and clears the then-bound plain journal, so a
+   * later run of the key seeds a fresh attempt path instead of failing on the kept clone). Step 3 is
+   * skipped, keeping the source, unless the first proof's Docker half was `not_wired` or
+   * `docker_unconfirmed`. Step 4 runs whatever the proof said; it only protects. A blocked or throwing proof, an
    * unreadable bare or a refused record gives `unknown` (the record, when written, stays): the
    * clone and its journal stay.
    *
@@ -16106,9 +16132,14 @@ export class RunRunner {
     if (!handler || handler.stale) flight.keepGuardedInventoryOpen = true;
     const log = flight.runLog;
     let blocked = true;
+    // The coverage proof below scans processes only (no Docker host), so it can vouch for the bytes
+    // only when this first proof saw no container that could still mount the clone: Docker not wired,
+    // or wired with the teardown merely unconfirmed. A `docker_error` keeps the source unchecked.
+    let dockerSettled = false;
     try {
       const q = await this.quiesceRun(flight, executor, { mode: "own", site: "stopped_source", forceProcessScan: true });
       blocked = q.blocked;
+      dockerSettled = q.outcome.docker.state === "not_wired" || q.outcome.docker.state === "docker_unconfirmed";
     } catch (err) {
       log.warn("stopped source: the quiescence proof failed; the clone is kept", { error: errMessage(err), reason });
     }
@@ -16123,7 +16154,7 @@ export class RunRunner {
     }
     const attemptId = flight.runnerClone?.attemptId;
     const key = pathBasename(cloneKeyOf(clonePath).canonicalPath);
-    if (!blocked && (handler !== undefined || !priorPreserve) && !flight.predecessorCapture && flight.claimGeneration > 0 &&
+    if (!blocked && dockerSettled && (handler !== undefined || !priorPreserve) && !flight.predecessorCapture && flight.claimGeneration > 0 &&
         !(handler?.memo === true && handler.capturedHead === undefined)) {
       try {
         const head = handler?.memo === true ? handler.capturedHead! : await this.git.worktreeHead(clonePath);
