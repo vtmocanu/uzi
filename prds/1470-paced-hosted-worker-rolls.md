@@ -1,6 +1,6 @@
 # PRD #1470 — Paced hosted worker rolls
 
-Status: in progress; hosted verification remains open.
+Status: locally implemented and reviewed; maintainer hosted verification remains open.
 
 ## Outcome
 
@@ -90,3 +90,13 @@ M3 focused execution evidence (2026-10-12):
 - Full API validation exposed two existing no-telemetry scheduling-query guards: the M3 diagnostic projection had directly read pressure counters in the shared eligibility query. The narrowed guard tests failed on the candidate and passed on the pre-M3-health export. The fix removes those telemetry predicates without widening the allowlist: independent pressure/maintenance lifecycle is represented by authoritative drain reason and maintenance fencing. The corrected guard tests and all eleven live-DB owner/capability/protocol/lane/independent-fence cases passed. Controller polling and protected lifecycle uncordon retain their existing debounced-pressure reads; claims and scheduling do not gain a telemetry dependency.
 
 - The full API gate passed at 4c9b2b0a (exit 0; includes format, vet, build, sqlc drift, lint, dead code and race tests). The controller gate then identified G704 in the test-only callback URL read from the environment. The bridge now accepts only HTTP 127.0.0.1 with a bounded integer port and reconstructs that destination; external hosts, userinfo, paths, query strings and fragments are rejected. Its focused URL tests, normal controller lint and real PostgreSQL retained-N-1 bridge all passed. No production controller/API code or permission changed in this fixture repair.
+
+## Final local validation
+
+- `task --verbose gate:api` passed at 4c9b2b0a (exit 0). API/web/fixture source is unchanged by the subsequent controller-fixture repair; this result remains valid for that code.
+- `task --verbose gate:controller` and `task --verbose gate:repo` passed at 110a8eb5 (exit 0). Repository secret canaries were detected and tracked-file scan was clean; Semgrep detected its canary and reported zero tree results/errors. Earlier API/controller gate failures were repaired and their scoped regressions/reviews are recorded above; none remains open.
+- The existing `e2e/run-store-it.sh` completed against disposable PostgreSQL, with the harness reporting 2,595 passed and zero skipped, exit 0. Every listed package contributed execution. This includes the actual register/heartbeat/poll/claim bridge and pacing persistence/health cases; it is local PostgreSQL plus fake Kubernetes evidence, not hosted or real API-server verification.
+- Browser type checking and all 195 web API-contract tests passed after the DTO mirror repair. `task docs:sync` ran; `task check-docs:web` passed with 76 validated docs and 48 house-style warnings. No workflow or specs/ai.md change was made.
+- Immutable reviewer/tester/auditor waves covered each implementation and repair range through 110a8eb5, with no remaining blocking or graded security finding. Independent checks that could not execute, scanner timeouts and optional coverage/timestamp/redirect notes are distinct from the lead's completed gates and are retained as review limitations, not claimed passes.
+
+Local M1/M2/M3 work is complete. The two unchecked acceptance items remain: KinD envelope smoke (binary unavailable, exit 127) and maintainer hosted verification. Keep this PRD here until maintainer evidence closes the hosted procedure.
