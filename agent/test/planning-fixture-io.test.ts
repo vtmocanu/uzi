@@ -50,7 +50,7 @@ for (const ipc of [false, true]) {
     assert.equal(entries.find(e => e.name.equals(Buffer.from("private")))!.isDirectory(), true);
     assert.equal(entries.find(e => e.name.equals(Buffer.from("link")))!.isSymbolicLink(), true);
     assert.equal(entries.find(e => e.name.equals(name))!.isFile(), true);
-    assert.equal((await io.fs.stat(root)).mode & 0o777, 0o700);
+    assert.equal((await io.fs.stat(root)).mode & 0o7777, 0o700);
     assert.equal((await io.fs.stat(path.join(root, "private"))).mode & 0o777, 0o700);
     const missing = path.join(root, "missing");
     await assert.rejects(io.fs.stat(missing), error => {

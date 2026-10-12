@@ -113,7 +113,7 @@ func TestCredentialPromoterUntimedRunsIgnoreSpentBudgetLiveDB(t *testing.T) {
 	// The existing Extend path resumes it.
 	if _, err := fx.env.q.ExtendAndResumeWallPark(fx.env.ctx, store.ExtendAndResumeWallParkParams{
 		Secs: 3600, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
-		ID: timed, UserID: fx.userID, Cap: 86400,
+		ID: timed, UserID: fx.userID, Cap: 86400, BaseWallUpperSeconds: 86400, FinalizeAllowanceSeconds: WallParkFinalizeSeconds, MaxWallSeconds: MaxRunWallSeconds,
 	}); err != nil {
 		t.Fatalf("ExtendAndResumeWallPark: %v", err)
 	}
@@ -212,7 +212,7 @@ func TestReassignHeldRunSettlesLiveDB(t *testing.T) {
 				// The owner's Extend keeps worker affinity, as for a worker-side wall park.
 				if _, err := fx.env.q.ExtendAndResumeWallPark(fx.env.ctx, store.ExtendAndResumeWallParkParams{
 					Secs: 3600, GlobalTimeoutSeconds: int32(testParams().RunTimeout.Seconds()),
-					ID: id, UserID: fx.userID, Cap: 86400,
+					ID: id, UserID: fx.userID, Cap: 86400, BaseWallUpperSeconds: 86400, FinalizeAllowanceSeconds: WallParkFinalizeSeconds, MaxWallSeconds: MaxRunWallSeconds,
 				}); err != nil {
 					t.Fatalf("ExtendAndResumeWallPark: %v", err)
 				}

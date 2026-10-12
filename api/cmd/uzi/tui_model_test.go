@@ -1789,7 +1789,7 @@ func TestTUIBoardSummaryCountsFollowupPark(t *testing.T) {
 // belong. Mutation that reddens this: dropping the !r.IsRevising gate in boardSummary.
 func TestTUIBoardSummaryExcludesRevisingApproval(t *testing.T) {
 	genuine := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "awaiting_approval", IssueTitle: "plan gate"}}
-	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning"}, IsRevising: true}
+	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning", IsRevising: true}}
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{genuine, revising}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})

@@ -663,11 +663,18 @@ A lead can hold its run slot while its read-only opposite-family checker
 uses a cross-check slot on the same worker: a Codex checker for a Claude lead
 (the worker must support the required Codex harness/model), or a Claude
 checker for a Codex lead (the worker must advertise
-`cross_check_codex_lead_v1`). Code cross-check is not shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
+`cross_check_codex_lead_v1`). See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
 own-worker preference, the 2-minute default fallback grace and mixed-image
 rollout behavior. Cordoning permits the worker's own pinned child to finish;
 quarantine and maintenance fencing still block claims. Shutdown and draining
 include the cross-check pool.
+
+[Code cross-check](./cross-check.md#code-cross-check) uses the same lane, but
+its checker is pinned to the lead's own worker, with no fallback to another
+worker. A worker advertises `cross_check_code_v1` only with a cross-check lane
+above zero and the Codex harness; a lead on a worker without it records
+"Code cross-check incomplete: worker unsupported". Deploy the api and its
+migrations before such workers.
 
 **Settings → Workers** shows separate capacity, for example `1/1 runs` and
 `1/1 cross-checks`. A live checker remains visible even if re-registration

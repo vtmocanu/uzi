@@ -12,7 +12,7 @@ import {
   type SteerInput,
   type WsEvent,
 } from "./api";
-import { applyFrame, emptyStream, ingestMany, type StreamState } from "./runStream";
+import { applyFrame, emptyStream, hasRefreshKind, ingestMany, type StreamState } from "./runStream";
 
 const RECONNECT_MS = 1500;
 const CATCHUP_DEBOUNCE_MS = 150;
@@ -55,38 +55,53 @@ export function useRunStream(runId: string) {
   // would capture the new generation and be accepted.
   const genRef = useRef(0);
   const activeRunIdRef = useRef(runId);
+  // Same-run run reads can overlap (a state frame and a plan_revising frame each
+  // re-read it). Each read takes a ticket; a response older than the newest one
+  // already applied is dropped, so a slow read never restores stale state (issue #2760).
+  const runReadTicketRef = useRef(0);
+  const runReadAppliedRef = useRef(0);
 
   const commit = useCallback((s: StreamState) => {
     streamRef.current = s;
     setMessages(s.messages);
   }, []);
 
-  const replay = useCallback(async () => {
+  const refreshRun = useCallback(async () => {
+    if (runId !== activeRunIdRef.current) return;
+    const gen = genRef.current;
+    const ticket = ++runReadTicketRef.current;
+    try {
+      const { run } = await api.getRun(runId);
+      if (gen !== genRef.current) return;
+      if (ticket < runReadAppliedRef.current) return;
+      runReadAppliedRef.current = ticket;
+      setRun(run);
+      statusRef.current = run.status;
+    } catch (e) {
+      if (gen !== genRef.current) return;
+      if (ticket < runReadAppliedRef.current) return;
+      if (e instanceof ApiError) setError(e.message);
+    }
+  }, [runId]);
+
+  // refreshOnKinds is set only by the debounced catch-up: the mount and onopen paths
+  // already re-read the run themselves, so they skip it rather than fetch it twice.
+  const replay = useCallback(async (refreshOnKinds = false) => {
     if (runId !== activeRunIdRef.current) return;
     const gen = genRef.current;
     try {
       const { messages: batch } = await api.getRunMessages(runId, streamRef.current.lastSeq);
       if (gen !== genRef.current) return;
       commit(ingestMany(streamRef.current, batch).state);
+      // A replayed plan/plan_revising/progress_note never arrived as a live frame, so
+      // nothing else re-reads the run for it (a revise changes no status, hence no state
+      // frame follows): apply the same refresh a live frame of that kind would (issue #2760).
+      if (refreshOnKinds && hasRefreshKind(batch)) void refreshRun();
     } catch {
       // Transient; the next frame or reconnect retries. The log is durable, so a
       // failed catch-up only delays rendering, never loses a message.
     }
-  }, [runId, commit]);
-
-  const refreshRun = useCallback(async () => {
-    if (runId !== activeRunIdRef.current) return;
-    const gen = genRef.current;
-    try {
-      const { run } = await api.getRun(runId);
-      if (gen !== genRef.current) return;
-      setRun(run);
-      statusRef.current = run.status;
-    } catch (e) {
-      if (gen !== genRef.current) return;
-      if (e instanceof ApiError) setError(e.message);
-    }
-  }, [runId]);
+  }, [runId, commit, refreshRun]);
 
   // refreshInputs re-reads the steer queue (PRD #95). Best-effort and SILENT on error:
   // a non-owner viewer (an admin on someone else's run) 404s here, which Decision 8/N2
@@ -149,7 +164,7 @@ export function useRunStream(runId: string) {
       if (catchup != null) return;
       catchup = window.setTimeout(() => {
         catchup = null;
-        void replay();
+        void replay(true);
       }, CATCHUP_DEBOUNCE_MS);
     };
 
@@ -159,6 +174,9 @@ export function useRunStream(runId: string) {
       ws.onopen = () => {
         setConnected(true);
         void replay();
+        // A reconnect may have missed a plan/plan_revising frame, and a revise changes
+        // no status, so re-read the run here too (issue #2760).
+        void refreshRun();
         // Reconcile the steer queue on every (re)connect, alongside the message
         // replay (PRD #95 S1): the `input` frame is droppable, so a follow-up
         // consumed while we were disconnected would otherwise strand at Queued —

@@ -338,12 +338,17 @@ A few worth knowing:
   of a kind the sweep can time out (issue, task, prompt, self-improve,
   mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
   interactive-task run never times out, so extending one is a 409 (exit 5).
-  Extending past the admin's per-run allowance, or while an admin has
-  turned extending off entirely, is also a 409, with the server's message
-  (naming the remaining allowance) printed verbatim. On success it prints
-  the new deadline and the running total against the allowance, e.g.
-  `Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this
-  run: 2h of 16h allowed.` Owner-only.
+  `--by` is limited per request by the admin's maximum per extension
+  (default 16h), not per run: you may extend the same run repeatedly, and
+  each extension is an audited action. A request above that maximum, a
+  request past the run's technical total limit (see [How much time a run
+  can have in total](./run-health.md#how-much-time-a-run-can-have-in-total)),
+  or an extend while an admin has turned extending off entirely, is a 409
+  (exit 5) with the server's message printed verbatim (for example `+20h is
+  more than the 16h maximum per extension`). On success it prints the new
+  deadline and the run's total extension, e.g. `Extended <id> by 2h. 3h05m
+  left, times out 17:20. Extensions on this run: 18h total (up to 16h per
+  extension).` Owner-only.
 - **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
@@ -1438,7 +1443,10 @@ A newer release is available.
   the offered version. If it is older, the command exits nonzero with
   `Installed CLI is vY; requested vX was not reached. Try again later.`
   (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
-  On verified success it tells you to rerun `uzi tui`; there is no automatic re-exec.
+  On verified success it restarts the TUI on the new version, running the
+  verified formula-owned binary with your original arguments (`--context` and
+  the rest). If that restart fails, the command exits nonzero saying the update
+  succeeded; run `uzi tui` yourself.
   For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
@@ -2412,12 +2420,12 @@ uzi settings get
 uzi settings get --json
 ```
 
-The human table shows the two Plan cross-check cells: stage, harness,
+The human table shows the Plan and Code cross-check cells: stage, harness,
 active/inactive status, stored model and effort, worker default model,
 resolved model and effort, and each resolved field's source. Stored null
-fields show `Default`; explicit choices show `Pin · value`. Both
+fields show `Default`; explicit choices show `Pin · value`. All
 cells are active and editable in **Settings → Run defaults → Cross-check**:
-the Codex cell configures the checker of a Claude lead, the Claude cell the
+in each stage the Codex cell configures the checker of a Claude lead, the Claude cell the
 checker of a Codex lead. CLI set/reset is deferred to #1703.
 
 JSON returns the decoded account settings DTO, including
@@ -2469,6 +2477,39 @@ appends the refusal sub-code with underscores shown as spaces, e.g.
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
+
+### Code cross-check evidence
+
+The [Code cross-check](./cross-check.md#code-cross-check) consent is set in
+**Settings → Run defaults → Cross-check**; there is no CLI write verb for it.
+
+`uzi run get <id>` prints a `CODE_CHECK` row for a run that took the setting
+at creation: `Pending`, `Completed` or `Incomplete`, or `Pending · evidence
+unavailable` / `Incomplete · outcome unavailable` when no summary is stored.
+The rows after it, all prefixed `CODE_CHECK_`, are `REASON` (the reason class
+with underscores shown as spaces), `CHECKED_SHA`, `CHECKER_ID`, `FAMILY`,
+`MODEL`, `EFFORT`, `COST` and, when owner guidance applied, `GUIDANCE`
+(`custom guidance applied (sha256 <12 hex>)`). `FINDINGS` reads `Findings
+unavailable` when the stored findings cannot be read (the dispositions then
+read `Dispositions unavailable`) or `No findings recorded` for an empty list. `DISPOSITIONS` reads `Pending
+report`, `Finalized` or `Dispositions unavailable`; once finalized on a
+completed check, `COUNTS` reads `N addressed, N declined, N not reported`.
+Each finding adds `_ID`, `_SEVERITY`, `_PATH`, `_TITLE` and `_DETAIL` rows
+(plus `_LINE` and, when reported, `_DISPOSITION` and `_DISPOSITION_REASON`),
+numbered from 1 and bounded to 20 findings; `CODE_CHECK_MORE` counts the
+rest. An interrupted attempt changes the prefix to `EARLIER_CODE_CHECK` and
+reads `Earlier attempt evidence · incomplete: interrupted`. Displayed text
+goes through the same terminal sanitization as the Plan rows.
+
+`uzi run get <id> --json` carries `code_cross_check_required` and the
+structured `code_cross_check_summary`.
+
+`uzi repo list` has two columns for the per-repository owner settings:
+`CHECK_GUIDANCE` is `none` or `set (N bytes)` and never prints the text, and
+`CHECK_REPO_INSTRUCTIONS` is the instructions toggle. `--json` carries the
+stored `code_cross_check_guidance` and `cross_check_repo_instructions_enabled`.
+The CLI never writes either; use the **Code cross-check** panel on the Repos
+page.
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run

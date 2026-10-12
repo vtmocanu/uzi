@@ -17,7 +17,7 @@ afterEach(() => { vi.resetModules(); vi.doUnmock("./data"); });
 
 describe("Go-recorded metadata corpus through public mock GET/PUT", () => {
   const tested = new Set<string>();
-  it.each(corpus)("matches both complete cells for $name", async entry => {
+  it.each(corpus)("matches all four complete cells for $name", async entry => {
     vi.doMock("./data", async importActual => {
       const actual = await importActual<typeof import("./data")>();
       const owner = actual.mockUsers.find(u => u.email === "vlad@uzi.local")!.id;
@@ -43,10 +43,55 @@ describe("Go-recorded metadata corpus through public mock GET/PUT", () => {
 });
 
 describe("mock checker pins", () => {
-  it("resolves two independent cells afresh, resets one field, and persists only stored overrides", async () => {
+  it("persists four hard pins, clears code fields independently, and never inherits plan pins", async () => {
+    let api = await fresh();
+    await api.putMySettings({ cross_check_pins: [
+      { stage: "plan", harness: "claude", model: "sonnet", effort: "max" },
+      { stage: "plan", harness: "codex", model: "plan-custom", effort: "high" },
+      { stage: "code", harness: "claude", model: "haiku", effort: "low" },
+      { stage: "code", harness: "codex", model: "code-custom", effort: "xhigh" },
+    ] });
+    api = await fresh();
+    const before = (await api.getMySettings()).settings.cross_check_pins!;
+    expect(before.map(p => [p.stage, p.harness, p.model, p.effort])).toEqual([
+      ["plan", "claude", "sonnet", "max"], ["plan", "codex", "plan-custom", "high"],
+      ["code", "claude", "haiku", "low"], ["code", "codex", "code-custom", "xhigh"],
+    ]);
+    await api.putMySettings({ default_claude_model: "opus", default_codex_model: "worker-custom",
+      cross_check_pins: [
+        { stage: "code", harness: "claude", model: null },
+        { stage: "code", harness: "codex", effort: null },
+      ] });
+    api = await fresh();
+    const after = (await api.getMySettings()).settings.cross_check_pins!;
+    expect(after.slice(0, 2)).toEqual(before.slice(0, 2).map(p => ({
+      ...p, worker_default_model: p.harness === "claude" ? "opus" : "worker-custom",
+    })));
+    expect(after[2]).toMatchObject({ model: null, effort: "low", resolved_model: "opus", model_source: "worker default", effort_source: "pin" });
+    expect(after[3]).toMatchObject({ model: "code-custom", effort: null, resolved_model: "code-custom", resolved_effort: "medium", model_source: "pin", effort_source: "worker default" });
+  });
+
+  it("loads a legacy two-plan-cell blob and projects empty code overrides", async () => {
+    let api = await fresh();
+    await api.putMySettings({ cross_check_pins: [
+      { stage: "plan", harness: "claude", model: "sonnet" },
+      { stage: "plan", harness: "codex", effort: "max" },
+    ] });
+    api = await fresh();
+    const cells = (await api.getMySettings()).settings.cross_check_pins!;
+    expect(cells).toHaveLength(4);
+    expect(cells[0]).toMatchObject({ stage: "plan", model: "sonnet" });
+    expect(cells[1]).toMatchObject({ stage: "plan", effort: "max" });
+    expect(cells.slice(2)).toEqual([
+      expect.objectContaining({ stage: "code", harness: "claude", model: null, effort: null, model_source: "worker default", effort_source: "worker default" }),
+      expect.objectContaining({ stage: "code", harness: "codex", model: null, effort: null, model_source: "worker default", effort_source: "worker default" }),
+    ]);
+  });
+
+  it("resolves four independent cells afresh, resets one field, and persists only stored overrides", async () => {
     let api = await fresh();
     let cells = (await api.getMySettings()).settings.cross_check_pins!;
-    expect(cells).toHaveLength(2);
+    expect(cells).toHaveLength(4);
     expect(cells.find(p => p.harness === "codex")).toMatchObject({
       model: null, effort: null, resolved_model: "gpt-6.1-sol", resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: true,
     });
@@ -78,7 +123,9 @@ describe("mock checker pins", () => {
     for (const response of [await api.getMySettings(), await api.putMySettings({ cross_check_pins: [{ stage: "plan", harness: "claude", effort: "max" }] })]) {
       expect(response.settings.cross_check_pins).toEqual([
         expect.objectContaining({ harness: "claude", worker_default_model: "haiku", resolved_model: "sonnet" }),
-        expect.objectContaining({ harness: "codex", worker_default_model: "worker-codex", resolved_model: "custom-codex" }),
+        expect.objectContaining({ stage: "plan", harness: "codex", worker_default_model: "worker-codex", resolved_model: "custom-codex" }),
+        expect.objectContaining({ stage: "code", harness: "claude", worker_default_model: "haiku", model: null, resolved_model: "haiku" }),
+        expect.objectContaining({ stage: "code", harness: "codex", worker_default_model: "worker-codex", model: null, resolved_model: "worker-codex" }),
       ]);
     }
   });
@@ -101,12 +148,12 @@ describe("mock checker pins", () => {
   });
 
   it.each([
-    null, {}, [null], [{ stage: "code", harness: "codex" }], [{ stage: "plan", harness: "other" }],
+    null, {}, [null], [{ stage: "bogus", harness: "codex" }], [{ stage: "plan", harness: "other" }],
     [{ stage: "plan", harness: "codex", resolved_model: "bad" }],
     [{ stage: "plan", harness: "claude", worker_default_model: null }],
     [{ stage: "plan", harness: "codex", worker_default_model: "bad" }],
     [{ stage: "plan", harness: "codex" }, { stage: "plan", harness: "codex" }],
-    Array.from({ length: 3 }, () => ({ stage: "plan", harness: "claude" })),
+    Array.from({ length: 5 }, () => ({ stage: "plan", harness: "claude" })),
   ])("rejects malformed list %j without changing worker fields", async list => {
     const api = await fresh();
     await expect(api.putMySettings({ default_effort: "max", cross_check_pins: list } as unknown as UserSettingsPatch)).rejects.toMatchObject({ status: 400 });

@@ -123,7 +123,7 @@ it("production 64MiB cap captures real coverage of divergent retained roots into
   const start = performance.now(), f = fixture(65 * 1024 * 1024);
   try {
     assert.equal(await f.cache.withRecoveryOperation(new AbortController().signal, Date.now() + 120_000,
-      () => f.cache.verifyRecoveryClosure(f.bare, f.tip)), true, "65 MiB decoded public history fits the production 1 GiB cap");
+      () => f.cache.verifyRecoveryClosure(f.bare, f.tip)), true, "65 MiB decoded public history fits the production 8 GiB cap");
     const divergent = commit(f, f.tree, [f.base], "retained older-base output");
     const unrelated = commit(f, f.tree, [], "retained unrelated output");
     const roots = [divergent, unrelated];

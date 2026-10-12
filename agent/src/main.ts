@@ -1,9 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind } from "./config.js";
+import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
 import { WorkerClient, RequestError } from "./client.js";
-import { GitCache } from "./git.js";
+import { GitCache, type GitCacheOptions } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
@@ -45,6 +45,17 @@ import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launche
 import { SECRET_PATH_PREFIXES, workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
+
+export function buildWorkerGitCache(
+  config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
+  log: Logger,
+  terminalRecordProtection: GitCacheOptions["terminalRecordProtection"],
+): GitCache {
+  return new GitCache(config.dataDir, log, undefined, {
+    recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
+    terminalRecordProtection,
+  });
+}
 
 /**
  * Issue #1598: the worker-startup pass of the Codex command orphan reaper (command tmps
@@ -413,9 +424,7 @@ async function main(): Promise<void> {
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
-  const git = new GitCache(config.dataDir, log, undefined, {
-    terminalRecordProtection: (runId) => outbox.hasPhysicalTerminalProtection(runId),
-  });
+  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId));
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and

@@ -2,7 +2,7 @@ import { test } from "node:test";
 import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
-import { verifyClosureFrames, RecoveryClosureLimitError } from "../src/recovery-closure.js";
+import { verifyClosureFrames, RecoveryClosureLimitError, recoveryClosureLimitDetail } from "../src/recovery-closure.js";
 
 const content = Buffer.from("public history");
 const oid = createHash("sha1").update(`blob ${content.length}\0`).update(content).digest("hex");
@@ -15,10 +15,17 @@ test("raw batch frames accept every header/content split and charge actual decod
     assert.equal(budget.delivered, content.length);
   }
 });
+test("decoded limit details report exact bytes and useful GiB", () => {
+  assert.equal(recoveryClosureLimitDetail(4096), "reachable recovery history exceeds the 4096 bytes decoded verification limit");
+  assert.equal(new RecoveryClosureLimitError().message, "reachable recovery history exceeds the 8589934592 bytes (8 GiB) decoded verification limit");
+  assert.equal(new RecoveryClosureLimitError(1610612736).message, "reachable recovery history exceeds the 1610612736 bytes (1.5 GiB) decoded verification limit");
+});
 test("delivered-byte overflow is charged across roots and never refunded", async () => {
   const budget = { delivered: 0, limit: content.length + 1 };
   await verifyClosureFrames(Readable.from([frame]), [object], budget);
-  await assert.rejects(verifyClosureFrames(Readable.from([frame]), [object], budget), RecoveryClosureLimitError);
+  await assert.rejects(verifyClosureFrames(Readable.from([frame]), [object], budget), {
+    message: `reachable recovery history exceeds the ${budget.limit} bytes decoded verification limit`,
+  });
   assert.equal(budget.delivered, content.length);
 });
 for (const [name, bytes] of [

@@ -73,6 +73,7 @@ import {
   renderBody,
   renderCompletionBlock,
   renderRegion,
+  swapCodeCrossCheckSection,
   type OwnedBlocks,
 } from "./pr-description.js";
 import { isCanonicalSizeTable, type ComputedSize } from "./pr-size.js";
@@ -890,8 +891,13 @@ export class PrDescriptionPublication {
       }
       const parts: OwnedBlocks = parsed;
       if (spec.mode === "refresh") {
+        // The code cross-check evidence belongs to the run that produced it: swap in this run's
+        // section (or drop a stale one this run did not redo); everything else stays as published.
+        const staleness = stalenessOf(region !== undefined);
         const nextCompletion =
-          parts.completion !== undefined ? withStalenessLine(parts.completion, stalenessOf(region !== undefined)) : undefined;
+          parts.completion !== undefined
+            ? withStalenessLine(swapCodeCrossCheckSection(parts.completion, completion, read.headSha), staleness)
+            : undefined;
         if (region !== undefined && parts.region === undefined) {
           return insertRegion(parts, region, nextCompletion);
         }

@@ -16,6 +16,14 @@ describe("deriveMockProgress agrees with the server (PRD #2602)", () => {
     },
   );
 
+  it("derives planning (not waiting) for an awaiting_approval run that is revising (issue #2760)", () => {
+    const base = { kind: "issue", health: "ok", milestones: [] } as unknown as Run;
+    expect(deriveMockProgress({ ...base, status: "awaiting_approval", is_revising: true })?.state).toBe("planning");
+    expect(deriveMockProgress({ ...base, status: "awaiting_approval", is_revising: false })?.state).toBe("waiting");
+    // is_revising is meaningful only at the plan gate.
+    expect(deriveMockProgress({ ...base, status: "running", is_revising: true })?.state).not.toBe("planning");
+  });
+
   it("is null for a terminal run", () => {
     expect(deriveMockProgress({ status: "completed", kind: "issue" } as Run)).toBeNull();
   });
