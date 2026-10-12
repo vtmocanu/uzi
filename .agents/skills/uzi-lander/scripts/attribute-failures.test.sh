@@ -84,9 +84,14 @@ if [[ $MODE == dependency || $MODE == race_setup ]]; then
   exit 1
 fi
 event() {
-  jq -nc --arg action "$1" --arg package "$package" --arg test "$2" --arg output "${3-}" \
-    '{Action:$action,Package:$package} + (if $test == "" then {} else {Test:$test} end) +
-      (if $output == "" then {} else {Output:$output} end)'
+  local output=${3-}
+  # Legacy callers provide whole lines. Fragment fixtures opt out explicitly.
+  if [[ $1 == output && $output != *$'\n' && ${4-} != fragment ]]; then output+=$'\n'; fi
+  jq -nc --arg action "$1" --arg package "$package" --arg test "$2" --arg output "$output" \
+    --argjson elapsed "${duration:-0}" '
+    {Action:$action,Package:$package} + (if $test == "" then {} else {Test:$test} end) +
+      (if $output == "" then {} else {Output:$output} end) +
+      (if $action == "pass" or $action == "fail" or $action == "skip" then {Elapsed:$elapsed} else {} end)'
 }
 if [[ $MODE == build ]]; then event output '' 'FAIL fixture [build failed]'; event fail ''; exit 1; fi
 names=(TestAlpha)
@@ -96,14 +101,19 @@ names=(TestAlpha)
 any_fail=false
 for name in "${names[@]}"; do
   outcome=fail
+  duration=0.01
+  [[ $sha == "$HEAD_SHA" ]] && duration=0.09
   case "$MODE" in
-    introduced|race_introduced|diagnostic_keywords|batch|controller|api_root|subselect|no_run_introduced|selected_no_run_introduced|child_no_run_introduced) [[ $sha == "$BASE" ]] && outcome=pass ;;
+    introduced|race_introduced|diagnostic_keywords|batch|controller|api_root|subselect|no_run_introduced|selected_no_run_introduced|child_no_run_introduced|lifecycle_uncertain_introduced) [[ $sha == "$BASE" ]] && outcome=pass ;;
     pass|livedb) outcome=pass ;;
     base_fail) [[ $sha == "$HEAD_SHA" ]] && outcome=pass ;;
     skip) outcome=skip ;;
   esac
   if [[ $MODE != no_run* && $MODE != selected_no_run* ||
         $MODE == *_introduced && $sha == "$BASE" ]]; then event run "$name"; fi
+  if [[ $MODE == lifecycle_noise || $MODE == lifecycle_deferred ]]; then
+    event output "$name" "=== RUN   $name"$'\n'
+  fi
   if [[ $MODE == livedb ]]; then
     event run "$name/LiveDB"
     event skip "$name/LiveDB"
@@ -119,13 +129,46 @@ for name in "${names[@]}"; do
     [[ $MODE == subtests && $sha == "$HEAD_SHA" ]] && child="$name/other"
     [[ $MODE == no_run* || $MODE == child_no_run* ]] || event run "$child"
     [[ $MODE != duplicate_run ]] || event run "$child"
+    if [[ $MODE == lifecycle_noise || $MODE == lifecycle_deferred ]]; then
+      event output "$child" "=== RUN   $child"$'\n'
+      event output "$child" "=== PAUSE $child"$'\n'
+      event pause "$child"
+      event cont "$child"
+      event output "$child" "=== CONT  $child"$'\n'
+    fi
     if [[ $MODE != markers ]]; then
       root=$("$REAL_GIT" rev-parse --show-toplevel)
       line=12
       [[ $sha == "$HEAD_SHA" ]] && line=87
       value=41
       [[ $MODE == changed && $sha == "$HEAD_SHA" ]] && value=42
-      if [[ $MODE == continuation* ]]; then
+      if [[ $MODE == lifecycle_multiline_terminal || $MODE == lifecycle_split_terminal || $MODE == lifecycle_fragment_tail ]]; then
+        value=0.02
+        [[ $sha == "$HEAD_SHA" ]] && value=0.03
+        if [[ $MODE == lifecycle_multiline_terminal ]]; then
+          event output "$child" "$(printf '    a_test.go:%s: expected output:\n        --- FAIL: %s (%ss)\n' "$line" "$child" "$value")"$'\n'
+        elif [[ $MODE == lifecycle_fragment_tail ]]; then
+          event output "$child" "    a_test.go:$line: expected output: " fragment
+          event output "$child" "--- FAIL: $child (${value}s)"$'\n' fragment
+        else
+          event output "$child" "$(printf '    a_test.go:%s: expected output:\n' "$line")"$'\n'
+          event output "$child" "        --- FAIL: $child (${value}s)"$'\n'
+        fi
+      elif [[ $MODE == lifecycle_regression || $MODE == lifecycle_multiline || $MODE == lifecycle_fragmented ]]; then
+        value=TestOne
+        [[ $sha == "$HEAD_SHA" ]] && value=TestTwo
+        if [[ $MODE == lifecycle_multiline ]]; then
+          event output "$child" "$(printf '    a_test.go:%s: expected output:\n        === RUN   %s\n' "$line" "$value")"$'\n'
+        else
+          event output "$child" "$(printf '    a_test.go:%s: expected output:\n' "$line")"$'\n'
+          if [[ $MODE == lifecycle_fragmented ]]; then
+            event output "$child" '        === RU' fragment
+            event output "$child" "N   $value"$'\n' fragment
+          else
+            event output "$child" "        === RUN   $value"$'\n'
+          fi
+        fi
+      elif [[ $MODE == continuation* ]]; then
         value=41
         [[ $sha == "$HEAD_SHA" ]] && value=42
         source=file.go
@@ -154,8 +197,23 @@ for name in "${names[@]}"; do
         event output "$child" "    $root/$module/pkg/$source_file:$line: expected 7 got $value"
       fi
     fi
-    duration=0.01
-    [[ $sha == "$HEAD_SHA" ]] && duration=0.09
+    # Each uncertain case has complete typed outcomes and a recognized assertion.
+    if [[ $MODE == lifecycle_uncertain_both ||
+          $MODE == lifecycle_uncertain_base && $sha == "$BASE" ||
+          $MODE == lifecycle_uncertain_head && $sha == "$HEAD_SHA" ||
+          $MODE == lifecycle_uncertain_introduced ]]; then
+      event output "$child" "=== NAME  $child"$'\n'
+    fi
+    if [[ $MODE == lifecycle_competing ]]; then
+      event output "$child" "        --- FAIL: $child (0.02s)"$'\n'
+    fi
+    if [[ $MODE == lifecycle_wrong_order ]]; then
+      event output "$child" "=== RUN   $child"$'\n'
+    fi
+    # Legacy verbose conversion defers the parent's typed report past its child.
+    if [[ $MODE == lifecycle_deferred ]]; then
+      event output "$name" "--- FAIL: $name (${duration}s)"$'\n'
+    fi
     if [[ $MODE == passing_diagnostic ]]; then
       event output "$child" "    --- PASS: $child (${duration}s)"
       event pass "$child"
@@ -164,9 +222,12 @@ for name in "${names[@]}"; do
       event output "$child" "    --- FAIL: $child (${duration}s)"
       [[ $MODE == child_missing ]] || event fail "$child"
     fi
-    event output "$name" "--- FAIL: $name (${duration}s)"
+    [[ $MODE == lifecycle_deferred ]] || event output "$name" "--- FAIL: $name (${duration}s)"
   fi
   [[ $MODE == missing ]] || event "$outcome" "$name"
+  if [[ $MODE == lifecycle_wrong_order ]]; then
+    event output "$name" "--- FAIL: $name (${duration}s)"$'\n'
+  fi
 done
 if [[ $MODE == contradictory ]]; then event pass ''; exit 0; fi
 if $any_fail; then event fail ''; exit 1; else event pass ''; fi
@@ -243,6 +304,123 @@ has() {
 }
 verdict() { has "\"$1\""; }
 no_go() { [[ ! -s $WORK/invocations ]] || fail "$MODE unexpectedly ran go"; }
+
+for mode in lifecycle_regression lifecycle_multiline lifecycle_fragmented; do
+  run "$mode"; verdict inconclusive; has 'different failure'
+  directory=${evidence_paths[0]%/*}
+  for side in base head; do
+    value=TestOne
+    [[ $side == head ]] && value=TestTwo
+    jq -e --arg value "$value" --arg mode "$mode" '
+      .result == "fail" and .assertion and .uncertainty == false and
+      .diagnostics == (
+        [{package:"fixture/api/pkg",test:"TestAlpha/child",
+          text:"    a_test.go:<line>: expected output:\n"}] +
+        (if $mode == "lifecycle_multiline" then [] else
+          if $mode == "lifecycle_fragmented" then
+            [{package:"fixture/api/pkg",test:"TestAlpha/child",text:"        === RU"},
+             {package:"fixture/api/pkg",test:"TestAlpha/child",text:("N   " + $value + "\n")}]
+          else [{package:"fixture/api/pkg",test:"TestAlpha/child",text:("        === RUN   " + $value + "\n")}] end
+        end) |
+        if $mode == "lifecycle_multiline" then
+          .[0].text += "        === RUN   " + $value + "\n" else . end)
+    ' "$directory/1-$side-TestAlpha.result" >/dev/null || fail "$mode compared continuation bytes or flag"
+    jq -es --arg value "$value" '
+      [.[] | select(.Action == "output") | .Output] | join("") |
+      contains("expected output:\n        === RUN   " + $value + "\n")
+    ' "$directory/1-$side.jsonl" >/dev/null || fail 'raw continuation lost'
+  done
+done
+for mode in lifecycle_multiline_terminal lifecycle_split_terminal lifecycle_fragment_tail; do
+  run "$mode"; verdict inconclusive
+  if [[ $mode == lifecycle_multiline_terminal ]]; then has 'different failure'
+  else has 'uncertain lifecycle output'; fi
+  directory=${evidence_paths[0]%/*}
+  for side in base head; do
+    value=0.02
+    duration=0.01
+    [[ $side != head ]] || { value=0.03; duration=0.09; }
+    jq -e --arg value "$value" --arg duration "$duration" --arg mode "$mode" '
+      .result == "fail" and .assertion and
+      .uncertainty == ($mode != "lifecycle_multiline_terminal") and
+      .diagnostics == (
+        [{package:"fixture/api/pkg",test:"TestAlpha/child",
+          text:("    a_test.go:<line>: expected output:" +
+            if $mode == "lifecycle_fragment_tail" then " " else "\n" end)}] +
+        [{package:"fixture/api/pkg",test:"TestAlpha/child",
+          text:((if $mode == "lifecycle_fragment_tail" then "" else "        " end) +
+            "--- FAIL: TestAlpha/child (" + $value + "s)\n")}] |
+        if $mode == "lifecycle_multiline_terminal" then
+          [.[0] + {text:(.[0].text + .[1].text)}]
+        elif $mode == "lifecycle_split_terminal" then
+          . + [{package:"fixture/api/pkg",test:"TestAlpha/child",
+            text:("    --- FAIL: TestAlpha/child (" + $duration + "s)\n")}]
+        else . end)
+    ' "$directory/1-$side-TestAlpha.result" >/dev/null || fail "$mode terminal continuation bytes/flag"
+  done
+done
+for mode in lifecycle_noise lifecycle_deferred; do
+  run "$mode"; verdict pre-existing
+  directory=${evidence_paths[0]%/*}
+  for side in base head; do
+    jq -e --arg mode "$mode" '
+      .result == "fail" and .assertion and .uncertainty == false and
+      .diagnostics ==
+        [{package:"fixture/api/pkg",test:"TestAlpha/child",
+          text:"    <worktree>/api/pkg/a_test.go:<line>: expected 7 got 41\n"}]
+    ' "$directory/1-$side-TestAlpha.result" >/dev/null || fail "$mode lifecycle correlation"
+    if [[ $mode == lifecycle_deferred ]]; then
+      jq -es '
+        to_entries |
+        [.[] | select(.value.Action == "output" and .value.Test == "TestAlpha" and
+          (.value.Output | startswith("--- FAIL:")))] as $output |
+        [.[] | select(.value.Action == "fail" and .value.Test == "TestAlpha")] as $terminal |
+        $output[0].key + 1 < $terminal[0].key
+      ' "$directory/1-$side.jsonl" >/dev/null || fail 'deferred terminal fixture was adjacent'
+    fi
+  done
+done
+for mode in lifecycle_uncertain_base lifecycle_uncertain_head lifecycle_uncertain_both lifecycle_competing; do
+  run "$mode"; verdict inconclusive; has 'uncertain lifecycle output'
+  directory=${evidence_paths[0]%/*}
+  for side in base head; do
+    uncertain=true
+    [[ $mode != lifecycle_uncertain_base || $side != head ]] || uncertain=false
+    [[ $mode != lifecycle_uncertain_head || $side != base ]] || uncertain=false
+    duration=0.01
+    [[ $side == head ]] && duration=0.09
+    jq -e --argjson uncertain "$uncertain" --arg mode "$mode" --arg duration "$duration" '
+      .result == "fail" and .assertion and .uncertainty == $uncertain and
+      .diagnostics == (
+        [{package:"fixture/api/pkg",test:"TestAlpha/child",
+          text:"    <worktree>/api/pkg/a_test.go:<line>: expected 7 got 41\n"}] +
+        (if $uncertain and $mode != "lifecycle_competing" then
+          [{package:"fixture/api/pkg",test:"TestAlpha/child",text:"=== NAME  TestAlpha/child\n"}]
+         else [] end) +
+        (if $mode == "lifecycle_competing" then
+          [{package:"fixture/api/pkg",test:"TestAlpha/child",
+            text:"        --- FAIL: TestAlpha/child (0.02s)\n"},
+           {package:"fixture/api/pkg",test:"TestAlpha/child",
+            text:("    --- FAIL: TestAlpha/child (" + $duration + "s)\n")}]
+         else [] end))
+    ' "$directory/1-$side-TestAlpha.result" >/dev/null || fail "$mode uncertainty/retained diagnostics"
+  done
+  if [[ $mode == lifecycle_uncertain_both ]]; then
+    jq -e --slurpfile head "$directory/1-head-TestAlpha.result" '
+      .uncertainty and $head[0].uncertainty and .diagnostics == $head[0].diagnostics
+    ' "$directory/1-base-TestAlpha.result" >/dev/null || fail 'matching ambiguous evidence was not exercised'
+  fi
+done
+run lifecycle_uncertain_introduced; verdict pr-introduced
+jq -e '.result == "fail" and .uncertainty == true' "${evidence_paths[0]%/*}/1-head-TestAlpha.result" >/dev/null ||
+  fail 'uncertainty changed typed introduced verdict'
+run lifecycle_wrong_order; verdict inconclusive; has 'uncertain lifecycle output'
+for side in base head; do
+  jq -e '.result == "fail" and .uncertainty == true and
+    any(.diagnostics[]; .text == "=== RUN   TestAlpha/child\n") and
+    any(.diagnostics[]; .test == "TestAlpha" and (.text | startswith("--- FAIL: TestAlpha (")))' \
+    "${evidence_paths[0]%/*}/1-$side-TestAlpha.result" >/dev/null || fail 'ordering uncertainty lost'
+done
 
 run introduced; verdict pr-introduced
 run race_introduced; verdict pr-introduced

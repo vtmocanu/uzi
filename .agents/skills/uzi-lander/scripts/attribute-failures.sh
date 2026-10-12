@@ -231,25 +231,72 @@ for group in "${!groups[@]}"; do
           (if $prefix != null then $prefix + "<line>: " + (ltrimstr($prefix) | sub("^[0-9]+: "; ""))
            else . end) |
           split($root) | join("<worktree>");
-        def diagnostic:
-          split("\n") | map(select(length > 0) |
-            select(test("^\\s*(=== (RUN|PAUSE|CONT|NAME)\\s+Test[A-Za-z0-9_]*(/.*)?|--- (PASS|FAIL|SKIP): Test[A-Za-z0-9_]*(/.*)? \\([0-9.]+s\\)|PASS|FAIL)$") | not) |
-            normalize) | join("\n");
-        [ .[] | select(selected) ] as $events |
+        def diagnostic: split("\n") | map(normalize) | join("\n");
+        # Classify whole events in the full ordered stream, before selecting failures.
+        # test2json emits run/cont before output, pause after output, and may defer
+        # terminal reports. NAME is consumed by test2json, without either event.
+        def marker:
+          .Output // "" |
+          ([capture("\\A=== (?<action>RUN  |PAUSE|CONT ) (?<test>[^\\r\\n]+)\\r?\\n\\z") |
+            .action |= (gsub(" "; "") | ascii_downcase)] +
+           [capture("\\A(?:    )*--- (?<action>PASS|FAIL|SKIP): (?<test>[^\\r\\n]+) \\((?<elapsed>[0-9]+\\.[0-9]+)s\\)\\r?\\n\\z") |
+            .action |= ascii_downcase | .elapsed |= tonumber] +
+           [capture("\\A(?<action>PASS|FAIL)\\r?\\n\\z") |
+            .action |= ascii_downcase | .test = null]) | .[0];
+        # Track output line fragments per test/package so a fragment tail cannot
+        # masquerade as a complete lifecycle event.
+        reduce (to_entries[]) as $entry ({events:[],pending:{}};
+          $entry.value as $e | ([$e.Package, $e.Test] | tojson) as $key |
+          .events += [$e + {ordinal:$entry.key,fragment:(.pending[$key] // false)}] |
+          if $e.Action == "output" then
+            .pending[$key] = (($e.Output // "") | endswith("\n") | not)
+          else . end) | .events as $full |
+        [$full[] | select(.Action == "output") | . + {marker:marker}] as $outputs |
+        [$outputs[] | . as $o |
+          . + {correlations: [
+            $full[] | select($o.marker != null and $o.fragment == false and
+              .Package == $o.Package and .Test == $o.Test and
+              .Test == $o.marker.test and .Action == $o.marker.action) |
+            select(if .Action == "run" or .Action == "cont" then
+              .ordinal < $o.ordinal and
+              (any($full[]; .Package == $o.Package and .Test == $o.Test and
+                (.Action == "pass" or .Action == "fail" or .Action == "skip") and
+                .ordinal < $o.ordinal) | not)
+            elif .Action == "pause" then .ordinal > $o.ordinal
+            else .ordinal > $o.ordinal end) |
+            select(.Test == null or any($full[];
+              .Package == $o.Package and .Test == $o.Test and .Action == "run" and
+              .ordinal < $o.ordinal)) |
+            .ordinal
+          ]}] as $candidates |
+        [$candidates[] | . as $o |
+          (($o.correlations | length) == 1 and
+            ([$candidates[] | select(.correlations | index($o.correlations[0]) != null)] | length) == 1 and
+            (if $o.marker.action == "run" or $o.marker.action == "cont" then
+               $o.correlations[0] == $o.ordinal - 1
+             elif $o.marker.action == "pause" then $o.correlations[0] == $o.ordinal + 1
+             else $o.marker.elapsed == null or
+               $full[$o.correlations[0]].Elapsed == $o.marker.elapsed end)) as $noise |
+          . + {noise:$noise,uncertain:(($noise | not) and
+            (.marker != null or
+             ((.Output // "") | test("\\A(=== (RUN|PAUSE|CONT|NAME)|--- (PASS|FAIL|SKIP):|PASS\\r?\\n\\z|FAIL\\r?\\n\\z)"))))}] as $classified |
+        [ $full[] | select(selected) ] as $events |
         [$events[] | select(.Test == $name and (.Action == "pass" or .Action == "fail"))] as $terminal |
         [$events[] | select(.Action == "fail") | {package:.Package,test:.Test}] | unique as $failed |
-        [$events[] | select(.Action == "output" and .Output != null) |
+        [$classified[] | select(selected and .Output != null and .noise == false) |
           . as $event | select(any($failed[]; .package == $event.Package and .test == $event.Test)) |
           {package:.Package,test:.Test,text:(.Output | diagnostic)} | select(.text != "")] as $diagnostics |
         {result:(if $valid[0] != true or ($terminal | length) != 1 or
                     ([$events[].Package] | unique | length) != 1 or
                     any($events[]; .Action == "skip") then "unknown" else $terminal[0].Action end),
          failed:$failed,diagnostics:$diagnostics,
+         uncertainty:any($classified[]; selected and .uncertain and
+           (. as $event | any($failed[]; .package == $event.Package and .test == $event.Test))),
          # Recognition is independent of normalization sentinels in assertion text.
          assertion:any($events[]; .Action == "output" and
            (. as $event | any($failed[]; .package == $event.Package and .test == $event.Test)) and
            any((.Output // "" | split("\n"))[]; source_prefix != null))}
-      ' "$prefix.jsonl" > "$prefix-$name.result" 2>/dev/null || printf '{"result":"unknown"}\n' > "$prefix-$name.result"
+      ' "$prefix.jsonl" > "$prefix-$name.result" 2>/dev/null || printf '{"result":"unknown","uncertainty":true}\n' > "$prefix-$name.result"
     done
     verdict=$(jq -nr --slurpfile b "$evidence/$index-base-$name.result" --slurpfile h "$evidence/$index-head-$name.result" '
       $b[0] as $b | $h[0] as $h |
@@ -257,7 +304,9 @@ for group in "${!groups[@]}"; do
       elif $b.result == "pass" and $h.result == "pass" then ["not-reproduced","both pass"]
       elif $b.result == "fail" and $h.result == "pass" then ["inconclusive","base fails, head passes"]
       elif $b.result == "fail" and $h.result == "fail" then
-        if $b.failed == $h.failed and $b.assertion and $h.assertion and
+        if $b.uncertainty != false or $h.uncertainty != false
+        then ["inconclusive","uncertain lifecycle output in compared failure diagnostics"]
+        elif $b.failed == $h.failed and $b.assertion and $h.assertion and
            ($b.diagnostics | length) > 0 and $b.diagnostics == $h.diagnostics
         then ["pre-existing","matching failing descendants and diagnostics"]
         else ["inconclusive","different failure or insufficient assertion diagnostics"] end

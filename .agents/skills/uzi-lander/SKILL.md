@@ -538,7 +538,7 @@ and they precede every merge (step 6):
   Compare failing-test sets, not counts. A worker's Go can be older than CI's `setup-go`:
   gofmt with CI's Go before trusting a worker's `fmt-check`.
   For Go test failures, use
-  `scripts/attribute-failures.sh --log <gate-log-file> --base <ref> --head <ref>`;
+  `S/attribute-failures.sh --log <gate-log-file> --base <ref> --head <ref>`;
   attribute other failures by hand, and a `pre-existing` verdict still needs the
   user's call before merging.
 - **Pin every local review to the immutable head.** The buddy is the default reviewer
