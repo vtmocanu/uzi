@@ -183,16 +183,21 @@ async function permissionsChild(): Promise<void> {
 
 function normalizationFailureChild(): void {
   const operation = process.env.UZI_FIXTURE_NORMALIZATION_FAILURE as "chownSync" | "chmodSync";
-  const original = fs[operation];
+  const originals = { chownSync: fs.chownSync, chmodSync: fs.chmodSync };
   const failure = new Error("injected fixture normalization failure");
   let target: fs.PathLike | undefined;
   let caught: unknown;
   try {
     // Both filesystem operations receive the root as their first argument.
-    fs[operation] = ((root: fs.PathLike) => { target = root; throw failure; }) as typeof original;
+    const fail = (root: fs.PathLike): never => { target = root; throw failure; };
+    if (operation === "chownSync") fs.chownSync = fail;
+    else fs.chmodSync = fail;
     try { makeFixture(); } catch (error) { caught = error; }
-  } finally { fs[operation] = original; }
-  assert.equal(fs[operation], original);
+  } finally {
+    if (operation === "chownSync") fs.chownSync = originals.chownSync;
+    else fs.chmodSync = originals.chmodSync;
+  }
+  assert.equal(fs[operation], originals[operation]);
   assert.equal(caught, failure, "preserves the exact normalization error");
   assert.ok(target);
   assert.equal(fs.existsSync(target), false);
