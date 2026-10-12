@@ -41,8 +41,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
-- **Hosted worker registrations now carry evidence for paced upgrades ([#1470](https://github.com/vtmocanu/uzi/issues/1470)).**
-  The API records a hosted pod's registration identity and a subsequent nonce-proven heartbeat, exposes additive controller evidence, and keeps image-roll drain ownership separate from maintenance fences. Older controllers retain their existing upgrade behavior; paced replacement will follow in the controller implementation.
+- **Hosted worker image rolls are now paced: one canary per owner pool proves itself before the rest roll ([#1470](https://github.com/vtmocanu/uzi/issues/1470)).**
+  When the worker image or template changes, the singleton controller admits one canary per owner-specific pool and promotes it only after the replacement pod registers with its current identity and sends a fresh nonce-proven heartbeat; it then replaces the remaining workers a bounded number at a time (`workers.rollConcurrency`, default 1) while keeping usable capacity. A canary that never proves itself holds the roll instead of draining the rest (holding is not a rollback). Image-roll drains are tracked separately from maintenance and custody fences, and ephemeral workers are not paced. Roll out the API and migrations 00328 and 00329 first, then the controller (`workers.controller.replicaCount` 0 or 1), keeping the worker pin unchanged until the API's evidence support is verified.
 
 - **Missing terminal reports no longer leave finalization pending ([#2655](https://github.com/vtmocanu/uzi/issues/2655)).**
   When a terminal journal is already absent or disappears during retirement, the worker clears its pending report entry so that the run's finalize records can be offered and retired again. Unreadable or unsafe journals stay protected, and report absence does not release custody or delete sources.
