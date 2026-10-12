@@ -6,7 +6,6 @@ import (
 	"fmt"
 	"strings"
 	"time"
-	"unicode"
 	"unicode/utf8"
 
 	"github.com/google/uuid"
@@ -14,6 +13,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 
 	"golang.org/x/mod/semver"
 )
@@ -550,7 +550,7 @@ func NormalizePacingReport(in *PacingReport) (*PacingReport, error) {
 	}
 	clean := func(s string) string {
 		return strings.Map(func(r rune) rune {
-			if unicode.IsControl(r) {
+			if termsafe.Unsafe(r) {
 				return -1
 			}
 			return r

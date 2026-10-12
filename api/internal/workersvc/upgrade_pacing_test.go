@@ -49,14 +49,14 @@ func TestRecordRollHealthPacingDirectValidation(t *testing.T) {
 	}
 }
 func TestPacingDisplayFieldsStripControls(t *testing.T) {
-	in := &PacingReport{State: "held", TargetImage: "repo:\u001bv2", TargetVersion: "2\n.0",
-		RetainedImage: ptrPacing("repo:\told"), RetainedVersion: ptrPacing("1\r.0")}
+	in := &PacingReport{State: "held", TargetImage: "repo:\u001b\u202ev2", TargetVersion: "2\n\u202c.0",
+		RetainedImage: ptrPacing("repo:\t\u202eold"), RetainedVersion: ptrPacing("1\r\u202c.0")}
 	out, err := NormalizePacingReport(in)
 	if err != nil || out.TargetImage != "repo:v2" || out.TargetVersion != "2.0" ||
 		*out.RetainedImage != "repo:old" || *out.RetainedVersion != "1.0" {
 		t.Fatal("pacing display controls survived validation")
 	}
-	if in.TargetImage != "repo:\u001bv2" || *in.RetainedVersion != "1\r.0" {
+	if in.TargetImage != "repo:\u001b\u202ev2" || *in.RetainedVersion != "1\r\u202c.0" {
 		t.Fatal("normalization mutated the input")
 	}
 }
