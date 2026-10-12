@@ -676,6 +676,7 @@ export function PageHeader({
   titleNode,
   description,
   actions,
+  actionsBesideTitle = false,
   backTo,
   backLabel,
 }: {
@@ -683,6 +684,8 @@ export function PageHeader({
   titleNode?: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
+  // Run-detail headers reserve a desktop title row for their compact controls.
+  actionsBesideTitle?: boolean;
   backTo?: string;
   backLabel?: string;
 }) {
@@ -696,8 +699,8 @@ export function PageHeader({
           <ArrowLeftIcon /> {backLabel ?? "Back"}
         </Link>
       )}
-      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-        <div className="min-w-0">
+      <div className={cx("flex flex-wrap items-start justify-between gap-x-6 gap-y-3", actionsBesideTitle && "lg:flex-nowrap")}>
+        <div className={cx("min-w-0", actionsBesideTitle && "lg:flex-1")}>
           {titleNode ?? (
             <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
           )}
@@ -706,7 +709,7 @@ export function PageHeader({
           )}
         </div>
         {actions && (
-          <div className="flex flex-wrap items-center gap-2">{actions}</div>
+          <div className={cx("flex flex-wrap items-center gap-2", actionsBesideTitle && "lg:shrink-0 lg:pt-6")}>{actions}</div>
         )}
       </div>
     </div>

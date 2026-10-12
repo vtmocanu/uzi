@@ -2111,16 +2111,16 @@ export function RunView() {
     run.kind !== "job" && canToggleWaitOnLimit(run.status) && run.wait_on_limit ? "waits on limits" : "",
     canToggleMrRework(run) && !effectiveMrRework(run, mrReworkDefault) ? "auto-rework off" : "",
   ].filter(Boolean);
-  const settingsLabel = ["Run settings", ...settingsStates].join(" · ");
 
   return (
     <div className="space-y-5">
       <PageHeader
+        actionsBesideTitle
         actions={<>
           <details className="relative" onKeyDown={(event) => {
             if (event.key === "Escape") { event.currentTarget.open = false; event.currentTarget.querySelector("summary")?.focus(); }
           }}>
-            <summary className="cursor-pointer rounded-md border border-edge px-3 py-1.5 text-sm text-muted">{settingsLabel}</summary>
+            <summary className="list-none cursor-pointer whitespace-nowrap rounded-md border border-edge px-3 py-1.5 text-sm text-muted [&::-webkit-details-marker]:hidden">Run settings ▾</summary>
             <div className="absolute right-0 z-20 mt-2 grid w-[min(32rem,85vw)] gap-4 rounded-lg border border-edge bg-surface p-4 shadow-xl">
               {!isCredentialDisabledHold(run) && (
                 <SwitchTokenAction run={run} canSteer={canSteer} onSwitched={refreshRun} />
@@ -2467,6 +2467,7 @@ export function RunView() {
                   model {stripUnsafeChars(run.model)}
                 </Badge>
               )}
+              {settingsStates.map(state => <Badge key={state} tone="neutral">{state}</Badge>)}
               {/* PRD #305: the frozen "apply model also to agents" flag, shown on EVERY
                   status like the model badge (SC6) so a user can confirm a run applied its
                   model fleet-wide. Absent = pins won (today's default). */}
