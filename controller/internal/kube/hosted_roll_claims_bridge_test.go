@@ -265,7 +265,7 @@ func TestHostedPressureClearedClaimsBridge(t *testing.T) {
 			t.Fatal(err)
 		}
 		req.Header.Set("Authorization", "Bearer "+key)
-		r, err := http.DefaultClient.Do(req)
+		r, err := http.DefaultClient.Do(req) //nolint:gosec // G704: request destination is the validated loopback-only httptest parent above.
 		if err != nil {
 			t.Fatal(err)
 		}
