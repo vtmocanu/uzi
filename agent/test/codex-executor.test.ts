@@ -14250,7 +14250,8 @@ describe("CodexExecutor agent selection (issue #1718)", () => {
 
 // ================================================================================
 // Issue #2099 — a Codex turn that ends `failed` with a TRANSIENT provider classification (category
-// transport: serverOverloaded, ...) is retried a bounded number of times in the same thread, then
+// transport: serverOverloaded, ...; or exact rateLimitExceeded token) is retried a bounded
+// number of times in the same thread, then
 // escalates as TransientRecoveryError (the runner parks it in recovery_wait) instead of failing the
 // run as agent_failure. Cancel, pause and a spent wall budget always win over the retry and over the
 // escalation; a non-transient classification is never retried.
