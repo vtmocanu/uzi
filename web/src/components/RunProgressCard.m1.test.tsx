@@ -66,6 +66,7 @@ describe("M1 unified progress invariants", () => {
     const {container} = mount({progress: pct({active_milestone_id: id}), iteration_count: 2}, null, "Thinking");
     const now = container.querySelector("[data-progress-now]")!;
     expect(now.closest("li")).toBeNull();
+    expect(now.compareDocumentPosition(container.querySelector("ul")!) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
     expect(now.textContent).toContain("model summary · 3m ago");
     expect(container.querySelector("[data-progress-head]")?.textContent).toContain("phase: implement · iteration 2 · run: Thinking");
     expect(container.querySelectorAll("[data-progress-now]")).toHaveLength(1);
@@ -103,6 +104,28 @@ describe("M1 unified progress invariants", () => {
     expect(within(row("m3")).queryByText("coder")).toBeNull();
     expect(screen.getAllByText("Wire the gate")).toHaveLength(1);
     expect(container.querySelector("[data-progress-activity]")).toBeNull();
+  });
+
+  it("paused DTO lanes disappear while the declared owner stays quiet", () => {
+    const {container} = mount({status: "paused", progress: pct({state: "parked", pct: null}), milestones_in_progress: ["m2"], milestones_agents: [{id: "m2", agent: "architect", agent_label: "Coordinate"}], milestones_live: [{milestone_id: "m2", lanes: [lane]}]}, activity);
+    expect(screen.getByText("architect")).toBeTruthy();
+    expect(screen.queryByText("coder")).toBeNull();
+    expect(screen.queryByText("Edit src/gate.ts")).toBeNull();
+    expect(container.querySelector(".animate-pulse")).toBeNull();
+  });
+
+  it("completed precedence prevents fallback activity under a completed row", () => {
+    mount({milestones_completed: ["m1"], milestones_in_progress: ["m1", "m2"]}, activity);
+    expect(within(row("m1")).getByLabelText("reported complete")).toBeTruthy();
+    expect(within(row("m1")).queryByText("coder")).toBeNull();
+    expect(within(row("m2")).getByText("coder")).toBeTruthy();
+    expect(screen.getAllByText("Wire the gate")).toHaveLength(1);
+  });
+
+  it("stale completed-row lanes do not disable fallback under the live row", () => {
+    mount({milestones_completed: ["m1"], milestones_in_progress: ["m1", "m2"], milestones_live: [{milestone_id: "m1", lanes: [lane]}]}, activity);
+    expect(within(row("m1")).queryByText("coder")).toBeNull();
+    expect(within(row("m2")).getByText("coder")).toBeTruthy();
   });
 
   it("nothing in progress keeps one unattached activity strip", () => {

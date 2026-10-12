@@ -116,7 +116,7 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   const completed = new Set(run.milestones_completed ?? []);
   const inProgress = new Set(run.milestones_in_progress ?? []);
   // Fallback activity attaches to the first in-progress milestone in frozen order.
-  const firstInProgress = firstInProgressMilestoneId(run);
+  const firstInProgress = firstInProgressMilestoneId({...run, milestones_in_progress: (run.milestones_in_progress ?? []).filter(id => !completed.has(id))});
   // PRD #1224 M5 (D8): "effective attribution" = milestones_agents entries whose milestone
   // is CURRENTLY in progress, in frozen order. ONLY a non-empty list activates per-milestone
   // rendering; null / [] / stale-only fall back to the pre-#1224 render below (the M4
@@ -135,8 +135,9 @@ export function MilestoneRows({ run, activity = null, activeContent }: { run: Pi
   // strip renders per lane, keyed by agent_instance so distinct subagents (reviewer×2) show
   // as distinct lines. We branch on PRESENCE of a lane (D5 back-compat), never on a nil test —
   // null / [] / all-empty-lanes ALL fall through to the pre-#1353 render below, byte-for-byte.
-  const milestonesLiveById = new Map((terminal ? [] : run.milestones_live ?? []).map((e) => [e.milestone_id, e.lanes]));
-  const hasLanes = (terminal ? [] : run.milestones_live ?? []).some((e) => e.lanes.length > 0);
+  const lanes = terminal || run.status === "paused" ? [] : run.milestones_live ?? [];
+  const milestonesLiveById = new Map(lanes.map((e) => [e.milestone_id, e.lanes]));
+  const hasLanes = lanes.some((e) => inProgress.has(e.milestone_id) && !completed.has(e.milestone_id) && e.lanes.length > 0);
   return (
     <div className="min-w-0">
       {/* Unattached strip: a milestone run with activity but nothing declared in progress

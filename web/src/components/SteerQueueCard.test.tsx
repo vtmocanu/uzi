@@ -9,7 +9,7 @@
 
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, fireEvent, render, screen } from "@testing-library/react";
-import { SteerQueueCard } from "./SteerQueueCard";
+import { RunControls, SteerQueueCard } from "./SteerQueueCard";
 import type { Run, SteerInput } from "../lib/api";
 
 afterEach(cleanup);
@@ -252,10 +252,20 @@ describe("SteerQueueCard scope directives (PRD #634)", () => {
   });
 });
 
+// Matches RunView: lifecycle controls in the header, queue/composer below.
+function SteeringSurface(props: Omit<Parameters<typeof SteerQueueCard>[0], "status"> & { status?: Run["status"] }) {
+  const run = props.run ?? pauseRun({ status: props.status ?? "running" });
+  return <>
+    <header><RunControls run={run} busy={props.busy} terminal={props.terminal}
+      canSteer={props.canSteer ?? true} onPause={props.onPause ?? noop} onStop={props.onStop ?? noop} /></header>
+    <SteerQueueCard {...props} />
+  </>;
+}
+
 describe("SteerQueueCard survives the terminal transition (B1)", () => {
   it("renders the queue read-only (no composer, no Stop) on a terminal run with a non-empty queue", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[input()]}
         terminal={true}
         status="completed"
@@ -280,7 +290,7 @@ describe("SteerQueueCard survives the terminal transition (B1)", () => {
 
   it("a live run shows the composer + Stop alongside the queue", () => {
     render(
-      <SteerQueueCard inputs={[input()]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+      <SteeringSurface inputs={[input()]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
     );
     expect(screen.getByText("Send follow-up")).toBeTruthy();
     expect(screen.getByText("Stop run")).toBeTruthy();
@@ -289,12 +299,12 @@ describe("SteerQueueCard survives the terminal transition (B1)", () => {
   it("a stable transition keeps an included entry's chip: same queue, terminal flips", () => {
     const rows = [input({ id: 5, consumed_at: RECEIVED, applied_at: ROUTED, included_at: INCLUDED })];
     const { rerender } = render(
-      <SteerQueueCard inputs={rows} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
+      <SteeringSurface inputs={rows} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
     );
     expect(screen.getByText("Included in a prompt")).toBeTruthy();
     // The run completes; the same lifted queue re-renders read-only, chip unchanged.
     rerender(
-      <SteerQueueCard inputs={rows} terminal={true} status="completed" busy={false} onStop={noop} onSend={noop} />,
+      <SteeringSurface inputs={rows} terminal={true} status="completed" busy={false} onStop={noop} onSend={noop} />,
     );
     expect(screen.getByText("Included in a prompt")).toBeTruthy();
     expect(screen.queryByText("Send follow-up")).toBeNull();
@@ -421,8 +431,8 @@ describe("SteerQueueCard — the composer does not promise resumption on a parke
   });
 });
 
-// PRD #1190: the "‖ Pause ▾" menu beside Stop run, for a RUNNING, pausable run. The card
-// only reads a handful of run fields, so a subset cast keeps each case readable (a paused
+// PRD #1190: the header Pause menu beside Stop run for a RUNNING, pausable run.
+// RunControls only reads a handful of run fields, so a subset cast keeps each case readable (a paused
 // run reads none of the omitted lifecycle fields).
 function pauseRun(over: Partial<Run> = {}): Run {
   return {
@@ -437,12 +447,12 @@ function pauseRun(over: Partial<Run> = {}): Run {
   } as Run;
 }
 
-describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
+describe("RunControls — Pause ▾ menu (PRD #1190)", () => {
   const PAUSE_BTN = /pause ▾/i;
 
   it("is ABSENT on a chat run (unpausable kind — chat parks between turns)", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -460,7 +470,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
 
   it("is ABSENT on an interactive task (it parks after each turn)", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -474,16 +484,18 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
     expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
   });
 
-  it("is ABSENT when run/onPause are omitted (every pre-#1190 caller is unchanged)", () => {
+  it("the queue card alone has no Pause or Stop and points to the header", () => {
     render(
       <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} />,
     );
     expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
+    expect(screen.getByText("Pause or stop this run from the header.")).toBeTruthy();
   });
 
   it("is ABSENT once a pause is already pending (the header chip owns it then)", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -499,7 +511,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
 
   it("is PRESENT on an issue run, and its milestone item says 'After current milestone'", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -527,7 +539,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
 
   it("says 'After current step' on a prompt run with no frozen milestones", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -545,7 +557,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
 
   it("HIDES the milestone item on the final milestone (only Pause now remains)", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -573,7 +585,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
 
   it("'Pause now' names the checkpoint age from checkpoint_tip_at", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -597,7 +609,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
 
   it("'Pause now' drops the age clause when no checkpoint has been pushed yet", () => {
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -615,7 +627,7 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
   it("clicking an item calls onPause with the mode and closes the menu", () => {
     const onPause = vi.fn();
     render(
-      <SteerQueueCard
+      <SteeringSurface
         inputs={[]}
         terminal={false}
         status="running"
@@ -631,6 +643,39 @@ describe("SteerQueueCard — Pause ▾ menu (PRD #1190)", () => {
     expect(onPause).toHaveBeenCalledWith("now");
     // Menu closed after a choice.
     expect(screen.queryByRole("menuitem", { name: /pause now/i })).toBeNull();
+  });
+
+  it("disables both controls while busy and never calls their callbacks", () => {
+    const onPause = vi.fn();
+    const onStop = vi.fn();
+    render(<RunControls run={pauseRun()} busy={true} terminal={false} canSteer={true} onPause={onPause} onStop={onStop} />);
+    const pause = screen.getByRole("button", { name: PAUSE_BTN }) as HTMLButtonElement;
+    const stop = screen.getByRole("button", { name: "Stop run" }) as HTMLButtonElement;
+    expect(pause.disabled).toBe(true);
+    expect(stop.disabled).toBe(true);
+    fireEvent.click(pause);
+    fireEvent.click(stop);
+    expect(screen.queryByRole("menu")).toBeNull();
+    expect(onPause).not.toHaveBeenCalled();
+    expect(onStop).not.toHaveBeenCalled();
+  });
+
+  it("Stop calls the original callback from the header", () => {
+    const onStop = vi.fn();
+    render(<RunControls run={pauseRun()} busy={false} terminal={false} canSteer={true} onPause={noop} onStop={onStop} />);
+    fireEvent.click(screen.getByRole("button", { name: "Stop run" }));
+    expect(onStop).toHaveBeenCalledOnce();
+  });
+
+  it("hides Pause and Stop for terminal and non-owner viewers", () => {
+    const { rerender } = render(<RunControls run={pauseRun()} busy={false} terminal={false} canSteer={true} onPause={noop} onStop={noop} />);
+    expect(screen.getByRole("button", { name: PAUSE_BTN })).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Stop run" })).toBeTruthy();
+    for (const [terminal, canSteer] of [[true, true], [false, false]]) {
+      rerender(<RunControls run={pauseRun()} busy={false} terminal={terminal} canSteer={canSteer} onPause={noop} onStop={noop} />);
+      expect(screen.queryByRole("button", { name: PAUSE_BTN })).toBeNull();
+      expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
+    }
   });
 
   it("still ACCEPTS a follow-up while parked — the fix is honesty about when, not a block", () => {

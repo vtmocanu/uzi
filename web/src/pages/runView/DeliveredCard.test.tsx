@@ -316,6 +316,7 @@ describe("DeliveredCard with nothing published", () => {
 describe("RunSummary hosts the Delivered section", () => {
   it("shows Delivered even with no intent or plan summary, and collapses with the card", () => {
     render(<RunSummary run={run({ pr_description: desc() })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByRole("region", { name: "Delivered" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
     expect(screen.queryByRole("region", { name: "Delivered" })).toBeNull();
@@ -336,6 +337,7 @@ describe("RunSummary hosts the Delivered section", () => {
 
   it("shows the outcome note when nothing was ever published", () => {
     render(<RunSummary run={run({ pr_description: null, pr_description_outcome: "write_failed" })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("Last PR update failed: the forge did not accept the new description.")).toBeTruthy();
     expect(screen.queryByRole("region", { name: "Delivered" })).toBeNull();
   });

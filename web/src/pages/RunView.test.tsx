@@ -735,7 +735,8 @@ describe("RunSummary (PRD #362 M4)", () => {
   });
 
   it("shows the intent card when summary_intent is present", () => {
-    render(<RunSummary run={run({ summary_intent: "Add a token-bucket rate limiter to the API." })} />);
+    render(<RunSummary run={run({ status: "running", summary_intent: "Add a token-bucket rate limiter to the API." })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("What this run will implement")).toBeTruthy();
     expect(screen.getByText("Add a token-bucket rate limiter to the API.")).toBeTruthy();
   });
@@ -752,6 +753,7 @@ describe("RunSummary (PRD #362 M4)", () => {
 
   it("labels the plan 'Approved plan' once past the gate (e.g. running/completed)", () => {
     render(<RunSummary run={run({ status: "running", summary_plan: "Introduce middleware and a store." })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("Approved plan")).toBeTruthy();
     expect(screen.queryByText("Proposed plan")).toBeNull();
   });
@@ -785,6 +787,7 @@ describe("RunSummary (PRD #362 M4)", () => {
 
   it("shows the no-deviations line for null deltas", () => {
     render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: null })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
   });
 
@@ -793,6 +796,7 @@ describe("RunSummary (PRD #362 M4)", () => {
     // value that somehow reaches the renderer as a non-array.
     const bad = { kind: "added", text: "not a list" } as unknown as Run["summary_deltas"];
     render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: bad })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
   });
 
@@ -804,9 +808,10 @@ describe("RunSummary (PRD #362 M4)", () => {
     const RLO = String.fromCodePoint(0x202e);
     const { container } = render(
       <RunSummary
-        run={run({ summary_intent: `Call \`fireSweep\` with **max_issues** <script>alert(1)</script> ${RLO}rate limiting` })}
+        run={run({ status: "running", summary_intent: `Call \`fireSweep\` with **max_issues** <script>alert(1)</script> ${RLO}rate limiting` })}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     // Markdown parsed to real elements.
     expect(container.querySelector("code")?.textContent).toBe("fireSweep");
     expect(container.querySelector("strong")?.textContent).toBe("max_issues");
@@ -819,17 +824,35 @@ describe("RunSummary (PRD #362 M4)", () => {
   });
 
   it("collapses on toggle and remembers the choice per run across a remount", () => {
-    const r = run({ id: "run-collapse", summary_intent: "Some intent." });
+    const r = run({
+      id: "run-collapse", status: "running", summary_intent: "Some intent.", summary_plan: "Body plan.",
+      summary_deltas: [{ kind: "added", text: "Body delta." }],
+    });
     const { unmount } = render(<RunSummary run={r} />);
-    // Expanded by default: the intent text is visible.
     expect(screen.getByText("Some intent.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(screen.getByText("What this run will implement")).toBeTruthy();
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    expect(screen.getByText("Body plan.")).toBeTruthy();
+    expect(screen.getByText("Body delta.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
-    expect(screen.queryByText("Some intent.")).toBeNull();
+    expect(screen.getByText("Some intent.")).toBeTruthy(); // Plain intent excerpt remains.
+    expect(screen.queryByText("What this run will implement")).toBeNull();
+    expect(screen.queryByText("Body plan.")).toBeNull();
+    expect(screen.queryByText("Body delta.")).toBeNull();
     unmount();
-    // A fresh mount reads the persisted per-run choice → still collapsed.
-    render(<RunSummary run={r} />);
-    expect(screen.queryByText("Some intent.")).toBeNull();
+    // The saved choice overrides even the gate default (expanded), proving persistence.
+    render(<RunSummary run={{ ...r, status: "awaiting_approval" }} />);
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    expect(screen.queryByText("What this run will implement")).toBeNull();
+    expect(screen.queryByText("Body plan.")).toBeNull();
+    expect(screen.queryByText("Body delta.")).toBeNull();
     expect(screen.getByRole("button", { name: "Expand" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(screen.getByText("What this run will implement")).toBeTruthy();
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    expect(screen.getByText("Body plan.")).toBeTruthy();
+    expect(screen.getByText("Body delta.")).toBeTruthy();
   });
 });
 

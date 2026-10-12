@@ -3,7 +3,7 @@ import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { JobResultPanel } from "./JobResultPanel";
 import { RunCompletedLine } from "../RunView";
-import { SteerQueueCard } from "../../components/SteerQueueCard";
+import { RunControls, SteerQueueCard } from "../../components/SteerQueueCard";
 import type { Run, RunJob } from "../../lib/api";
 import { extendEnabled } from "../../lib/budget";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
@@ -154,19 +154,23 @@ describe("job run chrome (PRD #1908)", () => {
     expect(screen.getByText(/Ran for 7m\./).textContent).toBe("Ran for 7m. Report and findings below.");
   });
 
-  it("the steer card offers Stop but no follow-up composer on a job", () => {
+  it("the header offers Stop job while the steer card has no follow-up composer", () => {
     const noop = () => {};
-    const { rerender } = render(
-      <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} run={issueRun} />,
-    );
-    // Control: an issue run has the composer.
+    function Chrome({ run }: { run: Run }) {
+      return <>
+        <header><RunControls run={run} terminal={false} canSteer={true} busy={false} onStop={noop} onPause={noop} /></header>
+        <SteerQueueCard inputs={[]} terminal={false} status={run.status} busy={false} onStop={noop} onSend={noop} run={run} />
+      </>;
+    }
+    const { rerender } = render(<Chrome run={issueRun} />);
+    // Positive controls keep both absence checks falsifiable.
     expect(screen.getByRole("textbox")).toBeTruthy();
-    rerender(
-      <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} run={queuedJob} />,
-    );
+    expect(screen.getByRole("button", { name: "Stop run" })).toBeTruthy();
+    rerender(<Chrome run={queuedJob} />);
     expect(screen.queryByRole("textbox")).toBeNull();
     expect(screen.getByText("A job takes no follow-ups. Stopping it cancels the job.")).toBeTruthy();
-    // The button names the thing the heading names ("Stop this job"); the old run copy is gone.
+    // The current header names the job; exact M2 copy remains pending.
+    expect(screen.getByText("Stop this job from the header.")).toBeTruthy();
     expect(screen.getByRole("button", { name: "Stop job" })).toBeTruthy();
     expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
   });

@@ -172,6 +172,7 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
         {badge && <span data-progress-what title={badge.reported ? "Milestones reported complete of the approved plan" : "No milestone completion reported for this run"} className="min-w-0 text-sm text-muted [overflow-wrap:anywhere]">{badge.reported ? badge.done : "–"} of {badge.total} {badge.reported ? "reported complete" : "reported"}</span>}
         {!hasActiveRow && phaseLine}
       </div>
+      {!hasActiveRow && nowLine}
       {p?.maybe_blocked_by_run_id && <Link className="text-sm text-info" title="A question mentions this run; this is a hint, not a recorded dependency." to={`/runs/${encodeURIComponent(stripUnsafeChars(p.maybe_blocked_by_run_id))}`}><span aria-hidden="true">⧗</span>may be blocked by {stripUnsafeChars(p.maybe_blocked_by_run_id).slice(0,8)}</Link>}
       {milestones.length > 0 && <div role="img" aria-label={trackLabel} className="grid gap-1" style={{gridTemplateColumns: `minmax(0, 0.6fr) repeat(${milestones.length}, minmax(0, 1fr))`}}>
         <Segment state="done" title="Plan approved" plan />
@@ -179,7 +180,6 @@ export function RunProgressCard({ run, activity = null, usage, stage = null }: {
       </div>}
       {milestones.length > 0 ? <MilestoneRows run={run} activity={live} activeContent={<>{phaseLine}{nowLine}</>} />
         : live && (run.status === "running" || ["limit_wait", "pool_wait", "recovery_wait"].includes(run.status)) && !run.is_planning && p?.state !== "planning" && <p data-progress-activity className="text-sm text-muted">{stripUnsafeChars(live.agent)} · {stripUnsafeChars(live.agent_label || live.tool)}</p>}
-      {!milestones.some(m => m.id === active) && nowLine}
       {(hasUsage || tailVisible(run.usage_estimated_tail)) && <div className="flex flex-wrap items-center gap-x-4 gap-y-1 border-t border-edge pt-3 text-xs text-muted">
         {usage?.hasConfirmed && cost ? <><span className="font-semibold text-fg">{costHeadline(cost)}</span><span>{costSubLabel(cost, run.harness)}</span><span>{formatTokens(usage.total.fresh + usage.total.cached)} in ({cacheDisplayPct(usage.total)}% cached)</span><span>{formatTokens(usage.total.out)} out</span></>
           : hasUsage && <span>Usage in flight; confirmed total not yet recorded</span>}
