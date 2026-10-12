@@ -166,7 +166,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 		}
 	})
 	t.Run("ordinary_pause_preserves_wall_allowance_and_resume_banks_once", func(t *testing.T) {
-		for _, pausedSeconds := range []int{120, 7200} {
+		for _, pausedSeconds := range []int32{120, 7200} {
 			t.Run(fmt.Sprintf("paused_%ds", pausedSeconds), func(t *testing.T) {
 				id := newRun(t)
 				const tip = "0123456789abcdef0123456789abcdef01234567"
@@ -262,7 +262,7 @@ func TestWorkerPauseLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 				assertKept(resumed)
-				if resumed.BudgetPausedSeconds != int32(60+pausedSeconds) ||
+				if resumed.BudgetPausedSeconds != 60+pausedSeconds ||
 					!resumed.StartedAt.Time.Equal(startedAt) || !resumed.StatusSince.Time.Equal(resumeAt) ||
 					resumed.BudgetWallSeconds != before.BudgetWallSeconds ||
 					resumed.BudgetExtensionSeconds != 0 || resumed.BudgetFinalizeSeconds != 0 {
