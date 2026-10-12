@@ -1406,6 +1406,7 @@ chain in the diagram above, with no intervening `running`.
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
   count slot freed). See the [ADR-2417 amendment](adr/2417-guarded-local-retention.md#amendment-2026-10-11--published-redundancy-early-expiry-2625).
+  A `failed` run's held work is instead published to a run-scoped forge ref, `refs/uzi-held/<run-id>/<generation>`, by the API with the owner's stored connection before custody is released, with the archive as fallback (#2545); see [docs/run-recovery.md](docs/run-recovery.md#publishing-a-failed-runs-held-work).
   Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature
   loss after guard latching retains custody with bounded retry. Credential-free
   boot cannot auto-capture dirty source. Unguarded APIs can retain local pins

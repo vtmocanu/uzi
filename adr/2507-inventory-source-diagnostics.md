@@ -106,6 +106,10 @@ unstamped older completions, including earlier self runs, gain no authority.
 Failed/cancelled/parked runs and `ci_fix`/`prompt`/`task` remain unchanged.
 This adds no intent, endpoint, discovery, driver or E2E mechanism. #2544 quota,
 #2545 failed publication and #2506 failed thin release are excluded.
+(2026-10-12: #2545 failed publication is now implemented separately by
+[ADR-2545](2545-failed-run-held-publication.md), with its own
+`held_publication` FINAL for failed runs. This completed-publication receipt
+is unchanged. #2544 and #2506 remain excluded.)
 
 See [ADR-1296](1296-durable-run-recovery.md#amendment-2026-10-09--2507-synchronous-completed-publication-release)
 for proof bindings and [ADR-2417](2417-guarded-local-retention.md#amendment-2026-10-09--completed-publication-receipt-authority)

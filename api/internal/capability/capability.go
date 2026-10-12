@@ -67,9 +67,9 @@ const RecoveryCompletedPublicationV1 = "recovery_completed_publication_v1"
 
 // RecoveryHeldPublicationV1 negotiates the publication of a failed run's held work to a
 // refs/uzi-held ref before custody is released (issue #2545). It is a worker/server protocol
-// fact, not a scheduler capability, so it lives in the protocol vocabulary only. This change only
-// defines the token and keeps it in a worker's reported set; no server code advertises or
-// requires it yet.
+// fact, not a scheduler capability, so it lives in the protocol vocabulary only. The server
+// advertises the matching protocol feature while UZI_HELD_PUBLICATION is on, and step A and
+// step B require the worker to report this token.
 const RecoveryHeldPublicationV1 = "recovery_held_publication_v1"
 
 // CodexHarnessV1 is the PROTOCOL capability a worker self-reports (PRD #1332 M5A, D3) after a

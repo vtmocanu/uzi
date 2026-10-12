@@ -21,11 +21,19 @@ torn down. For guarded generations, release normally requires final acknowledgme
 of a covering, prerequisite-free archive or a verified empty inventory.
 Eligible completed issue, MR-rework and self-improvement runs can instead
 release their exact completing-generation hold after the API verifies the
-published final commit against the run's branch and MR (see below). Legacy generations can release on proof that their
+published final commit against the run's branch and MR (see below). A `failed`
+run can instead release its hold against a published held ref (see
+[Publishing a failed run's held work](#publishing-a-failed-runs-held-work)). Legacy generations can release on proof that their
 recorded work is published. If the boundary cannot verify and resolve the
 source, it keeps the source held for you to decide (see below). A hard
 crash with no shutdown window — a killed node, an out-of-memory kill — is
 outside this guarantee.
+
+A run that ends `failed` first tries a different route: uzi publishes its
+held work to a run-scoped ref on your forge, `refs/uzi-held/<run-id>/<generation>`,
+and releases custody against that ref. The archive above is then the fallback
+when publishing is not possible. See
+[Publishing a failed run's held work](#publishing-a-failed-runs-held-work).
 
 This is a safety net for a run that already produced real commits, not a
 guarantee against every possible failure. It does **not** cover uncommitted
@@ -89,6 +97,11 @@ preserved diff, shown inline on the run page (or via `uzi run get <run-id>
 diff nor an available archive exists yet, uzi reports it as
 **unrecoverable** instead: the same underlying cause, but nothing left to
 hand a human.
+
+A third place to look on a failed run is its **held ref**: when uzi could
+publish the run's work to your forge, the run page shows a **Held work** panel
+and `uzi run held <run-id>` lists the ref. See
+[Publishing a failed run's held work](#publishing-a-failed-runs-held-work).
 
 Every download surface warns that the original may contain secrets: review
 it before publishing anywhere, and if it exposed a real credential, revoke
@@ -446,7 +459,9 @@ The release applies to the **exact completing generation**. It does not
 release older or successor holds or backfill older completed runs, including
 earlier self-improvement runs without a stamped completion identity. Failed,
 cancelled and parked runs, and `ci_fix`, `prompt` and `task`, keep their
-existing rules. Healthy completion release needs no heartbeat prerequisite.
+existing rules for this completion proof; a failed run's separate route is
+[held-work publication](#publishing-a-failed-runs-held-work). Healthy
+completion release needs no heartbeat prerequisite.
 
 A successful receipt needs no capture, WIP commit, frozen inventory or
 clean-source proof. Existing available, thin or needs-action captures do not
@@ -816,11 +831,176 @@ executed on an older worker, or against an older server, is honestly
 reported as **unsupported** rather than silently promised a recovery that
 was never captured. Upgrading your fleet only protects runs going forward.
 
+Publishing a failed run's held work needs the server to advertise
+`recovery_held_publication_v1` (and to have `UZI_HELD_PUBLICATION` on). An
+older server, or an older worker, simply keeps the archive path for failed
+runs.
+
 If the API lacks `recovery_inventory_v1` or the claim is not guarded, the
 worker emits an **UNGUARDED legacy generation** notice. Local pins may still
 retain commits, but complete inventory protection at terminal release and
 worker reclamation is unsupported. Once a generation's guard has latched,
 later feature loss retains custody rather than falling back to legacy release.
+
+## Publishing a failed run's held work
+
+When a run ends `failed`, uzi first tries to put its held work on your forge
+instead of keeping it only as a recovery archive. The work is published to a
+run-scoped ref, `refs/uzi-held/<run-id>/<generation>`, and only then is the
+worker's custody hold released. The recovery archive described above is the
+**fallback**: whenever publishing is not possible, uzi captures the archive
+exactly as it always did. The ref is yours to fetch with plain `git`.
+
+This is on by default. An operator turns it off with `UZI_HELD_PUBLICATION`
+(see [Configuration](configuration.md)); the knob, its default and its
+interaction with `UZI_RECOVERY_READY_RETENTION` are documented there and not
+repeated here.
+
+### What is eligible
+
+A run qualifies when all of these hold:
+
+- It ends **`failed`**, and its failure origin is neither `push_secret_blocked`
+  nor `worker_residue_blocked`. **Cancelled and parked runs keep the archive
+  path** described above, and so do the two excluded failure origins.
+- It is a run kind that opens a custody hold: issue, MR-rework,
+  self-improvement, `ci_fix`, prompt and task runs.
+- Its hold is the inventory-guarded hold of that exact claim generation, and
+  both the worker and the server support held publication (the server
+  advertises `recovery_held_publication_v1`; see
+  [Mixed fleets](#mixed-fleets)).
+
+### What gets published
+
+The ref points at the run's final tip: the commits made since the last
+checkpoint or published branch tip uzi could confirm on the forge, plus one
+work-in-progress commit holding the clone's uncommitted and untracked changes.
+Gitignored files are never included. Fetching the ref brings the full history
+that leads to it, not only the new commits.
+
+### How it happens
+
+1. **The worker scans and uploads.** After the failed terminal is recorded,
+   the worker freshly secret-scans exactly the range it is about to pack, and
+   applies the same remembered-finding gate as checkpoints (a commit flagged
+   earlier in the run is held back). It rejects a range that changes a
+   workflow file, because the stored credential may lack workflow scope, and
+   it refuses a pack over **64 MiB**. It then uploads the pack to the API,
+   with a 330 second timeout. The worker never holds a forge credential.
+2. **The API creates the ref.** The API pushes the pack with your stored
+   forge connection, **create-only**: an existing ref is refused, never moved
+   or overwritten. It records a "may have invoked" marker before the push, so
+   the create is sent at most once per run and generation. An outcome that
+   cannot be confirmed is only reconciled afterwards (the ref is listed), never
+   re-sent.
+3. **The worker releases custody.** Once the API answers that the ref was
+   created at the expected tip, the worker journals a final
+   `held_publication` disposition. The API re-checks the forge, and if the
+   ref is advertised at that exact tip it releases the one custody hold the
+   publication was made for. A replay of the same request is answered from the
+   stored receipt first. The worker, its clone and its disk can then be torn
+   down as for any released hold.
+
+The retention clock starts when the release is **acknowledged**, not when the
+ref was created. The ref is kept for `UZI_RECOVERY_READY_RETENTION` (default 7
+days), then deleted.
+
+### When it falls back to the archive
+
+Any of these sends the run down the archive path instead, and custody stays
+open until an archive final disposition is acknowledged:
+
+- the fresh scan finds a secret, or cannot be trusted or completed;
+- a finding remembered earlier in the run still holds the range;
+- the range cannot be resolved against what the forge already has;
+- the range changes a workflow file, or the check cannot tell;
+- the pack is over 64 MiB;
+- the forge refuses the push or is unreachable, or the upload fails;
+- the server predates held publication (no `recovery_held_publication_v1`),
+  or `UZI_HELD_PUBLICATION` is off.
+
+The worker logs a short notice naming the reason code (never file contents or
+finding text), for example
+`Held publication of <sha> skipped: secret_found; archiving instead.` By the
+time a run has failed its feed is closed, so the notice normally lands in the
+worker log rather than on the run page.
+
+### Finding and fetching the ref
+
+On the run page, a failed run with a held publication shows a **Held work**
+panel: one badge per publication (for example **Published**, **Publishing**,
+**Removing**, **Removed**, **Not published**), the ref and short tip, when it
+expires, and a copyable fetch command. It refreshes on its own while a
+publication is still settling, then stops after about ten minutes; reload the
+page to refresh. On an older server the panel does not appear.
+
+From the CLI:
+
+```sh
+uzi run held <run-id>
+```
+
+prints one row per generation: `GEN`, `STATE`, `REF`, `TIP`, `EXPIRES`.
+`uzi run recovery <run-id>` also names the ref on a hold that was released
+against a held publication (`hold <id> held: <ref> @ <tip>`). See
+[the CLI reference](cli.md#fetching-and-expiring-a-failed-runs-held-ref-uzi-run-held)
+for the flags, output and JSON form.
+
+Fetch it from a clone of the repository, naming a local branch so a later
+fetch cannot overwrite it and the commit stays reachable after the ref is
+deleted:
+
+```sh
+git fetch origin refs/uzi-held/<run-id>/<generation>:refs/heads/recovered/<run-id>
+```
+
+The bare `git fetch origin refs/uzi-held/<run-id>/<generation>` is fine to
+inspect the commit, but it only sets `FETCH_HEAD`.
+
+The publication states are `prepared`, `invoked`, `created`, `create_unknown`,
+`refused`, `acknowledged`, `delete_unknown`, `deleted` and `abandoned`. Only
+`created` and `acknowledged` have a ref on the forge worth fetching. `refused`
+means the forge rejected the create and no ref exists; `create_unknown` and
+`delete_unknown` are outcomes uzi has not been able to confirm yet and will
+reconcile; `abandoned` means the ref now points at a commit uzi did not
+publish, which uzi leaves untouched.
+
+### Expiry and early expiry
+
+Cleanup runs in the server's sweeper, and is always on, even with
+`UZI_HELD_PUBLICATION` off, so turning the feature off never strands a ref
+that was already published. It deletes:
+
+- **acknowledged** refs once their retention has passed; and
+- refs that were **created but never acknowledged**, once the run has no open
+  hold.
+
+Every delete is a compare-and-swap on the tip uzi recorded, taken under the
+run's database row lock, and never runs while any hold of that run is open. A
+ref that has moved to a different commit is left alone and the publication is
+marked `abandoned`. A create or delete whose outcome was unknown is reconciled
+by listing the ref.
+
+To end the retention early:
+
+```sh
+uzi run held expire <run-id>
+```
+
+This makes the run's **acknowledged** publications due now; the sweeper
+deletes each ref shortly after, and the command itself deletes nothing. A
+publication that is not acknowledged is never touched, so work still protected
+by an open hold keeps its ref. Fetch the ref first: once it is deleted, the
+work survives only in a clone you fetched it into.
+
+### Removing a repo or forge connection
+
+While a held ref may still exist, removing its repo or its forge connection is
+refused with a 409 that names the refs (see
+[the CLI reference](cli.md#fetching-and-expiring-a-failed-runs-held-ref-uzi-run-held)
+for the body). The block lifts once each ref is deleted or settled. An
+acknowledged ref clears at its retention expiry, or sooner with
+`uzi run held expire`.
 
 ## Salvage copies
 
@@ -903,8 +1083,12 @@ open first — that is usually where it is.
 
 ### Recovery order
 
-When you're recovering a failed run's work, check in this order: whether a
-salvage copy exists, then compare its tip against any available
+When you're recovering a failed run's work, check in this order: first its
+[held ref](#publishing-a-failed-runs-held-work), if the run has one (find it with
+`uzi run held <run-id>`, then `git fetch origin refs/uzi-held/<run-id>/<generation>`).
+It is published from the run's final frozen tip, so it holds the run's last committed
+and uncommitted work as of the failure, unlike the salvage copy. Then check whether a
+salvage copy exists, and compare its tip against any available
 [recovery archive](#downloading-an-archive), the run's
 [retained checkpoint or recovery ref](#where-the-work-is-kept), a live
 worker clone, and the worker's own tracking ref. Restore whichever verified

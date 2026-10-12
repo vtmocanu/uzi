@@ -111,6 +111,8 @@ uzi run export <id> --output <path> [--capture <id>]
 uzi run fetches <id> [--json]
 uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
+uzi run held <id> [--json]
+uzi run held expire <id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -1186,6 +1188,79 @@ uzi run discard <run-id> --hold <hold-id> --yes
   might still need it.
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
+
+### Fetching and expiring a failed run's held ref: `uzi run held`
+
+When a run ends `failed`, uzi first tries to publish its held work to your forge as
+`refs/uzi-held/<run-id>/<generation>` and release the worker's custody against that ref;
+the recovery archive above is the fallback. See
+[Publishing a failed run's held work](./run-recovery.md#publishing-a-failed-runs-held-work)
+for what is eligible, what is published, and when it falls back. Both commands are
+owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
+
+```
+uzi run held <run-id> [--json]
+```
+
+- **One row per publication, newest generation first.** Columns are `GEN`, `STATE`, `REF`,
+  `TIP` (short) and `EXPIRES` (UTC, RFC 3339; `-` when none is set). The states are
+  `prepared`, `invoked`, `created`, `create_unknown`, `refused`, `acknowledged`,
+  `delete_unknown`, `deleted` and `abandoned`. Below the table, a publication's `LastError`
+  prints as `gen <n>: <text>` and its refusal as `gen <n>: reason <code>`. When a ref may
+  still be on the forge (`acknowledged`, `created` or `delete_unknown`), it also prints
+  ``fetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire <run-id>` ``.
+- **No publication.** Prints `run <run-id> has no held publications` (nothing under
+  `--quiet`). That is also the answer for a run that was cancelled, parked, or failed on
+  an excluded origin, or whose work fell back to the archive.
+- **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
+  `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
+  `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty
+  result is `[]`, never `null`.
+- **Fetch it before it expires.** A ref is kept for `UZI_RECOVERY_READY_RETENTION` after its
+  release is acknowledged. Name a local branch so the commit stays reachable once the ref
+  is deleted:
+
+```
+git fetch origin refs/uzi-held/<run-id>/<generation>:refs/heads/recovered/<run-id>
+```
+
+`uzi run recovery <run-id>` also prints `hold <hold-id> held: <ref> @ <12-char tip>` for a
+hold that was released against a held publication (`held_ref` on the hold with `--json`).
+The run page shows the same refs in its **Held work** panel.
+
+```
+uzi run held expire <run-id> [--yes]
+```
+
+- **Ends the retention early.** It makes every **acknowledged** publication of the run due
+  for deletion now; the server's cleanup deletes each ref shortly after. The command deletes
+  nothing itself, and a publication that is not acknowledged is never touched.
+- **Destructive, so it confirms.** Once the ref is deleted, the work survives only in a
+  clone you fetched it into. Without `--yes` it prompts `[y/N]` on stderr (a bare Enter
+  aborts, printing `aborted` unless `--quiet`); with stdin not a terminal and no `--yes` it
+  refuses with exit 2 and changes nothing.
+- **Result.** `N held publication(s) of run <run-id> are due for deletion; the server deletes
+  each ref shortly`, or `run <run-id> has no acknowledged held publication to expire` when
+  there was nothing to do. `--json` prints the endpoint's object (`expired`, and the
+  affected `publications`).
+
+Held-ref cleanup does not depend on `UZI_HELD_PUBLICATION`: with the feature switched off,
+refs already published are still deleted at their expiry, and `uzi run held expire` still
+works.
+
+While a held ref may still exist, removing its repo or its forge connection is refused with a
+409. The error text (`connection` in place of `repo` for a connection removal) reads:
+
+```
+this repo has N held-work publication(s) of failed runs still on the forge (<ref> (<state>); ...);
+acknowledged refs clear at their retention expiry (or sooner with `uzi run held expire <run-id>`);
+refs in any other state (being created, reconciled or deleted) settle against the forge first; a
+ref that is then acknowledged follows the retention rule. Remove the repo after the block lifts
+```
+
+The body also carries `held_refs` (**at most 5** refs, each named with its state in the error
+text; any further ones are only counted, as `and N more`) and `held_count` (the true total).
+Retry the removal once the refs are deleted or settled.
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 

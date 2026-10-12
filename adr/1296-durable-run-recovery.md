@@ -606,4 +606,32 @@ Existing archive source-boundary diagnostics, including failed/cancelled
 foreground `execution_tail_present`, remain applicable to capture fallback.
 This amendment adds no intent, endpoint, crash discovery, forge driver or E2E
 mechanism and does not implement #2544 quota, #2545 failed publication or
-#2506 failed thin release.
+#2506 failed thin release. (Superseded for #2545 only by the 2026-10-12
+amendment below: failed publication is now implemented by
+[ADR-2545](2545-failed-run-held-publication.md). #2544 and #2506 remain
+excluded.)
+
+## Amendment 2026-10-12 — #2545: a failed run's held work is published before custody release
+
+**Status**: Implemented in API and worker. See
+[ADR-2545](2545-failed-run-held-publication.md) for the full design.
+
+This adds a fifth final disposition to the inventory-guarded hold:
+`final_disposition = release_evidence = 'held_publication'`, bound by NULL-safe
+CHECKs to a non-null `final_publication_id`. It applies only to a `failed` run
+whose `fail_origin` is not `push_secret_blocked` or `worker_residue_blocked`,
+for the exact claim generation, with a `created` publication row whose tip and
+coverage digest match the FINAL. `recovery_inventory_hold_guard` enforces this.
+The API first creates `refs/uzi-held/<run-id>/<generation>` with the owner's
+stored connection credential from a worker-uploaded, scanned pack (step A). The
+worker then sends a journaled FINAL `{kind:"held_publication"}` on the existing
+release route (step B). Step B answers an exact replay before any mutable
+check and lists the ref outside every lock. It releases under worker, run, hold
+and publication locks.
+
+Cancelled and parked runs, completed runs (still #2507's receipt policy) and
+every unproved failed case keep the archive path, which is unchanged. Every
+step-A or step-B outcome short of an ACKed held FINAL falls back to capturing an
+archive on the same frozen record. Retention for the held ref runs from
+acknowledgement for `UZI_RECOVERY_READY_RETENTION`. #2544 quota and #2506 failed
+thin release remain excluded.

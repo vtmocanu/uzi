@@ -808,7 +808,8 @@ type Config struct {
 	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is the held-work publication switch.
 	// Unset or empty means on. Accepted values, case-insensitive and trimmed: true, on, 1, yes, t,
 	// y (on) and false, off, 0, no, f, n (off); any other value fails startup. It is copied to
-	// workersvc.Params.HeldPublication; nothing reads it there yet.
+	// workersvc.Params.HeldPublication (step A admission); the handler reads it from Config for the
+	// advertised protocol feature and step B.
 	HeldPublication bool
 }
 
