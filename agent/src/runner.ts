@@ -534,6 +534,10 @@ interface RecoveryCaptureResult {
   published: boolean;
   residueBlocked?: boolean;
   residueDetail?: string;
+  /** issue #1786: the clone HEAD that `verifyRunnerTrackingCovers` compared after the WIP marker (set
+   *  only on a verified capture). A later exit revalidates coverage against exactly this head; a
+   *  result without it (the degraded stub included) is never sufficient on its own. */
+  capturedHead?: string;
 }
 
 /** Issue #1766: how many doublings a credential recovery park's retry wait may grow by before it is capped
@@ -909,8 +913,9 @@ const REPO_AGENT_FOLDER_FEATURE = "repo_agent_folder";
  * PRD #1247 M5b: a /state report came back with the top-level `stale_claim` disposition
  * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
  * SUPERSEDED it. This flight no longer owns the run, so it MUST STOP without reporting a
- * terminal state (another claim owns the run now) and without setting a preserve flag
- * (normal teardown — the new claim has its own clone). Thrown from the flight.reportState
+ * terminal state (another claim owns the run now). It sets no preserve flag itself: the catch arm
+ * keeps any clone source until proven preserved (issue #1786, retainStoppedSource); the new claim
+ * has its own clone but cannot see this worker's bytes. Thrown from the flight.reportState
  * closure the moment any report is answered stale, and caught in executeClaim's catch chain
  * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Runtime throws and
  * catches stay in runner.ts; exported so tests can reproduce the reportState throw.
@@ -5154,6 +5159,11 @@ export class RunRunner {
     this.terminalDiskInterruption(flight);
     if (own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration
       || TERMINAL_RUN_STATUSES.has(own.status)) {
+      // issue #1786: a successor generation or a terminal status owns the run, but it cannot see this
+      // worker's bytes. The stop stays silent (no report, no capture); the clone is kept unless it is
+      // already held by the bare. This pre-handler check is the same exit as the recheck rows in
+      // handleRecoveryExhausted.
+      await this.retainStoppedSource(flight, flight.executor, "terminal_disk_precheck");
       await flight.batcher.close().catch(() => undefined);
       return true;
     }
@@ -14055,13 +14065,17 @@ export class RunRunner {
    *     terminal ack or ownership read, a given-up input receipt, a live non-running ack or
    *     ownership read) first run the credential-free exit capture: settle, WIP commit, fetch-back
    *     and verify, with a best-effort credential-free publish (skipped when the run is already
-   *     known terminal). Only a VERIFIED capture clears the preserve flags; otherwise the clone and
-   *     session are kept, so executeClaim's finally never discards the only copy of unfetched
-   *     commits or uncommitted edits;
+   *     known terminal). Only a VERIFIED capture whose coverage still holds at the exit clears the
+   *     preserve flags; otherwise the clone and session are kept, so executeClaim's finally never
+   *     discards the only copy of unfetched commits or uncommitted edits;
    *   - the STOP arms deliberately do NOT capture: a `stop` confirm (a stale_claim ack or another
    *     generation on the probe), the park loop's claim_generation mismatch, and a StaleClaimError
-   *     on the park report clear both preserve flags and discard the clone, per the #1247
-   *     stale-claim convention (the new claim has its own clone);
+   *     on the park report make no report and clear the session keep. issue #1786 reverses the
+   *     #1247 convention for the clone: the new claim has its own clone but cannot see this
+   *     worker's bytes, so every exit that used to clear `preserveRecoveryClone` now releases the
+   *     clone only when `retainStoppedSource` revalidates coverage at that exit for this exact
+   *     source (a cached capture, `capture.verified` or the degraded stub is never enough), and
+   *     otherwise keeps and records it for the operator channel;
    *   - a terminal status then ends the flight, a live non-running status posts a feed line and
    *     keeps the clone and session without parking (even after a verified capture), and a given-up
    *     input receipt reports the generic failure without the credentialed pre-report reap or any
@@ -14118,7 +14132,7 @@ export class RunRunner {
     }
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
-    let capture: { verified: boolean; published: boolean } | undefined;
+    let capture: { verified: boolean; published: boolean; capturedHead?: string } | undefined;
     let notified = false;
     // issue #1783 M3: consecutive capture attempts whose quiescence proof blocked (see
     // RECOVERY_CAPTURE_BLOCKED_ATTEMPTS); reset by any capture outcome that is not a blocked proof.
@@ -14153,8 +14167,8 @@ export class RunRunner {
     // run it first, because executeClaim's finally DISCARDS the clone once preserveRecoveryClone is
     // false: commits since the last fetch-back and uncommitted edits exist only there. The stop arms
     // (a `stop` confirm, the loop's claim_generation mismatch, a StaleClaimError on the park report)
-    // deliberately discard WITHOUT a capture, per the #1247 stale-claim convention: the new claim
-    // has its own clone. Credential-free: settle the executor (never reconciling),
+    // make no capture and no report; since issue #1786 they keep the clone unless coverage is
+    // revalidated (releaseCloneIfCovered). Credential-free: settle the executor (never reconciling),
     // then WIP commit, fetch-back and verify, then a best-effort join-token publish (skipped for a
     // run already known terminal). True only for a VERIFIED capture; never throws.
     const captureForCredentialExit = async (publish: boolean): Promise<boolean> => {
@@ -14191,10 +14205,30 @@ export class RunRunner {
       }
       return false;
     };
-    // Only a verified capture may release the clone and session to executeClaim's finally.
-    const keepUnlessCaptured = (captured: boolean): void => {
-      flight.preserveRecoveryClone = !captured;
+    // issue #1786: every exit below that used to clear `preserveRecoveryClone` on a cached verdict (a
+    // captured/verified memo, a stale claim, a terminal status) hands the clone to executeClaim's
+    // finally only when `retainStoppedSource` revalidates coverage NOW for this exact source: the
+    // memoized capture's head (a memo without one, the degraded stub included, is never covered), or
+    // the clone's current head when nothing was captured. Anything else keeps the source and records
+    // it for the operator channel. Local-only: no report, publish or credential call, no new wait. A
+    // predecessor-capture flight keeps its custody path (it deletes only through its own verified
+    // in-place release), so its flag keeps the earlier shape.
+    const releaseCloneIfCovered = async (reason: string, stale = false): Promise<void> => {
+      if (flight.predecessorCapture) {
+        flight.preserveRecoveryClone = false;
+        return;
+      }
+      flight.preserveRecoveryClone = true;
+      await this.retainStoppedSource(flight, executor, reason, {
+        memo: capture !== undefined, ...(capture?.capturedHead === undefined ? {} : { capturedHead: capture.capturedHead }), stale,
+      });
+    };
+    // Only a verified capture may release the clone and session to executeClaim's finally, and the
+    // clone only when its coverage still holds at this exit.
+    const keepUnlessCaptured = async (captured: boolean, reason: string): Promise<void> => {
       flight.preserveSession = !captured;
+      if (captured) await releaseCloneIfCovered(reason);
+      else flight.preserveRecoveryClone = true;
     };
     // A live non-running status (paused, awaiting_approval, ...): never park over it and never fail
     // it. Capture, say so on the feed, and keep the clone and session for whoever resumes it.
@@ -14224,11 +14258,12 @@ export class RunRunner {
               await retryWait();
               continue;
             case "stop":
-              // #1247: the run moved on under this worker. Stop silently: no report, normal teardown.
+              // #1247: the run moved on under this worker. Stop silently: no report. issue #1786: the
+              // successor claim cannot see this clone's bytes, so it is kept unless proven preserved.
               runLog.info("credential recovery park: the claim moved on under this worker; stopping silently", {
                 run_id: flight.runId,
               });
-              flight.preserveRecoveryClone = false;
+              await releaseCloneIfCovered("recovery_confirm_stop", true);
               flight.preserveSession = false;
               return false;
             case "gone":
@@ -14237,10 +14272,10 @@ export class RunRunner {
               runLog.info("credential recovery park: the run is not found for this worker; keeping the clone and session", {
                 run_id: flight.runId,
               });
-              keepUnlessCaptured(capture !== undefined);
+              await keepUnlessCaptured(capture !== undefined, "recovery_confirm_gone");
               return false;
             case "terminal":
-              keepUnlessCaptured(await captureForCredentialExit(false));
+              await keepUnlessCaptured(await captureForCredentialExit(false), "recovery_confirm_terminal");
               return false;
             case "held":
               return await credentialHeld();
@@ -14254,7 +14289,7 @@ export class RunRunner {
             case "receipt_failed":
               // The run fails, so capture first. keepCustody: no credentialed pre-report reap (it
               // would retry the deferred credential operation) and no custody settle; the hold stays open.
-              keepUnlessCaptured(await captureForCredentialExit(true));
+              await keepUnlessCaptured(await captureForCredentialExit(true), "recovery_receipt_failed");
               await this.reportGenericFailure(claim, flight, confirm.error, { keepCustody: true });
               return false;
           }
@@ -14268,8 +14303,9 @@ export class RunRunner {
           status = own.status;
           if ((credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
               own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
-            // An authoritative successor claim keeps the existing stale-claim cleanup convention.
-            flight.preserveRecoveryClone = false;
+            // An authoritative successor claim: no report, and (issue #1786) the clone is kept unless
+            // proven preserved, since the successor cannot see this worker's bytes.
+            await releaseCloneIfCovered("recovery_other_generation", true);
             flight.preserveSession = false;
             return false;
           }
@@ -14279,8 +14315,9 @@ export class RunRunner {
           }
         } catch (probeError) {
           if (probeError instanceof RequestError && probeError.status === 404) {
-            if (credentialDeferred) keepUnlessCaptured(capture !== undefined);
-            if (opts.terminalDisk && !credentialDeferred) { flight.preserveRecoveryClone = false; flight.preserveSession = false; }
+            if (credentialDeferred) await keepUnlessCaptured(capture !== undefined, "recovery_probe_gone");
+            // Missing authority is unknown, not a disposal proof: a seeded source stays unless covered.
+            if (opts.terminalDisk && !credentialDeferred) { await releaseCloneIfCovered("recovery_probe_gone"); flight.preserveSession = false; }
             return false;
           }
           if (credentialDeferred) await note(feed.confirmUnknown);
@@ -14295,13 +14332,14 @@ export class RunRunner {
           if (cancelDisposition !== undefined) return status === "recovery_wait";
           if (credentialDeferred && status !== "recovery_wait") {
             if (terminal.has(status)) {
-              keepUnlessCaptured(await captureForCredentialExit(false));
+              await keepUnlessCaptured(await captureForCredentialExit(false), "recovery_terminal_status");
               return false;
             }
             return await credentialHeld();
           }
           if (terminal.has(status)) {
-            flight.preserveRecoveryClone = false;
+            // issue #1786: a terminal status is reporting evidence, never a source proof.
+            await releaseCloneIfCovered("recovery_terminal_status");
             flight.preserveSession = false;
             // PRD #1349 M2 (D4.5) / #1539: a statusless cancel ack (HTTP 204), or a thrown cancel
             // report that actually LANDED, followed by a terminal ownership read arrives here with
@@ -14344,8 +14382,9 @@ export class RunRunner {
             const ack = await reportState({ status: "failed", failure_reason: "run cancelled" });
             if (ack.status && terminal.has(ack.status)) {
               if (!ownerCancel) {
-                flight.preserveRecoveryClone = credentialDeferred && !cancelCaptured;
                 flight.preserveSession = credentialDeferred && !cancelCaptured;
+                if (credentialDeferred && !cancelCaptured) flight.preserveRecoveryClone = true;
+                else await releaseCloneIfCovered("recovery_cancel_ack");
               }
               // PRD #1349 M2 (D4.5) / #1539: the provider was reaped above while actively-claimed;
               // now the terminal report has landed, so run the non-status-gated custody settle. A
@@ -14399,7 +14438,8 @@ export class RunRunner {
             if (attempt.residueBlocked) blockedDetail = attempt.residueDetail ?? "not quiescent";
             if (attempt.verified) {
               capture = attempt;
-              flight.preserveRecoveryClone = credentialDeferred;
+              if (credentialDeferred) flight.preserveRecoveryClone = true;
+              else await releaseCloneIfCovered("recovery_capture_verified");
               flight.predecessorCaptureVerified = flight.predecessorCapture;
               retries = 0;
             }
@@ -14516,9 +14556,9 @@ export class RunRunner {
             continue;
           }
           this.terminalDiskInterruption(flight);
-          if (own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration
-            || TERMINAL_RUN_STATUSES.has(own.status)) {
-            flight.preserveRecoveryClone = false;
+          const movedGeneration = own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration;
+          if (movedGeneration || TERMINAL_RUN_STATUSES.has(own.status)) {
+            await releaseCloneIfCovered("terminal_disk_recheck", movedGeneration);
             flight.preserveSession = false;
             return false;
           }
@@ -14529,7 +14569,8 @@ export class RunRunner {
           await batcher.awaitPermanentFailureSettled();
           this.terminalDiskInterruption(flight);
           if (flight.terminalResolved || this.outbox?.hasPendingTerminal(flight.runId, flight.claimGeneration)) {
-            flight.preserveRecoveryClone = false;
+            // Pending reporting authority is not source authority (issue #1786); the report keeps precedence.
+            await releaseCloneIfCovered("terminal_disk_pending_terminal");
             flight.preserveSession = false;
             await this.reportGenericFailure(claim, flight, err);
             return false;
@@ -14573,14 +14614,17 @@ export class RunRunner {
               },
             });
             // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
+            // issue #1786: a clone the capture released is revalidated again at this exit.
+            if (!flight.preserveRecoveryClone) await releaseCloneIfCovered("recovery_park_ack");
             return true;
           }
           if (ack.status === "recovery_wait") {
             if (credentialDeferred) {
               // Verified fetch-back plus the park ACK ends the retained-clone hold. The
               // tracking ref and session remain recovery sources; normal retirement still
-              // requires its independent quiescence proof before removing the clone.
-              flight.preserveRecoveryClone = false;
+              // requires its independent quiescence proof before removing the clone. issue #1786: the
+              // clone is released only when coverage is revalidated at this ACK; otherwise it stays.
+              await releaseCloneIfCovered("recovery_park_ack");
               // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would
               // retry the deferred credential operation and could release custody. The hold is kept.
               runLog.info("run parked for credential recovery", {
@@ -14595,6 +14639,8 @@ export class RunRunner {
               });
               return true;
             }
+            // issue #1786: a clone the capture released is revalidated again at this exit.
+            if (!flight.preserveRecoveryClone) await releaseCloneIfCovered("recovery_park_ack");
             runLog.info("run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
@@ -14619,7 +14665,7 @@ export class RunRunner {
           }
           if (ack.status && ack.status !== "running") {
             if (terminal.has(ack.status)) {
-              flight.preserveRecoveryClone = false;
+              await releaseCloneIfCovered("recovery_park_ack_terminal");
               flight.preserveSession = false;
               return false;
             }
@@ -14635,8 +14681,9 @@ export class RunRunner {
           // because this healthy worker's heartbeats prevent stale-worker requeue.
         } catch (reportError) {
           if ((credentialDeferred || opts.terminalDisk) && reportError instanceof StaleClaimError) {
-            // #1247: the run moved on under this worker. Stop silently, normal teardown.
-            flight.preserveRecoveryClone = false;
+            // #1247: the run moved on under this worker. Stop silently; issue #1786: the clone is kept
+            // unless proven preserved (no write through the stale claim).
+            await releaseCloneIfCovered("recovery_park_report_stale", true);
             flight.preserveSession = false;
             return false;
           }
@@ -15067,6 +15114,9 @@ export class RunRunner {
     // POSITIVELY VERIFY the LOCAL restore point: the bare's tracking ref now covers the
     // run's current HEAD (incl. any WIP marker), so a same-worker reseed recovers exactly
     // this tip. A clean tree whose already-committed tip already matches is a no-op success.
+    // issue #1786: the head being compared, kept for the exit-time coverage revalidation. The clone is
+    // quiescent here (proved before and after the WIP marker), so this is the head the verify reads.
+    const headAtVerify = await this.git.worktreeHead(worktreePath);
     const verified = await this.git.verifyRunnerTrackingCovers(
       barePath,
       worktreePath,
@@ -15074,6 +15124,7 @@ export class RunRunner {
     );
     if (opts.terminalDisk) this.terminalDiskInterruption(flight);
     if (!verified) return { verified: false, published: false };
+    const capturedHead = headAtVerify ?? undefined;
     // PRD #1416 M3 (C8): bridge a divergent tracking tip AFTER the fetch-back + verify (so the verify
     // still confirms the tracking ref covered the run's HEAD H) and BEFORE the capture publish, so
     // the recovery restore point + its published checkpoint hold B — a reseed on resume adopts B
@@ -15110,9 +15161,9 @@ export class RunRunner {
     // `publish: false` (a run already known terminal) keeps the verified local capture and skips
     // the publish: a terminal run is never resumed from a checkpoint.
     if (opts.credentialFree) {
-      if (opts.publish === false) return { verified, published: false };
+      if (opts.publish === false) return { verified, published: false, capturedHead };
       const freePublished = await this.publishCheckpointBestEffort(flight, barePath, branch, undefined, opts.signal);
-      return { verified, published: freePublished };
+      return { verified, published: freePublished, capturedHead };
     }
     let published = false;
     try {
@@ -15132,7 +15183,7 @@ export class RunRunner {
       });
     }
     if (opts.terminalDisk) this.terminalDiskInterruption(flight);
-    return { verified, published };
+    return { verified, published, capturedHead };
   }
 
   /**
@@ -15852,6 +15903,13 @@ export class RunRunner {
    */
   private async retainStoppedSource(
     flight: RunFlight, executor: Executor, reason: string,
+    /** issue #1786 M2: set by a `handleRecoveryExhausted` exit. The handler latches the preserve flag
+     *  itself, so a prior latch is not a reason to skip the coverage check; `covered` then clears it.
+     *  `memo`: the handler holds a capture memo, whose `capturedHead` (when it has one) is the head to
+     *  revalidate; a memo without one (the degraded stub) is never covered. No memo: the clone's
+     *  current head, as at the generic arms. `stale`: the exit is a stale-claim or other-generation
+     *  one, so the guarded inventory stays closed (no ownership probe or upload through that claim). */
+    handler?: { memo: boolean; capturedHead?: string; stale: boolean },
   ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
     const clonePath = flight.worktreePath;
     if (clonePath === undefined) return "no_source";
@@ -15865,7 +15923,7 @@ export class RunRunner {
     flight.preserveRecoveryClone = true;
     flight.stoppedSourceKept = true;
     // The stale claim owns the guarded inventory now: no ownership probe, freeze or upload from here.
-    flight.keepGuardedInventoryOpen = true;
+    if (!handler || handler.stale) flight.keepGuardedInventoryOpen = true;
     const log = flight.runLog;
     let blocked = true;
     try {
@@ -15885,9 +15943,10 @@ export class RunRunner {
     }
     const attemptId = flight.runnerClone?.attemptId;
     const key = pathBasename(cloneKeyOf(clonePath).canonicalPath);
-    if (!blocked && !priorPreserve && !flight.predecessorCapture && flight.claimGeneration > 0) {
+    if (!blocked && (handler !== undefined || !priorPreserve) && !flight.predecessorCapture && flight.claimGeneration > 0 &&
+        !(handler?.memo === true && handler.capturedHead === undefined)) {
       try {
-        const head = await this.git.worktreeHead(clonePath);
+        const head = handler?.memo === true ? handler.capturedHead! : await this.git.worktreeHead(clonePath);
         if (head !== null) {
           const quiesce = async (paths: string[]): Promise<boolean> => {
             if (process.platform !== "linux") return false;
@@ -15905,7 +15964,7 @@ export class RunRunner {
             head, { runId: flight.runId, generation: flight.claimGeneration }, quiesce,
           );
           if (covered === "covered") {
-            flight.preserveRecoveryClone = priorPreserve;
+            flight.preserveRecoveryClone = false;
             flight.stoppedSourceKept = false;
             log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
             return "covered";

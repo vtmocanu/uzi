@@ -357,7 +357,9 @@ describe("terminal execution disk deferral", () => {
         assert.equal(f.reclaims(), 1);
         assert.deepEqual(latest, [undefined, undefined, undefined], "no publish ACK means no latest-checkpoint claim");
         assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "cap ACK causes no extra failure report");
-        assert.equal(fs.existsSync(f.clone()), false, "server-terminal cap uses normal cleanup");
+        // issue #1786: a terminal ACK is reporting evidence, not a source proof. A verified capture that is
+        // still covered at the exit uses normal cleanup; the unverified (degraded) one keeps its clone.
+        assert.equal(fs.existsSync(f.clone()), !verified, verified ? "server-terminal cap uses normal cleanup" : "an unverified capture keeps the clone");
       } finally { client.reportState = report; }
     });
   }

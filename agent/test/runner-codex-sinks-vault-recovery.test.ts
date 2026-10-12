@@ -221,7 +221,8 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     client.protocolFeatures = [VAULT_FEATURE];
     let locked = true;
     const rig1 = codexRig({ vaultLocked: () => locked });
-    const claim = gitlabClaim(1773);
+    // issue #1786: the park ACK releases the clone only when its coverage is revalidated, which needs a claim generation.
+    const claim = gitlabClaim(1773, { claim_generation: 1 });
     const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "RESUME.txt", "work saved across the vault lock\n");
       return { branch: ctx.branch };
@@ -961,7 +962,7 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     client.protocolFeatures = [VAULT_FEATURE];
     const rig = codexRig({ vaultLocked: () => true });
     const w = workThenDefer(rig);
-    const claim = gitlabClaim(1796);
+    const claim = gitlabClaim(1796, { claim_generation: 5 });
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => {
       if (body.status === "recovery_wait") {
