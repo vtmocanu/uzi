@@ -7284,10 +7284,10 @@ export class GitCache {
         (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
           { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
       // git re-encodes `--format` output to UTF-8, and a non-UTF-8 `encoding` header can blank or
-      // garble `%B` (a UTF-16-labelled `Fixes #12` prints empty without `--encoding=none` and as
-      // `a6ar` with it), so the `%e` refusal below is the gate: never drop it as redundant.
-      // `--encoding=none` does NOT yield raw message bytes. `%e` is git's own per-commit reading of that header (empty when absent), so no
-      // framing can be forged in a message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
+      // garble `%B`, so the `%e` refusal below is the gate: never drop it as redundant. `--format`
+      // output under `--encoding=none` is still not the raw message bytes. `%e` is git's own
+      // per-commit reading of that header (empty when absent), so no framing can be forged in a
+      // message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
       // (sha, encoding, message) triples. A commit OBJECT can still carry a NUL inside its message
       // (git hash-object --literally writes one, and %B stops printing at it), which would hide the
       // text after it; a literal NUL is written as a \u escape (never a raw control byte in source).
