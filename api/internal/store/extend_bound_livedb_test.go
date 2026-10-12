@@ -17,8 +17,8 @@ import (
 )
 
 // #2735: run_extension_cap_seconds is a PER-REQUEST maximum. These tests pin CreateExtendInput's
-// two bounds - `secs <= cap` and the technical total-time bound that keeps the served wall total
-// inside the worker timer's range - against a real Postgres.
+// two bounds - `secs <= cap` and the technical extension-admission bound
+// (workersvc.MaxRunWallSeconds) on the served wall total - against a real Postgres.
 
 func extendParams(id uuid.UUID, secs, capv int32, body string) store.CreateExtendInputParams {
 	return store.CreateExtendInputParams{

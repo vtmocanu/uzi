@@ -157,7 +157,7 @@ func TestExtendFillThenWallParkStopStaysInTimerRangeLiveDB(t *testing.T) {
 
 // (c) A persisted wall (72h, e.g. from a larger ceiling at freeze time) above the current service
 // ceiling (24h): the room is computed from the persisted 72h, +60 beyond it is refused, and after a
-// wall park and Stop the served total is still inside the timer range.
+// wall park and Stop the served total is still within the extension-admission limit.
 func TestPersistedWallAboveCeilingRoomAndStopLiveDB(t *testing.T) {
 	f := newWallParkExtendFixture(t, 604800)
 	f.sealClaimSecrets(t)

@@ -554,7 +554,9 @@ A run's harness is frozen at create. The admin's `run_extension_cap_seconds` now
 one extend request, not a run's lifetime total (#2735), so the old cumulative-cap case is
 gone; a run can be extended repeatedly. A successor run remains the way to switch harness,
 or to continue a run that has reached the technical total wall limit (2147483 s, the
-worker's timer limit; an over-limit extend is a 409 naming the room left). The successor is
+extension-admission limit `workersvc.MaxRunWallSeconds`; an over-limit extend is a 409 naming
+the room left; a configuration-driven served total may exceed it, since the worker re-arms its
+timers in chunks, #2761). The successor is
 seeded from `origin/agent/issue-N` if that branch exists, otherwise from main. It never
 adopts another run's checkpoint, and `run create` has no base flag. `uzi handoff --base`
 gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.

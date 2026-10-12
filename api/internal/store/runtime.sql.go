@@ -3099,7 +3099,9 @@ type CreateExtendInputParams struct {
 //
 // The predicate is the same non-terminal + timed-kind allowlist the sweep uses PLUS two bounds:
 // @cap is a PER-REQUEST maximum (@secs <= @cap; the cumulative budget_extension_seconds is not
-// capped by it), and a TECHNICAL bound keeps the served wall total inside the worker timer's range
+// capped by it), and a TECHNICAL extension-admission bound (workersvc.MaxRunWallSeconds) limits how
+// far an extend may raise the served wall total; a configuration-driven total may exceed it, since
+// the worker re-arms its timers in chunks (#2761)
 // (GREATEST(budget_wall_seconds, @base_wall_upper_seconds) + extension + @secs + GREATEST(
 // budget_finalize_seconds, @finalize_allowance_seconds) <= @max_wall_seconds; bigint arithmetic).
 // A completed/failed/cancelled run, a chat/judge/interactive run (which never times out), or a
