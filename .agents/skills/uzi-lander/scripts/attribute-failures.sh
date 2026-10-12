@@ -1,7 +1,18 @@
 #!/usr/bin/env bash
 # Advisory, offline reproduction of identifiable Go test failures in the caller's repo.
 set -euo pipefail
-die() { printf 'attribute-failures: %s\n' "$*" >&2; exit 2; }
+command -v jq >/dev/null || { printf 'attribute-failures: jq is required\n' >&2; exit 2; }
+# Escape rendering only; raw diagnostic evidence retains its original bytes.
+render() {
+  local escaped
+  escaped=$(jq -aRs .)
+  printf '%s' "${escaped:1:${#escaped}-2}"
+}
+die() { printf 'attribute-failures: %s\n' "$(printf %s "$*" | render)" >&2; exit 2; }
+# 8 MiB per input/stream and 32 candidates bound retained evidence and runs.
+# Read one extra byte to prove truncation, never slurp the original gate log.
+LIMIT=$((8 * 1024 * 1024))
+MAX_CANDIDATES=32
 declare -A args=()
 while (($#)); do
   case "$1" in --log|--base|--head) ;; *) die "unknown argument: $1";; esac
@@ -14,7 +25,6 @@ done
 log=${args[--log]}
 [[ $log == /* ]] || log="$PWD/$log"
 [[ -f $log && -r $log ]] || die 'log is not a readable file'
-command -v jq >/dev/null || die 'jq is required'
 repo=$(git rev-parse --show-toplevel 2>/dev/null) || die 'caller is not in a repository'
 base=$(git -C "$repo" rev-parse --verify --end-of-options "${args[--base]}^{commit}" 2>/dev/null) || die 'base is not a commit'
 head=$(git -C "$repo" rev-parse --verify --end-of-options "${args[--head]}^{commit}" 2>/dev/null) || die 'head is not a commit'
@@ -35,14 +45,25 @@ trap cleanup EXIT
 trap 'exit 2' HUP INT TERM
 : > "$evidence/base.jsonl"
 : > "$evidence/head.jsonl"
-printf 'base JSON: %s\nhead JSON: %s\n' "$evidence/base.jsonl" "$evidence/head.jsonl"
+printf 'base JSON: %s\nhead JSON: %s\n' "$(printf %s "$evidence/base.jsonl" | render)" "$(printf %s "$evidence/head.jsonl" | render)"
 printf 'Evidence is advisory, not merge authority.\n'
 jq -n --arg base "$base" --arg head "$head" '{base:$base,head:$head}' > "$evidence/refs.json"
 row() {
   # JSON strings keep even hostile names/reasons on one escaped, reviewable line.
-  jq -nr --args '$ARGS.positional | map(tojson) | join("\t")' -- "$@"
+  local value separator=
+  for value in "$@"; do
+    printf '%s"%s"' "$separator" "$(printf %s "$value" | render)"
+    separator=$'\t'
+  done
+  printf '\n'
 }
 printf 'name\tmodule/package\tbase\thead\tverdict\treason\n'
+head -c "$((LIMIT + 1))" -- "$log" > "$evidence/input.log" || die 'cannot read input log'
+if [[ $(wc -c < "$evidence/input.log") -gt $LIMIT ]]; then
+  printf '{"input_truncated":true}\n' > "$evidence/limits.json"
+  row '<input>' '-' unknown unknown inconclusive 'input exceeds byte limit'
+  exit 0
+fi
 jq -Rs '
   split("\n") | map(select(test("--- FAIL: "))) |
   map(sub("^.*?--- FAIL: "; "") | sub(" \\([0-9.]+s\\)\\r?$"; "") |
@@ -51,12 +72,17 @@ jq -Rs '
                 (.raw | contains(";") or contains("$(") or contains("\r") | not) and
                 (. as $c | .raw == .name or (.raw | startswith($c.name + "/"))))) |
   unique_by(if .valid then .name else .raw end)
-' "$log" > "$evidence/candidates.json"
+' "$evidence/input.log" > "$evidence/candidates.json"
+if [[ $(jq length "$evidence/candidates.json") -gt $MAX_CANDIDATES ]]; then
+  printf '{"candidate_limit_exceeded":true}\n' > "$evidence/limits.json"
+  row '<candidates>' '-' unknown unknown inconclusive 'candidate limit exceeded'
+  exit 0
+fi
 # Unsupported evidence is reported explicitly, even alongside supported Go failures.
-if jq -eRs 'test("(?im)(vitest|node:|node --|ERR_TEST|not ok |eslint|golangci|lint|gofmt|fmt-check|go vet|vet:|\\[build failed\\])")' "$log" >/dev/null; then
+if jq -eRs 'test("(?im)(vitest|node:|node --|ERR_TEST|not ok |eslint|golangci|lint|gofmt|fmt-check|go vet|vet:|\\[build failed\\])")' "$evidence/input.log" >/dev/null; then
   row '<unsupported>' '-' unknown unknown inconclusive 'unsupported failure evidence'
 fi
-declare -A groups=()
+declare -A groups=() sources=()
 while IFS= read -r candidate; do
   valid=$(jq -r '.valid' <<< "$candidate")
   name=$(jq -r 'if .valid then .name else .raw end' <<< "$candidate")
@@ -73,6 +99,7 @@ while IFS= read -r candidate; do
     continue
   fi
   file=${matches[0]#"$head:"}
+  sources["head:$name"]=$file
   module=${file%%/*}
   directory=${file%/*}
   pkg=${directory#"$module"}
@@ -86,6 +113,7 @@ while IFS= read -r candidate; do
     row "$name" "$module/$pkg" unknown unknown inconclusive 'base definition absent or ambiguous in owning package'
     continue
   fi
+  sources["base:$name"]=${base_matches[0]#"$base:"}
   group="$module/$pkg"
   groups[$group]="${groups[$group]-} $name"
 done < <(jq -c '.[]' "$evidence/candidates.json")
@@ -98,6 +126,27 @@ trees=$(cd "$trees" && pwd -P)
 git -C "$repo" worktree add --detach "$trees/base" "$base" > "$evidence/worktrees.log" 2>&1 || die 'base worktree setup failed'
 git -C "$repo" worktree add --detach "$trees/head" "$head" >> "$evidence/worktrees.log" 2>&1 || die 'head worktree setup failed'
 
+# FIFO readers close at LIMIT+1 bytes. Wait for the producer and both readers
+# before returning; no file-size limit reaches Go build artifacts.
+capture() {
+  local output=$1 directory=$2 producer_rc=0 out_rc=0 err_rc=0 out_pid err_pid
+  shift 2
+  mkfifo "$output.out.pipe" "$output.err.pipe"
+  head -c "$((LIMIT + 1))" < "$output.out.pipe" > "$output" & out_pid=$!
+  head -c "$((LIMIT + 1))" < "$output.err.pipe" > "$output.stderr" & err_pid=$!
+  (cd "$directory" && GOFLAGS=-mod=readonly GOPROXY=off GOTOOLCHAIN=local "$@") \
+    > "$output.out.pipe" 2> "$output.err.pipe" || producer_rc=$?
+  wait "$out_pid" || out_rc=$?
+  wait "$err_pid" || err_rc=$?
+  rm -- "$output.out.pipe" "$output.err.pipe"
+  CAPTURE_RC=$producer_rc
+  CAPTURE_TRUNCATED=false
+  [[ $(wc -c < "$output") -le $LIMIT && $(wc -c < "$output.stderr") -le $LIMIT &&
+     $out_rc -eq 0 && $err_rc -eq 0 ]] || CAPTURE_TRUNCATED=true
+  jq -n --argjson producer "$producer_rc" --argjson stdout_reader "$out_rc" \
+    --argjson stderr_reader "$err_rc" --argjson truncated "$CAPTURE_TRUNCATED" \
+    '{producer:$producer,stdout_reader:$stdout_reader,stderr_reader:$stderr_reader,truncated:$truncated}' > "$output.capture.json"
+}
 # Each independent package runs once per side, without retries; go test retains its
 # default ten-minute test timeout. Failure never prevents sibling packages.
 index=0
@@ -113,21 +162,23 @@ for group in "${!groups[@]}"; do
   for side in base head; do
     prefix="$evidence/$index-$side"
     cwd="$trees/$side/$module"
-    rc=0
-    (cd "$cwd" && GOFLAGS=-mod=readonly GOPROXY=off GOTOOLCHAIN=local go version) > "$prefix.version" 2> "$prefix.version.stderr" || rc=$?
-    version_rc=$rc
+    capture "$prefix.version" "$cwd" go version
+    version_rc=$CAPTURE_RC
+    version_truncated=$CAPTURE_TRUNCATED
     argv=(go test -json -race -count=1 -run "$pattern" "$pkg")
     printf -v quoted '%q ' GOFLAGS=-mod=readonly GOPROXY=off GOTOOLCHAIN=local "${argv[@]}"
-    rc=0
-    (cd "$cwd" && GOFLAGS=-mod=readonly GOPROXY=off GOTOOLCHAIN=local "${argv[@]}") > "$prefix.jsonl" 2> "$prefix.stderr" || rc=$?
+    capture "$prefix.jsonl" "$cwd" "${argv[@]}"
+    rc=$CAPTURE_RC
+    mv -- "$prefix.jsonl.stderr" "$prefix.stderr"
     cat "$prefix.jsonl" >> "$evidence/$side.jsonl"
     jq -n --arg sha "$(if [[ $side == base ]]; then printf %s "$base"; else printf %s "$head"; fi)" \
       --arg cwd "$cwd" --arg command "$quoted" --argjson status "$rc" --argjson version_status "$version_rc" \
+      --argjson truncated "$CAPTURE_TRUNCATED" --argjson version_truncated "$version_truncated" \
       --rawfile version "$prefix.version" --rawfile version_stderr "$prefix.version.stderr" \
       --rawfile stderr "$prefix.stderr" \
       '{sha:$sha,cwd:$cwd,command:$command,env:{GOFLAGS:"-mod=readonly",GOPROXY:"off",GOTOOLCHAIN:"local"},
         version_command:"GOFLAGS=-mod=readonly GOPROXY=off GOTOOLCHAIN=local go version",
-        status:$status,version_status:$version_status,version:$version,version_stderr:$version_stderr,stderr:$stderr}' > "$prefix.meta.json"
+        truncated:$truncated,version_truncated:$version_truncated,status:$status,version_status:$version_status,version:$version,version_stderr:$version_stderr,stderr:$stderr}' > "$prefix.meta.json"
     # Invalid JSON, setup failure, skips and incomplete package execution invalidate all
     # selected tests in that run. Exit status supports completeness, never test attribution.
     if ! jq -s --slurpfile meta "$prefix.meta.json" '
@@ -143,6 +194,10 @@ for group in "${!groups[@]}"; do
         . as $start |
         ([$events[] | select(.Package == $start.Package and .Test == $start.Test and
           (.Action == "pass" or .Action == "fail"))] | length) == 1) and
+      all(.[] | select(.Test != null and (.Action == "pass" or .Action == "fail" or .Action == "skip"));
+        . as $terminal |
+        ([$events[] | select(.Package == $terminal.Package and .Test == $terminal.Test and .Action == "run")] | length) == 1) and
+      $m.truncated == false and $m.version_truncated == false and
       $m.version_status == 0 and $m.version_stderr == "" and $m.stderr == "" and
       ($m.status == 0 or $m.status == 1) and
       (any(.[]; .Test == null and (.Action == "pass" or .Action == "fail"))) and
@@ -159,11 +214,21 @@ for group in "${!groups[@]}"; do
   for name in "${names[@]}"; do
     for side in base head; do
       prefix="$evidence/$index-$side"
-      jq -s --arg name "$name" --arg root "$trees/$side" --slurpfile valid "$prefix.valid" '
+      jq -s --arg name "$name" --arg root "$trees/$side" --arg source "${sources["$side:$name"]}" --slurpfile valid "$prefix.valid" '
         def selected: .Test == $name or ((.Test // "") | startswith($name + "/"));
+        # Go logger first lines have four spaces; continuations have eight.
+        # Normalize only the discovered definition filename or its full path.
+        def source_prefix:
+          . as $line |
+          [($source | split("/")[-1]), ($root + "/" + $source)] |
+          map(("    " + . + ":") as $prefix |
+              select($line | startswith($prefix)) |
+              select($line | ltrimstr($prefix) | test("^[0-9]+: ")) | $prefix) | .[0];
         def normalize:
-          split($root) | join("<worktree>") |
-          gsub("^(?<file>\\s*(?:<worktree>/)?[A-Za-z0-9_./-]+\\.go):[0-9]+(?=:)"; "\(.file):<line>");
+          source_prefix as $prefix |
+          (if $prefix != null then $prefix + "<line>: " + (ltrimstr($prefix) | sub("^[0-9]+: "; ""))
+           else . end) |
+          split($root) | join("<worktree>");
         def diagnostic:
           split("\n") | map(select(length > 0) |
             select(test("^\\s*(=== (RUN|PAUSE|CONT|NAME)\\s+Test[A-Za-z0-9_]*(/.*)?|--- (PASS|FAIL|SKIP): Test[A-Za-z0-9_]*(/.*)? \\([0-9.]+s\\)|PASS|FAIL)$") | not) |
@@ -178,7 +243,9 @@ for group in "${!groups[@]}"; do
                     ([$events[].Package] | unique | length) != 1 or
                     any($events[]; .Action == "skip") then "unknown" else $terminal[0].Action end),
          failed:$failed,diagnostics:$diagnostics,
-         assertion:any($diagnostics[]; .text | test("(?i)(\\.go:<line>|assert|error|expected|want|got|fatal)"))}
+         # Recognition is independent of normalization sentinels in assertion text.
+         assertion:any($events[]; .Action == "output" and
+           any((.Output // "" | split("\n"))[]; source_prefix != null))}
       ' "$prefix.jsonl" > "$prefix-$name.result" 2>/dev/null || printf '{"result":"unknown"}\n' > "$prefix-$name.result"
     done
     verdict=$(jq -nr --slurpfile b "$evidence/$index-base-$name.result" --slurpfile h "$evidence/$index-head-$name.result" '

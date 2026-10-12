@@ -34,6 +34,10 @@ printf 'head\n' > "$WORK/repo/revision"
 git -C "$WORK/repo" add api revision
 git -C "$WORK/repo" commit -qm head
 HEAD_SHA=$(git -C "$WORK/repo" rev-parse HEAD)
+ORIGINAL_HEAD=$HEAD_SHA
+git -C "$WORK/repo" mv api/pkg/a_test.go api/pkg/renamed_test.go
+git -C "$WORK/repo" commit -qm renamed
+RENAMED_HEAD=$(git -C "$WORK/repo" rev-parse HEAD)
 export BASE HEAD_SHA WORK
 cat > "$WORK/bin/go" <<'STUB'
 #!/usr/bin/env bash
@@ -50,6 +54,14 @@ jq -nc --arg sha "$sha" --arg cwd "$PWD" --arg flags "$GOFLAGS" --arg proxy "$GO
 if [[ $1 == version ]]; then
   [[ $# -eq 1 ]] || exit 97
   if [[ $MODE == toolchain ]]; then echo 'go: toolchain unavailable offline' >&2; exit 1; fi
+  if [[ $MODE == oversized_version* ]]; then
+    if [[ $MODE == oversized_version_stderr ]]; then
+      head -c 16777217 /dev/zero >&2
+    else
+      head -c 16777217 /dev/zero
+    fi
+    exit 0
+  fi
   echo 'go version fixture linux/amd64'
   exit 0
 fi
@@ -57,6 +69,11 @@ fi
 [[ $6 == "$EXPECTED_PATTERN" && $7 == "$EXPECTED_PKG" ]] || exit 97
 [[ $module == "$EXPECTED_MODULE" || $MODE == multi ]] || exit 97
 package="fixture/$module/${7#./}"
+if [[ $MODE == oversized_stdout || $MODE == oversized_stderr ]]; then
+  if [[ $MODE == oversized_stderr ]]; then head -c 16777217 /dev/zero >&2
+  else head -c 16777217 /dev/zero; fi
+  exit 1
+fi
 if [[ $MODE == invalid ]]; then printf 'not JSON\n'; exit 1; fi
 if [[ $MODE == truncated ]]; then
   printf '{"Action":"run","Package":"fixture/api/pkg","Test":"TestAlpha"}\n{"Action":'
@@ -80,12 +97,13 @@ any_fail=false
 for name in "${names[@]}"; do
   outcome=fail
   case "$MODE" in
-    introduced|batch|controller|api_root|subselect) [[ $sha == "$BASE" ]] && outcome=pass ;;
+    introduced|batch|controller|api_root|subselect|no_run_introduced|selected_no_run_introduced|child_no_run_introduced) [[ $sha == "$BASE" ]] && outcome=pass ;;
     pass|livedb) outcome=pass ;;
     base_fail) [[ $sha == "$HEAD_SHA" ]] && outcome=pass ;;
     skip) outcome=skip ;;
   esac
-  event run "$name"
+  if [[ $MODE != no_run* && $MODE != selected_no_run* ||
+        $MODE == *_introduced && $sha == "$BASE" ]]; then event run "$name"; fi
   if [[ $MODE == livedb ]]; then
     event run "$name/LiveDB"
     event skip "$name/LiveDB"
@@ -99,19 +117,39 @@ for name in "${names[@]}"; do
     any_fail=true
     child="$name/child"
     [[ $MODE == subtests && $sha == "$HEAD_SHA" ]] && child="$name/other"
-    event run "$child"
+    [[ $MODE == no_run* || $MODE == child_no_run* ]] || event run "$child"
+    [[ $MODE != duplicate_run ]] || event run "$child"
     if [[ $MODE != markers ]]; then
       root=$("$REAL_GIT" rev-parse --show-toplevel)
       line=12
       [[ $sha == "$HEAD_SHA" ]] && line=87
       value=41
       [[ $MODE == changed && $sha == "$HEAD_SHA" ]] && value=42
-      if [[ $MODE == location_value ]]; then
+      if [[ $MODE == continuation* ]]; then
+        value=41
+        [[ $sha == "$HEAD_SHA" ]] && value=42
+        source=file.go
+        [[ $MODE == *test* ]] && source=a_test.go
+        continuation="$source:$value: got different path"
+        [[ $MODE == *indent* ]] && continuation="        $continuation"
+        if [[ $MODE == *split* ]]; then
+          event output "$child" "    a_test.go:$line: expected path"
+          event output "$child" "$continuation"
+        else
+          event output "$child" "$(printf '    a_test.go:%s: expected path\n%s' "$line" "$continuation")"
+        fi
+      elif [[ $MODE == unknown_location ]]; then
+        event output "$child" '    unknown_test.go:12: expected 7 got 41'
+      elif [[ $MODE == location_value ]]; then
         value=41
         [[ $sha == "$HEAD_SHA" ]] && value=42
         event output "$child" "    a_test.go:$line: expected file.go:$value: got different path"
+      elif [[ $MODE == body_root ]]; then
+        event output "$child" "    a_test.go:$line: expected path $root/api/pkg/example"
       else
-        event output "$child" "    $root/$module/pkg/a_test.go:$line: expected 7 got $value"
+        source_file=a_test.go
+        [[ $MODE != renamed || $sha != "$HEAD_SHA" ]] || source_file=renamed_test.go
+        event output "$child" "    $root/$module/pkg/$source_file:$line: expected 7 got $value"
       fi
     fi
     duration=0.01
@@ -149,7 +187,7 @@ clean_trees() {
   [[ $(git worktree list --porcelain | jq -Rs 'split("\n") | map(select(startswith("worktree "))) | length') -eq 1 ]] ||
     fail "$MODE leaked a registered worktree"
   local path
-  for path in "$WORK/tmp"/attribute-worktrees.*; do
+  for path in "$TMPDIR"/attribute-worktrees.*; do
     [[ ! -e $path ]] || fail "$MODE leaked worktree container"
   done
 }
@@ -204,10 +242,45 @@ run introduced; verdict pr-introduced
 cd "$WORK/repo"
 run pass; verdict not-reproduced
 run matching; verdict pre-existing
+HEAD_SHA=$RENAMED_HEAD
+run renamed; verdict inconclusive; has 'different failure'
+HEAD_SHA=$ORIGINAL_HEAD
+run body_root; verdict pre-existing
 run changed; verdict inconclusive; has 'different failure'
 jq -es 'any(.[]; (.Output // "") | contains("got 41"))' "${evidence_paths[0]}" >/dev/null || fail 'base diagnostic lost'
 jq -es 'any(.[]; (.Output // "") | contains("got 42"))' "${evidence_paths[1]}" >/dev/null || fail 'head diagnostic value lost'
 run location_value; verdict inconclusive; has 'different failure'
+for mode in continuation continuation_test continuation_split continuation_test_split continuation_indent continuation_test_indent continuation_indent_split continuation_test_indent_split no_run no_run_introduced selected_no_run selected_no_run_introduced child_no_run child_no_run_introduced duplicate_run; do
+  run "$mode"; verdict inconclusive
+  [[ $(<"$WORK/out") != *'"pre-existing"'* && $(<"$WORK/out") != *'"pr-introduced"'* ]] ||
+    fail "$mode overclaimed evidence"
+done
+run unknown_location; verdict inconclusive
+for mode in oversized_stdout oversized_stderr oversized_version oversized_version_stderr; do
+  run "$mode"; verdict inconclusive
+  directory=${evidence_paths[0]%/*}
+  for side in base head; do
+    jq -e '.truncated or .version_truncated' "$directory/1-$side.meta.json" >/dev/null ||
+      fail "$mode missing truncation metadata"
+    for suffix in jsonl stderr version version.stderr; do
+      [[ $(wc -c < "$directory/1-$side.$suffix") -le 8388609 ]] || fail "$mode unbounded capture"
+    done
+    [[ ! -e $directory/1-$side.jsonl.out.pipe && ! -e $directory/1-$side.version.err.pipe ]] ||
+      fail "$mode leaked FIFO"
+  done
+done
+run oversized_input "$(printf '%s' '--- FAIL: TestAlpha (0.01s)'; head -c 8388610 /dev/zero | tr '\000' x)"
+verdict inconclusive; has 'input exceeds byte limit'; no_go
+directory=${evidence_paths[0]%/*}
+[[ $(wc -c < "$directory/input.log") -eq 8388609 ]] || fail 'input snapshot consumed beyond cap'
+jq -e .input_truncated "$directory/limits.json" >/dev/null || fail 'missing input truncation'
+candidates=
+for ((i=0; i<33; i++)); do candidates+="--- FAIL: TestLimit$i (0.01s)"$'\n'; done
+run candidate_limit "$candidates"; verdict inconclusive; has 'candidate limit exceeded'; no_go
+jq -e .candidate_limit_exceeded "${evidence_paths[0]%/*}/limits.json" >/dev/null || fail 'missing candidate limit'
+run bidi $'--- FAIL: TestBad\342\200\256 (0.01s)'; no_go
+has '\u202e'
+[[ $(<"$WORK/out") != *$'\342\200\256'* ]] || fail 'raw bidi rendered'
 run subtests; verdict inconclusive; has 'different failure'
 run base_fail; verdict inconclusive; has 'base fails, head passes'
 run markers; verdict inconclusive; has 'insufficient assertion'
@@ -259,6 +332,27 @@ expect_two --log "$WORK/failure.log" --base "$blob" --head "$HEAD_SHA"
 expect_two --log "$WORK/failure.log" --base --help --head "$HEAD_SHA"
 expect_two --log "$WORK/failure.log" --base "$BASE" --head "$HEAD_SHA" --base "$BASE"
 expect_two --log "$WORK/failure.log" --base "$BASE" --head "$HEAD_SHA" --other x
+expect_two $'--bad\nINJECT\033[31m\342\200\256'
+[[ $(wc -l < "$WORK/err") -eq 1 && $(<"$WORK/err") != *$'\033'* &&
+   $(<"$WORK/err") != *$'\342\200\256'* ]] || fail 'unsafe CLI error rendering'
+has_paths_tmp=$TMPDIR
+TMPDIR="$WORK/tmp/"$'path\n\033[31m\342\200\256'
+mkdir -p "$TMPDIR"
+MODE=matching
+printf '%s\n' '--- FAIL: TestAlpha (0.01s)' > "$WORK/failure.log"
+"$SCRIPT" --log "$WORK/failure.log" --base "$BASE" --head "$HEAD_SHA" > "$WORK/out" 2> "$WORK/err"
+verdict inconclusive
+[[ $(wc -l < "$WORK/out") -eq 5 && $(<"$WORK/out") != *$'\033'* &&
+   $(<"$WORK/out") != *$'\342\200\256'* ]] || fail 'unsafe path rendering'
+while IFS= read -r line; do
+  case "$line" in
+    'base JSON: '*|'head JSON: '*)
+      decoded=$(printf '"%s"\n' "${line#*: }" | jq -r .)
+      [[ -r $decoded ]] || fail 'escaped evidence path unusable' ;;
+  esac
+done < "$WORK/out"
+clean_trees
+TMPDIR=$has_paths_tmp
 expect_two --log "$WORK/failure.log" --base "$BASE" --head
 expect_two --log "$WORK/repo" --base "$BASE" --head "$HEAD_SHA"
 MODE=introduced
