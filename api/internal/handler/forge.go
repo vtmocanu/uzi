@@ -1155,7 +1155,7 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 // always reported in held_count.
 const heldRefListCap = 5
 
-// heldRestrictConstraint is run_held_publications' live pointer FK (migration 00324). The
+// heldRestrictConstraint is run_held_publications' live pointer FK (migration 00328). The
 // handlers match it by name so only a held restriction maps to the held 409.
 const heldRestrictConstraint = "run_held_publications_live_run_id_fkey"
 

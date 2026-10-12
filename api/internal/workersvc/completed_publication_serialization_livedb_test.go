@@ -252,7 +252,7 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	// The generated hold queries select final_publication_id (migration 00324), which this
+	// The generated hold queries select final_publication_id (migration 00328), which this
 	// database deliberately stops short of. Add the bare column so production code can run
 	// against the 319/320 schemas under test; 00320 and its Down never touch it.
 	if _, err = pool.Exec(ctx, "ALTER TABLE recovery_custody_holds ADD COLUMN final_publication_id uuid"); err != nil {

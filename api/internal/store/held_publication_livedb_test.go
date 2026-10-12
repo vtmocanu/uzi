@@ -13,7 +13,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
-// Issue #2545 M1: migration 00324's held-publication schema. Every test stands its own
+// Issue #2545 M1: migration 00328's held-publication schema. Every test stands its own
 // database, so the CHECKs, the two triggers and the rebuilt recovery_inventory_hold_guard are
 // executed by real UPDATEs. A refused guard update is a silent zero-row UPDATE (RETURN NULL),
 // a failed CHECK is a 23514, and the tests tell the two apart.
