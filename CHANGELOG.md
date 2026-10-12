@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Changed
 
 - **Code cross-check instructions now use a fresh default-branch pin even for older forks ([#2788](https://github.com/vtmocanu/uzi/issues/2788)).**
-  Checks read the root CLAUDE.md at the configured default branch's freshly fetched tip, pinned once when the check starts; the diff still uses its original merge base. Consent, bounded reads and advisory fencing remain. Retries reuse the same pin, and legacy checks retain their frozen inputs. Deploy the api and migration 00328 before upgraded workers; roll back workers first and retain stored provenance. PRD #2170's hosted acceptance remains pending.
+  When the repository-instructions consent is on, checks read the root CLAUDE.md at the configured default branch's freshly fetched tip, pinned once when the check starts (the pin is taken either way, but the file is read only under consent); the diff still uses its original merge base. Consent, bounded reads and advisory fencing remain. Retries reuse the same pin, and legacy checks retain their frozen inputs. Deploy the api and migration 00328 before upgraded workers; roll back workers first and retain stored provenance. PRD #2170's hosted acceptance remains pending.
 
 ### Fixed
 
