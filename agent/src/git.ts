@@ -7268,7 +7268,9 @@ export class GitCache {
    * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
    * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on
    * any failure to resolve the base, run git or parse its output, so callers fail CLOSED and
-   * refuse to publish rather than treat unreadable history as clean.
+   * refuse to publish rather than treat unreadable history as clean. Messages are read with
+   * `--encoding=none` (raw bytes); a commit whose `%e` encoding is non-empty and not UTF-8, or whose
+   * object holds a NUL byte, also yields null.
    */
   async publishedCommitMessages(barePath: string, tip: string): Promise<{ sha: string; message: string }[] | null> {
     try {
@@ -7281,34 +7283,33 @@ export class GitCache {
       const read = async (args: string[], input?: string): Promise<string> =>
         (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
           { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
-      // `-z` with %x00 between %H and %B yields a flat NUL-delimited stream of (sha, message) pairs.
-      // A commit OBJECT can still carry a NUL inside its message (git hash-object --literally writes
-      // one, and %B stops printing at it), which would hide the text after it from this scan. A
-      // literal NUL is written as a \u escape (never a raw control byte in source); the raw-object
-      // check below refuses any such commit.
-      const out = await read(["log", "-z", "--format=%H%x00%B", `${baseRef}..${tip}`]);
+      // `--encoding=none` prints the raw message bytes with no re-encoding, so a commit labelled with
+      // a non-UTF-8 `encoding` header still shows its ASCII text to the caller's scan. `%e` is git's
+      // own per-commit reading of that header (empty when absent), so no framing can be forged in a
+      // message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
+      // (sha, encoding, message) triples. A commit OBJECT can still carry a NUL inside its message
+      // (git hash-object --literally writes one, and %B stops printing at it), which would hide the
+      // text after it; a literal NUL is written as a \u escape (never a raw control byte in source).
+      const out = await read(["log", "--encoding=none", "-z", "--format=%H%x00%e%x00%B", `${baseRef}..${tip}`]);
       const tokens = out.split("\u0000");
       // The trailing NUL from `-z` leaves one empty final token.
       if (tokens.pop() !== "") return null;
-      if (tokens.length % 2 !== 0) return null;
+      if (tokens.length % 3 !== 0) return null;
       const commits: { sha: string; message: string }[] = [];
-      for (let i = 0; i < tokens.length; i += 2) {
+      for (let i = 0; i < tokens.length; i += 3) {
         const sha = tokens[i]!;
         if (!SHA40_RE.test(sha)) return null;
-        commits.push({ sha, message: tokens[i + 1]! });
+        // A declared non-UTF-8 encoding means the message bytes are not text we can scan: refuse.
+        const enc = tokens[i + 1]!.trim();
+        if (enc !== "" && !/^utf-?8$/i.test(enc)) return null;
+        commits.push({ sha, message: tokens[i + 2]! });
       }
       if (commits.length > 0) {
         // `cat-file --batch` prints framing as text, so a NUL anywhere in its output came from a
-        // commit object's own bytes: fail closed rather than trust the truncated %B.
+        // commit object's own bytes: fail closed rather than trust the truncated %B. This is a
+        // whole-buffer check, so message text cannot hide a NUL from it.
         const raw = await read(["cat-file", "--batch"], commits.map(c => c.sha).join("\n") + "\n");
         if (raw.includes("\u0000")) return null;
-        // A commit with a non-UTF-8 `encoding` header makes %B print a re-encoded (possibly empty)
-        // body while the raw object holds plain text, so the message scan would see nothing. Refuse.
-        const objects = /(?:^|\n)[0-9a-f]{40} commit \d+\n([\s\S]*?)(?:\n\n|$)/g;
-        for (const m of raw.matchAll(objects)) {
-          const enc = /^encoding (.*)$/m.exec(m[1]!);
-          if (enc && !/^utf-?8$/i.test(enc[1]!.trim())) return null;
-        }
       }
       return commits;
     } catch {

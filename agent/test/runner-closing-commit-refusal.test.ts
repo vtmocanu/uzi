@@ -99,7 +99,19 @@ describe("declared non-closing run with a closing commit message (issue #2779)",
     const { github, all } = fakeGitHub();
     const obs: { sha?: string } = {};
     const claim = githubClaim(2172);
-    await runner(committing("Fixes #2172", obs, true), rawFakeGitlab({}).gitlab, undefined, { github }).execute(claim);
+    // Only the early check runs before the publication preflight, so zero preflight calls pins it.
+    let preflights = 0;
+    const original = git.scratchPublicationPreflight;
+    git.scratchPublicationPreflight = async function (this: unknown, ...args: Parameters<typeof original>) {
+      preflights++;
+      return original.apply(this as typeof git, args);
+    };
+    try {
+      await runner(committing("Fixes #2172", obs, true), rawFakeGitlab({}).gitlab, undefined, { github }).execute(claim);
+    } finally {
+      git.scratchPublicationPreflight = original;
+    }
+    assert.equal(preflights, 0, "refused before any publication preflight");
     const failed = api.states.find(s => s.runId === claim.run_id && s.body.status === "failed");
     assert.ok(failed);
     assert.ok((failed.body.failure_reason ?? "").includes(obs.sha!));

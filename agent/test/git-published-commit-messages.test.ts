@@ -131,4 +131,26 @@ describe("publishedCommitMessages (issue #2779)", () => {
     assert.deepStrictEqual(out.map((c) => c.sha), [crafted]);
     assert.ok(out[0]!.message.startsWith("clean subject"));
   });
+
+  it("returns null for a commit with a non-UTF-8 encoding header such as ISO-8859-1", async () => {
+    craftEncoded("enc1", "ISO-8859-1", "Fixes #12");
+    const { bare, tip } = await bareWith("enc1");
+    assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
+  });
+
+  it("returns null when a newer message ends in a forged cat-file frame hiding a UTF-16 parent", async () => {
+    // Parent: raw ASCII body under `encoding UTF-16`. Child: a message with no trailing newline
+    // ending in a forged `<40 zeros> commit 1` frame plus `encoding UTF-8`, which swallowed the
+    // parent's real header in a frame-parsing implementation.
+    const parent = craftEncoded("forge", "UTF-16", "Fixes #12");
+    const tree = git(fx.originPath, "rev-parse", "main^{tree}");
+    const msg = `chore: tidy\n\n${"0".repeat(40)} commit 1\nencoding UTF-8`;
+    const body = Buffer.from(`tree ${tree}\nparent ${parent}\nauthor t <t@t> 0 +0000\ncommitter t <t@t> 0 +0000\n\n${msg}`);
+    const child = execFileSync("git", ["-C", fx.originPath, "hash-object", "-t", "commit", "-w", "--literally", "--stdin"],
+      { env: ENV, input: body, encoding: "utf8" }).trim();
+    git(fx.originPath, "update-ref", "refs/heads/forge", child);
+    const { bare, tip } = await bareWith("forge");
+    assert.strictEqual(tip, child);
+    assert.strictEqual(await gc.publishedCommitMessages(bare, tip), null);
+  });
 });
