@@ -592,12 +592,14 @@ describe("RunRunner — over-cap forge answers are permanent and treated as unre
 
 // PRD #1798 M6 (amended D10, M1): a legacy non-closing run whose publisher NEVER read the PR must not
 // complete on the strength of having observed nothing. It falls back to the blind whole-body
-// non-closing rewrite; only when that is refused too does the run fail closed.
+// non-closing rewrite; only when that is refused too does the run fail closed. Since #2815 a
+// scope-capped or owner-partial run also reads its PR title back, so a PR that is never readable at
+// all fails closed on the title confirm even when the blind description rewrite lands.
 describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD #1798 M6, amended D10)", () => {
   const closingCompletion = (iid: number) =>
     [COMPLETION_START, `Related to #${iid}.`, "", `Closes #${iid}`, "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
 
-  it("every GET is refused (403): the blind non-closing rewrite lands and the scope-capped run completes non-closing", async () => {
+  it("description reads refused (403) before the blind rewrite: the rewrite lands and the scope-capped run completes non-closing", async () => {
     const existing = `${SIZE_REGION}\n\n${closingCompletion(1930)}`;
     // Issue #2815: the title confirm also reads the PR now, so only the reads BEFORE the blind
     // description write are refused; the title read after it succeeds.
@@ -613,6 +615,22 @@ describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD
 
     assert.ok(statuses(claim.run_id).includes("completed"), "the blind rewrite removed the directive");
     assert.equal(closingDirectiveFor(pr.description, 1930, "org/repo"), false);
+    assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "one blind write");
+  });
+
+  it("every GET is refused (403): the blind rewrite lands but the unreadable title fails the scope-capped run closed (#2815)", async () => {
+    const existing = `${SIZE_REGION}\n\n${closingCompletion(1933)}`;
+    const { gitlab, pr, calls } = fakeGitlab({ headStatus: 403, existing });
+    const claim = gitlabClaim(1933);
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    const failed = api.states.find((st) => st.runId === claim.run_id && st.body.status === "failed")?.body;
+    assert.equal(failed?.failure_reason,
+      "completion interlock: a closing directive could not be removed from a non-closing merge request's title; the merge request remains open and must not be merged as-is");
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(closingDirectiveFor(pr.description, 1933, "org/repo"), false, "the blind description rewrite still landed");
     assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "one blind write");
   });
 
@@ -639,7 +657,7 @@ describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD
 
     // One refused over-cap description read (permanent: not retried) plus, since #2815, the title
     // confirm read of the already rewritten (small) body.
-    assert.equal(reads.length, 2, "the over-cap read is permanent: not retried");
+    assert.equal(reads.length, 2, "one over-cap read (permanent: not retried) plus the title confirm read");
     assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "the blind rewrite");
     assert.ok(statuses(claim.run_id).includes("completed"));
     assert.equal(closingDirectiveFor(pr.description, 1932, "org/repo"), false);

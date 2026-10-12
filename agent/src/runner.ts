@@ -7818,8 +7818,8 @@ export class RunRunner {
     const scanIid = runKind === "issue" && typeof claim.issue_iid === "number" ? claim.issue_iid : undefined;
     // The ONE non-closing-delivery predicate: this delivery must leave its issue open, so no
     // body it writes may close the issue, verified head or not. It gates the closing-directive scans,
-    // strips and fail-closed paths below, and the PR title neutralisation and fail-closed title
-    // confirm (issues #2779, #2815) (the publisher's non-closing scan via createCloses, the
+    // strips and fail-closed paths below, plus the PR title neutralisation and fail-closed title
+    // confirm of issues #2779 and #2815 (the publisher's non-closing scan via createCloses, the
     // reconcile's `nonClosing` scan via its `closes`, whether the verified reconcile ADDED Closes). The
     // rendered Closes line itself is decided by renderCloses/withCloses going into the renderer's
     // issueArm (agent/src/pr-description.ts), whose partial arms never write it. Any new partial or
