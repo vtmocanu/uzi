@@ -1255,6 +1255,13 @@ export class WorkerClient {
     this.latestDindMaintenanceValue = undefined;
   }
 
+  /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
+   *  after an api proves it cannot decode a single optional wire field, only that field's gate
+   *  closes and every other negotiated extension stays on. */
+  dropFeature(f: string): void {
+    this.serverFeatures.delete(f);
+  }
+
   async heartbeat(
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
@@ -1719,8 +1726,19 @@ export class WorkerClient {
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
     const outbound = { ...body };
+    if (body.provider_progress_turns !== undefined) {
+      const count = body.provider_progress_turns;
+      if (!Number.isInteger(count) || count < 0 || count > 2147483647 ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          body.status !== "recovery_wait" ||
+          (body.recovery_cause !== undefined && body.recovery_cause !== "empty_turn" && body.recovery_cause !== "data_volume_full")) {
+        throw new Error("invalid provider_progress_turns recovery park");
+      }
+    }
+    if (!this.hasFeature("provider_progress_on_recovery_park_v1")) delete outbound.provider_progress_turns;
     if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
+    if (!included) delete outbound.provider_progress_turns;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -1728,17 +1746,48 @@ export class WorkerClient {
     // allocating api still answers with its revision and an older api accepts unchanged.
     const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
     let ack: StateAck;
-    try {
-      ack = await this.withGenerationFallback(included, (includeField) =>
-        this.reportStateOnce(
-          runId,
-          path,
-          includeField ? outbound : { ...outbound, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
-          signal,
-          undefined,
-          evidence,
-        ),
+    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
+      this.reportStateOnce(
+        runId,
+        path,
+        includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
+        signal,
+        undefined,
+        evidence,
       );
+    try {
+      if (outbound.provider_progress_turns !== undefined && included) {
+        // Both attempts retain the fence. A stripped retry refusal propagates without
+        // invoking the older generation fallback or sending a third variant.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.provider_progress_turns;
+          this.dropFeature("provider_progress_on_recovery_park_v1");
+          ack = await sendWith(stripped)(true);
+        }
+      } else if (outbound.recovery_cause === "provider_outage" && included) {
+        // PRD #1733: a typed provider park. An api that predates `productive_turns` answers the
+        // strict-decode 400 `invalid request body`; a current api refuses a bad typed report with
+        // `state must be one of ...`, which is NOT that body and propagates unchanged. The generation
+        // is not stripped first (the generic fallback would send an untyped body without the fence):
+        // re-send once untyped with claim_generation kept, then close only this feature's gate.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const untyped = { ...outbound };
+          delete untyped.recovery_cause;
+          delete untyped.productive_turns;
+          ack = await this.withGenerationFallback(included, sendWith(untyped));
+          this.dropFeature("recovery_cause_provider_outage");
+          this.log.warn("provider-outage park rejected by an api that predates it; re-sent untyped and stopped typing it", {});
+        }
+      } else {
+        ack = await this.withGenerationFallback(included, sendWith(outbound));
+      }
     } catch (err) {
       if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
         throw new StateReportUnappliedError(runId, err);

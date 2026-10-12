@@ -2629,7 +2629,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
-  it on a capped backoff until it recovers or you cancel it — see [Recovering
+  it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
+  typed `provider_outage` parks use the elapsed streak bound and can become
+  `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
   without an automatic timer. A Codex credential
@@ -2686,6 +2688,41 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
+
+### Provider outage recovery and owner hold
+
+`recovery_wait` with cause `provider_outage` is a typed provider retry.
+`run get` shows the count, streak start and next retry; `--json` carries
+`provider_park_count` and `provider_park_streak_started_at`. The counter
+belongs to the current streak, separately from the recovery backoff count.
+The default elapsed bound is 24h from the first park; operators can change
+`RUN_PROVIDER_PARK_MAX_DURATION` or use `0` to disable the hold while
+typing/counting remain enabled. Positive completed `productive_turns` on
+a provider park starts a new streak; the same evidence on an ordinary or
+disk recovery park (`provider_progress_turns`) clears an open streak. Owner Resume, early credential-driven
+promotion and credential switching clear it; automatic and vault-unlock
+promotion preserve it. Detection is at the next qualifying park, with no
+maximum overshoot promised.
+
+At the bound, `paused` with `hold_reason: provider_unavailable` means the
+run waits for its owner, without automatic retry or policy-driven failure.
+`run get` and the TUI show Resume, Cancel and server-gated Stop hints.
+Use `uzi run resume <id>` for a fresh attempt or `uzi run cancel <id>`.
+For eligible Stop, run `uzi run stop <id>` to set the scope ceiling, then,
+after success, `uzi run resume <id>`. There is no atomic Stop endpoint for
+this hold. It requires a non-interactive milestone issue run and at least
+one completed milestone; unavailable actions explain why. Existing
+completion-permit and budget checks apply, and a provider outage during
+finalization can open a new streak.
+
+The hold retains the claim, worker affinity and the issue lock for issue
+runs. Clone and HOME stay on the worker. Recovery depends on surviving
+worker storage or an available verified recovery copy; it does not promise
+that unpublished latest edits are available on another worker.
+`run wait` prints the provider retry/hold notice and continues waiting
+through `paused` unless `--until paused` is selected.
+See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for both harnesses, verified-capture limits and mixed-fleet compatibility.
 
 ### Worker recovery exhaustion
 

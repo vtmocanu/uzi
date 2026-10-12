@@ -23,7 +23,8 @@
 // SCOPE (R4): this does NOT clone SdkExecutor's Claude-lane extras (empty-turn retry,
 // plan/intent summary hooks, health/interleave sentinels, interactive OWNER park).
 // Issue #2099 is the one retry that IS in scope: a turn that fails with a transient PROVIDER
-// classification (CodexTurnFailedError: category transport, see isCodexTransientClassification)
+// classification (CodexTurnFailedError: transport or exact rateLimitExceeded token;
+// see isCodexTransientClassification)
 // is retried a bounded number of times in the same thread, then escalates as
 // TransientRecoveryError so the runner parks the run in recovery_wait instead of failing it.
 // It sits on top of Codex's own request/stream retries (config.ts keeps the production retry
@@ -4077,7 +4078,10 @@ export class CodexExecutor implements Executor {
             if (!stopAfter) continue;
             err = stopAfter;
           } else {
-            throw new TransientRecoveryError(`provider transient error persisted after bounded in-process retries: ${caught.message}`);
+            throw new TransientRecoveryError(
+              `provider transient error persisted after bounded in-process retries: ${caught.message}`,
+              { providerOrigin: true },
+            );
           }
         }
         const msg = err instanceof Error ? err.message : "";

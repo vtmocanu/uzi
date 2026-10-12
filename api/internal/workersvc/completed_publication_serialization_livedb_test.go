@@ -286,14 +286,92 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 	return ctx, isolated, e
 }
 
+// assertPublicationDowngradeRaw is assertPublicationDowngrade's schema-only twin: it drives the
+// 00320 completed_publication_run_guard trigger with a raw UPDATE, so it runs at ANY schema
+// version (the service's sqlc column lists name columns later migrations add, so a service call
+// cannot run on a database migrated back to 319). A worker without recovery_completed_publication_v1
+// completes with the publication head dropped; on the pre-00320 guard a permit-bearing contract
+// run is refused outright (the UPDATE matches no row) because the NULLed head no longer matches a
+// consumed permit.
+func assertPublicationDowngradeRaw(t *testing.T, e interlockLiveDB, permit, applies bool) {
+	t.Helper()
+	wid := e.seedWorker(t, []string{"completion_interlock_v1"})
+	var run uuid.UUID
+	if permit {
+		run = e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+	} else {
+		run = e.seedLegacyRunningRun(t, wid)
+	}
+	tag, err := e.pool.Exec(e.ctx, "UPDATE runs SET status='completed', completion_final_head=$2 WHERE id=$1", run, strings.Repeat("a", 40))
+	if err != nil {
+		t.Fatalf("raw downgrade completion permit=%t: %v", permit, err)
+	}
+	if (tag.RowsAffected() == 1) != applies {
+		t.Fatalf("raw downgrade permit=%t applied=%t want=%t", permit, tag.RowsAffected() == 1, applies)
+	}
+	wantStatus := "running"
+	if applies {
+		wantStatus = "completed"
+	}
+	var status string
+	var headNull bool
+	if err = e.pool.QueryRow(e.ctx, "SELECT status, completion_final_head IS NULL FROM runs WHERE id=$1", run).Scan(&status, &headNull); err != nil || status != wantStatus || !headNull {
+		t.Fatalf("raw downgrade permit=%t: status=%s headNull=%t err=%v want status %s with no head", permit, status, headNull, err, wantStatus)
+	}
+}
+
+// TestCompletedPublicationDowngradeMigrationLiveDB walks the 00320 trigger across 319 <-> 320 on a
+// private database. The service-level steps (a stamped receipt, then the service-driven downgrade)
+// run at HEAD, because the service's sqlc queries name columns later migrations add (PRD #1733's
+// provider_park_* among them) and fail on a database migrated back to 319; the version walk itself
+// asserts the trigger with raw SQL (assertPublicationDowngradeRaw) and that existing evidence
+// survives every step.
 func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 	ctx, dsn, e := isolatedPublicationDB(t)
-	preserved := seedSerializedPublication(t, e, true)
+	// reopen returns the fixture on a FRESH pool: a pool that straddled a down/up migration may
+	// hold statement descriptions for columns that were dropped and re-added.
+	reopen := func() interlockLiveDB {
+		t.Helper()
+		pool, err := store.OpenPool(ctx, dsn)
+		if err != nil {
+			t.Fatal(err)
+		}
+		t.Cleanup(pool.Close)
+		fresh := e
+		fresh.pool, fresh.q = pool, store.New(pool)
+		return fresh
+	}
+	// isolatedPublicationDB's code cross-check shims stand in for columns 00324 and 00327 add;
+	// drop them so the walk to head adds the real columns instead of colliding with the shims.
+	for _, ddl := range []string{
+		"ALTER TABLE users DROP COLUMN IF EXISTS code_cross_check_enabled",
+		"ALTER TABLE runs DROP COLUMN IF EXISTS code_cross_check_required",
+		`ALTER TABLE repos DROP COLUMN IF EXISTS code_cross_check_guidance,
+			DROP COLUMN IF EXISTS cross_check_repo_instructions_enabled`,
+		`ALTER TABLE cross_checks DROP COLUMN IF EXISTS head_commit,
+			DROP COLUMN IF EXISTS outcome,
+			DROP COLUMN IF EXISTS code_context,
+			DROP COLUMN IF EXISTS guidance_snapshot,
+			DROP COLUMN IF EXISTS guidance_text,
+			DROP COLUMN IF EXISTS guidance_digest,
+			DROP COLUMN IF EXISTS repo_instructions_enabled,
+			DROP COLUMN IF EXISTS repo_instructions_text,
+			DROP COLUMN IF EXISTS repo_instructions_digest,
+			DROP COLUMN IF EXISTS dispositions,
+			DROP COLUMN IF EXISTS finalized_at`,
+	} {
+		e.exec(t, ddl)
+	}
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate to head: %v", err)
+	}
+	head := reopen()
+	preserved := seedSerializedPublication(t, head, true)
 	result, err := preserved.svc.SetStateReportWithReconciliation(ctx, preserved.worker, preserved.run, preserved.req)
 	if err != nil || result.CompletedPublicationReceipt == nil {
 		t.Fatalf("seed existing receipt: %+v %v", result, err)
 	}
-	read := func() ([]byte, []byte) {
+	read := func(e interlockLiveDB) ([]byte, []byte) {
 		t.Helper()
 		var identity, receipt []byte
 		if err := e.pool.QueryRow(ctx, "SELECT completion_identity,completed_publication_receipt FROM recovery_custody_holds WHERE id=$1", preserved.hold).Scan(&identity, &receipt); err != nil {
@@ -301,25 +379,36 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		}
 		return identity, receipt
 	}
-	identity, receipt := read()
+	identity, receipt := read(head)
 	for step, version := range []int64{319, 320, 319, 320} {
-		if step > 0 {
-			if version == 319 {
-				err = store.MigrateDownTo(ctx, dsn, version)
-			} else {
-				err = store.MigrateTo(ctx, dsn, version)
-			}
-			if err != nil {
-				t.Fatalf("migration step %d: %v", step, err)
-			}
+		var err error
+		if version == 319 {
+			err = store.MigrateDownTo(ctx, dsn, version)
+		} else {
+			err = store.MigrateTo(ctx, dsn, version)
 		}
+		if err != nil {
+			t.Fatalf("migration step %d: %v", step, err)
+		}
+		walk := reopen()
 		t.Run(fmt.Sprintf("step_%d_version_%d", step, version), func(t *testing.T) {
-			assertPublicationDowngrade(t, e, false, true)
-			assertPublicationDowngrade(t, e, true, version == 320)
-			afterIdentity, afterReceipt := read()
+			assertPublicationDowngradeRaw(t, walk, false, true)
+			assertPublicationDowngradeRaw(t, walk, true, version == 320)
+			afterIdentity, afterReceipt := read(walk)
 			if !bytes.Equal(identity, afterIdentity) || !bytes.Equal(receipt, afterReceipt) {
 				t.Fatal("migration altered existing identity or receipt")
 			}
 		})
+	}
+	// Back at head the service-driven downgrade completes normally without a receipt.
+	if err := store.Migrate(ctx, dsn); err != nil {
+		t.Fatalf("migrate back to head: %v", err)
+	}
+	final := reopen()
+	assertPublicationDowngrade(t, final, false, true)
+	assertPublicationDowngrade(t, final, true, true)
+	afterIdentity, afterReceipt := read(final)
+	if !bytes.Equal(identity, afterIdentity) || !bytes.Equal(receipt, afterReceipt) {
+		t.Fatal("migration altered existing identity or receipt")
 	}
 }

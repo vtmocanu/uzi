@@ -705,6 +705,15 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     // status (D3): the run stays running and only the three pause columns are set. The park
     // to `paused` then lands on a timer (the mock's stand-in for the worker's next report /
     // turn abort): quickly for "now", after a beat for "milestone" (the boundary rule).
+    case "scope": {
+      if (isTerminalRun(run.status) || run.kind !== "issue" || !run.milestones?.length)
+        return { status: 409, message: "scope requires an active milestone issue run" };
+      if (!/^\d+$/.test(body)) return { status: 400, message: "invalid scope ceiling" };
+      const done = new Set(run.milestones_completed ?? []);
+      const completed = run.milestones.filter((m) => done.has(m.id)).length;
+      patchRun(runId, { scope_ceiling: Math.max(completed, Math.min(run.milestones.length, Number(body))) });
+      return null;
+    }
     case "pause": {
       if (run.status !== "running")
         return { status: 409, message: `run is ${run.status}; the clock is already stopped` };

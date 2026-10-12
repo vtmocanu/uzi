@@ -421,6 +421,16 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_data_volume_full"},
+		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
+		// with the optional productive_turns count, stores and counts the typed park, bounds an
+		// unbroken streak of them in elapsed time, and may answer the park with status "paused"
+		// (hold_reason provider_unavailable). Advertised UNCONDITIONALLY (RUN_PROVIDER_PARK_MAX_DURATION=0
+		// only lifts the hold): a worker sends the typed body ONLY after seeing this token, both
+		// because an older api's strict decoder 400s productive_turns and because only a worker
+		// that handles a "paused" ack may receive one.
+		{"recovery_cause_provider_outage"},
+		// Fenced ordinary and disk recovery parks can atomically consume completed-turn evidence.
+		{"provider_progress_on_recovery_park_v1"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
 		// /state limit_wait / recovery_wait / paused reports and the wall-park report) and stores
 		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a

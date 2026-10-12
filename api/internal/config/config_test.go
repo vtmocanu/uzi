@@ -257,6 +257,41 @@ func TestLoadRunDiskParkMax(t *testing.T) {
 	}
 }
 
+// TestLoadRunProviderParkMaxDuration pins the PRD #1733 provider park bound: unset is 24h, a
+// positive override is honoured, 0 is the legal "no hold" off switch (so it must NOT parse like
+// parseDuration, which would turn it into the default), and a negative or malformed value falls
+// back to 24h.
+func TestLoadRunProviderParkMaxDuration(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	for _, tc := range []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 24 * time.Hour},
+		{"36h", 36 * time.Hour},
+		{"0", 0},
+		{"0s", 0},
+		{"-1h", 24 * time.Hour},
+		{"nonsense", 24 * time.Hour},
+	} {
+		t.Setenv("RUN_PROVIDER_PARK_MAX_DURATION", tc.env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with RUN_PROVIDER_PARK_MAX_DURATION=%q: %v", tc.env, err)
+		}
+		if cfg.RunProviderParkMaxDuration != tc.want {
+			t.Errorf("RunProviderParkMaxDuration for RUN_PROVIDER_PARK_MAX_DURATION=%q = %v, want %v", tc.env, cfg.RunProviderParkMaxDuration, tc.want)
+		}
+	}
+}
+
 // TestProposalConfirmStuckTimeoutClamped pins the load-bearing ordering invariant:
 // the stuck-confirming sweep timeout must sit safely above the forge HTTP timeout, so
 // a slow CreateIssue can never be reverted mid-flight and re-confirmed into a
