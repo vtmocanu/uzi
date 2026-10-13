@@ -405,13 +405,14 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assert.ok(!statuses(r.claim.run_id).some((s) => s === "failed" || s === "completed"), "no terminal report");
   });
 
-  it("row 9 without a later change: the stale park report finds the capture still covered, so teardown proceeds", async () => {
+  it("row 9 without a later change: the stale park report finds the capture still covered, but a stopped exit keeps and records the clone (coverage is diagnostic only)", async () => {
     const iid = 17909;
     const r = credRig(iid);
     api.failStateWhen(r.claim.run_id, (b) => b.status === "recovery_wait", { runStatus: "running", disposition: "stale_claim" });
     await r.runner.execute(r.claim);
-    assert.equal(fs.existsSync(r.clone()), false, "covered at the exit");
-    assert.deepEqual(coveredReasons(r.lines), ["recovery_park_report_stale"]);
+    assert.ok(fs.existsSync(r.clone()), "a stopped exit keeps the clone even when covered at the exit");
+    assert.deepEqual(coveredReasons(r.lines), [], "no release on a covered verdict");
+    assert.deepEqual(retainedReasons(r.lines), ["recovery_park_report_stale"]);
   });
 
   it("keepUnlessCaptured: an ownership read of a terminal status keeps a source that changed after its capture", async () => {

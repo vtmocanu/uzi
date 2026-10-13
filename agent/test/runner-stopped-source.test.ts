@@ -402,7 +402,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   });
 
   for (const flavor of ["canonical", "attempt"] as const) {
-    it(`${flavor} clone, clean and fully fetched under this run's tracking ownership: teardown proceeds and retains nothing`, async () => {
+    it(`${flavor} clone, clean and fully fetched under this run's tracking ownership: coverage is only a diagnostic, the clone is kept and recorded`, async () => {
       const rl = recordingLogger();
       const rig = stopRig(17883 + (flavor === "attempt" ? 1 : 0), flavor, "stale", {
         cleanTree: true, log: rl.logger,
@@ -418,11 +418,14 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
       await rig.runner.execute(rig.claim);
       const facts = rig.facts();
       const lines = rl.lines as Array<{ msg: string; stopped_source?: string }>;
-      assert.ok(lines.some((l) => l.stopped_source === "covered"), "the covered teardown is logged as `covered`, not `no_source`");
-      assert.ok(!lines.some((l) => l.stopped_source === "no_source"));
-      assert.equal(fs.existsSync(facts.clonePath), false, "a fully covered clean clone is retired by the normal teardown");
-      assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
-      assert.deepEqual(retained, [], "nothing retained, nothing notified");
+      assert.ok(lines.some((l) => l.stopped_source === "retained_local"), "a stopped exit is logged as `retained_local` even when coverage verified");
+      assert.ok(!lines.some((l) => l.stopped_source === "covered" || l.stopped_source === "no_source"));
+      assert.ok(lines.some((l) => /coverage verified \(diagnostic only\)/.test(l.msg)), "the coverage diagnostic is logged");
+      assert.ok(lines.some((l) => (l as { coverage?: string }).coverage === "covered"), "the retention line carries coverage=covered");
+      assert.ok(fs.existsSync(facts.clonePath), "a covered stopped clone is kept until explicit operator discard");
+      if (flavor === "attempt") assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed");
+      else assert.equal(markers(rig.bare, rig.runId).length, 1, "the retention record is written");
+      assert.deepEqual(retained, [1], "the retention is notified");
       assert.equal(gitIn(rig.bare, "rev-parse", `refs/uzi-runner/${rig.branch}`), facts.commit, "the tracking ref still holds the commit");
     });
   }
@@ -457,6 +460,39 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
       assert.equal(coveredCalls, 2, "the coverage proof asked before and after");
       assert.ok(fs.existsSync(facts.clonePath), "the clone is kept");
       assert.equal(fs.readFileSync(latePath, "utf8"), LATE, "the late file survives");
+      if (flavor === "attempt") assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed");
+      else assert.equal(markers(rig.bare, rig.runId).length, 1, "the retention record is written");
+    });
+  }
+
+  for (const flavor of ["canonical", "attempt"] as const) {
+    it(`${flavor} clone, clean and fully fetched, with a writer that wrote and exited before the final proof: a covered verdict never discards the clone`, async () => {
+      const iid = 17892 + (flavor === "attempt" ? 1 : 0);
+      const LATE = Buffer.from([0x4c, 0x41, 0x54, 0x45, 0x00, 0xff, 0x10, 0x20]);
+      let coveredCalls = 0;
+      let latePath = "";
+      const rig = stopRig(iid, flavor, "stale", {
+        cleanTree: true,
+        beforeStop: async (ctx) => {
+          await fixtureFetchTracking(git, git.barePathFor(fx.originPath), ctx.worktreePath, ctx.branch, ctx.runId, 2);
+        },
+        runnerOpts: {
+          quiesceRun: async (req: QuiesceRunRequest): Promise<QuiesceRunOutcome> => {
+            if (req.site !== "stopped_source:covered") return quiescentOutcome();
+            coveredCalls++;
+            if (coveredCalls < 2) return quiescentOutcome();
+            // The "after" proof: the writer already wrote and exited, so nothing is reaped and the scan is quiet.
+            latePath = path.join(req.targetPaths[0]!, "LATE.bin");
+            fs.writeFileSync(latePath, LATE);
+            return quiescentOutcome();
+          },
+        },
+      });
+      await rig.runner.execute(rig.claim);
+      const facts = rig.facts();
+      assert.equal(coveredCalls, 2, "the coverage proof asked before and after");
+      assert.ok(fs.existsSync(facts.clonePath), "the clone is kept even though the coverage verdict was covered");
+      assert.deepEqual(fs.readFileSync(latePath), LATE, "the late bytes survive");
       if (flavor === "attempt") assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed");
       else assert.equal(markers(rig.bare, rig.runId).length, 1, "the retention record is written");
     });
@@ -503,7 +539,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
 
   // The seed gives the clone a local default branch at the bare's HEAD and every bare tag, and a
   // resumed branch can be older than main: refs the bare already holds must not look like unfinished work.
-  it("clean clone at the owned tracking tip whose local default branch and tag are held by the bare is retired, not retained", async () => {
+  it("clean clone at the owned tracking tip whose local default branch and tag are held by the bare is kept and recorded (coverage is diagnostic only)", async () => {
     const rig = stopRig(17960, "canonical", "stale", {
       cleanTree: true,
       beforeStop: async (ctx, facts) => {
@@ -521,22 +557,23 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
     });
     await rig.runner.execute(rig.claim);
     const facts = rig.facts();
-    assert.equal(fs.existsSync(facts.clonePath), false, "refs the bare holds do not keep a fully fetched clone");
-    assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
+    assert.ok(fs.existsSync(facts.clonePath), "a stopped exit keeps the clone even when the bare holds every ref");
+    assert.equal(markers(rig.bare, rig.runId).length, 1, "the retention record is written");
   });
 
   // A flight stopped while planning never committed past its seed base: HEAD is an ancestor of the
   // bare's default branch, so there is no tracking ref to anchor and no worker-only commit either.
   for (const flavor of ["canonical", "attempt"] as const) {
-    it(`${flavor} clone, clean at the seed base head already on the bare's default branch: teardown proceeds, nothing retained`, async () => {
+    it(`${flavor} clone, clean at the seed base head already on the bare's default branch: kept and recorded, coverage is diagnostic only`, async () => {
       const rig = stopRig(17970 + (flavor === "attempt" ? 1 : 0), flavor, "stale", {
         seedOnly: "clean",
         ...(flavor === "attempt" ? { runnerOpts: { quiesceRun: async () => quiescentOutcome() } } : {}),
       });
       await rig.runner.execute(rig.claim);
       const facts = rig.facts();
-      assert.equal(fs.existsSync(facts.clonePath), false, "nothing worker-only: the clone is retired");
-      assert.deepEqual(markers(rig.bare, rig.runId), [], "no marker");
+      assert.ok(fs.existsSync(facts.clonePath), "a stopped exit keeps the clone even when nothing is worker-only");
+      if (flavor === "attempt") assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed");
+      else assert.equal(markers(rig.bare, rig.runId).length, 1, "the retention record is written");
     });
 
     it(`${flavor} clone, seed base head but an untracked file: retained`, async () => {
@@ -936,7 +973,7 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
   });
 
   for (const dockerState of ["docker_error", "docker_unconfirmed"] as const) {
-    it(`attempt clone, clean and fully fetched, Docker half ${dockerState}: ${dockerState === "docker_error" ? "the coverage check is skipped and the clone is retained" : "the coverage check runs and the clone is retired"}`, async () => {
+    it(`attempt clone, clean and fully fetched, Docker half ${dockerState}: ${dockerState === "docker_error" ? "the coverage check is skipped and the clone is retained" : "the coverage check runs but is diagnostic only, the clone is retained"}`, async () => {
       const requests: QuiesceRunRequest[] = [];
       const rig = stopRig(dockerState === "docker_error" ? 17968 : 17969, "attempt", "stale", {
         cleanTree: true,
@@ -961,7 +998,8 @@ describe("RunRunner #1786 M1 — a flight that learns its claim is stale keeps i
         assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed", "and recorded");
       } else {
         assert.equal(coverageProofs, 2, "the coverage proof ran before and after");
-        assert.equal(fs.existsSync(facts.clonePath), false, "a covered clone is retired by the normal teardown");
+        assert.ok(fs.existsSync(facts.clonePath), "a covered stopped clone is kept");
+        assert.equal(ledgerStates(rig.bare, rig.branch).get(attemptIdOf(facts.clonePath)), "reclaimed", "and recorded");
       }
     });
   }

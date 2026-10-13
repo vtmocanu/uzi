@@ -948,7 +948,7 @@ const REPO_AGENT_FOLDER_FEATURE = "repo_agent_folder";
  * (`ack.staleClaim`) — a held-state credential switch RELEASED this claim, or a reclaim
  * SUPERSEDED it. This flight no longer owns the run, so it MUST STOP without reporting a
  * terminal state (another claim owns the run now). It sets no preserve flag itself: the catch arm
- * keeps any clone source until proven preserved (issue #1786, retainStoppedSource); the new claim
+ * keeps any clone source and records it for the operator channel (issue #1786, retainStoppedSource); the new claim
  * has its own clone but cannot see this worker's bytes. Thrown from the flight.reportState
  * closure the moment any report is answered stale, and caught in executeClaim's catch chain
  * BEFORE the generic terminal path (mirroring the PauseNowSignal arm). Runtime throws and
@@ -3758,7 +3758,7 @@ export class RunRunner {
         // terminal), and the steering channel ended the flight. Like the StaleClaimError arm below:
         // report NO terminal state and journal nothing (the server fence would refuse it) and close
         // the batcher. Issue #1786: the new claim owns the RUN, not this worker's clone, so any
-        // source here stays until proven preserved; the finally then runs the rest of the
+        // source here stays for the operator channel; the finally then runs the rest of the
         // teardown (HOME and skills cleanup) without disposing of it. A server wall park is still
         // recognised by the ServerWallParkedError arm above, when a report surfaced it first.
         const stopped = await this.retainStoppedSource(flight, executor, "claim_fence");
@@ -3775,7 +3775,7 @@ export class RunRunner {
         // PauseNowSignal arm above, but WITHOUT its park): log, close the batcher, and report NO
         // terminal state — a `failed` here would fight the owning claim. Issue #1786: the owning
         // claim has its own clone but cannot see THIS worker's bytes, so a source here is kept
-        // (retainStoppedSource latches the preserve flag) until proven preserved; the finally then
+        // (retainStoppedSource latches the preserve flag) for the operator channel; the finally then
         // runs the rest of the teardown (HOME and skills cleanup) without disposing of it.
         // Issue #1742: deliberately NO retireFinalizeRecord here (nor in the claim-fence,
         // RunningAckTerminalError and CredentialSwitchSignal "released" arms): none of them is an
@@ -14772,10 +14772,11 @@ export class RunRunner {
    *     generation on the probe), the park loop's claim_generation mismatch, and a StaleClaimError
    *     on the park report make no report and clear the session keep. issue #1786 reverses the
    *     #1247 convention for the clone: the new claim has its own clone but cannot see this
-   *     worker's bytes, so every exit that used to clear `preserveRecoveryClone` now releases the
-   *     clone only when `retainStoppedSource` revalidates coverage at that exit for this exact
-   *     source (a cached capture, `capture.verified` or the degraded stub is never enough), and
-   *     otherwise keeps and records it for the operator channel;
+   *     worker's bytes, so a stopped exit (`record: "stopped"`) keeps and records the clone for the
+   *     operator channel whatever `retainStoppedSource` revalidates (a `covered` verdict there is
+   *     diagnostic only); a park or terminal exit (`record: "none"`) releases the clone only when
+   *     `retainStoppedSource` revalidates coverage at that exit for this exact source (a cached
+   *     capture, `capture.verified` or the degraded stub is never enough);
    *   - a terminal status then ends the flight, a live non-running status posts a feed line and
    *     keeps the clone and session without parking (even after a verified capture), and a given-up
    *     input receipt reports the generic failure without the credentialed pre-report reap or any
@@ -14914,7 +14915,8 @@ export class RunRunner {
     };
     // issue #1786: every exit below that used to clear `preserveRecoveryClone` on a cached verdict (a
     // captured/verified memo, a stale claim, a terminal status) hands the clone to executeClaim's
-    // finally only when `retainStoppedSource` revalidates coverage NOW for this exact source: the
+    // finally only when a park or terminal exit's `retainStoppedSource` revalidates coverage NOW for
+    // this exact source (a stopped exit keeps the clone whatever the verdict): the
     // memoized capture's head (a memo without one, the degraded stub included, is never covered), or
     // the clone's current head when nothing was captured. Anything else keeps the source and records
     // it for the operator channel. Local-only: no report, publish or credential call, no new wait. A
@@ -16712,7 +16714,9 @@ export class RunRunner {
    * holds (this run's committed tracking tip, an owed pin, or the default branch), hand teardown back its normal retire
    * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
    * local ref, in every namespace, to be reachable from that head or from a ref of the worker bare,
-   * and the absence of a stash); otherwise (4) record
+   * and the absence of a stash), a park or terminal exit (`handler.record === "none"`) hands teardown
+   * back its normal retire; a stopped exit treats the verdict as diagnostic only and keeps the clone;
+   * and (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
    * clone (which also persists the key's attempt mode and clears the then-bound plain journal, so a
@@ -16722,8 +16726,9 @@ export class RunRunner {
    * unreadable bare or a refused record gives `unknown` (the record, when written, stays): the
    * clone and its journal stay.
    *
-   * `no_source`: there was no clone (ordinary teardown proceeds). `covered`: the covered case above
-   * (ordinary teardown proceeds and retires the clone). A flight already held by retained-recovery
+   * `no_source`: there was no clone (ordinary teardown proceeds). `covered`: the covered case above,
+   * returned only for a park or terminal exit (ordinary teardown proceeds and retires the clone); a
+   * stopped exit logs the verdict and goes on to the record. A flight already held by retained-recovery
    * custody latches `preserveRecoveryClone`, `stoppedSourceKept` and `keepGuardedInventoryOpen` like
    * any other and runs the quiescence proof, but skips the coverage check and the record: it
    * answers `retained_local` (`unknown` when the proof was blocked), and `stoppedSourceKept` stays
@@ -16735,7 +16740,8 @@ export class RunRunner {
   private async retainStoppedSource(
     flight: RunFlight, executor: Executor, reason: string,
     /** issue #1786 M2: set by a `handleRecoveryExhausted` exit. The handler latches the preserve flag
-     *  itself, so a prior latch is not a reason to skip the coverage check; `covered` then clears it.
+     *  itself, so a prior latch is not a reason to skip the coverage check; for `record: "none"`,
+     *  `covered` then clears it (a `stopped` exit only logs the verdict and keeps the latch).
      *  `memo`: the handler holds a capture memo, whose `capturedHead` (when it has one) is the head to
      *  revalidate; a memo without one (the degraded stub) is never covered. No memo: the clone's
      *  current head, as at the generic arms. `stale`: the exit is a stale-claim or other-generation
@@ -16766,6 +16772,7 @@ export class RunRunner {
     // only when this first proof saw no container that could still mount the clone: Docker not wired,
     // or wired with the teardown merely unconfirmed. A `docker_error` keeps the source unchecked.
     let dockerSettled = false;
+    let coverage: "covered" | "not_covered" | "skipped" = "skipped";
     try {
       const q = await this.quiesceRun(flight, executor, { mode: "own", site: "stopped_source", forceProcessScan: true });
       blocked = q.blocked;
@@ -16808,11 +16815,19 @@ export class RunRunner {
             { runId: flight.runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) },
             head, { runId: flight.runId, generation: flight.claimGeneration }, quiesce,
           );
+          coverage = covered === "covered" ? "covered" : "not_covered";
           if (covered === "covered") {
-            flight.preserveRecoveryClone = false;
-            flight.stoppedSourceKept = false;
-            log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
-            return "covered";
+            if (handler === undefined || handler.record === "stopped") {
+              // A stopped exit never trusts the verdict to discard: a writer that wrote and exited between
+              // the status read and the "after" scan is invisible to it, and the successor claim cannot see
+              // this clone. The latches stay and the retention record below is written.
+              log.info("stopped source: coverage verified (diagnostic only); the clone is kept until explicit operator discard", { clone: clonePath, reason });
+            } else {
+              flight.preserveRecoveryClone = false;
+              flight.stoppedSourceKept = false;
+              log.info("stopped source: clean and already held by the worker bare (tracking tip, owed pin or default branch); teardown proceeds", { clone: clonePath, reason });
+              return "covered";
+            }
           }
         }
       } catch (err) {
@@ -16821,7 +16836,7 @@ export class RunRunner {
     }
     if (handler?.record === "none") {
       log.warn("source kept without a stopped-source record (park or terminal exit); a resume recaptures it", {
-        clone: clonePath, reason, proof: blocked ? "unresolved" : "quiescent",
+        clone: clonePath, reason, proof: blocked ? "unresolved" : "quiescent", coverage,
       });
       return blocked ? "unknown" : "retained_local";
     }
@@ -16841,7 +16856,7 @@ export class RunRunner {
       return "unknown";
     }
     log.warn("stopped source retained on this worker; inspect it with the operator channel before any disposal", {
-      clone: clonePath, reason, proof: blocked ? "unresolved" : "quiescent",
+      clone: clonePath, reason, proof: blocked ? "unresolved" : "quiescent", coverage,
     });
     try { this.onSourceRetained?.(); } catch { /* diagnostics only */ }
     // Recorded, but with unresolved writers the source is not known to be at rest: `unknown`.
