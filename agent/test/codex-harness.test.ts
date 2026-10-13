@@ -391,21 +391,24 @@ describe("m1 response usage", () => {
   });
 
   it("omits incomplete and impossible splits, accepts equality, and retains aggregate accounting", async () => {
-    const { harness, transport } = makeHarness();
+    const accountant = new CodexUsageAccountant();
+    const { harness, transport } = makeHarness({ accountant });
     const complete = tokenUsage(last, last);
     const incomplete = { ...complete, usage: { ...complete.usage, pricingEvidenceComplete: false } };
     const impossible = { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
     const equality = { inputTokens: 100, cachedInputTokens: 70, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
+    // doubled + equality keeps cumulative splits consistent and uncached input nondecreasing at 100.
     transport.push(incomplete).push(tokenUsage(doubled, impossible))
-      .push(tokenUsage({ inputTokens: 300, cachedInputTokens: 130, cacheWriteInputTokens: 80, outputTokens: 120, totalTokens: 420 }, equality))
+      .push(tokenUsage({ inputTokens: 300, cachedInputTokens: 130, cacheWriteInputTokens: 70, outputTokens: 120, totalTokens: 420 }, equality))
       .push(turnCompleted("completed"));
     const events = await collect(harness.startTurn(makeRequest()).events);
     assert.deepEqual(records(events).map(e => e.usage), [{ input_tokens: 0, cache_read_input_tokens: 70, cache_creation_input_tokens: 30, output_tokens: 40 }]);
     const terminal = events.find(e => e.kind === "turn_finished");
     assert.ok(terminal?.kind === "turn_finished");
     assert.deepEqual(terminal.terminal.usage?.wire?.modelUsage, { [provider.model]: {
-      inputTokens: 90, outputTokens: 120, cacheReadInputTokens: 130, cacheCreationInputTokens: 80, reasoningOutputTokens: 0, costStatus: "unreported",
+      inputTokens: 100, outputTokens: 120, cacheReadInputTokens: 130, cacheCreationInputTokens: 70, reasoningOutputTokens: 0, costStatus: "unreported",
     } });
+    assert.equal(accountant.usageIncomplete, false);
   });
 
   it("proved historical replay and unproved resume emit none; current resumed response emits once", async () => {
