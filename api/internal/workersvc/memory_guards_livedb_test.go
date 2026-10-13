@@ -34,7 +34,9 @@ func TestMemoryHoldNonOwnerGuardsLiveDB(t *testing.T) {
 	if err != nil || !applied {
 		t.Fatalf("memory hold=%v %v", applied, err)
 	}
-	env.exec("UPDATE runs SET recovery_retry_not_before=now()-interval '1 minute' WHERE id=$1", run)
+	// Non-default accounting makes every event sensitive to an accidental reset.
+	env.exec(`UPDATE runs SET recovery_retry_not_before=now()-interval '1 minute',
+    memory_episode=7,memory_intervention_count=2,memory_policy='{"version":1,"max_interventions":3}' WHERE id=$1`, run)
 	before := exhaustionRun(t, env, run)
 	if before.Status != "recovery_wait" || before.RecoveryWaitCause.String != "worker_memory_pressure" || !before.ClaimReleasedAt.Valid {
 		t.Fatalf("not exhausted: %+v", before)

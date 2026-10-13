@@ -21,6 +21,9 @@ import (
 
 func observationFixture(t *testing.T) string {
 	t.Helper()
+	if err := os.MkdirAll("../../../.uzi/scratch", 0755); err != nil {
+		t.Fatal(err)
+	}
 	root, err := os.MkdirTemp("../../../.uzi/scratch", "observation-proc-")
 	if err != nil {
 		t.Fatal(err)
@@ -465,6 +468,9 @@ func (root *liveObservationRoot) dispose(t *testing.T) {
 func TestRealObservationSupervisedTrees(t *testing.T) {
 	// Keep real fixture artifacts inside the worktree. The command uid needs
 	// traverse/read permission to execute the copied test binary.
+	if err := os.MkdirAll("../../../.uzi/scratch", 0755); err != nil {
+		t.Fatal(err)
+	}
 	stage, err := os.MkdirTemp("../../../.uzi/scratch", "observation-real-")
 	if err != nil {
 		t.Fatal(err)
