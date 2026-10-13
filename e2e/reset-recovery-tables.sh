@@ -23,17 +23,14 @@
 # recovery_capture_chunks is ON DELETE CASCADE from recovery_captures, but recovery_captures
 # is ON DELETE RESTRICT from recovery_custody_holds — so a hold cannot be deleted while a
 # capture references it. Deleting chunks, then captures, then holds satisfies the RESTRICT
-# without relying on any cascade. custody_episode_notices (migration 00226) is independent
+# without relying on any cascade. custody_episode_notices (migration 00229) is independent
 # of that chain (FK to users, ON DELETE CASCADE) and is cleared last.
 #
-# NEVER AGAINST A NON-TEST DB. Like the rest of the harness (which fences destructive work
-# by the dedicated UZI_TEST_DATABASE_URL var the Go tests refuse to run without, the
-# uzi-e2e-<pid> project-name + pid-liveness pattern in reclaim-leaked-e2e.sh, and the
-# loopback-only DSN the throwaway Postgres publishes on), this refuses unless the target is
-# unmistakably a throwaway: the DSN comes ONLY from --dsn / the first arg / UZI_TEST_DATABASE_URL
-# (NEVER the production DATABASE_URL), its host is loopback, and it carries sslmode=disable
-# (the throwaway store-it/e2e DSN always does; a real managed Postgres uses TLS). Any miss
-# aborts with NO deletion.
+# NEVER AGAINST A NON-TEST DB. Loopback and disabled TLS are insufficient:
+# local production databases can have both. Require the initialization-only harness
+# marker, with exactly one expected row, before any deletion in the same transaction.
+# DSN comes ONLY from --dsn / first arg / UZI_TEST_DATABASE_URL, never DATABASE_URL.
+# There is no force option and this reset never creates or repairs the marker.
 #
 # Usage:
 #   UZI_TEST_DATABASE_URL=postgres://uzi:PASS@127.0.0.1:PORT/uzi?sslmode=disable e2e/reset-recovery-tables.sh
@@ -75,7 +72,7 @@ case "$DSN" in
   *sslmode=disable*) ;;
   *)
     echo "reset-recovery-tables: REFUSING — DSN does not carry sslmode=disable." >&2
-    echo "  The throwaway store-it/e2e Postgres always sets it; a real (TLS) DB never would." >&2
+    echo "  The throwaway store-it/e2e Postgres always sets it; the database marker is also required." >&2
     exit 3 ;;
 esac
 
@@ -85,17 +82,15 @@ PGIMAGE="${UZI_STORE_IT_PG_IMAGE:-postgres:17}"
 # postgres container sharing the host network so the loopback DSN resolves.
 run_psql() {
   if command -v psql >/dev/null 2>&1; then
-    psql "$DSN" -v ON_ERROR_STOP=1 -q
+    psql -X "$DSN" -v ON_ERROR_STOP=1 -q
   else
-    docker run --rm -i --network host "$PGIMAGE" psql "$DSN" -v ON_ERROR_STOP=1 -q
+    docker run --rm -i --network host "$PGIMAGE" psql -X "$DSN" -v ON_ERROR_STOP=1 -q
   fi
 }
 
-echo "reset-recovery-tables: clearing recovery tables on loopback throwaway DB (host=$host) — HARNESS ISOLATION ONLY."
-
-# One implicit transaction; each DELETE guarded by to_regclass so a partially-migrated or
-# never-migrated throwaway DB (no recovery schema yet) is a clean no-op rather than an
-# error. Row counts are RAISEd as NOTICEs (stderr) for the log.
+# One implicit transaction: validate the marker first, then guard each DELETE by
+# to_regclass so a marked partially-migrated or never-migrated throwaway DB is a no-op.
+# Row counts are RAISEd as NOTICEs (stderr) for the log.
 run_psql <<'SQL'
 DO $$
 DECLARE
@@ -104,22 +99,31 @@ DECLARE
   n_holds    int := 0;
   n_notices  int := 0;
 BEGIN
+  IF to_regclass('uzi_test_harness.database_marker') IS NULL THEN
+    RAISE EXCEPTION 'reset-recovery-tables: REFUSING — missing test database marker';
+  END IF;
+  IF (SELECT count(*) FROM uzi_test_harness.database_marker) <> 1
+     OR (SELECT count(*) FROM uzi_test_harness.database_marker
+         WHERE marker = 'recovery-reset-v1') <> 1 THEN
+    RAISE EXCEPTION 'reset-recovery-tables: REFUSING — expected exactly one recovery-reset-v1 marker';
+  END IF;
+  -- run_held_publications has a RESTRICT hold FK: refuse and roll back if present.
   -- FK-safe order: chunks (CASCADE child) → captures (RESTRICT child of holds) → holds.
   IF to_regclass('public.recovery_capture_chunks') IS NOT NULL THEN
-    DELETE FROM recovery_capture_chunks;
+    DELETE FROM public.recovery_capture_chunks;
     GET DIAGNOSTICS n_chunks = ROW_COUNT;
   END IF;
   IF to_regclass('public.recovery_captures') IS NOT NULL THEN
-    DELETE FROM recovery_captures;
+    DELETE FROM public.recovery_captures;
     GET DIAGNOSTICS n_captures = ROW_COUNT;
   END IF;
   IF to_regclass('public.recovery_custody_holds') IS NOT NULL THEN
-    DELETE FROM recovery_custody_holds;
+    DELETE FROM public.recovery_custody_holds;
     GET DIAGNOSTICS n_holds = ROW_COUNT;
   END IF;
   -- Independent of the hold chain; cleared last.
   IF to_regclass('public.custody_episode_notices') IS NOT NULL THEN
-    DELETE FROM custody_episode_notices;
+    DELETE FROM public.custody_episode_notices;
     GET DIAGNOSTICS n_notices = ROW_COUNT;
   END IF;
   RAISE NOTICE 'reset-recovery-tables: deleted chunks=% captures=% holds=% episode_notices=%',
@@ -127,4 +131,5 @@ BEGIN
 END $$;
 SQL
 
+echo "reset-recovery-tables: clearing complete — HARNESS ISOLATION ONLY."
 echo "reset-recovery-tables: done."

@@ -351,6 +351,7 @@ tasks:
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
       # the worker's Docker data-root. Before `scan:secrets` (deliberately last).
       - task: test:store-it-cleanup
+      - task: test:reset-recovery-tables
       # hermetic (~11s, fake docker, no daemon; Linux-only via `platforms`): the opt-in
       # codex-git-trust wrapper's bind/cleanup/exit-code/signal contract (#1769). Its
       # SIGTERM case waits out the 10s kill grace, so it is not sub-second.
@@ -1061,6 +1062,16 @@ tasks:
       # asserts only a definitely-dead `uzi-e2e-<pid>` project is torn down (the real
       # `uzi` stack, store-it, the current run, and an EPERM/alive pid are all skipped).
       - ./e2e/reclaim-leaked-e2e.test.sh
+
+  test:reset-recovery-tables:
+    desc: hermetic reset client and refusal contract
+    cmds:
+      - bash ./e2e/reset-recovery-tables.test.sh
+
+  test:reset-recovery-tables:live:
+    desc: owned throwaway PostgreSQL reset safety and initialization proof
+    cmds:
+      - bash ./e2e/reset-recovery-tables.live.test.sh
 
   test:store-it-cleanup:
     desc: behavioral test that run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME (fake docker, hermetic)
