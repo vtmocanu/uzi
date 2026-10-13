@@ -252,6 +252,17 @@ printf '%s## [Unreleased]\n\n### Changed\n\n- **branch new (#9)**\n  branch desc
 mkconflict link
 expect_ok link
 
+# 16b. Per-bullet protection: a historical released bullet that already carries a linked
+#      `[#2361](...)` on every side must not stop an unrelated [Unreleased] bullet's bare `(#2361)`
+#      from folding as its linkified form.
+printf '%s' "${LANC_/earlier desc/earlier cites [#2361](${U_}/pull/2361).}" > "$WORK/hist.base.md"
+sed "s#^  earlier desc#  earlier cites [\#2361](${U_}/pull/2361).#" "$WORK/link.main.md" > "$WORK/hist.main.md"
+sed "s#^  earlier desc#  earlier cites [\#2361](${U_}/pull/2361).#" "$WORK/link.branch.md" > "$WORK/hist.branch.md"
+sed "s#^  earlier desc#  earlier cites [\#2361](${U_}/pull/2361).#" "$WORK/link.want.md" > "$WORK/hist.want.md"
+grep -Fq "earlier cites" "$WORK/hist.main.md" || fail "hist fixture not built"
+mkconflict hist
+expect_ok hist
+
 # 17. Linkification is the ONLY tolerated difference: a reworded released copy, a link whose
 #     target number differs from its text, and a released copy of a bullet that the ancestor
 #     held twice (one copy dropped) all still refuse.
