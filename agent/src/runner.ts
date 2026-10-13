@@ -12055,7 +12055,7 @@ export class RunRunner {
       const labels = chunk.map(s => s.slice(0, 12));
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
         archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; local custody retained. Use uzi run recovery or uzi run export.`
-          : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
+          : `Retained heads ${labels.join(", ")} are retained locally with no confirmed checkpoint coverage. Inspect status with uzi run recovery or uzi run export.`,
       } });
       for (const s of chunk) seen.add(s);
     }
@@ -12064,10 +12064,31 @@ export class RunRunner {
   private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string): Promise<void> {
     try {
       const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha);
-      // Released heads are no longer owed: forget them so the ledger tracks only live pins.
+      // Only reconcileOwedCandidates supplies positive checkpoint coverage proof.
+      // Snapshot previously announced removals before forgetting all released heads.
+      const resolved = [...new Set(result.removedShas)].filter(sha => /^[0-9a-f]{40}$/.test(sha) &&
+        (flight.owedAnnounced.heads.has(sha) || flight.owedAnnounced.archived.has(sha)));
       for (const sha of result.removedShas) {
         flight.owedAnnounced.heads.delete(sha);
         flight.owedAnnounced.archived.delete(sha);
+      }
+      // Diagnostics confer no cleanup authority and delivery adds no retry ledger.
+      // One synchronous attempt per eight-head row, bounded by the finite inventory;
+      // a refused row does not block later rows or remaining-head announcements.
+      for (let i = 0; i < resolved.length; i += 8) {
+        const chunk = resolved.slice(i, i + 8);
+        try {
+          if (flight.owedFeedClosed) throw new Error("feed closed");
+          flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
+            `Confirmed checkpoint covers previously retained heads ${chunk.map(sha => sha.slice(0, 12)).join(", ")}; these heads are no longer owed locally.`,
+          } });
+        } catch (err) {
+          try {
+            flight.runLog.info("recovery: checkpoint coverage resolution not delivered", {
+              heads: chunk, error: errMessage(err),
+            });
+          } catch { /* Best-effort diagnostics must not interrupt reconciliation. */ }
+        }
       }
       this.announceOwedHeads(flight, result.retainedShas);
     } catch (err) {
