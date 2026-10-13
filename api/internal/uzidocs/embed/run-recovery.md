@@ -1091,7 +1091,9 @@ exact source under one lock. It never cancels a run or stops the worker.
 > or protected-descriptor sources, the marker canonical, and attempt clones whose last
 > ledger entry for the run is `live` or `reclaimed` (an unreadable one counts as attributed
 > only on that evidence, or when a journal names it); completed and cancelled runs capture
-> only protected-descriptor or marker sources. If an attributed source is listed but
+> protected-descriptor or marker sources and the same `live`/`reclaimed` attempt clones (the
+> plain journal is ignored for them, and a retired or abandoned attempt is never a source: a
+> terminal status does not prove a predecessor's unique work is preserved). If an attributed source is listed but
 > unreadable, any capture is not verified, or a probe of the search failed (a kubectl
 > listing or exec, an unreadable bare repository), it logs
 > `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`,
@@ -1099,12 +1101,19 @@ exact source under one lock. It never cancels a run or stops the worker.
 > capture) plus attributed unreadable ones, exits 1 and does not advance `latest`; any
 > archive that did verify is kept. When nothing is captured at all (no readable clone and
 > no owned tracking ref), a failed search instead logs
-> `FAIL <run> (<label>) status=<st>: status saved, but the source search was inconclusive (a kubectl listing or exec failed); retry`
-> (still exit 1, `latest` not advanced). An
-> unreadable directory that no journal, ledger or marker names is not an attributed
+> `FAIL <run> (<label>) status=<st>: status saved, but the source search was inconclusive (<reasons>); retry`
+> (still exit 1, `latest` not advanced); each reason names the failing pod or namespace
+> (`exec into pod <ns>/<pod> failed`, `listing Running pods in namespace <ns> failed`). A
+> same-stem directory without `.git` is skipped only when it is positively empty; a nonempty
+> or unlistable one that the journal, ledger (`live`/`reclaimed`) or marker names is an
+> attributed source that is listed but unreadable (incomplete coverage, `latest` not
+> advanced). A directory that no journal, ledger or marker names is not an attributed
 > source. Cost: every cycle execs into every Running pod in `UZI_WORKER_NS` for each
-> bound run, and one pod that cannot be exec'd into fails every live run's cycle until it
-> is fixed or its namespace is dropped from `UZI_WORKER_NS` (which lists namespaces, not pods).
+> bound run, and one pod that cannot be exec'd into fails every bound run's cycle until it
+> is fixed (the FAIL line names it and verified artifacts are kept). Do not drop its
+> namespace from `UZI_WORKER_NS` (which lists namespaces, not pods) unless you have verified
+> that namespace holds no source a tracked run needs: excluding it hides those sources from
+> the search, so their work is no longer backed up and the backup could read green without it.
 
 What the channel does not promise:
 
