@@ -1145,7 +1145,7 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
               } else if (entry.isFile() && entry.name.endsWith(`-${sessionId}.jsonl`) && isAllowedSessionArtifact(entry.name)) {
                 let file: FileHandle | undefined;
                 try {
-                  file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW);
+                  file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
                   if ((await file.stat()).isFile()) return true;
                 } catch (error) {
                   const code = (error as NodeJS.ErrnoException).code;
