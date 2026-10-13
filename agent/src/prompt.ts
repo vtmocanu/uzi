@@ -1671,8 +1671,11 @@ export interface ImplementPromptInput {
   /** PRD #122 M6: the lead's latest reported progress over `milestones`, so the note marks
    *  each milestone done / in progress / not started. DYNAMIC (unlike deps/baseCommit),
    *  which is why the milestone note is not first-turn-only: it re-renders the live status
-   *  each turn. Absent ⇒ every milestone renders as not-yet-started. See milestoneStatusNote. */
+   *  each turn. Combined for display with serverCompletedIds. See milestoneStatusNote. */
   progress?: MilestoneProgress;
+  /** Completed IDs from the iteration ACK, for display only. Absent means prior declarations
+   *  may be unknown; never manufacture progress from this snapshot. */
+  serverCompletedIds?: readonly string[];
   /** PRD #390 M2/M3: the executor sets this when the PREVIOUS work turn marked no
    *  milestone in progress, so this turn's note escalates from the standing per-turn
    *  requirement into a direct re-ask. Absent/false ⇒ no escalation line. It only ever
@@ -1835,6 +1838,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
     input.milestones,
     input.progress,
     input.progressMissedLastTurn,
+    input.serverCompletedIds,
   );
   if (milestoneNote) lines.push("", milestoneNote);
   // PRD #1416 M2: a WORKER-AUTHORITATIVE safety steer, rendered EVERY turn it is present (it is
@@ -2002,9 +2006,12 @@ export function milestoneStatusNote(
   milestones: readonly Milestone[] | undefined,
   progress: MilestoneProgress | undefined,
   progressMissedLastTurn?: boolean,
+  serverCompletedIds?: readonly string[],
 ): string {
   if (!milestones || milestones.length === 0) return "";
-  const done = new Set(progress?.completed ?? []);
+  // Display only: the ACK can retain declarations from before this executor resumed.
+  // Rows remain restricted to frozen IDs and local in_progress is left untouched.
+  const done = new Set([...(serverCompletedIds ?? []), ...(progress?.completed ?? [])]);
   const active = new Set(progress?.in_progress ?? []);
   const rows = milestones.map((m) => {
     const status = done.has(m.id)
@@ -2019,6 +2026,10 @@ export function milestoneStatusNote(
     "committed locally, call the `checkpoint` tool once and end your turn so the work is",
     "saved durably before you start the next one:",
     ...rows,
+    ...(serverCompletedIds === undefined ? [
+      "Prior completion declarations may be unknown because the iteration ACK supplied no completed IDs.",
+      "The statuses above use locally known progress; reconcile them with committed/reviewed work on resume.",
+    ] : []),
     "",
     // PRD #265 M3 / PRD #390 M2: keep the run's milestone tracker truthful. report_progress
     // gives mid-run visibility without ending the turn (it is already decoupled from the
@@ -2030,7 +2041,8 @@ export function milestoneStatusNote(
     // them all" that re-lies (a deliberately-skipped milestone stays undeclared).
     "Keep this tracker honest as you go. At the start of each implement turn, call",
     "`report_progress` with the id of the milestone you are working on (its `in_progress`);",
-    "call it again with that id in `completed` when it is done. It updates the tracker right",
+    "call it again with that id in `completed` when its required work and checks are complete",
+    "and committed as milestones land. It updates the tracker right",
     "away and does NOT end your turn. When you have DISPATCHED a subagent to work a milestone",
     "that is `in_progress`, also pass `milestones_agents` with that milestone's id and the",
     "EXACT `subagent_type` string you gave the Agent/Task dispatch (its kebab-case identifier),",
@@ -2039,6 +2051,12 @@ export function milestoneStatusNote(
     "milestones you ACTUALLY completed on `signal_done` (its `milestones_completed` field):",
     "list only what you truly finished, and leave any you deliberately left undone undeclared,",
     "so the tracker reflects what actually shipped rather than reading as 0 on a run that succeeded.",
+    "On resume, reconcile previous committed/reviewed work with this tracker.",
+    "Immediately before calling `signal_done`, report finished-but-unreported milestone IDs",
+    "with `report_progress` completed, then include the actually complete `milestones_completed`",
+    "in `signal_done` in the same turn. An unchanged, already verified gate need not be rerun",
+    "just to report completion; lost verification evidence or code changes require checks.",
+    "Leave maintainer-owned, deferred, or genuinely unfinished work undeclared.",
     // PRD #1353 M2: bind a dispatched subagent's LIVE activity to the milestone it works by
     // tagging the dispatch description with the milestone id in square brackets. This is the
     // description-side companion to milestones_agents above: report_progress records who is

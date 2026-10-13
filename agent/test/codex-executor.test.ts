@@ -10187,6 +10187,108 @@ describe("CodexExecutor: per-run command cache (issue #1598)", () => {
   });
 });
 
+describe("approved m1 Codex resume reconciliation", () => {
+  for (const ack of ["present", "absent"] as const) {
+    it(`m1 Codex resume display combines local progress with ${ack} ACK`, async () => {
+      const milestones = ["m1", "m2", "m3"].map((id) => ({ id, title: `Title ${id}` }));
+      const rig = makeMultiEpochRig([(c) => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method !== "turn/start") return {};
+        const tn = `tn-${c.turnStartCount}`;
+        if (c.turnStartCount === 1) {
+          c.transport.push(threadStarted("th-1")).push(toolCall(1, "report_progress",
+            { completed: ["m2"], in_progress: ["m1", "m3"] }, "th-1", tn, "progress"));
+        } else {
+          c.transport.push(toolCall(2, "signal_done", {}, "th-1", tn, "done"));
+        }
+        c.transport.push(turnCompleted("completed", "th-1", tn));
+        return { turn: { id: tn } };
+      }]);
+      const pushed: unknown[] = [];
+      const { ctx } = makeCtx({
+        frozenMilestones: milestones,
+        reportIteration: async () => ack === "present" ? { completedIds: ["m1", "unknown-server"] } : undefined,
+        reportProgress: async (progress) => { pushed.push(progress); },
+      });
+      await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, ack);
+      const turn = rig.epochs[0]!.transport.requests.filter((r) => r.method === "turn/start")[1]!;
+      const second = (turn.params as { input: { text: string }[] }).input[0]!.text;
+      assert.match(second, ack === "present" ? /\[m1\] Title m1 — done/ : /\[m1\] Title m1 — in progress/);
+      assert.match(second, /\[m2\] Title m2 — done/);
+      assert.match(second, /\[m3\] Title m3 — in progress/);
+      assert.doesNotMatch(second, /unknown-server/);
+      assert.equal(second.includes("Prior completion declarations may be unknown"), ack === "absent");
+      assert.deepEqual(pushed, [{ completed: ["m2"], in_progress: ["m1", "m3"] }]);
+    });
+  }
+  for (const declaration of ["progress", "done", "unfinished"] as const) {
+    it(`m1 Codex resume first prompt and completion: ${declaration}`, async () => {
+      // Same trace regression as Claude: f93ddb57 seq1969/2279–93 and
+      // ed894e5c seq5523/5526–38. m4 is verified-but-unreported except in the
+      // unfinished control; scripts test delivery and mechanics, not model compliance.
+      const milestones = ["m1", "m2", "m3", "m4"].map((id) => ({ id, title: `Title ${id}` }));
+      const finish = (t: FakeTransport, th: string, tn: string): void => {
+        if (declaration === "progress") t.push(toolCall(1, "report_progress",
+          { completed: ["m4"], in_progress: [] }, th, tn, "progress"));
+        t.push(toolCall(2, "signal_done",
+          declaration === "unfinished" ? {} : { milestones_completed: ["m4"] }, th, tn, "done"));
+        t.push(turnCompleted("completed", th, tn));
+      };
+      const rig = makeMultiEpochRig([
+        epochResponder("th-1", "tn-1", finish),
+        resumedEpochResponder("th-1", "tn-2", finish),
+        resumedEpochResponder("th-1", "tn-3", finish),
+      ]);
+      const persisted = new Set(["m1", "m2", "m3"]);
+      const iterations: number[] = [];
+      const attempts: string[][] = [];
+      const holds: string[] = [];
+      const pushed: unknown[] = [];
+      const { ctx } = makeCtx({
+        frozenMilestones: milestones, completionInterlock: true,
+        reportIteration: async (n) => {
+          iterations.push(n);
+          return { completedIds: [...persisted], completedCount: persisted.size };
+        },
+        reportProgress: async (progress) => {
+          pushed.push(progress);
+          for (const id of progress.completed ?? []) persisted.add(id);
+        },
+        recordCompletionAttempt: async ({ declared }) => {
+          attempts.push(declared);
+          for (const id of declared) persisted.add(id);
+          return { unmet: milestones.filter((m) => !persisted.has(m.id)).map((m) => m.id),
+            attemptCount: attempts.length };
+        },
+        enterCompletionHold: async (reason) => { holds.push(reason); return true; },
+      });
+      const result = await withTimeout(makeExecutor(rig, bindingOf(SUBSCRIPTION)).run(ctx), 5000, declaration);
+      const prompts = rig.epochs.flatMap((epoch) => epoch.transport.requests
+        .filter((r) => r.method === "turn/start")
+        .map((r) => (r.params as { input: { text: string }[] }).input[0]!.text));
+      for (const m of milestones) assert.ok(prompts[0]!.includes(`[${m.id}] ${m.title}`));
+      for (const id of ["m1", "m2", "m3"]) assert.ok(prompts[0]!.includes(`[${id}] Title ${id} — done`),
+        "Codex first prompt reconciles every persisted ID");
+      assert.match(prompts[0]!, /\[m4\] Title m4 — not started/, "unreported work requires reconciliation");
+      assert.match(prompts[0]!, /Immediately before .*signal_done/, "Codex receives before-done instruction");
+      assert.deepEqual(pushed, declaration === "progress" ? [{ completed: ["m4"], in_progress: [] }] : [],
+        "ACK display does not manufacture progress");
+      if (declaration === "unfinished") {
+        assert.equal(attempts.length, 3);
+        assert.equal(holds.length, 1);
+        assert.ok(result.completionHeld);
+        assert.match(prompts[1]!, /Title m4/, "reentry retains frozen context");
+      } else {
+        assert.equal(prompts.length, 1);
+        assert.deepEqual(iterations, [1]);
+        assert.deepEqual(attempts, [["m4"]]);
+        assert.deepEqual(holds, []);
+        assert.equal(result.completionHeld, undefined);
+      }
+    });
+  }
+});
+
 describe("Codex completion interlock", () => {
   for (const scenario of [
     { name: "zero", ack: { scopeCeiling: 0, completedCount: 0 }, capped: 0 },

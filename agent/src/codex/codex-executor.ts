@@ -486,8 +486,9 @@ function codexMilestoneNote(
   milestones: readonly Milestone[] | undefined,
   progress: MilestoneProgress | undefined,
   progressMissedLastTurn: boolean,
+  serverCompletedIds?: readonly string[],
 ): string {
-  const shared = milestoneStatusNote(milestones, progress, progressMissedLastTurn);
+  const shared = milestoneStatusNote(milestones, progress, progressMissedLastTurn, serverCompletedIds);
   return shared ? `${shared}\n\n${CODEX_MILESTONE_DISPATCH_NOTE}` : "";
 }
 
@@ -2971,7 +2972,7 @@ export class CodexExecutor implements Executor {
       // Issue #1514: every completed id seen this run; latestProgress is pruned across checkpoints.
       const seenCompletedIds = new Set<string>();
       const isIssueRun = resolveRunKind(ctx.kind) === "issue";
-      const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
+      const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn, lastServedScope?.completedIds);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
         && !ctx.interactive && !!ctx.recordCompletionAttempt;
       // Issue #1764 (PRD #1190 parity with sdk-executor): honour a seeded/steered pause at the
