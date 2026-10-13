@@ -301,6 +301,17 @@ async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: Resolv
   await actOnAck(deps, args, ack);
 }
 
+/** Admission bookkeeping is advisory: failure must never skip the existing retirement attempt. */
+async function markServerSettledBestEffort(deps: TerminalOutboxDeps, args: ResolveArgs): Promise<void> {
+  try {
+    await deps.outbox.markTerminalServerSettled(args.runId, args.claimGeneration, args.retirementContext);
+  } catch {
+    deps.log.debug("outbox: server-settled observation failed; attempting retirement", {
+      run_id: args.runId, claim_generation: args.claimGeneration,
+    });
+  }
+}
+
 /** Classify a terminal-report ack that is NOT `messages_pending` and act on it. Order matters:
  *  stale_claim outranks a terminal status (a superseded generation must local-retire, never write). */
 async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateAck): Promise<void> {
@@ -308,7 +319,7 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
   const { runId, claimGeneration } = args;
   if (ack.applied) {
     // 200: the transition landed. Retire the journal (the outcome is the run's outcome now).
-    await outbox.markTerminalServerSettled(runId, claimGeneration, args.retirementContext);
+    await markServerSettledBestEffort(deps, args);
     await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
@@ -327,7 +338,7 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
     // 409 whose returned status is terminal: the outcome already landed (a lost ack after a prior
     // commit, or a racing cancel). Stop advertising the exact outcome even if custody
     // retains the journal; this observation grants no deletion authority.
-    await outbox.markTerminalServerSettled(runId, claimGeneration, args.retirementContext);
+    await markServerSettledBestEffort(deps, args);
     await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
