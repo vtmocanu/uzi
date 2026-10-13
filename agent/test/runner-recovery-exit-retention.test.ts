@@ -881,7 +881,9 @@ describe("RunRunner #1786 M2 rework — no return path of the handler releases a
       assert.deepEqual(parked, [false], "the handler did not park");
       assertRecoverable(r.clone(), hook.late()!, exit.name);
       assert.deepEqual(stopMarkers(r.claim.run_id), []);
-      assert.deepEqual(keptReasons(r.lines).length, 1, "one cleanup-time check, which kept the source");
+      // A shutdown exit runs no cleanup-time check at all (the clone is kept by the latched flag).
+      assert.deepEqual(keptReasons(r.lines).length, exit.iid === 17933 ? 0 : 1,
+        exit.iid === 17933 ? "shutdown: no cleanup-time check" : "one cleanup-time check, which kept the source");
     });
   }
 
@@ -1211,5 +1213,28 @@ describe("RunRunner #1786 — an ownership 404 in the handler's loop keeps a cov
     assert.deepEqual(sites, [], "no coverage-based release was attempted");
     assert.deepEqual(stopMarkers(f.claim.run_id), []);
     assert.equal(api.states.filter((s) => s.body.status === "failed" || s.body.status === "recovery_wait").length, 0);
+  });
+});
+
+describe("RunRunner #1786 — a shutdown exit runs no cleanup-time coverage check", { skip: LINUX_CAPTURE }, () => {
+  it("a verified, still-covered capture marks release eligible, then shutdown during the loop: no coverage check runs and the clone survives", async () => {
+    const r = transientRig(17960);
+    const sites = spyExitSites(r.runner);
+    const parked = spyHandlerResults(r.runner);
+    const report = client.reportState.bind(client);
+    // A statusless park ACK sends the loop back to its top, where the shutdown is observed.
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait") { r.runner.shutdown(); return { applied: true } as never; }
+      return report(runId, body, signal);
+    };
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+    }
+    assert.deepEqual(parked, [false], "the handler stopped without parking");
+    assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "shutdown exit");
+    assert.deepEqual(sites, [], "no retainStoppedSource call inside the termination grace");
+    assert.deepEqual(coveredReasons(r.lines), []);
   });
 });

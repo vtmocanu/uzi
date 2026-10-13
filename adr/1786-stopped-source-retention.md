@@ -18,10 +18,10 @@ unfetched or uncommitted bytes, so that convention deleted the last copy.
 
 ### Invariant
 
-A stopped generation's exact local source is kept until one of two things happens:
-
-- complete preservation is proven **at cleanup time**, or
-- an operator explicitly disposes of it.
+A stopped generation's exact local source is kept until an operator explicitly disposes of it. For
+stopped-source exits the coverage check is diagnostic only and never authorizes release. Park and
+terminal exits (which can still be resumed or recaptured) are the one place a source may also be
+released, when complete preservation is proven **at cleanup time**.
 
 None of the following is proof: a successor's claim, a released hold (including a successor's
 release of a predecessor hold), a terminal run status, or a capture result remembered from

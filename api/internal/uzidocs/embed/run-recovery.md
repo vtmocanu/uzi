@@ -1091,8 +1091,9 @@ exact source under one lock. It never cancels a run or stops the worker.
 
 - On a Docker-wired worker, discard itself runs the Docker teardown, which
   force-removes containers that bind-mount the clone (with their anonymous
-  volumes), and is refused unless that teardown reported `docker_unconfirmed` (no
-  container known to mount the clone). A `docker_error` or any other state
+  volumes), and is refused unless that teardown reported `docker_unconfirmed` (a bounded
+  observation: two consecutive listings found no known container mounting the clone;
+  a container create the Docker daemon had already accepted could still complete afterwards). A `docker_error` or any other state
   refuses the request. Discard clears a journal
   only when it still names that source, never a successor's.
 - A busy channel, a drain timeout (claims did not drain in 5 s), a non-idle worker, a

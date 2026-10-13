@@ -15518,7 +15518,10 @@ export class RunRunner {
       throw error;
     } finally {
       // B2: the one cleanup-time coverage check, after the last possible writer on every return.
-      if (!propagating) await settleCloneRelease();
+      // A shutdown exit does no cleanup-time work inside the termination grace (own-mode quiesce, Docker
+      // teardown, bare lock): the pending release is dropped and the latched preserve flag keeps the clone.
+      if (!propagating && (flight.active?.shuttingDown || this.shuttingDownGlobal)) pendingRelease = undefined;
+      else if (!propagating) await settleCloneRelease();
       if (!credentialRedispatch) await batcher.close().catch(() => undefined);
     }
   }
