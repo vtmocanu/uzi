@@ -629,6 +629,23 @@ jobs:
           cache: npm
           cache-dependency-path: agent/package-lock.json
       - uses: ./.github/actions/setup-task
+      - uses: actions/setup-go@b7ad1dad31e06c5925ef5d2fc7ad053ef454303e  # v7
+        with:
+          go-version: "1.27"
+          check-latest: true
+          cache: false
+      # Both shards build the same tool with the same flags; shard 1 alone saves.
+      - uses: ./.github/actions/go-cache
+        id: gocache
+        with:
+          class: agent-test-tools
+          module: api
+      - name: Install gitleaks (shared Taskfile pin)
+        env:
+          GOBIN: ${{ runner.temp }}/gitleaks-bin
+        run: |
+          task install:gitleaks
+          printf '%s\n' "$GOBIN" >> "$GITHUB_PATH"
       - name: npm ci
         working-directory: agent
         run: npm ci
@@ -658,6 +675,13 @@ jobs:
           path: agent/shard-${{ matrix.shard }}.*
           if-no-files-found: error
           retention-days: 1
+
+      - name: Save Go cache (main, shard 1 only)
+        if: github.event_name == 'push' && github.ref == 'refs/heads/main' && matrix.shard == 1 && steps.gocache.outputs.key != '' && steps.gocache.outputs.cache-hit != 'true'
+        uses: ./.github/actions/go-cache-save
+        with:
+          key: ${{ steps.gocache.outputs.key }}
+          paths: ${{ steps.gocache.outputs.paths }}
 
   test-agent-worker-uid:
     runs-on: ubuntu-latest
@@ -900,8 +924,8 @@ jobs:
         run: task gate:repo
       # Offline fixture test of the release-train scripts (PRD 1265 M1). A `gate`
       # member, not a `gate:repo` member (it builds a multi-commit git repo), so it
-      # is a distinct step here in the repo-wide job. Needs only git + bash, both
-      # present on the runner and set up by the checkout above.
+      # is a distinct step here in the repo-wide job. Registry identity fixtures also
+      # use jq; packaging fixtures run separately in helm-chart, which installs Helm.
       - name: test:release-scripts (release-train fixture)
         run: task test:release-scripts
       - name: Save Go cache (main only)
@@ -935,6 +959,8 @@ jobs:
             --show-only templates/controller-deployment.yaml > /tmp/uzi-controller.yaml
           sh scripts/assert-controller-strategy.sh /tmp/uzi-controller.yaml
       - uses: ./.github/actions/setup-task
+      - name: Verify packaged-chart worker roll target
+        run: task test:worker-roll-target-package
       - name: Render and assert the OpenShift/OKD knobs
         # Offline (strips the CNPG subchart). Needs helm (above) and yq, which the
         # ubuntu-latest runner provides, the same unpinned-reader reasoning as
