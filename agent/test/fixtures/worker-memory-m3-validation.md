@@ -55,6 +55,18 @@ Lead also passed all five captured-memory epoch seam cases (`gate-log.lfw2xJ`, E
 
 Additional lifecycle/adapter integration proofs and the full canonical M3 agent gate remain pending. Production default remains disabled; M4 and M5 have not started.
 
+## Actual runner-to-Codex fake-process integration
+
+At `6fecde685e922d2d860cfb1b1e09bc8658bb9911`, two new cases connect the actual runner, captured capability, Codex executor, broker callback and default command spawner to the monitor. The tests do not manually register a memory command or emit its tool result. One case verifies identical structured callback/feed content, retry refusal without another root launch, sustained-low-Q rearm and retained spent allowance. The other verifies exhausted owner-hold acceptance and retained clone/HOME through the real client and fake API DTO. Memory samples, process handles and API storage are synthetic: no real-process, LiveDB runner or calibration proof is inferred.
+
+This connection exposed an owner-capture defect: the memory operation intentionally aborts model execution before capture, but its default settlement consulted that spent model signal. Memory preservation now requests the existing `cancel` settlement purpose, which drains, joins the installer and re-observes known registries under the independent owner deadline. The other helper callers keep the existing `capture` default. The fixture also now uses production's deferred registry teardown; an earlier standalone-fixture disposal failure is not attributed to production.
+
+Lead pinned dependency/lint/dead-code/typecheck recipes passed (`gate-log.caKuTm`, EXIT=0). The two new cases, five existing capture-seam cases and 124 focused memory cases passed (`gate-log.RVZfVs`, EXIT=0). Lead subsequently executed the existing credential-free owner-cancel suite: 79 passed, zero failures/cancellations/skips (`gate-log.yhB0Vz`, EXIT=0). An earlier name-pattern probe selected no meaningful cases and is excluded from behavioral evidence.
+
+Reviewer and auditor found no production authority/security defect at `6fecde68`. Reviewer identified, and tester reproduced, a mandatory regression-proof gap: an early argument assertion threw before forwarding the folded default-capture call, yielding an owner-settlement timeout. That timeout is not accepted RED evidence. The proof repair removes that early implementation assertion and keeps the completed-installer behavior assertion. Lead rechecked all seven integration/seam cases after removal (`gate-log.VEAWKu`, EXIT=0). Typed fix-absent proof and repair review remain to be recorded after execution; no result is inferred here. Tester's optional c8 coverage-gate suggestion at `6fecde68` is deferred.
+
+M3 remains in progress. Additional delayed owner-park/capture/lifecycle proofs, a memory-hold-specific owner Cancel LiveDB case and the full canonical agent gate remain pending. Production default is disabled; M4/M5 have not started.
+
 ## Next serial integration
 
 The full canonical integration gate remains pending for the wired M3 unit; M2's earlier passing gate is historical evidence at its own candidate. Required fake-API/live-DB end-to-end proofs, including missing-preservation-integration sensitivity, remain pending.

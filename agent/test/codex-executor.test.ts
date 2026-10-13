@@ -835,7 +835,6 @@ describe("M3 actual runner memory Codex delivery", () => {
           return executor.run(ctx);
         },
         settleForCredentialFreeCapture: async (...args) => {
-          assert.equal(args[1], "cancel", "owner uses the existing independent cancellation settlement");
           assert.ok(args[0] > 0 && args[0] <= 5000, "settlement stays inside the finite owner budget");
           const result = await executor.settleForCredentialFreeCapture(...args);
           settlements.push(result);
