@@ -238,6 +238,8 @@ export function makeExecRig(mods: ExecModules, responder: Responder): ExecRig {
         supervisorPid: 200,
         transport: { stdin, stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        // This scripted transport has no attributable process observation.
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
         waitChild: async () => ({ event: "child_exit", code: 0 }),
         dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
         failed: undefined,
