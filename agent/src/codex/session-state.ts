@@ -585,7 +585,9 @@ async function hasAllowlistedArtifact(sessionsDir: FileHandle, scanCap: number):
       } else if (entry.isFile() && isAllowedSessionArtifact(entry.name)) {
         let file: FileHandle;
         try {
-          file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW);
+          // Open nonblocking before stat so a candidate raced to a FIFO cannot
+          // block inspect; file.stat() below rejects it as nonregular.
+          file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
         } catch (error) {
           const code = (error as NodeJS.ErrnoException).code;
           if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") continue;

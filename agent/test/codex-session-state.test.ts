@@ -2,7 +2,8 @@ import { afterEach, beforeEach, describe, it, type TestContext } from "node:test
 import type { Dir, Dirent } from "node:fs";
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { constants as FS, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -184,6 +185,54 @@ describe("streamed session scans", { skip: LINUX_ONLY }, () => {
     store = join(root, "store");
   });
   afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  it("inspect: a candidate swapped to a FIFO cannot block the store lock", async (t) => {
+    await writeFileAt(join(source, "sessions", rollout), "{}");
+    await CodexSessionStore.persist(source, store);
+    const sessions = join((await currentGenDir(store))!, "sessions");
+    const candidate = join(sessions, rollout);
+    const identity = await fsp.stat(sessions);
+    const probe = await probeScans(t, [{ path: sessions }]);
+    const open = fsp.open;
+    let fired = 0;
+    let yieldedAtSwap: number | undefined;
+    let observedFlags: Parameters<typeof fsp.open>[1];
+    let candidateHandle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+    let result;
+    try {
+      t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+        const path = String(args[0]);
+        if (path.endsWith(`/${rollout}`)) {
+          const st = await fsp.stat(dirname(path)).catch(() => undefined);
+          if (st && st.dev === identity.dev && st.ino === identity.ino) {
+            fired++;
+            yieldedAtSwap = probe.records[0]?.yielded;
+            await fsp.unlink(candidate);
+            execFileSync("mkfifo", [candidate]);
+            observedFlags = args[1];
+            // Refuse a blocking open so the unfixed code fails without hanging.
+            if (typeof observedFlags !== "number" || !(observedFlags & FS.O_NONBLOCK)) {
+              throw new Error("candidate open would block on the FIFO");
+            }
+            candidateHandle = await open(...args);
+            return candidateHandle;
+          }
+        }
+        return open(...args);
+      });
+      result = await CodexSessionStore.inspect(store);
+    } finally { t.mock.restoreAll(); }
+    assert.equal(fired, 1);
+    assert.equal(yieldedAtSwap, 1, "regular candidate was yielded before the swap");
+    assert.ok(typeof observedFlags === "number" && (observedFlags & FS.O_NONBLOCK),
+      "presence candidate open must be nonblocking");
+    assert.equal((await fsp.lstat(candidate)).isFIFO(), true);
+    assert.ok(candidateHandle, "the real FIFO was opened");
+    assert.equal(candidateHandle.fd, -1, "FIFO FileHandle closes after rejecting its stat");
+    assert.equal(result, "absent");
+    assert.deepEqual(probe.yields(sessions), [1]);
+    await probe.verify();
+  });
 
   for (const operation of ["inspect", "inspectSession"] as const) {
     for (const outcome of ["cap", "success", "exhaustion"] as const) {
