@@ -32,6 +32,7 @@ import { Badge } from "./ui";
 export function RunCredential({
   run,
   variant = "full",
+  displayLabel,
 }: {
   run: Pick<
     Run,
@@ -48,6 +49,8 @@ export function RunCredential({
   // row stays scannable. "full" is the run-detail sentence chip and stays the
   // default for the run-detail page.
   variant?: "full" | "compact";
+  // Personal list presentation only; the recorded snapshot remains in the tooltip.
+  displayLabel?: string;
 }) {
   const codex = run.harness === "codex";
   const label = codex ? run.codex_secret_label : run.anthropic_secret_label;
@@ -105,7 +108,7 @@ export function RunCredential({
             `wrap` (a 64-char token has no break opportunity to wrap on); `truncate`
             keeps the full text in the DOM so screen readers still read it, and the
             title carries the full label for mouse users. */}
-        <span className="max-w-[12rem] truncate">{safe}</span>
+        <span className="max-w-[12rem] truncate">{displayLabel !== undefined ? sanitizeLabel(displayLabel) : safe}</span>
         {deleted && " (deleted)"}
       </Badge>
     ) : (
