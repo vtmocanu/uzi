@@ -5253,8 +5253,8 @@ export class RunRunner {
     const movedGeneration = own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration;
     if (movedGeneration || TERMINAL_RUN_STATUSES.has(own.status)) {
       // issue #1786: a successor generation or a terminal status owns the run, but it cannot see this
-      // worker's bytes. The stop stays silent (no report, no capture); the clone is kept unless it is
-      // already held by the bare. This pre-handler check is the same exit as the recheck rows in
+      // worker's bytes. The stop stays silent (no report, no capture). Another generation keeps the
+      // clone whatever its coverage; a terminal status keeps it unless it is proven covered. This pre-handler check is the same exit as the recheck rows in
       // handleRecoveryExhausted: another generation records the stopped source, a terminal status
       // keeps the plain journal (no ledger `reclaimed`, no marker).
       // Both arms keep the guarded inventory closed (stale:true; the moved-generation call omits the
@@ -15042,8 +15042,8 @@ export class RunRunner {
           holdReason = own.hold_reason ?? undefined;
           if ((credentialDeferred || opts.terminalDisk || this.isCredentialFreeOwnerCancel(claim, flight)) &&
               own.claim_generation !== undefined && own.claim_generation !== flight.claimGeneration) {
-            // An authoritative successor claim: no report, and (issue #1786) the clone is kept unless
-            // proven preserved, since the successor cannot see this worker's bytes.
+            // An authoritative successor claim: no report, and (issue #1786) the clone is kept (even
+            // when covered), since the successor cannot see this worker's bytes.
             markReleaseEligible("recovery_other_generation", { stale: true, record: "stopped" });
             flight.preserveSession = false;
             return false;
@@ -16750,7 +16750,7 @@ export class RunRunner {
      *  `record`: `stopped` writes the stopped-source representation (attempt ledger `reclaimed`,
      *  canonical `uzi-stopped` marker) whatever the coverage verdict: only for an exit where this
      *  generation is stopped by staleness or superseded. `none` keeps the ADR-1197 posture of a park
-     *  or terminal exit instead: the preserve flag stays latched and the plain journal is untouched,
+     *  or terminal exit instead: unless covered, the preserve flag stays latched and the plain journal is untouched,
      *  so a resume recaptures the bytes and a later run's terminal-orphan handling applies. */
     handler?: { memo: boolean; capturedHead?: string; stale: boolean; record: "stopped" | "none" },
   ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
