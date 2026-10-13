@@ -13,6 +13,7 @@ import (
 	"os/exec"
 	"path/filepath"
 	"runtime"
+	"slices"
 	"strings"
 	"sync"
 	"testing"
@@ -199,19 +200,37 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		t.Fatalf("overlay subject = %q, want a ckpt(overlay): commit", subject)
 	}
 
-	if len(publishes) != 2 {
-		t.Fatalf("publishes = %d, want 2 (overlay, then the chained checkpoint)\n%s", len(publishes), describe())
+	// A lost acknowledgement is an HTTP 500 the agent retries once with the SAME overlay tip, so
+	// that case makes three requests (overlay, overlay retry, chained checkpoint); a clean run two.
+	wantPublishes := 2
+	if lostAck {
+		wantPublishes = 3
 	}
-	if len(summary.Tips) != 2 || publishes[0].tip != summary.Tips[0] || publishes[1].tip != summary.Tips[1] {
-		t.Fatalf("Go-recorded tips %v != fixture-reported tips %v\n%s", []string{publishes[0].tip, publishes[1].tip}, summary.Tips, describe())
+	if len(publishes) != wantPublishes {
+		t.Fatalf("publishes = %d, want %d\n%s", len(publishes), wantPublishes, describe())
+	}
+	last := len(publishes) - 1
+	recorded := make([]string, len(publishes))
+	for i, p := range publishes {
+		recorded[i] = p.tip
+	}
+	if !slices.Equal(recorded, summary.Tips) {
+		t.Fatalf("Go-recorded tips %v != fixture-reported tips %v\n%s", recorded, summary.Tips, describe())
+	}
+	if publishes[0].tip != summary.Overlay {
+		t.Fatalf("first publish tip %s, want overlay %s\n%s", publishes[0].tip, summary.Overlay, describe())
+	}
+	if lostAck && publishes[1].tip != summary.Overlay {
+		t.Fatalf("retry tip %s, want the same overlay %s\n%s", publishes[1].tip, summary.Overlay, describe())
 	}
 	if boundary == "tick" && summary.TickOutcome != "published" {
 		t.Fatalf("tick outcome = %q, want published\n%s", summary.TickOutcome, describe())
 	}
 	if lostAck {
-		// The agent must actually have seen the overlay publish fail after it landed.
-		if len(summary.Results) < 1 || summary.Results[0].OK || summary.Results[0].HTTPStatus != http.StatusInternalServerError {
-			t.Fatalf("lost-ack: results[0] = %+v, want {ok:false httpStatus:500}\n%s", summary.Results, describe())
+		// The agent must actually have seen the overlay publish fail after it landed, then the
+		// retry of the same tip acknowledged.
+		if len(summary.Results) < 2 || summary.Results[0].OK || summary.Results[0].HTTPStatus != http.StatusInternalServerError || !summary.Results[1].OK {
+			t.Fatalf("lost-ack: results = %+v, want [{ok:false httpStatus:500} {ok:true} ...]\n%s", summary.Results, describe())
 		}
 	}
 
@@ -221,8 +240,8 @@ func runAgentCheckpointBridge(t *testing.T, root, node, boundary string, iid int
 		}
 	}
 	final := f.originRef(ref)
-	if publishes[1].tip != final {
-		t.Fatalf("second publish tip %s != final ref %s\n%s", publishes[1].tip, final, describe())
+	if publishes[last].tip != final {
+		t.Fatalf("last publish tip %s != final ref %s\n%s", publishes[last].tip, final, describe())
 	}
 	if final == summary.Overlay {
 		t.Fatalf("the checkpoint ref never advanced past the overlay %s\n%s", summary.Overlay, describe())
