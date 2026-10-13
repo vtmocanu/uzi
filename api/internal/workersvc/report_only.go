@@ -9,6 +9,32 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
+// validateReportOnlyShape checks raw pointer presence before normalization or replay.
+func validateReportOnlyShape(req StateRequest) error {
+	if req.State != "completed" || req.ReportOnly == nil || !*req.ReportOnly {
+		return nil
+	}
+	capped := req.ScopeCapped != nil && *req.ScopeCapped
+	if req.CompletionFinalHead != nil || req.MrIID != nil || req.MrWebURL != nil ||
+		(!capped && (req.Head != nil || req.Branch != nil)) {
+		return ErrInvalidState
+	}
+	return nil
+}
+
+// validateCappedReportOnly requires the permit-backed issue lane for mixed reports.
+func validateCappedReportOnly(run store.Run, req StateRequest) error {
+	if req.State != "completed" {
+		return nil
+	}
+	if req.ReportOnly != nil && *req.ReportOnly && req.ScopeCapped != nil && *req.ScopeCapped &&
+		(req.Head != nil || req.Branch != nil) &&
+		(run.Kind != runkind.Issue || !run.CompletionContractVersion.Valid) {
+		return ErrInvalidState
+	}
+	return nil
+}
+
 // clampWireReportOnly gates the worker's report_only declaration to issue runs
 // (defense-in-depth: the worker already schema-gates the tool param to issue runs).
 // runs.kind is NOT NULL. A nil/false declaration or a non-issue run yields false.

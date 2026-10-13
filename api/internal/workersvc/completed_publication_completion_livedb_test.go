@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"errors"
+	"fmt"
 	"strings"
 	"testing"
 
@@ -115,6 +116,15 @@ func completedPublicationCompletionIdentity(t *testing.T, kind string) {
 			if err != nil || replay.CompletedPublicationReceipt == nil {
 				t.Fatalf("unavailable forge replay: %+v %v", replay, err)
 			}
+			reportOnlyReplay := req
+			yes := true
+			reportOnlyReplay.ReportOnly = &yes
+			beforeMixed := reportOnlySnapshot(t, e, run)
+			mixed, mixedErr := svc.SetStateReportWithReconciliation(e.ctx, w, run, reportOnlyReplay)
+			if !errors.Is(mixedErr, ErrInvalidState) || mixed.Applied || mixed.CompletedPublicationReceipt != nil ||
+				!bytes.Equal(beforeMixed, reportOnlySnapshot(t, e, run)) {
+				t.Fatalf("report-only receipt replay: %+v %v", mixed, mixedErr)
+			}
 			wrong, _ = svc.SetStateReportWithReconciliation(e.ctx, w, run, bad)
 			final := read()
 			if wrong.CompletedPublicationReceipt != nil || final.State != "released" || !bytes.Equal(released.CompletedPublicationReceipt, final.CompletedPublicationReceipt) {
@@ -192,6 +202,56 @@ func TestCompletedPublicationLegacyOmissionsLiveDB(t *testing.T) {
 			}
 			if state != "open" || len(identity) != 0 {
 				t.Fatalf("omission minted identity or released hold: %s %s", state, identity)
+			}
+		})
+	}
+}
+
+func TestCompletedPublicationHeadlessFollowupLiveDB(t *testing.T) {
+	for _, permit := range []bool{true, false} {
+		t.Run(fmt.Sprint("permit=", permit), func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc := e.permitService(t)
+			wid := e.seedWorker(t, nil)
+			w := store.Worker{ID: wid}
+			id := e.seedFrozenRun(t, wid, []string{"m1"}, []string{"m1"}, false)
+			e.exec(t, "UPDATE runs SET claim_generation=1 WHERE id=$1", id)
+			gen, mr := int64(1), int64(7)
+			req := StateRequest{State: "completed", Branch: strPtr("b"), Head: strPtr("h"), MrIID: &mr, MrWebURL: strPtr("https://forge.e2e/mr/7"), ClaimGeneration: &gen}
+			if permit {
+				p, err := svc.RequestCompletionPermit(e.ctx, w, id, CompletionPermitRequest{ContractRevision: 1, Branch: "b", Head: "h"})
+				if err != nil || !p.Granted {
+					t.Fatalf("permit=%+v err=%v", p, err)
+				}
+			}
+			result, err := svc.SetStateReportWithReconciliation(e.ctx, w, id, req)
+			if err != nil || result.Applied != permit {
+				t.Fatalf("publication applied=%v err=%v", result.Applied, err)
+			}
+			var status, branch, url string
+			var storedMR int64
+			if err := e.pool.QueryRow(e.ctx, "SELECT status,branch,mr_iid,mr_web_url FROM runs WHERE id=$1", id).Scan(&status, &branch, &storedMR, &url); err != nil {
+				t.Fatal(err)
+			}
+			wantStatus := "running"
+			if permit {
+				wantStatus = "completed"
+			}
+			if status != wantStatus || branch != "b" || storedMR != mr || url != *req.MrWebURL {
+				t.Fatalf("publication not persisted: status=%s branch=%s mr=%d url=%s", status, branch, storedMR, url)
+			}
+			before := reportOnlySnapshot(t, e, id)
+			for _, public := range []bool{false, true} {
+				var ok bool
+				if public {
+					r, eerr := svc.SetStateReportWithReconciliation(e.ctx, w, id, reportOnlyRequest())
+					ok, err = r.Applied, eerr
+				} else {
+					_, ok, err = svc.SetState(e.ctx, w, id, reportOnlyRequest())
+				}
+				if err != nil || ok || !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+					t.Fatalf("headless followup applied=%v err=%v", ok, err)
+				}
 			}
 		})
 	}

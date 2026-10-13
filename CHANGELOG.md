@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Report-only issue runs now finish under the completion interlock ([#2821](https://github.com/vtmocanu/uzi/issues/2821)).**
+  A report-only issue run with every frozen milestone declared complete can store its findings and finish without publishing a branch or opening a merge request. Completion still checks the current worker and claim generation; identical retries preserve the stored report. Mixed report-only publication requests are refused, except for an interlocked issue's scope-capped zero-work delivery through its existing valid permit. Legacy headless report-only completions keep their existing behavior.
+
 - **Jobs with a wall budget above Node's timer range no longer abort at once ([#2771](https://github.com/vtmocanu/uzi/issues/2771)).**
   The job runner's input-download and session deadlines now re-arm in chunks below the native timer limit, as #2761 did for the executors, so a long job budget runs to its full length.
 
