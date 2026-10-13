@@ -16,13 +16,17 @@ import { nullLogger } from "./helpers.js";
 import { api, baseUrl, client, deferred, fakeGitlab, fx, git, gitlabClaim, runner } from "./runner-harness.js";
 
 /** Real git, MAC journals, archive bytes, Outbox and runner; only server responses are fixtures.
- * No FINAL or source cleanup is supplied as report-retirement authority. */
+ * By default no FINAL or cleanup authority is supplied. acknowledgeArchive drives real FINAL
+ * and generation cleanup for the producer-ordering regression. */
 export async function reportRetirementFixture(t: TestContext, options: {
   archiveGeneration?: number;
   capturedWip?: boolean;
   invalidJournal?: boolean;
   liveFlight?: boolean;
   thinArchive?: boolean;
+  olderOpenHold?: boolean;
+  currentArchiveReleased?: boolean;
+  olderSource?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
   const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
@@ -48,8 +52,9 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.ok(workerId);
     return Response.json({
       run_id: claim.run_id, worker_id: workerId, generation,
-      exact_holds: [{ id: holdId, state: "open" }], sibling_holds: [],
-      exact_count: 1, sibling_count: 0, complete: true, exact_complete: true,
+      exact_holds: [{ id: holdId, state: options.currentArchiveReleased ? "released" : "open" }],
+      sibling_holds: options.olderOpenHold ? [{ id: "44444444-4444-4444-8444-444444444444", state: "open" }] : [],
+      exact_count: 1, sibling_count: options.olderOpenHold ? 1 : 0, complete: true, exact_complete: true,
       sibling_complete: true, outcome: "retained",
     });
   });
@@ -62,10 +67,11 @@ export async function reportRetirementFixture(t: TestContext, options: {
     return { status: ownership.mode === "unknown" ? "unknown" : status,
       claim_generation: ownership.generation, inventory_guarded: true };
   };
-  client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [{
+  client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [...(options.currentArchiveReleased ? [] : [{
     hold_id: holdId, generation: archiveGeneration, inventory_guarded: true,
     has_available_capture: !!manifest,
-  }] });
+  }]), ...(options.olderOpenHold ? [{ hold_id: "44444444-4444-4444-8444-444444444444",
+    generation: 1, inventory_guarded: true, has_available_capture: false }] : [])] });
   let reserved: { sourceSha: string; digest: string; generation: number } | undefined;
   client.reserveRecoveryCapture = async (runId, req) => {
     assert.equal(runId, claim.run_id);
@@ -203,6 +209,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
   await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
   const coordinator = new RecoveryCoordinator({ client, git, log: nullLogger(),
     recoveryRoot: git.recoveryRoot, workerToken: token });
+  if (options.olderOpenHold && options.olderSource !== false) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
+    inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
   assert.ok(await coordinator.pin({ runId: claim.run_id, generation: archiveGeneration,
     inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
   const inventory = await coordinator.freezeInventory({ context, currentSha: head, defaultBranch: "main" });
@@ -274,7 +282,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.equal(fs.statSync(clone).isDirectory(), true);
     assert.equal(cmd(bare, ["show-ref"]), refs, "source and recovery pins remain");
     for (const [file, bytes] of files) assert.deepEqual(fs.readFileSync(file), bytes, file);
-    assert.equal((await client.listRecoveryHolds(claim.run_id)).holds.length, 1);
+    assert.equal((await client.listRecoveryHolds(claim.run_id)).holds.length,
+      (options.currentArchiveReleased ? 0 : 1) + (options.olderOpenHold ? 1 : 0));
     assert.equal((await coordinator.inspect(claim.run_id)).find(row => row.captureId === archive.captureId)?.finalAcknowledged === true, false);
   };
   const assertPending = async () => {
@@ -342,7 +351,12 @@ export async function reportRetirementFixture(t: TestContext, options: {
     () => !outbox.hasPendingTerminal(claim.run_id, generation), assertPending);
   const assertFinalizePending = async () => {
     assert.ok(outbox.finalizeRecordIdentity(claim.run_id, generation), "finalize must remain pending");
-    await assertCustody();
+    if (options.currentArchiveReleased) {
+      assert.equal((await coordinator.inspect(claim.run_id)).find(row => row.captureId === archive.captureId)?.finalAcknowledged, true);
+      assert.equal(fs.existsSync(archive.bundlePath!), false);
+      assert.equal(cmd(bare, ["show-ref"]), refs, "ancestry pins stay available");
+      assert.equal(calls.sourceDelete, 0);
+    } else await assertCustody();
   };
   // Deterministic first-proof expiry. Headroom keeps the production budget from lapsing on a slow
   // runner before the proof reaches its first budgeted boundary (the hooked withReportProofBudget).
@@ -373,6 +387,30 @@ export async function reportRetirementFixture(t: TestContext, options: {
     return { observation, restore };
   };
   const liveFlight = { flight, release: leave.resolve, executions: () => executions };
-  return { headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
+  const acknowledgeArchive = async (owner = r) => {
+    client.releaseRecoveryCustody = async (runId, gen) => {
+      assert.equal(runId, claim.run_id);
+      assert.equal(gen, generation);
+      calls.final++;
+      options.currentArchiveReleased = true;
+      return { run_id: runId, generation: gen, released: true, holds_released: 1 };
+    };
+    // Drive the runner's real FINAL producer and its generation cleanup, not a metadata deletion.
+    await owner.resumePendingRecoveries(undefined, [archive]);
+    assert.equal(calls.final, 1, "archive FINAL acknowledged once");
+  };
+  const recoveryOf = (owner: typeof r) => (owner as unknown as { recovery: RecoveryCoordinator }).recovery;
+  const restartedRunner = async (opts: { root?: string; brokenRoot?: boolean } = {}) => {
+    const root = opts.root ?? path.join(fx.dataDir, "outbox");
+    if (opts.brokenRoot) fs.writeFileSync(root, "outbox init failure");
+    const restarted = new Outbox({ root, log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000 });
+    await restarted.init();
+    return { root, outbox: restarted, r: runner({ run: async () => { throw new Error("no execution on restart"); } },
+      fakeGitlab().gitlab, token, { outbox: restarted,
+        quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "" },
+          docker: { state: "not_wired", removed: [], detail: "" } }) }) };
+  };
+  return { recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }
