@@ -10,6 +10,7 @@ import (
 	lipgloss "charm.land/lipgloss/v2"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 )
 
 // D7's render layer: every untrusted string the TUI draws passes through sanitizeTTY
@@ -246,7 +247,10 @@ func displayHealth(health string) string {
 // status-specific qualifiers never share a slot; every other landing_state ("unrecoverable",
 // "none", "") reads as an ordinary failed run. landing_state is a closed server enum, so it is
 // branched on directly (no d7 guard needed — see tui_d7_guard_test.go).
-func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) (glyph, word string) {
+func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingState, stopKind string, cause ...string) (glyph, word string) {
+	if runpresentation.HumanStopReason(status, stopKind) != "" {
+		return "·", "stopped"
+	}
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
@@ -335,9 +339,12 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 }
 
 // stateColor is the colour half of the state token, resolved from the same ANDON tokens.
-// Health warn wins (→ stall orange), except recovery_wait ignores stale health;
-// otherwise the status maps to its material.
-func (p palette) stateColor(status, health string, isPlanning, isRevising bool) color.Color {
+// Human stops use faint ink. Other health warnings use stall orange, except
+// recovery_wait ignores stale health; otherwise the status maps to its material.
+func (p palette) stateColor(status, health string, isPlanning, isRevising bool, stopKind string) color.Color {
+	if runpresentation.HumanStopReason(status, stopKind) != "" {
+		return p.faintC
+	}
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return p.stall
 	}
@@ -369,12 +376,12 @@ type runToken struct {
 	color color.Color
 }
 
-// stateToken is the ONE shared helper the design mandates: (glyph, colour, word) from a
-// run's status/health/planning, used on the board row, the board strip and the detail
-// header so they cannot render one run three ways.
-func (p palette) stateToken(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) runToken {
-	g, w := stateGlyphWord(status, health, isPlanning, isRevising, landingState, cause...)
-	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising)}
+// stateToken shares a run's glyph, colour and compact word across the board row,
+// board strip and detail header. detailHeaderLines expands human stops to their full
+// HumanStopLabel while retaining the shared glyph and colour.
+func (p palette) stateToken(status, health string, isPlanning, isRevising bool, landingState, stopKind string, cause ...string) runToken {
+	g, w := stateGlyphWord(status, health, isPlanning, isRevising, landingState, stopKind, cause...)
+	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising, stopKind)}
 }
 
 // codexReloginHold reports whether a run is held on its Codex account AND the account needs
@@ -411,6 +418,9 @@ const (
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" {
+		return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""))
+	}
 	if isProviderUnavailableHold(r) {
 		return runToken{glyph: "⊘", word: providerHoldWord, color: p.amber}
 	}
@@ -423,7 +433,7 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if isCredentialDisabledHold(r) {
 		return runToken{glyph: credDisabledGlyph, word: credDisabledWord, color: p.amber}
 	}
-	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 }
 
 // verdictColor maps a judge verdict to a severity colour: issues → alarm red, everything

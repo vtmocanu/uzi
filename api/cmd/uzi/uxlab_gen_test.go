@@ -84,9 +84,17 @@ func TestGenerateUXLabFrames(t *testing.T) {
 
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
-		"board-populated": func(d bool) string { return boardPopulated(d, now) },
-		"board-codex":     func(d bool) string { return boardCodex(d, now) },
-		"board-empty":     boardEmpty,
+		"board-human-stop-own-unselected":   func(d bool) string { return humanStopBoardScene(d, false, false) },
+		"board-human-stop-own-selected":     func(d bool) string { return humanStopBoardScene(d, false, true) },
+		"board-human-stop-admin-unselected": func(d bool) string { return humanStopBoardScene(d, true, false) },
+		"board-human-stop-admin-selected":   func(d bool) string { return humanStopBoardScene(d, true, true) },
+		"detail-human-stop-cancel":          func(d bool) string { return humanStopDetailScene(d, "cancel") },
+		"detail-human-stop-reject":          func(d bool) string { return humanStopDetailScene(d, "reject") },
+		"detail-human-stop-stop":            func(d bool) string { return humanStopDetailScene(d, "stop") },
+		"detail-human-stop-failure":         func(d bool) string { return humanStopDetailScene(d, "failure") },
+		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
+		"board-empty":                       boardEmpty,
 		"board-restart-hint": func(d bool) string {
 			m := uxModel(&uzicli.FakeClient{}, "", d)
 			m.showVersion = true
@@ -1394,5 +1402,33 @@ func helpFrame(dark bool) string {
 func quitFrame(dark bool) string {
 	m := uxModel(&uzicli.FakeClient{}, "", dark)
 	m = key(m, keyQuit)
+	return m.View().Content
+}
+
+// humanStopBoardScene includes conflicting cancellation metadata, stale health,
+// landing metadata, a genuine failure and active work in the shipped board.
+func humanStopBoardScene(dark, admin, selected bool) string {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	m.board.admin = admin
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, admin: admin, runs: humanStopRows()})
+	if selected {
+		for i, r := range m.board.visible() {
+			if r.ID == "reject" {
+				m.board.cursor = i
+				break
+			}
+		}
+	}
+	return m.View().Content
+}
+
+func humanStopDetailScene(dark bool, id string) string {
+	m := uxModel(&uzicli.FakeClient{}, id, dark)
+	for _, r := range humanStopRows() {
+		if r.ID == id {
+			m = applyDetail(m, r.RunDTO, nil)
+			break
+		}
+	}
 	return m.View().Content
 }

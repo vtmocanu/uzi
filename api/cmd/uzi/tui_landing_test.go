@@ -16,7 +16,7 @@ import (
 // drop the needs_landing branch in stateGlyphWord's failed arm → the word falls back to "failed"
 // and the first assertion fails.
 func TestStateGlyphWordLanding(t *testing.T) {
-	glyph, word := stateGlyphWord("failed", "", false, false, landingStateNeedsLanding)
+	glyph, word := stateGlyphWord("failed", "", false, false, landingStateNeedsLanding, "")
 	if glyph != "✗" {
 		t.Errorf("needs_landing glyph = %q, want %q (still the failed glyph)", glyph, "✗")
 	}
@@ -25,17 +25,17 @@ func TestStateGlyphWordLanding(t *testing.T) {
 	}
 	// Every other landing_state keeps the plain failed word.
 	for _, ls := range []string{"unrecoverable", "none", ""} {
-		if g, w := stateGlyphWord("failed", "", false, false, ls); g != "✗" || w != "failed" {
+		if g, w := stateGlyphWord("failed", "", false, false, ls, ""); g != "✗" || w != "failed" {
 			t.Errorf("failed run with landing_state %q = (%q, %q), want (✗, failed)", ls, g, w)
 		}
 	}
 	// The colour stays the failed/alarm ink for every landing bucket — only the word changes.
 	p := newPalette(true)
-	if bgFillSGR(p.stateColor("failed", "", false, false)) != bgFillSGR(p.alarm) {
+	if bgFillSGR(p.stateColor("failed", "", false, false, "")) != bgFillSGR(p.alarm) {
 		t.Error("failed colour is not the alarm ink; the needs-landing split must not change the colour")
 	}
 	// The full token via stateToken carries the needs-landing word AND the alarm colour together.
-	tok := p.stateToken("failed", "", false, false, landingStateNeedsLanding)
+	tok := p.stateToken("failed", "", false, false, landingStateNeedsLanding, "")
 	if tok.word != "needs landing" {
 		t.Errorf("stateToken needs_landing word = %q, want %q", tok.word, "needs landing")
 	}

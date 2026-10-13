@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -223,7 +224,7 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	if isCredentialDisabledHold(r.RunDTO) {
 		return credDisabledWord
 	}
-	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 	return word
 }
 
@@ -1139,8 +1140,8 @@ func (m tuiModel) boardSummary() string {
 		case "awaiting_followup":
 			followups++
 		}
-		// Match the recovery row's token: health frozen while parked needs no attention.
-		if r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
+		// Match the token: human stops and recovery waits ignore stale health.
+		if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) == "" && r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
 			warn++
 		}
 	}

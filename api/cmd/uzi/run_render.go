@@ -96,9 +96,8 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		{"TRIGGER", r.TriggerSource},
 		// RunDTO.IsRevising (issue #2760) is the server-derived "mid-revise replan" flag,
 		// so a re-planning run reads "revising" here instead of waiting on the owner.
-		// displayRunStatus (issue #1418) additionally reads "needs landing" for a failed run
-		// whose landing_state is needs_landing; every other status is unchanged.
-		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)},
+		// displayRunStatus resolves human stops before the needs_landing failure label.
+		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""))},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},
@@ -2265,7 +2264,7 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // (PRD #1809) a data_volume_full park adds "(waiting for disk space)".
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
-	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
+	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""))
 	if isWorkerRecoveryExhausted(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}
