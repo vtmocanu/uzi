@@ -6,7 +6,7 @@ import path from "node:path";
 import type { AdviceRequest, AdviceUsageSnapshot } from "../src/harness.js";
 import type { OutgoingMessage } from "../src/protocol.js";
 
-import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt } from "../src/review-runner.js";
+import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt, hasProviderCostForEveryModel } from "../src/review-runner.js";
 import { CODEX_TASK_REVIEW_MODEL } from "../src/codex/task-review-model.js";
 import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -182,12 +182,54 @@ const goodModelJson = JSON.stringify({
 });
 
 describe("ReviewRunner", () => {
+  it("requires provider cost for every model, not a priced subset", () => {
+    const entry = { inputTokens: 10, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+    assert.equal(hasProviderCostForEveryModel({}), false);
+    assert.equal(hasProviderCostForEveryModel({ haiku: { ...entry, costUSD: 0 } }), true);
+    assert.equal(hasProviderCostForEveryModel({ haiku: { ...entry, costUSD: 0.01 }, opus: entry }), false);
+    for (const costUSD of [-1, NaN, Infinity]) {
+      assert.equal(hasProviderCostForEveryModel({ haiku: { ...entry, costUSD } }), false);
+    }
+  });
+  for (const failure of ["transient", "stale"] as const) {
+    it(`Review usage post failure: ${failure}`, async () => {
+      const { client, calls } = fencedFakeClient();
+      const { git } = fakeGit("diff --git a/a b/a\n+fix\n");
+      client.postMessages = async () => { throw new RequestError("POST", "/api/worker/runs/review-1/messages",
+        failure === "stale" ? 409 : 503, failure === "stale" ? '{"disposition":"stale_claim"}' : "unavailable"); };
+      const warns: string[] = [];
+      const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+        codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
+          req.usageObserver?.({ [CODEX_TASK_REVIEW_MODEL]: { inputTokens: 100, outputTokens: 10,
+            cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0003, costStatus: "metered" } });
+          return { text: JSON.stringify({ summary: "reviewed", findings: [] }),
+            end: { kind: "terminal", terminal: { outcome: "success" } } };
+        } })) as never,
+      });
+      await runner.execute(reviewClaim({ claim_generation: 7, secrets: { forge_pat: "pat", codex: {
+        auth_mode: "api_key", access_token: "test-codex", capability: "cap-1",
+      } } as never }));
+      if (failure === "stale") {
+        assert.equal(calls.review, undefined);
+        assert.deepEqual(calls.accepted.map((s) => s.body.status), ["running", "running"]);
+      } else {
+        assert.equal(calls.review?.review.status, "complete");
+        assert.deepEqual(calls.accepted.map((s) => s.body.status), ["running", "running", "completed"]);
+        assert.ok(warns.includes("review usage post failed"));
+      }
+    });
+  }
   for (const harness of ["claude", "codex"] as const) {
     for (const scenario of ["success", "error", "no_usage", "no_cost"] as const) {
       it(`Review pass usage: ${harness} ${scenario}`, async () => {
         const { client, calls } = fencedFakeClient();
         const { git } = fakeGit("diff --git a/a b/a\n+fix\n");
         const order: string[] = [];
+        const reportState = client.reportState.bind(client);
+        client.reportState = async (...args) => {
+          if (args[1].status === "running") order.push("running");
+          return reportState(...args);
+        };
         const postMessages = client.postMessages.bind(client);
         client.postMessages = async (...args) => { order.push("usage"); return postMessages(...args); };
         const postReview = client.postTaskReview.bind(client);
@@ -233,7 +275,7 @@ describe("ReviewRunner", () => {
           assert.equal(calls.messages[0]!.generation, 7);
           assert.deepEqual(calls.messages[0]!.messages, [{ seq: 2, kind: "status", agent: "reviewer",
             payload: { event: "result", modelUsage: snapshot } }]);
-          assert.deepEqual(order, ["usage", "review"]);
+          assert.deepEqual(order, ["running", "running", "usage", "review"]);
         }
         if (harness === "claude" && scenario === "no_cost") assert.ok(warns.includes("review pass usage unavailable"));
         assert.equal(calls.review?.id, "target-1");

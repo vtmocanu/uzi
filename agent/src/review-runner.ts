@@ -52,6 +52,13 @@ const DIFF_CHAR_BUDGET = 600_000;
 
 const VALID_SEVERITIES = new Set<TaskReviewFinding["severity"]>(["info", "warning", "error"]);
 
+/** Claude's result fold requires provider dollars for every model, including a real zero. */
+export function hasProviderCostForEveryModel(snapshot: AdviceUsageSnapshot): boolean {
+  const models = Object.values(snapshot);
+  return models.length > 0 && models.every((u) =>
+    typeof u.costUSD === "number" && Number.isFinite(u.costUSD) && u.costUSD >= 0);
+}
+
 const REVIEW_SYSTEM_PROMPT = `You are a code reviewer for the "uzi" AI factory. You are given the unified git DIFF of a
 task branch against its base branch, and you produce a structured review of the changes in that diff.
 
@@ -224,8 +231,7 @@ export class ReviewRunner {
         const onUsage = (snapshot: AdviceUsageSnapshot): void => {
           // The Claude result fold assumes a provider cost. Token-only interrupted
           // evidence would otherwise fabricate metered zero; keep that gap explicit.
-          if (selection.kind === "claude" && Object.values(snapshot).some((u) =>
-            typeof u.costUSD !== "number" || !Number.isFinite(u.costUSD) || u.costUSD < 0)) {
+          if (selection.kind === "claude" && !hasProviderCostForEveryModel(snapshot)) {
             this.log.warn("review pass usage unavailable", { run_id: reviewRunId });
             return;
           }
@@ -281,9 +287,18 @@ export class ReviewRunner {
       // advice helper flushes once on success or failure; no evidence posts nothing.
       // Append after any claim-time notes to retain the accounting frame in the trace.
       if (modelUsage) {
-        await this.client.postMessages(reviewRunId, [{ seq: claim.last_seq + 1, kind: "status", agent: "reviewer",
-          payload: { event: "result", modelUsage },
-        }], claim.claim_generation);
+        try {
+          await this.client.postMessages(reviewRunId, [{ seq: claim.last_seq + 1, kind: "status", agent: "reviewer",
+            payload: { event: "result", modelUsage },
+          }], claim.claim_generation);
+        } catch (err) {
+          if (isStaleClaimRefusal(err)) {
+            this.log.warn("review claim superseded (stale) at usage post; abandoning", { run_id: reviewRunId });
+            return;
+          }
+          // Accounting is best effort; a transport failure must not discard the findings.
+          this.log.warn("review usage post failed", { run_id: reviewRunId, error: errMessage(err) });
+        }
       }
       try {
         await this.client.postTaskReview(targetId, review, claim.claim_generation, reviewRunId);
