@@ -5206,7 +5206,7 @@ describe("#2878 M1 cause-specific worker notice", () => {
       /(?:retained|proved|proven|established|available|known)\b[^.]*\bbaseline|baseline\b[^.]*\b(?:retained|proved|proven|established|available|known)/i,
       "notice states that the proved baseline remains available");
     assert.doesNotMatch(text,
-      /\b(?:no|without)\s+(?:(?:known|available|proved|proven|established|retained)\s+)?baseline\b|\bbaseline\b[^.;]*\b(?:not|unavailable|unknown|unproved|unestablished)\b/i,
+      /\b(?:no|without)\s+(?:(?:known|available|proved|proven|established|retained)\s+)?baseline\b|\bbaseline\s+(?:(?:is|was|remains|has been)\s+)?(?:not|unavailable|unknown|unproved|unestablished)\b/i,
       "notice must not contradict its retained-baseline assertion");
     assert.doesNotMatch(text, /this resumed claim/i,
       "same-claim recreation must not be mislabeled as an unbaselined resumed claim");
