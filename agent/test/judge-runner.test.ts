@@ -4,6 +4,7 @@ import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AdviceRequest, AdviceUsageSnapshot } from "../src/harness.js";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview, calibrateReview } from "../src/judge-runner.js";
@@ -189,6 +190,50 @@ function replyingQueryFnWithUsage(text: string): SdkQueryFn {
 }
 
 describe("JudgeRunner", () => {
+  for (const authMode of ["api_key", "subscription"] as const) {
+    for (const scenario of ["success", "error", "no_usage", "unreported"] as const) {
+      it(`Codex judge usage: ${authMode} ${scenario}`, async () => {
+        const { client, calls } = fakeClient(emptyTrace);
+        const order: string[] = [];
+        const postMessages = client.postMessages.bind(client);
+        client.postMessages = async (...args) => { order.push("usage"); return postMessages(...args); };
+        const postReview = client.postReview.bind(client);
+        client.postReview = async (...args) => { order.push("review"); return postReview(...args); };
+        const snapshot: AdviceUsageSnapshot = { "gpt-6-sol": {
+          inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+          ...(scenario === "unreported" ? { costStatus: "unreported" } : { costUSD: 0.0003, costStatus: "metered" }),
+        } };
+        const runner = new JudgeRunner(client, nullLogger(), {
+          codexAdviceHarnessFactory: (async () => ({
+            kind: "codex",
+            run: async (req: AdviceRequest) => {
+              if (scenario !== "no_usage") {
+                req.usageObserver?.({ "gpt-6-sol": { ...snapshot["gpt-6-sol"]!, inputTokens: 50 } });
+                req.usageObserver?.(snapshot);
+              }
+              if (scenario === "error") throw new Error("aborted after observed usage");
+              return { text: JSON.stringify({ verdict: "ok", summary: "reviewed", recommendations: [] }),
+                end: { kind: "terminal", terminal: { outcome: "success" } } };
+            },
+          })) as never,
+        });
+        await runner.execute(judgeClaim({ claim_generation: 7, secrets: { forge_pat: "",
+          codex: { auth_mode: authMode, access_token: "test-codex", capability: "cap-1",
+            ...(authMode === "subscription" ? { generation: 1, chatgpt_account_id: "test-account", chatgpt_plan_type: null } : {}),
+          },
+        } as never }));
+        assert.equal(calls.messages.length, scenario === "no_usage" ? 0 : 1);
+        if (scenario !== "no_usage") {
+          assert.equal(calls.messages[0]!.id, "judge-1");
+          assert.equal(calls.messages[0]!.generation, 7);
+          assert.deepEqual(calls.messages[0]!.messages, [{ seq: 1, kind: "status", agent: "judge",
+            payload: { event: "result", modelUsage: snapshot } }]);
+          assert.deepEqual(order, ["usage", "review"]);
+        }
+        assert.equal(calls.review?.review.status, scenario === "error" ? "failed" : "complete");
+      });
+    }
+  }
   it("posts the parsed verdict + recommendations and completes the run", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const modelJson = JSON.stringify({
