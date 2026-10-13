@@ -33,7 +33,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
-  A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory that records its origin and is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete.
+  A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
 
 ## [0.86.0] - 2026-10-06
 

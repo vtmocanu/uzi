@@ -1984,7 +1984,7 @@ describe("bounded bare cache names (issue #2886)", () => {
   function makeLongOrigin(): { origin: string; sha: string } {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-longorigin-"));
     longRoots.push(root);
-    const segs = Array.from({ length: 6 }, (_, i) => `${i}`.repeat(1) + "s".repeat(58));
+    const segs = Array.from({ length: 6 }, (_, i) => `${i}` + "s".repeat(58));
     const origin = path.join(root, ...segs, "origin");
     fs.mkdirSync(origin, { recursive: true });
     gitIn(origin, ["init", "-q", "-b", "main"]);
@@ -2103,9 +2103,15 @@ describe("bounded bare cache names (issue #2886)", () => {
 
   it("resolves restart sources: legacy names without the key, hashed names with it, never a symlink", async () => {
     const sha = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
-    const legacy = await git.ensureClone(fx.originPath);
-    gitIn(legacy, ["config", "--local", "--unset", "uzi.cacheOrigin"]);
-    const legacyRes = await git.resolveRestartSource(path.basename(legacy), sha, "main");
+    // A pre-#2886 bare: short, non-hashed name and no stored origin. Built directly so the name
+    // stays legacy under any TMPDIR length (ensureClone(fx.originPath) hashes under a long one).
+    const legacyName = "legacy-short+origin.git";
+    assert.doesNotMatch(legacyName, HASHED);
+    fs.mkdirSync(path.join(fx.dataDir, "repos"), { recursive: true });
+    const legacy = path.join(fx.dataDir, "repos", legacyName);
+    gitIn(fx.originPath, ["clone", "-q", "--bare", fx.originPath, legacy]);
+    assert.equal(await git.resolveRecoveryBareDir(legacyName), legacy);
+    const legacyRes = await git.resolveRestartSource(legacyName, sha, "main");
     assert.equal(legacyRes.status, "on_default");
 
     const long = await hashedBare();
@@ -2124,6 +2130,44 @@ describe("bounded bare cache names (issue #2886)", () => {
 
     gitIn(long.bare, ["config", "--local", "--unset", "uzi.cacheOrigin"]);
     assert.equal((await git.resolveRestartSource(path.basename(long.bare), long.sha, "main")).status, "missing_bare");
+  });
+
+  it("refuses a copied hashed bare under a different hashed name", async () => {
+    const { bare, sha } = await hashedBare();
+    const otherName = `uzi-sha256-${"c".repeat(64)}.git`;
+    const copy = path.join(path.dirname(bare), otherName);
+    await fs.promises.cp(bare, copy, { recursive: true, preserveTimestamps: true });
+    assert.equal(fs.lstatSync(copy).isSymbolicLink(), false);
+    assert.equal(await git.resolveRecoveryBareDir(otherName), undefined);
+    assert.equal((await git.resolveRestartSource(otherName, sha, "main")).status, "missing_bare");
+    assert.equal((await git.resolveRestartSource(path.basename(bare), sha, "main")).status, "on_default");
+  });
+
+  it("refuses a hashed bare whose stored origin is a short string flattening to its own name", async () => {
+    const { origin, bare } = await hashedBare();
+    const name = path.basename(bare);
+    const short = "/" + name;
+    assert.equal(bareDirName(short), name);
+    gitIn(bare, ["config", "--local", "--replace-all", "uzi.cacheOrigin", short]);
+    const refsBefore = refs(bare);
+    // The resolver's self-consistency check passes here; only the identity check guards the long origin.
+    assert.equal(await git.resolveRecoveryBareDir(name), bare);
+    await assert.rejects(git.recoveryAttemptMode(origin, "k"), BareCacheIdentityError);
+    await assert.rejects(git.discoverRetainedRecovery(origin, "agent/issue-1", "k", "run-1"), BareCacheIdentityError);
+    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
+    assert.equal(refs(bare), refsBefore);
+  });
+
+  it("refuses a hashed bare whose stored origin key has no value", async () => {
+    const { origin, bare, cfg } = await hashedBare();
+    gitIn(bare, ["config", "--local", "--unset", "uzi.cacheOrigin"]);
+    fs.appendFileSync(cfg, "[uzi]\n\tcacheOrigin\n");
+    const refsBefore = refs(bare);
+    const cfgBefore = fs.readFileSync(cfg, "utf8");
+    await assert.rejects(git.ensureClone(origin), BareCacheIdentityError);
+    assert.equal(await git.resolveRecoveryBareDir(path.basename(bare)), undefined);
+    assert.equal(refs(bare), refsBefore);
+    assert.equal(fs.readFileSync(cfg, "utf8"), cfgBefore);
   });
 
   it("keeps the recovery ownership check for hashed bares", async () => {
