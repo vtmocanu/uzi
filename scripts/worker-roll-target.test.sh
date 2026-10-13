@@ -2,6 +2,30 @@
 # Offline registry/verifier fixtures, including digest binding and exact signer identity.
 set -euo pipefail
 scripts="$(cd "$(dirname "$0")" && pwd)"
+cases=0
+# Validate the production workflow's job/output and packaging chain offline.
+# An override lets mutation probes exercise this assertion without modifying production.
+workflow="${ROLL_WORKFLOW_FIXTURE:-$scripts/../.github/workflows/release.yml}"
+awk '
+  /^  assert-worker-pin:/ { job="pin" }
+  /^  publish-chart:/ { job="chart" }
+  /^  [a-z][a-z-]*:/ && $0 !~ /^  (assert-worker-pin|publish-chart):/ { job="" }
+  job == "pin" && index($0, "steps.worker-pin.outputs.roll_target_version") { output++ }
+  job == "pin" && index($0, "roll_target_version=") && index($0, ">>") && index($0, "$GITHUB_OUTPUT") { write++ }
+  job == "chart" && /needs:/ && index($0, "assert-worker-pin") { dependency++ }
+  job == "chart" && index($0, "needs.assert-worker-pin.outputs.roll_target_version") { input++ }
+  job == "chart" && index($0, "cp -R deploy/chart \"$chart_copy\"") { copy=NR }
+  job == "chart" && index($0, "./scripts/chart-inject-roll-target.sh \"$chart_copy\" \"$WORKER_ROLL_TARGET_VERSION\"") { inject=NR }
+  job == "chart" && index($0, "helm package \"$chart_copy\" -d /tmp/chart") { package=NR }
+  job == "chart" && index($0, "./scripts/assert-worker-roll-target-package.sh /tmp/chart/uzi-*.tgz \"$WORKER_ROLL_TARGET_VERSION\"") { verify=NR }
+  job == "chart" && index($0, "helm push /tmp/chart/uzi-*.tgz") { push=NR }
+  END { if (output != 1 || write != 1 || dependency != 1 || input != 1 ||
+            !copy || !(copy < inject && inject < package && package < verify && verify < push)) {
+    print "FAIL: release workflow worker stamp/output/package wiring" > "/dev/stderr"; exit 1
+  } }
+' "$workflow"
+cases=$((cases + 1)); echo 'PASS: worker-pin output and copied-chart inject/package/assert ordering'
+if [ "${1:-}" = --wiring-only ]; then echo "cases=$cases passed=$cases"; exit 0; fi
 work="$(mktemp -d)"
 trap 'rm -rf "$work"' EXIT
 export ROLL_FIXTURE="$work" ROLL_PIN=0.85.0-rc.3
@@ -48,7 +72,6 @@ reset() {
   cp "$work/base.json" "$work/jvm.json"
   : > "$work/docker.log"; : > "$work/cosign.log"
 }
-cases=0
 reject() {
   if "$scripts/worker-roll-target.sh" "$ROLL_PIN" > "$work/out" 2> "$work/err"; then
     echo "FAIL: accepted $1" >&2; exit 1
@@ -63,6 +86,8 @@ reset
 cases=$((cases + 1)); echo 'PASS: valid older pin, single resolution per template, exact signer and digest-bound config'
 for mode in signature_error registry_error bad_digest signed_digest_mismatch config_error; do
   reset; export ROLL_MODE="$mode"; reject "$mode"
+  if [ "$mode" = registry_error ]; then grep -Fq 'only a PUBLISHED one' "$work/err"; fi
+  if [ "$mode" = signature_error ]; then grep -Fq "expected identity https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tags/v$ROLL_PIN" "$work/err"; fi
 done
 for mode in missing duplicate label wrong_pin invalid_suffix trailing_newline disagreement malformed; do
   reset

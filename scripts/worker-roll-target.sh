@@ -12,11 +12,17 @@ identity="https://github.com/vtmocanu/uzi/.github/workflows/release.yml@refs/tag
 stamp=''
 for t in base jvm; do  # worker templates; workertmpl.Names (pinned by template_sources_test.go)
   repo="ghcr.io/vtmocanu/uzi/agent-${t}"
-  digest="$("$docker_bin" buildx imagetools inspect "${repo}:${pin}" --format '{{.Manifest.Digest}}')"
+  digest="$("$docker_bin" buildx imagetools inspect "${repo}:${pin}" --format '{{.Manifest.Digest}}')" || {
+    echo "ERROR: ${repo}:${pin} could not be resolved (unpublished pin or registry/auth error). A stable chart may pin an RC worker (D11), but only a PUBLISHED one; see .agents/skills/uzi-release" >&2
+    exit 1
+  }
   [[ "$digest" =~ ^sha256:[0-9a-f]{64}$ ]] || { echo "invalid image digest: $repo" >&2; exit 1; }
   ref="${repo}@${digest}"
   "$cosign_bin" verify --certificate-identity "$identity" \
-    --certificate-oidc-issuer https://token.actions.githubusercontent.com "$ref" >/dev/null
+    --certificate-oidc-issuer https://token.actions.githubusercontent.com "$ref" >/dev/null || {
+      echo "ERROR: $ref signature verification failed; expected identity $identity and GitHub Actions OIDC issuer" >&2
+      exit 1
+    }
   config="$("$docker_bin" buildx imagetools inspect "$ref" --format '{{json .Image.Config}}')"
   current="$(printf '%s' "$config" | jq -er --arg pin "$pin" '
     . as $config

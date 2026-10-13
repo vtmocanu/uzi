@@ -2260,7 +2260,9 @@ stays unchanged, it rolls zero worker pods. A controller change that alters the
 worker template can still cause a paced same-image roll (notably #1470's pod UID
 environment); the image pin alone does not prevent template rolls. Advancing
 the worker fleet is a deliberate operator step: bump `workers.image.tag` to a
-new concrete version with its verified exact `workers.rollTargetVersion`.
+new concrete version. Published charts supply its verified exact
+`workers.rollTargetVersion`; set a matching override only for a custom worker pin
+or a source-chart deployment.
 
 **Paced replacement (#1470 M2)** adds admission before that drain. The chart
 enforces controller replicas `0` or `1`, with Recreate; disabled hosting/controller
@@ -2301,7 +2303,9 @@ capacity and fresh old-worker drain confirmation, not replacement promotion.
 
 `workers.rollTargetVersion` must name the pinned image's **verified exact baked
 stamp**, including ADR-1720's `+g<commit>`, even for published bare SemVer tags.
-The controller cannot derive that stamp from a bare tag or the worker being
+Published charts supply the stamp automatically; custom pins and source-chart
+deployments need a matching verified override. The controller cannot derive
+that stamp from a bare tag or the worker being
 promoted. Registration keeps its 64-byte display limit; altered/truncated
 versions withhold the incarnation binding. Missing mapping or evidence holds
 rather than falling back to unpaced replacement.

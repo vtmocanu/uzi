@@ -57,8 +57,9 @@ set; two partial workers cannot provide that set by union.
    `UZI_WORKER_NAME=uzi-pod:$(UZI_POD_UID)` changes the template at the steady pin.
    Worker images and user-chosen names stay unchanged. Confirm current-UID proof
    before proceeding to an image-pin change.
-5. Advance the worker pin together with its verified exact target version only
-   after that cohort closes. Do not downgrade an active paced roll. A new
+5. Advance the worker pin only after that cohort closes. Published charts carry
+   the verified exact target version; set it explicitly only for a custom worker
+   pin or a source-chart deployment. Do not downgrade an active paced roll. A new
    controller with an old API must hold for missing proof, without unpaced fallback.
 
 `workers.drainDeadline` bounds only an admitted busy image turn. For a disposable

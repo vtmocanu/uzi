@@ -49,7 +49,15 @@ helm template uzi "$work"/fixed/uzi-*.tgz --set workers.enabled=true --set api.t
   --show-only templates/controller-deployment.yaml > "$work/override.yaml"
 grep -Fq 'value: "0.85.0-rc.3+g1234567"' "$work/override.yaml"
 echo 'PASS: per-cluster override still wins'
-if "$scripts/chart-inject-roll-target.sh" "$scripts/../deploy/chart" "$stamp" > "$work/tracked.log" 2>&1; then exit 1; fi
+tracked_pin="$(awk '
+  /^workers:/ { inw=1; next }
+  inw && /^[^[:space:]]/ { inw=0 }
+  inw && /^  image:/ { inimg=1; next }
+  inw && inimg && /^  [^[:space:]]/ { inimg=0 }
+  inw && inimg && /^    tag:/ { v=$2; gsub(/"/, "", v); print v; exit }
+' "$scripts/../deploy/chart/values.yaml")"
+if "$scripts/chart-inject-roll-target.sh" "$scripts/../deploy/chart" "${tracked_pin}+gabcdef0" > "$work/tracked.log" 2>&1; then exit 1; fi
+grep -Fq 'refusing tracked chart' "$work/tracked.log"
 [ "$before" = "$(cksum "$scripts/../deploy/chart/values.yaml")" ]
 echo 'PASS: tracked chart mutation refused'
 echo 'cases=7 passed=7'
