@@ -14717,10 +14717,10 @@ export class RunRunner {
    *  its live registry (never reconciling or minting a permit); a legacy executor was already
    *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
    *  closed. Never throws. */
-  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs): Promise<CredentialFreeSettleOutcome> {
+  private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeSettleOutcome> {
     if (executor.settleForCredentialFreeCapture) {
       try {
-        return await executor.settleForCredentialFreeCapture(deadlineMs);
+        return await executor.settleForCredentialFreeCapture(deadlineMs, purpose);
       } catch {
         return { kind: "incomplete", errors: [{ category: "protocol", message: "capture settle threw" }] };
       }
@@ -16809,7 +16809,8 @@ export class RunRunner {
             throw new RetainedRecoveryStop();
         };
         await check();
-        const settled = await this.settleForCredentialCapture(flight.executor, Math.max(1, deadline - Date.now()));
+        // Memory parking already stopped the model; settle under the independent owner deadline.
+        const settled = await this.settleForCredentialCapture(flight.executor, Math.max(1, deadline - Date.now()), "cancel");
         await check();
         if (settled.kind !== "observed_empty") throw new RetainedRecoveryStop();
         let captured: RecoveryCaptureResult = { verified: false, published: false };
