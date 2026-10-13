@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, within } from "@testing-library/react";
+import { cleanup, fireEvent as domFireEvent, render, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { PlanCrossCheckSummary, Run } from "../lib/apiTypes";
 import { mockRuns } from "../mocks/data/runs";
@@ -11,6 +11,10 @@ import { PlanPanel } from "../pages/runView/PlanPanel";
 vi.mock("../lib/api", async (original) => {
   const actual = await original<typeof import("../lib/api")>();
   return { ...actual, api: { ...actual.api, listSecrets: vi.fn().mockResolvedValue({ secrets: [] }) } };
+});
+// Testing Library's event map does not include the native details toggle event.
+const fireEvent = Object.assign(domFireEvent, {
+  toggle: (node: Element) => domFireEvent(node, new Event("toggle")),
 });
 afterEach(cleanup);
 const child = "11111111-1111-4111-8111-111111111111";
@@ -252,8 +256,84 @@ describe("recorded checker sources", () => {
       checker_model_source: modelSource as PlanCrossCheckSummary["checker_model_source"],
       checker_effort_source: effortSource as PlanCrossCheckSummary["checker_effort_source"],
     }) })} />);
-    expect(r.getByText(`Model: historical-model (${modelLabel}) · Effort: high (${effortLabel})`)).toBeTruthy();
+    const model = r.getByText(`Model: historical-model (${modelLabel})`);
+    const effort = r.getByText(`Effort: high (${effortLabel})`);
+    expect(model.closest("p")).toBe(effort.closest("p"));
     expect(r.container.textContent).not.toContain("provider-attribute");
+    expect(r.getByText("These findings concern an earlier plan; they do not certify the current plan.")).toBeTruthy();
+  });
+});
+
+describe("plan evidence rows and recording states", () => {
+  it.each([3, 5])("renders %s ordered rows with inert paths and native disclosure", count => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+      summary: "Overview", items: Array.from({ length: count }, (_, i) => ({
+        file: "pkg/__init__.py", severity: i === 0 ? "toString" : i === 1 ? "error" : "warning",
+        summary: "**Title " + i + "**", rationale: "Inline `code` [safe](https://example.com) [bad](javascript:alert(1))",
+      })),
+    } }) })} />);
+    const rows = [...r.container.querySelectorAll("li")];
+    expect(rows.map(row => row.querySelector("strong")?.textContent)).toEqual(Array.from({ length: count }, (_, i) => "Title " + i));
+    const chip = rows[0].querySelector("code")!;
+    expect(chip.textContent).toBe("pkg/__init__.py");
+    expect(chip.querySelector("strong, em")).toBeNull();
+    expect(rows[0].textContent).toContain("Severity unavailable");
+    expect(rows[1].querySelector(".text-danger")).toBeTruthy();
+    expect(rows[2].querySelector(".text-warn")).toBeTruthy();
+    expect(rows[0].querySelector(".judge-prose.text-muted code")?.textContent).toBe("code");
+    expect(rows[0].querySelector('a[href="https://example.com"]')).toBeTruthy();
+    expect(r.container.querySelector('a[href^="javascript:"]')).toBeNull();
+    const details = r.container.querySelector("details");
+    expect(rows.slice(0, 3).every(row => !row.closest("details"))).toBe(true);
+    if (count === 3) { expect(details).toBeNull(); return; }
+    expect(rows.slice(3).every(row => row.closest("details") === details)).toBe(true);
+    const toggle = r.getByText("Show 2 more findings");
+    expect(toggle.tagName).toBe("SUMMARY");
+    expect(toggle.className).toContain("focus-visible:ring-2");
+    (details as HTMLDetailsElement).open = true;
+    fireEvent.toggle(details!);
+    expect(r.getByText("Hide 2 more findings")).toBeTruthy();
+    (details as HTMLDetailsElement).open = false;
+    fireEvent.toggle(details!);
+    expect(r.getByText("Show 2 more findings")).toBeTruthy();
+  });
+  it("consumes summary then file/severity/summary/rationale without a new path cap", () => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+      summary: "S".repeat(1000), items: [
+        { file: "P".repeat(1000), severity: "info", summary: "T".repeat(10000), rationale: "R".repeat(5000) },
+        ...Array.from({ length: 20 }, () => ({ file: "omitted", summary: "omitted" })),
+      ],
+    } }) })} />);
+    const rows = r.container.querySelectorAll("li");
+    expect(rows).toHaveLength(20);
+    expect(rows[0].querySelector("code")?.textContent).toBe("P".repeat(1000));
+    expect(rows[0].querySelector(".judge-prose.text-muted")?.textContent).toBe("R".repeat(4380));
+    expect(rows[1].textContent).not.toContain("omitted");
+    const notice = r.getByText("Findings truncated for display.");
+    const details = r.container.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(notice.closest("details")).toBeNull();
+    details.open = true;
+    fireEvent.toggle(details);
+    expect(r.getByText("Hide 17 more findings")).toBeTruthy();
+    expect(notice.closest("details")).toBeNull();
+  });
+  it.each(["queued", "running", "completed", "failed", "cancelled"] as const)("labels missing required plan evidence for %s", status => {
+    const terminal = ["completed", "failed", "cancelled"].includes(status);
+    const r = render(<PlanCrossCheck run={run({ status, plan_cross_check_required: true, plan_cross_check_summary: undefined, plan_cross_check_gate_reason: undefined })} />);
+    expect(r.getByText(terminal ? "Not recorded" : "Pending")).toBeTruthy();
+    expect(r.getByText(terminal ? "This run ended without a plan cross-check result." : "Runs when the plan is ready, before it can proceed.")).toBeTruthy();
+  });
+  it.each([null, ""])("shows valid pending reason %s with no-result copy", reason_class => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ verdict: "pending", reason_class }) })} />);
+    expect(r.getByText("Pending").closest("header")).toBeTruthy();
+    expect(r.getByText("No result recorded yet.")).toBeTruthy();
+  });
+  it("prioritizes historical state while retaining strict outcome evidence", () => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ historical: true, verdict: "approve", reason_class: "block" }) })} />);
+    expect(r.getByText("Superseded").closest("header")).toBeTruthy();
+    expect(r.getByText("Earlier-plan evidence")).toBeTruthy();
+    expect(r.getByText("Earlier-plan evidence: Outcome unavailable")).toBeTruthy();
     expect(r.getByText("These findings concern an earlier plan; they do not certify the current plan.")).toBeTruthy();
   });
 });
