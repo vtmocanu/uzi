@@ -18,7 +18,8 @@
 # it). Every blank line between a section's entries is kept byte-identical. Only a join the
 # union itself makes gets a chosen gap: the first side's last line against the second side's
 # first gets the larger of the two sides' own blank runs there, or, when neither has one,
-# [Unreleased]'s convention; a folded repeat's bullets against its first occurrence's always
+# [Unreleased]'s convention (when [Unreleased] holds no pair of entries to vote, e.g. right
+# after a release fold, the convention of the file's released sections); a folded repeat's bullets against its first occurrence's always
 # get the convention (the
 # majority of item pairs each side already had; on a tie the nearest pair before the join,
 # else blank when any pair is blank-separated, else none). A file with no conflict markers
@@ -77,14 +78,19 @@ SEP_AWK='
   function sepcount(s, k) {
     if (s ~ /^[ \t]*$/) { gap[k] = 1; return }
     if (s ~ /^#/) { pl[k] = 0; gap[k] = 0; last[k] = ""; return }
-    if (s ~ /^[-*] / && pl[k]) { if (gap[k]) nblank++; else ntight++; last[k] = (gap[k] ? 1 : 0) }
+    if (s ~ /^[-*] / && pl[k]) {
+      if (k == "g") { if (gap[k]) gblank++; else gtight++ }   # fallback: the released sections
+      else { if (gap[k]) nblank++; else ntight++ }
+      last[k] = (gap[k] ? 1 : 0)
+    }
     pl[k] = (s ~ /^[-*] / || s ~ /^  /); gap[k] = 0
   }
   # joinstyle(near): 1 = one blank line at a join, 0 = none.
   function joinstyle(near) {
     if (nblank != ntight) return (nblank > ntight)
     if (near != "") return near + 0
-    return (nblank > 0)
+    if (nblank > 0) return 1
+    return (gblank > gtight)   # no pair in [Unreleased] at all: the released sections decide
   }
 '
 
@@ -307,6 +313,7 @@ awk "$SEP_AWK"'
     for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
     ns = 0; np = 0; dup = 0
     for (i = u + 1; i < e; i++) sepcount(L[i], "f")
+    for (i = 1; i <= n; i++) if (i < u || i >= e) sepcount(L[i], "g")
     for (i = u + 1; i < e; i++) {
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
@@ -389,6 +396,7 @@ if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL"
   st == 2 { C[++nc] = $0; next }
   st == 1 { A[++na] = $0 }
   st == 3 { B[++nb] = $0 }
+  !unrel && st != 3 { sepcount($0, "g") }
   unrel && st != 3 { sepcount($0, "o") }
   unrel && st != 1 { sepcount($0, "t") }
   { print; print > before }
@@ -396,6 +404,7 @@ if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL"
     if (bad != "") { print "changelog-union: refusing: " bad > "/dev/stderr"; exit 1 }
     if (st != 0) { print "changelog-union: unterminated conflict block" > "/dev/stderr"; exit 1 }
     print "votes", nblank + 0, ntight + 0 > sepfile
+    print "fallback", gblank + 0, gtight + 0 > sepfile
     for (j = 1; j <= nj; j++) print "join", j, near[j] > sepfile
   }
 ' "$FILE" > "$tmpd/union"; then
@@ -441,6 +450,7 @@ awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
     while ((getline ln < sepfile) > 0) {
       split(ln, f, " ")
       if (f[1] == "votes") { nblank = f[2] + 0; ntight = f[3] + 0 }
+      else if (f[1] == "fallback") { gblank = f[2] + 0; gtight = f[3] + 0 }
       else if (f[1] == "join") near[f[2]] = f[3]
     }
   }

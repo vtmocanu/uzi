@@ -675,4 +675,32 @@ printf '## [Unreleased]\n\n### Fixed\n\n- **main only**\n\n- **branch only**\n\n
 bash "$SCRIPT" "$WORK/novote.md" > "$WORK/novote.out" 2>&1 || fail "no-vote union failed: $(cat "$WORK/novote.out")"
 diff -u "$WORK/novote.want" "$WORK/novote.md" || fail "no-vote union dropped a side's blank line"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept"
+# 13. Fresh [Unreleased] after a release fold (no pair of entries to vote), both sides add one
+#     bullet under the same `### Changed`: the join follows the file's convention, which the
+#     released sections show (a blank line between bullets), instead of touching bullets.
+REL13='## [0.1.0] - 2026-01-01
+
+### Changed
+
+- **old a**
+  old a desc
+
+- **old b**
+  old b desc
+'
+printf '## [Unreleased]\n\n### Changed\n\n<<<<<<< HEAD\n- **main new**\n  main desc\n||||||| base\n=======\n- **branch new**\n  branch desc\n>>>>>>> branch\n\n%s' "$REL13" > "$WORK/fresh.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **main new**\n  main desc\n\n- **branch new**\n  branch desc\n\n%s' "$REL13" > "$WORK/fresh.want"
+bash "$SCRIPT" "$WORK/fresh.md" > "$WORK/fresh.out" 2>&1 || fail "fresh union failed: $(cat "$WORK/fresh.out")"
+diff -u "$WORK/fresh.want" "$WORK/fresh.md" || fail "fresh-[Unreleased] union lost the blank line between bullets"
+# the same for a --collapse of two single-bullet `### Changed` repeats
+printf '## [Unreleased]\n\n### Changed\n\n- **a**\n  a desc\n\n### Changed\n\n- **b**\n  b desc\n\n%s' "$REL13" > "$WORK/freshc.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **a**\n  a desc\n\n- **b**\n  b desc\n\n%s' "$REL13" > "$WORK/freshc.want"
+bash "$SCRIPT" --collapse "$WORK/freshc.md" > "$WORK/freshc.out" 2>&1 || fail "fresh collapse failed: $(cat "$WORK/freshc.out")"
+diff -u "$WORK/freshc.want" "$WORK/freshc.md" || fail "fresh-[Unreleased] collapse lost the blank line between bullets"
+# a file whose released sections are tight keeps tight joins (the convention is the file's, not a default)
+printf '## [Unreleased]\n\n### Changed\n\n<<<<<<< HEAD\n- **main new**\n||||||| base\n=======\n- **branch new**\n>>>>>>> branch\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n' > "$WORK/tight.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **main new**\n- **branch new**\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n' > "$WORK/tight.want"
+bash "$SCRIPT" "$WORK/tight.md" > "$WORK/tight.out" 2>&1 || fail "tight union failed: $(cat "$WORK/tight.out")"
+diff -u "$WORK/tight.want" "$WORK/tight.md" || fail "a tight file's union gained a blank line"
+
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept, and a fresh [Unreleased] joining with the file's blank-line convention"
