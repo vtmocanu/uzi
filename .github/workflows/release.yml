@@ -299,7 +299,9 @@ jobs:
             UZI_PRDS_OPEN=${{ needs.assert-changelog.outputs.prds_open }}
       # Sign by digest (covers both pushed tags; no tag->digest TOCTOU).
       - name: Sign image (cosign keyless)
-        run: cosign sign --yes ghcr.io/vtmocanu/uzi/api@${{ steps.build.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/api@${DIGEST}"
 
   publish-web:
     runs-on: ubuntu-latest
@@ -352,7 +354,9 @@ jobs:
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
       - name: Sign image (cosign keyless)
-        run: cosign sign --yes ghcr.io/vtmocanu/uzi/web@${{ steps.build.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/web@${DIGEST}"
 
   publish-controller:
     runs-on: ubuntu-latest
@@ -404,7 +408,9 @@ jobs:
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}
       - name: Sign image (cosign keyless)
-        run: cosign sign --yes ghcr.io/vtmocanu/uzi/controller@${{ steps.build.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/controller@${DIGEST}"
 
   # Per-template worker images. Destination is <prefix>/agent-<template>, which is what
   # makes the chart's workers.image.repository (ghcr.io/vtmocanu/uzi) + the controller's
@@ -523,7 +529,7 @@ jobs:
         env:
           TEMPLATE: ${{ matrix.template }}
           DIGEST: ${{ steps.base.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
       - id: runtime
         name: Pin the runtime base digest this release builds on
         env:
@@ -571,7 +577,7 @@ jobs:
         env:
           TEMPLATE: ${{ matrix.template }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
       # Filesystem half of the identity check (assert-agent-version reads only the image
       # config): export JUST /opt/uzi-src/BUILD_INFO from the digest this job pushed and
       # require it to name this commit. The builder already holds those layers, so this
@@ -658,13 +664,16 @@ jobs:
   # at tip whose tag was kept local-only leaves release.yml never building that image,
   # and shipping the chart then ImagePullBackOffs every new hosted worker (the
   # 0.83.0-rc.7 incident, 2026-09-19). The pin moves only when the agent runtime surface
-  # changes (scripts/worker-tag-autobump.sh), so this tests EXISTENCE of the pinned tag,
+  # changes (scripts/worker-tag-autobump.sh), so this verifies the pinned image identity,
   # not "pin == this release" -- the pin may point at an older, already-published tag. It runs after
   # publish-agent (the images are live by then) and gates publish-chart via `needs`, so
-  # a bad pin blocks the chart push before ArgoCD can ever see it.
+  # a bad pin blocks the chart push before ArgoCD can ever see it. The verified baked
+  # stamp also supplies the packaged chart's exact paced-roll target (#2906).
   assert-worker-pin:
     runs-on: ubuntu-latest
     needs: [publish-agent]
+    outputs:
+      roll_target_version: ${{ steps.worker-pin.outputs.roll_target_version }}
     permissions:
       contents: read
       packages: read
@@ -685,7 +694,11 @@ jobs:
           registry: ghcr.io
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
-      - name: Assert the chart's worker pin names a published image
+      - uses: ./.github/actions/install-cosign
+        with:
+          cosign-release: 'v3.1.3'
+      - name: Verify the pinned worker identity
+        id: worker-pin
         run: |
           set -euo pipefail
           # workers.image.tag: the tag under the FIRST `image:` that is a direct
@@ -705,24 +718,8 @@ jobs:
             echo "ERROR: could not read workers.image.tag from deploy/chart/values.yaml" >&2
             exit 1
           fi
-          echo "chart pins workers.image.tag=$PIN"
-          # Worker template images. Keep equal to api/internal/workertmpl.Names, the same
-          # source of truth the publish-agent matrix mirrors (pinned by
-          # api/internal/workertmpl/template_sources_test.go via the trailing marker).
-          fail=0
-          for t in base jvm; do  # worker templates; workertmpl.Names (pinned by template_sources_test.go)
-            REPO="ghcr.io/vtmocanu/uzi/agent-${t}"
-            # stdout to /dev/null, but LET STDERR THROUGH: a transient auth/registry error
-            # must be readable and not misreported as a bad pin (release-watch re-runs
-            # transient publish flakes). Fail-closed either way.
-            if docker buildx imagetools inspect "${REPO}:${PIN}" >/dev/null; then
-              echo "OK: ${REPO}:${PIN} exists on GHCR"
-            else
-              echo "ERROR: chart pins workers.image.tag=${PIN} but ${REPO}:${PIN} could not be resolved on GHCR (unpublished, or a transient registry/auth error -- see the inspect stderr above). A stable chart may pin an RC worker (D11), but only a PUBLISHED one -- push the RC tag and let release.yml build it before promoting (see .agents/skills/uzi-release)." >&2
-              fail=1
-            fi
-          done
-          [ "$fail" -eq 0 ]
+          stamp="$(./scripts/worker-roll-target.sh "$PIN")"
+          printf 'roll_target_version=%s\n' "$stamp" >> "$GITHUB_OUTPUT"
 
   # ----------------------------------------------------------------- chart ----
   # Package + push the Helm chart as an OCI artifact, LAST (after every image), so
@@ -764,12 +761,18 @@ jobs:
           username: ${{ github.actor }}
           password: ${{ secrets.GITHUB_TOKEN }}
       - name: Package + push + sign chart
+        env:
+          WORKER_ROLL_TARGET_VERSION: ${{ needs.assert-worker-pin.outputs.roll_target_version }}
         run: |
           set -euo pipefail
           # helm dependency build vendors the CNPG `cluster` subchart (Chart.lock) into
           # the package, so the published OCI artifact is self-contained for ArgoCD.
-          helm dependency build deploy/chart
-          helm package deploy/chart -d /tmp/chart
+          chart_copy="$(mktemp -d)/uzi"
+          cp -R deploy/chart "$chart_copy"
+          ./scripts/chart-inject-roll-target.sh "$chart_copy" "$WORKER_ROLL_TARGET_VERSION"
+          helm dependency build "$chart_copy"
+          helm package "$chart_copy" -d /tmp/chart
+          ./scripts/assert-worker-roll-target-package.sh /tmp/chart/uzi-*.tgz "$WORKER_ROLL_TARGET_VERSION"
           # helm push writes "Pushed:" + "Digest: sha256:…" to STDOUT; the 2>&1 folds
           # STDERR in too, and tee (not a captured $()) means a push FAILURE still
           # prints its error before set -e/pipefail aborts the step. Then sign the chart
@@ -781,7 +784,7 @@ jobs:
             sha256:*) : ;;
             *) echo "ERROR: could not parse chart digest from helm push output" >&2; exit 1 ;;
           esac
-          cosign sign --yes "ghcr.io/vtmocanu/uzi/uzi@${digest}"
+          ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/uzi@${digest}"
 
   # --------------------------------------------------------------- release ----
   # Create the GitHub Release from the tag's CHANGELOG section. The curated prose
