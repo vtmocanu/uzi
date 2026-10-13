@@ -6838,6 +6838,7 @@ describe("M4 dependency wait cancellation", () => {
   for (const alreadyAborted of [false, true]) {
     it(`rejects caller cancellation and completes cleanup alreadyAborted=${alreadyAborted}`, async (t) => {
       const controller = new AbortController();
+      const signal = AbortSignal.any([controller.signal, t.signal]);
       const reason = new Error("caller cancelled dependency wait");
       const directories = t.mock.method(fs, "mkdtempSync");
       let enter!: () => void;
@@ -6853,14 +6854,14 @@ describe("M4 dependency wait cancellation", () => {
           executorExited = true;
           throw new Error("fixture executor released");
         },
-      }), controller.signal).then(
+      }), signal).then(
         () => ({ error: undefined }),
         error => ({ error }),
       );
       let listeners = 0;
       if (!alreadyAborted) {
         await entered;
-        listeners = getEventListeners(controller.signal, "abort").length;
+        listeners = getEventListeners(signal, "abort").length;
         controller.abort(reason);
         release();
       }
@@ -6868,7 +6869,7 @@ describe("M4 dependency wait cancellation", () => {
       assert.equal(result.error, reason, "the caller's exact abort reason is propagated");
       assert.equal(executorExited, !alreadyAborted, "cleanup joins the released executor");
       if (!alreadyAborted) assert.equal(listeners, 1, "readiness observes caller cancellation");
-      assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+      assert.equal(getEventListeners(signal, "abort").length, 0);
       assert.ok(directories.mock.calls.length >= 3);
       for (const call of directories.mock.calls.slice(0, 3))
         assert.equal(fs.existsSync(call.result!), false, "helper finally removes its fixture directories");
