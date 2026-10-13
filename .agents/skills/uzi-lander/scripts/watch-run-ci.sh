@@ -39,7 +39,8 @@
 #      appeared for the SHA" (a push to main sometimes spawns none: re-point at a descendant
 #      commit rather than waiting)
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
-#      superseded it) and nothing failed. A run not yet concluded whose jobs are all
+#      superseded it) and no non-superseded run failed (a superseded run may still show
+#      a failed aggregator job). A run not yet concluded whose jobs are all
 #      terminal with at least one cancelled counts as superseded too, never green; a run
 #      GitHub already concluded keeps its own verdict (success green, failure exit 1). A
 #      failed job beside cancelled ones (an aggregator needing its cancelled shards) waits
@@ -76,7 +77,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="${2:?}"; shift 2;;
     --max-ticks) MAX_TICKS="${2:?}"; shift 2;;
     --repo) REPO="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,48p' "$0"; exit 3;;
+    -h|--help) sed -n '2,49p' "$0"; exit 3;;
     *)
       if [ -z "$RUN" ]; then RUN="$1"; shift
       else echo "unexpected arg: $1" >&2; exit 3
@@ -265,10 +266,16 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
           # Confirm with one immediate re-query to shake off a stale first-tick read.
           if dump "$rid"; then
             verdict2="$(printf '%s\n' "$DUMP_OUT" | classify 1)"
-            if [ "$(printf '%s\n' "$verdict2" | head -1 | cut -c1-4)" = "FAIL" ]; then
+            head2="$(printf '%s\n' "$verdict2" | head -1)"
+            if [ "$head2" = FAIL ] || { [ "$head2" = FAIL_WITH_CANCELLED ] && [ "$rstatus" = "completed" ]; }; then
               print_fails "$rid" "$wname" "$verdict2"; failed=1; break
             fi
-            echo "[tick $tick] $wname: a fail cleared on re-query (stale read); continuing"; pending=1
+            if [ "$head2" = FAIL_WITH_CANCELLED ]; then
+              echo "[tick $tick] run $rid has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
+            else
+              echo "[tick $tick] $wname: a fail cleared on re-query (stale read); continuing"
+            fi
+            pending=1
           else
             pending=1
           fi
@@ -331,8 +338,13 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   # Branch mode only: a run cancelled by ci.yml concurrency was superseded by a newer
   # push — re-resolve to the newer run next tick instead of reporting a red. (In
   # explicit run-id mode a cancelled run is a genuine failure and falls through.)
+  # The run's status gates every conclusion-based decision: an in-progress run can carry a
+  # stale non-empty conclusion, which must never count as GitHub's final verdict.
+  rstat=""; concl=""
   if [ -n "$BRANCH" ]; then
-    concl="$(gh run view "${GHR[@]}" "$cur" --json conclusion --jq '.conclusion // ""' 2>/dev/null)"
+    IFS=$'\t' read -r rstat concl < <(gh run view "${GHR[@]}" "$cur" --json status,conclusion \
+      --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null) || true
+    [ "$rstat" = "completed" ] || concl=""
     if [ "$concl" = "cancelled" ]; then
       echo "[tick $tick] run $cur cancelled (superseded by a newer push); re-resolving next tick"
       sleep "$INTERVAL"; tick=$((tick+1)); continue
@@ -342,7 +354,7 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   bmode=0; [ -n "$BRANCH" ] && bmode=1
   verdict="$(printf '%s\n' "$out" | classify "$bmode")"
   head1="$(printf '%s\n' "$verdict" | head -1)"
-  if [ "$head1" = FAIL_WITH_CANCELLED ] && [ -z "${concl:-}" ]; then
+  if [ "$head1" = FAIL_WITH_CANCELLED ] && [ "$rstat" != "completed" ]; then
     echo "[tick $tick] run $cur has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
     sleep "$INTERVAL"; tick=$((tick+1)); continue
   fi
@@ -353,10 +365,15 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       # fail we could not reconfirm.
       if dump "$cur"; then
         verdict2="$(printf '%s\n' "$DUMP_OUT" | classify "$bmode")"
-        if [ "$(printf '%s\n' "$verdict2" | head -1 | cut -c1-4)" = "FAIL" ]; then
+        head2="$(printf '%s\n' "$verdict2" | head -1)"
+        if [ "$head2" = FAIL ] || { [ "$head2" = FAIL_WITH_CANCELLED ] && [ "$rstat" = "completed" ]; }; then
           print_fails "$cur" "" "$verdict2"; exit 1
         fi
-        echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
+        if [ "$head2" = FAIL_WITH_CANCELLED ]; then
+          echo "[tick $tick] run $cur has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
+        else
+          echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
+        fi
       fi
       ;;
     GREEN)
