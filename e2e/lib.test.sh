@@ -329,9 +329,10 @@ park_phase_call() {
 }
 custody_case "park phase gets generation absent from run DTO" pass 'phase used authoritative DB generation' park_phase_call
 
-# The actual capture decoder must recognize guarded and legacy typed logs while
-# preserving generation, ordering and unique-capture requirements.
-eval "$(awk '/^f42_assert_capture_park\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+# The actual capture decoder must accept #2512's same-claim recovery and reject
+# another claim or a capture that was not available before the fresh seed.
+eval "$(awk '/^f42_assert_capture_resume\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+eval "$(awk '/^wait_same_claim_capture_resume\(\) \{/,/^\}/' "$LIB")"
 fake_compose() { cat "$SEQ_DIR/events"; }
 # shellcheck disable=SC2034  # read by the extracted production capture decoder
 COMPOSE=(fake_compose)
@@ -340,24 +341,53 @@ uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"availabl
 capture_fixture() {
   jq -nc --arg variant "$1" '
     {run_id:"R",msg:"run claimed"} as $claim |
-    {run_id:"R",msg:"run parked for transient recovery",detail:"recovering retained work before reseeding"} as $park |
-    {run_id:"R",msg:"recovery: guarded inventory disposition",generation:2,capture_id:"capture",state:"uploaded"} as $capture |
-    (if $variant=="legacy" then [$claim,$claim,$park,($capture+{msg:"recovery: park/early-terminal disposition outcome",claim_generation:2}),$claim]
-     else [$claim,$claim,$park,$capture,$capture,$claim] end) |
-    if $variant=="wrong-generation" then .[3].generation=3 | .[4].generation=3
-    elif $variant=="wrong-order" then [.[0],.[1],.[3],.[2],.[4],.[5]]
-    elif $variant=="two-captures" then .[4].capture_id="other"
-    elif $variant=="missing-id" then .[3].capture_id=null | .[4].capture_id=null
+    {run_id:"R",msg:"stub executor committed marker",branch:"agent/issue-1"} as $branch |
+    {run_id:"R",msg:"recovery: bundle uploaded (durable capture)",server_capture_id:"capture",server_state:"available"} as $capture |
+    {msg:"runner clone: seeding",branch:"agent/issue-1",path:"/data/runner/issue-1.attempt-time-g2-0123456789abcdef"} as $seed |
+    {run_id:"R",msg:"recovery: prior open custody holds inventoried after clone",claim_generation:2} as $ready |
+    [$claim,$branch,$claim,$capture,$capture,$seed,$ready] |
+    if $variant=="single-upload" then del(.[4])
+    elif $variant=="wrong-generation" then .[6].claim_generation=3
+    elif $variant=="wrong-order" then [.[0],.[1],.[2],.[5],.[3],.[4],.[6]]
+    elif $variant=="two-captures" then .[4].server_capture_id="other"
+    elif $variant=="missing-id" then .[3].server_capture_id=null | .[4].server_capture_id=null
+    elif $variant=="extra-claim" then . + [$claim]
+    elif $variant=="wrong-seed-generation" then .[5].path="/data/runner/issue-1.attempt-time-g3-0123456789abcdef"
     else . end | .[]' > "$SEQ_DIR/events"
 }
 capture_fixture guarded
-custody_case "guarded G+1 capture retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_park R 2
-capture_fixture legacy
-custody_case "legacy G+1 capture contract still accepted" pass 'exact generation 2 captured' f42_assert_capture_park R 2
-for variant in wrong-generation wrong-order two-captures missing-id; do
+custody_case "same-claim capture retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+capture_fixture single-upload
+custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+for variant in wrong-generation wrong-order two-captures missing-id extra-claim wrong-seed-generation; do
   capture_fixture "$variant"
-  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_park R 2
+  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
 done
+
+cap2_recovery_contract() {
+  local mode="$1" RUN_KA=R RUN_KB=S fixture_generation=2
+  # shellcheck disable=SC2034  # used by the old real phase statements in the regression
+  local RWC_KA RWC_KB
+  [ "$mode" != extra-generation ] || fixture_generation=3
+  db_psql() { case "$1" in *claim_generation*) echo "$fixture_generation";; *) echo 0;; esac; }
+  wait_same_claim_capture_resume() {
+    [ "$mode" != missing-capture ] || fail 'cap2 recovery missing exact capture'
+    [ "$2:$4" = 2:agent/fixture ] || fail 'cap2 recovery lost generation or branch'
+  }
+  local definition
+  definition="$(awk '/^assert_cap2_recovered_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  if [ -n "$definition" ]; then
+    eval "$definition"
+    assert_cap2_recovered_run R 1 agent/fixture
+  else
+    # Run the old real counter assertion against a valid same-claim recovery.
+    eval "$(awk '/^  RWC_KA=/ { inside=1 } inside {print} /^  pass "restarted worker/ {inside=0}' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  fi
+  echo 'cap2 capture verified inside the one successor claim'
+}
+custody_case "cap2 kill recovery accepts same-claim capture without a park" pass 'cap2 capture verified' cap2_recovery_contract valid
+custody_case "cap2 kill recovery refuses an extra generation" fail 'recovery generation' cap2_recovery_contract extra-generation
+custody_case "cap2 kill recovery requires capture evidence" fail 'missing exact capture' cap2_recovery_contract missing-capture
 
 # The spent finalize allowance preserves recoverable work after #2426. Exercise
 # the phase's exact outcome assertions without a stack or timing dependency.
@@ -864,6 +894,6 @@ done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 137 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 151 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 137 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 151 ] && [ "$cases" -eq "$passed" ]
