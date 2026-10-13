@@ -724,6 +724,21 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
   const withStats = (over: Partial<Worker>): Worker =>
     aWorker({ stats_source: "cgroup", stats_mem_bytes: 1_000_000, ...over });
 
+  it("hides idle cross-checks while retaining active checks", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [
+      withStats({ id: "lane-idle", name: "idle-lane-worker", active_runs: 0, max_concurrent_runs: 1, active_cross_checks: 0, max_cross_check_slots: 1 }),
+      withStats({ id: "lane-active", name: "active-lane-worker", active_runs: 1, max_concurrent_runs: 1, active_cross_checks: 1, max_cross_check_slots: 1 }),
+    ] });
+    renderDashboard();
+    const idleRow = (await screen.findByText("idle-lane-worker")).closest("li");
+    const activeRow = (await screen.findByText("active-lane-worker")).closest("li");
+    expect(idleRow).not.toBeNull();
+    expect(activeRow).not.toBeNull();
+    expect(within(activeRow!).getByTitle("Running 1 of 1 cross-check slots")).toBeTruthy();
+    expect(within(idleRow!).getByText("0/1 runs")).toBeTruthy();
+    expect(within(idleRow!).queryByText("0/1 cross-checks")).toBeNull();
+  });
+
   it("shows separate cap-one badges and drains dedicated cross-checks", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [withStats({
@@ -735,7 +750,7 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     renderDashboard();
     await flush();
     expect(screen.getByText("Worker load")).toBeTruthy();
-    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-check"));
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -748,7 +763,7 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     });
     renderDashboard();
     await flush();
-    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("1/1 cross-check")).toBeTruthy();
     expect(screen.getByText("draining")).toBeTruthy();
   });
 

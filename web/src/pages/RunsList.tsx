@@ -753,7 +753,7 @@ export function RunsList() {
                       </Badge>
                       <AdminWorkerResources worker={w} />
                       <WorkerCordonBadge worker={w} />
-                      <WorkerRunBadge worker={w} />
+                      <WorkerRunBadge worker={w} hideIdleCrossChecks />
                       <WorkerPendingOutcomeBadge worker={w} />
                       <WorkerCustodyBadge worker={w} />
                     </div>

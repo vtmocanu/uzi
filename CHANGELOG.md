@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Runs list and Dashboard: the stalled and waits-on-you flags show their elapsed time inline ([#2836](https://github.com/vtmocanu/uzi/issues/2836)).**
   The progress flags read `◼ stalled · 14m` and `● waits on you · plan gate · 6m`, so the flag lines up with its neighbouring pills; the clock time moves to the tooltip.
 
+- **Worker cross-check badges reflect active load ([#2857](https://github.com/vtmocanu/uzi/issues/2857)).**
+  A single active cross-check uses the singular label; Dashboard and Runs hide idle cross-check badges while Workers settings retains idle capacity, with run and busy badges unchanged.
+
 - **Report-only issue runs now finish under the completion interlock ([#2821](https://github.com/vtmocanu/uzi/issues/2821)).**
   A report-only issue run with every frozen milestone declared complete can store its findings and finish without publishing a branch or opening a merge request. Completion still checks the current worker and claim generation; identical retries preserve the stored report. Mixed report-only publication requests are refused, except for an interlocked issue's scope-capped zero-work delivery through its existing valid permit. Legacy headless report-only completions keep their existing behavior.
 

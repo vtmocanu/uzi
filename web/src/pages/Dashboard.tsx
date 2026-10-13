@@ -351,7 +351,7 @@ export function Dashboard() {
                       {w.status}
                     </Badge>
                     <WorkerCordonBadge worker={w} />
-                    <WorkerRunBadge worker={w} />
+                    <WorkerRunBadge worker={w} hideIdleCrossChecks />
                     <span className="truncate text-sm font-medium text-fg">{w.name}</span>
                   </div>
                   <WorkerStatLine worker={w} />

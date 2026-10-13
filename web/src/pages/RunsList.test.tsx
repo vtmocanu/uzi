@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { act, cleanup, fireEvent, render, screen, waitFor } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter, Route, Routes, useLocation } from "react-router-dom";
 import { RunRow, RunsHistory, RunsLayout, RunsList, sortPast } from "./RunsList";
 import { api, type RunListItem, type SecretMeta, type CostStatus } from "../lib/api";
@@ -233,6 +233,24 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
     ...over,
   });
 
+  it("hides idle cross-checks while retaining active checks", async () => {
+    adminAuth();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [
+      adminWorker({ id: "lane-idle", name: "idle-lane-worker", active_runs: 0, max_concurrent_runs: 1, active_cross_checks: 0, max_cross_check_slots: 1 }),
+      adminWorker({ id: "lane-active", name: "active-lane-worker", active_runs: 1, max_concurrent_runs: 1, active_cross_checks: 1, max_cross_check_slots: 1 }),
+    ] } as never);
+    renderRuns();
+    const idleRow = (await screen.findByText("idle-lane-worker")).closest("li");
+    const activeRow = (await screen.findByText("active-lane-worker")).closest("li");
+    expect(idleRow).not.toBeNull();
+    expect(activeRow).not.toBeNull();
+    expect(within(activeRow!).getByTitle("Running 1 of 1 cross-check slots")).toBeTruthy();
+    expect(within(idleRow!).getByText("0/1 runs")).toBeTruthy();
+    expect(within(idleRow!).queryByText("0/1 cross-checks")).toBeNull();
+  });
+
   it("shows separate cap-one badges and drains dedicated cross-checks", async () => {
     adminAuth();
     mockApi.listRuns.mockResolvedValue({ runs: [] });
@@ -246,7 +264,7 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
     } as never);
     renderRuns();
     await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
-    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-check"));
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -262,7 +280,7 @@ describe("RunsList — the admin fleet list surfaces the cordon badge (PRD #496)
     } as never);
     renderRuns();
     await waitFor(() => expect(screen.getByText("someone@else.test")).toBeTruthy());
-    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("1/1 cross-check")).toBeTruthy();
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
