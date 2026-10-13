@@ -44,6 +44,9 @@ func TestStatusReportConsumerContract(t *testing.T) {
 		t.Fatalf("the api cannot decode the controller's own golden: %v", err)
 	}
 
+	if got.Kind != "fleet" {
+		t.Errorf("Kind = %q, want fleet", got.Kind)
+	}
 	if got.WorkerImageTag != "0.11.7" {
 		t.Errorf("WorkerImageTag = %q, want 0.11.7 (Decision 9's hosted target)", got.WorkerImageTag)
 	}
@@ -59,6 +62,19 @@ func TestStatusReportConsumerContract(t *testing.T) {
 
 	// The stuck worker: every optional field populated.
 	stuck := got.Workers[0]
+	pacing := stuck.Pacing
+	if pacing == nil {
+		t.Fatal("workers[0].Pacing is nil; the golden carries pacing")
+	}
+	if pacing.State != "waiting_evidence" ||
+		pacing.TargetImage != "harbor.example.com/uzi/agent-base:0.11.7" || pacing.TargetVersion != "0.11.7" ||
+		pacing.CanaryID == nil || *pacing.CanaryID != "11111111-1111-1111-1111-111111111111" ||
+		pacing.BlockingWorkerID == nil || *pacing.BlockingWorkerID != "11111111-1111-1111-1111-111111111111" ||
+		pacing.BlockingReason == nil || *pacing.BlockingReason != "waiting_for_registration" ||
+		pacing.RetainedImage == nil || *pacing.RetainedImage != "0.11.6" ||
+		pacing.RetainedVersion == nil || *pacing.RetainedVersion != "0.11.6" {
+		t.Errorf("workers[0].Pacing lost golden values: %+v", pacing)
+	}
 	if stuck.Phase != "stuck" {
 		t.Errorf("workers[0].Phase = %q, want stuck", stuck.Phase)
 	}
@@ -84,6 +100,9 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	// while RestartCount must stay a VALUE of 0, since 0 restarts is a real
 	// observation rather than an absence.
 	settled := got.Workers[1]
+	if settled.Pacing != nil {
+		t.Errorf("workers[1].Pacing = %+v, want nil", settled.Pacing)
+	}
 	if settled.Phase != "settled" {
 		t.Errorf("workers[1].Phase = %q, want settled", settled.Phase)
 	}

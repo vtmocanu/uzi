@@ -28,6 +28,7 @@ import {
   type RawPrDescriptionFields,
   type ClaimRequest,
   type PublishResponse,
+  type HeldPublicationResponse,
   type PublishResult,
   type ChatClaimResponse,
   type ClaimResponse as ProtocolClaimResponse,
@@ -302,6 +303,30 @@ export interface InputReceipt {
 }
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
+/** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
+ *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
+ *  30 s of margin lets an answer written at the server's deadline still arrive. */
+export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
+
+/** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
+export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
+
+/** Issue #2545: a held_publication FINAL was requested but this client's negotiated features do not
+ *  include {@link HELD_PUBLICATION_FEATURE}. Thrown BEFORE anything is sent, so it is non-definitive:
+ *  the journaled FINAL stays and is replayed once the feature is back. */
+export class HeldFeatureUnavailableError extends Error {
+  constructor() {
+    super("held publication feature unavailable; held final release retained");
+    this.name = "HeldFeatureUnavailableError";
+  }
+}
+
+/** The typed outcome of {@link WorkerClient.publishHeld}. `ok: true` only means the api answered 2xx
+ *  with a well-formed body; the caller must still require `body.state === "created"`. */
+export type HeldPublishResult =
+  | { ok: true; body: HeldPublicationResponse }
+  | { ok: false; httpStatus?: number; reason: string };
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -1255,6 +1280,13 @@ export class WorkerClient {
     this.latestDindMaintenanceValue = undefined;
   }
 
+  /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
+   *  after an api proves it cannot decode a single optional wire field, only that field's gate
+   *  closes and every other negotiated extension stays on. */
+  dropFeature(f: string): void {
+    this.serverFeatures.delete(f);
+  }
+
   async heartbeat(
     stats?: WorkerStats,
     outbox?: OutboxHeartbeatEntry[],
@@ -1613,10 +1645,10 @@ export class WorkerClient {
   }
 
   async submitCodeCrossCheck(runId: string, generation: number,
-    snapshot: { head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
+    snapshot: { head_commit: string; base_commit: string; repo_instructions_commit?: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
     signal?: AbortSignal,
     /** PRD #2170: the consent this submit was built under and, when on, the CLAUDE.md read at
-     *  base_commit. Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
+     *  repo_instructions_commit (base_commit for legacy adapters). Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
     instructions?: CodeCrossCheckInstructions): Promise<CodeCrossCheckStatus> {
     return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
       { stage: "code", claim_generation: generation, ...snapshot, ...instructions },
@@ -1702,6 +1734,12 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.require_running === true) {
+      if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
+          (body.claim_generation ?? 0) <= 0)
+        throw new Error("guarded question state requires awaiting_input and positive claim_generation");
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
     // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
@@ -1713,8 +1751,19 @@ export class WorkerClient {
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
     const outbound = { ...body };
+    if (body.provider_progress_turns !== undefined) {
+      const count = body.provider_progress_turns;
+      if (!Number.isInteger(count) || count < 0 || count > 2147483647 ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          body.status !== "recovery_wait" ||
+          (body.recovery_cause !== undefined && body.recovery_cause !== "empty_turn" && body.recovery_cause !== "data_volume_full")) {
+        throw new Error("invalid provider_progress_turns recovery park");
+      }
+    }
+    if (!this.hasFeature("provider_progress_on_recovery_park_v1")) delete outbound.provider_progress_turns;
     if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
+    if (!included) delete outbound.provider_progress_turns;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
@@ -1722,17 +1771,48 @@ export class WorkerClient {
     // allocating api still answers with its revision and an older api accepts unchanged.
     const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
     let ack: StateAck;
-    try {
-      ack = await this.withGenerationFallback(included, (includeField) =>
-        this.reportStateOnce(
-          runId,
-          path,
-          includeField ? outbound : { ...outbound, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
-          signal,
-          undefined,
-          evidence,
-        ),
+    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
+      this.reportStateOnce(
+        runId,
+        path,
+        includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
+        signal,
+        undefined,
+        evidence,
       );
+    try {
+      if (outbound.provider_progress_turns !== undefined && included) {
+        // Both attempts retain the fence. A stripped retry refusal propagates without
+        // invoking the older generation fallback or sending a third variant.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.provider_progress_turns;
+          this.dropFeature("provider_progress_on_recovery_park_v1");
+          ack = await sendWith(stripped)(true);
+        }
+      } else if (outbound.recovery_cause === "provider_outage" && included) {
+        // PRD #1733: a typed provider park. An api that predates `productive_turns` answers the
+        // strict-decode 400 `invalid request body`; a current api refuses a bad typed report with
+        // `state must be one of ...`, which is NOT that body and propagates unchanged. The generation
+        // is not stripped first (the generic fallback would send an untyped body without the fence):
+        // re-send once untyped with claim_generation kept, then close only this feature's gate.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const untyped = { ...outbound };
+          delete untyped.recovery_cause;
+          delete untyped.productive_turns;
+          ack = await this.withGenerationFallback(included, sendWith(untyped));
+          this.dropFeature("recovery_cause_provider_outage");
+          this.log.warn("provider-outage park rejected by an api that predates it; re-sent untyped and stopped typing it", {});
+        }
+      } else {
+        ack = await this.withGenerationFallback(included, sendWith(outbound));
+      }
     } catch (err) {
       if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
         throw new StateReportUnappliedError(runId, err);
@@ -1974,6 +2054,64 @@ export class WorkerClient {
     return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
+  /**
+   * Issue #2545 step A: upload one raw, non-thin pack of a failed run's held work; the api creates
+   * `refs/uzi-held/<run-id>/<generation>` at `tip` with the stored credential (the worker never
+   * sends one). Modeled on {@link publishCheckpoint}: the pack is the `application/octet-stream`
+   * body, the tip, generation and coverage digest ride the `X-Uzi-Held-*` headers.
+   *
+   * Never throws for an HTTP outcome: any non-2xx is `{ ok: false, httpStatus, reason }`, where
+   * `reason` is the api's bounded refusal token (a 409/422/413/503) or a local token such as
+   * `http_429`. A transport error or the {@link HELD_PUBLICATION_TIMEOUT_MS} timeout throws, and the
+   * caller treats a throw exactly like a refusal: nothing is on the forge until the answer says
+   * `created`. Without {@link HELD_PUBLICATION_FEATURE} nothing is sent (`unsupported_feature`).
+   */
+  async publishHeld(
+    runId: string,
+    generation: number,
+    tip: string,
+    coverage: string,
+    pack: Readable | Buffer,
+    signal?: AbortSignal,
+  ): Promise<HeldPublishResult> {
+    if (!this.hasFeature(HELD_PUBLICATION_FEATURE)) return { ok: false, reason: "unsupported_feature" };
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/held-publication`;
+    const timeout = AbortSignal.timeout(HELD_PUBLICATION_TIMEOUT_MS);
+    const init: RequestInit = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Held-Tip": tip,
+        "X-Uzi-Held-Generation": String(generation),
+        "X-Uzi-Held-Coverage": coverage,
+      },
+      body: pack as RequestInit["body"],
+      // undici requires `duplex: "half"` for a streamed (Readable) request body.
+      duplex: "half",
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    };
+    const res = await fetch(this.baseUrl + path, init);
+    const text = await res.text().catch(() => "");
+    if (res.status < 200 || res.status >= 300) {
+      let reason = `http_${res.status}`;
+      try {
+        const parsed = JSON.parse(text) as { reason?: unknown };
+        if (typeof parsed.reason === "string" && /^[a-z0-9_]{1,64}$/.test(parsed.reason)) reason = parsed.reason;
+      } catch { /* a non-JSON refusal keeps the status-derived token */ }
+      return { ok: false, httpStatus: res.status, reason };
+    }
+    let body: Partial<HeldPublicationResponse> | undefined;
+    try { body = JSON.parse(text) as Partial<HeldPublicationResponse>; } catch { body = undefined; }
+    if (!body || typeof body !== "object" || typeof body.publication_id !== "string" ||
+        typeof body.ref !== "string" || typeof body.tip !== "string" || typeof body.state !== "string" ||
+        (body.reason !== undefined && typeof body.reason !== "string")) {
+      return { ok: false, httpStatus: res.status, reason: "malformed_response" };
+    }
+    return { ok: true, body: body as HeldPublicationResponse };
+  }
+
   // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
   // The Bearer-authenticated worker↔API archive endpoints. Shapes are the M1-frozen
   // protocol types (agent/src/protocol.ts, mirrored from apitypes/recovery.go). The bundle
@@ -2115,6 +2253,11 @@ export class WorkerClient {
         throw new Error("final inventory release requires an exact positive safe generation");
       }
       if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; final release retained");
+      // Issue #2545: a held_publication FINAL names a ref on the forge; without the negotiated
+      // feature nothing is sent, and the typed error keeps the journaled FINAL (non-definitive).
+      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE)) {
+        throw new HeldFeatureUnavailableError();
+      }
       body.final_disposition = finalDisposition;
     }
     if (releaseEvidence !== undefined) body.release_evidence = releaseEvidence;
@@ -2925,6 +3068,31 @@ export class WorkerClient {
     });
   }
 
+  /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
+   * One HTTP attempt, bounded by httpTimeoutMs, with no generation or owner fallback. */
+  async requestWorkerPause(runId: string, claimGeneration: number, signal?: AbortSignal): Promise<StateAck> {
+    if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0)
+      throw new Error("worker pause requires positive claim_generation");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pause`;
+    try {
+      const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
+      if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+      const fields = await readRunAck(res, CROSS_CHECK_RESPONSE_MAX_BYTES);
+      if (fields.status === undefined || fields.applied === undefined)
+        throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
+      const ack: StateAck = { status: fields.status, applied: fields.applied };
+      if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
+      if (fields.reason !== undefined) ack.reason = fields.reason;
+      if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;
+      if (fields.credentialSwitch !== undefined) ack.credentialSwitch = fields.credentialSwitch;
+      if (fields.credentialSwitchReleased !== undefined) ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+      return ack;
+    } catch (err) {
+      if (err instanceof RequestError) throw err;
+      throw new RequestError("POST", path, 0, "worker pause transport failed");
+    }
+  }
+
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
   // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
   // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
@@ -3582,6 +3750,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * applied it.
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
+  applied?: boolean;
   completedPublicationCandidate?: unknown;
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
@@ -3611,6 +3780,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const text = boundedText ?? await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
+      applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
       completed_publication_receipt?: unknown;
@@ -3644,6 +3814,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     };
     const run = parsed?.run;
     const out: {
+      applied?: boolean;
       completedPublicationCandidate?: unknown;
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
@@ -3668,6 +3839,7 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gateRevision?: number;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
     if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
     const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);
     if (completionReason) out.completedPublicationReason = completionReason;

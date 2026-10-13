@@ -34,6 +34,7 @@ import { sanitizeLabel } from "../lib/sanitizeLabel";
 import { useNow } from "../lib/useNow";
 import {
   effectiveRunStatus,
+  parkLabel,
   formatElapsed,
   healthFlagLabel,
   isStoppedRun,
@@ -55,6 +56,7 @@ import { statusSinceIso } from "../lib/statusSince";
 import { firstStartIso } from "../lib/runDuration";
 import { CIFixRunHeader } from "../components/CIFixRunHeader";
 import { RecoveryArchivesPanel } from "../components/RecoveryArchives";
+import { HeldPublicationPanel } from "../components/HeldPublicationPanel";
 import { SalvagePanel } from "../components/SalvagePanel";
 import { RunIssueRef } from "../components/RunIssueRef";
 import { RunCredential } from "../components/RunCredential";
@@ -382,9 +384,10 @@ export function HealthFlag({ run }: { run: Run }) {
 // the copy states the hold is available on the same worker only — it must NOT claim the
 // completion hold is durable across workers.
 export function CompletionStatePanel({ run }: { run: Run }) {
+  if (run.status === "paused" && run.hold_reason === "provider_unavailable") return null;
   const phase = run.completion_phase ?? "";
   // PRD #1732: a credential_disabled hold is not a completion state; its own panel covers it.
-  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled";
+  const held = run.hold_reason != null && run.hold_reason !== "credential_disabled" && run.hold_reason !== "provider_unavailable";
   if (phase === "" && !held) return null;
   const unmet = run.completion_unmet ?? [];
   const attempts = run.completion_attempts ?? 0;
@@ -836,7 +839,8 @@ export function PausedPanel({
   if (
     run.status !== "paused" ||
     run.hold_reason === "completion_blocked" ||
-    run.hold_reason === "credential_disabled"
+    run.hold_reason === "credential_disabled" ||
+    run.hold_reason === "provider_unavailable"
   )
     return null;
 
@@ -1400,6 +1404,34 @@ function WorkerExhaustionPanel({ run, ownerProof, busy, onResume, onCancel }: {
   );
 }
 
+function ProviderHoldPanel({ run, ownerProof, busy, onResume, onStop, onCancel }: {
+  run: Run; ownerProof: boolean; busy: boolean;
+  onResume: () => void; onStop: () => void; onCancel: () => void;
+}) {
+  if (run.status !== "paused" || run.hold_reason !== "provider_unavailable") return null;
+  const completed = new Set(run.milestones_completed ?? []);
+  const done = (run.milestones ?? []).filter((m) => completed.has(m.id)).length;
+  const unavailable = run.kind !== "issue" || !run.milestones?.length
+    ? "Stop requires a milestone issue run."
+    : done === 0 ? "Stop requires at least one completed milestone."
+    : !run.can_stop_at_provider_hold ? "The server does not permit Stop for this hold."
+    : null;
+  return <Card className="p-4">
+    <h2 className="text-sm font-semibold text-warn">Provider unavailable — waiting for owner</h2>
+    <p className="mt-1 text-xs text-muted">Automatic retries have stopped. No retry is scheduled. Resume starts a fresh attempt.</p>
+    <p className="mt-1 text-xs text-muted">Retained work may remain on the assigned worker. Only a verified available recovery archive can restore captured work on another worker; uncaptured work is not guaranteed.</p>
+    <p className="mt-1 text-xs text-muted">The worker claim and affinity are retained.{run.kind === "issue" ? " The issue remains locked to this run." : ""}</p>
+    <p className="mt-1 text-xs text-muted">Provider parks: {run.provider_park_count}. Streak started: {run.provider_park_streak_started_at ?? "unknown"}.</p>
+    <p className="mt-1 text-xs text-muted">Stop saves a scope ceiling at completed work, then resumes to finalize. Finalization may need the provider and park again.</p>
+    {unavailable && <p className="mt-1 text-xs text-muted">{unavailable}</p>}
+    {ownerProof ? <div className="mt-3 flex gap-2">
+      <Button size="sm" disabled={busy} onClick={onResume}>Resume</Button>
+      <Button size="sm" disabled={busy || unavailable !== null} onClick={onStop}>Stop completed work</Button>
+      <Button size="sm" variant="danger" disabled={busy} onClick={onCancel}>Cancel</Button>
+    </div> : <p className="mt-2 text-xs text-muted">Only the confirmed run owner can Resume, Stop or Cancel.</p>}
+  </Card>;
+}
+
 export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onResume = () => {}, onCancel = () => {} }: {
   run: Run;
   ownerProof?: boolean;
@@ -1418,6 +1450,7 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
   // PRD #1392 M5: a forge-unreachable park gets forge-specific copy, and (PRD #1590 D6) a
   // codex_account_unavailable hold gets the Codex copy below. Every other cause (including
   // the null/untyped transient-interruption park, issue #1197/#1088) keeps the generic copy.
+  const providerPark = run.recovery_wait_cause === "provider_outage";
   const forgePark = run.recovery_wait_cause === "forge_unreachable";
   // Issue #1766: a vault_locked park waits for the run owner's vault to be unlocked; it
   // explicit unlock queues it promptly, and the timer remains the fallback (#1792).
@@ -1453,6 +1486,8 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
           <span aria-hidden="true">⏸ </span>
           {codexHold
             ? codexHold.heading
+            : providerPark
+              ? "Waiting for the provider"
             : forgePark
               ? "Waiting for the forge"
               : vaultPark
@@ -1477,6 +1512,11 @@ export function RecoveryWaitPanel({ run, ownerProof = false, busy = false, onRes
               </p>
             )}
           </>
+        ) : providerPark ? (
+          <p className="mt-1.5 text-xs text-muted">
+            Provider outage: {run.provider_park_count} parks. Streak started: {run.provider_park_streak_started_at ?? "unknown"}.
+            {" "}{retryAt ? `Next retry at ${retryAt}.` : "Next retry time unavailable."} Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold.
+          </p>
         ) : forgePark ? (
           <>
             <p className="mt-0.5 text-xs text-muted">
@@ -1653,8 +1693,10 @@ export function RunView() {
   const { run, messages, connected, error, submit, refreshRun, inputs, canSteer: optimisticCanSteer, confirmedOwner } = useRunStream(id);
   const workerExhausted = run?.status === "recovery_wait" && run.recovery_wait_cause === "worker_requeue_exhausted";
   // All page control surfaces share this gate, including the existing top Stop.
-  // Other holds retain their optimistic canSteer semantics.
-  const canSteer = optimisticCanSteer && (!workerExhausted || confirmedOwner === true);
+  // Provider holds and worker exhaustion require confirmed ownership; other holds
+  // retain their optimistic canSteer semantics.
+  const providerHeld = run?.status === "paused" && run.hold_reason === "provider_unavailable";
+  const canSteer = optimisticCanSteer && (!(workerExhausted || providerHeld) || confirmedOwner === true);
   const planCheckSeqs = useRef(new Map<string, number>());
   const planCheckRefresh = useRef<{ runId: string; busy: boolean; queued: boolean } | null>(null);
   useEffect(() => {
@@ -1902,7 +1944,7 @@ export function RunView() {
     setDiscardOutcomeErr("");
   };
   const cancelRun = async (discardPendingOutcome = false): Promise<boolean> => {
-    if (workerExhausted && !canSteer) return false;
+    if ((workerExhausted || providerHeld) && !canSteer) return false;
     const requestRunId = id;
     const isCurrent = startAction();
     // A fresh attempt clears the modal-local error so a stale reason never lingers under a retry.
@@ -2033,9 +2075,13 @@ export function RunView() {
                   // transient interruption, so it gets its own stable key and sentence.
                   run.recovery_wait_cause === "data_volume_full"
                   ? "data_volume_full"
+                  : run.recovery_wait_cause === "provider_outage"
+                    ? "provider_outage"
                   : run.recovery_wait_cause === "worker_requeue_exhausted"
                     ? "worker_requeue_exhausted"
                     : "recovery_wait"
+            : run?.status === "paused" && run.hold_reason === "provider_unavailable"
+              ? "provider_unavailable"
             : run?.status === "paused" && run.hold_reason === "credential_disabled"
               ? "credential_disabled"
             : run?.status === "paused"
@@ -2054,6 +2100,8 @@ export function RunView() {
           ? "The run is waiting for a pooled Anthropic token. Add a token to the pool and it resumes automatically."
           : parkKey === "worker_requeue_exhausted"
             ? "Worker recovery needs your decision. Only the run owner can resume or cancel this hold. There is no scheduled retry."
+          : parkKey === "provider_outage"
+            ? "The provider is unavailable. Retries automatically. If a provider recovery bound is enabled and reached, the run enters an owner hold."
           : parkKey === "recovery_wait"
             ? "This run paused to recover from a transient interruption and will resume automatically."
             : parkKey === "vault_locked"
@@ -2064,6 +2112,8 @@ export function RunView() {
               ? codexHoldCopy(parkKey.slice("codex:".length) || null, "").announce
             : parkKey === "credential_disabled"
               ? "The run is waiting because a credential it needs is disabled. Enable it and the run resumes automatically."
+            : parkKey === "provider_unavailable"
+              ? "Provider unavailable. Automatic retries have stopped; the run waits for its owner."
             : parkKey === "paused"
               ? "The run is paused. Resume it from this page or with the uzi run resume command."
             : "The agent is asking you a question. The run is parked until you answer.",
@@ -2202,7 +2252,9 @@ export function RunView() {
               {/* Focus target after a credential Enable (PRD #1732): the held panel that
                   had focus unmounts, and the status is what changed. */}
               <span ref={statusRef} tabIndex={-1} className="rounded-md focus-visible:ring-2 focus-visible:ring-brand/60 focus:outline-none">
-                <StatusPill status={pillStatus} />
+                {pillStatus === "provider_unavailable" || pillStatus === "provider_outage"
+                  ? <Badge tone="warning" dot>{parkLabel(run)}</Badge>
+                  : <StatusPill status={pillStatus} />}
               </span>
               {/* PRD #320 M6: the queue-priority pill + the owner's Expedite/undo action.
                   Both are QUEUED-ONLY (the pill self-hides on any other status; the action
@@ -2248,6 +2300,7 @@ export function RunView() {
                 // PRD #1732: a credential_disabled hold resumes on Enable (its panel), and a
                 // plain Resume would only park it again.
                 run.hold_reason !== "credential_disabled" &&
+                run.hold_reason !== "provider_unavailable" &&
                 (canSteer ? (
                   <Button
                     size="sm"
@@ -2550,6 +2603,36 @@ export function RunView() {
         }}
       />
 
+      <ProviderHoldPanel run={run} ownerProof={canSteer && run.id === id} busy={busy}
+        onResume={() => act(async (isCurrent) => {
+          const requestRunId = run.id;
+          await api.resumeRun(requestRunId);
+          if (isCurrent()) await refreshRun();
+        })}
+        onCancel={() => cancelRun()}
+        onStop={() => act(async (isCurrent) => {
+          if (!canSteer || run.id !== id || !run.can_stop_at_provider_hold) return;
+          const requestRunId = run.id;
+          const completed = new Set(run.milestones_completed ?? []);
+          const ceiling = (run.milestones ?? []).filter((m) => completed.has(m.id)).length;
+          await api.submitRunInput(requestRunId, "scope", String(ceiling));
+          if (!isCurrent()) return;
+          try {
+            await api.resumeRun(requestRunId);
+          } catch (e) {
+            if (!isCurrent()) return;
+            const message = `Scope saved through milestone ${ceiling}; Resume outcome unconfirmed. ${errorMessage(e, "Action failed")}`;
+            setActionErr(message);
+            try {
+              await refreshRun();
+            } catch (refreshError) {
+              if (isCurrent()) setActionErr(`${message} Current state unavailable. ${errorMessage(refreshError, "Refresh failed")}`);
+            }
+            return;
+          }
+          if (isCurrent()) await refreshRun();
+        })}
+      />
       <PausedPanel
         run={run}
         busy={busy}
@@ -2781,6 +2864,7 @@ export function RunView() {
           published checkpoint at refs/uzi-salvage/<run-id>. Renders only for a failed run
           whose detail read carries a salvage_state; nothing otherwise. */}
       <SalvagePanel run={run} />
+      <HeldPublicationPanel run={run} />
 
       {/* Run retrospective (PRD #46 M4): the LLM judge's verdict + recommendations,
           shown once a run is finished. The panel fetches its own review and owns the

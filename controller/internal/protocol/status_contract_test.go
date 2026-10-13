@@ -35,14 +35,18 @@ func sampleStatusReport() StatusReport {
 	reason := "CrashLoopBackOff"
 	var exit int32 = 2
 
+	canary := "11111111-1111-1111-1111-111111111111"
+	blockingReason := "waiting_for_registration"
+	retained := "0.11.6"
 	return StatusReport{
-		ReportedAt:          time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
+		Kind: "fleet", ReportedAt: time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
 		PollIntervalSeconds: 10,
 		WorkerImageTag:      "0.11.7",
 		Workers: []WorkerStatus{
 			{
 				// The motivating incident, in fixture form: an init container wedged in
 				// CrashLoopBackOff reseeding the browser's nix closure.
+				Pacing:            &Pacing{State: "waiting_evidence", TargetImage: "harbor.example.com/uzi/agent-base:0.11.7", TargetVersion: "0.11.7", CanaryID: &canary, BlockingWorkerID: &canary, BlockingReason: &blockingReason, RetainedImage: &retained, RetainedVersion: &retained},
 				ID:                "11111111-1111-1111-1111-111111111111",
 				Phase:             PhaseStuck,
 				PhaseSince:        &phaseSince,
@@ -79,10 +83,10 @@ func TestStatusReportWireContract(t *testing.T) {
 	got = append(got, '\n')
 
 	if os.Getenv("UPDATE_GOLDEN") == "1" {
-		if err := os.MkdirAll(filepath.Dir(statusContractFixture), 0o755); err != nil {
+		if err := os.MkdirAll(filepath.Dir(statusContractFixture), 0o750); err != nil {
 			t.Fatalf("mkdir testdata: %v", err)
 		}
-		if err := os.WriteFile(statusContractFixture, got, 0o644); err != nil {
+		if err := os.WriteFile(statusContractFixture, got, 0o600); err != nil {
 			t.Fatalf("write golden: %v", err)
 		}
 		t.Log("golden file updated")

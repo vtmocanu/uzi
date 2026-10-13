@@ -407,6 +407,8 @@ var seedResources = corev1.ResourceRequirements{
 // Every field here is operator config — the api sends names, this side owns every
 // mapping to a concrete pod-spec value.
 type RenderConfig struct {
+	RollConcurrency   int
+	RollTargetVersion string
 	// Namespace is the dedicated worker namespace: it contains nothing but hosted
 	// workers, which is what bounds a compromised controller.
 	Namespace string
@@ -899,6 +901,8 @@ func podTemplate(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) c
 	}
 
 	env := []corev1.EnvVar{
+		{Name: "UZI_POD_UID", ValueFrom: &corev1.EnvVarSource{FieldRef: &corev1.ObjectFieldSelector{FieldPath: "metadata.uid"}}},
+		{Name: "UZI_WORKER_NAME", Value: "uzi-pod:$(UZI_POD_UID)"},
 		{Name: "UZI_API_URL", Value: cfg.APIURL},
 		{Name: "UZI_WORKER_TOKEN_FILE", Value: cfg.tokenPath()},
 		{Name: "UZI_DATA_DIR", Value: dataMountPath},

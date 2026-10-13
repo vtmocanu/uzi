@@ -132,6 +132,7 @@ export const CODEX_SIGNAL_TOOLS: ReadonlySet<string> = new Set([
   "ask_user",
   "report_progress",
   "checkpoint",
+  "park_run",
 ]);
 
 // The delegation family. `spawn_agent`/`collaborationspawn_agent` START a child;
@@ -362,6 +363,8 @@ export interface RunGrants {
   readonly allowedSkills: ReadonlySet<string>;
   /** Whether this thread is the run's root/main thread (root-only authority gate). */
   readonly isRoot: boolean;
+  readonly parkRunSupported?: boolean;
+  readonly nonInteractiveIssue?: boolean;
 }
 
 /** Everything the broker is constructed with: the registry, the injected seams, the
@@ -1013,6 +1016,13 @@ export class CodexCallbackBroker {
     // latch a signal. A child or unknown origin can NEVER move the run's workflow.
     if (origin !== "root" || !this.grants.isRoot) {
       return deny("signal_root_only", `signal "${safeId(canonical)}" may be latched only by the root origin`);
+    }
+    if (canonical === "park_run" && (this.grants.phase !== "implement"
+      || this.grants.parkRunSupported !== true || this.grants.nonInteractiveIssue !== true)) {
+      return deny("park_run_denied", "park_run requires supported root issue implementation");
+    }
+    if (canonical === "park_run" && (!asObject(args) || Object.keys(asObject(args)!).length !== 0)) {
+      return deny("invalid_signal", "park_run takes no arguments");
     }
     // Reuse the AUTHORITATIVE main-thread parser rather than a second copy of the
     // clamping logic: synthesize the same assistant/tool_use frame scanSignals reads.

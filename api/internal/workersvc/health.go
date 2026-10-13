@@ -635,6 +635,9 @@ func (s *Service) runningTarget(ctx context.Context, now time.Time, r store.List
 				}); ok {
 					if childID, err := reader.GetPlanCrossCheckChildForHealth(ctx, r.ID); err == nil {
 						if counts, err := s.workerEligibilityForHealth(ctx, now, childID, s.capabilityAwareOn(ctx)); err == nil {
+							if reason := rollWaitReason(now, counts); reason != "" {
+								return healthWaitingWorker, reason
+							}
 							if counts.StrictEligible == 0 {
 								return healthWaitingWorker, reasonNoCrossCheckWorker
 							}
@@ -1063,6 +1066,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: read child eligibility", "run_id", r.ID, "error", err)
 			return reasonPlanCrossCheckWaiting
 		}
+		if reason := rollWaitReason(now, counts); reason != "" {
+			return reason
+		}
 		if counts.StrictEligible > 0 {
 			if counts.Claimable == 0 {
 				return reasonCrossCheckSlotsBusy
@@ -1076,7 +1082,9 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 	eligibility, eligibilityErr := s.workerEligibilityForHealth(ctx, now, r.ID, capAware)
 	if eligibilityErr != nil {
 		slog.Error("health: read current worker eligibility", "run_id", r.ID, "error", eligibilityErr)
-	} else if eligibility.DrainingEligible > 0 && eligibility.NonDrainingEligible == 0 && eligibility.SuitableOwnDraining == 0 {
+	} else if reason := rollWaitReason(now, eligibility); reason != "" {
+		return reason
+	} else if DrainOnlyEligibleForHealth(eligibility) {
 		return ReasonWorkersUpgrading
 	}
 	n, err := s.q.CountOnlineWorkersForUser(ctx, r.UserID)

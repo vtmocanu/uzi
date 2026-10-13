@@ -20,6 +20,7 @@
   "final_receipt": {
     "kind": "x",
     "capture_id": "x",
+    "publication_id": "x",
     "source_sha": "x",
     "coverage_digest": "x"
   },
@@ -38,5 +39,7 @@
   "released_at": "2020-01-02T03:04:05Z",
   "checkpoint_ref": "x",
   "checkpoint_tip": "x",
-  "checkpoint_state": "x"
+  "checkpoint_state": "x",
+  "final_publication_id": "x",
+  "held_ref": "x"
 }

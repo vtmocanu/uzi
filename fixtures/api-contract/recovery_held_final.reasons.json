@@ -1,0 +1,7 @@
+{
+  "held_publication_unsupported": {"definitive": false},
+  "held_publication_unavailable": {"definitive": false},
+  "held_publication_ref_missing": {"definitive": true},
+  "held_publication_ref_mismatch": {"definitive": true},
+  "held_publication_not_eligible": {"definitive": true}
+}

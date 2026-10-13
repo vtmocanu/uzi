@@ -1548,6 +1548,9 @@ func TestHealthQueuedWorkersUpgrading(t *testing.T) {
 	}{
 		{"one drainer", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1}, nil, ReasonWorkersUpgrading},
 		{"several drainers", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 3}, nil, ReasonWorkersUpgrading},
+		{"healthy active drain", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, DiagnosticSuitable: 1, DiagnosticRolling: 1, DiagnosticDrainingOnly: 1}, nil, ReasonWorkersUpgrading},
+		{"fresh drain with unreported offline peer", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, DiagnosticSuitable: 2, DiagnosticRolling: 1, DiagnosticDrainingOnly: 1}, nil, reasonNoWorker},
+		{"legacy or stale diagnostics preserve fallback", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, DiagnosticSuitable: 2}, nil, ReasonWorkersUpgrading},
 		{"own veto one", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, SuitableOwnDraining: 1}, nil, reasonNoWorker},
 		{"own veto several", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 3, SuitableOwnDraining: 1}, nil, reasonNoWorker},
 		{"non draining eligible", store.CountOnlineWorkersClaimableForRunRow{DrainingEligible: 1, NonDrainingEligible: 1}, nil, reasonNoWorker},

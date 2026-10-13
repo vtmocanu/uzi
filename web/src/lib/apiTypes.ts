@@ -2270,7 +2270,22 @@ export interface WorkerRunDisk {
   sampled_at: string;
 }
 
+// Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
+// members are optional for skew and its recorded empty-object contract fixture.
+export interface WorkerRollPacing {
+  state?: "active" | "held" | "waiting_evidence" | "override";
+  target_image?: string;
+  target_version?: string;
+  canary_id?: string;
+  blocking_worker_id?: string;
+  blocking_reason?: string;
+  retained_image?: string;
+  retained_version?: string;
+}
+
 export interface Worker {
+  // Omitted when absent, invalid or older than the API's independent receipt TTL.
+  roll_pacing?: WorkerRollPacing;
   id: string;
   name: string;
   status: string; // "offline" | "online"
@@ -3226,8 +3241,8 @@ export interface Run {
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
    *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
-   *  "empty_turn"/"provider_outage"
-   *  are reserved. Render an unrecognised value honestly (a
+   *  "provider_outage" is a counted provider interruption with a scheduled retry;
+   *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
@@ -3269,6 +3284,8 @@ export interface Run {
    *  from forge_park_count. A preventive disk park (the worker stopped the run before its
    *  data volume filled) does not count. 0 for a run that has never taken a counted disk park. */
   disk_park_count?: number;
+  provider_park_count: number;
+  provider_park_streak_started_at: string | null;
   /** PRD #1809 M6 (D8): the worker's report, on the run's latest park, of whether the checkpoint
    *  that park published contains the run's latest committed work. false: it does not (the worker
    *  keeps the latest work under its custody hold). Absent when not reported. The server clears
@@ -3355,7 +3372,9 @@ export interface Run {
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
-   *  wall-clock park (PRD #1497). Render an unrecognised value honestly.
+   *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
    *  must NOT be shown as cross-worker durable.
@@ -3376,6 +3395,9 @@ export interface Run {
    *  a completed milestone and the finalize allowance unused). Both OPTIONAL for rollout skew. */
   worker_name?: string | null;
   can_stop_at_wall?: boolean;
+  /** Server authorization/eligibility hint for scoped Stop at a provider hold; absent or
+   *  false must never be treated as permission. Scope success precedes owner Resume. */
+  can_stop_at_provider_hold: boolean;
   completion_phase?: "checking" | "reworking" | "blocked" | "";
   /** PRD #1227 M1: the owner-decision contract projection — contract-derived (no extra DB read),
    *  all OPTIONAL for api/web rollout skew exactly like the completion block above; the server
@@ -3557,6 +3579,7 @@ export interface CodeCrossCheckSummary {
   guidance_digest?: string;
   repo_instructions_enabled?: boolean;
   repo_instructions_digest?: string;
+  repo_instructions_commit?: string | null;
   usage?: RunUsage | null;
   stage: string;
   round: number;
@@ -4503,6 +4526,8 @@ export type RunInputKind =
   | "reject_plan"
   | "revise_plan"
   | "cancel"
+  /** Server-side milestone ceiling; body is the completed milestone count. */
+  | "scope"
   | "answer"
   /** PRD #1190: an owner's pause request (`pause`, body = the mode "milestone"|"now")
    *  and its withdrawal (`pause_cancel`), both POSTed to /runs/{id}/inputs. `resume` is
@@ -4918,7 +4943,7 @@ export interface RecoveryCustodyHold {
   };
   completed_publication_reason?: string;
   inventory_guarded: boolean;
-  final_receipt?: { kind: string; capture_id?: string; source_sha?: string; coverage_digest: string };
+  final_receipt?: { kind: string; capture_id?: string; publication_id?: string; source_sha?: string; coverage_digest: string };
   terminal_record_rejection?: string;
   id: string;
   run_id: string;
@@ -4935,6 +4960,9 @@ export interface RecoveryCustodyHold {
   checkpoint_ref?: string;
   checkpoint_tip?: string;
   checkpoint_state?: string;
+  // Issue #2545: a hold released by held publication names its publication and forge ref.
+  final_publication_id?: string;
+  held_ref?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
@@ -4946,6 +4974,33 @@ export interface RecoveryCustodyAggregate {
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;
+}
+
+// HeldPublication is one held-work publication of a failed run (issue #2545), mirroring
+// apitypes.HeldPublicationDTO. state is a server enum (prepared, invoked, created,
+// create_unknown, refused, acknowledged, delete_unknown, deleted, abandoned); treat an
+// unknown value as opaque. Every optional field is omitted by the server when unset.
+export interface HeldPublication {
+  id: string;
+  run_id: string;
+  generation: number;
+  ref: string;
+  tip: string;
+  state: string;
+  created_at: string;
+  ref_created_at?: string;
+  acknowledged_at?: string;
+  expires_at?: string;
+  owner_expired_at?: string;
+  deleted_at?: string;
+  last_error?: string;
+  refusal_reason?: string;
+}
+
+// HeldPublications is the owner GET /api/runs/{id}/held-publications response. publications
+// is always an array on the wire, never null.
+export interface HeldPublications {
+  publications: HeldPublication[];
 }
 
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the

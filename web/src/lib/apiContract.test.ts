@@ -52,6 +52,8 @@ import type {
   RecoveryArchiveSummary,
   RecoveryCustodyHold,
   RecoveryCustodyAggregate,
+  HeldPublication,
+  HeldPublications,
   RecoveryCustodyHolds,
   GuardrailOverrideRequest,
   CodexAccountRateLimit,
@@ -173,6 +175,8 @@ import recoveryCustodyHoldZero from "../../../fixtures/api-contract/recovery_cus
 import recoveryCustodyHoldFull from "../../../fixtures/api-contract/recovery_custody_hold.full.json";
 import recoveryCustodyAggregateZero from "../../../fixtures/api-contract/recovery_custody_aggregate.zero.json";
 import recoveryCustodyAggregateFull from "../../../fixtures/api-contract/recovery_custody_aggregate.full.json";
+import heldPublicationsZero from "../../../fixtures/api-contract/held_publications.zero.json";
+import heldPublicationsFull from "../../../fixtures/api-contract/held_publications.full.json";
 import recoveryCustodyHoldsZero from "../../../fixtures/api-contract/recovery_custody_holds.zero.json";
 import recoveryCustodyHoldsFull from "../../../fixtures/api-contract/recovery_custody_holds.full.json";
 import guardrailOverrideRequestZero from "../../../fixtures/api-contract/guardrail_override_request.zero.json";
@@ -1251,6 +1255,17 @@ it("recovery publication receipt matches the Go contract and permits older serve
   void withoutMR;
 });
 
+it("recovery held-publication fields match the Go contract and permit older servers", () => {
+  const full: RecoveryCustodyHold = recoveryCustodyHoldFull;
+  const older: RecoveryCustodyHold = recoveryCustodyHoldZero;
+  expect(full.final_publication_id).toBe("x");
+  expect(full.held_ref).toBe("x");
+  expect(full.final_receipt?.publication_id).toBe("x");
+  expect(older.final_publication_id).toBeUndefined();
+  expect(older.held_ref).toBeUndefined();
+  expect(older.final_receipt).toBeUndefined();
+});
+
 // ── RecoveryCustodyAggregate (PRD #1349 M1) ──────────────────────────────────
 // All four fields are ints, so the zero.json carries no null (declared nullable:false).
 {
@@ -1263,6 +1278,29 @@ it("recovery publication receipt matches the Go contract and permits older serve
   void _recoveryCustodyAggregateZero;
   void _recoveryCustodyAggregateFull;
 }
+
+// ── HeldPublications (issue #2545) ───────────────────────────────────────────
+// publications is non-omitempty, so zero.json carries a null the handler normalizes to [].
+{
+  const _heldPublicationsMissing: never = null as unknown as Exclude<keyof HeldPublications, keyof typeof heldPublicationsFull>;
+  const _heldPublicationsExtra: never = null as unknown as Exclude<keyof typeof heldPublicationsFull, keyof HeldPublications>;
+  const _heldPublicationsZero: ZeroOf<HeldPublications, "publications"> = heldPublicationsZero;
+  const _heldPublicationsFull: Widen<HeldPublications> = heldPublicationsFull;
+  void _heldPublicationsMissing;
+  void _heldPublicationsExtra;
+  void _heldPublicationsZero;
+  void _heldPublicationsFull;
+}
+
+it("held publication rows carry exactly the Go key set", () => {
+  const row: HeldPublication = heldPublicationsFull.publications[0]!;
+  expect(Object.keys(row).sort()).toEqual(
+    [
+      "id", "run_id", "generation", "ref", "tip", "state", "created_at", "ref_created_at",
+      "acknowledged_at", "expires_at", "owner_expired_at", "deleted_at", "last_error", "refusal_reason",
+    ].sort(),
+  );
+});
 
 // ── RecoveryCustodyHolds (PRD #1349 M1) ──────────────────────────────────────
 // ZeroOf exemption: holds — the endpoint (M5) returns [] for an owner with no holds, so the
@@ -1568,6 +1606,8 @@ const dtos: { stem: string; nullable: boolean }[] = [
   { stem: "recovery_custody_hold", nullable: false },
   { stem: "recovery_custody_aggregate", nullable: false },
   { stem: "recovery_custody_holds", nullable: true },
+  // issue #2545: held_publications' publications slice is non-omitempty (zero.json carries a null).
+  { stem: "held_publications", nullable: true },
   // issue #1432: the admin override-request queue row. findings is a non-omitempty
   // slice the handler normalizes to [], so its zero.json carries a null (the nil-slice
   // marshal) that the "findings" ZeroOf exemption above accounts for.

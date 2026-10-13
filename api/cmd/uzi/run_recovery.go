@@ -458,6 +458,9 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 		if line := checkpointLine(h); line != "" {
 			p.Printf("%s\n", line)
 		}
+		if line := heldReceiptLine(h); line != "" {
+			p.Printf("%s\n", line)
+		}
 	}
 	printRecoveryFailureReasons(p, holds, reasons)
 	if !gf.quiet {

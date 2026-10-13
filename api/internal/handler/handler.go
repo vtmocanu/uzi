@@ -33,6 +33,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/notifysvc"
 	"github.com/vtmocanu/uzi/api/internal/oidc"
 	"github.com/vtmocanu/uzi/api/internal/privcheck"
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/recovery"
 	"github.com/vtmocanu/uzi/api/internal/releasecheck"
 	"github.com/vtmocanu/uzi/api/internal/schedsvc"
@@ -102,6 +103,9 @@ type Handler struct {
 	// never nil-panics, mirroring forgeMemo/memo(). New sets it directly.
 	forgeBudget     *forgeBudget
 	forgeBudgetOnce sync.Once
+	// heldListLimiter is the proposal limiter, stored by mountWorkerRoutes for step B's
+	// per-worker forge-listing bucket (recovery()); nil permits every listing.
+	heldListLimiter *mw.Limiter
 	// recoverySvc is the durable-recovery archive service (PRD #1296 M2). Accessed only
 	// through recovery(), which lazily constructs it under recoveryOnce from h.q/h.pool/
 	// h.box + the cfg limits (production and struct-literal test Handlers alike, so the
@@ -123,6 +127,7 @@ type Handler struct {
 	productSkillsSyncing atomic.Bool
 	svc                  *forgesvc.Service
 	wsvc                 *workersvc.Service
+	heldSvc              heldPublisher // test seam for WorkerRunHeldPublication; nil = wsvc
 	// pcheck runs the PAT least-privilege checks (PRD #5): the save-time token
 	// gate and the on-demand full connection check.
 	pcheck *privcheck.Service
@@ -517,6 +522,18 @@ func (h *Handler) recovery() *recovery.Service {
 			h.recoverySvc = recovery.New(h.q, h.pool, h.box, h.recoveryLimits(), h.now)
 			if h.wsvc != nil {
 				h.recoverySvc.SetCustodySettledHook(h.wsvc.SettleRetainedCheckpoint)
+				// Issue #2545 step B: the held-ref listing goes through the same SSRF-gated
+				// derivation as step A's push.
+				heldRemote := h.wsvc.HeldRemote()
+				h.recoverySvc.SetHeldPublication(h.cfg.HeldPublication, func(ctx context.Context, runID uuid.UUID) (pushbroker.ListRefsOptions, error) {
+					f, err := heldRemote(ctx, runID)
+					return f.ListOptions(), heldRemoteForRecovery(err)
+				})
+				// Step B's forge listing spends the owner's forge quota: one shared per-worker
+				// bucket, consulted by the service only just before that listing.
+				if lim := h.heldListLimiter; lim != nil {
+					h.recoverySvc.SetHeldListAllow(heldListAllowFor(lim))
+				}
 			}
 		}
 	})
@@ -1053,6 +1070,14 @@ func (h *Handler) Routes(authLimiter, forgeLimiter, slackDMLimiter, chatLimiter,
 				// BEFORE any SQL. This disposes a HELD SOURCE (custody), distinct from the
 				// archive-artifact DELETE above.
 				r.Delete("/{id}/recovery-holds/{holdID}", h.DiscardRecoveryHold)
+				// Held-work publication — owner side (issue #2545): the forge refs a failed run's
+				// work was published to, and an early expiry of the acknowledged ones. Same
+				// RequireUser group and strict GetRun owner-or-404 gate as the hold discard above, so
+				// `uzi run held` reaches both from a uzc_ Bearer and a worker token is refused. The
+				// expiry deletes nothing: it makes the rows due, and the held_publication sweeper
+				// pass deletes the refs. Not gated by UZI_HELD_PUBLICATION (cleanup never is).
+				r.Get("/{id}/held-publications", h.ListRunHeldPublications)
+				r.Post("/{id}/held-publications/expire", h.ExpireRunHeldPublications)
 			})
 			r.Group(func(r chi.Router) {
 				r.Use(mw.RequireAuth(h.q, h.cfg))
@@ -1147,6 +1172,8 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 // token (sha256 lookup), not a session cookie. No CSRF step — the credential is a
 // held bearer secret, not an ambient cookie.
 func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
+	// Read once by recovery() when it builds the recovery service, after routes are mounted.
+	h.heldListLimiter = proposalLimiter
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))
 		// PRD #1906 M5 (D-D): an isolated-lane worker reaches only the lifecycle routes its
@@ -1196,6 +1223,7 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// three-term deadline. paused = parked (clean up), anything else = the owner extended in the
 		// window, restart the turn. Mirrors the completion/hold ack contract.
 		r.Post("/runs/{id}/wall-park", h.WorkerRunWallPark)
+		r.Post("/runs/{id}/pause", h.WorkerRunPause)
 
 		// Ownership/terminality probe (#559): worker-authenticated, run-scoped,
 		// READ ONLY. The interactive park-SKIP path polls it to detect a mid-turn
@@ -1233,6 +1261,12 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// limiter-argument-order tests — so it is left as a follow-up rather than folded
 		// into this hardening pass.
 		r.With(h.refuseJobRuns).Post("/runs/{id}/publish", h.WorkerRunPublish)
+
+		// Held-work publication, step A (issue #2545): the worker of a FAILED run uploads one pack
+		// and the api creates refs/uzi-held/<run-id>/<generation> with the stored credential. It
+		// extends its own read/write deadlines (worker_held_publication.go); the body is capped
+		// at maxPackBytes. Eligibility is checked before the body is read.
+		r.With(h.refuseJobRuns).Post("/runs/{id}/held-publication", h.WorkerRunHeldPublication)
 
 		// Agent memory (PRD #90): the worker's save_memory tool POSTs one bounded
 		// entry; the read half lists the run's (user, repo) memory the worker fences

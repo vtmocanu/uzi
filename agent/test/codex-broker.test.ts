@@ -1193,6 +1193,25 @@ describe("CodexCallbackBroker: production tool-handler map (buildCodexToolHandle
   });
 });
 
+describe("M3 park_run admission", () => {
+  for (const overrides of [
+    { phase: "plan" as const }, { isRoot: false }, { parkRunSupported: false },
+    { parkRunSupported: undefined }, { nonInteractiveIssue: false }, {},
+  ]) {
+    for (const origin of ["root", "child", "unknown"] as const) {
+      it(`independently gates ${JSON.stringify(overrides)} origin=${origin}`, async () => {
+        const h = makeBroker({ grants: grants({ allowedTools: new Set(["park_run"]),
+          parkRunSupported: true, nonInteractiveIssue: true, ...overrides }) });
+        const r = await h.broker.handleToolCall(rt(), "park_run", {}, origin);
+        const admitted = origin === "root" && Object.keys(overrides).length === 0;
+        assert.equal(r.ok, admitted);
+        if (admitted && r.ok) assert.deepEqual(r.output, { parkRun: true });
+        assert.equal(h.spawn.calls.length, 0);
+      });
+    }
+  }
+});
+
 
 it("U3 D9 production handler map is opt-in and revalidates before reporting", async () => {
   const row: import("../src/code-cross-check-contract.js").CodeCrossCheckRecord = {

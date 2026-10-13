@@ -636,6 +636,7 @@ SELECT
     h.final_capture_id,
     h.final_source_sha,
     h.final_coverage_digest,
+    h.final_publication_id,
     h.completed_publication_receipt,
     h.completed_publication_reason,
     COALESCE(w.name, '')::text AS worker_name,

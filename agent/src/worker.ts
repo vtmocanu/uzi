@@ -707,6 +707,7 @@ export class Worker {
           "recovery_archive_v2",
           "recovery_inventory_v1",
           "recovery_completed_publication_v1",
+          "recovery_held_publication_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised
@@ -725,6 +726,7 @@ export class Worker {
           // row can be asked to park itself; an image WITHOUT it has its out-of-time run parked
           // server-side at once (never failed), so advertising it is negotiation, not a toggle.
           "wall_park_v1",
+          "park_run_v1",
           "input_receipts_v1",
           // Issue #1800: this image reports when an owner follow-up was really put into an
           // executor prompt (POST /inputs/included); the api refuses the route without it.
