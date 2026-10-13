@@ -750,39 +750,7 @@ f42_wait_reclaim() {
 # issue binds the branch's seed between this run's two claim events.
 # TIMEOUT=0 is a single observation for the hermetic decoder regressions.
 f42_assert_capture_resume() {
-  local run="$1" gen="$2" timeout="${3:-60}" deadline=$((SECONDS + ${3:-60}))
-  local log_file="$RUNROOT/.f42-capture.log" recovery_file="$RUNROOT/.f42-capture.json"
-  while :; do
-    "${COMPOSE[@]}" logs --no-color agent > "$log_file" 2>/dev/null \
-      || fail "issue 1742: could not read predecessor-capture evidence for $run"
-    uzi_cli run recovery "$run" --json > "$recovery_file" \
-      || fail "issue 1742: could not read recovery captures for $run"
-    if jq -Rse --arg run "$run" --argjson gen "$gen" --slurpfile recovery "$recovery_file" '
-      [split("\n")[] | sub("^[^{]*"; "") | fromjson?] as $events |
-      ($events | to_entries) as $indexed |
-      [$indexed[] | select(.value.run_id == $run and .value.msg == "run claimed") | .key] as $claims |
-      (first($events[] | select(.run_id == $run and .msg == "stub executor committed marker") | .branch) // "") as $branch |
-      [$indexed[] | select(.value.msg == "runner clone: seeding" and .value.branch == $branch
-        and (.value.path | test("-g" + ($gen | tostring) + "-[0-9a-f]{16}$"))) | .key] as $seeds |
-      [$indexed[] | select(.value.run_id == $run and .value.msg == "recovery: bundle uploaded (durable capture)"
-        and .value.server_state == "available" and (.value.server_capture_id | type == "string" and length > 0))]
-        | unique_by(.value.server_capture_id) as $captures |
-      [$indexed[] | select(.value.run_id == $run
-        and .value.msg == "recovery: prior open custody holds inventoried after clone"
-        and .value.claim_generation == $gen) | .key] as $ready |
-      [$recovery[0][] | select(.generation == $gen) | .captures[]? | select(.state == "available") | .id] as $available |
-      ($claims | length) == 2 and ($seeds | length) == 1 and ($captures | length) == 1
-      and ($ready | length) == 1 and ($available | length) == 1
-      and $available[0] == $captures[0].value.server_capture_id
-      and $claims[1] < $captures[0].key and $captures[0].key < $seeds[0] and $seeds[0] < $ready[0]
-    ' "$log_file" >/dev/null; then
-      pass "run $run: exact generation $gen captured retained work before fresh reseed without another claim"
-      return 0
-    fi
-    [ "$SECONDS" -lt "$deadline" ] \
-      || fail "issue 1742: run $run lacks the exact G+1 same-claim capture-before-reseed sequence after ${timeout}s"
-    sleep 0.5
-  done
+  wait_same_claim_capture_resume "$@"
 }
 
 # The api is up here, so a failure to resolve the budget can fail at once.
