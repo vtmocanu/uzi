@@ -131,7 +131,10 @@ describe("subscription API-equivalent pricing", () => {
           acct.record(CHILD, usage({ inputTokens: 100, outputTokens: 60, totalTokens: 160 }, { inputTokens: 50, outputTokens: 30, totalTokens: 80 }));
         }
         const agg = acct.aggregateByModel({ authMode, now: new Date("2026-11-21T00:00:00Z") });
-        if (scenario === "incomplete resume") assert.equal(agg, undefined);
+        if (scenario === "incomplete resume") assert.deepEqual(agg, { [model]: {
+          inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+          reasoningOutputTokens: 0, costStatus: "unreported",
+        } });
         else {
           const entry = get(agg, model);
           assert.equal(entry.costStatus, "unreported");
