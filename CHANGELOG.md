@@ -47,6 +47,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Builtin coder, reviewer and tester agents check slow integration suites and fakes when a change alters a contract ([#2889](https://github.com/vtmocanu/uzi/issues/2889)).**
+  Synced to skills v0.48.0 (coder v19, reviewer v23, tester v20). When a change alters a state, reason string, ordering or external call, these agents search the end-to-end scenarios and fakes that consume it, even when the diff touches none of them. They update stale expectations in the same change, run the cheap hermetic checks, and name the affected scenarios left unrun. Release upgrades preserve edited and source-synced builtin templates. Reset on the agent page restores the definition shipped in this release.
+
 - **The bundled Codex runtime moves from 0.160.0 to 0.160.1 ([#2819](https://github.com/vtmocanu/uzi/pull/2819)).**
   The launcher path, fail-closed probe digests, image assertions and e2e version checks move together. The patch release only backports Windows environment preservation for remote MCP servers; the app-server protocol, error enum, config, rollout and sandbox code are unchanged.
 
