@@ -17,7 +17,7 @@ const note = (id, project_id, issue_iid, day, author = { id: 1, username: "uzi-b
   author,
 });
 
-test("shared fake HTTPS comment and author contracts", { timeout: 30000 }, async (t) => {
+test("shared fake HTTPS comment, author and publication contracts", { timeout: 30000 }, async (t) => {
   mkdirSync(path.join(root, ".uzi/scratch"), { recursive: true });
   const scratch = mkdtempSync(path.join(root, ".uzi/scratch/issue-comments-"));
   let child;
@@ -51,6 +51,24 @@ test("shared fake HTTPS comment and author contracts", { timeout: 30000 }, async
   ];
   const statePath = path.join(scratch, "state.json");
   writeFileSync(statePath, JSON.stringify({ notes: fixtures }));
+  const gitRoot = path.join(scratch, "gitroot");
+  mkdirSync(gitRoot);
+  const git = (repo, ...args) => execFileSync("git", ["--git-dir", path.join(gitRoot, `${repo}.git`), ...args], {
+    encoding: "utf8", env: { ...process.env, GIT_AUTHOR_NAME: "Fixture", GIT_AUTHOR_EMAIL: "fixture@example.com",
+      GIT_COMMITTER_NAME: "Fixture", GIT_COMMITTER_EMAIL: "fixture@example.com" }, stdio: ["ignore", "pipe", "pipe"],
+  }).trim();
+  for (const repo of ["repo", "repo2"]) git(repo, "init", "--bare");
+  const tree = git("repo", "hash-object", "-w", "-t", "tree", "/dev/null");
+  const base = git("repo", "commit-tree", tree, "-m", "base");
+  const head = git("repo", "commit-tree", tree, "-p", base, "-m", "head");
+  const other = git("repo", "commit-tree", tree, "-p", base, "-m", "other");
+  git("repo", "update-ref", "refs/heads/agent/fixture", head);
+  git("repo", "update-ref", "refs/heads/main", base);
+  git("repo", "update-ref", "refs/uzi-checkpoints/agent/fixture", base);
+  const tree2 = git("repo2", "hash-object", "-w", "-t", "tree", "/dev/null");
+  const head2 = git("repo2", "commit-tree", tree2, "-m", "second project");
+  git("repo2", "update-ref", "refs/heads/agent/fixture", head2);
+  git("repo2", "update-ref", "refs/heads/main", head2);
   let diagnostics = "";
   child = spawn(process.execPath, [path.join(root, "e2e/forge-fake/forge-fake.mjs")], {
     cwd: root,
@@ -59,6 +77,7 @@ test("shared fake HTTPS comment and author contracts", { timeout: 30000 }, async
       FORGE_FAKE_PORT: "0", FORGE_FAKE_CERT: certPath, FORGE_FAKE_KEY: keyPath,
       FORGE_FAKE_STATE: statePath, FORGE_FAKE_BASE_URL: "https://configured.invalid",
       FORGE_FAKE_PROJECT: "group/repo", FORGE_FAKE_PROJECT2: "group/repo2",
+      FORGE_FAKE_GIT_ROOT: gitRoot,
     },
     stdio: ["ignore", "pipe", "pipe"],
   });
@@ -119,6 +138,57 @@ test("shared fake HTTPS comment and author contracts", { timeout: 30000 }, async
     const response = await request(route);
     assert.equal(response.status, 200, route);
     return response;
+  }
+
+  await t.test("GitLab custody proof reads exact project refs and real ancestry", async () => {
+    const branch = encodeURIComponent("agent/fixture");
+    assert.deepEqual((await get(`/api/v4/projects/1/repository/branches/${branch}`)).body,
+      { name: "agent/fixture", commit: { id: head } });
+    assert.equal((await get(`/api/v4/projects/group%2Frepo2/repository/branches/${branch}`)).body.commit.id, head2);
+    assert.equal((await request("/api/v4/projects/1/repository/branches/missing")).status, 404);
+    const checkpoint = encodeURIComponent("refs/uzi-checkpoints/agent/fixture");
+    assert.equal((await get(`/api/v4/projects/1/repository/commits/${checkpoint}`)).body.id, base);
+    assert.equal((await request("/api/v4/projects/1/repository/commits/refs%2Fheads%2Fmissing")).status, 404);
+    const mergeBase = (a, b) => `/api/v4/projects/1/repository/merge_base?refs[]=${a}&refs[]=${b}`;
+    assert.equal((await get(mergeBase(head, base))).body.id, base);
+    assert.equal((await get(mergeBase(head, other))).body.id, base);
+    assert.equal((await request(mergeBase(head, "a".repeat(40)))).status, 404);
+    assert.equal((await request(mergeBase(head, "--help"))).status, 400);
+    git("repo", "update-ref", "refs/heads/agent/fixture", other);
+    assert.equal((await get(`/api/v4/projects/1/repository/branches/${branch}`)).body.commit.id, other);
+  });
+  for (const [dialect, shaField, refRoute] of [["v1", "id", "refs"], ["v3", "sha", "ref"]]) {
+    await t.test(`${dialect} custody proof reads real branch heads, checkpoint refs and comparisons`, async () => {
+      const route = `/api/${dialect}/repos/group/repo`;
+      const branch = dialect === "v1" ? "agent/fixture" : encodeURIComponent("agent/fixture");
+      const response = await get(`${route}/branches/${branch}`);
+      assert.equal(response.body.name, "agent/fixture");
+      assert.equal(response.body.commit[shaField], other);
+      assert.equal(response.body.protected, true);
+      for (const repo of ["repo", "repo2"]) {
+        const main = (await get(`/api/${dialect}/repos/group/${repo}/branches/main`)).body;
+        assert.equal(main.protected, true);
+        assert.equal(main.commit[shaField], repo === "repo" ? base : head2);
+      }
+      assert.equal((await get(`/api/${dialect}/repos/group/repo2/branches/${branch}`)).body.commit[shaField], head2);
+      assert.equal((await request(`${route}/branches/missing`)).status, 404);
+      const ref = await get(`${route}/git/${refRoute}/uzi-checkpoints/agent/fixture`);
+      assert.equal(ref.body.ref, "refs/uzi-checkpoints/agent/fixture");
+      assert.deepEqual(ref.body.object, { type: "commit", sha: base });
+      assert.equal((await request(`${route}/git/${refRoute}/heads/missing`)).status, 404);
+      const behind = (await get(`${route}/compare/${other}...${base}`)).body;
+      const ahead = (await get(`${route}/compare/${base}...${other}`)).body;
+      if (dialect === "v1") {
+        assert.equal(behind.total_commits, 0);
+        assert.equal(ahead.total_commits, 1);
+      } else {
+        assert.equal(behind.status, "behind");
+        assert.equal(ahead.status, "ahead");
+        assert.equal((await get(`${route}/compare/${head}...${other}`)).body.status, "diverged");
+        assert.equal((await get(`${route}/compare/${head}...${head}`)).body.status, "identical");
+      }
+      assert.equal((await request(`${route}/compare/${head}...${"a".repeat(40)}`)).status, 404);
+    });
   }
 
   // HTTP contracts only: projection.go skips bot comments in assessment.

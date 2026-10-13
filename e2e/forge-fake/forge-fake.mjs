@@ -419,14 +419,53 @@ function mrHeadSha(sourceBranch) {
 // host dir the worker pushes to (fakeremote/<repo>.git, lib.sh), so it is the commit a
 // real forge would report as the MR/PR head. null when the bare or branch is absent.
 function bareHeadSha(projectId, branch) {
+  return bareRefSha(projectId, `refs/heads/${branch}`);
+}
+function bareRefSha(projectId, ref) {
   const project = PROJECTS.find((p) => p.id === projectId) || PROJECT;
   const bare = `${GIT_ROOT}/${project.path_with_namespace.split("/").pop()}.git`;
   try {
-    const sha = execFileSync("git", ["--git-dir", bare, "rev-parse", "--verify", "--quiet", `refs/heads/${branch}^{commit}`], {
+    const sha = execFileSync("git", ["--git-dir", bare, "rev-parse", "--verify", "--quiet", "--end-of-options", `${ref}^{commit}`], {
       encoding: "utf8",
       stdio: ["ignore", "pipe", "ignore"],
     }).trim();
     return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+  } catch {
+    return null;
+  }
+}
+function bareMergeBase(projectId, refs) {
+  const project = PROJECTS.find((p) => p.id === projectId) || PROJECT;
+  const bare = `${GIT_ROOT}/${project.path_with_namespace.split("/").pop()}.git`;
+  try {
+    return execFileSync("git", ["--git-dir", bare, "merge-base", ...refs], {
+      encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+    }).trim();
+  } catch {
+    return null;
+  }
+}
+function bareComparison(projectId, base, head) {
+  if (![base, head].every((ref) => /^[0-9a-f]{40}$/.test(ref))) return null;
+  const ancestor = bareMergeBase(projectId, [base, head]);
+  if (!ancestor) return null;
+  const project = PROJECTS.find((p) => p.id === projectId) || PROJECT;
+  const bare = `${GIT_ROOT}/${project.path_with_namespace.split("/").pop()}.git`;
+  const total = Number(execFileSync("git", ["--git-dir", bare, "rev-list", "--count", `${base}..${head}`], {
+    encoding: "utf8", stdio: ["ignore", "pipe", "ignore"],
+  }).trim());
+  const status = base === head ? "identical" : ancestor === head ? "behind" : ancestor === base ? "ahead" : "diverged";
+  return { status, total_commits: total };
+}
+function bareRefObject(projectId, ref) {
+  const project = PROJECTS.find((p) => p.id === projectId) || PROJECT;
+  const bare = `${GIT_ROOT}/${project.path_with_namespace.split("/").pop()}.git`;
+  const opts = { encoding: "utf8", stdio: ["ignore", "pipe", "ignore"] };
+  try {
+    execFileSync("git", ["check-ref-format", ref], opts);
+    const sha = execFileSync("git", ["--git-dir", bare, "rev-parse", "--verify", "--quiet", "--end-of-options", ref], opts).trim();
+    const type = execFileSync("git", ["--git-dir", bare, "cat-file", "-t", sha], opts).trim();
+    return { ref, object: { type, sha } };
   } catch {
     return null;
   }
@@ -1199,13 +1238,29 @@ const server = https.createServer(
       // for the caller: compliant fixture = protected, bot cannot push or merge.
       const fjBranch = rest.match(/^\/branches\/(.+)$/);
       if (method === "GET" && fjBranch) {
+        const branch = decodeURIComponent(fjBranch[1]);
+        const head = bareHeadSha(project.id, branch);
+        if (!head) return send(res, 404, { message: "Branch not found" });
         return send(res, 200, {
-          name: decodeURIComponent(fjBranch[1]),
+          name: branch,
+          commit: { id: head },
           protected: true,
           user_can_push: false,
           user_can_merge: false,
           effective_branch_protection_name: "",
         });
+      }
+      const fjRef = rest.match(/^\/git\/refs\/(.+)$/);
+      if (method === "GET" && fjRef) {
+        const ref = bareRefObject(project.id, `refs/${decodeURIComponent(fjRef[1])}`);
+        return ref ? send(res, 200, ref) : send(res, 404, { message: "Ref not found" });
+      }
+      const fjCompare = rest.match(/^\/compare\/([^.]+)\.\.\.([^.]+)$/);
+      if (method === "GET" && fjCompare) {
+        // Real Forgejo answers an unavailable merge base with an empty 200.
+        // This fake uses 404; the driver treats both as inconclusive, never proof.
+        const result = bareComparison(project.id, fjCompare[1], fjCompare[2]);
+        return result ? send(res, 200, result) : send(res, 404, { message: "Comparison unavailable" });
       }
       // The admin-gated route the driver must NEVER call (a write bot 403s it). If it
       // ever does, fail loudly rather than pretending it works.
@@ -1502,7 +1557,20 @@ const server = https.createServer(
         // for the compliant fixture.
         const ghBranch = rest.match(/^\/branches\/([^/]+)$/);
         if (method === "GET" && ghBranch) {
-          return send(res, 200, { name: decodeURIComponent(ghBranch[1]), protected: true });
+          const branch = decodeURIComponent(ghBranch[1]);
+          const head = bareHeadSha(project.id, branch);
+          return head ? send(res, 200, { name: branch, protected: true, commit: { sha: head } })
+            : send(res, 404, { message: "Branch not found" });
+        }
+        const ghRef = rest.match(/^\/git\/ref\/(.+)$/);
+        if (method === "GET" && ghRef) {
+          const ref = bareRefObject(project.id, `refs/${decodeURIComponent(ghRef[1])}`);
+          return ref ? send(res, 200, ref) : send(res, 404, { message: "Ref not found" });
+        }
+        const ghCompare = rest.match(/^\/compare\/([^.]+)\.\.\.([^.]+)$/);
+        if (method === "GET" && ghCompare) {
+          const result = bareComparison(project.id, ghCompare[1], ghCompare[2]);
+          return result ? send(res, 200, result) : send(res, 404, { message: "Comparison unavailable" });
         }
         // Branch rulesets (ListRulesForBranch, reader-gated). A readable, enforced
         // pull_request rule covers the branch -> the driver reports Can*=false,
@@ -1671,6 +1739,28 @@ const server = https.createServer(
     if (proj) {
       const project = resolveProject(proj[1]);
       const rest = proj[2] || "";
+
+      // Custody publication/settlement proofs must read the same bare the worker
+      // pushes to, including checkpoint refs and ancestry, rather than synthetic heads.
+      const branchGet = rest.match(/^\/repository\/branches\/([^/]+)$/);
+      if (method === "GET" && branchGet) {
+        const branch = decodeURIComponent(branchGet[1]);
+        const head = bareHeadSha(project.id, branch);
+        return head ? send(res, 200, { name: branch, commit: { id: head } })
+          : send(res, 404, { message: "404 Branch Not Found" });
+      }
+      const commitGet = rest.match(/^\/repository\/commits\/([^/]+)$/);
+      if (method === "GET" && commitGet) {
+        const head = bareRefSha(project.id, decodeURIComponent(commitGet[1]));
+        return head ? send(res, 200, { id: head }) : send(res, 404, { message: "404 Commit Not Found" });
+      }
+      if (method === "GET" && rest === "/repository/merge_base") {
+        const refs = url.searchParams.getAll("refs[]");
+        if (refs.length !== 2 || refs.some((ref) => !/^[0-9a-f]{40}$/.test(ref)))
+          return send(res, 400, { message: "two commit SHAs required" });
+        const base = bareMergeBase(project.id, refs);
+        return base ? send(res, 200, { id: base }) : send(res, 404, { message: "404 Merge Base Not Found" });
+      }
 
       // Issues.
       const issueGet = rest.match(/^\/issues\/(\d+)$/);
