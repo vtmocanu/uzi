@@ -28,7 +28,7 @@ for t in base jvm; do  # worker templates; workertmpl.Names (pinned by template_
     . as $config
     |
     [.Env[]? | select(startswith("UZI_AGENT_VERSION=")) | ltrimstr("UZI_AGENT_VERSION=")] as $versions
-    | if ($versions | length) != 1 then error("expected one UZI_AGENT_VERSION") else $versions[0] end as $stamp
+    | (if ($versions | length) != 1 then error("expected one UZI_AGENT_VERSION") else $versions[0] end) as $stamp
     | ($stamp | ltrimstr($pin + "+g")) as $sha
     | if $stamp != ($pin + "+g" + $sha) or ($sha | length) != 7
          or ($sha | test("^[0-9a-f]+$") | not)
