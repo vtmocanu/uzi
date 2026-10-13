@@ -292,7 +292,7 @@ async function reconcileCase(
   t: TestContext,
   configure: (runId: string) => void,
   retained = true,
-  budget: number | null = 40,
+  budget: number | null = 5_000,
 ): Promise<void> {
   const forge = fakeGitlab();
   let reconciliationReads: string[] = [];
@@ -493,7 +493,7 @@ describe("completion hold streamed ownership bounds", () => {
       await reconcileCase(t, (runId) => {
         api.setCompletionHoldResponse("", 200);
         api.committedHoldOwnership.set(runId, exactHeld);
-      });
+      }, true, overflow ? 5_000 : 40);
       assert.ok(events.includes("cancel"));
       assert.ok(events.indexOf("cancel") < events.indexOf("reject"), "cancel settles before rejection");
       if (overflow) {
