@@ -123,7 +123,8 @@ carries it as `usage_estimated_tail`). The design is in
   figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
   cent).
 - **Unpriced means unknown, never $0.** A model the table does not know, a
-  non-standard service tier, speed or inference geo, or cache writes without a
+  non-standard service tier, speed or inference geo (Haiku 4.5's
+  `not_available` counts as standard, see above), or cache writes without a
   consistent 5-minute/1-hour split leaves the cost unknown: the tokens are
   still shown, and the cost reads "cost unknown". `uzi run get` then shows
   "cost unknown (unpriced)" with no price-table version, since no table was
