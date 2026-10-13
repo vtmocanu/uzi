@@ -314,11 +314,20 @@ export class JudgeRunner {
         // PRD #1247 M2 fix round: pass the claim's generation so the usage batch rides the m3
         // send-gate (postMessages applies includeClaimGeneration internally, gating on
         // generation > 0 && capability/feature) rather than being refused for a capability worker.
-        await this.client.postMessages(
-          judgeRunId,
-          [{ seq: claim.last_seq + 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
-          claim.claim_generation,
-        );
+        try {
+          await this.client.postMessages(
+            judgeRunId,
+            [{ seq: claim.last_seq + 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
+            claim.claim_generation,
+          );
+        } catch (err) {
+          if (isStaleClaimRefusal(err)) {
+            this.log.warn("judge claim superseded (stale) at usage post; abandoning", { run_id: judgeRunId });
+            return;
+          }
+          // Accounting is best effort; a transport failure must not discard the verdict.
+          this.log.warn("judge usage post failed", { run_id: judgeRunId, error: errMessage(err) });
+        }
       }
       // PRD #1247 fix round (Greptile P1, pre-post probe): the initial running ack closes only the
       // pre-model window. A judge model call can run minutes while a stale-worker requeue (~45s)

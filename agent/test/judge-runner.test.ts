@@ -190,6 +190,33 @@ function replyingQueryFnWithUsage(text: string): SdkQueryFn {
 }
 
 describe("JudgeRunner", () => {
+  for (const failure of ["transient", "stale"] as const) {
+    it(`Judge usage post failure: ${failure}`, async () => {
+      const { client, calls } = fakeClient(emptyTrace);
+      client.postMessages = async () => { throw new RequestError("POST", "/api/worker/runs/judge-1/messages",
+        failure === "stale" ? 409 : 503, failure === "stale" ? '{"disposition":"stale_claim"}' : "unavailable"); };
+      const warns: string[] = [];
+      const runner = new JudgeRunner(client, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+        codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
+          req.usageObserver?.({ "gpt-6-sol": { inputTokens: 100, outputTokens: 10,
+            cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0003, costStatus: "metered" } });
+          return { text: JSON.stringify({ verdict: "ok", summary: "reviewed", recommendations: [] }),
+            end: { kind: "terminal", terminal: { outcome: "success" } } };
+        } })) as never,
+      });
+      await runner.execute(judgeClaim({ claim_generation: 7, secrets: { forge_pat: "", codex: {
+        auth_mode: "api_key", access_token: "test-codex", capability: "cap-1",
+      } } as never }));
+      if (failure === "stale") {
+        assert.equal(calls.review, undefined);
+        assert.deepEqual(calls.states.map((s) => s.body.status), ["running"]);
+      } else {
+        assert.equal(calls.review?.review.status, "complete");
+        assert.deepEqual(calls.states.map((s) => s.body.status), ["running", "running", "completed"]);
+        assert.ok(warns.includes("judge usage post failed"));
+      }
+    });
+  }
   it("Claude judge usage follows the claim's existing messages", async () => {
     const { client, calls } = fakeClient(emptyTrace);
     const runner = new JudgeRunner(client, nullLogger(), {
