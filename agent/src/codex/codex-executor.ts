@@ -5181,7 +5181,10 @@ export function makeDefaultSpawnCommand(
         const result = await (memory?.reap() ?? boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs));
         reaped = result.ok;
         if (!result.ok) cleanupError = new Error(COMMAND_ROOT_UNREAPED);
-      } catch (error) { cleanupError = error; }
+      } catch (error) {
+        registry.poison({ category: "protocol", message: "command cleanup completion unconfirmed" });
+        cleanupError = error;
+      }
       memory?.recordDisposal(reaped);
       try { await boundedCommandWait(outputEnded, reapDeadlineMs); } catch (error) { cleanupError ??= error; }
       const prepared = memory?.preparedOutcome();

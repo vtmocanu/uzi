@@ -541,3 +541,23 @@ test("full adapter refuses a mismatched callback result after private ID binding
   assert.equal(result.memoryPressure, undefined);
   assert.ok(!JSON.stringify(result).includes("private-fixture"));
 });
+
+
+test("plain command timeout closes registry admission without captured memory context", async () => {
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  root.hangDisposal();
+  root.child.resolve({ event: "child_exit", code: 0 });
+  try {
+    const reply = await broker(makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off"),
+      registry).handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+    assert.equal(reply.ok, false);
+    assert.equal(registry.hasLiveCommandRoot(), true);
+    assert.equal(registry.isPoisoned(), true, "uncertain cleanup must close admission without an adapter");
+    assert.equal(registry.reserveLaunch("command").kind, "denied");
+  } finally {
+    root.completeDisposal();
+    await until(() => !registry.hasLiveCommandRoot());
+  }
+  assert.equal(registry.isPoisoned(), true, "late ordinary cleanup cannot reopen admission");
+});
