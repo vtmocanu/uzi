@@ -684,6 +684,146 @@ function wedgeBroker(): { broker: CodexCallbackBroker; entered: Promise<void>; r
   return { broker, entered, release };
 }
 
+describe("#2878 M1 harness terminal", () => {
+  const entry = (inputTokens: number, outputTokens: number) => ({
+    inputTokens, outputTokens, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0, costStatus: "unreported",
+  });
+  const note = (inputTokens: number, outputTokens: number, threadId = "resumed-1", turnId = "tn-1") =>
+    tokenUsage({ inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }, threadId, turnId);
+
+  for (const sameModel of [false, true]) {
+    it(`RED retains earlier child in terminal after root incomplete: ${sameModel ? "same model" : "distinct model"}`, async () => {
+      const { harness, transport } = makeHarness({ authMode: "api_key" });
+      const childModel = sameModel ? "gpt-6-astra" : "gpt-6.1-sol";
+      harness.recordChildThreadModel("child", childModel);
+      harness.registerChildSink("child", { push() {} });
+      transport.push(note(200, 100, "child", "child-turn"))
+        .push(turnStarted("resumed-1"))
+        .push(note(600, 180))
+        .push(turnCompleted("completed", undefined, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, sameModel
+          ? { "gpt-6-astra": entry(200, 100) }
+          : { "gpt-6-astra": entry(0, 0), [childModel]: {
+            ...entry(200, 100), costStatus: "metered", costUSD: 0.0014,
+          } }, "terminal retains proved child work even with a zero incomplete root");
+        assert.deepEqual(result.terminal.metrics?.cost, { kind: "unreported" });
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const invalid of ["raw bucket", "unknown identity", "missing turn", "activity"] as const) {
+    it(`RED baselined resumed root retains pre/post counters after invalid live ${invalid}`, async () => {
+      const accountant = new CodexUsageAccountant();
+      let notices = 0;
+      const { harness, transport } = makeHarness({ authMode: "api_key", accountant,
+        onTokenUsageIncomplete: () => { notices++; } });
+      let bad = note(9000, 900);
+      if (invalid === "raw bucket") {
+        bad = { ...bad, params: { threadId: "resumed-1", turnId: "tn-1", tokenUsage: {
+          total: { ...bd(), inputTokens: "invalid" }, last: bd(),
+        } } };
+      } else if (invalid === "unknown identity") {
+        bad = { ...bad, threadId: "", params: { ...bad.params as object, threadId: "" } };
+      } else if (invalid === "missing turn") {
+        bad = { ...bad, turnId: "", params: { ...bad.params as object, turnId: "" } };
+      }
+      const invalidNote: CodexNotification = invalid === "activity"
+        ? { kind: "activity", method: bad.method, params: { threadId: "resumed-1", turnId: "tn-1", tokenUsage: {} } }
+        : bad;
+      transport.push(note(1000, 200, "resumed-1", "historical"))
+        .push(turnStarted("resumed-1"))
+        .push(tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"))
+        .push(invalidNote)
+        .push(tokenUsage({ inputTokens: 1130, outputTokens: 230, totalTokens: 1360 },
+          { inputTokens: 30, outputTokens: 10, totalTokens: 40 }, "resumed-1"))
+        .push(turnCompleted("completed", undefined, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.equal(notices, 1);
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, { "gpt-6-astra": entry(130, 30) },
+          "retain validated strictly-newer usage on both sides of the latch");
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const historicalOnly of [true, false]) {
+    it(`RED ${historicalOnly ? "recoverable historical malformation" : "live missing baseline quarantine"} terminal`, async () => {
+      const { harness, transport } = makeHarness({ authMode: "api_key" });
+      if (historicalOnly) transport.push({ kind: "activity", method: "thread/tokenUsage/updated",
+        params: { threadId: "resumed-1", turnId: "historical", tokenUsage: {} } });
+      else transport.push(turnStarted("resumed-1")).push(note(600, 180));
+      transport.push(note(1000, 200, "resumed-1", "historical")).push(turnStarted("resumed-1"))
+        .push(tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"))
+        .push(turnCompleted("completed", undefined, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage,
+          { "gpt-6-astra": historicalOnly ? entry(100, 20) : entry(0, 0) });
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const shape of ["equal", "reset", "advancing regression"] as const) {
+    it(`${shape === "advancing regression" ? "RED" : "GREEN"} real transport active ${shape}`, async () => {
+      // Decode NDJSON through the production transport, including deliberate split frames.
+      // The pinned resume fixtures prove replay ordering, not a reset/compaction incident cause.
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const accountant = new CodexUsageAccountant();
+      const { harness } = makeHarness({ authMode: "api_key", accountant,
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) });
+      let buffered = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffered += chunk;
+        let end: number;
+        while ((end = buffered.indexOf("\n")) !== -1) {
+          const frame = rec(JSON.parse(buffered.slice(0, end)));
+          buffered = buffered.slice(end + 1);
+          if (frame.id === undefined || typeof frame.method !== "string") continue;
+          inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+          if (frame.method !== "turn/start") continue;
+          const totals = shape === "equal" ? [1110, 210] : shape === "reset" ? [10, 2] : [1120, 210];
+          const sequence = [
+            note(1000, 200, "resumed-1", "historical"), turnStarted("resumed-1"),
+            tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+              { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"),
+            tokenUsage({ inputTokens: totals[0], outputTokens: totals[1], totalTokens: totals[0]! + totals[1]! },
+              { inputTokens: 10, outputTokens: 2, totalTokens: 12 }, "resumed-1"),
+            turnCompleted("completed", undefined, "resumed-1"),
+          ];
+          for (const n of sequence) {
+            const line = JSON.stringify({ method: n.method, params: n.params }) + "\n";
+            inbound.write(line.slice(0, 17)); inbound.write(line.slice(17));
+          }
+        }
+      });
+      try {
+        const events = await withTimeout(collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events), 5000, shape);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.equal(accountant.usageIncomplete, shape === "advancing regression");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, { "gpt-6-astra":
+          shape === "advancing regression" ? entry(100, 20)
+            : { ...entry(100, 20), costStatus: "metered", costUSD: 0.002 } });
+      } finally { await harness.close(); inbound.destroy(); outbound.destroy(); }
+    });
+  }
+});
+
 // U1 resumed-claim accounting through completed turns, both credential modes.
 describe("CodexHarness: resumed usage evidence", () => {
   const historical = { inputTokens: 300, cachedInputTokens: 60, outputTokens: 90, reasoningOutputTokens: 30, totalTokens: 390 };

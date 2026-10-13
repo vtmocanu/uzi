@@ -64,6 +64,38 @@ function assertTokens(
   assert.equal(entry.reasoningOutputTokens, want.reasoning);
 }
 
+describe("#2878 M1 priced cumulative monotonicity", () => {
+  const baseline = { inputTokens: 1000, cachedInputTokens: 100, cacheWriteInputTokens: 50,
+    outputTokens: 200, totalTokens: 1200 };
+  const accepted = { inputTokens: 1100, cachedInputTokens: 110, cacheWriteInputTokens: 55,
+    outputTokens: 220, totalTokens: 1320 };
+  const response = { inputTokens: 100, cachedInputTokens: 10, cacheWriteInputTokens: 5,
+    outputTokens: 20, totalTokens: 120 };
+  const regressions: [string, Partial<CodexUsageBreakdown>][] = [
+    ["input", { ...accepted, inputTokens: 1090, outputTokens: 250, totalTokens: 1340 }],
+    ["cache read", { ...accepted, inputTokens: 1120, cachedInputTokens: 109, outputTokens: 230, totalTokens: 1350 }],
+    ["cache creation", { ...accepted, inputTokens: 1120, cacheWriteInputTokens: 54, outputTokens: 230, totalTokens: 1350 }],
+    ["output", { ...accepted, inputTokens: 1120, outputTokens: 210, totalTokens: 1330 }],
+  ];
+  for (const [bucket, total] of regressions) {
+    it(`RED advancing decrease in cumulative priced ${bucket} retains proved delta without cost`, () => {
+      const acct = new CodexUsageAccountant();
+      acct.registerThread(ROOT, ASTRA, true);
+      acct.record(ROOT, usage(baseline, baseline), true);
+      acct.record(ROOT, usage(accepted, response));
+      assert.equal(get(acct.aggregateByModel(API_KEY_EARLY), ASTRA).costStatus, "metered",
+        "proved replay last is excluded, live response reconciles before regression");
+      acct.record(ROOT, usage(total, { inputTokens: 20, outputTokens: 10, totalTokens: 30 }));
+      assert.deepEqual(acct.aggregateByModel(API_KEY_EARLY), { [ASTRA]: {
+        inputTokens: 85, outputTokens: 20, cacheReadInputTokens: 10,
+        cacheCreationInputTokens: 5, reasoningOutputTokens: 0, costStatus: "unreported",
+      } }, "reject entire advancing snapshot, preserve all proved priced buckets and omit costUSD");
+      assert.equal(acct.usageIncomplete, true);
+      assert.deepEqual(deriveCodexRunCost(acct.aggregateByModel(API_KEY_EARLY)), { kind: "unreported" });
+    });
+  }
+});
+
 describe("subscription API-equivalent pricing", () => {
   it("gpt-6.1-sol identical responses have independent literal dollar parity with per-response tiers", () => {
     const acct = new CodexUsageAccountant();

@@ -5035,6 +5035,179 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 });
 
+// #2878 M1: a shared API fixture is asserted against ctx.emit from the real executor,
+// never manufactured from accountant output. Strip only elapsed duration from the actual
+// result payload; JSON serialization omits undefined wire fields exactly as persistence does.
+describe("#2878 M1 worker emitted fixture", () => {
+  const fixture = JSON.parse(readFileSync(
+    new URL("../../fixtures/run-usage/codex-incomplete-claim.json", import.meta.url), "utf8",
+  )) as Record<string, unknown>;
+  const accountingPayload = (emitted: EmittedMessage[]) => {
+    const result = emitted.filter(m => m.payload.event === "result").at(-1);
+    assert.ok(result, "actual executor emits a result");
+    const stable = Object.fromEntries(Object.entries(result.payload).filter(([key]) => key !== "duration_ms"));
+    return JSON.parse(JSON.stringify(stable)) as unknown;
+  };
+
+  it("GREEN earlier metered worker payload matches shared fixture", async () => {
+    const rig = makeRig();
+    rig.transport.push(threadStarted())
+      .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
+      .push(signalDone()).push(turnCompleted()).end();
+    const { ctx, emitted } = makeCtx();
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "earlier metered fixture");
+    assert.deepEqual(accountingPayload(emitted), fixture.earlierMetered);
+  });
+
+  for (const childModel of ["gpt-6.1-sol", "gpt-6-astra"]) {
+    it(`RED retained child recorded before incomplete root worker payload: ${childModel}`, async () => {
+      const responder: Responder = c => {
+        if (c.method === "thread/start") return { thread: { id: "th-child" } };
+        if (c.method === "thread/resume") return { thread: { id: "th-1" } };
+        if (c.method === "turn/start") {
+          if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+          c.transport.push(tokenUsageUpdated("th-child", "tn-child",
+            { inputTokens: 200, outputTokens: 100, totalTokens: 300 }))
+            .push(turnCompleted("completed", "th-child", "tn-child"));
+          return { turn: { id: "tn-child" } };
+        }
+        return {};
+      };
+      const rig = makeRig({ responder });
+      // Root is resumed without replay; postpone its boundary until child usage is proved.
+      rig.transport.push(toolCall(1, "spawn_agent", { role: "coder", prompt: "help" }, "th-1", "tn-1", "c-root"));
+      const agents: AgentTemplate[] = [
+        { name: "lead", description: "lead", prompt_body: "lead", tools: null, skills: [] },
+        { name: "coder", description: "coder", prompt_body: "coder", model: childModel, tools: null, skills: [] },
+      ];
+      const { ctx, emitted } = makeCtx({ agents, sessionId: "th-1" });
+      const running = makeExecutor(rig, bindingOf(API_KEY)).run(ctx);
+      await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "child fully settled before root latch");
+      rig.transport.push({ kind: "turn_started", method: "turn/started", threadId: "th-1",
+        turnId: "tn-1", params: { threadId: "th-1", turn: { id: "tn-1" } } })
+        .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 600, totalTokens: 600 }))
+        .push(signalDone()).push(turnCompleted()).end();
+      await withTimeout(running, 3000, "retained child incomplete fixture");
+      assert.equal(emitted.filter(m => m.payload.event === "codex_token_usage_incomplete").length, 1);
+      assert.deepEqual(accountingPayload(emitted), childModel === "gpt-6-astra"
+        ? fixture.incompleteRootSameModelChild : fixture.incompleteRootDistinctChild,
+      "worker must emit proved child counters after root becomes incomplete");
+    });
+  }
+
+  it("RED zero incomplete worker payload downgrades an earlier same-key meter", async () => {
+    const rig = makeMultiEpochRig([resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
+      t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
+        params: { threadId: th, turn: { id: tn } } })
+        .push(tokenUsageUpdated(th, tn, { inputTokens: 600, totalTokens: 600 }))
+        .push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+    })]);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1" });
+    await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "zero incomplete fixture");
+    assert.deepEqual(accountingPayload(emitted), fixture.zeroIncomplete,
+      "explicit zero unreported root is necessary to downgrade prior same-key metered usage");
+  });
+});
+
+describe("#2878 M1 cause-specific worker notice", () => {
+  it("RED missing replay notice names the unavailable baseline for attempted resumed work once across epochs", async () => {
+    const rig = makeMultiEpochRig([
+      resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
+          params: { threadId: th, turn: { id: tn } } })
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 }))
+          .push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, "historical", { inputTokens: 150, totalTokens: 150 }))
+          .push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
+            params: { threadId: th, turn: { id: tn } } })
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 200, totalTokens: 200 },
+            { inputTokens: 50, totalTokens: 50 }))
+          .push(toolCall(2, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx, emitted } = makeCtx({ sessionId: "th-1", checkpoint: async () => undefined });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000,
+      "missing replay notice run completes");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 2, "execution continues through the retry epoch");
+    const notices = emitted.filter(m => m.payload.event === "codex_token_usage_incomplete");
+    assert.equal(notices.length, 1, "late replay and retried work never duplicate the worker notice");
+    assert.equal(notices[0]!.kind, "status");
+    assert.equal(notices[0]!.agent, "worker");
+    const text = String(notices[0]!.payload.text);
+    assert.match(text,
+      /(?:missing|absent|unavailable|unproved|unestablished|no)\b[^.]*\b(?:replay|baseline)|(?:replay|baseline)\b[^.]*\b(?:missing|absent|unavailable|unproved|unestablished|not established)/i,
+      "notice identifies missing replay or an unavailable baseline as the accounting cause");
+    assert.match(text, /baseline/i, "notice explicitly describes baseline availability");
+    assert.doesNotMatch(text, /usage for this resumed claim is unavailable/i,
+      "a resumed claim alone must not stand in for the actual accounting cause");
+  });
+
+  it("RED invalid live raw usage notice names validation failure and the retained baseline after same-claim recreation once across epochs", async () => {
+    const rawMarker = "private-invalid-usage-bucket";
+    const invalidUsage = (th: string, tn: string): CodexNotification => {
+      const note = tokenUsageUpdated(th, tn, { inputTokens: 9000, totalTokens: 9000 });
+      // The typed notification is plausible; the raw bucket fails numeric validation.
+      const usage = rec(rec(note.params).tokenUsage);
+      return { ...note, params: { threadId: th, turnId: tn, tokenUsage: {
+        total: { ...rec(usage.total), inputTokens: rawMarker },
+        last: usage.last,
+      } } };
+    };
+    const rig = makeMultiEpochRig([
+      epochResponder("th-1", "tn-1", (t, th, tn) => {
+        t.push(tokenUsageUpdated(th, tn, { inputTokens: 100, totalTokens: 100 }))
+          .push(toolCall(1, "checkpoint", {}, th, tn, "c-ckpt-1"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-2", (t, th, tn) => {
+        t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
+          params: { threadId: th, turn: { id: tn } } })
+          .push(tokenUsageUpdated(th, tn, { inputTokens: 150, totalTokens: 150 },
+            { inputTokens: 50, totalTokens: 50 }))
+          .push(invalidUsage(th, tn))
+          .push(toolCall(2, "checkpoint", {}, th, tn, "c-ckpt-2"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+      resumedEpochResponder("th-1", "tn-3", (t, th, tn) => {
+        t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
+          params: { threadId: th, turn: { id: tn } } })
+          .push(invalidUsage(th, tn))
+          .push(toolCall(3, "signal_done", {}, th, tn, "c-done"))
+          .push(turnCompleted("completed", th, tn));
+      }),
+    ]);
+    const { ctx, emitted } = makeCtx({ checkpoint: async () => undefined });
+    const result = await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 5000,
+      "invalid live usage notice run completes");
+    assert.equal(result.branch, "agent/issue-42");
+    assert.equal(rig.providerLaunches(), 3, "the invalid note does not prevent another retry epoch");
+    const responses = emitted.filter(m => m.payload.event === "codex_response_usage");
+    assert.ok(responses.some(m => rec(m.payload.usage).input_tokens === 100),
+      "fresh root usage proves a baseline before provider recreation");
+    assert.ok(responses.some(m => rec(m.payload.usage).input_tokens === 50),
+      "same-claim recreated root retains its baseline without a replay");
+    const notices = emitted.filter(m => m.payload.event === "codex_token_usage_incomplete");
+    assert.equal(notices.length, 1, "repeated invalid raw usage in the retry epoch emits no second notice");
+    assert.equal(notices[0]!.kind, "status");
+    assert.equal(notices[0]!.agent, "worker");
+    assert.ok(emitted.indexOf(responses[0]!) < emitted.indexOf(notices[0]!));
+    assert.ok(!JSON.stringify(emitted).includes(rawMarker), "worker feed never includes the raw provider bucket");
+    const text = String(notices[0]!.payload.text);
+    assert.match(text, /invalid|malformed|validation|validat(?:ion|e|ed|ing)[^.]*fail|fail[^.]*validat/i,
+      "notice identifies invalid usage or validation failure as the accounting cause");
+    assert.match(text,
+      /(?:retained|proved|proven|established|available|known)\b[^.]*\bbaseline|baseline\b[^.]*\b(?:retained|proved|proven|established|available|known)/i,
+      "notice states that the proved baseline remains available");
+    assert.doesNotMatch(text, /this resumed claim/i,
+      "same-claim recreation must not be mislabeled as an unbaselined resumed claim");
+  });
+});
+
 describe("CodexExecutor: incomplete resumed claim notice", () => {
   for (const credential of [API_KEY, SUBSCRIPTION]) {
     it(`${credential.auth_mode}: persists fixed worker notice once across epochs while execution completes`, async () => {
