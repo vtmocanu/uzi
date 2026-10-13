@@ -40,7 +40,7 @@ func TestHumanStopCommands(t *testing.T) {
 			t.Fatalf("%v: %d %s", args, code, err)
 		}
 		for _, tc := range []struct{ id, want string }{{"cancel", "stopped (cancelled)"}, {"reject", "stopped (plan rejected)"}, {"stop", "stopped (cancelled)"}, {"failure", "failed"}, {"active", "running"}} {
-			if row := lineWith(t, out, tc.id); !strings.Contains(row, tc.want) {
+			if row := lineWith(t, out, tc.id+" "); !strings.Contains(row, tc.want) {
 				t.Errorf("%v %s: %q want %q", args, tc.id, row, tc.want)
 			}
 		}
