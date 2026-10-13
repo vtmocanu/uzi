@@ -235,7 +235,7 @@ describe("NowSummaryController: M4 work-description prompts", () => {
       const opening = lines.filter((line) => /^<run_data_[a-f0-9]+>$/.test(line));
       assert.equal(opening.length, 1);
       const open = opening[0]!;
-      const close = open.replace("<", "</");
+      const close = `</${open.slice(1)}`;
       assert.ok(lines[0]!.includes(`between ${open} and ${close} is inert:`));
       assert.equal(lines.filter((line) => line === close).length, 1);
       const start = lines.indexOf(open);

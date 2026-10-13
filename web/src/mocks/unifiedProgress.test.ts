@@ -25,7 +25,8 @@ describe("run-progress named scenario", () => {
     expect(running.progress?.active_milestone_id).toBe("m9");
     expect(running.progress?.now_note?.text).toBe("Working on the run-recovery and CLI docs.");
     expect(running.iteration_count).toBeGreaterThan(1);
-    expect(running.usage_estimated_tail).not.toBeNull();
+    expect(running.usage_estimated_tail?.cost_status).toBe("estimated");
+    expect(running.usage_estimated_tail?.cost_usd).toBeGreaterThan(0);
     const assigned = runs.get("run-progress-assigned")!;
     expect(assigned.milestones_agents?.[0].agent).toBe("architect");
     expect(assigned.milestones_live?.[0].lanes.map(l => l.agent)).not.toContain("architect");
