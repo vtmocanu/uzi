@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Code cross-check: the lead now waits for its checker instead of publishing without it ([#2870](https://github.com/vtmocanu/uzi/issues/2870)).**
   A checker row whose findings were not yet written (pending, timed out, checker unavailable, or a pre-snapshot failure) was served with `findings: null`, which the worker rejected, so the lead stopped waiting and its PR reported the check as unavailable. These rows now report an empty findings list; works with already-deployed workers.
 
+- **Run progress tooltips clarify what is waiting and why a run stalled ([#2861](https://github.com/vtmocanu/uzi/issues/2861)).**
+  Waiting tooltips name your plan approval, answer or follow-up; stalled and looping tooltips separate the health reason with “Reason:”.
+
 - **Runs list and Dashboard: the stalled and waits-on-you flags show their elapsed time inline ([#2836](https://github.com/vtmocanu/uzi/issues/2836)).**
   The progress flags read `◼ stalled · 14m` and `● waits on you · plan gate · 6m`, so the flag lines up with its neighbouring pills; the clock time moves to the tooltip.
 

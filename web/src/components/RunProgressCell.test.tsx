@@ -4,7 +4,7 @@
 // enum member).
 import { afterEach, describe, expect, it } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
-import { RunProgressCell } from "./RunProgressCell";
+import { RunProgressCell, stallTitle } from "./RunProgressCell";
 import { formatElapsed } from "../lib/runBadge";
 import type { RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
@@ -40,6 +40,23 @@ const occurrences = (hay: string, needle: string) => hay.split(needle).length - 
 
 const cellOf = (c: HTMLElement) => c.querySelector("[data-run-progress]");
 
+describe.each([
+  ["stalled", "Stalled: no progress is being made; the percentage returns once activity resumes."],
+  ["looping", "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."],
+] as const)("stallTitle (%s)", (health, base) => {
+  it.each([
+    ["absent", undefined, ""],
+    ["empty", "", ""],
+    ["lowercase", "no tool call for 25m", " Reason: no tool call for 25m"],
+    ["identifier", "tool_call_timeout", " Reason: tool_call_timeout"],
+    ["whitespace and case", "  lowerCase reason  ", " Reason:   lowerCase reason  "],
+    ["unsafe characters", "no\u202E tool\u0007 call", " Reason: no tool call"],
+    ["sanitized to empty", "\u202E\u0007", ""],
+  ])("preserves the base sentence with a %s reason", (_label, health_reason, suffix) => {
+    expect(stallTitle({ health, health_reason })).toBe(base + suffix);
+  });
+});
+
 describe("RunProgressCell (PRD #2602)", () => {
   it("percent: NN% without ≈ and a 0-100 progressbar with a descriptive name", () => {
     const { container } = renderCell({
@@ -66,10 +83,10 @@ describe("RunProgressCell (PRD #2602)", () => {
   });
 
   it.each([
-    ["awaiting_approval", "plan gate"],
-    ["awaiting_input", "question"],
-    ["awaiting_followup", "follow-up"],
-  ] as const)("waiting (%s): `waits on you · %s · <elapsed>` from status_since", (status, reason) => {
+    ["awaiting_approval", "plan gate", `Waiting for your plan approval since ${formatLocalTime(STATUS_SINCE)}.`],
+    ["awaiting_input", "question", `Waiting for your answer since ${formatLocalTime(STATUS_SINCE)}.`],
+    ["awaiting_followup", "follow-up", `Waiting for your follow-up since ${formatLocalTime(STATUS_SINCE)}.`],
+  ] as const)("waiting (%s): `waits on you · %s · <elapsed>` from status_since", (status, reason, title) => {
     const { container } = renderCell({ status, status_since: STATUS_SINCE, progress: progress({ state: "waiting" }) });
     const cell = cellOf(container) as HTMLElement;
     expect(cell.getAttribute("data-run-progress")).toBe("waiting");
@@ -83,7 +100,7 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(container.querySelector(".sr-only")?.textContent).toBe(srSince(STATUS_SINCE));
     expect(container.querySelector("[title]")?.className).toContain("text-warn");
     expect(container.querySelector("[title]")?.getAttribute("title")).toBe(
-      `Waiting on you at the ${reason} since ${formatLocalTime(STATUS_SINCE)}.`,
+      title,
     );
   });
 
@@ -115,10 +132,26 @@ describe("RunProgressCell (PRD #2602)", () => {
     );
   });
 
+  it.each([
+    ["valid time", STATUS_SINCE, `waits on you · 6m${srSince(STATUS_SINCE)}`],
+    ["missing time", null, "waits on you"],
+  ])("waiting with an unknown reason and %s uses the fallback title", (_label, since, text) => {
+    const { container } = renderCell({
+      status: "unknown",
+      status_since: since,
+      progress: progress({ state: "waiting" }),
+    });
+    expect(container.textContent).toBe(text);
+    expect(container.querySelector("[title]")?.getAttribute("title")).toBe(
+      "This run is waiting on you: a plan approval, a question or a follow-up.",
+    );
+  });
+
   it("stalled: danger flag with the elapsed time from health_since (not status_since)", () => {
     const { container } = renderCell({
       status_since: STATUS_SINCE,
       health: "stalled",
+      health_reason: "no tool call for 25m",
       health_since: HEALTH_SINCE,
       progress: progress({ state: "stalled", milestone_done: 1, milestone_total: 3 }),
     });
@@ -130,7 +163,9 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(container.textContent).not.toContain("6m");
     const flag = container.querySelector("[title]") as HTMLElement;
     expect(flag.className).toContain("text-danger");
-    expect(flag.getAttribute("title")).toMatch(new RegExp(`^Since ${formatLocalTime(HEALTH_SINCE)}\\. Stalled: `));
+    expect(flag.getAttribute("title")).toBe(
+      `Since ${formatLocalTime(HEALTH_SINCE)}. Stalled: no progress is being made; the percentage returns once activity resumes. Reason: no tool call for 25m`,
+    );
     const hidden = Array.from(container.querySelectorAll('[aria-hidden="true"]')).map((e) => e.textContent);
     expect(hidden).toEqual(["◼", " · 2h 5m"]);
     // A flag replaces the percent (PRD D4).
@@ -140,11 +175,14 @@ describe("RunProgressCell (PRD #2602)", () => {
   it("stalled while looping: the health word rides in the tooltip and accessible name", () => {
     const { container } = renderCell({
       health: "looping",
+      health_reason: "repeat_step",
       health_since: HEALTH_SINCE,
       progress: progress({ state: "stalled" }),
     });
     const flag = container.querySelector("[title]") as HTMLElement;
-    expect(flag.getAttribute("title")).toMatch(/^Since .*\. Looping: /);
+    expect(flag.getAttribute("title")).toBe(
+      `Since ${formatLocalTime(HEALTH_SINCE)}. Looping: the run keeps repeating the same steps; the percentage returns once it moves on. Reason: repeat_step`,
+    );
     expect(flag.textContent).toBe(`◼ stalled (looping) · 2h 5m${srSince(HEALTH_SINCE)}`);
     expect(screen.getByText("(looping)", { exact: false }).className).toContain("sr-only");
   });
@@ -187,7 +225,9 @@ describe("RunProgressCell (PRD #2602)", () => {
       progress: progress({ state: "stalled" }),
     });
     const title = container.querySelector("[title]")?.getAttribute("title") ?? "";
-    expect(title).toMatch(/^Stalled: .* no tool call for 12m$/);
+    expect(title).toBe(
+      "Stalled: no progress is being made; the percentage returns once activity resumes. Reason: no tool call for 12m",
+    );
     expect(title.includes("\u202E") || title.includes("\u0007")).toBe(false);
   });
 
