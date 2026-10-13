@@ -1010,6 +1010,7 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
     // Run the script's own ledger filter (last value per attemptId wins) over what we wrote.
     const m = /"\$JQ" -rRn --arg rid "\$rid" '([\s\S]*?)' 2>\/dev\/null\)"/.exec(script);
     assert.ok(m, "the script's ledger jq filter");
+    assert.ok(m[1]!.includes(".state"), "the ledger filter carries the winning state");
     await git.releaseAttemptInPlace(s.bare, seeded.path, s.branch, "run-3101", "abandoned");
     // The same jq the script runs: its `JQ="${UZI_JQ:-jq}"` default, read from the script itself.
     const jqBin = process.env.UZI_JQ ?? /^JQ="\$\{UZI_JQ:-([^}]+)\}"$/m.exec(script)?.[1];

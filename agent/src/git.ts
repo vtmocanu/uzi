@@ -1171,9 +1171,12 @@ export interface RecoveryJournalEntry extends RecoverySource {
 // toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
 // attemptId (see compactAttemptLedger).
 // The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
-// this key and these field names: keep them byte-for-byte. It reads `state` only to report a BARE
-// backup's attempt as retired, which requires every entry for the run to be `retired` or
-// `abandoned`; any other value, including a new one, reads as "attempt state unknown".
+// this key and these field names: keep them byte-for-byte. It reads `state` in three places: an
+// attempt whose last entry for the run is `live` or `reclaimed` is an attributed source it captures
+// (and counts as a coverage gap when unreadable); protected-descriptor validation accepts only the
+// four states above (any other fails that capture closed); and a BARE backup's attempt reads as
+// retired only when every entry for the run is `retired` or `abandoned`. A new state therefore needs
+// a matching backup-runs.sh change.
 function attemptLedgerKey(branch: string): string {
   return `uzi-attempts.${branch}.entry`;
 }
