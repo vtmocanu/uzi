@@ -373,14 +373,24 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
     await withHome(async (homeRoot) => {
       client.protocolFeatures = FEATURES;
       const rig = rigFor("claude", { turns: 1 }, homeRoot);
-      const claim = gitlabClaim(3308, { claim_generation: 3 });
-      const stop = api.dropStatesWhen(claim.run_id, (b) => b.recovery_cause === "provider_outage");
-      api.setOwnershipStatus(claim.run_id, "paused", 3);
+      const claim = gitlabClaim(3308, { claim_generation: 3, inventory_guarded: true });
+      api.setOwnershipStatus(claim.run_id, "running", 3, true);
+      let matchedTypedReport = false;
+      // Flip ownership after the typed report so the lost-ack path runs; a guarded claim
+      // would enter settlement if paused without the provider hold were wrongly accepted.
+      const stop = api.dropStatesWhen(claim.run_id, (b) => {
+        if (b.recovery_cause !== "provider_outage") return false;
+        matchedTypedReport = true;
+        api.setOwnershipStatus(claim.run_id, "paused", 3, true);
+        return true;
+      });
       try {
         await rig.runner.execute(claim);
       } finally {
         stop();
       }
+      assert.equal(matchedTypedReport, true, "the typed provider-outage report reached the drop matcher");
+      assert.equal(parks(claim.run_id).length, 0, "the typed report was dropped before it was recorded");
       assert.equal(rig.custody(), 0, "nothing settled: the ownership read is not the provider hold");
       assert.equal(feedTexts(claim.run_id).some((t) => /provider outage/.test(t)), false);
     });
