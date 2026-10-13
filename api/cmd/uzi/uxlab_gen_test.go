@@ -687,7 +687,7 @@ func boardProgress(dark bool, now time.Time) string {
 	}
 	stalled := mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"})
 	stalled.Health = "stalled"
-	waiting := mk("f6a7b8c9-1111", "awaiting_input", "Answer the retry question while stalled", 15*time.Minute, &apitypes.RunProgress{State: "waiting"})
+	waiting := mk("f6a7b8c9-1111", "awaiting_approval", "Approve the retry plan while stalled", 15*time.Minute, &apitypes.RunProgress{State: "waiting"})
 	waiting.Health = "stalled"
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		mk("a1b2c3d4-1111", "running", "Add rate-limit headroom to the scheduler poll", 4*time.Minute, &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4}),

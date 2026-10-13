@@ -872,8 +872,8 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 	return rows
 }
 
-// progressRow renders the PROGRESS row of `uzi run get` (PRD #2602), the CLI twin of the web
-// progress cell and the TUI board PROG column. It reads the server-derived RunDTO.Progress and
+// progressRow renders the PROGRESS row of `uzi run get` (PRD #2602), sharing progress
+// state semantics with the web and TUI surfaces. It reads server-derived RunDTO.Progress and
 // returns nil when it is absent (a terminal run, or an older server), so those runs render
 // byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
 // in the frozen order, else `N of M done`; the pct is clamped to 0..100), `stalled · since 16:41`

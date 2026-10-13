@@ -26,16 +26,10 @@ func (m tuiModel) boardWorkerWidth() int {
 	return 0
 }
 
+// boardProgRoom is title room after the merged cell and actual worker column.
 func (m tuiModel) boardProgRoom() int {
 	prefix := boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost())
-	worker := m.boardWorkerWidth()
-	// The admin owner/credential prefix would otherwise let percentages appear
-	// below 120 and disappear when the worker column arrives. Own-board layouts
-	// retain their title floor at 120, so use actual worker width there.
-	if m.board.admin {
-		worker = boardWorkerColumnWidth
-	}
-	return m.width - worker - (prefix + boardMileWidth + 1 + boardProgPctWidth + 2)
+	return m.width - m.boardWorkerWidth() - (prefix + boardMileWidth + 1 + boardProgPctWidth + 2)
 }
 
 // boardShowProg adds the percentage only when the title retains its floor.
@@ -72,15 +66,14 @@ func (m tuiModel) boardProgCell(p *apitypes.RunProgress, bg color.Color) string 
 
 // boardProgressCell is the merged column. A waiting/parked annotation replaces
 // the marker only when health precedence hides that actionable status word.
-func (m tuiModel) boardProgressCell(r apitypes.RunListItemDTO, terminal bool, bg color.Color) string {
+func (m tuiModel) boardProgressCell(r apitypes.RunListItemDTO, terminal bool, bg color.Color, statusWord string) string {
 	wide := m.boardShowProg()
 	width := boardMileWidth
 	if wide {
 		width += 1 + boardProgPctWidth
 	}
 	if !terminal && r.Progress != nil {
-		tok := m.pal.runStateToken(r.RunDTO, r.IsRevising)
-		if tok.word == "stalled" || tok.word == "looping" {
+		if statusWord == "stalled" || statusWord == "looping" {
 			switch r.Progress.State {
 			case runprogress.StateWaiting:
 				word := "on you"
@@ -93,10 +86,11 @@ func (m tuiModel) boardProgressCell(r apitypes.RunListItemDTO, terminal bool, bg
 			}
 		}
 	}
-	out := padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg)
+	marker := m.milestoneMarker(r, terminal, bg)
+	out := padSeg(marker, boardMileWidth, bg)
 	if wide {
 		pct := ""
-		if !terminal {
+		if !terminal && marker != "" {
 			pct = m.boardProgCell(r.Progress, bg)
 		}
 		out += paintSeg(nil, bg, false, " ") + padSeg(pct, boardProgPctWidth, bg)

@@ -57,7 +57,7 @@ func TestTUIBoardProgStates(t *testing.T) {
 			m := progBoard(t, 140, run)
 			next, _ := m.Update(tea.ColorProfileMsg{Profile: prof})
 			m = next.(tuiModel)
-			cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, c.status == "completed", nil)))
+			cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, c.status == "completed", nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word)))
 			if cell != c.want {
 				t.Errorf("%s/%v cell=%q want=%q", c.name, prof, cell, c.want)
 			}
@@ -91,7 +91,7 @@ func TestTUIBoardProgWaitingParkedUnderHealth(t *testing.T) {
 						want = c.wide
 						cellWidth += 1 + boardProgPctWidth
 					}
-					cell := stripANSI(m.boardProgressCell(run, false, nil))
+					cell := stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))
 					if strings.TrimSpace(cell) != want || visualWidth(cell) != cellWidth {
 						t.Errorf("%s/%s/%d/%v: cell %q width %d, want %q width %d", c.status, health, width, prof, cell, visualWidth(cell), want, cellWidth)
 					}
@@ -111,18 +111,18 @@ func TestTUIBoardProgMilestoneFallbacks(t *testing.T) {
 		run.Milestones = append(run.Milestones, apitypes.Milestone{ID: itoa(i)})
 	}
 	m := progBoard(t, 140, run)
-	if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil))); cell != "2/12       34%" {
+	if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))); cell != "2/12       34%" {
 		t.Errorf("count+pct %q", cell)
 	}
 	for _, p := range []*apitypes.RunProgress{nil, {State: "percent"}, {State: "none"}, {State: "future-state"}} {
 		run.Progress = p
-		if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil))); cell != "2/12" {
+		if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))); cell != "2/12" {
 			t.Errorf("marker lost or fabricated pct: %q", cell)
 		}
 	}
 	run.Milestones = nil
-	run.Progress = &apitypes.RunProgress{State: "none"}
-	if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil))); cell != "" {
+	run.Progress = &apitypes.RunProgress{State: "percent", Pct: &pct}
+	if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))); cell != "" {
 		t.Errorf("non-milestone row fabricated progress: %q", cell)
 	}
 }
@@ -215,6 +215,45 @@ func TestTUIBoardProgTitleFloor(t *testing.T) {
 				if min, ok := minTitle[cfg.name]; !ok || tw < min {
 					minTitle[cfg.name] = tw
 				}
+			}
+		}
+	}
+}
+
+// The percentage slot stays padded for every row, including missing plans and flags.
+func TestTUIBoardProgTitleAlignment(t *testing.T) {
+	pct := 9
+	percent := progRun("11111111", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
+	noPercent := progRun("22222222", "queued", &apitypes.RunProgress{State: "queued"})
+	noMilestones := progRun("33333333", "running", nil)
+	noMilestones.Milestones = nil
+	flag := progRun("44444444", "awaiting_approval", &apitypes.RunProgress{State: "waiting"})
+	flag.Health = "stalled"
+	runs := []apitypes.RunListItemDTO{percent, noPercent, noMilestones, flag}
+	for _, cfg := range []struct {
+		name       string
+		width      int
+		admin, pct bool
+	}{
+		{"wide", 140, false, true}, {"narrow admin", 125, true, false},
+	} {
+		m := progBoard(t, cfg.width, runs...)
+		m.board.admin = cfg.admin
+		if !m.boardShowMile() || m.boardShowProg() != cfg.pct {
+			t.Fatalf("%s: unexpected milestone/percentage visibility", cfg.name)
+		}
+		col := -1
+		for _, run := range runs {
+			line := progLine(m, run.ID)
+			i := strings.Index(line, "title "+run.ID)
+			if i < 0 {
+				t.Fatalf("%s: missing title in %q", cfg.name, line)
+			}
+			got := visualWidth(line[:i])
+			if col < 0 {
+				col = got
+			} else if col != got {
+				t.Errorf("%s: %s title column %d, want %d: %q", cfg.name, run.ID, got, col, line)
 			}
 		}
 	}

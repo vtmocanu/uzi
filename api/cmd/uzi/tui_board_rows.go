@@ -286,7 +286,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		paintSeg(m.pal.faintC, bg, false, padCell(relAge(r.CreatedAt), boardAgeWidth)) + gap
 
 	if m.boardShowMile() {
-		row += m.boardProgressCell(r, terminal, bg) + gap
+		row += m.boardProgressCell(r, terminal, bg, tok.word) + gap
 	}
 
 	// WHICH credential this run spent, gated by its own harness:

@@ -502,7 +502,7 @@ Where it appears:
   bar, or `● waits on you` / `◼ stalled` as above. On the Dashboard the cell
   is hidden at phone widths; the runs list keeps it.
 - **TUI board**: one progress cell combines the milestone micro-bar with the
-  server-derived percent, e.g. `▰▰▱      70%`. On narrow terminals the percent
+  server-derived percent in a fixed slot after the marker. On narrow terminals the percent
   drops first, preserving the milestone marker and room for the title. Repeated
   status words are omitted; waiting or parked flags remain when stalled or looping
   health hides that status. Every flag survives `NO_COLOR`; no "since" time is shown.

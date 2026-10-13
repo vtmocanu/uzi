@@ -24,7 +24,7 @@ through `[0.52.0]`.)
 
 ### Fixed
 
-- **TUI board progress uses one milestone bar with its percentage.**
+- **TUI board progress uses one milestone bar with its percentage ([#2897](https://github.com/vtmocanu/uzi/pull/2897)).**
   The redundant percentage bar and repeated status words are removed, while narrow terminals retain milestones and stalled rows retain hidden waiting or parked conditions.
 
 - **Claude cross-checks no longer fail with `confinement_failed` as soon as they start ([#2869](https://github.com/vtmocanu/uzi/issues/2869)).**
