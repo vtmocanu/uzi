@@ -147,8 +147,17 @@ LOG="$(mktemp "${TMPDIR:-/tmp}/uzi-store-it-log.XXXXXX")" || {
   echo "run-store-it: mktemp failed" >&2
   exit 1
 }
-UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
-  -run 'LiveDB$' "${PKGS[@]}" 2>&1 | tee "$LOG"
+# workersvc's cumulative LiveDB runtime approaches the default 600s timeout.
+# Bound it at 900s; this is timeout headroom, not a speedup. Reset other packages
+# to 10m on every iteration, and stop on any failed pipeline before the next one.
+for p in "${PKGS[@]}"; do
+  timeout=10m
+  if [ "$p" = "./internal/workersvc/..." ]; then
+    timeout=15m
+  fi
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a "$LOG"
+done
 
 # Gate on the gate, mirrored from ci.yml. (1) Aggregate: the suite must have RUN
 # something and SKIPPED nothing -- with the DSN unset or Postgres unreachable every test

@@ -113,6 +113,12 @@ the same list. A `*LiveDB` test in a package neither list names runs nowhere and
 prints `ok`, so a new live-DB test in an eighth package must add that package to both
 the script and `.github/workflows/ci.yml` in the same commit.
 
+The script runs each package in a separate Go invocation against the same DSN,
+appending to one log for the aggregate and per-package guards. Each invocation has
+a 10-minute timeout except `workersvc`, whose cumulative LiveDB runtime approaches
+600 seconds and gets a bounded 15 minutes (900 seconds). This adds timeout headroom,
+not a speedup; a failed invocation stops the sweep immediately.
+
 ## Phase registry (what it asserts)
 
 The suite is now a **phase registry**: each assertion group lives in its own file
