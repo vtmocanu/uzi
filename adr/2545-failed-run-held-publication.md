@@ -38,7 +38,7 @@ parked runs keep the archive path. Four places enforce this independently:
 - step B's locked eligibility (`heldStateEligible` in
   `api/internal/recovery/held_final.go`);
 - the `held_publication` branch of `recovery_inventory_hold_guard`
-  (migration `00328_held_publication.sql`). A cancelled run, including one with
+  (migration `00333_held_publication.sql`). A cancelled run, including one with
   a NULL `fail_origin`, a stale generation or an excluded origin can never
   release this way, whatever the application code does.
 

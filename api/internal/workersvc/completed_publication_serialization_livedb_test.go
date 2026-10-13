@@ -252,7 +252,7 @@ func isolatedPublicationDB(t *testing.T) (context.Context, string, interlockLive
 		t.Fatal(err)
 	}
 	t.Cleanup(pool.Close)
-	// The generated hold queries select final_publication_id (migration 00328), which this
+	// The generated hold queries select final_publication_id (migration 00333), which this
 	// database deliberately stops short of. Add the bare column so production code can run
 	// against the 319/320 schemas under test; 00320 and its Down never touch it.
 	if _, err = pool.Exec(ctx, "ALTER TABLE recovery_custody_holds ADD COLUMN final_publication_id uuid"); err != nil {
@@ -355,7 +355,7 @@ func TestCompletedPublicationDowngradeMigrationLiveDB(t *testing.T) {
 		return fresh
 	}
 	// isolatedPublicationDB's shims stand in for the code cross-check columns 00324, 00327 and 00329 add
-	// and the worker roll columns 00330 adds, and the held-publication column;
+	// and the worker roll columns 00330 adds, and the held-publication column 00333 adds;
 	// drop them so the walk to head adds the real columns instead of colliding with the shims.
 	for _, ddl := range []string{
 		"ALTER TABLE recovery_custody_holds DROP COLUMN IF EXISTS final_publication_id",

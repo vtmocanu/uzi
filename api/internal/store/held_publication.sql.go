@@ -957,7 +957,7 @@ type UpsertHeldPublicationParams struct {
 }
 
 // Issue #2545: the run_held_publications lifecycle and the hold-side queries of a failed run's
-// held-work publication (migration 00328). The held_publication_guard trigger enforces the state
+// held-work publication (migration 00333). The held_publication_guard trigger enforces the state
 // machine; every transition below is a CAS on the expected state, so a lost race reads as 0 rows.
 // Lock order, wherever more than one is taken: worker, run, hold, publication.
 // Insert-or-load by (run_id, generation). A conflict returns the EXISTING row, unchanged (the
