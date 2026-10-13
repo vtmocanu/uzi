@@ -280,9 +280,8 @@ type autopilotCall struct {
 	// a test can prove the auto-approve scheduled path threads scheduleCredentialOverride(sched)
 	// onto the created run. nil for the poller-shaped CreateAutopilotRun (no per-run override).
 	credOverride *workersvc.CredentialOverride
-	// explicit is the schedule's pinned run_schedules.harness (PRD #1429 M2, D5), captured so a
-	// test can prove the auto-approve scheduled path threads scheduleHarness(sched). nil for the
-	// poller-shaped CreateAutopilotRun (no per-schedule harness pin) and for a NULL-harness schedule.
+	// explicit captures the effective schedule pin or fresh issue-label selection.
+	// It is nil when neither the schedule nor the issue selects a harness.
 	explicit *workersvc.Harness
 }
 

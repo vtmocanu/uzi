@@ -851,12 +851,27 @@ time-driven. `api/internal/schedsvc`'s engine is a single-instance background
 actor (a wake ticker over the durable `run_schedules.next_fire_at` due-gate,
 `FOR UPDATE SKIP LOCKED` claim, a `Boot()` immediate tick so a fire missed
 across a restart happens on the next wake rather than backfilling the missed
-cadences). A due schedule fires through the same `workersvc.CreateRun`/
-`CreateAutopilotRun` seam autopilot uses, so the eligibility gate
-(`isEligibleIssue`, PRD #764 M1, widened by PRD #767 M2 to also match
-`assignee_ids` against the connection's `bot_forge_user_id`), the fresh-label
-fetch, active-run dedup, and the usage-limit park all apply as for a manual
-start. Its **ad-hoc prompt** target has no issue to seam through, so it lands
+cadences). A due issue schedule uses `workersvc.CreateScheduledRun` or
+`CreateScheduledAutopilotRun`. These share the underlying create body with
+manual `CreateRun` and the poller's `CreateAutopilotRun`, so the eligibility
+gate (`isEligibleIssue`, PRD #764 M1, widened by PRD #767 M2 to also match
+`assignee_ids` against the connection's `bot_forge_user_id`), active-run
+dedup, and usage-limit park apply as for a manual start. Automatic issue starts additionally select the harness from fresh
+`issueinput.Capture` labels (`harness::codex` / `harness::claude`), across
+every issue schedule selector and the autopilot poller. Namespace validation
+precedes pin comparison inside the fire; a label cannot replace a differing
+schedule pin or trigger cross-harness credential fallback. The once-schedule
+stored-token/pin disabled precheck remains before forge selection.
+Unpinned sweeps treat label-selected credential refusals per candidate;
+stored-pin/override disable keeps the existing hold/stop boundary, including
+a stored-token-only recheck when resolution fails before the insert guard.
+The poller retains consent/identity checks before capture and the legacy
+Anthropic-token presence gate for unlabelled issues, while a valid Codex
+label permits a consenting Codex-only owner with a usable credential.
+Manual run creation and chat `start_run` retain their selection behavior.
+See [ADR-2853](adr/2853-automatic-issue-harness-labels.md) for precedence,
+credential-disable boundaries and the maintainer landing step.
+Its **ad-hoc prompt** target has no issue to seam through, so it lands
 via a dedicated INSERT as a `prompt` run kind: repo-ful, issue-less,
 `schedule_id`-keyed for dedup, MR-opening on the `ci_fix` shape. A **sweep**
 target fans out over the oldest open issues matching its label; `max_issues`
@@ -2123,9 +2138,11 @@ claims a Codex-indicating run, which stays queued instead. See
 [PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
 for the operator-facing knobs. See [ADR-1106](adr/1106-codex-harness.md) for
-the Codex harness's own execution design (the app-server architecture,
+the Codex harness's own execution design; automatic issue harness selection
+is recorded separately in [ADR-2853](adr/2853-automatic-issue-harness-labels.md).
+ADR-1106 covers the app-server architecture,
 capability owners, and the untrusted-construction boundary the uid split
-exists to satisfy), and [ADR-0285](adr/0285-worker-egress-tier-trust-model.md)
+exists to satisfy. See [ADR-0285](adr/0285-worker-egress-tier-trust-model.md)
 for the two-tier egress trust model the Codex hosts above (restricted-tier
 allowlist) were added against.
 

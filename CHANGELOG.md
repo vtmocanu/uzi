@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
   A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
 
+- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
+  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

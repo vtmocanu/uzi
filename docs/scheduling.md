@@ -325,24 +325,64 @@ only when you hold a usable credential for both harnesses) or with
 pin. Its default option is "Use my default" — leave it there to resolve the
 harness automatically at fire time.
 
-- **Unpinned** (the default): each fire resolves the harness afresh, the same
-  way a manual start does — your default harness if its credential is usable,
-  otherwise whichever harness you have a usable credential for, Claude if
-  both. If neither is usable, the fire records the `no_usable_credential`
-  skip (see [Fire outcomes](#fire-outcomes)). An unpinned schedule with a
-  stored Anthropic credential override that now resolves to Codex fails
-  closed instead, with the `codex_override_conflict` skip.
-- **Pinned**: every fire uses that harness and never falls back to the
-  other. If its credential is missing or unusable, the behavior differs by
-  target: a **single-issue** or **prompt** schedule starts nothing, records
-  no outcome, and does not advance — it retries each tick until the
-  credential is usable again or you change the pin. A **sweep** schedule
-  instead records each affected candidate as a `fetch_failed` skip and
-  keeps advancing, since one bad candidate shouldn't stall the rest of the
-  fan-out.
+For **automatic issue starts**, exact forge labels `harness::codex` and
+`harness::claude` select the harness from the fresh issue-input capture,
+not the cached candidate. This applies to recurring and one-time issue
+schedules, schedule run-now, and every issue selector (`bug`, `Planned`,
+`on-deck`, assigned and custom sweeps), as well as
+[autopilot](./autopilot.md#which-harness-autopilot-uses). Manual web/CLI run
+creation and chat `start_run` keep their existing selection; prompt and
+self-improve schedules do not consume issue harness labels.
 
-Each run a fire starts records the harness it actually ran on, shown on the
-run.
+The precedence inside an issue fire is:
+
+| Fresh issue labels | Schedule harness pin | Result |
+|---|---|---|
+| No `harness::*` label | None | Existing automatic resolution (D11): usable user default, otherwise a usable harness, Claude if both. |
+| No `harness::*` label | Claude or Codex | Use the stored pin, without cross-harness fallback. |
+| Exactly `harness::claude` or `harness::codex` | None | Explicitly select that harness, without credential fallback to the other. |
+| One recognized label | Matching pin | Use the pin. |
+| One recognized label | Differing pin | Start nothing; `harness_label_conflict`. |
+| Both recognized labels, or any other `harness::*` label | Any or none | Start nothing; `harness_label_invalid`, before pin comparison. |
+
+Repeated copies of the same recognized label are allowed. Label selection
+is per candidate and does not save a schedule pin. A stored Anthropic
+credential override with label-selected Codex gives
+`codex_override_conflict`; label selection does not gain the actual-pin
+exemption. The existing stored-model compatibility fallback (D6) is unchanged:
+harness selection does not merge the separate Claude and Codex model defaults.
+
+**The one-time stored-credential precheck comes first.** Before fetching
+forge input, it checks the stored token override and schedule harness pin,
+not a label-selected candidate. A disabled stored choice can therefore hold
+the schedule before labels are fetched or validated. If creation reaches
+the authoritative stored-override guard, a disabled override retains its
+existing precedence.
+
+On an **unpinned sweep**, a label-selected harness with disabled credentials
+records `credential_disabled` for that candidate; a missing or unusable
+selected credential records `no_usable_credential`. The sweep continues
+within its existing scan window and start cap, without cross-harness
+fallback. A disabled actual schedule pin or stored token override retains
+the existing one-time hold before any start, or stop-and-advance after a
+partial start. If resolution refuses before the stored-override insert
+check, the scheduler rechecks the stored token alone to preserve that
+classification when it was disabled after preflight.
+
+For a **one-time single issue**, a disabled label-selected harness holds
+and resumes on re-enable like a pin. Merely missing or unusable credentials
+create no new disable hold: explicit `no_credential_for_harness` remains a
+hard refusal retried each tick; implicit `no_usable_credential` remains a
+benign advancing skip. Recurring credential semantics are unchanged.
+A single-issue or prompt fire explicitly selecting a harness with a missing
+credential retries without recording an outcome; an actual pinned sweep
+buckets that refusal as `fetch_failed` and continues.
+
+Invalid or conflicting labels are advancing skips on tick-driven one-time
+fires; sweeps continue to the next candidate. Run-now reports skips without
+persisting cadence, last-fire or recent-fire changes. Each started run
+records its actual harness. See [Fire outcomes](#fire-outcomes) for the
+labels and repair hints shown in web and CLI.
 
 ### Running a schedule on several repos
 
@@ -470,11 +510,19 @@ exceed `max_issues` once backfill walks past a skip), which ones
   came due, so nothing started. It's benign and self-resolving: the
   schedule's cadence advances normally and re-fires on schedule next time,
   and nothing replays on resume.
-- `no_usable_credential` — neither harness has a usable credential for the
-  owner (no Anthropic token and no usable Codex credential — an API key
-  counts), and the fire has no explicit harness pin forcing one. It's
-  benign: the schedule's cadence advances normally and re-fires next time,
-  once the owner configures a usable credential for either harness. This
+- `harness_label_invalid` — both recognized harness labels, or an unknown
+  `harness::*` value, appeared in the fresh issue capture. Keep one of
+  `harness::codex` or `harness::claude` and remove other harness labels.
+  This validation precedes pin comparison inside the fire.
+- `harness_label_conflict` — one valid issue harness label differs from
+  the schedule pin. Match the label to the pin, or change/clear the pin.
+  Both label skips start nothing and advance tick-driven fires, including
+  one-time schedules; sweeps continue.
+- `no_usable_credential` — implicit automatic resolution found neither
+  harness usable, or an unpinned sweep's label-selected harness has a
+  missing or unusable credential. The web label is "no usable credential".
+  It's benign: the schedule advances; repair credentials for the selected
+  harness when a label chose it, since there is no cross-harness fallback. This
   reason is recorded (and the schedule advances) for issue, sweep, and
   prompt fires; the `self-improve` [default job](#default-jobs) is the one
   exception — there, the same condition instead leaves the fire unrecorded
@@ -482,20 +530,25 @@ exceed `max_issues` once backfill walks past a skip), which ones
   harness with no usable credential (see [Which harness a schedule runs
   on](#which-harness-a-schedule-runs-on)).
 - `codex_override_conflict` — the schedule is unpinned but carries a stored
-  Anthropic credential override, and the owner's harness now resolves to
-  Codex. The override can't ride a Codex run and there's no cross-harness
-  fallback, so the fire starts nothing and leaves the stored override
+  Anthropic credential override, and automatic resolution or the issue's
+  `harness::codex` label selects Codex. The override can't ride a Codex run
+  and there's no cross-harness fallback, so the fire starts nothing and leaves the stored override
   untouched. Benign: the schedule advances and re-fires next cadence, and
   may resolve back to Claude (or the override may be changed) by then.
-- `credential_disabled` — the schedule is pinned to a token you have
-  [disabled](anthropic-token.md#disabling-a-token), or to a harness whose
-  credentials are all disabled. The fire starts nothing and never swaps in
-  another credential or harness; the pin is kept. A recurring schedule
-  advances and re-fires next cadence. A one-time schedule is **held**
-  instead: it stays due, un-advanced, with this skip recorded as its last
-  fire, and fires once you enable the credential or change the schedule's
-  token. The web shows it as "pinned credential is disabled"; `uzi schedule
-  get` prints the same label with a hint pointing at Settings.
+- `credential_disabled` — a stored token is
+  [disabled](anthropic-token.md#disabling-a-token), or the selected harness
+  has credentials but none enabled. The affected candidate starts nothing;
+  uzi keeps the stored choice without credential or cross-harness fallback.
+  Recurring schedules advance and re-fire next cadence. A one-time schedule
+  with a disabled stored pin/override is **held** before any start: due,
+  un-advanced, with the skip recorded as its last fire, until re-enable or
+  a changed stored choice. A disable after a partial one-time sweep start
+  stops the scan and advances instead. A one-time single issue whose label
+  selects a disabled harness holds like a pin. On an unpinned label-selected
+  sweep, harness disable is a per-candidate skip and scanning continues
+  within the caps; stored-pin/override rules still apply. Missing credentials
+  do not acquire a disable hold. The web shows "pinned credential is disabled";
+  `uzi schedule get` prints the same label with a Settings hint.
 - `config_not_supported` — a removal-enabled schedule's effective target,
   timing or selector no longer supports removal (for example, a catalog
   selector changed to multiple labels). The fire starts nothing; an invalid
@@ -570,8 +623,9 @@ a **parked** schedule (bad repo or config) or a fire that hit a
 transient error (retried next tick, see `fetch_failed` above) leaves
 `last_fire` untouched — it shows whatever fired before, or nothing. The
 one exception is a one-time schedule held on a disabled credential (see
-`credential_disabled` above): it records that skip as its last fire
-without advancing, so it can show a `last_fire` while it is still due. A
+`credential_disabled` above, including a label-selected single issue,
+but not a per-candidate unpinned sweep skip): it records that skip as its
+last fire without advancing, so it can show a `last_fire` while still due. A
 `run-now` fire reports its own outcome in the response without
 touching `last_fire` at all, since a manual fire must not disturb the
 cadence. A schedule that has never fired and was never held that way

@@ -6784,10 +6784,11 @@ func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UU
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
-// user's behalf (PRD #19 M4). It is IDENTICAL to CreateRun — same ownership, single
-// uzi_label eligibility gate (PRD #764 M1), and one-active-run gate, same state
-// machine, same queued→In Progress column notify — except it sets auto_approve, which
-// the worker reads (M5) to resolve the plan gate without a human. Sharing one createRun
+// user's behalf (PRD #19 M4). It shares CreateRun's ownership, uzi_label eligibility
+// gate (PRD #764 M1), one-active-run gate, state machine and queued→In Progress
+// column notify. It sets auto_approve and accepts the poller's fresh issue-label
+// harness selection. The worker reads auto_approve (M5) to resolve the plan gate
+// without a human. Sharing one createRun
 // body is the whole point: the invariant that an autopilot run and a manual run are
 // born through the same path is enforced structurally, not by two implementations that
 // could drift.
