@@ -110,6 +110,69 @@ describe("#2878 M2 accountant", () => {
     assert.deepEqual(acct.aggregateByModel(pricing), { [MODEL_ROOT]: entry(130, 30) });
   });
 
+  for (const cacheBucket of ["cachedInputTokens", "cacheWriteInputTokens"] as const) {
+    for (const alreadyIncomplete of [false, true]) {
+      it(`regression advancing uncached input decrease rejects whole snapshot: ${cacheBucket}, ${alreadyIncomplete ? "already incomplete" : "initially complete"}`, () => {
+        const acct = new CodexUsageAccountant();
+        acct.registerThread(ROOT, MODEL_ROOT, true);
+        acct.record(ROOT, usage(
+          { inputTokens: 1000, cachedInputTokens: 200, cacheWriteInputTokens: 100, outputTokens: 200, totalTokens: 1200 },
+          { inputTokens: 1000, cachedInputTokens: 200, cacheWriteInputTokens: 100, outputTokens: 200, totalTokens: 1200 },
+        ), true);
+        acct.record(ROOT, usage(
+          { inputTokens: 1100, cachedInputTokens: 220, cacheWriteInputTokens: 110, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, cachedInputTokens: 20, cacheWriteInputTokens: 10, outputTokens: 20, totalTokens: 120 },
+        ));
+        assert.equal(acct.usageIncomplete, false);
+        const before = acct.aggregateByModel();
+        if (alreadyIncomplete) acct.markIncomplete(ROOT, "invalid_raw_usage");
+        const rejected = acct.record(ROOT, usage(
+          { inputTokens: 1120, cachedInputTokens: 220, cacheWriteInputTokens: 110, outputTokens: 230,
+            totalTokens: 1350, [cacheBucket]: cacheBucket === "cachedInputTokens" ? 300 : 190 },
+          { inputTokens: 20, cachedInputTokens: 0, cacheWriteInputTokens: 0, outputTokens: 10,
+            totalTokens: 30, [cacheBucket]: 10 },
+        ));
+        assert.equal(rejected, undefined, "advancing uncached input decrease cannot become a priced response");
+        assert.equal(acct.usageIncomplete, true);
+        assertEntry(acct.aggregateByModel(pricing)?.[MODEL_ROOT],
+          { input: 70, cacheRead: 20, cacheCreation: 10, output: 20, reasoning: 0 });
+        assert.deepEqual(acct.aggregateByModel(), before, "accepted lower bound survives rejection");
+        const adopted = acct.record(ROOT, usage(
+          { inputTokens: 1130, cachedInputTokens: 225, cacheWriteInputTokens: 115, outputTokens: 240, totalTokens: 1370 },
+          { inputTokens: 30, cachedInputTokens: 5, cacheWriteInputTokens: 5, outputTokens: 20, totalTokens: 50 },
+        ));
+        assert.ok(adopted, "valid continuation advances from preserved accepted snapshot");
+        assertEntry(acct.aggregateByModel(pricing)?.[MODEL_ROOT],
+          { input: 90, cacheRead: 25, cacheCreation: 15, output: 40, reasoning: 0 });
+        assert.equal(acct.usageIncomplete, true);
+      });
+    }
+
+    for (const equalMagnitude of [true, false]) {
+      it(`compatibility uncached input decrease in ${equalMagnitude ? "equal magnitude" : "low magnitude reset"}: ${cacheBucket}`, () => {
+        const acct = new CodexUsageAccountant();
+        acct.registerThread(ROOT, MODEL_ROOT, true);
+        acct.record(ROOT, usage(
+          { inputTokens: 1000, cachedInputTokens: 200, cacheWriteInputTokens: 100, outputTokens: 200, totalTokens: 1200 },
+          { inputTokens: 1000, cachedInputTokens: 200, cacheWriteInputTokens: 100, outputTokens: 200, totalTokens: 1200 },
+        ), true);
+        acct.record(ROOT, usage(
+          { inputTokens: 1100, cachedInputTokens: 220, cacheWriteInputTokens: 110, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, cachedInputTokens: 20, cacheWriteInputTokens: 10, outputTokens: 20, totalTokens: 120 },
+        ));
+        const before = acct.aggregateByModel(pricing);
+        assert.equal(acct.usageIncomplete, false);
+        const total = equalMagnitude
+          ? { inputTokens: 1120, cachedInputTokens: 220, cacheWriteInputTokens: 110, outputTokens: 200,
+            totalTokens: 1320, [cacheBucket]: cacheBucket === "cachedInputTokens" ? 300 : 190 }
+          : { inputTokens: 20, cachedInputTokens: 5, cacheWriteInputTokens: 5, outputTokens: 2, totalTokens: 22 };
+        assert.equal(acct.record(ROOT, usage(total, total)), undefined);
+        assert.deepEqual(acct.aggregateByModel(pricing), before, "nonadvancing note preserves counters and cost status");
+        assert.equal(acct.usageIncomplete, false);
+      });
+    }
+  }
+
   it("regression missing live baseline quarantines attempted work despite later replay", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);

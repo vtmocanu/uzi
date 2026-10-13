@@ -297,7 +297,13 @@ export class CodexUsageAccountant {
     }
     const m = magnitude(usage.total);
     if (m > acct.maxMagnitude) {
-      if (total.inputTokens < acct.maxTotal.inputTokens ||
+      // Raw input includes cached details, so growing raw buckets can still reduce priced uncached input.
+      const uncached = Math.max(total.inputTokens - total.cachedInputTokens - total.cacheWriteInputTokens, 0);
+      const acceptedUncached = Math.max(
+        acct.maxTotal.inputTokens - acct.maxTotal.cachedInputTokens - acct.maxTotal.cacheWriteInputTokens, 0,
+      );
+      if (uncached < acceptedUncached ||
+          total.inputTokens < acct.maxTotal.inputTokens ||
           total.cachedInputTokens < acct.maxTotal.cachedInputTokens ||
           total.cacheWriteInputTokens < acct.maxTotal.cacheWriteInputTokens ||
           total.outputTokens < acct.maxTotal.outputTokens) {

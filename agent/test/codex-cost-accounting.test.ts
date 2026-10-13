@@ -322,33 +322,36 @@ describe("CodexUsageAccountant cost: conservative dominance across threads on th
 
 describe("CodexUsageAccountant cost: per-response dominance within ONE reconciled thread", () => {
   it("a single individually-unpriceable response on an otherwise-reconciling thread taints the whole model to unreported, tokens retained", () => {
-    // Distinct from the two-thread dominance block above and from every whole-model-unpriceable
-    // case (unknown model / Sol flip): here ONE thread has TWO adopted responses whose SUMMED
-    // cumulative reconciles the priced buckets, but response 2 is INDIVIDUALLY unpriceable — its own
-    // cache detail buckets exceed its own input (40 + 30 > 50), the impossible split
-    // priceCodexResponse refuses. Per-response conservative dominance must taint the WHOLE model to
-    // `unreported`; it must NOT silently price only response 1 and emit a too-low `metered` figure.
+    // Three adopted responses ultimately reconcile the cumulative priced buckets. The second
+    // last has an impossible cache split (40 + 30 > 50); its failure must suppress the valid
+    // cost already accumulated from the first response, not emit a partial metered amount.
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, ASTRA, false);
-    // Response 1: cleanly priceable (uncached-only).
-    acct.record(ROOT, usage({ inputTokens: 100, outputTokens: 60, totalTokens: 160 }, { inputTokens: 100, outputTokens: 60, totalTokens: 160 }));
-    // Response 2: the cumulative grows so the note is ADOPTED (magnitude 250 > 160) and Σ last
-    // reconciles the delta on all four priced buckets (input 150, cached 40, cacheWrite 30, output
-    // 100) — yet last2 ALONE is unpriceable (cached 40 + cacheWrite 30 > input 50).
-    acct.record(
-      ROOT,
-      usage(
-        { inputTokens: 150, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 100, totalTokens: 260 },
-        { inputTokens: 50, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 120 },
-      ),
-    );
+    const first = acct.record(ROOT, usage(
+      { inputTokens: 100, outputTokens: 60, totalTokens: 160 },
+      { inputTokens: 100, outputTokens: 60, totalTokens: 160 },
+    ));
+    assert.ok(first, "the initial priceable response is adopted");
+    assert.equal(get(acct.aggregateByModel(API_KEY_EARLY), ASTRA).costStatus, "metered");
+    // Cumulative uncached input grows 100 → 110; the malformed last is still individually
+    // unpriceable. Numeric reconciliation is completed by the third notification below.
+    const second = acct.record(ROOT, usage(
+      { inputTokens: 180, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 100, totalTokens: 280 },
+      { inputTokens: 50, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 90 },
+    ));
+    assert.ok(second, "the unpriceable last is adopted with monotone cumulative priced buckets");
+    const third = acct.record(ROOT, usage(
+      { inputTokens: 200, cachedInputTokens: 40, cacheWriteInputTokens: 30, outputTokens: 110, totalTokens: 310 },
+      { inputTokens: 50, outputTokens: 10, totalTokens: 60 },
+    ));
+    assert.ok(third, "the final priceable last completes numeric reconciliation");
+    assert.equal(acct.usageIncomplete, false, "unreported cost comes from per-response pricing, not guard incompleteness");
     const agg = acct.aggregateByModel(API_KEY_EARLY);
     const astra = get(agg, ASTRA);
     assert.equal(astra.costStatus, "unreported", "one individually-unpriceable response taints the whole model");
-    assert.ok(!("costUSD" in astra), "no costUSD on an unreported entry — never a too-low metered $ from pricing only response 1");
-    // Tokens RETAINED from the cumulative delta: uncached 150-40-30 = 80, cacheRead 40, cacheCreation 30, output 100.
-    assertTokens(astra, { input: 80, output: 100, cacheRead: 40, cacheCreation: 30, reasoning: 0 });
-    // Run-level rollup: the unreported entry dominates.
+    assert.ok(!("costUSD" in astra), "no costUSD on an unreported entry — never a partial metered amount");
+    // Sum(last) and cumulative agree on input 200, cached 40, writes 30, output 110.
+    assertTokens(astra, { input: 130, output: 110, cacheRead: 40, cacheCreation: 30, reasoning: 0 });
     assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 });
