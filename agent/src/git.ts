@@ -1169,6 +1169,18 @@ export class ForeignRetainedRecoveryError extends Error {
   constructor() { super("foreign retained recovery"); }
 }
 
+/**
+ * issue #2886: a bare cache directory named by the bounded `uzi-sha256-<hex>.git` form does not
+ * provably belong to the origin being asked for (stored origin missing, duplicated, unreadable or
+ * different, or the path is not a bare). Fail closed: nothing is fetched, deleted or rewritten.
+ */
+export class BareCacheIdentityError extends Error {
+  constructor(readonly bareName: string) {
+    super(`bare cache identity check failed: ${bareName}`);
+    this.name = "BareCacheIdentityError";
+  }
+}
+
 export class RetainedRecoveryBlockedError extends Error {
   readonly reason = "source_missing";
   constructor(readonly barePath: string, readonly branch: string, readonly key: string,
@@ -2074,6 +2086,43 @@ export class GitCache {
     return path.join(this.reposRoot, bareDirName(repoUrl));
   }
 
+  /**
+   * The bare cache path for an origin that must already exist locally: no fetch, no creation.
+   * A hashed-name bare must carry this exact origin (see {@link BareCacheIdentityError}); a path
+   * that does not exist is returned as-is, like {@link barePathFor}.
+   */
+  async existingBarePathFor(repoUrl: string): Promise<string> {
+    const barePath = this.barePathFor(repoUrl);
+    if (await lstatPresent(barePath)) await this.assertBareOriginIdentity(barePath, repoUrl);
+    return barePath;
+  }
+
+  /** Read the stored `uzi.cacheOrigin` of a bare. Only `ok` admits reuse of a hashed-name bare. */
+  private async readBareCacheOrigin(barePath: string): Promise<BareCacheOrigin> {
+    let out: string;
+    try {
+      out = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      return { kind: "unreadable" };
+    }
+    // `--null` entries are `key\nvalue`, or a bare `key` when the entry has no value.
+    const entries = out.split("\0").filter(item => item === BARE_CACHE_ORIGIN_KEY || item.startsWith(BARE_CACHE_ORIGIN_KEY + "\n"));
+    if (entries.length === 0) return { kind: "absent" };
+    if (entries.length !== 1 || !entries[0]!.includes("\n")) return { kind: "invalid" };
+    return { kind: "ok", value: entries[0]!.slice(BARE_CACHE_ORIGIN_KEY.length + 1) };
+  }
+
+  /** issue #2886: a hashed-name bare is reusable only for the origin stored in it at clone time. */
+  private async assertBareOriginIdentity(barePath: string, repoUrl: string): Promise<void> {
+    const name = path.basename(barePath);
+    if (!HASHED_BARE_NAME.test(name)) return;
+    const stored = await this.readBareCacheOrigin(barePath);
+    if (stored.kind !== "ok" || stored.value !== repoUrl) throw new BareCacheIdentityError(name);
+  }
+
   /** Resolve a recovery journal basename to a real bare directly under the private repos root. */
   async resolveRecoveryBareDir(bareDir: string): Promise<string | undefined> {
     if (
@@ -2100,6 +2149,11 @@ export class GitCache {
       try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
       catch { return undefined; }
     } else if (!(await isBareRepo(barePath))) return undefined;
+    // issue #2886: a hashed name is trusted only when the origin stored in the bare hashes to it.
+    if (HASHED_BARE_NAME.test(bareDir)) {
+      const stored = await this.readBareCacheOrigin(barePath);
+      if (stored.kind !== "ok" || bareDirName(stored.value) !== bareDir) return undefined;
+    }
     return barePath;
   }
 
@@ -2173,6 +2227,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       await fs.mkdir(this.reposRoot, { recursive: true });
       if (await isBareRepo(barePath)) {
+        await this.assertBareOriginIdentity(barePath, repoUrl);
         this.log.info("repo cache: fetching", { bare: barePath });
         // Issue #134: reassert IDEMPOTENTLY on the warm path, BEFORE the fetch (the first
         // object-writing command, hence the first spawner). cloneBare only runs on the very
@@ -2188,6 +2243,10 @@ export class GitCache {
           label: "clone/fetch",
         });
       } else {
+        // issue #2886: never clone over (or beside) something occupying a hashed name.
+        if (HASHED_BARE_NAME.test(path.basename(barePath)) && await lstatPresent(barePath)) {
+          throw new BareCacheIdentityError(path.basename(barePath));
+        }
         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
         await withForgeRetry(() => this.cloneBare(repoUrl, barePath, pat, scope, username), {
           schedule: this.retry?.schedule,
@@ -5750,7 +5809,10 @@ export class GitCache {
 
   /** Credential-free effective path mode, independent of recovery journal disposition. */
   async recoveryAttemptMode(repoUrl: string, key: string): Promise<boolean> {
-    return this.readRecoveryAttemptMode(this.barePathFor(repoUrl), key);
+    const barePath = this.barePathFor(repoUrl);
+    await this.assertRecoveryBare(barePath);
+    await this.assertBareOriginIdentity(barePath, repoUrl);
+    return this.readRecoveryAttemptMode(barePath, key);
   }
 
   private async readRecoveryAttemptMode(barePath: string, key: string): Promise<boolean> {
@@ -5775,6 +5837,7 @@ export class GitCache {
     if (!await this.pathPresent(barePath)) return undefined;
     await this.assertRecoveryBare(barePath);
     return this.withLock(barePath, async () => {
+      await this.assertBareOriginIdentity(barePath, repoUrl);
       const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
       if (!stored) return undefined;
       const journal = stored.journal;
@@ -11079,7 +11142,7 @@ export class GitCache {
     // non-empty dir → a deterministic "already exists" failure (permanent), converting a
     // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
-      await this.runGit(undefined, ["clone", "--bare", "--", repoUrl, dest], pat, scope, username);
+      await this.runGit(undefined, ["clone", "--bare", "-c", `${BARE_CACHE_ORIGIN_KEY_CONFIG}=${repoUrl}`, "--", repoUrl, dest], pat, scope, username);
       // Convert the mirror refspec to remote-tracking so future fetches write to
       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
@@ -14525,10 +14588,21 @@ async function isBareRepo(p: string): Promise<boolean> {
   return pathExists(path.join(p, "HEAD"));
 }
 
+/** issue #2886: the bounded bare name {@link bareDirName} falls back to; detected by format. */
+const HASHED_BARE_NAME = /^uzi-sha256-[0-9a-f]{64}\.git$/;
+/** Config key (as `git config --list` prints it, lowercased) holding the origin a bare was cloned from. */
+const BARE_CACHE_ORIGIN_KEY = "uzi.cacheorigin";
+/** The same key in the spelling `git clone -c` takes. */
+const BARE_CACHE_ORIGIN_KEY_CONFIG = "uzi.cacheOrigin";
+type BareCacheOrigin = { kind: "ok"; value: string } | { kind: "absent" } | { kind: "invalid" } | { kind: "unreadable" };
+
 /**
  * Filesystem-safe, collision-free bare-clone dir name for a repo URL: host plus
  * each path segment joined by '+'. '+' is illegal in GitHub/GitLab path
  * segments, so two names collide only for the same repo on the same host.
+ * A name over 255 UTF-8 bytes (one path component's limit) is replaced by
+ * `uzi-sha256-<sha256 hex of the raw input>.git`; such a bare records its origin in
+ * `uzi.cacheOrigin` and is reused only when that matches (issue #2886).
  * Examples:
  *   https://gitlab.com/org/repo.git  -> gitlab.com+org+repo.git
  *   git@gitlab.com:org/repo          -> gitlab.com+org+repo.git
@@ -14548,6 +14622,7 @@ export function bareDirName(rawUrl: string): string {
   let name = parts.join("+");
   if (!name.endsWith(".git")) name += ".git";
   if (name === ".git") name = "repo.git";
+  if (Buffer.byteLength(name, "utf8") > 255) return `uzi-sha256-${sha256Hex(rawUrl)}.git`;
   return name;
 }
 

@@ -376,6 +376,9 @@ export interface RecoveryCoordinatorOptions {
   ) => Promise<"passed" | "retained">;
   isExecuting?: (runId: string) => boolean;
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
+  /** Exact reports still need their authenticated generation evidence after FINAL.
+   * Read synchronously so cleanup rechecks it at every destructive boundary. */
+  pendingGenerationReport?: (runId: string, generation: number) => boolean;
   onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void;
   client: RecoveryArchiveClient;
   git: RecoveryBundleProducer;
@@ -781,6 +784,7 @@ export class RecoveryCoordinator {
   private readonly isExecuting: (runId: string) => boolean;
   private bootOwed: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["discoverOwedCandidates"]>>> = [];
   private readonly terminalRecordProtection: RecoveryCoordinatorOptions["terminalRecordProtection"];
+  private readonly pendingGenerationReport: RecoveryCoordinatorOptions["pendingGenerationReport"];
   private readonly onAuthoritativeGenerationReleased: RecoveryCoordinatorOptions["onAuthoritativeGenerationReleased"];
   private readonly client: RecoveryArchiveClient;
   private readonly git: RecoveryBundleProducer;
@@ -808,6 +812,8 @@ export class RecoveryCoordinator {
   private readonly lastAttemptAt = new Map<string, number>();
   /** Per-capture exponential backoff of the live archived-pin cleanup (pruned like lastAttemptAt). */
   private readonly pinCleanupBackoff = new Map<string, { failures: number; nextAt: number }>();
+  /** One diagnostic per retained ACK; pruned with the live journal snapshot. */
+  private readonly pendingReportLogged = new Set<string>();
   /** serverCaptureIds whose redundancy claim got a final answer (expired, or a non-transient retained). */
   private readonly redundancySettled = new Set<string>();
 
@@ -816,6 +822,7 @@ export class RecoveryCoordinator {
     this.withCompletionSourceBoundary = opts.withCompletionSourceBoundary;
     this.isExecuting = opts.isExecuting ?? (() => false);
     this.terminalRecordProtection = opts.terminalRecordProtection;
+    this.pendingGenerationReport = opts.pendingGenerationReport;
     this.onAuthoritativeGenerationReleased = opts.onAuthoritativeGenerationReleased;
     this.client = opts.client;
     this.git = opts.git;
@@ -2623,9 +2630,13 @@ export class RecoveryCoordinator {
       const seen = new Set(all.map((r) => r.captureId));
       for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
       for (const id of this.pinCleanupBackoff.keys()) if (!seen.has(id)) this.pinCleanupBackoff.delete(id);
-      // Executing runs are filtered BEFORE the per-pass cap so they cannot hold its slots.
+      for (const id of this.pendingReportLogged) if (!seen.has(id)) this.pendingReportLogged.delete(id);
+      // Executing runs and ACKs whose reports still need them are filtered BEFORE
+      // the cap. Deferred local cleanup must not displace a fresh upload or FINAL.
       const candidates = all
         .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId) &&
+          !(r.inventoryGuarded && r.finalAcknowledged && typeof r.generation === "number" &&
+            this.pendingGenerationReport?.(r.runId, r.generation)) &&
           (!credentialsBlocked || (r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
@@ -2856,7 +2867,6 @@ export class RecoveryCoordinator {
       if (!open() || !ack.coverageContext || !ack.bareDir) return;
       const bare = await this.git.resolveRecoveryBareDir?.(ack.bareDir);
       if (bare !== ack.coverageContext.barePath) return;
-      claims = await this.buildRedundancyClaims(selected, generation, bare, budget);
       const bundles = new Set<string>();
       // Positive ownership is the canonical capture filename, not an arbitrary MAC-covered path.
       // Validate every path before changing refs; an unknown journal path retains all authority.
@@ -2876,15 +2886,33 @@ export class RecoveryCoordinator {
         bundles.add(canonical);
       }
       if (!open()) return;
+      // The uploaded byte identity is already authenticated. Retirement needs the ACK
+      // journal and pinned Git objects for ancestry, but never reads the local bundle.
+      // Release those bytes on FINAL's existing schedule even if the report cannot retire.
+      if (this.pendingGenerationReport?.(runId, generation)) {
+        if (!this.pendingReportLogged.has(ack.captureId)) {
+          this.pendingReportLogged.add(ack.captureId);
+          this.log.debug("recovery cleanup deferred: pending report", { run_id: runId, generation });
+        }
+        for (const bundle of bundles) {
+          if (!open()) return;
+          try { await fs.unlink(bundle); }
+          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+        }
+        return;
+      }
+      const cleanupOpen = (): boolean => open() && !this.pendingGenerationReport?.(runId, generation);
+      this.pendingReportLogged.delete(ack.captureId);
+      claims = await this.buildRedundancyClaims(selected, generation, bare, budget);
       const result = await this.git.cleanupRecoveryGeneration(bare, ack.coverageContext,
         ack.originalRoots ?? [], selected.filter(r => r.coverageDigest).map(r => ({
           fingerprint: r.coverageDigest!, sha: r.sourceSha,
           coveredHeads: [...new Set([r.originalSourceSha!, r.inventoryCurrentSha!, ...(r.originalRoots ?? []).map(root => root.sha)])],
         })), [...new Set(selected.flatMap(r => [r.sourceSha, r.originalSourceSha].filter((s): s is string => !!s)))],
-        ack.sourceSha, open);
+        ack.sourceSha, cleanupOpen);
       if (result !== "removed") return;
       const unlink = async (file: string): Promise<void> => {
-        if (!open()) throw new Error("recovery cleanup source protection changed");
+        if (!cleanupOpen()) throw new Error("recovery cleanup source protection changed");
         try { await fs.unlink(file); }
         catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       };

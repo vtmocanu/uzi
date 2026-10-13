@@ -329,9 +329,10 @@ park_phase_call() {
 }
 custody_case "park phase gets generation absent from run DTO" pass 'phase used authoritative DB generation' park_phase_call
 
-# The actual capture decoder must recognize guarded and legacy typed logs while
-# preserving generation, ordering and unique-capture requirements.
-eval "$(awk '/^f42_assert_capture_park\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+# Guarded and legacy typed transcripts both obey #2512's same-claim recovery:
+# exact available capture before the fresh seed, without another claim or park.
+eval "$(awk '/^f42_assert_capture_resume\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+eval "$(awk '/^wait_same_claim_capture_resume\(\) \{/,/^\}/' "$LIB")"
 fake_compose() { cat "$SEQ_DIR/events"; }
 # shellcheck disable=SC2034  # read by the extracted production capture decoder
 COMPOSE=(fake_compose)
@@ -340,24 +341,57 @@ uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"availabl
 capture_fixture() {
   jq -nc --arg variant "$1" '
     {run_id:"R",msg:"run claimed"} as $claim |
-    {run_id:"R",msg:"run parked for transient recovery",detail:"recovering retained work before reseeding"} as $park |
-    {run_id:"R",msg:"recovery: guarded inventory disposition",generation:2,capture_id:"capture",state:"uploaded"} as $capture |
-    (if $variant=="legacy" then [$claim,$claim,$park,($capture+{msg:"recovery: park/early-terminal disposition outcome",claim_generation:2}),$claim]
-     else [$claim,$claim,$park,$capture,$capture,$claim] end) |
-    if $variant=="wrong-generation" then .[3].generation=3 | .[4].generation=3
-    elif $variant=="wrong-order" then [.[0],.[1],.[3],.[2],.[4],.[5]]
-    elif $variant=="two-captures" then .[4].capture_id="other"
-    elif $variant=="missing-id" then .[3].capture_id=null | .[4].capture_id=null
+    {run_id:"R",msg:"stub executor committed marker",branch:"agent/issue-1"} as $branch |
+    {run_id:"R",msg:"recovery: bundle uploaded (durable capture)",server_capture_id:"capture",server_state:"available"} as $capture |
+    {run_id:"R",msg:"recovery: guarded inventory disposition",generation:2,capture_id:"local-capture",state:"uploaded"} as $typed |
+    {msg:"runner clone: seeding",branch:"agent/issue-1",path:"/data/runner/issue-1.attempt-time-g2-0123456789abcdef"} as $seed |
+    {run_id:"R",msg:"recovery: prior open custody holds inventoried after clone",claim_generation:2} as $ready |
+    [$claim,$branch,$claim,$capture,$capture,
+      (if $variant=="legacy" then ($typed | del(.generation) | .msg="recovery: park/early-terminal disposition outcome" | .claim_generation=2) else $typed end),$seed,$ready] |
+    if $variant=="single-upload" then del(.[4])
+    elif $variant=="wrong-generation" then .[7].claim_generation=3
+    elif $variant=="wrong-order" then [.[0],.[1],.[2],.[6],.[3],.[4],.[5],.[7]]
+    elif $variant=="two-captures" then .[4].server_capture_id="other"
+    elif $variant=="missing-id" then .[3].server_capture_id=null | .[4].server_capture_id=null
+    elif $variant=="extra-claim" then . + [$claim]
+    elif $variant=="wrong-seed-generation" then .[6].path="/data/runner/issue-1.attempt-time-g3-0123456789abcdef"
     else . end | .[]' > "$SEQ_DIR/events"
 }
 capture_fixture guarded
-custody_case "guarded G+1 capture retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_park R 2
+custody_case "guarded typed G+1 same-claim retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
 capture_fixture legacy
-custody_case "legacy G+1 capture contract still accepted" pass 'exact generation 2 captured' f42_assert_capture_park R 2
-for variant in wrong-generation wrong-order two-captures missing-id; do
+custody_case "legacy typed G+1 same-claim capture still accepted" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+capture_fixture single-upload
+custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+for variant in wrong-generation wrong-order two-captures missing-id extra-claim wrong-seed-generation; do
   capture_fixture "$variant"
-  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_park R 2
+  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
 done
+
+cap2_recovery_contract() {
+  local mode="$1" RUN_KA=R RUN_KB=S fixture_generation=2
+  # shellcheck disable=SC2034  # used by the old real phase statements in the regression
+  local RWC_KA RWC_KB
+  [ "$mode" != extra-generation ] || fixture_generation=3
+  db_psql() { case "$1" in *claim_generation*) echo "$fixture_generation";; *) echo 0;; esac; }
+  wait_same_claim_capture_resume() {
+    [ "$mode" != missing-capture ] || fail 'cap2 recovery missing exact capture'
+    [ "$2:$4" = 2:agent/fixture ] || fail 'cap2 recovery lost generation or branch'
+  }
+  local definition
+  definition="$(awk '/^assert_cap2_recovered_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  if [ -n "$definition" ]; then
+    eval "$definition"
+    assert_cap2_recovered_run R 1 agent/fixture
+  else
+    # Run the old real counter assertion against a valid same-claim recovery.
+    eval "$(awk '/^  RWC_KA=/ { inside=1 } inside {print} /^  pass "restarted worker/ {inside=0}' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  fi
+  echo 'cap2 capture verified inside the one successor claim'
+}
+custody_case "cap2 kill recovery accepts same-claim capture without a park" pass 'cap2 capture verified' cap2_recovery_contract valid
+custody_case "cap2 kill recovery refuses an extra generation" fail 'recovery generation' cap2_recovery_contract extra-generation
+custody_case "cap2 kill recovery requires capture evidence" fail 'missing exact capture' cap2_recovery_contract missing-capture
 
 # The spent finalize allowance preserves recoverable work after #2426. Exercise
 # the phase's exact outcome assertions without a stack or timing dependency.
@@ -451,7 +485,15 @@ completed_receipt_fixture() {
     jq -nc --arg run "$UUID" --arg step "$step" '{run_id:$run,status:"completed",generation:1,holds:[
       {id:"own-hold",generation:1,inventory_guarded:true,state:"released",after_outcome:true,
         final_disposition:"archive",release_evidence:"archive",archive_matches:true}]}
-      | if $step=="open" then .holds[0] += {state:"open",final_disposition:null,release_evidence:null}
+      | if $step=="completed-publication" then
+          . += {owner_id:"owner",worker_id:"worker",repo_id:"repo",mr_iid:7,branch:"agent/issue-1",final_head:("a"*40)} |
+          {hold_id:"own-hold",run_id:$run,owner_id:"owner",worker_id:"worker",generation:1,repo_id:"repo",
+            connection_id:"connection",project_id:1,forge_type:"gitlab",base_url:"https://example.test",
+            branch:"agent/issue-1",mr_iid:7,final_head:("a"*40)} as $identity |
+          .holds[0] += {final_disposition:"completed_publication",release_evidence:"completed_publication",
+            final_capture_id:null,final_source_sha:null,final_coverage_digest:null,final_publication_id:null,
+            completion_identity:$identity,completed_publication_receipt:($identity+{observed_branch_head:("b"*40)})}
+        elif $step=="open" then .holds[0] += {state:"open",final_disposition:null,release_evidence:null}
         elif $step=="missing" then .holds=[]
         elif $step=="duplicate" then .holds += .holds
         elif $step=="wrong-generation" then .holds[0].generation=2
@@ -500,6 +542,33 @@ completed_receipt_fixture legacy-before-completion
 custody_case "legacy archive receipt may precede completion" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
 completed_receipt_fixture failed
 custody_case "failed run cannot satisfy completed custody boundary" fail 'missing exact run/generation/hold' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture completed-publication
+custody_case "completed publication accepts its exact immutable receipt" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+for field in hold_id run_id owner_id worker_id generation repo_id connection_id project_id forge_type base_url branch mr_iid final_head; do
+  completed_receipt_fixture completed-publication
+  jq -c --arg field "$field" '.holds[0].completed_publication_receipt[$field]="other"' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
+  mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+  custody_case "publication receipt refuses mismatched $field" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
+done
+completed_receipt_fixture completed-publication
+jq -c '.holds[0].completed_publication_receipt.observed_branch_head="invalid"' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
+mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+custody_case "publication receipt refuses an invalid observed head" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
+
+handoff_receipt_boundary() {
+  # shellcheck disable=SC2034  # consumed by the evaluated real phase statements
+  local RUN_T=T RUN_M=M settled=""
+  wait_completed_custody_receipt() { settled="$settled $1"; }
+  assert_settled() { case " $settled " in *" $1 "*) ;; *) fail "handoff $1 leaves a pending receipt for custody seeding";; esac; }
+  assert_no_receipt_wait() { case " $settled " in *" $1 "*) fail "no-MR handoff $1 must not require an unstated custody receipt";; esac; }
+  eval "$(awk '
+    /^wait_completed_custody_receipt / { print }
+    /^RM_JSON=.*handoff rm/ { print "assert_no_receipt_wait T" }
+    /^pass "task\/handoff coverage complete/ { print "assert_settled M" }
+  ' "$ROOT/e2e/phases/70-handoff.sh")"
+  echo 'MR handoff receipt settles before the next phase; no-MR cleanup has no receipt gate'
+}
+custody_case "only the MR handoff owes the prior receipt boundary" pass 'MR handoff receipt settles' handoff_receipt_boundary
 
 diagnostic_trap() {
   local phase="$1" status="$2"
@@ -740,6 +809,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 121 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 143 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 121 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 143 ] && [ "$cases" -eq "$passed" ]

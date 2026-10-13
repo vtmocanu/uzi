@@ -39,8 +39,10 @@ Open **Admin → Instance → Agent source**:
 4. **Sync automatically on the interval below** — the enable toggle. Leaving
    it off doesn't stop you from syncing by hand (below); it only stops the
    timer.
-5. **Sync interval** — how often the automatic reconcile re-checks the
-   source, as a Go duration (e.g. `1h`).
+5. **Sync interval** — how often the enabled timer discovers updates and
+   stages the configured ref, as a Go duration (e.g. `1h`). Each tick checks
+   advertised refs first, then syncs; either operation can fail without
+   preventing the other. The timer does not bump the pin or apply templates.
 6. **Access credential** — only needed for a private repo. Write-only:
    pasting a value seals it and it is never shown again; leave it blank to
    keep whatever is already stored.
@@ -85,8 +87,8 @@ hand. Two preconditions to know before you click it:
 
 ## 2. Sync, review, approve
 
-Once a repository URL is saved, click **Sync now** (or wait for the
-interval) to fetch the pinned ref and stage what it finds. The card's
+Once a repository URL is saved, click **Sync now** (or wait for an automatic
+tick if enabled) to fetch the configured ref and stage what it finds. The card's
 **Sync status** panel shows when it last synced, the fetched commit, and
 counts of roles staged, changed, and failed.
 
@@ -96,7 +98,12 @@ Next to **Sync now** is **Check for updates**. It does the same lightweight
 `git ls-remote` (a ref-advertisement round trip, no full clone) the preset
 above uses, but against the **saved, configured** source with its stored
 credential, and it records what it finds — a check never stages or applies
-anything on its own.
+anything on its own. The enabled automatic timer also runs this discovery
+on the existing **Sync interval**, independently of staging the configured
+ref. **Sync now** stages without checking for newer refs; **Check for updates**
+discovers without staging. Neither action bumps the pin or applies templates.
+Failed discovery preserves the last-good recorded facts; a staging failure
+does not erase a successful discovery.
 
 The **Sync status** panel then derives an "update available" badge from
 what the last check found, plus the current configuration, with **no
@@ -106,8 +113,8 @@ further network call**. How the badge clears depends on the pin type: a
 leaves it showing), while a **branch-moved** badge clears once an **apply**
 advances the last-applied SHA to match the tip recorded by the last check.
 The comparison is against that recorded tip, not the live branch, so a
-branch that moves again after the check needs another **Check for updates**
-to re-evaluate. What counts as
+branch that moves again after the check needs another automatic discovery
+or **Check for updates** to re-evaluate. What counts as
 "newer" depends on how the source is pinned:
 
 - **Tag-pinned** (e.g. `v1.2.0`) — the badge reads **"Update available:
@@ -132,6 +139,25 @@ When the tag-pinned badge is showing, a **Bump pin to `<tag>`** button
 appears beside it. Clicking it only rewrites the saved **Ref** to that tag
 — it doesn't sync or apply anything by itself. Click **Sync now**
 afterward, then review and approve the staged diff as usual.
+
+### Health and admin badges
+
+[Admin Health](./admin-health.md#agent-source-updates) includes an
+instance-scoped housekeeping check, `agentsource.update`, derived from the
+same persisted discovery facts. It reads `warn` for an available update,
+`ok` when a recorded check finds no update, `na` when disabled, unconfigured
+or pinned to a full SHA, and `unknown` before a recorded check or when settings
+cannot be read. It never reads `danger` and cannot trigger the Danger banner
+or admin Danger notices. It does not diagnose sync failures or the age of
+last-good discovery facts.
+
+Warnings and unknowns contribute to the Admin sidebar and Health tab attention
+counts. The **Instance** tab also shows a separate agent-source advisory mark:
+update available for `warn`, status unavailable for `unknown`. Health's action
+links directly to `/admin/settings#agent-source` to review the source. As with
+the card badge, bumping a tag pin clears its update signal; applying a snapshot
+matching the recorded branch tip clears a branch signal. A successful sync
+alone does not clear either signal.
 
 ### Staging and approval: nothing applies itself
 
@@ -223,7 +249,7 @@ status` prints the sync status (last sync/apply time and SHA, staged
 counts, whether a snapshot is pending review) plus the derived update
 signal — `update_available`, and (once a check has run) `latest_ref` and
 `update_checked_at`. These are computed the same way the web badge is: from
-the last **Check for updates** result plus the live config, with no
+the last automatic or manual discovery result plus the live config, with no
 network call from the CLI itself. Both commands are read-only, like every
 other `uzi admin` command — see [uzi CLI](./cli.md#commands). Setting up
 the source, and clicking **Sync now**, **Check for updates**, **Bump pin**,

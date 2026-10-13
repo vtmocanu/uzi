@@ -48,6 +48,7 @@ GitHub label descriptions mirror the one-liners below; keep both in sync.
 ## Labels with consumers: never rename or repurpose
 
 - `uzi`: run eligibility. `bug`, `Planned` and `on-deck` (ondeck-sweep, [on-deck.md](on-deck.md)): sweep selectors. `refactor`: refactor-sweep selector.
+- `harness::codex`, `harness::claude`: automatic issue-start harness selection (issue schedules, all sweep selectors and autopilot). Fresh forge labels select one harness without credential fallback; both or unknown `harness::*` values refuse the start. Manual run creation and chat `start_run` do not consume them. See [scheduling](../../../../docs/scheduling.md#which-harness-a-schedule-runs-on).
 - `In Progress`, `Human Review`: uzi board columns (`api/internal/board/board.go`).
 - `Later`, `brainstorm`: this skill's park tiers. `local`, `scheduled`, `acceptance`, `agent-found`, `nightly-e2e*`: workflow markers.
 - `reviewed`: root `AGENTS.md` rule. `recurring`: above. `unreviewed`: intake, awaiting first triage.

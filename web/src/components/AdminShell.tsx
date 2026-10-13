@@ -11,10 +11,11 @@ import type { ReactNode } from "react";
 import { CountPill, cx, PageHeader } from "./ui";
 import { healthPipLabel } from "../lib/healthView";
 import { useHealthStatus } from "../lib/useAdminHealth";
+import { SeverityShape } from "./healthSeverity";
 
 // Health is last (PRD #1484 D1); its entry points are the sidebar pip
-// (M5) and the Overview card (M5), not tab position. `pip: true` marks the one tab that
-// carries the health severity pip when checks need attention.
+// (M5) and the Overview card (M5), not tab position. `pip: true` marks the aggregate
+// health severity pip; Instance separately carries the agent-source advisory mark.
 const TABS = [
   { to: "/admin/users", label: "Users" },
   { to: "/admin/rate-limits", label: "Rate limits" },
@@ -37,6 +38,8 @@ export function AdminShell({ description, children }: { description: ReactNode; 
   // Danger dominates the pip tone, else warn (warn covers unknown, which ranks as warn). The
   // label names every non-zero severity in words (PRD #1648 D9), so the tone is never the
   // only carrier of severity.
+  const sourceSeverity = health?.checks.find((c) => c.id === "agentsource.update")?.severity;
+  const sourcePip = sourceSeverity === "warn" || sourceSeverity === "unknown";
   const pipDanger = (health?.counts.danger ?? 0) > 0;
   const pipLabel = health ? healthPipLabel(health.counts) : "";
 
@@ -47,7 +50,8 @@ export function AdminShell({ description, children }: { description: ReactNode; 
   // 100-300 ms after mount, widening the (rightmost) Health tab; without it in the deps the
   // scroll runs once on the pre-pip width and leaves the just-rendered pip's count clipped at
   // the strip's right edge on a narrow viewport (PRD #1484 M4 review). `attention`/`pipDanger`
-  // are the two inputs to the pip's rendered width.
+  // are the inputs to the aggregate pip's rendered width. Source severity/presence
+  // also re-run the scroll when the independent Instance mark changes.
   const stripRef = useRef<HTMLDivElement>(null);
   const { pathname } = useLocation();
   useEffect(() => {
@@ -55,7 +59,7 @@ export function AdminShell({ description, children }: { description: ReactNode; 
     if (active && typeof (active as HTMLElement).scrollIntoView === "function") {
       (active as HTMLElement).scrollIntoView({ block: "nearest", inline: "nearest" });
     }
-  }, [pathname, attention, pipDanger]);
+  }, [pathname, attention, pipDanger, sourcePip, sourceSeverity]);
 
   return (
     <div className="space-y-6">
@@ -83,6 +87,17 @@ export function AdminShell({ description, children }: { description: ReactNode; 
             }
           >
             {t.label}
+            {t.to === "/admin/settings" && sourcePip && (
+              <SeverityShape
+                severity={sourceSeverity!}
+                label={
+                  sourceSeverity === "warn"
+                    ? "Agent source update available"
+                    : "Agent source update status unavailable"
+                }
+                className={sourceSeverity === "warn" ? "text-warn" : "text-muted"}
+              />
+            )}
             {t.pip && attention > 0 && (
               <CountPill count={attention} tone={pipDanger ? "alert" : "warn"} label={pipLabel} />
             )}

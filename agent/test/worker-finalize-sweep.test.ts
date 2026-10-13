@@ -72,10 +72,40 @@ type Seam = {
   sweepPendingFinalizes(signal?: AbortSignal): Promise<void>;
   admittedRunIds: Map<string, number>;
 };
-function worker(outbox: Outbox, runner: Partial<RunRunner>, registry?: ActiveRunRegistry): Seam {
-  return new Worker({} as Config, { getRunOwnership: terminal } as unknown as WorkerClient, runner as RunRunner,
+function worker(outbox: Outbox, runner: Partial<RunRunner>, registry?: ActiveRunRegistry,
+  ownership: () => Promise<unknown> = terminal): Seam {
+  return new Worker({} as Config, { getRunOwnership: ownership } as unknown as WorkerClient, runner as RunRunner,
     {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner, nullLogger(),
     () => ({ ok: true, missing: [] }), outbox, new Map(), registry) as unknown as Seam;
+}
+
+for (const fence of ["running", "older", "admission", "registry", "execution", "identity", "abort"] as const) {
+  it(`exact ACK finalize priority preserves the ${fence} fence`, async () => {
+    const { outbox } = await rig();
+    await outbox.journalFinalize(RUN, 1);
+    const registry = new ActiveRunRegistry(() => [], () => 0);
+    const controller = new AbortController();
+    let executing = false;
+    const w = worker(outbox, {
+      recoveryFinalAcknowledged: async () => {
+        if (fence === "admission") w.admittedRunIds.set(RUN, 1);
+        if (fence === "registry") registry.has = () => true;
+        if (fence === "execution") executing = true;
+        if (fence === "identity") {
+          await outbox.retireFinalize(RUN, 1);
+          await outbox.journalFinalize(RUN, 1);
+        }
+        if (fence === "abort") controller.abort();
+        return true;
+      },
+      isExecuting: () => executing,
+      recoveryInventoryPending: async () => false,
+      retireRecoveryReport: async () => false,
+    }, registry, fence === "running" ? running : fence === "older" ?
+      async () => ({ status: "completed", claim_generation: 0 }) : terminal);
+    await w.sweepPendingFinalizes(controller.signal);
+    assert.ok(outbox.finalizeRecordIdentity(RUN, 1), "ACK priority grants no permission past the existing fence");
+  });
 }
 function fakeOutbox(entries: PendingFinalize[]) {
   const deleted: PendingFinalize[] = [];

@@ -66,6 +66,12 @@ const (
 	// skipReasonForErr, so a stored override that reaches the create seam classifies the same way.
 	SkipCodexOverrideConflict SkipReason = "codex_override_conflict"
 
+	// SkipHarnessLabelConflict: the issue's harness label disagrees with the schedule pin.
+	SkipHarnessLabelConflict SkipReason = "harness_label_conflict"
+
+	// SkipHarnessLabelInvalid: the issue has both recognized labels or an unsupported harness::* value.
+	SkipHarnessLabelInvalid SkipReason = "harness_label_invalid"
+
 	// SkipSchedulesPaused ← the user-level "pause all schedules" kill switch (PRD #1093):
 	// the owner has paused every schedule they own (optionally until an auto-resume instant),
 	// so a fire that comes due while paused starts no run. Benign for a recurring row: the
@@ -82,7 +88,11 @@ const (
 	// recurring row instead: the schedule advances normally and re-fires next cadence, once the
 	// owner configures a usable credential. This is deliberately narrower than
 	// ErrNoCredentialForHarness (an EXPLICIT/inherited harness that is unusable), which stays a
-	// hard, non-advancing refusal — only the implicit "neither harness usable" case is benign.
+	// hard, non-advancing refusal in skipReasonForErr. createIssueRun also records this reason
+	// for an unpinned, label-selected sweep candidate whose selected harness has no usable
+	// credential; sibling candidates may use another harness. That candidate skip does not
+	// hold a one-time sweep or stop its siblings. This scoped classification does not change
+	// the global refusal mapping or the single-issue schedule's hard refusal.
 	SkipNoUsableCredential SkipReason = "no_usable_credential" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential — mirrors the same-shaped exclusion already granted the "credential"-named vocabulary constants elsewhere (e.g. store.KindAnthropicToken, capability.CredentialSwitchV1).
 
 	// SkipCredentialDisabled ← workersvc.ErrCredentialDisabled or
@@ -93,7 +103,10 @@ const (
 	// once the owner enables the credential or changes the pin. A one-time row is held
 	// un-advanced instead, with this skip recorded in last_fire (holdsOnceCredentialDisabled), so
 	// its pinned work waits rather than being consumed. An implicit-harness fire with no enabled credential anywhere records
-	// no_usable_credential instead (D15).
+	// no_usable_credential instead (D15). createIssueRun also records credential_disabled for
+	// an unpinned, label-selected sweep candidate whose selected harness has only disabled
+	// credentials; that candidate skip does not hold a one-time sweep or stop its siblings.
+	// A disabled stored credential override retains the schedule-wide hold/stop semantics.
 	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
 )
 
@@ -109,6 +122,8 @@ var AllSkipReasons = []SkipReason{
 	SkipSelfImproveMRCapReached,
 	SkipOpenMRExists,
 	SkipCodexOverrideConflict,
+	SkipHarnessLabelConflict,
+	SkipHarnessLabelInvalid,
 	SkipSchedulesPaused,
 	SkipNoUsableCredential,
 	SkipCredentialDisabled,

@@ -116,6 +116,12 @@ func checkStoredOverrideEnabled(ctx context.Context, q credentialSecretMetaReade
 	return nil
 }
 
+// CheckStoredCredentialOverrideEnabled strictly checks a stored schedule override,
+// preserving lookup errors so the scheduler can retry an unreadable pin.
+func (s *Service) CheckStoredCredentialOverrideEnabled(ctx context.Context, userID uuid.UUID, o *CredentialOverride) error {
+	return checkStoredOverrideEnabled(ctx, s.q, userID, o)
+}
+
 // ScheduleCredentialDisabled is the scheduler's read-only pre-fire check of a schedule's stored
 // choices (PRD #1732 D2/D15), made before the fire touches the forge. It returns
 // ErrCredentialDisabled when the stored pin o names a disabled token, ErrHarnessCredentialDisabled

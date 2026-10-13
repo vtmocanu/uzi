@@ -123,18 +123,21 @@ func TestCrewStateRevising(t *testing.T) {
 	}
 }
 
-// A revising run's server progress is planning: both renderers take the planning branch and
-// never claim the run waits on the owner. Reddening mutation: none in the renderers (they key
-// on Progress.State); this guards a future status-keyed branch.
+// A revising run carries planning progress: detail names it, and the board omits
+// the repeated flag. Neither renderer claims it waits on the owner, even with stalled health.
 func TestRevisingProgressNeverWaitsOnYou(t *testing.T) {
 	m := ownerDetail(t, revisingRun("rv-6", true))
 	got := stripANSI(m.renderProgress())
 	if !strings.Contains(got, "planning") || strings.Contains(got, "on you") || strings.Contains(got, "plan gate") {
 		t.Errorf("detail progress for a revising run = %q", got)
 	}
-	cell := stripANSI(m.boardProgCell(m.detail.run.Progress, m.detail.run.Status, nil, true))
-	if strings.Contains(cell, "on you") {
-		t.Errorf("board progress cell = %q", cell)
+	for _, health := range []string{"ok", "stalled"} {
+		r := apitypes.RunListItemDTO{RunDTO: revisingRun("rv-6", true)}
+		r.Health = health
+		cell := stripANSI(m.boardProgressCell(r, false, nil, m.pal.runStateToken(r.RunDTO, r.IsRevising).word))
+		if strings.Contains(cell, "on you") || strings.Contains(cell, "plan gate") {
+			t.Errorf("board progress with health %s = %q", health, cell)
+		}
 	}
 }
 

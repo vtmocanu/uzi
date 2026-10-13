@@ -1850,6 +1850,32 @@ describe("RunRow — Progress cell (PRD #2602)", () => {
     expect(container.textContent).not.toContain("⚠");
   });
 
+  it("shows one percentage in the running status while retaining the milestone badge", () => {
+    const { container } = renderRow({status:"running",
+      milestones:[{id:"a",title:"A"},{id:"b",title:"B"},{id:"c",title:"C"}],
+      milestones_completed:["a"], milestones_in_progress:["b"],
+      progress:{...prog("percent"),pct:40,milestone_done:1,milestone_total:3}});
+    const bar = screen.getByRole("progressbar");
+    expect(bar.textContent).toBe("running · 40%");
+    expect(bar.getAttribute("aria-valuetext")).toBe("Running, about 40%; 1 of 3 milestones done");
+    expect(screen.getByText("M1/3 ◐")).toBeTruthy();
+    expect(container.querySelector('[data-run-progress="percent"]')).toBeNull();
+  });
+
+  it("completion-phase row keeps its server percentage in one status progressbar", () => {
+    const { container } = renderRow({ status: "running", completion_phase: "checking",
+      completion_interlock: true, completion_attempts: 1,
+      milestones: [{id:"a",title:"A"},{id:"b",title:"B"},{id:"c",title:"C"}],
+      milestones_completed: ["a", "b"],
+      progress: {...prog("percent"), pct:70, milestone_done:2, milestone_total:3} });
+    const bars = screen.getAllByRole("progressbar");
+    expect(bars).toHaveLength(1);
+    expect(bars[0].textContent).toBe("Checking completion · 70%");
+    expect(bars[0].getAttribute("aria-valuetext")).toBe("Checking completion, about 70%; 2 of 3 milestones done");
+    expect(screen.getByText("M2/3")).toBeTruthy();
+    expect(container.querySelector('[data-run-progress="percent"]')).toBeNull();
+  });
+
   it("keeps the health badge when the cell is not showing the stalled flag", () => {
     const { container } = renderRow({
       status: "running",

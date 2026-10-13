@@ -71,6 +71,32 @@ it("timeout with unconfirmed native cleanup retains the snapshot reader", async 
   } finally { f.fx.cleanup(); }
 });
 
+it("a slow local-bare identity check runs before the model timer, so the snapshot reader still opens (#2886)", async (t) => {
+  const f = await fixture();
+  try {
+    // The lookup outlasts modelTimeoutMs: had it run after the timer started, the abort would land
+    // before runnerCloneAtCommit and no reader would ever open.
+    const realExisting = f.git.existingBarePathFor.bind(f.git);
+    t.mock.method(f.git, "existingBarePathFor", async (url: string) => {
+      await new Promise((resolve) => setTimeout(resolve, 50));
+      return realExisting(url);
+    });
+    const clone = t.mock.method(f.git, "runnerCloneAtCommit");
+    t.mock.method(f.git, "closeCodeSnapshotReader", async () => assert.fail("unconfirmed reader cannot close"));
+    await new CrossCheckRunner(f.client, f.git, nullLogger(), {
+      homeRoot: f.fx.dataDir, modelTimeoutMs: 5, model: { run: async (_claim, _checkout, _home, signal) => {
+        await new Promise<void>((resolve) => {
+          if (signal.aborted) resolve();
+          else signal.addEventListener("abort", () => resolve(), { once: true });
+        });
+        throw new Error("cross-check cleanup unconfirmed");
+      } },
+    }).execute(f.claim);
+    assert.equal(clone.mock.callCount(), 1, "the timer must not abort ahead of the snapshot reader");
+    assert.equal(JSON.parse(fs.readFileSync(metadataPath(f.bare), "utf8")).readers[0].state, "OPEN");
+  } finally { f.fx.cleanup(); }
+});
+
 it("code snapshot ref survives until child settlement and is deleted by exact name", async (t) => {
   const f = await fixture();
   try {

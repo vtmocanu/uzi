@@ -47,7 +47,16 @@ Sibling generations remain intact. Lightweight context metadata remains when
 referenced by sibling candidates, tracking refs, owner stamps or publication
 receipts/markers; an indeterminate consumer retains that context.
 
-Cleanup proceeds in this order:
+Issue #2854 qualifies this order while an exact terminal/finalize report is pending,
+or outbox initialization failed: canonical local bundles may be unlinked after the
+covering ACK and execution/quarantine checks, before step 1. ACK journals and pins
+remain until report retirement (or a healthy store proves no pending report).
+The retained ACK preserves the acknowledged-inventory report clause below.
+Redundancy claims wait with the report; server `local_replica_worker_id` retention
+and the absence of acknowledged-bundle readers make this byte-only deletion safe.
+See [ADR-2652](2652-report-only-retirement.md#consequences-and-limits).
+
+Outside that pending-report exception, cleanup proceeds in this order:
 
 1. Delete the selected generation's recovery and coverage refs and unshared
    owed refs using their expected SHAs, then read back to verify deletion.

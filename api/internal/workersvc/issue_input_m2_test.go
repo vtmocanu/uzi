@@ -55,7 +55,7 @@ func TestM2CreatePolicyScheduleOnly(t *testing.T) {
 				case "manual":
 					_, err = svc.CreateRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, false, nil, nil, nil)
 				case "poller":
-					_, err = svc.CreateAutopilotRun(context.Background(), user, repo, 4, "caller raw body")
+					_, err = svc.CreateAutopilotRun(context.Background(), user, repo, 4, "caller raw body", nil)
 				case "schedule_manual":
 					_, err = svc.CreateScheduledRun(context.Background(), user, repo, 4, "caller raw body", nil, nil, nil, false, nil, nil, nil)
 				case "schedule_auto":

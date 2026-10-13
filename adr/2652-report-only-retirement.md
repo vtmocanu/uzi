@@ -124,6 +124,40 @@ custody or report authority.
 
 ## Consequences and limits
 
+Issue #2854: an acknowledged FINAL's exact generation evidence stays available while that generation
+has a pending terminal or finalize report. FINAL's existing cleanup retries defer the
+journal and pin removal until the report retires, including across worker restart.
+The retained covering ACK preserves [ADR-2417](2417-guarded-local-retention.md)'s
+existing acknowledged-inventory report-retirement authority, which normally handles the
+terminal report. The independent archive-backed predicate above still works when that
+ACK clause is unavailable. Retention preserves these authorities; it does not mint one.
+
+Unlike the previous ordering, local bundle unlink does not wait for
+`cleanupRecoveryGeneration` to return `removed`: an authenticated covering ACK, canonical
+bundle paths and the existing execution/quarantine guard suffice. No path reads an
+acknowledged record's local bundle. ADR-2417's server retention while
+`local_replica_worker_id` is set preserves the uploaded bytes. The journal and pins remain
+for ancestry and retry; redundancy claims are deferred until the pending report clears,
+so this cleanup does not request expiry of an archive the report may still need.
+
+A disabled outbox at initialization conservatively protects every acknowledged generation,
+even if no report was loaded. A failed initialization cannot establish physical absence;
+narrowing this to an empty in-memory pending set would lose that guarantee. Such records
+retain journals and run-scoped pins indefinitely, but their local bundles are freed.
+ACK cleanup protected by a pending report is excluded before the live-pass cap
+(four by default), leaving slots for uploads and FINAL. Once the exact report retires,
+its ACK cleanup becomes eligible again. There is no
+per-recovery TTL or quota; data-volume statfs accounting, disk pressure and owed-head
+admission remain in force. A repaired store or successful exact report retirement permits
+the existing cleanup retry. One debug diagnostic per retained ACK exposes the deferral.
+
+Finalize retirement checks the exact covering ACK before attempting an archive-only
+proof under the same authority deadline. It then uses the existing ownership,
+incarnation and live-execution fences and conditional outbox unlink. A slow alternative
+proof must not consume the whole deadline before an already-authoritative ACK can be
+used. Absent, legacy and unknown inventory do not qualify for this priority; their
+existing proof paths are unchanged.
+
 A healthy covering thin capture may retire a report while custody remains open.
 Once live execution has ended, the next accepted heartbeat omits the retired
 report's terminal-pending active-run row. This changes the worker's pending-report
@@ -136,8 +170,9 @@ remain distinct.
 Rollout is evidence-based rather than version-based. Older workers keep their
 existing report policy; older API responses or old journals missing the required
 contract evidence cannot supply this new authority. Workers retain reports
-until fresh supported evidence satisfies the full predicate. No API, schema,
-workflow, custody or physical-cleanup change is introduced here. Ordinary report
+until fresh supported evidence satisfies the full predicate. The original #2652 change
+introduced no API, schema, workflow, custody or physical-cleanup change. Issue #2854
+changes only the local cleanup ordering described above. Ordinary report
 retirement work in #2655 is outside this decision.
 
 ## Validation evidence

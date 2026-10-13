@@ -52,15 +52,33 @@ function runtimeSecret(): string {
 }
 
 function realGitleaks(): string {
+  let bin = "";
   try {
     const p = execFileSync("sh", ["-c", "command -v gitleaks"], { encoding: "utf8" }).trim();
-    return path.isAbsolute(p) ? p : "";
+    if (path.isAbsolute(p)) bin = p;
   } catch {
-    return "";
+    // Discovery failure is optional locally, but must never be a CI skip.
   }
+  assert.ok(bin || !process.env.CI, "CI requires the real gitleaks binary on PATH");
+  return bin;
 }
 const REAL = realGitleaks();
 const skip = REAL ? false : "gitleaks is not on PATH in this environment";
+
+it("missing real gitleaks fails in CI and remains optional locally", () => {
+  const oldPath = process.env.PATH;
+  const oldCI = process.env.CI;
+  try {
+    process.env.PATH = "";
+    process.env.CI = "1";
+    assert.throws(realGitleaks, /CI requires the real gitleaks/);
+    delete process.env.CI;
+    assert.equal(realGitleaks(), "");
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldCI === undefined) delete process.env.CI; else process.env.CI = oldCI;
+  }
+});
 
 const errors: unknown[] = [];
 afterEach(() => {

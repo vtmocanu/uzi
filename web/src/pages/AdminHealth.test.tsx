@@ -135,7 +135,7 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
 
   it("shows both Codex pricing reasons and operator docs without blocking work", async () => {
     const doc = healthySilentDoc();
-    expect(doc.checks).toHaveLength(20);
+    expect(doc.checks).toHaveLength(21);
     const pricing = doc.checks.find((c) => c.id === "pricing.codex")!;
     pricing.severity = "warn";
     pricing.summary = "2 Codex models lack usable pricing";
@@ -161,8 +161,8 @@ describe("AdminHealth — attention card and all-clear line (M3)", () => {
     expect(container.querySelector('[role="alert"], [role="status"]')).toBeNull();
     expect(screen.queryByRole("heading", { name: /blocking|attention/ })).toBeNull();
     expect(attentionIds(container)).toEqual([]);
-    // Every check's shape carries its word; all 20 read OK, none Warn/Danger.
-    expect(screen.getAllByText("OK").length).toBe(20);
+    // Every check's shape carries its word; all 21 read OK, none Warn/Danger.
+    expect(screen.getAllByText("OK").length).toBe(21);
     expect(screen.queryByText(/^(Warn|Danger|Unknown)$/)).toBeNull();
     expect(screen.queryByLabelText(/health checks? needs? attention/)).toBeNull();
   });
@@ -419,12 +419,12 @@ describe("AdminHealth — copy feedback lifecycle", () => {
 describe("AdminHealth — All checks inventory (M4)", () => {
   it("counts: header and per-group status, na excluded from every denominator", async () => {
     await renderHealth(healthySilentDoc());
-    expect(screen.getByText("20 of 20 passing")).toBeTruthy();
+    expect(screen.getByText("21 of 21 passing")).toBeTruthy();
     // workers (5, fleet.rundisk and fleet.quarantine included), queue (2), control (4),
-    // integrations (3), housekeeping (6).
+    // integrations (3), housekeeping (7).
     // Exact per-string tallies: integrations reads "all 3 passing", control "all 4 passing".
     expect(screen.getAllByText("all 5 passing").length).toBe(1);
-    expect(screen.getByText("all 6 passing")).toBeTruthy();
+    expect(screen.getByText("all 7 passing")).toBeTruthy();
     expect(screen.getAllByText("all 2 passing").length).toBe(1);
     expect(screen.getAllByText("all 3 passing").length).toBe(1);
     expect(screen.getAllByText("all 4 passing").length).toBe(1);
@@ -433,7 +433,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
 
   it("incident: attention groups read 'K of N need attention'", async () => {
     await renderHealth(incidentDoc());
-    expect(screen.getByText("16 of 20 passing")).toBeTruthy();
+    expect(screen.getByText("17 of 21 passing")).toBeTruthy();
     expect(screen.getByText("2 of 5 need attention")).toBeTruthy(); // workers: fleet.rundisk and fleet.quarantine stay ok
     expect(screen.getByText("1 of 2 need attention")).toBeTruthy(); // queue
     expect(screen.getByText("1 of 3 need attention")).toBeTruthy(); // integrations
@@ -504,7 +504,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     expect(screen.getByText("All systems normal.")).toBeTruthy();
     // fleet.roll, controller.report, db.size and slack.socket are N/A (never green, never gone).
     expect(screen.getAllByText("N/A").length).toBe(4);
-    expect(screen.getByText("16 of 16 passing, 4 not applicable")).toBeTruthy();
+    expect(screen.getByText("17 of 17 passing, 4 not applicable")).toBeTruthy();
     expect(screen.getByText("all 4 passing, 1 not applicable")).toBeTruthy(); // workers (fleet.rundisk and fleet.quarantine apply)
     expect(screen.getAllByText("all 2 passing, 1 not applicable").length).toBe(1); // integrations
     expect(screen.getAllByText("all 2 passing, 2 not applicable").length).toBe(1); // control
@@ -522,7 +522,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
   it("a group whose checks are all N/A reads 'not applicable'", async () => {
     await renderHealth(withSeverity(noHostedWorkersDoc(), { "forge.ciwatch": "na", "forge.sync": "na" }));
     expect(screen.getByText("not applicable")).toBeTruthy();
-    expect(screen.getByText("14 of 14 passing, 6 not applicable")).toBeTruthy();
+    expect(screen.getByText("15 of 15 passing, 6 not applicable")).toBeTruthy();
   });
 
   it("no interactive element is nested inside another", async () => {

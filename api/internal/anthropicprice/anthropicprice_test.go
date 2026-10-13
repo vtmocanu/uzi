@@ -5,8 +5,8 @@ import "testing"
 func i64(v int64) *int64 { return &v }
 
 func TestPriceExactMicrodollars(t *testing.T) {
-	// 1,000,000 of each token class on Sonnet 5.5 = 2 + 0.20 + 2.50 + 4 + 10 = $18.70 exactly
-	// (the pricing page's per-MTok rates), i.e. 1,870,000,000 hundredths of a microdollar.
+	// 1,000,000 of each token class on Sonnet 5.5 = 2 + 0.10 + 2.50 + 4 + 10 = $18.60 exactly
+	// (the pricing page's per-MTok rates), i.e. 1,860,000,000 hundredths of a microdollar.
 	got, ok := Price(Usage{
 		Model:                    "claude-sonnet-5-5",
 		InputTokens:              1_000_000,
@@ -19,11 +19,11 @@ func TestPriceExactMicrodollars(t *testing.T) {
 	if !ok {
 		t.Fatal("standard Sonnet 5.5 usage must be priced")
 	}
-	if g := got.HundredthMicroUSD(); g != "1870000000" {
-		t.Fatalf("cost = %s hundredth-microdollars, want 1870000000", g)
+	if g := got.HundredthMicroUSD(); g != "1860000000" {
+		t.Fatalf("cost = %s hundredth-microdollars, want 1860000000", g)
 	}
-	if usd := got.USD(); usd != 18.7 {
-		t.Fatalf("USD() = %v, want 18.7", usd)
+	if usd := got.USD(); usd != 18.6 {
+		t.Fatalf("USD() = %v, want 18.6", usd)
 	}
 }
 
@@ -46,7 +46,7 @@ func TestPriceEveryRowMatchesTheFetchedTable(t *testing.T) {
 		"claude-opus-5-5":           {4, 0.20, 5, 8, 20},
 		"claude-opus-5":             {5, 0.50, 6.25, 10, 25},
 		"claude-opus-4-8":           {5, 0.50, 6.25, 10, 25},
-		"claude-sonnet-5-5":         {2, 0.20, 2.5, 4, 10},
+		"claude-sonnet-5-5":         {2, 0.10, 2.5, 4, 10},
 		"claude-haiku-4-5":          {1, 0.10, 1.25, 2, 5},
 		"claude-haiku-4-5-20251001": {1, 0.10, 1.25, 2, 5},
 	}
@@ -111,6 +111,50 @@ func TestPriceStandardMarkersArePriced(t *testing.T) {
 	u2 := Usage{Model: "claude-haiku-4-5", CacheCreation5mTokens: i64(0), CacheCreation1hTokens: i64(0)}
 	if c, ok := Price(u2); !ok || c.HundredthMicroUSD() != "0" {
 		t.Fatalf("zero split = %s ok=%v, want 0 true", c.HundredthMicroUSD(), ok)
+	}
+}
+
+func TestPriceNotAvailableInferenceGeoUsesStandardRates(t *testing.T) {
+	u := Usage{Model: "claude-haiku-4-5-20251001", InputTokens: 10,
+		CacheReadInputTokens: 12326, CacheCreationInputTokens: 5572,
+		CacheCreation5mTokens: i64(0), CacheCreation1hTokens: i64(5572),
+		OutputTokens: 1, ServiceTier: "standard"}
+	want, ok := Price(u)
+	if !ok {
+		t.Fatal("absent geography must price")
+	}
+	u.InferenceGeo = "not_available"
+	got, ok := Price(u)
+	if !ok || got.HundredthMicroUSD() != want.HundredthMicroUSD() {
+		t.Fatalf("not_available = %s ok=%v, want %s true", got.HundredthMicroUSD(), ok, want.HundredthMicroUSD())
+	}
+	for _, geo := range []string{"us", "unknown"} {
+		u.InferenceGeo = geo
+		if _, ok := Price(u); ok {
+			t.Errorf("%s geography must remain unpriced", geo)
+		}
+	}
+	u.Model = "claude-haiku-4-5"
+	u.InferenceGeo = "not_available"
+	if c, ok := Price(u); !ok || c.HundredthMicroUSD() != want.HundredthMicroUSD() {
+		t.Fatal("the undated Haiku 4.5 alias must use the same standard rates")
+	}
+}
+
+func TestPriceNotAvailableInferenceGeoOnCapableModelsStaysUnpriced(t *testing.T) {
+	for _, model := range []string{"claude-fable-5-1", "claude-opus-5-5", "claude-opus-5", "claude-opus-4-8", "claude-sonnet-5-5"} {
+		t.Run(model, func(t *testing.T) {
+			if _, ok := Price(Usage{Model: model, InputTokens: 100, InferenceGeo: "not_available"}); ok {
+				t.Fatal("missing geography evidence on a geo-capable model must stay unpriced")
+			}
+		})
+	}
+}
+
+func TestPriceSonnet55CacheReadUsesFivePercentOfInput(t *testing.T) {
+	c, ok := Price(Usage{Model: "claude-sonnet-5-5", CacheReadInputTokens: 1_000_000})
+	if !ok || c.HundredthMicroUSD() != "10000000" {
+		t.Fatalf("Sonnet 5.5 cache read = %s ok=%v, want $0.10", c.HundredthMicroUSD(), ok)
 	}
 }
 

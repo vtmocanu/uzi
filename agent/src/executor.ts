@@ -254,10 +254,10 @@ export interface RunContext {
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** PRD #1064 M1 (Decision 2, resumed runs): the run's FROZEN milestone list as carried
-   *  on the claim (`ClaimResponse.milestones`). The implement loop assigns its own
-   *  `frozenMilestones` at the plan gate, but that stays undefined on a PRE-APPROVED RESUME
-   *  (no gate runs there), so the transition-frame closure falls back to THIS list for the
-   *  `<title>` on a re-claimed run. Absent/null ⇒ a titleless frame (`milestone m2 started`)
+   *  on the claim (`ClaimResponse.milestones`). The implement loop uses the gate's list
+   *  on a fresh approval and this claim's list on a pre-approved resume. Transition frames
+   *  also fall back to this list for the `<title>` on a re-claimed run. Absent/null ⇒ a
+   *  titleless frame (`milestone m2 started`)
    *  rather than a skip. Never load-bearing — a milestone with no title still emits a frame. */
   frozenMilestones?: Milestone[] | null;
   /** SDK session to resume; null/absent for a fresh run. The runner clears this when

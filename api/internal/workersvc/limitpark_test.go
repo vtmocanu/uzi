@@ -1074,7 +1074,7 @@ func TestEveryCreationPathStampsWaitOnLimit(t *testing.T) {
 			userByID:        optedIn,
 		}
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateAutopilotRun(context.Background(), optedIn.ID, uuid.New(), 4, "d"); err != nil {
+		if _, err := svc.CreateAutopilotRun(context.Background(), optedIn.ID, uuid.New(), 4, "d", nil); err != nil {
 			t.Fatalf("CreateAutopilotRun: %v", err)
 		}
 		if !fs.createRunParams.WaitOnLimit {

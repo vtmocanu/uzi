@@ -68,6 +68,15 @@ the service tier. These figures compare work across harnesses, **not a
 bill**; subscription users may also consume purchased credits beyond
 included usage.
 
+Claude summary and Now entries without a provider cost are priced from uzi's
+standard Anthropic table. For Haiku 4.5's dated and undated model IDs,
+`inference_geo: "not_available"` uses standard pricing: these table rows predate
+geographic routing ([usage-report semantics](https://platform.claude.com/docs/en/manage-claude/usage-cost-api#data-residency),
+[standard pricing for earlier models](https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing)).
+The marker stays unpriced on geo-capable models because it cannot rule out a
+routing premium. Other non-standard geographies remain unpriced.
+Existing unreported summary/Now rows are not backfilled.
+
 The legacy `subscription` status means **no cost estimate was recorded**.
 It can come from a historical run or a worker not yet rolled to the new
 pricing behavior. Its tokens remain, but its numeric zero is a storage
@@ -110,11 +119,12 @@ carries it as `usage_estimated_tail`). The design is in
 
 - **It is an estimate, with provenance.** The dollar figure is priced from
   Anthropic's official standard pricing page as fetched on 2026-10-03 and
-  recorded as a version id (`anthropic-standard-2026-10-03`), shown beside the
+  recorded as a version id (`anthropic-standard-2026-10-13`), shown beside the
   figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
   cent).
 - **Unpriced means unknown, never $0.** A model the table does not know, a
-  non-standard service tier, speed or inference geo, or cache writes without a
+  non-standard service tier, speed or inference geo (Haiku 4.5's
+  `not_available` counts as standard, see above), or cache writes without a
   consistent 5-minute/1-hour split leaves the cost unknown: the tokens are
   still shown, and the cost reads "cost unknown". `uzi run get` then shows
   "cost unknown (unpriced)" with no price-table version, since no table was

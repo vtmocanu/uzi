@@ -1,11 +1,11 @@
-// RunProgressCell is the compact Progress cell of a run row (PRD #2602 M1): the Dashboard
-// "Recent runs" list and the Runs list both render it right after the milestone badge.
+// RunProgressCell renders compact state flags after the milestone badge in Dashboard
+// "Recent runs" and Runs rows. Percentages live in the adjacent running StatusPill.
 // It only renders what the server derived (RunDTO.progress) — never re-derives a percent
 // or a flag client-side (PRD D3) — and every string it draws is enum-derived copy or a
 // number, so no untrusted text reaches it.
 //
 // States (PRD rules 1-8; the board shows `70%` without the ≈ the run page carries):
-//   percent  → `70%` over a thin brand-tone bar (a progressbar, aria value 0-100)
+//   percent  → nothing here; the adjacent running StatusPill carries the estimate
 //   waiting  → `● waits on you · plan gate|question|follow-up · 6m`, warn, one line: the
 //              reason from the status, the elapsed time from status_since (the clock time
 //              rides in the tooltip and the screen-reader text)
@@ -15,8 +15,8 @@
 //              progressShowsStall)
 //   parked / queued / planning → screen-reader-only `Progress: <word>`: the status pill
 //              beside the cell already names the state, so a visible flag would repeat it
-//              (the TUI and CLI, which have no such pill, keep the visible flag)
-//   none     → faint `—`, titled, with a screen-reader `Progress: no estimate`
+//              (the TUI also omits flags already carried by its status word)
+//   none     → screen-reader-only `Progress: no estimate`, no visible placeholder
 // An absent/null progress (a pre-feature server, or a terminal run) or an unknown state
 // (a newer server's enum member) renders nothing, so the row reads exactly as before.
 import type { Run, RunProgress } from "../lib/apiTypes";
@@ -102,34 +102,9 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
   if (!p) return null;
   const clock = now ?? Date.now();
   switch (p.state) {
-    case "percent": {
-      if (typeof p.pct !== "number" || !Number.isFinite(p.pct)) return null;
-      const pct = Math.max(0, Math.min(100, Math.round(p.pct)));
-      const of =
-        p.milestone_total > 0 ? `, ${p.milestone_done} of ${p.milestone_total} milestones done` : "";
-      return (
-        <span
-          data-run-progress="percent"
-          role="progressbar"
-          aria-valuemin={0}
-          aria-valuemax={100}
-          aria-valuenow={pct}
-          aria-label={`Run progress: about ${pct}%${of}`}
-          title={`About ${pct}% through the approved plan${of}`}
-          className="inline-flex w-16 flex-col gap-1"
-        >
-          <span
-            aria-hidden="true"
-            className="font-mono text-[13px] font-semibold leading-none tabular-nums text-fg"
-          >
-            {pct}%
-          </span>
-          <span aria-hidden="true" className="relative h-1 w-full overflow-hidden rounded-full bg-edge">
-            <span className="absolute inset-y-0 left-0 rounded-full bg-brand" style={{ width: `${pct}%` }} />
-          </span>
-        </span>
-      );
-    }
+    case "percent":
+      // Running rows render the estimate inside StatusPill instead of a second bar.
+      return null;
     case "waiting": {
       const reason = waitReason(run.status);
       const at = formatLocalTime(run.status_since);
@@ -171,16 +146,7 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
     case "planning":
       return <Quiet state="planning" word="planning" />;
     case "none":
-      return (
-        <span
-          data-run-progress="none"
-          title="No milestone plan to measure progress against"
-          className="font-mono text-[11px] text-faint"
-        >
-          <span aria-hidden="true">—</span>
-          <span className="sr-only">Progress: no estimate</span>
-        </span>
-      );
+      return <Quiet state="none" word="no estimate" />;
     default:
       return null;
   }

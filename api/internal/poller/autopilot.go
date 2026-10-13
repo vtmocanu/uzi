@@ -24,7 +24,8 @@ import (
 // gate: an issue is uzi's if it carries the uzi_label OR is assigned to the
 // uzi-bot account — PRD #764 M1, widened by PRD #767 M2).
 type RunStarter interface {
-	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
+	ResolveHarnessForUser(context.Context, uuid.UUID, *workersvc.Harness) (workersvc.Harness, error)
+	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error)
 }
 
 // SettingsReader resolves the instance settings the autopilot detector needs: the
@@ -191,18 +192,18 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 
 	// Attribution (Decision 3): the label adder, then the issue author, matched
 	// against the repo owner's declared human_username. Consent (Decision 4): the
-	// owner opted in and has an Anthropic token. Any miss → record-then-comment.
+	// owner opted in and matches the forge identity. Any miss → record-then-comment.
 	author := ""
 	if iss.Author.Valid {
 		author = iss.Author.String
 	}
-	if !eligible(cc, adder, author) {
+	if !consentingOwner(cc, adder, author) {
 		a.recordThenComment(ctx, r, f, iid, eventID, noEligibleUserComment(label))
 		return
 	}
 
 	// Eligible: create the run through the SAME path as a manual start (ownership,
-	// cached-PRD-issue, PRD-link and one-active-run gates all enforced there), only
+	// issue eligibility and one-active-run gates all enforced there), only
 	// with auto_approve set. The description is the fresh forge copy, snapshotted onto
 	// the run exactly as the manual start path snapshots the description it is given.
 	capture, err := issueinput.Fetch(ctx, f, r.ForgeProjectID, iid, cc.BotForgeUserID)
@@ -212,7 +213,21 @@ func (a *Autopilot) handle(ctx context.Context, r store.ListEnabledReposWithConn
 		return
 	}
 
-	_, err = a.runs.CreateAutopilotRun(issueinput.WithCapture(ctx, capture), cc.UserID, r.ID, iid, capture.Issue.Description)
+	selection, err := workersvc.ResolveIssueHarness(capture, r.ForgeProjectID, iid, nil)
+	if err == nil {
+		if selection.LabelSelected {
+			_, err = a.runs.ResolveHarnessForUser(ctx, cc.UserID, selection.Explicit)
+		} else if !cc.HasAnthropicToken {
+			a.recordThenComment(ctx, r, f, iid, eventID, noEligibleUserComment(label))
+			return
+		}
+	}
+	if err != nil {
+		slog.Error("poller: autopilot create run", "repo", r.PathWithNamespace, "issue", iid, "error", err)
+		return
+	}
+
+	_, err = a.runs.CreateAutopilotRun(issueinput.WithCapture(ctx, capture), cc.UserID, r.ID, iid, capture.Issue.Description, selection.Explicit)
 	switch {
 	case err == nil:
 		// Create-then-record: a crash before recording leaves the created run active,
@@ -328,14 +343,9 @@ func (a *Autopilot) uziLabel(ctx context.Context) string {
 	return settings.DefaultUziLabel
 }
 
-// eligible reports whether the repo owner may run this issue under autopilot: they
-// opted in, they have an Anthropic token, and their declared human_username is the
-// label adder or (fallback) the issue author. The adder is preferred per Decision 3,
-// but since the "repo connected by that user" gate admits only the repo owner, the
-// resolved user is the owner either way — so a plain match against the owner's
-// username on adder-then-author is exactly the ordered resolution.
-func eligible(cc store.GetAutopilotConnectionContextRow, adder, author string) bool {
-	if !cc.AutopilotEnabled || !cc.HasAnthropicToken {
+// consentingOwner is checked before fetching fresh issue input or reading credentials.
+func consentingOwner(cc store.GetAutopilotConnectionContextRow, adder, author string) bool {
+	if !cc.AutopilotEnabled {
 		return false
 	}
 	if !cc.HumanUsername.Valid || cc.HumanUsername.String == "" {

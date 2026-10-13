@@ -3,8 +3,10 @@ import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
+import type { AdviceRequest, AdviceUsageSnapshot } from "../src/harness.js";
+import type { OutgoingMessage } from "../src/protocol.js";
 
-import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt } from "../src/review-runner.js";
+import { ReviewRunner, parseTaskReview, fallbackTaskReview, buildReviewPrompt, hasProviderCostForEveryModel } from "../src/review-runner.js";
 import { CODEX_TASK_REVIEW_MODEL } from "../src/codex/task-review-model.js";
 import { Outbox } from "../src/outbox.js";
 import type { SdkQueryFn } from "../src/sdk-executor.js";
@@ -42,8 +44,12 @@ function fencedFakeClient() {
     review?: { id: string; review: TaskReviewRequest };
     accepted: { id: string; body: StateRequest }[];
     refused: { id: string; body: StateRequest }[];
-  } = { accepted: [], refused: [] };
+    messages: { id: string; messages: OutgoingMessage[]; generation?: number }[];
+  } = { accepted: [], refused: [], messages: [] };
   const client = {
+    postMessages: async (id: string, messages: OutgoingMessage[], generation?: number) => {
+      calls.messages.push({ id, messages, generation });
+    },
     reportState: async (id: string, body: StateRequest) => {
       if (MUTATING.has(body.status) && typeof body.claim_generation !== "number") {
         calls.refused.push({ id, body });
@@ -176,6 +182,107 @@ const goodModelJson = JSON.stringify({
 });
 
 describe("ReviewRunner", () => {
+  it("requires provider cost for every model, not a priced subset", () => {
+    const entry = { inputTokens: 10, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+    assert.equal(hasProviderCostForEveryModel({}), false);
+    assert.equal(hasProviderCostForEveryModel({ haiku: { ...entry, costUSD: 0 } }), true);
+    assert.equal(hasProviderCostForEveryModel({ haiku: { ...entry, costUSD: 0.01 }, opus: entry }), false);
+    for (const costUSD of [-1, NaN, Infinity]) {
+      assert.equal(hasProviderCostForEveryModel({ haiku: { ...entry, costUSD } }), false);
+    }
+  });
+  for (const failure of ["transient", "stale"] as const) {
+    it(`Review usage post failure: ${failure}`, async () => {
+      const { client, calls } = fencedFakeClient();
+      const { git } = fakeGit("diff --git a/a b/a\n+fix\n");
+      client.postMessages = async () => { throw new RequestError("POST", "/api/worker/runs/review-1/messages",
+        failure === "stale" ? 409 : 503, failure === "stale" ? '{"disposition":"stale_claim"}' : "unavailable"); };
+      const warns: string[] = [];
+      const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+        codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
+          req.usageObserver?.({ [CODEX_TASK_REVIEW_MODEL]: { inputTokens: 100, outputTokens: 10,
+            cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0003, costStatus: "metered" } });
+          return { text: JSON.stringify({ summary: "reviewed", findings: [] }),
+            end: { kind: "terminal", terminal: { outcome: "success" } } };
+        } })) as never,
+      });
+      await runner.execute(reviewClaim({ claim_generation: 7, secrets: { forge_pat: "pat", codex: {
+        auth_mode: "api_key", access_token: "test-codex", capability: "cap-1",
+      } } as never }));
+      if (failure === "stale") {
+        assert.equal(calls.review, undefined);
+        assert.deepEqual(calls.accepted.map((s) => s.body.status), ["running", "running"]);
+      } else {
+        assert.equal(calls.review?.review.status, "complete");
+        assert.deepEqual(calls.accepted.map((s) => s.body.status), ["running", "running", "completed"]);
+        assert.ok(warns.includes("review usage post failed"));
+      }
+    });
+  }
+  for (const harness of ["claude", "codex"] as const) {
+    for (const scenario of ["success", "error", "no_usage", "no_cost"] as const) {
+      it(`Review pass usage: ${harness} ${scenario}`, async () => {
+        const { client, calls } = fencedFakeClient();
+        const { git } = fakeGit("diff --git a/a b/a\n+fix\n");
+        const order: string[] = [];
+        const reportState = client.reportState.bind(client);
+        client.reportState = async (...args) => {
+          if (args[1].status === "running") order.push("running");
+          return reportState(...args);
+        };
+        const postMessages = client.postMessages.bind(client);
+        client.postMessages = async (...args) => { order.push("usage"); return postMessages(...args); };
+        const postReview = client.postTaskReview.bind(client);
+        client.postTaskReview = async (...args) => { order.push("review"); return postReview(...args); };
+        const model = harness === "claude" ? "claude-haiku-4-5-20251001" : CODEX_TASK_REVIEW_MODEL;
+        const snapshot: AdviceUsageSnapshot = { [model]: {
+          inputTokens: 100, outputTokens: 10, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+          ...(scenario === "no_cost" ? (harness === "codex" ? { costStatus: "unreported" } : {}) :
+            { costUSD: 0.0003, ...(harness === "codex" ? { costStatus: "metered" } : {}) }),
+        } };
+        const text = JSON.stringify({ summary: "reviewed", findings: [] });
+        const queryFn = (async function* () {
+          if (scenario !== "no_usage") yield { type: "assistant", message: {
+            id: "msg1", model, role: "assistant", content: [{ type: "text", text }],
+            usage: { input_tokens: 100, output_tokens: 10 },
+          } };
+          else yield { type: "assistant", message: { role: "assistant", content: [{ type: "text", text }] } };
+          if (scenario === "no_cost") throw new Error("aborted without provider cost");
+          yield { type: "result", subtype: scenario === "error" ? "error_during_execution" : "success",
+            is_error: scenario === "error", ...(scenario !== "no_usage" ? { modelUsage: snapshot } : {}) };
+        }) as unknown as SdkQueryFn;
+        const warns: string[] = [];
+        const runner = new ReviewRunner(client, git, { ...nullLogger(), warn: (message: string) => { warns.push(message); } }, {
+          queryFn,
+          codexAdviceHarnessFactory: (async () => ({ kind: "codex", run: async (req: AdviceRequest) => {
+            if (scenario !== "no_usage") {
+              req.usageObserver?.({ [model]: { ...snapshot[model]!, inputTokens: 50 } });
+              req.usageObserver?.(snapshot);
+            }
+            if (scenario === "error" || scenario === "no_cost") throw new Error("aborted after usage");
+            return { text, end: { kind: "terminal", terminal: { outcome: "success" } } };
+          } })) as never,
+        });
+        await runner.execute(reviewClaim({ last_seq: 1, claim_generation: 7,
+          ...(harness === "codex" ? { secrets: { forge_pat: "pat", codex: {
+            auth_mode: "api_key", access_token: "test-codex", capability: "cap-1",
+          } } as never } : {}),
+        }));
+        const hasUsage = scenario !== "no_usage" && !(harness === "claude" && scenario === "no_cost");
+        assert.equal(calls.messages.length, hasUsage ? 1 : 0);
+        if (hasUsage) {
+          assert.equal(calls.messages[0]!.id, "review-1", "spend belongs to the review, not its target");
+          assert.equal(calls.messages[0]!.generation, 7);
+          assert.deepEqual(calls.messages[0]!.messages, [{ seq: 2, kind: "status", agent: "reviewer",
+            payload: { event: "result", modelUsage: snapshot } }]);
+          assert.deepEqual(order, ["running", "running", "usage", "review"]);
+        }
+        if (harness === "claude" && scenario === "no_cost") assert.ok(warns.includes("review pass usage unavailable"));
+        assert.equal(calls.review?.id, "target-1");
+        assert.equal(calls.review?.review.status, scenario === "error" || scenario === "no_cost" ? "failed" : "complete");
+      });
+    }
+  }
   it("clones the reviewed branch, diffs it against base, and posts parsed findings with status complete", async () => {
     const { client, calls } = fakeClient();
     const { git, calls: gitCalls } = fakeGit("diff --git a/poller.ts b/poller.ts\n@@ -1 +1 @@\n-old\n+new\n");

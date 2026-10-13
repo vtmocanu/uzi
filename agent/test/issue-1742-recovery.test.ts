@@ -1,5 +1,6 @@
 import { afterEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import fsp from "node:fs/promises";
 import os from "node:os";
@@ -10,7 +11,7 @@ import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator, type RecoveryArchiveClient } from "../src/recovery.js";
 import { nullLogger } from "./helpers.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
-import { TOKEN, fakeGitlab, git, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
+import { TOKEN, fakeGitlab, fx, git, gitlabClaim, installHarness, runner, simulateCommittedWork } from "./runner-harness.js";
 
 // Issue #1742 M3 D4(b) — the EARLY CUT: a crash at finalize fetch-back, before the finalization
 // pin, with committed work only in the owner's runner clone. G's record is still the early base
@@ -141,6 +142,64 @@ describe("issue #1742 D4(a): the runner's finalization pin", () => {
       assert.equal(client.reserveCalls[0]!.generation, GEN);
       assert.equal(client.uploadCalls.length, 1);
       assert.equal((await coord.inspect(claim.run_id))[0]!.state, "uploaded");
+    } finally {
+      release();
+      await execution;
+    }
+  });
+});
+
+describe("issue #2886: the finalization pin for a long origin", () => {
+  it("records the bounded hashed bareDir and captures it at exact G", async () => {
+    const GEN = 4;
+    // A nested local origin whose legacy flattened name is over 255 bytes, holding the fixture's content.
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "issue-2886-longorigin-"));
+    roots.push(root);
+    const longOrigin = path.join(root, ...Array.from({ length: 6 }, (_, i) => `${i}` + "s".repeat(58)), "origin");
+    fs.mkdirSync(path.dirname(longOrigin), { recursive: true });
+    execFileSync("git", ["clone", "-q", fx.originPath, longOrigin], {
+      env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    });
+    assert.ok(Buffer.byteLength(longOrigin.split("/").filter(Boolean).join("+") + ".git", "utf8") > 255);
+    const base = gitlabClaim(1886);
+    const claim = gitlabClaim(1886, { claim_generation: GEN, repo: { ...base.repo, clone_url: longOrigin } });
+    simulateCommittedWork();
+    let fetched = false;
+    const realFetch = git.fetchAgentBranch.bind(git);
+    git.fetchAgentBranch = (async (...args: Parameters<typeof git.fetchAgentBranch>) => {
+      const out = await realFetch(...args);
+      fetched = true;
+      return out;
+    }) as typeof git.fetchAgentBranch;
+    let reached!: () => void;
+    const at = new Promise<void>((resolve) => { reached = resolve; });
+    let release!: () => void;
+    const gate = new Promise<void>((resolve) => { release = resolve; });
+    git.changedFiles = (async () => {
+      if (fetched) {
+        reached();
+        await gate;
+        throw new Error("cut: process died after the finalization pin");
+      }
+      return ["src/impl.ts"];
+    }) as typeof git.changedFiles;
+    const { gitlab } = fakeGitlab();
+    const execution = runner(new StubExecutor(nullLogger()), gitlab, TOKEN).execute(claim);
+    try {
+      await Promise.race([at, new Promise<void>((_, rej) => setTimeout(() => rej(new Error("post-pin cut not reached")), 10_000))]);
+      const client = new FakeRecoveryClient();
+      const coord = new RecoveryCoordinator({ client, git, log: nullLogger(), recoveryRoot: git.recoveryRoot, workerToken: TOKEN });
+      const records = await coord.inspect(claim.run_id);
+      assert.equal(records.length, 1);
+      const rec = records[0]!;
+      assert.equal(rec.generation, GEN);
+      assert.equal(rec.finalizationPin, true);
+      assert.match(rec.bareDir!, /^uzi-sha256-[0-9a-f]{64}\.git$/);
+      assert.equal(rec.bareDir, path.basename(git.barePathFor(claim.repo.clone_url)));
+      const snapshot = await coord.snapshotBootRecords();
+      await coord.resumePending(undefined, snapshot);
+      assert.equal(client.reserveCalls.length, 1, "reserved once");
+      assert.equal(client.reserveCalls[0]!.generation, GEN);
     } finally {
       release();
       await execution;

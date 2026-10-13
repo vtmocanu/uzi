@@ -931,12 +931,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
   });
 
   it("(e) real gitleaks: a secret committed then removed within the range is found and not published", async (t) => {
-    let gitleaks = "";
-    try {
-      gitleaks = execFileSync("sh", ["-c", "command -v gitleaks"], { encoding: "utf8" }).trim();
-    } catch {
-      /* not installed */
-    }
+    const gitleaks = realGitleaks();
     if (!gitleaks || !path.isAbsolute(gitleaks)) {
       t.skip("gitleaks is not on PATH in this environment; the shim variants above cover the logic");
       return;
@@ -1713,15 +1708,33 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
 
 const execFileP = promisify(execFile);
 
-/** The absolute gitleaks on PATH, or "" (then the real-binary variants skip explicitly). */
+/** Absolute scanner path; missing locally skips, missing in CI fails the test. */
 function realGitleaks(): string {
+  let bin = "";
   try {
     const p = execFileSync("sh", ["-c", "command -v gitleaks"], { encoding: "utf8" }).trim();
-    return path.isAbsolute(p) ? p : "";
+    if (path.isAbsolute(p)) bin = p;
   } catch {
-    return "";
+    // The CI assertion must stay outside this discovery catch.
   }
+  assert.ok(bin || !process.env.CI, "CI requires the real gitleaks binary on PATH");
+  return bin;
 }
+
+it("missing real gitleaks fails in CI and remains optional locally", () => {
+  const oldPath = process.env.PATH;
+  const oldCI = process.env.CI;
+  try {
+    process.env.PATH = "";
+    process.env.CI = "1";
+    assert.throws(realGitleaks, /CI requires the real gitleaks/);
+    delete process.env.CI;
+    assert.equal(realGitleaks(), "");
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldCI === undefined) delete process.env.CI; else process.env.CI = oldCI;
+  }
+});
 
 /** Resolve with `p`, or reject after `ms` — a probe that must never block. */
 function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {

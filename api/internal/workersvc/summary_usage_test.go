@@ -247,6 +247,27 @@ func TestSummaryUsageCodexMarkerMatrix(t *testing.T) {
 	}
 }
 
+func TestSummaryUsageNotAvailableInferenceGeoFoldsMetered(t *testing.T) {
+	fs := appendSummaryUsage(t, harnessClaude, summaryMsg(107, `{"pass":"pr_description",
+		"model_usage":{"claude-haiku-4-5-20251001":{"inputTokens":10,"outputTokens":1,
+		"cacheReadInputTokens":12326,"cacheCreationInputTokens":5572,
+		"cacheCreation1hInputTokens":5572,"cacheCreation5mInputTokens":0,
+		"service_tier":"standard","inference_geo":"not_available"}}}`))
+	if len(fs.upsertedUsage) != 1 {
+		t.Fatalf("upserts = %d, want 1", len(fs.upsertedUsage))
+	}
+	u := fs.upsertedUsage[0]
+	if u.Model != "summary_pass:claude-haiku-4-5-20251001" || u.LineageEpoch != 107 ||
+		u.CostStatus != "metered" || u.CostUsd.Int.Int64() != 12392 {
+		t.Fatalf("summary row = %+v, want own fold key and metered $0.012392", u)
+	}
+	refolded := appendSummaryUsage(t, harnessClaude, summaryMsg(107, string(fs.insertedMessages[0].Payload)))
+	r := refolded.upsertedUsage[0]
+	if r.CostStatus != u.CostStatus || r.CostUsd.Int.Cmp(u.CostUsd.Int) != 0 {
+		t.Fatalf("stored summary re-fold differs: %+v", r)
+	}
+}
+
 // The model name is capped so the prefixed key still fits maxUsageModelRunes.
 func TestSummaryUsageLongModelNameKeepsPrefixedKeyWithinCap(t *testing.T) {
 	long := ""

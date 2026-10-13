@@ -22,7 +22,7 @@ func TestEvaluateScopes(t *testing.T) {
 		"queue.waiting":    "owner", "queue.undispatched": "owner", "forge.sync": "owner",
 		"forge.ciwatch": "owner", "slack.socket": "owner", "schedules.paused": "owner",
 		"board.drift": "owner", "custody.holds": "owner", "recovery.storage": "owner", "release.check": "owner",
-		"pricing.codex": "instance",
+		"pricing.codex": "instance", "agentsource.update": "instance",
 	}
 	svc := newSvc(&fakeStore{}, &fakeSettings{})
 	doc, err := svc.Evaluate(context.Background())

@@ -22,6 +22,7 @@
 // names, upgrade details, blocking reasons) are server-sanitized, but any that reach a
 // `title=` attribute are re-stripped with stripUnsafeChars first (FleetRow, BlockingCell).
 
+import { Link } from "react-router-dom";
 import { useCallback, useEffect, useMemo, useRef, useState } from "react";
 
 import { AdminShell } from "../components/AdminShell";
@@ -264,6 +265,11 @@ function AttentionItem({ check, nowMs }: { check: HealthCheck; nowMs: number }) 
         <div className="flex flex-wrap items-center gap-x-3 gap-y-1 text-xs text-faint">
           <span className="font-mono">{check.id}</span>
           {check.doc && <DocLink slug={check.doc}>Docs: {check.doc}</DocLink>}
+          {check.id === "agentsource.update" && (
+            <Link to="/admin/settings#agent-source" className="text-brand hover:underline">
+              Review agent source updates
+            </Link>
+          )}
           {check.id.startsWith("fleet.") && (
             <a
               href="#fleet"

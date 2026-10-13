@@ -176,6 +176,9 @@ export class CrossCheckRunner {
         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)
         || (code && (candidate.round !== 1 || !/^[a-f0-9]{40}$/.test(code.head_commit))))
         throw new Error("invalid checker claim");
+      // issue #2886: resolve (and identity-check) the code child's existing bare before the model
+      // timer starts, so this await cannot race the timeout ahead of the snapshot reader.
+      const codeBare = code ? await this.git.existingBarePathFor(claim.repo.clone_url) : undefined;
       const deadline = Date.parse(candidate.deadline_at);
       const timeout = Math.min(this.opts.modelTimeoutMs ?? 15 * 60_000, deadline - Date.now());
       if (!Number.isFinite(timeout) || timeout <= 0) {
@@ -187,7 +190,7 @@ export class CrossCheckRunner {
       steering = new ChatSteering(this.client, runId, this.opts.pollMs ?? 1000, this.log, cancel,
         { onFollowUp: () => this.log.warn("cross-check ignores follow-up input", { run_id: runId }) }, generation);
       steering.start();
-      const bare = code ? this.git.barePathFor(claim.repo.clone_url)
+      const bare = code ? codeBare!
         : await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
       cancel.signal.throwIfAborted();
       if (code) {

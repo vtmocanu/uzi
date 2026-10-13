@@ -6779,19 +6779,20 @@ func (s *Service) CreateRun(ctx context.Context, userID, repoID uuid.UUID, issue
 func (s *Service) CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *SeededPlan, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
 	// false force (issue #856): a scheduled run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored (pre-validated) override, written as-is. explicit: the
-	// schedule's pinned run_schedules.harness (nil ⇒ implicit D11 at fire time), PRD #1429 M2.
+	// schedule's pin or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
 	return s.createRun(ctx, userID, repoID, issueIID, "schedule", description, false, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false, seed, credOverride, explicit, nil /*rawOverride*/)
 }
 
 // CreateAutopilotRun queues a run the poller's autopilot detection started on a
-// user's behalf (PRD #19 M4). It is IDENTICAL to CreateRun — same ownership, single
-// uzi_label eligibility gate (PRD #764 M1), and one-active-run gate, same state
-// machine, same queued→In Progress column notify — except it sets auto_approve, which
-// the worker reads (M5) to resolve the plan gate without a human. Sharing one createRun
+// user's behalf (PRD #19 M4). It shares CreateRun's ownership, uzi_label eligibility
+// gate (PRD #764 M1), one-active-run gate, state machine and queued→In Progress
+// column notify. It sets auto_approve and accepts the poller's fresh issue-label
+// harness selection. The worker reads auto_approve (M5) to resolve the plan gate
+// without a human. Sharing one createRun
 // body is the whole point: the invariant that an autopilot run and a manual run are
 // born through the same path is enforced structurally, not by two implementations that
 // could drift.
-func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
+func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *Harness) (store.Run, error) {
 	// nil waitOnLimit: an autopilot run has no human in the loop to express a per-run
 	// choice, so it takes the owner's default (PRD #35 Decision 7 / design brief 7.3).
 	// nil model: the label poller's autopilot has no per-run model (PRD #300) — a
@@ -6806,24 +6807,18 @@ func (s *Service) CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UU
 	// false force (issue #856): label-poller autopilot never bypasses the open-MR dedup.
 	// nil credOverride (PRD #1247 M1): label-poller autopilot has no per-run credential
 	// choice, so it inherits the worker binding exactly as before.
-	// nil explicit + nil rawOverride (PRD #1429 M2): label-poller autopilot has no per-run harness
-	// choice, so it uses implicit D11 resolution at create.
-	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil /*credOverride*/, nil /*explicit*/, nil /*rawOverride*/)
+	// explicit is the fresh issue-label selection; nil keeps implicit D11 resolution.
+	// No raw credential override is supplied by the poller.
+	return s.createRun(ctx, userID, repoID, issueIID, "autopilot", description, true, nil, nil, nil, false, false, nil, nil /*credOverride*/, explicit, nil /*rawOverride*/)
 }
 
-// CreateScheduledAutopilotRun queues an auto-approve run for a schedule while honouring
-// the schedule's explicit wait-on-limit intent (PRD #274 Decision 1a). It is IDENTICAL
-// to CreateAutopilotRun EXCEPT it threads the caller-supplied waitOnLimit instead of
-// forcing nil: unlike the label poller (which has no per-run choice and so falls back to
-// the owner default), a scheduled run carries a persisted per-schedule wait_on_limit that
-// must take effect. Kept as a SEPARATE method on purpose — the poller's CreateAutopilotRun
-// seam (its interface, fake, and call site) stays byte-identical, so widening the
-// scheduler seam cannot change label-driven autopilot. seed=nil for the same reason as
-// CreateAutopilotRun: autopilot never seeds its plan.
+// CreateScheduledAutopilotRun queues an auto-approve scheduled issue run. It carries
+// the schedule's wait/model/override choices and effective pin or issue-label harness.
+// The poller supplies only its issue-label harness and inherits the owner defaults.
 func (s *Service) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
 	// false force (issue #856): a scheduled autopilot run never bypasses the open-MR dedup.
 	// credOverride: the schedule's stored override; explicit: the schedule's pinned harness
-	// (nil ⇒ implicit D11 at fire time), PRD #1429 M2.
+	// or fresh issue-label selection (nil ⇒ implicit D11 at fire time).
 	return s.createRun(context.WithValue(ctx, scheduleApprovalKey{}, true), userID, repoID, issueIID, "autopilot", description, true /*autoApprove*/, waitOnLimit, mrReworkEnabled, model, overrideSubagentModel, false /*force*/, nil /*seed*/, credOverride, explicit, nil /*rawOverride*/)
 }
 
@@ -7139,7 +7134,7 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		// validated here — an effective-Codex harness + Anthropic override fails
 		// ErrCredentialOverrideHarnessUnsupported and rolls the whole create back (no run row, no
 		// forge write after the invalid fact is known); a pre-resolved credOverride (a schedule's
-		// stored choice) is written as-is. nil override ⇒ inherit, byte-identical to a pre-#1247 run.
+		// stored choice) is checked for disabled and incompatible credentials below. nil override ⇒ inherit.
 		// The pinned-secret lookup reads through the tx-bound q (issue #1626), not the pool, so
 		// no second connection is taken while this closure holds the run-branch lock.
 		effOverride := credOverride
@@ -7164,6 +7159,11 @@ func (s *Service) createRun(ctx context.Context, userID, repoID uuid.UUID, issue
 		}
 		if err := lockPinnedOverrideEnabled(ctx, q, userID, effOverride, pinMissing); err != nil {
 			return store.Run{}, err
+		}
+		// Stored scheduled overrides are Anthropic-only. Check after disabled reads
+		// and the pin lock so ErrCredentialDisabled retains precedence.
+		if credOverride != nil && resolved.Harness == HarnessCodex {
+			return store.Run{}, ErrCredentialOverrideHarnessUnsupported
 		}
 		// Stamp unseeded issue runs for either resolved harness when the switch is on.
 		var completionContractVersion pgtype.Int4

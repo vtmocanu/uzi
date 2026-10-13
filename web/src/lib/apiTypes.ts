@@ -1921,6 +1921,8 @@ export type ScheduleSkipReason =
   | "self_improve_mr_cap_reached"
   | "open_mr_exists"
   | "codex_override_conflict"
+  | "harness_label_conflict"
+  | "harness_label_invalid"
   | "schedules_paused"
   | "no_usable_credential"
   | "credential_disabled";

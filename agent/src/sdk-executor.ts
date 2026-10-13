@@ -1304,9 +1304,8 @@ export class SdkExecutor implements Executor {
     let latestProgress: MilestoneProgress | undefined = undefined;
     // PRD #122 M6: the milestone list FROZEN at the gate, hoisted out of the block-scoped
     // `candidateMilestones` inside the plan-and-gate block so the implement loop can name
-    // the milestones in its prompt. Assigned once the gate resolves `approve`; it stays
-    // undefined on the pre-approved resume path (no plan-and-gate block runs there) —
-    // acceptable for M6, which introduces no claim change to carry it across a resume.
+    // the milestones in its prompt. Assigned once the gate resolves `approve`, or from
+    // ctx.frozenMilestones when a pre-approved resume skips the plan-and-gate block.
     // Initialized undefined for the same reason as latestProgress above: it is
     // assigned in phasePlanGate through the carrier, not here.
     let frozenMilestones: Milestone[] | undefined = undefined;
@@ -1922,6 +1921,7 @@ export class SdkExecutor implements Executor {
           },
         });
         approvedPlan = ctx.approvedPlan!;
+        frozenMilestones = ctx.frozenMilestones ?? undefined;
       } else {
         // --- Phase 1: planning turn ------------------------------------------
         // A ci_fix run (PRD #6) diagnoses a failed pipeline from its frozen snapshot
@@ -2874,11 +2874,11 @@ export class SdkExecutor implements Executor {
             // byte-identical to before (it never carried this). First turn only.
             priorWork: preApproved ? ctx.priorWork : undefined,
             // PRD #122 M6: name the frozen milestones and their live status so the lead
-            // can see the boundaries and checkpoint at each one. Both undefined on the
-            // pre-approved resume path (frozenMilestones is never assigned there) and on
-            // any run with no approved breakdown, which makes the note additive-absent.
+            // can see the boundaries and checkpoint at each one. A pre-approved resume
+            // uses the claim's frozen list; no approved breakdown adds no note.
             milestones: frozenMilestones,
             progress: latestProgress,
+            serverCompletedIds: lastServedScope?.completedIds,
             // PRD #390 M3: escalate this turn when the PREVIOUS work turn left the tracker with no
             // milestone in progress on a milestone-bearing run.
             progressMissedLastTurn,

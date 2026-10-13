@@ -18,8 +18,10 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   self_improve_mr_cap_reached: "self-improve MR cap reached",
   open_mr_exists: "issue already has an open MR",
   codex_override_conflict: "Codex harness cannot use an Anthropic credential override",
+  harness_label_conflict: "issue harness label conflicts with schedule pin",
+  harness_label_invalid: "invalid issue harness labels",
   schedules_paused: "all schedules paused",
-  no_usable_credential: "no usable credential for either harness",
+  no_usable_credential: "no usable credential",
   credential_disabled: "pinned credential is disabled",
 };
 
