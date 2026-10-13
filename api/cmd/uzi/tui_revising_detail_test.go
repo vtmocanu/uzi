@@ -132,8 +132,8 @@ func TestRevisingProgressNeverWaitsOnYou(t *testing.T) {
 	if !strings.Contains(got, "planning") || strings.Contains(got, "on you") || strings.Contains(got, "plan gate") {
 		t.Errorf("detail progress for a revising run = %q", got)
 	}
-	cell := stripANSI(m.boardProgCell(m.detail.run.Progress, m.detail.run.Status, nil, true))
-	if strings.Contains(cell, "on you") {
+	cell := stripANSI(m.boardProgCell(m.detail.run.Progress, nil))
+	if cell != "" {
 		t.Errorf("board progress cell = %q", cell)
 	}
 }

@@ -495,7 +495,7 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
 	runs[5].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
 	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → n/a
-	// PRD #2602: the PROG column, mirroring TUI mock 1 — a percent (55% here: 2 of 4 done), a
+	// PRD #2602: the merged milestone/percentage cell — a percent (55% here: 2 of 4 done), a
 	// stalled run, a looping run (also stalled), a run waiting on the plan gate, and a parked run.
 	pct := 55
 	runs[0].Progress = &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4, ActiveMilestoneID: "m3"}
@@ -674,9 +674,8 @@ func boardMilestones(dark bool, now time.Time) string {
 	return m.View().Content
 }
 
-// boardProgress renders the own-board PROG column (PRD #2602) at 116 cols with no credential
-// column: the bar form (percent + 8-cell bar) plus the waiting, stalled, parked and queued
-// flags. The 100-col scenes show the narrow form (percent or short flag) instead.
+// boardProgress renders the merged milestone/percentage cell at 116 columns.
+// Status words carry ordinary state flags; waiting under stalled health is an exception.
 func boardProgress(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
@@ -686,10 +685,15 @@ func boardProgress(dark bool, now time.Time) string {
 		return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status, IssueTitle: title, CreatedAt: now.Add(-age),
 			Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, Progress: p}}
 	}
+	stalled := mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"})
+	stalled.Health = "stalled"
+	waiting := mk("f6a7b8c9-1111", "awaiting_input", "Answer the retry question while stalled", 15*time.Minute, &apitypes.RunProgress{State: "waiting"})
+	waiting.Health = "stalled"
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		mk("a1b2c3d4-1111", "running", "Add rate-limit headroom to the scheduler poll", 4*time.Minute, &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4}),
 		mk("b2c3d4e5-1111", "awaiting_input", "Pick the retry policy for webhook delivery", 9*time.Minute, &apitypes.RunProgress{State: "waiting"}),
-		mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"}),
+		stalled,
+		waiting,
 		mk("d4e5f6a7-1111", "limit_wait", "Port the judge to per-model usage folding", 22*time.Minute, &apitypes.RunProgress{State: "parked"}),
 		mk("e5f6a7b8-1111", "queued", "Tighten the retry backoff jitter", time.Minute, &apitypes.RunProgress{State: "queued"}),
 	}})

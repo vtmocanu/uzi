@@ -8,26 +8,13 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 )
 
-const (
-	// boardProgBarCells is the PROG bar length (PRD #2602): round(pct*8/100) filled of 8.
-	boardProgBarCells = 8
-	// boardProgWideWidth is the PROG cell with the bar ("70% ▰▰▰▰▰▰▱▱"); boardProgNarrowWidth
-	// is the cell once the bar drops (percent alone or a short flag). The cell is one fixed
-	// width per terminal width so the TITLE column stays aligned down the board.
-	boardProgWideWidth   = 12
-	boardProgNarrowWidth = 8
-)
-
-// boardProgTitleFloor is the computed title room (before the variable "#iid " prefix and the
-// judge-marker allowance, ~10 cols together) the PROG cell must leave. It keeps at least ~20
-// real title columns at every width where PROG is shown.
+// The merged progress cell keeps the milestone renderer's nine columns and an
+// optional four-column percentage. Annotation visibility reserves the worker column
+// even below 120, so it cannot flap off when that column appears.
+const boardProgPctWidth = 4
 const boardProgTitleFloor = 25
-
-// boardWorkerColumnWidth is the worker column when it is shown.
 const boardWorkerColumnWidth = 18
 
-// boardWorkerWidth is the width of the trailing worker column (two spaces and a fixed 16-column
-// cell): 18 from 120 columns up, else 0. boardRow and boardProgRoom both read it.
 func (m tuiModel) boardWorkerWidth() int {
 	if m.width >= 120 {
 		return boardWorkerColumnWidth
@@ -35,38 +22,15 @@ func (m tuiModel) boardWorkerWidth() int {
 	return 0
 }
 
-// boardProgRoom is the title width left once the PROG cell of width cell is drawn next to the
-// MILES cell, with worker columns set aside for the trailing worker column.
-func (m tuiModel) boardProgRoom(cell, worker int) int {
+func (m tuiModel) boardProgRoom() int {
 	prefix := boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost())
-	return m.width - worker - (prefix + boardMileWidth + 2 + cell + 2)
+	return m.width - boardWorkerColumnWidth - (prefix + boardMileWidth + 1 + boardProgPctWidth + 2)
 }
 
-// boardShowProg reports whether the PROG column is drawn (PRD #2602). It is drawn exactly when
-// boardShowMile is, taking its narrow cell out of the flexible title width so MILES keeps its
-// #379 threshold; only where that would leave the title under boardProgTitleFloor (the admin
-// board with its owner and credential cells) does PROG shed first, before MILES.
+// boardShowProg adds the percentage only when the title retains its floor.
+// Milestones keep their existing #379 threshold and COST shedding order.
 func (m tuiModel) boardShowProg() bool {
-	return m.boardShowMile() && m.boardProgRoom(boardProgNarrowWidth, m.boardWorkerWidth()) >= boardProgTitleFloor
-}
-
-// boardShowProgBar reports whether the PROG cell keeps its 8-cell bar. The bar drops before
-// the percent (PRD #2602): it needs boardProgBarMinWidth (shifted by the same extra prefix
-// columns that shift boardShowMile) and the wide cell must still leave the title its floor.
-// The floor check always reserves the full worker column: counting it only from 120 up made the
-// bar flap off at 120-123 after being on at 115-119 (own board with the credential column), so
-// the bar now starts at the width where it stays on.
-func (m tuiModel) boardShowProgBar() bool {
-	min := boardProgBarMinWidth
-	min += boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost()) - boardRowPrefixWidth(false, false, false)
-	return m.boardShowProg() && m.width >= min && m.boardProgRoom(boardProgWideWidth, boardWorkerColumnWidth) >= boardProgTitleFloor
-}
-
-func (m tuiModel) boardProgWidth() int {
-	if m.boardShowProgBar() {
-		return boardProgWideWidth
-	}
-	return boardProgNarrowWidth
+	return m.boardShowMile() && m.boardProgRoom() >= boardProgTitleFloor
 }
 
 // progParkWord is the short park reason shown after "⏸". Only the closed status enum is
@@ -84,43 +48,49 @@ func progParkWord(status string) string {
 	}
 }
 
-// boardProgCell renders the PROG cell (without padding): "<pct> <8-cell bar>", or a text flag
-// that replaces the number when it would mislead. Every state is plain text, so the colorprofile
-// downgrade keeps it. Only the closed state enum and the integer pct are drawn.
-func (m tuiModel) boardProgCell(p *apitypes.RunProgress, status string, bg color.Color, bar bool) string {
-	if p == nil {
+// boardProgCell draws only the server percentage; milestone cells are rendered
+// alongside it by boardProgressCell. Queued, planning and stalled words already
+// appear in the status column.
+func (m tuiModel) boardProgCell(p *apitypes.RunProgress, bg color.Color) string {
+	if p == nil || p.State != runprogress.StatePercent || p.Pct == nil {
 		return ""
 	}
-	faint := func(s string) string { return paintSeg(m.pal.faintC, bg, false, s) }
-	switch p.State {
-	case runprogress.StatePercent:
-		if p.Pct == nil {
-			return ""
-		}
-		pct := min(max(*p.Pct, 0), 100)
-		out := paintSeg(m.pal.faintC, bg, false, padLeftVisual(itoa(pct)+"%", 3))
-		if !bar {
-			return out
-		}
-		filled := (pct*boardProgBarCells + 50) / 100
-		return out + paintSeg(nil, bg, false, " ") +
-			paintSeg(m.pal.tungsten, bg, false, strings.Repeat("▰", filled)) +
-			faint(strings.Repeat("▱", boardProgBarCells-filled))
-	case runprogress.StateStalled:
-		return paintSeg(m.pal.stall, bg, false, "stalled")
-	case runprogress.StateWaiting:
-		if bar {
-			return paintSeg(m.pal.amber, bg, false, "waits on you")
-		}
-		return paintSeg(m.pal.amber, bg, false, "on you")
-	case runprogress.StateParked:
-		return faint("⏸ " + progParkWord(status))
-	case runprogress.StateQueued:
-		return faint("queued")
-	case runprogress.StatePlanning:
-		return faint("planning")
+	pct := min(max(*p.Pct, 0), 100)
+	return paintSeg(m.pal.faintC, bg, false, padLeftVisual(itoa(pct)+"%", boardProgPctWidth))
+}
+
+// boardProgressCell is the merged column. A waiting/parked annotation replaces
+// the marker only when health precedence hides that actionable status word.
+func (m tuiModel) boardProgressCell(r apitypes.RunListItemDTO, terminal bool, bg color.Color) string {
+	wide := m.boardShowProg()
+	width := boardMileWidth
+	if wide {
+		width += 1 + boardProgPctWidth
 	}
-	return ""
+	if !terminal && r.Progress != nil {
+		tok := m.pal.runStateToken(r.RunDTO, r.IsRevising)
+		if tok.word == "stalled" || tok.word == "looping" {
+			switch r.Progress.State {
+			case runprogress.StateWaiting:
+				word := "on you"
+				if wide {
+					word = "waits on you"
+				}
+				return padSeg(paintSeg(m.pal.amber, bg, false, word), width, bg)
+			case runprogress.StateParked:
+				return padSeg(paintSeg(m.pal.faintC, bg, false, "⏸ "+progParkWord(r.Status)), width, bg)
+			}
+		}
+	}
+	out := padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg)
+	if wide {
+		pct := ""
+		if !terminal {
+			pct = m.boardProgCell(r.Progress, bg)
+		}
+		out += paintSeg(nil, bg, false, " ") + padSeg(pct, boardProgPctWidth, bg)
+	}
+	return out
 }
 
 func padLeftVisual(s string, n int) string {

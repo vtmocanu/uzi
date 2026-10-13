@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **TUI board progress uses one milestone bar with its percentage.**
+  The redundant percentage bar and repeated status words are removed, while narrow terminals retain milestones and stalled rows retain hidden waiting or parked conditions.
+
 - **Claude cross-checks no longer fail with `confinement_failed` as soon as they start ([#2869](https://github.com/vtmocanu/uzi/issues/2869)).**
   The SDK's new builtin plugin-authoring plugin tripped the checker's confinement check; it is now disabled in checker, research and isolated job sessions, and confinement refusals log a fixed reason category. Takes effect after a release and worker rollout.
 
