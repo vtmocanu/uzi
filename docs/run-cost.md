@@ -69,9 +69,13 @@ bill**; subscription users may also consume purchased credits beyond
 included usage.
 
 Claude summary and Now entries without a provider cost are priced from uzi's
-standard Anthropic table. `inference_geo: "not_available"` uses standard
-pricing, as these models do not support geographic routing; other non-standard
-geographies remain unpriced. Existing unreported summary/Now rows are not backfilled.
+standard Anthropic table. For Haiku 4.5's dated and undated model IDs,
+`inference_geo: "not_available"` uses standard pricing: these table rows predate
+geographic routing ([usage-report semantics](https://platform.claude.com/docs/en/manage-claude/usage-cost-api#data-residency),
+[standard pricing for earlier models](https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing)).
+The marker stays unpriced on geo-capable models because it cannot rule out a
+routing premium. Other non-standard geographies remain unpriced.
+Existing unreported summary/Now rows are not backfilled.
 
 The legacy `subscription` status means **no cost estimate was recorded**.
 It can come from a historical run or a worker not yet rolled to the new
