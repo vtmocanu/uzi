@@ -366,7 +366,7 @@ func TestRollHealthStaysRollingAcrossTicksWhileThePodIsNotReady(t *testing.T) {
 	if err != nil {
 		t.Fatalf("Observe (tick 1): %v", err)
 	}
-	if err := m.Reconcile(ctx, []protocol.DesiredWorker{desired}, observed); err != nil {
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{evidence(desired, m.now())}, observed); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 

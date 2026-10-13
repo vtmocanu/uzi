@@ -168,7 +168,7 @@ INSERT INTO worker_upgrade_reports (
     worker_id, phase, phase_since, target_image, pod_phase,
     blocking_container, blocking_reason, restart_count, last_exit_code,
     controller_reported_at, observed_at, upgrading_since,
-    poll_interval_seconds, worker_image_tag
+    poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at
 )
 SELECT
     w.id, $1, $2, $3, $4,
@@ -213,10 +213,15 @@ SELECT
                    OR split_part($12::text, '+', 1)
                       IS DISTINCT FROM split_part(w.version, '+', 1))
          THEN $10::timestamptz ELSE NULL END,
-    $13, $12
+    $13, $12,
+    CASE WHEN $14::boolean THEN $15::jsonb ELSE NULL END,
+    CASE WHEN $14::boolean AND $15::jsonb IS NOT NULL
+         THEN $10::timestamptz ELSE NULL END
 FROM workers w
-WHERE w.id = $14 AND w.kind = 'hosted'
+WHERE w.id = $16 AND w.kind = 'hosted'
 ON CONFLICT (worker_id) DO UPDATE SET
+    pacing = CASE WHEN $14::boolean THEN EXCLUDED.pacing ELSE worker_upgrade_reports.pacing END,
+    pacing_observed_at = CASE WHEN $14::boolean THEN EXCLUDED.pacing_observed_at ELSE worker_upgrade_reports.pacing_observed_at END,
     phase                  = EXCLUDED.phase,
     phase_since            = EXCLUDED.phase_since,
     target_image           = EXCLUDED.target_image,
@@ -391,6 +396,8 @@ type UpsertWorkerRollHealthParams struct {
 	TagValid             bool               `json:"tag_valid"`
 	WorkerImageTag       pgtype.Text        `json:"worker_image_tag"`
 	PollIntervalSeconds  pgtype.Int4        `json:"poll_interval_seconds"`
+	UpdatePacing         bool               `json:"update_pacing"`
+	Pacing               []byte             `json:"pacing"`
 	WorkerID             uuid.UUID          `json:"worker_id"`
 }
 
@@ -430,6 +437,8 @@ func (q *Queries) UpsertWorkerRollHealth(ctx context.Context, arg UpsertWorkerRo
 		arg.TagValid,
 		arg.WorkerImageTag,
 		arg.PollIntervalSeconds,
+		arg.UpdatePacing,
+		arg.Pacing,
 		arg.WorkerID,
 	)
 	if err != nil {

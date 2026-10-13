@@ -544,8 +544,9 @@ func noAnthropicTokenAtAll(ctx context.Context, q *store.Queries, userID uuid.UU
 }
 
 // secretMutationQueries is the statement surface of the requirement writers that share the
-// promoter's lock order: the worker rebind, the Judge opt-in and rebind, and the per-run
-// reassignment of a held run. Both the Store and a transaction-bound *store.Queries satisfy it.
+// promoter's lock order: the worker rebind, the Judge opt-in and rebind, the per-run
+// reassignment of a held run, and the set-token override-plus-promote of a queued or parked run.
+// Both the Store and a transaction-bound *store.Queries satisfy it.
 type secretMutationQueries interface {
 	GetUserSecretCiphertextByID(ctx context.Context, arg store.GetUserSecretCiphertextByIDParams) (store.GetUserSecretCiphertextByIDRow, error)
 	SetWorkerAnthropicSecret(ctx context.Context, arg store.SetWorkerAnthropicSecretParams) (store.Worker, error)
@@ -555,6 +556,11 @@ type secretMutationQueries interface {
 	SetRunCredentialOverride(ctx context.Context, arg store.SetRunCredentialOverrideParams) (int64, error)
 	ReassignCredentialDisabledRun(ctx context.Context, arg store.ReassignCredentialDisabledRunParams) (store.ReassignCredentialDisabledRunRow, error)
 	StampHeldCredentialSwitch(ctx context.Context, arg store.StampHeldCredentialSwitchParams) (int64, error)
+	LockRunForCredentialSwitch(ctx context.Context, arg store.LockRunForCredentialSwitchParams) (store.LockRunForCredentialSwitchRow, error)
+	PromoteLimitWaitRunNow(ctx context.Context, arg store.PromoteLimitWaitRunNowParams) (int64, error)
+	PromotePoolWaitRun(ctx context.Context, arg store.PromotePoolWaitRunParams) (int64, error)
+	PromoteRecoveryWaitRunNow(ctx context.Context, arg store.PromoteRecoveryWaitRunNowParams) (int64, error)
+	ResetProviderParkStreakForOwner(ctx context.Context, arg store.ResetProviderParkStreakForOwnerParams) (int64, error)
 	secretEnablementLocker
 	credentialHoldReleaser
 }

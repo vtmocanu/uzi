@@ -1,6 +1,28 @@
 {
   "workers": [
     {
+      "roll_evidence": {
+        "never_registered": false,
+        "version": 1,
+        "owner_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "registered": true,
+        "scheduling_capabilities": [
+          "docker"
+        ],
+        "protocol_capabilities": [
+          "cross_check_v1",
+          "cross_check_lane_v1"
+        ],
+        "ordinary_coverage": false,
+        "checker_coverage": true,
+        "registered_version": "0.11.7",
+        "register_nonce": "registration-nonce",
+        "pod_uid": "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb",
+        "heartbeat_at": "2026-01-02T03:04:05Z",
+        "liveness_valid_until": "2026-01-02T03:05:05Z",
+        "evaluated_at": "2026-01-02T03:04:05Z",
+        "valid_until": "2026-01-02T03:04:50Z"
+      },
       "id": "11111111-1111-1111-1111-111111111111",
       "template": "base",
       "size": "s",
@@ -19,6 +41,24 @@
       "join_token": "uzw_EXAMPLE-NOT-A-REAL-TOKEN"
     },
     {
+      "roll_evidence": {
+        "never_registered": true,
+        "version": 1,
+        "owner_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+        "registered": false,
+        "scheduling_capabilities": [],
+        "protocol_capabilities": [],
+        "ordinary_coverage": false,
+        "checker_coverage": false,
+        "registered_version": null,
+        "register_nonce": null,
+        "pod_uid": null,
+        "heartbeat_at": null,
+        "liveness_valid_until": null,
+        "evaluated_at": "2026-01-02T03:04:05Z",
+        "valid_until": "2026-01-02T03:04:05Z"
+      },
+      "draining_reason": "image_roll",
       "id": "22222222-2222-2222-2222-222222222222",
       "template": "jvm",
       "size": "l",

@@ -198,8 +198,9 @@ func TestHasLivePollerIsFalseForARecoveryParkedRun(t *testing.T) {
 // TestSetStateRecoveryWaitVaultLockedPersistsCause (issue #1766 M2): a worker reporting
 // {recovery_wait, recovery_cause:"vault_locked"} is ACCEPTED (not the unknown-cause 400) and
 // takes the ordinary park, which is the ONE cause that park persists; every other ordinary
-// cause (empty_turn, provider_outage, absent) stays NULL (PRD #1392 D9). A garbage cause is
-// still the 400 before any state SQL.
+// cause (empty_turn, absent) stays NULL (PRD #1392 D9). A garbage cause is still the 400 before
+// any state SQL. provider_outage no longer takes this park at all (PRD #1733: it routes to
+// parkProviderOutage, covered by providerpark_livedb_test.go and providerpark_test.go).
 func TestSetStateRecoveryWaitVaultLockedPersistsCause(t *testing.T) {
 	for name, tc := range map[string]struct {
 		cause *string
@@ -207,7 +208,6 @@ func TestSetStateRecoveryWaitVaultLockedPersistsCause(t *testing.T) {
 	}{
 		"vault_locked persists": {strPtr("vault_locked"), "vault_locked"},
 		"empty_turn stays NULL": {strPtr("empty_turn"), ""},
-		"provider_outage NULL":  {strPtr("provider_outage"), ""},
 		"absent stays NULL":     {nil, ""},
 	} {
 		run := recoveryRun(0)

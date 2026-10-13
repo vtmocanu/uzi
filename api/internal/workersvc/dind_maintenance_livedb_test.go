@@ -835,7 +835,16 @@ func TestDindMaintenanceDrainCancellationRegistrationLiveDB(t *testing.T) {
 	if rows, err := env.q.UncordonHostedWorker(env.ctx, w.ID); err != nil || rows != 1 {
 		t.Fatalf("legacy uncordon: rows=%d err=%v", rows, err)
 	}
+	// Cancellation releases maintenance ownership, while the independent pressure
+	// streak still fences the worker until a healthy meter clears it.
+	if current := read(); !current.DrainingSince.Valid || current.DindPressureStreak < 2 {
+		t.Fatalf("uncordon cleared the independent pressure fence: %+v", current)
+	}
+	env.exec("UPDATE workers SET dind_pressure_streak=0 WHERE id=$1", w.ID)
+	if rows, err := env.q.UncordonHostedWorker(env.ctx, w.ID); err != nil || rows != 1 {
+		t.Fatalf("healthy legacy uncordon: rows=%d err=%v", rows, err)
+	}
 	if current := read(); current.DrainingSince.Valid {
-		t.Fatalf("uncordon retained legacy drain: %+v", current)
+		t.Fatalf("uncordon retained healthy legacy drain: %+v", current)
 	}
 }

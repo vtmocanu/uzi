@@ -2,15 +2,18 @@ package workersvc
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"github.com/vtmocanu/uzi/api/internal/termsafe"
 
 	"golang.org/x/mod/semver"
 )
@@ -507,10 +510,94 @@ func rollingDetail(s *RollSignal) string {
 // Persistence (PRD #113 M4).
 // -------------------------------------------------------------------------
 
+// PacingReport describes controller pacing independently of the pod-derived phase.
+type PacingReport struct {
+	State            string  `json:"state"`
+	TargetImage      string  `json:"target_image"`
+	TargetVersion    string  `json:"target_version"`
+	CanaryID         *string `json:"canary_id,omitempty"`
+	BlockingWorkerID *string `json:"blocking_worker_id,omitempty"`
+	BlockingReason   *string `json:"blocking_reason,omitempty"`
+	RetainedImage    *string `json:"retained_image,omitempty"`
+	RetainedVersion  *string `json:"retained_version,omitempty"`
+}
+
+// NormalizePacingReport validates a whole entry and strips control characters from
+// its bounded display reason. Errors contain no controller-supplied values.
+func NormalizePacingReport(in *PacingReport) (*PacingReport, error) {
+	if in == nil {
+		return nil, nil
+	}
+	out := *in
+	switch out.State {
+	case "active", "held", "waiting_evidence", "override":
+	default:
+		return nil, fmt.Errorf("invalid pacing state")
+	}
+	bounded := func(v string, max int) bool { return utf8.ValidString(v) && len(v) <= max }
+	if !bounded(out.TargetImage, 512) || !bounded(out.TargetVersion, 128) ||
+		(out.RetainedImage != nil && !bounded(*out.RetainedImage, 512)) ||
+		(out.RetainedVersion != nil && !bounded(*out.RetainedVersion, 128)) ||
+		(out.BlockingReason != nil && !bounded(*out.BlockingReason, 192)) {
+		return nil, fmt.Errorf("invalid pacing field bounds")
+	}
+	for _, id := range []*string{out.CanaryID, out.BlockingWorkerID} {
+		if id != nil {
+			if _, err := uuid.Parse(*id); err != nil {
+				return nil, fmt.Errorf("invalid pacing worker id")
+			}
+		}
+	}
+	clean := func(s string) string {
+		return strings.Map(func(r rune) rune {
+			if termsafe.Unsafe(r) {
+				return -1
+			}
+			return r
+		}, s)
+	}
+	out.TargetImage, out.TargetVersion = clean(out.TargetImage), clean(out.TargetVersion)
+	for _, field := range []**string{&out.BlockingReason, &out.RetainedImage, &out.RetainedVersion} {
+		if *field != nil {
+			value := clean(**field)
+			*field = &value
+		}
+	}
+	return &out, nil
+}
+
+// ParseFreshPacingReport reads diagnostic pacing using only the API receipt time.
+// Readiness reports cannot extend this independent receipt's lifetime.
+func ParseFreshPacingReport(data []byte, receipt pgtype.Timestamptz, now time.Time) *PacingReport {
+	if !receipt.Valid || receipt.InfinityModifier != pgtype.Finite || receipt.Time.After(now) ||
+		now.Sub(receipt.Time) > DefaultControllerSignalTTL || len(data) == 0 || len(data) > 4096 {
+		return nil
+	}
+	var report PacingReport
+	if err := json.Unmarshal(data, &report); err != nil {
+		return nil
+	}
+	reportCopy, err := NormalizePacingReport(&report)
+	if err != nil {
+		return nil
+	}
+	reportCopy.TargetImage = termsafe.CellText(reportCopy.TargetImage)
+	reportCopy.TargetVersion = termsafe.CellText(reportCopy.TargetVersion)
+	for _, field := range []**string{&reportCopy.BlockingReason, &reportCopy.RetainedImage, &reportCopy.RetainedVersion} {
+		if *field != nil {
+			value := termsafe.CellText(**field)
+			*field = &value
+		}
+	}
+	return reportCopy
+}
+
 // RollHealthReport is one validated, sanitized entry from a controller report, ready
 // to persist. The handler does the decoding, enum validation and sanitizing; this
-// layer only writes.
+// layer also validates pacing for callers that do not use the handler.
 type RollHealthReport struct {
+	Kind       string
+	Pacing     *PacingReport
 	WorkerID   uuid.UUID
 	Phase      string
 	PhaseSince *time.Time
@@ -545,8 +632,25 @@ func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (i
 	// agree on which tags are usable. An invalid tag is passed as false so the SQL arms
 	// fail-closed (NOT @tag_valid): that is exactly where the classifier falls back to
 	// CPVersion and can say `outdated`, so the ceiling must engage.
+	if rep.Kind != "" && rep.Kind != "fleet" && rep.Kind != "readiness" {
+		return 0, fmt.Errorf("invalid report kind")
+	}
+	pacing, err := NormalizePacingReport(rep.Pacing)
+	if err != nil {
+		return 0, err
+	}
+	var pacingJSON []byte
+	if pacing != nil {
+		pacingJSON, err = json.Marshal(pacing)
+		if err != nil {
+			return 0, fmt.Errorf("encoding pacing report")
+		}
+	}
+	updatePacing := rep.Kind == "fleet" || (rep.Kind == "" && pacing != nil)
 	tagValid := semver.IsValid(normSemver(rep.WorkerImageTag))
 	return s.q.UpsertWorkerRollHealth(ctx, store.UpsertWorkerRollHealthParams{
+		Pacing:               pacingJSON,
+		UpdatePacing:         updatePacing,
 		WorkerID:             rep.WorkerID,
 		Phase:                rep.Phase,
 		PhaseSince:           pgconv.TimePtr(rep.PhaseSince),

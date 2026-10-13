@@ -29,6 +29,7 @@ export interface CodeCrossCheckRecord {
   candidate_generation: number;
   base_commit: string | null;
   head_commit: string | null;
+  repo_instructions_commit?: string | null;
   candidate_digest: string;
   checker_run_id: string | null;
   checker_harness: string | null;
@@ -124,6 +125,8 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
     || typeof v.deadline_at !== "string" || !Number.isFinite(Date.parse(v.deadline_at))
     || !bounded(v.plan_md, 256 * 1024)) return invalid();
   if (v.stage === "code") {
+    if (v.repo_instructions_commit !== undefined && (typeof v.repo_instructions_commit !== "string"
+      || v.repo_instructions_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.repo_instructions_commit))) return invalid();
     if (!/^[A-Za-z0-9_-]+(?![\s\S])/.test(v.lead_run_id as string) || v.base_commit.length !== 40 || (v.candidate_digest as string).length !== 64 || v.round !== 1 || !/^[a-f0-9]{64}$/.test(v.candidate_digest as string) || typeof v.head_commit !== "string" || v.head_commit.length !== 40 || !/^[a-f0-9]{40}$/.test(v.head_commit)
       || v.code_context === undefined || Buffer.byteLength(JSON.stringify(v.code_context)) > 512 * 1024
       || (v.guidance_snapshot !== undefined && !bounded(v.guidance_snapshot, 8192))) return invalid();
@@ -142,6 +145,7 @@ export function decodeCrossCheckClaim(v: unknown): ClaimPlanCrossCheck | ClaimCo
       || (v.custom_guidance_applied !== undefined && v.custom_guidance_applied !== (guidance !== ""))) return invalid();
     return { ...v, guidance_snapshot: guidance } as unknown as ClaimCodeCrossCheck;
   }
+  if ("repo_instructions_commit" in v) return invalid();
   if (!Number.isInteger(v.round) || (v.round as number) < 1 || (v.round as number) > 5
     || !v.plan_md || !bounded(v.planning_diff, 512 * 1024)
     || !Array.isArray(v.milestones) || v.milestones.length > 64
@@ -197,6 +201,7 @@ export function decodeCodeCrossCheckStatus(v: unknown): CodeCrossCheckStatus {
     return { stage: "code", result: "no_row", repo_instructions_enabled: v.repo_instructions_enabled };
   }
   const sha = (s: unknown) => typeof s === "string" && s.length === 40 && /^[a-f0-9]{40}$/.test(s);
+  if (v.repo_instructions_commit !== undefined && v.repo_instructions_commit !== null && !sha(v.repo_instructions_commit)) return invalid();
   const date = (s: unknown) => typeof s === "string" && Number.isFinite(Date.parse(s));
   if ((v.reason_class === "interrupted" && !date(v.interrupted_at)) || v.round !== 1 || !Number.isSafeInteger(v.candidate_generation) || (v.candidate_generation as number) < 1
     || !["pending", "completed", "failed"].includes(v.outcome as string) || !date(v.deadline_at)

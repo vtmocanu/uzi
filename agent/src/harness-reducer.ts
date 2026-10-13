@@ -209,6 +209,7 @@ export class RunTurnReducerImpl implements RunTurnReducer {
     if (s.done) this.result.done = true;
     if (s.nonClosing !== undefined) this.result.nonClosing = s.nonClosing;
     if (s.checkpoint) this.result.checkpoint = true;
+    if (s.parkRun) this.result.parkRun = true;
     if (s.prdDonePath !== undefined) this.result.prdDonePath = s.prdDonePath;
     if (s.milestonesCompleted !== undefined) {
       this.result.milestonesCompleted = s.milestonesCompleted;

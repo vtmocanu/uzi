@@ -373,9 +373,13 @@ describe("isCodexTransientClassification", () => {
     }
   });
 
-  it("is false for every non-transport category and for an absent classification", () => {
-    for (const raw of ["unauthorized", "usageLimitExceeded", "rateLimitExceeded", "contextWindowExceeded", "other", "totallyMadeUp"]) {
-      assert.equal(transient(raw), false, raw);
+  it("accepts the exact rateLimitExceeded token", () => {
+    assert.equal(transient("rateLimitExceeded"), true);
+  });
+
+  it("rejects other rate-limit tokens, permanent/unknown failures and an absent classification", () => {
+    for (const raw of ["unauthorized", "usageLimitExceeded", "sessionBudgetExceeded", "contextWindowExceeded", "other", "totallyMadeUp", "RateLimitExceeded", "rateLimitExceeded ", { rateLimitExceeded: {} }]) {
+      assert.equal(transient(raw), false, JSON.stringify(raw));
     }
     assert.equal(isCodexTransientClassification(undefined, isTransientStatus), false);
   });

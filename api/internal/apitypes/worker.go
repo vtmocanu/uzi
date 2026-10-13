@@ -7,9 +7,10 @@ import (
 
 // WorkerDTO is the browser/CLI view of a worker.
 type WorkerDTO struct {
-	ID     string `json:"id"`
-	Name   string `json:"name"`
-	Status string `json:"status"`
+	RollPacing json.RawMessage `json:"roll_pacing,omitempty"`
+	ID         string          `json:"id"`
+	Name       string          `json:"name"`
+	Status     string          `json:"status"`
 	// Kind is "external" (a worker its owner runs by hand) or "hosted" (one the
 	// controller runs in the cluster, PRD #58). HostedSize is the S/M/L preset name,
 	// null for an external worker. Together they are what lets the UI mark hosted

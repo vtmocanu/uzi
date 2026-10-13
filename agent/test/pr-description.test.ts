@@ -13,6 +13,7 @@ import {
   STALENESS_START,
   capBody,
   mermaidRemovalReason,
+  nonClosingTitle,
   closingDirectiveFor,
   codeSpan,
   composeBody,
@@ -910,5 +911,60 @@ describe("m2 non-closing deterministic rendering", () => {
     const ci = Reflect.apply(mrCompletionBlock, undefined, args) as string;
     assert.match(ci, /Closes #7/);
     assert.ok(!ci.includes("Follow-up remains"));
+  });
+});
+
+describe("nonClosingTitle", () => {
+  const closing = [
+    "Fixes #2172",
+    "closes: #2172",
+    "Resolves org/repo#2172",
+    "Fi&#120;es #2172",
+    "Fi<b></b>xes #2172",
+    "Fix<!-- x --> #2172",
+    "Fixes **#2172**",
+    "Implements the widget, fixes #2172 too",
+  ];
+  for (const title of closing) {
+    it(`never closes issue 2172: ${JSON.stringify(title)}`, () => {
+      assert.strictEqual(closingDirectiveFor(title, 2172, "org/repo"), true, "fixture is closing");
+      const out = nonClosingTitle(title, 2172, "org/repo");
+      assert.strictEqual(closingDirectiveFor(out, 2172, "org/repo"), false, out);
+      assert.ok(out.length > 0);
+    });
+  }
+
+  it("returns a non-closing title byte-identical", () => {
+    for (const t of ["Add a widget", "Refs #2172", "Fixes #9999", "closes org/other#2172", ""]) {
+      assert.strictEqual(nonClosingTitle(t, 2172, "org/repo"), t);
+    }
+  });
+
+  it("keeps a reference to another issue unchanged", () => {
+    const t = "Fixes #9999 and tidy";
+    assert.strictEqual(nonClosingTitle(t, 2172, "org/repo"), t);
+  });
+
+  it("breaks the keyword and keeps the rest of the title when that suffices", () => {
+    const out = nonClosingTitle("Fixes #2172", 2172, "org/repo");
+    assert.ok(out.includes("#2172"));
+    assert.strictEqual(closingDirectiveFor(out, 2172, "org/repo"), false);
+    // Pins the middle tier: neither the unchanged title nor the fixed fallback, only the keyword broken.
+    assert.notStrictEqual(out, "Work on issue #2172");
+    assert.notStrictEqual(out, "Fixes #2172");
+    assert.strictEqual(out.replace(/\u200b/g, ""), "Fixes #2172");
+  });
+
+  it("uses the fixed fallback when breaking keywords cannot neutralise a markup-split form", () => {
+    assert.strictEqual(nonClosingTitle("Fi<b></b>xes #2172", 2172, "org/repo"), "Work on issue #2172");
+  });
+
+  it("falls back to a fixed non-closing title for an invalid iid (scanner fails closed)", () => {
+    const out = nonClosingTitle("Fixes #1", Number.NaN, "org/repo");
+    assert.strictEqual(out, "Work on issue #NaN");
+  });
+
+  it("the fixed fallback title itself does not close", () => {
+    assert.strictEqual(closingDirectiveFor("Work on issue #2172", 2172, "org/repo"), false);
   });
 });

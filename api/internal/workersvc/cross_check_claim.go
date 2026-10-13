@@ -20,6 +20,7 @@ import (
 // ClaimPlanCrossCheck carries the stored candidate only. Credentials stay in the
 // existing child claim's worker-owned secret envelope, never in this model input.
 type ClaimPlanCrossCheck struct {
+	RepoInstructionsCommit  *string         `json:"repo_instructions_commit,omitempty"`
 	GuidanceDigest          string          `json:"guidance_digest,omitempty"`
 	RepoInstructionsEnabled *bool           `json:"repo_instructions_enabled,omitempty"`
 	RepoInstructionsText    string          `json:"repo_instructions_text,omitempty"`
@@ -69,7 +70,7 @@ func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error)
 		}
 		return &ClaimPlanCrossCheck{Stage: "code", LeadRunID: cc.LeadRunID.String(), Round: 1,
 			CandidateDigest: hex.EncodeToString(cc.CandidateDigest), DeadlineAt: cc.DeadlineAt.Time,
-			GuidanceDigest: hex.EncodeToString(guidanceHash[:]), RepoInstructionsEnabled: &cc.RepoInstructionsEnabled,
+			RepoInstructionsCommit: textPtr(cc.RepoInstructionsCommit), GuidanceDigest: hex.EncodeToString(guidanceHash[:]), RepoInstructionsEnabled: &cc.RepoInstructionsEnabled,
 			RepoInstructionsText: cc.RepoInstructionsText.String, RepoInstructionsDigest: hex.EncodeToString(instructionsHash[:]), CustomGuidanceApplied: &custom,
 			HeadCommit: cc.HeadCommit.String, CodeContext: cc.CodeContext, GuidanceSnapshot: cc.GuidanceSnapshot.String,
 			PlanCrossCheckCandidate: PlanCrossCheckCandidate{BaseCommit: cc.BaseCommit.String, PlanMd: cc.PlanMd.String,
@@ -80,7 +81,7 @@ func crossCheckCandidateInput(cc store.CrossCheck) (*ClaimPlanCrossCheck, error)
 		RequiredCapabilities: cc.RequiredCapabilities, RequiredTools: cc.RequiredTools,
 		SizeClass: cc.SizeClass.String, BaseCommit: cc.BaseCommit.String, PlanningDiff: cc.PlanningDiff.String}
 	var milestones []json.RawMessage
-	if cc.Stage != "plan" || cc.Round < 1 || cc.Round > config.MaxPlanCrossCheckMaxRevisions+1 || !cc.PlanMd.Valid || len(c.PlanMd) == 0 || len(c.PlanMd) > 256*1024 ||
+	if cc.RepoInstructionsCommit.Valid || cc.Stage != "plan" || cc.Round < 1 || cc.Round > config.MaxPlanCrossCheckMaxRevisions+1 || !cc.PlanMd.Valid || len(c.PlanMd) == 0 || len(c.PlanMd) > 256*1024 ||
 		len(c.Milestones) > 256*1024 || json.Unmarshal(c.Milestones, &milestones) != nil || milestones == nil || len(milestones) > 64 ||
 		len(c.PlanningDiff) > 512*1024 || len(c.BaseCommit) != 40 || strings.Trim(c.BaseCommit, "0123456789abcdefABCDEF") != "" ||
 		len(c.RequiredCapabilities) > 64 || len(c.RequiredTools) > 64 || !cc.DeadlineAt.Valid {

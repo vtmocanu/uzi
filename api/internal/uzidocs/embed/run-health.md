@@ -105,6 +105,25 @@ never stops the run.
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 
+## Provider recovery and owner attention
+
+A typed `recovery_wait` / `provider_outage` park shows its provider park
+count, streak start and next retry. After the configured elapsed streak
+bound (default 24h), the next qualifying provider park becomes `paused` /
+`provider_unavailable`, an owner-attention hold rather than a running
+stalled/looping warning. There is no maximum detection overshoot promise.
+Positive completed model turns on the park report start a new streak.
+
+The owner can **Resume** a fresh attempt or **Cancel**. Eligible **Stop**
+sets the scope ceiling, then requires **Resume** after success; it is not
+an atomic endpoint. Stop requires a non-interactive milestone issue run
+with at least one completed milestone. Claim, worker affinity and the
+issue lock for issue runs remain held. Clone/HOME and verified captures
+depend on surviving storage or an available verified recovery copy, not
+a guarantee that every latest edit is recoverable elsewhere.
+See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for resets, the `0` off switch and mixed-fleet limits.
+
 ## Giving a run more time
 
 A run that can time out shows its wall-clock budget in the header, right

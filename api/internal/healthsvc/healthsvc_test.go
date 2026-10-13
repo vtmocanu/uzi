@@ -1256,6 +1256,16 @@ func TestFleetCapacityRollConfirmation(t *testing.T) {
 	}{
 		{name: "ordinary roll informational", want: sevOK},
 		{name: "older unrelated health uses drain overlap", want: sevOK},
+		{name: "fresh active cohort drain", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DiagnosticSuitable, e.DiagnosticRolling, e.DiagnosticDrainingOnly = 2, 2, 2
+		}, want: sevOK},
+		{name: "fresh drain plus unreported offline peer", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DrainingEligible = 1
+			e.DiagnosticSuitable, e.DiagnosticRolling, e.DiagnosticDrainingOnly = 2, 1, 1
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "fresh held cohort", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DiagnosticSuitable, e.DiagnosticRolling, e.DiagnosticDrainingOnly = 2, 2, 0
+		}, want: sevDanger, since: row.HealthSince.Time},
 		{name: "24h equality", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
 			e.LatestSuitableDrainingSince.Time = fixedNow.Add(-24 * time.Hour)
 		}, want: sevDanger, since: fixedNow.Add(-24 * time.Hour)},

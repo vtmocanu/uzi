@@ -41,6 +41,35 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 
 	// A worker whose token is still awaiting delivery.
 	pending := resp.Workers[0]
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	evidence := pending.RollEvidence
+	if evidence == nil {
+		t.Fatal("first worker lost roll evidence")
+	}
+	if evidence.Version != 1 || evidence.OwnerID != "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" || !evidence.Registered {
+		t.Fatalf("registered evidence identity = %+v", evidence)
+	}
+	if evidence.NeverRegistered == nil || *evidence.NeverRegistered {
+		t.Fatal("registered worker lost explicit negative registration evidence")
+	}
+	if !slices.Equal(evidence.SchedulingCapabilities, []string{"docker"}) ||
+		!slices.Equal(evidence.ProtocolCapabilities, []string{"cross_check_v1", "cross_check_lane_v1"}) ||
+		evidence.OrdinaryCoverage || !evidence.CheckerCoverage {
+		t.Fatalf("registered evidence coverage = %+v", evidence)
+	}
+	if evidence.RegisteredVersion == nil || *evidence.RegisteredVersion != "0.11.7" ||
+		evidence.RegisterNonce == nil || *evidence.RegisterNonce != "registration-nonce" ||
+		evidence.PodUID == nil || *evidence.PodUID != "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb" {
+		t.Fatalf("registered evidence binding = %+v", evidence)
+	}
+	if evidence.HeartbeatAt == nil || !evidence.HeartbeatAt.Equal(at) ||
+		!evidence.EvaluatedAt.Equal(at) || !evidence.ValidUntil.Equal(at.Add(45*time.Second)) ||
+		evidence.LivenessValidUntil == nil || !evidence.LivenessValidUntil.Equal(at.Add(60*time.Second)) {
+		t.Fatalf("registered evidence timestamps = %+v", evidence)
+	}
+	if pending.DrainingReason != nil {
+		t.Fatalf("first worker draining reason = %v, want nil", pending.DrainingReason)
+	}
 	if !slices.Equal(pending.DiskPressureVolumes, []string{"nix", "dind"}) {
 		t.Fatalf("disk_pressure_volumes = %v, want [nix dind]", pending.DiskPressureVolumes)
 	}
@@ -106,6 +135,25 @@ func TestControllerParsesTheAPIsPollShape(t *testing.T) {
 	// nil is load-bearing — it means "write nothing", not "this worker has no token"
 	// — so the pointer type must survive the round trip rather than collapsing to "".
 	noToken := resp.Workers[1]
+	unregistered := noToken.RollEvidence
+	if unregistered == nil || unregistered.NeverRegistered == nil || !*unregistered.NeverRegistered {
+		t.Fatal("positive never-registered evidence missing")
+	}
+	if unregistered == nil {
+		t.Fatal("second worker lost unregistered roll evidence")
+	}
+	if unregistered.Version != 1 || unregistered.OwnerID != "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa" ||
+		unregistered.Registered || unregistered.OrdinaryCoverage || unregistered.CheckerCoverage ||
+		unregistered.RegisteredVersion != nil || unregistered.RegisterNonce != nil ||
+		unregistered.PodUID != nil || unregistered.HeartbeatAt != nil || unregistered.LivenessValidUntil != nil ||
+		unregistered.SchedulingCapabilities == nil || len(unregistered.SchedulingCapabilities) != 0 ||
+		unregistered.ProtocolCapabilities == nil || len(unregistered.ProtocolCapabilities) != 0 ||
+		!unregistered.EvaluatedAt.Equal(at) || !unregistered.ValidUntil.Equal(at) {
+		t.Fatalf("unregistered evidence = %+v", unregistered)
+	}
+	if noToken.DrainingReason == nil || *noToken.DrainingReason != "image_roll" {
+		t.Fatalf("second worker draining reason = %v, want image_roll", noToken.DrainingReason)
+	}
 	if noToken.DiskPressureVolumes == nil || len(noToken.DiskPressureVolumes) != 0 {
 		t.Fatalf("disk_pressure_volumes = %v, want non-nil empty array", noToken.DiskPressureVolumes)
 	}

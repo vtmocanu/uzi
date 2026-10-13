@@ -98,6 +98,9 @@ export interface MergeRequestDetail {
   targetBranch: string;
   description: string;
   state: MergeRequestState;
+  /** The MR/PR title, present only when the forge returned a string `title`. Absent means
+   *  unreadable: callers that need it must fail closed rather than assume it is clean. */
+  title?: string;
 }
 
 export class ForgeError extends Error {
@@ -142,6 +145,10 @@ export interface ForgeClient {
    *  https-only, redirect:"error" and transient-5xx guards are inherited from `request`.
    *  Throws a ForgeError on a non-2xx so the caller can log-and-continue best-effort. */
   updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void>;
+  /** Forge-neutral rewrite of an existing MR/PR title. Same single-item resource, method and
+   *  transport guards as updateMergeRequestDescription, with a `{ title }` body on all three
+   *  drivers. Throws a ForgeError on a non-2xx so the caller can fail closed. */
+  updateMergeRequestTitle(repoUrl: string, pat: string, iid: number, title: string, signal?: AbortSignal): Promise<void>;
   /** Forge-neutral read of one existing MR/PR (PRD #1798 D11): head SHA, target branch,
    *  current description and normalised state. Same single-item resource and transport
    *  guards as getMergeRequestHead. Throws a ForgeError on a non-200 (a 404 for a missing
@@ -252,6 +259,16 @@ abstract class HttpForgeClient implements ForgeClient {
    */
   async updateMergeRequestDescription(repoUrl: string, pat: string, iid: number, description: string, signal?: AbortSignal): Promise<void> {
     const res = await this.request(this.updateMethod(), this.headUrl(repoUrl, iid), pat, this.updateBody(description), signal);
+    if (res.status < 200 || res.status >= 300) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
+  }
+
+  /**
+   * Rewrite an existing MR/PR title through the shared transport. Same URL and method as
+   * updateMergeRequestDescription; the body is `{ title }` for GitLab, Forgejo and GitHub
+   * alike. Any 2xx is success; a non-2xx throws a ForgeError.
+   */
+  async updateMergeRequestTitle(repoUrl: string, pat: string, iid: number, title: string, signal?: AbortSignal): Promise<void> {
+    const res = await this.request(this.updateMethod(), this.headUrl(repoUrl, iid), pat, { title }, signal);
     if (res.status < 200 || res.status >= 300) throw new ForgeError(res.status, (await safeText(res)).slice(0, 512));
   }
 
@@ -391,6 +408,7 @@ export class GitLabClient extends HttpForgeClient {
       targetBranch: requireBranch(rec["target_branch"], "merge request"),
       description: bodyText(rec["description"], "merge request"),
       state: gitlabState(rec["state"]),
+      ...(typeof rec["title"] === "string" ? { title: rec["title"] } : {}),
     };
   }
 
@@ -701,6 +719,7 @@ function parsePrDetail(obj: unknown): MergeRequestDetail {
     targetBranch,
     description: bodyText(rec["body"], "pull request"),
     state: merged ? "merged" : raw,
+    ...(typeof rec["title"] === "string" ? { title: rec["title"] } : {}),
   };
 }
 

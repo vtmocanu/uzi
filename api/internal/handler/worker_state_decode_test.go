@@ -38,6 +38,7 @@ const workerStateFixtureDir = "../../../fixtures/worker-state-request"
 // after #1795 by design (TestWorkerStateDecodeMirrorInLockstep fails until they are mirrored
 // here), so it is not a frozen snapshot of the pre-#1795 struct.
 type stateRequestMinusGateRevision struct {
+	RequireRunning            bool                       `json:"require_running,omitempty"`
 	CompletionFinalHead       *string                    `json:"completion_final_head,omitempty"`
 	State                     string                     `json:"status"`
 	ClaimGeneration           *int64                     `json:"claim_generation"`
@@ -81,7 +82,21 @@ type stateRequestMinusGateRevision struct {
 	SizeClass                 *string                    `json:"size_class"`
 	RecoveryCause             *string                    `json:"recovery_cause"`
 	DiskParkPreventive        *bool                      `json:"disk_park_preventive"`
+	ProductiveTurns           *int32                     `json:"productive_turns"`
+	ProviderProgressTurns     *int32                     `json:"provider_progress_turns"`
 	CheckpointContainsLatest  *bool                      `json:"checkpoint_contains_latest"`
+}
+
+func TestWorkerStateDecodesProviderProgress(t *testing.T) {
+	body := "{\"status\":\"recovery_wait\",\"claim_generation\":2,\"provider_progress_turns\":3}"
+	r := httptest.NewRequest("POST", "/api/worker/runs/"+uuid.NewString()+"/state", strings.NewReader(body))
+	var req workersvc.StateRequest
+	if err := httpx.DecodeJSON(r, &req); err != nil {
+		t.Fatal(err)
+	}
+	if req.ProviderProgressTurns == nil || *req.ProviderProgressTurns != 3 {
+		t.Fatalf("progress=%v", req.ProviderProgressTurns)
+	}
 }
 
 // gateRevisionStateFields are the StateRequest fields PRD #1795 added (the only difference

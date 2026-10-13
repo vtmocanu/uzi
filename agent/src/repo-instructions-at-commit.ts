@@ -1,6 +1,7 @@
 // PRD #2170: the repository's root CLAUDE.md as it exists at one COMMIT, read from the worker's
-// bare repository. The code cross-check pins instructions to the lead's `base_commit`, so the
-// agent-writable worktree (which may already carry the change under review) is never opened.
+// bare repository. The code cross-check pins instructions to the freshly fetched default tip
+// (`repo_instructions_commit`), independently of the diff base. The agent-writable worktree
+// (which may already carry the change under review) is never opened.
 //
 // Same trust model as readRepoInstructions (repo-instructions.ts): ROOT CLAUDE.md only, a symlink
 // followed only when it stays inside the repo, never into `.git/`, and ending on a regular blob.

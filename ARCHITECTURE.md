@@ -817,21 +817,27 @@ cookie-only, at most 8 KiB) is appended to the checker's trusted brief after
 the locked base brief, so it can add checks but not remove required ones or
 change the output format or read-only rules. Repository instructions are a
 separate consent (`repos.cross_check_repo_instructions_enabled`): the worker
-reads the root `CLAUDE.md` from the **base commit** (the merge base with the
-default branch) out of its bare repository, never the run's worktree, and
-hands it to the checker as fenced advisory data. A run therefore cannot
-author or rewrite the instructions it is checked against; the accepted limit
-is that a run forked from an older default-branch commit is checked against
-that older file, or none. See the amendment in
-[ADR-246](adr/0246-trusted-repo-instructions.md). Guidance and the instruction
-text are frozen into the check row, with digests the worker verifies on claim.
+freshly fetches the configured default-branch tip and freezes it once as
+`repo_instructions_commit` when the check starts, after fresh lead quiescence
+within the held worker boundary and before the durable local pin. The previously captured default-branch
+commit remains the merge-base diff input. Consent on reads root `CLAUDE.md`
+at the instruction pin with the existing 64 KiB, 8-hop, repository-root,
+`.git/`, regular-blob, import-stripping and advisory-fencing protections;
+consent off pins without reading. A consent retry keeps the same pin; existing
+checks reuse frozen inputs. Guidance and instruction text are frozen into the check row,
+with digests the worker verifies on claim; a present pin binds candidate
+identity even with consent off. Legacy NULL provenance is not backfilled.
+See [Code cross-check instructions](docs/cross-check.md#owner-guidance-and-repository-instructions)
+and [ADR-246](adr/0246-trusted-repo-instructions.md) for details.
 
 The local snapshot ref is deleted once the checker has settled. A boot sweep
 deletes leftovers only on positive server evidence matching the lead id and,
 when a check row exists, its claim generation and head, and only when the lead is finished or not held by that
 worker (for a lead with no check row, additionally only when the ref was never
-read), and keeps the ref on any doubt. Roll out the api and migrations 00324 to 00327 before workers
-that advertise `cross_check_code_v1`.
+read), and keeps the ref on any doubt. Roll out the api and migrations 00324 to 00327 and 00329 before upgraded workers
+that advertise `cross_check_code_v1`. Roll back workers before the api, retaining
+00329's column, stored pins and digests; its Down destructively removes provenance.
+See [rollout details](docs/cross-check.md#rolling-out-code-cross-check).
 
 ### Run lifecycle
 
@@ -2231,29 +2237,80 @@ Rationale, the decision log, and the alternatives that were rejected are in
 concrete pinned version independent of `Chart.AppVersion` (`required` in the chart —
 a blank tag fails the render rather than silently following appVersion). An
 app-only release (an api/web/db/controller bump that advances `Chart.version`/
-`appVersion`) therefore renders an unchanged worker pod-spec hash, and the
-controller rolls **zero** worker pods; any run in flight keeps running on the old
-worker, which talks to the new api unchanged. Advancing the worker fleet is a
-deliberate operator step: bump `workers.image.tag` to a new concrete version.
+`appVersion`) leaves the worker image pin unchanged. If worker rendering also
+stays unchanged, it rolls zero worker pods. A controller change that alters the
+worker template can still cause a paced same-image roll (notably #1470's pod UID
+environment); the image pin alone does not prevent template rolls. Advancing
+the worker fleet is a deliberate operator step: bump `workers.image.tag` to a
+new concrete version with its verified exact `workers.rollTargetVersion`.
 
-When that deliberate bump does move the tag, the controller does not hard-kill a
-busy worker. On spec-hash drift it first asks the api whether the worker has an
-active run; if so it **cordons** the worker over a new authenticated control-write
-endpoint (`POST /api/controller/workers/{id}/drain`, distinct from the existing
-display-only status report above) instead of rolling — the api stamps a `workers.
-draining_since` timestamp, an orthogonal column, not a `workers.status` value,
-because `status` is rewritten to `'online'` on every heartbeat and would clobber a
-drain flag stored there. A draining worker keeps heartbeating and finishes its
-in-flight run. It can re-claim its own promoted runs, but the claim gate prevents
-it from taking on new runs (PRD #1030); the
-controller performs the `Recreate` roll once the api reports it idle, and
-`RegisterWorker` clears `draining_since` on the worker's next registration after
-that roll. The wait is bounded by `workers.drainDeadline` (default `24h`) — past
-it the controller rolls the busy worker anyway and its run falls back to the
-existing requeue-resume path — and `workers.forceRoll` is the operator emergency
-override that rolls every drifted worker immediately regardless of busy-ness, for
-a fix that cannot wait on a drain. Any failure reading busy-ness or writing the
-cordon fails safe: the roll is deferred, never forced through.
+**Paced replacement (#1470 M2)** adds admission before that drain. The chart
+enforces controller replicas `0` or `1`, with Recreate; disabled hosting/controller
+and a zero-replica stop remain supported. Extra controllers outside the chart
+are unsupported. There is no API journal or multi-controller coordination.
+
+`controller/internal/kube/roll_pacing.go` groups persistent workers by owner,
+placement lane, effective registered scheduling/protocol capabilities and the
+legacy-checker-fallback/dedicated-checker booleans. The wire's `ordinary_coverage`
+is legacy checker fallback, not ordinary primary-job support. Size and template
+do not split pools; ephemeral workers bypass pacing. Each pool starts with one
+canary, then admits up to positive `workers.rollConcurrency` (default `1`).
+Multi-worker admission protects the last usable owner/lane provider, including
+across overlapping pools; a replacement supplying coverage must individually
+cover the frozen set, not contribute to a union of partial sets. A singleton
+pool can roll with an outage, subject to the wider owner/lane capacity guard.
+
+An 8192-byte-bounded `uzi.dev/image-roll` Deployment metadata annotation freezes
+coverage, target hash/image/version, prior registration identity and
+canary/completed history. Reservations include busy drains and unknown write
+outcomes. Synchronous UID/resourceVersion-preconditioned patches confirm
+reservation, template mutation and cancellation; uncertainty holds sibling work
+until fresh observation. A completed canary closes its original cohort before
+later pin changes use current coverage. Only ADR-1759's required Deployment
+delete/new-UID lifecycle temporarily mirrors the same marker onto the retained
+/data PVC, through bounded lists and optimistic patches; it is not a second
+journal. Legacy volume recycling can retain a zero-replica Deployment.
+
+Promotion requires current Deployment → ReplicaSet → pod UID ownership, one
+current running target-image worker, exact registered target version, current
+pod UID, changed registration nonce and a subsequent nonce-proven heartbeat
+fresh at API evaluation. Ready alone and same-version old-process
+re-registration do not prove replacement; an A→B→A pin with an old UID remains
+ambiguous. The existing registration Name transport uses `UZI_POD_UID` and
+`UZI_WORKER_NAME=uzi-pod:$(UZI_POD_UID)` without changing worker images or the
+user-chosen label. Ordinary API liveness independently supports retained old
+capacity and fresh old-worker drain confirmation, not replacement promotion.
+
+`workers.rollTargetVersion` must name the pinned image's **verified exact baked
+stamp**, including ADR-1720's `+g<commit>`, even for published bare SemVer tags.
+The controller cannot derive that stamp from a bare tag or the worker being
+promoted. Registration keeps its 64-byte display limit; altered/truncated
+versions withhold the incarnation binding. Missing mapping or evidence holds
+rather than falling back to unpaced replacement.
+
+Only admitted image turns receive a roll-owned cordon over the authenticated
+`POST /api/controller/workers/{id}/drain` control-write channel. The API's
+`draining_since` and reason remain separate from heartbeat-derived status.
+`workers.drainDeadline` (default `24h`) bounds that admitted busy turn; a bounded
+fresh re-cordon/poll must confirm the **current** expired timestamp and fences.
+An old expired timestamp cannot authorize a newly reset drain. Independent
+pressure/maintenance deadlines retain their meaning. An unresolved stuck
+participant holds the rest of its pool. Release clears only roll-owned drains
+on healthy retained old workers or proven current replacements; independent
+maintenance, pressure and custody fences remain. `workers.forceRoll` explicitly
+bypasses pacing, holds, evidence and busy waits and can remove remaining capacity,
+while preserving custody and independent maintenance protection. No timer
+forces admission and no automatic rollback is added.
+
+Deploy API first, then the singleton controller/chart with the worker pin steady,
+verify evidence/report support, then change the pin. An old controller with a new
+API remains unpaced; active-roll downgrade is unsafe. Controller diagnostics
+remain read-only at the API boundary, which holds no kube credentials. Local health/report persistence and retained-fleet claim replay checks are
+recorded in the PRD;
+hosted real-apiserver verification remains open. See
+[ADR-1470](adr/1470-paced-hosted-worker-rolls.md),
+[PRD #1470](prds/1470-paced-hosted-worker-rolls.md) and the
+[maintainer runbook](docs/hosted-worker-roll-verification.md).
 
 "Surge" here means the app stack surges forward on every release while old
 worker pods linger until their work is done — not overlapping worker pods.

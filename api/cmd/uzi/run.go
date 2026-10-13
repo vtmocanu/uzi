@@ -96,8 +96,8 @@ const statusRecoveryWait = "recovery_wait"
 // `run wait` keep waiting on it rather than exiting.
 const statusPaused = "paused"
 
-// holdBudgetExhausted and holdCompletionBlocked are the two run.HoldReason values a
-// `paused` run can carry (PRD #1497 M1 / PRD #1226). A wall park — a run that reached its
+// holdBudgetExhausted and holdCompletionBlocked name the wall and completion holds
+// surfaced below (PRD #1497 M1 / PRD #1226). A wall park — a run that reached its
 // wall-clock time limit — carries budget_exhausted; a structural completion hold carries
 // completion_blocked. Both are surfaced by the `uzi run get` HOLD row and the `run wait`
 // informative line; named here so those two surfaces compare against one literal, the same
@@ -110,9 +110,11 @@ const statusPaused = "paused"
 // enabled again (or, where the CLI and web offer a per-run override, once the owner points
 // the run at another token); uzi never substitutes a credential on its own (D2).
 const (
-	holdBudgetExhausted    = "budget_exhausted"
-	holdCompletionBlocked  = "completion_blocked"
-	holdCredentialDisabled = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdProviderUnavailable = "provider_unavailable"
+	providerOutageCause     = "provider_outage"
+	holdBudgetExhausted     = "budget_exhausted"
+	holdCompletionBlocked   = "completion_blocked"
+	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls

@@ -145,6 +145,9 @@ var runDTOKeys = []string{
 	// allowance unused). Both always on the wire; worker_name is null unless the run-detail read
 	// enriched it.
 	"worker_name", "can_stop_at_wall",
+	// PRD #1733: the server-derived Stop gate for a provider_unavailable hold (a paused milestone
+	// issue run with a completed milestone). Always on the wire.
+	"can_stop_at_provider_hold",
 	// PRD #1227 M1: the owner-decision contract projection. completion_revision is the run's current
 	// contract_revision (null when unfrozen); completion_deferred / completion_accepted are the
 	// owner-deferred milestones and owner-accepted criteria decoded from the frozen contract, STABLE
@@ -238,6 +241,8 @@ var runDTOKeys = []string{
 	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
 	// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 	"disk_park_count",
+	// PRD #1733: the open provider-park streak (count, and when it began; null when none is open).
+	"provider_park_count", "provider_park_streak_started_at",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.

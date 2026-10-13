@@ -161,12 +161,13 @@ func (s *Service) parkDataVolumeFull(ctx context.Context, wkr store.Worker, owne
 
 	retryNotBefore := s.now().Add(s.recoveryParkFallbackFor(run.RecoveryWaitCount) + recoveryParkJitter())
 	parked, perr := qtx.ParkRunDataVolumeFull(ctx, store.ParkRunDataVolumeFullParams{
-		Counted:         counted,
-		RetryNotBefore:  pgconv.Time(retryNotBefore),
-		SessionID:       sessionID,
-		ID:              run.ID,
-		WorkerID:        workerID,
-		ClaimGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
+		ResetProviderStreak: req.ProviderProgressTurns != nil && *req.ProviderProgressTurns > 0,
+		Counted:             counted,
+		RetryNotBefore:      pgconv.Time(retryNotBefore),
+		SessionID:           sessionID,
+		ID:                  run.ID,
+		WorkerID:            workerID,
+		ClaimGeneration:     pgconv.Int8Ptr(req.ClaimGeneration),
 	})
 	if perr != nil {
 		if errors.Is(perr, pgx.ErrNoRows) {

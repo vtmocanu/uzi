@@ -275,9 +275,10 @@ export interface RecoveryBundleProducer {
     cloneUrl?: string,
     username?: string,
   ): Promise<string>;
-  /** Optional best-effort cleanup of the transient pin after durable upload. */
   resolveRecoveryBareDir?(bareDir: string): Promise<string | undefined>;
-  deleteRecoveryPin?(barePath: string, runId: string, generation: number): Promise<void>;
+  /** Optional: delete the transient recovery pin of an archived (uploaded) record. A producer
+   *  without it never cleans a pin (see {@link RecoveryCoordinator}'s archived-pin cleanup). */
+  cleanupArchivedRecoveryPin?: GitCache["cleanupArchivedRecoveryPin"];
   /** issue #1742 D4(a): resolve a journaled bare-dir basename under the private repos root and
    *  classify `sourceSha` against it (see `GitCache.resolveRestartSource`). Optional: a producer
    *  without it makes every finalization-pinned record `source_not_verifiable_after_restart`. */
@@ -392,6 +393,9 @@ export interface RecoveryCoordinatorOptions {
   liveBackoffBaseMs?: number;
   /** issue #1995: the ceiling of the live re-drive's exponential backoff. */
   liveBackoffCapMs?: number;
+  /** In-process delay before a settled (`deleted` / `already_absent`) archived-pin cleanup is attempted
+   *  again for the same capture (default {@link LIVE_PIN_SETTLE_MS}). A restart re-checks every record once. */
+  livePinSettleMs?: number;
   /** Delays between the bounded retries of {@link RecoveryCoordinator.settleUnadoptedGuardedGeneration}. */
   unadoptedSettleRetryDelaysMs?: readonly number[];
   /** Test seams (never set in production). */
@@ -451,9 +455,29 @@ interface PendingRedundancyClaim { runId: string; generation: number; captureId:
  *  so building (under the journal lock) and submitting (after it) share it. */
 interface RedundancyBudget { signal: AbortSignal; deadline: number; dispose(): void }
 
+/** Archived-pin cleanup: per-record cap, and the shared boot-sweep budget for all of them. */
+const PIN_CLEANUP_RECORD_MS = 10_000;
+const PIN_CLEANUP_BOOT_MS = 60_000;
+export type UploadedPinCleanupMode = "capture" | "sweep" | "live" | "boot";
+export type UploadedPinCleanupResult =
+  | { state: "deleted" | "already_absent" }
+  | { state: "retained"; reason: string };
+
+/** The archive proof for deleting a pin: an authenticated, plain (non-guarded) `uploaded` record
+ *  whose bundle was self-contained with no prerequisites, so the archive alone holds the head. */
+function archiveProvesPin(r: RecoveryRecord): boolean {
+  return r.state === "uploaded" && !r.inventoryGuarded && r.coverageDigest === undefined &&
+    r.finalRequest === undefined && r.completionReceipt === undefined &&
+    typeof r.serverCaptureId === "string" && r.serverCaptureId !== "" &&
+    typeof r.checksum === "string" && /^[0-9a-f]{64}$/.test(r.checksum) &&
+    typeof r.byteSize === "number" && Number.isSafeInteger(r.byteSize) && r.byteSize >= 0 &&
+    r.selfContained === true && Array.isArray(r.prerequisiteShas) && r.prerequisiteShas.length === 0;
+}
+
 const LIVE_MAX_PER_PASS = 4;
 const LIVE_BACKOFF_BASE_MS = 30_000;
 const LIVE_BACKOFF_CAP_MS = 15 * 60_000;
+const LIVE_PIN_SETTLE_MS = 6 * 60 * 60_000;
 
 /** Dispositions of a journaled bundle's upload that no retry can change: the api refused the
  *  capture for good, or the local bytes no longer match what was journaled. Written into the
@@ -585,7 +609,9 @@ function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
 // issue #1995: the per-capture cycle lock. A capture cycle (authenticated re-read → short-circuits
 // → production + install → reserve + upload → failure marking) is one critical section per record,
 // so two entry points can never produce twice or stream concurrently. It is OUTER to the per-run
-// journal lock (withJournalLock), which every inner helper takes only briefly. Process memory on
+// journal lock (withJournalLock). Most inner helpers take it only briefly; a few hold it across
+// bounded Git work (the archived-pin cleanup, cleanupUploadedRecoveryPin, holds it from the journal
+// re-read through the destructive Git call). Process memory on
 // purpose, like recoveryJournalLocks: one worker process owns each data dir.
 const captureCycleTails = new Map<string, Promise<void>>();
 
@@ -766,6 +792,7 @@ export class RecoveryCoordinator {
   private readonly liveMaxPerPass: number;
   private readonly liveBackoffBaseMs: number;
   private readonly liveBackoffCapMs: number;
+  private readonly livePinSettleMs: number;
   private readonly testHooks: RecoveryCoordinatorOptions["testHooks"];
   private readonly unadoptedSettleRetryDelaysMs: readonly number[];
   /** In-flight passes (the boot sweep, a live pass): {@link resumeLive} is a no-op while non-empty. */
@@ -779,6 +806,8 @@ export class RecoveryCoordinator {
   /** Set by any 401: a live pass runs only for a heartbeat sent after it. */
   private credentialBlockedAt: number | undefined;
   private readonly lastAttemptAt = new Map<string, number>();
+  /** Per-capture exponential backoff of the live archived-pin cleanup (pruned like lastAttemptAt). */
+  private readonly pinCleanupBackoff = new Map<string, { failures: number; nextAt: number }>();
   /** serverCaptureIds whose redundancy claim got a final answer (expired, or a non-transient retained). */
   private readonly redundancySettled = new Set<string>();
 
@@ -796,6 +825,7 @@ export class RecoveryCoordinator {
     this.liveMaxPerPass = opts.liveMaxPerPass ?? LIVE_MAX_PER_PASS;
     this.liveBackoffBaseMs = opts.liveBackoffBaseMs ?? LIVE_BACKOFF_BASE_MS;
     this.liveBackoffCapMs = opts.liveBackoffCapMs ?? LIVE_BACKOFF_CAP_MS;
+    this.livePinSettleMs = opts.livePinSettleMs ?? LIVE_PIN_SETTLE_MS;
     this.testHooks = opts.testHooks;
     this.unadoptedSettleRetryDelaysMs = opts.unadoptedSettleRetryDelaysMs ?? UNADOPTED_SETTLE_RETRY_DELAYS_MS;
     // The MAC key is DERIVED from the (stable) worker join token, so it re-derives
@@ -2021,7 +2051,11 @@ export class RecoveryCoordinator {
     // A stream already in flight when cleanup ran cannot be recalled; this guarded write then
     // throws RecordGoneError instead of recreating the removed record.
     const uploaded = await this.writeExistingRecord(current, (cur) => ({ ...cur, state: "uploaded", reason: undefined }));
-    if (!uploaded.inventoryGuarded) await this.cleanupUploadedRecoveryPin(uploaded);
+    if (!uploaded.inventoryGuarded) {
+      // In capture mode a runner-driven settle is still executing, so this usually retains `executing`; the live pass
+      // or boot deletes the pin once the run is no longer executing.
+      await this.cleanupUploadedRecoveryPin(uploaded, { mode, signal });
+    }
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
     if (!uploaded.inventoryGuarded) await fs.rm(current.bundlePath!, { force: true }).catch(() => undefined);
@@ -2034,20 +2068,69 @@ export class RecoveryCoordinator {
     return { state: "uploaded", captureId: current.captureId };
   }
 
-  /** One best-effort attempt after the authenticated uploaded write. A crash here may retain
-   * the transient ref indefinitely; settlement evidence and journals have their own lifecycle. */
-  private async cleanupUploadedRecoveryPin(record: RecoveryRecord): Promise<void> {
-    if (!record.recoveryPinBareDir || !this.git.resolveRecoveryBareDir || !this.git.deleteRecoveryPin) return;
+  /**
+   * Delete the transient recovery pin of an archived (`uploaded`) record, once. Journal lock first
+   * (held across the authenticated re-read and the destructive call), then the primitive's own
+   * attribution and bare locks. Writes nothing to the journal: a retry is idempotent
+   * (`already_absent`). Never throws; every refusal is a bounded `retained` reason.
+   */
+  private async cleanupUploadedRecoveryPin(
+    record: RecoveryRecord,
+    opts: { mode: UploadedPinCleanupMode; signal?: AbortSignal; deadline?: number },
+  ): Promise<UploadedPinCleanupResult> {
+    const cleanup = this.git.cleanupArchivedRecoveryPin;
+    if (!cleanup) return { state: "retained", reason: "unsupported" };
+    const { runId, captureId } = record;
+    const controller = new AbortController();
+    const deadline = Math.min(Date.now() + PIN_CLEANUP_RECORD_MS, opts.deadline ?? Infinity);
+    const timer = setTimeout(() => controller.abort(), Math.max(0, deadline - Date.now()));
+    timer.unref?.();
+    const signal = opts.signal ? AbortSignal.any([opts.signal, controller.signal]) : controller.signal;
+    let generation = record.generation ?? 0;
+    let result: UploadedPinCleanupResult;
     try {
-      const barePath = await this.git.resolveRecoveryBareDir(record.recoveryPinBareDir);
-      if (!barePath) return;
-      await this.git.deleteRecoveryPin(barePath, record.runId, record.generation ?? 0);
-    } catch (err) {
-      this.log.warn("recovery: uploaded bundle pin cleanup failed", {
-        run_id: record.runId,
-        error: errText(err).slice(0, 512),
-      });
+      result = await this.withJournalLock(runId, async (): Promise<UploadedPinCleanupResult> => {
+        const retained = (reason: string): UploadedPinCleanupResult => ({ state: "retained", reason });
+        let records: RecoveryRecord[];
+        try { records = await this.checkedRecords(runId, { signal, deadline }); }
+        catch { return retained("unverified_journal"); }
+        const cur = records.find((r) => r.captureId === captureId);
+        if (!cur) return retained("record_gone");
+        generation = cur.generation ?? 0;
+        if (!archiveProvesPin(cur)) return retained("archive_unproven");
+        if (records.some((r) => r.inventoryGuarded)) return retained("inventory_guarded");
+        if (records.some((r) => r.captureId !== captureId && (r.generation ?? 0) === generation && r.state !== "uploaded")) {
+          return retained("sibling_pending");
+        }
+        if (residueQuarantine() !== undefined) return retained("quarantined");
+        if (this.isExecuting(runId)) return retained("executing");
+        // Forward each authenticated directory independently: the primitive refuses a disagreement.
+        const out = await cleanup.call(this.git, {
+          runId,
+          generation,
+          sourceSha: cur.sourceSha,
+          ...(cur.recoveryPinBareDir ? { recoveryPinBareDir: cur.recoveryPinBareDir } : {}),
+          ...(cur.bareDir ? { bareDir: cur.bareDir } : {}),
+          signal,
+          deadline,
+          isEligible: () => residueQuarantine() === undefined && !this.isExecuting(runId) && !signal.aborted,
+        });
+        return out.state === "retained" ? retained(out.reason) : out;
+      }, signal);
+    } catch {
+      // Includes lock-wait aborts and any primitive failure; raw error text never leaves here.
+      result = { state: "retained", reason: signal.aborted ? "deadline" : "cleanup_failed" };
+    } finally {
+      clearTimeout(timer);
     }
+    if (result.state === "retained") {
+      // `executing` is the expected answer while the run is still running: info, not a warning.
+      const level = result.reason === "executing" ? "info" : "warn";
+      this.log[level]("recovery: uploaded record pin retained", { run_id: runId, generation, reason: result.reason, mode: opts.mode });
+    } else {
+      this.log.info("recovery: uploaded record pin cleanup", { run_id: runId, generation, state: result.state, mode: opts.mode });
+    }
+    return result;
   }
 
   /** Classify a reserve/upload RPC failure and journal its disposition on the CURRENT record. */
@@ -2207,6 +2290,8 @@ export class RecoveryCoordinator {
    * BEFORE register, so it provably excludes any record a live flight of this process writes
    * later; {@link resumePending} then processes only this snapshot. Authenticated records only
    * (a tampered record is never trusted), legacy uploads omitted; guarded ACKs retry local cleanup.
+   * Non-guarded `uploaded` records are included so {@link resumePending} can retry their archived
+   * recovery-pin cleanup (the upload phase still skips them, and {@link isLiveCandidate} is false).
    */
   async snapshotBootRecords(): Promise<RecoveryRecord[]> {
     if (!this.enabled) return [];
@@ -2219,7 +2304,7 @@ export class RecoveryCoordinator {
     const out: RecoveryRecord[] = [];
     for (const runId of runDirs) {
       for (const record of await this.listRecords(runId)) {
-        if (record.state !== "uploaded" || record.inventoryGuarded) out.push(record);
+        out.push(record);
       }
     }
     return out;
@@ -2270,12 +2355,50 @@ export class RecoveryCoordinator {
 
   private async resumePendingPass(signal?: AbortSignal, snapshot?: RecoveryRecord[]): Promise<void> {
     const records = snapshot ?? (await this.snapshotBootRecords());
+    // Archived-pin cleanups run AFTER every upload/FINAL step of the snapshot.
+    const cleanups: RecoveryRecord[] = [];
     for (const snap of records) {
       if (signal?.aborted) return;
+      if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
       // The whole record step runs under the per-capture cycle lock (issue #1995), so a foreground
       // capture or a live pass on the same record cannot interleave with it.
       await runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal));
     }
+    await this.bootPinCleanups(cleanups, signal);
+  }
+
+  /** Boot-time archived-pin cleanups: least recently attempted first, at most `liveMaxPerPass`,
+   *  all inside one shared budget; the rest is left for the live pass. */
+  private async bootPinCleanups(cleanups: RecoveryRecord[], signal?: AbortSignal): Promise<void> {
+    if (cleanups.length === 0 || !this.git.cleanupArchivedRecoveryPin) return;
+    const deadline = Date.now() + PIN_CLEANUP_BOOT_MS;
+    // Deterministic at boot, when no attempt stamps exist yet: oldest record first.
+    const ordered = [...cleanups].sort((a, b) =>
+      (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0) ||
+      a.createdAt - b.createdAt || (a.captureId < b.captureId ? -1 : a.captureId > b.captureId ? 1 : 0));
+    let handled = 0;
+    for (const snap of ordered.slice(0, this.liveMaxPerPass)) {
+      if (signal?.aborted || Date.now() >= deadline) break;
+      handled++;
+      this.lastAttemptAt.set(snap.captureId, this.now());
+      try {
+        await runCaptureCycle(await this.cycleKey(snap), "wait", async () => {
+          const record = await this.readRecord(this.recordPath(snap));
+          if (!record || record.state !== "uploaded" || record.inventoryGuarded) return;
+          const res = await this.cleanupUploadedRecoveryPin(record, { mode: "boot", signal, deadline });
+          this.log.info("recovery restart sweep", {
+            run_id: record.runId,
+            generation: record.generation,
+            outcome: "pin_cleanup",
+            reason: res.state === "retained" ? res.reason : res.state,
+          });
+        });
+      } catch (err) {
+        this.log.warn("recovery: uploaded pin cleanup step failed; continuing", { run_id: snap.runId, error: errText(err).slice(0, 512) });
+      }
+    }
+    const deferred = ordered.length - handled;
+    if (deferred > 0 && !signal?.aborted) this.log.info("recovery: uploaded pin cleanup deferred", { count: deferred });
   }
 
   /** One boot-sweep record step; the caller holds the record's capture-cycle lock. */
@@ -2481,6 +2604,8 @@ export class RecoveryCoordinator {
 
   private async livePass(opts: ResumeLiveOptions): Promise<void> {
     let transient = false;
+    // A credential-blocked pass whose only work is archived-pin cleanup must not move the upload schedule.
+    let pinOnlyBlocked = false;
     try {
       const credentialsBlocked = this.credentialBlockedAt !== undefined && opts.authenticatedAtMs <= this.credentialBlockedAt;
       // Discovery may materialize uploads; blocked passes only retry persisted local ACKs.
@@ -2497,14 +2622,23 @@ export class RecoveryCoordinator {
       // Forget the attempt stamps of captures no longer in the journal listing (bounded map).
       const seen = new Set(all.map((r) => r.captureId));
       for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
+      for (const id of this.pinCleanupBackoff.keys()) if (!seen.has(id)) this.pinCleanupBackoff.delete(id);
       // Executing runs are filtered BEFORE the per-pass cap so they cannot hold its slots.
       const candidates = all
         .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId) &&
           (!credentialsBlocked || (r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
-      // A blocked pass with no local ACK work must not delay a newer authenticated heartbeat.
-      if (credentialsBlocked && candidates.length === 0) return;
+      // Archived-pin cleanups are local (no credential), so they run while credentials are blocked.
+      // They take only the slots the upload candidates leave, and back off per record.
+      const cleanupCandidates = !this.git.cleanupArchivedRecoveryPin ? [] : all
+        .filter((r) => r.state === "uploaded" && !r.inventoryGuarded && archiveProvesPin(r) && !opts.isExecuting(r.runId) &&
+          (this.pinCleanupBackoff.get(r.captureId)?.nextAt ?? 0) <= this.now())
+        .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
+        .slice(0, Math.max(0, this.liveMaxPerPass - candidates.length));
+      // A blocked pass with no local work must not delay a newer authenticated heartbeat.
+      if (credentialsBlocked && candidates.length === 0 && cleanupCandidates.length === 0) return;
+      pinOnlyBlocked = credentialsBlocked && candidates.length === 0;
       let uploadsStopped = credentialsBlocked;
       for (const snap of candidates) {
         if (uploadsStopped && !(snap.inventoryGuarded && (snap.finalAcknowledged || snap.completionReceipt))) continue;
@@ -2521,10 +2655,16 @@ export class RecoveryCoordinator {
         // timestamp is newer than the local clock. Local ACK siblings still run.
         if (res.value === "credential") uploadsStopped = true;
       }
+      for (const snap of cleanupCandidates) {
+        if (opts.signal?.aborted) break;
+        const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.livePinCleanupStep(snap, opts));
+        if (!res.ran) this.lastAttemptAt.set(snap.captureId, this.now());
+      }
     } catch (err) {
       this.log.warn("recovery: live re-drive pass failed", { error: errText(err) });
       transient = true;
     }
+    if (pinOnlyBlocked) return;
     if (transient) {
       this.transientPasses++;
       this.nextPassAt = this.now() + Math.min(this.liveBackoffBaseMs * 2 ** this.transientPasses, this.liveBackoffCapMs);
@@ -2532,6 +2672,25 @@ export class RecoveryCoordinator {
       this.transientPasses = 0;
       this.nextPassAt = this.now() + this.liveBackoffBaseMs;
     }
+  }
+
+  /** One live archived-pin cleanup; the caller holds the record's capture-cycle lock. */
+  private async livePinCleanupStep(snap: RecoveryRecord, opts: ResumeLiveOptions): Promise<void> {
+    this.lastAttemptAt.set(snap.captureId, this.now());
+    const record = await this.readRecord(this.recordPath(snap));
+    if (!record || record.state !== "uploaded" || record.inventoryGuarded || opts.isExecuting(record.runId)) return;
+    const res = await this.cleanupUploadedRecoveryPin(record, { mode: "live", signal: opts.signal });
+    // A settled record is re-checked in-process only after the long settle interval (no durable marker);
+    // a restart still re-checks it once at boot.
+    if (res.state === "deleted" || res.state === "already_absent") {
+      this.pinCleanupBackoff.set(record.captureId, { failures: 0, nextAt: this.now() + this.livePinSettleMs });
+      return;
+    }
+    const failures = (this.pinCleanupBackoff.get(record.captureId)?.failures ?? 0) + 1;
+    this.pinCleanupBackoff.set(record.captureId, {
+      failures,
+      nextAt: this.now() + Math.min(this.liveBackoffBaseMs * 2 ** failures, this.liveBackoffCapMs),
+    });
   }
 
   /** One live record step; the caller holds the record's capture-cycle lock. */

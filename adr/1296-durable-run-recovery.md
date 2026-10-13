@@ -523,6 +523,22 @@ this new field, while the new worker reads old field-absent journals. Rollback r
 inspection and adoption by returning to a compatible worker; refusal erases neither bytes nor pins.
 No server rollout is required.
 
+### Issue #2263: uploaded-record pin cleanup
+
+Supersedes, for non-guarded records, the #2021 sentence "A crash between the uploaded write and cleanup may leave the pin indefinitely: no retry or cleanup scheduler is added." The coordinator now deletes a surviving transient pin (`generation ?? 0`) of an `uploaded` record, closing two leaks: bundles installed before #2021 / PR #2249 (no `recoveryPinBareDir`; when the record also has no `bareDir`, bounded discovery of up to 256 bares, ambiguity refused; a record with `bareDir` uses it directly; a record carrying both `recoveryPinBareDir` and `bareDir` passes both, and a disagreement retains the pin as `invalid_identity`) and a crash after the authenticated `uploaded` write.
+
+**Archive proof.** Deletion requires an authenticated, non-guarded `uploaded` record with server capture id, checksum and size, `selfContained === true` and explicit empty `prerequisiteShas`; `archiveProvesPin` additionally requires no coverage digest, final request or completion receipt. A thin archive keeps its pin. Consequence: a park made with forge credentials usually bundles forge prerequisites, so its pin is now kept, where the runner deleted it unconditionally after upload. This was required at plan approval (issue #2263 plan review).
+
+**Eligibility** is decided under the journal lock, held across a bounded, fail-closed journal read and the delete (lock order journal, attribution, bare): no inventory-guarded record in the run, every same pin-generation record uploaded, residue quarantine clear, run not executing; execution and quarantine are rechecked synchronously before the Git commit. `GitCache.cleanupArchivedRecoveryPin` makes one bounded attempt (30 s; the coordinator caps each record at 10 s, `PIN_CLEANUP_RECORD_MS`, within the 60 s boot budget): bare identity (no `.git`/`commondir`/`gitdir` redirects, unsafe config keys, symlinked reflog paths and a symlinked or hard-linked `logs/HEAD`), a bounded `cat-file -t` that must print `commit`, then `update-ref --stdin` prepare/commit compare-and-delete. Every failure retains the pin with a reason; an uncommitted transaction is aborted gracefully so no ref lock is stranded (teardown may add up to the 5 s abort grace beyond the cap).
+
+**Paths.** Upload path: retains `executing` while the run is still executing (normal for the runner's own settle); the live pass deletes later. Boot sweep: after uploads, archive-proven records only, least recently attempted first, capped per pass, 60 s budget. Live pass: leftover upload slots only, per-record exponential backoff on refusal (the live re-drive base and cap), a 6-hour in-process settle interval after deleted or already-absent, and it runs while credentials are blocked (local work, no credential needed; it does not move the upload schedule).
+
+**No completion marker is persisted.** A pin recreated by `anchorRecoveryHead` is caught at the next boot or settle interval; a marker would hide it.
+
+**Runner and plain delete.** The runner's unconditional post-upload delete is removed. Its already-published path deletes with an expected-SHA compare-and-delete and honours the residue quarantine. Settlement cleanup and the owner-cancel custody release (inventory-guarded completion cleanup does not use it) keep their call sites, but the plain three-argument `deleteRecoveryPin` they call now refuses symlinked ref and reflog paths, repository redirects (including a `reftable` entry), a symlinked `packed-refs` and a symlinked or hard-linked `logs/HEAD`, so their behaviour changed: they retain the pin on unsafe metadata.
+
+**Accepted residuals.** A symlink planted between the last check and Git's own unlink is not detectable in userspace. A v1 run (no claim generation) whose journal is removed at completed-run release before the live pass runs keeps its pin. The already-published delete gets one attempt.
+
 ## Amendment 2026-10-09 — #2507: synchronous completed-publication release
 
 **Status**: Implemented in API and worker; this amendment records the maintainer

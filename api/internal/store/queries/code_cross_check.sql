@@ -33,13 +33,13 @@ INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation, head
  base_commit, candidate_digest, checker_run_id, checker_harness, deadline_at, verdict,
  outcome, code_context, guidance_snapshot, plan_md, milestones, required_capabilities,
  required_tools, size_class, guidance_text, guidance_digest,
- repo_instructions_enabled, repo_instructions_text, repo_instructions_digest)
+ repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, repo_instructions_commit)
 SELECT lead.id, 'code', 1, lead.claim_generation, @head_commit::text, @base_commit::text,
  @candidate_digest::bytea, child.id, child.harness, @deadline_at::timestamptz, 'failed',
  'pending', @code_context::jsonb, @guidance_text::text, lead.plan_md, lead.milestones_frozen,
  lead.required_capabilities, lead.required_tools, lead.size_class,
  @guidance_text::text, sha256(convert_to(@guidance_text::text, 'UTF8')),
- @repo_instructions_enabled::boolean, @repo_instructions_text::text, sha256(convert_to(@repo_instructions_text::text, 'UTF8'))
+ @repo_instructions_enabled::boolean, @repo_instructions_text::text, sha256(convert_to(@repo_instructions_text::text, 'UTF8')), sqlc.narg('repo_instructions_commit')::text
 FROM runs lead JOIN runs child ON child.id = @checker_run_id
 WHERE lead.id = @lead_run_id AND child.target_run_id = lead.id AND child.kind = 'cross_check'
  AND child.user_id = lead.user_id AND child.worker_id = lead.worker_id
@@ -123,13 +123,13 @@ FROM credited cc WHERE lead.id = cc.lead_run_id;
 INSERT INTO cross_checks (lead_run_id, stage, round, lead_claim_generation,
  base_commit, head_commit, candidate_digest, verdict, outcome, reason_class,
  code_context, guidance_snapshot, guidance_text, guidance_digest,
- repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, deadline_at, decided_at,
+ repo_instructions_enabled, repo_instructions_text, repo_instructions_digest, repo_instructions_commit, deadline_at, decided_at,
  wait_credited, plan_md, milestones, required_capabilities, required_tools, size_class)
 SELECT lead.id, 'code', 1, lead.claim_generation,
  sqlc.narg('base_commit')::text, sqlc.narg('head_commit')::text,
  sqlc.narg('candidate_digest')::bytea, 'failed', 'failed', @reason_class::text,
  @code_context::jsonb, @guidance_text::text, @guidance_text::text, sha256(convert_to(@guidance_text::text, 'UTF8')),
- @repo_instructions_enabled::boolean, @repo_instructions_text::text, sha256(convert_to(@repo_instructions_text::text, 'UTF8')), now(), now(), true,
+ @repo_instructions_enabled::boolean, @repo_instructions_text::text, sha256(convert_to(@repo_instructions_text::text, 'UTF8')), sqlc.narg('repo_instructions_commit')::text, now(), now(), true,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.plan_md END,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.milestones_frozen END,
  CASE WHEN sqlc.narg('head_commit')::text IS NOT NULL THEN lead.required_capabilities ELSE '{}' END,

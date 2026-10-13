@@ -1,7 +1,7 @@
 import { fixtureFetchTracking } from "./runner-tracking-fixture.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import { getEventListeners } from "node:events";
 import fs from "node:fs";
 import net from "node:net";
@@ -31,6 +31,57 @@ function gitIn(dir: string, args: string[]): string {
 }
 
 describe("bareDirName", () => {
+  it("normalizes empty, all-slash, trailing and internal slash runs exactly", () => {
+    assert.equal(bareDirName(""), "repo.git");
+    assert.equal(bareDirName("/".repeat(500_000)), "repo.git");
+    assert.equal(bareDirName("org/repo" + "/".repeat(500_000)), "org+repo.git");
+    // Keep adversarial internal runs in the bounded child below.
+    assert.equal(bareDirName("org" + "/".repeat(128) + "repo"), "org+repo.git");
+  });
+
+  it("bounds normalization of a long internal slash run in an isolated child", async () => {
+    // Fixed workload/deadline: calibration belongs outside CI. Import/startup has its own
+    // deadline; only the invocation is timed. The non-slash suffix exercises regex backtracking.
+    const child = spawn(process.execPath, ["--import", "tsx", "--input-type=module", "-e", `
+      import { bareDirName } from ${JSON.stringify(new URL("../src/git.ts", import.meta.url).href)};
+      process.on("message", () => {
+        const start = performance.now();
+        const name = bareDirName("org" + "/".repeat(500_000) + "repo");
+        process.send({ name, elapsedMs: performance.now() - start });
+      });
+      process.send({ ready: true });
+    `], { stdio: ["ignore", "ignore", "pipe", "ipc"] });
+    let stderr = "";
+    child.stderr!.on("data", (chunk) => { stderr += chunk; });
+    let ready!: () => void;
+    let result!: (value: { name: string; elapsedMs: number }) => void;
+    const readyP = new Promise<void>((resolve) => { ready = resolve; });
+    const resultP = new Promise<{ name: string; elapsedMs: number }>((resolve) => { result = resolve; });
+    const failure = new Promise<never>((_, reject) => {
+      child.once("error", reject);
+      child.once("exit", (code, signal) => reject(new Error(`normalization child exited ${code}/${signal}: ${stderr}`)));
+    });
+    const settled = new Promise<void>((resolve) => child.once("close", () => resolve()));
+    child.on("message", (message: { ready?: boolean; name: string; elapsedMs: number }) => {
+      if (message.ready) ready(); else result(message);
+    });
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    const deadline = (ms: number, label: string) => new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(label)), ms);
+    });
+    try {
+      await Promise.race([readyP, failure, deadline(30_000, "normalization child ready timeout")]);
+      clearTimeout(timer);
+      child.send("start");
+      const answer = await Promise.race([resultP, failure, deadline(10_000, "normalization invocation deadline exceeded")]);
+      assert.equal(answer.name, "org+repo.git");
+    } finally {
+      clearTimeout(timer);
+      if (child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
+      await settled;
+    }
+  });
+
   it("maps repo URLs to collision-free directory names", () => {
     assert.strictEqual(bareDirName("https://gitlab.com/org/repo.git"), "gitlab.com+org+repo.git");
     assert.strictEqual(bareDirName("https://gitlab.com/org/repo"), "gitlab.com+org+repo.git");

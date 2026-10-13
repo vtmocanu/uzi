@@ -39,6 +39,18 @@ function rig(overrides: Partial<Exclude<CodeCrossCheckStatus, { result: string }
   return { gate, batches, interrupt, defer: (pending: Promise<CodeCrossCheckStatus>) => { deferredRead = pending; }, set: (next: CodeCrossCheckStatus) => { row = next; }, row: () => row, counts: () => ({ submits, snapshots }) };
 }
 
+it("pin-only mutation revokes repair and reporting despite unchanged candidate digest", async () => {
+  const r = rig({ repo_instructions_commit: "d".repeat(40) });
+  assert.equal((await r.gate.done()).action, "repair");
+  const row = r.row();
+  assert.ok(!("result" in row));
+  r.set({ ...row, repo_instructions_commit: "e".repeat(40) });
+  assert.equal(await r.gate.repair(), undefined);
+  await assert.rejects(r.gate.report([]), /not active/);
+  assert.equal(r.gate.repairActive(), false);
+  assert.deepEqual(r.batches, []);
+});
+
 it("one authorized repair then durable empty finalizer; later done never snapshots or submits", async () => {
   const r = rig();
   const first = await r.gate.done();

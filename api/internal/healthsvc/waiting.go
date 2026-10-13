@@ -63,7 +63,7 @@ func (w *waitConfirmations) confirm(s *Service, ctx context.Context, now time.Ti
 		w.outcomes[id] = result
 	}
 	e := result.eligibility
-	if !result.timely || e.DrainingEligible <= 0 || e.NonDrainingEligible != 0 || e.SuitableOwnDraining != 0 || !validWaitTime(e.LatestSuitableDrainingSince, now) {
+	if !result.timely || !workersvc.DrainOnlyEligibleForHealth(e) || !validWaitTime(e.LatestSuitableDrainingSince, now) {
 		return false, time.Time{}
 	}
 	overlap := since.Time

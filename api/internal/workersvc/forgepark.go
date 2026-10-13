@@ -17,9 +17,10 @@ import (
 // matching migration 00232's runs_recovery_wait_cause_check. SetState validates a non-nil
 // cause against this set BEFORE any state SQL, so an unknown value is a 400 rather than a
 // constraint violation at the park write. NULL (an absent cause) is the LEGACY/untyped park
-// and is not a member here — the empty-turn park writes NULL. Only 'forge_unreachable' drives
-// the dedicated park transaction today; 'empty_turn'/'provider_outage' are reserved (D9,
-// #1088 adopts provider_outage) and, if reported, take the ordinary untyped park. Issue #1766
+// and is not a member here — the empty-turn park writes NULL. 'forge_unreachable' and
+// 'provider_outage' use dedicated park transactions; provider parks have their own streak
+// accounting and owner hold (PRD #1733). 'empty_turn' remains reserved (D9) and, if reported,
+// takes the ordinary untyped park. Issue #1766
 // M2: 'vault_locked' (migration 00257) is reported by a worker whose codex refresh/release was
 // answered 409 vault_locked (the owner's vault is locked); it takes the ordinary park too, but
 // it is the ONE cause that park persists (recoveryCauseStored), so the surfaces can say "waiting
@@ -31,7 +32,7 @@ import (
 var recoveryWaitCauses = map[string]bool{
 	"forge_unreachable":                  true,
 	"empty_turn":                         true,
-	"provider_outage":                    true,
+	recoveryCauseProviderOutage:          true,
 	recoveryCauseVaultLocked:             true,
 	recoveryCauseDataVolumeFull:          true,
 	recoveryCauseCodexAccountUnavailable: true,
@@ -45,6 +46,12 @@ const recoveryCauseVaultLocked = "vault_locked"
 // worker's data volume is (or was about to be) full. It is also the server-derived fail_origin a
 // run gets past the disk park cap (failOrigins).
 const recoveryCauseDataVolumeFull = "data_volume_full"
+
+// recoveryCauseProviderOutage is the PRD #1733 cause for a run parked because a provider error
+// the harness classed as transient outlived its in-process retries. It is the wire token the
+// worker reports and the token the typed park stores (already in runs_recovery_wait_cause_check
+// since migration 00232); parkProviderOutage counts and bounds it.
+const recoveryCauseProviderOutage = "provider_outage"
 
 // recoveryCauseCodexAccountUnavailable is the PRD #1590 cause for a Codex run held on its
 // quarantined subscription account or a same-alias re-login (D1/D2).
