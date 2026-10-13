@@ -84,8 +84,10 @@
 # <m> counts the sources found (the clones or tracking ref the run tried to capture) plus
 # the attributed ones listed but unreadable (deduped by pod and path). The artifacts that were captured are kept. A dir the journal, ledger
 # and marker do not name is not an attributed source: it is never a gap by itself, though
-# on a run that captured nothing, a dir with an unreadable .git still makes the search
-# inconclusive (an unnamed dir with no .git, empty or not, does not). Each inconclusive reason names the pod or namespace that failed.
+# on a run that captured nothing, a .git that exists but cannot be read still makes the
+# search inconclusive (an unnamed dir with no visible .git, empty or not, does not). A
+# kubectl listing or exec failure, an errored probe, an unreadable .git and an attributed
+# source listed but unreadable each name their pod or namespace in the FAIL reasons.
 # Exit: 0 when every active target produced a verified recovery artifact for every
 # attributed source (no coverage gap, see above; terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
@@ -484,9 +486,9 @@ select_clone(){
   case "$rc" in
     0) ;;
     # Whether an unreadable dir is an attributed source is decided per dir below (it
-    # records a gap only when the journal, ledger or marker names it); the listing's
+    # records a gap only when the journal, a protected descriptor, the ledger or marker names it); the listing's
     # rc alone is not a coverage gap, but it still keeps a no-capture run from SNAP.
-    3) : > "$PROBE_ERR_FILE" ;;
+    3) : > "$PROBE_ERR_FILE"; printf '%s\n' "$ns/$pod" >> "$GIT_UNREAD_FILE" ;;
     *) probe_inconclusive "listing candidate clones on pod $ns/$pod failed"; return 1 ;;
   esac
   [ -n "$listing" ] || return 1
@@ -681,7 +683,7 @@ select_clone(){
          || { [ -n "$aid" ] && printf '%s\n' "$ledger_live" | grep -qxF -- "$aid$tab$path"; }; then
         : > "$PROBE_ERR_FILE"
         printf '%s\t%s\n' "$pod" "$path" >> "$UNREAD_FILE"
-        mark_gap "attributed source $path is listed but unreadable"
+        mark_gap "attributed source $path on pod $ns/$pod is listed but unreadable"
       fi
       continue
     fi
@@ -772,6 +774,8 @@ PROBE_ERR_FILE="$DEST/.probe-inconclusive"
 GAP_FILE="$DEST/.coverage-gap"
 # "<pod>TAB<path>" per attributed source that was listed but unreadable (deduped when counted).
 UNREAD_FILE="$DEST/.unreadable-sources"
+# "<ns>/<pod>" per pod whose candidate listing found a .git it could not read (rc 3).
+GIT_UNREAD_FILE="$DEST/.unreadable-git"
 
 # add_sources <ns> <pod> <select_clone-output> <skip-first 0|1>: append each printed clone
 # path to the SRC_* tuple arrays, skipping one already added for that pod. select_clone's
@@ -878,7 +882,7 @@ capture_one(){
 }
 
 for RID in "${RUNS[@]}"; do
-  rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE"
+  rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE" "$GIT_UNREAD_FILE"
   J="$("$UZI" run get "$RID" --json 2>/dev/null)"
   st="$(printf '%s' "$J" | "$JQ" -r '.status // ""' 2>/dev/null)"
   if [ -z "${st:-}" ]; then
@@ -1033,6 +1037,9 @@ for RID in "${RUNS[@]}"; do
       # which sets only PROBE_ERR_FILE. Never an empty parenthetical.
       why=""
       if [ -s "$GAP_FILE" ]; then why="$(sort -u "$GAP_FILE" | paste -sd ';' - | sed 's/;/; /g')"; fi
+      if [ -z "$why" ] && [ -s "$GIT_UNREAD_FILE" ]; then
+        why="a candidate's .git on pod $(sort -u "$GIT_UNREAD_FILE" | paste -sd ',' - | sed 's/,/, /g') could not be read"
+      fi
       [ -n "$why" ] || why="a candidate's .git could not be read"
       log "FAIL $RID ($LBL) status=$st: status saved, but the source search was inconclusive ($why); retry"
       failures=1
@@ -1072,7 +1079,7 @@ for RID in "${RUNS[@]}"; do
   fi
 done
 
-rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE"
+rm -f "$PROBE_ERR_FILE" "$GAP_FILE" "$UNREAD_FILE" "$GIT_UNREAD_FILE"
 ln -sfn "$DEST" "$OUTROOT/latest-attempt"
 if [ "$failures" -eq 0 ] && [ "$recoverable" -eq 1 ]; then
   ln -sfn "$DEST" "$OUTROOT/latest"

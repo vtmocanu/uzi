@@ -1252,7 +1252,7 @@ ledger "$A1" completed-1 "$BADA1" reclaimed
 D_T1B="$WORK/out.t1.unreadable"
 rc="$(backup_rc "$D_T1B" completed-1)"
 [ "$rc" -eq 1 ] || fail "t1 unreadable: exit $rc, want 1; log: $(log_of "$D_T1B")"
-grep -q 'FAIL completed-1 .*inconclusive (.*attributed source .* is listed but unreadable.*); retry' "$D_T1B/latest-attempt/backup.log" \
+grep -q 'FAIL completed-1 .*inconclusive (.*attributed source .* on pod ns/uzi-hw-w0rker-test is listed but unreadable.*); retry' "$D_T1B/latest-attempt/backup.log" \
   || fail "t1 unreadable: FAIL line does not give the unreadable-source reason; log: $(log_of "$D_T1B")"
 [ ! -e "$D_T1B/latest" ] || fail "t1 unreadable: latest advanced"
 # A retired attempt is never a source: status-only, success.
@@ -1336,9 +1336,10 @@ bad_dir "$BADA1"
 D_T3C="$WORK/out.t3.rc3"
 rc="$(backup_rc "$D_T3C" failed-2)"
 [ "$rc" -eq 1 ] || fail "t3 rc3: exit $rc, want 1"
-grep -qF "FAIL failed-2 (#4242) status=failed: status saved, but the source search was inconclusive (a candidate's .git could not be read); retry" "$D_T3C/latest-attempt/backup.log" \
+grep -qF "FAIL failed-2 (#4242) status=failed: status saved, but the source search was inconclusive (a candidate's .git on pod ns/uzi-hw-w0rker-test could not be read); retry" "$D_T3C/latest-attempt/backup.log" \
   || fail "t3 rc3: FAIL line mismatch; log: $(log_of "$D_T3C")"
 ! grep -q 'inconclusive ()' "$D_T3C/latest-attempt/backup.log" || fail "t3 rc3: empty parenthetical"
+[ ! -e "$D_T3C/latest-attempt/.unreadable-git" ] || fail "t3 rc3: .unreadable-git state file left behind"
 echo "PASS t3: the no-capture FAIL line names the failing pod, namespace or unreadable .git"
 
 echo "ALL PASS"
