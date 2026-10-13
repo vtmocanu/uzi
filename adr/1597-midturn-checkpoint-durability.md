@@ -74,7 +74,9 @@ holding its pure, I/O-free helpers; `CHECKPOINT_TICK_INTERVAL` parsing is in
 
 [Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric
 HTTP 500–599 within one logical checkpoint publish: at most three HTTP requests total,
-with 250ms then 1000ms backoffs under the original deadline and abort signals. The
+with 250ms then 1000ms backoffs. Any supplied caller deadline or abort signal is shared
+across attempts; each HTTP request retains its own client timeout. Some callers supply
+no outer signal, so the first request's timeout does not bound the total operation. The
 `CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical operations. HTTP 4xx,
 nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried.
 
