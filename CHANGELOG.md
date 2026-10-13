@@ -27,6 +27,12 @@ through `[0.52.0]`.)
 - **Run lists show accounts across both harnesses, and the TUI keeps accounts close to their costs ([#2913](https://github.com/vtmocanu/uzi/issues/2913), [#2912](https://github.com/vtmocanu/uzi/issues/2912)).**
   Personal lists show every recorded account once you hold more than one credential across Claude and Codex, including one of each. A lone live credential named `default` displays as `claude` or `codex`; deleted accounts, admin views and run details retain their recorded labels. The TUI fits its account and cost cells to the visible rows while preserving conservative column thresholds; board titles fill the remaining space up to the judge and worker columns, with no fixed 60-column cap. Web lists refresh credential counts with their normal poll and retain last-good counts on failures. The Dashboard Active runs hint breaks the same total into `running`, `needs you`/`need you`, `queued` and `waiting to resume` counts, omitting empty buckets.
 
+- **Self-improvement and prompt runs receive inline summaries ([#2838](https://github.com/vtmocanu/uzi/issues/2838)).**
+  Accepted autopilot plans are summarized alongside implementation, with owned plan-summary cleanup before claim release or resource teardown.
+
+- **Parked runs keep late local work even when the coverage snapshot passes ([#2852](https://github.com/vtmocanu/uzi/issues/2852)).**
+  Recovery, provider-outage, credential-switch and disk parks now keep the worker clone even when cleanup coverage passes, protecting writes missed by that snapshot. Same-worker resume recaptures work onto a fresh attempt and model session while retaining the old source after completion; this costs storage and session continuity on workers without Docker. Terminal covered release is unchanged, and its late-writer gap remains open on #2852.
+
 ### Fixed
 
 - **GitHub pipeline discovery prefers the newest Actions suite.**
@@ -42,11 +48,6 @@ through `[0.52.0]`.)
 
 - **Settled terminal outcomes no longer keep worker admission closed ([#2921](https://github.com/vtmocanu/uzi/issues/2921)).**
   An authenticated acknowledgement that a run already finished on the server stops its terminal journal from being advertised as an unresolved execution or counted toward pending-overflow admission. The journal and recovery evidence remain until existing custody checks permit retirement. After worker restart, one replay restores this distinction; unknown replies and replaced journals remain conservative.
-
-### Changed
-
-- **Self-improvement and prompt runs receive inline summaries ([#2838](https://github.com/vtmocanu/uzi/issues/2838)).**
-  Accepted autopilot plans are summarized alongside implementation, with owned plan-summary cleanup before claim release or resource teardown.
 
 ## [0.86.0] - 2026-10-06
 
