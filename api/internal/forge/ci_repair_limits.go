@@ -8,11 +8,17 @@ import (
 	"io"
 	"net/http"
 	"sync"
+	"sync/atomic"
 )
 
 const (
 	ciRepairJSONBytes = 4 << 20
 	ciRepairFireBytes = 16 << 20
+
+	// Raw network bytes, charged below the gzip reader, in addition to the
+	// decompressed budgets above.
+	ciRepairCompressedJSONBytes = 4 << 20
+	ciRepairCompressedFireBytes = 16 << 20
 )
 
 // ErrCIReadBudget identifies incomplete CI discovery evidence.
@@ -28,6 +34,12 @@ type ciRepairBudget struct {
 	mu        sync.Mutex
 	remaining int64
 	err       *CIReadBudgetError
+
+	// compressedRemaining and compressedErr are touched by the compressed-byte
+	// counter, which runs beneath the gzip reader while ciRepairReader.Read holds
+	// mu, so they are atomics and the counter never takes mu.
+	compressedRemaining atomic.Int64
+	compressedErr       atomic.Pointer[CIReadBudgetError]
 }
 type ciRepairBudgetKey struct{}
 type ciRepairJSONKey struct{}
@@ -36,7 +48,9 @@ type ciRepairJSONKey struct{}
 // Derived and cloned contexts retain it. Workflow/job methods opt in individually;
 // log tails and other forge reads do not consume it.
 func WithCIRepairReadLimits(ctx context.Context) context.Context {
-	return context.WithValue(ctx, ciRepairBudgetKey{}, &ciRepairBudget{remaining: ciRepairFireBytes})
+	b := &ciRepairBudget{remaining: ciRepairFireBytes}
+	b.compressedRemaining.Store(ciRepairCompressedFireBytes)
+	return context.WithValue(ctx, ciRepairBudgetKey{}, b)
 }
 
 func ciBudget(ctx context.Context) *ciRepairBudget {
@@ -60,7 +74,11 @@ func (b *ciRepairBudget) fail(reason string) error {
 	b.mu.Lock()
 	defer b.mu.Unlock()
 	if b.err == nil {
-		b.err = &CIReadBudgetError{reason: reason}
+		if ce := b.compressedErr.Load(); ce != nil {
+			b.err = ce
+		} else {
+			b.err = &CIReadBudgetError{reason: reason}
+		}
 	}
 	return b.err
 }
@@ -71,6 +89,9 @@ func ciReadError(ctx context.Context, err error) error {
 		defer b.mu.Unlock()
 		if b.err != nil {
 			return b.err
+		}
+		if ce := b.compressedErr.Load(); ce != nil {
+			return ce
 		}
 	}
 	return err
@@ -109,18 +130,25 @@ func (t ciRepairTransport) RoundTrip(req *http.Request) (*http.Response, error) 
 	if err := ciReadError(req.Context(), nil); err != nil {
 		return nil, err
 	}
+	// Ask for gzip explicitly: net/http then leaves the body compressed instead
+	// of inflating it transparently below the compressed-byte counter.
+	req = req.Clone(req.Context())
+	req.Header.Set("Accept-Encoding", "gzip")
 	resp, err := t.base.RoundTrip(req)
 	if err != nil || resp == nil || resp.Body == nil {
 		return resp, err
 	}
 	body := resp.Body
 	defer func() { _ = body.Close() }()
-	var reader io.Reader = resp.Body
+	var reader io.Reader = &ciCompressedReader{reader: resp.Body, budget: b, remaining: ciRepairCompressedJSONBytes}
 	switch resp.Header.Get("Content-Encoding") {
 	case "", "identity":
 	case "gzip":
-		z, zerr := gzip.NewReader(resp.Body)
+		z, zerr := gzip.NewReader(reader)
 		if zerr != nil {
+			if ce := b.compressedErr.Load(); ce != nil {
+				return nil, b.fail(ce.reason)
+			}
 			return nil, b.fail("invalid gzip discovery body")
 		}
 		defer func() { _ = z.Close() }()
@@ -158,11 +186,44 @@ func (r *ciRepairReader) Read(p []byte) (int, error) {
 		p = p[:allowance+1]
 	}
 	n, err := r.reader.Read(p)
+	if ce := b.compressedErr.Load(); ce != nil {
+		b.err = ce
+		return 0, ce
+	}
 	r.remaining -= int64(n)
 	b.remaining -= int64(n)
 	if int64(n) > allowance {
 		b.err = &CIReadBudgetError{reason: "decompressed JSON bytes"}
 		return 0, b.err
+	}
+	return n, err
+}
+
+// ciCompressedReader charges raw network bytes against the per-response and
+// per-fire compressed budgets. It sits beneath the gzip reader, which is read
+// while ciRepairReader.Read holds budget.mu, so it must never take that mutex:
+// the per-fire state is atomic and the first error is set by CompareAndSwap.
+type ciCompressedReader struct {
+	reader    io.Reader
+	budget    *ciRepairBudget
+	remaining int64
+}
+
+func (r *ciCompressedReader) Read(p []byte) (int, error) {
+	b := r.budget
+	if ce := b.compressedErr.Load(); ce != nil {
+		return 0, ce
+	}
+	allowance := max(min(r.remaining, b.compressedRemaining.Load()), 0)
+	if int64(len(p)) > allowance+1 {
+		p = p[:allowance+1]
+	}
+	n, err := r.reader.Read(p)
+	r.remaining -= int64(n)
+	b.compressedRemaining.Add(-int64(n))
+	if int64(n) > allowance {
+		b.compressedErr.CompareAndSwap(nil, &CIReadBudgetError{reason: "compressed JSON bytes"})
+		return 0, b.compressedErr.Load()
 	}
 	return n, err
 }
