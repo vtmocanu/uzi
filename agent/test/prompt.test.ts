@@ -1105,7 +1105,7 @@ describe("approved m1 display reconciliation", () => {
   });
   it("absent or empty breakdown adds no guidance even with ACK and local status", () => {
     for (const list of [undefined, []]) assert.equal(
-      milestoneStatusNote(list, { completed: ["m1"] }, true, ["m1", "unknown"]), "");
+      milestoneStatusNote(list, { completed: ["m1"], in_progress: [] }, true, ["m1", "unknown"]), "");
   });
 });
 

@@ -10666,8 +10666,8 @@ export class RunRunner {
       // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
       selfImproveDogfood: claim.self_improve_dogfood,
       config: claim.config,
-      // PRD #1064 M1 (Decision 2): the claim's FROZEN milestone list, the transition-frame
-      // title fallback on a pre-approved resume whose loop-scope frozen list is undefined.
+      // PRD #1064 M1 (Decision 2): the claim's FROZEN milestone list supplies resumed
+      // implementation prompts and the transition-frame title fallback.
       frozenMilestones: claim.milestones,
       // Preflighted above: the claim's id, or undefined when its transcript is not
       // on this worker (issue #105).
