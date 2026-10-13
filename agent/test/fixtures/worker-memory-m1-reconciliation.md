@@ -1,6 +1,6 @@
 # Worker memory foundation reconciliation — issue #2396
 
-This record supersedes the current-state statements in `worker-memory-validation.md`; that earlier record remains historical evidence for its named revisions and commands. M1 validation remains **incomplete**. M2–M5 have not been implemented in this resumed run. Real adapter integration and private-cgroup calibration remain unverified; production enablement remains disabled.
+This record supersedes the current-state statements in `worker-memory-validation.md`; that earlier record remains historical evidence for its named revisions and commands. M1 implementation and required local validation are **complete** at the fixture-isolation candidate below. M2–M5 have not been implemented in this resumed run. Real adapter integration and private-cgroup calibration remain unverified; production enablement remains disabled.
 
 ## Source and contract seam
 
@@ -25,6 +25,9 @@ Logs below are run-local `.uzi/scratch/` artifacts, not portable published artif
 | default export | Same named registration diagnostic | PASS: zero skips, package 8.623s | `gate-log.yXDdEQ` |
 | default export | Unchanged `./e2e/run-store-it.sh` | PASS: 2,779 passed, zero skips; elapsed 1,767s, workersvc 756.007s | `gate-log.3CAM8S` |
 | `f8003a14` | Unchanged `./e2e/run-store-it.sh` | FAIL: 2,614 top-level passes, zero skips before workersvc's 900s package deadline; elapsed 1,759s | `gate-log.KIGQrj` |
+| `26f92823` export | Focused memory and pending-health LiveDB diagnostic | PASS: 27 tests, zero skips, including the new isolation assertion; elapsed 347s | `gate-log.MMWnkR` |
+| `26f92823` | `task gate:api`, database URL unset | PASS; ordinary LiveDB skips are expected | `gate-log.TloOdJ` |
+| `26f92823` | Unchanged `./e2e/run-store-it.sh` | PASS: 2,808 tests, zero skips; elapsed 1,702s, workersvc 717.050s | `gate-log.of370n` |
 
 The live harness owns its PostgreSQL lifecycle and database URL. `TMPDIR` pointed to this worktree's scratch directory solely to contain temporary artifacts. Focused diagnostic exports used scratch-only harness copies with a narrowed test selector/package list; they were not replacements for the unchanged required sweep. Each export was removed after its run.
 
@@ -32,10 +35,19 @@ The first unchanged candidate sweep (`gate-log.Frtggw`) failed two owned fixture
 
 Named required cases positively executed in the repaired unchanged candidate sweep include `TestMemoryCodeCheckerAuthorityLiveDB`, `TestMemoryHoldOwnerOnlyReleaseLiveDB`, `TestMemoryHoldNonOwnerGuardsLiveDB`, `TestMemoryHoldResumeClaimIncarnationLiveDB`, `TestMemoryOrdinaryRedispatchPreservesAllowanceLiveDB`, `TestMemoryReservationConcurrentLastSlotLiveDB`, `TestMemoryReservationOwnerResumeRaceLiveDB`, `TestMemoryReservationNonceRotationRaceLiveDB`, `TestMemoryReservationHistoricalRetryAfterNewClaimLiveDB`, `TestMemoryReservationNoSignalNoRefundLiveDB` and `TestMemoryOutcomeAndFeedDeduplicationLiveDB`. None skipped. This executes the contract seam, but does not turn the failed full sweep into a pass or prove runner preservation.
 
-## Review and unresolved evidence
+## Fixture-isolation repair and review evidence
 
 Reviewer, tester and auditor reviewed immutable saved/default-to-merge ranges at `2abb091f`. The mandatory scratch-fixture finding was repaired at `f8003a14`; a scoped reviewer/tester/auditor wave reported clean closure. The supervisor fixtures now create their scratch parent independently. The unrelated-event memory-hold matrix now seeds a nonzero episode/count and policy so reset regressions are observable. Focused live execution confirmed the repaired matrix.
 
 Auditor at `f8003a14` left one optional, unverified transaction-clock note: a lock wait might cross a deadline while SQL uses transaction-start `now()`. No demonstrated violation or graded security finding was established; existing default eligibility uses the same clock convention. This note remains deferred, rather than represented as proven safe.
 
-The cumulative candidate workersvc timeout remains unresolved and blocks M1 completion. Full component gates and all subsequent implementation/calibration proofs remain mandatory later work. Local calibration duration and bounded worst-case evidence belong to the worker; post-publication before/after CI step and dependency-path timing remains pending lander-owned acceptance before merge.
+The final unchanged candidate sweep passed after fixture isolation; the earlier timeouts remain recorded failures, not reclassified baseline defects. This establishes passing validation on the final M1 code candidate, not exact causation for all observed timing differences. Full final-component gates and all subsequent implementation/calibration proofs remain mandatory later work. Local calibration duration and bounded worst-case evidence belong to the worker; post-publication before/after CI step and dependency-path timing remains pending lander-owned acceptance before merge.
+
+
+## Final M1 candidate and scope
+
+Fixture-isolation commit `26f92823b4f3e9d227372f4dee4ce2989c07f4e4` removes only fresh fixture-owner data before pool closure. It registers reassigned owners, removes cross-check attempts before run cascades, and explicitly handles custody hold bindings. The new `TestMemoryFixtureIsolationLiveDB` exercises issue/chat/plan/code and foreign-owner cases through the real health query, verifies absence after cleanup and retains a sibling fixture as a control. The handler's resumed run is also cleaned up by its exact fixture owner. No production policy, harness package list, deadline, test flag or concurrency setting changed.
+
+Reviewer, tester and auditor found no blocking introduced defect in `90ed4d8a..26f92823`. Their no-database checks proved compilation/skip behavior only; the lead's focused and full live executions supply database proof. Tester and auditor each noted that the discard UPDATE lacks `release_evidence='owner_discard'` and can be suppressed for guarded holds. The following scoped DELETE still removes the current capture-free fixture holds, and live checks passed. This shared optional note remains deferred; fixtures that add restrictive capture/publication references will need corresponding cleanup. Tester's generic coverage-threshold and pre-commit-hook suggestions remain optional deferred tooling work.
+
+The final full sweep positively executed all seven packages: store 398.323s, handler 331.510s, forgesvc 12.771s, schedsvc 9.959s, workersvc 717.050s, recovery 24.232s and poller 3.137s. It included the named reservation, owner-hold and checker cases above, plus `TestMemoryCustodyV1ReleaseRunBeforeHoldLiveDB`, `TestMemoryCustodyWorkerFinalReleaseRefusedLiveDB` and `TestMemoryCustodyLegacyWorkerReleaseRefusedLiveDB`. Required-case skips were zero. Source-only deployment evidence and unverified M2–M5 claims remain unchanged.
