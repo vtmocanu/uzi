@@ -81,7 +81,7 @@ func TestTUIBoardProgWaitingParkedUnderHealth(t *testing.T) {
 			} {
 				run := progRun("bbbbbbbb", c.status, &apitypes.RunProgress{State: c.state})
 				run.Health = health
-				for _, width := range []int{100, 140} {
+				for _, width := range []int{80, 140} {
 					m := progBoard(t, width, run)
 					next, _ := m.Update(tea.ColorProfileMsg{Profile: prof})
 					m = next.(tuiModel)
@@ -95,7 +95,7 @@ func TestTUIBoardProgWaitingParkedUnderHealth(t *testing.T) {
 					if strings.TrimSpace(cell) != want || visualWidth(cell) != cellWidth {
 						t.Errorf("%s/%s/%d/%v: cell %q width %d, want %q width %d", c.status, health, width, prof, cell, visualWidth(cell), want, cellWidth)
 					}
-					if !strings.Contains(progLine(m, run.ID), want) {
+					if m.boardShowMile() && !strings.Contains(progLine(m, run.ID), want) {
 						t.Errorf("flag absent from row: %q", progLine(m, run.ID))
 					}
 				}
@@ -156,13 +156,16 @@ func TestTUIBoardProgWidthShedding(t *testing.T) {
 			sawPct = sawPct || prog
 			prevProg, prevMile = prog, mile
 		}
-		if !sawMarkerOnly || !sawPct {
-			t.Errorf("%s missing marker-only or pct band", cfg.name)
+		if !sawPct || (cfg.admin && !sawMarkerOnly) {
+			t.Errorf("%s missing pct band or admin marker-only band", cfg.name)
 		}
 	}
 	m := progBoard(t, 100, run)
 	if !m.boardShowCost() || !m.boardShowMile() {
 		t.Fatal("#379: milestones/COST displaced at 100")
+	}
+	if !strings.Contains(progLine(m, run.ID), "70%") {
+		t.Fatal("percentage must remain visible on the 100-column own board")
 	}
 }
 

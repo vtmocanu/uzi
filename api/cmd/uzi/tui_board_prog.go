@@ -8,13 +8,17 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/runprogress"
 )
 
-// The merged progress cell keeps the milestone renderer's nine columns and an
-// optional four-column percentage. Annotation visibility reserves the worker column
-// even below 120, so it cannot flap off when that column appears.
+// boardProgPctWidth fits the longest bounded percentage, "100%".
 const boardProgPctWidth = 4
+
+// boardProgTitleFloor is title room before the issue-id prefix and judge marker.
+// The merged percentage must leave at least twenty real title columns.
 const boardProgTitleFloor = 25
+
+// boardWorkerColumnWidth reserves a gap plus the sixteen-column worker cell.
 const boardWorkerColumnWidth = 18
 
+// boardWorkerWidth is the trailing worker column, present from 120 columns up.
 func (m tuiModel) boardWorkerWidth() int {
 	if m.width >= 120 {
 		return boardWorkerColumnWidth
@@ -24,7 +28,14 @@ func (m tuiModel) boardWorkerWidth() int {
 
 func (m tuiModel) boardProgRoom() int {
 	prefix := boardRowPrefixWidth(m.board.admin, m.boardShowCred(), m.boardShowCost())
-	return m.width - boardWorkerColumnWidth - (prefix + boardMileWidth + 1 + boardProgPctWidth + 2)
+	worker := m.boardWorkerWidth()
+	// The admin owner/credential prefix would otherwise let percentages appear
+	// below 120 and disappear when the worker column arrives. Own-board layouts
+	// retain their title floor at 120, so use actual worker width there.
+	if m.board.admin {
+		worker = boardWorkerColumnWidth
+	}
+	return m.width - worker - (prefix + boardMileWidth + 1 + boardProgPctWidth + 2)
 }
 
 // boardShowProg adds the percentage only when the title retains its floor.

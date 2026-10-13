@@ -663,11 +663,11 @@ func boardRevising(dark bool, now time.Time) string {
 // draws an all-empty ▱▱▱ bar — the graphical 0/N, never –/N text. No credential labels, so
 // the MILE column clears the width gate at the lab's 100 cols instead of being dropped.
 func boardMilestones(dark bool, now time.Time) string {
-	pct70 := 70
+	pct55 := 55
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, Progress: &apitypes.RunProgress{State: "percent", Pct: &pct70}}}, // two in flight (#1176)
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, Progress: &apitypes.RunProgress{State: "percent", Pct: &pct55}}}, // two in flight (#1176)
 		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}},                                                                                                                 // nil completed ⇒ never reported
 		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                                                                                                                                               // no frozen list ⇒ no bar
 	}})
@@ -680,7 +680,7 @@ func boardProgress(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
 	m = step(m, tea.WindowSizeMsg{Width: 116, Height: frameHeight})
-	pct := 70
+	pct := 55
 	mk := func(id, status, title string, age time.Duration, p *apitypes.RunProgress) apitypes.RunListItemDTO {
 		return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status, IssueTitle: title, CreatedAt: now.Add(-age),
 			Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, Progress: p}}
