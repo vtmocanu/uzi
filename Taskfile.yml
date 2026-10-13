@@ -166,6 +166,8 @@ output: prefixed
 # Static and quoted at every use. Task renders the value before echoing each
 # command, so the resolved pin stays visible without accepting shell input.
 vars:
+  # renovate: datasource=github-releases depName=gitleaks/gitleaks
+  GITLEAKS_VERSION: "v8.30.1"
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
   GOLANGCI_LINT_VERSION: v2.14.0
   # The pinned OpenAPI diff tool behind check:api-v1-compat (PRD #1908 Decision 11). Passed to
@@ -1475,15 +1477,9 @@ tasks:
       # SHOWS THEM MOVING, the same reason `lint:shell` carries its severity and
       # its version pin rather than defaulting them inside the script.
       #
-      # THE VERSION IS THE ONLY VERSION RECORD THERE IS. Built from source (`go install`), gitleaks'
-      # own `version` subcommand prints the literal string "version is set by build
-      # process" -- measured 2026-08-03 -- because the release workflow stamps it
-      # with ldflags and a source build does not. So NOTHING CAN ASSERT THE RUNNING
-      # BINARY'S VERSION the way `lint:shell` asserts shellcheck's; this line is the
-      # pin, and a `gitleaks version` assertion written against it would compare a
-      # sentence to a number. Pinned `go install` for the reason carry-forward item 6
-      # gives for golangci-lint: the official image would be this pipeline's first
-      # unpinned effective toolchain.
+      # GITLEAKS_VERSION is the shared scan/test installation pin. Source builds do
+      # not stamp the `version` subcommand; scan-secrets verifies Go main-module
+      # metadata instead, falling back to its pinned private install when unknown.
       #
       # THE CANARY PATHS ARE ARGUMENTS for the reason `lint:yaml` passes its config
       # path: they are separate tracked files that can be deleted, moved or edited,
@@ -1520,7 +1516,16 @@ tasks:
       # on the walk is what keeps a contributor's verdict equal to CI's, since
       # gitleaks does not honour `.gitignore`; findings in untracked files are
       # printed and do NOT gate.
-      - ./scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
+      - ./scripts/scan-secrets.sh "{{.GITLEAKS_VERSION}}" scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
+
+  install:gitleaks:
+    desc: install the shared scanner pin into an explicit private GOBIN
+    preconditions:
+      - sh: test -n "$GOBIN"
+        msg: set GOBIN to a private tool directory
+    cmds:
+      - go install "github.com/zricethezav/gitleaks/v8@{{.GITLEAKS_VERSION}}"
+      - go version -m "$GOBIN/gitleaks"
 
   sast:semgrep:
     desc: semgrep SAST over the tree, with a canary proving the scanner ran
