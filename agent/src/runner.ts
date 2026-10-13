@@ -15054,9 +15054,16 @@ export class RunRunner {
           }
         } catch (probeError) {
           if (probeError instanceof RequestError && probeError.status === 404) {
-            if (credentialDeferred) keepUnlessCaptured(capture !== undefined, "recovery_probe_gone");
-            // Missing authority is unknown, not a disposal proof: a seeded source stays unless covered.
-            if (opts.terminalDisk && !credentialDeferred) { markReleaseEligible("recovery_probe_gone"); flight.preserveSession = false; }
+            // issue #1786: a 404 is a quiet stop with unknown authority. It proves neither a park nor a
+            // terminal status, and not that this generation was superseded either, so it can neither
+            // authorize a coverage-based release (a covered verdict is diagnostic only, as at every
+            // stopped exit) nor justify a stopped-source record. The clone is kept as an explicit keep
+            // (`keepClone`: no cleanup-time check may release it, the plain journal is untouched), with
+            // no report or publication through the unconfirmed claim. The session keeps its earlier
+            // posture: a credential-deferred exit keeps it unless a verified capture exists, a
+            // terminal-disk exit does not preserve it.
+            if (credentialDeferred) { keepClone(); flight.preserveSession = capture === undefined; }
+            else if (opts.terminalDisk) { keepClone(); flight.preserveSession = false; }
             return false;
           }
           if (credentialDeferred) await note(feed.confirmUnknown);

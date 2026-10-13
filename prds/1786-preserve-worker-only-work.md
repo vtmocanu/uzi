@@ -85,7 +85,7 @@ Audit every flag-clear site in `handleRecoveryExhausted` on this baseline. The t
 |---|---|---|
 | `confirmRunningForCredentialPark`, `case stop` | Clear flags, return false | Local-only stopped-source retention; no stale network writes. |
 | Ownership probe returns another generation | Clear flags, return false | Same stopped-source rule; do not touch the successor. |
-| Ownership probe 404, terminal-disk and not credential-deferred | Clear flags, return false | Missing authority is unknown; retain a seeded source. |
+| Ownership probe 404, credential-deferred or terminal-disk | Credential-deferred: keep the session unless a verified capture exists, clone released on a covered verdict. Terminal-disk: clear flags. | A 404 proves neither a park nor a terminal status nor supersession (unknown authority): both arms keep the clone as an explicit keep (`keepClone`), so a covered verdict never releases it, with the plain journal and no stopped-source record. The session posture and the absence of any report are unchanged. |
 | Ownership loop sees terminal status | Clear flags, optional existing settle, return false | Preserve source unless existing complete physical-source disposition covers it; terminal status alone is insufficient. |
 | Terminal-disk recheck sees another generation or terminal status | Clear flags, return false | Preserve exact source under the same fence/terminal rules. |
 | Terminal-disk finds `terminalResolved` or pending outbox terminal | Clear flags, existing failure reporting | Keep reporting precedence; pending reporting authority cannot authorize source deletion. |
