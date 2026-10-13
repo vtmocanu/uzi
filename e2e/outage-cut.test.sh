@@ -23,7 +23,8 @@ fixture() {
             ALIAS_AVAILABLE=1 ;;
           api) [ "$REFUSE_API" = 0 ] || return 1; API_AVAILABLE=1; API_PAUSED=0 ;;
         esac ;;
-      rm) [ "$API_AVAILABLE" = 1 ] || fail 'alias removal creates a DNS gap';
+      rm) [ "$*" = 'rm -s -f -v outbox-api-placeholder' ] || fail 'placeholder removal must remove its anonymous volumes';
+        [ "$API_AVAILABLE" = 1 ] || fail 'alias removal creates a DNS gap';
         [ "$REFUSE_REMOVE" = 0 ] || return 1; ALIAS_AVAILABLE=0 ;;
       logs) echo fixture-evidence ;;
       restart) [ "$BARRIER_RELEASED:$FIXTURE_FINISHED" = 1:0 ] || fail 'restart preceded the guarded terminal outage' ;;
@@ -74,7 +75,7 @@ if ( fixture; configure_outbox_api_alias; eval "$(awk '/^trap .*restore_outage_s
   echo 'FAIL: failure status lost'; exit 1
 else [ "$?" = 7 ]; fi
 awk 'index($0,"force-recreate api") { api=1 } index($0,"force-recreate agent") { agent=1 }
-  index($0,"rm -s -f outbox-api-placeholder") { removed=1 } END { exit(api && agent && removed ? 0 : 1) }' "$SCRATCH/calls"
+  index($0,"rm -s -f -v outbox-api-placeholder") { removed=1 } END { exit(api && agent && removed ? 0 : 1) }' "$SCRATCH/calls"
 echo 'PASS: failure trap restores defaults and removes the placeholder'
 fixture
 configure_outbox_api_alias
