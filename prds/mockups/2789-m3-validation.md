@@ -351,7 +351,8 @@ Unmodified post-break logs: `m3-proof-f2083e52-unmodified-after-typecheck.log` a
 - `npm run build` in web: exit 0 at source SHA; log `gate-log.Z04Scc`. The existing large-bundle warning remains; no bundle-splitting claim.
 - `task docs:sync`: exit 0; source run-activity and embedded mirror updated together.
 - `go test -count=1 ./internal/uzidocs -run '^TestEmbeddedDocsMatchSource$'` in api: exit 0, log `gate-log.KYILhX`. `gofmt -l` for the four M1 CLI/TUI comment files produced no paths, exit 0.
-- Repository gate and final evidence review: pending at this evidence commit; recorded below after their actual results.
+- `task gate:repo`: exit 0 at evidence SHA `df1b5d2874db1d77ad311ef5959b3b83dd05a241`, log `gate-log.luND2f`; secrets canaries DETECTED with zero tracked findings, Semgrep canary detected with zero tree findings/errors. Workflow lint was explicitly SKIPPED because actionlint is absent; triage skill rendering was Bash-only because zsh is absent. No workflow files changed.
+- Reviewer, tester and auditor verified the immutable evidence range `f2083e52..df1b5d28`, including exact raw failures/typecheck results, post-break passing summaries and both PNGs. No mandatory evidence/security findings or optional code/security notes. Tester independently passed the docs check and suggested named passing output, coverage thresholds and a pre-commit gate. Named passing output was added below; broader coverage/pre-commit infrastructure suggestions are deferred under the approved existing-gates/no-workflow-change scope.
 
 Reviewer, tester and auditor found no demonstrated mandatory source defects and no optional code/security notes at the source SHA. They checked the unit and cumulative M3-owned ranges, including kept prototype behavior, attention contents/handlers, optimistic controls and the separate confirmed-owner CodeCrossCheck gate. Reviewer ran 115 focused tests, deadcode and mirror checks; tester ran 680 focused tests, focused lint and scope/mirror checks; auditor ran 197 focused tests, secrets (canaries DETECTED), Semgrep canary/tree scan and npm audit. These reports are scoped review evidence, not live API or model-output proof. They explicitly left new mutation/browser evidence to the lead and its later immutable review.
 
@@ -362,3 +363,41 @@ Backend-free named `run-progress` scenario, real Chromium, 1280px desktop, reduc
 Permanent comparisons: [light](2789-run-page-parity-light.png), [dark](2789-run-page-parity-dark.png). Both sheets were inspected by the lead for order, single list, row glyphs, semantic colours, active context, Now/lane attachment, footer and summary defaults. Responsive controls remain covered by shipping browser tests and the [M2 captures](2789-m2-validation.md); these desktop sheets do not themselves prove narrow-view layout.
 
 Necessary mock differences under the approved PRD: existing approval/hero content, controls and semantic styling are retained rather than replaced by the mock's shortened panels; actual usage/ages come from scenario messages, so the amounts differ from illustrative mock totals; the approval fixture has no usage and therefore no invented footer. Terminal progress is null, so frozen reported rows remain without a fabricated terminal progress state or active segment. The plan segment uses the existing plan colour and completion rows retain their existing strike-through. The mock's simplified summary is a production Expand/Collapse control plus a plain excerpt. These follow preserved renderer/panel semantics and M3's no-redesign constraint. The prototype's generic side-only 'in flight' line and ambiguous unpriced-tail wording were intentionally dropped.
+
+## Named post-break passing evidence
+
+A fresh unmodified archive of the source SHA passed typecheck and all 72 selected tests using Vitest JSON output after the mutation sequence. All 29 named failure occurrences recorded across the 13 breaks match an explicit passing result by source-file suffix and exact trimmed test name. This closes the tester's optional passing-name instrumentation gap; the earlier pre-break count summary remains a count-only observation.
+
+Commands: `npm run typecheck`; `npm exec vitest -- run src/components/RunProgressCard.m3.test.tsx src/pages/RunView.m3.test.tsx src/lib/prefs.test.ts --reporter=json --outputFile=<scratch result>`. Matching lockfile and own provisioned dependencies, no primary mutation or install. Logs: `gate-log.OSodG5`, `m3-named-pass-typecheck.log`, `m3-named-pass-tests.log`; raw JSON `m3-named-pass-results.json` and checked mapping `m3-named-pass-match.json`. Typecheck 0, tests 0, 72 passed, zero skipped.
+
+| Break | Failing test now explicitly passing |
+| --- | --- |
+| confirmed-status | `confirmed status subscription uses run status and the same total as the panel` |
+| confirmed-status | `confirmed status unreported uses run status and the same total as the panel` |
+| confirmed-status | `confirmed status  uses run status and the same total as the panel` |
+| side-status | `side statuses subscription/subscription own the display with no confirmed result` |
+| side-status | `side statuses unreported/unreported own the display with no confirmed result` |
+| side-status | `side statuses / own the display with no confirmed result` |
+| side-status | `side statuses metered/unreported own the display with no confirmed result` |
+| side-status | `side statuses metered/ own the display with no confirmed result` |
+| live-billing | `live-only provisional input, tail false, never prices live or shows output` |
+| live-billing | `live-only provisional input, tail true, never prices live or shows output` |
+| total-once | `confirmed plus sides counts each once and suppresses live input, live false` |
+| total-once | `confirmed plus sides counts each once and suppresses live input, live true` |
+| cache-honesty | `confirmed status metered uses run status and the same total as the panel` |
+| cache-honesty | `confirmed status subscription uses run status and the same total as the panel` |
+| cache-honesty | `confirmed status unreported uses run status and the same total as the panel` |
+| cache-honesty | `confirmed status  uses run status and the same total as the panel` |
+| unpriced-tail | `tail-only unpriced/null has no panel or Full usage link` |
+| tail-link | `tail-only unpriced/null has no panel or Full usage link` |
+| tail-link | `tail-only estimated/0.5 has no panel or Full usage link` |
+| tail-link | `tail-only estimated/0.001 has no panel or Full usage link` |
+| gate-default | `stored preference undefined wins at mount and gate exit without remount` |
+| explicit-false | `stored preference false wins at mount and gate exit without remount` |
+| explicit-true | `stored preference true wins at mount and gate exit without remount` |
+| excerpt-scrub | `collapsed excerpt parses lists, references, nested destinations, entities, images and code into safe plain text` |
+| excerpt-format | `collapsed excerpt parses lists, references, nested destinations, entities, images and code into safe plain text` |
+| history-order | `awaiting_approval attention comes before history directly before progress` |
+| history-order | `completed attention comes before history directly before progress` |
+| history-order | `failed attention comes before history directly before progress` |
+| history-order | `cancelled attention comes before history directly before progress` |

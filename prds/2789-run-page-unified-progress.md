@@ -1,6 +1,6 @@
 # PRD #2789: Run page, one progress card for milestones, live work and Now
 
-**Status**: In progress — M1 and M2 complete; M3 awaiting final repository gate and evidence review; M4 pending
+**Status**: In progress — M1–M3 complete; M4 pending
 **Priority**: Medium
 **GitHub issue**: #2789
 **Design mock**: `prds/mockups/2789-run-page-unified-progress-mock.html` (open it in a browser; a Before/After toggle and a run-state switch sit at the top)
@@ -135,7 +135,7 @@ Blocked by: M1 (the cost footer lives in the card)
 - [x] `CHANGELOG.md` line.
 - [x] Acceptance: examples 2 and 3; mock parity for the attention slot and footer.
 
-Evidence: [M3 validation and isolated deliberate breaks](mockups/2789-m3-validation.md), with [light](mockups/2789-run-page-parity-light.png) and [dark](mockups/2789-run-page-parity-dark.png) four-state Chromium comparisons. Source review is clean at `f2083e52`; full web gate, production build and uncached docs mirror passed. Thirteen valid deliberate breaks typechecked and failed intended assertions, followed by 72 unmodified passing cases. Final repository gate and evidence review remain pending at this snapshot; M4 is unchecked.
+Evidence: [M3 validation and isolated deliberate breaks](mockups/2789-m3-validation.md), with [light](mockups/2789-run-page-parity-light.png) and [dark](mockups/2789-run-page-parity-dark.png) four-state Chromium comparisons. Source review is clean at `f2083e52`; full web gate, production build and uncached docs mirror passed. Thirteen valid deliberate breaks typechecked and failed intended assertions, followed by 72 unmodified passing cases. Final repository gate passed at `df1b5d28`; reviewer, tester and auditor verified the committed proof and screenshots with no mandatory findings. A fresh JSON-report run matched all 29 recorded failing test names to passing results among 72 tests. M4 is unchecked.
 
 ### M4: The Now note describes the work, not the tool
 Blocked by: none
