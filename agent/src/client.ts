@@ -1865,6 +1865,23 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.recovery_cause === "worker_memory_pressure") {
+      // Snapshot once: caller mutation and transport retries cannot rebind this request.
+      const outbound: PlanCrossCheckStateRequest = Object.freeze(JSON.parse(JSON.stringify(body)));
+      const incarnation = this.memoryIncarnationValue;
+      if (!this.hasFeature("worker_memory_pressure_v1") || !incarnation || !memoryUUID(runId) ||
+          outbound.status !== "recovery_wait" || outbound.recovery_cause !== "worker_memory_pressure" ||
+          outbound.require_running === true ||
+          !memoryNonce(outbound.register_nonce) || outbound.register_nonce !== incarnation.register_nonce ||
+          !memoryNatural(outbound.claim_generation) || outbound.claim_generation === 0 ||
+          !memoryNatural(outbound.memory_episode)) throw memoryError();
+      const binding = Object.freeze({ run_id: runId, worker_id: incarnation.worker_id,
+        register_nonce: outbound.register_nonce, claim_generation: outbound.claim_generation,
+        memory_episode: outbound.memory_episode });
+      // No generation send gate or strict-decode downgrade: this park requires every fence.
+      return this.reportStateOnce(runId, path, outbound, signal, CROSS_CHECK_RESPONSE_MAX_BYTES,
+        undefined, { incarnation, binding });
+    }
     if (body.require_running === true) {
       if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) <= 0)
@@ -2004,7 +2021,10 @@ export class WorkerClient {
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence, memoryPark?: {
+    incarnation: MemoryIncarnation;
+    binding: NonNullable<StateAck["memoryParkAccepted"]>;
+  }): Promise<StateAck> {
     const incarnation = this.completionIncarnation;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
@@ -2023,6 +2043,18 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
           };
+          // parkWorkerMemoryPressure returns 409 only for exact replay when these DTO fields
+          // match and no decline/switch disposition is present. Generation/nonce stay in the
+          // captured request: the public RunDTO intentionally exposes neither as a receipt.
+          if (memoryPark && this.hasFeature("worker_memory_pressure_v1") &&
+              this.memoryIncarnationValue === memoryPark.incarnation &&
+              this.memoryRegistrationRevision === memoryPark.incarnation.revision &&
+              fields.memoryParkUndisposed === true && fields.runId === memoryPark.binding.run_id &&
+              fields.workerId === memoryPark.binding.worker_id && fields.status === "recovery_wait" &&
+              fields.recoveryCause === "worker_memory_pressure" &&
+              fields.memoryEpisode === memoryPark.binding.memory_episode) {
+            Object.defineProperty(ack, "memoryParkAccepted", { value: memoryPark.binding, enumerable: true });
+          }
           if (body.completion_final_head !== undefined) {
             if (!this.hasFeature("recovery_completed_publication_v1")) {
               ack.completedPublicationReason = "unsupported_feature";
@@ -3886,6 +3918,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   completedPublicationReason?: CompletedPublicationReason;
   runId?: unknown;
   workerId?: unknown;
+  recoveryCause?: string;
+  memoryEpisode?: number;
+  memoryParkUndisposed?: boolean;
   status?: string;
   holdReason?: string | null;
   budgetMaxIterations?: number;
@@ -3920,6 +3955,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
         id?: unknown;
         worker_id?: unknown;
         status?: unknown;
+        recovery_wait_cause?: unknown;
+        memory_hold?: unknown;
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
         hold_reason?: unknown;
@@ -3950,6 +3987,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       completedPublicationReason?: CompletedPublicationReason;
       runId?: unknown;
       workerId?: unknown;
+      recoveryCause?: string;
+      memoryEpisode?: number;
+      memoryParkUndisposed?: boolean;
       status?: string;
       holdReason?: string | null;
       budgetMaxIterations?: number;
@@ -3977,6 +4017,13 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (run?.id !== undefined) out.runId = run.id;
     if (run?.worker_id !== undefined) out.workerId = run.worker_id;
     if (typeof run?.status === "string") out.status = run.status;
+    if (typeof run?.recovery_wait_cause === "string") out.recoveryCause = run.recovery_wait_cause;
+    if (isRecord(run?.memory_hold) && memoryNatural(run.memory_hold.episode))
+      out.memoryEpisode = run.memory_hold.episode;
+    // Presence, even malformed/null, blocks authority rather than degrading to absence.
+    if (isRecord(parsed) && !Object.hasOwn(parsed, "reason") &&
+        !Object.hasOwn(parsed, "disposition") && !Object.hasOwn(parsed, "credential_switch"))
+      out.memoryParkUndisposed = true;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
     // which the ServerWallParkedError check reads as "no hold" (never a wall park).
