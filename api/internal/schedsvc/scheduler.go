@@ -1037,6 +1037,15 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// whole fire unless the fire already started a run.
 	// An unpinned label selects one sweep candidate, not the entire schedule.
 	// Stored-override disabled errors still take the existing once hold/stop path.
+	if selection.LabelSelected && sched.Target != "issue" && scheduleCredentialOverride(sched) != nil &&
+		(errors.Is(err, workersvc.ErrNoCredentialForHarness) || errors.Is(err, workersvc.ErrNoUsableCredential)) {
+		// Resolution can refuse before the insert closure checks a stored override.
+		// Reclassify that refusal if the stored token was disabled after preflight;
+		// it remains schedule-wide even when it was the label's only usable token.
+		if disabled := e.runs.ScheduleCredentialDisabled(ctx, sched.UserID, scheduleCredentialOverride(sched), nil); errors.Is(disabled, workersvc.ErrCredentialDisabled) {
+			err = disabled
+		}
+	}
 	if selection.LabelSelected && sched.Target != "issue" && !errors.Is(err, workersvc.ErrCredentialDisabled) {
 		var reason SkipReason
 		switch {
