@@ -29,16 +29,23 @@ fixture() {
       logs) echo fixture-evidence ;;
       restart) [ "$BARRIER_RELEASED:$FIXTURE_FINISHED" = 1:0 ] || fail 'restart preceded the guarded terminal outage' ;;
       exec) [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop';
+        if [ "${3:-}:${4:-}" = agent:test ]; then
+          [ "$BARRIER_RELEASED" = 1 ] || fail 'finalize file checked before barrier release'
+          return 0
+        fi
         [ "${3:-}:${4:-}" = -u:10001:10001 ] || fail 'barrier writer must match worker uid for sticky tmp cleanup'
         BARRIER_RELEASED=1 ;;
     esac
   }
   fail() { echo "$*" >&2; exit 1; }
+  pass() { :; }
   wait_http() { [ "$API_AVAILABLE:$ALIAS_AVAILABLE" = 1:0 ]; }
   login() { :; }
   wait_worker_online() { :; }
   set_interlock() { :; }
-  make_outbox_run() { [ "${1:-}" != cut_barrier ] || BARRIER_ARMED=1; }
+  make_outbox_run() {
+    case "${1:-}" in cut_barrier|first_cut_barrier) BARRIER_ARMED=1 ;; esac
+  }
   wait_permit_retrying() { wait_terminal_lost "$@"; }
   wait_terminal_lost() {
     [ "$FIXTURE_FINISHED" = 0 ] || fail 'slow helper let fixture finish before API cut'
@@ -51,10 +58,11 @@ fixture() {
       .profiles == ["outbox-api-cut"] and .networks == {default:{aliases:["api"]}} and
       (.container_name | startswith("cdr-")) and .entrypoint[0] == "/usr/local/bin/node" and
       .command == [] and .user == "65534:65534" and .read_only == true and
-      .cap_drop == ["ALL"] and .environment == null and .volumes == null and .secrets == null' "$OUTBOX_DNS_OVERRIDE" >/dev/null \
+      .cap_drop == ["ALL"] and .environment == null and .volumes == null and .secrets == null and
+      .tmpfs == ["/data:size=1m","/nix:size=1m"]' "$OUTBOX_DNS_OVERRIDE" >/dev/null \
       || fail 'placeholder must be idle, phase-scoped and authority-free'
   }
-  eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|release_outbox_cut_barrier|api_back|restore_outbox_resolution|restore_outage_state)\(\) \{/,/^\}/' "$PHASE")"
+  eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|release_outbox_cut_barrier|api_back|restore_outbox_resolution|restore_outage_state|f42_cut)\(\) \{/,/^\}/' "$PHASE")"
 }
 fixture
 configure_outbox_api_alias
@@ -120,4 +128,59 @@ for case_number in 4 5 6; do
   )
   echo "PASS: real CASE $case_number cannot finish during slow helper startup before the cut"
 done
-echo 'cases=11 passed=11'
+for case_number in 7 8; do
+  (
+    fixture
+    configure_outbox_api_alias
+    SLOW_HELPER=1
+    eval "$(awk -v selected="$case_number" '
+      /^say "CASE [0-9]+:/ { inside = index($0, "CASE " selected ":") > 0 }
+      inside && /^make_outbox_run/ { print }
+    ' "$PHASE")"
+    checks=0
+    f42_durable_logged() {
+      checks=$((checks + 1))
+      [ "$FIXTURE_FINISHED" = 0 ] || return 0
+      if [ "$checks" -gt 1 ] && [ "$BARRIER_RELEASED" != 1 ]; then
+        fail 'durable finalize proof attempted without releasing the cut barrier'
+      fi
+      [ "$BARRIER_RELEASED" = 1 ]
+    }
+    f42_cut "$RUN_B1" 1 || fail "case $case_number: finalize handed off before the API cut"
+    [ "$API_AVAILABLE:$BARRIER_ARMED:$BARRIER_RELEASED:$FIXTURE_FINISHED" = 0:1:1:0 ]
+    [ "$checks" = 2 ] || fail 'must check pre-existing durable proof before releasing the barrier'
+    api_back
+    if [ "$case_number" = 8 ]; then
+      # A new execution consumes its own release, after the second cut too.
+      BARRIER_RELEASED=0 checks=0
+      f42_cut "$RUN_B1" 2 || fail 'case 8: second finalize handed off before the API cut'
+      [ "$API_AVAILABLE:$BARRIER_RELEASED:$FIXTURE_FINISHED:$checks" = 0:1:0:2 ]
+      api_back
+    fi
+  )
+  echo "PASS: real CASE $case_number orders finalize after the cut despite slow helper startup"
+done
+(
+  fixture
+  # Exercise the real issue producer too, so an incorrect token cannot hide
+  # behind the mode-aware fake used for the cut-order controls.
+  # shellcheck disable=SC2034  # extracted helper consumes the fixture repo id
+  REPO_ID=fixture
+  apipost() {
+    if [[ "$1" == */issues ]]; then
+      printf '%s\n' "$2" > "$SCRATCH/issue.json"
+      echo '{"card":{"iid":7}}'
+    else echo '{}'; fi
+  }
+  create_run() { echo "$RUN_B1"; }
+  wait_custody_headroom() { :; }
+  wait_status() { :; }
+  tick_count() { echo 3; }
+  eval "$(awk '/^make_outbox_run\(\) \{/,/^\}/' "$PHASE")"
+  make_outbox_run first_cut_barrier
+  jq -e '.description | contains("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER") and (contains("UZI_STUB_OUTBOX_CUT_BARRIER") | not)' "$SCRATCH/issue.json" >/dev/null
+  make_outbox_run cut_barrier
+  jq -e '.description | contains("UZI_STUB_OUTBOX_CUT_BARRIER")' "$SCRATCH/issue.json" >/dev/null
+)
+echo 'PASS: real issue producer arms first-claim and every-execution barriers distinctly'
+echo 'cases=14 passed=14'
