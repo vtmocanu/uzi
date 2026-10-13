@@ -898,3 +898,5 @@ done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
+# Tally guard: every combined harness case must run and pass.
+[ "$cases" -ge 152 ] && [ "$cases" -eq "$passed" ]
