@@ -27,6 +27,16 @@ through `[0.52.0]`.)
 - **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
   Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; remove a hand-set `workers.rollTargetVersion` when using the published chart's pin so a stale override cannot hold the next roll. Missing or conflicting image identity blocks chart publication.
 
+### Changed
+
+- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
+  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
+
+- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
+  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
+
+### Fixed
+
 - **Haiku 4.5 usage with unavailable inference geography keeps its standard cost estimate ([#2914](https://github.com/vtmocanu/uzi/issues/2914)).**
   Summary and Now entries on Haiku 4.5's dated and undated model IDs accept `inference_geo: "not_available"` because those rows predate geographic routing. Geo-capable models with that marker remain unpriced. The Anthropic table also corrects Sonnet 5.5 cache reads to $0.10 per million tokens; stored unreported rows are not backfilled.
 
@@ -38,14 +48,6 @@ through `[0.52.0]`.)
 
 - **Resumed implementation prompts preserve milestone reporting guidance ([#2438](https://github.com/vtmocanu/uzi/issues/2438)).**
   Resumed Claude implementation prompts retain the approved milestone tracker and reporting instructions; both harnesses display persisted completion declarations alongside local progress, and the lead is instructed to report finished work before `signal_done` in the same turn. This is prompt guidance, not a guarantee of model compliance; the completion interlock is unchanged and incomplete work remains blocked.
-
-### Changed
-
-- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
-  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
-
-- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
-  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
 
 ## [0.86.0] - 2026-10-06
 
