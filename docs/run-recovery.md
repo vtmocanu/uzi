@@ -1103,12 +1103,15 @@ exact source under one lock. It never cancels a run or stops the worker.
 > no owned tracking ref), a failed search instead logs
 > `FAIL <run> (<label>) status=<st>: status saved, but the source search was inconclusive (<reasons>); retry`
 > (still exit 1, `latest` not advanced); each reason names the failing pod or namespace
-> (`exec into pod <ns>/<pod> failed`, `listing Running pods in namespace <ns> failed`). A
+> for a kubectl listing or exec failure (`exec into pod <ns>/<pod> failed`, `listing Running pods in
+> namespace <ns> failed`), an errored probe, an unreadable `.git` (`a candidate's .git on pod
+> <ns>/<pod> could not be read`) and an attributed source listed but unreadable (`attributed source
+> <path> on pod <ns>/<pod> is listed but unreadable`); capture failures name the source path. A
 > same-stem directory without `.git` is skipped only when it is positively empty; a nonempty
-> or unlistable one that the journal, ledger (`live`/`reclaimed`) or marker names is an
-> attributed source that is listed but unreadable (incomplete coverage, `latest` not
-> advanced). A directory that no journal, ledger or marker names is not an attributed
-> source. Cost: every cycle execs into every Running pod in `UZI_WORKER_NS` for each
+> or unlistable one that the journal (active and failed runs only), a protected descriptor, a `live`/`reclaimed` ledger entry or the stopped marker names is an
+> attributed source that is listed but unreadable: incomplete coverage when another source was
+> captured, else the no-capture inconclusive FAIL line above; either way exit 1 and `latest`
+> not advanced. A directory none of those name is not an attributed source. Cost: every cycle execs into every Running pod in `UZI_WORKER_NS` for each
 > bound run, and one pod that cannot be exec'd into fails every bound run's cycle until it
 > is fixed (the FAIL line names it and verified artifacts are kept). Do not drop its
 > namespace from `UZI_WORKER_NS` (which lists namespaces, not pods) unless you have verified

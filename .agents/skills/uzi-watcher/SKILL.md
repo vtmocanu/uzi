@@ -499,12 +499,16 @@ and falling back to the durable bare tracking ref when no clone survives:
   is kept. When nothing is captured at all (no readable clone and no owned tracking ref), a failed
   search instead logs `FAIL <run> (<label>) status=<st>: status saved, but the source search was
   inconclusive (<reasons>); retry` (still exit 1, `latest` not advanced); each reason names the
-  failing pod or namespace (`exec into pod <ns>/<pod> failed`, `listing Running pods in namespace
-  <ns> failed`). A same-stem directory without `.git` is skipped only when it is positively empty;
-  a nonempty or unlistable one that the journal, ledger (`live`/`reclaimed`) or marker names is an
-  attributed source that is listed but unreadable, so it is incomplete coverage (FAIL, `latest`
-  not advanced). A directory no journal, ledger or marker names is not an attributed source, but on
-  a run that captures nothing an unreadable `.git` in any same-stem directory, even an
+  failing pod or namespace for a kubectl listing or exec failure (`exec into pod <ns>/<pod> failed`,
+  `listing Running pods in namespace <ns> failed`), an errored probe, an unreadable `.git`
+  (`a candidate's .git on pod <ns>/<pod> could not be read`) and an attributed source listed but
+  unreadable (`attributed source <path> on pod <ns>/<pod> is listed but unreadable`); capture
+  failures name the source path. A same-stem directory without `.git` is skipped only when it is positively empty;
+  a nonempty or unlistable one that the journal (active and failed runs only), a protected descriptor, a `live`/`reclaimed` ledger entry or the stopped marker names is an
+  attributed source that is listed but unreadable: incomplete coverage when another source was
+  captured, else the no-capture inconclusive FAIL line above; either way exit 1 and `latest` not
+  advanced. A directory none of those name is not an attributed source, but on
+  a run that captures nothing a `.git` that exists but cannot be read in any same-stem directory, even an
   unattributed one, still makes the search inconclusive (FAIL, retry): a known limitation. Cost: every
   cycle execs into every Running pod in `UZI_WORKER_NS` for each bound run (a handful of probes
   per pod), and one pod that cannot be exec'd into fails every bound run's cycle until it is fixed (the FAIL line names it and verified artifacts are kept). Do not drop its namespace from `UZI_WORKER_NS` unless you have verified that namespace holds no source a tracked run needs: excluding it hides those sources from the search, so their work is no longer backed up and the backup could read green without it (it lists namespaces, so
