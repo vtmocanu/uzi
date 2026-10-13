@@ -957,7 +957,7 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     assert.ok(sessionKept(lines), "the session is kept");
   });
 
-  it("a 404 in the loop after a verified capture releases the clone and session", async () => {
+  it("a 404 in the loop after a verified capture keeps the clone (issue #1786: a 404 is unknown authority) and releases the session", async () => {
     const { gitlab } = fakeGitlab();
     client.protocolFeatures = [VAULT_FEATURE];
     const rig = codexRig({ vaultLocked: () => true });
@@ -975,8 +975,8 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 0);
     assertCaptured(1796);
-    assert.equal(fs.existsSync(worktreeDirFor(1796)), false, "the verified capture lets the clone go");
-    assert.equal(sessionKept(lines), false, "and the session");
+    assert.equal(fs.existsSync(worktreeDirFor(1796)), true, "a covered verdict never releases the clone after a 404");
+    assert.equal(sessionKept(lines), false, "the verified capture still lets the session go");
   });
 
   it("a cancel whose capture is not verified (fetch-back fails) keeps the clone and session after a terminal ack", async () => {
