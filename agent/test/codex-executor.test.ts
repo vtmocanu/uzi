@@ -15991,7 +15991,7 @@ describe("Codex dependency provisioning M2", () => {
       if (failure === "throw") throw new Error(hostile);
       return Promise.reject(new Error(hostile));
     } };
-    const { ctx, emitted } = makeCtx();
+    const { ctx, emitted } = makeCtx({ summaryIntentPresent: true });
     await makeExecutor(rig, bindingOf(SUBSCRIPTION), { ...noopLog, warn: (message) => { warnings.push(message); } }).run(ctx);
     assert.equal(rig.transport.turnStartCount, 1);
     assert.deepEqual(warnings, ["JS dependency provisioning failed"]);
@@ -17042,6 +17042,17 @@ describe("2833 Codex inline summaries", () => {
       let input: IntentSummaryInput | undefined;
       let resolve!: (value: string) => void;
       let fenced = false;
+      let abandoned = false;
+      const teardown: { aborted: boolean; abandoned: boolean }[] = [];
+      const reap = rig.root.reap.bind(rig.root);
+      rig.root.reap = async (...args) => {
+        teardown.push({ aborted: input?.signal?.aborted === true, abandoned });
+        input?.onUsage?.(usage);
+        return reap(...args);
+      };
+      const log = { ...noopLog, warn: (message: string) => {
+        if (message === "intent summary did not settle within the bound") abandoned = true;
+      } };
       const summaryRunner = {
         generateIntentSummary: (i: IntentSummaryInput) => {
           input = i;
@@ -17049,7 +17060,7 @@ describe("2833 Codex inline summaries", () => {
         },
         generatePlanSummary: async () => null,
       };
-      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, { summaryRunner, summarySettleMs: 1 });
+      const executor = makeExecutor(rig, bindingOf(API_KEY), log, undefined, provider, { summaryRunner, summarySettleMs: 1 });
       const { ctx, emitted } = makeCtx({
         claimFenced: () => fenced,
         reportIteration: async () => {
@@ -17071,9 +17082,39 @@ describe("2833 Codex inline summaries", () => {
       resolve("Too late"); await drain();
       assert.deepEqual(intents, []);
       assert.equal(emitted.filter(m => m.kind === "summary_usage").length, 0);
-      if (close === "terminal" || close === "fence") assert.ok(rig.disposed() > 0);
+      assert.equal(abandoned, true, "intent reached bounded abandonment");
+      if (close === "terminal" || close === "fence") {
+        assert.deepEqual(teardown, [{ aborted: true, abandoned: true }], "abort and bounded abandonment precede provider reap");
+        assert.ok(rig.disposed() > 0);
+      }
     });
   }
+  it("2833 terminal intent cooperatively settles before provider teardown", async () => {
+    const { rig } = summaryRig();
+    let input: IntentSummaryInput | undefined;
+    let settled = false;
+    const teardown: { aborted: boolean; settled: boolean }[] = [];
+    const reap = rig.root.reap.bind(rig.root);
+    rig.root.reap = async (...args) => {
+      teardown.push({ aborted: input?.signal?.aborted === true, settled });
+      return reap(...args);
+    };
+    const summaryRunner = {
+      generateIntentSummary: async (i: IntentSummaryInput) => {
+        input = i;
+        await new Promise<void>(resolve => i.signal?.addEventListener("abort", () => resolve(), { once: true }));
+        await drain();
+        settled = true;
+        return null;
+      },
+      generatePlanSummary: async () => null,
+    };
+    const { ctx } = makeCtx({ reportIteration: async () => {
+      await waitForSummary(() => input !== undefined, "intent started");
+    } });
+    await makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, { summaryRunner }).run(ctx);
+    assert.deepEqual(teardown, [{ aborted: true, settled: true }], "abort and cooperative settlement precede provider reap");
+  });
   it("2833 abort settle emits already-observed usage once, ignores PauseNowSignal, then genuine terminal cancel", async () => {
     const { rig, intents } = summaryRig();
     const pause = new AbortController();

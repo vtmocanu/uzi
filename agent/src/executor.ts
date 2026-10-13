@@ -812,8 +812,8 @@ export interface ExecutorResult {
   nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
    *  summary pass produced and the api accepted,
-   *  latched only for the current gate generation after API acceptance. A newer gate clears the
-   *  previous latch even if its replacement fails. Absent when the pass did not run or succeed,
+   *  latched after API acceptance. Codex latches only for the current gate generation: a newer
+   *  gate clears its previous latch even if its replacement fails. Absent when the pass did not run or succeed,
    *  including a resumed run past its gate. */
   summaryPlan?: string;
   /** PRD #1798 M2: the tagged deltas (added / changed / dropped) that accompanied
