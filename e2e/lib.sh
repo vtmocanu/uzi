@@ -735,6 +735,16 @@ settle_runs_terminal() {
 # acknowledged. Before starting the next case or recreating its worker, require
 # terminal outcomes AND absence from the worker snapshot for these exact fixtures.
 # Never changes custody. One shared deadline bounds the whole batch.
+dump_fixture_settlement() {
+  local dir="$RUNROOT/artifacts/fixture-settlement"
+  mkdir -p "$dir"
+  "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data \
+    < "$ROOT/e2e/settlement-diagnostic.mjs" > "$dir/recovery.jsonl" 2> "$dir/read-errors.txt" \
+    || echo 'fixture settlement: worker diagnostic unavailable' >&2
+  # Keep the full already-redacted worker log as evidence of actual redrive cadence.
+  "${COMPOSE[@]}" logs --no-color agent > "$dir/agent-redrive.log" 2>/dev/null || true
+  cat "$dir/recovery.jsonl"
+}
 wait_runs_terminal_off_worker() {
   local timeout="$1" run status active start=$SECONDS deadline pending settled; shift
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture settlement timeout: $timeout"
@@ -755,8 +765,10 @@ wait_runs_terminal_off_worker() {
       for run in "${settled[@]}"; do pass "fixture settled off worker: $run"; done
       return 0
     fi
-    [ "$SECONDS" -lt "$deadline" ] \
-      || fail "fixture settlement timeout after ${timeout}s: ${pending[*]}"
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      dump_fixture_settlement || true
+      fail "fixture settlement timeout after ${timeout}s: ${pending[*]}"
+    fi
     sleep 0.3
   done
 }
