@@ -7,7 +7,7 @@
 # requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
-# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stop/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the api already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; paused/unpaused per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already paused, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
 # restores: api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
 # =============================================================================
@@ -180,7 +180,7 @@ make_outbox_run() {
 # for the first recovered heartbeat to report a depth. Gate the outage on the EVENT
 # instead, then hold it open for the caller's window so a real backlog builds.
 # Returns 0 once observed and 1 on timeout; it never calls `fail` itself, because it runs
-# with the api STOPPED and a `fail` there would leave the whole stack down for every later
+# with the API paused and a `fail` there would leave the whole stack down for every later
 # phase. The caller restores the api first and judges after.
 wait_spilled() {
   local run="$1" timeout="${2:-60}" f="$RUNROOT/.outbox-spill.log"
@@ -219,7 +219,7 @@ wait_spilled() {
 # The FIRST failed attempt is the same
 # proof and fires ~one connect timeout after the terminal, keeping the whole outage well under the
 # window. TIMEOUT bounds it likewise. Returns 0 once observed and 1 on timeout; it never calls `fail`
-# itself (it runs with the api STOPPED) — the caller restores the api and judges after.
+# itself (it runs with the API paused) — the caller restores the api and judges after.
 # TIMEOUT defaults to 180s. The old 80s under-shot on the gitlab CI lane (nightly run 36680011794,
 # 2026-09-30): with the api down, finalize itself takes ~60s, because PR-description staging waits
 # ~10s on a failed fetch and MR creation spends ~32s in transient forge retries, so the terminal
@@ -269,30 +269,47 @@ wait_permit_retrying() {
 set_interlock() {
   apiput /api/admin/settings "{\"settings\":{\"completion_interlock_rollout\":\"$1\"}}" >/dev/null
 }
-# api_back — bring the api up after an outage and wait for the harness's HTTP path
-# through web to recover. Compose nginx now re-resolves the api address after its
-# five-second DNS cache expires; the standalone compose-web-dns phase proves the
-# address-swap behavior directly. Case 4 still exercises the real outage path.
+# Keep DNS stable while HTTP is unavailable, as a Kubernetes Service does during
+# an API pod outage. Compose stop removes the alias; slow failed API lookups then
+# occupy Node's DNS workers and can time out unrelated healthy forge requests.
+OUTBOX_API_PAUSED=0
+api_cut() {
+  "${COMPOSE[@]}" pause api >/dev/null 2>&1 || fail "outbox phase: could not pause the api"
+  OUTBOX_API_PAUSED=1
+}
+# api_back restores HTTP before judging an outage assertion.
 api_back() {
+  "${COMPOSE[@]}" unpause api >/dev/null || return
+  OUTBOX_API_PAUSED=0
   "${COMPOSE[@]}" up -d --wait api >/dev/null
   wait_http
   login
 }
+restore_outage_state() {
+  local rc=$?
+  if [ "$OUTBOX_API_PAUSED" = 1 ]; then
+    "${COMPOSE[@]}" unpause api >/dev/null 2>&1 \
+      || { echo "outbox cleanup: could not unpause API" >&2; return 1; }
+    OUTBOX_API_PAUSED=0
+  fi
+  set_interlock true 2>/dev/null || true
+  return "$rc"
+}
+trap restore_outage_state EXIT
 # outage RUN SECS — cut the api, wait until the batcher has SPILLED run RUN, hold the
 # outage SECS longer so a real backlog accumulates, bring the api back, re-login (the
-# bounce drops the session), then assert the barrier. Spill-gated rather than
+# recovery refreshes the session), then assert the barrier. Spill-gated rather than
 # fixed-length: see wait_spilled for why a bare `sleep` cannot bound the spill. The
 # total stays well under the 300s heartbeat-stale window raised below (~21s worst-case
-# spill + 25s the longest hold). No `docker compose start` (no phase uses it): stop,
-# then api_back, which waits for the existing web proxy to recover.
+# spill + 25s the longest hold). api_back waits for the existing web proxy to recover.
 outage() {
   local run="$1" secs="$2" spilled=0
   say "cutting the api (> WORKER_TRANSIENT_TRIP_MS=3s) so the batcher spills run $run, then holding it down ${secs}s past the spill"
-  "${COMPOSE[@]}" stop api >/dev/null 2>&1
+  api_cut
   if wait_spilled "$run"; then spilled=1; fi
   sleep "$secs"
   api_back
-  # Judge the spill only AFTER the api is back: a `fail` with it still stopped would take
+  # Judge the spill only AFTER the api is back: a `fail` with it still unavailable would take
   # every later phase down with this one.
   [ "$spilled" = 1 ] \
     || fail "outbox phase: the batcher never entered spill mode for run $run while the api was down — nothing was spilled, so there is no barrier to observe"
@@ -412,9 +429,8 @@ rb_run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 # restart and the api start, well inside 300s.
 
 # Cases 3-5 exercise the terminal journal, so their runs are created un-interlocked (set_interlock).
-# The trap restores the default even if a case fails.
+# The phase trap restores the default even if a case fails.
 set_interlock false
-trap 'set_interlock true 2>/dev/null || true' EXIT
 
 # =============================================================================
 # CASE 3 — a run FINISHING during the outage is `completed` AFTER its messages (the fence), at its
@@ -424,10 +440,10 @@ make_outbox_run
 RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+api_cut
 terminal_lost_b1=0; if wait_terminal_lost "$RUN_B1"; then terminal_lost_b1=1; fi
 api_back
-# Judge only AFTER the api is back: a `fail` with it still stopped would take every later phase down
+# Judge only AFTER the api is back: a `fail` with it still unavailable would take every later phase down
 # with this one.
 [ "$terminal_lost_b1" = 1 ] \
   || fail "case 3: run $RUN_B1 never reached+journaled its terminal AND lost its first send while the api was down — the finish-during-outage precondition never held, so the first send could have landed post-recovery and the fence replay was never exercised"
@@ -463,7 +479,7 @@ RUN_B2="$OUTBOX_RUN"
 GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
 RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
 say "cutting the api so run $RUN_B2 spills its messages and journals its terminal while down"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+api_cut
 # Gate BEFORE the restart on the terminal being journaled AND its first live send lost: the run must
 # have spilled its messages AND installed its terminal journal (the batcher is final-flushed before
 # the terminal is journaled, so the message spill is already on disk by the time the journal line
@@ -528,7 +544,7 @@ pass "case 5: past-wall carve-out run held at 'running' across the sweep (carve-
 # Now lose its terminal to an outage. Without the journal replay this run would stay non-terminal
 # forever (the carve-out spares it from the timeout sweep AND the judge sweep never touches it).
 say "cutting the api so the carve-out run's terminal is journaled and its first send lost"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+api_cut
 terminal_lost_b3=0; if wait_terminal_lost "$RUN_B3"; then terminal_lost_b3=1; fi
 api_back
 [ "$terminal_lost_b3" = 1 ] \
@@ -558,7 +574,7 @@ GEN_B4="$(rb_run_field "$RUN_B4" claim_generation)"
 [ -n "$(rb_run_field "$RUN_B4" completion_contract_version)" ] \
   || fail "case 6: run $RUN_B4 was not stamped for the completion interlock (completion_contract_version is NULL), so it cannot prove the permit path"
 say "cutting the api so run $RUN_B4 reaches its completion permit while it is down"
-"${COMPOSE[@]}" stop api >/dev/null 2>&1
+api_cut
 permit_retrying_b4=0; if wait_permit_retrying "$RUN_B4"; then permit_retrying_b4=1; fi
 api_back
 [ "$permit_retrying_b4" = 1 ] \
@@ -577,7 +593,7 @@ pass "case 6: the interlocked run waited out the outage for its permit -> comple
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart
 # that lands while the api is DOWN, and the one-shot finalize-resume allowance keeps that run from
 # being failed as worker_lost by the orphan pass, exactly once. The cut is DETERMINISTIC: the api is
-# stopped while the stub stream is still running (executor not returned), so no terminal can land, and
+# paused while the stub stream is still running (executor not returned), so no terminal can land, and
 # the agent is restarted only once the finalize record is PROVEN durable, by BOTH the agent's own
 # `finalize record durable` line (logged after the directory fsync) AND the file being on disk.
 say "ISSUE #1742: finalize-resume allowance across an agent restart during an api outage (A completes, B is one-shot)"
@@ -605,15 +621,15 @@ f42_durable_logged() {
     index($0, "finalize record durable") && index($0, r) && ($0 ~ ("\"claim_generation\":" g "([^0-9]|$)")) { hit = 1 }
     END { exit(hit ? 0 : 1) }' "$f"
 }
-# f42_cut RUN GEN — the deterministic cut for run RUN at claim generation GEN: stop the api (the run's
+# f42_cut RUN GEN — the deterministic cut for run RUN at claim generation GEN: pause the API (the run's
 # stream is still running, so no terminal can land), assert there is NO durable finalize line yet, then
 # wait (bounded) for BOTH proofs of the durable point. Returns 0 once both hold, 1 on timeout, 2 when the
 # hand-off beat the outage (inconclusive). Like the other wait_* it never calls `fail` itself: it runs
-# with the api STOPPED, and a `fail` there would wedge every later phase. The caller restores the api
+# with the API paused, and a `fail` there would wedge every later phase. The caller restores the api
 # first and judges after.
 f42_cut() {
   local run="$1" gen="$2" start deadline
-  "${COMPOSE[@]}" stop api >/dev/null 2>&1
+  api_cut
   if f42_durable_logged "$run" "$gen"; then
     return 2
   fi
