@@ -151,6 +151,41 @@ describe("checkpoint publication acknowledgment", () => {
     await assert.rejects(publish(), (e: unknown) => e === err);
   });
 
+  describe("source cancellation that never settles", () => {
+    /** Fails the test instead of waiting for the runner timeout when `p` stays pending. */
+    const settles = <T>(p: Promise<T>) => Promise.race([p, new Promise<never>((_, rej) =>
+      setTimeout(() => rej(new Error("publishCheckpoint did not settle")), 2000).unref())]);
+    function hanging(chunks: Uint8Array[], cancel: () => Promise<void>): Source {
+      let i = 0, cancelled = false;
+      const stream = new ReadableStream<Uint8Array>({
+        pull(c) { if (i < chunks.length) c.enqueue(chunks[i++]!); else return new Promise<void>(() => undefined); },
+        cancel() { cancelled = true; return cancel(); },
+      }, { highWaterMark: 0 });
+      return { stream, cancelled: () => cancelled };
+    }
+    it("still rejects an over-cap body and invokes cancel", async () => {
+      const src = hanging([padded(CAP + 1)], () => new Promise<void>(() => undefined));
+      stub(() => new Response(src.stream, { status: 200 }));
+      await assert.rejects(settles(publish()), overflow);
+      assert.equal(src.cancelled(), true);
+    });
+    it("still rejects a boundary abort", async () => {
+      const src = hanging([], () => new Promise<void>(() => undefined));
+      const boundary = new AbortController();
+      stub(() => new Response(src.stream, { status: 200 }));
+      const pending = settles(publish(boundary.signal));
+      setTimeout(() => boundary.abort(), 20);
+      await assert.rejects(pending, { name: "AbortError" });
+      assert.equal(src.cancelled(), true);
+    });
+    it("keeps the original error when cancel rejects", async () => {
+      const src = hanging([padded(CAP + 1)], () => Promise.reject(new Error("cancel failed")));
+      stub(() => new Response(src.stream, { status: 200 }));
+      await assert.rejects(settles(publish()), overflow);
+      assert.equal(src.cancelled(), true);
+    });
+  });
+
   it("aborts a stalled read when the boundary signal fires and cancels the source", async () => {
     let cancelled = false;
     const stream = new ReadableStream<Uint8Array>({

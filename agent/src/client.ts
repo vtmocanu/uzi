@@ -3737,7 +3737,9 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
   } finally {
     signal?.removeEventListener("abort", abort);
     // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
-    await reader.cancel().catch(() => undefined);
+    // Best effort and not awaited: a source whose cancel never settles must not keep the caller's
+    // result or error from propagating (#2888).
+    void reader.cancel().catch(() => undefined);
   }
   return new TextDecoder().decode(Buffer.concat(parts));
 }
