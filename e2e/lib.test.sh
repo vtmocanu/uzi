@@ -555,6 +555,7 @@ done
 # shared boundary with a virtual clock, including the actual phase-42 calls.
 readopt_settlement() {
   local mode="$1" run X=X ED=ED
+  dump_fixture_settlement() { echo 'settlement diagnostic requested'; }
   # shellcheck disable=SC2034  # consumed by the evaluated real phase statements
   local E=E G=G EA=EA GA=GA
   eval "$(awk '/^wait_runs_terminal_off_worker\(\) \{/,/^\}/' "$LIB")"
@@ -861,6 +862,7 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
   else echo "FAIL: $phase still clears custody or lacks headroom wait"; fi
 done
 
+node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
 # Tally guard (the driver.test.sh idiom): a real run has all 137 cases green; a zero-case or
 # partially-red run must exit nonzero.
