@@ -53,6 +53,14 @@
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
+  - Read `uzi run recovery --json` (owner-scoped, includes settled holds); inspect
+    open custody on terminal runs (`completed`, `failed`, `cancelled`), which
+    active-run inventories omit. Also flag corroborated terminal-report backlogs
+    on workers (`outbox_pending_terminal`, `outbox_blocked`); null/stale signals
+    are unknown. Correlate with run IDs; infer no run from an aggregate alone.
+    Route to the run's owning session, then the recovery owner, else the user,
+    to check whether custody is valid or should have released. Terminal status
+    alone proves no invalid hold; never silently clean, discard or release it.
   - Read all open PR pages with
     `gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq '.[] | {number, url: .html_url, headRefOid: .head.sha}'`;
     flag a PR without a live
