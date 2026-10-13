@@ -100,7 +100,7 @@ function callerSites(): string[] {
  */
 function normalizeRoot(base: string): void {
   try {
-    // A setgid TMPDIR can lend makeFixture a foreign group and special bits.
+    // A setgid TMPDIR can lend a fixture or scratch root a foreign group and special bits.
     // Normalize only this root before any descendants inherit its metadata.
     if (process.platform !== "win32" && process.getuid && process.getgid) {
       fs.chownSync(base, process.getuid(), process.getgid());
@@ -119,7 +119,7 @@ function normalizeRoot(base: string): void {
 
 /**
  * Create a private (uid/gid-owned, 0700) scratch root under os.tmpdir() whose
- * descendants cannot inherit a setgid TMPDIR's foreign group or group-write bits.
+ * descendants cannot inherit a setgid TMPDIR's foreign group or setgid bit.
  * The parent directory is never touched. The caller removes the root.
  */
 export function makeScratchRoot(prefix: string): string {
