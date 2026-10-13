@@ -693,10 +693,13 @@ describe("P1-a/c: 4097 authenticated completing generations reclaim bindings thr
   let f: Awaited<ReturnType<typeof fixture>>;
   before(async () => { f = await fixture(); });
   after(async () => { await f.close(); });
-  // Serial chunks retain one client/runner and bound each test well below the timeout.
-  for (let chunk = 0; chunk < 5; chunk++) it("successful history chunk " + chunk, async () => {
+  const historyGenerations = 4097;
+  const chunkSize = 256;
+  const chunkCount = Math.ceil(historyGenerations / chunkSize);
+  // Smaller serial chunks leave timeout headroom while retaining one fixture/client/runner.
+  for (let chunk = 0; chunk < chunkCount; chunk++) it("successful history chunk " + chunk, async () => {
     // Remove only this fixture's proved record between iterations to keep disk work linear.
-    for (let n = chunk * 1024 + 1; n <= Math.min((chunk + 1) * 1024, 4097); n++) {
+    for (let n = chunk * chunkSize + 1; n <= Math.min((chunk + 1) * chunkSize, historyGenerations); n++) {
       const id = n.toString(16).padStart(8, "0") + "-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
       f.select(id, n);
       await f.client.claimRun();
@@ -792,14 +795,18 @@ describe("Unit 1: proven nonreceipt history preserves completion admission", () 
   let f: CompletionFixture;
   before(async () => { f = await fixture(); });
   after(async () => { await f.close(); });
-  for (let chunk = 0; chunk < 3; chunk++) it("nonreceipt history chunk " + chunk, async t => {
+  const historyGenerations = 2050;
+  const chunkSize = 256;
+  const chunkCount = Math.ceil(historyGenerations / chunkSize);
+  // Retain the shared history fixture with timeout headroom and publication only in the last chunk.
+  for (let chunk = 0; chunk < chunkCount; chunk++) it("nonreceipt history chunk " + chunk, async t => {
     // Model the existing acknowledged FINAL coverage seam; real reports, deletion and client admission.
     t.mock.method(f.recovery, "inventoryCleanupState", async () => "acknowledged" as const);
     const terminal = f.run as unknown as {
       journalAndSendTerminal(flight: unknown, phase: string, body: StateRequest,
         send: (body: StateRequest) => Promise<StateAck>): Promise<void>;
     };
-    for (let n = chunk * 1024 + 1; n <= Math.min((chunk + 1) * 1024, 2050); n++) {
+    for (let n = chunk * chunkSize + 1; n <= Math.min((chunk + 1) * chunkSize, historyGenerations); n++) {
       f.select(literal.run_id, n);
       await f.client.claimRun();
       await f.client.listRecoveryHolds(literal.run_id);
@@ -811,7 +818,7 @@ describe("Unit 1: proven nonreceipt history preserves completion admission", () 
       assert.equal(f.client.canStartPublicationCompletion(literal.run_id, n + 1), true,
         "Unit 1: retired history must free admission");
     }
-    if (chunk === 2) {
+    if (chunk === chunkCount - 1) {
       f.select(literal.run_id, 2051);
       // The prior ordinary terminals prepared inventory and changed the pushed SHA.
       // Model a fresh publication flight with its actual successful push and unsent terminal.
