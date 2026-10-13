@@ -3034,7 +3034,8 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
         assert.equal(argv[2], "pwd");
         return { code: 0, stdout: WORKSPACE + "\n", stderr: "" };
       },
-      fileop: { op: async () => {
+      fileop: { op: async operation => {
+        assert.deepEqual(operation, { op: "read", path: "progress.txt" });
         fileops++;
         order.push("read");
         return { ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") };
@@ -3090,7 +3091,10 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
       assert.deepEqual(outputs[3], { checkpoint: true });
       const checkpointFrames = events.filter(e => e.kind === "frame" && e.signals?.checkpoint);
       assert.equal(checkpointFrames.length, 1);
-      assert.equal(events.at(-1)?.kind, "turn_finished");
+      const terminal = events.at(-1);
+      assert.equal(terminal?.kind, "turn_finished");
+      assert.ok(terminal?.kind === "turn_finished");
+      assert.equal(terminal.terminal.outcome, "success");
       assert.equal(fileops, 1);
       assert.equal(registry.inFlightCallbackCount(), 0);
       assert.equal(registry.isPoisoned(), false);
