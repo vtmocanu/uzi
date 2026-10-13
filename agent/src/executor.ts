@@ -3,6 +3,7 @@ import { promisify } from "node:util";
 import fs from "node:fs/promises";
 import path from "node:path";
 import type { Logger } from "./log.js";
+import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { UsageSink } from "./usage-recorder.js";
 import type { RunCacheDropResult } from "./run-caches.js";
 import type { BoundarySink, CodexExecutionSafety, HarnessError } from "./harness.js";
@@ -230,6 +231,11 @@ export interface RunContext {
    *  executor composes it into the lead's plan prompt as inert, nonce-fenced,
    *  UNTRUSTED-advisory context. Absent/empty ⇒ no memory block is injected. */
   memory?: MemoryEntry[];
+  /** Trusted runner capability, separate from advisory memory. Read once per Codex
+   * provider epoch; never include this accessor or its result in model/provider payloads.
+   * An explicit accessor returning undefined refuses epoch startup, even when the
+   * executor has a static capturedMemory option. */
+  capturedMemory?(): CapturedMemoryContext | undefined;
   /** Issue #2083: whether the server enabled the private decisions memo for this run (claim-
    *  time read; false on any read failure). Gates the `decisions_memo` signal_done param. */
   decisionsMemoEnabled?: boolean;

@@ -3348,6 +3348,18 @@ export class CodexExecutor implements Executor {
     epochIndex: number,
     opts: { persistAfterLaunchOnly?: boolean } = {},
   ): Promise<ProviderEpoch> {
+    // Snapshot the runner contract once for all effect surfaces in this epoch.
+    // Legacy direct callers may still bind through the static executor option.
+    const captureMemory = ctx.capturedMemory;
+    const capturedMemory = captureMemory !== undefined
+      ? captureMemory.call(ctx)
+      : this.opts.capturedMemory;
+    if (captureMemory !== undefined && capturedMemory === undefined) {
+      throw new TrustedExecutionRefusal("captured memory capability unavailable");
+    }
+    if (capturedMemory !== undefined && capturedMemory.context.run_id !== ctx.runId) {
+      throw new TrustedExecutionRefusal("captured memory run identity mismatch");
+    }
     const {
       provider, binding, worktreePath, storeDir, homeRoot, boundaryDeadlineMs, childTurnDeadlineMs,
       commandEnv, commandSandbox, screenPolicy, toolHandlers, registerToken, committedGeneration, launchEffectRoot,
@@ -3424,7 +3436,7 @@ export class CodexExecutor implements Executor {
         this.log,
         commandCache,
         DEFAULT_WALL_MS,
-        this.opts.capturedMemory,
+        capturedMemory,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
@@ -3495,7 +3507,7 @@ export class CodexExecutor implements Executor {
           tool_id: scrubProjected(result.tool_id), attempt_id: scrubProjected(result.attempt_id),
         });
         const delegationRunner = new CodexDelegationRunner({
-          capturedMemory: this.opts.capturedMemory,
+          capturedMemory,
           scrubToolResult,
           registry,
           roles: runPlan.roles,
@@ -3513,7 +3525,7 @@ export class CodexExecutor implements Executor {
           scrubPolicyRole: scrubProjected,
         });
         return new CodexCallbackBroker({
-          capturedMemory: this.opts.capturedMemory,
+          capturedMemory,
           scrubToolResult,
           registry,
           spawnCommand,

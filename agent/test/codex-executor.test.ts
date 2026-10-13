@@ -86,7 +86,8 @@ import { detectRepoAgents } from "../src/repoagents.js";
 import { buildReviewCommentsContext, CLAUDE_LONG_COMMAND_APPEND, CODEX_LONG_COMMAND_APPEND, FOLLOW_UP_TRAILER, PR_SUMMARY_GUIDANCE, REPO_SUBAGENT_UNTRUSTED_APPEND } from "../src/prompt.js";
 
 import { ENV_PROBE_SCRIPT, EnvProbeCleanupError } from "../src/env-probe.js";
-import type { SpawnCommandOptions } from "../src/codex/broker.js";
+import { isBrokerModelCommand, type CapturedMemoryContext, type SpawnCommandOptions } from "../src/codex/broker.js";
+import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { makeGitRepo, PR_SUMMARY_EXPECTED, PR_SUMMARY_INPUT } from "./pr-summary-fixture.js";
 import type { Logger } from "../src/log.js";
 import type { DockerWiring } from "../src/docker-wiring.js";
@@ -707,6 +708,115 @@ function makeExecutor(
       ...(seam ? { spawnCommand: answerEnvProbe(seam, rig.probeCalls) } : {}) },
   );
 }
+
+describe("captured memory epoch seam", () => {
+  const runId = "11111111-1111-4111-8111-111111111111";
+  function capture(commands = new WorkerMemoryCommands(), episode = 0): CapturedMemoryContext {
+    const flight = {};
+    const context = commands.begin({
+      run_id: runId, worker_id: "22222222-2222-4222-8222-222222222222",
+      register_nonce: "private-epoch-nonce", claim_generation: 1,
+      memory_episode: episode, flight, lifecycleRevision: episode,
+    });
+    return { commands, context, flight, lifecycleRevision: episode };
+  }
+
+  it("late capture reaches broker and default spawn with the same binding", async (t) => {
+    const rig = makeRig({ responder: epochResponder("th-1", "tn-1", (transport, th, tn) => {
+      transport.push(toolCall(10, "Bash", { command: "echo seam" }, th, tn, "memory-shell"))
+        .push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+    }) });
+    const launch = rig.deps.launchEffectRoot!;
+    rig.deps = { ...rig.deps, spawnCommand: undefined, launchEffectRoot: async (spec, deadline) => {
+      const handle = await launch(spec, deadline);
+      if (spec.args.includes("/usr/local/bin/uzi-codex-fileop")) return handle;
+      const stdout = handle.transport.stdout as PassThrough;
+      const stderr = handle.transport.stderr as PassThrough;
+      // Fake roots execute nothing; complete their streams after spawn attaches listeners.
+      setImmediate(() => { stdout.end(spec.args.includes(ENV_PROBE_SCRIPT) ? PROBE_OK_STDOUT : "seam\n"); stderr.end(); });
+      return {
+        ...handle,
+        observe: async () => ({
+          event: "observe", id: 1, state: "complete",
+          supervisor: { pid: 200, startTime: "1" }, root: { pid: 201, startTime: "1" },
+          processes: [{ pid: 201, startTime: "1", ppid: 200, rss: 100 }],
+        }),
+      };
+    } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const captured = capture();
+    const registered: Parameters<WorkerMemoryCommands["register"]>[0][] = [];
+    const register = captured.commands.register.bind(captured.commands);
+    t.mock.method(captured.commands, "register", (...args: Parameters<WorkerMemoryCommands["register"]>) => {
+      registered.push(args[0]);
+      return register(...args);
+    });
+    let reads = 0;
+    const { ctx, emitted } = makeCtx({
+      runId, capturedMemory: () => { reads++; return captured; },
+    });
+    await executor.run(ctx);
+    assert.equal(reads, 1);
+    assert.equal(registered.length, 1, "only the model command enrolls through default spawn");
+    assert.equal(registered[0], captured.context);
+    assert.ok(rig.transport.responses.some(r => r.requestId === 10));
+    assert.doesNotMatch(JSON.stringify([rig.transport.requests, emitted]), /private-epoch-nonce/);
+  });
+
+  it("epoch recreation reads a new capture once and binds its broker commands", async () => {
+    const commands = new WorkerMemoryCommands();
+    let current = capture(commands);
+    const seen: CapturedMemoryContext[] = [];
+    const plan = epochResponder("th-1", "tn-plan", (transport, th, tn) => {
+      transport.push(toolCall(10, "Bash", { command: "echo plan" }, th, tn, "plan-shell"))
+        .push(toolCall(11, "submit_plan", { plan_md: "approved work" }, th, tn, "plan"))
+        .push(turnCompleted("completed", th, tn));
+    });
+    const implement = resumedEpochResponder("th-1", "tn-impl", (transport, th, tn) => {
+      transport.push(toolCall(12, "Bash", { command: "echo implement" }, th, tn, "impl-shell"))
+        .push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+    });
+    const rig = makeMultiEpochRig([plan, implement]);
+    rig.deps = { ...rig.deps, spawnCommand: async (_argv, opts) => {
+      assert.ok(isBrokerModelCommand(opts.modelCommand, current));
+      seen.push(current);
+      return { code: 0, stdout: "ok", stderr: "" };
+    } };
+    const executor = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+    const first = current;
+    let reads = 0;
+    const { ctx } = makeCtx({
+      runId, planApproved: false, approvedPlan: undefined,
+      capturedMemory: () => { reads++; return current; },
+      gatePlan: async () => {
+        current = capture(commands, 1);
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+    });
+    await executor.run(ctx);
+    assert.equal(reads, 2);
+    assert.deepEqual(seen, [first, current]);
+    assert.equal(rig.providerLaunches(), 2);
+  });
+
+  for (const missing of [true, false]) {
+    it(`${missing ? "absent runner capture overrides static authority" : "mismatched run identity"} refuses before epoch launch`, async () => {
+      const rig = makeRig();
+      const captured = capture();
+      const executor = new CodexExecutor(noopLog, "/data/agent-home/run-1",
+        { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, capturedMemory: captured },
+        rig.deps);
+      const { ctx } = makeCtx({
+        runId: missing ? runId : "33333333-3333-4333-8333-333333333333",
+        capturedMemory: () => missing ? undefined : captured,
+      });
+      await assert.rejects(executor.run(ctx), /captured memory.*(unavailable|mismatch)/);
+      assert.equal(rig.providerLaunches(), 0);
+      assert.equal(rig.fileopSpawns.length, 0);
+      assert.equal(rig.client.releaseCalls.length, 0);
+    });
+  }
+});
 
 // --- a MULTI-EPOCH rig (m4 new-root resume) ------------------------------------
 // The m4 recreation path builds a BRAND-NEW provider epoch (registry + harness + transport) at
