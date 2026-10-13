@@ -1,5 +1,5 @@
 #!/usr/bin/env bash
-# sourced by run-e2e.sh; shared helpers used by >=2 phases (PRD #966 M1)
+# sourced by run-e2e.sh; reusable harness helpers (PRD #966 M1)
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 # Failure-only metadata for a retained FINAL or an unstable custody baseline.
@@ -669,6 +669,62 @@ settle_runs_terminal() {
     done
   done
   return 0
+}
+
+# wait_runs_terminal_off_worker TIMEOUT RUN...: cancellation is enqueued, not
+# acknowledged. Before starting the next case or recreating its worker, require
+# terminal outcomes AND absence from the worker snapshot for these exact fixtures.
+# Never changes custody. One shared deadline bounds the whole batch.
+dump_fixture_settlement() {
+  local dir="$RUNROOT/artifacts/fixture-settlement"
+  mkdir -p "$dir"
+  "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data \
+    < "$ROOT/e2e/settlement-diagnostic.mjs" > "$dir/recovery.jsonl" 2> "$dir/read-errors.txt" \
+    || echo 'fixture settlement: worker diagnostic unavailable' >&2
+  # Keep the full already-redacted worker log as evidence of actual redrive cadence.
+  "${COMPOSE[@]}" logs --no-color agent > "$dir/agent-redrive.log" 2>/dev/null || true
+  db_psql "SELECT json_build_object('worker_id',w.id,'last_heartbeat_at',w.last_heartbeat_at,'max_concurrent_runs',w.max_concurrent_runs,'pending_overflow_until',w.pending_overflow_until,'active',COALESCE((SELECT json_agg(json_build_object('run_id',a.run_id,'generation',a.claim_generation,'phase',a.phase,'terminal_pending',a.terminal_pending,'reported_at',a.reported_at)) FROM worker_active_runs a WHERE a.worker_id=w.id),'[]'::json)) FROM workers w" \
+    > "$dir/workers.jsonl" || echo 'fixture settlement: worker snapshot unavailable' >&2
+  cat "$dir/recovery.jsonl"
+}
+wait_worker_heartbeat_after() {
+  local worker="$1" restored_at="$2" timeout="${3:-30}" ready deadline=$((SECONDS + ${3:-30}))
+  while :; do
+    ready="$(db_psql "SELECT COALESCE(last_heartbeat_at > '$restored_at'::timestamptz AND last_heartbeat_at > clock_timestamp() - interval '15 seconds',false) FROM workers WHERE id='$worker'")" || ready=""
+    [ "$ready" = t ] && return 0
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      dump_fixture_settlement || true
+      fail "worker $worker has no fresh heartbeat after API restore ($restored_at) within ${timeout}s"
+    fi
+    sleep 0.5
+  done
+}
+wait_runs_terminal_off_worker() {
+  local timeout="$1" run status active start=$SECONDS deadline pending settled; shift
+  [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture settlement timeout: $timeout"
+  [ "$#" -gt 0 ] || fail "fixture settlement requires run ids"
+  deadline=$((SECONDS + timeout))
+  while :; do
+    pending=(); settled=()
+    for run in "$@"; do
+      status="$(run_status_quick "$run")" || status=""
+      active="$(db_psql "SELECT count(*) FROM worker_active_runs WHERE run_id = '$run'")" || active=""
+      case "$status:$active" in
+        cancelled:0|failed:0|completed:0) settled+=("run=$run status=$status") ;;
+        *) pending+=("run=$run status=${status:-unknown} worker_active_runs=${active:-unknown}") ;;
+      esac
+    done
+    if [ "${#pending[@]}" -eq 0 ]; then
+      record_margin "fixtures terminal and off worker" "$((SECONDS - start))" "$timeout"
+      for run in "${settled[@]}"; do pass "fixture settled off worker: $run"; done
+      return 0
+    fi
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      dump_fixture_settlement || true
+      fail "fixture settlement timeout after ${timeout}s: ${pending[*]}"
+    fi
+    sleep 0.3
+  done
 }
 
 # wait_regated RUN PREV_CLAIMED_AT [TIMEOUT] — after a restart/kill of a run parked at the
