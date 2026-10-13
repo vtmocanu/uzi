@@ -2488,6 +2488,9 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        pendingGenerationReport: (runId, generation) => !!this.outbox &&
+          (this.outbox.isDisabled() || this.outbox.hasPendingTerminal(runId, generation) ||
+            !!this.outbox.finalizeRecordIdentity(runId, generation)),
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
