@@ -864,6 +864,6 @@ done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 137 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 146 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 137 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 146 ] && [ "$cases" -eq "$passed" ]
