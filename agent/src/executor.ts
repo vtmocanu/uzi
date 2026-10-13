@@ -366,24 +366,17 @@ export interface RunContext {
    * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
    * the report (additive-optional; a run with no milestones is unchanged).
    *
-   * PRD #362 M3c: `onAwaitingApproval` is an ADVISORY callback the gate invokes AFTER
-   * it persists `plan_md` (the awaiting_approval report) and BEFORE it blocks on the
-   * verdict. The plan-summary hook rides it: the summary's stale-write guard value is
-   * `runs.plan_md`, so the POST can only match once the gate has persisted it — posting
-   * before the gate always 409s against a NULL/previous plan_md and is silently dropped.
-   * It is NEVER invoked on the autopilot short-circuit (which DOES persist plan_md via
-   * its running report / SetRunAutopilotPlan, RC1 #1197, but never invokes this callback),
-   * so an auto-approved run generates no plan summary. The gate swallows any throw.
-   *
-   * Issue #1604: `settles` is the input id of the revise this plan revises (the revise
-   * verdict's `inputId`). The runner marks that revise final only once this gate's
-   * awaiting_approval report is applied (the revised plan is persisted); a declined or failed
-   * report, or an absent id, leaves it unapplied, so an interruption replays it.
+   * Advisory hook after accepted plan persistence. Human gates await it before their
+   * verdict wait; autopilot starts it without waiting before implementation. The
+   * callback receives the actual stored candidate, including a checked canonical plan.
+   * `settles` identifies the revise input this plan answers: it is finalized only
+   * after the revised plan's awaiting_approval report is applied; refusal or failure
+   * leaves that input replayable after interruption.
    */
   gatePlan?(
     planMd: string,
     milestones?: Milestone[],
-    onAwaitingApproval?: (planMd: string) => Promise<void>,
+    onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
   ): Promise<PlanVerdict>;
   /**
@@ -883,6 +876,8 @@ export class PlanRejectedError extends Error {
  */
 export interface Executor {
   run(ctx: RunContext): Promise<ExecutorResult>;
+  /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
+  closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;
   /**
    * Group-kill every subprocess the agent spawned for the last run. The runner
    * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded

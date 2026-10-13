@@ -17211,6 +17211,170 @@ describe("2833 Codex inline summaries", () => {
     });
     return { rig, intents, plans };
   }
+  for (const when of ["before execution", "between executions"] as const) {
+    it(`M1 Codex generic settlement ${when} preserves fresh summary admission`, async () => {
+      const { rig, intents } = summaryRig();
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summaryRunner: {
+          generateIntentSummary: async () => "Fresh intent",
+          generatePlanSummary: async () => null,
+        },
+        summarySettleMs: 1,
+      });
+      if (when === "between executions") await executor.run(makeCtx().ctx);
+      await executor.closeAndSettlePlanSummary(1);
+      await executor.run(makeCtx().ctx);
+      assert.equal(intents.length, when === "before execution" ? 1 : 2);
+    });
+  }
+
+  function m1Barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  for (const kind of ["issue", "self_improve", "prompt"] as const) {
+    for (const phase of ["generation", "post"] as const) {
+      for (const invalidation of ["live", "close", "fence", "cancel"] as const) {
+        it(`M1 Codex owned ${kind} ${phase} ${invalidation} permits implementation and drops obsolete advice`, async () => {
+          const entered = m1Barrier(), generate = m1Barrier(), postEntered = m1Barrier();
+          const postAck = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+          let calls = 0, posts = 0, fenced = false, cancelled = false;
+          let input: PlanSummaryInput | undefined;
+          let callbackDone: Promise<void> | undefined;
+          const summaryRunner = {
+            generateIntentSummary: async () => null,
+            generatePlanSummary: async (i: PlanSummaryInput) => {
+              input = i; calls++; entered.resolve();
+              await generate.promise;
+              i.onUsage?.({}); i.onUsage?.({});
+              return { summary: "Accepted advice", deltas: [] };
+            },
+          };
+          const post = async () => { posts++; postEntered.resolve(); await postAck.promise; };
+          const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+            callbackDone = persisted!(md);
+            assert.equal(persisted!(md), callbackDone, "storage retry joins the same flight");
+            if (phase === "post") await postEntered.promise;
+            return { kind: "approve", selection: { status: "absent" } };
+          };
+          const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+            t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))
+              .push(turnCompleted("completed", th, tn)));
+          const implementResponder: Responder = c => {
+            if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-impl" } };
+            if (c.method !== "turn/start") return {};
+            implementation.resolve();
+            void finish.promise.then(() => c.transport
+              .push(toolCall(99, "signal_done", {}, "th-impl", "tn-impl", "done"))
+              .push(turnCompleted("completed", "th-impl", "tn-impl")));
+            return { turn: { id: "tn-impl" } };
+          };
+          const rig = makeMultiEpochRig([planResponder, implementResponder]);
+          Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: post });
+          const { ctx, emitted } = makeCtx({ kind, planApproved: false, approvedPlan: undefined,
+            summaryIntentPresent: true, gatePlan, claimFenced: () => fenced, cancelRequested: () => cancelled });
+          const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+            summaryRunner, summarySettleMs: 1,
+          });
+          if (phase === "post") generate.resolve();
+          const execution = executor.run(ctx);
+          try {
+            await Promise.all([entered.promise, implementation.promise]);
+            assert.equal(calls, 1, "one generation despite repeated callback");
+            if (invalidation === "close") await executor.closeAndSettlePlanSummary(1);
+            if (invalidation === "fence") fenced = true;
+            if (invalidation === "cancel") cancelled = true;
+            generate.resolve();
+            if (invalidation === "live" || phase === "post") await postEntered.promise;
+            postAck.resolve();
+            await callbackDone;
+            assert.equal(posts, phase === "post" || invalidation === "live" ? 1 : 0);
+            assert.equal(emitted.filter(m => m.kind === "summary_usage").length,
+              phase === "post" || invalidation === "live" ? 1 : 0);
+            if (invalidation === "close") assert.equal(input!.signal!.aborted, true);
+          } finally {
+            generate.resolve(); postAck.resolve(); finish.resolve();
+          }
+          if (invalidation === "cancel") await assert.rejects(execution, /run cancelled/);
+          else {
+            const result = await execution;
+            assert.equal(result.summaryPlan, invalidation === "live" ? "Accepted advice" : undefined);
+          }
+        });
+      }
+    }
+  }
+
+  for (const phase of ["generation", "post"] as const) {
+    it(`M1 Codex supersedes ${phase} before a failing replacement and suppresses late usage`, async () => {
+      const oldEntry = m1Barrier(), release = m1Barrier();
+      let calls = 0, posts = 0;
+      let oldDone: Promise<void> | undefined;
+      const summaryRunner = {
+        generateIntentSummary: async () => null,
+        generatePlanSummary: async (input: PlanSummaryInput) => {
+          calls++;
+          if (calls === 2) return null;
+          if (phase === "generation") { oldEntry.resolve(); await release.promise; }
+          input.onUsage?.({});
+          return { summary: "Obsolete", deltas: [] };
+        },
+      };
+      const post = async () => { posts++; oldEntry.resolve(); await release.promise; };
+      let gates = 0;
+      const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+        if (++gates === 1) {
+          oldDone = persisted!(md); await oldEntry.promise;
+          return { kind: "revise", feedback: "Replace it" };
+        }
+        await persisted!(md);
+        release.resolve(); await oldDone;
+        return { kind: "approve", selection: { status: "absent" } };
+      };
+      let plans = 0;
+      const planResponder: Responder = c => {
+        if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-plan" } };
+        if (c.method !== "turn/start") return {};
+        const tn = `tn-${++plans}`;
+        c.transport.push(toolCall(98 + plans, "submit_plan", { plan_md: plans === 1 ? "# Old" : "# Replacement" }, "th-plan", tn, tn))
+          .push(turnCompleted("completed", "th-plan", tn));
+        return { turn: { id: tn } };
+      };
+      const rig = makeMultiEpochRig([planResponder, done]);
+      Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: post });
+      const { ctx, emitted } = makeCtx({ planApproved: false, approvedPlan: undefined,
+        summaryIntentPresent: true, gatePlan });
+      const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+        summaryRunner, summarySettleMs: 1,
+      });
+      const result = await executor.run(ctx);
+      assert.equal(calls, 2);
+      assert.equal(posts, phase === "post" ? 1 : 0);
+      assert.equal(result.summaryPlan, undefined);
+      assert.equal(emitted.filter(m => m.kind === "summary_usage").length, phase === "post" ? 1 : 0);
+    });
+  }
+
+  for (const kind of ["issue", "self_improve", "prompt"] as const) {
+    for (const present of [false, true]) it(`M1 Codex ${kind} intent and human plan summaries present=${present}`, async () => {
+      const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+        t.push(toolCall(98, "submit_plan", { plan_md: "M1 plan" }, th, tn, "plan"))
+          .push(turnCompleted("completed", th, tn)));
+      const rig = makeMultiEpochRig([planResponder, done]);
+      const calls: string[] = [];
+      Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => {} });
+      const summaryRunner = {
+        generateIntentSummary: async () => { calls.push("intent"); return "Intent"; },
+        generatePlanSummary: async () => { calls.push("plan"); return { summary: "Plan", deltas: [] }; },
+      };
+      const { ctx } = makeCtx({ kind, summaryIntentPresent: present, planApproved: false, approvedPlan: undefined,
+        gatePlan: async (md, _milestones, persisted) => { await persisted?.(md); return approve; } });
+      await makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, { summaryRunner }).run(ctx);
+      assert.deepEqual(calls.sort(), present ? ["plan"] : ["intent", "plan"]);
+    });
+  }
+
   it("2833 forwards original subscription claim identity to intent and plan summaries", async () => {
     const rawCodex = { ...SUBSCRIPTION, claim_metadata: "original subscription claim" };
     const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
@@ -17549,7 +17713,7 @@ describe("2833 Codex inline summaries", () => {
     });
   }
   for (const accepted of [false, true]) {
-    it(`2833 ${accepted ? "accepted" : "refused"} pause park preserves advisory until terminal settlement`, async () => {
+    it(`2833 ${accepted ? "accepted" : "refused"} pause park closes advisory before callback`, async () => {
       const { rig, intents } = summaryRig();
       let input: IntentSummaryInput | undefined;
       let resolve!: (s: string) => void;
@@ -17575,14 +17739,14 @@ describe("2833 Codex inline summaries", () => {
         },
       });
       const result = await executor.run(ctx);
-      assert.deepEqual(observations, [false]);
+      assert.deepEqual(observations, [true]);
       assert.equal(!!result.pausedAt, accepted);
-      assert.deepEqual(intents, accepted ? [] : ["Preserved intent"]);
+      assert.deepEqual(intents, []);
       if (accepted) { resolve("Late"); await drain(); assert.deepEqual(intents, []); }
     });
   }
   for (const sink of ["wall", "request", "hold"] as const) for (const accepted of [false, true]) {
-    it(`2833 ${sink} ${accepted ? "accepted" : "declined"} park keeps intent open through callback`, async () => {
+    it(`2833 ${sink} ${accepted ? "accepted" : "declined"} park closes before destructive callback`, async () => {
       const responder: Responder = c => {
         if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-1" } };
         if (c.method !== "turn/start") return {};
@@ -17627,10 +17791,10 @@ describe("2833 Codex inline summaries", () => {
         const result = await executor.run(ctx);
         assert.equal(!!(result.walled || result.pausedAt || result.completionHeld), accepted);
       }
-      assert.deepEqual(observations, [false]);
-      assert.deepEqual(posts, accepted ? [] : ["Preserved"]);
+      assert.deepEqual(observations, [sink !== "request"]);
+      assert.deepEqual(posts, accepted || sink !== "request" ? [] : ["Preserved"]);
       resolve("Late"); await drain();
-      assert.deepEqual(posts, accepted ? [] : ["Preserved"]);
+      assert.deepEqual(posts, accepted || sink !== "request" ? [] : ["Preserved"]);
     });
   }
   it("2833 advisory failures leave a successful seeded run unchanged", async () => {

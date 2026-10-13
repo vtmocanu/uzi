@@ -4036,6 +4036,7 @@ export class RunRunner {
       let terminalDisposeUnproven = false;
       if (executor.safety) {
         try {
+          await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
           const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
           if (disposal.kind === "incomplete") {
             terminalDisposeUnproven = true;
@@ -6062,6 +6063,7 @@ export class RunRunner {
         // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
         if (flight.completionHoldOutcome === "confirmed")
           await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("completion hold retained; skipping finalization", {
@@ -6142,6 +6144,7 @@ export class RunRunner {
         // hold/wall park below); the runner's terminal
         // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
         // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run parked on an owner-requested pause; skipping finalization", {
@@ -6156,6 +6159,7 @@ export class RunRunner {
       // the finally preserves HOME and clone. Every completionHeld result reaches here via
       // executeClaim's finalize-boundary bypass, including an ambiguous hold delivery.
       if (result.completionHeld) {
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("completion hold retained; skipping finalization", {
@@ -6175,6 +6179,7 @@ export class RunRunner {
       // an undeliverable park still arrives inside the boundary. Keyed on the executor's result so no
       // non-wall path can reach this branch.
       if (result.walled) {
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run parked at its wall-clock limit; skipping finalization", {
@@ -6193,6 +6198,7 @@ export class RunRunner {
       // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
       // Keyed on the executor's result so no non-release path can reach this branch.
       if (result.switchReleased) {
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run released for a credential switch in place; skipping finalization", {
@@ -6231,6 +6237,7 @@ export class RunRunner {
       // PRD #1171 m4: needs NO own permit — for a Codex run this runs INSIDE the finalize
       // withBoundary that wraps phasePublish, and this line is a no-op for Codex; for Claude it
       // is the literal legacy reap, byte-unchanged.
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       batcher.emit({
         kind: "status",
@@ -7939,6 +7946,7 @@ export class RunRunner {
       reason: string,
       failureReason: string = COMPLETION_INTERLOCK_UNHELD_REASON,
     ): Promise<void> => {
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
       // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
@@ -10606,7 +10614,7 @@ export class RunRunner {
         ? new NowSummaryController({
             steering,
             claim: {
-              issueRun: resolveRunKind(claim.kind) === "issue",
+              kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
               ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
             },
@@ -10867,7 +10875,7 @@ export class RunRunner {
       ...(claim.plan_approved !== true
         ? { takeResumedGateEvent: (signal?: AbortSignal) => this.takeResumedGateEvent(runId, steering, batcher, runLog, signal) }
         : {}),
-      gatePlan: async (planMd, milestones, onAwaitingApproval, settles) => {
+      gatePlan: async (planMd, milestones, onPlanPersisted, settles) => {
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
@@ -11013,7 +11021,7 @@ export class RunRunner {
           runnerClone.path,
           // PRD #1416 M5: the published floor P for the warn-only plan-gate nudge.
           flight.publishedTip,
-          onAwaitingApproval,
+          onPlanPersisted,
           settles,
           checkedHuman,
           checkedFields,
@@ -11711,6 +11719,7 @@ export class RunRunner {
     // incomplete reap or a survivor blocks the push instead of being logged and ignored. A
     // process that has dropped both (another HOME and a working directory outside the run) is
     // beyond either reap.
+    await executor.closeAndSettlePlanSummary?.();
     executor.killAgentTree?.();
     flight.result = result;
     return result;
@@ -11798,6 +11807,9 @@ export class RunRunner {
     // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
     // stands) and keeps the clone.
     const quiesceSink = flight !== undefined;
+    const deadlineAt = Date.now() + Math.max(0, req.deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(req.deadlineMs);
+    req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
@@ -11812,6 +11824,7 @@ export class RunRunner {
       await this.quiesceOrBlockSink(flight, executor, req.boundary, sinkOpts);
       await action(undefined);
     } else {
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       await action(undefined);
     }
@@ -11907,6 +11920,7 @@ export class RunRunner {
     opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string; propagateControl?: boolean; forceProcessScan?: boolean },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     return flight.sinkGate.run(async () => {
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       // issue #1783 M2: a flight capturing a PREDECESSOR attempt's clone never quiesces it as its
       // own: every proof there (the capture, its re-proofs, the pre-settle reap) is a
@@ -12025,6 +12039,9 @@ export class RunRunner {
     req: BoundaryRequest,
     action: (permit?: BoundaryPermit) => Promise<void>,
   ): Promise<void> {
+    const deadlineAt = Date.now() + Math.max(0, req.deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(req.deadlineMs);
+    req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
@@ -14849,6 +14866,9 @@ export class RunRunner {
    *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
    *  closed. Never throws. */
   private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs): Promise<CredentialFreeSettleOutcome> {
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(deadlineMs);
+    deadlineMs = Math.max(0, deadlineAt - Date.now());
     if (executor.settleForCredentialFreeCapture) {
       try {
         return await executor.settleForCredentialFreeCapture(deadlineMs);
@@ -14944,6 +14964,7 @@ export class RunRunner {
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
     // data_volume_full park.
     const disk = cause.kind === "data_volume_full" ? cause : undefined;
+    await executor.closeAndSettlePlanSummary?.();
     executor.killAgentTree?.();
     if (disk) {
       // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
@@ -16177,6 +16198,7 @@ export class RunRunner {
   ): Promise<boolean> {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
+    await flight.executor.closeAndSettlePlanSummary?.();
     flight.executor.killAgentTree?.();
     // Retain clone and session throughout capture and ambiguous delivery.
     flight.preserveRecoveryClone = true;
@@ -16339,6 +16361,7 @@ export class RunRunner {
     const { batcher } = flight;
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like the
     //    completion hold. Idempotent — phasePublish's walled branch reaps again.
+    await flight.executor.closeAndSettlePlanSummary?.();
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front (D4/D17): the wall park NEVER fails, so — unlike the completion
     //    hold, which clears the flags when it gives up — these STAY set through a degraded park and a
@@ -16554,6 +16577,7 @@ export class RunRunner {
     const generation = flight.steering.pendingCredentialSwitch();
     flight.keepGuardedInventoryOpen = true;
     // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
+    await flight.executor.closeAndSettlePlanSummary?.();
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.
     flight.preserveRecoveryClone = true;
@@ -17363,6 +17387,7 @@ export class RunRunner {
           // model admission; the predecessor executor never runs the resumed model.
           if (claim.secrets.codex || flight.executor.safety || flight.executor.settleForCredentialFreeCapture) {
             blocker = "quiescence_failed";
+            await flight.executor.closeAndSettlePlanSummary?.(Math.max(0, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await check();
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
@@ -17612,12 +17637,9 @@ export class RunRunner {
     // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
     // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
     publishedTip: string | undefined,
-    // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
-    // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never invoked
-    // on the autopilot branch: that branch DOES persist plan_md durably (RC1 #1197, via
-    // its running report / SetRunAutopilotPlan) but never invokes onAwaitingApproval, so
-    // it still generates no plan summary.
-    onAwaitingApproval?: (planMd: string) => Promise<void>,
+    // Advisory hook after accepted storage; awaited for human gates and unawaited
+    // for autopilot. Receives the plan carried by the accepted report.
+    onPlanPersisted?: (planMd: string) => Promise<void>,
     // Issue #1604 (D2): the input id of the revise this plan revises. Settled (made due its
     // APPLIED) only once the awaiting_approval report below is applied, i.e. the revised plan is
     // persisted; a declined or failed report leaves the revise unapplied, so an interruption
@@ -17717,6 +17739,17 @@ export class RunRunner {
           throw new TrustedExecutionRefusal(
             `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
           );
+        }
+        // Admission belongs to the accepted storage ACK. Autopilot implementation
+        // proceeds independently of the advisory model and its POST.
+        if (onPlanPersisted && autopilotState.plan_md !== undefined) {
+          try {
+            void Promise.resolve(onPlanPersisted(autopilotState.plan_md)).catch(error => {
+              runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
+            });
+          } catch (error) {
+            runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
+          }
         }
         batcher.emit({
           kind: "status",
@@ -17857,17 +17890,10 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
-    // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
-    // plan-summary POST's stale-write guard (`plan_md = @expected`) can match. Fire the
-    // hook HERE — after persist, before the verdict wait — never on the autopilot branch,
-    // which returned above. That branch DOES persist plan_md durably (RC1 #1197, via
-    // SetRunAutopilotPlan) but never invokes this hook, so it generates no plan summary.
-    // ADVISORY: swallow any throw so a
-    // summary failure can never wedge the gate or change the run's outcome (the hook
-    // itself also swallows internally; this is belt-and-suspenders).
-    if (onAwaitingApproval) {
+    // Human gates await advisory work only after a positive storage acknowledgement.
+    if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {
       try {
-        await onAwaitingApproval(planMd);
+        await onPlanPersisted(planMd);
       } catch (e) {
         runLog.warn("plan summary hook failed", {
           run_id: runId,

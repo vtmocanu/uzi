@@ -2,7 +2,7 @@
 // that produces two plain-English run summaries — an "intent" summary (what a run will
 // implement, from the issue + PRD) and a "plan" summary + deltas (what the proposed
 // plan will do and how it diverges from the original ask). Unlike the Judge it is NOT a
-// run kind: it runs INLINE inside a normal, in-flight issue run (Decision 1), on the
+// run kind: it runs INLINE inside a normal, in-flight eligible run (Decision 1), on the
 // claim's harness: Codex uses the injected isolated advice factory with private
 // model/effort pins and refresh denied; absent Codex uses the legacy Anthropic token
 // and model. It reuses the read-only model pass's timeout, usage and abort mechanics,
@@ -51,9 +51,9 @@ const CODEX_INTENT_PLAN_EFFORT = "low";
 
 /** PRD #1798 M5: the Claude model the editor pass runs on when the claim carries no usable
  *  `summary_model`. The api resolves `summary_model` (user value, else the instance setting,
- *  default "haiku": api/internal/settings/keys.go DefaultSummaryModel) only onto ISSUE-run claims
- *  (protocol.ts ClaimResponse.summary_model), so any other claim would otherwise fall to the SDK's
- *  own default model. This mirrors the api default the intent/plan summaries effectively run on;
+ *  default "haiku": api/internal/settings/keys.go DefaultSummaryModel) onto ordinary run claims
+ *  (protocol.ts ClaimResponse.summary_model). Older servers may omit it, which would otherwise
+ *  select the SDK's own default model. This mirrors the api default the intent/plan summaries effectively run on;
  *  not shared across the TS/Go boundary, change it with DefaultSummaryModel. */
 export const DEFAULT_DELIVERY_SUMMARY_MODEL = "haiku";
 

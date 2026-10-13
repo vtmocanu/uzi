@@ -57,11 +57,11 @@ function answer(runId: string, body: Record<string, unknown>, verdict = "approve
     candidate_generation: 1, candidate, verdict, reason_class: reason, findings: null,
     deadline_at: new Date(Date.now() + 60_000).toISOString(), ...proof(runId), ...overrides };
 }
-function checkedExec(before?: (ctx: RunContext) => Promise<void>) {
+function checkedExec(before?: (ctx: RunContext) => Promise<void>, persisted?: (plan: string) => Promise<void>) {
   const verdicts: PlanVerdict[] = [];
   const exec: Executor = { run: async (ctx) => {
     await before?.(ctx);
-    const verdict = await ctx.gatePlan!(PLAN);
+    const verdict = await ctx.gatePlan!(PLAN, undefined, persisted);
     verdicts.push(verdict);
     if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
     if (verdict.kind !== "approve") throw new Error("not approved");
@@ -1021,8 +1021,10 @@ describe("U2 real runner checked gate", () => {
       api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
       api.failStateWhen(c.run_id, (b) => b.status === "running" && b.candidate_digest === digest,
         { httpStatus, runStatus: "cancelled" });
-      const { exec, verdicts } = checkedExec();
+      const summaries: string[] = [];
+      const { exec, verdicts } = checkedExec(undefined, async md => { summaries.push(md); });
       await start(exec, c);
+      assert.deepEqual(summaries, [], "refused canonical ACK admits no summary callback");
       assert.deepEqual(verdicts, [], "no implementation verdict after negative storage ACK");
       assert.ok(!statuses(c.run_id).includes("completed"));
     });
@@ -1051,7 +1053,9 @@ describe("U2 real runner checked gate", () => {
     api.crossCheckHandler = ({ runId, body }) => ({ status: 200, body: answer(runId, body) });
     api.failStateWhen(c.run_id, (b) => b.status === "running" && b.candidate_digest === digest,
       { httpStatus: 409, runStatus: "running", disposition: "stale_claim" });
-    await start(checkedExec().exec, c);
+    const summaries: string[] = [];
+    await start(checkedExec(undefined, async md => { summaries.push(md); }).exec, c);
+    assert.deepEqual(summaries, [], "stale canonical ACK admits no summary callback");
     assert.ok(!statuses(c.run_id).includes("failed"), `superseded owner must not terminal-report: ${JSON.stringify(statuses(c.run_id))}`);
   });
 
@@ -2069,17 +2073,31 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
   });
   const prompts: string[] = [];
   const base = planWithMilestonesThenDoneQuery([{ id: "local", title: "local milestone" }]);
+  let enterImplementation!: () => void;
+  const implementationEntered = new Promise<void>(resolve => { enterImplementation = resolve; });
+  let releaseSummary!: () => void;
+  const summaryHeld = new Promise<void>(resolve => { releaseSummary = resolve; });
   let turns = 0;
   const queryFn: SdkQueryFn = (params) => {
-    if (turns++ > 0) assert.ok(applied, "implementation requires the applied canonical ACK");
+    if (turns++ > 0) {
+      assert.ok(applied, "implementation requires the applied canonical ACK");
+      enterImplementation();
+    }
     const original = params.prompt;
     params.prompt = (async function* () {
       for await (const frame of original) { prompts.push(JSON.stringify(frame)); yield frame; }
     })();
     return base(params);
   };
+  const summaries: string[] = [];
   const sdk = new SdkExecutor(nullLogger(), homeDir, { queryFn });
   const exec: Executor = { run: async (ctx) => {
+    const gate = ctx.gatePlan!;
+    ctx.gatePlan = (md, milestones, callback, settles) => gate(md, milestones, async canonical => {
+      summaries.push(canonical);
+      await summaryHeld;
+      await callback?.(canonical);
+    }, settles);
     git.worktreeStatus = async () => ["M src/impl.ts"];
     git.commitWipMarker = async () => false;
     const switchAttempt = ctx.attemptCredentialSwitch!;
@@ -2099,6 +2117,7 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
     assert.ok(await until(() => retried, 3000), `canonical operation must retry after give-up: ${JSON.stringify(api.states)}`);
     assert.ok(gaveUp);
     assert.equal(applied, false, "held retry ACK cannot approve");
+    assert.deepEqual(summaries, [], "held retry ACK admits no summary generation");
     assert.equal(turns, 1, "no implementation before ACK");
     assert.equal(requests.length, 2, "resume the original operation once");
     assert.equal(requests[1], requests[0], "same immutable report object");
@@ -2107,8 +2126,18 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
     assert.equal(requests[1]!.claim_generation, 1);
     assert.deepEqual([requests[1]!.milestones, requests[1]!.required_tools, requests[1]!.required_capabilities], [[], [], []]);
     releaseAck();
+    let timer: NodeJS.Timeout | undefined;
+    try {
+      await Promise.race([implementationEntered, new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error("canonical implementation awaited advisory callback")), 1500);
+      })]);
+    } finally { clearTimeout(timer); }
+    assert.deepEqual(summaries, [NORMALIZED], "accepted canonical prose while advisory callback is held");
+    releaseSummary();
     await done;
     assert.equal(attempts, 1);
+    assert.notEqual(PLAN, NORMALIZED);
+    assert.deepEqual(summaries, [NORMALIZED], "one summary of accepted canonical prose after retry ACK");
     assert.equal(api.states.filter((s) => s.runId === c.run_id && canonical(s.body)).length, committed ? 2 : 1,
       "the held initial request cannot commit after dropping is restored");
     assert.equal(api.crossCheckRequests.length, 1);
@@ -2119,6 +2148,7 @@ it(`checked canonical storage resumes after real switch give-up with ${committed
     assert.ok(!prompts.slice(1).some((p) => p.includes("local milestone")));
     assert.equal(api.messages(c.run_id).filter((m) => m.kind === "plan").length, 1, "no second initial plan emission");
   } finally {
+    releaseSummary();
     releaseBeforeDrop();
     releaseInitialAck();
     releaseAck();

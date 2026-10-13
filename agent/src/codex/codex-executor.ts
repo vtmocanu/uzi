@@ -74,7 +74,7 @@ import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal } from "../steering.js";
-import { resolveRunKind } from "../run-kind.js";
+import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
@@ -1971,7 +1971,7 @@ export class CodexExecutor implements Executor {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     this.summaryLifecycleClosed = true;
     if (!this.summaryRunActive) this.summaryCapturedBeforeStart = true;
-    await this.settleIntentSummary(deadlineAt);
+    await this.closeAndSettlePlanSummary(Math.max(0, deadlineAt - Date.now()));
     if (purpose === "cancel") {
       // Owner cancellation spends one deadline independently of the spent lifecycle signal.
       // Close admission and drain before joining the installer, then observe the drain again:
@@ -2145,6 +2145,38 @@ export class CodexExecutor implements Executor {
   private summaryRunActive = false;
   private summaryCapturedBeforeStart = false;
   private intentFlight?: { ctrl: AbortController; done: Promise<void>; delivered: boolean; abandoned: boolean };
+  private planFlight?: { ctrl: AbortController; done: Promise<void>; delivered: boolean; abandoned: boolean; closed: boolean; generation: number };
+  private readonly planFlights = new Set<NonNullable<CodexExecutor["planFlight"]>>();
+
+  /** Admission closes before yielding; both passes drain concurrently under one sink bound.
+   * Late generation/POST acknowledgements cannot update a closed or abandoned flight. */
+  async closeAndSettlePlanSummary(deadlineMs?: number): Promise<void> {
+    this.summaryLifecycleClosed = true;
+    // Generic cleanup drains existing work; only credential-free capture fences
+    // an unstarted leg. Do not poison a fresh execution or executor reuse.
+    const flights = [...this.planFlights];
+    for (const flight of flights) { flight.closed = true; flight.ctrl.abort(); }
+    const bound = Math.min(this.opts.summarySettleMs ?? 3_000, Math.max(0, deadlineMs ?? Infinity));
+    const deadlineAt = Date.now() + bound;
+    await Promise.all([
+      this.settleIntentSummary(deadlineAt),
+      ...flights.map(async flight => {
+        if (flight.abandoned) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const settled = await Promise.race([
+            flight.done.then(() => true, () => true),
+            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now())); }),
+          ]);
+          if (!settled) {
+            flight.abandoned = true;
+            this.log.warn("plan summary did not settle within the bound");
+          }
+        } finally { clearTimeout(timer); }
+      }),
+    ]);
+  }
+
   private readonly summaryRunner: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
 
   /** Abort once and join within one bound; abandonment drops all late results and usage. */
@@ -2235,6 +2267,7 @@ export class CodexExecutor implements Executor {
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
     this.intentFlight = undefined;
+    this.planFlight = undefined;
     // A capture before run starts closes admission permanently for that unstarted leg.
     const summaryState = { closed: this.summaryCapturedBeforeStart };
     this.summaryCapturedBeforeStart = false;
@@ -2332,6 +2365,7 @@ export class CodexExecutor implements Executor {
     // recreates it at the implement loop top (epochNeedsRecreate). The fresh epoch's newer session
     // state is captured by its own persists; until then the store keeps the pre-sink generation.
     const beforeReapingSink = async (): Promise<void> => {
+      await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
       await settleInstall();
       if (reapedSinceLastPersist || !epoch) return;
       await epoch.persistSession();
@@ -2358,7 +2392,10 @@ export class CodexExecutor implements Executor {
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
     const lifecycleSignal = ctx.terminalLifecycleSignal
       ? AbortSignal.any([lifecycleAbort.signal, ctx.terminalLifecycleSignal]) : lifecycleAbort.signal;
-    const intentAbort = (): void => { this.intentFlight?.ctrl.abort(lifecycleSignal.reason); };
+    const intentAbort = (): void => {
+      this.intentFlight?.ctrl.abort(lifecycleSignal.reason);
+      for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(lifecycleSignal.reason); }
+    };
     lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
     const summaryAllowed = (): boolean => !summaryState.closed && !this.summaryLifecycleClosed
       && !lifecycleSignal.aborted && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
@@ -2369,7 +2406,7 @@ export class CodexExecutor implements Executor {
         chatgpt_plan_type: null,
       } : {}),
     };
-    const summariesOn = ctx.kind === undefined || ctx.kind === "issue";
+    const summariesOn = isRunSummaryKind(ctx.kind);
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => ({
@@ -2381,29 +2418,44 @@ export class CodexExecutor implements Executor {
     });
     const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
       const generation = ++planGeneration;
+      if (this.planFlight) { this.planFlight.closed = true; this.planFlight.ctrl.abort(); }
       latestPlanSummary = undefined;
-      return async planMd => {
-        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return;
-        let delivered = false;
-        try {
-          const inputs = await summaryInputs();
-          if (!summaryAllowed() || generation !== planGeneration) return;
-          const result = await this.summaryRunner.generatePlanSummary({
-            ...inputs, planMd, signal: lifecycleSignal,
-            onUsage: usage => {
-              if (delivered || ctx.claimFenced?.() || generation !== planGeneration || summaryState.closed || this.summaryLifecycleClosed) return;
-              delivered = true;
-              ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
-            },
-          });
-          if (!result || !summaryAllowed() || generation !== planGeneration) return;
-          await this.opts.client.postPlanSummary(ctx.runId, {
-            ...result, plan_md: planMd.replaceAll("\u0000", ""),
-          });
-          if (summaryAllowed() && generation === planGeneration) latestPlanSummary = result;
-        } catch (error) {
-          this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
-        }
+      // A later accepted candidate may start fresh after a refused capture/switch.
+      this.summaryLifecycleClosed = false;
+      let flight: CodexExecutor["planFlight"];
+      return planMd => {
+        if (flight) return flight.done;
+        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
+        flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false,
+          abandoned: false, closed: false, generation };
+        const owned = flight;
+        this.planFlight = owned;
+        this.planFlights.add(owned);
+        const allowed = (): boolean => summaryAllowed() && generation === planGeneration
+          && this.planFlight === owned && !owned.closed && !owned.abandoned && !owned.ctrl.signal.aborted;
+        owned.done = (async () => {
+          try {
+            if (!allowed()) return;
+            const inputs = await summaryInputs();
+            if (!allowed()) return;
+            const result = await this.summaryRunner.generatePlanSummary({
+              ...inputs, planMd, signal: AbortSignal.any([lifecycleSignal, owned.ctrl.signal]),
+              onUsage: usage => {
+                if (owned.delivered || !allowed()) return;
+                owned.delivered = true;
+                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
+              },
+            });
+            if (!result || !allowed()) return;
+            await this.opts.client.postPlanSummary(ctx.runId, {
+              ...result, plan_md: planMd.replaceAll("\u0000", ""),
+            });
+            if (allowed()) latestPlanSummary = result;
+          } catch (error) {
+            this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
+          } finally { this.planFlights.delete(owned); }
+        })();
+        return owned.done;
       };
     };
     const installAbort = new AbortController();
@@ -3233,6 +3285,7 @@ export class CodexExecutor implements Executor {
             await epoch.persistSession();
             // Set before awaiting the sink: an error after reap must not persist a deleted home.
             reapedSinceLastPersist = true;
+            await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
             await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
             progressMissedLastTurn = false;
             consecutiveMisses = 0;
@@ -3263,6 +3316,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
+          await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
           // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
           // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
@@ -3321,6 +3375,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
+          await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
@@ -3399,7 +3454,7 @@ export class CodexExecutor implements Executor {
       return completed;
     } finally {
       summaryState.closed = true;
-      await this.settleIntentSummary();
+      await this.closeAndSettlePlanSummary();
       if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
         delete summaryResult.summaryPlan;
         delete summaryResult.summaryDeltas;
@@ -4353,6 +4408,7 @@ export class CodexExecutor implements Executor {
         ...(at.total !== undefined ? { total: at.total } : {}),
       },
     });
+    if (ctx.parkForPause) await this.closeAndSettlePlanSummary();
     return (await ctx.parkForPause?.(at)) ?? false;
   }
 

@@ -1289,7 +1289,7 @@ PRD at `prds/done/2602-run-progress.md`.
 
 PRD at `prds/done/2603-run-now-summary.md`.
 
-- A running issue run shows one plain sentence (at most 120 characters), written by a small model on the run's own credential, of what it is doing now, on the run page progress card, the TUI detail and `uzi run get`; it is marked as a model summary with its age. (AI-synced 2026-10-10, #2603)
+- Running issue, self-improvement and prompt runs with a frozen milestone list and an active milestone are eligible for one plain sentence (at most 120 characters), written by a small model on the run's own credential, of what they are doing now. Existing milestone display prerequisites still apply on the run page progress card, the TUI detail and `uzi run get`; a run without milestones shows no note. It is marked as a model summary with its age. Inline intent and persisted-plan summaries share these eligible kinds regardless of scheduling origin; autopilot starts its plan summary after accepted persistence without delaying implementation, while human gates await it. (AI-synced 2026-10-13, #2603)
 - It is on by default, each user can turn it off for their own runs, and an admin kill switch turns it off for the whole instance; turning it off reaches runs already executing. [user 2026-10-09] (AI-synced 2026-10-10, #2603)
 - The summary calls' spend counts toward the run's usage and shows as its own row, never as `$0` when a price is unknown. (AI-synced 2026-10-10, #2603)
 
