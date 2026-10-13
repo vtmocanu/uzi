@@ -407,7 +407,9 @@ tasks:
       # `scan:secrets` too. Belongs in gate:repo, not a component gate.
       - task: check:skill-size
       # Per-file byte budgets on loaded agent guidance (AGENTS.md, .claude/rules/*.md), so
-      # growth toward the 64 KiB runtime cap is a reviewed edit. Sub-second, tree-fact.
+      # growth toward the 64 KiB runtime cap is a reviewed edit. Offline tree fact; about 2-3 s
+      # locally (macOS, 2026-10-13), nearly all in the hermetic fixture test (the real-tree
+      # check is ~0.1 s), so it is not in the sub-second band.
       - task: check:guidance-size
       # /api/v1 backward-compatibility gate (PRD #1908 Decision 11): oasdiff diffs the spec on
       # origin/main against the tree's and fails on any breaking change. It sits here, not in

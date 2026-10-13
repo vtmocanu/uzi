@@ -116,4 +116,16 @@ run nocanary 2 "canary file not found" missing.txt
 mk nobudgets
 run nobudgets 2 "budgets file not found" canary.txt missing.tsv
 
+# An unreadable in-scope file must fail closed, never measure as empty and read clean.
+# Root reads through mode 000, so the case is meaningless there and is skipped.
+mk unreadable
+stage
+chmod 000 "$D/AGENTS.md"
+if [ -r "$D/AGENTS.md" ]; then
+  echo "check-guidance-size.test.sh: skip unreadable (running as root)"
+else
+  NOSTAGE=1 run unreadable 2 "cannot read in-scope file: AGENTS.md"
+fi
+chmod 644 "$D/AGENTS.md"
+
 echo "check-guidance-size.test.sh: PASS ($CASES cases)"

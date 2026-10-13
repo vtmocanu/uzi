@@ -164,14 +164,26 @@ for p in $scope; do
   fi
   scanned=$((scanned + 1))
   budget="$(budget_of "$p")"
-  size="$(wc -c < "$p" | tr -d ' ')"
+  # Measure once, without a pipe: in sh a pipeline's status is its last command's, so a
+  # failed read would surface as an empty size and the comparison below would read clean.
+  if ! size="$(wc -c < "$p")"; then
+    echo "check-guidance-size: INSTRUMENT BROKEN -- cannot read in-scope file: $p" >&2
+    exit 2
+  fi
+  size="$(printf '%s' "$size" | tr -d ' ')"
+  case "$size" in
+    '' | *[!0-9]*)
+      echo "check-guidance-size: INSTRUMENT BROKEN -- non-numeric size '$size' for $p" >&2
+      exit 2
+      ;;
+  esac
   if [ -z "$budget" ]; then
     echo "$p $size/none"
     add "no budget row for in-scope file: $p ($size bytes)"
     continue
   fi
   echo "$p $size/$budget"
-  if over "$p" "$budget"; then
+  if [ "$size" -gt "$budget" ]; then
     add "over budget: $p is $size bytes, budget $budget"
   fi
 done
