@@ -197,9 +197,9 @@ something goes wrong or a human has touched the request in between:
   Before pushing, it checks the messages of every commit the push would
   publish (relative to the default branch, merge commits included, and again
   on the exact commit about to be pushed) with the same matcher as the
-  body. On a hit it pushes nothing, opens or updates no request, rewrites no
-  history, and fails the run naming the offending commit SHA(s); if the
-  messages can't be read (including commits whose header declares a
+  body. On a hit it stops publication (no further push, no request opened or
+  updated, no history rewrite) and fails the run naming the offending
+  commit SHA(s); if the messages can't be read (including commits whose header declares a
   non-UTF-8 encoding) it refuses the same way, but names no SHA. The
   committed work is preserved for recovery, and fixing the commits needs a
   history rewrite left to the owner. A new
