@@ -1189,7 +1189,7 @@ Real issue-page Stop/textbox positives make terminal/non-owner/job negatives fal
 
 ## Final documentation validation
 
-The repository gate passed at 5d20c1c1 with positive canaries and zero gating findings. That green did not cover a separate docs-check failure: this PR body initially had 13 invalid relative paths (tester check exit 201). Equivalent base-925 docs validation passed, then the repaired links and completed PRD move passed the direct docs check (75 docs, 48 existing advisory warnings). The lifecycle and repair range receive immutable review before submission. No source/test change or new prompt behavior is introduced by that repair.
+The repository gate passed at 5d20c1c1 with positive canaries and zero gating findings. That green did not cover a separate docs-check failure: this PR body initially had 13 invalid relative paths (tester check exit 201). The unmodified archive check skipped PRD validation because archives lack `.git`, so its green was inconclusive. A matched diagnostic enabled that one detection guard in three scratch exports: base 9255f834 passed, broken 5d20c1c1 failed with the same 13 link errors, and repair 2ce4d8a8 passed. These diagnostic runs are distinct from the repaired primary-checkout direct docs check, which passed (75 docs, 48 existing advisory warnings). The lifecycle and repair range receive immutable review before submission. No source/test change or new prompt behavior is introduced by that repair.
 
 ## M4 evidence and accepted limits
 

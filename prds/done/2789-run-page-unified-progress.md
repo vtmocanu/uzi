@@ -96,7 +96,7 @@ Acceptance examples:
 - **Spinner**: shared by PlanPanel, JudgePanel and others; under `prefers-reduced-motion: reduce` it renders a static frame and starts no interval. jsdom has no `matchMedia`, so the test stubs it.
 - **Agent (M4)**: `now-summary.test.ts` asserts through the fake harness's captured `opts.systemPrompt` and prompt on both the Claude and Codex controller paths (`SYSTEM_PROMPT` is not exported): label and title framed as intended work, never an outcome; no prediction of next steps; a leading `[mN]` tag ignored; tool named only when nothing else is known; fencing, redaction, 120-character cap and no-command disclosure unchanged. A prompt assertion proves the instruction, not model output; live wording is a maintainer spot check, not a merge gate.
 - **Mock parity**: mock-mode screenshots of running, awaiting approval, failed and completed, light and dark, beside the mock, in the PR.
-- **Gates**: `task gate:web`, `task gate:agent` (M4), `task gate:repo` (check-docs for the mock path, `check:changelog-entry`).
+- **Gates**: `task gate:web`, `task gate:agent` (M4), `task gate:repo` (including `check:changelog-entry`), plus the separate `task check-docs:web` for PRD/mock links in the primary checkout.
 
 ## Milestones
 
