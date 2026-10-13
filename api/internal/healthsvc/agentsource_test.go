@@ -147,7 +147,9 @@ func TestAgentSourceHealthConfiguredEndpointZeroRequests(t *testing.T) {
 			t.Errorf("unexpected advertisement request: %s %s", r.Method, r.URL)
 		}
 		w.Header().Set("Content-Type", "application/x-git-upload-pack-advertisement")
-		fmt.Fprint(w, body)
+		if _, err := fmt.Fprint(w, body); err != nil {
+			t.Errorf("write advertisement: %v", err)
+		}
 	}))
 	defer server.Close()
 	url := server.URL + "/source.git"
