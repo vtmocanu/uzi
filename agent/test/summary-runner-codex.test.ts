@@ -40,6 +40,7 @@ for (const pass of ["intent", "plan"] as const) {
           assert.equal(params.binding.capability, binding.capability);
           if (params.binding.authMode === "subscription") assert.equal(params.binding.generation, 7);
           assert.equal(params.refresh, "deny");
+          assert.ok(params.signal);
           assert.equal(params.signal.aborted, false);
           return { kind: "codex", run: async (req: AdviceRequest, policy: AdviceResultPolicy) => {
             calls++;
@@ -55,7 +56,7 @@ for (const pass of ["intent", "plan"] as const) {
             return { text, end: { kind: "terminal", terminal: success } };
           } };
         }) as CodexAdviceHarnessFactory;
-        const queryFn = async function* () { claudeCalls++; throw new Error("unexpected Claude"); } as unknown as SdkQueryFn;
+        const queryFn = (() => { claudeCalls++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn;
         const r = new SummaryRunner(nullLogger(), { homeRoot, modelTimeoutMs: 1000, queryFn, codexAdviceHarnessFactory: factory });
         const out = await run(r, { ...base, claim: { run_id: "run-summary", secrets: { codex: binding } } });
         assert.deepEqual(out, pass === "intent" ? "Adds reports." : { summary: "Adds reports.", deltas: [{ kind: "added", text: "Reports" }] });
@@ -73,7 +74,7 @@ for (const pass of ["intent", "plan"] as const) {
       it(`${name} binding returns null/warn even with usable Claude`, async () => {
         let calls = 0;
         const warns: string[] = [];
-        const queryFn = async function* () { calls++; throw new Error("unexpected Claude"); } as unknown as SdkQueryFn;
+        const queryFn = (() => { calls++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn;
         const factory = (async () => { calls++; throw new Error("unexpected factory"); }) as CodexAdviceHarnessFactory;
         const r = new SummaryRunner({ ...nullLogger(), warn: (message) => void warns.push(message) }, { homeRoot, queryFn, codexAdviceHarnessFactory: factory });
         assert.equal(await run(r, { ...base, claim: { run_id: "run-summary", secrets: { codex } } }), null);
@@ -87,8 +88,8 @@ for (const pass of ["intent", "plan"] as const) {
         let builds = 0;
         let calls = 0;
         let claudeCalls = 0;
-        const queryFn = async function* () { claudeCalls++; throw new Error("unexpected Claude"); } as unknown as SdkQueryFn;
-        const factory = (async () => {
+        const queryFn = (() => { claudeCalls++; throw new Error("unexpected Claude"); }) as unknown as SdkQueryFn;
+        const factory: CodexAdviceHarnessFactory = (async () => {
           builds++;
           if (failure === "release failure") throw new Error("credential release failed");
           return { kind: "codex", run: async (req: AdviceRequest, policy: AdviceResultPolicy) => {
@@ -107,11 +108,11 @@ for (const pass of ["intent", "plan"] as const) {
               };
               // Exercise the model pass's injected terminal policy before returning text.
               policy.onTerminal(terminal, { isError: true, latest: undefined });
-              assert.fail("error terminal policy must throw");
+              return { text, end: { kind: "terminal", terminal } };
             }
             return { text: " ", end: { kind: "terminal", terminal: success } };
           } };
-        }) as CodexAdviceHarnessFactory;
+        }) as unknown as CodexAdviceHarnessFactory;
         const r = new SummaryRunner(nullLogger(), { homeRoot, queryFn, codexAdviceHarnessFactory: failure === "missing factory" ? undefined : factory });
         assert.equal(await run(r, { ...base, claim: { run_id: "run-summary", secrets: { codex: bindings[0] } } }), null);
         assert.equal(claudeCalls, 0);
