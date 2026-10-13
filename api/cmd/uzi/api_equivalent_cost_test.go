@@ -32,7 +32,7 @@ func TestCostReadersAPIEstimate(t *testing.T) {
 			m := spendModel(t, u)
 			board := tuiTestModel(t, &uzicli.FakeClient{}, "")
 			readers := map[string]string{
-				"board":   stripANSI(board.boardCostSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: u}}, nil)),
+				"board":   stripANSI(board.boardCostSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: u}}, nil, boardCostWidth)),
 				"header":  stripANSI(strings.Join(m.detailHeaderLines(), "\n")),
 				"spend":   stripANSI(m.renderSpend(0)),
 				"run get": renderDetail(t, apitypes.RunDTO{ID: "r", Kind: "issue", Usage: u}),
@@ -62,7 +62,7 @@ func TestCostReadersAPIEstimate(t *testing.T) {
 	}
 	u := &apitypes.UsageDTO{CostStatus: "metered"}
 	m := spendModel(t, u)
-	for _, out := range []string{renderDetail(t, apitypes.RunDTO{ID: "r", Usage: u}), stripANSI(m.renderSpend(0)), stripANSI(strings.Join(m.detailHeaderLines(), "\n")), stripANSI(m.boardCostSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: u}}, nil))} {
+	for _, out := range []string{renderDetail(t, apitypes.RunDTO{ID: "r", Usage: u}), stripANSI(m.renderSpend(0)), stripANSI(strings.Join(m.detailHeaderLines(), "\n")), stripANSI(m.boardCostSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: u}}, nil, boardCostWidth))} {
 		if !strings.Contains(out, "$0") {
 			t.Errorf("genuine metered zero lost dollars: %s", out)
 		}

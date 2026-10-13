@@ -63,7 +63,7 @@ func TestWorkersApprovedMissingFloorWorker(t *testing.T) {
 	m.width = 120
 	for _, status := range []string{"queued", "claimed", "running", "awaiting_approval", "completed", "failed", "cancelled"} {
 		r := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "run", Status: status}}
-		got := stripANSI(m.boardRow(r, false, boardMarkerCols{}))
+		got := stripANSI(m.boardRow(r, false, boardMarkerCols{}, m.boardAccountCols([]apitypes.RunListItemDTO{r})))
 		want := "no worker yet"
 		if status == "completed" || status == "failed" || status == "cancelled" {
 			want = "—"

@@ -217,7 +217,7 @@ func (m tuiModel) boardEmptyState() string {
 // milestone micro-bar, and the title, with an own-board-only judge marker flushed right. A
 // selected row rides the full-width warm selection bar with a ▸ cursor; a DONE-band row is
 // faint end to end.
-func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols) string {
+func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCols, cols boardAccountCols) string {
 	unfocused := sel && m.splitDrawn() && m.view != viewBoard
 	if unfocused {
 		sel = false
@@ -289,21 +289,12 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		row += m.boardProgressCell(r, terminal, bg, tok.word) + gap
 	}
 
-	// WHICH credential this run spent, gated by its own harness:
-	// drawn after the milestone micro-bar and before the COST column, so the row reads
-	// account → cost → title.
+	// Account then cost; all rendered rows use the same measured cell widths.
 	if showCred {
-		if m.boardShowRunCred(r) {
-			row += m.boardCredSeg(r, bg) + gap
-		} else {
-			row += padSeg("", boardCredWidth, bg) + gap
-		}
+		row += m.boardCredSeg(r, bg, cols.credW) + gap
 	}
-
-	// WHAT this run cost (PRD #650), gated by boardShowCost: a right-aligned whole-dollar cell,
-	// own board only. Drawn after the credential column and before the title.
 	if m.boardShowCost() {
-		row += m.boardCostSeg(r, bg) + gap
+		row += m.boardCostSeg(r, bg, cols.costW) + gap
 	}
 
 	// Title: capped to the remaining width AND to boardTitleMax. The marker column allowance is
@@ -354,25 +345,53 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	return clampVisual(row, m.width)
 }
 
-// boardCredSeg renders the run's snapshotted credential label. A run with no recorded
-// credential (a Claude run not yet claimed; a Codex run not yet bound to an alias) keeps
-// an empty cell; a queued Codex run already bound shows its alias. Both labels are user supplied
-// and pass through Plain before entering the fixed-width column.
-func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string {
-	var label *string
-	switch r.Harness {
-	case "codex":
-		label = r.CodexSecretLabel
-	case "claude", "":
-		label = r.AnthropicSecretLabel
+// boardAccountCols holds capped display widths for one rendered board window.
+// Visibility still reserves the fixed maxima, independently of the window.
+type boardAccountCols struct{ credW, costW int }
+
+func (m tuiModel) boardAccountCols(rows []apitypes.RunListItemDTO) boardAccountCols {
+	var cols boardAccountCols
+	for _, r := range rows {
+		if m.boardShowRunCred(r) {
+			cols.credW = max(cols.credW, visualWidth(m.boardCredLabel(r)))
+		}
+		if m.boardShowCost() {
+			cols.costW = max(cols.costW, visualWidth(boardCostText(r)))
+		}
 	}
-	if label == nil || *label == "" {
-		return padSeg("", boardCredWidth, bg)
-	}
-	return paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(*label, boardCredWidth), boardCredWidth))
+	return cols
 }
 
-// boardCostSeg renders WHAT a run cost (PRD #650), right-aligned in a fixed cell, branching on
+// boardCredLabel selects the run's snapshot, then applies the personal-list-only
+// display hint. A deleted snapshot and every admin label keep their recorded name.
+func (m tuiModel) boardCredLabel(r apitypes.RunListItemDTO) string {
+	var label, id *string
+	count := 0
+	switch r.Harness {
+	case "codex":
+		label, id, count = r.CodexSecretLabel, r.CodexSecretID, m.codexCredentialCount
+	case "claude", "":
+		label, id, count = r.AnthropicSecretLabel, r.AnthropicSecretID, m.tokenCount
+	}
+	if label == nil {
+		return ""
+	}
+	if !m.board.admin && id != nil && *label == "default" && count == 1 {
+		if r.Harness == "codex" {
+			return "codex"
+		}
+		return "claude"
+	}
+	return clampVisual(m.renderer.Plain(*label, boardCredWidth), boardCredWidth)
+}
+
+// boardCredSeg draws a sanitized snapshot (blank when absent) in the shared frame width.
+func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color, width int) string {
+	return paintSeg(m.pal.faintC, bg, false, padVisual(m.boardCredLabel(r), width))
+}
+
+// boardCostSeg renders WHAT a run cost (PRD #650), right-aligned in a frame-sized cell
+// capped at boardCostWidth, branching on
 // the run's cost_status (PRD #1429 M5, D7) rather than guessing "subscription" from cost_usd ==
 // 0 — the bug this retires: a subscription run and an unreported run both used to price at 0 and
 // render identically to a real metered $0. Four states: a nil Usage (a pre-#40 or unclaimed run)
@@ -382,23 +401,22 @@ func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string
 // label (never a dollar figure); anything else — "unreported", the pre-M1 empty string, or a
 // status this build has not heard of — draws "n/a", the same safe-unavailable fold web's
 // costCellText uses.
-func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string {
-	if r.Usage == nil {
-		return padSeg("", boardCostWidth, bg)
-	}
-	var s string
-	switch classifyCostStatus(r.Usage.CostStatus) {
-	case costStatusMetered:
-		s = fmtCostBoard(r.Usage.CostUSD) // width-capped so a pathological cost can't blow the cell
-	case costStatusSubscription:
-		s = "n/a"
-	default:
-		s = "n/a"
-	}
-	if pad := boardCostWidth - visualWidth(s); pad > 0 {
-		s = strings.Repeat(" ", pad) + s // right-align within the cell
+func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color, width int) string {
+	s := boardCostText(r)
+	if pad := width - visualWidth(s); pad > 0 {
+		s = strings.Repeat(" ", pad) + s
 	}
 	return paintSeg(m.pal.faintC, bg, false, s)
+}
+
+func boardCostText(r apitypes.RunListItemDTO) string {
+	if r.Usage == nil {
+		return ""
+	}
+	if classifyCostStatus(r.Usage.CostStatus) == costStatusMetered {
+		return fmtCostBoard(r.Usage.CostUSD)
+	}
+	return "n/a"
 }
 
 // boardRowPrefixWidth measures the fixed prefix without the milestone micro-bar

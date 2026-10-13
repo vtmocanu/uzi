@@ -617,6 +617,14 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 		// window) so the columns do not jitter as you scroll. Every row flushes its marker to the
 		// board's right edge.
 		mc := m.boardMarkerCols(rows)
+		// Account/cost widths belong to this rendered window, shared across bands.
+		rendered := make([]apitypes.RunListItemDTO, 0, end-start)
+		for _, item := range items[start:end] {
+			if item.kind == biRow {
+				rendered = append(rendered, rows[item.runIdx])
+			}
+		}
+		accountCols := m.boardAccountCols(rendered)
 		for i := start; i < end; i++ {
 			switch it := items[i]; it.kind {
 			case biEyebrow:
@@ -624,7 +632,7 @@ func (m tuiModel) renderBoardBody(height int, fullScreen bool) string {
 			case biRow:
 				r := rows[it.runIdx]
 				sel := it.runIdx == m.board.cursor
-				sb.WriteString(m.boardRow(r, sel, mc) + "\n")
+				sb.WriteString(m.boardRow(r, sel, mc, accountCols) + "\n")
 				// The selected row gains a variable-height second "now" line (D4). The window
 				// math reserves its physical line via boardCapacity, so this never overflows.
 				if sel {
@@ -888,7 +896,7 @@ const (
 	boardMileWidth       = 9  // milestone micro-bar cell (up to boardMileCap ▰/▱ cells, or done/total | –/N text above that)
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
 	boardOwnerWidth      = 20 // admin owner-email cell
-	boardCredWidth       = 10 // credential cell: a 2-col tone-dot slot + up to 8 cols of token label
+	boardCredWidth       = 10 // maximum credential label width; no tone dot
 	boardCostWidth       = 6  // COST cell width (right-aligned; fits "$9999", "<$1", "—")
 	boardTitleMax        = 60 // TITLE cap: long titles trim to a tidy column instead of running a wide terminal
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
@@ -930,26 +938,15 @@ func (m tuiModel) boardShowCost() bool {
 	return m.width >= min
 }
 
-// boardShowCred reserves one aligned credential column when either harness has
-// multiple credentials. The admin board always shows it.
+// boardShowCred reserves an account column when the viewer holds multiple
+// credentials across both harnesses. The admin board always shows it.
 func (m tuiModel) boardShowCred() bool {
-	return m.board.admin || m.tokenCount > 1 || m.codexCredentialCount > 1
+	return m.board.admin || m.tokenCount+m.codexCredentialCount > 1
 }
 
-// boardShowRunCred gates the cell by this run's harness, so a second Codex
-// credential never exposes the sole Claude credential (and vice versa).
+// boardShowRunCred fills every known harness's row once the column is enabled.
 func (m tuiModel) boardShowRunCred(r apitypes.RunListItemDTO) bool {
-	if m.board.admin {
-		return true
-	}
-	switch r.Harness {
-	case "codex":
-		return m.codexCredentialCount > 1
-	case "claude", "":
-		return m.tokenCount > 1
-	default:
-		return false
-	}
+	return m.boardShowCred() && (r.Harness == "codex" || r.Harness == "claude" || r.Harness == "")
 }
 
 // boardMeterLayout is the ONE per-frame snapshot of the header rate-limit meter line(s) (PRD 1519
