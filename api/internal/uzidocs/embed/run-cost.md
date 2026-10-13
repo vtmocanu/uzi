@@ -68,6 +68,11 @@ the service tier. These figures compare work across harnesses, **not a
 bill**; subscription users may also consume purchased credits beyond
 included usage.
 
+Claude summary and Now entries without a provider cost are priced from uzi's
+standard Anthropic table. `inference_geo: "not_available"` uses standard
+pricing, as these models do not support geographic routing; other non-standard
+geographies remain unpriced. Existing unreported summary/Now rows are not backfilled.
+
 The legacy `subscription` status means **no cost estimate was recorded**.
 It can come from a historical run or a worker not yet rolled to the new
 pricing behavior. Its tokens remain, but its numeric zero is a storage
@@ -110,7 +115,7 @@ carries it as `usage_estimated_tail`). The design is in
 
 - **It is an estimate, with provenance.** The dollar figure is priced from
   Anthropic's official standard pricing page as fetched on 2026-10-03 and
-  recorded as a version id (`anthropic-standard-2026-10-03`), shown beside the
+  recorded as a version id (`anthropic-standard-2026-10-13`), shown beside the
   figure and rendered as "~$X.XX estimated" ("<$0.01 estimated" under half a
   cent).
 - **Unpriced means unknown, never $0.** A model the table does not know, a

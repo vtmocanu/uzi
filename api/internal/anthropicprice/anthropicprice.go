@@ -1,6 +1,7 @@
 // Package anthropicprice prices one Anthropic Messages API usage record from a recorded public
-// price table (issue #2014, ADR-2014 D6). The result is an ESTIMATE shown apart from the metered
-// total; it is never billed money and never merged into run_usage_totals.
+// price table (issue #2014, ADR-2014 D6). Callers keep interrupted-session estimates apart
+// from run_usage_totals, or record summary/Now pass costs as API-equivalent usage. Neither
+// reading proves billed money.
 //
 // Provenance. Every rate below was transcribed from Anthropic's official pricing page, fetched
 // during the run that introduced this package (see AnthropicPriceSourceURL and
@@ -24,7 +25,7 @@ import (
 
 // AnthropicPriceTableVersion identifies this table. It changes whenever a rate, a model row or a
 // pricing rule changes, so a stored-nothing estimate can say which table produced it.
-const AnthropicPriceTableVersion = "anthropic-standard-2026-10-03"
+const AnthropicPriceTableVersion = "anthropic-standard-2026-10-13"
 
 // AnthropicPriceSourceURL is the official pricing page the rates were transcribed from.
 const AnthropicPriceSourceURL = "https://platform.claude.com/docs/en/about-claude/pricing"
@@ -70,6 +71,8 @@ var table = map[string]rates{
 
 // Usage is one message's token usage and the response markers that decide whether it is priced
 // at the standard rates. Empty ServiceTier, Speed and InferenceGeo mean the field was absent.
+// InferenceGeo "not_available" means the model does not support geographic routing and uses
+// standard pricing (https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing).
 type Usage struct {
 	Model                    string
 	InputTokens              int64
@@ -120,7 +123,7 @@ func Price(u Usage) (Cost, bool) {
 	if u.Speed != "" && u.Speed != standardSpeed {
 		return Cost{}, false
 	}
-	if u.InferenceGeo != "" && u.InferenceGeo != standardInferenceGeo {
+	if u.InferenceGeo != "" && u.InferenceGeo != standardInferenceGeo && u.InferenceGeo != "not_available" {
 		return Cost{}, false
 	}
 	if u.InputTokens < 0 || u.CacheReadInputTokens < 0 || u.CacheCreationInputTokens < 0 || u.OutputTokens < 0 {

@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Claude usage with unavailable inference geography keeps its standard cost estimate ([#2914](https://github.com/vtmocanu/uzi/issues/2914)).**
+  Summary and Now entries reporting `inference_geo: "not_available"` can be priced from the standard Anthropic table, so they no longer make a run's cost unavailable solely because the model lacks geographic routing. Non-standard geography and other pricing guards remain; stored unreported rows are not backfilled.
+
 - **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
   A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
 

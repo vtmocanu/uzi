@@ -114,6 +114,28 @@ func TestPriceStandardMarkersArePriced(t *testing.T) {
 	}
 }
 
+func TestPriceNotAvailableInferenceGeoUsesStandardRates(t *testing.T) {
+	u := Usage{Model: "claude-haiku-4-5-20251001", InputTokens: 10,
+		CacheReadInputTokens: 12326, CacheCreationInputTokens: 5572,
+		CacheCreation5mTokens: i64(0), CacheCreation1hTokens: i64(5572),
+		OutputTokens: 1, ServiceTier: "standard"}
+	want, ok := Price(u)
+	if !ok {
+		t.Fatal("absent geography must price")
+	}
+	u.InferenceGeo = "not_available"
+	got, ok := Price(u)
+	if !ok || got.HundredthMicroUSD() != want.HundredthMicroUSD() {
+		t.Fatalf("not_available = %s ok=%v, want %s true", got.HundredthMicroUSD(), ok, want.HundredthMicroUSD())
+	}
+	for _, geo := range []string{"us", "unknown"} {
+		u.InferenceGeo = geo
+		if _, ok := Price(u); ok {
+			t.Errorf("%s geography must remain unpriced", geo)
+		}
+	}
+}
+
 func TestPriceHostileTokenCountsDoNotOverflow(t *testing.T) {
 	const huge = int64(1) << 62
 	c, ok := Price(Usage{Model: "claude-fable-5-1", InputTokens: huge, OutputTokens: huge})
