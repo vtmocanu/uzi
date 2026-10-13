@@ -1,138 +1,141 @@
 # ADR-2903: Codex Read observation during an owned command
 
-**Status: APPROVED DESIGN. Observation implementation PENDING (M2).**
+**Status: IMPLEMENTED (M2); focused validation recorded below.**
 **Date:** 2026-10-13
 **Related:** Issue #2903
 
-## Scope and baseline evidence (M1)
+## Historical baseline (M1)
 
-M1 adds a real-broker characterization test and this decision record only.
-There are no source scheduling changes. The existing “A blocked, B queued,
-C commentary” test remains unchanged.
+M1 at `27c47b8a`, tightened at `27fe35a2`, added a real-broker
+characterization test and this decision record without source scheduling
+changes. At those refs, `CodexHarness.runTurn` had one notification reader,
+one serial request mapping and a bounded FIFO. Read, pwd and checkpoint all
+waited behind a held Bash callback.
 
-The focused test `#2903 M1: real broker queues read pwd checkpoint behind held Bash`
-in `agent/test/codex-harness.test.ts:3012` uses the real
-`ExecutionRegistry` and `CodexCallbackBroker` through `makeHarness`.
-An injected `spawnCommand` holds the first Bash on a promise latch; it
-executes no shell payload and uses no long sleep. Once that seam is entered,
-the transport receives `uzi_read`, `uzi_bash({command:"pwd"})`, and
-`checkpoint`, followed by commentary. The test consumes the commentary
-before checking absence, proving the reader encountered all queued requests.
-Before release there are no replies, no read fileop, and no checkpoint signal
-frame; the held callback is the sole in-flight registry reservation.
+The historical test, `#2903 M1: real broker queues read pwd checkpoint behind
+held Bash`, used the real `ExecutionRegistry` and `CodexCallbackBroker`
+through `makeHarness`. An injected `spawnCommand` held the first Bash on a
+promise latch; it executed no shell payload and used no long sleep. Commentary
+proved the reader encountered all queued requests. Before release there were
+no replies, read fileops or checkpoint frames; Bash was the sole in-flight
+registry reservation. After release, Read, pwd and checkpoint completed in FIFO
+order with exactly one successful reply each. Read returned the independent
+literal `"gate progress fixture\n"`; pwd returned the fixture worktree path.
+A checkpoint frame and successful terminal followed with an unpoisoned, idle
+registry.
 
-After release, the read, pwd and checkpoint complete in FIFO order, each with
-exactly one successful reply. The read performs exactly one fileop and returns
-the independent literal `"gate progress fixture\n"`; pwd returns the fixture
-worktree path. Exactly one checkpoint signal frame and a successful terminal
-follow; the registry has no in-flight callbacks and is unpoisoned.
+The preserved baseline log .uzi/scratch/gate-log.Bwjpku records exit 0,
+1 test passed, 0 failed, 0 cancelled; body 42.519731 ms, runner 3171.765266 ms.
+This describes those historical refs, not the current scheduler. The original
+“A blocked, B queued, C commentary” serial-effects test remains unchanged.
 
-Direct evidence, run from the absolute agent cwd in this worktree:
-
-```sh
-node --import tsx --test --test-timeout=120000 --test-name-pattern='#2903 M1: real broker queues read pwd checkpoint behind held Bash' test/codex-harness.test.ts
-```
-
-Recorded result: **exit 0**, 1 test passed, 0 failed, 0 cancelled.
-Test body: 42.519731 ms; runner duration: 3171.765266 ms.
-Local evidence log: .uzi/scratch/gate-log.Bwjpku (temporary, untracked).
-This is in-memory harness/broker baseline evidence, not a real Codex process,
-command-supervisor cancellation, Kubernetes or full-stack measurement.
-
-Mechanism anchors verified in the current source:
-
-- `CodexHarness` turn loop, `agent/src/codex/codex-harness.ts:1177`:
-  one reader, one serial request mapping and a bounded FIFO.
-  The `mapping || deferred.length > 0` branch at :1346 queues requests,
-  including Read, while the shell mapping is pending.
-- `CodexCallbackBroker.dispatchShell`, `agent/src/codex/broker.ts:734`,
-  awaits `spawnCommand`; `handleToolCall` reserves at :597 and settles
-  at :625. The latch therefore holds a genuine admitted broker callback.
-- `CodexHarness.routeToolCall`, `agent/src/codex/codex-harness.ts:1695`,
-  checks active thread and turn identity; :1711 calls the broker with the
-  thread, turn and call IDs and root origin.
-
-## Approved design — implementation pending M2
+## Implemented scheduling contract
 
 Permit at most one Read observation (canonical `Read`, including `uzi_read`)
-alongside an active-root Bash callback. Keep one notification reader, one serial
-request mapping, and at most one observation mapping. This is a narrow Read
-exception to the FIFO, not a general parallel callback scheduler.
+alongside a pending active-root Bash mapping. Keep one notification reader, one
+serial effect mapping and at most one observation mapping. Every other callback
+stays in the serial FIFO: other Bash commands including pwd, Search, file writes,
+MCP, delegation callbacks, checkpoint, progress and questions. Existing delegated
+child execution semantics remain unchanged.
 
-Every other callback stays in the serial FIFO: other Bash commands including
-pwd, Search, file writes, MCP, delegation callbacks, checkpoint, progress and
-questions. Existing delegated child execution semantics remain unchanged.
-The observation and deferred requests share the existing 4096-request /
-64 MiB queue accounting; the observation must not acquire a separate budget
-or escape overflow handling.
+Current mechanism anchors in `agent/src/codex/codex-harness.ts` are
+`CodexHarness.runTurn`'s local `activeTool`, `beginMapping`, `mapping`,
+`observation`, `readEnded` and readiness-ordinal selection. `activeTool`
+requires raw active-root thread and turn identity and reuses
+`canonicalizeCodexToolName` from `agent/src/codex/broker.ts`. While Bash has
+no readiness ordinal, the loop finds the oldest eligible Read in the same
+bounded deferred collection, even behind queued effects. A held observation
+prevents another Read admission.
+
+Observation and deferred requests share the existing 4096-request / 64 MiB
+serialized-notification budget. The observation keeps its count and byte charge
+until its mapping is consumed as settled; there is no second queue or budget.
+Overflow refuses undispatched requests and fails the stream; already admitted
+callbacks retain broker reply ownership.
 
 Once Bash is completion-ready, admit no new bypass. Wait for any current
-observation to settle before dispatching the next serial callback.
-An active terminal waits for both request mappings and the deferred queue;
-existing delegation handling remains unchanged. Stop, EOF, transport failure,
-overflow and terminal cleanup must
-settle/refuse each owned request and clean up each projection exactly once.
-Confirmed quiescence requirements remain unchanged; an observation is not
-permission to publish or checkpoint during active effects.
+observation to settle before dispatching the next serial callback. An active
+terminal waits for both mappings and the deferred FIFO. The retained reader
+stamps EOF/failure while a consumer is suspended at a yield; known EOF/failure
+prevents further queued admissions. Completion/projection/read readiness retains
+the existing ordinal ordering, including when both mappings settle during yield
+suspension.
 
-Reuse `canonicalizeCodexToolName` (`agent/src/codex/broker.ts:191`)
-instead of a second alias classifier. Preserve the entire runtime identity:
-raw active-root thread and turn matching, call ID, root origin, and registry
-epoch binding. Every observation still passes through the existing broker
-authority/grant, path jail, size, replay, ingestion and admission checks.
-Scheduling eligibility grants no additional read authority.
+Every observation still passes through `CodexHarness.routeToolCall` and the
+entire `CodexCallbackBroker.handleToolCall` path: runtime identity, call ID,
+root origin, ingestion bounds, registry epoch reservation, replay/change-reuse,
+grants, path jail and read-size limits. Scheduling eligibility grants no
+additional authority. Stop, EOF, transport failure, overflow and terminal cleanup
+retain exactly-once refusal/reply ownership and projection isolation.
+`CodexHarness.safeRespond` drops replies that cannot be delivered after close.
 
-Read is not a snapshot relative to shell or delegated writes. It may observe
-a file while another owned effect changes it; callers must not infer atomicity
-or a consistent multi-file view.
+Read is not a snapshot relative to shell or delegated writes. It may observe a
+file while another owned effect changes it; callers must not infer atomicity or
+a consistent multi-file view. The Read dynamic-tool description says so.
 
 ## Cancellation and command ownership
 
 Native orchestration-cell termination or promise abandonment is **not worker
-cancellation**. An owned command runs until exit, the unchanged command deadline
+cancellation**. An owned command runs until exit, its unchanged command deadline
 or output cap, or explicit harness/run stop cleanup. There is no per-command
 cancel API in this design.
 
-`CodexHarness.requestStop` (`agent/src/codex/codex-harness.ts:991`)
-requests best-effort `turn/interrupt` and wakes/ends the stream. That is a
-cancellation request, not proof that an owned command was killed.
+`CodexHarness.requestStop` requests best-effort `turn/interrupt` and wakes/ends
+the stream. That is a cancellation request, not proof that a command was killed.
 `CodexHarness.close` closes the iterator/transport; registry reap/dispose and
 executor cleanup remain the process-ownership boundary.
 
-The executor combines `turnAbort.signal` and `effectsAbort.signal` for the
-broker in `agent/src/codex/codex-executor.ts:3933`; its turn cleanup fires
-`effectsAbort.abort()` in `finally` at :4023.
-`makeDefaultSpawnCommand` (:5194) races child exit/deadline, abort and the
-existing output cap. At :5278 it awaits `registry.reapRoot`, then at :5280
-drains output before reporting command aborted, deadline or other errors.
-An unproven reap fails closed. The broker converts generic exceptions into
-`broker_error` (`handleToolCall`, `agent/src/codex/broker.ts:623`);
-a reply can be dropped if the transport has closed
-(`CodexHarness.safeRespond`, `agent/src/codex/codex-harness.ts:1992`).
-These are source mechanism anchors, not cancellation experiments performed
-by the M1 baseline test.
+In `agent/src/codex/codex-executor.ts`, the turn's `effectsAbort` and
+`turnAbort.signal` are combined for the broker, and the cleanup finally aborts
+effects. `makeDefaultSpawnCommand` races child exit/deadline, abort and the
+existing output cap; it awaits `registry.reapRoot` and drains output before
+returning or reporting failure. An unproven reap fails closed. The broker converts
+generic exceptions into `broker_error`; a reply can be dropped after transport
+closure.
 
-This preserves the requirements in `specs/human.md:1153` (confirmed
-quiescence before credentialed sinks) and :1216 (Codex delegated children
-settle before checkpoint). Adding an observation must not weaken either.
+Confirmed quiescence before credentialed sinks (human spec feature #1783) and
+settlement of Codex delegated children before checkpoint (human spec bug #1864)
+remain required. The focused observation quiescence test **settles Bash first**,
+then proves the admitted Read alone blocks the checkpoint sink and poisons the
+registry on a failed boundary. It does not count Bash as the blocker.
 
-## Validation planned for M2 (not performed in M1)
+## Focused validation (M2)
 
-- Update this baseline's Bash expectation so Read succeeds while Bash is held;
-  pwd and checkpoint still wait. Keep the original serial latch test unchanged.
-- Add a separately latched non-Bash control proving no Read bypass occurs there.
-- Cover single-reader and one-observation limits, shared count/byte bounds,
-  completion-ready Bash refusing new bypass, and FIFO dispatch after observation.
-- Exercise aliases, malformed/stale/foreign runtime identity, authority/path/size
-  denials, replay and admission without widening any broker checks.
-- Cover terminal, stop, EOF, failure and overflow with exactly-once cleanup
-  and reply ownership, including closed-transport replies.
-- For held-observation quiescence, **settle Bash first** so observation is the
-  sole remaining blocker. Then prove terminal/checkpoint boundaries wait until
-  that observation settles. Retain the existing child-settlement requirements.
-- Measure focused outcomes and run the appropriate integrated gates before
-  claiming M2 implemented. Real command cancellation and worker deployment
-  proof require their own evidence; M1 establishes neither.
+Commands below ran from this worktree's agent directory. Logs are temporary,
+untracked local evidence, not published artifacts.
 
-No unresolved M1 design questions. M2 implementation and its validation remain
-pending.
+- Narrowed selection:
+  `timeout 20s node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=120000 --test-name-pattern='#2903' test/codex-harness.test.ts`.
+  .uzi/scratch/gate-log.C7oy0m: **exit 0**, 25 passed, 0 failed/cancelled;
+  runner 5603.912058 ms. Covers early Read before and behind pwd/checkpoint,
+  Search serial control, canonical/wire aliases, sole reader, one observation,
+  both completion orders and co-ready yield suspension, ready EOF, shared
+  count/byte boundaries and recovery, terminal/FIFO barriers, sole-observation
+  quiescence, identity/grant denial, replay/change-reuse, stop/abort/EOF/failure/
+  close and late projection isolation.
+- Four whole focused files:
+  `node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=120000 test/codex-harness.test.ts test/codex-broker.test.ts test/codex-registry.test.ts test/codex-safety.test.ts`.
+  .uzi/scratch/gate-log.zteUJ5: **exit 0**, 504 passed, 0 failed/cancelled;
+  runner 27266.652284 ms. Includes existing broker authority/path/size,
+  registry admission and child/quiescence coverage.
+- Executor cancellation selection:
+  `timeout 20s node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=120000 --test-name-pattern='reserves before launch and an active-turn abort reaps' test/codex-executor.test.ts`.
+  .uzi/scratch/gate-log.zrk4on: **exit 0**, 1 passed, 0 failed/cancelled;
+  runner 5993.321718 ms. A fake supervisor proves abort awaits clean root
+  disposal before rejection; this is not a real process/deployment experiment.
+- Negative reproducer: safely archived resolved pre-fix ref
+  `27fe35a2fc2529ec945fb0e2d6589165a80b0c2a` into a scratch export, copied
+  the updated harness test, and symlinked dependencies from the primary tree.
+  No Git commands ran inside the export. Using the narrow command above with
+  pattern `#2903 M2: real broker observes read`, .uzi/scratch/gate-log.N9ppbY
+  records **exit 1**, both tests failing at the expected early-read assertion:
+  only `spawn:echo held-2903` existed while Read and its reply were required.
+  The export was removed after inspection. Older logs AZsWRO (exit 1) and
+  ZiNmsG (exit 0) were inspected but concern an earlier version of that test.
+
+The 20-second wrapper bounds fixture triage only; it is not an integration gate.
+Full `task gate:agent` is required for publication; its result belongs in the
+PR check summary. The focused checks recorded here do not establish full-gate
+or review approval, real Codex process, real supervisor cancellation, Kubernetes
+or full-stack success. Focused runner time above includes setup and existing tests; before/after
+CI job time and critical-path impact were not measured.

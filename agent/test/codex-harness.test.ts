@@ -2853,21 +2853,22 @@ describe("CodexHarness: owner abort cancels a turn wedged in a broker callback",
   });
 });
 
-describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
-  const label = (e: HarnessEvent): string => e.kind !== "frame" ? e.kind :
-    e.items.some(i => i.kind === "tool") ? e.items.filter(i => i.kind === "tool").map(i => i.phase).join(",") :
-      JSON.stringify(e).includes("commentary") ? "commentary" : "signal";
-  async function pullUntil(iter: AsyncIterator<HarnessEvent>, wanted: string): Promise<HarnessEvent[]> {
-    const events: HarnessEvent[] = [];
-    for (let n = 0; n < 20; n++) {
-      const step = await withTimeout(iter.next(), 1000, wanted);
-      assert.equal(step.done, false);
-      events.push(step.value!);
-      if (label(step.value!) === wanted) return events;
-    }
-    assert.fail(`missing ${wanted}`);
-  }
+const label = (e: HarnessEvent): string => e.kind !== "frame" ? e.kind :
+  e.items.some(i => i.kind === "tool") ? e.items.filter(i => i.kind === "tool").map(i => i.phase).join(",") :
+    JSON.stringify(e).includes("commentary") ? "commentary" : "signal";
 
+async function pullUntil(iter: AsyncIterator<HarnessEvent>, wanted: string): Promise<HarnessEvent[]> {
+  const events: HarnessEvent[] = [];
+  for (let n = 0; n < 20; n++) {
+    const step = await withTimeout(iter.next(), 1000, wanted);
+    assert.equal(step.done, false);
+    events.push(step.value!);
+    if (label(step.value!) === wanted) return events;
+  }
+  assert.fail(`missing ${wanted}`);
+}
+
+describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
   it("deep queued B preserves dispatch and exactly one reply", async () => {
     const { broker: wedged, release } = wedgeBroker();
     let expectedArgs: unknown;
@@ -3009,7 +3010,8 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     });
   }
 
-  it("#2903 M1: real broker queues read pwd checkpoint behind held Bash", async () => {
+  for (const readBehindEffects of [false, true]) {
+  it(`#2903 M2: real broker observes read ${readBehindEffects ? "behind" : "before"} queued pwd checkpoint during held Bash`, async () => {
     const ac = new AbortController();
     const request = makeRequest({ signal: ac.signal });
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -3054,16 +3056,18 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
       events.push((await iter.next()).value!);
       events.push(...await pullUntil(iter, "started"));
       await withTimeout(entered, 1000, "held command entry");
-      transport.push(toolCall(29031, "uzi_read", { path: "progress.txt" }, "th-1", "tn-1", "read-2903"))
-        .push(toolCall(29032, "uzi_bash", { command: "pwd" }, "th-1", "tn-1", "pwd-2903"))
-        .push(toolCall(29033, "checkpoint", {}, "th-1", "tn-1", "checkpoint-2903"))
+      if (!readBehindEffects) transport.push(toolCall(29031, "uzi_read", { path: "progress.txt" }, "th-1", "tn-1", "read-2903"));
+      transport.push(toolCall(29032, "uzi_bash", { command: "pwd" }, "th-1", "tn-1", "pwd-2903"))
+        .push(toolCall(29033, "checkpoint", {}, "th-1", "tn-1", "checkpoint-2903"));
+      if (readBehindEffects) transport.push(toolCall(29031, "uzi_read", { path: "progress.txt" }, "th-1", "tn-1", "read-2903"));
+      transport
         // Consuming this frame proves the reader encountered every queued request.
         .push(agentMessage("commentary after all #2903 requests"));
       events.push(...await pullUntil(iter, "commentary"));
       await tick();
-      assert.deepEqual(order, ["spawn:echo held-2903"]);
-      assert.equal(transport.responses.length, 0);
-      assert.equal(fileops, 0);
+      assert.deepEqual(order, ["spawn:echo held-2903", "read", "reply:29031"]);
+      assert.equal(transport.responses.length, 1);
+      assert.equal(fileops, 1);
       assert.equal(events.some(e => e.kind === "frame" && e.signals?.checkpoint), false);
       assert.equal(registry.inFlightCallbackCount(), 1);
 
@@ -3071,10 +3075,10 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
       transport.push(turnCompleted());
       events.push(...await withTimeout(collect({ [Symbol.asyncIterator]: () => iter }), 5000, "#2903 FIFO completion"));
       assert.deepEqual(order, [
-        "spawn:echo held-2903", "reply:29030", "read", "reply:29031",
+        "spawn:echo held-2903", "read", "reply:29031", "reply:29030",
         "spawn:pwd", "reply:29032", "reply:29033",
       ]);
-      assert.deepEqual(transport.responses.map(r => r.requestId), [29030, 29031, 29032, 29033]);
+      assert.deepEqual(transport.responses.map(r => r.requestId), [29031, 29030, 29032, 29033]);
       const outputs = transport.responses.map(({ response }) => {
         const result = rec(rec(response).result);
         assert.equal(result.success, true);
@@ -3083,7 +3087,7 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
         assert.equal(items[0]!.type, "inputText");
         return rec(JSON.parse(items[0]!.text));
       });
-      assert.deepEqual(outputs[1], {
+      assert.deepEqual(outputs[0], {
         size: Buffer.byteLength(raw), content: "gate progress fixture\n", offset: 1,
         linesReturned: 1, partialLastLine: false, truncated: false,
       });
@@ -3106,6 +3110,8 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
       await harness.close();
     }
   });
+
+  }
 
   it("A blocked, B queued, C commentary: effects stay serial and terminal waits without reading beyond it", async () => {
     const ac = new AbortController();
@@ -3467,6 +3473,406 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
       await harness.close();
     }
   });
+});
+
+
+describe("#2903 M2: observation scheduling", () => {
+  function latch() {
+    let release!: () => void;
+    const promise = new Promise<void>(resolve => { release = resolve; });
+    return { promise, release };
+  }
+
+  async function fixture(effect: "Bash" | "Search" = "Bash", denyRead = false) {
+    const shell = latch();
+    const read = latch();
+    const readEntered = latch();
+    const effectEntered = latch();
+    const controller = new AbortController();
+    const request = makeRequest({ signal: controller.signal });
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const order: string[] = [];
+    const renderedGrants = renderCodexRun(request).leadGrants;
+    const grants = { ...renderedGrants, allowedTools: new Set([...renderedGrants.allowedTools, "Search"]) };
+    const broker = new CodexCallbackBroker({
+      registry, worktreePath: WORKSPACE,
+      grants: denyRead ? { ...grants, allowedTools: new Set([...grants.allowedTools].filter(t => t !== "Read")) } : grants,
+      spawnCommand: async argv => {
+        order.push(`shell:${argv[2]}`);
+        if (argv[2] === "echo held") { effectEntered.release(); await shell.promise; }
+        return { code: 0, stdout: "done\n", stderr: "" };
+      },
+      fileop: { op: async operation => {
+        if (operation.op === "list") {
+          assert.deepEqual(operation, { op: "list", path: "." });
+          order.push("Search");
+          effectEntered.release();
+          await shell.promise;
+          return { ok: true, entries: [] };
+        }
+        assert.equal(operation.op, "read");
+        order.push(`read:${operation.path}`);
+        if (operation.path === "first.txt") {
+          readEntered.release();
+          await read.promise;
+        }
+        return { ok: true, size: 2, data: Buffer.from("x\n").toString("base64") };
+      } },
+      delegate: async () => ({ ok: false, code: "unused", message: "unused" }),
+      allowedRoles: new Set<string>(),
+    });
+    let turns = 0;
+    const transport = new FakeTransport(method => method === "turn/start"
+      ? { turn: { id: `tn-${++turns}` } } : defaultResponder(method));
+    const { harness } = makeHarness({ registry, broker, transport });
+    let reads = 0;
+    let reading = false;
+    const notifications = transport.notifications.bind(transport);
+    transport.notifications = () => {
+      const notes = notifications();
+      return {
+        next: () => {
+          assert.equal(reading, false, "sole notification reader");
+          reading = true;
+          reads++;
+          const pending = notes.next();
+          void pending.then(() => { reading = false; }, () => { reading = false; });
+          return pending;
+        },
+        return: notes.return?.bind(notes),
+        [Symbol.asyncIterator]() { return this; },
+      };
+    };
+    transport.push(toolCall(1, effect === "Bash" ? "uzi_bash" : "Search",
+      effect === "Bash" ? { command: "echo held" } : { query: "gate" }, "th-1", "tn-1", "effect"));
+    const turn = harness.startTurn(request);
+    const iter = turn.events[Symbol.asyncIterator]();
+    await iter.next();
+    await pullUntil(iter, "started");
+    try {
+      await withTimeout(effectEntered.promise, 1000, "effect admission");
+    } catch (error) {
+      controller.abort(); shell.release(); read.release();
+      await harness.close(); await iter.return?.();
+      throw new Error(`effect admission failed: ${JSON.stringify({ order, responses: transport.responses })}`, { cause: error });
+    }
+    return {
+      harness, transport, registry, broker, order, iter, turn, controller, shell, read, readEntered,
+      reads: () => reads,
+      async cleanup() {
+        controller.abort(); shell.release(); read.release();
+        await tick(); await iter.return?.(); await harness.close();
+      },
+    };
+  }
+
+  async function driveUntilReply(f: Awaited<ReturnType<typeof fixture>>, id: number) {
+    for (let n = 0; n < 20 && !f.transport.responses.some(r => r.requestId === id); n++) {
+      f.transport.push(agentMessage(`commentary driving reply ${id}`));
+      assert.equal((await withTimeout(f.iter.next(), 1000, `reply ${id}`)).done, false);
+    }
+    assert.ok(f.transport.responses.some(r => r.requestId === id), `missing reply ${id}`);
+  }
+
+  it("Search held at list fileop keeps Read in the serial FIFO", async () => {
+    const f = await fixture("Search");
+    try {
+      f.transport.push(toolCall(2, "uzi_read", { path: "second.txt" }, "th-1", "tn-1", "read"))
+        .push(agentMessage("commentary Search control"));
+      await pullUntil(f.iter, "commentary");
+      assert.deepEqual(f.order, ["Search"]);
+      assert.equal(f.registry.inFlightCallbackCount(), 1);
+      assert.equal(f.transport.responses.length, 0);
+      f.shell.release();
+      f.transport.push(turnCompleted());
+      await collect({ [Symbol.asyncIterator]: () => f.iter });
+      assert.deepEqual(f.order, ["Search", "read:second.txt"]);
+      assert.deepEqual(f.transport.responses.map(r => r.requestId), [1, 2]);
+    } finally { await f.cleanup(); }
+  });
+
+  for (const firstTool of ["Read", "uzi_read"]) {
+    it(`${firstTool}: one held observation, read FIFO, Bash readiness closes bypass, terminal barrier`, async () => {
+      const f = await fixture();
+      try {
+        f.transport.push(toolCall(2, "Bash", { command: "pwd" }, "th-1", "tn-1", "pwd"))
+          .push(toolCall(3, firstTool, { path: "first.txt" }, "th-1", "tn-1", "first"))
+          .push(toolCall(4, "uzi_read", { path: "second.txt" }, "th-1", "tn-1", "second"))
+          .push(agentMessage("commentary read FIFO barrier"));
+        await pullUntil(f.iter, "commentary");
+        await withTimeout(f.readEntered.promise, 1000, "observation admission");
+        assert.deepEqual(f.order, ["shell:echo held", "read:first.txt"]);
+        assert.equal(f.registry.inFlightCallbackCount(), 2);
+        f.shell.release();
+        await tick();
+        assert.equal(f.registry.inFlightCallbackCount(), 1, "only the admitted read remains");
+        f.transport.push(toolCall(5, "Read", { path: "third.txt" }, "th-1", "tn-1", "third"))
+          .push(agentMessage("commentary Bash completed, read still held"));
+        await pullUntil(f.iter, "commentary");
+        assert.deepEqual(f.order, ["shell:echo held", "read:first.txt"]);
+        f.transport.push(turnCompleted()).push(toolCall(6, "Bash", { command: "beyond" }));
+        const events: HarnessEvent[] = [];
+        let settled = false;
+        const pending = collect({ [Symbol.asyncIterator]: () => f.iter }).then(e => { events.push(...e); settled = true; });
+        await tick();
+        const readsAtTerminal = f.reads();
+        assert.equal(settled, false);
+        f.read.release();
+        await withTimeout(pending, 1000, "terminal after observation");
+        assert.deepEqual(f.order, ["shell:echo held", "read:first.txt", "shell:pwd", "read:second.txt", "read:third.txt"]);
+        assert.equal(f.reads(), readsAtTerminal, "no notification read beyond active terminal");
+        assert.deepEqual(f.transport.responses.map(r => r.requestId), [1, 3, 2, 4, 5]);
+        assert.equal(events.at(-1)?.kind, "turn_finished");
+        assert.equal(f.registry.inFlightCallbackCount(), 0);
+      } finally { await f.cleanup(); }
+    });
+  }
+
+  for (const completion of ["Read first", "Bash first", "co-ready"] as const) {
+    it(`${completion} while suspended at yield preserves the observation barrier`, async () => {
+      const f = await fixture();
+      try {
+        f.transport.push(toolCall(2, "Read", { path: "first.txt" }, "th-1", "tn-1", "first"))
+          .push(toolCall(3, "Bash", { command: "pwd" }, "th-1", "tn-1", "pwd"))
+          .push(agentMessage("commentary suspended completion"));
+        await pullUntil(f.iter, "commentary");
+        await withTimeout(f.readEntered.promise, 1000, "held observation");
+        if (completion === "Read first") {
+          f.read.release(); await tick();
+          assert.equal(f.registry.inFlightCallbackCount(), 1);
+          assert.deepEqual(f.transport.responses.map(r => r.requestId), [2]);
+          f.shell.release();
+        } else if (completion === "Bash first") {
+          f.shell.release(); await tick();
+          assert.equal(f.registry.inFlightCallbackCount(), 1);
+          assert.deepEqual(f.transport.responses.map(r => r.requestId), [1]);
+          f.read.release();
+        } else {
+          f.shell.release(); f.read.release();
+        }
+        await tick();
+        assert.deepEqual(f.order, ["shell:echo held", "read:first.txt"], "yield suspension cannot dispatch pwd");
+        // Bash is already completion-ready: a newly encountered Read must stay
+        // behind pwd even if its notification and both mappings are co-ready.
+        f.transport.push(toolCall(4, "Read", { path: "second.txt" }, "th-1", "tn-1", "second"))
+          .push(turnCompleted());
+        const events = await collect({ [Symbol.asyncIterator]: () => f.iter });
+        assert.deepEqual(f.order, ["shell:echo held", "read:first.txt", "shell:pwd", "read:second.txt"]);
+        assert.deepEqual(f.transport.responses.map(r => r.requestId),
+          completion === "Read first" ? [2, 1, 3, 4] : [1, 2, 3, 4]);
+        assert.equal(events.at(-1)?.kind, "turn_finished");
+      } finally { await f.cleanup(); }
+    });
+  }
+
+  it("ready EOF while suspended with an observation stops queued admissions", async () => {
+    const f = await fixture();
+    try {
+      f.transport.push(toolCall(2, "Read", { path: "first.txt" }, "th-1", "tn-1", "first"))
+        .push(toolCall(3, "Bash", { command: "pwd" }, "th-1", "tn-1", "pwd"))
+        .push(toolCall(4, "Read", { path: "second.txt" }, "th-1", "tn-1", "second"))
+        .push(agentMessage("commentary held before EOF"));
+      await pullUntil(f.iter, "commentary");
+      f.read.release();
+      await pullUntil(f.iter, "finished");
+      await pullUntil(f.iter, "activity"); // observation removed; retained read is pending
+      f.shell.release(); f.transport.end(); await tick();
+      await assert.rejects(collect({ [Symbol.asyncIterator]: () => f.iter }), /stream ended before turn completion/);
+      assert.deepEqual(f.order, ["shell:echo held", "read:first.txt"]);
+      assert.deepEqual(f.transport.responses.map(r => r.requestId).sort(), [1, 2, 3, 4]);
+      assert.equal(new Set(f.transport.responses.map(r => r.requestId)).size, 4);
+    } finally { await f.cleanup(); }
+  });
+
+  for (const limit of ["count", "bytes"] as const) {
+    for (const extra of [0, 1]) {
+      it(`shared ${limit} budget with held observation at boundary + ${extra} and slot recovery`, async () => {
+        const f = await fixture();
+        try {
+          const observed = toolCall(2, "Read", { path: "first.txt" }, "th-1", "tn-1", "first");
+          f.transport.push(observed).push(agentMessage("commentary observation charged"));
+          await pullUntil(f.iter, "commentary");
+          await withTimeout(f.readEntered.promise, 1000, "budget observation");
+          const queued = limit === "count" ? 4095 + extra : 1;
+          for (let n = 0; n < queued; n++) {
+            const note = toolCall(n + 10, "Bash", { command: "pwd", data: "" }, "th-1", "tn-1", `pwd-${n}`);
+            if (limit === "bytes") {
+              const overhead = Buffer.byteLength(JSON.stringify(observed)) + Buffer.byteLength(JSON.stringify(note));
+              rec(rec(note.params).arguments).data = "x".repeat(64 * 1024 * 1024 - overhead + extra);
+              assert.equal(Buffer.byteLength(JSON.stringify(observed)) + Buffer.byteLength(JSON.stringify(note)),
+                64 * 1024 * 1024 + extra);
+            }
+            f.transport.push(note);
+          }
+          f.transport.push(agentMessage("commentary budget boundary"));
+          if (extra) {
+            await assert.rejects(collect({ [Symbol.asyncIterator]: () => f.iter }), /deferred request queue overflow/);
+            assert.equal(f.transport.responses.length, queued);
+            assert.ok(f.transport.responses.every(r => rec(rec(r.response).result).success === false));
+            assert.equal(f.registry.inFlightCallbackCount(), 2, "overflow leaves admitted callbacks broker-owned");
+          } else {
+            await pullUntil(f.iter, "commentary");
+            assert.equal(f.transport.responses.length, 0, "observation plus queue fits exactly");
+            f.read.release();
+            await pullUntil(f.iter, "finished"); await pullUntil(f.iter, "activity");
+            const recovered = toolCall(5, "Read", { path: "first.txt" }, "th-1", "tn-1", "again");
+            assert.equal(Buffer.byteLength(JSON.stringify(recovered)), Buffer.byteLength(JSON.stringify(observed)));
+            f.transport.push(recovered);
+            await driveUntilReply(f, 5);
+            assert.equal(rec(rec(f.transport.responses.find(r => r.requestId === 5)!.response).result).success, true);
+            assert.deepEqual(f.order, ["shell:echo held", "read:first.txt", "read:first.txt"]);
+            f.controller.abort();
+            await collect({ [Symbol.asyncIterator]: () => f.iter });
+          }
+          f.shell.release(); f.read.release(); await tick();
+          assert.equal(new Set(f.transport.responses.map(r => r.requestId)).size, f.transport.responses.length);
+          assert.equal(f.transport.responses.length, queued + (extra ? 2 : 3));
+          assert.equal(f.registry.inFlightCallbackCount(), 0);
+        } finally { await f.cleanup(); }
+      });
+    }
+  }
+
+  it("a settled observation frees its slot for the oldest queued Read behind effects", async () => {
+    const f = await fixture();
+    try {
+      f.transport.push(toolCall(2, "Bash", { command: "pwd" }, "th-1", "tn-1", "pwd"))
+        .push(toolCall(3, "Read", { path: "first.txt" }, "th-1", "tn-1", "first"))
+        .push(toolCall(4, "Read", { path: "second.txt" }, "th-1", "tn-1", "second"))
+        .push(agentMessage("commentary first held"));
+      await pullUntil(f.iter, "commentary");
+      f.read.release();
+      await tick();
+      f.transport.push(agentMessage("commentary second observed"));
+      await pullUntil(f.iter, "commentary");
+      await driveUntilReply(f, 4);
+      assert.deepEqual(f.order, ["shell:echo held", "read:first.txt", "read:second.txt"]);
+      assert.deepEqual(f.transport.responses.map(r => r.requestId), [3, 4]);
+      f.shell.release(); f.transport.push(turnCompleted());
+      await collect({ [Symbol.asyncIterator]: () => f.iter });
+      assert.deepEqual(f.transport.responses.map(r => r.requestId), [3, 4, 1, 2]);
+    } finally { await f.cleanup(); }
+  });
+
+  it("only the admitted held observation prevents a credentialed sink after Bash settles", async () => {
+    const f = await fixture();
+    try {
+      f.transport.push(toolCall(2, "Read", { path: "first.txt" }, "th-1", "tn-1", "first"))
+        .push(agentMessage("commentary read admitted"));
+      await pullUntil(f.iter, "commentary");
+      await f.readEntered.promise;
+      f.shell.release(); await tick();
+      assert.equal(f.registry.inFlightCallbackCount(), 1);
+      assert.deepEqual(f.transport.responses.map(r => r.requestId), [1]);
+      const { createCodexExecutionSafety } = await import("../src/codex/safety.js");
+      const safety = createCodexExecutionSafety(f.registry, async () => { throw new Error("no boundary spawn"); });
+      let sink = 0;
+      await assert.rejects(safety.withBoundary({ boundary: "checkpoint", deadlineMs: 30 },
+        async () => { sink++; }), /boundary failed at quiesce/);
+      assert.equal(sink, 0);
+      assert.equal(f.registry.isPoisoned(), true);
+      f.read.release(); await tick();
+      assert.equal(f.registry.inFlightCallbackCount(), 0);
+    } finally { await f.cleanup(); }
+  });
+
+  for (const identity of ["stale", "foreign", "absent", "denied"]) {
+    it(`${identity} Read gets no observation authority`, async () => {
+      const f = await fixture("Bash", identity === "denied");
+      try {
+        const note = toolCall(2, "uzi_read", { path: "second.txt" },
+          identity === "foreign" ? "other" : "th-1", identity === "stale" ? "old" : "tn-1", "read");
+        if (identity === "absent") delete rec(note.params).threadId;
+        f.transport.push(note).push(agentMessage("commentary identity barrier"));
+        await pullUntil(f.iter, "commentary"); await tick();
+        assert.deepEqual(f.order, ["shell:echo held"]);
+        assert.equal(f.transport.responses.length, identity === "denied" ? 1 : 0);
+        f.shell.release(); f.transport.push(turnCompleted());
+        await collect({ [Symbol.asyncIterator]: () => f.iter });
+        const reply = f.transport.responses.find(r => r.requestId === 2)!;
+        assert.equal(rec(rec(reply.response).result).success, false);
+        assert.equal(f.transport.responses.filter(r => r.requestId === 2).length, 1);
+        assert.equal(f.registry.isPoisoned(), false);
+      } finally { await f.cleanup(); }
+    });
+  }
+
+  it("observed Read replay is effect-free; changed reuse is denied and poisons", async () => {
+    const f = await fixture();
+    try {
+      f.transport.push(toolCall(2, "uzi_read", { path: "second.txt" }, "th-1", "tn-1", "read"))
+        .push(toolCall(3, "uzi_read", { path: "second.txt" }, "th-1", "tn-1", "read"))
+        .push(toolCall(4, "uzi_read", { path: "third.txt" }, "th-1", "tn-1", "read"))
+        .push(agentMessage("commentary replay barrier"));
+      await pullUntil(f.iter, "commentary"); await tick();
+      f.transport.push(agentMessage("commentary replay settled"));
+      await pullUntil(f.iter, "commentary");
+      await driveUntilReply(f, 4);
+      assert.deepEqual(f.order, ["shell:echo held", "read:second.txt"]);
+      assert.deepEqual(f.transport.responses.map(r => r.requestId), [2, 3, 4]);
+      const result = (id: number) => rec(rec(f.transport.responses.find(r => r.requestId === id)!.response).result);
+      assert.equal(result(2).success, true);
+      assert.deepEqual(JSON.parse((result(3).contentItems as { text: string }[])[0]!.text), { replay: true });
+      assert.equal(result(4).success, false);
+      assert.equal(f.registry.isPoisoned(), true);
+    } finally { await f.cleanup(); }
+  });
+
+  for (const end of ["abort", "requestStop", "EOF", "failure", "close"] as const) {
+    it(`${end} with admitted observation refuses only undispatched work and isolates late completion`, async () => {
+      const f = await fixture();
+      let pending: Promise<IteratorResult<HarnessEvent>> | undefined;
+      try {
+        f.transport.push(toolCall(2, "Read", { path: "first.txt" }, "th-1", "tn-1", "first"))
+          .push(toolCall(3, "Bash", { command: "pwd" }, "th-1", "tn-1", "pwd"))
+          .push(toolCall(4, "Read", { path: "second.txt" }, "th-1", "tn-1", "second"))
+          .push(agentMessage("commentary cleanup barrier"));
+        await pullUntil(f.iter, "commentary"); await f.readEntered.promise;
+        f.shell.release(); await tick();
+        assert.equal(f.registry.inFlightCallbackCount(), 1);
+        // Drain the shell projection, then suspend with the genuinely held Read.
+        await pullUntil(f.iter, "activity");
+        pending = f.iter.next(); await tick();
+        if (end === "EOF") f.transport.end();
+        else if (end === "failure") f.transport.fail(new Error("observation transport failure"));
+        else if (end === "abort") f.controller.abort();
+        else if (end === "requestStop") await f.turn.requestStop("cancel");
+        else await f.harness.close();
+        if (end === "EOF" || end === "failure")
+          await assert.rejects(withTimeout(pending, 1000, "observation failure"),
+            end === "EOF" ? /stream ended before turn completion/ : /observation transport failure/);
+        else {
+          let step = await withTimeout(pending, 1000, "observation stop");
+          for (let n = 0; !step.done && n < 10; n++) step = await withTimeout(f.iter.next(), 1000, "stop projection drain");
+          assert.equal(step.done, true);
+        }
+        assert.deepEqual(f.transport.responses.map(r => r.requestId).sort(), end === "close" ? [1] : [1, 3, 4]);
+        assert.equal(f.registry.inFlightCallbackCount(), 1, "harness refusal cannot settle broker-owned Read");
+        if (end === "abort" || end === "requestStop") {
+          const next = f.harness.startTurn(makeRequest()).events[Symbol.asyncIterator]();
+          // A reused turn has no initialized event: drive setup with an explicit
+          // note before releasing the old callback or delivering its terminal.
+          f.transport.push(agentMessage("commentary next turn ready"));
+          const events = await pullUntil(next, "commentary");
+          f.read.release(); await tick();
+          f.transport.push(turnCompleted("completed", undefined, "th-1", "tn-2"));
+          events.push(...await collect({ [Symbol.asyncIterator]: () => next }));
+          assert.equal(events.some(e => e.kind === "frame" && e.items.some(i => i.kind === "tool")), false, "no late projection in next turn");
+        } else {
+          f.read.release(); await tick();
+          assert.equal((await f.iter.next()).done, true);
+        }
+        assert.equal(f.registry.inFlightCallbackCount(), 0);
+        assert.equal(f.transport.responses.filter(r => r.requestId === 2).length, end === "close" ? 0 : 1);
+        assert.equal(f.transport.respondAttempts, 4, "each callback has exactly one reply owner");
+      } finally {
+        f.controller.abort(); f.shell.release(); f.read.release();
+        await f.harness.close();
+        await pending?.catch(() => {});
+        await f.cleanup();
+      }
+    });
+  }
 });
 
 describe("CodexHarness: root tool projection outbox (issue #1583)", () => {

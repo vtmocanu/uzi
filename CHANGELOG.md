@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Read Codex gate logs during commands ([#2903](https://github.com/vtmocanu/uzi/issues/2903)).**
+  Codex can read gate logs while a shell command runs; other effects/checkpoints remain ordered.
+
 - **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
   Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; remove a hand-set `workers.rollTargetVersion` when using the published chart's pin so a stale override cannot hold the next roll. Missing or conflicting image identity blocks chart publication.
 
