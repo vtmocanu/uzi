@@ -354,20 +354,26 @@ the stopped claim, and records the source as retained:
   not the journal, now attributes and protects the kept clone. If the clear never
   landed (a crash after the marker write), the next discovery finishes it.
 
-A clean clone whose HEAD is already anchored still tears down: the anchor is a
-tracking tip this run and generation owns, an owed pin of this run, or a commit
-already on the worker bare's default branch (a flight that never committed past
-its seed base), and every
-local ref of the clone, in any namespace, must point at a commit reachable from
+A stale or fenced stop keeps the clone even when it is clean and its HEAD is
+already anchored. The worker still checks coverage, and logs the verdict as a
+diagnostic only ("coverage verified (diagnostic only)"), because the check is a
+snapshot: a writer that writes and exits between the status read and the final
+process scan is invisible to it, and releasing the clone would delete that
+writer's bytes. The clone waits for explicit operator discard. A clone counts as
+covered when its HEAD is anchored (a tracking tip this run and generation owns,
+an owed pin of this run, or a commit already on the worker bare's default branch,
+for a flight that never committed past its seed base) and every
+local ref of the clone, in any namespace, points at a commit reachable from
 that HEAD or from a ref of the worker's bare repository, with no stash entry. A
 commit that only the clone holds (on another local branch, under a tag or under
-`refs/remotes/`) or a stash entry keeps the clone. Gitignored files are not covered by any capture, so they do not
-keep a clone that is otherwise anchored. Accepted residuals: commits reachable
+`refs/remotes/`) or a stash entry makes it not covered. Gitignored files are not covered by any capture, so they do not
+make a clone that is otherwise anchored not covered. Accepted residuals: commits reachable
 only from the reflog (for example after an agent's `git reset --hard`) are not
 counted as source, and a bare ref that justified coverage can later move (a
 forge force-push, pin settlement).
 
-Coverage is also refused, and the clone kept, in these cases:
+Coverage is also refused (`not_covered`) in these cases, which matter where coverage
+still gates release (recovery parks and terminal exits, below):
 
 - **Populated submodule.** A `.git/modules` store, or a gitlink path that holds
   anything but nothing or an empty directory, is never covered, even with
@@ -376,7 +382,8 @@ Coverage is also refused, and the clone kept, in these cases:
   submodule's own files, commits or refs.
 - **Late writer.** If the final process proof had to kill a writer, the earlier
   byte checks do not cover what it wrote. The residual is a writer that writes and
-  exits between the status read and that proof.
+  exits between the status read and that proof. Stopped exits no longer rely on
+  the check to release the clone for this reason; park and terminal exits still do.
 - **Docker teardown failed.** The proof scans processes only, so it is skipped
   unless the Docker half was `not_wired` or `docker_unconfirmed`.
 
@@ -394,8 +401,13 @@ path if the mode landed late. Consequences:
 - That key stays in attempt mode on that worker permanently, so later claims start
   a fresh model session; the work carries over through the tracking ref and
   checkpoints, not the old session.
-- While a run's marker exists, that run's later stops are never judged covered:
-  the clone is kept.
+- Every stale or fenced stop keeps its clone until an operator discards it, even
+  a clean one the bare already holds. Attempt-ledger `reclaimed` entries stay
+  until discard, so disk use grows per stop. On a worker with no Docker host,
+  every stopped canonical clone (even one stopped while planning, clean at its
+  seed base) persists the key's attempt mode. Stopped markers count toward the
+  per-run cap of 64; past it the record is `unknown` and the clone stays under
+  its plain journal.
 - A dirty kept clone keeps the run's hold open, so inspect routes it to
   `owner_hold_discard`.
 - The run's final inventory counts marker-kept paths. A missing one makes that
@@ -429,15 +441,15 @@ The source is kept in every fail-closed case, but what a later run sees differs:
   worker claims nothing until its container restarts; the next discovery then
   completes the detachment.
 
-Recovery parks and terminal-disk exits follow the same coverage rule. The worker
-decides once, when the recovery handler exits, whether the clone is covered, and
-tears it down only if it is; a capture taken earlier, remembered or degraded, never
-counts as proof. Which record a kept clone leaves depends on the exit:
+Recovery handler exits decide once, when the handler exits. A capture taken
+earlier, remembered or degraded, never counts as proof. Which record a kept clone
+leaves, and whether coverage can release it, depends on the exit:
 
 - **Exits that stop the flight** (a stopped confirm, another generation, a stale
-  park report) record the source as retained, as above.
+  park report) record the source as retained, as above, and keep it even when
+  covered; the verdict is diagnostic only.
 - **Parks** (`recovery_wait`, a live non-terminal status, shutdown) and **terminal
-  exits** keep the clone and its plain recovery journal with no `uzi-stopped` marker
+  exits** release a clone proven covered at the handler's exit; otherwise they keep the clone and its plain recovery journal with no `uzi-stopped` marker
   and no `reclaimed` entry; inspect lists a kept canonical clone as described below. A resume on the same worker recaptures bytes written
   after the earlier capture. A kept terminal clone is later moved by the next run's
   terminal-orphan handling, as before.

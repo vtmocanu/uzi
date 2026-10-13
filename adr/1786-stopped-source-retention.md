@@ -65,7 +65,7 @@ The artifact is the existing clone; nothing is copied.
   records retention whatever the proof returned. `preserveSession` is not newly set, so
   existing HOME cleanup still runs.
 
-### Coverage: when a stopped clone may still be torn down
+### Coverage: a diagnostic on stopped exits, the release gate on park and terminal exits
 
 `GitCache.verifyStoppedSourceCovered` runs under the bare lock, with the flight's execution
 tail excluding same-run successors, and is evaluated at the exit's cleanup, not when a
@@ -92,6 +92,22 @@ Recovery-handler exits below). It returns `covered` only if all of these hold:
 - the stopped-source proof's Docker half was `not_wired` or `docker_unconfirmed`. A failed
   Docker teardown (`docker_error`) skips the coverage check and keeps the clone, because the
   proof scans processes only.
+
+The verdict is a snapshot, and its final process scan cannot see a writer that writes and
+exits between the status read and the scan; the cleanup's retire (`discard: true`) would then
+delete that writer's bytes. So the verdict gates release only where the exit can still be
+resumed or recaptured:
+
+- **Stopped-source exits** (no handler: the generic `stale_claim`, `claim_fence`,
+  `running_ack_terminal` arms and a `terminal_disk_precheck` where the generation moved; or a
+  handler exit with `record: "stopped"`: a stop confirm, another generation, a stale park
+  report) keep the clone even when `retainStoppedSource` finds it `covered`. The verdict is
+  diagnostic only: it is logged ("stopped source: coverage verified (diagnostic only); the
+  clone is kept until explicit operator discard") and the retention log lines carry
+  `coverage: covered|not_covered|skipped`. The preserve latch stays and the retention record
+  is written as for any other stopped source; the clone waits for explicit operator discard.
+- **Park and terminal exits** (`record: "none"`) are unchanged: they release a clone proven
+  covered at the handler's exit.
 
 Status reads on a kept clone run with `GIT_OPTIONAL_LOCKS=0`, so they never rewrite its
 index stat cache.
@@ -206,14 +222,16 @@ positive server evidence that its run is terminal; an absent or released hold is
 site. A site only marks release as eligible (`markReleaseEligible`) or keeps the clone
 (`keepClone`); the handler's `finally` runs `settleCloneRelease` once, after the last
 possible writer on every return path, and that is the only place the clone can be released.
-It calls `retainStoppedSource` with the capture's `capturedHead`, and the clone goes only
-when `verifyStoppedSourceCovered` returns `covered` then. A remembered capture result, a
+It calls `retainStoppedSource` with the capture's `capturedHead`. On a park or terminal
+exit the clone goes only when `verifyStoppedSourceCovered` returns `covered` then; on an exit
+that stops the generation the verdict is diagnostic and the clone is kept either way (see
+Coverage above). A remembered capture result, a
 memo without a `capturedHead` (including the degraded `{ verified: false }` stub) and a
 check that throws are all `not_covered`: the clone is kept.
 
 The exit decides the representation of a source that is not covered:
 
-- **Stops this generation** (a `stop` confirm, an ownership read showing another
+- **Stops this generation** (kept even when covered; a `stop` confirm, an ownership read showing another
   generation, the terminal-disk recheck or the pre-handler precheck showing another
   generation, a stale park report, plus the M1 stale and fenced arms): the stopped-source
   record, as in M1 (attempt ledger `reclaimed` and the journal cleared; canonical
@@ -355,8 +373,20 @@ Every case keeps the source. What a later run sees depends on where the failure 
   (reported missing, never empty); PVC teardown loses both.
 - A key whose canonical clone was kept stays in attempt mode on that worker permanently, so
   later claims of the issue start a fresh model session; the work carries over through the
-  tracking ref and checkpoints. While a run's marker exists, that run's later stops are never
-  judged covered. A dirty kept clone keeps the run's hold, so its route is `owner_hold_discard`.
+  tracking ref and checkpoints. A dirty kept clone keeps the run's hold, so its route is
+  `owner_hold_discard`.
+- **Retention cost of keeping covered stopped clones.** Every stale or fenced stop keeps its
+  clone until an operator discards it, even a clean one the bare already holds. Attempt-ledger
+  `reclaimed` entries are permanent until discard, so disk use grows per stop. On a worker with
+  no Docker host every stopped canonical clone, even one stopped while planning and clean at
+  its seed base, persists the key's attempt mode, so later claims of that issue use fresh
+  attempt paths and fresh model sessions. Stopped markers count toward the per-run cap of 64;
+  past it the record is `unknown` and the clone stays under its plain journal.
+- **Deferred (not shipped):** writer exclusion spanning the final byte checks through retirement
+  disposal, which would let a covered stopped clone be released again. The same snapshot
+  residual remains on park and terminal exits. Persisting the coverage verdict into inspect
+  output is also not done; today it is in the worker log only. Decision: PRD
+  `prds/1786-preserve-worker-only-work.md`, Maintainer decision 6.
 - **Not shipped:** teardown of attributed containers is not proven by tests or hosted
   acceptance (tracked in #2747). The teardown code ships (`teardownDocker` force-removes
   containers mounting the clone and answers `docker_unconfirmed` only after two clean
