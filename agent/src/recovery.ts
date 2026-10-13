@@ -2631,9 +2631,12 @@ export class RecoveryCoordinator {
       for (const id of this.lastAttemptAt.keys()) if (!seen.has(id)) this.lastAttemptAt.delete(id);
       for (const id of this.pinCleanupBackoff.keys()) if (!seen.has(id)) this.pinCleanupBackoff.delete(id);
       for (const id of this.pendingReportLogged) if (!seen.has(id)) this.pendingReportLogged.delete(id);
-      // Executing runs are filtered BEFORE the per-pass cap so they cannot hold its slots.
+      // Executing runs and ACKs whose reports still need them are filtered BEFORE
+      // the cap. Deferred local cleanup must not displace a fresh upload or FINAL.
       const candidates = all
         .filter((r) => isLiveCandidate(r) && !opts.isExecuting(r.runId) &&
+          !(r.inventoryGuarded && r.finalAcknowledged && typeof r.generation === "number" &&
+            this.pendingGenerationReport?.(r.runId, r.generation)) &&
           (!credentialsBlocked || (r.inventoryGuarded && (r.finalAcknowledged || r.completionReceipt))))
         .sort((a, b) => (this.lastAttemptAt.get(a.captureId) ?? 0) - (this.lastAttemptAt.get(b.captureId) ?? 0))
         .slice(0, this.liveMaxPerPass);
