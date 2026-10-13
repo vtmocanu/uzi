@@ -421,7 +421,7 @@ describe("AdminHealth — All checks inventory (M4)", () => {
     await renderHealth(healthySilentDoc());
     expect(screen.getByText("21 of 21 passing")).toBeTruthy();
     // workers (5, fleet.rundisk and fleet.quarantine included), queue (2), control (4),
-    // integrations (3), housekeeping (6).
+    // integrations (3), housekeeping (7).
     // Exact per-string tallies: integrations reads "all 3 passing", control "all 4 passing".
     expect(screen.getAllByText("all 5 passing").length).toBe(1);
     expect(screen.getByText("all 7 passing")).toBeTruthy();
