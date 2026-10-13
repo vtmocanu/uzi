@@ -50,6 +50,7 @@
   - Compare queued runs with `uzi worker list --json`: flag full eligible online
     capacity from `active_runs` and `max_concurrent_runs`, accounting for harness,
     tier and repo eligibility. Missing eligibility or capacity fields are unknown.
+    Also compare `active_cross_checks` / `max_cross_check_slots`; surface a child waiting on cross-check slots on its parent.
   - Read `uzi schedule list --json`; flag fired one-shot schedules that linger.
     Verify their single-fire state from schedule timing/history; do not delete
     schedules or classify cron schedules as spent one-shots.
