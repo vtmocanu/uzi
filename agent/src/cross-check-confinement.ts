@@ -1,8 +1,20 @@
 import { CrossCheckMalformedError } from "./codex/cross-check.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 
+import type { IsolatedRefusalCode } from "./isolated-executor.js";
+
+const INIT_REFUSALS = {
+  init_tools: "init tools refused",
+  init_mcp: "init MCP servers refused",
+  init_plugin: "init plugin refused",
+  init_agents: "init agents refused",
+  init_skills: "init skills refused",
+  init_malformed: "malformed init frame",
+  content_before_init: "content before init verification",
+} satisfies Record<IsolatedRefusalCode, string>;
+
 const REFUSALS = {
-  frame_refused: "frame refused",
+  ...INIT_REFUSALS,
   no_init: "the SDK never reported its tool set (no init frame)",
   tool_unallowed: "unallowed tool block",
   tool_repeated: "repeated tool block",

@@ -8,7 +8,7 @@
 //   2. A matcher-less PreToolUse gate denies any tool outside that set and EVERY tool until the
 //      SDK's `system/init` frame has passed checkIsolatedInit (a latch that defaults to refuse).
 //   3. The init check itself: tools, MCP servers, plugins, agents and skills must be exactly the
-//      surface; guardIsolatedFrame refuses model output before a passing init.
+//      surface; guardIsolatedFrameRefusal refuses model output before a passing init.
 //   4. ONE path guard (buildIsolatedPreToolUse -> buildPathGuardHook) rooted at the checkout,
 //      worker credential paths and /run/uzi-secrets denied, plus Read of this session's own
 //      authenticated SDK spill file (sdkHomeDir). The checker appends only a pattern guard for
@@ -27,7 +27,7 @@ import {
   BUILTIN_PLUGINS_DISABLED,
   buildIsolatedPreToolUse,
   checkIsolatedInit,
-  guardIsolatedFrame,
+  guardIsolatedFrameRefusal,
   isolateSdkEnv,
   isolatedDisallowedTools,
   type InitGate,
@@ -128,7 +128,7 @@ function buildCheckerPatternGuard(log: Logger): (input: HookInput) => Promise<Ho
  * Assemble the SDK options of a read-only Claude checker session. Pure, exported so the suite
  * asserts the confinement on the built options and the composed hook list with no live session,
  * and stage-neutral (no plan-specific input) so the code stage can reuse it. `gate` is the init
- * latch the caller opens through guardIsolatedFrame.
+ * latch the caller opens through guardIsolatedFrameRefusal.
  */
 export function buildClaudeCrossCheckOptions(input: {
   cwd: string;
@@ -336,8 +336,8 @@ export class ClaudeCrossCheck {
         const msg = next.value;
         signal.throwIfAborted();
         budget?.assertWithinBudget();
-        const refusal = guardIsolatedFrame(msg, gate, CHECKER_SURFACE);
-        if (refusal) throw new CrossCheckConfinementError("frame_refused");
+        const refusal = guardIsolatedFrameRefusal(msg, gate, CHECKER_SURFACE);
+        if (refusal) throw new CrossCheckConfinementError(refusal.code);
         const frame = asRecord(msg);
         budget?.observe(frame);
         if (frame?.["type"] === "system" && frame["subtype"] === "init") {

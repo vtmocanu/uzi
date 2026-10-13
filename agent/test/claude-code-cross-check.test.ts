@@ -448,21 +448,27 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
 
-it("cross-check diagnostics use fixed categories after token deregistration and retain a prior cleanup failure", async () => {
+it("cross-check diagnostics use fixed categories after token deregistration and retain the prior failure when cleanup also fails", async () => {
   const sentinel = "sentinel-provider-secret-2869";
   const cases: { name: string; frames?: unknown[]; queryFailure?: boolean; returnFailure?: boolean; callbackMissing?: boolean; legacy?: boolean;
     subreason: string; prior?: string }[] = [
     ...[
-      { tools: ["Read", "Grep", sentinel] }, { plugins: [{ name: sentinel }] },
-      { agents: [sentinel] }, { skills: [sentinel] }, { mcp_servers: [{ name: sentinel }] },
-    ].map(over => ({ name: "hostile init", frames: [{ ...init, ...over }], subreason: "frame_refused" })),
-    { name: "early content", frames: [{ type: "assistant", message: { content: [{ type: "text", text: sentinel }] } }], subreason: "frame_refused" },
+      { over: { tools: ["Read", "Grep", sentinel] }, subreason: "init_tools" },
+      { over: { plugins: [{ name: sentinel }] }, subreason: "init_plugin" },
+      { over: { agents: [sentinel] }, subreason: "init_agents" },
+      { over: { skills: [sentinel] }, subreason: "init_skills" },
+      { over: { mcp_servers: [{ name: sentinel }] }, subreason: "init_mcp" },
+      { over: { tools: sentinel }, subreason: "init_malformed" },
+      { over: { agents: sentinel }, subreason: "init_malformed" },
+      { over: { skills: sentinel }, subreason: "init_malformed" },
+    ].map(({ over, subreason }) => ({ name: "hostile init " + subreason, frames: [{ ...init, ...over }], subreason })),
+    { name: "early content", frames: [{ type: "assistant", message: { content: [{ type: "text", text: sentinel }] } }], subreason: "content_before_init" },
     { name: "no init", frames: [], subreason: "no_init" },
     { name: "bad tool", frames: [init, { type: "assistant", message: { content: [{ type: "tool_use", id: "t", name: sentinel }] } }], subreason: "tool_unallowed" },
     { name: "repeat", frames: [init, ...[1, 2].map(() => ({ type: "assistant", message: { content: [{ type: "tool_use", id: "t", name: "Read" }] } }))], subreason: "tool_repeated" },
     { name: "budget", frames: [init, { type: "assistant", message: { content: [{ type: "tool_use", name: "Read" }] } }], subreason: "tool_budget" },
     { name: "query error plus cleanup", queryFailure: true, subreason: "cleanup_unconfirmed", prior: "unknown" },
-    { name: "init refusal plus cleanup", frames: [{ ...init, skills: [sentinel] }], returnFailure: true, subreason: "cleanup_unconfirmed", prior: "frame_refused" },
+    { name: "init refusal plus cleanup", frames: [{ ...init, skills: [sentinel] }], returnFailure: true, subreason: "cleanup_unconfirmed", prior: "init_skills" },
     { name: "callback", callbackMissing: true, subreason: "cleanup_callback_missing" },
     { name: "legacy error", legacy: true, subreason: "unknown" },
   ];
