@@ -191,6 +191,43 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
       assert.ok(api.isApplied(s.runId, row.id), "the reject is applied with the plan_rejected failed transition");
     }));
 
+  it("releaseAtGate waits for the shown plan when its POST follows the gate state", async (t) =>
+    scenario(async (s) => {
+      const post = client.postMessages.bind(client);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let entered!: () => void;
+      const posting = new Promise<void>((resolve) => { entered = resolve; });
+      let attempts = 0;
+      t.mock.method(client, "postMessages", async (...args: Parameters<typeof post>) => {
+        if (args[0] === s.runId && args[1].some((m) => m.kind === "plan" &&
+          (m.payload as { plan_md?: unknown }).plan_md === PLAN_V1)) {
+          if (++attempts === 1) {
+            entered();
+            throw new Error("initial plan delivery retry");
+          }
+          await held;
+        }
+        return post(...args);
+      });
+      const releasing = releaseAtGate(s, () => s.send(s.input("approve_plan", SELECTION))[0]!, "unacked");
+      void releasing.catch(() => undefined);
+      try {
+        await waitForTestEvent(posting, "initial plan POST entered");
+        assert.ok(await until(() => s.gates().length === 1), "gate state arrived while the plan POST is held");
+        assert.equal(api.messages(s.runId).some((m) => m.kind === "plan"), false);
+        assert.equal(s.rowsOf("approve_plan").length, 0, "no verdict before the plan is shown");
+      } finally {
+        release();
+        await releasing;
+      }
+      const flight = s.start(s.resumeClaim("kept"));
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.texts(flight)));
+      assert.equal(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), false);
+      assert.equal(api.humanPlanApproved(s.runId), true);
+    }));
+
   for (const verdict of ["approve_plan", "reject_plan"] as const) {
     it(`D5: a ${verdict} applied at a resumed gate gets one status line naming the verdict`, () =>
       scenario(async (s) => {

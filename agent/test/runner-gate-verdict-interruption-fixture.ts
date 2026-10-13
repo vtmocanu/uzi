@@ -645,6 +645,12 @@ export async function resumeAndApprove(s: Scenario, claim: ClaimResponse, select
 /** Park the first claim at its gate, then let a credential switch release it while `row` is sent. */
 export async function releaseAtGate(s: Scenario, send: () => UserInput, when: "unacked" | "acked"): Promise<{ first: Flight; row: UserInput }> {
   const first = await s.toFirstGate();
+  // The state report can precede the feed POST. Verdicts in this helper are for a
+  // plan the owner has seen; wait for that persisted frame, even when the claim
+  // intentionally omits resume_plan_at.
+  assert.ok(await until(() => api.messages(s.runId).some((m) =>
+    m.seq > first.seqFrom && m.kind === "plan" &&
+    (m.payload as { plan_md?: unknown }).plan_md === PLAN_V1)), "the initial plan frame is persisted before the verdict");
   if (when === "unacked") api.requestCredentialSwitch(s.runId, 1);
   else api.pendSwitchAfterNextAck(s.runId, 1);
   const row = send();
