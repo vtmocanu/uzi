@@ -218,6 +218,7 @@ func TestMemoryBindingCollisionAndOutcomeLiveDB(t *testing.T) {
 		user, repo := f.w.UserID, f.repo
 		if foreignTenant {
 			user, _, repo = f.e.seedCodexInfra(t)
+			f.ownUser(user)
 		}
 		wid := seedSnapshotWorker(t, f.e, user, "collision")
 		f.e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", wid, []string{capability.WorkerMemoryPressureV1})
@@ -395,7 +396,9 @@ func TestMemoryCrossCheckParentScopeLiveDB(t *testing.T) {
 					other := seedOutageRun(t, f.e, f.w.UserID, f.repo, f.w.ID, "running", "issue", 2, 0)
 					f.e.exec("UPDATE runs SET target_run_id=$2 WHERE id=$1", f.b.RunID, other)
 				case "tenant ownership":
-					f.e.exec(tc.sql, lead, f.e.seedUser(t))
+					user := f.e.seedUser(t)
+					f.ownUser(user)
+					f.e.exec(tc.sql, lead, user)
 				default:
 					if tc.sql != "" {
 						f.e.exec(tc.sql, lead)

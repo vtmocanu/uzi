@@ -16,17 +16,19 @@ import (
 )
 
 type memoryFixture struct {
-	e    codexTestEnv
-	s    *Service
-	w    store.Worker
-	b    MemoryBinding
-	repo uuid.UUID
+	e       codexTestEnv
+	s       *Service
+	w       store.Worker
+	b       MemoryBinding
+	repo    uuid.UUID
+	ownUser func(uuid.UUID)
 }
 
 func newMemoryFixture(t *testing.T) memoryFixture {
 	t.Helper()
 	e := setupCodexLiveDB(t)
 	user, _, repo := e.seedCodexInfra(t)
+	ownUser := memoryFixtureCleanup(t, e, user)
 	wid := seedSnapshotWorker(t, e, user, "memory-nonce")
 	e.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", wid, []string{capability.WorkerMemoryPressureV1})
 	run := seedOutageRun(t, e, user, repo, wid, "running", "issue", 2, 2)
@@ -35,9 +37,31 @@ func newMemoryFixture(t *testing.T) memoryFixture {
 	if err != nil {
 		t.Fatal(err)
 	}
-	return memoryFixture{e: e, s: snapshotSvc(e, testParams()), w: w, repo: repo,
+	return memoryFixture{e: e, s: snapshotSvc(e, testParams()), w: w, repo: repo, ownUser: ownUser,
 		b: MemoryBinding{RunID: run, WorkerID: wid, RegisterNonce: "memory-nonce",
 			ClaimGeneration: 2, MemoryEpisode: 0, InterventionID: uuid.New()}}
+}
+
+// Register after setupCodexLiveDB: LIFO cleanup removes data before pool.Close.
+// Only fresh fixture owners may be registered; their runs, repos and workers
+// belong to this serial fixture, including parents reassigned to another owner.
+func memoryFixtureCleanup(t *testing.T, e codexTestEnv, user uuid.UUID) func(uuid.UUID) {
+	t.Helper()
+	owners := []uuid.UUID{user}
+	t.Cleanup(func() {
+		// Match newCrossCheckContentionFixture's custody release before cascades:
+		// clear the RESTRICT live_run_id/live_worker_id bindings before cascades.
+		e.exec(`UPDATE recovery_custody_holds SET state='discarded',live_worker_id=NULL,live_run_id=NULL,
+			released_at=now(),updated_at=now() WHERE user_id=ANY($1) AND state='open'`, owners)
+		// Remove attempts before run cascades, avoiding ON DELETE SET NULL
+		// updates to cross-check snapshots and their shape checks.
+		e.exec(`DELETE FROM cross_checks WHERE lead_run_id IN (SELECT id FROM runs WHERE user_id=ANY($1))
+			OR checker_run_id IN (SELECT id FROM runs WHERE user_id=ANY($1))`, owners)
+		// Custody provenance has no owner FK, so owner deletion cannot remove it.
+		e.exec(`DELETE FROM recovery_custody_holds WHERE user_id=ANY($1)`, owners)
+		e.exec(`DELETE FROM users WHERE id=ANY($1)`, owners)
+	})
+	return func(user uuid.UUID) { owners = append(owners, user) }
 }
 
 func (f memoryFixture) reserve(t *testing.T, b MemoryBinding) MemoryReservation {

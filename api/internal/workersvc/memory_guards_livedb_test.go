@@ -17,6 +17,7 @@ import (
 func TestMemoryHoldNonOwnerGuardsLiveDB(t *testing.T) {
 	env := setupCodexLiveDB(t)
 	user, _, repo := env.seedCodexInfra(t)
+	memoryFixtureCleanup(t, env, user)
 	worker := seedSnapshotWorker(t, env, user, "exhaustion-guards")
 	run := seedOutageRun(t, env, user, repo, worker, "running", "issue", 2, 2)
 	env.exec("UPDATE runs SET checkpoint_tip=$2 WHERE id=$1", run, strings.Repeat("c", 40))

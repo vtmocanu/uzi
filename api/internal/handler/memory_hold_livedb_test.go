@@ -14,6 +14,13 @@ import (
 
 func TestMemoryHoldOwnerOnlyReleaseLiveDB(t *testing.T) {
 	fx := newEphemeralFixture(t, false)
+	// Cleanup runs before the pool closes; this test's resumed run must not
+	// become an unrelated candidate for later shared-database health scans.
+	t.Cleanup(func() {
+		if _, err := fx.pool.Exec(fx.ctx, "DELETE FROM users WHERE id=$1", fx.userID); err != nil {
+			t.Errorf("cleanup memory hold owner: %v", err)
+		}
+	})
 	worker := fx.onlineWorker("memory owner hold", true)
 	id := fx.queuedRun([]string{})
 	if _, err := fx.pool.Exec(fx.ctx, `UPDATE runs SET status='recovery_wait',

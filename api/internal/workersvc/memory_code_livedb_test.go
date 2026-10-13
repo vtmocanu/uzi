@@ -64,7 +64,9 @@ func TestMemoryCodeCheckerAuthorityLiveDB(t *testing.T) {
 			f.e.exec("UPDATE runs SET target_run_id=$2 WHERE id=$1", f.b.RunID, other)
 		}},
 		{"foreign parent", false, false, func(f memoryFixture, lead uuid.UUID) {
-			f.e.exec("UPDATE runs SET user_id=$2 WHERE id=$1", lead, f.e.seedUser(t))
+			user := f.e.seedUser(t)
+			f.ownUser(user)
+			f.e.exec("UPDATE runs SET user_id=$2 WHERE id=$1", lead, user)
 		}},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
