@@ -443,29 +443,41 @@ if (process.env.UZI_SCRATCH_PERMISSIONS_CHILD) {
       { kind: "own", name: "own-group setgid", gid: supported ? process.getgid!() : 0, mode: 0o2770, raw: true },
       { kind: "foreign", name: "foreign-group setgid", gid: foreignGid, mode: 0o2770, raw: true },
     ];
+    // Sets up an owned outer parent with the given group and mode, runs `children`, then checks
+    // the parent is unchanged and empty.
+    function withParent(parent: (typeof parents)[number], mask: number, children: string[]): void {
+      const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-"));
+      try {
+        fs.chownSync(outer, process.getuid!(), parent.gid!);
+        fs.chmodSync(outer, parent.mode);
+        const before = fs.statSync(outer);
+        assert.equal(before.gid, parent.gid);
+        assert.equal(before.mode & 0o7777, parent.mode);
+        const env = { UZI_SCRATCH_PARENT_KIND: parent.kind, UZI_SCRATCH_UMASK: String(mask) };
+        for (const child of children) runChild(outer, { ...env, UZI_SCRATCH_PERMISSIONS_CHILD: child });
+        const after = fs.statSync(outer);
+        assert.deepEqual([after.uid, after.gid, after.mode], [before.uid, before.gid, before.mode],
+          "parent ownership and mode remain unchanged");
+        assert.deepEqual(fs.readdirSync(outer), []);
+      } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+    }
+    const identitySkip = (parent: (typeof parents)[number]) =>
+      !supported ? "POSIX identity unavailable" : parent.gid === undefined ? "foreign supplementary group unavailable" : false;
     for (const parent of parents) {
       for (const mask of [0o002, 0o022]) {
-        const rawCase = parent.raw && (parent.kind !== "foreign" || mask === 0o002);
-        it(`${parent.name} parent with umask ${mask.toString(8)}: the scratch root is accepted${rawCase ? (parent.kind === "foreign" ? "; a raw root is refused" : "; a raw root is accepted") : ""}`, {
-          skip: !supported ? "POSIX identity unavailable" : parent.gid === undefined ? "foreign supplementary group unavailable" : false,
-        }, () => {
-          const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-"));
-          try {
-            fs.chownSync(outer, process.getuid!(), parent.gid!);
-            fs.chmodSync(outer, parent.mode);
-            const before = fs.statSync(outer);
-            assert.equal(before.gid, parent.gid);
-            assert.equal(before.mode & 0o7777, parent.mode);
-            const env = { UZI_SCRATCH_PARENT_KIND: parent.kind, UZI_SCRATCH_UMASK: String(mask) };
-            runChild(outer, { ...env, UZI_SCRATCH_PERMISSIONS_CHILD: "scratch" });
-            if (rawCase) runChild(outer, { ...env, UZI_SCRATCH_PERMISSIONS_CHILD: "raw" });
-            const after = fs.statSync(outer);
-            assert.deepEqual([after.uid, after.gid, after.mode], [before.uid, before.gid, before.mode],
-              "parent ownership and mode remain unchanged");
-            assert.deepEqual(fs.readdirSync(outer), []);
-          } finally { fs.rmSync(outer, { recursive: true, force: true }); }
-        });
+        // The own-group raw root is accepted on every POSIX platform; the foreign-group raw refusal
+        // is a Linux setgid-inheritance calibration and runs in its own Linux-only test below.
+        const rawCase = parent.raw && parent.kind !== "foreign";
+        it(`${parent.name} parent with umask ${mask.toString(8)}: the scratch root is accepted${rawCase ? "; a raw root is accepted" : ""}`, {
+          skip: identitySkip(parent),
+        }, () => withParent(parent, mask, rawCase ? ["scratch", "raw"] : ["scratch"]));
       }
+    }
+    {
+      const foreign = parents.find(p => p.kind === "foreign")!;
+      it("foreign-group setgid parent with umask 2: a raw root inherits the foreign group and is refused (Linux setgid calibration)", {
+        skip: process.platform !== "linux" ? "Linux setgid directory inheritance required" : identitySkip(foreign),
+      }, () => withParent(foreign, 0o002, ["raw"]));
     }
 
     for (const operation of ["chownSync", "chmodSync"]) {
