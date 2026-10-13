@@ -9,6 +9,7 @@ import (
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
 	"github.com/vtmocanu/uzi/api/internal/store"
+	"slices"
 	"strings"
 	"testing"
 )
@@ -221,8 +222,12 @@ func TestReportOnlyDeliveryMatrixLiveDB(t *testing.T) {
 					t.Fatal(err)
 				}
 				var done []string
-				if err := json.Unmarshal(ids, &done); err != nil || len(done) != 2 {
+				if err := json.Unmarshal(ids, &done); err != nil {
 					t.Fatalf("persisted union=%s err=%v", ids, err)
+				}
+				slices.Sort(done)
+				if !slices.Equal(done, []string{"m1", "m2"}) {
+					t.Fatalf("persisted union=%s want exactly [m1 m2]", ids)
 				}
 			}
 			if name == "NULL report retry" {
