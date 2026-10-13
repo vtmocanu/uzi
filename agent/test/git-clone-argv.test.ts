@@ -51,7 +51,8 @@ it("cloneBare terminates options before the repository and destination", async (
     const repoUrl = "-repository";
     const dest = path.join(fx.dataDir, "captured.git");
     const args = await captureBareClone(cache, repoUrl, dest);
-    assert.deepEqual(args, ["clone", "--bare", "--", repoUrl, dest]);
+    // issue #2886: the stored origin identity rides as one `-c key=value` operand, still before `--`.
+    assert.deepEqual(args, ["clone", "--bare", "-c", `uzi.cacheOrigin=${repoUrl}`, "--", repoUrl, dest]);
   } finally {
     fx.cleanup();
   }
