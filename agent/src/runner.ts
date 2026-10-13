@@ -3237,6 +3237,7 @@ export class RunRunner {
     const executionRejection: ExecutionRejection = { rejected: false };
     const dispatchFailure = async (failure: unknown, allowDiskDeferral = false): Promise<void> => {
       if (flight.completionHoldOutcome === "unresolved") {
+        await batcher.close().catch(() => undefined);
         runLog.warn("completion hold unresolved; retaining artifacts without terminal dispatch");
         return;
       }

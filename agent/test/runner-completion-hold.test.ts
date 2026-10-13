@@ -5,6 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Executor, RunContext } from "../src/executor.js";
+import { MessageBatcher } from "../src/batcher.js";
 import {
   api,
   fakeGitlab,
@@ -91,7 +92,15 @@ function seedHome(): { homeDir: string; sentinel: string; root: string } {
 }
 
 describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
-  it("ambiguous ACK + exact running snapshot retains clone and HOME without a terminal report, even after executor error", async () => {
+  it("ambiguous ACK + exact running snapshot retains clone and HOME without a terminal report, even after executor error", async (t) => {
+    const close = MessageBatcher.prototype.close;
+    let completedCloses = 0;
+    t.mock.method(MessageBatcher.prototype, "close", async function (
+      this: MessageBatcher, ...args: Parameters<MessageBatcher["close"]>
+    ) {
+      await close.apply(this, args);
+      completedCloses++;
+    });
     const { gitlab, calls } = fakeGitlab();
     const probe = makeHoldExecutor(true);
     const home = seedHome();
@@ -112,6 +121,7 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
         recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 100,
       }).execute(claim);
 
+      assert.equal(completedCloses, 1, "execute awaits real batcher close after the late error");
       assert.equal(probe.held.value, true, "running cannot fence a delayed hold POST");
       assert.deepEqual(api.ownershipRequests.slice(readsBefore), [claim.run_id], "one reconciliation read");
       assert.ok(!statuses(claim.run_id).some((status) => ["completed", "failed", "cancelled"].includes(status)));
