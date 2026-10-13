@@ -25,6 +25,26 @@ afterEach(() => {
 });
 
 describe("mutable agent source Health", () => {
+  it.each(["codex-only", "oidc", "run-progress", "judge-admin"])("seeds passing Health and stable card facts for unrelated scenario %s", async (scenario) => {
+    const api = await fresh(scenario);
+    const doc = await api.getAdminHealth();
+    expect(doc).toMatchObject({ status: "ok", blocking: false });
+    expect(doc.counts).toEqual({ ok: 21, warn: 0, danger: 0, unknown: 0, na: 0 });
+    expect(doc.checks).toHaveLength(21);
+    expect(doc.checks.every((c) => c.severity === "ok")).toBe(true);
+    expect(doc.checks.find((c) => c.id === "agentsource.update"))
+      .toMatchObject({ severity: "ok", summary: "Agent source is up to date." });
+    const card = (await api.getAgentSource()).agent_source;
+    expect(card.status.update_available).toBe(false);
+    expect(card.status.latest_ref).toBeUndefined();
+    expect(card.status.update_checked_at).toBeTruthy();
+    await api.getAdminHealth();
+    expect((await api.getAgentSource()).agent_source.status).toMatchObject({
+      update_available: false,
+      update_checked_at: card.status.update_checked_at,
+    });
+  });
+
   it.each(["health-first", "card-first"])("seeds once before either read (%s), then keeps a saved pin", async (order) => {
     const api = await fresh("agent-source-update");
     const health = order === "health-first" ? await api.getAdminHealth() : null;
@@ -84,8 +104,8 @@ describe("mutable agent source Health", () => {
       .toMatchObject({ severity, summary });
   });
 
-  it("default passing facts do not clobber edits or an explicit update check before Health reads", async () => {
-    const api = await fresh("");
+  it.each(["", "codex-only", "oidc", "run-progress", "judge-admin"])("passing facts in %s do not clobber edits or an explicit update check before Health reads", async (scenario) => {
+    const api = await fresh(scenario);
     await api.updateSettings({ agent_source_ref: "v1.3.0" });
     const checked = (await api.updateCheckAgentSource()).agent_source;
     window.history.replaceState({}, "", "/?mock=health-silent");

@@ -12,7 +12,8 @@ export let agentSource: AgentSourceView = structuredClone(mockAgentSource);
 // server's persist-facts/derive-at-read split: the update-check writes these, and
 // getAgentSource DERIVES update_available/latest_ref from them + the LIVE config at
 // read time — so a pin bump or apply self-clears the badge with no new egress. Null
-// outside the pre-checked demo seeds below, until an explicit check has run.
+// only in the test-only unchecked-source scenario until an explicit check has run;
+// other demos start with current passing facts or the agent-source-update newer tag.
 let agentSourceRemote: { latestRef: string; tipSha: string; checkedAt: string } | null = null;
 
 // Seed before either consumer can read, once per module lifetime. Later reads never
@@ -26,7 +27,7 @@ if (scenario === "agent-source-update") {
     tipSha: agentSource.staged!.fetched_sha,
     checkedAt: new Date().toISOString(),
   };
-} else if (scenario === "" || scenario.startsWith("health-")) {
+} else if (scenario !== "unchecked-source") {
   agentSourceRemote = {
     latestRef: agentSource.config.ref,
     tipSha: agentSource.status.last_applied_sha ?? "",
