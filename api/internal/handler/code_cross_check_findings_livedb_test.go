@@ -9,6 +9,7 @@ import (
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
 // Issue #2870: every code cross-check row the worker can read serializes findings as an array, never
@@ -73,6 +74,26 @@ func TestCodeCrossCheckFindingsNeverNullLiveDB(t *testing.T) {
 		}
 	}
 
+	t.Run("pending submit", func(t *testing.T) {
+		// A usable opposite-harness credential admits a real child instead of a failed row.
+		sealed := mustSealT(t.Context(), t, h.box, []byte("pending-submit-fixture"))
+		secret := uuid.New()
+		cliMustExec(t, pool, `INSERT INTO user_secrets(id,user_id,kind,label,is_default,ciphertext,sealed_with)
+ VALUES($1,$2,'openai_api_key','pending-submit',true,$3,'master')`, secret, owner, sealed)
+		if _, err := h.q.InsertCodexCredentialState(t.Context(), store.InsertCodexCredentialStateParams{UserSecretID: secret, UserID: owner, Status: "static"}); err != nil {
+			t.Fatal(err)
+		}
+		lead, _ := newLead()
+		body := `{"stage":"code","claim_generation":1,"base_commit":"` + strings.Repeat("a", 40) + `","head_commit":"` + strings.Repeat("b", 40) + `"}`
+		submitted := call(http.MethodPost, "/api/worker/runs/"+lead.String()+"/cross-checks", body)
+		assertArray(t, "pending submit", submitted, "pending", "")
+		storedNull(t, "pending submit", lead)
+		latest := status(lead)
+		assertArray(t, "pending submit latest", latest, "pending", "")
+		if submitted.Body.String() != latest.Body.String() {
+			t.Fatalf("pending submit and latest disagree: submit=%s latest=%s", submitted.Body.String(), latest.Body.String())
+		}
+	})
 	t.Run("pending", func(t *testing.T) {
 		lead, repo := newLead()
 		pendingRow(lead, repo, "running", "30 minutes")
