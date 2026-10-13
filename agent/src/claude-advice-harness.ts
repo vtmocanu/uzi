@@ -52,6 +52,12 @@ interface ClaudeAdviceInputs {
  *  field for it). buildSdkEnv passes an allowlist only, so it is set on the built env. */
 const MAX_OUTPUT_TOKENS_ENV = "CLAUDE_CODE_MAX_OUTPUT_TOKENS";
 
+/** Issue #2828: the ceiling on one advice response's accumulated text, in UTF-8 bytes. The same
+ *  8 MiB value as MAX_ADVICE_TEXT_BYTES in codex/codex-advice-harness.ts (see its rationale);
+ *  the two harnesses deliberately share no code. Exceeding it fails closed with a thrown error,
+ *  never a truncated result: a runaway or looping stream must not grow worker memory unbounded. */
+const MAX_ADVICE_TEXT_BYTES = 8 * 1024 * 1024;
+
 function rec(v: unknown): Record<string, unknown> | undefined {
   return typeof v === "object" && v !== null && !Array.isArray(v) ? (v as Record<string, unknown>) : undefined;
 }
@@ -240,6 +246,8 @@ export class ClaudeAdviceHarness implements AdviceHarness {
     if (request.thinking === "disabled") options.thinking = { type: "disabled" };
 
     let text = "";
+    // Running UTF-8 byte total of `text`; each chunk is measured once (see MAX_ADVICE_TEXT_BYTES).
+    let textBytes = 0;
     let terminalMsg: unknown;
     let terminalIsError = false;
     const rateLimits = new RateLimitObserver();
@@ -258,7 +266,16 @@ export class ClaudeAdviceHarness implements AdviceHarness {
       for (const em of mapSdkMessage(msg)) {
         if (em.kind === "text") {
           const t = (em.payload as { text?: string }).text;
-          if (t) text += t;
+          if (t) {
+            const chunkBytes = Buffer.byteLength(t, "utf8");
+            // Fail closed: the throw leaves the for-await like any other stream failure, so the
+            // caller never sees a truncated response. Usage was already published above.
+            if (textBytes + chunkBytes > MAX_ADVICE_TEXT_BYTES) {
+              throw new Error("advice response exceeded the maximum size");
+            }
+            textBytes += chunkBytes;
+            text += t;
+          }
         }
       }
       if (isResult(msg)) {

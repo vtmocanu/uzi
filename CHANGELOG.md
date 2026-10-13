@@ -40,6 +40,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **A runaway Claude advice response now fails closed at 8 MiB instead of growing worker memory without limit ([#2828](https://github.com/vtmocanu/uzi/issues/2828)).**
+  Claude judge, review and Now-summary passes stop with "advice response exceeded the maximum size" once the response text passes 8 MiB of UTF-8, matching the Codex advice harness; no truncated result is ever returned, and usage seen before the stop is still recorded.
+
 - **Hosted worker image rolls are now paced: one canary per owner pool proves itself before the rest roll ([#1470](https://github.com/vtmocanu/uzi/issues/1470)).**
   When the worker image or template changes, the singleton controller admits one canary per owner-specific pool and promotes it only after the replacement pod registers with its current identity and sends a fresh nonce-proven heartbeat; it then replaces the remaining workers a bounded number at a time (`workers.rollConcurrency`, default 1) while keeping usable capacity. A canary that never proves itself holds the roll instead of draining the rest (holding is not a rollback). Image-roll drains are tracked separately from maintenance and custody fences, and ephemeral workers are not paced. Initial provisioning accepts unknown version mappings only with explicit never-registered evidence and no replacement history; cleared pressure recycling releases only its own drain after independent fences clear. Roll out the API and migrations 00330, 00331 and 00332 first, then the controller (`workers.controller.replicaCount` 0 or 1), keeping the worker pin unchanged until the API's evidence support is verified.
 
