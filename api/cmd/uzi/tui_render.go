@@ -219,13 +219,14 @@ func displayHealth(health string) string {
 }
 
 // stateGlyphWord is the DISPLAY vocabulary for a run's state — a single-cell glyph and a
-// human word — shared by the board row, the board strip and the detail header so they can
-// never disagree (the baseline rendered `stalled` differently on the board and the header;
-// this is the single source that fixes that class of drift). The underlying status/health
-// strings still drive all logic, filtering and sorting; this only changes what is shown.
+// human word — shared by the board row, the board strip and the detail header for consistent
+// state precedence. Human stops use the compact word here; the detail header adds the full
+// reason. The underlying status/health strings still drive all logic, filtering and
+// sorting; this only changes what is shown.
 //
-// HEALTH OVERRIDE: except during recovery_wait, a WARN health flag (stalled/looping/slow) replaces the status token
-// entirely with ▲ + the health word, because a run that needs attention is what the board
+// HEALTH OVERRIDE: except for human stops and recovery_wait, a WARN health flag
+// (stalled/looping/slow) replaces the status token entirely with ▲ + the health word,
+// because a run that needs attention is what the board
 // is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
 // displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
 // every logic path still keys off the raw enum.
@@ -240,9 +241,10 @@ func displayHealth(health string) string {
 // #1766: "vault_locked" reads "vault wait" (the run is waiting for vault unlock). PRD #1809:
 // "data_volume_full" reads "disk wait" (the worker's data volume is full or nearly full).
 //
-// LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
-// whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
-// committed work is human-landable — while the glyph (✗) and the alarm COLOUR (in stateColor)
+// LANDING (issue #1418): landingState is the run's server-derived LandingState. After human
+// stops are resolved, a genuinely failed run whose value is "needs_landing" reads the word
+// "needs landing" instead of "failed" — its committed work is human-landable — while the
+// glyph (✗) and the alarm COLOUR (in stateColor)
 // stay the failed ones. It is a plain param (not folded into the cause variadic) so the two
 // status-specific qualifiers never share a slot; every other landing_state ("unrecoverable",
 // "none", "") reads as an ordinary failed run. landing_state is a closed server enum, so it is
@@ -323,9 +325,10 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	case "completed":
 		return "✓", "done"
 	case "failed":
-		// issue #1418: a failed run whose committed work is human-landable reads "needs
-		// landing"; the ✗ glyph and the alarm colour (stateColor) stay the failed ones, so it
-		// still reads as a failure that now has a recovery path. Other landing_state buckets
+		// issue #1418: after human stops are resolved, a genuinely failed run reads "needs
+		// landing" when its committed work is human-landable; the ✗ glyph and the alarm
+		// colour (stateColor) stay the failed ones, so it still reads as a failure that now
+		// has a recovery path. Other landing_state buckets
 		// ("unrecoverable"/"none"/"") read as an ordinary failed run.
 		if landingState == landingStateNeedsLanding {
 			return "✗", "needs landing"

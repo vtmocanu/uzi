@@ -87,8 +87,9 @@ func effectiveRunStatus(status string, isPlanning, isRevising bool) string {
 }
 
 // landingStateNeedsLanding is the one apitypes.RunDTO.LandingState bucket (issue #1418) the
-// CLI/TUI render specially: a `failed` run whose committed work is human-landable reads
-// "needs landing" instead of "failed". The other server-derived buckets ("unrecoverable",
+// CLI/TUI render specially: after human stops are resolved, a genuinely failed run
+// whose committed work is human-landable reads "needs landing" instead of "failed".
+// The other server-derived buckets ("unrecoverable",
 // "none") read as an ordinary failed run. Kept in sync with workersvc.DeriveLandingState's
 // enum on the wire.
 const landingStateNeedsLanding = "needs_landing"

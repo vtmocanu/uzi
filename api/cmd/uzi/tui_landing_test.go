@@ -8,7 +8,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// Issue #1418 M4: the shared status token must read "needs landing" for a `failed` run whose
+// Issue #1418 M4: these genuinely failed fixtures have no human stop reason.
+// The shared status token must read "needs landing" for a failed run whose
 // server-derived landing_state is "needs_landing" — its committed work is human-landable — while
 // keeping the ✗ glyph and the failed/alarm colour. Every other landing_state reads "failed".
 

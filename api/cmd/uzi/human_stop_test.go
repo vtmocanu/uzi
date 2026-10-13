@@ -4,7 +4,6 @@ import (
 	"bytes"
 	"fmt"
 	"os"
-	"path/filepath"
 	"strings"
 	"testing"
 	"time"
@@ -68,18 +67,27 @@ func TestHumanStopJSONBaseline(t *testing.T) {
 	if dir == "" {
 		t.Skip("scratch baseline directory required")
 	}
+	root, err := os.OpenRoot(dir)
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() {
+		if err := root.Close(); err != nil {
+			t.Error(err)
+		}
+	})
 	for i, args := range [][]string{{"run", "get", "reject", "--json"}, {"run", "list", "--json"}, {"admin", "runs", "--json"}} {
 		out, err, code := runCLI(t, fakeEnv(humanStopClient()), args...)
 		if code != 0 {
 			t.Fatalf("%v: %d %s", args, code, err)
 		}
-		path := filepath.Join(dir, fmt.Sprintf("command-%d.json", i))
+		name := fmt.Sprintf("command-%d.json", i)
 		if os.Getenv("UZI_HUMAN_STOP_CAPTURE") == "1" {
-			if err := os.WriteFile(path, []byte(out), 0600); err != nil {
+			if err := root.WriteFile(name, []byte(out), 0600); err != nil {
 				t.Fatal(err)
 			}
 		} else {
-			want, err := os.ReadFile(path)
+			want, err := root.ReadFile(name)
 			if err != nil {
 				t.Fatal(err)
 			}
@@ -295,16 +303,21 @@ func TestHumanStopNarrowBoards(t *testing.T) {
 				statusCol, credCol := -1, -1
 				for _, id := range []string{"cancel", "reject", "stop"} {
 					row := lineWith(t, out, " "+id+" ")
-					col := visualWidth(row[:strings.Index(row, "stopped")])
-					if statusCol >= 0 && col != statusCol {
-						t.Errorf("status columns %d/%d: %q", statusCol, col, row)
+					at := strings.Index(row, "stopped")
+					if at < 0 {
+						t.Errorf("width %d dark %t admin %t: stopped label missing for %s: %q", width, dark, admin, id, row)
+					} else {
+						col := visualWidth(row[:at])
+						if statusCol >= 0 && col != statusCol {
+							t.Errorf("status columns %d/%d: %q", statusCol, col, row)
+						}
+						statusCol = col
 					}
-					statusCol = col
-					at := strings.Index(row, "credential")
+					at = strings.Index(row, "credential")
 					if at < 0 {
 						t.Fatalf("credential fixture not rendered: %q", row)
 					}
-					col = visualWidth(row[:at])
+					col := visualWidth(row[:at])
 					if credCol >= 0 && col != credCol {
 						t.Errorf("credential columns %d/%d", credCol, col)
 					}
