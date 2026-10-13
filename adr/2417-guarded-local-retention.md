@@ -110,8 +110,16 @@ counts. No open sibling hold on that worker may remain. The negotiated
 `terminal_rejection_report` feature must still be available and registration
 must still identify the same worker after the read.
 
-- With pending authenticated guarded inventory, every exact hold must be
-  `discarded`. Mixed `released`/`discarded` holds do not suffice.
+- With pending authenticated guarded inventory, the generic custody path
+  requires every exact hold to be `discarded`. Mixed `released`/`discarded`
+  holds do not suffice for that path.
+  [ADR-2883](2883-acknowledged-final-report-retirement.md) adds a separate
+  ACK-final report-only exception for exact completed guarded ownership and
+  covering archive ACK, with fresh complete custody containing at least one
+  released exact hold. It permits positively missing attributed clone paths,
+  retains unresolved sources and publication reservations, and grants no
+  cleanup authority. [ADR-2652](2652-report-only-retirement.md)'s existing
+  physical archive proof, including its missing-clone refusal, is unchanged.
 - With absent recovery journals, every exact hold may be `released` or
   `discarded`, provided the exact authority checks above pass.
 

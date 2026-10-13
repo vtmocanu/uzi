@@ -54,6 +54,9 @@ through `[0.52.0]`.)
 - **Codex retains proven usage when cost accounting becomes incomplete ([#2878](https://github.com/vtmocanu/uzi/issues/2878)).**
   Proven token counters survive invalid usage and advancing cumulative regressions; affected model costs remain unreported, and a once-per-claim notice names the actual accounting cause and whether a proved baseline is available.
 
+- **Completed runs' pending reports can retire after restart loses their clones ([#2883](https://github.com/vtmocanu/uzi/issues/2883)).**
+  A separate report-only proof requires covering archive acknowledgment and fresh complete custody; unresolved recovery sources and publication reservations remain retained.
+
 ### Changed
 
 - **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**

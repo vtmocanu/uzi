@@ -25,7 +25,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 
 import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, type HeldFinalRetainedReason } from "./protocol.js";
-import { RequestError, isRunOwnershipLost } from "./client.js";
+import { RequestError, isRunOwnershipLost, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
@@ -213,7 +213,7 @@ export interface RecoveryOutcome {
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
  *  structurally; a test supplies a fake. */
 export interface RecoveryArchiveClient {
-  withAcknowledgedFinalReportCustody?: import("./client.js").WorkerClient["withAcknowledgedFinalReportCustody"];
+  withAcknowledgedFinalReportCustody?: WorkerClient["withAcknowledgedFinalReportCustody"];
   hasFeature?(feature: string): boolean;
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
