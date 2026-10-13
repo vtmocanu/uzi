@@ -1285,7 +1285,7 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
 
 // ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
 //
-// A stopped generation's clone is kept, not discarded, until it is proven preserved or an operator
+// A stopped generation's clone is kept, not discarded, until an operator
 // explicitly disposes of it. An ATTEMPT clone is retained through the ledger's never-deleted
 // `reclaimed` state (see attemptLedgerKey); a CANONICAL clone, which has no ledger identity, through
 // the bounded multi-valued bare-config marker `uzi-stopped.<runId>.entry` below. The marker grants

@@ -14996,7 +14996,7 @@ export class RunRunner {
               continue;
             case "stop":
               // #1247: the run moved on under this worker. Stop silently: no report. issue #1786: the
-              // successor claim cannot see this clone's bytes, so it is kept unless proven preserved.
+              // successor claim cannot see this clone's bytes, so it is kept (even when covered).
               runLog.info("credential recovery park: the claim moved on under this worker; stopping silently", {
                 run_id: flight.runId,
               });
@@ -15474,7 +15474,7 @@ export class RunRunner {
         } catch (reportError) {
           if ((credentialDeferred || opts.terminalDisk) && reportError instanceof StaleClaimError) {
             // #1247: the run moved on under this worker. Stop silently; issue #1786: the clone is kept
-            // unless proven preserved (no write through the stale claim).
+            // even when covered (no write through the stale claim).
             markReleaseEligible("recovery_park_report_stale", { stale: true, record: "stopped" });
             flight.preserveSession = false;
             return false;

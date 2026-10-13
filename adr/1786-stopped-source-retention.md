@@ -386,7 +386,7 @@ Every case keeps the source. What a later run sees depends on where the failure 
   disposal, which would let a covered stopped clone be released again. The same snapshot
   residual remains on park and terminal exits. Persisting the coverage verdict into inspect
   output is also not done; today it is in the worker log only. Decision: PRD
-  `prds/1786-preserve-worker-only-work.md`, Maintainer decision 6.
+  `prds/1786-preserve-worker-only-work.md`, Decision 6 (lander and reviewer).
 - **Not shipped:** teardown of attributed containers is not proven by tests or hosted
   acceptance (tracked in #2747). The teardown code ships (`teardownDocker` force-removes
   containers mounting the clone and answers `docker_unconfirmed` only after two clean
