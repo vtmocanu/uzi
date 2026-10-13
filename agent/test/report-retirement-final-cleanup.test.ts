@@ -6,10 +6,66 @@ import { installHarness, client, fx } from "./runner-harness.js";
 import { reportRetirementFixture } from "./report-retirement-fixture.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal } from "../src/terminal-resolve.js";
 import { nullLogger } from "./helpers.js";
+import { Worker } from "../src/worker.js";
+import { reportProofTiming } from "../src/report-proof-timing.js";
 
 installHarness();
 const linux = { skip: process.platform !== "linux" && "requires the real Linux inventory source boundary" };
 type Fixture = Awaited<ReturnType<typeof reportRetirementFixture>>;
+
+it("real FINAL ACK retires finalize before an archive proof can exhaust its authority deadline", linux, async t => {
+  const f = await reportRetirementFixture(t);
+  await f.outbox.journalFinalize(f.claim.run_id, 2);
+  await f.acknowledgeArchive();
+  await replay(f);
+  assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
+  assert.ok(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2));
+  assert.equal(await f.r.recoveryInventoryPending(f.claim.run_id, 2), false);
+  const restoreHeadroom = f.useHeadroom();
+  t.after(() => restoreHeadroom());
+  const timers = f.captureTimers(ms => ms === reportProofTiming.finalizeAuthorityMs());
+  t.after(() => timers.restore());
+  let expensiveProofs = 0;
+  t.mock.method(f.r, "retireRecoveryReport", async () => {
+    expensiveProofs++;
+    timers.fire();
+    return false;
+  });
+  const worker = new Worker({} as never, client, f.r, {} as never, {} as never, {} as never,
+    nullLogger(), () => ({ ok: true, missing: [] }), f.outbox, new Map(), f.registry);
+  await (worker as unknown as { sweepPendingFinalizes(): Promise<void> }).sweepPendingFinalizes();
+  assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined,
+    "the existing ACK clause must retire finalize before the alternative proof expires");
+  assert.equal(expensiveProofs, 0);
+  await f.r.resumePendingRecoveries(undefined, await f.coordinator.inspect(f.claim.run_id));
+  assert.deepEqual(await f.coordinator.inspect(f.claim.run_id), [], "retiring finalize permits final ACK cleanup");
+});
+
+it("without a FINAL ACK the worker still retires finalize through the real archive proof", linux, async t => {
+  const f = await reportRetirementFixture(t);
+  await f.outbox.journalFinalize(f.claim.run_id, 2);
+  await replay(f);
+  assert.equal(f.outbox.hasPendingTerminal(f.claim.run_id, 2), false);
+  assert.equal(await f.r.recoveryFinalAcknowledged(f.claim.run_id, 2), false);
+  assert.ok(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2));
+  const restore = f.useHeadroom();
+  t.after(restore);
+  const realProof = f.r.retireRecoveryReport.bind(f.r);
+  let attempts = 0;
+  t.mock.method(f.r, "retireRecoveryReport", async (...args: Parameters<typeof realProof>) => {
+    attempts++;
+    return realProof(...args);
+  });
+  const worker = new Worker({} as never, client, f.r, {} as never, {} as never, {} as never,
+    nullLogger(), () => ({ ok: true, missing: [] }), f.outbox, new Map(), f.registry);
+  await (worker as unknown as { sweepPendingFinalizes(): Promise<void> }).sweepPendingFinalizes();
+  assert.equal(attempts, 1, "archive-only authority remains reachable");
+  assert.equal(f.outbox.finalizeRecordIdentity(f.claim.run_id, 2), undefined);
+  assert.equal(f.calls.final, 0, "report retirement grants no FINAL or source release");
+  assert.deepEqual({ clone: f.calls.cloneCleanup, source: f.calls.sourceDelete, pins: f.calls.pinDelete },
+    { clone: 0, source: 0, pins: 0 }, "archive-only report proof does not delete sources");
+  assert.notEqual((await f.coordinator.inspect(f.claim.run_id)).find(row => row.captureId === f.archive.captureId)?.finalAcknowledged, true);
+});
 
 async function replay(f: Fixture, r = f.r, outbox = f.outbox) {
   const deps = makeTerminalOutboxDeps(outbox, client, { gapFillMax: 100,
