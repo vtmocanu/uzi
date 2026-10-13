@@ -1256,7 +1256,7 @@ export interface CodexAdviceHarnessBuildParams {
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
-   *  refreshCodex, for a caller that shares the run's credential (the Now summary). */
+   *  refreshCodex, for callers sharing the run's credential (Now, intent and plan summaries). */
   readonly refresh?: "deny";
 }
 

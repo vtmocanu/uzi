@@ -3,6 +3,13 @@ import assert from "node:assert/strict";
 import { execFileSync } from "node:child_process";
 import fs, { writeFileSync } from "node:fs";
 import path from "node:path";
+import { PassThrough } from "node:stream";
+import { createInterface } from "node:readline";
+import { CodexExecutor, type CodexExecutorDeps } from "../src/codex/codex-executor.js";
+import { createCodexTransport } from "../src/codex/transport.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
+import type { ExecutorResult } from "../src/executor.js";
 import { type SDKMessage, type SpawnOptions } from "@anthropic-ai/claude-agent-sdk";
 import { spawnDetached } from "../src/sdk-spawn.js";
 import { nullLogger } from "./helpers.js";
@@ -28,6 +35,7 @@ import {
   planWithMilestonesThenDoneQuery,
   resultOk,
   runner,
+  runnerWith,
   simulateCommittedWork,
   waitDead,
   worktreeDirFor,
@@ -188,6 +196,159 @@ describe("approval waiter", () => {
       await wait.execution;
     }
   });
+});
+
+// Script only the external app-server peer; the real transport, Codex hooks and runner
+// gate own framing, revision, persistence and callback ordering.
+function summaryPlanProvider(plans: string[]): NonNullable<CodexExecutorDeps["launchProviderRoot"]> {
+  let turns = 0;
+  return async () => {
+    const inbound = new PassThrough();
+    const outbound = new PassThrough();
+    const lines = createInterface({ input: outbound });
+    const frame = (value: unknown) => inbound.write(JSON.stringify(value) + "\n");
+    lines.on("line", line => {
+      const request = JSON.parse(line);
+      if (!request.method || request.id === undefined) return;
+      let result: unknown = {};
+      if (request.method === "initialize")
+        result = { userAgent: "codex/test", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
+      else if (request.method === "account/login/start") result = { type: request.params.type };
+      else if (request.method === "thread/start" || request.method === "thread/resume")
+        result = { thread: { id: "summary-thread" } };
+      else if (request.method === "turn/start") {
+        const index = turns++;
+        const turnId = `summary-turn-${index}`;
+        result = { turn: { id: turnId } };
+        frame({ id: 100 + index, method: "item/tool/call", params: {
+          threadId: "summary-thread", turnId, callId: `summary-call-${index}`,
+          tool: index < plans.length ? "submit_plan" : "signal_done",
+          arguments: index < plans.length ? { plan_md: plans[index] } : { report_only: true, summary: "Done" },
+        } });
+        frame({ method: "turn/completed", params: {
+          threadId: "summary-thread", turn: { id: turnId, status: "completed" },
+        } });
+      }
+      frame({ id: request.id, result });
+    });
+    return {
+      root: { kind: "provider", reap: async () => ({ ok: true }), dispose: async () => {
+        lines.close(); outbound.destroy(); inbound.destroy();
+      } },
+      transport: createCodexTransport({ inbound, outbound }), supervisorPid: 1234,
+    };
+  };
+}
+
+describe("2833 M3 runner Codex summary persistence", () => {
+  for (const mode of ["initial", "revised", "replacement-failed", "replacement-409", "autopilot"] as const) {
+    it(`2833 M3 ${mode}: summaries follow durable human gates and only accepted replacement reaches result`, async () => {
+      const revised = mode.startsWith("replacement") || mode === "revised";
+      const plans = revised ? ["Initial\u0000 plan", "Revised\u0000 plan"] : ["Initial\u0000 plan"];
+      const { gitlab } = fakeGitlab();
+      const codex = { auth_mode: "api_key", access_token: "fixture-codex-access", capability: "fixture-codex-capability" };
+      const claim = gitlabClaim(2833, {
+        auto_approve: mode === "autopilot", summary_intent: "Existing intent",
+        secrets: { forge_pat: "fixture-forge-pat-000000", codex },
+      });
+      const selected = selectCodexBinding({ codex });
+      assert.equal(selected.kind, "codex");
+      if (selected.kind !== "codex") throw new Error("invalid fixture binding");
+      api.codexAuthModes.set(claim.run_id, "api_key");
+      let presentations = 0;
+      api.onState(claim.run_id, body => {
+        if (body.status !== "awaiting_approval") return;
+        presentations++;
+        api.appendInputs(claim.run_id, [input(revised && presentations === 1 ? "revise_plan" : "approve_plan",
+          revised && presentations === 1 ? "Revise the plan" : undefined)]);
+      });
+      const observations: { generated: string; persisted: string | undefined; status: string | undefined }[] = [];
+      const attempts: { guard: string; persisted: string | undefined; status: string | undefined }[] = [];
+      const accepted: string[] = [];
+      const callbacks: string[] = [];
+      let result: ExecutorResult | undefined;
+      // This public client seam models the summary endpoint's exact stale-write guard.
+      // Record successes separately; a swallowed mismatch/HTTP error cannot look green.
+      client.postPlanSummary = async (_runId, body: Parameters<WorkerClient["postPlanSummary"]>[1]) => {
+        const state = api.states.filter(s => s.runId === claim.run_id && s.body.plan_md !== undefined).at(-1)?.body;
+        attempts.push({ guard: body.plan_md, persisted: state?.plan_md, status: state?.status });
+        if (state?.plan_md !== body.plan_md || mode === "replacement-409" && attempts.length === 2)
+          throw new RequestError("POST", "/summary/plan", 409, "superseded plan");
+        if (mode === "replacement-failed" && attempts.length === 2)
+          throw new RequestError("POST", "/summary/plan", 500, "summary persistence failed");
+        accepted.push(body.summary);
+      };
+      const deps: CodexExecutorDeps = {
+        launchProviderRoot: summaryPlanProvider(plans),
+        launchEffectRoot: async () => ({
+          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+            nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+          supervisorPid: 200,
+          transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
+          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+          waitChild: async () => ({ event: "child_exit", code: 0 }),
+          dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
+          failed: undefined, whenFailed: new Promise<Error>(() => {}),
+        }),
+        wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
+        sessionStore: {
+          adopt: async () => ({ files: 0 }), inspect: async () => "absent",
+          remove: async () => {}, persist: async () => ({ files: 0, bytes: 0 }),
+        },
+        spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+        provisionRunTools: async () => ({ toolEnv: {} }),
+        installDeps: async () => ({ results: [], truncated: false }),
+        idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
+      };
+      await runnerWith(() => {
+        const executor = new CodexExecutor(nullLogger(), homeDir, {
+          binding: selected.binding, client,
+          provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
+          summaryRunner: {
+            generateIntentSummary: async () => null,
+            generatePlanSummary: async ({ planMd }) => {
+              const state = api.states.filter(s => s.runId === claim.run_id && s.body.plan_md !== undefined).at(-1)?.body;
+              observations.push({ generated: planMd, persisted: state?.plan_md, status: state?.status });
+              return { summary: `Summary ${observations.length}`, deltas: [] };
+            },
+          },
+        }, deps);
+        return { executor: { run: async ctx => {
+          const gate = ctx.gatePlan!;
+          result = await executor.run({ ...ctx, gatePlan: (md, milestones, callback, settles) =>
+            gate(md, milestones, callback && (async persisted => {
+              callbacks.push(persisted);
+              await callback(persisted);
+            }), settles),
+          });
+          return result;
+        } } };
+      }, gitlab).execute(claim);
+      // All assertions are outside the runner/executor's swallowed advisory callbacks.
+      assert.ok(result, JSON.stringify(api.states));
+      assert.equal(api.states.at(-1)?.body.status, "completed");
+      const durable = plans.map(plan => plan.replaceAll("\u0000", ""));
+      if (mode === "autopilot") {
+        assert.deepEqual(callbacks, []);
+        assert.deepEqual(observations, []);
+        assert.deepEqual(attempts, []);
+        assert.deepEqual(accepted, []);
+        assert.equal(result.summaryPlan, undefined);
+        assert.ok(api.states.some(s => s.body.status === "running" && s.body.plan_md === durable[0]));
+        assert.equal(presentations, 0);
+      } else {
+        assert.deepEqual(callbacks, plans);
+        assert.deepEqual(observations, plans.map((generated, i) => ({
+          generated, persisted: durable[i], status: "awaiting_approval",
+        })));
+        assert.deepEqual(attempts, durable.map(guard => ({ guard, persisted: guard, status: "awaiting_approval" })));
+        const failed = mode.startsWith("replacement");
+        assert.deepEqual(accepted, revised && !failed ? ["Summary 1", "Summary 2"] : ["Summary 1"]);
+        assert.equal(result.summaryPlan, failed ? undefined : revised ? "Summary 2" : "Summary 1");
+        assert.equal(presentations, plans.length);
+      }
+    });
+  }
 });
 
 describe("RunRunner — plan gate + steering end to end", () => {

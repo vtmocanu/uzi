@@ -45,6 +45,9 @@ through `[0.52.0]`.)
 - **An uncertain completion-hold response now preserves the worker's local work ([#2816](https://github.com/vtmocanu/uzi/issues/2816)).**
   The worker makes one bounded ownership read after an ambiguous hold response and retains the clone, session and recovery evidence unless explicit refusal or exact-generation unheld terminal proof permits cleanup. Unresolved holds end nonterminal without a competing failure report; post-permit holds retain verified local capture while skipping the optional nested remote checkpoint. Automatic recovery depends on active snapshot availability; retained artifacts remain available for owner action.
 
+- **Codex issue runs get intent and human-gate plan summaries on their own credential (#2833).**
+  Codex issue runs now show intent summaries and plan summaries with divergence deltas at initial and revised human approval gates. They use the run's own credential on `gpt-6-luna` with low effort; advisory failures leave the run outcome unchanged.
+
 ### Changed
 
 - **The bundled Codex runtime moves from 0.160.0 to 0.160.1 ([#2819](https://github.com/vtmocanu/uzi/pull/2819)).**

@@ -1604,7 +1604,10 @@ export class FakeApi {
       res.end(raw.body);
       return;
     }
-    const body = json as unknown as StateRequest;
+    const body = { ...json } as unknown as StateRequest;
+    // Mirror worker state decoding: PostgreSQL plans persist without NUL bytes.
+    // worker_messages_poison_livedb_test.go exercises this server contract.
+    if (body.plan_md !== undefined) body.plan_md = body.plan_md.replaceAll("\u0000", "");
     const typedRefusal = this.typedParkRefusal.get(runId);
     if (typedRefusal !== undefined && typedRefusal.remaining > 0 && body.recovery_cause === "provider_outage") {
       typedRefusal.remaining--;
