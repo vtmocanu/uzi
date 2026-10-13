@@ -62,7 +62,7 @@ func TestTriggerSourceThreadedByCreateRunFamily(t *testing.T) {
 
 	t.Run("CreateAutopilotRun stamps autopilot", func(t *testing.T) {
 		fs := newFS()
-		if _, err := New(fs, newBox(t), testParams()).CreateAutopilotRun(ctx, user, repo, 1, "desc"); err != nil {
+		if _, err := New(fs, newBox(t), testParams()).CreateAutopilotRun(ctx, user, repo, 1, "desc", nil); err != nil {
 			t.Fatalf("CreateAutopilotRun: %v", err)
 		}
 		assertStamp(t, fs, "autopilot")

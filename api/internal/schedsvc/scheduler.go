@@ -126,11 +126,11 @@ type RunCreator interface {
 	// plan gate still requires a human (see workersvc.CreateScheduledRun). Eligibility is
 	// the single uzi_label gate (PRD #764 M1); a PRD link is no longer required.
 	CreateScheduledRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, seed *workersvc.SeededPlan, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
-	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error)
+	CreateAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error)
 	// CreateScheduledAutopilotRun is the auto-approve scheduled path (PRD #274 Decision
 	// 1a): like CreateAutopilotRun but it HONOURS the schedule's persisted wait_on_limit
 	// instead of the owner default. It is a distinct method so the poller's
-	// CreateAutopilotRun seam stays untouched (see workersvc.CreateScheduledAutopilotRun).
+	// CreateAutopilotRun inherits owner defaults (see workersvc.CreateScheduledAutopilotRun).
 	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
 	// ResolveHarnessForUser resolves the harness a user's next run WOULD get under D11 (PRD #1429
@@ -549,7 +549,7 @@ func (e *Scheduler) fireIssue(ctx context.Context, sched store.RunSchedule) (Fir
 		return FireOutcome{}, fmt.Errorf("get issue %d: %w", iid, err) // transient forge error
 	}
 	issue := capture.Issue
-	return e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+	return e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL, capture, repo.ForgeProjectID)
 }
 
 // fireSweep resolves the label selector (an empty/NULL selector defaults to the PRD
@@ -756,7 +756,7 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			continue
 		}
 		issue := capture.Issue
-		res, err := e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL)
+		res, err := e.createIssueRun(issueinput.WithCapture(ctx, capture), sched, repo.ID, iid, issue.Title, issue.Description, issue.WebURL, capture, repo.ForgeProjectID)
 		if holdsOnceCredentialDisabled(sched, err) {
 			// PRD #1732 D2: the schedule-wide pin is disabled, so every candidate would be
 			// refused the same way. A one-time sweep that has started nothing yet is held
@@ -944,8 +944,8 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 //
 // Wait-on-limit (PRD #274 Decision 1a, revising PRD #241 Decision 2): BOTH branches now
 // thread the schedule's persisted wait_on_limit. The auto-approve branch fires through
-// CreateScheduledAutopilotRun (NOT the poller's CreateAutopilotRun, whose seam stays
-// untouched so label-driven autopilot keeps taking the owner default); the non-auto
+// CreateScheduledAutopilotRun (rather than the poller's CreateAutopilotRun, which inherits
+// the owner default); the non-auto
 // branch fires through CreateScheduledRun. So a schedule's explicit wait_on_limit takes
 // effect regardless of auto_approve.
 //
@@ -956,14 +956,27 @@ func (e *Scheduler) firePrompt(ctx context.Context, sched store.RunSchedule) (Fi
 // MaxIssueDescriptionBytes, so guidance never turns a runnable issue into a silent
 // ErrDescriptionTooLarge skip. It is purely additive: the eligibility gate reads the
 // cached issue's uzi_label (PRD #764 M1) and never sees the composed text.
-func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, webURL string) (FireOutcome, error) {
+func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule, repoID uuid.UUID, iid int64, title, description string, webURL string, capture *issueinput.Capture, projectID int64) (FireOutcome, error) {
 	iidCopy := iid
+	selection, err := workersvc.ResolveIssueHarness(capture, projectID, iid, scheduleHarness(sched))
+	if err != nil {
+		var reason SkipReason
+		switch {
+		case errors.Is(err, workersvc.ErrHarnessLabelInvalid):
+			reason = SkipReason("harness_label_invalid")
+		case errors.Is(err, workersvc.ErrHarnessLabelConflict):
+			reason = SkipReason("harness_label_conflict")
+		default:
+			return FireOutcome{}, err
+		}
+		return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil
+	}
 
 	desc := composeRunDescription(description, guidanceOf(sched))
 
 	// PRD #1429 M2 (D5): a null-harness schedule with a stored Anthropic override that now resolves
 	// to Codex fails closed with a legible Skip — no run, override untouched, no fallback.
-	if conflict, cerr := e.codexOverrideConflict(ctx, sched); cerr != nil {
+	if conflict, cerr := e.issueCodexOverrideConflict(ctx, sched, selection); cerr != nil {
 		return FireOutcome{}, cerr // transient (D11 read error)
 	} else if conflict {
 		e.logger.Info("scheduler: issue fire codex+override conflict, skipping", "schedule", sched.ID.String(), "issue", iid)
@@ -972,17 +985,15 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 
 	waitOnLimit := sched.WaitOnLimit
 	var run store.Run
-	var err error
 	if sched.AutoApprove {
 		// CreateScheduledAutopilotRun, NOT the poller's CreateAutopilotRun: a scheduled
 		// auto-approve run carries a persisted per-schedule wait_on_limit that must take
-		// effect (PRD #274 Decision 1a). Leaving the poller seam untouched is a structural
-		// guarantee that label-driven autopilot behaviour is unchanged.
+		// effect (PRD #274 Decision 1a); the poller inherits the owner's default.
 		// PRD #841 M2: the schedule's stored mr_rework override stamps onto the run
 		// (nil ⇒ inherit the owner default live).
 		// PRD #1247 M6: the schedule's stored credential override is threaded here
 		// (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), scheduleHarness(sched))
+		run, err = e.runs.CreateScheduledAutopilotRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), scheduleCredentialOverride(sched), selection.Explicit)
 	} else {
 		// CreateScheduledRun is the non-auto-approve scheduled seam. Post-PRD #764 M1 it
 		// and the interactive CreateRun apply the SAME single uzi_label eligibility gate —
@@ -994,7 +1005,7 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// (nil ⇒ inherit the owner default live).
 		// trailing seed=nil (no seeded plan for a scheduled issue run); PRD #1247 M6 threads
 		// the schedule's stored credential override (nil ⇒ inherit the worker binding).
-		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), scheduleHarness(sched))
+		run, err = e.runs.CreateScheduledRun(ctx, sched.UserID, repoID, iid, desc, &waitOnLimit, scheduleMrRework(sched), scheduleModel(sched), scheduleOverrideSubagentModel(sched), nil, scheduleCredentialOverride(sched), selection.Explicit)
 	}
 
 	if err == nil {
@@ -1024,6 +1035,20 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 	// un-advanced (process's quiet hold, not advance's transient arm) instead of being consumed
 	// by the skip. For a sweep the pin is schedule-wide, so fireSweep returns this error for the
 	// whole fire unless the fire already started a run.
+	// An unpinned label selects one sweep candidate, not the entire schedule.
+	// Stored-override disabled errors still take the existing once hold/stop path.
+	if selection.LabelSelected && sched.Target != "issue" && !errors.Is(err, workersvc.ErrCredentialDisabled) {
+		var reason SkipReason
+		switch {
+		case errors.Is(err, workersvc.ErrHarnessCredentialDisabled):
+			reason = SkipCredentialDisabled
+		case errors.Is(err, workersvc.ErrNoCredentialForHarness), errors.Is(err, workersvc.ErrNoUsableCredential):
+			reason = SkipNoUsableCredential
+		}
+		if reason != "" {
+			return FireOutcome{Matched: 1, Skips: []Skip{{IssueIID: &iidCopy, Title: title, Reason: reason, WebURL: webURL}}}, nil
+		}
+	}
 	if holdsOnceCredentialDisabled(sched, err) {
 		return FireOutcome{}, err
 	}
@@ -1449,6 +1474,14 @@ func (e *Scheduler) codexOverrideConflict(ctx context.Context, sched store.RunSc
 		return false, err
 	}
 	return h == workersvc.HarnessCodex, nil
+}
+
+// issueCodexOverrideConflict keeps actual-pin exemptions separate from label selection.
+func (e *Scheduler) issueCodexOverrideConflict(ctx context.Context, sched store.RunSchedule, selection workersvc.IssueHarnessSelection) (bool, error) {
+	if selection.LabelSelected {
+		return selection.Explicit != nil && *selection.Explicit == workersvc.HarnessCodex && scheduleCredentialOverride(sched) != nil, nil
+	}
+	return e.codexOverrideConflict(ctx, sched)
 }
 
 // truncateUTF8 returns the longest prefix of s that is at most n bytes AND does not split

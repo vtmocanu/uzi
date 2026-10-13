@@ -418,19 +418,19 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	// false force: the scheduled seam never forces a run creation (issue #856).
 	// credOverride captured (PRD #1247 M6): proves the non-auto path threads the schedule's
 	// stored override onto the run. explicit captured (PRD #1429 M2, D5): proves it threads
-	// scheduleHarness(sched).
+	// the effective pin or fresh issue-label selection.
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
+func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
 	// satisfied even though the scheduler no longer calls it. nil credOverride (PRD #1247).
-	// nil explicit (PRD #1429 M2): the poller seam has no per-schedule harness pin either.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, nil})
+	// explicit is the poller's ephemeral issue-label selection.
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
@@ -490,7 +490,8 @@ type fakeForge struct {
 	// getIID logs every candidate iid GetIssue was called for, in order (issue #416): the
 	// examined-count / forge-call-bound assertions read it. A candidate skipped by the
 	// active-run pre-check never reaches GetIssue, so it is absent here.
-	getIID []int64
+	getIID      []int64
+	labelsByIID map[int64][]string
 
 	// self_improve tracking-issue resolution (PRD #590 M1): ListIssues returns listResult;
 	// CreateIssue is only called when no OPEN listResult issue exists, and it records the
@@ -519,6 +520,9 @@ func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue
 	f.getIID = append(f.getIID, iid)
 	issue := f.issue
 	issue.IID = iid
+	if labels, ok := f.labelsByIID[iid]; ok {
+		issue.Labels = labels
+	}
 	if issue.AuthorForgeUserID == 0 {
 		issue.AuthorForgeUserID = 2
 	}

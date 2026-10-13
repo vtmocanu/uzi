@@ -134,7 +134,7 @@ func TestTriggerSourceStampedLiveDB(t *testing.T) {
 	r, err = svc.CreateScheduledRun(ctx, userID, repoID, 202, "desc", &waitFalse, nil, nil, false, nil, nil, nil)
 	assert(t, "CreateScheduledRun", "schedule", r, err)
 
-	r, err = svc.CreateAutopilotRun(ctx, userID, repoID, 203, "desc")
+	r, err = svc.CreateAutopilotRun(ctx, userID, repoID, 203, "desc", nil)
 	assert(t, "CreateAutopilotRun", "autopilot", r, err)
 
 	r, err = svc.CreateScheduledAutopilotRun(ctx, userID, repoID, 204, "desc", &waitFalse, nil, nil, false, nil, nil)

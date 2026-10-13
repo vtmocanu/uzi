@@ -4958,7 +4958,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 	// refused with ErrNotPRDIssue on the autopilot path too.
 	fsNoLabel := &fakeStore{issueByID: store.Issue{Title: "T", Labels: labelsJSON(t, "documentation")}}
 	svc := New(fsNoLabel, newBox(t), testParams())
-	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc"); err != ErrNotPRDIssue {
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc", nil); err != ErrNotPRDIssue {
 		t.Fatalf("err = %v, want ErrNotPRDIssue (autopilot must enforce the same gate)", err)
 	}
 
@@ -4969,7 +4969,7 @@ func TestCreateAutopilotRunSetsAutoApproveAndSharesGates(t *testing.T) {
 		createRunResult: store.Run{ID: uuid.New()},
 	}
 	svc = New(fs, newBox(t), testParams())
-	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "the description"); err != nil {
+	if _, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "the description", nil); err != nil {
 		t.Fatalf("CreateAutopilotRun: %v", err)
 	}
 	if fs.createRunParams == nil {
@@ -5063,7 +5063,7 @@ func TestCreateRunRejectsOversizeDescription(t *testing.T) {
 	}
 
 	fsAuto := &fakeStore{issueByID: store.Issue{Title: "T", Labels: uziLabels(), HasPrdLink: true}}
-	if _, err := New(fsAuto, newBox(t), testParams()).CreateAutopilotRun(context.Background(), user, repo, 4, big); err != ErrDescriptionTooLarge {
+	if _, err := New(fsAuto, newBox(t), testParams()).CreateAutopilotRun(context.Background(), user, repo, 4, big, nil); err != ErrDescriptionTooLarge {
 		t.Fatalf("CreateAutopilotRun err = %v, want ErrDescriptionTooLarge", err)
 	}
 
