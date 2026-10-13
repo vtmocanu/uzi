@@ -36,6 +36,7 @@ def main():
             raise ValueError
     except (IndexError, ValueError):
         print("takeover: deadline must be positive finite seconds", file=sys.stderr)
+        print("UNKNOWN=1\nNEXT=unknown (invalid snapshot deadline)", flush=True)
         return 3
     try:
         process = subprocess.Popen(sys.argv[2:], start_new_session=True)
@@ -44,8 +45,17 @@ def main():
         print("UNKNOWN=1\nNEXT=unknown (snapshot could not start)", flush=True)
         return 3
 
+    finishing = False
+
     def interrupted(signum, _frame):
-        stop_group(process)
+        nonlocal finishing
+        if finishing:
+            return
+        finishing = True
+        try:
+            stop_group(process)
+        finally:
+            print("SNAPSHOT_INTERRUPTED=1\nUNKNOWN=1\nNEXT=unknown (snapshot interrupted)", flush=True)
         raise SystemExit(128 + signum)
 
     signal.signal(signal.SIGTERM, interrupted)
@@ -54,6 +64,7 @@ def main():
         result = process.wait(timeout=seconds)
         return result if result >= 0 else 128 - result
     except subprocess.TimeoutExpired:
+        finishing = True
         stop_group(process)
         print("takeover: snapshot deadline exceeded; rerun before acting", file=sys.stderr)
         print("SNAPSHOT_TIMEOUT=1\nUNKNOWN=1\nNEXT=unknown (snapshot deadline exceeded)", flush=True)

@@ -6,6 +6,9 @@ import subprocess
 import tempfile
 import unittest
 import sys
+import signal
+import time
+import shutil
 
 
 HERE = Path(__file__).resolve().parent
@@ -43,6 +46,60 @@ class TakeoverTimeoutTest(unittest.TestCase):
             result = self.deadline(seconds, "print('must not start')")
             self.assertEqual(result.returncode, 3)
             self.assertNotIn(b"must not start", result.stdout)
+            self.assertTrue(result.stdout.endswith(b"UNKNOWN=1\nNEXT=unknown (invalid snapshot deadline)\n"))
+
+    def test_caller_term_preserves_unknown_trailer(self):
+        process = subprocess.Popen([sys.executable, str(HERE / "takeover-deadline.py"), "5",
+                                    sys.executable, "-c", "import time; print('ready', flush=True); time.sleep(60)"],
+                                   stdout=subprocess.PIPE, stderr=subprocess.PIPE)
+        try:
+            time.sleep(1)
+            process.send_signal(signal.SIGTERM)
+            out, err = process.communicate(timeout=5)
+        finally:
+            if process.poll() is None:
+                process.kill()
+                process.communicate()
+        self.assertEqual(process.returncode, 143, err.decode())
+        self.assertTrue(out.endswith(b"SNAPSHOT_INTERRUPTED=1\nUNKNOWN=1\nNEXT=unknown (snapshot interrupted)\n"))
+
+    def test_invalid_timeout_setting_refuses_with_unknown_trailer(self):
+        result = subprocess.run([shutil.which("bash"), str(HERE / "takeover.sh"), "42", "--no-claim"],
+                                env=dict(os.environ, TAKEOVER_TIMEOUT_SECONDS="invalid"),
+                                capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 3)
+        self.assertEqual(result.stdout, b"UNKNOWN=1\nNEXT=unknown (invalid snapshot deadline)\n")
+
+    def test_signal_during_timeout_cleanup_cannot_skip_trailer(self):
+        # Inject synchronous signals at the cleanup seam, avoiding a timing race.
+        code = ("import os, runpy, signal, sys\n"
+                f"ns=runpy.run_path({str(HERE / 'takeover-deadline.py')!r})\n"
+                "main=ns['main']; original=ns['stop_group']; seen=[]\n"
+                "def stop(process):\n"
+                " original(process)\n"
+                " if not seen:\n"
+                "  seen.append(True)\n"
+                "  os.kill(os.getpid(), signal.SIGTERM)\n"
+                "  os.kill(os.getpid(), signal.SIGINT)\n"
+                "main.__globals__['stop_group']=stop\n"
+                "sys.argv=['supervisor', '0.2', sys.executable, '-c', 'import time; time.sleep(60)']\n"
+                "sys.exit(main())\n")
+        result = subprocess.run([sys.executable, "-c", code], capture_output=True, timeout=5)
+        self.assertEqual(result.returncode, 124, result.stderr.decode())
+        self.assertEqual(result.stdout, b"SNAPSHOT_TIMEOUT=1\nUNKNOWN=1\nNEXT=unknown (snapshot deadline exceeded)\n")
+
+    def test_child_signal_exit_is_preserved(self):
+        result = self.deadline(3, "import os, signal; os.kill(os.getpid(), signal.SIGKILL)")
+        self.assertEqual(result.returncode, 137)
+
+    def test_missing_python_refuses_with_unknown_trailer(self):
+        with tempfile.TemporaryDirectory(prefix="takeover-no-python-") as scratch:
+            for name in ("dirname", "bash"):
+                os.symlink(shutil.which(name), Path(scratch) / name)
+            result = subprocess.run([shutil.which("bash"), str(HERE / "takeover.sh"), "42", "--no-claim"],
+                                    env=dict(os.environ, PATH=scratch), capture_output=True, timeout=5)
+            self.assertEqual(result.returncode, 3)
+            self.assertEqual(result.stdout, b"UNKNOWN=1\nNEXT=unknown (python3 missing)\n")
 
     def test_hung_lookup_finishes_with_unknown_trailer(self):
         with tempfile.TemporaryDirectory(prefix="takeover-deadline-") as scratch:

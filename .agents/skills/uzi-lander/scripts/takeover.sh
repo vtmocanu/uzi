@@ -57,6 +57,11 @@ HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 if [ "${1:-}" = --deadline-child ]; then
   shift
 else
+  command -v python3 >/dev/null || {
+    echo "UNKNOWN=1"
+    echo "NEXT=unknown (python3 missing)"
+    exit 3
+  }
   exec python3 "$HERE/takeover-deadline.py" "${TAKEOVER_TIMEOUT_SECONDS:-120}" \
     bash "$0" --deadline-child "$@"
 fi
