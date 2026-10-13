@@ -332,6 +332,7 @@ custody_case "park phase gets generation absent from run DTO" pass 'phase used a
 # Guarded and legacy typed transcripts both obey #2512's same-claim recovery:
 # exact available capture before the fresh seed, without another claim or park.
 eval "$(awk '/^f42_assert_capture_resume\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+eval "$(awk '/^wait_same_claim_capture_resume\(\) \{/,/^\}/' "$LIB")"
 fake_compose() { cat "$SEQ_DIR/events"; }
 # shellcheck disable=SC2034  # read by the extracted production capture decoder
 COMPOSE=(fake_compose)
@@ -366,6 +367,31 @@ for variant in wrong-generation wrong-order two-captures missing-id extra-claim 
   capture_fixture "$variant"
   custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
 done
+
+cap2_recovery_contract() {
+  local mode="$1" RUN_KA=R RUN_KB=S fixture_generation=2
+  # shellcheck disable=SC2034  # used by the old real phase statements in the regression
+  local RWC_KA RWC_KB
+  [ "$mode" != extra-generation ] || fixture_generation=3
+  db_psql() { case "$1" in *claim_generation*) echo "$fixture_generation";; *) echo 0;; esac; }
+  wait_same_claim_capture_resume() {
+    [ "$mode" != missing-capture ] || fail 'cap2 recovery missing exact capture'
+    [ "$2:$4" = 2:agent/fixture ] || fail 'cap2 recovery lost generation or branch'
+  }
+  local definition
+  definition="$(awk '/^assert_cap2_recovered_run\(\) \{/,/^\}/' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  if [ -n "$definition" ]; then
+    eval "$definition"
+    assert_cap2_recovered_run R 1 agent/fixture
+  else
+    # Run the old real counter assertion against a valid same-claim recovery.
+    eval "$(awk '/^  RWC_KA=/ { inside=1 } inside {print} /^  pass "restarted worker/ {inside=0}' "$ROOT/e2e/phases/45-bounded-concurrency.sh")"
+  fi
+  echo 'cap2 capture verified inside the one successor claim'
+}
+custody_case "cap2 kill recovery accepts same-claim capture without a park" pass 'cap2 capture verified' cap2_recovery_contract valid
+custody_case "cap2 kill recovery refuses an extra generation" fail 'recovery generation' cap2_recovery_contract extra-generation
+custody_case "cap2 kill recovery requires capture evidence" fail 'missing exact capture' cap2_recovery_contract missing-capture
 
 # The spent finalize allowance preserves recoverable work after #2426. Exercise
 # the phase's exact outcome assertions without a stack or timing dependency.
@@ -783,6 +809,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 137 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 143 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 137 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 143 ] && [ "$cases" -eq "$passed" ]
