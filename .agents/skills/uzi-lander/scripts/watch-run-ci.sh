@@ -39,10 +39,14 @@
 #      appeared for the SHA" (a push to main sometimes spawns none: re-point at a descendant
 #      commit rather than waiting)
 #   4  --sha mode only: the SHA's runs were cancelled by concurrency (a newer commit
-#      superseded it) and nothing failed. A run not yet concluded whose jobs are all
+#      superseded it) and no non-superseded run failed (a superseded run may still show
+#      a failed aggregator job). A run not yet concluded whose jobs are all
 #      terminal with at least one cancelled counts as superseded too, never green; a run
-#      GitHub already concluded keeps its own verdict (success green, failure exit 1). `git fetch origin main` and re-watch the CURRENT
-#      head, whose run exercises this change plus the newer one. Not a failure.
+#      GitHub already concluded keeps its own verdict (success green, failure exit 1). A
+#      failed job beside cancelled ones (an aggregator needing its cancelled shards) waits
+#      for the run's conclusion: cancelled is superseded (exit 4), anything else exit 1.
+#      `git fetch origin main` and re-watch the CURRENT head, whose run exercises this
+#      change plus the newer one. Not a failure.
 #
 # Design notes:
 #  - Parses `gh run view --json jobs` with jq, then classifies with awk -F'\t' (this
@@ -73,7 +77,7 @@ while [ $# -gt 0 ]; do
     --interval) INTERVAL="${2:?}"; shift 2;;
     --max-ticks) MAX_TICKS="${2:?}"; shift 2;;
     --repo) REPO="${2:?}"; shift 2;;
-    -h|--help) sed -n '2,44p' "$0"; exit 3;;
+    -h|--help) sed -n '2,49p' "$0"; exit 3;;
     *)
       if [ -z "$RUN" ]; then RUN="$1"; shift
       else echo "unexpected arg: $1" >&2; exit 3
@@ -161,7 +165,11 @@ runs_for_sha() {
 # run-level guard handles it before jobs are read. In explicit run-id mode a cancelled job
 # IS a failure (you asked to watch that specific run). In --branch/--sha mode a
 # cancelled job yields CANCELLED (no failure, nothing pending): the run is being
-# superseded but its own conclusion has not landed yet, so it is never GREEN.
+# superseded but its own conclusion has not landed yet, so it is never GREEN. A failure
+# beside a cancelled job yields FAIL_WITH_CANCELLED: an aggregator job that requires its
+# cancelled shards fails while concurrency supersedes the run, so the caller waits for
+# the run's own conclusion (cancelled = superseded, anything else = failure) instead of
+# exiting 1 early. A matrix fail-fast cancellation is then reported at run conclusion.
 classify() {
   awk -F'\t' -v bmode="${1:-0}" '
     function isfail(c){
@@ -176,7 +184,7 @@ classify() {
       else if (concl=="cancelled") canc++                        # bmode only: superseded
     }
     END {
-      if (nf>0){ print "FAIL"; for(i=0;i<nf;i++) print fails[i] }
+      if (nf>0){ print (canc>0 ? "FAIL_WITH_CANCELLED" : "FAIL"); for(i=0;i<nf;i++) print fails[i] }
       else if (pend>0) print "PENDING"
       else if (canc>0) print "CANCELLED"
       else print "GREEN"
@@ -246,15 +254,28 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
       gh_errs=0
       if [ -z "$DUMP_OUT" ]; then pending=1; continue; fi
       verdict="$(printf '%s\n' "$DUMP_OUT" | classify 1)"
-      case "$(printf '%s\n' "$verdict" | head -1)" in
-        FAIL)
+      head1="$(printf '%s\n' "$verdict" | head -1)"
+      if [ "$head1" = FAIL_WITH_CANCELLED ]; then
+        if [ "$rstatus" != "completed" ]; then
+          echo "[tick $tick] run $rid has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
+          pending=1; continue
+        fi
+      fi
+      case "$head1" in
+        FAIL|FAIL_WITH_CANCELLED)
           # Confirm with one immediate re-query to shake off a stale first-tick read.
           if dump "$rid"; then
             verdict2="$(printf '%s\n' "$DUMP_OUT" | classify 1)"
-            if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
+            head2="$(printf '%s\n' "$verdict2" | head -1)"
+            if [ "$head2" = FAIL ] || { [ "$head2" = FAIL_WITH_CANCELLED ] && [ "$rstatus" = "completed" ]; }; then
               print_fails "$rid" "$wname" "$verdict2"; failed=1; break
             fi
-            echo "[tick $tick] $wname: a fail cleared on re-query (stale read); continuing"; pending=1
+            if [ "$head2" = FAIL_WITH_CANCELLED ]; then
+              echo "[tick $tick] run $rid has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
+            else
+              echo "[tick $tick] $wname: a fail cleared on re-query (stale read); continuing"
+            fi
+            pending=1
           else
             pending=1
           fi
@@ -317,8 +338,13 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
   # Branch mode only: a run cancelled by ci.yml concurrency was superseded by a newer
   # push — re-resolve to the newer run next tick instead of reporting a red. (In
   # explicit run-id mode a cancelled run is a genuine failure and falls through.)
+  # The run's status gates every conclusion-based decision: an in-progress run can carry a
+  # stale non-empty conclusion, which must never count as GitHub's final verdict.
+  rstat=""; concl=""
   if [ -n "$BRANCH" ]; then
-    concl="$(gh run view "${GHR[@]}" "$cur" --json conclusion --jq '.conclusion // ""' 2>/dev/null)"
+    IFS=$'\t' read -r rstat concl < <(gh run view "${GHR[@]}" "$cur" --json status,conclusion \
+      --jq '[.status, (.conclusion // "")] | @tsv' 2>/dev/null) || true
+    [ "$rstat" = "completed" ] || concl=""
     if [ "$concl" = "cancelled" ]; then
       echo "[tick $tick] run $cur cancelled (superseded by a newer push); re-resolving next tick"
       sleep "$INTERVAL"; tick=$((tick+1)); continue
@@ -327,17 +353,27 @@ while [ "$tick" -lt "$MAX_TICKS" ]; do
 
   bmode=0; [ -n "$BRANCH" ] && bmode=1
   verdict="$(printf '%s\n' "$out" | classify "$bmode")"
-  case "$(printf '%s\n' "$verdict" | head -1)" in
-    FAIL)
+  head1="$(printf '%s\n' "$verdict" | head -1)"
+  if [ "$head1" = FAIL_WITH_CANCELLED ] && [ "$rstat" != "completed" ]; then
+    echo "[tick $tick] run $cur has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
+    sleep "$INTERVAL"; tick=$((tick+1)); continue
+  fi
+  case "$head1" in
+    FAIL|FAIL_WITH_CANCELLED)
       # Confirm with one immediate re-query to shake off a stale first-tick read. If the
       # re-query itself gh-errors, skip confirmation this tick rather than exit 1 on a
       # fail we could not reconfirm.
       if dump "$cur"; then
         verdict2="$(printf '%s\n' "$DUMP_OUT" | classify "$bmode")"
-        if [ "$(printf '%s\n' "$verdict2" | head -1)" = "FAIL" ]; then
+        head2="$(printf '%s\n' "$verdict2" | head -1)"
+        if [ "$head2" = FAIL ] || { [ "$head2" = FAIL_WITH_CANCELLED ] && [ "$rstat" = "completed" ]; }; then
           print_fails "$cur" "" "$verdict2"; exit 1
         fi
-        echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
+        if [ "$head2" = FAIL_WITH_CANCELLED ]; then
+          echo "[tick $tick] run $cur has a failed job beside cancelled jobs; waiting for the run's own conclusion (cancelled = superseded)"
+        else
+          echo "[tick $tick] a fail cleared on re-query (stale read); continuing"
+        fi
       fi
       ;;
     GREEN)

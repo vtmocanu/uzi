@@ -11,6 +11,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -223,7 +224,7 @@ func runStateWord(r apitypes.RunListItemDTO) string {
 	if isCredentialDisabledHold(r.RunDTO) {
 		return credDisabledWord
 	}
-	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	_, word := stateGlyphWord(r.Status, r.Health, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 	return word
 }
 
@@ -893,12 +894,7 @@ const (
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
-	// PROG (PRD #2602) is shown with MILES but its narrow cell comes out of the flexible TITLE
-	// width, not out of this threshold: raising it would push MILES off the 100-col board (#379).
 	boardMileMinWidth = 91
-	// boardProgBarMinWidth is the narrowest own board that keeps the PROG bar; below it the cell
-	// is the percent or a short flag alone, so the bar drops before the percent.
-	boardProgBarMinWidth = boardMileMinWidth + boardProgWideWidth - boardProgNarrowWidth
 	// boardCostMinWidth is the narrowest own board that keeps the COST column. It sits BELOW
 	// boardMileMinWidth so COST (the higher-priority cost signal) is retained after the milestone
 	// micro-bar drops on a narrowing terminal (PRD #650 M2; issue #379 invariant).
@@ -1139,8 +1135,8 @@ func (m tuiModel) boardSummary() string {
 		case "awaiting_followup":
 			followups++
 		}
-		// Match the recovery row's token: health frozen while parked needs no attention.
-		if r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
+		// Match the token: human stops and recovery waits ignore stale health.
+		if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) == "" && r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
 			warn++
 		}
 	}

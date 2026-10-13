@@ -1,7 +1,6 @@
 package main
 
 import (
-	"regexp"
 	"strings"
 	"testing"
 
@@ -12,7 +11,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// PRD #2602: the board PROG column.
+// The board's merged milestone/percentage column.
 
 func progRun(id, status string, p *apitypes.RunProgress) apitypes.RunListItemDTO {
 	return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status,
@@ -33,148 +32,144 @@ func progLine(m tuiModel, id string) string {
 }
 
 func TestTUIBoardProgStates(t *testing.T) {
-	pct70, pct11 := 70, 11
+	pct := 70
 	cases := []struct {
-		name   string
-		status string
-		p      *apitypes.RunProgress
-		want   string
+		name, status, health, state string
+		planning                    bool
+		want                        string
 	}{
-		{"percent", "running", &apitypes.RunProgress{State: "percent", Pct: &pct70}, "70% ▰▰▰▰▰▰▱▱"},
-		{"low percent", "running", &apitypes.RunProgress{State: "percent", Pct: &pct11}, "11% ▰▱▱▱▱▱▱▱"},
-		{"stalled", "running", &apitypes.RunProgress{State: "stalled"}, "stalled"},
-		{"waiting", "awaiting_input", &apitypes.RunProgress{State: "waiting"}, "waits on you"},
-		{"parked limit", "limit_wait", &apitypes.RunProgress{State: "parked"}, "⏸ limit"},
-		{"parked pool", "pool_wait", &apitypes.RunProgress{State: "parked"}, "⏸ pool"},
-		{"parked recov", "recovery_wait", &apitypes.RunProgress{State: "parked"}, "⏸ recov"},
-		{"parked paused", "paused", &apitypes.RunProgress{State: "parked"}, "⏸ paused"},
-		{"queued", "queued", &apitypes.RunProgress{State: "queued"}, "queued"},
-		{"planning", "planning", &apitypes.RunProgress{State: "planning"}, "planning"},
+		{"percent", "running", "ok", "percent", false, "▰▰▱        70%"},
+		{"queued", "queued", "ok", "queued", false, "▰▰▱"},
+		{"planning", "running", "ok", "planning", true, "▰▰▱"},
+		{"stalled", "running", "stalled", "stalled", false, "▰▰▱"},
+		{"looping", "running", "looping", "stalled", false, "▰▰▱"},
+		{"waiting", "awaiting_input", "ok", "waiting", false, "▰▰▱"},
+		{"parked", "limit_wait", "ok", "parked", false, "▰▰▱"},
+		{"recovery stale health", "recovery_wait", "stalled", "parked", false, "▰▰▱"},
+		{"none", "running", "ok", "none", false, "▰▰▱"},
+		{"unknown", "running", "ok", "future-state", false, "▰▰▱"},
+		{"terminal", "completed", "ok", "percent", false, "▰▰▱"},
 	}
 	for _, prof := range []colorprofile.Profile{colorprofile.TrueColor, colorprofile.Ascii, colorprofile.NoTTY} {
 		for _, c := range cases {
-			m := progBoard(t, 140, progRun("aaaaaaaa", c.status, c.p))
+			run := progRun("aaaaaaaa", c.status, &apitypes.RunProgress{State: c.state, Pct: &pct})
+			run.Health, run.IsPlanning = c.health, c.planning
+			m := progBoard(t, 140, run)
 			next, _ := m.Update(tea.ColorProfileMsg{Profile: prof})
 			m = next.(tuiModel)
-			if line := progLine(m, "aaaaaaaa"); !strings.Contains(line, c.want) {
-				t.Errorf("%s (profile %v): PROG %q missing in %q", c.name, prof, c.want, line)
+			cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, c.status == "completed", nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word)))
+			if cell != c.want {
+				t.Errorf("%s/%v cell=%q want=%q", c.name, prof, cell, c.want)
+			}
+			line := progLine(m, run.ID)
+			_, word := stateGlyphWord(run.Status, run.Health, run.IsPlanning, false, "", "")
+			if strings.Count(line, word) != 1 {
+				t.Errorf("%s duplicated/missing status %q in %q", c.name, word, line)
 			}
 		}
 	}
 }
 
-// none, nil progress and an unknown state draw nothing in the cell.
-func TestTUIBoardProgBlank(t *testing.T) {
-	for name, p := range map[string]*apitypes.RunProgress{
-		"nil": nil, "none": {State: "none"}, "unknown": {State: "future-state"},
-	} {
-		line := progLine(progBoard(t, 140, progRun("bbbbbbbb", "running", p)), "bbbbbbbb")
-		for _, bad := range []string{"%", "stalled", "queued", "planning", "on you", "⏸"} {
-			if strings.Contains(line, bad) {
-				t.Errorf("%s: unexpected %q in %q", name, bad, line)
+func TestTUIBoardProgWaitingParkedUnderHealth(t *testing.T) {
+	for _, prof := range []colorprofile.Profile{colorprofile.TrueColor, colorprofile.Ascii, colorprofile.NoTTY} {
+		for _, health := range []string{"stalled", "looping"} {
+			for _, c := range []struct{ status, state, wide, narrow string }{
+				{"awaiting_input", "waiting", "waits on you", "on you"},
+				{"limit_wait", "parked", "⏸ limit", "⏸ limit"},
+				{"pool_wait", "parked", "⏸ pool", "⏸ pool"},
+				{"paused", "parked", "⏸ paused", "⏸ paused"},
+			} {
+				run := progRun("bbbbbbbb", c.status, &apitypes.RunProgress{State: c.state})
+				run.Health = health
+				for _, width := range []int{80, 140} {
+					m := progBoard(t, width, run)
+					next, _ := m.Update(tea.ColorProfileMsg{Profile: prof})
+					m = next.(tuiModel)
+					want := c.narrow
+					cellWidth := boardMileWidth
+					if m.boardShowProg() {
+						want = c.wide
+						cellWidth += 1 + boardProgPctWidth
+					}
+					cell := stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))
+					if strings.TrimSpace(cell) != want || visualWidth(cell) != cellWidth {
+						t.Errorf("%s/%s/%d/%v: cell %q width %d, want %q width %d", c.status, health, width, prof, cell, visualWidth(cell), want, cellWidth)
+					}
+					if m.boardShowMile() && !strings.Contains(progLine(m, run.ID), want) {
+						t.Errorf("flag absent from row: %q", progLine(m, run.ID))
+					}
+				}
 			}
 		}
 	}
 }
 
-// The PROG bar drops before the percent, and the column leaves with MILES; no row overflows
-// and the title is never the first thing cut.
+func TestTUIBoardProgMilestoneFallbacks(t *testing.T) {
+	pct := 34
+	run := progRun("bbbbbbbb", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
+	for i := 4; i <= 12; i++ {
+		run.Milestones = append(run.Milestones, apitypes.Milestone{ID: itoa(i)})
+	}
+	m := progBoard(t, 140, run)
+	if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))); cell != "2/12       34%" {
+		t.Errorf("count+pct %q", cell)
+	}
+	for _, p := range []*apitypes.RunProgress{nil, {State: "percent"}, {State: "none"}, {State: "future-state"}} {
+		run.Progress = p
+		if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))); cell != "2/12" {
+			t.Errorf("marker lost or fabricated pct: %q", cell)
+		}
+	}
+	run.Milestones = nil
+	run.Progress = &apitypes.RunProgress{State: "percent", Pct: &pct}
+	if cell := strings.TrimSpace(stripANSI(m.boardProgressCell(run, false, nil, m.pal.runStateToken(run.RunDTO, run.IsRevising).word))); cell != "" {
+		t.Errorf("non-milestone row fabricated progress: %q", cell)
+	}
+}
+
 func TestTUIBoardProgWidthShedding(t *testing.T) {
 	pct := 70
 	run := progRun("cccccccc", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
-	sawBarless, sawNone := false, false
-	for w := 60; w <= 200; w++ {
-		m := progBoard(t, w, run)
-		if m.boardShowProg() && !m.boardShowMile() {
-			t.Fatalf("width %d: PROG shown without MILES", w)
-		}
-		line := progLine(m, "cccccccc")
-		if line == "" {
-			t.Fatalf("width %d: title cut from the row", w)
-		}
-		if vw := visualWidth(line); vw > w {
-			t.Errorf("width %d: row is %d cols wide: %q", w, vw, line)
-		}
-		hasPct, hasBar := strings.Contains(line, "70%"), strings.Contains(line, "▰▰▰▰▰▰▱▱")
-		if hasPct != m.boardShowProg() || hasBar != m.boardShowProgBar() {
-			t.Errorf("width %d: pct=%v bar=%v, want %v/%v: %q", w, hasPct, hasBar, m.boardShowProg(), m.boardShowProgBar(), line)
-		}
-		sawBarless = sawBarless || (hasPct && !hasBar)
-		sawNone = sawNone || !hasPct
-	}
-	if !sawBarless || !sawNone {
-		t.Errorf("expected a bar-less band (%v) and a width without PROG (%v)", sawBarless, sawNone)
-	}
-}
-
-// The PROG column and its bar never flap: widening the terminal only ever turns them on, for
-// the own board with and without the credential column and the admin board.
-func TestTUIBoardProgMonotonicInWidth(t *testing.T) {
-	pct := 70
-	run := progRun("gggggggg", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
 	for _, cfg := range []struct {
 		name        string
 		admin, cred bool
 	}{{"own", false, false}, {"own+cred", false, true}, {"admin", true, false}} {
-		prevProg, prevBar := false, false
-		for w := 80; w <= 220; w++ {
+		prevProg, prevMile, sawMarkerOnly, sawPct := false, false, false, false
+		for w := 60; w <= 220; w++ {
 			m := progBoard(t, w, run)
 			m.board.admin = cfg.admin
 			if cfg.cred {
 				m.tokenCount = 2
 			}
-			prog, bar := m.boardShowProg(), m.boardShowProgBar()
-			if prevProg && !prog {
-				t.Errorf("%s width %d: PROG went on -> off as the terminal widened", cfg.name, w)
+			prog, mile := m.boardShowProg(), m.boardShowMile()
+			if prevProg && !prog || prevMile && !mile {
+				t.Fatalf("%s/%d: visibility flapped", cfg.name, w)
 			}
-			if prevBar && !bar {
-				t.Errorf("%s width %d: PROG bar went on -> off as the terminal widened", cfg.name, w)
+			line := progLine(m, run.ID)
+			if (line == "" && mile) || visualWidth(line) > w {
+				t.Fatalf("%s/%d: missing title/overflow: %q", cfg.name, w, line)
 			}
-			prevProg, prevBar = prog, bar
+			if strings.Contains(line, "70%") != prog || strings.Contains(line, "▰▰▱") != mile {
+				t.Errorf("%s/%d: visibility disagrees: %q", cfg.name, w, line)
+			}
+			sawMarkerOnly = sawMarkerOnly || mile && !prog
+			sawPct = sawPct || prog
+			prevProg, prevMile = prog, mile
+		}
+		if !sawPct || (cfg.admin && !sawMarkerOnly) {
+			t.Errorf("%s missing pct band or admin marker-only band", cfg.name)
 		}
 	}
-}
-
-// Narrow flags use the short forms: the first width that shows MILES has no bar yet.
-func TestTUIBoardProgNarrowFlags(t *testing.T) {
-	run := progRun("dddddddd", "awaiting_input", &apitypes.RunProgress{State: "waiting"})
-	for w := 60; w <= 200; w++ {
-		m := progBoard(t, w, run)
-		if !m.boardShowMile() {
-			continue
-		}
-		if m.boardShowProgBar() {
-			t.Fatalf("width %d: first MILES width already shows the PROG bar", w)
-		}
-		line := progLine(m, "dddddddd")
-		if !strings.Contains(line, "on you") || strings.Contains(line, "waits on you") {
-			t.Errorf("narrow waiting flag should read 'on you': %q", line)
-		}
-		return
-	}
-	t.Fatal("no width showed MILES")
-}
-
-// Regression (#379 shed order): PROG rides with MILES and must not raise the MILES threshold.
-// At 100 cols with COST shown (and no credential column) MILES is on and the row carries both
-// the milestone marker and the PROG percent.
-func TestTUIBoardProgDoesNotDisplaceMiles(t *testing.T) {
-	pct := 70
-	run := progRun("eeeeeeee", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
 	m := progBoard(t, 100, run)
-	if !m.boardShowCost() || m.boardShowCred() {
-		t.Fatalf("setup: want COST and no credential column at 100 cols")
+	if !m.boardShowCost() || !m.boardShowMile() {
+		t.Fatal("#379: milestones/COST displaced at 100")
 	}
-	if !m.boardShowMile() {
-		t.Fatalf("MILES must be shown at 100 cols with COST (shed order, #379)")
-	}
-	line := progLine(m, "eeeeeeee")
-	if !strings.Contains(line, "▰▰▱") || !strings.Contains(line, "70%") {
-		t.Errorf("row lacks MILES marker or 70%%: %q", line)
+	if !strings.Contains(progLine(m, run.ID), "70%") {
+		t.Fatal("percentage must remain visible on the 100-column own board")
 	}
 }
 
-// At every width the title keeps a sane floor wherever MILES (and so PROG) is shown, for the
+// At every width the title keeps a sane floor wherever milestones are shown, for the
 // own board with/without the credential column and the admin board.
 func TestTUIBoardProgTitleFloor(t *testing.T) {
 	pct := 70
@@ -215,7 +210,7 @@ func TestTUIBoardProgTitleFloor(t *testing.T) {
 					tw++
 				}
 				if tw < 20 {
-					t.Errorf("%s width %d: only %d title cols left with MILES+PROG shown", cfg.name, w, tw)
+					t.Errorf("%s width %d: only %d title cols left with progress shown", cfg.name, w, tw)
 				}
 				if min, ok := minTitle[cfg.name]; !ok || tw < min {
 					minTitle[cfg.name] = tw
@@ -225,28 +220,41 @@ func TestTUIBoardProgTitleFloor(t *testing.T) {
 	}
 }
 
-// The stalled flag keeps the app-wide stall ink and "waits on you" the amber one; the two stay
-// distinct SGR sequences (colour profile TrueColor so the foreground survives).
-func TestTUIBoardProgFlagInks(t *testing.T) {
-	sel := progRun("11111111", "running", nil)
-	stalled := progRun("22222222", "running", &apitypes.RunProgress{State: "stalled"})
-	waiting := progRun("33333333", "awaiting_input", &apitypes.RunProgress{State: "waiting"})
-	m := progBoard(t, 140, sel, stalled, waiting)
-	next, _ := m.Update(tea.ColorProfileMsg{Profile: colorprofile.TrueColor})
-	m = next.(tuiModel)
-	if m.pal.stall == nil || m.pal.amber == nil || paintSeg(m.pal.stall, nil, false, "x") == paintSeg(m.pal.amber, nil, false, "x") {
-		t.Fatal("setup: stall and amber inks must differ")
-	}
-	rawStalled := lineContaining(strings.Split(m.View().Content, "\n"), "title 22222222")
-	rawWaiting := lineContaining(strings.Split(m.View().Content, "\n"), "title 33333333")
-	// The cell's SGR opens with the palette foreground triplet (a background may follow it).
-	inInk := func(raw string, c interface{ RGBA() (r, g, b, a uint32) }, word string) bool {
-		return regexp.MustCompile(regexp.QuoteMeta(toneCode(t, c)) + `[0-9;]*m` + regexp.QuoteMeta(word)).MatchString(raw)
-	}
-	if !inInk(rawStalled, m.pal.stall, "stalled") || inInk(rawStalled, m.pal.amber, "stalled") {
-		t.Errorf("stalled cell must use the stall ink, not amber: %q", rawStalled)
-	}
-	if !inInk(rawWaiting, m.pal.amber, "waits on you") || inInk(rawWaiting, m.pal.stall, "waits on you") {
-		t.Errorf("waiting cell must use amber, not the stall ink: %q", rawWaiting)
+// The percentage slot stays padded for every row, including missing plans and flags.
+func TestTUIBoardProgTitleAlignment(t *testing.T) {
+	pct := 9
+	percent := progRun("11111111", "running", &apitypes.RunProgress{State: "percent", Pct: &pct})
+	noPercent := progRun("22222222", "queued", &apitypes.RunProgress{State: "queued"})
+	noMilestones := progRun("33333333", "running", nil)
+	noMilestones.Milestones = nil
+	flag := progRun("44444444", "awaiting_approval", &apitypes.RunProgress{State: "waiting"})
+	flag.Health = "stalled"
+	runs := []apitypes.RunListItemDTO{percent, noPercent, noMilestones, flag}
+	for _, cfg := range []struct {
+		name       string
+		width      int
+		admin, pct bool
+	}{
+		{"wide", 140, false, true}, {"narrow admin", 125, true, false},
+	} {
+		m := progBoard(t, cfg.width, runs...)
+		m.board.admin = cfg.admin
+		if !m.boardShowMile() || m.boardShowProg() != cfg.pct {
+			t.Fatalf("%s: unexpected milestone/percentage visibility", cfg.name)
+		}
+		col := -1
+		for _, run := range runs {
+			line := progLine(m, run.ID)
+			i := strings.Index(line, "title "+run.ID)
+			if i < 0 {
+				t.Fatalf("%s: missing title in %q", cfg.name, line)
+			}
+			got := visualWidth(line[:i])
+			if col < 0 {
+				col = got
+			} else if col != got {
+				t.Errorf("%s: %s title column %d, want %d: %q", cfg.name, run.ID, got, col, line)
+			}
+		}
 	}
 }

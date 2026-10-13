@@ -40,9 +40,12 @@ fi
 exit 1
 STUB
 # A verified registry listing this session and one other live session. state.sh runs
-# `python3 peers.py list --json`; a python3 stub serves it, so the test needs no Python.
+# `python3 peers.py list --json`; stub only that call, leaving the deadline supervisor real.
+export REAL_PYTHON3
+REAL_PYTHON3=$(command -v python3)
 cat > "$WORK/bin/python3" <<'STUB'
 #!/usr/bin/env bash
+if [ "$*" != "$SESSION_PEERS_PY list --json" ]; then exec "$REAL_PYTHON3" "$@"; fi
 echo '{"claude":[{"sessionId":"uuid-me","name":"me","socket":"/x"},{"sessionId":"uuid-other","name":"other","socket":"/y"}],"codex":[],"codex_schema_recognised":true}'
 STUB
 : > "$WORK/peers.py"

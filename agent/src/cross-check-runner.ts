@@ -16,6 +16,7 @@ import { selectCodexBinding } from "./codex/select.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, isStaleClaimRefusal } from "./terminal-resolve.js";
+import { CrossCheckConfinementError } from "./cross-check-confinement.js";
 import { errMessage } from "./util.js";
 import { rmHomeTree } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -214,7 +215,7 @@ export class CrossCheckRunner {
       cancel.signal.throwIfAborted();
       reason = "malformed";
       if (code) {
-        if (!nativeCleanupConfirmed) throw new Error("cross-check cleanup unconfirmed");
+        if (!nativeCleanupConfirmed) throw new CrossCheckConfinementError("cleanup_callback_missing");
         const findings = validateCodeFindings(text);
         const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation }, cancel.signal);
         cancel.signal.throwIfAborted();
@@ -252,6 +253,13 @@ export class CrossCheckRunner {
       else if (!cancel.signal.aborted && err instanceof CrossCheckCheckerUnavailableError) reason = "checker_unavailable";
       else if (err instanceof CrossCheckMalformedError || (err instanceof Error && /invalid code cross-check|JSON/.test(err.message))) reason = "malformed";
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
+      if (err instanceof CrossCheckConfinementError || reason === "confinement_failed") {
+        // The Claude token has already left the secret registry. Do not log errMessage(err).
+        this.log.warn("cross-check confinement refused", { run_id: runId, stage: code ? "code" : "plan",
+          subreason: err instanceof CrossCheckConfinementError ? err.subreason : "unknown",
+          ...(err instanceof CrossCheckConfinementError && err.priorFailure ? { prior_failure: err.priorFailure } : {}),
+        });
+      }
       try {
         if (!verdictDelivered) {
           if (code) await this.client.reportCodeCrossCheckVerdict(runId, generation, { outcome: "failed", reason_class: reason, findings: [] });

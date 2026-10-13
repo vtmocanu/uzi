@@ -2990,7 +2990,7 @@ export class WorkerClient {
    *  literally "paused", so both statuses are read off the body (like reportState) rather than a
    *  409 throwing through postJSON. Returns `{ status }` = the run's status from the response
    *  body (paused on a landed hold, the real status on a refusal); an unmodelled 2xx or an
-   *  unreadable body yields "" (never "paused" ⇒ retain, the safe default). A genuine transport
+   *  unreadable body yields "" (ambiguous: the runner retains artifacts and reconciles ownership). A genuine transport
    *  error or a non-200/409 4xx/5xx still throws RequestError. */
   async requestCompletionHold(
     runId: string,
@@ -3022,7 +3022,7 @@ export class WorkerClient {
       }
       if (res.status >= 400) throw await this.toError("POST", path, res);
       // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
-      // not "paused" and so retains the run.
+      // ambiguous; enterCompletionHold retains artifacts while reconciling ownership.
       return { status: "" };
     });
   }
@@ -3747,9 +3747,10 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * Without maxAckBytes, TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
  * body with no run, a non-string status, a non-numeric budget, an older server that sent
  * nothing — yields the field absent rather than throwing. That is not defensiveness for
- * its own sake: the status caller's rule is a POSITIVE test for one literal, so a missing
- * status means "not parked", and a missing budget means "no budget update" — both the safe
- * answer to every one of those failures. A throw here would instead surface as a state
+ * its own sake: each caller's rule is a POSITIVE test for one literal, so a missing status
+ * means "unconfirmed", never a confirmed outcome, and a missing budget means "no budget
+ * update". What unconfirmed implies is the caller's: a state report treats it as not parked,
+ * while a completion hold retains its artifacts and reconciles ownership. A throw here would instead surface as a state
  * report that appears to have failed, and would be retried against a server that already
  * applied it.
  */

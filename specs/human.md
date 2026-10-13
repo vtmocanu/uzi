@@ -1276,7 +1276,7 @@ Tracked as GitHub issue vtmocanu/uzi#2012.
 
 PRD at `prds/done/2602-run-progress.md`.
 
-- Every non-terminal issue run with a frozen milestone list shows an approximate server-derived percent (11% for planning plus 89% of completed/total milestones, held below 100% until the run ends) on the web board and run page, the TUI board and detail, and `uzi run get`; a run that is waiting, parked, queued, stalled/looping or planning shows that flag instead of a number, and no surface shows a time remaining. (AI-synced 2026-10-09, #2602)
+- Every non-terminal issue run with a frozen milestone list shows an approximate server-derived percent (11% for planning plus 89% of completed/total milestones, held below 100% until the run ends) on the web board and run page, the TUI board and detail, and `uzi run get`; a run that is waiting, parked, queued, stalled/looping or planning shows that condition instead of a number, and no surface shows a time remaining. The TUI board combines milestones and percent in one cell, drops the percent first on narrow terminals, and omits repeated status flags except waiting/parked flags hidden by stalled/looping health. (AI-synced 2026-10-13, #2602)
 - Run detail (web, TUI, CLI) shows "may be blocked by <run>" while a run waits on an unanswered question that mentions `#N` and another live run of the same owner on the same repo is working issue N; it is a hint, never another user's or repo's run, never the run itself. (AI-synced 2026-10-09, #2602)
 
 ## Feature #2603 — Model-written "Now" summary

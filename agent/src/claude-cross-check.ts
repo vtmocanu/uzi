@@ -8,7 +8,7 @@
 //   2. A matcher-less PreToolUse gate denies any tool outside that set and EVERY tool until the
 //      SDK's `system/init` frame has passed checkIsolatedInit (a latch that defaults to refuse).
 //   3. The init check itself: tools, MCP servers, plugins, agents and skills must be exactly the
-//      surface; guardIsolatedFrame refuses model output before a passing init.
+//      surface; guardIsolatedFrameRefusal refuses model output before a passing init.
 //   4. ONE path guard (buildIsolatedPreToolUse -> buildPathGuardHook) rooted at the checkout,
 //      worker credential paths and /run/uzi-secrets denied, plus Read of this session's own
 //      authenticated SDK spill file (sdkHomeDir). The checker appends only a pattern guard for
@@ -27,7 +27,7 @@ import {
   BUILTIN_PLUGINS_DISABLED,
   buildIsolatedPreToolUse,
   checkIsolatedInit,
-  guardIsolatedFrame,
+  guardIsolatedFrameRefusal,
   isolateSdkEnv,
   isolatedDisallowedTools,
   type InitGate,
@@ -36,6 +36,7 @@ import {
 import { buildSdkEnv } from "./sdk-env.js";
 import { defaultQueryFn, isErrorResult, isResult, mapSdkMessage, promptStream } from "./sdk-messages.js";
 import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
+import { CrossCheckConfinementError, priorCrossCheckFailure } from "./cross-check-confinement.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The checker's whole tool surface: read-only, no MCP, no plugin, no skill. */
@@ -127,7 +128,7 @@ function buildCheckerPatternGuard(log: Logger): (input: HookInput) => Promise<Ho
  * Assemble the SDK options of a read-only Claude checker session. Pure, exported so the suite
  * asserts the confinement on the built options and the composed hook list with no live session,
  * and stage-neutral (no plan-specific input) so the code stage can reuse it. `gate` is the init
- * latch the caller opens through guardIsolatedFrame.
+ * latch the caller opens through guardIsolatedFrameRefusal.
  */
 export function buildClaudeCrossCheckOptions(input: {
   cwd: string;
@@ -204,7 +205,7 @@ class CodeToolBudget {
     if (this.exceeded) return false;
     if (typeof id !== "string" || !id || (!this.ids.has(id) && this.ids.size >= 200)) {
       this.exceeded = true;
-      this.abort.abort(new Error("cross-check tool budget exceeded"));
+      this.abort.abort(new CrossCheckConfinementError("tool_budget"));
       return false;
     }
     this.ids.add(id);
@@ -215,7 +216,7 @@ class CodeToolBudget {
     const id = input.tool_use_id;
     if (!this.executed.has(id) && this.admit(id)) { this.executed.add(id); return {}; }
     this.exceeded = true;
-    this.abort.abort(new Error("cross-check tool budget exceeded"));
+    this.abort.abort(new CrossCheckConfinementError("tool_budget"));
     return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
       permissionDecisionReason: "cross-check tool budget exceeded" } };
   };
@@ -226,15 +227,15 @@ class CodeToolBudget {
       const block = asRecord(raw);
       if (block?.["type"] === "tool_use") {
         const id = block["id"];
-        if (!CHECKER_SURFACE.tools.includes(String(block["name"]))) throw new Error("cross-check confinement refused: unallowed tool block");
-        if (typeof id === "string" && this.observed.has(id)) throw new Error("cross-check confinement refused: repeated tool block");
+        if (!CHECKER_SURFACE.tools.includes(String(block["name"]))) throw new CrossCheckConfinementError("tool_unallowed");
+        if (typeof id === "string" && this.observed.has(id)) throw new CrossCheckConfinementError("tool_repeated");
         if (this.admit(id)) this.observed.add(id as string);
       }
     }
     this.assertWithinBudget();
   }
   assertWithinBudget(): void {
-    if (this.exceeded) throw new Error("cross-check confinement refused: tool budget exceeded");
+    if (this.exceeded) throw new CrossCheckConfinementError("tool_budget");
   }
 }
 
@@ -335,8 +336,8 @@ export class ClaudeCrossCheck {
         const msg = next.value;
         signal.throwIfAborted();
         budget?.assertWithinBudget();
-        const refusal = guardIsolatedFrame(msg, gate, CHECKER_SURFACE);
-        if (refusal) throw new Error(`cross-check confinement refused: ${refusal}`);
+        const refusal = guardIsolatedFrameRefusal(msg, gate, CHECKER_SURFACE);
+        if (refusal) throw new CrossCheckConfinementError(refusal.code);
         const frame = asRecord(msg);
         budget?.observe(frame);
         if (frame?.["type"] === "system" && frame["subtype"] === "init") {
@@ -359,7 +360,7 @@ export class ClaudeCrossCheck {
         if (isResult(msg)) { resultFrame = frame; break; }
       }
       // A result without a passing init frame means the tool set was never verified.
-      if (!gate.passed) throw new Error("cross-check confinement refused: the SDK never reported its tool set (no init frame)");
+      if (!gate.passed) throw new CrossCheckConfinementError("no_init");
       if (!resultFrame) throw new Error("cross-check ended without a result");
       for (const em of mapSdkMessage(resultFrame)) {
         if (em.payload["event"] === "result") { resultPosted = true; await postUsage({ ...em.payload, is_error: isErrorResult(resultFrame) }); }
@@ -418,7 +419,7 @@ export class ClaudeCrossCheck {
         this.log.removeSecret(token);
       }
     }
-    if ((code || confirmNativeCleanup) && !nativeClean) throw new Error("cross-check confinement refused: cleanup unconfirmed");
+    if ((code || confirmNativeCleanup) && !nativeClean) throw new CrossCheckConfinementError("cleanup_unconfirmed", failure ? priorCrossCheckFailure(failure.error) : undefined);
     if (nativeClean) confirmNativeCleanup?.();
     budget?.assertWithinBudget();
     if (failure) throw failure.error;

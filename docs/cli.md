@@ -2686,7 +2686,8 @@ readable the same way under `--json`.
 
 ### Run status, and what `--follow` waits for
 
-A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** values:
+A run's raw `status` (in `run get --json`, `run list --json` and
+`run get --field status`) is one of exactly **thirteen** values:
 `queued`, `claimed`, `running`, `awaiting_approval`, `awaiting_input`,
 `awaiting_followup`, `limit_wait`, `pool_wait`, `recovery_wait`, `paused`, `completed`,
 `failed`, `cancelled`. Only the last three are **terminal**, and `uzi run logs
@@ -2767,6 +2768,31 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
+
+Human-facing STATUS labels also distinguish a human stop from a failure:
+
+| Raw `status` | `stop_kind` | Full CLI label |
+|---|---|---|
+| `cancelled` | Any value, missing or conflicting | `stopped (cancelled)` |
+| `failed` | `cancelled` | `stopped (cancelled)` |
+| `failed` | `plan_rejected` | `stopped (plan rejected)` |
+
+`run get` and `run list` use these full labels. The `admin runs` renderer
+uses the same labels, but its endpoint lists active runs only; terminal
+runs are not reachable through that listing. Human stops take precedence
+over `needs landing`, even when the run carries recoverable work. Genuine
+failures, including `stop_kind: auto_stopped`, keep their existing failure
+or `needs landing` presentation.
+
+TUI boards use compact `stopped`; the detail header expands it to the full
+label above. Both use a neutral glyph and colour. Slack preserves
+`Cancelled` for cancellations and shows `Stopped (plan rejected)` for a
+failed run with `stop_kind: plan_rejected`.
+
+These are presentation labels: raw JSON, scalar fields and status
+transitions stay unchanged. Filtering raw `status: failed` in JSON still
+includes failed-path cancellations and plan rejections. Neither `run list`
+nor `admin runs` exposes a `--status` flag.
 
 ### Provider outage recovery and owner hold
 

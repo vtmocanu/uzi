@@ -5,6 +5,12 @@
   `uzi-lander`; plan gate means approval or steering is required; RC cut means
   creating a release candidate through `uzi-release`.
 - Delivery/landing skill: `uzi-lander`. Dispatch and plan steering: `uzi-watcher`.
+- Local resources: relay this rule to each lead at enrollment. Run at most one
+  heavy local test job per lead at a time, including delegated buddy jobs:
+  `task gate:*`, `go test -race`, full `node --test`/Vitest suites or local
+  e2e/Docker tests. Prefer CI for full gates (`uzi-lander` `LOCAL_GATES=none`);
+  run only targeted tests locally. Never unset, raise or override the machine's
+  inherited local test-concurrency caps.
 - Resources: this repo's main branch for merges; the GitHub account's shared CI
   capacity for CI admission. Derive identities from the remote and operational
   reports; keep live owners and resource identifiers in private state.
@@ -40,6 +46,11 @@
     parent/child IDs and owner reports for child findings.
     Read `.agents/skills/uzi-lander/scripts/claims.sh list --json`. Every visible active delivery run
     needs a live landing owner: `run-<id>` before its PR, `#<PR>` after takeover.
+    For `mr_rework` and `ci_fix`, resolve the existing PR by `mr_iid`, or by
+    matching `pipeline_ref` to its head branch in the same repository; accept
+    that PR's live `#<PR>` claim without requiring a separate run claim.
+    Missing or ambiguous PR mapping is unknown; retain the run-claim check
+    when no existing PR is confirmed.
     Check claim liveness; unreadable or unverified claims remain unknown.
   - Compare active runs by repository and issue against board claims and the
     skipper ledger. Flag a second run for an issue another session owns; route
@@ -47,6 +58,17 @@
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
+  - Read `uzi run recovery --json` (owner-scoped, includes settled holds); inspect
+    open custody on runs ended long ago (`completed`, `failed`, `cancelled`),
+    which active-run inventories omit. Route only decision-bearing dispositions
+    (`needs_action`, `source_only`); healthy dispositions such as `archive_ready`
+    awaiting export are not findings. Also flag corroborated terminal-report
+    backlogs on workers (`outbox_pending_terminal`, `outbox_blocked`); zero/null
+    values are no evidence, not proof of no backlog. Treat stale signals as
+    unknown. Correlate with run IDs; infer no run from an aggregate alone.
+    Route to the run's owning session, then the recovery owner, else the user,
+    to check whether custody is valid or should have released. Terminal status
+    alone proves no invalid hold; never silently clean, discard or release it.
   - Read all open PR pages with
     `gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq '.[] | {number, url: .html_url, headRefOid: .head.sha}'`;
     flag a PR without a live

@@ -269,8 +269,26 @@ grep -q 'waiting on exact quota reset at ' "$WORK/exact-future-wait.out" || fail
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/exact-future-wait.out" || fail "future exact reset did not release the wait: $(cat "$WORK/exact-future-wait.out")"
 if grep -q '^CR_RESUMED=1$' "$WORK/exact-future-wait.out"; then fail "stale status ended future exact wait early"; fi
 
-# A known reset outside the 15-minute review lane also switches reviewers immediately.
-RESET_MIN=18; EXACT_WAIT_CLOCK_STEP=70; export RESET_MIN EXACT_WAIT_CLOCK_STEP
+# A live countdown of 20 minutes stays in the CodeRabbit lane. All time is
+# virtual: the query poll advances 30 s, preserving each rounded live minute value.
+minutes=20
+MODE=query; RESET_MIN=$minutes; HEAD_OID="boundary-$minutes"; EXACT_WAIT_CLOCK_STEP=30
+export MODE RESET_MIN HEAD_OID EXACT_WAIT_CLOCK_STEP
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+if ! bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 30 > "$WORK/boundary-$minutes.out" 2>&1; then
+  fail "$minutes-minute live reset rejected the wait: $(cat "$WORK/boundary-$minutes.out")"
+fi
+grep -q "^CR_RESET_MIN=$minutes\$" "$WORK/boundary-$minutes.out" || fail "$minutes-minute live reset header wrong: $(cat "$WORK/boundary-$minutes.out")"
+grep -q 'waiting on exact quota reset at ' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not wait: $(cat "$WORK/boundary-$minutes.out")"
+grep -q '^CR_RESET_ELAPSED=1$' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not elapse: $(cat "$WORK/boundary-$minutes.out")"
+grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not trigger review: $(cat "$WORK/boundary-$minutes.out")"
+[ "$(cat "$WATCHED")" = 'test/repo 42 60 60 --reviewer coderabbit' ] || fail "$minutes-minute reset did not hand off to CodeRabbit"
+unset HEAD_OID EXACT_WAIT_CLOCK_STEP RESET_MIN
+
+# A live reset of 21 minutes is outside the 20-minute lane and switches immediately.
+# The query poll advances 70 s, so a stated 22-minute reply reports 21 live minutes.
+RESET_MIN=22; EXACT_WAIT_CLOCK_STEP=70; export RESET_MIN EXACT_WAIT_CLOCK_STEP
 printf '[]\n' > "$COMMENTS"
 rm -f "$POSTED" "$WATCHED"
 set +e
@@ -278,7 +296,7 @@ bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 1 > "$W
 rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "long reset rc=$rc, want 1: $(cat "$WORK/long-reset.out")"
-grep -q '^CR_RESET_MIN=17$' "$WORK/long-reset.out" || fail "long reset header wrong: $(cat "$WORK/long-reset.out")"
+grep -q '^CR_RESET_MIN=21$' "$WORK/long-reset.out" || fail "long reset header wrong: $(cat "$WORK/long-reset.out")"
 grep -q '^NEXT=switch_reviewer' "$WORK/long-reset.out" || fail "long reset did not switch reviewer: $(cat "$WORK/long-reset.out")"
 if grep -q 'waiting on exact quota reset\|^CR_WAIT_CEILING=' "$WORK/long-reset.out"; then
   fail "long reset waited despite the reviewer-switch rule: $(cat "$WORK/long-reset.out")"

@@ -46,6 +46,12 @@ const WAIT_REASONS: Record<string, string> = {
   awaiting_followup: "follow-up",
 };
 
+const WAIT_ACTIONS: Record<string, string> = {
+  awaiting_approval: "your plan approval",
+  awaiting_input: "your answer",
+  awaiting_followup: "your follow-up",
+};
+
 // waitReason names what a `waiting` run waits on (plan gate / question / follow-up), or
 // undefined for a status outside the three. Shared with the run page's RunProgressCard.
 export function waitReason(status: string): string | undefined {
@@ -61,7 +67,7 @@ export function stallTitle(run: Partial<Pick<Run, "health" | "health_reason">>):
     run.health === "looping"
       ? "Looping: the run keeps repeating the same steps; the percentage returns once it moves on."
       : "Stalled: no progress is being made; the percentage returns once activity resumes.";
-  return reason === "" ? base : `${base} ${reason}`;
+  return reason === "" ? base : `${base} Reason: ${reason}`;
 }
 
 // Since renders the elapsed time inline (` · 14m`, hidden from assistive tech) plus a
@@ -127,9 +133,10 @@ export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }
     case "waiting": {
       const reason = waitReason(run.status);
       const at = formatLocalTime(run.status_since);
+      const action = WAIT_ACTIONS[run.status];
       const title =
-        reason && at
-          ? `Waiting on you at the ${reason} since ${at}.`
+        action && at
+          ? `Waiting for ${action} since ${at}.`
           : "This run is waiting on you: a plan approval, a question or a follow-up.";
       return (
         <span data-run-progress="waiting" className="inline-flex">

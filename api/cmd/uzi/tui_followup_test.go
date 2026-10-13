@@ -18,7 +18,7 @@ import (
 // the lowercased status), i.e. glyph "·" and word "awaiting_followup", so both assertions
 // fail. The word must NOT be "needs input" (awaiting_input's) either.
 func TestStateGlyphWordAwaitingFollowup(t *testing.T) {
-	glyph, word := stateGlyphWord("awaiting_followup", "", false, false, "")
+	glyph, word := stateGlyphWord("awaiting_followup", "", false, false, "", "")
 	if glyph != "➤" {
 		t.Errorf("awaiting_followup glyph = %q, want %q", glyph, "➤")
 	}
@@ -27,7 +27,7 @@ func TestStateGlyphWordAwaitingFollowup(t *testing.T) {
 	}
 	// A distinct glyph from the neighbouring parks, so the spine reads three different
 	// states under NO_COLOR where colour cannot tell them apart.
-	if inputGlyph, _ := stateGlyphWord("awaiting_input", "", false, false, ""); glyph == inputGlyph {
+	if inputGlyph, _ := stateGlyphWord("awaiting_input", "", false, false, "", ""); glyph == inputGlyph {
 		t.Errorf("awaiting_followup and awaiting_input share glyph %q — they must be distinguishable without colour", glyph)
 	}
 }
@@ -37,18 +37,18 @@ func TestStateGlyphWordAwaitingFollowup(t *testing.T) {
 // the faintC default, so it stops matching amber (and awaiting_input) and matches faintC.
 func TestStateColorAwaitingFollowup(t *testing.T) {
 	p := newPalette(true)
-	followup := bgFillSGR(p.stateColor("awaiting_followup", "", false, false))
+	followup := bgFillSGR(p.stateColor("awaiting_followup", "", false, false, ""))
 	if followup != bgFillSGR(p.amber) {
 		t.Errorf("awaiting_followup colour is not amber; a needs-you park must share the amber attention ink")
 	}
-	if followup != bgFillSGR(p.stateColor("awaiting_input", "", false, false)) {
+	if followup != bgFillSGR(p.stateColor("awaiting_input", "", false, false, "")) {
 		t.Error("awaiting_followup and awaiting_input resolve to different colours; both are needs-you parks and share amber")
 	}
 	if followup == bgFillSGR(p.faintC) {
 		t.Error("awaiting_followup resolved to the faint default; its explicit amber case is not being read")
 	}
 	// Health precedence is unchanged: a stalled park is still the stall colour.
-	if bgFillSGR(p.stateColor("awaiting_followup", "stalled", false, false)) != bgFillSGR(p.stall) {
+	if bgFillSGR(p.stateColor("awaiting_followup", "stalled", false, false, "")) != bgFillSGR(p.stall) {
 		t.Error("stalled health no longer overrides the awaiting_followup bucket; the precedence rule regressed")
 	}
 }

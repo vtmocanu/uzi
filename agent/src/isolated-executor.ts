@@ -115,8 +115,8 @@ const RESEARCH_SURFACE: IsolationSurface = {
   skills: [],
 };
 
-/** The builtin plugin the pinned CLI loads unless it is disabled through settings. */
-export const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false };
+/** The builtin plugins the pinned CLI loads unless they are disabled through settings. */
+export const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false };
 
 const REASON_INIT_PENDING = "denied: the isolated session's tool set has not been verified yet";
 const REASON_TOOL_NOT_ALLOWED = "denied: this tool is not in the isolated run's fixed tool set";
@@ -217,52 +217,59 @@ function isContentFrame(message: unknown): boolean {
   return t === "assistant" || t === "user";
 }
 
+export type IsolatedRefusalCode = "init_tools" | "init_mcp" | "init_plugin" | "init_agents" | "init_skills" | "init_malformed" | "content_before_init";
+interface IsolatedRefusal { code: IsolatedRefusalCode; message: string }
+
 /**
  * Check the SDK's `system/init` frame against the fixed surface (default: the research one).
  * Returns a reason on any difference; undefined when the effective session is exactly what was
  * requested.
  */
 export function checkIsolatedInit(message: unknown, surface: IsolationSurface = RESEARCH_SURFACE): string | undefined {
+  return checkIsolatedInitRefusal(message, surface)?.message;
+}
+
+function checkIsolatedInitRefusal(message: unknown, surface: IsolationSurface): IsolatedRefusal | undefined {
   const frame = asRecord(message);
-  if (!frame || !isInitFrame(frame)) return "not an init frame";
+  if (!frame || !isInitFrame(frame)) return { code: "init_malformed", message: "not an init frame" };
 
   const tools = stringList(frame, "tools");
-  if (!tools) return "init frame has a malformed tool list";
+  if (!tools) return { code: "init_malformed", message: "init frame has a malformed tool list" };
   const want = new Set(surface.tools);
   const got = new Set(tools);
   const extra = [...got].filter((t) => !want.has(t));
   const missing = [...want].filter((t) => !got.has(t));
   if (extra.length || missing.length || tools.length !== got.size) {
-    return `effective tool set differs from the fixed set (extra: ${extra.join(",") || "none"}; missing: ${missing.join(",") || "none"})`;
+    return { code: "init_tools", message: `effective tool set differs from the fixed set (extra: ${extra.join(",") || "none"}; missing: ${missing.join(",") || "none"})` };
   }
 
   const servers = frame["mcp_servers"];
   const names = Array.isArray(servers) ? servers.map((s) => asRecord(s)?.["name"]) : undefined;
   if (!names || names.length !== surface.mcpServers.length || !surface.mcpServers.every((n) => names.includes(n))) {
-    return `MCP servers must be exactly [${surface.mcpServers.join(", ")}]`;
+    return { code: "init_mcp", message: `MCP servers must be exactly [${surface.mcpServers.join(", ")}]` };
   }
 
   const plugins = frame["plugins"];
   if (surface.plugins.length === 0) {
     if (plugins !== undefined && plugins !== null && (!Array.isArray(plugins) || plugins.length > 0)) {
-      return "a plugin is loaded";
+      return { code: "init_plugin", message: "a plugin is loaded" };
     }
   } else {
     const pluginNames = Array.isArray(plugins) ? plugins.map((p) => asRecord(p)?.["name"]) : undefined;
     if (!pluginNames || pluginNames.length !== surface.plugins.length || !surface.plugins.every((n) => pluginNames.includes(n))) {
-      return `plugins must be exactly [${surface.plugins.join(", ")}]`;
+      return { code: "init_plugin", message: `plugins must be exactly [${surface.plugins.join(", ")}]` };
     }
   }
 
   const agents = stringList(frame, "agents");
-  if (!agents) return "init frame has a malformed agent list";
+  if (!agents) return { code: "init_malformed", message: "init frame has a malformed agent list" };
   const strayAgents = agents.filter((a) => !PINNED_BUILTIN_AGENTS.has(a));
-  if (strayAgents.length) return `unexpected agents: ${strayAgents.join(",")}`;
+  if (strayAgents.length) return { code: "init_agents", message: `unexpected agents: ${strayAgents.join(",")}` };
 
   const skills = stringList(frame, "skills");
-  if (!skills) return "init frame has a malformed skill list";
+  if (!skills) return { code: "init_malformed", message: "init frame has a malformed skill list" };
   const straySkills = skills.filter((s) => !PINNED_BUILTIN_SKILLS.has(s) && !surface.skills.includes(s));
-  if (straySkills.length) return `unexpected skills: ${straySkills.join(",")}`;
+  if (straySkills.length) return { code: "init_skills", message: `unexpected skills: ${straySkills.join(",")}` };
   return undefined;
 }
 
@@ -272,12 +279,17 @@ export function checkIsolatedInit(message: unknown, surface: IsolationSurface = 
  * content seen while the latch is closed is refused. Returns the refusal reason, if any.
  */
 export function guardIsolatedFrame(msg: unknown, gate: InitGate, surface: IsolationSurface): string | undefined {
+  return guardIsolatedFrameRefusal(msg, gate, surface)?.message;
+}
+
+/** The same latch and acceptance rules, with a fixed code beside potentially untrusted prose. */
+export function guardIsolatedFrameRefusal(msg: unknown, gate: InitGate, surface: IsolationSurface): IsolatedRefusal | undefined {
   if (isInitFrame(msg)) {
-    const refusal = checkIsolatedInit(msg, surface);
+    const refusal = checkIsolatedInitRefusal(msg, surface);
     gate.passed = refusal === undefined;
     return refusal;
   }
-  if (!gate.passed && isContentFrame(msg)) return "the session produced output before its tool set was verified";
+  if (!gate.passed && isContentFrame(msg)) return { code: "content_before_init", message: "the session produced output before its tool set was verified" };
   return undefined;
 }
 

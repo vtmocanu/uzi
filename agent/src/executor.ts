@@ -198,7 +198,7 @@ export interface RunContext {
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
-   *  model. Only the SDK executor's summary hooks read it; the stub ignores it. */
+   *  model. Claude summary hooks read it; Codex intent/plan summaries use fixed model pins. */
   summaryModel?: string;
   /** PRD #362 M3c (Decision 3): the run's INTENT summary is already set, so the
    *  executor skips intent generation on a resume/re-claim rather than re-spending
@@ -704,10 +704,10 @@ export interface RunContext {
    *  legacy throw (the runner wires it in production; an unwired seam, as in tests, never fires
    *  the hold).
    *
-   *  Returns TRUE when the run ENTERED the verified hold (parked; the runner preserved the clone
-   *  and HOME and the caller latches {@link ExecutorResult.completionHeld} and breaks so the runner
-   *  skips finalization). Returns FALSE when the hold could NOT be entered — capture was never
-   *  verified, or the server did not ACK `paused` — so the run is KEPT LIVE and nothing was cleaned
+   *  Returns TRUE for a confirmed hold or unresolved delivery: the runner preserves clone
+   *  and HOME and the caller latches {@link ExecutorResult.completionHeld} to skip finalization.
+   *  Returns FALSE if capture was never verified or explicit proof refused the hold;
+   *  nothing was cleaned
    *  up; the caller then falls through to the LEGACY terminal throw (never the destructive
    *  cleanup). The implementation MUST NOT run the destructive clone/HOME cleanup on the false
    *  path. */
@@ -811,10 +811,10 @@ export interface ExecutorResult {
   /** Latest accepted declaration that an issue delivery leaves the issue open. */
   nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
-   *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
-   *  latched from the LAST successful generation of this run. Absent whenever that pass did not
-   *  run or did not succeed, which is normal: a resumed run past its gate and every Codex run
-   *  never produce one. */
+   *  summary pass produced and the api accepted,
+   *  latched after API acceptance. Codex latches only for the current gate generation: a newer
+   *  gate clears its previous latch even if its replacement fails. Absent when the pass did not run or succeed,
+   *  including a resumed run past its gate. */
   summaryPlan?: string;
   /** PRD #1798 M2: the tagged deltas (added / changed / dropped) that accompanied
    *  `summaryPlan`, from the same generation. Present only alongside `summaryPlan`. */
@@ -837,7 +837,7 @@ export interface ExecutorResult {
    *  completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed to
    *  `ctx.enterCompletionHold` instead of throwing. The runner reads it in phasePublish to SKIP
    *  finalization (no push, no PR, no completion report), exactly like `pausedAt`: the hold seam
-   *  already parked the run (M4). `reason` is the static, content-free failure-reason constant the
+   *  retained the run, either confirmed parked or unresolved. `reason` is the static, content-free failure-reason constant the
    *  route used. Only ever set when `ctx.enterCompletionHold` is wired (M4); nil in M3 production
    *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
    *  sets it. */

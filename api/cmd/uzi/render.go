@@ -7,6 +7,7 @@ import (
 	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -86,24 +87,20 @@ func effectiveRunStatus(status string, isPlanning, isRevising bool) string {
 }
 
 // landingStateNeedsLanding is the one apitypes.RunDTO.LandingState bucket (issue #1418) the
-// CLI/TUI render specially: a `failed` run whose committed work is human-landable reads
-// "needs landing" instead of "failed". The other server-derived buckets ("unrecoverable",
+// CLI/TUI render specially: after human stops are resolved, a genuinely failed run
+// whose committed work is human-landable reads "needs landing" instead of "failed".
+// The other server-derived buckets ("unrecoverable",
 // "none") read as an ordinary failed run. Kept in sync with workersvc.DeriveLandingState's
 // enum on the wire.
 const landingStateNeedsLanding = "needs_landing"
 
-// displayRunStatus is the human-facing STATUS word for a run's table cell (issue #1418): it
-// is effectiveRunStatus, then the landing bucket — a `failed` run whose server-derived
-// landing_state is "needs_landing" reads "needs landing" instead of "failed", surfacing that
-// its committed work can still be landed by hand. ONLY that one bucket is remapped: an
-// "unrecoverable" or "none" failed run, and every non-failed status, read exactly as
-// effectiveRunStatus resolves them.
-//
-// The remap lives HERE, at the CLI display sites (run list, run get, admin runs), NOT in
-// effectiveRunStatus itself: the TUI's stateColor keys on the raw "failed" token to pick the
-// alarm colour, so effectiveRunStatus must keep returning "failed" for the glyph/colour logic
-// to work. The TUI word is remapped separately in stateGlyphWord's failed arm.
-func displayRunStatus(status string, isPlanning, isRevising bool, landingState string) string {
+// displayRunStatus resolves human-stop labels before planning/revising and landing.
+// After human stops are resolved, a failure with needs_landing reads "needs landing";
+// remaining statuses retain effectiveRunStatus's word. The raw status stays intact.
+func displayRunStatus(status string, isPlanning, isRevising bool, landingState, stopKind string) string {
+	if label := runpresentation.HumanStopLabel(status, stopKind); label != "" {
+		return label
+	}
 	s := effectiveRunStatus(status, isPlanning, isRevising)
 	if s == "failed" && landingState == landingStateNeedsLanding {
 		return "needs landing"

@@ -501,10 +501,11 @@ Where it appears:
 - **Web** (dashboard and runs list rows): a Progress cell, `70%` with a thin
   bar, or `● waits on you` / `◼ stalled` as above. On the Dashboard the cell
   is hidden at phone widths; the runs list keeps it.
-- **TUI board**: a `PROG` column after `MILES`, e.g. `70% ▰▰▰▰▰▰▱▱`. The bar
-  drops before the percent on narrow terminals, leaving the percent or a
-  short flag. Every flag is text, so `NO_COLOR` keeps all of them. The board
-  shows no "since" time.
+- **TUI board**: one progress cell combines the milestone micro-bar with the
+  server-derived percent in a fixed slot after the marker. On narrow terminals the percent
+  drops first, preserving the milestone marker and room for the title. Repeated
+  status words are omitted; waiting or parked flags remain when stalled or looping
+  health hides that status. Every flag survives `NO_COLOR`; no "since" time is shown.
 - **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
   of 3`, `stalled · since 14:05` or `waits on you · plan gate`; a run
   waiting on a question may add ` · may be blocked by <id>` (see [May be

@@ -20,13 +20,13 @@
 #   --wait           when limited with a known reset, poll until the reset elapses (+2 min
 #                    margin) or CR's status leaves "rate limited"; then exit 0. An exact
 #                    --query wait switches reviewer immediately when the reset is unknown
-#                    or over 15 min away. Without --query, an unknown reset waits until
+#                    or over 20 min away. Without --query, an unknown reset waits until
 #                    --max-wait-min. Hitting that ceiling exits 2, never 0.
 #   --trigger-review atomically query, wait, post `@coderabbitai review` exactly once when
 #                    safe, then exec watch-pr.sh with `--reviewer coderabbit`; implies --query
 #                    --wait. A per-PR lock plus a current-head marker and recent-trigger check
 #                    prevent parallel/replayed invocations posting twice. An unknown or
-#                    over-15-min reset exits promptly so the caller can switch reviewer.
+#                    over-20-min reset exits promptly so the caller can switch reviewer.
 #                    A non-zero countdown is waited out plus UZI_LANDER_CR_TRIGGER_MARGIN
 #                    seconds (default 60): CodeRabbit states whole minutes. After posting, it
 #                    reads CodeRabbit's reply; a "Review rate limited" refusal records nothing
@@ -41,7 +41,7 @@
 # Exit codes:
 #   0  not limited, OR the limit window has elapsed; with --trigger-review the review command
 #      was posted (or an equivalent recent command already exists)
-#   1  limited, reset known and still in the future (switch reviewer when over 15 min), or
+#   1  limited, reset known and still in the future (switch reviewer when over 20 min), or
 #      --trigger-review saw 3 triggers refused as rate limited
 #   2  reset unknown (switch reviewer after an exact query; plain --wait has a ceiling)
 #   3  usage / gh error
@@ -340,7 +340,7 @@ if [ "$WAIT" -eq 0 ]; then
 fi
 
 # An exact query has already spent its ask window trying to obtain an authoritative
-# countdown. Without one, or when it is outside the 15-minute CR review lane, waiting
+# countdown. Without one, or when it is outside the 20-minute CR review lane, waiting
 # to the generic ceiling cannot change the reviewer decision.
 if [ "$QUERY" -eq 1 ]; then
   if [ -z "$reset_ts" ]; then
@@ -348,7 +348,7 @@ if [ "$QUERY" -eq 1 ]; then
     exit 2
   fi
   reset_min=$(( (reset_ts - $(date +%s) + 59) / 60 ))
-  if [ "$reset_min" -gt 15 ]; then
+  if [ "$reset_min" -gt 20 ]; then
     echo "NEXT=switch_reviewer (CodeRabbit reset $reset_min min away)"
     exit 1
   fi
