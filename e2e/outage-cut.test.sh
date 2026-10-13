@@ -6,8 +6,9 @@ SCRATCH="$(mktemp -d)"
 trap 'rm -rf "$SCRATCH"' EXIT
 fixture() {
   # shellcheck disable=SC2034  # evaluated real helpers consume these variables
-  RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=fixture
+  RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=00000000-0000-0000-0000-000000000001
   API_AVAILABLE=1 API_PAUSED=0 ALIAS_AVAILABLE=0 REFUSE_API=0 REFUSE_ALIAS=0 REFUSE_REMOVE=0
+  BARRIER_ARMED=0 BARRIER_RELEASED=0 FIXTURE_FINISHED=0 SLOW_HELPER=0
   fake_compose() {
     while [ "${1:-}" = -f ] || [ "${1:-}" = --profile ]; do shift 2; done
     printf '%s\n' "$*" >> "$SCRATCH/calls"
@@ -17,12 +18,15 @@ fixture() {
       pause) API_PAUSED=1; API_AVAILABLE=0 ;;
       up)
         case "${!#}" in
-          outbox-api-placeholder) [ "$REFUSE_ALIAS" = 0 ] || return 1; ALIAS_AVAILABLE=1 ;;
+          outbox-api-placeholder) [ "$REFUSE_ALIAS" = 0 ] || return 1;
+            if [ "$SLOW_HELPER:$BARRIER_ARMED" = 1:0 ]; then FIXTURE_FINISHED=1; fi
+            ALIAS_AVAILABLE=1 ;;
           api) [ "$REFUSE_API" = 0 ] || return 1; API_AVAILABLE=1; API_PAUSED=0 ;;
         esac ;;
       rm) [ "$API_AVAILABLE" = 1 ] || fail 'alias removal creates a DNS gap';
         [ "$REFUSE_REMOVE" = 0 ] || return 1; ALIAS_AVAILABLE=0 ;;
       logs) echo fixture-evidence ;;
+      exec) [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop'; BARRIER_RELEASED=1 ;;
     esac
   }
   fail() { echo "$*" >&2; exit 1; }
@@ -30,7 +34,10 @@ fixture() {
   login() { :; }
   wait_worker_online() { :; }
   set_interlock() { :; }
+  make_outbox_run() { [ "${1:-}" != cut_barrier ] || BARRIER_ARMED=1; }
   wait_terminal_lost() {
+    [ "$FIXTURE_FINISHED" = 0 ] || fail 'slow helper let fixture finish before API cut'
+    [ "$SLOW_HELPER:$BARRIER_RELEASED" != 1:0 ] || fail 'cut barrier never released'
     [ "$API_AVAILABLE:$API_PAUSED:$ALIAS_AVAILABLE" = 0:0:1 ] || fail 'outage must stop API while preserving its DNS alias'
     jq -e '.services | keys == ["outbox-api-placeholder"]' "$OUTBOX_DNS_OVERRIDE" >/dev/null \
       || fail 'placeholder must not change API, worker or network configuration'
@@ -42,14 +49,15 @@ fixture() {
       .cap_drop == ["ALL"] and .environment == null and .volumes == null and .secrets == null' "$OUTBOX_DNS_OVERRIDE" >/dev/null \
       || fail 'placeholder must be idle, phase-scoped and authority-free'
   }
-  eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|api_back|restore_outbox_resolution|restore_outage_state)\(\) \{/,/^\}/' "$PHASE")"
+  eval "$(awk '/^(configure_outbox_api_alias|start_outbox_api_alias|remove_outbox_api_alias|recreate_outbox_api|recreate_outbox_agent|api_cut|release_outbox_cut_barrier|api_back|restore_outbox_resolution|restore_outage_state)\(\) \{/,/^\}/' "$PHASE")"
 }
 fixture
 configure_outbox_api_alias
+SLOW_HELPER=1
 eval "$(awk '
   /^say "CASE 3:/ { inside=1; next }
   /^say "CASE 4:/ { inside=0 }
-  inside && (/^api_cut$/ || /^terminal_lost_b1=/ || /^api_back$/) { print }
+  inside && (/^make_outbox_run/ || /^api_cut$/ || /^release_outbox_cut_barrier/ || /^terminal_lost_b1=/ || /^api_back$/) { print }
 ' "$PHASE")"
 [ "$API_AVAILABLE:$API_PAUSED:$ALIAS_AVAILABLE" = 1:0:0 ]
 echo 'PASS: real CASE 3 keeps API alias through stop, removes placeholder after health'

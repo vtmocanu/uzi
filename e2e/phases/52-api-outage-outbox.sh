@@ -137,14 +137,15 @@ assert_contiguous() {
   done
   fail "outbox phase: run $run stream is not a gapless 1..N sequence after drain: $(printf '%s' "$msgs" | jq -c '[.messages[].seq] | sort')"
 }
-# make_outbox_run — create + approve a UZI_STUB_OUTBOX stub run and wait until its stream
+# make_outbox_run [cut_barrier] — create + approve a UZI_STUB_OUTBOX stub run and wait until its stream
 # is flowing; leave the id in OUTBOX_RUN (a GLOBAL, so a `fail`/`pass` in here runs in the
 # current shell and a captured command-substitution can't swallow its exit — the 50/51
 # idiom). The caller has already recreated the agent with the case's outbox knobs.
+# cut_barrier holds stub completion until the harness releases the run after API stop.
 make_outbox_run() {
-  local iid n deadline
+  local iid n deadline barrier="${1:-}"
   iid="$(apipost "/api/repos/$REPO_ID/issues" \
-    '{"title":"E2E outbox UZI_STUB_OUTBOX","description":"implements prds/1391-worker-outbox-durable-reports.md UZI_STUB_OUTBOX"}' \
+    "$(jq -nc --arg barrier "$barrier" '{title:"E2E outbox UZI_STUB_OUTBOX",description:("implements prds/1391-worker-outbox-durable-reports.md UZI_STUB_OUTBOX" + (if $barrier == "cut_barrier" then " UZI_STUB_OUTBOX_CUT_BARRIER" else "" end))}')" \
     | jq -r '.card.iid')"
   { [ -n "$iid" ] && [ "$iid" != null ]; } || fail "outbox phase: could not create the stub issue"
   # Cases create one fresh run at a time. Re-check before each initial claim;
@@ -314,6 +315,13 @@ api_cut() {
   start_outbox_api_alias
   "${COMPOSE[@]}" stop api >/dev/null 2>&1 || fail "outbox phase: could not stop the api"
 }
+release_outbox_cut_barrier() {
+  local run="$1"
+  [[ "$run" =~ ^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$ ]] || fail "outbox phase: invalid cut barrier run id"
+  "${COMPOSE[@]}" exec -T agent node -e \
+    'require("node:fs").writeFileSync("/tmp/cdr-outbox-cut-" + process.argv[1], "cut\n", {flag:"wx"})' "$run" \
+    || fail "outbox phase: could not release cut barrier for run $run"
+}
 # api_back restores HTTP before judging an outage assertion.
 api_back() {
   "${COMPOSE[@]}" up -d --wait api >/dev/null || fail "outbox phase: API restart failed"
@@ -480,11 +488,12 @@ set_interlock false
 # CASE 3 — a run FINISHING during the outage is `completed` AFTER its messages (the fence), at its
 # original generation (replayed, not re-executed), with no false `failed` (SC1/SC2).
 say "CASE 3: a run finishing during the outage -> completed after its messages (fence), no false failed"
-make_outbox_run
+make_outbox_run cut_barrier
 RUN_B1="$OUTBOX_RUN"
 GEN_B1="$(rb_run_field "$RUN_B1" claim_generation)"
 say "cutting the api so run $RUN_B1 reaches AND journals its terminal (write-ahead) while it is down"
 api_cut
+release_outbox_cut_barrier "$RUN_B1"
 terminal_lost_b1=0; if wait_terminal_lost "$RUN_B1"; then terminal_lost_b1=1; fi
 api_back
 # Judge only AFTER the api is back: a `fail` with it still unavailable would take every later phase down

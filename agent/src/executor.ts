@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { UsageSink } from "./usage-recorder.js";
@@ -1795,6 +1796,36 @@ export class StubExecutor implements Executor {
           payload: { text: `stub: outbox tick ${i}` },
         });
         await sleep(outboxTickMs);
+      }
+      // Stub-only E2E barrier: helper startup may outlast the stream. The harness
+      // releases this exact run only after stopping the API, never by elapsed time.
+      if (ctx.issueDescription.includes("UZI_STUB_OUTBOX_CUT_BARRIER")) {
+        if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(ctx.runId))
+          throw new Error("invalid stub outbox barrier run id");
+        const name = `cdr-outbox-cut-${ctx.runId}`;
+        const file = path.join("/tmp", name);
+        await new Promise<void>((resolve, reject) => {
+          let done = false;
+          const finish = (error?: unknown) => {
+            if (done) return;
+            done = true;
+            watcher.close();
+            clearTimeout(timer);
+            ctx.signal?.removeEventListener("abort", abort);
+            if (error) reject(error); else resolve();
+          };
+          const abort = () => finish(ctx.signal?.reason ?? new Error("stub outbox barrier aborted"));
+          const check = () => { void fs.access(file).then(() => finish(), error => {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(error);
+          }); };
+          const watcher = watch("/tmp", (_event, changed) => { if (changed === name) check(); });
+          watcher.on("error", finish);
+          const timer = setTimeout(() => finish(new Error("stub outbox cut barrier timeout")), 180_000);
+          ctx.signal?.addEventListener("abort", abort, { once: true });
+          if (ctx.signal?.aborted) abort(); else check();
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: outbox waiting for API cut" } });
+        });
+        await fs.unlink(file).catch(() => undefined);
       }
       return;
     }
