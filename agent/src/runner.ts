@@ -2493,6 +2493,9 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        pendingGenerationReport: (runId, generation) => !!this.outbox &&
+          (this.outbox.isDisabled() || this.outbox.hasPendingTerminal(runId, generation) ||
+            !!this.outbox.finalizeRecordIdentity(runId, generation)),
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
@@ -4420,9 +4423,13 @@ export class RunRunner {
     }
   }
 
-  /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
-   *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
-   *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
+  /** Read-only exact covering ACK predicate, using ADR-2417's unchanged physical journal rule. */
+  async recoveryFinalAcknowledged(runId: string, generation: number): Promise<boolean> {
+    try { return await this.recovery.inventoryCleanupState(runId, generation) === "acknowledged"; }
+    catch { return false; }
+  }
+
+  /** Unknown or unresolved custody retains the generation's terminal/finalize reports. */
   async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
     if (this.unpersistedCompletionReceipts.has(this.completionKey(runId, generation))) return true;
     const key = this.completionKey(runId, generation);
