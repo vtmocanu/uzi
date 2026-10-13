@@ -88,9 +88,9 @@ function Findings({ value, dispositions }: { value: unknown; dispositions: Map<s
       <div className="min-w-0 flex-1 space-y-1">
         <p className="text-xs text-muted">Finding: {id ? <code className="rounded bg-raised px-1.5 py-0.5 font-mono break-all">{stripUnsafeChars(id)}</code> : "ID unavailable"}</p>
         {path && <p className="text-xs text-muted">Path: <code className="rounded bg-raised px-1.5 py-0.5 font-mono break-all">{path}</code>{Number.isSafeInteger(f.line) && (f.line as number) > 0 && (f.line as number) <= 2147483647 ? `:${f.line}` : ""}</p>}
-        <div className="judge-prose"><Markdown content={title} /></div>
-        <div className="judge-prose text-muted"><Markdown content={detail} /></div>
-        {disposition && <><p>Disposition: <Badge>{disposition.disposition}</Badge></p><div className="judge-prose"><Markdown content={disposition.reason} /></div></>}
+        <div className="judge-prose break-words"><Markdown content={title} /></div>
+        <div className="judge-prose break-words text-muted"><Markdown content={detail} /></div>
+        {disposition && <><p>Disposition: <Badge>{disposition.disposition}</Badge></p><div className="judge-prose break-words"><Markdown content={disposition.reason} /></div></>}
       </div>
     </article>;
   });
@@ -134,12 +134,15 @@ export function CodeCrossCheck({ run }: { run: Run }) {
       <p>{evidence.state === "Pending report" ? "Dispositions pending" : evidence.state}</p>
       {!historical && s.outcome === "completed" && evidence.state === "Finalized" && <p>{counts.addressed} addressed, {counts.declined} declined, {counts.not_reported} not reported</p>}
       <Findings value={s.findings} dispositions={evidence.entries} />
-      <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted"><span>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"}</span><span> · </span><span>Model: {plain(s.checker_model) || "Unreported"}</span><span> · </span><span>Effort: {plain(s.checker_effort) || "Unreported"}</span>
-      <span> · </span><span>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : ""}</span>
-      {typeof s.head_commit === "string" && /^[a-f0-9]{40}(?![\s\S])/i.test(s.head_commit) && <span> · Checked SHA: <code className="font-mono" title={s.head_commit}>{s.head_commit.slice(0, 12)}</code></span>}
-      {s.custom_guidance_applied === true && <><span> · </span><span>Custom guidance applied{typeof s.guidance_digest === "string" && /^[0-9a-f]{12}/i.test(s.guidance_digest)
-        && <> <code className="font-mono">{s.guidance_digest.slice(0, 12).toLowerCase()}</code></>}
-      </span></>}
+      <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
+        <span>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"}</span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Model: {plain(s.checker_model) || "Unreported"}</span></span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Effort: {plain(s.checker_effort) || "Unreported"}</span></span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : ""}</span></span>
+        {typeof s.head_commit === "string" && /^[a-f0-9]{40}(?![\s\S])/i.test(s.head_commit) && <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checked SHA: <code className="font-mono" title={s.head_commit}>{s.head_commit.slice(0, 12)}</code></span></span>}
+        {s.custom_guidance_applied === true && <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Custom guidance applied{typeof s.guidance_digest === "string" && /^[0-9a-f]{12}/i.test(s.guidance_digest)
+          && <> <code className="font-mono">{s.guidance_digest.slice(0, 12).toLowerCase()}</code></>}
+        </span></span>}
       </p>
     </>}
     </Card>

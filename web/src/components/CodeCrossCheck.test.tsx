@@ -85,7 +85,10 @@ it("renders hostile prose and paths safely, strict IDs, validated child and subs
     findings: [{ id: "KEEP_id-1", path: "<img src=x>\u202E\u0007", line: 2, severity: "major",
       title: "**Finding title**", detail: "<script>alert(1)</script> [bad](javascript:alert(1))" }] });
   expect(screen.getByText(/KEEP_id-1/)).toBeTruthy();
-  expect(screen.getByText("<img src=x>").closest("p")).toBeTruthy();
+  const chip = screen.getByText("<img src=x>");
+  expect(chip.tagName).toBe("CODE");
+  expect(chip.closest("p")).toBeTruthy();
+  expect(chip.querySelector("img, em, strong")).toBeNull();
   expect(container.querySelector("script, img")).toBeNull();
   expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
   expect(screen.getByRole("link", { name: "Open checker run" }).getAttribute("href")).toBe("/runs/12345678-abcd-abcd-abcd-123456789abc");
@@ -254,6 +257,12 @@ it.each(["running", "queued", "completed", "failed", "cancelled"] as const)("lab
   render(<MemoryRouter><CodeCrossCheck run={{ ...mockRuns[0], status, code_cross_check_required: true, code_cross_check_summary: undefined }} /></MemoryRouter>);
   expect(screen.getByText(terminal ? "Not recorded" : "Pending")).toBeTruthy();
   expect(screen.getByText(terminal ? "This run ended without a code cross-check result." : "Runs after implementation, before the PR is published.")).toBeTruthy();
+  if (!terminal) {
+    expect(screen.queryByText("Not recorded")).toBeNull();
+    expect(screen.queryByText(/This run ended/)).toBeNull();
+    expect(screen.queryByRole("link", { name: "Open checker run" })).toBeNull();
+    expect(screen.queryByText(/Family:|Model:|Checker cost:|Dispositions/)).toBeNull();
+  }
 });
 it.each(["pending", "completed", "failed", "future"])("keeps outcome %s honest without valid dispositions", outcome => {
   view({ outcome, findings: [{ id: "f1" }], dispositions: [], finalized_at: "recorded" });
@@ -279,4 +288,26 @@ it("retains malformed-item and unavailable-batch copy", () => {
   cleanup();
   view({ findings: null as unknown as CodeCrossCheckSummary["findings"] });
   expect(screen.getByText("Findings unavailable")).toBeTruthy();
+});
+
+it.each(["path", "title", "detail", "items"])("discloses isolated code %s truncation outside either disclosure state", field => {
+  const findings = Array.from({ length: field === "items" ? 21 : 5 }, (_, i) => ({
+    id: "f" + i, path: "path_" + i, severity: "minor", title: "Title " + i, detail: "Detail " + i,
+  }));
+  if (field === "path") findings[0].path = "P".repeat(513);
+  if (field === "title") findings[0].title = "T".repeat(513);
+  if (field === "detail") findings[0].detail = "D".repeat(2049);
+  const { container } = view({ findings });
+  const notice = screen.getByText("Findings truncated for display.");
+  const details = container.querySelector("details")!;
+  expect(details.open).toBe(false);
+  expect(notice.closest("details")).toBeNull();
+  expect(container.querySelectorAll("article")).toHaveLength(field === "items" ? 20 : 5);
+  if (field === "items") expect(screen.queryByText("Title 20")).toBeNull();
+  details.open = true;
+  fireEvent.toggle(details);
+  expect(screen.getByText(field === "items" ? "Hide 17 more findings" : "Hide 2 more findings")).toBeTruthy();
+  expect(notice.closest("details")).toBeNull();
+  expect(container.querySelector(".animate-pulse, .overflow-auto, .overflow-y-auto, .overflow-scroll, .overflow-y-scroll")).toBeNull();
+  expect(screen.queryByText(/Checking/)).toBeNull();
 });

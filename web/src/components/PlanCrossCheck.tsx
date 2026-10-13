@@ -96,13 +96,13 @@ function Findings({ value }: { value: unknown }) {
       <span className="shrink-0 sm:w-20"><Badge wrap tone={known ? tones[f.severity] : "neutral"}>{known ? f.severity : "Severity unavailable"}</Badge></span>
       <div className="min-w-0 flex-1 space-y-1">
         {f.file && <code className="rounded bg-raised px-1.5 py-0.5 font-mono text-xs break-all">{f.file}</code>}
-        <div className="judge-prose"><Markdown content={f.summary} /></div>
-        <div className="judge-prose text-muted"><Markdown content={f.rationale} /></div>
+        <div className="judge-prose break-words"><Markdown content={f.summary} /></div>
+        <div className="judge-prose break-words text-muted"><Markdown content={f.rationale} /></div>
       </div>
     </li>;
   });
   return <div className="space-y-2">
-    <div className="judge-prose"><Markdown content={summary} /></div>
+    <div className="judge-prose break-words"><Markdown content={summary} /></div>
     {rows.length > 0 && <ul className="divide-y divide-edge rounded-md border border-edge">{rows.slice(0, 3)}</ul>}
     {rows.length > 3 && <details open={open} onToggle={e => setOpen(e.currentTarget.open)}>
       <summary className="cursor-pointer rounded-sm text-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60">{open ? "Hide" : "Show"} {rows.length - 3} more findings</summary>
@@ -152,9 +152,12 @@ export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run;
     {s?.historical && <p>These findings concern an earlier plan; they do not certify the current plan.</p>}
     {s && <>
       <Findings value={s.findings} />
-      <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted"><span>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)})</span><span> · </span><span>Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</span>
-      {usage && <span> · Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</span>}
-      <span> · </span><span>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · no cost estimate recorded" : cost === "Unavailable" ? " · cost unavailable" : " · API-equivalent"}</span></p>
+      <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
+        <span>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)})</span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</span></span>
+        {usage && <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</span></span>}
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checker cost: {cost}{usage?.cost_status === "subscription" ? " · no cost estimate recorded" : cost === "Unavailable" ? " · cost unavailable" : " · API-equivalent"}</span></span>
+      </p>
     </>}
   </>;
   return presentation === "inset"

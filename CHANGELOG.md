@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Worker cross-check badges reflect active load ([#2857](https://github.com/vtmocanu/uzi/issues/2857)).**
   A single active cross-check uses the singular label; Dashboard and Runs hide idle cross-check badges while Workers settings retains idle capacity, with run and busy badges unchanged.
 
+- **Run-page cross-check cards match the Run summary treatment ([#2856](https://github.com/vtmocanu/uzi/issues/2856)).**
+  Plan and Code cross-checks use consistent headers, styled checker links, compact prose and literal finding chips. The first three findings stay visible, with the rest in a keyboard-accessible disclosure; checker metadata shares a footer, and pending or missing results have clearer states. Plan approval shows checker evidence below its header, and Run review uses the same sentence-case heading style.
+
 - **Report-only issue runs now finish under the completion interlock ([#2821](https://github.com/vtmocanu/uzi/issues/2821)).**
   A report-only issue run with every frozen milestone declared complete can store its findings and finish without publishing a branch or opening a merge request. Completion still checks the current worker and claim generation; identical retries preserve the stored report. Mixed report-only publication requests are refused, except for an interlocked issue's scope-capped zero-work delivery through its existing valid permit. Legacy headless report-only completions keep their existing behavior.
 

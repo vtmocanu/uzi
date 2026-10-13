@@ -323,6 +323,12 @@ describe("plan evidence rows and recording states", () => {
     const r = render(<PlanCrossCheck run={run({ status, plan_cross_check_required: true, plan_cross_check_summary: undefined, plan_cross_check_gate_reason: undefined })} />);
     expect(r.getByText(terminal ? "Not recorded" : "Pending")).toBeTruthy();
     expect(r.getByText(terminal ? "This run ended without a plan cross-check result." : "Runs when the plan is ready, before it can proceed.")).toBeTruthy();
+    if (!terminal) {
+      expect(r.queryByText("Not recorded")).toBeNull();
+      expect(r.queryByText(/This run ended/)).toBeNull();
+      expect(r.queryByRole("link", { name: "Open checker run" })).toBeNull();
+      expect(r.queryByText(/Model:|Checker cost:|Checked candidate:/)).toBeNull();
+    }
   });
   it.each([null, ""])("shows valid pending reason %s with no-result copy", reason_class => {
     const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ verdict: "pending", reason_class }) })} />);
@@ -336,4 +342,48 @@ describe("plan evidence rows and recording states", () => {
     expect(r.getByText("Earlier-plan evidence: Outcome unavailable")).toBeTruthy();
     expect(r.getByText("These findings concern an earlier plan; they do not certify the current plan.")).toBeTruthy();
   });
+});
+
+it("renders summary inline code, literal hostile path and info/info/warning in source order", () => {
+  const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+    summary: "Overview uses `plan_summary`.", items: ["info", "info", "warning"].map((severity, i) => ({
+      file: "<img src=x>__hostile__*path*", severity, summary: "Row " + i, rationale: "Reason " + i,
+    })),
+  } }) })} />);
+  const inline = r.getByText("plan_summary");
+  expect(inline.tagName).toBe("CODE");
+  expect(inline.closest(".judge-prose")).toBeTruthy();
+  const rows = [...r.container.querySelectorAll("li")];
+  expect(rows.map(row => row.querySelector(".judge-prose")?.textContent)).toEqual(["Row 0", "Row 1", "Row 2"]);
+  expect(rows.map(row => row.querySelector(".shrink-0")?.textContent)).toEqual(["info", "info", "warning"]);
+  expect(rows[2].querySelector(".text-warn")).toBeTruthy();
+  for (const row of rows) {
+    const chip = row.querySelector("code")!;
+    expect(chip.textContent).toBe("<img src=x>__hostile__*path*");
+    expect(chip.querySelector("img, em, strong")).toBeNull();
+  }
+  expect(r.container.querySelector("img, .animate-pulse, .overflow-auto, .overflow-y-auto, .overflow-scroll, .overflow-y-scroll")).toBeNull();
+  expect(r.queryByText(/Checking/)).toBeNull();
+});
+
+it.each(["summary", "file", "title", "detail", "items"])("discloses isolated plan %s truncation outside either disclosure state", field => {
+  const items = Array.from({ length: field === "items" ? 21 : 5 }, (_, i) => ({
+    file: "path_" + i, severity: "info", summary: "Title " + i, rationale: "Detail " + i,
+  }));
+  if (field === "file") items[0].file = "P".repeat(16385);
+  if (field === "title") items[0].summary = "T".repeat(16385);
+  if (field === "detail") items[0].rationale = "D".repeat(16385);
+  const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+    summary: field === "summary" ? "S".repeat(16385) : "Overview", items,
+  } }) })} />);
+  const notice = r.getByText("Findings truncated for display.");
+  const details = r.container.querySelector("details")!;
+  expect(details.open).toBe(false);
+  expect(notice.closest("details")).toBeNull();
+  expect(r.container.querySelectorAll("li")).toHaveLength(field === "items" ? 20 : 5);
+  if (field === "items") expect(r.queryByText("Title 20")).toBeNull();
+  details.open = true;
+  fireEvent.toggle(details);
+  expect(r.getByText(field === "items" ? "Hide 17 more findings" : "Hide 2 more findings")).toBeTruthy();
+  expect(notice.closest("details")).toBeNull();
 });
