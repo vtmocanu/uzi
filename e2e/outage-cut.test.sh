@@ -26,6 +26,7 @@ fixture() {
       rm) [ "$API_AVAILABLE" = 1 ] || fail 'alias removal creates a DNS gap';
         [ "$REFUSE_REMOVE" = 0 ] || return 1; ALIAS_AVAILABLE=0 ;;
       logs) echo fixture-evidence ;;
+      restart) [ "$BARRIER_RELEASED:$FIXTURE_FINISHED" = 1:0 ] || fail 'restart preceded the guarded terminal outage' ;;
       exec) [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop';
         [ "${3:-}:${4:-}" = -u:10001:10001 ] || fail 'barrier writer must match worker uid for sticky tmp cleanup'
         BARRIER_RELEASED=1 ;;
@@ -37,6 +38,7 @@ fixture() {
   wait_worker_online() { :; }
   set_interlock() { :; }
   make_outbox_run() { [ "${1:-}" != cut_barrier ] || BARRIER_ARMED=1; }
+  wait_permit_retrying() { wait_terminal_lost "$@"; }
   wait_terminal_lost() {
     [ "$FIXTURE_FINISHED" = 0 ] || fail 'slow helper let fixture finish before API cut'
     [ "$SLOW_HELPER:$BARRIER_RELEASED" != 1:0 ] || fail 'cut barrier never released'
@@ -100,4 +102,21 @@ if ( fixture; fake_compose() { return 0; }; configure_outbox_api_alias ) > "$SCR
 fi
 grep -F 'built worker image missing for API placeholder' "$SCRATCH/image.log" >/dev/null
 echo 'PASS: missing built worker image fails before mutation'
-echo 'cases=8 passed=8'
+for case_number in 4 5 6; do
+  (
+    fixture
+    configure_outbox_api_alias
+    # shellcheck disable=SC2034  # evaluated real case commands consume these ids
+    RUN_B2="$RUN_B1" RUN_B3="$RUN_B1" RUN_B4="$RUN_B1" SLOW_HELPER=1
+    eval "$(awk -v selected="$case_number" '
+      /^say "CASE [0-9]+:/ { inside = index($0, "CASE " selected ":") > 0 }
+      inside && (/^make_outbox_run/ || /^api_cut$/ || /^release_outbox_cut_barrier/ ||
+        /^terminal_lost_b[234]=/ || /^permit_retrying_b4=/ || /^api_back$/ ||
+        index($0, "\"${COMPOSE[@]}\" restart agent") == 1) { print }
+    ' "$PHASE")"
+    [ "$API_AVAILABLE:$ALIAS_AVAILABLE:$BARRIER_ARMED:$BARRIER_RELEASED:$FIXTURE_FINISHED" = 1:0:1:1:0 ] \
+      || fail "case $case_number did not enforce the cut barrier"
+  )
+  echo "PASS: real CASE $case_number cannot finish during slow helper startup before the cut"
+done
+echo 'cases=11 passed=11'
