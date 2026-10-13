@@ -13,7 +13,8 @@
 //   resolvePendingTerminal — the REUSABLE resolve primitive (M4 also calls it at boot): read the
 //   journal, send the canonical bytes (adding the `messages_through_seq` fence ONLY when the api
 //   advertised `terminal_fence`, D9), and classify the ack:
-//     - 200, or a 409 whose returned status is terminal → retire (the transition landed);
+//     - 200, or a 409 whose returned status is terminal → settle admission and attempt retirement;
+//       a custody guard may retain the journal and evidence after the server outcome settled;
 //     - 409 stale_claim → local stale-retire (D11: increments stale_retired, NO server write,
 //       NEVER rebinds to a newer generation);
 //     - 409 messages_pending → run the gap-fill loop, then re-send;
@@ -32,8 +33,7 @@ import { canonicalizeTerminalBody } from "./outbox.js";
 import type { MessageGapsResponse, OutgoingMessage, StateAck, StateRequest } from "./protocol.js";
 import { errMessage } from "./util.js";
 
-/** The run's terminal statuses. A 409 whose returned status is one of these means the outcome has
- *  already landed (a lost ack after a prior commit, or a racing cancel), so the journal retires. */
+/** Terminal server statuses settle the outcome, while custody can still defer journal retirement. */
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
 
 /** The fixed reason a gap-fill tombstone records (PRD #1391 Run B M3). Mirrors Run A's dropped-range
@@ -301,6 +301,17 @@ async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: Resolv
   await actOnAck(deps, args, ack);
 }
 
+/** Admission bookkeeping is advisory: failure must never skip the existing retirement attempt. */
+async function markServerSettledBestEffort(deps: TerminalOutboxDeps, args: ResolveArgs): Promise<void> {
+  try {
+    await deps.outbox.markTerminalServerSettled(args.runId, args.claimGeneration, args.retirementContext);
+  } catch {
+    deps.log.debug("outbox: server-settled observation failed; attempting retirement", {
+      run_id: args.runId, claim_generation: args.claimGeneration,
+    });
+  }
+}
+
 /** Classify a terminal-report ack that is NOT `messages_pending` and act on it. Order matters:
  *  stale_claim outranks a terminal status (a superseded generation must local-retire, never write). */
 async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateAck): Promise<void> {
@@ -308,6 +319,7 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
   const { runId, claimGeneration } = args;
   if (ack.applied) {
     // 200: the transition landed. Retire the journal (the outcome is the run's outcome now).
+    await markServerSettledBestEffort(deps, args);
     await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
@@ -324,7 +336,9 @@ async function actOnAck(deps: TerminalOutboxDeps, args: ResolveArgs, ack: StateA
   }
   if (ack.status !== undefined && TERMINAL_STATUSES.has(ack.status)) {
     // 409 whose returned status is terminal: the outcome already landed (a lost ack after a prior
-    // commit, or a racing cancel). Retire.
+    // commit, or a racing cancel). Stop advertising the exact outcome even if custody
+    // retains the journal; this observation grants no deletion authority.
+    await markServerSettledBestEffort(deps, args);
     await outbox.retireTerminal(runId, claimGeneration, args.retirementContext);
     return;
   }
