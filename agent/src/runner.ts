@@ -16710,19 +16710,20 @@ export class RunRunner {
    * Order: (1) with a clone, latch `preserveRecoveryClone` SYNCHRONOUSLY, before any await, so no
    * teardown path can dispose of it while the rest runs; (2) prove the run's processes and
    * attributed containers quiet (`own` mode, forced process scan), which kills only attributed
-   * processes; (3) when the proof holds and the clone is clean at a head the worker bare already
-   * holds (this run's committed tracking tip, an owed pin, or the default branch), hand teardown back its normal retire
+   * processes; (3) when the proof holds, check whether the clone is clean at a head the worker bare
+   * already holds (this run's committed tracking tip, an owed pin, or the default branch)
    * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
    * local ref, in every namespace, to be reachable from that head or from a ref of the worker bare,
-   * and the absence of a stash), a park or terminal exit (`handler.record === "none"`) hands teardown
-   * back its normal retire; a stopped exit treats the verdict as diagnostic only and keeps the clone;
-   * and (4) record
+   * and the absence of a stash): on `covered`, only a park or terminal exit (`handler.record ===
+   * "none"`) hands teardown back its normal retire; a stopped exit (no handler, or `record:
+   * "stopped"`) logs the verdict as a diagnostic and keeps the clone; and (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
    * clone (which also persists the key's attempt mode and clears the then-bound plain journal, so a
    * later run of the key seeds a fresh attempt path instead of failing on the kept clone). Step 3 is
    * skipped, keeping the source, unless the first proof's Docker half was `not_wired` or
-   * `docker_unconfirmed`. Step 4 runs whatever the proof said; it only protects. A blocked or throwing proof, an
+   * `docker_unconfirmed`. On a stopped exit step 4 runs whatever the proofs said; it only protects. A
+   * `record: "none"` exit skips step 4 (see `record` below). A blocked or throwing proof, an
    * unreadable bare or a refused record gives `unknown` (the record, when written, stays): the
    * clone and its journal stay.
    *
@@ -16747,7 +16748,7 @@ export class RunRunner {
      *  current head, as at the generic arms. `stale`: the exit is a stale-claim or other-generation
      *  one, so the guarded inventory stays closed (no ownership probe or upload through that claim).
      *  `record`: `stopped` writes the stopped-source representation (attempt ledger `reclaimed`,
-     *  canonical `uzi-stopped` marker) when the source is not covered: only for an exit where this
+     *  canonical `uzi-stopped` marker) whatever the coverage verdict: only for an exit where this
      *  generation is stopped by staleness or superseded. `none` keeps the ADR-1197 posture of a park
      *  or terminal exit instead: the preserve flag stays latched and the plain journal is untouched,
      *  so a resume recaptures the bytes and a later run's terminal-orphan handling applies. */
