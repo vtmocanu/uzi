@@ -45,6 +45,9 @@ through `[0.52.0]`.)
 - **Resumed implementation prompts preserve milestone reporting guidance ([#2438](https://github.com/vtmocanu/uzi/issues/2438)).**
   Resumed Claude implementation prompts retain the approved milestone tracker and reporting instructions; both harnesses display persisted completion declarations alongside local progress, and the lead is instructed to report finished work before `signal_done` in the same turn. This is prompt guidance, not a guarantee of model compliance; the completion interlock is unchanged and incomplete work remains blocked.
 
+- **Codex session scans stream within their entry budgets ([#2281](https://github.com/vtmocanu/uzi/issues/2281)).**
+  Session copying, presence checks and generation cleanup enumerate held directory descriptors one entry at a time; incomplete presence scans return unknown, and cleanup enumeration failures preserve the published generation.
+
 ### Changed
 
 - **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**
