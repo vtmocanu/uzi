@@ -364,6 +364,10 @@ type fakeRuns struct {
 	credDisabledCalls int
 }
 
+func (f *fakeRuns) CheckStoredCredentialOverrideEnabled(context.Context, uuid.UUID, *workersvc.CredentialOverride) error {
+	return f.credDisabledErr
+}
+
 // ScheduleCredentialDisabled fakes the pre-fire stored-pin check (PRD #1732 D2).
 func (f *fakeRuns) ScheduleCredentialDisabled(_ context.Context, _ uuid.UUID, _ *workersvc.CredentialOverride, _ *workersvc.Harness) error {
 	f.credDisabledCalls++

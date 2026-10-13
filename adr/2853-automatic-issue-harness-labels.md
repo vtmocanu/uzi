@@ -58,9 +58,15 @@ stop-and-advance after a partial start.
 
 Resolution may fail before the stored-override insert check when the sole
 Claude token is also the override and is disabled after preflight. After
-that refusal the scheduler calls the existing stored-token-only check
-(with nil explicit harness), restoring the stored-token hold/stop
-classification. No deferred preflight or aggregate hold machinery is added.
+that refusal the scheduler calls the strict stored-token-only
+`CheckStoredCredentialOverrideEnabled` check. A disabled token restores the
+stored-token hold/stop classification. An enabled or deleted token preserves the
+original per-candidate label refusal. An unreadable token lookup returns a
+wrapped transient error: a once sweep with no starts stays due without a hold
+or history write; after a partial start it records `fetch_failed`, stops scanning,
+and advances. Recurring sweeps record `fetch_failed` and continue within the
+existing caps. Run-now follows the same zero/partial outcomes without persisting
+cadence or fire history. The tolerant once preflight remains unchanged.
 
 A once **single issue** whose label selects a disabled harness holds like a
 pin and resumes on re-enable. Missing/unusable credentials gain no new

@@ -17,12 +17,9 @@ import (
 // before the insertion closure can report ErrCredentialDisabled.
 type lateOverrideRuns struct{ *fakeRuns }
 
-func (r *lateOverrideRuns) ScheduleCredentialDisabled(context.Context, uuid.UUID, *workersvc.CredentialOverride, *workersvc.Harness) error {
+func (r *lateOverrideRuns) CheckStoredCredentialOverrideEnabled(context.Context, uuid.UUID, *workersvc.CredentialOverride) error {
 	r.credDisabledCalls++
-	if r.credDisabledCalls > 1 {
-		return workersvc.ErrCredentialDisabled
-	}
-	return nil
+	return workersvc.ErrCredentialDisabled
 }
 func TestLateStoredOverrideDoesNotBecomeLabelSkip(t *testing.T) {
 	for _, auto := range []bool{false, true} {

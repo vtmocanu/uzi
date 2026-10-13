@@ -27,8 +27,8 @@ type removalForge struct {
 	writeErr    error
 }
 
-func (f *removalForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
-	return forge.Issue{Title: "candidate", Labels: f.labels, WebURL: "https://forge.e2e/issue"}, nil
+func (f *removalForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
+	return forge.Issue{IID: iid, Title: "candidate", Labels: f.labels, WebURL: "https://forge.e2e/issue"}, nil
 }
 func (f *removalForge) UpdateIssueLabels(_ context.Context, project, iid int64, add, remove []string) error {
 	f.writes++

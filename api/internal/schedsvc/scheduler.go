@@ -152,7 +152,17 @@ type RunCreator interface {
 	// too; the fire's own checks decide it). process() runs it for a one-time row before any forge
 	// call, so a held row spends no forge call per tick.
 	ScheduleCredentialDisabled(ctx context.Context, userID uuid.UUID, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) error
+	// CheckStoredCredentialOverrideEnabled preserves errors from the late stored-pin lookup.
+	CheckStoredCredentialOverrideEnabled(ctx context.Context, userID uuid.UUID, credOverride *workersvc.CredentialOverride) error
 }
+
+// storedOverrideLookupError identifies a late lookup failure rather than a credential refusal.
+type storedOverrideLookupError struct{ cause error }
+
+func (e *storedOverrideLookupError) Error() string {
+	return "scheduler: stored override check: " + e.cause.Error()
+}
+func (e *storedOverrideLookupError) Unwrap() error { return e.cause }
 
 // ForgeBuilder builds a forge driver from a stored (encrypted) connection — the same
 // seam selfimprove/autopilot use. *forgesvc.Service satisfies it.
@@ -771,6 +781,14 @@ func (e *Scheduler) fireSweep(ctx context.Context, sched store.RunSchedule) (Fir
 			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipCredentialDisabled, WebURL: issue.WebURL})
 			break
 		}
+		var lookupErr *storedOverrideLookupError
+		if sched.Timing == "once" && errors.As(err, &lookupErr) {
+			if len(out.Started) == 0 {
+				return FireOutcome{}, err
+			}
+			out.Skips = append(out.Skips, Skip{IssueIID: &iidCopy, Title: issue.Title, Reason: SkipFetchFailed, WebURL: issue.WebURL})
+			break
+		}
 		if err != nil {
 			// A permanent/transient repo error mid-sweep is unexpected (the repo just
 			// resolved); record it as fetch_failed and keep going rather than aborting the
@@ -1042,8 +1060,11 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		// Resolution can refuse before the insert closure checks a stored override.
 		// Reclassify that refusal if the stored token was disabled after preflight;
 		// it remains schedule-wide even when it was the label's only usable token.
-		if disabled := e.runs.ScheduleCredentialDisabled(ctx, sched.UserID, scheduleCredentialOverride(sched), nil); errors.Is(disabled, workersvc.ErrCredentialDisabled) {
-			err = disabled
+		if checkErr := e.runs.CheckStoredCredentialOverrideEnabled(ctx, sched.UserID, scheduleCredentialOverride(sched)); checkErr != nil {
+			if !errors.Is(checkErr, workersvc.ErrCredentialDisabled) {
+				return FireOutcome{}, &storedOverrideLookupError{cause: checkErr}
+			}
+			err = checkErr
 		}
 	}
 	if selection.LabelSelected && sched.Target != "issue" && !errors.Is(err, workersvc.ErrCredentialDisabled) {
