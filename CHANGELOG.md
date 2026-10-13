@@ -30,19 +30,6 @@ through `[0.52.0]`.)
 - **Keep archive evidence until pending reports retire ([#2854](https://github.com/vtmocanu/uzi/issues/2854)).**
   An acknowledged recovery FINAL now preserves its exact generation journal and pins while a terminal or finalize report still needs them, including across restart, then retries the existing cleanup after retirement. Local bundle bytes are freed immediately.
 
-### Changed
-
-- **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**
-  The existing sync interval checks advertised refs, then independently stages the configured ref; either operation can fail without preventing the other, and neither bumps the pin nor applies templates. The new instance housekeeping check `agentsource.update` reads persisted discovery facts only, warning for a newer tag or moved branch, reporting `ok` when no update is derived, `na` when disabled, unconfigured or SHA-pinned, and `unknown` before a recorded check or on a settings read failure. It never yields Danger; warnings and unknowns feed Admin/Health attention counts and a separate Instance advisory mark, with a direct link to agent-source settings. Bumping a tag pin clears the tag signal; applying a snapshot matching the recorded tip clears the branch signal. Failed discovery retains last-good facts, so Health does not diagnose discovery freshness or sync failures; template changes still require review and approval.
-
-- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
-  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
-
-- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
-  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
-
-### Fixed
-
 - **Haiku 4.5 usage with unavailable inference geography keeps its standard cost estimate ([#2914](https://github.com/vtmocanu/uzi/issues/2914)).**
   Summary and Now entries on Haiku 4.5's dated and undated model IDs accept `inference_geo: "not_available"` because those rows predate geographic routing. Geo-capable models with that marker remain unpriced. The Anthropic table also corrects Sonnet 5.5 cache reads to $0.10 per million tokens; stored unreported rows are not backfilled.
 
@@ -54,6 +41,17 @@ through `[0.52.0]`.)
 
 - **Resumed implementation prompts preserve milestone reporting guidance ([#2438](https://github.com/vtmocanu/uzi/issues/2438)).**
   Resumed Claude implementation prompts retain the approved milestone tracker and reporting instructions; both harnesses display persisted completion declarations alongside local progress, and the lead is instructed to report finished work before `signal_done` in the same turn. This is prompt guidance, not a guarantee of model compliance; the completion interlock is unchanged and incomplete work remains blocked.
+
+### Changed
+
+- **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**
+  The existing sync interval checks advertised refs, then independently stages the configured ref; either operation can fail without preventing the other, and neither bumps the pin nor applies templates. The new instance housekeeping check `agentsource.update` reads persisted discovery facts only, warning for a newer tag or moved branch, reporting `ok` when no update is derived, `na` when disabled, unconfigured or SHA-pinned, and `unknown` before a recorded check or on a settings read failure. It never yields Danger; warnings and unknowns feed Admin/Health attention counts and a separate Instance advisory mark, with a direct link to agent-source settings. Bumping a tag pin clears the tag signal; applying a snapshot matching the recorded tip clears the branch signal. Failed discovery retains last-good facts, so Health does not diagnose discovery freshness or sync failures; template changes still require review and approval.
+
+- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
+  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
+
+- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
+  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
 
 ## [0.86.0] - 2026-10-06
 
