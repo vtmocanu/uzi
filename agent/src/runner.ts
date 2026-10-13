@@ -6190,12 +6190,12 @@ export class RunRunner {
       }
       // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
       // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
-      // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+      // reported credential_switch (queued ack), kept preserveRecoveryClone + set parked, and the
       // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
       // park and the completion hold above, the run is non-terminal and already handled, so there is
       // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
-      // (idempotent — the release already drained it) and return; the finally retires the clone
-      // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+      // (idempotent — the release already drained it) and return; the finally keeps the clone
+      // and HOME (parked) so the next same-worker claim recaptures the source.
       // Keyed on the executor's result so no non-release path can reach this branch.
       if (result.switchReleased) {
         await executor.closeAndSettlePlanSummary?.();
@@ -14914,8 +14914,8 @@ export class RunRunner {
    *     terminal ack or ownership read, a given-up input receipt, a live non-running ack or
    *     ownership read) first run the credential-free exit capture: settle, WIP commit, fetch-back
    *     and verify, with a best-effort credential-free publish (skipped when the run is already
-   *     known terminal). Only a VERIFIED capture whose coverage still holds at the exit clears the
-   *     preserve flags; otherwise the clone and session are kept, so executeClaim's finally never
+   *     known terminal). A terminal exit releases the clone only when verified coverage still holds;
+   *     a park keeps the clone even when covered. Otherwise the clone and session are kept, so executeClaim's finally never
    *     discards the only copy of unfetched commits or uncommitted edits;
    *   - the STOP arms deliberately do NOT capture: a `stop` confirm (a stale_claim ack or another
    *     generation on the probe), the park loop's claim_generation mismatch, and a StaleClaimError
@@ -14923,9 +14923,9 @@ export class RunRunner {
    *     #1247 convention for the clone: the new claim has its own clone but cannot see this
    *     worker's bytes, so a stopped exit (`record: "stopped"`) keeps and records the clone for the
    *     operator channel whatever `retainStoppedSource` revalidates (a `covered` verdict there is
-   *     diagnostic only); a park or terminal exit (`record: "none"`) releases the clone only when
-   *     `retainStoppedSource` revalidates coverage at that exit for this exact source (a cached
-   *     capture, `capture.verified` or the degraded stub is never enough);
+   *     diagnostic only); a park (`record: "none"`) also keeps the clone with diagnostic coverage,
+   *     while a terminal exit releases it only when `retainStoppedSource` revalidates coverage
+   *     for this exact source (a cached capture, `capture.verified` or the degraded stub is never enough);
    *   - a terminal status then ends the flight, a live non-running status posts a feed line and
    *     keeps the clone and session without parking (even after a verified capture), and a given-up
    *     input receipt reports the generic failure without the credentialed pre-report reap or any
@@ -15065,8 +15065,8 @@ export class RunRunner {
     };
     // issue #1786: every exit below that used to clear `preserveRecoveryClone` on a cached verdict (a
     // captured/verified memo, a stale claim, a terminal status) hands the clone to executeClaim's
-    // finally only when a park or terminal exit's `retainStoppedSource` revalidates coverage NOW for
-    // this exact source (a stopped exit keeps the clone whatever the verdict): the
+    // finally only when a terminal exit's `retainStoppedSource` revalidates coverage NOW for
+    // this exact source (park and stopped exits keep it whatever the verdict): the
     // memoized capture's head (a memo without one, the degraded stub included, is never covered), or
     // the clone's current head when nothing was captured. Anything else keeps the source and records
     // it for the operator channel. Local-only: no report, publish or credential call, no new wait. A
@@ -15075,8 +15075,8 @@ export class RunRunner {
     //
     // B2 (issue #1786): an exit never revalidates in place. It records that release is ELIGIBLE
     // (`markReleaseEligible`, flag stays latched), and `settleCloneRelease` runs the one coverage
-    // revalidation in this handler's finally, after the last writer could have acted on every return
-    // path. `record` selects the representation: `stopped` only where this generation is stopped by
+    // revalidation in this handler's finally, after its return-path work. The verdict is a snapshot,
+    // diagnostic only for a park or stopped exit. `record` selects the representation: `stopped` only where this generation is stopped by
     // staleness or superseded; park and terminal exits keep the plain journal (`none`).
     let pendingRelease: { reason: string; stale: boolean; record: "stopped" | "none" } | undefined;
     const markReleaseEligible = (reason: string, opts: { stale?: boolean; record?: "stopped" | "none" } = {}): void => {
@@ -15088,7 +15088,13 @@ export class RunRunner {
       flight.preserveRecoveryClone = true;
       pendingRelease = { reason, stale: opts.stale ?? false, record: opts.record ?? "none" };
     };
-    const releaseEligible = (): boolean => pendingRelease !== undefined;
+    // Park coverage is diagnostic: latch custody before asynchronous disposition,
+    // including when this flight captured a predecessor.
+    const markParkKeep = (): void => {
+      flight.preserveRecoveryClone = true;
+      flight.stoppedSourceKept = true;
+      pendingRelease = { reason: "recovery_park_keep", stale: false, record: "none" };
+    };
     // An explicit keep: no later cleanup-time check may release it.
     const keepClone = (): void => {
       pendingRelease = undefined;
@@ -15109,8 +15115,8 @@ export class RunRunner {
         runLog.warn("cleanup-time coverage check failed; the clone is kept", { error: errMessage(settleError) });
       }
     };
-    // Only a verified capture may release the clone and session to executeClaim's finally, and the
-    // clone only when its coverage still holds at the exit's cleanup.
+    // A terminal exit may release a verified clone only when coverage still holds at cleanup.
+    // Park exits keep the clone; session preservation follows the existing capture policy.
     const keepUnlessCaptured = (captured: boolean, reason: string): void => {
       flight.preserveSession = !captured;
       if (captured) markReleaseEligible(reason);
@@ -15230,6 +15236,7 @@ export class RunRunner {
           // PRD #1733: the typed provider park landed and only its ack was lost.
           if (providerTypedSent && !credentialDeferred &&
               (status === "recovery_wait" || (status === "paused" && holdReason === PROVIDER_HOLD_REASON))) {
+            markParkKeep();
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, status)) keepClone();
             return true;
           }
@@ -15251,6 +15258,7 @@ export class RunRunner {
             // that earlier reap earned. No reap here: the run is no longer actively-claimed.
             if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
+          if (!terminal.has(status)) markParkKeep();
           return status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
@@ -15544,6 +15552,7 @@ export class RunRunner {
             });
             // issue #1786: a held or unproven-reap park keeps the clone explicitly, so the handler's
             // cleanup-time coverage check cannot release it.
+            markParkKeep();
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status)) keepClone();
             return true;
           }
@@ -15567,16 +15576,13 @@ export class RunRunner {
               },
             });
             // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
-            if (releaseEligible()) markReleaseEligible("recovery_park_ack");
+            markParkKeep();
             return true;
           }
           if (ack.status === "recovery_wait") {
             if (credentialDeferred) {
-              // Verified fetch-back plus the park ACK ends the retained-clone hold. The
-              // tracking ref and session remain recovery sources; normal retirement still
-              // requires its independent quiescence proof before removing the clone. issue #1786: the
-              // clone is released only when coverage is revalidated at this ACK; otherwise it stays.
-              markReleaseEligible("recovery_park_ack");
+              // A verified capture is diagnostic at a park; a resume recaptures the retained clone.
+              markParkKeep();
               // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would
               // retry the deferred credential operation and could release custody. The hold is kept.
               runLog.info("run parked for credential recovery", {
@@ -15591,7 +15597,7 @@ export class RunRunner {
               });
               return true;
             }
-            if (releaseEligible()) markReleaseEligible("recovery_park_ack");
+            markParkKeep();
             runLog.info("run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
@@ -15621,9 +15627,10 @@ export class RunRunner {
               return false;
             }
             // Issue #1766: a live non-running park ack (paused, awaiting_approval, ...) is the held
-            // posture: the feed says so, and the clone and session are kept (the in-loop capture
-            // above had already released the clone) for whoever resumes the run.
+            // posture: the feed says so, and the clone and session are kept for whoever resumes
+            // the run (the in-loop capture was only provisional release eligibility).
             if (credentialDeferred) return await credentialHeld();
+            markParkKeep();
             return false;
           }
           // A statusless ACK (including HTTP204) proves neither a park nor a
@@ -15667,7 +15674,7 @@ export class RunRunner {
       pendingRelease = undefined;
       throw error;
     } finally {
-      // B2: the one cleanup-time coverage check, after the last possible writer on every return.
+      // B2: the one cleanup-time snapshot, after the handler's return-path work.
       // A shutdown exit does no cleanup-time work inside the termination grace (own-mode quiesce, Docker
       // teardown, bare lock): the pending release is dropped and the latched preserve flag keeps the clone.
       if (!propagating && (flight.active?.shuttingDown || this.shuttingDownGlobal)) pendingRelease = undefined;
@@ -15684,8 +15691,8 @@ export class RunRunner {
    * cache drop is skipped, while the park itself still stands. A held (paused) run keeps its clone
    * for the owner's resume, and settles only a guarded claim: the guarded path is credential-free,
    * the legacy path fetches with the forge PAT and so keeps custody without settling.
-   * Returns true when the clone must be kept (held, or an unproven reap), so the caller can make
-   * that an explicit keep rather than a release-eligible exit (issue #1786).
+   * The caller keeps every park clone. Returns true for held or unproven-reap parks, which
+   * also skip cleanup coverage; other parks run that check as a diagnostic (issue #2852).
    */
   private async dispositionProviderPark(
     claim: ClaimResponse,
@@ -16541,10 +16548,10 @@ export class RunRunner {
    *      idempotent release after a reclaim (applied, status 'running'); the positive-ack contract,
    *      as enterCompletionHold requires "paused". An unconfirmed release or a throw (incl. a
    *      stale_claim) keeps the flags and returns "retained_stop" — never assume released.
-   *   7. Only after the confirmed release: preserveRecoveryClone=false (the finally RETIRES the
-   *      clone — a cross-worker reclaim re-clones and recovers from the durable tracking ref +
-   *      best-effort origin; work is safe) and parked=true (preserve HOME + plugin dir for a
-   *      same-worker resume); return "released".
+   *   7. After the confirmed release, preserveRecoveryClone stays true: capture verification
+   *      does not exclude late writers. Set parked=true to preserve HOME + plugin dir, and
+   *      return "released". A same-worker resume recaptures the retained source; a cross-worker
+   *      reclaim uses the durable tracking ref + best-effort origin.
    *
    * Callers. The in-place ctx.attemptCredentialSwitch (the executor's turn catch and idle held-state
    * waiters) CONTINUES the run on the old token on "gave_up" (it clears both preserve flags and
@@ -16665,12 +16672,12 @@ export class RunRunner {
       });
     }
     if (!released) return "retained_stop"; // flags stay SET; STOP — never continue on a possibly-released claim
-    // 7. Released. The work is durable on the worker tracking ref (+ best-effort origin), so RETIRE
-    // the clone (a cross-worker reclaim re-clones); KEEP the HOME (parked) for a same-worker resume.
-    flight.preserveRecoveryClone = false;
+    // 7. Released. Capture verification is diagnostic; keep the clone for fresh recapture
+    // and the HOME for a same-worker resume.
+    flight.preserveRecoveryClone = true;
     flight.parked = true;
     runLog.info(
-      "run released for a credential switch; retiring the clone, preserving HOME for resume",
+      "run released for a credential switch; verified capture is diagnostic, clone kept for recapture and HOME preserved",
       { run_id: flight.runId, generation },
     );
     return "released";
@@ -16885,9 +16892,9 @@ export class RunRunner {
    * already holds (this run's committed tracking tip, an owed pin, or the default branch)
    * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
    * local ref, in every namespace, to be reachable from that head or from a ref of the worker bare,
-   * and the absence of a stash): on `covered`, only a park or terminal exit (`handler.record ===
-   * "none"`) hands teardown back its normal retire; a stopped exit (no handler, or `record:
-   * "stopped"`) logs the verdict as a diagnostic and keeps the clone; and (4) record
+   * and the absence of a stash): on `covered`, only a terminal exit (`handler.record ===
+   * "none"`) hands teardown back its normal retire. Park and stopped exits log diagnostic
+   * coverage and keep the clone; and (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
    * clone (which also persists the key's attempt mode and clears the then-bound plain journal, so a
@@ -16899,8 +16906,8 @@ export class RunRunner {
    * clone and its journal stay.
    *
    * `no_source`: there was no clone (ordinary teardown proceeds). `covered`: the covered case above,
-   * returned only for a park or terminal exit (ordinary teardown proceeds and retires the clone); a
-   * stopped exit logs the verdict and goes on to the record. A flight already held by retained-recovery
+   * returned only for a terminal exit (ordinary teardown proceeds and retires the clone); a
+   * park keeps its plain journal and a stopped exit goes on to the retention record. A flight already held by retained-recovery
    * custody latches `preserveRecoveryClone`, `stoppedSourceKept` and `keepGuardedInventoryOpen` like
    * any other and runs the quiescence proof, but skips the coverage check and the record: it
    * answers `retained_local` (`unknown` when the proof was blocked), and `stoppedSourceKept` stays
@@ -16913,7 +16920,7 @@ export class RunRunner {
     flight: RunFlight, executor: Executor, reason: string,
     /** issue #1786 M2: set by a `handleRecoveryExhausted` exit. The handler latches the preserve flag
      *  itself, so a prior latch is not a reason to skip the coverage check; for `record: "none"`,
-     *  `covered` then clears it (a `stopped` exit only logs the verdict and keeps the latch).
+     *  `covered` clears it only at a terminal exit. Park and stopped exits log the verdict and keep it.
      *  `memo`: the handler holds a capture memo, whose `capturedHead` (when it has one) is the head to
      *  revalidate; a memo without one (the degraded stub) is never covered. No memo: the clone's
      *  current head, as at the generic arms. `stale`: the exit is a stale-claim or other-generation
@@ -16921,8 +16928,8 @@ export class RunRunner {
      *  `record`: `stopped` writes the stopped-source representation (attempt ledger `reclaimed`,
      *  canonical `uzi-stopped` marker) whatever the coverage verdict: only for an exit where this
      *  generation is stopped by staleness or superseded. `none` keeps the ADR-1197 posture of a park
-     *  or terminal exit instead: unless covered, the preserve flag stays latched and the plain journal is untouched,
-     *  so a resume recaptures the bytes and a later run's terminal-orphan handling applies. */
+     *  or terminal exit instead: parks always keep the latch and plain journal; terminals keep them
+     *  unless covered. A resume recaptures the bytes and later terminal-orphan handling still applies. */
     handler?: { memo: boolean; capturedHead?: string; stale: boolean; record: "stopped" | "none" },
   ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
     const clonePath = flight.worktreePath;
@@ -16989,7 +16996,7 @@ export class RunRunner {
           );
           coverage = covered === "covered" ? "covered" : "not_covered";
           if (covered === "covered") {
-            if (handler === undefined || handler.record === "stopped") {
+            if (handler === undefined || handler.record === "stopped" || reason === "recovery_park_keep") {
               // A stopped exit never trusts the verdict to discard: a writer that wrote and exited between
               // the status read and the "after" scan is invisible to it, and the successor claim cannot see
               // this clone. The latches stay and the retention record below is written.
