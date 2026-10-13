@@ -1119,6 +1119,7 @@ tasks:
       # on both success and timeout and require the exact guarded forge-park receipt.
       - ./e2e/lib.test.sh
       - bash ./e2e/heartbeat-settlement.test.sh
+      - bash ./e2e/outage-cut.test.sh
 
   test:uzi-watcher-backups:
     desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
