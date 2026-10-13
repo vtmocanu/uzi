@@ -36,6 +36,7 @@ import {
 import { buildSdkEnv } from "./sdk-env.js";
 import { defaultQueryFn, isErrorResult, isResult, mapSdkMessage, promptStream } from "./sdk-messages.js";
 import { killProcessGroup, killProcessGroupOnly, processGroupPresent, spawnDetached } from "./sdk-spawn.js";
+import { CrossCheckConfinementError, priorCrossCheckFailure } from "./cross-check-confinement.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
 
 /** The checker's whole tool surface: read-only, no MCP, no plugin, no skill. */
@@ -204,7 +205,7 @@ class CodeToolBudget {
     if (this.exceeded) return false;
     if (typeof id !== "string" || !id || (!this.ids.has(id) && this.ids.size >= 200)) {
       this.exceeded = true;
-      this.abort.abort(new Error("cross-check tool budget exceeded"));
+      this.abort.abort(new CrossCheckConfinementError("tool_budget"));
       return false;
     }
     this.ids.add(id);
@@ -215,7 +216,7 @@ class CodeToolBudget {
     const id = input.tool_use_id;
     if (!this.executed.has(id) && this.admit(id)) { this.executed.add(id); return {}; }
     this.exceeded = true;
-    this.abort.abort(new Error("cross-check tool budget exceeded"));
+    this.abort.abort(new CrossCheckConfinementError("tool_budget"));
     return { hookSpecificOutput: { hookEventName: "PreToolUse", permissionDecision: "deny",
       permissionDecisionReason: "cross-check tool budget exceeded" } };
   };
@@ -226,15 +227,15 @@ class CodeToolBudget {
       const block = asRecord(raw);
       if (block?.["type"] === "tool_use") {
         const id = block["id"];
-        if (!CHECKER_SURFACE.tools.includes(String(block["name"]))) throw new Error("cross-check confinement refused: unallowed tool block");
-        if (typeof id === "string" && this.observed.has(id)) throw new Error("cross-check confinement refused: repeated tool block");
+        if (!CHECKER_SURFACE.tools.includes(String(block["name"]))) throw new CrossCheckConfinementError("tool_unallowed");
+        if (typeof id === "string" && this.observed.has(id)) throw new CrossCheckConfinementError("tool_repeated");
         if (this.admit(id)) this.observed.add(id as string);
       }
     }
     this.assertWithinBudget();
   }
   assertWithinBudget(): void {
-    if (this.exceeded) throw new Error("cross-check confinement refused: tool budget exceeded");
+    if (this.exceeded) throw new CrossCheckConfinementError("tool_budget");
   }
 }
 
@@ -336,7 +337,7 @@ export class ClaudeCrossCheck {
         signal.throwIfAborted();
         budget?.assertWithinBudget();
         const refusal = guardIsolatedFrame(msg, gate, CHECKER_SURFACE);
-        if (refusal) throw new Error(`cross-check confinement refused: ${refusal}`);
+        if (refusal) throw new CrossCheckConfinementError("frame_refused");
         const frame = asRecord(msg);
         budget?.observe(frame);
         if (frame?.["type"] === "system" && frame["subtype"] === "init") {
@@ -359,7 +360,7 @@ export class ClaudeCrossCheck {
         if (isResult(msg)) { resultFrame = frame; break; }
       }
       // A result without a passing init frame means the tool set was never verified.
-      if (!gate.passed) throw new Error("cross-check confinement refused: the SDK never reported its tool set (no init frame)");
+      if (!gate.passed) throw new CrossCheckConfinementError("no_init");
       if (!resultFrame) throw new Error("cross-check ended without a result");
       for (const em of mapSdkMessage(resultFrame)) {
         if (em.payload["event"] === "result") { resultPosted = true; await postUsage({ ...em.payload, is_error: isErrorResult(resultFrame) }); }
@@ -418,7 +419,7 @@ export class ClaudeCrossCheck {
         this.log.removeSecret(token);
       }
     }
-    if ((code || confirmNativeCleanup) && !nativeClean) throw new Error("cross-check confinement refused: cleanup unconfirmed");
+    if ((code || confirmNativeCleanup) && !nativeClean) throw new CrossCheckConfinementError("cleanup_unconfirmed", failure ? priorCrossCheckFailure(failure.error) : undefined);
     if (nativeClean) confirmNativeCleanup?.();
     budget?.assertWithinBudget();
     if (failure) throw failure.error;

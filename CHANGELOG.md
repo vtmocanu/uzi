@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Claude cross-checks start with a confined SDK tool surface ([#2869](https://github.com/vtmocanu/uzi/issues/2869)).**
+  Disable the new builtin plugin-authoring plugin in checker, research and isolated job sessions; cross-check confinement failures log fixed diagnostic categories and preserve an earlier failure category when cleanup also fails. The worker fix takes effect after a release and worker rollout.
+
 - **Runs list and Dashboard: the stalled and waits-on-you flags show their elapsed time inline ([#2836](https://github.com/vtmocanu/uzi/issues/2836)).**
   The progress flags read `◼ stalled · 14m` and `● waits on you · plan gate · 6m`, so the flag lines up with its neighbouring pills; the clock time moves to the tooltip.
 

@@ -447,3 +447,63 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
     assert.equal(closed, clean ? 1 : 0);
   } finally { await fs.rm(root, { recursive: true, force: true }); }
 });
+
+it("cross-check diagnostics use fixed categories after token deregistration and retain a prior cleanup failure", async () => {
+  const sentinel = "sentinel-provider-secret-2869";
+  const cases: { name: string; frames?: unknown[]; queryFailure?: boolean; returnFailure?: boolean; callbackMissing?: boolean; legacy?: boolean;
+    subreason: string; prior?: string }[] = [
+    ...[
+      { tools: ["Read", "Grep", sentinel] }, { plugins: [{ name: sentinel }] },
+      { agents: [sentinel] }, { skills: [sentinel] }, { mcp_servers: [{ name: sentinel }] },
+    ].map(over => ({ name: "hostile init", frames: [{ ...init, ...over }], subreason: "frame_refused" })),
+    { name: "early content", frames: [{ type: "assistant", message: { content: [{ type: "text", text: sentinel }] } }], subreason: "frame_refused" },
+    { name: "no init", frames: [], subreason: "no_init" },
+    { name: "bad tool", frames: [init, { type: "assistant", message: { content: [{ type: "tool_use", id: "t", name: sentinel }] } }], subreason: "tool_unallowed" },
+    { name: "repeat", frames: [init, ...[1, 2].map(() => ({ type: "assistant", message: { content: [{ type: "tool_use", id: "t", name: "Read" }] } }))], subreason: "tool_repeated" },
+    { name: "budget", frames: [init, { type: "assistant", message: { content: [{ type: "tool_use", name: "Read" }] } }], subreason: "tool_budget" },
+    { name: "query error plus cleanup", queryFailure: true, subreason: "cleanup_unconfirmed", prior: "unknown" },
+    { name: "init refusal plus cleanup", frames: [{ ...init, skills: [sentinel] }], returnFailure: true, subreason: "cleanup_unconfirmed", prior: "frame_refused" },
+    { name: "callback", callbackMissing: true, subreason: "cleanup_callback_missing" },
+    { name: "legacy error", legacy: true, subreason: "unknown" },
+  ];
+  for (const c of cases) {
+    const root = await fs.mkdtemp(path.join(scratch, "diagnostic-"));
+    const warnings: { message: string; fields?: Record<string, unknown> }[] = [];
+    const registered = new Set<string>();
+    const log = { ...nullLogger(), addSecret: (s: string) => { registered.add(s); }, removeSecret: (s: string) => { registered.delete(s); },
+      warn: (message: string, fields?: Record<string, unknown>) => {
+        if (message === "cross-check confinement refused") assert.equal(registered.size, 0, "diagnostic runs after token deregistration");
+        warnings.push({ message, fields });
+      } };
+    const queryFn = (() => {
+      if (c.queryFailure) throw new Error(`provider error ${sentinel}`);
+      const frames = [...(c.frames ?? [])];
+      return { [Symbol.asyncIterator]() { return this; },
+        next: async () => frames.length ? { done: false, value: frames.shift() } : { done: true, value: undefined },
+        return: async () => { if (c.returnFailure) throw new Error(`cleanup ${sentinel}`); return { done: true, value: undefined }; },
+      };
+    }) as unknown as SdkQueryFn;
+    const model = c.callbackMissing || c.legacy ? { run: async () => {
+      if (c.legacy) throw new Error(`confinement ${sentinel}`);
+      return output();
+    } } : new ClaudeCrossCheck(log, { secretPaths: ["/worker-secret"], queryFn });
+    const decisions: Record<string, unknown>[] = [];
+    const client = { reportState: async () => ({ applied: true }), getInputs: async () => ({ inputs: [] }), postMessages: async () => {},
+      reportCodeCrossCheckVerdict: async (_id: string, _gen: number, v: Record<string, unknown>) => { decisions.push(v); },
+    } as unknown as WorkerClient;
+    const git = { barePathFor: () => "/bare", runnerCloneAtCommit: async () => root,
+      readBare: async () => ({ text: "diff", truncated: false }), removeRunnerClone: async () => {},
+    } as unknown as GitCache;
+    const claimed = claim(); claimed.secrets.anthropic_oauth_token = sentinel;
+    try {
+      await new CrossCheckRunner(client, git, log, { homeRoot: root, pollMs: 1, modelTimeoutMs: 1000, claudeModel: model }).execute(claimed);
+      assert.equal(registered.size, 0, c.name);
+      const diagnostic = warnings.filter(w => w.message === "cross-check confinement refused");
+      assert.equal(diagnostic.length, 1, c.name);
+      assert.equal(diagnostic[0]?.fields?.subreason, c.subreason, c.name);
+      assert.equal(diagnostic[0]?.fields?.prior_failure, c.prior, c.name);
+      assert.doesNotMatch(JSON.stringify(warnings), new RegExp(sentinel), c.name);
+      assert.equal(decisions.at(-1)?.reason_class, "confinement_failed", c.name);
+    } finally { await fs.rm(root, { recursive: true, force: true }); }
+  }
+});

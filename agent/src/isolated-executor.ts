@@ -115,8 +115,8 @@ const RESEARCH_SURFACE: IsolationSurface = {
   skills: [],
 };
 
-/** The builtin plugin the pinned CLI loads unless it is disabled through settings. */
-export const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false };
+/** The builtin plugins the pinned CLI loads unless they are disabled through settings. */
+export const BUILTIN_PLUGINS_DISABLED = { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false };
 
 const REASON_INIT_PENDING = "denied: the isolated session's tool set has not been verified yet";
 const REASON_TOOL_NOT_ALLOWED = "denied: this tool is not in the isolated run's fixed tool set";
