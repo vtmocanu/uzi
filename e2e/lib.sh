@@ -41,6 +41,33 @@ wait_same_claim_capture_resume() {
 }
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
+# Read-only, bounded allocation evidence; no contents, credentials or reclamation.
+storage_diagnostic_snapshot() {
+  [ -n "${RUNROOT:-}" ] && [ -n "${ROOT:-}" ] || return 0
+  local label="$1" dir="$RUNROOT/artifacts/storage" limiter start=$SECONDS
+  mkdir -p "$dir" || return 0
+  {
+    printf 'storage snapshot: %s %s\n' "$label" "$(date -u +%FT%TZ)"
+    df -Pk "$ROOT" "$RUNROOT" || echo 'storage diagnostic: runner df unavailable'
+    # CI provides timeout; local macOS may provide gtimeout. Never run an unbounded
+    # daemon query when neither is installed.
+    limiter="$(command -v timeout || command -v gtimeout || true)"
+    if [ -n "$limiter" ]; then
+      "$limiter" 15 docker system df || echo 'storage diagnostic: Docker allocation unavailable or timed out'
+    else
+      echo 'storage diagnostic: Docker allocation skipped (no timeout command)'
+    fi
+    if declare -p COMPOSE >/dev/null 2>&1; then
+      "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 sh -ec \
+        'df -Pk /data; du -kx -d 2 /data; if [ -d /data/recovery ]; then du -akx /data/recovery | awk '\''/\.bundle$/ { bundles += $1; bundle_count++ } /\.json$/ { journals += $1; journal_count++ } END { printf "recovery bundles_kib=%d bundle_count=%d journals_kib=%d journal_count=%d\n", bundles, bundle_count, journals, journal_count }'\''; fi' \
+        || echo 'storage diagnostic: agent allocation unavailable or timed out'
+    fi
+    printf 'storage diagnostic elapsed_seconds=%s\n' "$((SECONDS - start))"
+  } > "$dir/$label-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM.txt" 2>&1 \
+    || echo 'storage diagnostic: artifact write failed' >&2
+  return 0
+}
+
 # Failure-only metadata for a retained FINAL or an unstable custody baseline.
 # Local records are inspected, not independently MAC-verified by this diagnostic.
 _inventory_diagnostic_rows() {
@@ -63,6 +90,7 @@ _inventory_diagnostic_rows() {
   done < <(db_psql_rows "SELECT DISTINCT run_id FROM recovery_custody_holds WHERE user_id=(SELECT id FROM users WHERE email='$ADMIN_EMAIL')")
 }
 inventory_diagnostic_snapshot() {
+  storage_diagnostic_snapshot inventory-failure
   _inventory_diagnostic_rows | tee "$RUNROOT/inventory-diagnostic-$(date -u +%Y%m%dT%H%M%SZ).jsonl"
 }
 pass() { printf '  \033[32mPASS\033[0m %s\n' "$1"; }
@@ -84,6 +112,7 @@ cleanup() {
   # `set -u` in a function all fire the trap normally — and the cause is still unknown.
   # One line converts the next occurrence from an investigation into a reading.
   printf '\n[cleanup] EXIT trap entered (code %s)\n' "$code"
+  storage_diagnostic_snapshot teardown || true
   # Margin report BEFORE teardown (PRD #97 M9) — on the failure path too, where it is
   # most useful: a red run's margins usually show the whole suite running hot, which is
   # the difference between "this assertion is wrong" and "this host was slow".
@@ -736,6 +765,7 @@ settle_runs_terminal() {
 # terminal outcomes AND absence from the worker snapshot for these exact fixtures.
 # Never changes custody. One shared deadline bounds the whole batch.
 dump_fixture_settlement() {
+  storage_diagnostic_snapshot fixture-settlement
   local dir="$RUNROOT/artifacts/fixture-settlement"
   mkdir -p "$dir"
   "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data \

@@ -11,9 +11,48 @@ import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext
 import { createHash, createHmac } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { buildRecoveryLiveTiming } from "../src/main.js";
 
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
+
+it("stub redrive wiring recaptures stale inventory and FINALs within the receipt window", async () => {
+  const f = await fixture(true);
+  try {
+    f.state.finalError = new Error("API cut");
+    f.state.sourceRefused = true;
+    f.state.diagnostic = { check: "execution_tail_present" };
+    const old = await f.freeze();
+    assert.ok(old);
+    await f.capture(old);
+    f.state.sourceRefused = false;
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/new-work", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    const uploaded = (await f.coordinator.inspect("run-1"))[0]!;
+    await f.coordinator.resumePending(undefined, [uploaded]);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+    Object.assign(f.git, { recoveryRoot: path.join(f.root, "journal") });
+    const runner = new RunRunner(f.client as never, f.git as never,
+      () => { throw new Error("unreached executor"); }, f.log, 20, "local-worker-fixture", {
+        now: () => f.state.now,
+        recoveryLiveTiming: buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }),
+      });
+    await runner.resumeLiveRecoveries(f.state.now);
+    const recovery = (runner as unknown as { recovery: RecoveryCoordinator }).recovery;
+    const fresh = (await recovery.inspect("run-1")).find(r => r.captureId !== old.captureId && r.state === "uploaded");
+    assert.ok(fresh, "live discovery must recapture the changed inventory");
+    assert.notEqual(fresh.coverageDigest, old.coverageDigest);
+    assert.equal(fresh.finalAcknowledged, undefined, "cut still prevents FINAL");
+    f.state.finalError = undefined;
+    f.state.closeOnRelease = true;
+    f.state.now += 5_000;
+    await runner.resumeLiveRecoveries(f.state.now);
+    assert.ok((await recovery.inspect("run-1")).some(r => r.captureId === fresh.captureId && r.finalAcknowledged),
+      "next bounded pass must FINAL the fresh capture, not wait on production backoff");
+    assert.equal(f.state.open, false);
+    assert.equal(f.state.uploads, 2);
+  } finally { await f.close(); }
+});
 
 it("pending-report ACK cleanup leaves every live-pass slot available for a fresh FINAL", async t => {
   const f = await fixture();
