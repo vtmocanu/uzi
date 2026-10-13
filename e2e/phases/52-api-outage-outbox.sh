@@ -296,7 +296,9 @@ start_outbox_api_alias() {
     || fail "outbox phase: API alias placeholder startup failed"
 }
 remove_outbox_api_alias() {
-  "${COMPOSE[@]}" rm -s -f outbox-api-placeholder >/dev/null \
+  # The reused worker image declares /data and /nix as VOLUME. This service
+  # mounts neither named volume, so remove its image-created anonymous copies.
+  "${COMPOSE[@]}" rm -s -f -v outbox-api-placeholder >/dev/null \
     || fail "outbox phase: API alias placeholder removal failed"
 }
 recreate_outbox_api() {
@@ -338,7 +340,7 @@ restore_outbox_resolution() {
   unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS
   "${COMPOSE[@]}" up -d --wait --no-deps outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder startup failed' >&2; return 1; }
   "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null || { echo 'outbox cleanup: API recreation failed' >&2; return 1; }
-  "${COMPOSE[@]}" rm -s -f outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder removal failed' >&2; return 1; }
+  "${COMPOSE[@]}" rm -s -f -v outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder removal failed' >&2; return 1; }
   COMPOSE=("${OUTBOX_BASE_COMPOSE[@]}")
   wait_http || { echo 'outbox cleanup: API HTTP recovery failed' >&2; return 1; }
   login || { echo 'outbox cleanup: API login failed' >&2; return 1; }
@@ -618,8 +620,8 @@ RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
 pass "case 5: the carve-out run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
 
 # =============================================================================
-# Cases 3-6 hold stub completion until the cut. Cases 7-8 require finalize before
-# their first cut and intentionally keep the stub ungated.
+# Cases 3-6 hold stub completion until the cut. Cases 7-8 require a durable
+# finalize hand-off AFTER the cut, then interrupt it before terminal completion.
 # CASE 6 — an INTERLOCKED run finishing during the outage WAITS for the api to issue its completion
 # permit, then completes. Regression: its one-shot permit request used to throw `fetch failed` into
 # the generic catch, and the run was journaled and replayed as `failed` (#1644 made every issue run
