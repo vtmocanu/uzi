@@ -4762,6 +4762,58 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     const promise = new Promise<void>(r => { resolve = r; });
     return { promise, resolve };
   }
+  for (const signalKind of ["terminal", "context"] as const) {
+    it(`B2 Claude ${signalKind} abort releases plan generator before executor finally`, async () => {
+      const entered = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+      const abort = new AbortController();
+      let input: PlanSummaryInput | undefined;
+      let released = false, callbackDone: Promise<void> | undefined;
+      const fake = summaryFakes();
+      const summaryRunner = {
+        generateIntentSummary: async () => null,
+        generatePlanSummary: async (i: PlanSummaryInput) => {
+          input = i;
+          await new Promise<void>(resolve => {
+            i.signal!.addEventListener("abort", () => { released = true; resolve(); }, { once: true });
+            entered.resolve();
+          });
+          i.onUsage?.({});
+          return { summary: "Cancelled advice", deltas: [] };
+        },
+      };
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        async function* () { implementation.resolve(); await finish.promise; yield signalDone(); yield resultSuccess(); },
+      ]);
+      const { ctx, emits } = makeCtx({
+        agents: [lead, coder], summaryIntentPresent: true,
+        ...(signalKind === "terminal" ? { terminalLifecycleSignal: abort.signal } : { signal: abort.signal }),
+        gatePlan: async (md, _milestones, persisted) => {
+          callbackDone = persisted!(md);
+          return { kind: "approve", selection: { status: "absent" } };
+        },
+      });
+      const executor = new SdkExecutor(nullLogger(), homeDir, {
+        queryFn, client: fake.client, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+      });
+      const execution = executor.run(ctx).catch(() => undefined);
+      try {
+        await Promise.all([entered.promise, implementation.promise]);
+        abort.abort();
+        assert.equal(input!.signal!.aborted, true, "generator sees abort while implementation is held open");
+        assert.equal(released, true, "signal-aware generator released before executor finally");
+        await callbackDone;
+        assert.equal(fake.rec.planPosts.length, 0);
+        assert.equal(emits.filter(m => m.kind === "summary_usage").length, 0);
+      } finally {
+        finish.resolve();
+        const result = await execution;
+        assert.equal(result?.summaryPlan, undefined);
+        assert.equal(result?.summaryDeltas, undefined);
+      }
+    });
+  }
+
   for (const kind of ["issue", "self_improve", "prompt"] as const) {
     for (const phase of ["generation", "post"] as const) {
       for (const invalidation of ["live", "close", "fence", "cancel"] as const) {

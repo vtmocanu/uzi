@@ -17211,6 +17211,37 @@ describe("2833 Codex inline summaries", () => {
     });
     return { rig, intents, plans };
   }
+  it("B1 Codex retains accepted plan summary after successful done checkpoint", async () => {
+    const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))
+        .push(turnCompleted("completed", th, tn)));
+    const rig = makeMultiEpochRig([planResponder, done]);
+    const plans: string[] = [], sinks: string[] = [];
+    Object.assign(rig.client, {
+      postIntentSummary: async () => {},
+      postPlanSummary: async (_id: string, plan: { summary: string }) => { plans.push(plan.summary); },
+    });
+    const { ctx } = makeCtx({
+      kind: "issue", completionInterlock: true, planApproved: false, approvedPlan: undefined,
+      summaryIntentPresent: true,
+      gatePlan: async (md, _milestones, persisted) => { await persisted!(md); return approve; },
+      checkpoint: async input => {
+        assert.deepEqual(plans, ["Accepted advice"], "summary accepted before checkpoint");
+        sinks.push(input.sink!);
+      },
+      recordCompletionAttempt: async () => ({ unmet: [], attemptCount: 1 }),
+    });
+    const result = await makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summaryRunner: {
+        generateIntentSummary: async () => null,
+        generatePlanSummary: async () => ({ summary: "Accepted advice", deltas: [{ kind: "added", text: "cache" }] }),
+      },
+    }).run(ctx);
+    assert.deepEqual(sinks, ["done_checkpoint"]);
+    assert.equal(result.summaryPlan, "Accepted advice");
+    assert.deepEqual(result.summaryDeltas, [{ kind: "added", text: "cache" }]);
+  });
+
   for (const when of ["before execution", "between executions"] as const) {
     it(`M1 Codex generic settlement ${when} preserves fresh summary admission`, async () => {
       const { rig, intents } = summaryRig();

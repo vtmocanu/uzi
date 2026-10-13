@@ -1111,7 +1111,9 @@ export class SdkExecutor implements Executor {
           const result = await this.summaryRunner.generatePlanSummary({
             token, model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
             issueBody: ctx.issueDescription, prdText: prd.prdText, planMd,
-            signal: owned.ctrl.signal,
+            signal: AbortSignal.any([owned.ctrl.signal,
+              ...(ctx.signal ? [ctx.signal] : []),
+              ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : [])]),
             onUsage: usage => {
               if (owned.delivered || !allowed()) return;
               owned.delivered = true;

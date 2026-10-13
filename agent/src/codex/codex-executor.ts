@@ -2397,8 +2397,10 @@ export class CodexExecutor implements Executor {
       for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(lifecycleSignal.reason); }
     };
     lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
+    const summaryResultAllowed = (): boolean => !lifecycleSignal.aborted
+      && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
     const summaryAllowed = (): boolean => !summaryState.closed && !this.summaryLifecycleClosed
-      && !lifecycleSignal.aborted && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
+      && summaryResultAllowed();
     const summaryBinding = {
       auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
       ...(binding.authMode === "subscription" ? {
@@ -3042,7 +3044,7 @@ export class CodexExecutor implements Executor {
       // Written only by an exhausted interlocked done with unmet milestones.
       let pendingIterationExhaustion = false;
       const loopResult = (): ExecutorResult => (summaryResult = {
-        ...(latestPlanSummary && summaryAllowed() ? { summaryPlan: latestPlanSummary.summary, summaryDeltas: latestPlanSummary.deltas } : {}),
+        ...(latestPlanSummary && summaryResultAllowed() ? { summaryPlan: latestPlanSummary.summary, summaryDeltas: latestPlanSummary.deltas } : {}),
         branch: ctx.branch,
         agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
