@@ -276,6 +276,8 @@ export class FakeApi {
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
   heartbeats = 0;
+  readonly heartbeatBodies: Record<string, unknown>[] = [];
+  registerNonce: string | undefined;
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
@@ -1019,10 +1021,12 @@ export class FakeApi {
       const registerBody: Record<string, unknown> = { worker_id: randomUUID() };
       if (this.registerProtocolFeatures !== undefined)
         registerBody.protocol_features = this.registerProtocolFeatures;
+      if (this.registerNonce !== undefined) registerBody.register_nonce = this.registerNonce;
       return send(res, 200, registerBody);
     }
     if (req.method === "POST" && p === "/api/worker/heartbeat") {
       this.heartbeats++;
+      this.heartbeatBodies.push(JSON.parse(body) as Record<string, unknown>);
       return send(res, 200, {});
     }
     if (req.method === "POST" && p === "/api/worker/runs/claim") {
