@@ -430,6 +430,8 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
+      - task: test:changelog-rc-bullets
+      - task: check:changelog-rc-bullets
       - task: test:livedb-skip-guard
       # CI and the baked worker share one SAST engine (#2093): CI installs the
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
@@ -1184,6 +1186,16 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/attribute-failures.test.sh
       - ./.agents/skills/uzi-lander/scripts/test-linux.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/ci-timing-report.test.py
+
+  check:changelog-rc-bullets:
+    desc: shipped RC changelog bullets remain byte-identical
+    cmds:
+      - bash scripts/changelog-section.sh check-rc-bullets HEAD
+
+  test:changelog-rc-bullets:
+    desc: hermetic frozen RC bullet guard regressions
+    cmds:
+      - bash scripts/changelog-rc-bullets.test.sh
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)
