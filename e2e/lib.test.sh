@@ -329,9 +329,9 @@ park_phase_call() {
 }
 custody_case "park phase gets generation absent from run DTO" pass 'phase used authoritative DB generation' park_phase_call
 
-# The actual capture decoder must recognize guarded and legacy typed logs while
-# preserving generation, ordering and unique-capture requirements.
-eval "$(awk '/^f42_assert_capture_park\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
+# Guarded and legacy typed transcripts both obey #2512's same-claim recovery:
+# exact available capture before the fresh seed, without another claim or park.
+eval "$(awk '/^f42_assert_capture_resume\(\) \{/,/^\}/' "$ROOT/e2e/phases/52-api-outage-outbox.sh")"
 fake_compose() { cat "$SEQ_DIR/events"; }
 # shellcheck disable=SC2034  # read by the extracted production capture decoder
 COMPOSE=(fake_compose)
@@ -340,23 +340,31 @@ uzi_cli() { echo '[{"generation":2,"captures":[{"id":"capture","state":"availabl
 capture_fixture() {
   jq -nc --arg variant "$1" '
     {run_id:"R",msg:"run claimed"} as $claim |
-    {run_id:"R",msg:"run parked for transient recovery",detail:"recovering retained work before reseeding"} as $park |
-    {run_id:"R",msg:"recovery: guarded inventory disposition",generation:2,capture_id:"capture",state:"uploaded"} as $capture |
-    (if $variant=="legacy" then [$claim,$claim,$park,($capture+{msg:"recovery: park/early-terminal disposition outcome",claim_generation:2}),$claim]
-     else [$claim,$claim,$park,$capture,$capture,$claim] end) |
-    if $variant=="wrong-generation" then .[3].generation=3 | .[4].generation=3
-    elif $variant=="wrong-order" then [.[0],.[1],.[3],.[2],.[4],.[5]]
-    elif $variant=="two-captures" then .[4].capture_id="other"
-    elif $variant=="missing-id" then .[3].capture_id=null | .[4].capture_id=null
+    {run_id:"R",msg:"stub executor committed marker",branch:"agent/issue-1"} as $branch |
+    {run_id:"R",msg:"recovery: bundle uploaded (durable capture)",server_capture_id:"capture",server_state:"available"} as $capture |
+    {run_id:"R",msg:"recovery: guarded inventory disposition",generation:2,capture_id:"local-capture",state:"uploaded"} as $typed |
+    {msg:"runner clone: seeding",branch:"agent/issue-1",path:"/data/runner/issue-1.attempt-time-g2-0123456789abcdef"} as $seed |
+    {run_id:"R",msg:"recovery: prior open custody holds inventoried after clone",claim_generation:2} as $ready |
+    [$claim,$branch,$claim,$capture,$capture,
+      (if $variant=="legacy" then ($typed | del(.generation) | .msg="recovery: park/early-terminal disposition outcome" | .claim_generation=2) else $typed end),$seed,$ready] |
+    if $variant=="single-upload" then del(.[4])
+    elif $variant=="wrong-generation" then .[7].claim_generation=3
+    elif $variant=="wrong-order" then [.[0],.[1],.[2],.[6],.[3],.[4],.[5],.[7]]
+    elif $variant=="two-captures" then .[4].server_capture_id="other"
+    elif $variant=="missing-id" then .[3].server_capture_id=null | .[4].server_capture_id=null
+    elif $variant=="extra-claim" then . + [$claim]
+    elif $variant=="wrong-seed-generation" then .[6].path="/data/runner/issue-1.attempt-time-g3-0123456789abcdef"
     else . end | .[]' > "$SEQ_DIR/events"
 }
 capture_fixture guarded
-custody_case "guarded G+1 capture retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_park R 2
+custody_case "guarded typed G+1 same-claim retries retain one distinct capture" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
 capture_fixture legacy
-custody_case "legacy G+1 capture contract still accepted" pass 'exact generation 2 captured' f42_assert_capture_park R 2
-for variant in wrong-generation wrong-order two-captures missing-id; do
+custody_case "legacy typed G+1 same-claim capture still accepted" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+capture_fixture single-upload
+custody_case "same-claim capture precedes fresh reseed" pass 'exact generation 2 captured' f42_assert_capture_resume R 2 0
+for variant in wrong-generation wrong-order two-captures missing-id extra-claim wrong-seed-generation; do
   capture_fixture "$variant"
-  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_park R 2
+  custody_case "capture decoder refuses $variant" fail 'lacks the exact G+1' f42_assert_capture_resume R 2 0
 done
 
 # The spent finalize allowance preserves recoverable work after #2426. Exercise
