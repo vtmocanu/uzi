@@ -1139,7 +1139,8 @@ describe("inspect and the plain discard", () => {
 
   it("caps an aggregate view at 64 descriptors and reports it partial", async () => {
     for (let i = 0; i < RETAINED_MAX_DESCRIPTORS + 2; i++) plantAttempt("agent/issue-3001", "issue-3001", attemptIdAt(100 + i), `run-${i}`, "abandoned");
-    const r = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive });
+    // Exercise the descriptor cap independently of elapsed time, with a bounded real-time guard.
+    const r = await git.inspectRetainedSources({ barePath: bare, isLivePath: notLive, now: () => 0, budgetMs: 30_000 });
     assert.equal(r.sources.length, RETAINED_MAX_DESCRIPTORS);
     assert.equal(r.partial, true);
     assert.ok(r.sources.every((s) => s.disposition === undefined), "no disposition without a selector and its run's holds");
