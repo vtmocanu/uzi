@@ -703,4 +703,12 @@ printf '## [Unreleased]\n\n### Changed\n\n- **main new**\n- **branch new**\n\n##
 bash "$SCRIPT" "$WORK/tight.md" > "$WORK/tight.out" 2>&1 || fail "tight union failed: $(cat "$WORK/tight.out")"
 diff -u "$WORK/tight.want" "$WORK/tight.md" || fail "a tight file's union gained a blank line"
 
+# 14. The fallback vote reads released `## [x.y.z]` sections only: a blank-separated non-release
+#     section (here `## Notes`) does not turn a tight file's join into a blank one, and a tie
+#     among released pairs keeps the join touching.
+printf '## [Unreleased]\n\n### Changed\n\n<<<<<<< HEAD\n- **m**\n||||||| base\n=======\n- **b**\n>>>>>>> branch\n\n## Notes\n\n- **x**\n\n- **y**\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n\n- **old c**\n' > "$WORK/tie.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **m**\n- **b**\n\n## Notes\n\n- **x**\n\n- **y**\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n\n- **old c**\n' > "$WORK/tie.want"
+bash "$SCRIPT" "$WORK/tie.md" > "$WORK/tie.out" 2>&1 || fail "tie union failed: $(cat "$WORK/tie.out")"
+diff -u "$WORK/tie.want" "$WORK/tie.md" || fail "non-release sections or a tie changed the join"
+
 echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept, and a fresh [Unreleased] joining with the file's blank-line convention"

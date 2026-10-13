@@ -135,7 +135,7 @@ fold_resolve() {
     function blank(s) { return s ~ /^[ \t]*$/ }
     function flush(f) {
       if (cur == "") return
-      nb[f]++; BT[f, nb[f]] = cur; BN[f, nb[f]] = norm(cur); BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
+      nb[f]++; BT[f, nb[f]] = cur; BN[f, nb[f]] = cur; BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
       cur = ""
     }
     function parse(f,   i, s, isu, h, sec) {
@@ -159,16 +159,17 @@ fold_resolve() {
       flush(f)
     }
     # The release cut linkifies bare `(#N)` citations (scripts/changelog-links.sh) while it folds,
-    # so a genuinely folded bullet differs from its ancestor copy by `#N` -> `[#N](URL/pull|issues/N)`.
-    # The proof compares this normalised text; a link whose target number differs from its text is
-    # a real edit and stays as written. Inserted text is always the branch'"'"'s own BT.
+    # so a folded bullet in the BASE differs from its ancestor copy by `#N` -> `[#N](URL/pull|issues/N)`.
+    # norm() undoes that on base text only, and only for a link whose target number equals its text
+    # and that the ancestor does not itself contain (PROT): a citation already linked in the
+    # ancestor is compared as written, so an edit to it (url, repo, kind) is never forgiven.
     function norm(s,   o, m, pre, a, b) {
       o = ""
       while (match(s, /\[#[0-9]+\]\(https?:\/\/[^) \t\n]*\/(pull|issues)\/[0-9]+\)/)) {
         m = substr(s, RSTART, RLENGTH); pre = substr(s, 1, RSTART - 1); s = substr(s, RSTART + RLENGTH)
         a = m; sub(/^\[#/, "", a); sub(/\].*/, "", a)
         b = m; sub(/\)$/, "", b); sub(/.*\//, "", b)
-        o = o pre (a == b ? "#" a : m)
+        o = o pre ((a == b && !(m in PROT)) ? "#" a : m)
       }
       return o s
     }
@@ -186,6 +187,10 @@ fold_resolve() {
     function title(t) { sub(/\n.*/, "", t); return t }
     END {
       for (f = 1; f <= 3; f++) { parse(f); if (nu[f] != 1) die("stage " f " does not hold exactly one ## [Unreleased] heading") }
+      # links the ancestor already carries (protected from norm)
+      for (i = 1; i <= N[1]; i++) { t = L[1, i]
+        while (match(t, /\[#[0-9]+\]\(https?:\/\/[^) \t\n]*\/(pull|issues)\/[0-9]+\)/)) { PROT[substr(t, RSTART, RLENGTH)] = 1; t = substr(t, RSTART + RLENGTH) } }
+      for (k = 1; k <= nb[2]; k++) BN[2, k] = norm(BT[2, k])
       if (prose[1] != "" || prose[3] != "") die("a non-bullet line under [Unreleased] of the ancestor or the branch (cannot place it)")
       # A block is identified by its subsection AND its text, with multiplicity: K-joined key.
       for (k = 1; k <= nb[1]; k++) if (BU[1, k]) {
@@ -222,7 +227,7 @@ fold_resolve() {
       if (oa != ot) die("the branch changed the file outside [Unreleased]")
       nadd = 0
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
-        t = BT[3, k]; tn = BN[3, k]; key = BH[3, k] K tn
+        t = BT[3, k]; tn = norm(t); key = BH[3, k] K tn
         if (++used[key] <= acnt[key]) continue   # an ancestor occurrence, not an addition
         if ((tn in ou) || (tn in orl)) die("a branch-added bullet already exists in the base: " title(t))
         if (tn in seenadd) die("a branch-added bullet is repeated: " title(t))
@@ -313,7 +318,7 @@ awk "$SEP_AWK"'
     for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
     ns = 0; np = 0; dup = 0
     for (i = u + 1; i < e; i++) sepcount(L[i], "f")
-    for (i = 1; i <= n; i++) if (i < u || i >= e) sepcount(L[i], "g")
+    for (i = 1; i <= n; i++) { if (L[i] ~ /^## /) isrel = (L[i] ~ /^## \[[0-9]+\.[0-9]+\.[0-9]+/); if ((i < u || i >= e) && isrel) sepcount(L[i], "g") }
     for (i = u + 1; i < e; i++) {
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
@@ -361,7 +366,7 @@ else
 # nearest earlier pair.
 if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
-  st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
+  st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/); isrel = ($0 ~ /^## \[[0-9]+\.[0-9]+\.[0-9]+/) }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
   /^[|][|][|][|][|][|][|]( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
   /^=======$/     {
@@ -396,7 +401,7 @@ if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL"
   st == 2 { C[++nc] = $0; next }
   st == 1 { A[++na] = $0 }
   st == 3 { B[++nb] = $0 }
-  !unrel && st != 3 { sepcount($0, "g") }
+  isrel && st != 3 { sepcount($0, "g") }
   unrel && st != 3 { sepcount($0, "o") }
   unrel && st != 1 { sepcount($0, "t") }
   { print; print > before }

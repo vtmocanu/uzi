@@ -268,6 +268,20 @@ cp "$WORK/link.main.md" "$WORK/linkdup.main.md"; cp "$WORK/linkdup.base.md" "$WO
 mkconflict linkdup; expect_refuse linkdup
 grep -Fq 'fold unproven' <<<"$OUT" || fail "linkdup: wrong refusal reason: $OUT"
 
+# 18. A citation ALREADY linked in the ancestor is compared as written: the branch re-pointing it
+#     (another repository, same number) is an edit, refused rather than dropped in favour of the
+#     base's old link; the same bullet untouched by the branch folds fine.
+LINK_='([#2361](https://github.com/o/r/pull/2361))'
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Linked already**\n  Cites %s here.\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n' "$HEAD_" "$LINK_" > "$WORK/relink.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Linked already**\n  Cites %s here.\n' "$HEAD_" "$LINK_" > "$WORK/relink.main.md"
+sed 's#github.com/o/r/pull/2361#github.com/other/repo/pull/2361#' "$WORK/relink.base.md" > "$WORK/relink.branch.md"
+mkconflict relink; expect_refuse relink
+grep -Fq 'moved or deleted' <<<"$OUT" || fail "relink: wrong refusal reason: $OUT"
+cp "$WORK/relink.base.md" "$WORK/relinkok.base.md"; cp "$WORK/relink.main.md" "$WORK/relinkok.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Linked already**\n  Cites %s here.\n\n- **new**\n  new desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n' "$HEAD_" "$LINK_" > "$WORK/relinkok.branch.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **new**\n  new desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Linked already**\n  Cites %s here.\n' "$HEAD_" "$LINK_" > "$WORK/relinkok.want.md"
+mkconflict relinkok; expect_ok relinkok
+
 # 15. Refusal: markers in a plain file with no index stages stay the old refusal.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **a**\n||||||| b\n- **old**\n=======\n- **b**\n>>>>>>> x\n' > "$WORK/plain.md"
 cp "$WORK/plain.md" "$WORK/plain.before"
