@@ -1340,6 +1340,12 @@ grep -qF "FAIL failed-2 (#4242) status=failed: status saved, but the source sear
   || fail "t3 rc3: FAIL line mismatch; log: $(log_of "$D_T3C")"
 ! grep -q 'inconclusive ()' "$D_T3C/latest-attempt/backup.log" || fail "t3 rc3: empty parenthetical"
 [ ! -e "$D_T3C/latest-attempt/.unreadable-git" ] || fail "t3 rc3: .unreadable-git state file left behind"
+# An unreadable .git on one pod is named even when another pod's exec also failed.
+D_T3D="$WORK/out.t3.both"
+rc="$(backup_rc "$D_T3D" failed-2 "UZI_TEST_PODS=pod/uzi-hw-$WID-test pod/uzi-hw-second-test" "UZI_TEST_EXECFAIL_POD=uzi-hw-second-test")"
+[ "$rc" -eq 1 ] || fail "t3 both: exit $rc, want 1"
+grep -q "FAIL failed-2 .*inconclusive (.*exec into pod ns/uzi-hw-second-test failed.*a candidate's .git on pod ns/uzi-hw-$WID-test could not be read); retry" "$D_T3D/latest-attempt/backup.log" \
+  || fail "t3 both: FAIL line must name both pods; log: $(log_of "$D_T3D")"
 echo "PASS t3: the no-capture FAIL line names the failing pod, namespace or unreadable .git"
 
 echo "ALL PASS"

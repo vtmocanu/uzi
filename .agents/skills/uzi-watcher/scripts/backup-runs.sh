@@ -1037,8 +1037,8 @@ for RID in "${RUNS[@]}"; do
       # which sets only PROBE_ERR_FILE. Never an empty parenthetical.
       why=""
       if [ -s "$GAP_FILE" ]; then why="$(sort -u "$GAP_FILE" | paste -sd ';' - | sed 's/;/; /g')"; fi
-      if [ -z "$why" ] && [ -s "$GIT_UNREAD_FILE" ]; then
-        why="a candidate's .git on pod $(sort -u "$GIT_UNREAD_FILE" | paste -sd ',' - | sed 's/,/, /g') could not be read"
+      if [ -s "$GIT_UNREAD_FILE" ]; then
+        why="${why:+$why; }a candidate's .git on pod $(sort -u "$GIT_UNREAD_FILE" | paste -sd ',' - | sed 's/,/, /g') could not be read"
       fi
       [ -n "$why" ] || why="a candidate's .git could not be read"
       log "FAIL $RID ($LBL) status=$st: status saved, but the source search was inconclusive ($why); retry"
