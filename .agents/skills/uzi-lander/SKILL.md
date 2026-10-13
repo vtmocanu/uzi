@@ -151,6 +151,10 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<state>
 ```
 
+The snapshot requires Python 3 and has a 120-second wall deadline (override with positive
+`TAKEOVER_TIMEOUT_SECONDS`). On expiry it stops its own subprocesses, prints `UNKNOWN=1`
+and `NEXT=unknown`, and exits 124. Rerun before acting; claims already recorded may remain.
+
 `MR_REWORK_ENABLED=true|false|unknown` reports the run's setting. On `true`, or `unknown` when
 you will fix locally, run `uzi run mr-rework RUN --enabled=false` first (the script never
 changes it); trust it over a handover's claim.

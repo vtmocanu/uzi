@@ -356,7 +356,7 @@ unset GH_ALWAYS_FAIL
 grep -qvx 0 "$SLEEP_LOG" && fail "non-zero backoff recorded: $(sort -u "$SLEEP_LOG" | tr '\n' ' ')"
 # No uzi on PATH: the absent-uzi path (have_uzi=0) is unchanged, no function stands in for it.
 mkdir -p "$WORK/nouzi"
-for t in bash env git jq awk sed tr head cat rm mktemp grep date dirname basename uname sort cut tail wc mkdir sleep xargs find cmp od; do
+for t in bash python3 env git jq awk sed tr head cat rm mktemp grep date dirname basename uname sort cut tail wc mkdir sleep xargs find cmp od; do
   p=$(command -v "$t" 2>/dev/null) && ln -sf "$p" "$WORK/nouzi/$t"
 done
 ln -sf "$WORK/bin/gh" "$WORK/nouzi/gh"

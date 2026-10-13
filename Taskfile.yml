@@ -1156,6 +1156,7 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
       - ./.agents/skills/uzi-lander/scripts/merge.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
+      - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-repo-fallback.test.sh
