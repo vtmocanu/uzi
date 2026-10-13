@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Keep archive evidence until pending reports retire ([#2854](https://github.com/vtmocanu/uzi/issues/2854)).**
+  An acknowledged recovery FINAL now preserves its exact generation journal and pins while a terminal or finalize report still needs them, including across restart, then retries the existing cleanup after retirement. Local bundle bytes are freed immediately.
+
 ### Changed
 
 - **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
