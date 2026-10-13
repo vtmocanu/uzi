@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 - **Read Codex gate logs during commands ([#2903](https://github.com/vtmocanu/uzi/issues/2903)).**
   Codex can read gate logs while a shell command runs; other effects/checkpoints remain ordered.
 
+- **Settled terminal outcomes no longer keep worker admission closed ([#2921](https://github.com/vtmocanu/uzi/issues/2921)).**
+  An authenticated acknowledgement that a run already finished on the server stops its terminal journal from being advertised as an unresolved execution or counted toward pending-overflow admission. The journal and recovery evidence remain until existing custody checks permit retirement. After worker restart, one replay restores this distinction; unknown replies and replaced journals remain conservative.
+
 ### Changed
 
 - **Self-improvement and prompt runs receive inline summaries ([#2838](https://github.com/vtmocanu/uzi/issues/2838)).**
