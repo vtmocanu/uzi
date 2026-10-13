@@ -46,6 +46,11 @@
     parent/child IDs and owner reports for child findings.
     Read `.agents/skills/uzi-lander/scripts/claims.sh list --json`. Every visible active delivery run
     needs a live landing owner: `run-<id>` before its PR, `#<PR>` after takeover.
+    For `mr_rework` and `ci_fix`, resolve the existing PR by `mr_iid`, or by
+    matching `pipeline_ref` to its head branch in the same repository; accept
+    that PR's live `#<PR>` claim without requiring a separate run claim.
+    Missing or ambiguous PR mapping is unknown; retain the run-claim check
+    when no existing PR is confirmed.
     Check claim liveness; unreadable or unverified claims remain unknown.
   - Compare active runs by repository and issue against board claims and the
     skipper ledger. Flag a second run for an issue another session owns; route
@@ -54,10 +59,13 @@
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
   - Read `uzi run recovery --json` (owner-scoped, includes settled holds); inspect
-    open custody on terminal runs (`completed`, `failed`, `cancelled`), which
-    active-run inventories omit. Also flag corroborated terminal-report backlogs
-    on workers (`outbox_pending_terminal`, `outbox_blocked`); null/stale signals
-    are unknown. Correlate with run IDs; infer no run from an aggregate alone.
+    open custody on runs ended long ago (`completed`, `failed`, `cancelled`),
+    which active-run inventories omit. Route only decision-bearing dispositions
+    (`needs_action`, `source_only`); healthy dispositions such as `archive_ready`
+    awaiting export are not findings. Also flag corroborated terminal-report
+    backlogs on workers (`outbox_pending_terminal`, `outbox_blocked`); zero/null
+    values are no evidence, not proof of no backlog. Treat stale signals as
+    unknown. Correlate with run IDs; infer no run from an aggregate alone.
     Route to the run's owning session, then the recovery owner, else the user,
     to check whether custody is valid or should have released. Terminal status
     alone proves no invalid hold; never silently clean, discard or release it.
