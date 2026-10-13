@@ -693,6 +693,8 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		PlanMd:                   textPtr(run.PlanMd),
 		AutoApprove:              run.AutoApprove,
 		PlanCrossCheckRequired:   run.PlanCrossCheckRequired,
+		CodeCrossCheckRequired:   run.CodeCrossCheckRequired,
+		PlanCrossCheckCodexLead:  planCrossCheckCodexLeadSupported(run),
 		PlanCrossCheckGateReason: textPtr(run.PlanCrossCheckGateReason),
 		// PRD #400 M2: task-run MR gate + source ref. open_mr is a plain bool (false
 		// for every non-task run); base_branch is pgtype.Text (nil for a run that has
@@ -714,8 +716,9 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 		// PRD #1190 M1: re-deliver a pending pause so a worker that died with one set re-arms
 		// it on resume. Derived from the loaded row like StopPending/OpenQuestionID; the
 		// columns survive every requeue, so the re-claim carries the intent forward.
-		PausePending: run.PauseRequestedAt.Valid,
-		PauseMode:    run.PauseMode.String,
+		ParkRunSupported: slices.Contains(wkr.ProtocolCapabilities, capability.ParkRunV1),
+		PausePending:     run.PauseRequestedAt.Valid,
+		PauseMode:        run.PauseMode.String,
 		// PRD #400 M4a: when set, this task run is a diff-review of that target task, and
 		// the worker (M4b) routes on it. nil for a plain handoff and every non-task run.
 		ReviewTargetRunID: uuidPtr(run.ReviewTargetRunID),
@@ -1201,3 +1204,10 @@ func (e legacyReviewClaimError) Error() string {
 }
 
 func (e legacyReviewClaimError) Unwrap() error { return errGuardrailBlockedClaim }
+
+// planCrossCheckCodexLeadSupported reports whether the claim should carry
+// plan_cross_check_codex_lead: this api accepts a Codex lead's checked-plan submission,
+// so the signal is set for a Codex run that requires the cross-check.
+func planCrossCheckCodexLeadSupported(run store.Run) bool {
+	return run.PlanCrossCheckRequired && run.Harness == harnessCodex
+}

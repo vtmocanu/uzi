@@ -145,12 +145,12 @@ func TestCrewStateForRecoveryWait(t *testing.T) {
 	now := time.Date(2026, 9, 8, 12, 0, 0, 0, time.UTC)
 	const me = "toolu_me"
 
-	if got := crewStateFor(statusRecoveryWait, "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
+	if got := crewStateFor(statusRecoveryWait, false, "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
 		t.Errorf("crewStateFor(recovery_wait, quiet for 4h) = %s, want %s — a run parked on a scheduled promotion is waiting, not idle", got, crewWaiting)
 	}
 	for _, health := range []string{"stalled", "slow", "looping"} {
-		if got := crewStateFor(statusRecoveryWait, health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
-			t.Errorf("crewStateFor(recovery_wait, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a parked run read stalled",
+		if got := crewStateFor(statusRecoveryWait, false, health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
+			t.Errorf("crewStateFor(recovery_wait, false, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a parked run read stalled",
 				health, got, crewWaiting)
 		}
 	}

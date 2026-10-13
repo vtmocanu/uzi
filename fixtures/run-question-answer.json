@@ -1,0 +1,515 @@
+{
+  "composition": [
+    {
+      "name": "free text",
+      "selected": [],
+      "text": "  words  ",
+      "answer": "words"
+    },
+    {
+      "name": "single pick",
+      "selected": [
+        " Table "
+      ],
+      "text": "",
+      "answer": "Table"
+    },
+    {
+      "name": "multiple labels",
+      "selected": [
+        " Age ",
+        "Version"
+      ],
+      "text": "",
+      "answer": "Age, Version"
+    },
+    {
+      "name": "pick and text",
+      "selected": [
+        "Table"
+      ],
+      "text": " daily ",
+      "answer": "Table \u2014 daily"
+    },
+    {
+      "name": "filter blank picks",
+      "selected": [
+        " ",
+        "\ufeff",
+        " A ",
+        ""
+      ],
+      "text": " \ufeff ",
+      "answer": "A"
+    },
+    {
+      "name": "whitespace only",
+      "selected": [],
+      "text": " \t\n\ufeff",
+      "answer": ""
+    },
+    {
+      "name": "empty",
+      "selected": [],
+      "text": "",
+      "answer": ""
+    },
+    {
+      "name": "FEFF trimmed",
+      "selected": [
+        "\ufeff A\ufeff"
+      ],
+      "text": "\ufeff text \ufeff",
+      "answer": "A \u2014 text"
+    },
+    {
+      "name": "0085 retained",
+      "selected": [
+        "\u0085"
+      ],
+      "text": " \u0085 ",
+      "answer": "\u0085 \u2014 \u0085"
+    }
+  ],
+  "readiness": [
+    {
+      "name": "aligned distinct",
+      "answers": [
+        "first",
+        "second"
+      ],
+      "count": 2,
+      "ready": true
+    },
+    {
+      "name": "shorter",
+      "answers": [
+        "first"
+      ],
+      "count": 2,
+      "ready": false
+    },
+    {
+      "name": "longer",
+      "answers": [
+        "first",
+        "second",
+        "third"
+      ],
+      "count": 2,
+      "ready": false
+    },
+    {
+      "name": "blank slot",
+      "answers": [
+        "first",
+        "\ufeff "
+      ],
+      "count": 2,
+      "ready": false
+    },
+    {
+      "name": "0085 nonblank",
+      "answers": [
+        "\u0085"
+      ],
+      "count": 1,
+      "ready": true
+    },
+    {
+      "name": "empty unanswered",
+      "answers": [],
+      "count": 1,
+      "ready": false
+    },
+    {
+      "name": "zero count parity",
+      "answers": [],
+      "count": 0,
+      "ready": true
+    }
+  ],
+  "actions": [
+    {
+      "name": "free text",
+      "payload": {
+        "question_id": " q-free ",
+        "questions": [
+          {
+            "question": "Window?",
+            "header": "",
+            "options": [],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "text": " 14 days ",
+          "answers": [
+            "14 days"
+          ],
+          "ready": true
+        }
+      ]
+    },
+    {
+      "name": "single pick",
+      "payload": {
+        "question_id": "q-single",
+        "questions": [
+          {
+            "question": "Backend?",
+            "header": "",
+            "options": [
+              {
+                "label": "Table",
+                "description": ""
+              },
+              {
+                "label": "Ring",
+                "description": ""
+              }
+            ],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "option": 0,
+          "answers": [
+            "Table"
+          ],
+          "ready": true
+        }
+      ]
+    },
+    {
+      "name": "reverse multi picks and independent deselect",
+      "payload": {
+        "question_id": "q-multi",
+        "questions": [
+          {
+            "question": "Fields?",
+            "header": "",
+            "options": [
+              {
+                "label": "Age",
+                "description": ""
+              },
+              {
+                "label": "Runs",
+                "description": ""
+              },
+              {
+                "label": "Version",
+                "description": ""
+              }
+            ],
+            "multiSelect": true
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "option": 2,
+          "answers": [
+            "Version"
+          ],
+          "ready": true
+        },
+        {
+          "question": 0,
+          "option": 0,
+          "answers": [
+            "Age, Version"
+          ],
+          "ready": true
+        },
+        {
+          "question": 0,
+          "option": 2,
+          "answers": [
+            "Age"
+          ],
+          "ready": true
+        }
+      ]
+    },
+    {
+      "name": "pick plus text",
+      "payload": {
+        "question_id": "q-refine",
+        "questions": [
+          {
+            "question": "Backend?",
+            "header": "",
+            "options": [
+              {
+                "label": "Table",
+                "description": ""
+              },
+              {
+                "label": "Ring",
+                "description": ""
+              }
+            ],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "option": 0,
+          "answers": [
+            "Table"
+          ],
+          "ready": true
+        },
+        {
+          "question": 0,
+          "text": " daily partitions ",
+          "answers": [
+            "Table \u2014 daily partitions"
+          ],
+          "ready": true
+        }
+      ]
+    },
+    {
+      "name": "whitespace only FEFF",
+      "payload": {
+        "question_id": "q-space",
+        "questions": [
+          {
+            "question": "Window?",
+            "header": "",
+            "options": [],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "text": "\ufeff \t\n",
+          "answers": [
+            ""
+          ],
+          "ready": false
+        }
+      ]
+    },
+    {
+      "name": "empty",
+      "payload": {
+        "question_id": "q-empty",
+        "questions": [
+          {
+            "question": "Window?",
+            "header": "",
+            "options": [],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [],
+      "answers": [
+        ""
+      ],
+      "ready": false
+    },
+    {
+      "name": "single deselect",
+      "payload": {
+        "question_id": "q-deselect",
+        "questions": [
+          {
+            "question": "Backend?",
+            "header": "",
+            "options": [
+              {
+                "label": "Table",
+                "description": ""
+              },
+              {
+                "label": "Ring",
+                "description": ""
+              }
+            ],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "option": 0,
+          "answers": [
+            "Table"
+          ],
+          "ready": true
+        },
+        {
+          "question": 0,
+          "option": 0,
+          "answers": [
+            ""
+          ],
+          "ready": false
+        }
+      ]
+    },
+    {
+      "name": "distinct answers isolation replacement",
+      "payload": {
+        "question_id": "\ufeff q-isolation \ufeff",
+        "questions": [
+          {
+            "question": "First?",
+            "header": "",
+            "options": [
+              {
+                "label": "A",
+                "description": ""
+              },
+              {
+                "label": "B",
+                "description": ""
+              }
+            ],
+            "multiSelect": false
+          },
+          {
+            "question": "Second?",
+            "header": "",
+            "options": [
+              {
+                "label": "A",
+                "description": ""
+              },
+              {
+                "label": "B",
+                "description": ""
+              }
+            ],
+            "multiSelect": true
+          },
+          {
+            "question": "Third?",
+            "header": "",
+            "options": [],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 1,
+          "option": 1,
+          "answers": [
+            "",
+            "B",
+            ""
+          ],
+          "ready": false
+        },
+        {
+          "question": 0,
+          "option": 0,
+          "answers": [
+            "A",
+            "B",
+            ""
+          ],
+          "ready": false
+        },
+        {
+          "question": 2,
+          "text": " third prose ",
+          "answers": [
+            "A",
+            "B",
+            "third prose"
+          ],
+          "ready": true
+        },
+        {
+          "question": 0,
+          "option": 1,
+          "answers": [
+            "B",
+            "B",
+            "third prose"
+          ],
+          "ready": true
+        },
+        {
+          "question": 1,
+          "option": 0,
+          "answers": [
+            "B",
+            "A, B",
+            "third prose"
+          ],
+          "ready": true
+        },
+        {
+          "question": 0,
+          "option": 1,
+          "answers": [
+            "",
+            "A, B",
+            "third prose"
+          ],
+          "ready": false
+        }
+      ]
+    },
+    {
+      "name": "FEFF trimmed 0085 retained",
+      "payload": {
+        "question_id": "q-unicode",
+        "questions": [
+          {
+            "question": "First?",
+            "header": "",
+            "options": [],
+            "multiSelect": false
+          },
+          {
+            "question": "Second?",
+            "header": "",
+            "options": [],
+            "multiSelect": false
+          }
+        ]
+      },
+      "steps": [
+        {
+          "question": 0,
+          "text": "\ufeff yes \ufeff",
+          "answers": [
+            "yes",
+            ""
+          ],
+          "ready": false
+        },
+        {
+          "question": 1,
+          "text": "\u0085",
+          "answers": [
+            "yes",
+            "\u0085"
+          ],
+          "ready": true
+        }
+      ]
+    }
+  ]
+}

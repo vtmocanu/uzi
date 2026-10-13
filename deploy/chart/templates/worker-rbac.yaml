@@ -47,6 +47,10 @@ rules:
     # a call that does not exist is what that forbids. Add it back the day something
     # calls it.
     verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    # Resolve current Deployment -> ReplicaSet -> pod UIDs for promotion.
+    verbs: ["list"]
   - apiGroups: [""]
     resources: ["secrets"]
     # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
@@ -77,7 +81,9 @@ rules:
     # `list` for the same orphan-detection reason as Deployments — and an orphan PVC
     # is otherwise invisible entirely (Pods get/list does not cover it: an orphan
     # Deployment scaled to zero has no pods).
-    verbs: ["create", "list", "delete"]
+    # Preserve the roll marker on retained /data through DinD Deployment deletion.
+    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata.
+    verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     # Decision 9's reserved V2 hook, now built (PRD #113 M3). Roll health is only
@@ -162,7 +168,7 @@ imagePullSecrets:
 
   A Role is namespace-scoped, so the controller needs a SECOND Role + RoleBinding to
   create/roll/tear-down docker workers in workers.docker.namespace. It retains the
-  restricted Role's verbs and adds ReplicaSet list only for replacement readiness.
+  restricted Role's verbs, including ReplicaSet list for replacement readiness.
   The Secrets line is
   identical and identically load-bearing: create/delete ONLY, never get/list. Read the
   restricted Role's Secrets comment before touching this; the reasoning is verbatim,
@@ -200,7 +206,9 @@ rules:
     verbs: ["create", "delete"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "list", "delete"]
+    # Preserve the roll marker on retained /data through DinD Deployment deletion.
+    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata.
+    verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     # Same grant, same reasons as the restricted Role above (PRD #113 M3): `list` only,
@@ -237,7 +245,7 @@ subjects:
 {{- if include "uzi.isolatedLaneEnabled" . }}
 {{- /*
   The controller's reach into the ISOLATED lane's namespace (PRD #1906 M6), copied from
-  the restricted Role above with the same minimal verbs and no DinD ReplicaSet read.
+  the restricted Role above with the same bounded ReplicaSet ancestry observation.
   The Secrets line is identical
   and identically load-bearing: create/delete ONLY, never get/list (read the restricted
   Role's comment). One controller identity, now bound into a third namespace.
@@ -255,6 +263,10 @@ rules:
   - apiGroups: ["apps"]
     resources: ["deployments"]
     verbs: ["create", "list", "patch", "delete"]
+  - apiGroups: ["apps"]
+    resources: ["replicasets"]
+    # Resolve current Deployment -> ReplicaSet -> pod UIDs for promotion.
+    verbs: ["list"]
   - apiGroups: [""]
     resources: ["secrets"]
     # ================= DO NOT ADD `get` OR `list` HERE. EVER. =================
@@ -263,7 +275,9 @@ rules:
     verbs: ["create", "delete"]
   - apiGroups: [""]
     resources: ["persistentvolumeclaims"]
-    verbs: ["create", "list", "delete"]
+    # Preserve the roll marker on retained /data through DinD Deployment deletion.
+    # Reads use list; get remains ungranted. Patch is not RBAC-limited to metadata.
+    verbs: ["create", "list", "patch", "delete"]
   - apiGroups: [""]
     resources: ["pods"]
     # `list` only, no `get`/`watch`, and `pods/log` refused, as in the other two Roles.

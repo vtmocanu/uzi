@@ -112,12 +112,15 @@ cleanup serialization and message-cursor refresh.
 
 "Verified capture before a promotable park" above assumes a clone already
 exists to inspect, WIP-commit and fetch. That assumption does not hold for
-a transient forge failure (DNS, connect, or a 5xx) hit *while cloning* — a
-run resumed from any park re-clones on every resume, so the same exposure
-recurs on every such resume, not only on first dispatch.
+a transient forge failure (DNS, connect, or a 5xx) hit *while cloning* —
+a healthy resume with no retained source can need the same forge refresh,
+so this exposure is not limited to first dispatch. Retained-source discovery
+now precedes forge refresh and disk preflight; the #2512 amendment below
+covers claims that already have local source.
 
-When `ensureClone` exhausts its retry schedule with a transient verdict,
-there is no runner clone, no worktree, no branch and no recovery journal
+On the healthy path with no retained source discovered, when `ensureClone`
+exhausts its retry schedule with a transient verdict, there is no runner
+clone, no worktree, no branch and no recovery journal
 yet (`phaseClone` reports `running` and starts steering before any of those
 exist). There is therefore **nothing to capture, verify, or retain a source
 for**: the worker reports `recovery_wait` with cause `forge_unreachable`
@@ -140,3 +143,180 @@ a generation that never adopted a source releases its hold without the
 forge proof this ADR's sibling amendments otherwise require — and
 [adr/1392-forge-unreachable-preclone-park.md](1392-forge-unreachable-preclone-park.md)
 for the full decision record.
+
+## Amendment 2026-10-08 — #2512: source-bound retained recovery
+
+Retained-source discovery runs inside an acquired claim before forge refresh
+or disk preflight. The #1392 no-local-source forge park remains valid on the
+healthy path where discovery found no retained source. A retained source
+instead enters a durable episode bound to its identity, reserving work
+before capture: **3 total iterations**, blocked and nonblocked together,
+with a **five-minute deadline from the first reservation**. Retries use the
+existing exponential delay capped at 16 times the base. Crash, reclaim,
+capture, publication and successor handoff preserve the reservation and
+deadline. Reset requires a trusted, successfully settled real model turn.
+
+A permanent blocker or exhaustion reports terminal `failed` with
+`keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
+The reason distinguishes missing source, invalid clock, preservation or
+adoption failure, unavailable/unverifiable needed prerequisites, and a
+fallback still over the size cap. `worker_residue_blocked` is reserved here
+for actual quiescence failure. Transient capture, forge and disk failures
+spend the same episode budget. The healthy provider/empty-turn park budgets
+and owner worker-recovery-exhaustion hold are separate and unchanged.
+
+The guarded producer's actual verified thin bundle, under the cap and with
+needed prerequisites locally available and verified, permits local adoption
+and model execution despite unknown remote publication. Nonempty
+prerequisites alone are not a blocker. Content verification reads only the
+reachable object closure and verifies object hashes within the recovery
+deadline. Under the original #2512 policy (superseded by the
+[2026-10-11 amendment](#amendment-2026-10-11--2743) below), decoded history above
+1 GiB failed closed with custody retained,
+even when its thin archive is below 64 MiB; the recorded reason is visible
+in `uzi run recovery` and the worker log. Local proof establishes neither
+independent recovery nor remote durability and grants no custody release. Predecessor
+sources, pins, journals and descriptors remain until the existing verified
+final disposition or explicit discard. Guarded prerequisite-free
+archive/verified-empty-inventory release conditions remain unchanged.
+
+Recovery seeds a fresh successor path and model session even on an unwired
+worker, avoiding execution in a predecessor while its recovery evidence
+must remain. Ordinary unwired keys that never entered retained recovery
+retain same-path continuity. External restarts require a genuinely fenced
+successor; local storage loss remains outside the protection. See the
+matching [ADR-1783 amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-08--2512-retained-recovery-on-unwired-workers).
+
+Healthy unknown publication continues within the same generation, preserving
+the tip, owed roots and publication time gate; confirmed durability requires
+positive proof. No API/schema, hold-rebinding, custody-cap or #2486 behavior
+changes are included; [ADR-1751](1751-continuation-custody-admission.md)'s soft cap
+is unchanged.
+
+A failed source-only run needs operator recovery from retained storage.
+Export remains limited to a manifest-bound available archive, with no new
+download API or failed-run Resume. Downgrade during pending recovery is
+unsupported: older workers may drop the durable recovery fields.
+
+## Amendment 2026-10-09 — #2512: bounded reachable integrity verification
+
+**Historical cap policy:** the 1 GiB limit in this section is superseded by the
+[2026-10-11 amendment](#amendment-2026-10-11--2743). The integrity, custody and
+residual-risk boundaries remain in force.
+
+The human review authorizes a 1 GiB delivered decoded-history limit for
+local recovery verification, separate from the 64 MiB encoded archive cap.
+Exceeding it fails closed and retains custody, with a visible recorded reason
+in `uzi run recovery` and the worker log. Verify reachable object contents
+and hashes under the existing deadline; unrelated cache objects do not
+participate in that proof. Overflow, timeout, corruption and interruption
+never authorize custody release or source cleanup.
+
+The 1 GiB budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads. The delivered-byte
+cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
+does not isolate this verifier from sibling runs. The resulting residual
+resource-exhaustion risk is deferred scope, as authorized by the human
+review on 2026-10-09 (#2512).
+
+## Amendment 2026-10-10 — #2613: pre-clone discovery error classification
+
+Pre-clone retained discovery used to fail the claim on any error that was not
+a foreign-retained rejection, so an operation deadline while waiting on the
+bare lock failed a run whose local work was intact. It now retries only
+confirmed operational errors: the operation deadline, identified by an elapsed
+absolute attempt deadline plus positive deadline evidence (the lock-wait
+abort message or a "recovery deadline exhausted" error in the cause chain), and the resource
+errnos EAGAIN, EMFILE, ENFILE and ENOMEM. A bare abort without that evidence
+is terminal. Typed errors and known corruption markers are rejected before
+any deadline-text match, and every other error is terminal unless positively
+identified as retryable; all of them except a foreign-retained rejection
+keep custody. Git spawn exhaustion is
+wrapped without a code, so it stays terminal.
+
+The allowance is at most 2 retries per claim, shared across both discovery
+callers (pre-clone and the pending-capture rediscovery), using the existing
+exponential recovery delay. It is in-memory and separate from the persisted
+episode budget, which it never reads, resets or replaces. It never parks and
+never mints a hold or generation. Exhaustion fails the claim with "local
+recovery storage busy or unavailable after bounded retries", keeping local
+work and custody like every other terminal discovery failure.
+
+The extra allowance is about 2 x codexBoundaryDeadlineMs plus 3 x
+recoveryRetryMs of scheduled time (about 63 s at defaults). It is not a
+wall-clock guarantee, since I/O settlement can add to it.
+
+## Amendment 2026-10-11 — #2743
+
+The delivered decoded-history cap is now worker-configurable through
+`UZI_RECOVERY_DECODED_LIMIT_BYTES`, with a default of **8589934592 bytes
+(8 GiB)** and a fixed ceiling of **68719476736 bytes (64 GiB)**. This replaces
+the historical 1 GiB policy in the #2512 sections above. The finite ceiling is
+eight times the default: it permits larger histories while retaining exact
+safe-integer arithmetic and existing deadlines, without promising a memory
+bound.
+
+### Reported offline measurement
+
+The following measurement was reported **OFFLINE on 2026-10-11** in the
+[issue #2743 measurement report](https://github.com/vtmocanu/uzi/issues/2743),
+not reproduced on a hosted worker as part of this change:
+
+| History or verification sequence | Decoded object bytes |
+|---|---:|
+| Base `4d28d412` | 1,469,170,456 |
+| Tip `ca44b5c1` | 1,477,164,071 |
+| Union of both actual archives, unique objects | 1,477,164,741 |
+| Base + failed archive, cumulative reads | 2,946,334,838 |
+| Previous archive + base + failed archive, cumulative reads | 4,423,499,268 |
+
+The old 1 GiB cap could not fit even one unique pass. The new 8 GiB default
+fits this reported sequence by decoded bytes; that is not a hosted success or
+deadline guarantee. Repeated reads remain chargeable and can still exhaust
+the cap.
+
+### Configuration and failure boundary
+
+The worker parses the variable once in `loadConfig` at startup and injects it
+through the main GitCache factory into a readonly instance setting. An unset
+variable selects the default. A set value is trimmed and must contain decimal
+digits representing a positive safe integer in `1..68719476736`; leading
+zeroes are accepted. Blank, malformed, fractional, exponent, signed, zero,
+negative, nonfinite, unsafe-integer and above-ceiling values reject worker
+startup. The error names the variable and range without echoing the raw value.
+Changing the setting requires restarting the worker.
+
+This is worker/operator configuration, not server, API, repository or model
+input. Inject it into a standalone container or an explicit operator container
+environment override; setting it in `.env`, the API or controller alone does
+not set the worker variable. The bundled hosted Helm chart and docker-compose
+do **not** expose this environment variable yet and use the 8 GiB default.
+This issue changes neither deployment manifest. See
+[operator configuration](../docs/configuration.md#recovery-decoded-history-limit).
+
+Outer recovery operations and closure checks without an operation context use
+the configured cap; nested recovery operations share their parent's cumulative
+delivered-byte counter. Verification continues to hash the **full reachable
+history**, including prerequisites, with no deduplication across repeated
+reads or history exclusion. Missing or corrupt objects are refused.
+Cancellation and existing deadlines remain in force. Cap exhaustion fails
+closed, preserving local work and custody; encoded archive limits and storage
+quotas are unchanged. Local proof still grants neither remote durability nor
+custody release.
+
+Cap errors report exact bytes, adding GiB when the cap is at least 1 GiB.
+A journal already blocked for decoded-history exhaustion stays blocked after
+restart or a cap increase. Its reason reports previous decoded verification
+exhaustion and the current cap, with "prior cap not recorded"; it does not
+attribute that earlier failure to the new cap or automatically retry it.
+
+### Memory and residual risk
+
+Object contents stream through a pipe chunk and bounded header; content buffers
+do not grow in proportion to the configured cap. Metadata listings still have
+the 64 MiB output cap (`GIT_MAX_BUFFER`), and the object arrays remain bounded
+by that existing listing. The delivered-byte cap is **not a RAM limit**:
+Git-internal delta decompression is not bounded by it. Existing deadlines limit
+duration, and the shared worker cgroup does not isolate sibling runs. The
+residual worker resource-exhaustion risk accepted in #2512 on 2026-10-09 remains
+deferred; this amendment does not claim to solve it.

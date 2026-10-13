@@ -25,6 +25,53 @@ afterEach(() => {
   vi.restoreAllMocks();
 });
 
+describe("cross-check preference request bodies", () => {
+  it.each([true, false])("sends only code=%s through the production setter", async (code) => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { user: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.setCodeCrossCheckEnabled(code);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/me/cross-check");
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(init?.body as string)).toEqual({ code });
+  });
+  it.each([true, false])("sends only plan=%s through the existing setter", async (plan) => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { user: {} }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    await api.setPlanCrossCheckEnabled(plan);
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/me/cross-check");
+    expect(init?.method).toBe("PUT");
+    expect(JSON.parse(init?.body as string)).toEqual({ plan });
+  });
+});
+
+describe("repo code cross-check inputs request", () => {
+  it.each([
+    [{ code_cross_check_guidance: "Check migrations.", cross_check_repo_instructions_enabled: true }],
+    [{ code_cross_check_guidance: null }],
+    [{ cross_check_repo_instructions_enabled: false }],
+  ])("sends exactly %j in one PATCH to the repo", async (inputs) => {
+    expect(MOCK_MODE).toBe(false);
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { repo: { id: "r1" } }));
+    vi.stubGlobal("fetch", fetchMock);
+    vi.stubGlobal("document", { cookie: "" });
+    const out = await api.setRepoCodeCrossCheckInputs("r1", inputs);
+    expect(out.repo.id).toBe("r1");
+    expect(fetchMock).toHaveBeenCalledTimes(1);
+    const [url, init] = fetchMock.mock.calls[0];
+    expect(url).toBe("/api/repos/r1");
+    expect(init?.method).toBe("PATCH");
+    expect(JSON.parse(init?.body as string)).toEqual(inputs);
+  });
+});
+
 describe("testSecret request", () => {
   it("posts to the selected credential without a provider body and returns the flat verdict", async () => {
     const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) => fakeResponse(200, { status: "inconclusive", reason: "vault_locked" }));
@@ -355,5 +402,49 @@ describe("product site-list allowance URLs", () => {
     const [url, init] = fetchMock.mock.calls[0];
     expect(url).toContain("/admin/products/prod-a/egress-profiles/model%20cards%2Fv2");
     expect((init as RequestInit).method).toBe(method);
+  });
+});
+
+// Issue #2661: ?view=summary is opt-in; the default calls must keep sending no view.
+describe("listRuns / adminListRuns summary view (#2661)", () => {
+  const emptyRuns = { runs: [] };
+  const stub = () => {
+    const fetchMock = vi.fn(async (_url: string, _init?: RequestInit) =>
+      fakeResponse(200, emptyRuns),
+    );
+    vi.stubGlobal("fetch", fetchMock);
+    return fetchMock;
+  };
+
+  it("listRuns() sends no query string and no view by default", async () => {
+    const fetchMock = stub();
+    await api.listRuns();
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/runs$/);
+  });
+
+  it("view=summary composes with repo_id and issue_iid", async () => {
+    const fetchMock = stub();
+    await api.listRuns({ repoId: "r1", issueIid: 7, view: "summary" });
+    const url = new URL(String(fetchMock.mock.calls[0][0]), "http://x");
+    expect(url.pathname.endsWith("/runs")).toBe(true);
+    expect(url.searchParams.get("repo_id")).toBe("r1");
+    expect(url.searchParams.get("issue_iid")).toBe("7");
+    expect(url.searchParams.get("view")).toBe("summary");
+  });
+
+  it("view=summary keeps the passive header", async () => {
+    const fetchMock = stub();
+    await api.listRuns({ passive: true, view: "summary" });
+    expect(String(fetchMock.mock.calls[0][0])).toContain("view=summary");
+    const init = fetchMock.mock.calls[0][1] as RequestInit;
+    expect((init.headers as Record<string, string>)["X-Uzi-Passive"]).toBe("1");
+  });
+
+  it("adminListRuns() sends no query string; with view it hits /admin/runs?view=summary", async () => {
+    const fetchMock = stub();
+    await api.adminListRuns();
+    await api.adminListRuns({ view: "summary" });
+    expect(String(fetchMock.mock.calls[0][0])).toMatch(/\/admin\/runs$/);
+    expect(String(fetchMock.mock.calls[1][0])).toMatch(/\/admin\/runs\?view=summary$/);
   });
 });

@@ -76,8 +76,10 @@ func extendSeedIssueRun(ctx context.Context, t *testing.T, pool *pgxpool.Pool, u
 	mustExec(ctx, t, pool,
 		`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, started_at,
 		                   budget_wall_seconds, budget_paused_seconds, budget_extension_seconds)
-		 VALUES ($1, $2, $3, 'issue', 42, 'ship the feature', 'ctx', $4, $5, $6, $7, $8)`,
-		runID, userID, repoID, status, pgtype.Timestamptz{Time: startedAt, Valid: true}, wallSecs, pausedSecs, extSecs)
+		 VALUES ($1, $2, $3, 'issue', $9, 'ship the feature', 'ctx', $4, $5, $6, $7, $8)`,
+		runID, userID, repoID, status, pgtype.Timestamptz{Time: startedAt, Valid: true}, wallSecs, pausedSecs, extSecs,
+		// Unique per run: uq_runs_one_active_per_issue allows one active run per (repo, issue).
+		int(runID.ID()%2000000000)+100)
 	return runID
 }
 
@@ -217,7 +219,7 @@ func TestCreateExtendInputSuccessLiveDB(t *testing.T) {
 	runID := extendSeedIssueRun(ctx, t, pool, userID, repoID, "running", 8*60*60, 0, 0, time.Now())
 
 	total, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-		ID: runID, Secs: 7200, Cap: 57600, Body: extendBody("extend +2h → total extension 2h of 16h"),
+		ID: runID, Secs: 7200, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("extend +2h → total extension 2h of 16h"),
 	})
 	if err != nil {
 		t.Fatalf("CreateExtendInput: %v", err)
@@ -241,7 +243,7 @@ func TestCreateExtendInputSuccessLiveDB(t *testing.T) {
 
 	// A second extension is cumulative: 7200 + 3600 = 10800.
 	total2, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-		ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("extend +1h → total extension 3h of 16h"),
+		ID: runID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("extend +1h → total extension 3h of 16h"),
 	})
 	if err != nil {
 		t.Fatalf("second CreateExtendInput: %v", err)
@@ -268,7 +270,7 @@ func TestCreateExtendInputQueuedRunLiveDB(t *testing.T) {
 	runID := extendSeedIssueRun(ctx, t, pool, userID, repoID, "queued", 8*60*60, 0, 0, time.Now())
 
 	total, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-		ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("extend +1h → total extension 1h of 16h"),
+		ID: runID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("extend +1h → total extension 1h of 16h"),
 	})
 	if err != nil {
 		t.Fatalf("CreateExtendInput on a queued (parked) run must succeed (D4), got: %v", err)
@@ -292,10 +294,10 @@ func TestCreateExtendInputRefusalsLiveDB(t *testing.T) {
 	userID, repoID := extendSeedRepo(ctx, t, pool)
 
 	t.Run("over cap", func(t *testing.T) {
-		// Already at the cap; a further 3600 would exceed 57600 → 0 rows.
+		// The cap is per request: 57660 > 57600 → 0 rows, whatever the cumulative total.
 		runID := extendSeedIssueRun(ctx, t, pool, userID, repoID, "running", 8*60*60, 0, 57600, time.Now())
 		_, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-			ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("should be refused"),
+			ID: runID, Secs: 57660, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("should be refused"),
 		})
 		if !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("over-cap err = %v, want pgx.ErrNoRows", err)
@@ -311,7 +313,7 @@ func TestCreateExtendInputRefusalsLiveDB(t *testing.T) {
 	t.Run("terminal run", func(t *testing.T) {
 		runID := extendSeedIssueRun(ctx, t, pool, userID, repoID, "completed", 8*60*60, 0, 0, time.Now())
 		_, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-			ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("should be refused"),
+			ID: runID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("should be refused"),
 		})
 		if !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("terminal err = %v, want pgx.ErrNoRows", err)
@@ -331,7 +333,7 @@ func TestCreateExtendInputRefusalsLiveDB(t *testing.T) {
 			`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status)
 			 VALUES ($1, $2, 'chat', 't', 'd', 'running')`, runID, userID)
 		_, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-			ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("should be refused"),
+			ID: runID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("should be refused"),
 		})
 		if !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("chat err = %v, want pgx.ErrNoRows", err)
@@ -349,7 +351,7 @@ func TestCreateExtendInputRefusalsLiveDB(t *testing.T) {
 			`INSERT INTO runs (id, user_id, kind, issue_title, issue_description, status, target_run_id)
 			 VALUES ($1, $2, 'judge', 't', 'd', 'running', $3)`, runID, userID, targetID)
 		_, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-			ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("should be refused"),
+			ID: runID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("should be refused"),
 		})
 		if !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("judge err = %v, want pgx.ErrNoRows", err)
@@ -368,7 +370,7 @@ func TestCreateExtendInputRefusalsLiveDB(t *testing.T) {
 			 VALUES ($1, $2, $3, 'task', true, $4, 't', 'd', 'running')`,
 			runID, userID, repoID, "uzi/task/"+runID.String())
 		_, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-			ID: runID, Secs: 3600, Cap: 57600, Body: extendBody("should be refused"),
+			ID: runID, Secs: 3600, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("should be refused"),
 		})
 		if !errors.Is(err, pgx.ErrNoRows) {
 			t.Fatalf("interactive-task err = %v, want pgx.ErrNoRows", err)
@@ -395,7 +397,7 @@ func TestConsumeRunInputsExcludesExtendLiveDB(t *testing.T) {
 	mustExec(ctx, t, pool,
 		`INSERT INTO run_user_inputs (run_id, kind, body) VALUES ($1, 'follow_up', 'please also add docs')`, runID)
 	if _, err := q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-		ID: runID, Secs: 7200, Cap: 57600, Body: extendBody("extend +2h"),
+		ID: runID, Secs: 7200, Cap: 57600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, Body: extendBody("extend +2h"),
 	}); err != nil {
 		t.Fatalf("CreateExtendInput: %v", err)
 	}

@@ -31,7 +31,7 @@ func TestPlanCrossCheckIssueByteBoundsLiveDB(t *testing.T) {
                 issue_title = $2, issue_description = $3 WHERE id = $1`, f.runID, tc.title, tc.body)
 			childID := uuid.New()
 			_, err := f.q.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{
-				ChildID: childID, LeadRunID: f.runID, UserID: f.userID,
+				ChildID: childID, ChildHarness: "codex", LeadRunID: f.runID, UserID: f.userID,
 				WorkerID: pgU(f.workerID), ClaimGeneration: 1, BudgetWallSeconds: 300,
 			})
 			if tc.accepted {

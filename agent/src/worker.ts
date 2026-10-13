@@ -26,6 +26,7 @@ import { toolchainPreflight, type PreflightResult } from "./toolchain-preflight.
 import { CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY } from "./codex/codex-runtime-probe.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
+import { reportProofTiming } from "./report-proof-timing.js";
 
 class UnsupportedMemoryAPI extends Error {}
 
@@ -45,7 +46,7 @@ const SETTLEMENT_SWEEP_MS = 5 * 60_000;
 
 // Process-wide quarantine: even an authority call that ignores cancellation occupies its slot
 // and exact key until settlement. Rejections are handled by both tracking and the bounded waiter.
-const finalizeAuthorities = new Map<string, Promise<boolean>>();
+const finalizeAuthorities = new Map<string, Promise<unknown>>();
 type FinalizeCandidate = { entry: PendingFinalize; identity: Readonly<object> };
 const finalizeKey = (entry: PendingFinalize): string => `${entry.run_id}:${entry.claim_generation}`;
 
@@ -140,7 +141,7 @@ export class Worker {
     },
     private readonly dindMaintenance?: DindMaintenanceController,
     private readonly terminalRejections?: TerminalRejectionCoordinator,
-    private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute">,
+    private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute"> & Partial<Pick<CrossCheckRunner, "snapshotBootCodeSnapshots" | "cleanupBootCodeSnapshots">>,
     private readonly memory?: Pick<WorkerMemoryRuntime, "run" | "stop">,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
@@ -201,10 +202,11 @@ export class Worker {
         typeof this.runner.recoveryInventoryPending !== "function") return;
     this.sweepingFinalizes = true;
     const pass = new AbortController();
-    const deadline = Date.now() + 5_000;
+    const passMs = reportProofTiming.finalizePassMs();
+    const deadline = Date.now() + passMs;
     const abort = () => pass.abort(signal?.reason);
     signal?.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), 5_000);
+    const timer = setTimeout(() => pass.abort(new Error("finalize pass deadline")), passMs);
     try {
       const candidates = frozen ?? this.captureFinalizes();
       const entries = candidates.map(candidate => candidate.entry);
@@ -279,25 +281,44 @@ export class Worker {
     outbox: Outbox, entry: PendingFinalize, key: string, identity: Readonly<object>, signal: AbortSignal, deadline: number,
     registrationLower = false,
   ): Promise<void> {
+    const incarnation = this.client.capturePublicationCompletionRetirement?.();
     const authorityWait = new AbortController();
     const abort = () => authorityWait.abort(signal.reason);
     signal.addEventListener("abort", abort, { once: true });
-    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")), 1_000);
+    const timer = setTimeout(() => authorityWait.abort(new Error("finalize authority deadline")),
+      reportProofTiming.finalizeAuthorityMs());
     try {
       // Install quarantine before invoking the predicate, including synchronously throwing doubles.
-      const authority = Promise.resolve().then(() => this.hasFinalizeAuthority(entry, identity, registrationLower));
+      const authority = Promise.resolve().then(async () => {
+        const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
+          !this.admittedRunIds.has(entry.run_id) && !(this.activeRuns?.has(entry.run_id) ?? false);
+        if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
+          const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
+            expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
+          }, "finalize", outbox);
+          if (retired === true) {
+            if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
+              entry.run_id, entry.claim_generation, incarnation);
+            return true;
+          }
+        }
+        if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
+            !reportEligible()) return;
+        if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return;
+        const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
+        if (!eligible()) return;
+        const retired = await outbox.retireFinalizeIfEligible(
+          entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
+        if (retired === true && incarnation && eligible())
+          await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+        return retired;
+      });
       finalizeAuthorities.set(key, authority);
       const settled = () => {
         if (finalizeAuthorities.get(key) === authority) finalizeAuthorities.delete(key);
       };
       void authority.then(settled, settled);
-      const authorized = await waitForFinalize(authority, authorityWait.signal);
-      if (authorized !== true) return;
-      const eligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
-        !this.isFinalizeRunLive(entry.run_id);
-      if (!eligible()) return;
-      await waitForFinalize(outbox.retireFinalizeIfEligible(
-        entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity), authorityWait.signal);
+      await waitForFinalize(authority, authorityWait.signal);
     } catch (err) {
       this.log.warn("outbox: finalize retry retained a generation", {
         run_id: entry.run_id, claim_generation: entry.claim_generation, error: errMessage(err),
@@ -376,6 +397,12 @@ export class Worker {
       // A runner stub without the method (older test doubles) simply has nothing to snapshot.
       const bootRecoveries =
         typeof this.runner.snapshotBootRecoveries === "function" ? await this.runner.snapshotBootRecoveries() : [];
+      let bootCodeSnapshots: Awaited<ReturnType<CrossCheckRunner["snapshotBootCodeSnapshots"]>> = [];
+      try {
+        bootCodeSnapshots = structuredClone(await this.crossCheckRunner?.snapshotBootCodeSnapshots?.(signal) ?? []);
+      } catch {
+        this.log.warn("code snapshot boot discovery failed; snapshots retained");
+      }
       let heartbeat = Promise.resolve();
       let rejections = Promise.resolve();
       let registered = false;
@@ -426,6 +453,11 @@ export class Worker {
       // cap (`pending_overflow`, checked each iteration in claimLoop), and message drain stays in the
       // background above. The heartbeat promise is created once and awaited alongside the claim loops.
       await this.resolveBootTerminals(signal);
+      try {
+        await this.crossCheckRunner?.cleanupBootCodeSnapshots?.(bootCodeSnapshots, signal);
+      } catch {
+        this.log.warn("code snapshot boot cleanup failed; snapshots retained");
+      }
       // issue #1582 M2: ONLY after the boot pending-terminal gate, start the ancestry-settlement loop
       // alongside the claim loops (it never gates them): an immediate sweep of every due
       // `pending_settle` record, then a re-sweep on a timer until abort. No forge credential needed.
@@ -731,6 +763,8 @@ export class Worker {
           "recovery_archive_v1",
           "recovery_archive_v2",
           "recovery_inventory_v1",
+          "recovery_completed_publication_v1",
+          "recovery_held_publication_v1",
           // PRD #1247 M5b (D3/protocol §9): this image implements the held-state credential-switch
           // protocol — it stamps claim_generation on every mutating report (already landed in W2a),
           // surfaces the credential_switch signal, and performs the two-phase release. Advertised
@@ -741,6 +775,7 @@ export class Worker {
           "credential_switch_v1",
           // M2: this image reconciles unknown Codex refresh outcomes before recovery capture.
           "codex_refresh_recovery_v1",
+          "codex_account_park_v1",
           // PRD #1497 M2 (D13): this image parks a run at its wall-clock limit instead of failing it
           // — BOTH harnesses (Claude and Codex) drop the turn in flight, capture the tree, and report
           // the wall_park transition. Advertised UNCONDITIONALLY: the sweep's RequestWallParks join
@@ -748,6 +783,7 @@ export class Worker {
           // row can be asked to park itself; an image WITHOUT it has its out-of-time run parked
           // server-side at once (never failed), so advertising it is negotiation, not a toggle.
           "wall_park_v1",
+          "park_run_v1",
           "input_receipts_v1",
           // Issue #1800: this image reports when an owner follow-up was really put into an
           // executor prompt (POST /inputs/included); the api refuses the route without it.
@@ -778,6 +814,10 @@ export class Worker {
           "cross_check_v1",
           "cross_check_rounds_v1",
           "cross_check_pins_v1",
+          // PRD #2460: this image runs a Codex lead's checked plan gate and a Claude plan
+          // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
+          // always present, and the api requires it of a worker claiming a Claude child.
+          "cross_check_codex_lead_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
@@ -814,7 +854,10 @@ export class Worker {
           protocolCapabilities.push(CODEX_CUSTOM_MODEL_CAPABILITY);
         }
         if (this.config.memoryGuard?.enabled) protocolCapabilities.push("worker_memory_pressure_v1");
-        if (this.config.crossCheckSlots > 0) protocolCapabilities.push("cross_check_lane_v1");
+        if (this.config.crossCheckSlots > 0) {
+          protocolCapabilities.push("cross_check_lane_v1");
+          if (this.crossCheckRunner && this.config.codexHarness?.advertise) protocolCapabilities.push("cross_check_code_v1");
+        }
         if (this.dindMaintenance) protocolCapabilities.push("dind_maintenance_v1");
         const res = await this.client.register(
           this.config.workerName,

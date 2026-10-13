@@ -130,7 +130,7 @@ func TestCrossCheckPinOppositeOrderSavesLiveDB(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if len(pins) != 2 || pins[0].Model.String != "haiku" || !pins[0].Model.Valid ||
+			if len(pins) != 4 || pins[0].Model.String != "haiku" || !pins[0].Model.Valid ||
 				pins[0].Effort.String != "high" || !pins[0].Effort.Valid ||
 				pins[1].Model.Valid || pins[1].Effort.String != "xhigh" || !pins[1].Effort.Valid {
 				t.Fatalf("concurrent saves lost omitted fields or explicit null: %+v", pins)
@@ -183,20 +183,20 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 			t.Fatal(err)
 		}
 		metadataCells(t, rec)
-		if len(response.Settings.Pins) != 2 {
+		if len(response.Settings.Pins) != 4 {
 			t.Fatalf("cells: %+v", response)
 		}
 		return response.Settings.Pins
 	}
 	initial := request("{}", 200)
-	if initial[0].Harness != "claude" || initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
+	if initial[0].Harness != "claude" || !initial[0].Active || !initial[1].Active || initial[1].ResolvedModel == nil ||
 		*initial[1].ResolvedModel != "gpt-6.1-sol" || initial[1].ResolvedEffort != "medium" || initial[1].Model != nil {
-		t.Fatalf("defaults/dormancy: %+v", initial)
+		t.Fatalf("defaults/both-cells-active: %+v", initial)
 	}
 	exec("UPDATE users SET default_codex_model='gpt-6-sol',default_codex_effort='high' WHERE id=$1", user)
 	got := request(`{"cross_check_pins":[{"stage":"plan","harness":"codex","model":"gpt-6-astra","effort":"xhigh"},{"stage":"plan","harness":"claude","model":"sonnet"}]}`, 200)
 	if *got[1].Model != "gpt-6-astra" || *got[1].ResolvedModel != "gpt-6-astra" || got[1].ResolvedEffort != "xhigh" ||
-		got[1].ModelSource != "pin" || got[1].EffortSource != "pin" || got[0].Active || *got[0].Model != "sonnet" {
+		got[1].ModelSource != "pin" || got[1].EffortSource != "pin" || !got[0].Active || *got[0].Model != "sonnet" {
 		t.Fatalf("pins: %+v", got)
 	}
 	got = request(`{"cross_check_pins":[{"stage":"plan","harness":"codex","effort":"max"}]}`, 200)
@@ -223,7 +223,7 @@ func TestCrossCheckPinSettingsLiveDB(t *testing.T) {
 	for _, body := range []string{
 		`{"cross_check_pins":[{"stage":"plan","harness":"claude","worker_default_model":null}]}`,
 		`{"cross_check_pins":null}`, `{"cross_check_pins":{}}`,
-		`{"cross_check_pins":[{"stage":"code","harness":"codex"}]}`,
+		`{"cross_check_pins":[{"stage":"unknown","harness":"codex"}]}`,
 		`{"cross_check_pins":[{"stage":"plan","harness":"other"}]}`,
 		`{"cross_check_pins":[{"stage":"plan","harness":"codex"},{"stage":"plan","harness":"codex"}]}`,
 		`{"default_effort":"low","cross_check_pins":[{"stage":"plan","harness":"claude","model":"haiku"},{"stage":"plan","harness":"codex","model":"sonnet"}]}`,

@@ -13,7 +13,6 @@ import (
 	"crypto/x509"
 	"encoding/json"
 	"fmt"
-	"io"
 	"log/slog"
 	"net/http"
 	"sync"
@@ -21,11 +20,6 @@ import (
 
 	"github.com/vtmocanu/uzi/controller/internal/protocol"
 )
-
-// maxErrorBodyBytes bounds how much of a non-2xx response we read back for the
-// error message, so a misrouted request to something that streams cannot balloon
-// the controller's memory.
-const maxErrorBodyBytes = 4 << 10
 
 // Client calls the uzi api's controller endpoints.
 type Client struct {
@@ -53,8 +47,9 @@ type Client struct {
 func New(baseURL, token string, timeout time.Duration, caPool *x509.CertPool, log *slog.Logger) *Client {
 	// Clone the default transport rather than building one: it carries the
 	// connection pooling, proxy handling and HTTP/2 support net/http has tuned, and
-	// only the TLS roots need changing.
+	// customize TLS roots and retain compression handling in the bounded poll decoder.
 	tr := http.DefaultTransport.(*http.Transport).Clone()
+	tr.DisableCompression = true
 	if caPool != nil {
 		tr.TLSClientConfig = &tls.Config{
 			RootCAs:    caPool,
@@ -84,6 +79,7 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 		return protocol.PollResponse{}, fmt.Errorf("apiclient: build poll request: %w", err)
 	}
 	req.Header.Set("Authorization", "Bearer "+c.token)
+	req.Header.Set("Accept-Encoding", "gzip")
 
 	resp, err := c.http.Do(req)
 	if err != nil {
@@ -94,18 +90,10 @@ func (c *Client) Poll(ctx context.Context) (protocol.PollResponse, error) {
 	defer func() { _ = resp.Body.Close() }()
 
 	if resp.StatusCode != http.StatusOK {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return protocol.PollResponse{}, fmt.Errorf("apiclient: poll: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return protocol.PollResponse{}, fmt.Errorf("apiclient: poll: api returned %d", resp.StatusCode)
 	}
 
-	var out protocol.PollResponse
-	if err := json.NewDecoder(resp.Body).Decode(&out); err != nil {
-		// The body may carry join-token plaintext, so the decode error is reported
-		// bare — json.Decode errors quote the offending token, and this response is
-		// the one place a plaintext could end up in a log line.
-		return protocol.PollResponse{}, fmt.Errorf("apiclient: decode poll response")
-	}
-	return out, nil
+	return decodePoll(resp)
 }
 
 // Report POSTs per-worker roll health to the api (PRD #113 M3).
@@ -131,6 +119,7 @@ func (c *Client) Report(ctx context.Context, report protocol.StatusReport) error
 
 // ReportReadiness requires the status endpoint to actually accept publication.
 func (c *Client) ReportReadiness(ctx context.Context, report protocol.StatusReport) error {
+	report.Kind = "readiness"
 	return c.reportStatus(ctx, report, true)
 }
 
@@ -162,8 +151,7 @@ func (c *Client) reportStatus(ctx context.Context, report protocol.StatusReport,
 	// exactly, so an api that grows a body later does not break this side — the
 	// response is never read regardless, which is what keeps the channel one-way.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return fmt.Errorf("apiclient: status report: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return fmt.Errorf("apiclient: status report: api returned %d", resp.StatusCode)
 	}
 	// Deliberately NOT decoding the response. A display-only sink returns 204 with no
 	// body, and reading one would be the first step towards this becoming a second
@@ -182,8 +170,18 @@ func (c *Client) reportStatus(ctx context.Context, report protocol.StatusReport,
 // without this endpoint) — is returned as an error, so the caller DEFERS the roll
 // rather than proceeding. A busy worker whose cordon could not be written is left
 // running, never hard-killed; deferring costs a tick, hard-killing costs a run.
-func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/workers/"+workerID+"/drain", nil)
+func (c *Client) RequestDrainWithReason(ctx context.Context, workerID string, reason ...string) error {
+	var body []byte
+	if len(reason) > 1 {
+		return fmt.Errorf("apiclient: invalid drain reason")
+	}
+	if len(reason) > 0 && reason[0] != "" {
+		if len(reason) != 1 || (reason[0] != "image_roll" && reason[0] != "pressure_recycle") {
+			return fmt.Errorf("apiclient: invalid drain reason")
+		}
+		body, _ = json.Marshal(map[string]string{"reason": reason[0]})
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodPost, c.baseURL+"/api/controller/workers/"+workerID+"/drain", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("apiclient: build drain request: %w", err)
 	}
@@ -197,10 +195,35 @@ func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
 
 	// 204 is the documented success. Accept the 2xx band rather than pinning 204.
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return fmt.Errorf("apiclient: drain request: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return fmt.Errorf("apiclient: drain request: api returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+// ConfirmImageRollDrain reasserts the image hold, then reads authoritative desired
+// state through Poll's bounded decoder. Missing or duplicate identity is uncertain.
+func (c *Client) ConfirmImageRollDrain(ctx context.Context, workerID string) (protocol.DesiredWorker, error) {
+	if err := c.RequestDrainWithReason(ctx, workerID, "image_roll"); err != nil {
+		return protocol.DesiredWorker{}, err
+	}
+	poll, err := c.Poll(ctx)
+	if err != nil {
+		return protocol.DesiredWorker{}, err
+	}
+	var found *protocol.DesiredWorker
+	for i := range poll.Workers {
+		if poll.Workers[i].ID != workerID {
+			continue
+		}
+		if found != nil {
+			return protocol.DesiredWorker{}, fmt.Errorf("apiclient: duplicate drain confirmation identity")
+		}
+		found = &poll.Workers[i]
+	}
+	if found == nil {
+		return protocol.DesiredWorker{}, fmt.Errorf("apiclient: drain confirmation worker absent")
+	}
+	return *found, nil
 }
 
 // ClearDrain asks the api to UNCORDON a hosted worker — clear draining_since so the
@@ -224,10 +247,21 @@ func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
 //     holds, so treating 404 as an error would be inverted from cordon for no reason and
 //     would inject a spurious per-tick error for a condition that is already correct.
 //
-// Only OTHER non-2xx (5xx store errors) and transport/build errors are returned as
-// errors; the caller logs and retries next tick.
-func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
-	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/controller/workers/"+workerID+"/drain", nil)
+// A pressure_recycle release requires an accepted control write, so its 404 is
+// returned as an error. Legacy and image_roll clears retain the 404 behavior above.
+// Other non-2xx and transport/build errors are returned for retry next tick.
+func (c *Client) ClearDrainWithReason(ctx context.Context, workerID string, reason ...string) error {
+	var body []byte
+	if len(reason) > 1 {
+		return fmt.Errorf("apiclient: invalid drain reason")
+	}
+	if len(reason) > 0 && reason[0] != "" {
+		if len(reason) != 1 || (reason[0] != "image_roll" && reason[0] != "pressure_recycle") {
+			return fmt.Errorf("apiclient: invalid drain reason")
+		}
+		body, _ = json.Marshal(map[string]string{"reason": reason[0]})
+	}
+	req, err := http.NewRequestWithContext(ctx, http.MethodDelete, c.baseURL+"/api/controller/workers/"+workerID+"/drain", bytes.NewReader(body))
 	if err != nil {
 		return fmt.Errorf("apiclient: build clear-drain request: %w", err)
 	}
@@ -239,15 +273,19 @@ func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
 	}
 	defer func() { _ = resp.Body.Close() }()
 
-	// 204 is the documented success; a 404 means the worker already is not draining —
-	// both are the desired "not cordoned" end state (see doc comment). Everything else
-	// (5xx) is a real error worth retrying next tick.
-	if resp.StatusCode == http.StatusNotFound {
+	// Legacy and image_roll releases tolerate 404; pressure_recycle requires 2xx.
+	if resp.StatusCode == http.StatusNotFound && (len(reason) == 0 || reason[0] != "pressure_recycle") {
 		return nil
 	}
 	if resp.StatusCode < 200 || resp.StatusCode > 299 {
-		snippet, _ := io.ReadAll(io.LimitReader(resp.Body, maxErrorBodyBytes))
-		return fmt.Errorf("apiclient: clear-drain request: api returned %d: %s", resp.StatusCode, bytes.TrimSpace(snippet))
+		return fmt.Errorf("apiclient: clear-drain request: api returned %d", resp.StatusCode)
 	}
 	return nil
+}
+
+func (c *Client) RequestDrain(ctx context.Context, workerID string) error {
+	return c.RequestDrainWithReason(ctx, workerID)
+}
+func (c *Client) ClearDrain(ctx context.Context, workerID string) error {
+	return c.ClearDrainWithReason(ctx, workerID)
 }

@@ -18,7 +18,7 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		{Stage: "plan", Harness: "codex", Model: &model, WorkerDefaultModel: &worker,
 			ResolvedModel: &model, ResolvedEffort: "high", ModelSource: "pin", EffortSource: "worker default", Active: true},
 		{Stage: "plan", Harness: "claude", Effort: &effort,
-			ResolvedEffort: effort, ModelSource: "worker default", EffortSource: "pin", Active: false},
+			ResolvedEffort: effort, ModelSource: "worker default", EffortSource: "pin", Active: true},
 	}}
 	fc := &uzicli.FakeClient{Settings: settings}
 	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
@@ -26,11 +26,11 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 3 {
-		t.Fatalf("expected header and two cells: %s", out)
+	if len(lines) != 4 || lines[3] != "Now summary: on (default)" {
+		t.Fatalf("expected header, two cells and the Now summary line: %s", out)
 	}
 	want := []string{
-		"plan claude inactive Default SDK/account default SDK/account default worker default Pin · high high pin",
+		"plan claude active Default SDK/account default SDK/account default worker default Pin · high high pin",
 		"plan codex active Pin · checker-custom worker-model checker-custom pin Default high worker default",
 	}
 	for i, row := range want {
@@ -53,11 +53,61 @@ func TestSettingsGetTableAndJSON(t *testing.T) {
 	}
 }
 
-func TestSettingsGetInactivePinAndDefaultModel(t *testing.T) {
+func TestSettingsGetFourIndependentCells(t *testing.T) {
+	model, effort, worker := "code-only", "low", "code-worker"
+	settings := apitypes.UserSettingsDTO{CrossCheckPins: []apitypes.CrossCheckPinDTO{
+		{Stage: "code", Harness: "codex", Model: &model, WorkerDefaultModel: &worker, ResolvedModel: &model, ResolvedEffort: "medium", ModelSource: "pin", EffortSource: "worker default", Active: true},
+		{Stage: "plan", Harness: "codex", ResolvedEffort: "high", ModelSource: "worker default", EffortSource: "worker default"},
+		{Stage: "code", Harness: "claude", Effort: &effort, ResolvedEffort: "low", ModelSource: "worker default", EffortSource: "pin"},
+		{Stage: "plan", Harness: "claude", ResolvedEffort: "high", ModelSource: "worker default", EffortSource: "worker default", Active: true},
+	}}
+	fc := &uzicli.FakeClient{Settings: settings}
+	out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 {
+		t.Fatalf("exit %d: %s", code, stderr)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	want := []string{
+		"plan claude active Default SDK/account default SDK/account default worker default Default high worker default",
+		"plan codex inactive Default unknown unknown worker default Default high worker default",
+		"code claude inactive Default SDK/account default SDK/account default worker default Pin · low low pin",
+		"code codex active Pin · code-only code-worker code-only pin Default medium worker default",
+	}
+	if len(lines) != 6 || lines[5] != "Now summary: on (default)" {
+		t.Fatalf("four cells: %s", out)
+	}
+	for i, row := range want {
+		if strings.Join(strings.Fields(lines[i+1]), " ") != row {
+			t.Fatalf("cell %d: %s", i, lines[i+1])
+		}
+	}
+	out, stderr, code = runCLI(t, fakeEnv(fc), "settings", "get", "--json")
+	var got apitypes.UserSettingsDTO
+	if code != 0 || json.Unmarshal([]byte(out), &got) != nil {
+		t.Fatalf("JSON %d %s", code, stderr)
+	}
+	actual, _ := json.Marshal(got)
+	expected, _ := json.Marshal(settings)
+	if !bytes.Equal(actual, expected) {
+		t.Fatalf("JSON changed: %s", out)
+	}
+	// The twenty-cell input bound applies independently to all four identities.
+	fc.Settings.CrossCheckPins = append([]apitypes.CrossCheckPinDTO{}, settings.CrossCheckPins[:2]...)
+	for len(fc.Settings.CrossCheckPins) < 20 {
+		fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[1])
+	}
+	fc.Settings.CrossCheckPins = append(fc.Settings.CrossCheckPins, settings.CrossCheckPins[2:]...)
+	out, _, code = runCLI(t, fakeEnv(fc), "settings", "get")
+	if code != 0 || strings.Count(out, "\n") != 4 {
+		t.Fatalf("input bound: %s", out)
+	}
+}
+
+func TestSettingsGetClaudePinAndDefaultModel(t *testing.T) {
 	model, codex := "sonnet", "gpt-6.1-sol"
 	fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{CrossCheckPins: []apitypes.CrossCheckPinDTO{
 		{Stage: "plan", Harness: "claude", Model: &model, ResolvedModel: &model,
-			ResolvedEffort: "high", ModelSource: "pin", EffortSource: "worker default"},
+			ResolvedEffort: "high", ModelSource: "pin", EffortSource: "worker default", Active: true},
 		{Stage: "plan", Harness: "codex", WorkerDefaultModel: &codex, ResolvedModel: &codex,
 			ResolvedEffort: "medium", ModelSource: "worker default", EffortSource: "worker default", Active: true},
 	}}}
@@ -66,11 +116,11 @@ func TestSettingsGetInactivePinAndDefaultModel(t *testing.T) {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if len(lines) != 3 {
+	if len(lines) != 4 {
 		t.Fatalf("expected two cells: %s", out)
 	}
 	for i, want := range []string{
-		"plan claude inactive Pin · sonnet SDK/account default sonnet pin Default high worker default",
+		"plan claude active Pin · sonnet SDK/account default sonnet pin Default high worker default",
 		"plan codex active Default gpt-6.1-sol gpt-6.1-sol worker default Default medium worker default",
 	} {
 		if got := strings.Join(strings.Fields(lines[i+1]), " "); got != want {
@@ -94,7 +144,7 @@ func TestSettingsGetHostileTextAndBounds(t *testing.T) {
 	if code != 0 {
 		t.Fatalf("exit %d: %s", code, stderr)
 	}
-	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 2 ||
+	if strings.ContainsAny(out, "\x1b\x07\u202e") || strings.Count(out, "\n") != 3 ||
 		len(out) > 3000 || !strings.Contains(out, "unknown") || strings.Contains(out, strings.Repeat("x", 201)) {
 		t.Fatalf("unsafe or unbounded output: %q", out)
 	}
@@ -150,5 +200,27 @@ func TestSettingsReadOnlyAndErrors(t *testing.T) {
 	out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{}), "settings", "get")
 	if code != 0 || !strings.Contains(out, "STORED MODEL") {
 		t.Fatalf("empty settings: exit %d, output %s", code, out)
+	}
+}
+
+func TestSettingsGetNowSummaryLine(t *testing.T) {
+	on, off := true, false
+	for _, c := range []struct {
+		name string
+		v    *bool
+		want string
+	}{{"default", nil, "Now summary: on (default)"}, {"on", &on, "Now summary: on"}, {"off", &off, "Now summary: off"}} {
+		fc := &uzicli.FakeClient{Settings: apitypes.UserSettingsDTO{NowSummaryEnabled: c.v}}
+		out, stderr, code := runCLI(t, fakeEnv(fc), "settings", "get")
+		if code != 0 {
+			t.Fatalf("%s: exit %d: %s", c.name, code, stderr)
+		}
+		if !strings.Contains(out, "\n"+c.want+"\n") {
+			t.Errorf("%s: missing %q in %q", c.name, c.want, out)
+		}
+		jout, _, _ := runCLI(t, fakeEnv(fc), "settings", "get", "--json")
+		if strings.Contains(jout, "Now summary:") {
+			t.Errorf("%s: JSON carries the human line: %s", c.name, jout)
+		}
 	}
 }

@@ -4,6 +4,10 @@ UPDATE workers SET maintenance_id = @maintenance_id, maintenance_nonce = @mainte
  maintenance_phase = @maintenance_phase, maintenance_deployment_uid = @maintenance_deployment_uid,
  maintenance_pvc_uid = @maintenance_pvc_uid, maintenance_register_nonce = @maintenance_register_nonce,
  maintenance_fenced = @maintenance_fenced, maintenance_ready_ack = @maintenance_ready_ack,
+ draining_reason = CASE
+   WHEN @maintenance_phase::text = 'requested' AND draining_since IS NULL THEN NULL
+   WHEN @maintenance_phase::text IN ('cancelled','complete') AND maintenance_owns_drain THEN NULL
+   ELSE draining_reason END,
  draining_since = CASE
    WHEN @maintenance_phase::text = 'requested' THEN COALESCE(draining_since, now())
    WHEN @maintenance_phase::text IN ('cancelled','complete') AND maintenance_owns_drain THEN NULL

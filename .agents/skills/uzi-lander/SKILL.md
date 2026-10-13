@@ -72,7 +72,7 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   own worktree, or save a patch file.
 - **CI is the gate; do not run full gates locally.** `land-prep.sh` runs none by default
   (`LOCAL_GATES=none`; report "awaiting CI", never a local pass); `merge.sh` requires the exact
-  head's required checks green. Run locally only fast targeted checks (`go build`/`vet` of
+  head's required checks green, or all reported checks passing/skipping when both readable rulesets and classic protection require none (zero reported checks never means green). Run locally only fast targeted checks (`go build`/`vet` of
   touched packages, `gofmt -l`, a `sqlc generate` diff, `task docs:sync` + `check-docs:web`,
   `check:changelog-entry`, the focused tests and their red/green mutation) and checks CI lacks.
   `--gate auto` still runs full component gates; a local failure counts only after the same
@@ -80,6 +80,13 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
 - **Run long local checks from a pinned worktree.** An e2e or Docker check runs in a
   detached worktree at the exact head it certifies, never in the `land-prep.sh` worktree:
   land-prep rebases that tree in place, so a check still running there tests a mixed tree.
+- **CI timing is advisory.** Run `S/ci-timing-report.py OWNER/REPO [RUN_ID]` for
+  per-attempt execution, activation/queue delays, reported required-context completion
+  and up to five ordinary successful main comparisons (median needs three).
+  `--input BUNDLE.json` replays saved metadata; `--junit-dir DIR` reads existing
+  reports. It only reads, never reruns or gates CI; missing data stays unknown.
+  Run after post-merge main CI for PRs you land touching tests, harness waits or CI, or when CI feels slow;
+  report the agent-gap line when `rebalance advisory=True`.
 
 ## Buddy
 
@@ -132,7 +139,7 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 | After a small local fix | the buddy's `APPROVE` of the fixed head, plus green CI; a fix too big for that goes to `uzi run rework` (step 4) |
 | CodeRabbit rate-limited | live reset ≤ 15 min: wait for CodeRabbit; otherwise a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too, a small PR takes the buddy alone |
 | Bot skipped or absent | the buddy |
-| Skill or script maintenance (`[skip-cr]`) | the buddy plus the user |
+| Skill or script maintenance (`[skip-cr]`) | the buddy; the lander and the buddy land it, no user review |
 | Rebase, merge of `main`, or renumber only | the buddy's `APPROVE` of the range-diff (for a merge, the conflict resolution) on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
 | Bot approved this head, no local fix since | none extra, except large or trust-boundary PRs: the buddy too, as a skim (a brief naming the diff range and the risky seams; a verdict pinned to the SHA). The bot does the full read |
 | Renovate, assessed CI-sufficient | none extra; a Renovate PR assessed as needing review follows the rows above |
@@ -155,7 +162,7 @@ changes it); trust it over a handover's claim.
 | `run_active:<status>` | step 1 |
 | `run_failed:*`, `run_completed_no_pr` | hand to `uzi-watcher` (*When a run fails*, recovery) |
 | `migration_collision`, `conflict` | step 5; the `EVERY_AUTHOR=` line and its rows (threads, code-scanning alerts, unacked comments) print whatever `NEXT` is, so read them first |
-| `ci_red` | read the failing job; fix locally (step 4) or classify flake |
+| `ci_red` | read the failing job; fix locally (step 4) or classify flake. An infra fix that landed on `main` (e.g. a registry mirror) needs a rebase (step 5): a rerun reuses the old head's workflow |
 | `claimed_by_other` | another live lander holds it: message the owner, take the patient path |
 | `mr_rework_active` | `S/wait-mrrework.sh` (references/mr-rework.md), then re-snapshot |
 | `ci_pending`, `review_pending` | step 2 |
@@ -168,18 +175,26 @@ changes it); trust it over a handover's claim.
 ## The loop
 
 1. **Run still active.** Poll blind to terminal with the watcher's poller, in the background:
-   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_input,paused 60 MAX`,
-   with `MAX` polls covering the run's remaining budget (`budget_total_seconds` minus
+   `.agents/skills/uzi-watcher/scripts/watch-run.sh RUN completed,failed,cancelled,awaiting_approval,awaiting_input,paused 60 MAX SEQ`,
+   with `SEQ` the seq of the plan that was approved, carried from the approval or the watcher's
+   handoff and kept across re-arms (`0` for a seeded run), so the stale gate is ignored but a NEW
+   plan stops it. Never recompute it as the latest plan seq: an unapproved re-plan would then
+   pass as the approved gate. Without the approved seq and with the run at `awaiting_approval`,
+   treat it as the re-plan case below. `MAX` polls cover the run's remaining budget (`budget_total_seconds` minus
    `budget_used_seconds`, plus any extension, over the interval). A poller that ends with
    `ELAPSED` stopped counting, not the run: re-launch it. Re-arm it after every
    `uzi run extend` or `uzi run resume`, which leave no poller running.
    `STOP=needs_attention` (exit 4) means a non-terminal run shows persistent non-ok health or
    a stale worker heartbeat: investigate (`uzi run get RUN --json`, `uzi worker list`, the
-   trace tail); do not assume dead or lost, change nothing until you know, then re-arm.
+   trace tail); do not assume dead or lost, change nothing until you know, then launch its
+   `REARM=` line in the background in the same turn (it acks that health episode).
    Parks: `awaiting_input` → read the question (`uzi run logs RUN --json`, kind `question`),
-   surface it, answer with `uzi run answer` if you can (a completion question about a milestone
-   the plan made maintainer-owned: "defer", open the PR); `awaiting_approval` → the plan gate
-   is `uzi-watcher`'s job; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
+   surface it, answer with `uzi run answer` if you can (never a wait-only answer: see `uzi-watcher`,
+   *Watching*; a completion question about a milestone
+   the plan made maintainer-owned: `uzi run decide RUN --partial <kept ids> --reason '...'`, since
+   a plain answer cannot exempt it, then open the PR); `awaiting_approval` past `SEQ` → the run re-planned
+   (usually a lost worker resumed from the default branch): before steering the new gate with
+   `uzi-watcher`, check `uzi run recovery RUN` for committed work worth landing instead; `limit_wait` / `pool_wait` / `recovery_wait` → one trail line,
    keep polling (they resume on their own). `paused` stops the poller because it never
    resumes on its own: read `hold_reason`. A run that hit its wall-clock limit is `paused`
    with `hold_reason: budget_exhausted` (PRD #1497), never `failed`: extend it (`uzi run
@@ -322,12 +337,18 @@ changes it); trust it over a handover's claim.
    when unsure, decide with the buddy (*Buddy*). Say which in the merge note. Greptile does not
    re-review on its own; re-comment if you want its second pass.
 5. **Base hygiene, when needed, unprompted.** `BEHIND` alone is fine under an admin merge.
+   Prepare lazily: run `land-prep.sh` only on a PR that is next in the merge order, after
+   its blocker has merged. Defer base-only preparation of a held PR: its push would only be
+   redone after the blocker lands, at a full CI run per push.
    A conflicting PR gets no CI at all, even right after uzi's own `mr_rework` push: read
    `mergeable` before waiting on checks.
    A worker's `chore: align .github/workflows with <sha>` commit copies `main`'s workflows
    onto an older base, which can make CI call a Task target the branch lacks. On such a
    finding, check the target on current `main`; when `main` defines it, rebase onto `main`,
-   rerun CI, then assess whatever finding remains.
+   rerun CI, then assess whatever finding remains. When the two-dot workflow diff vs `main` is
+   empty, verify a workflow finding against current `main` and the align commit: drop a redundant
+   align commit with `land-prep.sh`, correct inaccurate PR-description claims, resolve as
+   inherited only after verifying attribution, and track a real defect on `main` separately.
    A migration-number collision, a `DIRTY` mergeable state, or a strict-check block needs:
 
    ```
@@ -380,7 +401,7 @@ changes it); trust it over a handover's claim.
    passed, merge; do not ask (the user opts out per PR or per session by saying so):
 
    ```
-   S/merge.sh OWNER/REPO PR --expect-head <sha you watched>     # squash + delete-branch + admin
+   S/merge.sh OWNER/REPO PR --expect-head <sha you watched> --expect-closes <N,...|none>   # squash + delete-branch + admin
    ```
 
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
@@ -401,7 +422,8 @@ changes it); trust it over a handover's claim.
    per-job live-log commands it prints, then fix on a branch, never `main`; flake → rerun +
    file), 3 no run appeared, 4 superseded → re-watch the current `main` head
    (references/merge-mechanics.md). Append the terminal result to the preserved trail
-   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line.
+   (`main ci green`, `main ci red`, or `main ci superseded`) and print the whole line. Read
+   the poller's own `EXIT=` line before reporting any of them (*Waiting, uniformly*).
    A post-merge publish step (a workflow dispatch, tag push, or tap publish) follows
    references/merge-mechanics.md, *Post-merge publish steps*.
 8. **Finish.** Remove the worktrees and branches you or your local reviewer created
@@ -497,9 +519,12 @@ and they precede every merge (step 6):
   rework reports (deferred items, behaviour changes, follow-ups) reach the PR body only
   through you: `gh pr edit PR --body-file FILE`, keeping the existing text.
 - **The closing references match the outcome.** uzi does not honor prose-only non-closing
-  intent (#2172). If the approved scope and verified outcome require an issue to stay open,
-  remove every closing directive for it from the PR body (use `Refs #N`) and confirm it is
-  absent from `gh pr view PR --json closingIssuesReferences` before merging.
+  intent (#2172), and GitHub parses negated prose ("does not close #N") as a closing
+  keyword. If the approved scope and verified outcome require an issue to stay open, remove
+  every closing directive for it from the PR body, title and commit messages (use `Refs #N`;
+  title and commit messages reach `main` in the squash commit and close issues there) and
+  pass the expected set to `merge.sh --expect-closes` (`none` for a Refs-only PR), which
+  checks all three and refuses a mismatch.
 - **A code-scanning alert on the PR ref may be an old one.** When the PR only touches
   lines near a known alert, compare rule and path with `main`'s alerts
   (`gh api repos/OWNER/REPO/code-scanning/alerts?ref=refs/heads/main`). Dismiss the
@@ -512,6 +537,10 @@ and they precede every merge (step 6):
   merging. File the regression with both results; queue it per the on-deck *Filing default*.
   Compare failing-test sets, not counts. A worker's Go can be older than CI's `setup-go`:
   gofmt with CI's Go before trusting a worker's `fmt-check`.
+  For Go test failures, use
+  `S/attribute-failures.sh --log <gate-log-file> --base <ref> --head <ref>`;
+  attribute other failures by hand, and a `pre-existing` verdict still needs the
+  user's call before merging.
 - **Pin every local review to the immutable head.** The buddy is the default reviewer
   for small/mechanical non-Renovate diffs. For Renovate-class work, record the
   explicit review-needed or CI-sufficient decision. Large/high-risk diffs use the stronger
@@ -538,6 +567,7 @@ session-peers registry, so a Codex thread with a shim is a peer like any Claude 
   `list` shows it, and B's lander waits on A's owner (trail `waiting #A`).
 - **Unclaimed run PRs.** `S/orphans.sh` lists them; the dispatching session lands its own
   run (`run-<RUN_ID>` claim), an orphan goes to whoever asks first: references/orphans.md.
+  Look a run up by its PR number too: takeover converts `run-<RUN_ID>` into the `#PR` claim.
 - **Contested PR.** Never `--force` a live session's claim; message the owner. A dead or
   stale owner (registry says gone, or no heartbeat for 6 h) is taken over silently.
 - **Cleanup spans the post-merge watch.** `merge.sh` releases the live claim on `MERGED`
@@ -572,9 +602,10 @@ wrapper always completes with 0.
 - Other behaviour changes, new scripts and new rules are batched into **one
   end-of-session ask** ("these three improvements to `uzi-lander`, ok?"), not applied
   silently.
-- A skill-maintenance PR is titled with `[skip-cr]` (no bot review), reviewed by the buddy
-  (or a local buddy) and by the user. Re-run `agnix` on `SKILL.md` after editing;
-  `task check:skill-size` gates the size; the reply budget for a long buddy loop is in *Buddy*.
+- A skill-maintenance PR is titled with `[skip-cr]` (no bot review) and is reviewed by the
+  buddy (or a local buddy); the lander and the buddy land it without a user review.
+  Re-run `agnix` on `SKILL.md` after editing; `task check:skill-size` gates the size;
+  the reply budget for a long buddy loop is in *Buddy*.
 
 ## Files
 
@@ -583,6 +614,7 @@ wrapper always completes with 0.
   `scripts/lib/state.sh` the shared state dir/session identity; `scripts/lib/review-threads.sh`
   the fail-closed GitHub thread-resolution reader; `scripts/lib/pr-comments.sh` the
   every-author blockers; `scripts/lib/sanitize.sh` the UNTRUSTED-text renderer;
+  `scripts/lib/net-retry.sh` read-only `gh`/`uzi` transport retry (takeover, land-prep, watch-pr);
   `scripts/ack-comments.sh` acknowledges read comments.
 - `scripts/watch-pr.sh` readiness (CI + CR/Greptile on head + rework + rate-limit/skip exits);
   `scripts/pr-findings.sh` findings from both bots; `scripts/cr-rate-limit.sh` reset +

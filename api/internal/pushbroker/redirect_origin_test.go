@@ -274,7 +274,32 @@ func brokerOps() []brokerOp {
 			}
 		}
 	}
+	// heldCreateSetup builds a held-work pack over file:// so PrepareHeldPack (a list, then a
+	// fetch) and SendHeldCreate (a receive-pack session, then the read-back list) run over
+	// the HTTP remote (issue #2545).
+	heldCreateSetup := func(t *testing.T, f *gitFixture) func(string) error {
+		t.Helper()
+		base := f.commit("a.txt", "base\n", "base")
+		f.pushMain()
+		tip := f.commit("b.txt", "one\n", "c1")
+		pack := f.pack(tip, base)
+		return func(u string) error {
+			p, err := pushbroker.PrepareHeldPack(context.Background(), pushbroker.HeldPackOptions{
+				CloneURL: u, Username: "uzi-bot", PAT: redirectTestPAT(), RunID: salvageRunID, Generation: 1,
+				Branch: "main", DefaultBranch: "main", Tip: tip, Pack: pack,
+			})
+			if err != nil {
+				return err
+			}
+			_, err = pushbroker.SendHeldCreate(context.Background(), p)
+			return err
+		}
+	}
 	return []brokerOp{
+		{"held prepare list", "git-upload-pack", 1, heldCreateSetup},
+		{"held prepare fetch", "git-upload-pack", 2, heldCreateSetup},
+		{"held create receive-pack", "git-receive-pack", 1, heldCreateSetup},
+		{"held create read-back list", "git-upload-pack", 3, heldCreateSetup},
 		{"publish list", "git-upload-pack", 1, publishSetup},
 		{"publish fetch", "git-upload-pack", 2, publishSetup},
 		{"publish receive-pack", "git-receive-pack", 1, publishSetup},

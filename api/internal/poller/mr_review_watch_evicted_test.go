@@ -19,8 +19,8 @@ import (
 func TestMRReworkEvictedPendingIDIsRemovedAndNextTickDoesNoAssessment(t *testing.T) {
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-		ledgers: map[string]store.MrReworkLedger{
-			mrwRef: {RepoID: mrwRepoID, Ref: mrwRef, HighWater: 200, PendingUnknownIds: []int64{50}},
+		ledgers: map[string]store.GetMRReworkLedgerRow{
+			mrwRef: mrwRow(mrwRef, 0, 200, mrwWithKeys("review_comment:50")),
 		},
 	}
 	runs := &mrwRuns{}
@@ -40,8 +40,8 @@ func TestMRReworkEvictedPendingIDIsRemovedAndNextTickDoesNoAssessment(t *testing
 	if len(runs.calls) != 0 {
 		t.Fatalf("tick 1 created %d runs; nothing in the capped snapshot is new", len(runs.calls))
 	}
-	if got := st.ledgers[mrwRef].PendingUnknownIds; slices.Contains(got, 50) {
-		t.Fatalf("pending after tick 1 = %v, want the evicted id 50 removed", got)
+	if got := st.ledgers[mrwRef].PendingUnknownKeys; slices.Contains(got, "review_comment:50") {
+		t.Fatalf("pending after tick 1 = %v, want the evicted key review_comment:50 removed", got)
 	}
 	if got := st.ledgers[mrwRef]; got.AttemptCount != 0 || got.HighWater != 200 {
 		t.Fatalf("a pending-only removal must not touch attempt_count or high_water: %+v", got)

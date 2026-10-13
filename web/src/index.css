@@ -453,6 +453,9 @@ body {
 .docs-prose > :first-child {
   @apply mt-0;
 }
+.docs-prose :is(h1,h2,h3,h4,h5,h6) {
+  scroll-margin-top: 5rem;
+}
 .docs-prose h1 {
   @apply mb-4 mt-8 text-3xl font-bold tracking-tight text-fg;
 }

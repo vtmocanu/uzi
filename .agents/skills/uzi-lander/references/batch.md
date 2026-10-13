@@ -37,8 +37,10 @@ so one diagnosis can unblock the batch; a red-defect PR cannot merge until fixed
   when cut goes red when a new CVE lands, and `main` fails the same way. Read the failing
   job (references/merge-mechanics.md, *Post-merge CI*, for the live-log commands).
 - **Repo-wide** (new CVE, toolchain currency): the fix is a dependency bump on its own
-  branch, landed first; then `gh pr update-branch <n>` the rest so their checks re-run.
-- **Defect**: the PR's own loop (SKILL.md step 4). **Stale base**: `gh pr update-branch`.
+  branch, landed first; then refresh each other PR only when it is next in merge order
+  (SKILL.md step 5), so its checks re-run on the fixed base.
+- **Defect**: the PR's own loop (SKILL.md step 4). **Stale base**: defer the refresh until
+  the PR is next (SKILL.md step 5).
 
 Watch several PRs' CI at once with `S/watch-prs-ci.sh <PR> [<PR>...]` in the background
 (exit 1 the moment any PR has a confirmed failing job, 0 when all are terminal and green).
@@ -70,7 +72,9 @@ adding a migration, note whether it is safe to renumber filename-only. Surface a
 would not merge to the user instead of merging it.
 
 Merge each PR the moment it is ready (`S/merge.sh`, squash; the subject carries `(#PR)`,
-which the release CHANGELOG cites); do not hold the batch to the end. Watch post-merge CI per
+which the release CHANGELOG cites); do not hold the batch to the end. Review in parallel,
+but rebase serially: land-prep one PR, merge it, then the next (SKILL.md step 5); never
+re-push the whole held batch, since every merge stales the rest again. Watch post-merge CI per
 SKILL.md step 7; a `cancelled` run under a newer merge is supersession, not red.
 
 ## 5. Report-only runs whose issue could now be closed

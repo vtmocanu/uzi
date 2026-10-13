@@ -7,6 +7,7 @@ import path from "node:path";
 import type { Options as SdkOptions, HookInput } from "@anthropic-ai/claude-agent-sdk";
 
 import { JudgeRunner, buildJudgePrompt, parseReview, fallbackReview, calibrateReview } from "../src/judge-runner.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import type { StateAck } from "../src/protocol.js";
 import { stubJudgeQueryFn } from "../src/judge-runner-stub.js";
@@ -467,6 +468,60 @@ describe("JudgeRunner", () => {
     assert.equal(calls.review?.review.recommendations[0]?.target, "jq");
     // Even a fallback completes the judge run (it produced a review).
     assert.equal(calls.state?.body.status, "completed");
+  });
+
+  // Issue #1970 (PRD #35 Decision 14): a usage-limit death is the one model error that
+  // does NOT fall back — the judge run fails with the structured limit facts (and leaves the
+  // worker's active-run snapshot), posting no review and no `completed`.
+  it("fails the judge run with structured limit facts on a usage-limit death (no fallback review)", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const activeRuns = new ActiveRunRegistry();
+    const resetsAt = Date.now() + 5 * 60 * 60 * 1000;
+    const queryFn = async function* () {
+      yield {
+        type: "rate_limit_event",
+        rate_limit_info: { status: "rejected", resetsAt, rateLimitType: "five_hour" },
+        uuid: "u",
+        session_id: "s",
+      };
+      yield { type: "result", subtype: "error_during_execution", is_error: true };
+    } as unknown as SdkQueryFn;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn, activeRuns });
+    await runner.execute(judgeClaim());
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "failed"],
+    );
+    const failed = calls.states[1]?.body;
+    assert.equal(failed?.rate_limit_type, "five_hour");
+    assert.equal(failed?.limit_resets_at, resetsAt);
+    assert.equal(failed?.failure_reason, undefined, "the server composes the reason from the limit facts");
+    assert.equal(calls.review, undefined, "a limit death posts no fallback review");
+    assert.equal(calls.messages.length, 0, "a limit death posts no usage frame");
+    assert.equal(activeRuns.has("judge-1"), false, "the judge run leaves the active-run snapshot");
+  });
+
+  it("fails with a text reason on a usage-limit death that carries no limit facts", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const activeRuns = new ActiveRunRegistry();
+    // terminal_reason alone classifies as a limit, but with no rate_limit_event there is no
+    // window and no reset — the failed report must still say why.
+    const queryFn = async function* () {
+      yield { type: "result", subtype: "error_during_execution", is_error: true, terminal_reason: "blocking_limit" };
+    } as unknown as SdkQueryFn;
+    const runner = new JudgeRunner(client, nullLogger(), { queryFn, activeRuns });
+    await runner.execute(judgeClaim());
+
+    assert.deepEqual(
+      calls.states.map((s) => s.body.status),
+      ["running", "failed"],
+    );
+    const failed = calls.states[1]?.body;
+    assert.match(failed?.failure_reason ?? "", /usage limit reached/);
+    assert.equal(failed?.rate_limit_type, undefined);
+    assert.equal(calls.review, undefined);
+    assert.equal(activeRuns.has("judge-1"), false);
   });
 
   it("posts the deterministic fallback when the trace fetch fails (findings still land)", async () => {
@@ -1322,7 +1377,7 @@ describe("buildJudgePrompt", () => {
   describe("target cost status (PRD #1429 M3, D7)", () => {
     it("renders a metered dollar figure in the trusted pre-fence header", () => {
       const prompt = buildJudgePrompt(emptyTrace, null, [], null, "metered", 1.23456);
-      assert.match(prompt, /Reviewed run cost: \$1\.23 \(metered\)\./);
+      assert.match(prompt, /Reviewed run cost: \$1\.23 \(API-equivalent\)\./);
       const costIdx = prompt.indexOf("Reviewed run cost:");
       const fenceIdx = prompt.indexOf("<untrusted_trace_");
       assert.ok(fenceIdx > 0, "expected an untrusted-trace fence");
@@ -1331,7 +1386,7 @@ describe("buildJudgePrompt", () => {
 
     it("labels a subscription spend and NEVER prints a dollar figure for it", () => {
       const prompt = buildJudgePrompt(emptyTrace, null, [], null, "subscription", 0);
-      assert.match(prompt, /Reviewed run cost: subscription usage/);
+      assert.match(prompt, /Reviewed run cost: no cost estimate was recorded\./);
       assert.ok(!/\$0(\.00)?\b/.test(prompt), "a subscription spend must never render as $0");
       assert.ok(!prompt.includes("$"), "subscription cost must carry NO dollar figure at all");
     });
@@ -1356,7 +1411,7 @@ describe("buildJudgePrompt", () => {
 
     it("a metered status with no known dollar amount says so rather than inventing a number", () => {
       const prompt = buildJudgePrompt(emptyTrace, null, [], null, "metered", null);
-      assert.match(prompt, /Reviewed run cost: metered \(dollar amount unavailable\)\./);
+      assert.match(prompt, /Reviewed run cost: API-equivalent estimate unavailable \(dollar amount unavailable\)\./);
     });
   });
 

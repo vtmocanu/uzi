@@ -288,6 +288,15 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	if m.boardShowMile() {
 		row += padSeg(m.milestoneMarker(r, terminal, bg), boardMileWidth, bg) + gap
 	}
+	// PROG (PRD #2602): shown with MILES (boardShowProg); a finished row has no progress (nil)
+	// and stays blank.
+	if m.boardShowProg() {
+		var prog string
+		if !terminal {
+			prog = m.boardProgCell(r.Progress, r.Status, bg, m.boardShowProgBar())
+		}
+		row += padSeg(prog, m.boardProgWidth(), bg) + gap
+	}
 
 	// WHICH credential this run spent, gated by its own harness:
 	// drawn after the milestone micro-bar and before the COST column, so the row reads
@@ -320,10 +329,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	} else if terminalRunStatuses[r.Status] {
 		text.runWorkerName = "—"
 	}
-	workerWidth := 0
-	if m.width >= 120 {
-		workerWidth = 18 // two spaces and a fixed 16-column worker cell
-	}
+	workerWidth := m.boardWorkerWidth()
 	contentWidth := m.width - workerWidth
 	avail := max(0, contentWidth-visualWidth(row)-markerAllow)
 	if avail > boardTitleMax {
@@ -381,7 +387,7 @@ func (m tuiModel) boardCredSeg(r apitypes.RunListItemDTO, bg color.Color) string
 // render identically to a real metered $0. Four states: a nil Usage (a pre-#40 or unclaimed run)
 // draws a BLANK cell, matching boardCredSeg's empty convention; "metered" draws fmtCostBoard's
 // whole-dollar figure (0 < usd < 0.5 renders "<$1" so a real cost never shows as $0, and an exact
-// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "sub"
+// metered $0 IS a genuine reading — never special-cased); "subscription" draws the short "n/a"
 // label (never a dollar figure); anything else — "unreported", the pre-M1 empty string, or a
 // status this build has not heard of — draws "n/a", the same safe-unavailable fold web's
 // costCellText uses.
@@ -394,7 +400,7 @@ func (m tuiModel) boardCostSeg(r apitypes.RunListItemDTO, bg color.Color) string
 	case costStatusMetered:
 		s = fmtCostBoard(r.Usage.CostUSD) // width-capped so a pathological cost can't blow the cell
 	case costStatusSubscription:
-		s = "sub"
+		s = "n/a"
 	default:
 		s = "n/a"
 	}
@@ -477,13 +483,13 @@ func (m tuiModel) verdictMarker(verdict string, todo, verdictW, countW int, bg c
 // milestoneMarker is the board's compact milestone micro-bar — one cell per frozen milestone,
 // done ▰ (tungsten, or faint on a DONE row) ahead of remaining ▱ (faint). A run that has reported
 // nothing yet has done=0, so it draws an all-empty ▱ bar (the graphical `0/N`) rather than the
-// web MilestoneBadge's `–/N` text — the board favours the at-a-glance bar over the never/zero
+// web RunProgressCard's `– of M reported` text — the board favours the bar over the never/zero
 // distinction the wider detail rail keeps. When the list is longer than boardMileCap the bar
 // would overflow the column, so it falls back to text: `done/total` once reported, and the
 // neutral `–/N` while nothing is reported (a text cell has no bar to read as `0`, so the
-// cross-surface `–/N` convention wins there). Empty for a run with no frozen list, so a
-// non-milestone row draws nothing. Carries only counts, so it needs no D7 sanitizing. bg carries
-// the selection bar behind it on a selected row.
+// compact CLI/TUI `–/N` convention wins there; the web board's milestoneBadgeText stays separate).
+// Empty for a run with no frozen list, so a non-milestone row draws nothing. Carries only
+// counts, so it needs no D7 sanitizing. bg carries the selection bar on a selected row.
 func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.Color) string {
 	done, total, reported := milestoneProgress(r.RunDTO)
 	if total == 0 {
@@ -514,18 +520,33 @@ func (m tuiModel) milestoneMarker(r apitypes.RunListItemDTO, dim bool, bg color.
 	return out + paintSeg(m.pal.faintC, bg, false, strings.Repeat("▱", empty))
 }
 
-// boardShowSecondLine reports whether the SELECTED row gets its second "now" line (PRD #1064
-// D4): a non-terminal run with a server-derived current_activity, a run held on its Codex
-// account (PRD #1590), whose second line is the account action, a vault_locked park (issue
-// #1766), whose second line is the vault park sentence, a data_volume_full park (PRD #1809),
-// whose second line is the disk park sentence, or a run held on credential_disabled
-// (PRD #1732), whose second line is its next step. It has no milestone
-// precondition (D5) — the board reads current_activity directly. Used both by the row window
-// math (which must reserve a physical line for it) and by renderBoard.
+// providerBoardLine keeps owner actions at the front of the compact row; the detail
+// carries the full commands, Stop eligibility and retained-work limits.
+func providerBoardLine(r apitypes.RunDTO) string {
+	if isProviderUnavailableHold(r) {
+		stop := "Stop unavailable: see detail"
+		if r.CanStopAtProviderHold {
+			stop = "Stop: scope + Resume"
+		}
+		return "owner Resume/Cancel · " + stop + " · provider unavailable"
+	}
+	if providerParkLine(r) != "" {
+		retry := "unknown"
+		if r.RecoveryRetryNotBefore != nil {
+			retry = r.RecoveryRetryNotBefore.Local().Format("15:04")
+		}
+		return fmt.Sprintf("provider outage · parks %d · retry %s", r.ProviderParkCount, retry)
+	}
+	return ""
+}
+
+// boardShowSecondLine reserves the selected row's activity or typed park/hold
+// guidance. It has no milestone precondition; window math and rendering share it.
 func (m tuiModel) boardShowSecondLine(r apitypes.RunListItemDTO) bool {
 	return (r.CurrentActivity != nil && !terminalRunStatuses[r.Status]) ||
 		codexAccountActionLine(r.RunDTO) != "" || vaultParkLine(r.RunDTO) != "" ||
-		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isWorkerRecoveryExhausted(r.RunDTO)
+		diskParkLine(r.RunDTO) != "" || credentialDisabledLine(r.RunDTO) != "" || isWorkerRecoveryExhausted(r.RunDTO) ||
+		isProviderUnavailableHold(r.RunDTO) || providerParkLine(r.RunDTO) != ""
 }
 
 // boardSecondLine is the selected row's second line (PRD #1064 D4): `▸ <id> <title> · <role>
@@ -546,6 +567,14 @@ func (m tuiModel) boardSecondLine(r apitypes.RunListItemDTO) string {
 	// bands into NEEDS YOU via runBandOf; its line keeps the wait ink). The line carries
 	// the owner's alias label (user-authored), folded through cellText by
 	// codexAccountActionLine and through renderer.Plain here (D7).
+	if line := providerBoardLine(r.RunDTO); line != "" {
+		ink := m.pal.wait
+		if isProviderUnavailableHold(r.RunDTO) {
+			ink = m.pal.amber
+		}
+		out := prefix + paintSeg(ink, bg, false, m.renderer.Plain(line, 240))
+		return padSeg(clampVisual(out, m.width), m.width, bg)
+	}
 	if isWorkerRecoveryExhausted(r.RunDTO) {
 		allowance := "allowance unknown"
 		if w := r.WorkerRecovery; w != nil {

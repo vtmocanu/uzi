@@ -15,6 +15,7 @@ import { afterEach, beforeEach, describe, expect, it, vi } from "vitest";
 import { act, renderHook, waitFor } from "@testing-library/react";
 import { api, ApiError, type Run, type RunMessage, type SteerInput } from "./api";
 import { useRunStream } from "./useRunStream";
+import { isRevisingRun } from "./runBadge";
 
 // DeadSocket looks like a WebSocket to the hook but never fires onopen (or any
 // event): the exact failure mode of a broken proxy handshake.
@@ -103,6 +104,9 @@ function fakeRun(): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -489,4 +493,183 @@ describe("useRunStream reconnect after switching from a terminal run (issue #143
     // A's "completed" leaking into B would skip the reconnect entirely.
     expect(setTimeoutSpy.mock.calls.some(([, ms]) => ms === 1500)).toBe(true);
   });
+});
+
+// Issue #2760: a revise replan flips the server-derived is_revising / progress.state, and
+// only a run re-read carries them, so the plan_revising and plan frames must refresh it.
+describe("useRunStream live revise cycle (issue #2760)", () => {
+  beforeEach(() => {
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+    LiveSocket.last = null;
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  const progressOf = (state: "waiting" | "planning") => ({
+    state,
+    pct: null,
+    milestone_done: 0,
+    milestone_total: 0,
+    active_milestone_id: "",
+    phase: "" as const,
+  });
+  const gate = (revising: boolean): Run => ({
+    ...fakeRun(),
+    status: "awaiting_approval",
+    is_revising: revising,
+    progress: progressOf(revising ? "planning" : "waiting"),
+  });
+  const frame = (seq: number, kind: string) => ({
+    type: "message",
+    seq,
+    kind,
+    agent: "lead",
+    payload: {},
+    created_at: "2026-10-11T10:00:00Z",
+  });
+
+  it("drops the owner-waiting state on plan_revising and restores it on the newer plan", async () => {
+    // The server's answer follows the log: the gate for plan #1, revising once
+    // plan_revising lands, a fresh gate once the next plan lands.
+    let serverRevising = false;
+    const getRun = vi.spyOn(api, "getRun").mockImplementation(async () => ({ run: gate(serverRevising) }));
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.status).toBe("awaiting_approval"));
+    expect(isRevisingRun(result.current.run!)).toBe(false);
+    expect(result.current.run?.progress?.state).toBe("waiting");
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+
+    serverRevising = true;
+    const before = getRun.mock.calls.length;
+    await act(async () => {
+      LiveSocket.last!.deliver(frame(1, "plan_revising"));
+    });
+    await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(true));
+    expect(getRun.mock.calls.length).toBeGreaterThan(before);
+    expect(result.current.run?.progress?.state).toBe("planning");
+
+    // A state frame re-reads the run: it must keep the revising value, not reset it.
+    await act(async () => {
+      LiveSocket.last!.deliver({ type: "state" });
+    });
+    await waitFor(() => expect(getRun.mock.calls.length).toBeGreaterThan(before + 1));
+    expect(isRevisingRun(result.current.run!)).toBe(true);
+
+    serverRevising = false;
+    await act(async () => {
+      LiveSocket.last!.deliver(frame(2, "plan"));
+    });
+    await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(false));
+    expect(result.current.run?.progress?.state).toBe("waiting");
+  });
+
+  it("re-reads the run when a gap-repair replay ingests a plan_revising message", async () => {
+    let serverRevising = false;
+    vi.spyOn(api, "getRun").mockImplementation(async () => ({ run: gate(serverRevising) }));
+    const getMsgs = vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.status).toBe("awaiting_approval"));
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+    expect(isRevisingRun(result.current.run!)).toBe(false);
+
+    // The server entered the revise while frames were dropped: the live frame that
+    // arrives is seq 3 (a gap), and the replay carries the missed plan_revising.
+    serverRevising = true;
+    getMsgs.mockResolvedValue({
+      messages: [1, 2, 3].map((seq) => ({
+        seq,
+        kind: seq === 2 ? "plan_revising" : "text",
+        agent: null,
+        agent_instance: null,
+        agent_label: null,
+        payload: {},
+        created_at: "",
+      })),
+    });
+    await act(async () => {
+      LiveSocket.last!.deliver(frame(3, "text"));
+    });
+    await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(true));
+    expect(result.current.run?.progress?.state).toBe("planning");
+  });
+
+  it("re-reads the run on reconnect", async () => {
+    let serverRevising = false;
+    vi.spyOn(api, "getRun").mockImplementation(async () => ({ run: gate(serverRevising) }));
+    vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+
+    const { result } = renderHook(() => useRunStream("run-1"));
+    await waitFor(() => expect(result.current.run?.status).toBe("awaiting_approval"));
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+
+    serverRevising = true;
+    await act(async () => {
+      LiveSocket.last!.open();
+    });
+    await waitFor(() => expect(isRevisingRun(result.current.run!)).toBe(true));
+  });
+});
+
+describe("useRunStream out-of-order run refresh (issue #2760)", () => {
+  beforeEach(() => {
+    LiveSocket.last = null;
+    vi.stubGlobal("WebSocket", LiveSocket as unknown as typeof WebSocket);
+  });
+  afterEach(() => {
+    vi.restoreAllMocks();
+    vi.unstubAllGlobals();
+  });
+
+  // A plan_revising / plan frame re-reads the run while an earlier re-read (here the
+  // state frame's) is still in flight. The older response resolving last must not
+  // overwrite the newer revising flag, in either direction.
+  for (const target of [true, false]) {
+    it(`keeps the newest is_revising=${target} when an older refresh resolves last`, async () => {
+      const gate = (revising: boolean): Run => ({ ...fakeRun(), status: "awaiting_approval", is_revising: revising });
+      const getRun = vi.spyOn(api, "getRun").mockResolvedValue({ run: gate(!target) });
+      vi.spyOn(api, "getRunMessages").mockResolvedValue({ messages: [] });
+      vi.spyOn(api, "getRunInputs").mockResolvedValue({ inputs: [] });
+      const { result } = renderHook(() => useRunStream("run-1"));
+      await waitFor(() => expect(result.current.run?.is_revising).toBe(!target));
+
+      let resolveOld!: (value: { run: Run }) => void;
+      const old = new Promise<{ run: Run }>((resolve) => {
+        resolveOld = resolve;
+      });
+      getRun.mockImplementationOnce(() => old).mockResolvedValue({ run: gate(target) });
+      const before = getRun.mock.calls.length;
+      await act(async () => {
+        LiveSocket.last!.deliver({ type: "state" });
+      });
+      expect(getRun.mock.calls.length).toBeGreaterThan(before);
+      await act(async () => {
+        LiveSocket.last!.deliver({
+          type: "message",
+          seq: 1,
+          kind: target ? "plan_revising" : "plan",
+          agent: "lead",
+          payload: {},
+          created_at: "",
+        });
+      });
+      await waitFor(() => expect(result.current.run?.is_revising).toBe(target));
+
+      await act(async () => {
+        resolveOld({ run: gate(!target) });
+        await old;
+      });
+      expect(result.current.run?.is_revising).toBe(target);
+    });
+  }
 });

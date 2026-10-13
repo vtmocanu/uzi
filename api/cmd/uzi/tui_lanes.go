@@ -292,14 +292,19 @@ func frameAgentTag(f laneFrame) string {
 // the rung below would be a worse one. crewStateFor short-circuits a parked run to
 // `waiting` above this function's result ever being consulted; that is where the park
 // is rendered, not here.
-func activeLaneKey(runStatus string, frames []laneFrame) string {
-	if runStatus != "running" && runStatus != "claimed" {
+//
+// isRevising (issue #2760): a revising awaiting_approval run is re-planning, so it has a live
+// speaker too, mirroring the web ActivityFeed's `live` counting isRevisingRun.
+func activeLaneKey(runStatus string, isRevising bool, frames []laneFrame) string {
+	revisingLive := runStatus == "awaiting_approval" && isRevising
+	if runStatus != "running" && runStatus != "claimed" && !revisingLive {
 		return ""
 	}
-	if len(frames) == 0 {
+	visible := presentationFrames(frames)
+	if len(visible) == 0 {
 		return ""
 	}
-	return laneKeyOf(frames[len(frames)-1])
+	return laneKeyOf(visible[len(visible)-1])
 }
 
 // crewStateFor is the D5 ladder (ActivityFeed.tsx:209-245). Precedence, in order:
@@ -308,7 +313,10 @@ func activeLaneKey(runStatus string, frames []laneFrame) string {
 //
 // actor is an OPAQUE identity compared only for equality against activeActor: a lane
 // key here, a role name in the rollup. The ladder itself does not care which.
-func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity, now time.Time) crewState {
+//
+// isRevising (issue #2760): an awaiting_approval run that is mid-revise replan is working,
+// not parked on the owner, so it skips the whole-crew gate rung below.
+func crewStateFor(runStatus string, isRevising bool, runHealth, actor, activeActor string, lastActivity, now time.Time) crewState {
 	if isTerminalRunStatus(runStatus) {
 		return crewDone
 	}
@@ -358,7 +366,7 @@ func crewStateFor(runStatus, runHealth, actor, activeActor string, lastActivity,
 	// limit_wait/pool_wait: a park routinely outlasts the recency window (so the split
 	// below would wrongly read `idle`), and health cannot be revisited on a parked run, so
 	// the active-speaker rung would read a FROZEN flag as `stalled`.
-	if runStatus == "awaiting_approval" || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runStatus == statusRecoveryWait || runHealth == "waiting_worker" {
+	if (runStatus == "awaiting_approval" && !isRevising) || runStatus == "awaiting_input" || runStatus == "awaiting_followup" || runStatus == statusLimitWait || runStatus == statusPoolWait || runStatus == statusRecoveryWait || runHealth == "waiting_worker" {
 		return crewWaiting
 	}
 	if activeActor != "" && actor == activeActor {

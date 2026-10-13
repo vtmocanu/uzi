@@ -70,8 +70,10 @@ func newContractCase[T any](name string) contractCase {
 func contractCases() []contractCase {
 	return []contractCase{
 		newContractCase[BuildInfoDTO]("build_info"),
+		newContractCase[ReleaseCheckStatusDTO]("release_check_status"),
 		newContractCase[RunDTO]("run"),
 		newContractCase[RunListItemDTO]("run_list_item"),
+		newContractCase[RunSummaryItemDTO]("run_summary_item"),
 		// M2 — the rest of the apitypes hot set.
 		newContractCase[RepoDTO]("repo"),
 		newContractCase[AdminDockerAllowlistRepoDTO]("admin_docker_allowlist_repo"),
@@ -132,6 +134,10 @@ func contractCases() []contractCase {
 		newContractCase[RecoveryCustodyHoldDTO]("recovery_custody_hold"),
 		newContractCase[RecoveryCustodyAggregateDTO]("recovery_custody_aggregate"),
 		newContractCase[RecoveryCustodyHoldsDTO]("recovery_custody_holds"),
+		// Issue #2545: the owner's held-work publication listing. HeldPublicationDTO's
+		// optionals are all omitempty, so only the wrapper's non-omitempty publications slice
+		// carries a null in its zero.json (the handler normalizes it to []).
+		newContractCase[HeldPublicationsDTO]("held_publications"),
 		// PRD #1432 M1: the admin cross-user guardrail override-request row. Its
 		// Findings slice is non-omitempty (its zero.json carries a null the handler
 		// normalizes to []); every other field is a required scalar, so its zero.json

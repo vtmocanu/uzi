@@ -135,11 +135,9 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 		AND pg_get_triggerdef(oid) LIKE '%settle_exited_plan_cross_check()%'
 		FROM pg_trigger WHERE tgname='runs_settle_exited_plan_cross_check' AND NOT tgisinternal`)
 	assertSQL("docker preference function preserved", `SELECT fn_ephemeral_docker_preference_applies(true,true,$1,'issue',NULL,ARRAY[$1]::uuid[])`, repo)
-	q := store.New(pool)
-	settings, err := q.GetUserByID(ctx, user)
-	if err != nil || !settings.EphemeralDockerEnabled || settings.PlanCrossCheckEnabled {
-		t.Fatalf("generated GetUserByID: %+v, %v", settings, err)
-	}
+	// The generated GetUserByID selects every CURRENT users column, so it only runs once the
+	// database is at head (below); a users column added after version 302 does not exist yet here.
+	assertSQL("upgraded user defaults", `SELECT ephemeral_docker_enabled AND NOT plan_cross_check_enabled FROM users WHERE id=$1`, user)
 	child := uuid.New()
 	mustExec(ctx, t, pool, `INSERT INTO runs(id,user_id,repo_id,kind,target_run_id,harness,report_only,budget_wall_seconds,
 		issue_title,issue_description,status) VALUES($1,$2,$3,'cross_check',$4,'codex',true,1800,'checker','candidate','running')`,
@@ -158,6 +156,11 @@ func TestPlanCrossCheckDefaultBranchUpgradeLiveDB(t *testing.T) {
 	// database to head first (the stages above pin versions 298 and 302 on purpose).
 	if err := store.Migrate(ctx, upgradeDSN); err != nil {
 		t.Fatalf("Migrate to head: %v", err)
+	}
+	q := store.New(pool)
+	settings, err := q.GetUserByID(ctx, user)
+	if err != nil || !settings.EphemeralDockerEnabled || settings.PlanCrossCheckEnabled {
+		t.Fatalf("generated GetUserByID: %+v, %v", settings, err)
 	}
 
 	// All four public recovery seams must obey the claim assembler's lead -> child order.

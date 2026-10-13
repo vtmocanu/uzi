@@ -42,6 +42,28 @@ title and the run proceeds exactly as if summaries didn't exist. A seeded or
 pre-approved run (one that skips planning) gets an intent summary only —
 there's no plan gate for a plan summary to attach to.
 
+## The Now summary
+
+A third, separate kind of summary is the **Now** line on a running run's
+progress card, in the TUI detail and in `uzi run get`: one sentence of at most
+120 characters on what the active lane is doing right now. It differs from the
+intent and plan summaries above:
+
+- **It repeats while the run works.** The intent and plan summaries are
+  written once (or again after a revised plan); the Now line is rewritten as
+  the run moves, at most once every 5 minutes, and disappears when the run
+  waits, parks or ends.
+- **It runs on the run's own harness credential.** Claude runs use `haiku`;
+  Codex runs use `gpt-6-luna`. It does not follow the **Summary model**
+  setting and does not use the delivery-summary model.
+- **It is on by default, with its own switches**: a per-user setting and an
+  admin kill switch, separate from the Summary model setting.
+- **Its spend counts toward the run's usage.**
+
+It is advisory like the others: a failed, refused or slow call is skipped and
+the run is unaffected. The triggers, what the model sees, the spend rules and
+the switches are in [Run activity pane](run-activity.md#now-summary).
+
 ## Collapsing a card
 
 Each card can be collapsed; the choice is remembered **per run, in your

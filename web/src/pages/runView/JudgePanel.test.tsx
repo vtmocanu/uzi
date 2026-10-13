@@ -51,7 +51,7 @@ describe("JudgeUsageStrip", () => {
     // Negative, paired with the above: never the retired ambiguous dash standing in
     // for a real $0, and never a non-metered label leaking onto a metered run.
     expect(container.textContent).not.toContain("—");
-    expect(container.textContent).not.toContain("Subscription");
+    expect(container.textContent).not.toContain("No estimate");
     expect(container.textContent).not.toContain("Unavailable");
   });
 
@@ -60,14 +60,18 @@ describe("JudgeUsageStrip", () => {
       <JudgeUsageStrip judgeRun={judgeRun({ usage: usage({ cost_status: "metered", cost_usd: 1.23 }) })} />,
     );
     expect(container.textContent).toContain("$1.23");
+    expect(container.textContent).toContain("API-equivalent");
+    expect(container.textContent).not.toContain("Claude SDK");
+    expect(container.textContent).not.toContain("uzi price table");
   });
 
   it("subscription: never a dollar figure even with real tokens spent — labelled, not hidden", () => {
     const { container } = render(
-      <JudgeUsageStrip judgeRun={judgeRun({ usage: usage({ cost_status: "subscription", cost_usd: 0 }) })} />,
+      <JudgeUsageStrip judgeRun={judgeRun({ usage: usage({ cost_status: "subscription", cost_usd: 4.2 }) })} />,
     );
-    // Positive: explicitly labelled as subscription usage, and its real tokens still show.
-    expect(container.textContent).toContain("Subscription");
+    // Positive: explicitly labelled without an estimate, and its real tokens still show.
+    expect(container.textContent).toContain("No estimate");
+    expect(container.textContent).toContain("no cost estimate recorded");
     expect(container.textContent).toContain("Tokens in");
     // Negative, paired with the above: no dollar figure anywhere in the strip.
     expect(container.textContent).not.toContain("$0.00");

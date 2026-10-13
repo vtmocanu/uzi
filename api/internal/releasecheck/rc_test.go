@@ -34,12 +34,12 @@ func TestRCSelectionAndClear(t *testing.T) {
 	set := &fakeSettings{enabled: true}
 	rec := NewReconciler(st, set, nil, nil)
 	got, _ := rec.CheckForUpdate(context.Background())
-	if got.Status != statusOK || got.Facts.RCTag != "v1.2.0-rc.10" || st.values[settings.KeyReleaseRCTag] != "v1.2.0-rc.10" {
+	if got.Partial || got.Status != statusOK || got.Facts.RCTag != "v1.2.0-rc.10" || st.values[settings.KeyReleaseRCTag] != "v1.2.0-rc.10" {
 		t.Fatalf("selection = %+v values=%v", got, st.values)
 	}
 	list = "[]"
 	got, _ = rec.CheckForUpdate(context.Background())
-	if got.Status != statusOK || st.values[settings.KeyReleaseRCTag] != "" || st.values[settings.KeyReleaseRCBody] != "" {
+	if got.Partial || got.Status != statusOK || st.values[settings.KeyReleaseRCTag] != "" || st.values[settings.KeyReleaseRCBody] != "" {
 		t.Fatalf("clear = %+v values=%v", got, st.values)
 	}
 }
@@ -106,7 +106,7 @@ func TestRCFetchFailureKeepsPriorRC(t *testing.T) {
 	st := newFakeStore(map[string]string{settings.KeyReleaseRCTag: "v1.0.0-rc.1"})
 	set := &fakeSettings{enabled: true}
 	got, _ := NewReconciler(st, set, nil, nil).CheckForUpdate(context.Background())
-	if got.Status != statusError || !strings.Contains(got.Message, "RC fetch failed") || st.values[settings.KeyReleaseLatestTag] != "v1.1.0" || st.values[settings.KeyReleaseRCTag] != "v1.0.0-rc.1" || set.invalidated.Load() != 1 {
+	if !got.Partial || got.Facts.LatestTag != "v1.1.0" || got.Status != statusError || !strings.Contains(got.Message, "RC fetch failed") || st.values[settings.KeyReleaseLatestTag] != "v1.1.0" || st.values[settings.KeyReleaseRCTag] != "v1.0.0-rc.1" || set.invalidated.Load() != 1 {
 		t.Fatalf("partial failure = %+v values=%v invalidated=%d", got, st.values, set.invalidated.Load())
 	}
 }
@@ -130,7 +130,7 @@ func TestRCWriteFailureKeepsFreshSnapshot(t *testing.T) {
 	st.failKey = settings.KeyReleaseRCBody
 	set := &fakeSettings{enabled: true}
 	got, _ := NewReconciler(st, set, nil, nil).CheckForUpdate(context.Background())
-	if got.Status != statusError || set.invalidated.Load() != 0 {
+	if got.Partial || got.Status != statusError || set.invalidated.Load() != 0 {
 		t.Fatalf("failed write = %+v invalidated=%d", got, set.invalidated.Load())
 	}
 	// A new cache would read the database map, rather than the reconciler's old cache.
@@ -169,5 +169,37 @@ func TestNullResponseIsFetchFailure(t *testing.T) {
 				t.Fatalf("RC null did not retain stable update: %v", st.values)
 			}
 		})
+	}
+}
+
+func TestRCFetchAndPersistFailureIsNotPartial(t *testing.T) {
+	srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+		if r.URL.Path == "/repos/vtmocanu/uzi/releases" {
+			http.Error(w, "failure", http.StatusBadGateway)
+			return
+		}
+		_, _ = w.Write([]byte(releaseJSON("v1.1.0", "stable", "new body", "", "")))
+	}))
+	defer srv.Close()
+	withBaseURL(t, srv.URL)
+	prior := map[string]string{
+		settings.KeyReleaseLatestTag: "v1.0.0",
+		settings.KeyReleaseRCTag:     "v1.0.0-rc.1",
+		settings.KeyReleaseCheckedAt: "2026-09-01T00:00:00Z",
+	}
+	st := newFakeStore(prior)
+	st.failKey = settings.KeyReleaseLatestBody
+	set := &fakeSettings{enabled: true}
+	got, err := NewReconciler(st, set, nil, nil).CheckForUpdate(context.Background())
+	if err != nil || got.Partial || got.Status != statusError || !strings.Contains(got.Message, "persist remote facts failed") || set.invalidated.Load() != 0 {
+		t.Fatalf("RC and persistence failure = %+v err=%v invalidated=%d", got, err, set.invalidated.Load())
+	}
+	for key, want := range prior {
+		if st.values[key] != want {
+			t.Errorf("cached fact %s = %q, want %q", key, st.values[key], want)
+		}
+	}
+	if len(st.values) != len(prior) {
+		t.Errorf("failed persistence added facts: %v", st.values)
 	}
 }

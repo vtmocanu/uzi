@@ -1,4 +1,5 @@
 import { describe, it, expect } from "vitest";
+import answerCorpus from "../../../fixtures/run-question-answer.json";
 import type { RunMessage } from "./api";
 import {
   answersReady,
@@ -10,6 +11,25 @@ import {
   parseQuestionsForDisplay,
   questionOrdinal,
 } from "./runQuestion";
+
+describe("shared run-question answer corpus", () => {
+  it("requires nonempty sections", () => {
+    expect(answerCorpus.composition.length).toBeGreaterThan(0);
+    expect(answerCorpus.readiness.length).toBeGreaterThan(0);
+    expect(answerCorpus.actions.length).toBeGreaterThan(0);
+  });
+
+  for (const c of answerCorpus.composition) {
+    it(`composes: ${c.name}`, () => {
+      expect(composeAnswer(c.selected, c.text)).toBe(c.answer);
+    });
+  }
+  for (const c of answerCorpus.readiness) {
+    it(`readiness: ${c.name}`, () => {
+      expect(answersReady(c.answers, c.count)).toBe(c.ready);
+    });
+  }
+});
 
 function msg(partial: Partial<RunMessage> & { kind: string; seq: number }): RunMessage {
   return {

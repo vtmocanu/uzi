@@ -1,3 +1,4 @@
+import { isAccountingStatus, isProgressNote, isSummaryUsage } from "../lib/accountingStatus";
 import { planCheckEventText } from "./PlanCrossCheck";
 import type { PlanCrossCheckSummary } from "../lib/apiTypes";
 import { useEffect, useMemo, useRef, useState, type ReactNode } from "react";
@@ -5,6 +6,7 @@ import type { Run, RunMessage } from "../lib/api";
 import { usageLimitPhrase } from "../lib/limitWait";
 import { formatTokens } from "../lib/formatTokens";
 import { prefs } from "../lib/prefs";
+import { isRevisingRun } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { deriveRunUsage, type PhaseUsage } from "../lib/runUsage";
 import { useReconnectingBanner, useTailOnAppend } from "../lib/useFollowScroll";
@@ -260,8 +262,11 @@ function crewStateFor(
   // does — the lead is stopped between turns and nothing else can proceed — so it joins
   // the gate arm rather than falling through to the recency split, which would age every
   // lane to `idle` while a human is simply thinking.
+  // Issue #2760: a revising run (awaiting_approval + is_revising) is the lead re-planning,
+  // not the owner being asked, so it skips the plan-gate arm and falls through to the
+  // active-speaker ladder below.
   if (
-    run.status === "awaiting_approval" ||
+    (run.status === "awaiting_approval" && !isRevisingRun(run)) ||
     run.status === "awaiting_input" ||
     // PRD #517: a follow-up park blocks the whole crew the same way — the lead is
     // stopped between turns awaiting the user's next follow-up and nothing else can
@@ -583,10 +588,11 @@ export function ActivityFeed({
     prefs.set(VIEW_KEY, next);
   };
 
-  const toolIndex = useMemo(() => buildToolIndex(messages), [messages]);
+  const presentationMessages = useMemo(() => messages.filter((m) => !isAccountingStatus(m) && !isProgressNote(m) && !isSummaryUsage(m)), [messages]);
+  const toolIndex = useMemo(() => buildToolIndex(presentationMessages), [presentationMessages]);
 
-  const capped = messages.length > CAP_TRIGGER && !showAll;
-  const hiddenCount = capped ? messages.length - CAP_VISIBLE : 0;
+  const capped = presentationMessages.length > CAP_TRIGGER && !showAll;
+  const hiddenCount = capped ? presentationMessages.length - CAP_VISIBLE : 0;
   // Select from the full loaded stream, before the presentation cap. A future
   // version or malformed payload cannot supersede the last valid draft.
   const latestDraftSeq = useMemo(() => {
@@ -596,7 +602,7 @@ export function ActivityFeed({
     }
     return latest;
   }, [messages]);
-  const visible = (capped ? messages.slice(-CAP_VISIBLE) : messages).filter(
+  const visible = (capped ? presentationMessages.slice(-CAP_VISIBLE) : presentationMessages).filter(
     (msg) => !parseDraftPlanCapture(msg) || msg.seq === latestDraftSeq,
   );
   const groups = useMemo(() => groupByAgent(visible), [visible]);
@@ -662,7 +668,7 @@ export function ActivityFeed({
   const newestAgent = newestMsg ? (newestMsg.agent ?? LEAD) : undefined;
   const newestLane = newestMsg ? laneKeyOf(newestMsg) : undefined;
   const live =
-    !terminal && (run.status === "running" || run.status === "claimed");
+    !terminal && (run.status === "running" || run.status === "claimed" || isRevisingRun(run));
   const liveSpeaker = live ? newestAgent : undefined;
   const liveLane = live ? newestLane : undefined;
   // activeAgent drives RunEventRow's running-tool spinner; keep it running-only (the
@@ -833,7 +839,7 @@ export function ActivityFeed({
     seen.agent = activeAgent;
 
     let meaningful: RunMessage | undefined;
-    for (const mm of messages) {
+    for (const mm of presentationMessages) {
       if (
         mm.kind === "status" ||
         mm.kind === "error" ||
@@ -893,7 +899,7 @@ export function ActivityFeed({
     seen.terminal = terminal;
 
     if (next !== null) setAnnouncement(truncate(next, ANNOUNCE_MAX));
-  }, [messages, activeAgent, terminal, run.plan_cross_check_summary, run.harness]);
+  }, [presentationMessages, activeAgent, terminal, run.plan_cross_check_summary, run.harness]);
 
   const anchored = new Set<string>();
 
@@ -955,7 +961,7 @@ export function ActivityFeed({
             />
             Follow live
           </label>
-          <span className="text-xs text-muted">{messages.length} messages</span>
+          <span className="text-xs text-muted">{presentationMessages.length} messages</span>
         </div>
       </div>
 

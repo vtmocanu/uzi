@@ -77,10 +77,10 @@ describe("extendBudgetView (PRD #1189)", () => {
     expect(v.wallSec).toBe(28800);
     expect(v.extSec).toBe(0);
     expect(v.capSec).toBe(57600);
-    expect(v.allowanceLeftSec).toBe(57600);
+    expect(v.perExtensionMaxSec).toBe(57600);
   });
 
-  it("folds the extension into the allowance-left and right-label, never into wallSec", () => {
+  it("folds the extension into the right-label (the per-extension max is not reduced by it), never into wallSec", () => {
     const run: BudgetRun = {
       status: "running",
       deadline_at: new Date(nowMs + 3600 * 1000).toISOString(),
@@ -92,7 +92,7 @@ describe("extendBudgetView (PRD #1189)", () => {
     const v = extendBudgetView(run, nowMs)!;
     expect(v.wallSec).toBe(28800); // the frozen budget, NOT total
     expect(v.extSec).toBe(7200);
-    expect(v.allowanceLeftSec).toBe(57600 - 7200);
+    expect(v.perExtensionMaxSec).toBe(57600);
     expect(budgetRightLabel(v)).toBe("8h+2h"); // never "10h"
   });
 

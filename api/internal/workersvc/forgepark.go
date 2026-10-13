@@ -17,9 +17,10 @@ import (
 // matching migration 00232's runs_recovery_wait_cause_check. SetState validates a non-nil
 // cause against this set BEFORE any state SQL, so an unknown value is a 400 rather than a
 // constraint violation at the park write. NULL (an absent cause) is the LEGACY/untyped park
-// and is not a member here — the empty-turn park writes NULL. Only 'forge_unreachable' drives
-// the dedicated park transaction today; 'empty_turn'/'provider_outage' are reserved (D9,
-// #1088 adopts provider_outage) and, if reported, take the ordinary untyped park. Issue #1766
+// and is not a member here — the empty-turn park writes NULL. 'forge_unreachable' and
+// 'provider_outage' use dedicated park transactions; provider parks have their own streak
+// accounting and owner hold (PRD #1733). 'empty_turn' remains reserved (D9) and, if reported,
+// takes the ordinary untyped park. Issue #1766
 // M2: 'vault_locked' (migration 00257) is reported by a worker whose codex refresh/release was
 // answered 409 vault_locked (the owner's vault is locked); it takes the ordinary park too, but
 // it is the ONE cause that park persists (recoveryCauseStored), so the surfaces can say "waiting
@@ -29,12 +30,13 @@ import (
 // volume filled; SetState routes it to its own park transaction (parkDataVolumeFull), which stores
 // the cause and counts it toward the disk-only lifetime cap (UZI_RUN_DISK_PARK_MAX).
 var recoveryWaitCauses = map[string]bool{
-	recoveryCauseWorkerMemoryPressure: true,
-	"forge_unreachable":               true,
-	"empty_turn":                      true,
-	"provider_outage":                 true,
-	recoveryCauseVaultLocked:          true,
-	recoveryCauseDataVolumeFull:       true,
+	recoveryCauseWorkerMemoryPressure:    true,
+	"forge_unreachable":                  true,
+	"empty_turn":                         true,
+	recoveryCauseProviderOutage:          true,
+	recoveryCauseVaultLocked:             true,
+	recoveryCauseDataVolumeFull:          true,
+	recoveryCauseCodexAccountUnavailable: true,
 }
 
 // recoveryCauseVaultLocked is the issue #1766 cause for a run parked because its owner's vault
@@ -46,18 +48,22 @@ const recoveryCauseVaultLocked = "vault_locked"
 // run gets past the disk park cap (failOrigins).
 const recoveryCauseDataVolumeFull = "data_volume_full"
 
+// recoveryCauseProviderOutage is the PRD #1733 cause for a run parked because a provider error
+// the harness classed as transient outlived its in-process retries. It is the wire token the
+// worker reports and the token the typed park stores (already in runs_recovery_wait_cause_check
+// since migration 00232); parkProviderOutage counts and bounds it.
+const recoveryCauseProviderOutage = "provider_outage"
+
 // recoveryCauseCodexAccountUnavailable is the PRD #1590 cause for a Codex run held on its
 // quarantined subscription account or a same-alias re-login (D1/D2).
 const recoveryCauseCodexAccountUnavailable = "codex_account_unavailable"
 
-// serverRecoveryWaitCauses are the recovery_wait causes only the SERVER writes, kept apart
-// from the worker-reportable recoveryWaitCauses above. codex_account_unavailable is written
-// by finishRunClaim's exact-claim park (ParkRunCodexAccountUnavailable), never by a worker:
-// SetState refuses it as a reported cause. Together the two sets are exactly
-// runs_recovery_wait_cause_check (pinned by TestRecoveryWaitCauseVocabularyMatchesCheck).
+// serverRecoveryWaitCauses contains causes a worker cannot request.
+// codex_account_unavailable is worker-requested only with CodexAccountParkV1,
+// and is never written on the worker's word: the server re-derives it under lock.
+// Together these sets partition runs_recovery_wait_cause_check.
 var serverRecoveryWaitCauses = map[string]bool{
-	recoveryCauseCodexAccountUnavailable: true,
-	"worker_requeue_exhausted":           true,
+	"worker_requeue_exhausted": true,
 }
 
 // parkForgeUnreachable is SetState's forge pre-clone park transaction (PRD #1392 M1, D2/D3/D4).

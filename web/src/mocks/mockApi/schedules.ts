@@ -154,6 +154,8 @@ function scheduleDTO(s: Schedule): Schedule {
   return {
     ...s,
     credential_override: s.credential_override ?? null,
+    // Issue #2519: the real ScheduleDTO always emits recent_fires as an array.
+    recent_fires: s.recent_fires ?? [],
     next_fire_at: nextFireAt,
     next_fires: nextFires,
   };
@@ -668,6 +670,34 @@ schedules.push(
       capacity: { in_flight: 2, limit: 4, room_needed: 2, room: 2, blocked: false } } },
 );
 
+// Recent fires demo (issue #2519): the latest tick was blocked on capacity (matched 0),
+// so last_fire is that blocked tick while recent_fires keeps the three fires that did
+// something, newest first: one started, one with skips, an older one started.
+schedules.push({ ...capacityDemo, id: "sch-recent-fires", labels: ["Planned"], capacity_limit: 4,
+  capacity_room_needed: 1, max_issues: 2, cron_expr: "*/30 * * * *", last_fired_at: minsAgo(4),
+  last_fire: { fired_at: minsAgo(4), matched: 0, capped: false, started: [], skips: [],
+    capacity: { in_flight: 4, limit: 4, room_needed: 1, room: 0, blocked: true } },
+  recent_fires: [
+    { fired_at: minsAgo(34), matched: 1, capped: false, skips: [],
+      started: [{ issue_iid: 1011, run_id: "run-done", title: "Retry the forge sync after a 502",
+        web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/1011" }],
+      capacity: { in_flight: 2, limit: 4, room_needed: 1, room: 2, blocked: false } },
+    { fired_at: minsAgo(124), matched: 3, capped: true, started: [],
+      skips: [
+        { issue_iid: 1007, title: "Board columns drift on resize", reason: "already_running",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/1007" },
+        { issue_iid: 1008, title: "Flaky worker heartbeat test", reason: "open_mr_exists",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/1008" },
+        { issue_iid: 1009, title: "Slack thread loses the run link", reason: "fetch_failed" },
+      ] },
+    { fired_at: minsAgo(1564), matched: 2, capped: false, skips: [],
+      started: [
+        { issue_iid: 1003, run_id: "run-awaiting", title: "Plan gate shows a stale diff",
+          web_url: "https://gitlab.example.com/vtmocanu/uzi/-/issues/1003" },
+        { issue_iid: 1004, run_id: "run-closed", title: "Mobile nav traps focus" },
+      ] },
+  ] });
+
 for (const failed of [false, true]) {
   schedules.push({ ...capacityDemo, id: failed ? "sch-removal-failed" : "sch-removal-success",
     labels: ["on-deck"], remove_label_on_dispatch: true, max_issues: 1,
@@ -1070,6 +1100,7 @@ export const schedulesApi = {
       enabled: cur.enabled,
       last_fired_at: cur.last_fired_at,
       last_fire: cur.last_fire,
+      recent_fires: cur.recent_fires,
       created_at: cur.created_at,
     });
     applyCapacity(restored, {});

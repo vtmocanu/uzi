@@ -1,4 +1,6 @@
 // @vitest-environment jsdom
+import { MilestoneRows } from "../components/RunMilestoneRows";
+import { RunProgressCard } from "../components/RunProgressCard";
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import {
   act,
@@ -16,8 +18,6 @@ import {
   AgentRosterSummary,
   JudgePanel,
   JUDGE_POLL_MAX_TRIES,
-  MilestoneBadge,
-  MilestoneChecklist,
   CompletionStatePanel,
   CompletionDecisionPanel,
   RunHeading,
@@ -98,6 +98,8 @@ vi.mock("../lib/api", async (importOriginal) => {
       continueCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
       partialCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
       acceptCompletionDecision: vi.fn().mockResolvedValue({ run: null }),
+      // Issue #2545: the failed-run held-work panel fetches its own list; empty renders nothing.
+      getRunHeldPublications: vi.fn().mockResolvedValue({ publications: [] }),
       // PRD #1296 M5: the run page's Recovery archives section fetches its own summary.
       // Defaulted to a supported-but-empty aggregate so a full-page render settles and the
       // section renders nothing (no archive, no open hold) on these non-recovery fixtures.
@@ -213,6 +215,9 @@ function run(over: Partial<Run>): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -735,7 +740,8 @@ describe("RunSummary (PRD #362 M4)", () => {
   });
 
   it("shows the intent card when summary_intent is present", () => {
-    render(<RunSummary run={run({ summary_intent: "Add a token-bucket rate limiter to the API." })} />);
+    render(<RunSummary run={run({ status: "running", summary_intent: "Add a token-bucket rate limiter to the API." })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("What this run will implement")).toBeTruthy();
     expect(screen.getByText("Add a token-bucket rate limiter to the API.")).toBeTruthy();
   });
@@ -752,6 +758,7 @@ describe("RunSummary (PRD #362 M4)", () => {
 
   it("labels the plan 'Approved plan' once past the gate (e.g. running/completed)", () => {
     render(<RunSummary run={run({ status: "running", summary_plan: "Introduce middleware and a store." })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("Approved plan")).toBeTruthy();
     expect(screen.queryByText("Proposed plan")).toBeNull();
   });
@@ -785,6 +792,7 @@ describe("RunSummary (PRD #362 M4)", () => {
 
   it("shows the no-deviations line for null deltas", () => {
     render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: null })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
   });
 
@@ -793,6 +801,7 @@ describe("RunSummary (PRD #362 M4)", () => {
     // value that somehow reaches the renderer as a non-array.
     const bad = { kind: "added", text: "not a list" } as unknown as Run["summary_deltas"];
     render(<RunSummary run={run({ status: "running", summary_plan: "A plan.", summary_deltas: bad })} />);
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     expect(screen.getByText("No deviations — the plan matches the original ask")).toBeTruthy();
   });
 
@@ -804,9 +813,10 @@ describe("RunSummary (PRD #362 M4)", () => {
     const RLO = String.fromCodePoint(0x202e);
     const { container } = render(
       <RunSummary
-        run={run({ summary_intent: `Call \`fireSweep\` with **max_issues** <script>alert(1)</script> ${RLO}rate limiting` })}
+        run={run({ status: "running", summary_intent: `Call \`fireSweep\` with **max_issues** <script>alert(1)</script> ${RLO}rate limiting` })}
       />,
     );
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
     // Markdown parsed to real elements.
     expect(container.querySelector("code")?.textContent).toBe("fireSweep");
     expect(container.querySelector("strong")?.textContent).toBe("max_issues");
@@ -819,17 +829,35 @@ describe("RunSummary (PRD #362 M4)", () => {
   });
 
   it("collapses on toggle and remembers the choice per run across a remount", () => {
-    const r = run({ id: "run-collapse", summary_intent: "Some intent." });
+    const r = run({
+      id: "run-collapse", status: "running", summary_intent: "Some intent.", summary_plan: "Body plan.",
+      summary_deltas: [{ kind: "added", text: "Body delta." }],
+    });
     const { unmount } = render(<RunSummary run={r} />);
-    // Expanded by default: the intent text is visible.
     expect(screen.getByText("Some intent.")).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(screen.getByText("What this run will implement")).toBeTruthy();
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    expect(screen.getByText("Body plan.")).toBeTruthy();
+    expect(screen.getByText("Body delta.")).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Collapse" }));
-    expect(screen.queryByText("Some intent.")).toBeNull();
+    expect(screen.getByText("Some intent.")).toBeTruthy(); // Plain intent excerpt remains.
+    expect(screen.queryByText("What this run will implement")).toBeNull();
+    expect(screen.queryByText("Body plan.")).toBeNull();
+    expect(screen.queryByText("Body delta.")).toBeNull();
     unmount();
-    // A fresh mount reads the persisted per-run choice → still collapsed.
-    render(<RunSummary run={r} />);
-    expect(screen.queryByText("Some intent.")).toBeNull();
+    // The saved choice overrides even the gate default (expanded), proving persistence.
+    render(<RunSummary run={{ ...r, status: "awaiting_approval" }} />);
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    expect(screen.queryByText("What this run will implement")).toBeNull();
+    expect(screen.queryByText("Body plan.")).toBeNull();
+    expect(screen.queryByText("Body delta.")).toBeNull();
     expect(screen.getByRole("button", { name: "Expand" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: "Expand" }));
+    expect(screen.getByText("What this run will implement")).toBeTruthy();
+    expect(screen.getByText("Some intent.")).toBeTruthy();
+    expect(screen.getByText("Body plan.")).toBeTruthy();
+    expect(screen.getByText("Body delta.")).toBeTruthy();
   });
 });
 
@@ -1740,8 +1768,8 @@ describe("RunView — a paused run shows no live 'now' activity strip (PRD #1190
       updated_at: "2026-01-01T03:42:00Z",
     });
     await screen.findByText("Add rate limiting");
-    // The checklist still renders (milestones are present) …
-    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    // The frozen rows still render while paused.
+    expect(container.querySelector("[data-run-progress-card] ul")).not.toBeNull();
     // … but the live "now" strip is gone (nothing runs while paused).
     expect(nowStrip(container)).toBeNull();
   });
@@ -2195,6 +2223,7 @@ describe("MrReworkPanel — on-demand rework + past-cap surface (PRD #1202)", ()
       </MemoryRouter>,
     );
     await screen.findByText("Add rate limiting");
+    fireEvent.click(screen.getByRole("button", { name: "Run settings ▾" }));
     fireEvent.click(await screen.findByRole("button", { name: REWORK_NOW }));
     await act(async () => {
       fireEvent.click(screen.getByRole("button", { name: /start rework/i }));
@@ -5380,6 +5409,70 @@ describe("RunView park announcement — awaiting_followup (PRD #517, a11y)", () 
   });
 });
 
+// Issue #2760: a run re-planning after a revise stays awaiting_approval, but the server
+// derives is_revising + progress.state "planning", so the header pill and the progress card
+// must not say the run waits on the owner.
+describe("RunView — a revising run does not read as waiting on the owner (issue #2760)", () => {
+  const PROGRESS_BASE = {
+    pct: null,
+    milestone_done: 0,
+    milestone_total: 0,
+    active_milestone_id: "",
+    phase: "",
+  } as const;
+  const extra = mockApi as unknown as Record<string, unknown>;
+  beforeEach(() => {
+    extra.listWorkers = vi.fn().mockResolvedValue({ workers: [] });
+    extra.listSecrets = vi.fn().mockResolvedValue({ secrets: [] });
+  });
+  afterEach(() => {
+    delete extra.listWorkers;
+    delete extra.listSecrets;
+  });
+
+  function renderPage(over: Partial<Run>) {
+    mockUseRunStream.mockReturnValue({
+      run: run(over),
+      messages: [],
+      connected: true,
+      error: "",
+      submit: vi.fn(),
+      refreshRun: vi.fn(),
+      inputs: [],
+      canSteer: true,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    return render(
+      <MemoryRouter initialEntries={["/runs/r1"]}>
+        <RunView />
+      </MemoryRouter>,
+    );
+  }
+
+  it("shows no 'awaiting approval' pill and no 'waits on you' while revising", async () => {
+    renderPage({
+      status: "awaiting_approval",
+      is_revising: true,
+      progress: { ...PROGRESS_BASE, state: "planning" },
+    });
+    await screen.findByText("Add rate limiting");
+    expect(screen.queryByText(/awaiting approval/i)).toBeNull();
+    expect(screen.queryByText(/waits on you/i)).toBeNull();
+    expect(screen.getAllByText(/revising/i).length).toBeGreaterThan(0);
+  });
+
+  it("still reads waiting on the owner for a plan gate that is not revising", async () => {
+    renderPage({
+      status: "awaiting_approval",
+      is_revising: false,
+      progress: { ...PROGRESS_BASE, state: "waiting" },
+    });
+    await screen.findByText("Add rate limiting");
+    expect(screen.getAllByText(/awaiting approval/i).length).toBeGreaterThan(0);
+    expect(screen.getByText(/waits on you/i)).toBeTruthy();
+  });
+});
+
 // Issue #1197 (a11y): recovery_wait is a self-resuming park with NO ActivityFeed message
 // backup (unlike limit_wait, whose run message the feed's polite region narrates) and
 // RecoveryWaitPanel mounts in the same tick as its content — so, exactly like pool_wait,
@@ -5573,30 +5666,33 @@ describe("RunView park announcement — paused (PRD #1190, a11y)", () => {
   });
 });
 
-// PRD #122: the milestone header badge, the checklist, and the plan-gate candidate list.
-describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
+// Count checks exercise the real card; row-only checks use MilestoneRows directly.
+function ProgressCountCard({ run }: { run: Run }) {
+  return <RunProgressCard run={{...run, progress: null}} />;
+}
+describe("RunProgressCard reported counts (PRD #122)", () => {
   const ms = (n: number) =>
     Array.from({ length: n }, (_, i) => ({ id: `m${i + 1}`, title: `Milestone ${i + 1}` }));
 
-  it("renders M{done}/{total} for a milestone-structured run", () => {
-    render(<MilestoneBadge run={run({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] })} />);
-    expect(screen.getByText("M3/7")).toBeTruthy();
+  it("renders reported counts for a milestone-structured run", () => {
+    render(<ProgressCountCard run={run({ milestones: ms(7), milestones_completed: ["m1", "m2", "m3"] })} />);
+    expect(screen.getByText("3 of 7 reported complete")).toBeTruthy();
   });
 
   it("renders NOTHING for a run with no milestones — the iteration badge stands alone", () => {
-    const { container } = render(<MilestoneBadge run={run({ milestones: null })} />);
+    const { container } = render(<ProgressCountCard run={run({ milestones: null })} />);
     expect(container.textContent).toBe("");
   });
 
-  it("renders M–/N (not a 0/N) when the tracker was never reported (PRD #265 M2)", () => {
-    render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
-    expect(screen.getByText("M–/4")).toBeTruthy();
-    expect(screen.queryByText("M0/4")).toBeNull();
+  it("renders – of N reported (not a reported zero) when the tracker was never reported (PRD #265 M2)", () => {
+    render(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: null })} />);
+    expect(screen.getByText("– of 4 reported")).toBeTruthy();
+    expect(screen.queryByText("0 of 4 reported complete")).toBeNull();
   });
 
-  it("still renders M0/N when an empty completion set WAS reported (genuine zero)", () => {
-    render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
-    expect(screen.getByText("M0/4")).toBeTruthy();
+  it("still renders 0 of N reported complete when an empty completion set WAS reported (genuine zero)", () => {
+    render(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    expect(screen.getByText("0 of 4 reported complete")).toBeTruthy();
   });
 
   // PRD #390 D5 / M4. The two cases above assert the visible LABEL; the tooltip that tells the
@@ -5604,16 +5700,16 @@ describe("MilestoneBadge (compact M{done}/{total}, PRD #122)", () => {
   // that handed the neutral state the "reported complete" wording (or the reverse) would slip
   // past them. Assert the attribute on both states directly.
   it("carries the 'not reported' tooltip on the neutral state and 'reported complete' on a genuine zero (PRD #390 D5)", () => {
-    const { rerender } = render(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: null })} />);
-    const neutral = screen.getByText("M–/4");
+    const { rerender } = render(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: null })} />);
+    const neutral = screen.getByText("– of 4 reported");
     expect(neutral.getAttribute("title")).toBe("No milestone completion reported for this run");
-    rerender(<MilestoneBadge run={run({ milestones: ms(4), milestones_completed: [] })} />);
-    const zero = screen.getByText("M0/4");
+    rerender(<ProgressCountCard run={run({ milestones: ms(4), milestones_completed: [] })} />);
+    const zero = screen.getByText("0 of 4 reported complete");
     expect(zero.getAttribute("title")).toBe("Milestones reported complete of the approved plan");
   });
 });
 
-describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
+describe("ProgressCountCard (done / in-progress / left, PRD #122)", () => {
   const milestones = [
     { id: "a", title: "First milestone" },
     { id: "b", title: "Second milestone" },
@@ -5622,12 +5718,12 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
 
   it("renders every title with a done / in-progress / left indicator", () => {
     render(
-      <MilestoneChecklist run={run({ milestones, milestones_completed: ["a"], milestones_in_progress: ["b"] })} />,
+      <MilestoneRows run={run({ milestones, milestones_completed: ["a"], milestones_in_progress: ["b"] })} />,
     );
     expect(screen.getByText("First milestone")).toBeTruthy();
     expect(screen.getByText("Second milestone")).toBeTruthy();
     expect(screen.getByText("Third milestone")).toBeTruthy();
-    expect(screen.getByLabelText("done")).toBeTruthy();
+    expect(screen.getByLabelText("reported complete")).toBeTruthy();
     expect(screen.getByLabelText("in progress")).toBeTruthy();
     expect(screen.getByLabelText("not started")).toBeTruthy();
   });
@@ -5635,38 +5731,38 @@ describe("MilestoneChecklist (done / in-progress / left, PRD #122)", () => {
   // PRD Decision 6: the worker REPORTS completion; nothing in uzi verified it, so the
   // copy must not say "verified". This is the header-wording guard.
   it("says 'reported complete' and NEVER implies verification", () => {
-    const { container } = render(<MilestoneChecklist run={run({ milestones, milestones_completed: ["a"] })} />);
-    expect(screen.getByText(/reported complete/i)).toBeTruthy();
+    const { container } = render(<ProgressCountCard run={run({ milestones, milestones_completed: ["a"] })} />);
+    expect(screen.getByText("1 of 3 reported complete")).toBeTruthy();
     expect(container.textContent?.toLowerCase()).not.toContain("verified");
   });
 
   it("shows a done/total count that is clamped to frozen membership", () => {
-    render(<MilestoneChecklist run={run({ milestones, milestones_completed: ["a", "b", "gone"] })} />);
+    render(<ProgressCountCard run={run({ milestones, milestones_completed: ["a", "b", "gone"] })} />);
     // "gone" is not a frozen member, so the count clamps to 2/3, never 3/3.
-    expect(screen.getByText("2/3")).toBeTruthy();
+    expect(screen.getByText("2 of 3 reported complete")).toBeTruthy();
   });
 
   it("renders NOTHING for a run with no milestones", () => {
-    const { container } = render(<MilestoneChecklist run={run({ milestones: null })} />);
+    const { container } = render(<ProgressCountCard run={run({ milestones: null })} />);
     expect(container.textContent).toBe("");
   });
 
   it("shows '–/N' (not '0/N') in the header when completion was never reported (PRD #265 M2)", () => {
-    render(<MilestoneChecklist run={run({ milestones, milestones_completed: null })} />);
-    expect(screen.getByText("–/3")).toBeTruthy();
-    expect(screen.queryByText("0/3")).toBeNull();
+    render(<ProgressCountCard run={run({ milestones, milestones_completed: null })} />);
+    expect(screen.getByText("– of 3 reported")).toBeTruthy();
+    expect(screen.queryByText("0 of 3 reported complete")).toBeNull();
     // Every milestone still renders as not-started — honest, just no longer a failure-look.
     expect(screen.getAllByLabelText("not started")).toHaveLength(3);
   });
 
   it("shows a genuine '0/3' when an empty completion set WAS reported", () => {
-    render(<MilestoneChecklist run={run({ milestones, milestones_completed: [] })} />);
-    expect(screen.getByText("0/3")).toBeTruthy();
+    render(<ProgressCountCard run={run({ milestones, milestones_completed: [] })} />);
+    expect(screen.getByText("0 of 3 reported complete")).toBeTruthy();
   });
 
   it("renders an untrusted title as PLAIN text, never a Markdown link", () => {
     const { container } = render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones: [{ id: "x", title: "[pwn](http://evil.test)" }], milestones_completed: [] })}
       />,
     );
@@ -7041,5 +7137,55 @@ describe("usage-limit provider regression #2360", () => {
   it.each([true, false])("keeps the shared setting neutral for read-only state %s", (wait_on_limit) => {
     render(<LimitWaitPanel run={run({ status: "running", harness: "codex", wait_on_limit })} canSteer={false} busy={false} onToggle={vi.fn()} onStop={vi.fn()} />);
     expect(screen.getByText(`${wait_on_limit ? "Waiting" : "Not waiting"} out future usage limits on this run — only its owner can change this.`)).toBeTruthy();
+  });
+});
+
+describe("RunView side-only usage panel", () => {
+  const entry = (over: Record<string, unknown> = {}) => ({
+    "claude-haiku-4-5": { inputTokens: 400, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered", ...over },
+  });
+  const msg = (kind: string, payload: unknown): RunMessage => ({
+    seq: 1, kind, agent: "lead", agent_instance: null, agent_label: null, payload, created_at: "2026-07-12T00:00:00Z",
+  });
+  const usageOf = (cost_status: "metered" | "unreported") => ({
+    input_tokens: 0, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 0, cost_usd: 0, cost_status,
+  });
+  function showWith(messages: RunMessage[], cost_status: "metered" | "unreported" = "metered") {
+    mockUseRunStream.mockReturnValue({
+      run: run({ status: "failed", usage: usageOf(cost_status) }), messages, connected: true, error: "", submit: vi.fn(),
+      refreshRun: vi.fn(), inputs: [], canSteer: false,
+    } as unknown as ReturnType<typeof useRunStream>);
+    mockApi.getRunReview.mockResolvedValue({ review: null, pending_judge: null });
+    render(<MemoryRouter initialEntries={["/runs/r1"]}><RunView /></MemoryRouter>);
+  }
+  const rowsOf = (table: HTMLElement) =>
+    Array.from(table.querySelectorAll("tbody tr")).map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""));
+
+  it("renders the summary rows and Run total for a summary-only run", async () => {
+    showWith([msg("summary_usage", { pass: "plan", model_usage: entry() })]);
+    const table = await screen.findByRole("table", { name: "Summary usage" });
+    expect(rowsOf(table)).toEqual([
+      ["Intent, plan & PR summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+    expect(screen.queryByRole("table", { name: "Per-phase usage" })).toBeNull();
+  });
+
+  it("renders Now summaries and Run total for a Now-note-only run", async () => {
+    showWith([msg("progress_note", { text: "Reading the code", model_usage: entry() })]);
+    const table = await screen.findByRole("table", { name: "Summary usage" });
+    expect(rowsOf(table)).toEqual([
+      ["Now summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+  });
+
+  it("shows unpriced side spend as n/a, not $0, under a metered run status", async () => {
+    showWith([msg("summary_usage", { pass: "plan", model_usage: entry({ costUSD: 0, costStatus: "unreported" }) })], "metered");
+    const table = await screen.findByRole("table", { name: "Summary usage" });
+    const rows = rowsOf(table);
+    expect(rows[0]?.[5]).toBe("n/a");
+    expect(rows[1]?.[5]).toBe("n/a");
+    expect(rows.flat().join(" ")).not.toMatch(/\$0/);
   });
 });

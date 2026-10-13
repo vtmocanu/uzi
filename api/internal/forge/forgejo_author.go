@@ -27,7 +27,11 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 	if userResp == nil || !completeAuthorResponse(userResp.Response) || u == nil || u.ID != authorID || u.UserName == "" {
 		return AuthorUnknown, ErrAuthorUnknown
 	}
-	r, err := assessmentEvidence(ctx, evidenceKey{f, projectID, "repository"}, func() (*gitea.Repository, error) {
+	r, err := assessmentEvidence(ctx, evidenceKey{f, projectID, "repository"}, func(ctx context.Context) (*gitea.Repository, error) {
+		c, err := f.newClient(ctx)
+		if err != nil {
+			return nil, err
+		}
 		repo, repoResp, err := c.GetRepoByID(projectID)
 		if err != nil {
 			return nil, f.wrapErr("author repository", err)
@@ -41,7 +45,7 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 	if err != nil {
 		return AuthorUnknown, err
 	}
-	personal, ownershipErr := assessmentEvidence(ctx, evidenceKey{f, projectID, "ownership"}, func() (bool, error) {
+	personal, ownershipErr := assessmentEvidence(ctx, evidenceKey{f, projectID, "ownership"}, func(ctx context.Context) (bool, error) {
 		return f.authorPersonalRepository(ctx, r.Owner.UserName, r.Name)
 	})
 	if ownershipErr == nil && personal && r.Owner.ID == authorID {
@@ -50,7 +54,11 @@ func (f *forgejo) RepositoryAuthorEligibility(ctx context.Context, projectID, au
 		}
 		return AuthorEligible, nil
 	}
-	direct, directErr := assessmentEvidence(ctx, evidenceKey{f, projectID, "direct collaborators"}, func() (map[int64]string, error) {
+	direct, directErr := assessmentEvidence(ctx, evidenceKey{f, projectID, "direct collaborators"}, func(ctx context.Context) (map[int64]string, error) {
+		c, err := f.newClient(ctx)
+		if err != nil {
+			return nil, err
+		}
 		all, err := paginate(func(e error) error { return f.wrapErr("author collaborators", e) }, func(page int) ([]*gitea.User, int, error) {
 			users, resp, err := c.ListCollaborators(r.Owner.UserName, r.Name,
 				gitea.ListCollaboratorsOptions{ListOptions: gitea.ListOptions{Page: page, PageSize: forgejoPerPage}})

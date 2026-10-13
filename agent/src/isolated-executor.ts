@@ -26,6 +26,7 @@
 // last assignment so no earlier key can override it. The fetch credential is never in it:
 // the fetch tool runs in this process (fetch-tools.ts).
 
+import { chunkedTimeout } from "./chunked-timeout.js";
 import path from "node:path";
 
 import type { EffortLevel, HookInput, HookJSONOutput, Options as SdkOptions, SpawnOptions, SpawnedProcess } from "@anthropic-ai/claude-agent-sdk";
@@ -78,8 +79,8 @@ const ISOLATED_DISALLOWED_TOOLS: readonly string[] = [
 const RUN_SECRETS_DIR = "/run/uzi-secrets";
 
 /**
- * The built-in agents and skills the pinned CLI (claude-agent-sdk 0.3.284, CLI 2.1.284)
- * still reports in its init frame with `agents: {}`, `skills: []`, `settingSources: []`,
+ * The built-in agents and skills the CLI reports in its init frame (seen on claude-agent-sdk
+ * 0.3.284, CLI 2.1.284) with `agents: {}`, `skills: []`, `settingSources: []`,
  * CLAUDE_CODE_DISABLE_BUNDLED_SKILLS and CLAUDE_CODE_DISABLE_EXPLORE_PLAN_AGENTS set:
  * captured from a real session (test/fixtures/isolated-init-frame.json). They cannot be
  * turned off, and they are unreachable here: agents need the Agent/Task tool and skills
@@ -296,13 +297,18 @@ export function buildIsolatedPreToolUse(input: {
   cwd: string;
   log: Logger;
   secretPaths: readonly string[];
+  /** The session's own SDK HOME. When set, the single path guard also lets `Read` open the SDK's
+   *  authenticated tool-result spill file under it (buildPathGuardHook's `sdkHomeDir`, Read-only).
+   *  Omitted by the research and job lanes, which keep the plain workspace jail. */
+  sdkHomeDir?: string;
 }): PreToolUseMatchers {
   return [
     // Matcher-less: runs for EVERY tool call, whatever its name.
     { hooks: [buildIsolatedToolGate(input.gate, input.log, input.surface)] },
     {
       matcher: "Read|Edit|Write|MultiEdit|NotebookEdit|Glob|Grep",
-      hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR])],
+      hooks: [buildPathGuardHook(input.cwd, input.log, [...input.secretPaths, RUN_SECRETS_DIR],
+        input.sdkHomeDir ? { sdkHomeDir: input.sdkHomeDir } : {})],
     },
     {
       matcher: WRITE_PATH_TOOLS.join("|"),
@@ -393,6 +399,8 @@ export function buildIsolatedSdkOptions(input: {
 }
 
 export interface IsolatedExecutorOptions {
+  /** Monotonic clock for relative timeout scheduling. */
+  timeoutNow?: () => number;
   queryFn?: SdkQueryFn;
   spawn?: (opts: SpawnOptions) => { pid?: number };
   kill?: (pid: number | undefined) => boolean;
@@ -406,6 +414,7 @@ export interface IsolatedExecutorOptions {
 
 /** Drives one isolated SDK session to its result frame. Throws on any failure. */
 export class IsolatedExecutor {
+  private readonly timeoutNow?: () => number;
   private readonly queryFn: SdkQueryFn;
   private readonly spawn: (opts: SpawnOptions) => { pid?: number };
   private readonly kill: (pid: number | undefined) => boolean;
@@ -418,6 +427,7 @@ export class IsolatedExecutor {
     if (!opts?.secretPaths || opts.secretPaths.length === 0) {
       throw new Error("IsolatedExecutor requires a non-empty secretPaths (the worker-credential deny set)");
     }
+    this.timeoutNow = opts.timeoutNow;
     this.queryFn = opts.queryFn ?? defaultQueryFn;
     this.spawn = opts.spawn ?? spawnDetached;
     this.kill = opts.kill ?? killProcessGroup;
@@ -432,11 +442,10 @@ export class IsolatedExecutor {
     if (ctx.signal.aborted) abort.abort();
     else ctx.signal.addEventListener("abort", onCancel, { once: true });
     let timedOut = false;
-    const timer = setTimeout(() => {
+    const timer = chunkedTimeout(() => {
       timedOut = true;
       abort.abort();
-    }, ctx.timeoutMs);
-    timer.unref?.();
+    }, ctx.timeoutMs, { now: this.timeoutNow, unref: true });
 
     const options = buildIsolatedSdkOptions({
       env: isolateSdkEnv(buildSdkEnv(ctx.oauthToken, ctx.homeDir)),
@@ -487,7 +496,7 @@ export class IsolatedExecutor {
       if (timedOut) throw new Error("isolated run exceeded its wall-clock limit");
       throw err;
     } finally {
-      clearTimeout(timer);
+      timer.cancel();
       ctx.signal.removeEventListener("abort", onCancel);
       for (const pid of pids) this.kill(pid);
     }

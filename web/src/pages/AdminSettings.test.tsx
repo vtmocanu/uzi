@@ -54,6 +54,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_daily_budget: "0",
   ephemeral_workers_enabled: "false",
   ci_autofix_enabled: "true",
+  now_summary_enabled: "true",
   release_check_enabled: "true",
   release_check_banner_enabled: "true",
   summary_model: "haiku",
@@ -541,11 +542,11 @@ describe("AdminSettings", () => {
     );
   });
 
-  it("rejects 3599 for the extension allowance (its bounds differ from the health seconds, PRD #1189)", async () => {
-    // 3599 discriminates the extension-allowance rule ([3600, 604800]) from the health-seconds
+  it("rejects 3599 for the extension cap (its bounds differ from the health seconds, PRD #1189)", async () => {
+    // 3599 discriminates the extension-cap rule ([3600, 604800]) from the health-seconds
     // rule ([60, 86400]): the health validator accepts 3599, this one rejects it.
     renderPage();
-    const cap = (await screen.findByLabelText(/Extension allowance per run/i)) as HTMLInputElement;
+    const cap = (await screen.findByLabelText(/Maximum per extension/i)) as HTMLInputElement;
     fireEvent.change(cap, { target: { value: "3599" } });
 
     expect(screen.getByText(/between 3600 and 604800 seconds/i)).toBeTruthy();
@@ -553,13 +554,13 @@ describe("AdminSettings", () => {
     expect(btn.disabled).toBe(true);
   });
 
-  it("accepts EXACTLY 3600 for the extension allowance (lower-bound fencepost, PRD #1189)", async () => {
+  it("accepts EXACTLY 3600 for the extension cap (lower-bound fencepost, PRD #1189)", async () => {
     // 3600 is the inclusive floor: the client validator's own boundary is `n < 3600` reject.
     // Paired with the 3599-reject test above this pins the fencepost at the UI layer — a
     // `<`→`<=` flip (or a floor bump to 3601) would reject 3600 and redden this.
     mockApi.updateSettings.mockResolvedValue(response({ run_extension_cap_seconds: "3600" }));
     renderPage();
-    const cap = (await screen.findByLabelText(/Extension allowance per run/i)) as HTMLInputElement;
+    const cap = (await screen.findByLabelText(/Maximum per extension/i)) as HTMLInputElement;
     fireEvent.change(cap, { target: { value: "3600" } });
 
     // No validation error, and Save is enabled.
@@ -575,7 +576,7 @@ describe("AdminSettings", () => {
   it("accepts 0 to turn extending off, and saves it (PRD #1189)", async () => {
     mockApi.updateSettings.mockResolvedValue(response({ run_extension_cap_seconds: "0" }));
     renderPage();
-    const cap = (await screen.findByLabelText(/Extension allowance per run/i)) as HTMLInputElement;
+    const cap = (await screen.findByLabelText(/Maximum per extension/i)) as HTMLInputElement;
     fireEvent.change(cap, { target: { value: "0" } });
 
     const btn = screen.getByRole("button", { name: /save run health/i }) as HTMLButtonElement;
@@ -718,6 +719,27 @@ describe("AdminSettings — run summaries (PRD #362)", () => {
     expect(btn.disabled).toBe(false);
     fireEvent.click(btn);
     await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ summary_model: "opus" }));
+  });
+
+  it("reads the Now-line kill switch, defaulting to on", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: "false" }));
+    renderPage();
+    expect((await screen.findByLabelText("Model-written Now line") as HTMLInputElement).checked).toBe(false);
+  });
+
+  it("reads an absent Now-line kill switch (older server) as on", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: undefined }));
+    renderPage();
+    expect((await screen.findByLabelText("Model-written Now line") as HTMLInputElement).checked).toBe(true);
+  });
+
+  it("saves only the Now-line kill switch when the model is unchanged (PRD #2603)", async () => {
+    mockApi.getSettings.mockResolvedValue(response({ now_summary_enabled: "true" }));
+    mockApi.updateSettings.mockResolvedValue(response({ now_summary_enabled: "false" }));
+    renderPage();
+    fireEvent.click(await screen.findByLabelText("Model-written Now line"));
+    fireEvent.click(screen.getByRole("button", { name: /save run summary settings/i }));
+    await waitFor(() => expect(mockApi.updateSettings).toHaveBeenCalledWith({ now_summary_enabled: "false" }));
   });
 
   it("blocks an empty summary model client-side without calling the API", async () => {

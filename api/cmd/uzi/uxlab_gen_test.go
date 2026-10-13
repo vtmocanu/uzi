@@ -15,6 +15,7 @@ package main
 
 import (
 	"context"
+	"encoding/json"
 	"fmt"
 	"os"
 	"path/filepath"
@@ -38,6 +39,7 @@ const (
 
 func sp(s string) *string       { return &s }
 func ip(n int64) *int64         { return &n }
+func ip32(n int) *int           { return &n }
 func tp(t time.Time) *time.Time { return &t }
 
 // uxModel builds a model at the lab's fixed size and theme. The renderer is rebuilt
@@ -82,16 +84,25 @@ func TestGenerateUXLabFrames(t *testing.T) {
 
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
-		"board-populated":              func(d bool) string { return boardPopulated(d, now) },
-		"board-codex":                  func(d bool) string { return boardCodex(d, now) },
-		"board-empty":                  boardEmpty,
+		"board-populated": func(d bool) string { return boardPopulated(d, now) },
+		"board-codex":     func(d bool) string { return boardCodex(d, now) },
+		"board-empty":     boardEmpty,
+		"board-restart-hint": func(d bool) string {
+			m := uxModel(&uzicli.FakeClient{}, "", d)
+			m.showVersion = true
+			m.updatePrompt.installedVersion = "v0.85.0"
+			return m.View().Content
+		},
 		"board-admin":                  boardAdmin,
 		"board-filter":                 func(d bool) string { return boardFilter(d, now) },
 		"board-planning":               func(d bool) string { return boardPlanning(d, now) },
 		"board-revising":               func(d bool) string { return boardRevising(d, now) },
 		"board-milestones":             func(d bool) string { return boardMilestones(d, now) },
+		"board-progress":               func(d bool) string { return boardProgress(d, now) },
 		"detail-running":               func(d bool) string { return detailRunning(d, now) },
+		"detail-accounting-backfill":   func(d bool) string { return detailAccountingBackfill(d, now).View().Content },
 		"detail-codex":                 func(d bool) string { return detailCodex(d, now) },
+		"detail-blocked-by":            func(d bool) string { return detailBlockedBy(d, now) },
 		"detail-milestones-attributed": func(d bool) string { return detailMilestonesAttributed(d, now) },
 		"detail-crew-autofold":         func(d bool) string { return detailCrewAutofold(d, now) },
 		"detail-planning":              func(d bool) string { return detailPlanning(d, now) },
@@ -100,36 +111,89 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-stalled":               func(d bool) string { return detailStalled(d, now) },
 		"detail-awaiting-approval":     func(d bool) string { return detailAwaitingApproval(d, now) },
 		"detail-awaiting-input":        func(d bool) string { return detailAwaitingInput(d, now) },
-		"detail-limit-wait":            func(d bool) string { return detailLimitWait(d, now) },
-		"detail-degraded":              func(d bool) string { return detailDegraded(d, now) },
-		"detail-steer-typing":          func(d bool) string { return detailSteerTyping(d, now) },
-		"detail-steer-confirm":         func(d bool) string { return detailSteerConfirm(d, now) },
-		"detail-steer-queue":           func(d bool) string { return detailSteerQueue(d, now) },
-		"review-overlay":               func(d bool) string { return reviewOverlay(d, now) },
-		"review-pending":               func(d bool) string { return reviewPending(d, now) },
-		"pulls-populated":              func(d bool) string { return pullsPopulated(d, now) },
-		"pulls-empty":                  func(d bool) string { return pullsEmpty(d, now) },
-		"ci-populated":                 func(d bool) string { return ciPopulated(d, now) },
-		"ci-unsupported":               func(d bool) string { return ciUnsupported(d, now) },
-		"pr-live":                      func(d bool) string { return prLive(d, now) },
-		"pr-changes-requested":         func(d bool) string { return prChangesRequested(d, now) },
-		"pr-failing":                   func(d bool) string { return prFailing(d, now) },
-		"cirun-running":                func(d bool) string { return ciRunRunning(d, now) },
-		"cirun-failing":                func(d bool) string { return ciRunFailing(d, now) },
-		"help":                         helpFrame,
-		"quit":                         quitFrame,
-		"split-floor-focus":            func(d bool) string { return splitScene(d, now, "floor") },
-		"split-ci-focus":               func(d bool) string { return splitScene(d, now, "ci") },
-		"split-pulls-focus":            func(d bool) string { return splitScene(d, now, "pulls") },
-		"split-min":                    func(d bool) string { return splitScene(d, now, "min") },
-		"split-80col":                  func(d bool) string { return splitScene(d, now, "80col") },
-		"split-needs-you-unfocused":    func(d bool) string { return splitScene(d, now, "needs-you") },
-		"split-ci-empty":               func(d bool) string { return splitScene(d, now, "ci-empty") },
-		"split-filtering":              func(d bool) string { return splitScene(d, now, "filtering") },
+		"detail-awaiting-input-collapsed": func(d bool) string {
+			return detailInputScene(d, now, "collapsed").View().Content
+		},
+		"detail-awaiting-input-24row": func(d bool) string {
+			return detailInputScene(d, now, "24row").View().Content
+		},
+		"detail-awaiting-input-24row-collapsed": func(d bool) string {
+			return detailInputScene(d, now, "24row-collapsed").View().Content
+		},
+		"detail-awaiting-input-single": func(d bool) string {
+			return detailInputScene(d, now, "single").View().Content
+		},
+		"detail-answer-transcript": func(d bool) string {
+			return detailInputScene(d, now, "answer").View().Content
+		},
+		"detail-limit-wait":         func(d bool) string { return detailLimitWait(d, now) },
+		"detail-degraded":           func(d bool) string { return detailDegraded(d, now) },
+		"detail-steer-typing":       func(d bool) string { return detailSteerTyping(d, now) },
+		"detail-steer-confirm":      func(d bool) string { return detailSteerConfirm(d, now) },
+		"detail-steer-queue":        func(d bool) string { return detailSteerQueue(d, now) },
+		"review-overlay":            func(d bool) string { return reviewOverlay(d, now) },
+		"review-pending":            func(d bool) string { return reviewPending(d, now) },
+		"pulls-populated":           func(d bool) string { return pullsPopulated(d, now) },
+		"pulls-empty":               func(d bool) string { return pullsEmpty(d, now) },
+		"ci-populated":              func(d bool) string { return ciPopulated(d, now) },
+		"ci-unsupported":            func(d bool) string { return ciUnsupported(d, now) },
+		"pr-live":                   func(d bool) string { return prLive(d, now) },
+		"pr-changes-requested":      func(d bool) string { return prChangesRequested(d, now) },
+		"pr-failing":                func(d bool) string { return prFailing(d, now) },
+		"cirun-running":             func(d bool) string { return ciRunRunning(d, now) },
+		"cirun-failing":             func(d bool) string { return ciRunFailing(d, now) },
+		"help":                      helpFrame,
+		"quit":                      quitFrame,
+		"split-floor-focus":         func(d bool) string { return splitScene(d, now, "floor") },
+		"split-ci-focus":            func(d bool) string { return splitScene(d, now, "ci") },
+		"split-pulls-focus":         func(d bool) string { return splitScene(d, now, "pulls") },
+		"split-min":                 func(d bool) string { return splitScene(d, now, "min") },
+		"split-80col":               func(d bool) string { return splitScene(d, now, "80col") },
+		"split-needs-you-unfocused": func(d bool) string { return splitScene(d, now, "needs-you") },
+		"split-ci-empty":            func(d bool) string { return splitScene(d, now, "ci-empty") },
+		"split-filtering":           func(d bool) string { return splitScene(d, now, "filtering") },
+	}
+
+	for _, scene := range []string{"board", "board-versioned", "board-marked", "board-admin", "ci", "pulls-linked"} {
+		scenes["footer-80-"+scene] = func(dark bool) string {
+			if scene == "board-versioned" {
+				oldVersion := version
+				version = "v0.84.0"
+				defer func() { version = oldVersion }()
+			}
+			m := uxModel(&uzicli.FakeClient{}, "", dark)
+			m.width, m.height, m.splitMode = 80, 34, "off"
+			m.renderer, _ = newTUIRenderer(m.transcriptWidth(), dark)
+			m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo(), oneRepo()}})
+			m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: boardRuns(now)})
+			m.board.admin = scene == "board-admin"
+			m.showVersion = scene == "board-versioned"
+			m.serverVersion = "0.85.0"
+			if scene == "board-marked" {
+				m.selfUsageReady = true
+				m.selfUsage.Last7SubscriptionRunCount = 1
+			}
+			if scene == "ci" {
+				m.setListView(viewCI)
+				m.ci.runs, m.ci.loaded = sampleCIRuns(now), true
+			}
+			if scene == "pulls-linked" {
+				m.setListView(viewPulls)
+				m.pulls.pulls, m.pulls.loaded = samplePulls(now), true
+				if len(m.pulls.pulls) > 0 {
+					m.pulls.pulls[0].RunID = sp("footer-linked-run")
+				}
+			}
+			return m.View().Content
+		}
 	}
 
 	for _, name := range append(append([]string{}, workerSceneNames...), workerDetailSceneNames...) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
+	}
+
+	for _, scene := range uxAnswerScenes() {
+		scenes[scene.name] = func(dark bool) string { return scene.build(dark, now).model.View().Content }
 	}
 
 	names := make([]string, 0, len(scenes))
@@ -416,13 +480,21 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	// PRD #650 / #1429 M5: attach Usage to a spread of runs so the board's COST column and floor
 	// total are exercised with all four states plus the blank cell visible together — $N (a
 	// normal rounded metered cost), $1187 (a big metered cost), <$1 (a real sub-dollar metered
-	// cost), sub (a subscription-billed run, cost_status-driven — never a guessed $0), and blank
+	// cost), n/a (stored legacy subscription usage without an estimate), and blank
 	// (nil Usage, the common case worth checking for alignment). runs[0]'s cost is kept identical
 	// to the detail-running scene, which reuses this same run id.
 	runs[0].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}          // → $10
 	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
 	runs[5].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
-	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → sub
+	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → n/a
+	// PRD #2602: the PROG column, mirroring TUI mock 1 — a percent (55% here: 2 of 4 done), a
+	// stalled run, a looping run (also stalled), a run waiting on the plan gate, and a parked run.
+	pct := 55
+	runs[0].Progress = &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4, ActiveMilestoneID: "m3"}
+	runs[1].Progress = &apitypes.RunProgress{State: "waiting"}
+	runs[2].Progress = &apitypes.RunProgress{State: "stalled"}
+	runs[4].Progress = &apitypes.RunProgress{State: "stalled"}
+	runs[6].Progress = &apitypes.RunProgress{State: "parked"}
 	return runs
 }
 
@@ -572,7 +644,7 @@ func boardRevising(dark bool, now time.Time) string {
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "b2c3d4e5-1111-2222-3333-444444444444", Kind: "ci_fix", Status: "awaiting_approval", IssueTitle: "Fix flaky pipeline on main", CreatedAt: now.Add(-2 * time.Minute)}},
-		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "awaiting_approval", IssueTitle: "Re-plan webhook delivery retries after steer", CreatedAt: now.Add(-90 * time.Second)}, IsRevising: true},
+		{RunDTO: apitypes.RunDTO{ID: "d0e1f2a3-1111-2222-3333-444444444444", Kind: "issue", Status: "awaiting_approval", IssueTitle: "Re-plan webhook delivery retries after steer", CreatedAt: now.Add(-90 * time.Second), IsRevising: true}},
 		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111-2222-3333-444444444444", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute)}},
 	}})
 	return m.View().Content
@@ -583,12 +655,35 @@ func boardRevising(dark bool, now time.Time) string {
 // draws an all-empty ▱▱▱ bar — the graphical 0/N, never –/N text. No credential labels, so
 // the MILE column clears the width gate at the lab's 100 cols instead of being dropped.
 func boardMilestones(dark bool, now time.Time) string {
+	pct70 := 70
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}}}, // two in flight (#1176)
-		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}},                                                 // nil completed ⇒ never reported
-		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                                                                               // no frozen list ⇒ no bar
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, Progress: &apitypes.RunProgress{State: "percent", Pct: &pct70}}}, // two in flight (#1176)
+		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}},                                                                                                                 // nil completed ⇒ never reported
+		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                                                                                                                                               // no frozen list ⇒ no bar
+	}})
+	return m.View().Content
+}
+
+// boardProgress renders the own-board PROG column (PRD #2602) at 116 cols with no credential
+// column: the bar form (percent + 8-cell bar) plus the waiting, stalled, parked and queued
+// flags. The 100-col scenes show the narrow form (percent or short flag) instead.
+func boardProgress(dark bool, now time.Time) string {
+	fake := &uzicli.FakeClient{}
+	m := uxModel(fake, "", dark)
+	m = step(m, tea.WindowSizeMsg{Width: 116, Height: frameHeight})
+	pct := 70
+	mk := func(id, status, title string, age time.Duration, p *apitypes.RunProgress) apitypes.RunListItemDTO {
+		return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status, IssueTitle: title, CreatedAt: now.Add(-age),
+			Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, Progress: p}}
+	}
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
+		mk("a1b2c3d4-1111", "running", "Add rate-limit headroom to the scheduler poll", 4*time.Minute, &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4}),
+		mk("b2c3d4e5-1111", "awaiting_input", "Pick the retry policy for webhook delivery", 9*time.Minute, &apitypes.RunProgress{State: "waiting"}),
+		mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"}),
+		mk("d4e5f6a7-1111", "limit_wait", "Port the judge to per-model usage folding", 22*time.Minute, &apitypes.RunProgress{State: "parked"}),
+		mk("e5f6a7b8-1111", "queued", "Tighten the retry backoff jitter", time.Minute, &apitypes.RunProgress{State: "queued"}),
 	}})
 	return m.View().Content
 }
@@ -614,6 +709,19 @@ func laneMsgs(now time.Time) []apitypes.MessageDTO {
 	}
 }
 
+// detailAccountingBackfill drives retained lead/child accounting through the real
+// model while history is loading. Only the lead and implementation lanes should appear.
+func detailAccountingBackfill(dark bool, now time.Time) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, detailRunID, dark)
+	msgs := []apitypes.MessageDTO{
+		msgDTO(10, "text", "lead", "", "", "Reviewing the implementation.", now.Add(-time.Minute)),
+		msgDTO(11, "text", "coder", "implementation", "implementation", "Running focused tests.", now.Add(-10*time.Second)),
+		accountingMsg(12, "lead", "", now),
+		accountingMsg(13, "coder", "accounting-only-child", now),
+	}
+	return applyDetail(m, apitypes.RunDTO{ID: detailRunID, Status: "running", Health: "ok", IssueTitle: "Codex accounting stays behind the transcript"}, msgs)
+}
+
 func detailBase(dark bool, run apitypes.RunDTO, now time.Time, allow bool) tuiModel {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, detailRunID, dark)
@@ -635,6 +743,20 @@ func withLiveStream(m tuiModel) tuiModel {
 }
 
 func detailRunning(dark bool, now time.Time) string {
+	return detailRunningSceneH(dark, now, nil, 0)
+}
+
+// detailRunningWithNoteH is detailRunning (light theme) with the PROGRESS block's Now note drawn, at a
+// chosen terminal height (width stays 100); an empty text draws no note.
+func detailRunningWithNoteH(now time.Time, text string, at time.Time, height int) string {
+	var note *apitypes.ProgressNote
+	if text != "" {
+		note = &apitypes.ProgressNote{Text: text, At: at}
+	}
+	return detailRunningSceneH(false, now, note, height)
+}
+
+func detailRunningSceneH(dark bool, now time.Time, note *apitypes.ProgressNote, height int) string {
 	// A milestone-structured run so the crew rail's milestone block renders (#379), coherent
 	// with the board's M2/4 for the same run id.
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "running", Health: "ok",
@@ -645,7 +767,10 @@ func detailRunning(dark bool, now time.Time) string {
 		IssueWebURL:         sp("https://github.com/vtmocanu/uzi/issues/452"),
 		StartedAt:           tp(now.Add(-4 * time.Minute)), // header elapsed WORK time (`● running · 4m`)
 		Milestones:          milestoneList,
-		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}} // two in flight (#1176)
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, // two in flight (#1176)
+		// PRD #2602: the crew rail's PROGRESS block (TUI mock 2).
+		Progress: &apitypes.RunProgress{State: "percent", Pct: ip32(70), MilestoneDone: 2, MilestoneTotal: 4,
+			ActiveMilestoneID: "m3", Phase: "implement", NowNote: note}}
 	// The credential label rides the right of the header's first line, before the transport tag
 	// (PRD #295), coherent with the board's meta label for this same run id.
 	run.AnthropicSecretID, run.AnthropicSecretLabel = sp("sec-meta"), sp("meta")
@@ -653,7 +778,22 @@ func detailRunning(dark bool, now time.Time) string {
 	// the board's runs[0] for this same run id (identical cost value).
 	run.Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, CacheReadTokens: 14_200_000, CacheCreationTokens: 120_000, OutputTokens: 88_400}
 	m := detailBase(dark, run, now, true)
+	if height > 0 {
+		m.height = height
+	}
 	m = withLiveStream(m)
+	return m.View().Content
+}
+
+// detailBlockedBy is a run waiting on a question that mentions another live run: the PROGRESS
+// block draws the waits-on-you flag and the may-be-blocked-by hint (TUI mock 3).
+func detailBlockedBy(dark bool, now time.Time) string {
+	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
+		IssueTitle: "Add rate-limit headroom to the scheduler poll", StatusSince: tp(now.Add(-12 * time.Minute)),
+		Milestones: milestoneList, MilestonesCompleted: []string{"m1"},
+		Progress: &apitypes.RunProgress{State: "waiting", MilestoneDone: 1, MilestoneTotal: 4,
+			MaybeBlockedByRunID: sp("fca7a801-3b1c-4d52-9e0a-6c1f2d7e8a90")}}
+	m := detailBase(dark, run, now, true)
 	return m.View().Content
 }
 
@@ -840,19 +980,67 @@ func detailAwaitingApproval(dark bool, now time.Time) string {
 	return m.View().Content
 }
 
+// These are real question payloads: the pinned card and transcript share the
+// production decoder, including the full option descriptions and overflow.
+const uxHistoryCapQuestion = `{
+	"header": "History cap",
+	"question": "Security review found that full Git integrity checking can decompress unbounded objects. May the replacement verifier retain and fail a run when decoded prerequisite history exceeds 1 GiB, even if its thin archive is under 64 MiB?",
+	"options": [
+		{"label": "Allow 1 GiB cap", "description": "Adds a bounded verification limit; over-limit work and custody remain retained."},
+		{"label": "Preserve existing size policy", "description": "Do not add a decoded-history cap that narrows the approved thin-capture success rule."}
+	]
+}`
+
+const uxGitBoundaryQuestion = `{
+	"header": "Git boundary",
+	"question": "May the replacement verifier use a cgroup limit for Git integrity checking, or should it preserve the existing resource boundary?",
+	"options": [
+		{"label": "Stronger resource boundary", "description": "Use a cgroup limit to bound Git integrity checking."},
+		{"label": "Preserve existing boundary", "description": "Keep the existing resource boundary for Git integrity checking."}
+	]
+}`
+
 func detailAwaitingInput(dark bool, now time.Time) string {
+	return detailInputScene(dark, now, "").View().Content
+}
+
+// detailInputScene keeps the populated crew/accounts beside the transcript.
+// The short scenes resize through Update; collapse uses the actual z key path.
+// An answer scene replays an answer DTO without executing an answering command.
+func detailInputScene(dark bool, now time.Time, scene string) tuiModel {
 	run := apitypes.RunDTO{ID: detailRunID, Kind: "issue", Status: "awaiting_input", Health: "ok",
-		IssueTitle: "Clarify the target branch for the fix",
-		StartedAt:  tp(now.Add(-1 * time.Minute))} // header elapsed WORK time beside the ✎ token
-	msgs := []apitypes.MessageDTO{
-		msgDTO(1, "text", "lead", "", "", "Which branch should the MR target: the default branch, or a release branch? I'll wait for your answer before opening it.", now.Add(-1*time.Minute)),
+		IssueTitle:          "Bound Git integrity verification",
+		StartedAt:           tp(now.Add(-4 * time.Minute)),
+		Milestones:          milestoneList,
+		MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3"},
+		Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.55, InputTokens: 2_400_000, OutputTokens: 88_400}}
+	if scene == "answer" {
+		run.Status = "running"
 	}
-	fake := &uzicli.FakeClient{}
-	m := uxModel(fake, detailRunID, dark)
-	m = applyDetail(m, run, msgs)
-	m = step(m, runInputsMsg{runID: detailRunID, err: nil})
+	m := detailBase(dark, run, now, true)
+	if strings.HasPrefix(scene, "24row") {
+		m = step(m, tea.WindowSizeMsg{Width: frameWidth, Height: 24})
+	}
+	questions := uxHistoryCapQuestion
+	if scene != "single" {
+		questions += "," + uxGitBoundaryQuestion
+	}
+	msgs := []apitypes.MessageDTO{
+		{Seq: 6, Kind: "question", Agent: sp("lead"), CreatedAt: now.Add(-time.Minute),
+			Payload: json.RawMessage(`{"question_id":"git-verification","questions":[` + questions + `]}`)},
+	}
+	if scene == "answer" {
+		msgs = append(msgs, apitypes.MessageDTO{
+			Seq: 7, Kind: "answer", CreatedAt: now.Add(-30 * time.Second),
+			Payload: json.RawMessage(`{"question_id":"git-verification","answers":["Allow 1 GiB cap","Stronger resource boundary"]}`),
+		})
+	}
+	m = step(m, detailPageMsg{runID: detailRunID, gen: m.detail.gen, kind: pageCatchup, msgs: msgs})
 	m = withLiveStream(m)
-	return m.View().Content
+	if strings.HasSuffix(scene, "collapsed") {
+		m = key(m, "z")
+	}
+	return m
 }
 
 func detailLimitWait(dark bool, now time.Time) string {

@@ -19,6 +19,7 @@ import (
 // NotifierStore is the slice of generated queries the notifier reads/writes.
 // *store.Queries satisfies it.
 type NotifierStore interface {
+	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	GetSlackRunContext(ctx context.Context, runID uuid.UUID) (store.GetSlackRunContextRow, error)
 	GetRunByID(ctx context.Context, runID uuid.UUID) (store.Run, error)
 	// GetSlackChatContext is the repo-less context for a CHAT run (PRD #191 M2b): the
@@ -158,18 +159,32 @@ type Notifier struct {
 	// Zero until wired via WithRunTimeout; a zero value only affects the rare null-budget
 	// run's deadline line, never the extension logic.
 	runTimeout time.Duration
-	// extensionCap reads the per-run extension allowance (settings.RunExtensionCapSeconds)
-	// so the near-timeout DM offers the `uzi run extend` command only while the cap has
-	// room (PRD #1189 D9: never suggest a command that would 409). nil until wired via
-	// WithExtensionCap; nil or a read error is treated as 0 (command omitted).
+	// extensionCap reads the PER-REQUEST extension maximum (settings.RunExtensionCapSeconds)
+	// so the near-timeout DM offers the `uzi run extend` command with a duration that fits
+	// it and the run's remaining total-time room (PRD #1189 D9: never suggest a command that
+	// would 409). nil until wired via WithExtensionCap; nil or a read error is treated as 0
+	// (command omitted).
 	extensionCap func(context.Context) (int, error)
+	// runWallCeiling is the instance RUN_WALL_CEILING; with runTimeout it sizes the room the
+	// extend bound reserves for a run's wall to scale up (workersvc.ExtensionRoomSeconds).
+	// Zero until wired via WithRunWallCeiling; zero falls back to runTimeout in the room math.
+	runWallCeiling      time.Duration
+	notificationUserCap int32
 }
 
-// NotifierOption wires the optional collaborators the near-timeout health DM needs
-// (PRD #1189): the RUN_TIMEOUT fallback and the extension-cap reader. They are options
-// rather than positional NewNotifier params so every existing caller and test keeps
-// compiling; main.go passes them at startup.
+// NotifierOption configures retention and optional near-timeout health DM
+// collaborators at construction without changing existing NewNotifier calls.
 type NotifierOption func(*Notifier)
+
+// WithNotificationUserCap sets the per-user retention cap after durable delivery.
+// Non-positive values fall back to notifysvc.DefaultUserCap, matching notifysvc.New.
+func WithNotificationUserCap(cap int) NotifierOption {
+	c := int32(cap) //nolint:gosec // G115: small per-user retention cap, matching notifysvc.New
+	if c <= 0 {
+		c = notifysvc.DefaultUserCap
+	}
+	return func(n *Notifier) { n.notificationUserCap = c }
+}
 
 // WithRunTimeout sets the instance-global RUN_TIMEOUT used as the wall-clock fallback for
 // a run with no frozen budget_wall_seconds when the notifier computes a run's deadline.
@@ -177,9 +192,16 @@ func WithRunTimeout(d time.Duration) NotifierOption {
 	return func(n *Notifier) { n.runTimeout = d }
 }
 
-// WithExtensionCap sets the reader for the per-run extension allowance
+// WithRunWallCeiling sets the instance RUN_WALL_CEILING used, with the run timeout, to size
+// the remaining total-time room in the near-timeout DM's suggested extend duration.
+func WithRunWallCeiling(d time.Duration) NotifierOption {
+	return func(n *Notifier) { n.runWallCeiling = d }
+}
+
+// WithExtensionCap sets the reader for the per-request extension maximum
 // (settings.RunExtensionCapSeconds), so the near-timeout DM omits the extend command
-// once the cap is exhausted or extending is disabled.
+// when extending is disabled or the run has no total-time room left, and otherwise
+// suggests a duration within the maximum.
 func WithExtensionCap(fn func(context.Context) (int, error)) NotifierOption {
 	return func(n *Notifier) { n.extensionCap = fn }
 }
@@ -230,15 +252,16 @@ func NewNotifier(s NotifierStore, poster Poster, baseURL func(context.Context) (
 		logger = slog.Default()
 	}
 	n := &Notifier{
-		store:      s,
-		poster:     poster,
-		baseURL:    baseURL,
-		logger:     logger,
-		ch:         make(chan stateEvent, notifierQueue),
-		notifyCh:   make(chan notifyEvent, notifierQueue),
-		healthCh:   make(chan healthEvent, notifierQueue),
-		msgCh:      make(chan chatMsgEvent, notifierMsgQueue),
-		chatConvos: make(map[uuid.UUID]*chatConvo),
+		notificationUserCap: notifysvc.DefaultUserCap,
+		store:               s,
+		poster:              poster,
+		baseURL:             baseURL,
+		logger:              logger,
+		ch:                  make(chan stateEvent, notifierQueue),
+		notifyCh:            make(chan notifyEvent, notifierQueue),
+		healthCh:            make(chan healthEvent, notifierQueue),
+		msgCh:               make(chan chatMsgEvent, notifierMsgQueue),
+		chatConvos:          make(map[uuid.UUID]*chatConvo),
 	}
 	for _, o := range opts {
 		o(n)

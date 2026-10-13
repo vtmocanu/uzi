@@ -414,3 +414,20 @@ func TestFilterProtocol_KeepsIsolatedJobV1(t *testing.T) {
 		}
 	}
 }
+
+// RecoveryHeldPublicationV1 (issue #2545) is a protocol capability: the worker's report keeps it,
+// ordered right after recovery_completed_publication_v1, and it never reaches the scheduler
+// vocabulary or a repo's required capabilities.
+func TestFilterProtocolRecoveryHeldPublication(t *testing.T) {
+	if RecoveryHeldPublicationV1 != "recovery_held_publication_v1" {
+		t.Fatalf("token = %q", RecoveryHeldPublicationV1)
+	}
+	got := FilterProtocol([]string{CodexHarnessV1, RecoveryHeldPublicationV1, "recovery_held_publication_v2", RecoveryCompletedPublicationV1})
+	want := []string{RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, CodexHarnessV1}
+	if !reflect.DeepEqual(got, want) {
+		t.Fatalf("FilterProtocol = %v, want %v", got, want)
+	}
+	if got := Filter([]string{RecoveryHeldPublicationV1}); len(got) != 0 {
+		t.Fatalf("held-publication capability leaked into the scheduler vocabulary: %v", got)
+	}
+}

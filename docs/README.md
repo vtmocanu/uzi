@@ -11,6 +11,8 @@ and a `git blame` see.
 This file itself is exempt from the frontmatter contract below and from
 `check-docs.mjs`'s validation (it is the index/meta page, not a doc).
 
+Repo contributors: see [Coordinated Codex runtime upgrades](./dev-conventions.md#coordinated-codex-runtime-upgrades).
+
 ## Adding a page
 
 1. Create `docs/<slug>.md`. The slug is the filename; it becomes the route

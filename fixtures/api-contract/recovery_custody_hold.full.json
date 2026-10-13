@@ -1,8 +1,26 @@
 {
+  "completed_publication_receipt": {
+    "hold_id": "x",
+    "run_id": "x",
+    "owner_id": "x",
+    "worker_id": "x",
+    "generation": 1,
+    "final_head": "x",
+    "repo_id": "x",
+    "connection_id": "x",
+    "project_id": 1,
+    "forge_type": "x",
+    "base_url": "x",
+    "branch": "x",
+    "mr_iid": 1,
+    "observed_branch_head": "x"
+  },
+  "completed_publication_reason": "x",
   "inventory_guarded": true,
   "final_receipt": {
     "kind": "x",
     "capture_id": "x",
+    "publication_id": "x",
     "source_sha": "x",
     "coverage_digest": "x"
   },
@@ -21,5 +39,7 @@
   "released_at": "2020-01-02T03:04:05Z",
   "checkpoint_ref": "x",
   "checkpoint_tip": "x",
-  "checkpoint_state": "x"
+  "checkpoint_state": "x",
+  "final_publication_id": "x",
+  "held_ref": "x"
 }

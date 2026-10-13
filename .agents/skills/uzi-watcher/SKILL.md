@@ -126,7 +126,8 @@ Plan steering is done with the buddy bound by `session-peers` (`buddy: @NAME`);
    message naming the precise change (re-plans without ending the run; then watch for the
    gate again). Not sound → `uzi run reject` with a `-m` reason, then stop.
 5. **Hand off to `uzi-lander`.** Once approved, the run is landing work: load `uzi-lander`
-   and start at its snapshot (`takeover.sh RUN`). It polls the run blind to terminal, then
+   and start at its snapshot (`takeover.sh RUN`), carrying the approved plan's seq into its
+   step-1 poller. It polls the run blind to terminal, then
    drives the PR to merged and `main` green, one status line per state change. A `failed`
    or `cancelled` run comes back here (*When a run fails*, recovery below). First claim
    it so the board names its lander before a PR exists:
@@ -150,11 +151,20 @@ re-invokes you when it exits:
 
 It also exits 4 with `STOP=needs_attention` plus evidence when a non-terminal run keeps a
 non-ok health (not `slow`) or a stale worker heartbeat for `WATCH_ATTENTION_POLLS` (default 3)
-consecutive polls; `0` disables. It means investigate, not dead.
+consecutive polls; `0` disables. It means investigate, not dead. Exit 4 ends coverage: in the
+same turn, investigate, then launch the printed `REARM=` line in the background. It acks that
+health episode, so a run that stays stalled in it (a long test suite) stops only on a park,
+a terminal state, a new episode or a stale heartbeat. A missed re-arm is how a question parks unseen.
 
 The thirteen run statuses and which are terminal are in the `uzi-cli` skill. A run at
 `awaiting_input` asked a question: read it from `uzi run logs RUN --json` (a `question`
-message) and answer with `uzi run answer`. A run at `limit_wait` is parked on an Anthropic
+message) and answer with `uzi run answer`. A completion-interlock question is different: a
+plain answer cannot exempt a frozen milestone. Record the decision with `uzi run decide RUN`
+(`--continue`, `--partial <kept ids> --reason '...'` or `--accept <ids> --reason '...'`), on the
+live question or on a run already parked in the completion hold. **Never answer with "keep waiting"**
+(e.g. for a dependency PR to merge): an answer resumes the run, and a run with nothing to do spends
+its iteration budget on no-op turns and fails (#2657). Leave the question unanswered, or answer and
+immediately `uzi run pause RUN --now`. A run at `limit_wait` is parked on an Anthropic
 usage limit and resumes itself — keep waiting. `uzi-lander` uses this same poller for its
 blind watch to terminal.
 
@@ -235,11 +245,12 @@ reject — the rest of a good plan stays.
 
 uzi's worker pushes with a GitHub PAT that **deliberately lacks the `workflow` scope** — a
 worker that could rewrite CI is a supply-chain risk, so this is by design, not a bug to
-"fix" by granting scope. A push creating a new ref that carries an authored workflow change
-is rejected **atomically** (`refusing to allow a Personal Access Token to create or update
-workflow … without workflow scope`), so nothing lands (#377, #456). How GitHub gates an
-update to an already-published ref is unverified (#1869). The worker checks before pushing:
-a run whose branch-only commits touch `.github/workflows/**` ends `failed` with
+"fix" by granting scope. In #1869's branch-ref probes, a pushed tip carrying a workflow blob absent from that path
+on every existing branch tip was rejected **atomically** (`refusing to allow a Personal
+Access Token to create or update workflow … without workflow scope`), so nothing lands
+(#377, #456). Deletions passed; other ref namespaces were not tested. The worker checks before pushing: a run whose pushed tip carries a
+`.github/workflows/**` blob matching neither the fresh default's nor the target ref's
+current tip at that path ends `failed` with
 `workflow_scope_missing` ("branch changes .github/workflows … failing early"), with a
 `preserved_patch` only when its secret scan is trusted and clean. The work is usually
 recoverable from the durable sources or the worker's bare tracking ref, not guaranteed: a
@@ -247,21 +258,26 @@ Docker worker's clone is an `emptyDir` lost with its pod. See *Recovering a fail
 work from the worker PVC* below.
 
 - **The flagged commit need not be the agent's.** An `mr_rework` or `uzi handoff --base
-  <branch>` run inherits the source branch's commits, so a maintainer workflow commit on a
-  PR branch can fail later runs on it while it stays branch-only by SHA, including after
-  equivalent content lands on main under another SHA (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
+  <branch>` run inherits the source branch's commits, so a maintainer workflow change on a
+  PR branch fails later runs on it until main or the target ref carries the same blob at
+  that path; equivalent content on main under another commit SHA passes (#1869). Keep workflow edits off uzi-owned branches (the `uzi-lander`
   rule, #1846).
 - **A branch merely behind main on workflow files is usually handled.** At finalize the
   worker tries to realign it to the current default (workflow-subtree overlay, else merge,
   else rebase; PRD #456, #627) before pushing; a conflict fails the run
   `finalize_base_align_conflict`. For GitHub, reaped milestone/done checkpoints attempt a
-  worker-side overlay (#1036). Tick and iteration checkpoints have no overlay; if GitHub rejects
-  their push for missing workflow scope, the broker returns a best-effort `workflow_scope` skip. The
-  precheck runs first, so an inherited workflow commit blocks this realign.
+  worker-side overlay (#1036). Tick and iteration checkpoints do not fetch a fresh overlay,
+  but chain over the last overlay checkpoint (#2733); if GitHub rejects their push for
+  missing workflow scope, the broker still returns a best-effort `workflow_scope` skip. The
+  precheck runs first, so an inherited workflow blob matching neither allowed tip blocks
+  this realign.
 - **Telling them apart on a recovered branch:** `git log --name-only origin/main..TIP --
   .github/workflows/` empty is evidence of base staleness only; a rebase onto main that
-  succeeds clears it, then gate and push as usual. A listed commit needs inspection: it may be a real workflow change (the
-  split below) or one whose content is already on main under another SHA (#1869).
+  succeeds clears it, then gate and push as usual. For a listed commit, compare each workflow blob in the pushed tip with the
+  fresh default and the current target tip at the same path. Matching either passes the
+  precheck; deleted paths pass (#1869). Commit lists and a nonempty diff against main alone
+  do not establish a blocker; a blob matching neither is a real workflow change (the split
+  below).
 
 **The split** (for a plan that genuinely *edits* a workflow file): uzi implements everything except `.github/workflows`; **you** add the
 workflow-file pieces locally, because your own token has `workflow` scope (confirm with
@@ -288,6 +304,13 @@ no kube access:
   --json` (each hold's `captures[].id`) or from `run export`'s own stderr listing when it
   refuses to guess.
 - `uzi run get RUN --json | jq -r .preserved_patch`: the diff a typed push failure preserves.
+- `git fetch origin refs/uzi-held/<run-id>/<generation>`: for a **failed** run on a server with
+  `UZI_HELD_PUBLICATION` on (the default), the api publishes the run's held work (commits since
+  its last checkpoint plus WIP) to this ref and releases the custody hold. Check it FIRST for a
+  failed run; `uzi run held RUN` lists the ref and its retention, and `uzi run held expire RUN`
+  ends the retention early. It does not exist for a run that failed `push_secret_blocked` or
+  `worker_residue_blocked`, nor for cancelled or parked runs, which keep the archive and salvage
+  sources below.
 - `uzi run get RUN --json | jq -r .salvage_state`: a **failed** run on a forge listed in
   `UZI_SALVAGE_FORGES` may have `salvage_state` at `promoted` — a bounded, run-scoped copy of
   the run's *last published checkpoint* (may be behind its final local work), fetchable with
@@ -489,8 +512,9 @@ and falling back to the durable bare tracking ref when no clone survives:
   For a Downloads backup root, keep the launchd stdout/stderr log under `/tmp`;
   launchd refused a log path in Downloads before starting the job. Set the plist's
   `WorkingDirectory` to the checkout (or `UZI_REPO_SLUG` in `EnvironmentVariables`);
-  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing. The loop
-  self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
+  otherwise the slug derivation fails and every cycle exits rc=2, capturing nothing.
+  A new session rewrites the plist's run ids and `UZI_CTX` rather than reusing an old plist.
+  The loop self-terminates when every run is terminal, after `UZI_BACKUP_MAX_HOURS`
   (default 12), or on `touch $UZI_BACKUP_DIR/STOP`.
   It rides through `limit_wait` (keeps snapshotting while a run is parked), retires each
   terminal run after its first complete terminal cycle, and retries active runs, and a failed
@@ -528,7 +552,52 @@ budget_exhausted`, not `failed` (PRD #1497).** It no longer has a
 `fail_origin` for the clock alone — do not wait for a `failed` state that no
 longer comes from the wall. Extend it (`uzi run extend RUN --by 2h`, which
 resumes it in one step) or recover it the same way you would any other
-non-terminal park.
+non-terminal park. After an extend, confirm with `uzi run get` that the run left
+`paused` (a refused extend is a 409 naming the reason, #2734).
+
+### Continue a run in a successor run (technical total limit reached, or a harness switch)
+
+A run's harness is frozen at create. The admin's `run_extension_cap_seconds` now limits
+one extend request, not a run's lifetime total (#2735), so the old cumulative-cap case is
+gone; a run can be extended repeatedly. A successor run remains the way to switch harness,
+or to continue a run that has reached the technical total wall limit (2147483 s, the
+extension-admission limit `workersvc.MaxRunWallSeconds`; an over-limit extend is a 409 naming
+the room left; a configuration-driven served total may exceed it, since the worker re-arms its
+timers in chunks, #2761). The successor is
+seeded from `origin/agent/issue-N` if that branch exists, otherwise from main. It never
+adopts another run's checkpoint, and `run create` has no base flag. `uzi handoff --base`
+gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
+
+1. **Capture commits plus dirty and untracked work.** Run `scripts/backup-runs.sh RUN`,
+   and compare its HEAD with the worker tracking ref and `refs/uzi-checkpoints/agent/issue-N`.
+   A `ckpt(overlay)` commit's message names its realTip: verify that SHA and the tree
+   difference rather than trusting the message. Push the freshest tip to
+   `recover/issue-N`. Before publishing the seed, account for every dirty and untracked
+   file in the backup. Put substantive unpublished work in a verified recovery commit,
+   or restore it into the successor through the recovery procedure before it runs: a
+   clean checkout of TIP alone does not bring over the backup's uncommitted work. Keep
+   the ref and the backup until both committed and uncommitted work are verified in the
+   successor.
+2. **Cancel normally, then verify the run is terminal** (`uzi run get RUN --json | jq -r
+   .status`). "cancellation sent" on a `paused` run, instead of "run cancelled", is
+   #1969: the cancel was queued for a worker that never polls a paused run. `uzi worker
+   rm` refuses while that worker holds the run. If cancellation remains queued, wait
+   for the #1969 fix, or use the exceptional workaround below after confirming its
+   worker-wide impact. Remove the workaround from this step once #1969 ships.
+   - Back up every flight on that worker first: a Docker worker's `/data/runner` is an
+     `emptyDir` lost with its pod.
+   - Confirm the impact on the whole worker with the user.
+   - Scale the worker's Deployment to 0.
+   - Wait until `uzi worker list` shows it `offline`. The threshold is
+     `WORKER_HEARTBEAT_STALE`, default 45s; a fixed sleep is not proof that it has passed.
+   - Re-cancel, and expect "run cancelled". Then scale the Deployment back to 1.
+3. **Publish the seed without force:** `git push origin TIP:refs/heads/agent/issue-N`.
+   If that branch already exists, or moves, stop and reconcile; never overwrite it.
+   Verify the remote tip with `git ls-remote`.
+4. **Create the successor gated** with `scripts/create-run.sh` plus `--harness` and
+   `--token`. Verify `harness`, `credential_override.label` and `auto_approve=false`
+   from `uzi run get`. At the gate, require the plan to build on the existing
+   commits and finish the in-progress milestone, and co-review it with the buddy.
 
 ## Cross-session handoff
 

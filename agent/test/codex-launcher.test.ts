@@ -1,10 +1,11 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { EventEmitter } from "node:events";
+import { channel } from "node:diagnostics_channel";
 import childProcess from "node:child_process";
 import { syncBuiltinESMExports } from "node:module";
-import type { SpawnSyncOptions } from "node:child_process";
-import { readFileSync } from "node:fs";
+import type { ChildProcess, SpawnSyncOptions } from "node:child_process";
+import syncFs, { readFileSync, type Stats } from "node:fs";
 import fs from "node:fs/promises";
 import os from "node:os";
 import path from "node:path";
@@ -15,6 +16,7 @@ import { fileURLToPath } from "node:url";
 import { CODEX_SESSION_GID, COMMAND_UID, WORKER_UID, setprivArgsForUid, setprivRunnerArgs } from "../src/runner-uid.js";
 import {
   CodexUnsupportedProfileError,
+  classifyCodexLaunchFailure,
   TMP_RETAINED_REASONS,
   launchCodexRoot,
   launchCodexEffectRoot,
@@ -23,7 +25,10 @@ import {
   type RunnerTreeRequest,
   type SupervisorProcess,
 } from "../src/codex/launcher.js";
-import { registeredRoot } from "../src/codex/codex-executor.js";
+import { registeredRoot, makeProductionLaunchAdviceRoot, CODEX_PRODUCTION_PROVIDER } from "../src/codex/codex-executor.js";
+import { recordingLogger } from "./helpers.js";
+import { AdviceTeardownDiagnostic } from "./advice-teardown-diagnostic.js";
+import { assertGone } from "./runner-teardown-fixtures.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { makeTextRedactor } from "../src/redact.js";
@@ -41,7 +46,7 @@ resetResidueQuarantineAfterEach();
 // Most privileged steps are injected; the worker-UID regression exercises the
 // production runner-tree creator with real setpriv and the worker image binaries.
 
-const CODEX_BIN = "/opt/uzi-codex/0.159.3/bin/codex";
+const CODEX_BIN = "/opt/uzi-codex/0.160.0/bin/codex";
 const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 const RUNNER_UID = 10002;
 const DATA_ROOT = "/data/run/root-1";
@@ -73,6 +78,7 @@ interface FakeOpts {
   exitCode?: number;
   disposeNearBudget?: boolean;
   exitDelayMs?: number;
+  exitBeforeEvidence?: boolean;
   /** When set (even to a malformed value), attached verbatim as the drained dispose's `tmpCleanup`. */
   disposeTmpCleanup?: unknown;
 }
@@ -93,11 +99,14 @@ class FakeSupervisor extends EventEmitter {
   private readonly exitCode: number;
   private readonly disposeNearBudget: boolean;
   private readonly exitDelayMs: number;
+  private readonly exitBeforeEvidence: boolean;
   private readonly tmpCleanup: { value: unknown } | undefined;
   readonly disposeTimeouts: number[] = [];
   readonly observeRequests: number[] = [];
   private readonly disposeReply: ((id: number) => unknown) | undefined;
   private readonly observeReply: ((id: number) => unknown) | undefined;
+  autoSnapshots = true;
+  readonly snapshotIds: number[] = [];
 
   constructor(opts: FakeOpts = {}) {
     super();
@@ -110,6 +119,7 @@ class FakeSupervisor extends EventEmitter {
     this.exitCode = opts.exitCode ?? 0;
     this.disposeNearBudget = opts.disposeNearBudget ?? false;
     this.exitDelayMs = opts.exitDelayMs ?? 0;
+    this.exitBeforeEvidence = opts.exitBeforeEvidence ?? false;
     this.tmpCleanup = "disposeTmpCleanup" in opts ? { value: opts.disposeTmpCleanup } : undefined;
     createInterface({ input: this.control }).on("line", (line) => this.onControl(line));
     if (opts.autoStarted ?? true) {
@@ -140,6 +150,8 @@ class FakeSupervisor extends EventEmitter {
       const result = this.observeReply?.(cmd.id);
       if (result !== undefined) this.writeEvidence(result);
     } else if (cmd.op === "snapshot") {
+      this.snapshotIds.push(cmd.id);
+      if (!this.autoSnapshots) return;
       this.writeEvidence({ event: "snapshot", id: cmd.id, processes: [{ pid: this.pid + 1, ppid: this.pid, pgid: this.pid, comm: "codex" }] });
     } else if (cmd.op === "dispose") {
       this.disposeTimeouts.push(cmd.timeoutMs ?? 0);
@@ -151,10 +163,16 @@ class FakeSupervisor extends EventEmitter {
             event: "dispose", id: cmd.id, state: "drained", authority: this.disposeAuthority, killed: [], reaped: [this.pid + 1],
             ...(this.tmpCleanup ? { tmpCleanup: this.tmpCleanup.value } : {}),
           });
-          setTimeout(() => this.exitWith(this.exitCode), this.exitDelayMs);
+          if (this.exitBeforeEvidence) {
+            this.stdout.end(); this.stderr.end(); this.evidence.end();
+            setImmediate(() => this.emit("close", this.exitCode, null));
+          } else setTimeout(() => this.exitWith(this.exitCode), this.exitDelayMs);
         };
         if (this.disposeNearBudget) setTimeout(emit, Math.max(0, (cmd.timeoutMs ?? 0) - 5));
-        else emit();
+        else if (this.exitBeforeEvidence) {
+          this.emit("exit", this.exitCode, null);
+          setImmediate(emit);
+        } else emit();
       } else {
         this.writeEvidence({ event: "dispose", id: cmd.id, state: "unconfirmed", reason: "deadline", killed: [], reaped: [], children: [{ pid: this.pid + 1, startTime: "18446744073709551615" }] });
       }
@@ -824,6 +842,228 @@ describe("launchCodexRoot: happy-path lifecycle over the fake supervisor", () =>
   });
 });
 
+describe("M1 controlled advice disposal ordering probe", () => {
+  // Portable lifecycle probe, not a replacement for the real worker-UID security
+  // inventory: privileged provisioning/parent metadata are scripted on this host.
+  for (const ordering of ["exit_first", "evidence_first", "unclean"] as const) {
+    for (const leaf of ["single_uid", "owner_refusal", "runner_owner"] as const) {
+      it(ordering + " through actual executor " + leaf, {
+        skip: process.platform !== "linux" && "actual advice cleanup requires Linux descriptor-pinned tree removal",
+      }, async (t) => {
+        const base = await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "advice-probe-"));
+        const fake = newFake({ exitBeforeEvidence: ordering === "exit_first", exitCode: ordering === "unclean" ? 1 : 0 });
+        const { logger, lines } = recordingLogger();
+        const diagnostic = new AdviceTeardownDiagnostic((line) => t.diagnostic(line));
+        const originalOpen = fs.open.bind(fs);
+        const originalStat = fs.stat.bind(fs);
+        const realLstat = syncFs.lstatSync.bind(syncFs);
+        let replacement: Stats | undefined;
+        let numericOwnerReads = 0;
+        let bigintIdentityReads = 0;
+        let launcherRemovalRefusals = 0;
+        const helperResults: { command: string; code?: number | null; signal?: NodeJS.Signals | null; error?: string }[] = [];
+        let owned = "";
+        let shared = false;
+        const parentMetadata = t.mock.method(fs, "open", async (...args: Parameters<typeof fs.open>) => {
+          const handle = await originalOpen(...args);
+          if (String(args[0]).startsWith(base + "/codex-advice-")) {
+            const stat = handle.stat.bind(handle);
+            t.mock.method(handle, "stat", async () => Object.assign(await stat(), { uid: WORKER_UID, gid: RUNNER_UID }));
+          }
+          return handle;
+        });
+        // execFileAsync captured execFile at module load. Observe its real child
+        // dispatch/result rather than replacing that binding or the helper execution.
+        const helperChannel = channel("child_process");
+        const observeHelper = (message: unknown) => {
+          const child = (message as { process: ChildProcess }).process;
+          // The channel publishes at construction, before spawnargs exists.
+          // At close the dispatch operands and actual execFile result are available.
+          let failure: string | undefined;
+          child.once("error", (error: NodeJS.ErrnoException) => { failure = error.code ?? error.message; });
+          child.once("close", (code, signal) => {
+            if (!replacement || !child.spawnargs?.includes(path.dirname(owned)) ||
+              !child.spawnargs.includes(path.basename(owned)) ||
+              !child.spawnargs.includes(`${replacement.dev}:${replacement.ino}`)) return;
+            helperResults.push({ command: child.spawnfile, code, signal, error: failure });
+          });
+        };
+        helperChannel.subscribe(observeHelper);
+        // Same spawnSync provisioning seam as the session seed test above. No
+        // shell payload is executed: script categories select literal FS actions.
+        const provision = t.mock.method(childProcess, "spawnSync", (command: string, args: readonly string[]) => {
+          let stdout = "";
+          if (command === "id") stdout = String(RUNNER_UID);
+          else {
+            if (command === "/bin/rm" || args.includes("/bin/rm")) {
+              assert.equal(args.at(-1), owned, "launcher rm targets only the replacement");
+              launcherRemovalRefusals++;
+              return { status: 1, signal: null, pid: 0, output: [], stdout: "", stderr: "scripted launcher removal refusal" };
+            }
+            assert.equal(command, "/bin/setpriv");
+            const sh = args.indexOf("/bin/sh");
+            assert.ok(sh >= 0, "only scripted provisioning shells are needed");
+            const script = args[sh + 2]!;
+            const operands = args.slice(sh + 4);
+            if (script === 'stat -c "%u:%g:%a" -- "$1"') {
+              const target = operands[0]!;
+              assert.ok(target.startsWith(base + "/"));
+              const session = target.endsWith("/sessions");
+              const traversable = shared && (target === owned || target === owned + "/codex");
+              stdout = RUNNER_UID + ":" + (session || traversable ? CODEX_SESSION_GID : RUNNER_UID) + ":" +
+                (target.endsWith("/config.toml") ? "600" : session ? "2750" : traversable ? "710" : "700") + "\n";
+            } else if (script.includes("mkdir -m 700")) {
+              owned = operands[0]!;
+              assert.ok(owned.startsWith(base + "/codex-advice-data/"));
+              assert.equal(syncFs.statSync(path.dirname(owned)).mode & 0o2000, 0o2000,
+                "actual advice parent is setgid");
+              for (const dir of [owned, ...operands.slice(2)]) {
+                syncFs.mkdirSync(dir, { mode: 0o700 });
+                // mkdir inherits setgid; production explicitly clears it before
+                // applying the separate managed-session export posture later.
+                syncFs.chmodSync(dir, 0o700);
+                assert.equal(syncFs.statSync(dir).mode & 0o7777, 0o700,
+                  "private provisioning chmod clears inherited setgid");
+              }
+            } else if (script.includes("chgrp")) {
+              shared = true;
+              syncFs.mkdirSync(owned + "/codex/sessions", { mode: 0o750 });
+            } else {
+              assert.ok(script.includes("cat >"), "only the config write remains");
+              // Contents are unnecessary for this lifecycle probe.
+              syncFs.writeFileSync(operands[0]!, "", { mode: 0o600 });
+            }
+          }
+          return { status: 0, signal: null, pid: 0, output: [], stdout, stderr: "" };
+        });
+        const spawn = t.mock.method(childProcess, "spawn", () => fake);
+        syncBuiltinESMExports();
+        let ownerMetadata: { mock: { restore(): void } } | undefined;
+        const launcherOwner = t.mock.method(syncFs, "lstatSync", (...args: Parameters<typeof syncFs.lstatSync>) => {
+          const stat = realLstat(...args);
+          // Force the launcher to dispatch its deliberately refused rm before
+          // fallback, independent of the caller UID and its own owner guard.
+          if (String(args[0]) === owned && stat && typeof stat.uid === "number") stat.uid = RUNNER_UID;
+          return stat;
+        });
+        syncBuiltinESMExports();
+        try {
+          await diagnostic.run(async () => {
+            const handle = await makeProductionLaunchAdviceRoot(base, "api_key", logger)({
+              kind: "advice", label: "review", provider: CODEX_PRODUCTION_PROVIDER, model: "gpt-6.1-sol",
+            });
+            await diagnostic.watch(owned, handle.cwd, lines);
+            // Match the named leaf's replacement of the launch-owned tree.
+            await fs.rename(owned, owned + ".retained");
+            await fs.mkdir(owned);
+            await fs.writeFile(owned + "/keep", "keep");
+            // Preserve the real inode and all Stats methods/types. Only the
+            // matching numeric pinned owner read is synthetic: this portable
+            // probe grants no privilege and does not replace worker UID inventory.
+            replacement = await originalStat(owned);
+            ownerMetadata = t.mock.method(fs, "stat", async (...args: Parameters<typeof fs.stat>) => {
+              const stat = await originalStat(...args);
+              if (/^\/proc\/self\/fd\/[0-9]+$/.test(String(args[0])) &&
+                String(stat.dev) === String(replacement!.dev) && String(stat.ino) === String(replacement!.ino)) {
+                if (typeof stat.uid === "bigint") bigintIdentityReads++;
+                else {
+                  numericOwnerReads++;
+                  stat.uid = leaf === "owner_refusal" ? WORKER_UID : leaf === "runner_owner" ? RUNNER_UID : replacement!.uid;
+                }
+              }
+              return stat;
+            });
+            if (leaf === "single_uid") delete process.env.UZI_UID_SPLIT;
+            await handle.dispose();
+            await assertGone(handle.cwd);
+            const retained = lines.find((line) => (line as Record<string, unknown>).msg ===
+              "Codex advice data retained: disposal was not confirmed clean") as Record<string, unknown> | undefined;
+            const refused = lines.some((line) => {
+              const value = line as Record<string, unknown>;
+              return value.msg === "Codex advice data cleanup failed" && /not owned/.test(String(value.error));
+            });
+            if (ordering === "unclean") {
+              assert.equal(await fs.readFile(owned + "/keep", "utf8"), "keep");
+              assert.equal(retained?.classification, "not_clean");
+              assert.equal(retained?.state, "drained");
+              assert.equal(retained?.authority, "ECHILD+__WALL");
+              assert.equal(retained?.cleanup_attempted, false);
+              assert.equal(refused, false, "unclean disposal skips owner-refusal cleanup");
+              assert.equal(numericOwnerReads, 0, "unclean disposal skips pinned owner read");
+              assert.equal(bigintIdentityReads, 0);
+              assert.equal(helperResults.length, 0);
+              assert.equal(launcherRemovalRefusals, 0);
+              const snapshot = await diagnostic.snapshot();
+              assert.equal((snapshot.warnings as Record<string, unknown>[])[0]?.cleanup_attempted, false);
+              const printed: string[] = [];
+              const output = t.mock.method(console, "error", (line: string) => printed.push(line));
+              const failureDiagnostic = new AdviceTeardownDiagnostic();
+              await failureDiagnostic.watch(owned, handle.cwd, lines);
+              const originalAssertion = new assert.AssertionError({ message: "private probe assertion" });
+              await assert.rejects(failureDiagnostic.run(async () => { throw originalAssertion; }), (error) => error === originalAssertion);
+              output.mock.restore();
+              const failureSnapshot = JSON.parse(printed[0]!.slice("advice-teardown-diagnostic ".length));
+              assert.deepEqual(failureSnapshot.warnings[0], {
+                category: "retained", classification: "not_clean", reason: "supervisor_exit_nonzero",
+                state: "drained", authority: "ECHILD+__WALL", cleanup_attempted: false,
+              });
+              assert.equal(printed[0]!.includes("private probe assertion"), false);
+            } else {
+              assert.equal(retained, undefined);
+              assert.equal(launcherRemovalRefusals, 1, "launcher pre-fallback rm was deliberately refused");
+              assert.ok(numericOwnerReads > 0, "clean disposal reaches matching numeric pinned owner read");
+              if (leaf === "single_uid") {
+                await assertGone(owned);
+                assert.ok(bigintIdentityReads > 0, "single uid reaches actual bigint identity read");
+                assert.ok(helperResults.length > 0, "single uid dispatches real cleanup helper");
+                assert.ok(helperResults.every((result) => result.code !== undefined || result.error !== undefined),
+                  "single uid helper results observed");
+              } else if (leaf === "owner_refusal") {
+                assert.equal(await fs.readFile(owned + "/keep", "utf8"), "keep");
+                assert.equal(refused, true, "clean disposal reaches owner refusal");
+                assert.equal(bigintIdentityReads, 0, "owner refusal precedes identity read");
+                assert.equal(helperResults.length, 0, "owner refusal precedes helper dispatch");
+              } else {
+                assert.equal(refused, false, "matching runner owner bypasses owner refusal");
+                assert.ok(bigintIdentityReads > 0, "matching runner owner reaches actual bigint identity read");
+                assert.ok(helperResults.length > 0, "matching runner owner dispatches real cleanup helper");
+                assert.ok(helperResults.every((result) => result.code !== undefined || result.error !== undefined),
+                  "matching runner owner helper results observed");
+                const failure = lines.find((line) => (line as Record<string, unknown>).msg ===
+                  "Codex advice data cleanup failed") as Record<string, unknown> | undefined;
+                if (failure) {
+                  assert.match(String(failure.error), /agent-uid helper|rmTreePinned:/,
+                    "negative control records a specific downstream cleanup failure");
+                  assert.doesNotMatch(String(failure.error), /not owned/);
+                  assert.ok(helperResults.some((result) => result.error !== undefined || result.code !== 0),
+                    "downstream failure has an observed unsuccessful helper result");
+                } else await assertGone(owned);
+              }
+            }
+            const snapshot = await diagnostic.snapshot();
+            const events = snapshot.events as Record<string, unknown>[];
+            const exit = events.findIndex((event) => event.event === "exit");
+            const evidence = events.findIndex((event) => event.event === "evidence" && event.category === "dispose");
+            assert.ok(exit >= 0 && evidence >= 0);
+            assert.equal(exit < evidence, ordering === "exit_first");
+            t.diagnostic(JSON.stringify({ ordering, leaf, result: ordering === "unclean" ? "legitimate_retention" : "clean",
+              exit_ordinal: events[exit]?.ordinal, dispose_evidence_ordinal: events[evidence]?.ordinal,
+              numeric_owner_reads: numericOwnerReads, bigint_identity_reads: bigintIdentityReads,
+              launcher_removal_refusals: launcherRemovalRefusals, helper_results: helperResults,
+              pipe_end_ordinals: events.filter((event) => event.event === "pipe_end").map((event) => event.ordinal) }));
+          });
+        } finally {
+          process.env.UZI_UID_SPLIT = "1";
+          helperChannel.unsubscribe(observeHelper);
+          ownerMetadata?.mock.restore(); launcherOwner.mock.restore();
+          spawn.mock.restore(); provision.mock.restore(); parentMetadata.mock.restore(); syncBuiltinESMExports();
+          await fs.rm(base, { recursive: true, force: true });
+        }
+      });
+    }
+  }
+});
+
 describe("createHandle: strict tmpCleanup evidence", () => {
   it("accepts and surfaces a removed tmpCleanup on the clean dispose outcome", async () => {
     const fake = newFake({ disposeTmpCleanup: { state: "removed", reason: "" } });
@@ -1139,6 +1379,22 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
     assert.match(outcome.clean ? "" : outcome.reason, /missing required authority/);
   });
 
+  it("refuses oversized evidence without a delimiter at the crossing write", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.write(Buffer.alloc(65535, 0x78));
+    assert.equal(handle.failed, undefined, "below cap");
+    fake.evidence.write(Buffer.from("x"));
+    assert.equal(handle.failed, undefined, "exactly cap");
+    fake.evidence.write(Buffer.from("x"));
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    const failure = handle.failed as Error | undefined;
+    assert.ok(failure instanceof TrustedExecutionRefusal, "crossing write must immediately refuse without a delimiter");
+    assert.equal(failure.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(classifyCodexLaunchFailure(failure), "protocol_evidence");
+    assert.equal(fake.evidence.destroyed, true);
+  });
+
   it("(f5) an oversized evidence line is a bounded rejection", async () => {
     const fake = newFake();
     const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
@@ -1162,6 +1418,197 @@ describe("launchCodexRoot: abnormal paths never claim clean disposal", () => {
       launchCodexRoot(baseSpec(), baseDeps(fake, { deadlines: { started: 40, snapshot: 40, dispose: 40, exit: 40 } })),
       /started_deadline; cleanup unconfirmed/,
     );
+  });
+});
+
+describe("launchCodexRoot: raw evidence guard", () => {
+  const checkpoint = (): Promise<void> => new Promise((resolve) => setImmediate(resolve));
+  function snapshotRecord(id: number, bytes?: number, text = "é"): Buffer {
+    const record = { event: "snapshot", id, processes: [], text };
+    const json = JSON.stringify(record);
+    return Buffer.from(bytes === undefined ? json : json + " ".repeat(bytes - Buffer.byteLength(json)));
+  }
+
+  for (const delimiter of ["\n", "\r", "\r\n"]) {
+    it(`dispatches multiple valid records in one chunk with ${JSON.stringify(delimiter)} delimiters`, async () => {
+      const fake = newFake();
+      const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+      fake.autoSnapshots = false;
+      const first = handle.snapshot(500);
+      const second = handle.snapshot(500);
+      fake.evidence.write(Buffer.concat(fake.snapshotIds.map((id) =>
+        Buffer.concat([snapshotRecord(id), Buffer.from(delimiter)]))));
+      assert.deepEqual((await Promise.all([first, second])).map((ev) => ev.id), fake.snapshotIds);
+      assert.equal(handle.failed, undefined);
+      assert.equal((await handle.dispose(500)).clean, true);
+    });
+  }
+
+  it("keeps split CRLF as one delimiter and split multibyte UTF8 verbatim", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const first = handle.snapshot(500);
+    const record = snapshotRecord(fake.snapshotIds[0]!);
+    const split = record.indexOf(Buffer.from("é")) + 1;
+    fake.evidence.write(record.subarray(0, split));
+    fake.evidence.write(Buffer.concat([record.subarray(split), Buffer.from("\r")]));
+    fake.evidence.write(Buffer.from("\n"));
+    const ev = await first;
+    assert.equal((ev as unknown as { text: string }).text, "é");
+    assert.equal(handle.failed, undefined, "split CRLF does not dispatch an empty line");
+    assert.equal((await handle.dispose(500)).clean, true);
+  });
+
+  it("dispatches exactly-cap and successive near-cap records with pending IDs", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const requests = [handle.snapshot(500), handle.snapshot(500), handle.snapshot(500)];
+    const sizes = [65536, 65535, 65535];
+    fake.evidence.write(Buffer.concat(fake.snapshotIds.map((id, index) =>
+      Buffer.concat([snapshotRecord(id, sizes[index]), Buffer.from("\n")]))));
+    assert.deepEqual((await Promise.all(requests)).map((ev) => ev.id), fake.snapshotIds);
+    assert.equal(handle.failed, undefined);
+    assert.equal((await handle.dispose(500)).clean, true);
+  });
+
+  it("refuses multibyte UTF8 by raw bytes before a delimiter", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const text = "é".repeat(32769);
+    assert.ok(text.length < 65536);
+    fake.evidence.write(Buffer.from(text));
+    await checkpoint();
+    assert.ok(handle.failed instanceof TrustedExecutionRefusal);
+    assert.equal(handle.failed.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(fake.evidence.destroyed, true);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("normal EOF releases the guard and settles terminal failure promptly", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.end();
+    await checkpoint();
+    assert.equal(fake.evidence.readableEnded, true);
+    assert.match(handle.failed?.message ?? "", /evidence stream closed before confirmed disposal/);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("source destruction without EOF releases the guard and settles terminal failure", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.destroy();
+    await checkpoint();
+    assert.equal(fake.evidence.readableEnded, false);
+    assert.match(handle.failed?.message ?? "", /evidence stream closed before confirmed disposal/);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("source error releases the guard and preserves the original stream refusal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.evidence.destroy(new Error("fd4 failed"));
+    await checkpoint();
+    const failure = handle.failed;
+    assert.equal(failure?.message, "evidence stream error: fd4 failed");
+    assert.equal(classifyCodexLaunchFailure(failure), "protocol_evidence");
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.equal(handle.failed, failure);
+  });
+
+  it("overflow teardown settles pending requests and preserves the first refusal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const pending = assert.rejects(handle.snapshot(500), /oversized evidence line/);
+    fake.evidence.write(Buffer.alloc(65537, 0x78));
+    await checkpoint();
+    await pending;
+    const failure = handle.failed;
+    assert.equal(failure?.message, "oversized evidence line (> 65536 bytes)");
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal(fake.evidence.destroyed, true);
+    fake.emit("exit", 2, null);
+    fake.emit("close", 2, null);
+    assert.equal((await handle.dispose(500)).clean, false);
+    assert.equal(handle.failed, failure);
+  });
+
+  it("line-count termination releases the guard during a forwarded chunk", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.autoSnapshots = false;
+    const requests = Array.from({ length: 256 }, () => handle.snapshot(500));
+    const settled = Promise.allSettled(requests);
+    fake.evidence.write(Buffer.concat(fake.snapshotIds.map((id) =>
+      Buffer.concat([snapshotRecord(id), Buffer.from("\n")]))));
+    await checkpoint();
+    const results = await settled;
+    assert.equal(results.filter((result) => result.status === "fulfilled").length, 255);
+    assert.equal(results[255]?.status, "rejected");
+    assert.equal(handle.failed?.message, "evidence line budget exceeded (> 256)");
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("source close without EOF cannot confirm an in-flight disposal", async () => {
+    const fake = newFake();
+    fake.exitWith = (code) => {
+      fake.emit("exit", code, null);
+      fake.stdout.end();
+      fake.stderr.end();
+      fake.evidence.destroy();
+      setImmediate(() => fake.emit("close", code, null));
+    };
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.match(outcome.clean ? "" : outcome.reason, /final disposal evidence unconfirmed/);
+    assert.equal(fake.evidence.readableEnded, false);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+  });
+
+  it("overflow after an unrelated failure retains the original refusal", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitChildExit(17);
+    const failure = handle.failed;
+    fake.evidence.write(Buffer.alloc(65537, 0x78));
+    await checkpoint();
+    assert.equal(handle.failed, failure);
+    assert.equal(fake.evidence.destroyed, true);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal((await handle.dispose(500)).clean, false);
+  });
+
+  it("startup abandonment detaches the guard without synthesizing EOF", async () => {
+    const fake = newFake({ autoStarted: false });
+    await assert.rejects(launchCodexRoot(baseSpec(), baseDeps(fake, {
+      deadlines: { started: 20, snapshot: 50, dispose: 50, exit: 50 },
+    })), /started_deadline; cleanup unconfirmed/);
+    assert.equal(fake.evidence.listenerCount("data"), 0);
+    assert.equal(fake.evidence.readableEnded, false);
+  });
+
+  it("retains later abnormal tmpCleanup after unrelated child_exit failure", async () => {
+    const fake = newFake();
+    const handle = await launchCodexRoot(baseSpec(), baseDeps(fake));
+    fake.emitChildExit(17);
+    const failure = handle.failed;
+    assert.match(failure?.message ?? "", /provider child exited unexpectedly/);
+    fake.writeEvidence({ event: "abnormal", reason: "control EOF",
+      cleanup: { state: "drained", authority: "ECHILD+__WALL", killed: [], reaped: [] },
+      tmpCleanup: { state: "retained", reason: "owner" } });
+    const outcome = await handle.dispose(500);
+    assert.equal(outcome.clean, false);
+    assert.deepEqual(outcome.clean ? undefined : outcome.tmpCleanup, { state: "retained", reason: "owner" });
+    assert.equal(handle.failed, failure);
   });
 });
 

@@ -588,6 +588,40 @@ describe("GitHubClient.updateMergeRequestDescription", () => {
   });
 });
 
+// updateMergeRequestTitle: the same resource and method as updateMergeRequestDescription, with a
+// `{ title }` body on all three drivers.
+const NEW_TITLE = "Work on issue #5";
+
+describe("updateMergeRequestTitle", () => {
+  const cases = [
+    { name: "GitLabClient", method: "PUT", url: /\/api\/v4\/projects\/group%2Fsub%2Frepo\/merge_requests\/42$/, ok: 200,
+      make: (f: FetchFn) => new GitLabClient({ fetchFn: f }), repoUrl: base.repoUrl },
+    { name: "ForgejoClient", method: "PATCH", url: /\/api\/v1\/repos\/org\/repo\/pulls\/42$/, ok: 201,
+      make: (f: FetchFn) => new ForgejoClient({ fetchFn: f }), repoUrl: fjBase.repoUrl },
+    { name: "GitHubClient", method: "PATCH", url: /^https:\/\/api\.github\.com\/repos\/octo\/repo\/pulls\/42$/, ok: 200,
+      make: (f: FetchFn) => new GitHubClient({ fetchFn: f }), repoUrl: ghBase.repoUrl },
+  ];
+  for (const c of cases) {
+    it(`${c.name}: ${c.method}s the single-item URL with exactly { title }`, async () => {
+      const { fetchFn, calls } = recorder([{ status: c.ok, body: {} }]);
+      await c.make(fetchFn).updateMergeRequestTitle(c.repoUrl, PAT, 42, NEW_TITLE);
+      const call = calls[0]!;
+      assert.strictEqual(call.method, c.method);
+      assert.match(call.url, c.url);
+      assert.ok(!call.url.includes(PAT), "PAT not in URL");
+      assert.deepStrictEqual(JSON.parse(call.body ?? "{}"), { title: NEW_TITLE });
+    });
+
+    it(`${c.name}: throws a ForgeError on a non-2xx (no PAT in the message)`, async () => {
+      const { fetchFn } = recorder([{ status: 403, body: { message: "forbidden" } }]);
+      await assert.rejects(
+        c.make(fetchFn).updateMergeRequestTitle(c.repoUrl, PAT, 42, NEW_TITLE),
+        (err: unknown) => err instanceof ForgeError && err.status === 403 && !err.message.includes(PAT),
+      );
+    });
+  }
+});
+
 // PRD #1798 M3 (D11): the forge-neutral single-MR/PR read. Each driver GETs the SAME
 // single-item resource as getMergeRequestHead and normalises head SHA, target branch,
 // description and state. The payloads below are recorded-shape responses from each forge's
@@ -728,7 +762,13 @@ for (const d of drivers) {
       const { fetchFn, calls } = recorder([{ status: 200, body: d.fixture() }]);
       const mr = await d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42);
 
-      assert.deepStrictEqual(mr, { headSha: MR_HEAD, targetBranch: "release/2.x", description: MR_BODY, state: "open" });
+      assert.deepStrictEqual(mr, {
+        headSha: MR_HEAD,
+        targetBranch: "release/2.x",
+        description: MR_BODY,
+        state: "open",
+        title: "Fix login redirect",
+      });
       assert.strictEqual(calls.length, 1);
       const call = calls[0]!;
       assert.strictEqual(call.method, "GET");
@@ -740,6 +780,17 @@ for (const d of drivers) {
       for (const [k, v] of Object.entries(call.headers)) {
         if (k !== d.authHeader) assert.ok(!v.includes(PAT), `PAT only in ${d.authHeader}, found in ${k}`);
       }
+    });
+
+    it("omits title when the forge returns none or a non-string, without throwing", async () => {
+      for (const title of [undefined, null, 42]) {
+        const { fetchFn } = recorder([{ status: 200, body: d.fixture({ title }) }]);
+        const mr = await d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42);
+        assert.strictEqual(mr.title, undefined);
+        assert.ok(!("title" in mr), "title key absent, not set to undefined");
+      }
+      const { fetchFn } = recorder([{ status: 200, body: d.fixture({ title: "Fixes #5" }) }]);
+      assert.strictEqual((await d.make(fetchFn).getMergeRequest(d.repoUrl, PAT, 42)).title, "Fixes #5");
     });
 
     it("maps a null description/body to the empty string", async () => {

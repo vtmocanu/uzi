@@ -180,6 +180,33 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 			dto.LastFire = &lf
 		}
 	}
+	// recent_fires (issue #2519): newest-first jsonb array. Always a non-nil slice so it
+	// serializes as []. A bad array is logged and treated as empty; a bad element is logged
+	// and dropped, so one corrupt entry never hides the rest.
+	dto.RecentFires = []apitypes.LastFire{}
+	if len(s.RecentFires) > 0 {
+		var raws []json.RawMessage
+		if err := json.Unmarshal(s.RecentFires, &raws); err != nil {
+			slog.Error("unmarshal schedule recent_fires", "schedule", s.ID.String(), "error", err)
+		} else {
+			fires := make([]apitypes.LastFire, 0, len(raws))
+			for i, raw := range raws {
+				var lf apitypes.LastFire
+				if err := json.Unmarshal(raw, &lf); err != nil {
+					slog.Error("unmarshal schedule recent_fires element", "schedule", s.ID.String(), "index", i, "error", err)
+					continue
+				}
+				// A JSON null element unmarshals without error into a zero summary; no writer
+				// stores one, so treat it as malformed rather than surface a year-0001 fire.
+				if lf.FiredAt.IsZero() {
+					slog.Error("schedule recent_fires element has no fired_at", "schedule", s.ID.String(), "index", i)
+					continue
+				}
+				fires = append(fires, lf)
+			}
+			dto.RecentFires = fires
+		}
+	}
 	if s.Timing == "recurring" && s.CronExpr.Valid {
 		if fires, err := schedsvc.NextFires(s.CronExpr.String, s.Timezone, h.clock(), 3); err == nil {
 			dto.NextFires = fires

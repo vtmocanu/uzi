@@ -82,6 +82,23 @@ describe("isWorkflowScopeRejection", () => {
 });
 
 describe("fetchDefaultTip", () => {
+  it("refreshes a stale valid tracking ref with an unrelated remote refspec, including forced rewrites", async () => {
+    gitIn(fx.originPath, ["branch", "release/é"]);
+    const bare = await git.ensureClone(fx.originPath);
+    const old = gitIn(bare, ["rev-parse", "refs/remotes/origin/release/é"]);
+    gitIn(bare, ["config", "--replace-all", "remote.origin.fetch", "+refs/heads/main:refs/remotes/origin/main"]);
+    gitIn(fx.originPath, ["checkout", "release/é"]);
+    advanceOriginMain(fx.originPath, { "tip.txt": "fresh\n" }, "advance release");
+    const fresh = gitIn(fx.originPath, ["rev-parse", "HEAD"]);
+    assert.notEqual(old, fresh);
+    assert.equal(await git.fetchDefaultTip(bare, "release/é"), fresh);
+    gitIn(fx.originPath, ["reset", "--hard", old]);
+    assert.equal(await git.fetchDefaultTip(bare, "release/é"), old, "explicit forced destination preserves rewrites");
+    assert.equal(gitIn(bare, ["rev-parse", "refs/remotes/origin/release/é"]), old);
+    await assert.rejects(git.fetchDefaultTip(bare, "bad..branch"));
+    await assert.rejects(git.fetchDefaultTip(bare, "-branch"));
+  });
+
   it("fetches the CURRENT default tip from origin (not the claim-time tip) and returns its SHA", async () => {
     const bare = await git.ensureClone(fx.originPath);
     const claimTip = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);

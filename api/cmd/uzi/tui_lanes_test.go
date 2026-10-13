@@ -169,7 +169,7 @@ func TestCrewStateForLadder(t *testing.T) {
 		{"quiet and old", "running", "ok", other, me, stale, crewIdle},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
-			got := crewStateFor(tc.status, tc.health, tc.actor, tc.active, tc.last, now)
+			got := crewStateFor(tc.status, false, tc.health, tc.actor, tc.active, tc.last, now)
 			if got != tc.want {
 				t.Errorf("crewStateFor(status=%s health=%s actor=%s active=%s) = %s, want %s",
 					tc.status, tc.health, tc.actor, tc.active, got, tc.want)
@@ -183,7 +183,7 @@ func TestCrewStateForLadder(t *testing.T) {
 	// normal healthy range for a long tool call. Applying laneStaleAfter to the active
 	// lane flips all of them to idle.
 	longCall := now.Add(-4 * time.Minute) // past 45s, well inside the server's 300s
-	if got := crewStateFor("running", "ok", me, me, longCall, now); got != crewWorking {
+	if got := crewStateFor("running", false, "ok", me, me, longCall, now); got != crewWorking {
 		t.Errorf("a healthy %v tool call by the ACTIVE speaker = %s, want working — the active lane trusts run.health and must never be gated by the %v recency window",
 			now.Sub(longCall), got, laneStaleAfter)
 	}
@@ -210,7 +210,7 @@ func TestCrewStateForParkedRun(t *testing.T) {
 	// the statusLimitWait rung this is the case the rail actually shows, and `idle`
 	// says "nothing is happening and nobody is coming" about a run with a server-side
 	// promotion already scheduled.
-	if got := crewStateFor(statusLimitWait, "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
+	if got := crewStateFor(statusLimitWait, false, "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
 		t.Errorf("crewStateFor(limit_wait, quiet for 4h) = %s, want %s — a parked run is waiting on a scheduled promotion, not idle", got, crewWaiting)
 	}
 
@@ -222,15 +222,15 @@ func TestCrewStateForParkedRun(t *testing.T) {
 	// regresses the symptom appears HERE, and "visibly waiting, never stalled" would be
 	// failing through the health column while the status column looked fine.
 	for _, health := range []string{"stalled", "slow", "looping"} {
-		if got := crewStateFor(statusLimitWait, health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
-			t.Errorf("crewStateFor(limit_wait, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a parked run read stalled",
+		if got := crewStateFor(statusLimitWait, false, health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
+			t.Errorf("crewStateFor(limit_wait, false, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a parked run read stalled",
 				health, got, crewWaiting)
 		}
 	}
 
 	// Same answer from the other side of the recency split, so the rung is proven to be
 	// the source of the verdict rather than the timer happening to agree.
-	if got := crewStateFor(statusLimitWait, "ok", me, "", now.Add(-5*time.Second), now); got != crewWaiting {
+	if got := crewStateFor(statusLimitWait, false, "ok", me, "", now.Add(-5*time.Second), now); got != crewWaiting {
 		t.Errorf("crewStateFor(limit_wait, recent) = %s, want %s", got, crewWaiting)
 	}
 
@@ -246,7 +246,7 @@ func TestCrewStateForParkedRun(t *testing.T) {
 	// No active speaker on a parked run: nothing is executing, so naming one lane the
 	// active one would be a lie (and would earn it a `working` dot on the rung below).
 	frames := []laneFrame{lf(1, "coder", "toolu_01", "", time.Minute, now)}
-	if got := activeLaneKey(statusLimitWait, frames); got != "" {
+	if got := activeLaneKey(statusLimitWait, false, frames); got != "" {
 		t.Errorf("activeLaneKey(limit_wait) = %q, want \"\" — a parked run has no executing agent", got)
 	}
 }
@@ -269,12 +269,12 @@ func TestCrewStateForAwaitingFollowup(t *testing.T) {
 	now := time.Date(2026, 8, 21, 12, 0, 0, 0, time.UTC)
 	const me = "toolu_me"
 
-	if got := crewStateFor("awaiting_followup", "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
+	if got := crewStateFor("awaiting_followup", false, "ok", me, "", now.Add(-4*time.Hour), now); got != crewWaiting {
 		t.Errorf("crewStateFor(awaiting_followup, quiet for 4h) = %s, want %s — a run parked for the user's follow-up is waiting, not idle", got, crewWaiting)
 	}
 	for _, health := range []string{"stalled", "slow", "looping"} {
-		if got := crewStateFor("awaiting_followup", health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
-			t.Errorf("crewStateFor(awaiting_followup, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a follow-up park read stalled",
+		if got := crewStateFor("awaiting_followup", false, health, me, me, now.Add(-4*time.Hour), now); got != crewWaiting {
+			t.Errorf("crewStateFor(awaiting_followup, false, health=%q, active speaker) = %s, want %s — a stale health flag frozen at park time must not make a follow-up park read stalled",
 				health, got, crewWaiting)
 		}
 	}
@@ -293,17 +293,17 @@ func TestActiveLaneKeyIncludesClaimed(t *testing.T) {
 		lf(2, "tester", "toolu_02", "", time.Second, now),
 	}
 	for _, status := range []string{"running", "claimed"} {
-		if got := activeLaneKey(status, frames); got != "toolu_02" {
+		if got := activeLaneKey(status, false, frames); got != "toolu_02" {
 			t.Errorf("activeLaneKey(%q) = %q, want the newest lane %q — `live` includes claimed, and a running-only test makes every lane of a claimed run read idle",
 				status, got, "toolu_02")
 		}
 	}
 	for _, status := range []string{"queued", "awaiting_approval", "completed", "failed", "cancelled"} {
-		if got := activeLaneKey(status, frames); got != "" {
+		if got := activeLaneKey(status, false, frames); got != "" {
 			t.Errorf("activeLaneKey(%q) = %q, want \"\" (no active speaker when the run is not live)", status, got)
 		}
 	}
-	if got := activeLaneKey("running", nil); got != "" {
+	if got := activeLaneKey("running", false, nil); got != "" {
 		t.Errorf("activeLaneKey with no frames = %q, want \"\"", got)
 	}
 }

@@ -178,8 +178,8 @@ func deriveRollHealth(pods []corev1.Pod, wantHash, replicaFailure string, now ti
 		//
 		// The ordinary one is the Recreate gap: the old pod is terminating or gone and
 		// the new one has not been created yet. MEASURED at ~1.4s on a healthy roll, and
-		// it happens on EVERY release, so reporting `stuck` for pod-lessness as such
-		// would turn the whole fleet's badge red every time uzi ships — the cry-wolf
+		// its duration is not guaranteed. Reporting `stuck` for pod-lessness as such
+		// would turn healthy rolling workers' badges red — the cry-wolf
 		// failure PRD #113 exists to prevent, arriving through this branch.
 		//
 		// The other is a Deployment that can never produce a pod at all: no

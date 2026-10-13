@@ -5,7 +5,7 @@ go 1.26.4
 // Build with the patched toolchain selected below so stdlib fixes reach the
 // packages govulncheck gates (net/http, crypto/tls, net/url, encoding/asn1, ...).
 // Go auto-downloads it; Renovate keeps it current while `go` remains the floor.
-toolchain go1.27.1
+toolchain go1.27.2
 
 require (
 	charm.land/bubbletea/v2 v2.0.10
@@ -24,15 +24,17 @@ require (
 	github.com/google/uuid v1.6.0
 	github.com/hashicorp/go-retryablehttp v0.7.8
 	github.com/jackc/pgx/v5 v5.11.0
+	github.com/klauspost/compress v1.20.1
 	github.com/pressly/goose/v3 v3.28.0
 	github.com/robfig/cron/v3 v3.0.1
+	github.com/sergi/go-diff v1.3.2-0.20230802210424-5b0b94c5c0d3
 	github.com/slack-go/slack v0.29.0
 	github.com/spf13/cobra v1.10.2
 	github.com/yuin/goldmark v1.8.6
 	gitlab.com/gitlab-org/api/client-go/v3 v3.15.0
 	golang.org/x/crypto v0.57.0
 	golang.org/x/mod v0.41.0
-	golang.org/x/net v0.59.0
+	golang.org/x/net v0.60.0
 	golang.org/x/oauth2 v0.37.0
 	golang.org/x/sync v0.23.0
 	gopkg.in/yaml.v3 v3.0.1
@@ -81,7 +83,6 @@ require (
 	github.com/muesli/cancelreader v0.2.2 // indirect
 	github.com/pjbgf/sha1cd v0.6.0 // indirect
 	github.com/rivo/uniseg v0.4.7 // indirect
-	github.com/sergi/go-diff v1.3.2-0.20230802210424-5b0b94c5c0d3 // indirect
 	github.com/sethvargo/go-retry v0.4.0 // indirect
 	github.com/skeema/knownhosts v1.3.1 // indirect
 	github.com/spf13/pflag v1.0.9 // indirect

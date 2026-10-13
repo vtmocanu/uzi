@@ -9,6 +9,8 @@ import {
   type Run,
   type RunPriority,
   type RunInputKind,
+  type RunListItem,
+  type RunSummaryItem,
   type SelfUsage,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
@@ -238,6 +240,69 @@ function overrideToRead(body: { mode: string; secret_id?: string }): CredentialO
   return { mode: body.mode, label: null };
 }
 
+// Mirrors the real client's summary projection (Go RunSummaryItemDTO): drops the four
+// detail-only keys at runtime so demo/test parity with ?view=summary holds.
+function toSummary(item: RunListItem): RunSummaryItem {
+  const {
+    plan_md: _planMd,
+    repo_agents: _repoAgents,
+    issue_description: _issueDescription,
+    preserved_patch: _preservedPatch,
+    ...summary
+  } = item;
+  return summary;
+}
+
+// Overload order mirrors realApi.listRuns: summary first, legacy LAST.
+function mockListRuns(params: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+  view: "summary";
+}): Promise<{ runs: RunSummaryItem[] }>;
+function mockListRuns(params?: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+}): Promise<{ runs: RunListItem[] }>;
+function mockListRuns(params?: {
+  repoId?: string;
+  issueIid?: number;
+  // Mirrors the real client's passive-poll flag (#331); the mock does no real
+  // fetch, so the marker has no effect here beyond keeping the types compatible.
+  passive?: boolean;
+  view?: "summary";
+}): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
+  const items = listRunsFor()
+    // Chat conversations ride runs but have their own page (PRD #39), and judge
+    // is a repo-less meta-run — both are excluded here exactly as the real
+    // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
+    .filter((r) => r.kind !== "chat" && r.kind !== "judge")
+    // Caller-scoped, like the real ListRunsForUser: other demo users' runs
+    // (mockOtherRunOwners) belong to the admin all-users list only.
+    .filter((r) => !(r.id in mockOtherRunOwners))
+    .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
+    .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
+    .map((r) => runListItem(harnessOverlay(r)));
+  return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
+}
+
+function mockAdminListRuns(params: { view: "summary" }): Promise<{ runs: RunSummaryItem[] }>;
+function mockAdminListRuns(): Promise<{ runs: RunListItem[] }>;
+function mockAdminListRuns(params?: {
+  view?: "summary";
+}): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
+  const items = listRunsFor()
+    .filter((r) => r.kind !== "chat")
+    .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
+    // Owner attribution: the mock's owner column is mockOtherRunOwners; every
+    // other run belongs to the session admin. Before this map existed, EVERY
+    // row here was stamped with the session email — the demo factory list was
+    // 100% "mine", the exact duplication amendment 2 removes.
+    .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email));
+  return delay({ runs: params?.view === "summary" ? items.map(toSummary) : items });
+}
+
 export const runsApi = {
   // ── Runs ────────────────────────────────────────────────────────────────────
   // Runs-in-progress count for the Runs nav badge (PRD #239). Counted LIVE from the
@@ -362,6 +427,9 @@ export const runsApi = {
       codex_secret_label: null,
       recovery_retry_not_before: null,
       forge_park_count: 0,
+      provider_park_count: 0,
+      provider_park_streak_started_at: null,
+      can_stop_at_provider_hold: false,
       forge_park_max: 0,
       // PRD #1247 M7: stamp the read-side override the caller chose (null = inherit).
       credential_override: credentialOverride ? overrideToRead(credentialOverride) : null,
@@ -449,6 +517,9 @@ export const runsApi = {
       codex_secret_label: null,
       recovery_retry_not_before: null,
       forge_park_count: 0,
+      provider_park_count: 0,
+      provider_park_streak_started_at: null,
+      can_stop_at_provider_hold: false,
       forge_park_max: 0,
       claimed_at: null,
       started_at: null,
@@ -462,34 +533,15 @@ export const runsApi = {
     startNewRun(run.id);
     return delay({ run: { ...run } }, 350);
   },
-  listRuns: async (params?: {
-    repoId?: string;
-    issueIid?: number;
-    // Mirrors the real client's passive-poll flag (#331); the mock does no real
-    // fetch, so the marker has no effect here beyond keeping the types compatible.
-    passive?: boolean;
-  }) =>
-    delay({
-      runs: listRunsFor()
-        // Chat conversations ride runs but have their own page (PRD #39), and judge
-        // is a repo-less meta-run — both are excluded here exactly as the real
-        // ListRunsForUser excludes them (`kind NOT IN ('chat','judge')`, PRD #239 D4).
-        .filter((r) => r.kind !== "chat" && r.kind !== "judge")
-        // Caller-scoped, like the real ListRunsForUser: other demo users' runs
-        // (mockOtherRunOwners) belong to the admin all-users list only.
-        .filter((r) => !(r.id in mockOtherRunOwners))
-        .filter((r) => (params?.repoId ? r.repo_id === params.repoId : true))
-        .filter((r) => (params?.issueIid != null ? r.issue_iid === params.issueIid : true))
-        .map((r) => runListItem(harnessOverlay(r))),
-    }),
+  listRuns: mockListRuns,
   // PRD #40: token/cost usage. Static demo figures — enough to populate the
   // dashboard's "Your usage" and (admin) factory cards + per-user table.
   getUsage: async () =>
     delay<SelfUsage>({
       // PRD #1429 M1 (D7): aggregate cost status stays empty; the explicit counts carry
       // subscription/unreported truth for each window.
-      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "" as const },
-      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 4.55, cost_status: "" as const },
+      lifetime: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "" as const },
+      last_7_days: { input_tokens: 280_000, cache_read_tokens: 2_800_000, cache_creation_tokens: 40_000, output_tokens: 120_000, cost_usd: 5.16, cost_status: "" as const },
       run_count: 23,
       // PRD #1293 failed-run outcomes. Internally consistent: finished === completed +
       // cancelled + plan_rejected + failed, and sum(fail_origins) === failed. finished is a
@@ -507,17 +559,18 @@ export const runsApi = {
           last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 1 },
         },
       },
-      // Mixed billing: eight lifetime subscription runs, two in the last week.
+      // Eight legacy rows (two recent) lack estimates. One mixed unreported run
+      // contributes its recorded $0.61 partial to both windows, matching u-vlad.
       lifetime_subscription_run_count: 8,
-      lifetime_unreported_run_count: 0,
+      lifetime_unreported_run_count: 1,
       last7_subscription_run_count: 2,
-      last7_unreported_run_count: 0,
+      last7_unreported_run_count: 1,
     }),
   getAdminUsage: async () =>
     delay<AdminUsage>({
       factory: {
-        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.15, cost_status: "" as const },
-        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 14.9, cost_status: "" as const },
+        lifetime: { input_tokens: 5_400_000, cache_read_tokens: 53_900_000, cache_creation_tokens: 900_000, output_tokens: 2_400_000, cost_usd: 88.76, cost_status: "" as const },
+        last_7_days: { input_tokens: 900_000, cache_read_tokens: 9_100_000, cache_creation_tokens: 120_000, output_tokens: 410_000, cost_usd: 15.51, cost_status: "" as const },
         run_count: 79,
         // Factory lifetime outcomes are the sum of the four per-user rows below (finished 38 +
         // 30 + 21 + 8 = 97, failed 5 + 5 + 2 + 0 = 12, needs_landing 1 + 2 + 0 + 0 = 3); the
@@ -532,11 +585,11 @@ export const runsApi = {
             last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null, fail_origins: { agent_failure: 2, run_timeout: 1 },
           },
         },
-        // Lifetime = 12 + 8 across the two mixed-billing users; last week = 3 + 2.
+        // Lifetime = 12 + 8 across the two users with legacy rows; last week = 3 + 2.
         lifetime_subscription_run_count: 20,
-        lifetime_unreported_run_count: 0,
+        lifetime_unreported_run_count: 1,
         last7_subscription_run_count: 5,
-        last7_unreported_run_count: 0,
+        last7_unreported_run_count: 1,
       },
       users: [
         {
@@ -548,11 +601,11 @@ export const runsApi = {
           last7_outcomes: { finished: 9, completed: 7, cancelled: 0, plan_rejected: 1, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
-          user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 26.4, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 0,
-          last_7_days: { input_tokens: 280000, cache_read_tokens: 2800000, cache_creation_tokens: 40000, output_tokens: 120000, cost_usd: 4.55, cost_status: "" as const },
+          user_id: "u-vlad", email: "vlad@example.com", usage: { input_tokens: 1_610_000, cache_read_tokens: 16_100_000, cache_creation_tokens: 240_000, output_tokens: 710_000, cost_usd: 27.01, cost_status: "metered" as const }, run_count: 23, outcomes: { finished: 30, completed: 22, cancelled: 2, plan_rejected: 1, failed: 5, needs_landing: 2, ...demoLinkedFailure, fail_origins: { agent_failure: 1, run_timeout: 1, workflow_scope_missing: 1, push_secret_blocked: 1, unknown: 1 } }, subscription_run_count: 8, unreported_run_count: 1,
+          last_7_days: { input_tokens: 280000, cache_read_tokens: 2800000, cache_creation_tokens: 40000, output_tokens: 120000, cost_usd: 5.16, cost_status: "" as const },
           last7_run_count: 6,
           last7_subscription_run_count: 2,
-          last7_unreported_run_count: 0,
+          last7_unreported_run_count: 1,
           last7_outcomes: { finished: 8, completed: 6, cancelled: 1, plan_rejected: 0, failed: 1, needs_landing: 0, fail_origins: {"agent_failure": 1}, last_failed_at: null, last_failed_run_id: null, last_failed_origin: null, last_failed_user_id: null, completed_since_last_failure: null },
         },
         {
@@ -622,7 +675,8 @@ export const runsApi = {
     // (a no-op for the default/unknown scenario, and for a run switched this session).
     // PRD #1429 M4a: layered with the harness overlay, so a "codex-only" run also
     // reads harness=codex on the detail page.
-    return delay({ run: { ...harnessOverlay(credentialOverlay(run)), own_agents } }, 60);
+    const decorated = harnessOverlay(credentialOverlay(run));
+    return delay({ run: { ...decorated, usage: runListItem(decorated).usage, own_agents } }, 60);
   },
   // PRD #35: flip this run's usage-limit opt-in. Mirrors the server's guard — the
   // same NEGATIVE predicate the cancel path uses — so a terminal run is refused and
@@ -875,7 +929,11 @@ export const runsApi = {
     if (!run) throw new ApiError(404, "run not found");
     if (run.status !== "paused" && run.status !== "pool_wait")
       throw new ApiError(409, `run is ${run.status}`);
-    patchRun(id, { status: "queued", updated_at: new Date().toISOString() });
+    patchRun(id, { status: "queued", updated_at: new Date().toISOString(),
+      ...(run.hold_reason === "provider_unavailable" ? {
+        provider_park_count: 0, provider_park_streak_started_at: null, can_stop_at_provider_hold: false,
+      } : {}),
+    });
     return delay({ run: { ...getRun(id)! } }, 80);
   },
 
@@ -969,6 +1027,29 @@ export const runsApi = {
       60,
     );
   },
+  // Issue #2545: one acknowledged held-work publication for the failed mock run
+  // run-workflow-scope; every other run has none.
+  getRunHeldPublications: async (id: string) => {
+    const r = getRun(id);
+    if (!r) throw new ApiError(404, "run not found");
+    const publications =
+      id === "run-workflow-scope" && r.status === "failed"
+        ? [
+            {
+              id: "pub-mock-1",
+              run_id: id,
+              generation: 1,
+              ref: `refs/uzi-held/${id}/1`,
+              tip: "7c1d90ab34e25f68a1b3c4d5e6f708192a3b4c5d",
+              state: "acknowledged",
+              created_at: new Date(Date.now() - 3_600_000).toISOString(),
+              acknowledged_at: new Date(Date.now() - 3_000_000).toISOString(),
+              expires_at: new Date(Date.now() + 6 * 86_400_000).toISOString(),
+            },
+          ]
+        : [];
+    return delay({ publications }, 80);
+  },
   // PRD #1349 M6 (D7/D8): the owner-wide custody hold listing + aggregate the board alert and
   // the Workers resolution surface read. Rich under ?mock=custody; empty otherwise so the
   // alert self-hides and the other demos stay clean.
@@ -1036,18 +1117,8 @@ export const runsApi = {
     if (kind === "approve_plan" && overrideCapabilities) {
       patchRun(id, { required_capabilities: [] });
     }
-    return delay({ server_side: false }, 150);
+    return delay({ server_side: kind === "scope" }, 150);
   },
 
-  adminListRuns: async () =>
-    delay({
-      runs: listRunsFor()
-        .filter((r) => r.kind !== "chat")
-        .filter((r) => !["completed", "failed", "cancelled"].includes(r.status))
-        // Owner attribution: the mock's owner column is mockOtherRunOwners; every
-        // other run belongs to the session admin. Before this map existed, EVERY
-        // row here was stamped with the session email — the demo factory list was
-        // 100% "mine", the exact duplication amendment 2 removes.
-        .map((r) => runListItem(r, mockOtherRunOwners[r.id] ?? requireSession().email)),
-    }),
+  adminListRuns: mockAdminListRuns,
 };

@@ -17,7 +17,7 @@ test("pinned cold resume token characterization", { timeout: 90_000, skip: P_LAY
   const mods = { ...await loadPackagedTransport(), ...await loadPackagedAppServerAuth() };
   const config = await loadPackagedConfig();
   const bin = resolveCodexBin().codexBin;
-  assertBinaryVersion(bin, "0.159.3");
+  assertBinaryVersion(bin, "0.160.0");
   const scratch = path.resolve(process.cwd(), "../.uzi/scratch");
   mkdirSync(scratch, { recursive: true });
   const base = mkdtempSync(path.join(scratch, "token-resume-"));
@@ -144,7 +144,7 @@ test("pinned cold resume token characterization", { timeout: 90_000, skip: P_LAY
       assert.equal(firstNew.params.tokenUsage.total[key] - firstNew.params.tokenUsage.last[key], resumed[replayIndex].params.tokenUsage.total[key]);
     assert.equal(provider.requests.length - 4, 0, "no provider recomputation observed");
     writeFileSync(evidence, JSON.stringify({
-      version: "0.159.3", metadata, requests: 4, recomputationRequests: 0,
+      version: "0.160.0", metadata, requests: 4, recomputationRequests: 0,
       legacyModeProved: false, legacyRecoveryProved: false,
       ordering: { responseIndex, replayIndex, startIndex },
       usage: usage.map(entry => entry.note.kind === "token_usage_updated" ? { phase: entry.phase, total: entry.note.usage.total, last: entry.note.usage.last } : {}),

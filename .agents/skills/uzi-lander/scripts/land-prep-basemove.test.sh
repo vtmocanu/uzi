@@ -36,6 +36,7 @@
 #   R3. ...including a deleted line that starts with `-- `, whose diff line `--- ...` must not
 #      be mistaken for a file header.
 set -eu
+export NET_RETRY_BASE_SLEEP=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/land-prep.sh"

@@ -6,7 +6,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
 import { Card, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
-import { runBadge } from "../lib/runBadge";
+import { effectiveRunStatus, runBadge } from "../lib/runBadge";
 import type { LatestRun, RunStatus } from "../lib/api";
 
 // A LatestRun carrying nothing but the status under test: no mr_iid (so `completed`
@@ -68,6 +68,51 @@ describe("StatusPill", () => {
     expect(pill.className).toContain("text-plan");
     // It pulses like running — it IS live work, just pre-approval.
     expect(pill.querySelector(".animate-pulse")).not.toBeNull();
+  });
+
+  it.each([
+    {
+      name: "provider owner hold",
+      run: { status: "paused", hold_reason: "provider_unavailable" },
+      label: "provider unavailable: owner hold", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "provider outage retry",
+      run: { status: "recovery_wait", recovery_wait_cause: "provider_outage" },
+      label: "waiting for provider", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "ordinary owner pause",
+      run: { status: "paused" },
+      label: "‖ paused", tone: "text-info", pulse: false,
+    },
+    {
+      name: "generic recovery",
+      run: { status: "recovery_wait" },
+      label: "recovery wait", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "disabled credential",
+      run: { status: "paused", hold_reason: "credential_disabled" },
+      label: "waiting: credential disabled", tone: "text-warn", pulse: false,
+    },
+    {
+      name: "live running",
+      run: { status: "running" },
+      label: "running", tone: "text-info", pulse: true,
+    },
+    {
+      name: "unknown status",
+      run: { status: "future_status" },
+      label: "future status", tone: "text-neutral-fg", pulse: false,
+    },
+  ])("renders $name with its label, tone and activity", ({ run, label, tone, pulse }) => {
+    // Dashboard and RunsList pass this same effective status to the shared pill.
+    const { container } = render(<StatusPill status={effectiveRunStatus(run)} />);
+    const pill = container.firstElementChild as HTMLElement;
+    expect(pill.textContent).toBe(label);
+    expect(pill.className).toContain(tone);
+    expect(pill.querySelector(".animate-pulse") !== null).toBe(pulse);
   });
 
   it("still falls back to neutral for a genuinely unknown status", () => {

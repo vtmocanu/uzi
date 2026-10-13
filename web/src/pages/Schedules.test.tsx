@@ -19,6 +19,7 @@ vi.mock("../lib/api", async (importOriginal) => {
     ...actual,
     api: {
       listSchedules: vi.fn(),
+      getRun: vi.fn(),
       listScheduleCatalog: vi.fn(),
       listRepos: vi.fn(),
       updateSchedule: vi.fn(),
@@ -122,6 +123,8 @@ function sched(over: Partial<Schedule>): Schedule {
 }
 
 beforeEach(() => {
+  // Current run reads are separate from the fire snapshot; refusal leaves it intact.
+  mockApi.getRun.mockRejectedValue(new Error("current state unavailable"));
   mockApi.listSchedules.mockResolvedValue([
     sched({ id: "s1", target: "sweep", enabled: true }),
     sched({ id: "s2", target: "prompt", prompt: "hunt flaky tests", enabled: false, cron_expr: "0 9 * * 1" }),

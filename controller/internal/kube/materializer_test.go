@@ -18,6 +18,7 @@ import (
 	"k8s.io/apimachinery/pkg/api/resource"
 	metav1 "k8s.io/apimachinery/pkg/apis/meta/v1"
 	"k8s.io/apimachinery/pkg/runtime"
+	"k8s.io/apimachinery/pkg/types"
 	"k8s.io/client-go/kubernetes/fake"
 	k8stesting "k8s.io/client-go/testing"
 
@@ -27,12 +28,33 @@ import (
 
 func newMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
-	client := fake.NewSimpleClientset(objs...)
+	client := enforcingClient(t, objs...)
 	m := New(client, testConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
 
 func token(s string) *string { return &s }
+
+// newWorkerFixture explicitly represents API-confirmed first provisioning.
+func newWorkerFixture(w protocol.DesiredWorker) protocol.DesiredWorker {
+	yes := true
+	w.RollEvidence = &protocol.RollEvidence{NeverRegistered: &yes}
+	return w
+}
+
+// retainedReplacementFixture carries the reservation left by an admitted replacement
+// on /data. It is not first-provision history for a previously registered worker.
+func retainedReplacementFixture(t *testing.T, client *fake.Clientset, w protocol.DesiredWorker) {
+	t.Helper()
+	p, err := client.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVCName(w.ID), metav1.GetOptions{})
+	if err != nil {
+		t.Fatal(err)
+	}
+	p.Annotations = markedDeployment(t, testConfig(), w, false).Annotations
+	if _, err := client.CoreV1().PersistentVolumeClaims(p.Namespace).Update(context.Background(), p, metav1.UpdateOptions{}); err != nil {
+		t.Fatal(err)
+	}
+}
 
 // assertNoSecretReads is THE gate on Decision 1's load-bearing line: the controller
 // holds create/delete on Secrets and nothing more, because k8s has no
@@ -69,7 +91,7 @@ func secretVerbs(client *fake.Clientset) []string {
 
 func TestReconcileCreatesTheWholeObjectSetForANewWorker(t *testing.T) {
 	m, client := newMat(t)
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")}
+	w := newWorkerFixture(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")})
 
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -112,7 +134,7 @@ func TestUnknownNamesSkipRenderingAndNEVERTearDownTheirObjects(t *testing.T) {
 			m, client := newMat(t, existing, pvcFor("w1", "data"), pvcFor("w1", "nix"))
 
 			skewed := protocol.DesiredWorker{ID: "w1", Template: tc.template, Size: tc.size}
-			healthy := protocol.DesiredWorker{ID: "w2", Template: "base", Size: "m", JoinToken: token("uzw_t")}
+			healthy := newWorkerFixture(protocol.DesiredWorker{ID: "w2", Template: "base", Size: "m", JoinToken: token("uzw_t")})
 			observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, SpecHash: "some-hash", HasDataPVC: true, HasNixPVC: true}}
 
 			// It must not crash the loop: one unknown name must never stall the fleet.
@@ -151,7 +173,7 @@ func TestUnknownNamesSkipRenderingAndNEVERTearDownTheirObjects(t *testing.T) {
 // only the first is the contract.
 func TestANullJoinTokenTouchesTheSecretNotAtAll(t *testing.T) {
 	m, client := newMat(t)
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: nil}
+	w := newWorkerFixture(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: nil})
 
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -173,7 +195,7 @@ func TestANullJoinTokenTouchesTheSecretNotAtAll(t *testing.T) {
 // as success. That is the whole of it.
 func TestASecondReconcileTreatsAlreadyExistsAsSuccess(t *testing.T) {
 	m, client := newMat(t)
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")}
+	w := newWorkerFixture(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", JoinToken: token("uzw_secret")})
 
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil); err != nil {
 		t.Fatalf("first Reconcile: %v", err)
@@ -352,7 +374,7 @@ func TestAGenerationChangeRollsTheDeploymentAndReadsNoSecret(t *testing.T) {
 	observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 1, SpecHash: currentHash(t, "w1", 1)}}
 
 	rotated := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 2}
-	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{rotated}, observed); err != nil {
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{evidence(rotated, m.now())}, observed); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	patch := findPatch(t, client)
@@ -363,14 +385,14 @@ func TestAGenerationChangeRollsTheDeploymentAndReadsNoSecret(t *testing.T) {
 }
 
 // Drift source 2: the spec hash. This is the one a generation can never catch — a
-// new release changes the agent image tag, which the controller resolves from its
+// deliberate worker image-tag change is resolved by the controller from its
 // OWN config, so the generation does not move.
 func TestASpecHashChangeRollsTheDeploymentAndReadsNoSecret(t *testing.T) {
 	m, client := newMat(t, deployedWorker("w1", 0, "the-old-releases-hash"))
 	observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: "the-old-releases-hash"}}
 
 	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0}
-	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, observed); err != nil {
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{evidence(w, m.now())}, observed); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	patch := findPatch(t, client)
@@ -389,7 +411,7 @@ func TestDriftPatchCarriesRevisionHistoryLimit(t *testing.T) {
 	observed := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: "the-old-releases-hash"}}
 
 	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0}
-	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, observed); err != nil {
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{evidence(w, m.now())}, observed); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
 	patch := findPatch(t, client)
@@ -462,7 +484,7 @@ func TestNoSecretReadAcrossAFullFleetReconcile(t *testing.T) {
 
 func newDockerMat(t *testing.T, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
-	client := fake.NewSimpleClientset(objs...)
+	client := enforcingClient(t, objs...)
 	m := New(client, dockerTestConfig(), testResolver(t), nil, DrainPolicy{}, RecyclePolicy{Enabled: true}, slog.New(slog.NewTextHandler(io.Discard, nil)))
 	return m, client
 }
@@ -501,7 +523,7 @@ func TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation(t *testin
 
 	// Fresh docker worker: all three claims created.
 	m, client := newDockerMat(t)
-	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+	dock := newWorkerFixture(protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")})
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{dock}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -514,7 +536,7 @@ func TestDinDDataPVCIsCreatedForDockerWorkersOnlyAndGatedOnObservation(t *testin
 
 	// Fresh PLAIN worker on the same (docker-capable) controller: two claims, no third.
 	m, client = newDockerMat(t)
-	plain := protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")}
+	plain := newWorkerFixture(protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")})
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{plain}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -619,8 +641,8 @@ func pvcForNS(id, kind, ns string) *corev1.PersistentVolumeClaim {
 func TestReconcilePlacesDockerAndPlainWorkersInSeparateNamespaces(t *testing.T) {
 	m, client := newDockerMat(t)
 	ctx := context.Background()
-	plain := protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")}
-	dock := protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")}
+	plain := newWorkerFixture(protocol.DesiredWorker{ID: "p1", Template: "base", Size: "m", JoinToken: token("uzw_p")})
+	dock := newWorkerFixture(protocol.DesiredWorker{ID: "d1", Template: "base", Size: "m", Docker: true, JoinToken: token("uzw_d")})
 
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{plain, dock}, nil); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -746,7 +768,7 @@ func TestDockerWorkerSkippedWhenDockerNamespaceUnconfigured(t *testing.T) {
 func findPatch(t *testing.T, client *fake.Clientset) string {
 	t.Helper()
 	for _, a := range client.Actions() {
-		if p, ok := a.(k8stesting.PatchAction); ok {
+		if p, ok := a.(k8stesting.PatchAction); ok && strings.Contains(string(p.GetPatch()), "\"spec\"") {
 			return string(p.GetPatch())
 		}
 	}
@@ -769,6 +791,7 @@ func currentHash(t *testing.T, id string, generation int64) string {
 func deployedWorker(id string, generation int64, hash string) *appsv1.Deployment {
 	return &appsv1.Deployment{
 		ObjectMeta: metav1.ObjectMeta{
+			UID: types.UID("uid-" + deploymentName(id)), ResourceVersion: "1",
 			Name:      deploymentName(id),
 			Namespace: testConfig().Namespace,
 			Labels:    objectLabels(id),
@@ -871,10 +894,11 @@ func keysOf(m map[string]bool) []string {
 // ClearDrain (uncordon), and can force either write to fail, so a test can prove
 // the fail-safe defer path and the no-drift uncordon-and-retry path.
 type fakeCordoner struct {
-	calls      []string
-	err        error
-	clearCalls []string
-	clearErr   error
+	confirmWorkers map[string]protocol.DesiredWorker
+	calls          []string
+	err            error
+	clearCalls     []string
+	clearErr       error
 }
 
 func (f *fakeCordoner) RequestDrain(_ context.Context, workerID string) error {
@@ -909,7 +933,7 @@ func newMatWithDrain(t *testing.T, c Cordoner, drain DrainPolicy, objs ...runtim
 // comparison (now - CreationTimestamp < Cooldown) is deterministic.
 func newMatWithRecycle(t *testing.T, c Cordoner, drain DrainPolicy, recycle RecyclePolicy, logw io.Writer, objs ...runtime.Object) (*Materializer, *fake.Clientset) {
 	t.Helper()
-	client := fake.NewSimpleClientset(objs...)
+	client := enforcingClient(t, objs...)
 	m := New(client, testConfig(), testResolver(t), c, drain, recycle, slog.New(slog.NewTextHandler(logw, nil)))
 	m.now = func() time.Time { return m5Now }
 	return m, client
@@ -930,14 +954,7 @@ func recentDrain() *time.Time { t := m5Now.Add(-time.Minute); return &t }
 
 // wasPatched reports whether any Deployment patch reached the fake apiserver — the
 // observable proof of a roll, and its absence the proof of a defer.
-func wasPatched(client *fake.Clientset) bool {
-	for _, a := range client.Actions() {
-		if a.GetVerb() == "patch" {
-			return true
-		}
-	}
-	return false
-}
+func wasPatched(client *fake.Clientset) bool { return len(templatePatches(client)) > 0 }
 
 // driftedWorker sets up a worker whose deployed spec hash no longer matches what the
 // renderer would stamp, so it has drifted. Busy and drainingSince (nil == not draining)
@@ -945,8 +962,11 @@ func wasPatched(client *fake.Clientset) bool {
 func driftedWorker(t *testing.T, busy bool, drainingSince *time.Time) (protocol.DesiredWorker, []reconcile.ObservedWorker, *appsv1.Deployment) {
 	t.Helper()
 	dep := deployedWorker("w1", 0, "the-old-releases-hash")
-	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: "the-old-releases-hash"}}
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: busy, DrainingSince: drainingSince}
+	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, DeploymentUID: string(dep.UID), DeploymentResourceVersion: dep.ResourceVersion, Generation: 0, SpecHash: "the-old-releases-hash"}}
+	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: busy, DrainingSince: drainingSince}, m5Now)
+	if drainingSince != nil {
+		w.DrainingReason = token("image_roll")
+	}
 	return w, obs, dep
 }
 
@@ -1043,8 +1063,8 @@ func TestDriftBusyCordonErrorStillDefers(t *testing.T) {
 	c := &fakeCordoner{err: errors.New("api unreachable")}
 	w, obs, dep := driftedWorker(t, true, nil)
 	m, client := newMatWithCordoner(t, c, dep)
-	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
-		t.Fatalf("Reconcile: %v", err)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err == nil {
+		t.Fatal("unconfirmed roll-owned cordon must require a new poll")
 	}
 	if len(c.calls) != 1 {
 		t.Fatalf("RequestDrain calls = %v, want exactly one attempt", c.calls)
@@ -1101,7 +1121,9 @@ func TestNoDriftDrainingClearsCordon(t *testing.T) {
 	dep := deployedWorker("w1", 0, hash)
 	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
 	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true, DrainingSince: recentDrain()}
-	m, client := newMatWithCordoner(t, c, dep)
+	w = evidence(w, m5Now)
+	w.DrainingReason = token("image_roll")
+	m, client := newMatWithCordoner(t, c, physicalOld(t, dep)...)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -1139,16 +1161,18 @@ func TestNoDriftNotDrainingDoesNotClear(t *testing.T) {
 
 // no drift + draining + ClearDrain fails ⇒ Reconcile still returns nil (self-heal:
 // the condition persists and the next tick retries), no patch, and the clear was
-// attempted once. A failed uncordon must NOT inject a spurious per-tick joined error.
+// attempted once. An unknown release outcome requests a fresh poll and observation.
 func TestNoDriftDrainingClearErrorSelfHeals(t *testing.T) {
 	c := &fakeCordoner{clearErr: errors.New("api unreachable")}
 	hash := currentHash(t, "w1", 0)
 	dep := deployedWorker("w1", 0, hash)
 	obs := []reconcile.ObservedWorker{{ID: "w1", HasDeployment: true, Generation: 0, SpecHash: hash}}
 	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, Busy: true, DrainingSince: recentDrain()}
-	m, client := newMatWithCordoner(t, c, dep)
-	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
-		t.Fatalf("Reconcile returned %v; a failed uncordon must self-heal (return nil) not error", err)
+	w = evidence(w, m5Now)
+	w.DrainingReason = token("image_roll")
+	m, client := newMatWithCordoner(t, c, physicalOld(t, dep)...)
+	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err == nil {
+		t.Fatal("an unconfirmed release must require a fresh observation and poll")
 	}
 	if len(c.clearCalls) != 1 || c.clearCalls[0] != "w1" {
 		t.Fatalf("ClearDrain calls = %v, want exactly one attempt on [w1]", c.clearCalls)
@@ -1185,6 +1209,7 @@ func TestDriftBusyDeadlineExceededRolls(t *testing.T) {
 	c := &fakeCordoner{}
 	since := m5Now.Add(-2 * time.Hour) // draining for 2h ...
 	w, obs, dep := driftedWorker(t, true, &since)
+	c.confirmWorkers = map[string]protocol.DesiredWorker{w.ID: w}
 	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: time.Hour}, dep) // ... against a 1h deadline
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1192,8 +1217,8 @@ func TestDriftBusyDeadlineExceededRolls(t *testing.T) {
 	if !wasPatched(client) {
 		t.Fatal("a busy worker past its drain deadline was not rolled; the deadline must force the roll")
 	}
-	if len(c.calls) != 0 {
-		t.Fatalf("RequestDrain calls = %v, want none (already draining; no re-cordon on the deadline roll)", c.calls)
+	if len(c.calls) != 1 || c.calls[0] != "w1" {
+		t.Fatalf("RequestDrain calls = %v, want one provenance cordon confirmation before deadline destruction", c.calls)
 	}
 }
 
@@ -1207,6 +1232,7 @@ func TestDriftBusyDeadlineExactlyReachedRolls(t *testing.T) {
 	deadline := time.Hour
 	since := m5Now.Add(-deadline) // now - since == Deadline, exactly
 	w, obs, dep := driftedWorker(t, true, &since)
+	c.confirmWorkers = map[string]protocol.DesiredWorker{w.ID: w}
 	m, client := newMatWithDrain(t, c, DrainPolicy{Deadline: deadline}, dep)
 	if err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, obs); err != nil {
 		t.Fatalf("Reconcile: %v", err)
@@ -1215,8 +1241,8 @@ func TestDriftBusyDeadlineExactlyReachedRolls(t *testing.T) {
 		t.Fatal("a busy worker exactly AT its drain deadline was not rolled; the boundary is >= " +
 			"(now - draining_since >= Deadline), so the deadline must force the roll at equality")
 	}
-	if len(c.calls) != 0 {
-		t.Fatalf("RequestDrain calls = %v, want none (already draining; no re-cordon on the deadline roll)", c.calls)
+	if len(c.calls) != 1 || c.calls[0] != "w1" {
+		t.Fatalf("RequestDrain calls = %v, want one provenance cordon confirmation before deadline destruction", c.calls)
 	}
 }
 
@@ -1356,6 +1382,8 @@ func TestNixSizeDriftRecyclesThenReMintsAtNewSize(t *testing.T) {
 		t.Fatalf("after the recycle, observed = %+v; want {HasDeployment:false HasNixPVC:false NixPVCSize:nil HasDataPVC:true}", o)
 	}
 
+	w = evidence(w, time.Now())
+	retainedReplacementFixture(t, client, w)
 	client.ClearActions()
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
 		t.Fatalf("tick 2 Reconcile: %v", err)
@@ -1486,6 +1514,9 @@ func TestNixLiveAtDesiredSizeWithoutDeploymentRecreatesDeployment(t *testing.T) 
 	}
 
 	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, JoinToken: nil}
+	w = evidence(w, time.Now())
+	retainedReplacementFixture(t, client, w)
+	client.ClearActions()
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
 		t.Fatalf("Reconcile: %v", err)
 	}
@@ -1548,23 +1579,25 @@ func TestNixSizeDriftBusyWorkerIsCordonedNotRecycled(t *testing.T) {
 func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	ctx := context.Background()
 	ns := testConfig().Namespace
-	hash := currentHash(t, "w1", 0)
+	w := evidence(protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", DiskPressure: true}, time.Now())
+	dep := markedDeployment(t, testConfig(), w, false)
+	zero := int32(0)
+	dep.Spec.Replicas = &zero
 	m, client := newMatWithRecycle(t, &fakeCordoner{}, DrainPolicy{Deadline: 24 * time.Hour},
 		RecyclePolicy{Enabled: true, Cooldown: time.Hour}, io.Discard,
-		deployedWorker("w1", 0, hash), pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
+		dep, pvcNix("w1", "20Gi"), pvcFor("w1", "data"))
 
 	observed, err := m.Observe(ctx)
 	if err != nil {
 		t.Fatalf("Observe: %v", err)
 	}
 	// Idle worker reporting disk pressure; the pod holds its token, so join_token is nil.
-	w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: true, JoinToken: nil}
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
 		t.Fatalf("tick 1 Reconcile: %v", err)
 	}
 	del := deletedSet(client)
-	if !del["deployments/uzi-hw-w1"] {
-		t.Errorf("tick 1 must delete the Deployment for the disk-pressure recycle; got %v", keysOf(del))
+	if del["deployments/uzi-hw-w1"] {
+		t.Error("tick 1 must retain replacement metadata at zero replicas")
 	}
 	if !del["persistentvolumeclaims/uzi-hw-w1-nix"] {
 		t.Errorf("tick 1 must delete the nix PVC; got %v", keysOf(del))
@@ -1584,7 +1617,7 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	}
 	assertNoSecretReads(t, client)
 
-	// --- Tick 2: re-mint. Re-Observe the fake (Deployment + both PVCs now gone). The
+	// --- Tick 2: re-mint. Both PVCs are gone; replacement metadata remains. The
 	// worker is no longer under pressure — once its pod is torn down it stops reporting a
 	// disk metric, so the api's stale pressure signal clears, which is what lets the
 	// reprovision proceed (the disk-pressure arm is gated on DiskPressure). ---
@@ -1592,14 +1625,14 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	if err != nil {
 		t.Fatalf("re-Observe between ticks: %v", err)
 	}
-	// Deployment + BOTH PVCs gone, and the Secret is never observed — so NOTHING remains
-	// stamped for this worker. It reprovisions off the DESIRED set (Reconcile iterates
-	// desired, not observed), the whole point of the recycle being a full re-mint.
-	if len(observed2) != 0 {
-		t.Fatalf("after recycling both volumes + the Deployment, observed = %+v; want nothing left for the worker", observed2)
+	// The admitted replacement retains its zero-replica Deployment. Both volumes
+	// must still be re-minted, and the delivered Secret must remain untouched.
+	if len(observed2) != 1 || !observed2[0].HasDeployment || observed2[0].HasDataPVC || observed2[0].HasNixPVC {
+		t.Fatalf("after recycling both volumes + the Deployment, observed = %+v; want retained Deployment only", observed2)
 	}
 	client.ClearActions()
-	w2 := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, DiskPressure: false, JoinToken: nil}
+	w2 := w
+	w2.DiskPressure = false
 	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w2}, observed2); err != nil {
 		t.Fatalf("tick 2 Reconcile: %v", err)
 	}
@@ -1608,8 +1641,17 @@ func TestDiskPressureRecyclesBothVolumes(t *testing.T) {
 	if !equalStrings(created, []string{"uzi-hw-w1-data", "uzi-hw-w1-nix"}) {
 		t.Fatalf("tick 2 pvc creates = %v, want BOTH re-minted [uzi-hw-w1-data uzi-hw-w1-nix]", created)
 	}
-	if got := createdDeploymentNames(client); !equalStrings(got, []string{"uzi-hw-w1"}) {
-		t.Errorf("tick 2 deployment creates = %v, want exactly [uzi-hw-w1]", got)
+	// Observe the re-minted volumes before restarting the retained Deployment.
+	observed3, err := m.Observe(ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	if err := m.Reconcile(ctx, []protocol.DesiredWorker{w2}, observed3); err != nil {
+		t.Fatal(err)
+	}
+	got, err := client.AppsV1().Deployments(ns).Get(ctx, deploymentName(w.ID), metav1.GetOptions{})
+	if err != nil || got.Spec.Replicas == nil || *got.Spec.Replicas != 1 {
+		t.Fatalf("observed volumes did not restart retained replacement: %v", err)
 	}
 	if _, err := client.AppsV1().Deployments(ns).Get(ctx, "uzi-hw-w1", metav1.GetOptions{}); err != nil {
 		t.Errorf("the Deployment must be recreated on tick 2: %v", err)
@@ -1633,7 +1675,7 @@ func TestDiskPressureRecycleOfADockerWorkerKeepsTheDinDDataPVC(t *testing.T) {
 	}
 	nix := pvcNix("d1", "20Gi")
 	nix.Namespace = ns
-	client := fake.NewSimpleClientset(
+	client := enforcingClient(t,
 		deployedWorkerNS("d1", ns, 0, SpecHashOf(cfg, w, spec)),
 		nix, pvcForNS("d1", "data", ns), pvcForNS("d1", "dind-data", ns),
 	)
@@ -1817,7 +1859,7 @@ func TestOrdinaryDriftRollPreservesDataAndCustodyDoesNotBlockThePodRoll(t *testi
 			t.Fatalf("Observe: %v", err)
 		}
 		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0, CustodyHeld: custody}
-		if err := m.Reconcile(ctx, []protocol.DesiredWorker{w}, observed); err != nil {
+		if err := m.Reconcile(ctx, []protocol.DesiredWorker{evidence(w, m.now())}, observed); err != nil {
 			t.Fatalf("Reconcile: %v", err)
 		}
 		return client
@@ -1872,6 +1914,8 @@ func TestElapsedDrainDeadlineDoesNotRecycleCustodyHeldData(t *testing.T) {
 		// BUSY + draining PAST the deadline ⇒ the busy-guard is overridden and the recycle runs.
 		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0,
 			Busy: true, DrainingSince: &elapsed, CustodyHeld: custody}
+		observed[0].DeploymentUID = "uid-" + deploymentName(w.ID)
+		observed[0].DeploymentResourceVersion = "1"
 		if err := m.recycleWorkerVolumes(ctx, w, observed[0], ns, recycleVolumes{Nix: true, Data: true}); err != nil {
 			t.Fatalf("recycleWorkerVolumes: %v", err)
 		}
@@ -1923,6 +1967,8 @@ func TestForceRollDoesNotDiscardCustodyHeldData(t *testing.T) {
 		// BUSY, never cordoned (DrainingSince nil): only ForceRoll overrides the busy-guard here.
 		w := protocol.DesiredWorker{ID: "w1", Template: "base", Size: "m", Generation: 0,
 			Busy: true, DrainingSince: nil, CustodyHeld: custody}
+		observed[0].DeploymentUID = "uid-" + deploymentName(w.ID)
+		observed[0].DeploymentResourceVersion = "1"
 		if err := m.recycleWorkerVolumes(ctx, w, observed[0], ns, recycleVolumes{Nix: true, Data: true}); err != nil {
 			t.Fatalf("recycleWorkerVolumes: %v", err)
 		}
@@ -2228,8 +2274,8 @@ func TestStrandedPVCReachesTheStatusReport(t *testing.T) {
 	if err := loop.Tick(ctx); err != nil {
 		t.Fatalf("Tick: %v", err)
 	}
-	if len(reporter.got) != 1 {
-		t.Fatalf("Report called %d times, want 1", len(reporter.got))
+	if len(reporter.got) != 1 || reporter.got[0].Kind != "fleet" {
+		t.Fatalf("expected one merged fleet report, got %+v", reporter.got)
 	}
 	var row *protocol.WorkerStatus
 	for i := range reporter.got[0].Workers {

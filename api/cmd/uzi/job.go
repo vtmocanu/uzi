@@ -8,6 +8,7 @@ package main
 // the raw DTO, which encoding/json already escapes.
 
 import (
+	"errors"
 	"fmt"
 	"io"
 	"os"
@@ -385,20 +386,34 @@ func readJobInputs(specs []string) ([]apitypes.V1JobInputDTO, error) {
 // hang the open itself; the fstat on the opened handle then refuses it.
 func readRegularFile(path, what string, max int64) (string, error) {
 	if fi, err := os.Stat(path); err != nil {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read %s: %v", what, err)
+		return "", regularFileReadError(path, what, err)
 	} else if !fi.Mode().IsRegular() {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "%s %q is not a regular file", what, path)
+		return "", notRegularFileError(path, what)
 	}
 	f, err := os.OpenFile(path, os.O_RDONLY|openNonblock, 0) //nolint:gosec // G304: the operator's own argument to their local CLI.
 	if err != nil {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "cannot read %s: %v", what, err)
+		return "", regularFileReadError(path, what, err)
 	}
 	defer func() { _ = f.Close() }()
 	// Re-check on the opened handle: a swap after the stat is caught here.
 	if fi, err := f.Stat(); err != nil || !fi.Mode().IsRegular() {
-		return "", uzicli.Exitf(uzicli.ExitUsage, "%s %q is not a regular file", what, path)
+		return "", notRegularFileError(path, what)
 	}
 	return readBoundedText(f, what, max)
+}
+
+// regularFileReadError puts the cause before the path so the CLI's bounded error line
+// keeps the reason for a long path.
+func regularFileReadError(path, what string, err error) error {
+	var pe *os.PathError
+	if errors.As(err, &pe) {
+		err = pe.Err
+	}
+	return uzicli.Exitf(uzicli.ExitUsage, "cannot read %s: %v: %q", what, err, cellText(path))
+}
+
+func notRegularFileError(path, what string) error {
+	return uzicli.Exitf(uzicli.ExitUsage, "%s is not a regular file: %q", what, cellText(path))
 }
 
 // readBoundedText reads at most max bytes; more is a usage error, never a silent truncation.

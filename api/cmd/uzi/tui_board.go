@@ -8,6 +8,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -163,7 +164,7 @@ func (b *boardState) visible() []apitypes.RunListItemDTO {
 
 // The three triage bands, in fixed top-to-bottom order.
 const (
-	bandNeedsYou = iota // awaiting_approval + awaiting_input + awaiting_followup + a Codex relogin_required hold + a credential_disabled hold — the only rows a human must act on
+	bandNeedsYou = iota // owner-action states and typed holds requiring a human decision
 	bandFloor           // everything non-terminal not in NEEDS YOU (running/claimed/queued/planning/limit_wait/pool_wait/recovery_wait, stalled)
 	bandDone            // terminal: completed/failed/cancelled
 	numBands
@@ -197,10 +198,11 @@ func runBand(status string, isRevising bool) int {
 // alone: a run held on its Codex account that needs the owner to re-log in (PRD #1590
 // relogin_required) is the owner's turn, so it bands into NEEDS YOU. Every other Codex hold
 // action resolves without the owner and stays ON THE FLOOR. A run held on credential_disabled
-// (PRD #1732 D14) resumes only on the owner's Enable or token switch, so it is NEEDS YOU too. Every band decision on the board
+// (PRD #1732 D14) resumes only on the owner's Enable or token switch. Provider unavailable
+// holds also require the owner to Resume, Stop or Cancel. Both are NEEDS YOU. Every band decision on the board
 // (the ordering, the eyebrow counts, the row's title ink) goes through here so they agree.
 func runBandOf(r apitypes.RunListItemDTO) int {
-	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isWorkerRecoveryExhausted(r.RunDTO) {
+	if codexReloginHold(r.RunDTO) || isCredentialDisabledHold(r.RunDTO) || isWorkerRecoveryExhausted(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
 		return bandNeedsYou
 	}
 	return runBand(r.Status, r.IsRevising)
@@ -209,6 +211,12 @@ func runBandOf(r apitypes.RunListItemDTO) int {
 // runStateWord is the human status word the board row draws for r (runStateToken's word),
 // which the `/` filter matches alongside the effective status.
 func runStateWord(r apitypes.RunListItemDTO) string {
+	if isProviderUnavailableHold(r.RunDTO) {
+		return providerHoldWord
+	}
+	if providerParkLine(r.RunDTO) != "" {
+		return providerRetryWord
+	}
 	if codexReloginHold(r.RunDTO) {
 		return codexReloginWord
 	}
@@ -726,65 +734,106 @@ func (m tuiModel) boardEyebrow(it boardItem) string {
 	return " " + m.pal.faint.Render(name+" · "+itoa(it.count))
 }
 
-// boardFooter is the one-line key legend; key letters are tungsten (keyHint), labels faint.
+// boardFooter preserves the unabridged legend for version-readout selection.
 func (m tuiModel) boardFooter() string {
-	parts := []string{m.keyHint("enter/→", "open"), m.keyHint("/", "filter")}
-	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
-	if markedCost {
-		// Keep the cost cue and quit key ahead of hints that may be clipped at narrow widths.
-		parts = append(parts, m.keyHint("q", "quit"), m.pal.faint.Render("+ partial"))
-	}
-	if m.board.admin {
-		parts = append(parts, m.keyHint("a", "my runs"))
-	} else {
-		parts = append(parts, m.keyHint("a", "factory"))
-		// The fold-done toggle is meaningless on the admin board (non-terminal runs only), so
-		// its hint is dropped there rather than offering a no-op.
-		if m.board.hideDone {
-			parts = append(parts, m.keyHint("h", "show done"))
-		} else {
-			parts = append(parts, m.keyHint("h", "fold done"))
-		}
-	}
-	parts = append(parts, m.keyHint("r", "refresh"), m.keyHint("?", "keys"))
-	if !markedCost {
-		parts = append(parts, m.keyHint("q", "quit"))
-	}
-	return " " + strings.Join(parts, m.pal.faint.Render(" · "))
+	return m.renderFooterHints(m.boardFooterHints(), 0)
 }
 
-// boardFooterLine is the board's footer: the help legend, plus an always-on compact
-// CLI-vs-server version readout right-aligned at the far edge (issue #687, superseding
-// #681's conditional skew sentence). m.showVersion gates the whole readout (the off
-// switches: --quiet / UZI_VERSION_CHECK=0 / the CheckServerVersion seam). The single
-// outer clampVisual(..., m.width) at the renderBoard call site is the only wrap.
+func (m tuiModel) boardFooterHints() []footerHint {
+	parts := []footerHint{m.footerHint("enter/→", "open"), m.footerHint("/", "filter")}
+	markedCost := !m.board.admin && m.selfUsageReady && (m.selfUsage.Last7SubscriptionRunCount > 0 || m.selfUsage.Last7UnreportedRunCount > 0)
+	if markedCost {
+		parts = append(parts, m.footerHint("q", "quit"), footerHint{text: m.pal.faint.Render("+ partial")})
+	}
+	if m.board.admin {
+		parts = append(parts, m.footerHint("a", "my runs"))
+	} else {
+		parts = append(parts, m.footerHint("a", "factory"))
+		if m.board.hideDone {
+			parts = append(parts, m.footerHint("h", "show done"))
+		} else {
+			parts = append(parts, m.footerHint("h", "fold done"))
+		}
+	}
+	parts = append(parts, m.footerHint("r", "refresh"), m.footerHint("?", "keys"))
+	if !markedCost {
+		parts = append(parts, m.footerHint("q", "quit"))
+	}
+	return parts
+}
+
+// boardFooterLine chooses the readout against the original legend, then fits
+// structured hints in the suffix budget. Split notes only use leftover space.
 func (m tuiModel) boardFooterLine() string {
-	help := m.boardFooter()
+	hints := m.boardFooterHints()
+	original := m.boardFooter()
+	if line, ok := m.restartFooterContent(original, hints); ok {
+		return line
+	}
 	if !m.showVersion {
-		return m.withSplitNote(help)
+		return m.withSplitNote(m.fitFooterHints(hints, m.width))
 	}
 	const gap = 1
-	helpW := visualWidth(help)
 	readout := m.versionReadout()
-	if helpW+gap+visualWidth(readout) <= m.width {
-		if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+visualWidth(readout) <= m.width {
-			help = candidate
-		}
-		return padVisual(help, m.width-visualWidth(readout)) + readout
+	if visualWidth(original)+gap+visualWidth(readout) > m.width {
+		readout = m.versionClientOnly()
 	}
-	// Too narrow for the full readout: drop the "<arrow> <server>" suffix and show the
-	// client version alone (still red when behind, so the alarm survives the drop).
-	client := m.versionClientOnly()
-	cw := visualWidth(client)
-	if helpW+gap+cw <= m.width {
-		if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+cw <= m.width {
-			help = candidate
-		}
-		return padVisual(help, m.width-cw) + client
+	// Shed all optional hints before shortening an unusually long client stamp.
+	essentialW := visualWidth(m.renderFooterHints(hints, 6))
+	if m.width >= 80 {
+		readout = clampVisual(readout, max(0, m.width-essentialW-gap))
+	} else {
+		readout = clampVisual(readout, max(0, m.width))
 	}
-	// Still too narrow: give the client version the right edge, let help truncate.
-	left := clampVisual(help, m.width-cw-gap)
-	return padVisual(left, m.width-cw) + client
+	rw := visualWidth(readout)
+	help := m.fitFooterHints(hints, m.width-rw-gap)
+	if candidate := m.withSplitNote(help); visualWidth(candidate)+gap+rw <= m.width {
+		help = candidate
+	}
+	return padVisual(help, max(0, m.width-rw)) + readout
+}
+
+// restartFooter also serves the split caller, whose supplied keys are essential.
+func (m tuiModel) restartFooter(help string) (string, bool) {
+	return m.restartFooterContent(help, nil)
+}
+
+// restartHintText is the unstyled full restart hint shared by the board and
+// split footers, so the wording cannot drift between them.
+func (m tuiModel) restartHintText() string {
+	installed := m.renderer.Plain(m.updatePrompt.installedVersion, 256)
+	return "v" + strings.TrimPrefix(installed, "v") + " installed, restart uzi to use it"
+}
+
+// restartFooterContent reserves essential help before choosing the installed
+// banner. Board hints shed within that budget; split hint selection stays intact.
+func (m tuiModel) restartFooterContent(help string, hints []footerHint) (string, bool) {
+	if !m.showVersion || m.updatePrompt.installedVersion == "" {
+		return "", false
+	}
+	hint := m.restartHintText()
+	width := max(0, m.width)
+	essentialW := visualWidth(help)
+	if hints != nil {
+		essentialW = visualWidth(m.renderFooterHints(hints, 6))
+	}
+	if visualWidth(hint)+1+essentialW > width {
+		hint = "restart uzi"
+	}
+	hint = clampVisual(hint, width)
+	if m.profile != colorprofile.Ascii {
+		hint = m.pal.faint.Render(hint)
+	}
+	hw := visualWidth(hint)
+	budget := max(0, width-hw-1)
+	if hints != nil {
+		help = m.fitFooterHints(hints, budget)
+	}
+	if m.profile == colorprofile.Ascii {
+		help = ansi.Strip(help)
+	}
+	left := clampVisual(help, budget)
+	return padVisual(left, max(0, width-hw)) + hint, true
 }
 
 // versionReadout is the compact CLI-vs-server version line. The client version renders
@@ -844,7 +893,12 @@ const (
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed
 	// prefix does not squeeze the title into an overflowing marker row (issue #379).
+	// PROG (PRD #2602) is shown with MILES but its narrow cell comes out of the flexible TITLE
+	// width, not out of this threshold: raising it would push MILES off the 100-col board (#379).
 	boardMileMinWidth = 91
+	// boardProgBarMinWidth is the narrowest own board that keeps the PROG bar; below it the cell
+	// is the percent or a short flag alone, so the bar drops before the percent.
+	boardProgBarMinWidth = boardMileMinWidth + boardProgWideWidth - boardProgNarrowWidth
 	// boardCostMinWidth is the narrowest own board that keeps the COST column. It sits BELOW
 	// boardMileMinWidth so COST (the higher-priority cost signal) is retained after the milestone
 	// micro-bar drops on a narrowing terminal (PRD #650 M2; issue #379 invariant).
@@ -1059,19 +1113,17 @@ func (m tuiModel) syncedScrollAt(capacity int) int {
 
 // boardSummary is the top-right glyph cluster: ⚑ N · ✎ N · ➤ N · ⚿ N · ⊘ N · ▲ N · <total> runs.
 // Zero-count segments are dropped, so a healthy factory reads simply "N runs". Computed
-// over m.board.runs so it does not shrink under a filter. Every park in the NEEDS YOU
-// band gets a segment — awaiting_followup (PRD #517) alongside awaiting_approval and
-// awaiting_input, and the Codex relogin_required hold (PRD #1590, ⚿) — so no run that is
-// the owner's turn is invisible in the summary line. The credential_disabled hold (PRD #1732,
-// ⊘) is counted the same way.
+// over m.board.runs so it does not shrink under a filter. Approval, input, follow-up
+// and Codex relogin each have a segment. The ⊘ segment counts credential-disabled
+// and provider-unavailable owner holds; their rows distinguish the typed reason.
 func (m tuiModel) boardSummary() string {
-	approvals, inputs, followups, relogins, credOff, warn := 0, 0, 0, 0, 0, 0
+	approvals, inputs, followups, relogins, ownerHolds, warn := 0, 0, 0, 0, 0, 0
 	for _, r := range m.board.runs {
 		if codexReloginHold(r.RunDTO) {
 			relogins++
 		}
-		if isCredentialDisabledHold(r.RunDTO) {
-			credOff++
+		if isCredentialDisabledHold(r.RunDTO) || isProviderUnavailableHold(r.RunDTO) {
+			ownerHolds++
 		}
 		switch r.Status {
 		case "awaiting_approval":
@@ -1088,7 +1140,7 @@ func (m tuiModel) boardSummary() string {
 			followups++
 		}
 		// Match the recovery row's token: health frozen while parked needs no attention.
-		if r.Status != statusRecoveryWait && stalledHealth[r.Health] {
+		if r.Status != statusRecoveryWait && !isProviderUnavailableHold(r.RunDTO) && stalledHealth[r.Health] {
 			warn++
 		}
 	}
@@ -1105,8 +1157,8 @@ func (m tuiModel) boardSummary() string {
 	if relogins > 0 {
 		segs = append(segs, paintSeg(m.pal.amber, nil, false, codexReloginGlyph+" "+itoa(relogins)))
 	}
-	if credOff > 0 {
-		segs = append(segs, paintSeg(m.pal.amber, nil, false, credDisabledGlyph+" "+itoa(credOff)))
+	if ownerHolds > 0 {
+		segs = append(segs, paintSeg(m.pal.amber, nil, false, credDisabledGlyph+" "+itoa(ownerHolds)))
 	}
 	if warn > 0 {
 		segs = append(segs, paintSeg(m.pal.stall, nil, false, "▲ "+itoa(warn)))

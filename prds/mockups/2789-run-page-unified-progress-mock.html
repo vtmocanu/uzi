@@ -1,0 +1,422 @@
+<!doctype html>
+<html lang="en"><head><meta charset="utf-8"><meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Run Page Redesign</title>
+<link rel="preconnect" href="https://fonts.googleapis.com">
+<link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=IBM+Plex+Mono:wght@400;500;600&family=IBM+Plex+Sans:wght@400;500;600;700&display=swap">
+<style>
+/* Layout: review doc framing two app mocks (before / after) in uzi's own Dawn (light) and Ember (dark) themes. */
+:root {
+  --bg: #F2F4F7; --surface: #FFFFFF; --raised: #EBEEF3; --edge: #D6DBE4; --edge-strong: #AEB6C4;
+  --fg: #151A22; --muted: #4A5567; --faint: #5F6A82;
+  --brand: #B93C0B; --on-brand: #FFFFFF; --ok: #03705A; --warn: #9A4A05; --danger: #BE123C; --info: #0369A1; --plan: #4F46E5;
+  --note: #FFF7E0; --note-edge: #E5C66A;
+  --sans: "IBM Plex Sans", ui-sans-serif, system-ui, -apple-system, "Segoe UI", sans-serif;
+  --mono: "IBM Plex Mono", ui-monospace, SFMono-Regular, Menlo, monospace;
+  --radius: 10px;
+}
+@media (prefers-color-scheme: dark) { :root:not([data-theme="light"]) {
+  --bg: #080A0F; --surface: #0F121A; --raised: #171B26; --edge: #272D3C; --edge-strong: #3A4256;
+  --fg: #E4E8F0; --muted: #949EB0; --faint: #7A859A;
+  --brand: #FB923C; --on-brand: #1A0D04; --ok: #34D399; --warn: #FBBF24; --danger: #FB7185; --info: #38BDF8; --plan: #818CF8;
+  --note: #2A2410; --note-edge: #6B5A20; color-scheme: dark; } }
+:root[data-theme="dark"] {
+  --bg: #080A0F; --surface: #0F121A; --raised: #171B26; --edge: #272D3C; --edge-strong: #3A4256;
+  --fg: #E4E8F0; --muted: #949EB0; --faint: #7A859A;
+  --brand: #FB923C; --on-brand: #1A0D04; --ok: #34D399; --warn: #FBBF24; --danger: #FB7185; --info: #38BDF8; --plan: #818CF8;
+  --note: #2A2410; --note-edge: #6B5A20; color-scheme: dark; }
+
+* { box-sizing: border-box; }
+body { background: var(--bg); color: var(--fg); font-family: var(--sans); font-size: 14px; line-height: 1.5; }
+.wrap { max-width: 980px; margin: 0 auto; padding-inline: 16px; padding-block: 28px 64px; display: grid; gap: 28px; }
+h1 { font-size: 24px; font-weight: 600; letter-spacing: -0.01em; margin: 0; text-wrap: balance; }
+h2 { font-size: 16px; font-weight: 600; margin: 0; }
+.lede { color: var(--muted); max-width: 68ch; margin: 6px 0 0; }
+.eyebrow { font: 500 11px/1 var(--mono); letter-spacing: .08em; text-transform: uppercase; color: var(--faint); }
+.mono { font-family: var(--mono); }
+.muted { color: var(--muted); } .faint { color: var(--faint); }
+
+/* controls */
+.controls { display: flex; flex-wrap: wrap; gap: 12px 20px; align-items: center; }
+.seg { display: inline-flex; border: 1px solid var(--edge); border-radius: 9px; background: var(--surface); padding: 3px; gap: 2px; flex-wrap: wrap; }
+.seg button { font: 500 13px var(--sans); border: 0; background: transparent; color: var(--muted); padding: 6px 12px; border-radius: 6px; cursor: pointer; }
+.seg button[aria-pressed="true"] { background: var(--fg); color: var(--bg); }
+.seg button:focus-visible, button:focus-visible, summary:focus-visible { outline: 2px solid var(--brand); outline-offset: 2px; }
+
+/* app frame */
+.frame { border: 1px solid var(--edge-strong); border-radius: 14px; background: var(--bg); overflow: hidden; }
+.framebar { display: flex; align-items: center; gap: 8px; padding: 8px 14px; border-bottom: 1px solid var(--edge); background: var(--raised); font: 12px var(--mono); color: var(--faint); min-width: 0; }
+.framebar span { overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.dots { display: flex; gap: 5px; } .dots i { width: 9px; height: 9px; border-radius: 50%; background: var(--edge-strong); display: block; }
+.app { padding: 18px; display: grid; gap: 16px; }
+
+.crumb { font-size: 12px; color: var(--faint); }
+.title { font-size: 20px; font-weight: 600; letter-spacing: -0.01em; text-wrap: balance; margin: 2px 0 8px; }
+.title .num { color: var(--faint); font-weight: 400; }
+.chips { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; }
+.chip { display: inline-flex; align-items: center; gap: 5px; font: 500 11px/1.4 var(--sans); padding: 2px 7px; border-radius: 8px; border: 1px solid var(--edge); background: var(--raised); color: var(--muted); white-space: nowrap; }
+.chip.info { color: var(--info); border-color: color-mix(in srgb, var(--info) 40%, transparent); background: color-mix(in srgb, var(--info) 10%, transparent); }
+.chip.ok { color: var(--ok); border-color: color-mix(in srgb, var(--ok) 40%, transparent); background: color-mix(in srgb, var(--ok) 10%, transparent); }
+.chip.warn { color: var(--warn); border-color: color-mix(in srgb, var(--warn) 40%, transparent); background: color-mix(in srgb, var(--warn) 10%, transparent); }
+.chip.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 40%, transparent); background: color-mix(in srgb, var(--danger) 10%, transparent); }
+.chip.plan { color: var(--plan); border-color: color-mix(in srgb, var(--plan) 40%, transparent); background: color-mix(in srgb, var(--plan) 10%, transparent); }
+.pill { border-radius: 999px; }
+.dot { width: 6px; height: 6px; border-radius: 50%; background: currentColor; display: inline-block; }
+.pulse { animation: pulse 1.6s ease-in-out infinite; }
+@keyframes pulse { 50% { opacity: .35; } }
+@media (prefers-reduced-motion: reduce) { .pulse { animation: none; } }
+
+.card { background: var(--surface); border: 1px solid var(--edge); border-radius: 14px; padding: 16px; display: grid; gap: 12px; min-width: 0; }
+.card h3 { font-size: 13px; font-weight: 600; margin: 0; }
+.row { display: flex; flex-wrap: wrap; gap: 8px 14px; align-items: baseline; }
+.btn { font: 500 12px var(--sans); border: 1px solid var(--edge-strong); background: var(--surface); color: var(--fg); padding: 5px 10px; border-radius: 8px; cursor: default; white-space: nowrap; }
+.btn.danger { color: var(--danger); border-color: color-mix(in srgb, var(--danger) 50%, transparent); }
+.btn.primary { background: var(--brand); border-color: var(--brand); color: var(--on-brand); }
+
+/* track */
+.track { display: grid; gap: 4px; }
+.seg-bar { height: 10px; border-radius: 3px; background: var(--raised); border: 1px solid var(--edge); }
+.seg-bar.done { background: var(--brand); border-color: var(--brand); }
+.seg-bar.now { border-color: var(--brand); background: repeating-linear-gradient(135deg, var(--brand) 0 4px, transparent 4px 8px); }
+.seg-bar.planned { background: var(--plan); border-color: var(--plan); }
+.seg-bar.stopped { border-color: var(--danger); background: repeating-linear-gradient(135deg, var(--danger) 0 4px, transparent 4px 8px); }
+.seg-lbl { font-size: 10px; color: var(--faint); overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.pct { font: 600 28px/1 var(--mono); letter-spacing: -0.02em; }
+
+/* milestone list */
+.ms { list-style: none; margin: 0; padding: 0; display: grid; gap: 2px; }
+.ms > li { display: grid; grid-template-columns: 20px 34px 1fr; gap: 6px; align-items: baseline; padding: 4px 6px; border-radius: 8px; min-width: 0; }
+.ms > li > span:last-child { min-width: 0; }
+.ms .ic { font-family: var(--mono); text-align: center; }
+.ms .id { font: 12px var(--mono); color: var(--faint); }
+.ms .done { color: var(--faint); } .ms .done .ic { color: var(--ok); }
+.ms .pending { color: var(--faint); }
+.ms .cur { background: color-mix(in srgb, var(--brand) 7%, transparent); color: var(--fg); font-weight: 600; }
+.ms .cur .ic { color: var(--brand); }
+.ms .cur.stop { background: color-mix(in srgb, var(--danger) 7%, transparent); } .ms .cur.stop .ic { color: var(--danger); }
+.lanes { grid-column: 3 / -1; border-left: 2px solid var(--brand); padding: 4px 0 4px 10px; margin-top: 4px; display: grid; gap: 4px; font-weight: 400; font-size: 13px; min-width: 0; }
+.lane { display: flex; flex-wrap: wrap; gap: 2px 8px; align-items: baseline; color: var(--muted); min-width: 0; }
+.lane b { color: var(--fg); font-weight: 600; }
+.lane .t { font: 12px var(--mono); color: var(--faint); }
+.lane.quiet { opacity: .7; }
+.now { display: flex; gap: 10px; align-items: baseline; flex-wrap: wrap; font-size: 13px; padding: 8px 10px; border-radius: 8px; background: var(--raised); }
+.now .k { font: 600 11px var(--mono); letter-spacing: .06em; text-transform: uppercase; color: var(--brand); }
+.foot { border-top: 1px solid var(--edge); padding-top: 10px; display: flex; flex-wrap: wrap; gap: 4px 14px; font: 12px var(--mono); color: var(--muted); }
+.foot a { color: var(--brand); text-decoration: none; }
+
+/* before-only bits */
+.stepper { display: flex; flex-wrap: wrap; gap: 6px; align-items: center; font-size: 12px; }
+.stepper .s { padding: 2px 8px; border-radius: 6px; border: 1px solid var(--edge); color: var(--faint); }
+.stepper .s.cur { border-color: var(--brand); color: var(--brand); font-weight: 600; }
+.kv { display: grid; grid-template-columns: max-content 1fr; gap: 2px 12px; font-size: 13px; }
+.tiles { display: grid; grid-template-columns: repeat(auto-fit, minmax(120px, 1fr)); gap: 10px; }
+.tile { border: 1px solid var(--edge); border-radius: 10px; padding: 8px 10px; }
+.tile .v { font: 600 18px var(--mono); }
+.check { display: flex; gap: 8px; align-items: center; font-size: 13px; }
+.check i { width: 14px; height: 14px; border: 1px solid var(--edge-strong); border-radius: 4px; display: inline-block; }
+.check i.on { background: var(--brand); border-color: var(--brand); }
+.feed { display: grid; gap: 4px; font-size: 12px; }
+.feed div { display: flex; gap: 8px; padding: 4px 6px; border-radius: 6px; background: var(--raised); min-width: 0; }
+.feed div span:last-child { margin-left: auto; color: var(--faint); white-space: nowrap; }
+.feed div span:nth-child(2) { min-width: 0; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; }
+.prose { font-size: 13px; color: var(--muted); max-width: 72ch; margin: 0; }
+.plus { list-style: none; padding: 0; margin: 0; display: grid; gap: 3px; font-size: 13px; color: var(--muted); }
+.plus li::before { content: "+ "; color: var(--ok); font-family: var(--mono); }
+
+/* annotation markers */
+.mark { position: relative; outline: 2px dashed var(--note-edge); outline-offset: 3px; border-radius: 6px; }
+.tag { display: inline-flex; align-items: center; justify-content: center; min-width: 20px; height: 20px; padding: 0 5px; border-radius: 999px; background: var(--note-edge); color: var(--fg); font: 600 11px var(--mono); vertical-align: middle; }
+.callout { background: var(--note); border: 1px solid var(--note-edge); border-radius: 10px; padding: 10px 12px; font-size: 13px; display: grid; gap: 4px; }
+.split { display: flex; justify-content: space-between; gap: 12px; flex-wrap: wrap; align-items: flex-start; }
+.actions { display: flex; gap: 6px; flex-wrap: wrap; }
+
+/* hero */
+.hero { border-radius: 14px; padding: 14px 16px; display: grid; gap: 8px; border: 1px solid; }
+.hero.ok { border-color: color-mix(in srgb, var(--ok) 45%, transparent); background: color-mix(in srgb, var(--ok) 8%, var(--surface)); }
+.hero.danger { border-color: color-mix(in srgb, var(--danger) 45%, transparent); background: color-mix(in srgb, var(--danger) 7%, var(--surface)); }
+.hero.plan { border-color: color-mix(in srgb, var(--plan) 45%, transparent); background: color-mix(in srgb, var(--plan) 7%, var(--surface)); }
+.hero strong { font-size: 15px; }
+details.disc > summary { cursor: pointer; font-size: 13px; color: var(--muted); list-style: none; }
+details.disc > summary::-webkit-details-marker { display: none; }
+details.disc > summary::before { content: "▸ "; font-family: var(--mono); }
+details.disc[open] > summary::before { content: "▾ "; }
+
+/* change list */
+.changes { display: grid; gap: 10px; counter-reset: c; list-style: none; padding: 0; margin: 0; }
+.changes li { background: var(--surface); border: 1px solid var(--edge); border-radius: 12px; padding: 12px 14px; display: grid; grid-template-columns: 28px 1fr; gap: 4px 10px; }
+.changes li > .tag { grid-row: span 3; margin-top: 2px; }
+.changes h4 { margin: 0; font-size: 14px; font-weight: 600; }
+.changes p { margin: 0; font-size: 13px; color: var(--muted); max-width: 75ch; }
+.who { display: flex; gap: 6px; flex-wrap: wrap; }
+.legend { display: flex; flex-wrap: wrap; gap: 8px 16px; font-size: 12px; color: var(--muted); align-items: center; }
+@media (max-width: 560px) { .app { padding: 12px; } .pct { font-size: 24px; } .ms > li { grid-template-columns: 18px 30px 1fr; } }
+</style>
+
+<div class="wrap">
+  <header>
+    <div class="eyebrow">uzi · run detail page · design review</div>
+    <h1>Run page: unify progress, milestones and “Now”</h1>
+    <p class="lede">Top of the run page for a real running run (#2545), as it renders today and as proposed. The proposal merges what a UX agent and a Codex reviewer each recommended from the current code. Content is the live run’s; the token name is redacted.</p>
+  </header>
+
+  <div class="controls">
+    <div class="seg" role="group" aria-label="Version">
+      <button id="v-before" data-view="before" aria-pressed="false">Before</button>
+      <button id="v-after" data-view="after" aria-pressed="true">After</button>
+    </div>
+    <div class="seg" role="group" aria-label="Run state" id="stateSeg">
+      <button id="s-running" data-state="running" aria-pressed="true">Running</button>
+      <button id="s-approval" data-state="approval" aria-pressed="false">Awaiting approval</button>
+      <button id="s-failed" data-state="failed" aria-pressed="false">Failed</button>
+      <button id="s-completed" data-state="completed" aria-pressed="false">Completed</button>
+    </div>
+    <span class="faint" id="stateHint" style="font-size:12px">State switch applies to the After mock. Running uses the live run; the other three states use example content.</span>
+  </div>
+
+  <!-- ===================== BEFORE ===================== -->
+  <section id="before" hidden aria-label="Before">
+    <div class="frame">
+      <div class="framebar"><div class="dots"><i></i><i></i><i></i></div><span>/runs/<id> · today</span></div>
+      <div class="app">
+        <div>
+          <div class="crumb">Runs / Board / #2545 / Run</div>
+          <div class="title">Publish a failed run’s held work to the forge, then release (archive only as fallback) <span class="num">#2545</span></div>
+          <div class="chips mark">
+            <span class="chip info pill"><span class="dot pulse"></span>running</span>
+            <span class="btn">Switch token</span>
+            <span class="chip">⠇ Working…</span>
+            <span class="chip ok"><span class="dot"></span>live</span>
+            <span class="chip mono">2h 31m / 1d</span>
+            <span class="chip">iteration 4</span>
+            <span class="chip">M3/4</span>
+            <span class="chip">claude</span>
+            <span class="chip">token A</span>
+            <span class="chip warn">token override: pinned “A”</span>
+            <span class="chip">opus-5-5</span>
+          </div>
+        </div>
+        <div class="callout"><div><span class="tag">1</span> Eleven chips compete. The milestone count reads “M3/4” here and “milestone 4 of 4” just below; the token shows three times.</div></div>
+
+        <div class="card">
+          <div class="row mark"><span class="pct">≈77%</span><span class="muted">milestone 4 of 4 · Run-recovery/CLI docs, ADR, spec supersessions; final gates</span></div>
+          <div class="track" style="grid-template-columns: .6fr 1fr 1fr 1fr 1fr">
+            <div class="seg-bar planned"></div><div class="seg-bar done"></div><div class="seg-bar done"></div><div class="seg-bar done"></div><div class="seg-bar now"></div>
+            <div class="seg-lbl">plan</div><div class="seg-lbl">Review M4+M5…</div><div class="seg-lbl">Owner web view…</div><div class="seg-lbl">Merge base…</div><div class="seg-lbl">Run-recovery/CLI…</div>
+          </div>
+          <div class="stepper mark"><span class="s">review</span><span class="s">validate</span><span class="faint">▸</span><span class="s cur">implement</span><span class="faint">current phase only, from the active role</span></div>
+          <div class="kv mark"><span class="faint">Now:</span><span>Running a bash command. <span class="faint">· model summary · 35s ago</span></span>
+            <span class="faint">Active role</span><span>documenter · [m9] run-recovery and CLI docs</span></div>
+        </div>
+        <div class="callout"><div><span class="tag">2</span> The phase strip looks like a sequence, but only the current phase is known. “Active role” names one agent while two are working on m9 (documenter and spec-keeper).</div></div>
+
+        <div class="card">
+          <h3>Token history</h3>
+          <div class="muted" style="font-size:13px">1. token A · run_pinned · 12/10/2026, 06:02</div>
+          <div class="check"><i class="on"></i>Wait out future usage limits on this run</div>
+          <div class="check"><i></i>Auto-rework this MR’s review comments <span class="btn">Reset to default</span></div>
+        </div>
+
+        <div class="card">
+          <div class="split"><h3>Run summary</h3><span class="btn">Collapse</span></div>
+          <div class="eyebrow">What this run will implement</div>
+          <p class="prose">Publish a failed run’s unpublished work (commits after the last checkpoint plus modified and untracked files) to a forge-backed ref, replacing the current archive-only custody hold. A fresh secret scan must pass before publication…</p>
+          <div class="eyebrow">Approved plan</div>
+          <ul class="plus"><li>Web UI for held publication details</li><li>Watcher skill docs list refs/uzi-held as a recovery source</li><li>CHANGELOG entry</li><li>Explicit base merge step (m8)</li><li>Multi-role validation in m6</li><li>run-store-it as final gate</li></ul>
+        </div>
+
+        <div class="card mark">
+          <div class="row"><h3>Milestones (reported complete)</h3><span class="mono muted">3/4 ◐ m9</span></div>
+          <ul class="ms">
+            <li class="done"><span class="ic">✓</span><span class="id">m6</span><span>Review M4+M5 with reviewer/tester/auditor/dba; fix mandatory findings</span></li>
+            <li class="done"><span class="ic">✓</span><span class="id">m7</span><span>Owner web view of held receipt, configuration docs, watcher skill, CHANGELOG</span></li>
+            <li class="done"><span class="ic">✓</span><span class="id">m8</span><span>Merge base 102a0f59 (git merge, no rewrite)</span></li>
+            <li class="cur"><span class="ic">◐</span><span class="id">m9</span><span>Run-recovery/CLI docs, ADR, spec supersessions; final gates <span class="faint" style="font-weight:400">· documenter docs Bash 0s ago</span></span></li>
+          </ul>
+        </div>
+        <div class="callout"><div><span class="tag">3</span> The same four milestones a second time, three cards further down, with the live lane that belongs next to the “Now” line.</div></div>
+
+        <div class="card">
+          <div class="tiles"><div class="tile"><div class="faint" style="font-size:11px">Tokens in</div><div class="v">58.85M</div></div><div class="tile"><div class="faint" style="font-size:11px">Tokens out</div><div class="v">334.1k</div></div><div class="tile"><div class="faint" style="font-size:11px">Duration</div><div class="v">2h 26m</div></div><div class="tile"><div class="faint" style="font-size:11px">Cost</div><div class="v">$32.56</div></div></div>
+          <details class="disc"><summary>Per-phase breakdown</summary></details><details class="disc"><summary>Per-agent breakdown</summary></details>
+        </div>
+        <div class="card">
+          <h3>Activity</h3>
+          <div class="feed"><div><span class="mono">documenter</span><span>[m9] run-recovery and CLI docs · Ran a tool</span><span>just now</span></div><div><span class="mono">spec-keeper</span><span>[m9] ADR and spec supersessions · Ran a tool</span><span>just now</span></div><div><span class="mono">reviewer</span><span>[m7] Re-review fd267bbc</span><span>23m ago</span></div><div class="faint" style="background:none">… 1,082 more, feed capped at 45vh</div></div>
+        </div>
+        <div class="card mark">
+          <h3>Steer this run</h3>
+          <div class="seg-bar" style="height:34px;border-radius:8px"></div>
+          <div class="actions"><span class="btn">‖ Pause ▾</span><span class="btn danger">Stop run</span></div>
+        </div>
+        <div class="callout"><div><span class="tag">4</span> Pause and Stop sit at the very bottom, below a 1,085-message feed.</div></div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== AFTER ===================== -->
+  <section id="after" aria-label="After">
+    <div class="frame">
+      <div class="framebar"><div class="dots"><i></i><i></i><i></i></div><span>/runs/<id> · proposed</span></div>
+      <div class="app">
+        <!-- A. header -->
+        <div class="split">
+          <div style="min-width:0;flex:1 1 420px">
+            <div class="crumb">Runs / Board / #2545 / Run</div>
+            <div class="title">Publish a failed run’s held work to the forge, then release (archive only as fallback) <span class="num">#2545</span></div>
+            <div class="chips" data-for="running">
+              <span class="chip info pill"><span class="dot pulse"></span>running</span>
+              <span class="chip mono"><span class="dot" style="color:var(--ok)"></span>2h 31m / 1d</span>
+              <span class="chip">claude · opus-5-5</span>
+              <span class="chip">token A · pinned</span>
+            </div>
+            <div class="chips" data-for="approval" hidden>
+              <span class="chip plan pill"><span class="dot"></span>awaiting approval</span>
+              <span class="chip mono">clock stopped · 14m / 1d</span>
+              <span class="chip">claude · opus-5-5</span>
+              <span class="chip">token A · pinned</span>
+            </div>
+            <div class="chips" data-for="failed" hidden>
+              <span class="chip danger pill"><span class="dot"></span>failed</span>
+              <span class="chip mono">ran 2h 51m</span>
+              <span class="chip">claude · opus-5-5</span>
+              <span class="chip">token A · pinned</span>
+            </div>
+            <div class="chips" data-for="completed" hidden>
+              <span class="chip ok pill"><span class="dot"></span>completed</span>
+              <span class="chip mono">ran 3h 04m</span>
+              <span class="chip">claude · opus-5-5</span>
+              <span class="chip">token A · pinned</span>
+            </div>
+          </div>
+          <div class="actions">
+            <span class="btn">Run settings ▾</span>
+            <span class="btn" data-for="running">‖ Pause ▾</span>
+            <span class="btn danger" data-for="running">Stop</span>
+            <span class="btn danger" data-for="approval" hidden>Stop</span>
+          </div>
+        </div>
+
+        <!-- B. attention slot -->
+        <div class="hero plan" data-for="approval" hidden>
+          <div class="row"><strong>Plan ready for review</strong><span class="faint" style="font-size:12px">4 milestones · proposed 14m ago</span></div>
+          <p class="prose">Publish a failed run’s unpublished work to a forge-backed ref after a fresh secret scan; keep archives only as fallback.</p>
+          <div class="actions"><span class="btn primary">Approve plan</span><span class="btn">Request changes</span><span class="btn">Open full plan</span></div>
+        </div>
+        <div class="hero danger" data-for="failed" hidden>
+          <div class="row"><strong>Run failed during m9</strong><span class="faint" style="font-size:12px">iteration 4 · 2h 51m</span></div>
+          <p class="prose" style="color:var(--fg)">Final gate failed: <span class="mono">run-store-it</span> reported 2 skipped tests (required 0).</p>
+          <div class="actions"><span class="btn primary">Recover held work</span><span class="btn">Restart from checkpoint</span><span class="btn">View log</span></div>
+        </div>
+        <div class="hero ok" data-for="completed" hidden>
+          <div class="row"><strong>Pull request opened</strong><span class="faint" style="font-size:12px">4 of 4 milestones reported complete</span></div>
+          <p class="prose" style="color:var(--fg)">Publish held work to the forge before releasing custody. Branch <span class="mono">agent/issue-2545</span>.</p>
+          <div class="actions"><span class="btn primary">Open PR</span><span class="btn">View diff summary</span></div>
+        </div>
+
+        <!-- C. unified progress card -->
+        <div class="card">
+          <div class="split">
+            <div class="row" data-for="running"><span class="pct">≈77%</span><span class="mono muted" style="font-size:13px">3 of 4 reported complete</span></div>
+            <div class="row" data-for="approval" hidden><span class="chip plan">● waits on you · plan gate</span><span class="muted" style="font-size:13px">Milestones freeze when you approve the plan</span></div>
+            <div class="row" data-for="failed" hidden><span class="chip danger">failed</span><span class="mono muted" style="font-size:13px">3 of 4 reported complete</span></div>
+            <div class="row" data-for="completed" hidden><span class="chip ok">done</span><span class="mono muted" style="font-size:13px">4 of 4 reported complete</span></div>
+          </div>
+
+          <div class="track" style="grid-template-columns: .6fr 1fr 1fr 1fr 1fr" data-for="running failed completed">
+            <div class="seg-bar planned"></div><div class="seg-bar done"></div><div class="seg-bar done"></div><div class="seg-bar done"></div><div class="seg-bar" id="lastSeg"></div>
+          </div>
+
+          <ul class="ms" data-for="running failed completed">
+            <li class="done"><span class="ic">✓</span><span class="id">m6</span><span>Review M4+M5 with reviewer/tester/auditor/dba; fix mandatory findings</span></li>
+            <li class="done"><span class="ic">✓</span><span class="id">m7</span><span>Owner web view of held receipt, configuration docs, watcher skill, CHANGELOG</span></li>
+            <li class="done"><span class="ic">✓</span><span class="id">m8</span><span>Merge base 102a0f59 (git merge, no rewrite)</span></li>
+            <li class="cur" id="m9row"><span class="ic" id="m9ic">◐</span><span class="id">m9</span><span>Run-recovery/CLI docs, ADR, spec supersessions; final gates incl. run-store-it 0 skipped</span>
+              <div class="lanes" data-for="running">
+                <div class="lane"><span class="chip">phase: implement · iteration 4</span></div>
+                <div class="now"><span class="k">Now</span><span>Writing the run-recovery and CLI docs.</span><span class="faint" style="font-size:12px">model summary · 35s ago</span></div>
+                <div class="lane"><span class="dot pulse" style="color:var(--ok)"></span><b>documenter</b><span>run-recovery and CLI docs</span><span class="t">Bash · 0s ago</span></div>
+                <div class="lane"><span class="dot pulse" style="color:var(--ok)"></span><b>spec-keeper</b><span>ADR and spec supersessions</span><span class="t">Edit · 6s ago</span></div>
+              </div>
+            </li>
+          </ul>
+
+
+          <div class="foot">
+            <span>$32.56 API-equivalent</span><span>58.9M in (93% cached)</span><span>334k out</span><span class="faint">+~$0.15 unrecorded</span><a href="#usage">full usage ↓</a>
+          </div>
+        </div>
+
+        <!-- D. run summary collapsed -->
+        <details class="card disc" data-for="running failed completed">
+          <summary><b style="color:var(--fg)">Run summary</b> · Publish a failed run’s unpublished work to a forge-backed ref after a fresh secret scan…</summary>
+          <p class="prose">Full intent, approved plan and plan deltas, as today.</p>
+        </details>
+
+        <div class="card" style="gap:6px">
+          <div class="faint" style="font-size:12px">Below, unchanged: judge · recovery archives · agent roster · <span id="usage">full usage tables</span> · Activity feed · Steer composer</div>
+        </div>
+      </div>
+    </div>
+  </section>
+
+  <!-- ===================== CHANGES ===================== -->
+  <section style="display:grid;gap:12px">
+    <div class="split"><h2>What changes, and who proposed it</h2>
+      <div class="legend"><span class="chip ok">both</span> UX agent and Codex buddy agree <span class="chip warn">your call</span> moves or changes existing UI</div></div>
+    <ol class="changes">
+      <li><span class="tag">1</span><h4>One progress card holds the percentage, the track, the milestone list and the live work</h4>
+        <div class="who"><span class="chip ok">both</span><span class="chip warn">your call</span></div>
+        <p>The separate “Milestones (reported complete)” card goes away. The current milestone expands to show every live agent lane (two on m9 today), replacing the single “Active role” line. Done rows are muted, pending rows faint.</p></li>
+      <li><span class="tag">2</span><h4>“Now” sits under the active milestone, and says what the work is</h4>
+        <div class="who"><span class="chip">UX agent</span><span class="chip">checked in code</span></div>
+        <p>The api shows a Now note only for exactly the active milestone it was written for, so placing it under m9 claims nothing the server did not. Today the note often restates the tool (“Running a bash command”); a worker prompt change makes it describe the work from the milestone title and the agent’s label, which the mock shows.</p></li>
+      <li><span class="tag">3</span><h4>One milestone vocabulary: “3 of 4 reported complete”</h4>
+        <div class="who"><span class="chip ok">both</span></div>
+        <p>Drops “M3/4” from the header while the card renders, and “milestone 4 of 4” from the card head. Keeps the honest wording “reported complete”; a run whose worker reported nothing reads “– of 4 reported”, never “0 of 4”.</p></li>
+      <li><span class="tag">4</span><h4>Phase stepper becomes one chip: “phase: implement · iteration 4”</h4>
+        <div class="who"><span class="chip ok">both</span></div>
+        <p>The three-step strip implies earlier phases passed, which the code does not know, and needs a caption to explain itself.</p></li>
+      <li><span class="tag">5</span><h4>Header keeps state and identity only; settings go behind “Run settings ▾”</h4>
+        <div class="who"><span class="chip ok">both</span><span class="chip warn">your call</span></div>
+        <p>Header: status, elapsed/budget (a parked run shows “clock stopped”), harness and model, one token chip. Switch token, token history (shown only with two or more entries) and the two run toggles move into the disclosure. A credential problem still surfaces as an attention panel.</p></li>
+      <li><span class="tag">6</span><h4>Pause and Stop move up to the header</h4>
+        <div class="who"><span class="chip ok">both</span><span class="chip warn">your call</span></div>
+        <p>Same buttons, same confirmation and ownership gates. The Steer composer and its queue stay at the bottom.</p></li>
+      <li><span class="tag">7</span><h4>Whatever needs you comes first</h4>
+        <div class="who"><span class="chip ok">both</span><span class="chip warn">your call</span></div>
+        <p>Plan approval, questions, holds and the completed/failed outcome render directly under the header, above progress. Today the plan panel sits below the run summary, archives and judge, and the outcome heroes below the run summary. Switch the state above to see each.</p></li>
+      <li><span class="tag">8</span><h4>Cost as one footer line; run summary collapsed after the gate</h4>
+        <div class="who"><span class="chip ok">both</span><span class="chip warn">your call</span></div>
+        <p>“$32.56 · 58.9M in (93% cached) · 334k out” with the unrecorded tail kept separate, linking to the full tables. Unavailable cost shows as unavailable, never $0. The summary stays expanded while awaiting approval and remembers your per-run choice.</p></li>
+    </ol>
+    <div class="callout">
+      <div><b>Kept as-is in any build:</b> untrusted milestone, lane and Now text rendered as sanitized plain text; intent and plan through the hardened Markdown renderer; the polite live-announcement region; no new pulsing element (a lane pulses only with a live frame); keyboard disclosures with <span class="mono">aria-expanded</span>; reduced-motion respected.</div>
+      <div><b>Also found:</b> the header spinner ignores reduced-motion; the card and the checklist read “in progress” from two different fields. The merged card keeps each field’s meaning: row marks from the reported in-progress list, the Now note and track from the active milestone the server names.</div>
+    </div>
+  </section>
+</div>
+
+<script>
+(function () {
+  var view = "after", state = "running";
+  var stateSeg = document.getElementById("stateSeg");
+  function apply() {
+    document.getElementById("before").hidden = view !== "before";
+    document.getElementById("after").hidden = view !== "after";
+    stateSeg.style.opacity = view === "after" ? "1" : ".45";
+    document.querySelectorAll("[data-view]").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.view === view)); });
+    document.querySelectorAll("[data-state]").forEach(function (b) { b.setAttribute("aria-pressed", String(b.dataset.state === state)); });
+    document.querySelectorAll("#after [data-for]").forEach(function (el) { el.hidden = el.dataset.for.split(" ").indexOf(state) < 0; });
+    var seg = document.getElementById("lastSeg"), row = document.getElementById("m9row"), ic = document.getElementById("m9ic");
+    seg.className = "seg-bar " + (state === "completed" ? "done" : state === "failed" ? "stopped" : "now");
+    row.className = state === "completed" ? "done" : state === "failed" ? "cur stop" : "cur";
+    ic.textContent = state === "completed" ? "✓" : "◐";
+    try { localStorage.setItem("rpr", JSON.stringify({ view: view, state: state })); } catch (e) {}
+  }
+  try { var s = JSON.parse(localStorage.getItem("rpr") || "null"); if (s) { view = s.view || view; state = s.state || state; } } catch (e) {}
+  document.querySelectorAll("[data-view]").forEach(function (b) { b.addEventListener("click", function () { view = b.dataset.view; apply(); }); });
+  document.querySelectorAll("[data-state]").forEach(function (b) { b.addEventListener("click", function () { state = b.dataset.state; if (view !== "after") view = "after"; apply(); }); });
+  apply();
+})();
+</script>
+
+</html>

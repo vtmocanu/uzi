@@ -252,7 +252,9 @@ describe("the review runner (issue #2213)", () => {
     fs.rmSync(root, { recursive: true, force: true });
   });
 
-  it("an unreadable unattributed process refuses the PAT-bearing fetch: no ensureClone, a failed review is posted, and the worker latches", TIMEOUT, async () => {
+  it("an unreadable unattributed process refuses the PAT-bearing fetch: no ensureClone, a failed review is posted, and the worker latches", {
+    ...TIMEOUT, skip: process.platform !== "linux" && "worker-wide pre-fetch process scan is Linux-only",
+  }, async () => {
     plantUnreadableUnattributed(root, 4242);
     const rig = reviewRig();
     const rr = runnerWith(factoryFor({ run: async () => ({ branch: "x" }) }), fakeGitlab().gitlab);

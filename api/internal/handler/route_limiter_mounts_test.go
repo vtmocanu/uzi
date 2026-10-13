@@ -529,6 +529,11 @@ var wantRouteMounts = []routeMount{
 	// and same owner-or-404 gate as the archive DELETE above. Owner-scoped, no forge call, no
 	// token spend → noLimiter; the ?confirm=discard mutation gate is the handler's, not a limiter.
 	{"DELETE", "/api/runs/{id}/recovery-holds/{holdID}", noLimiter},
+	// Issue #2545: the owner held-publication list and early expiry, in the same RequireUser /runs
+	// group and owner-or-404 gate as the hold DISCARD above. Local DB read and write, no forge
+	// call (the sweeper pass deletes the refs) and no spend -> noLimiter.
+	{"GET", "/api/runs/{id}/held-publications", noLimiter},
+	{"POST", "/api/runs/{id}/held-publications/expire", noLimiter},
 	{"GET", "/api/runs/{id}/inputs", noLimiter},
 	{"GET", "/api/runs/{id}/messages", noLimiter},
 	{"GET", "/api/runs/{id}/review", noLimiter},
@@ -844,6 +849,7 @@ var wantRouteMounts = []routeMount{
 	// own run with no forge call → noLimiter, exactly like the completion/hold report beside it (both
 	// are fenced server-side, not by a per-user limiter).
 	{"POST", "/api/worker/runs/{id}/wall-park", noLimiter},
+	{"POST", "/api/worker/runs/{id}/pause", noLimiter},
 	// PRD #333 M2: the incidental-findings capture route. It rides
 	// proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback mount), which this
 	// per-USER probe reads as noLimiter — same as the proposals route below it.
@@ -862,6 +868,12 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/archives/reserve", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/upload", noLimiter},
 	{"POST", "/api/worker/runs/{id}/archives/{captureID}/reconcile", noLimiter},
+	// Issue #2625: the archive redundancy claim. Worker-authenticated; a claim that passes the
+	// local checks spends the OWNER's forge quota (a summary, a branch head and one compare per
+	// distinct commit), so it rides proposalLimiter.PerWorkerMiddleware (a per-WORKER, IP-fallback
+	// mount), which this per-USER probe reads as noLimiter, like /settle below. A refused claim is
+	// also memoized for an hour, so a looping worker is answered without any forge call.
+	{"POST", "/api/worker/runs/{id}/archives/{captureID}/redundancy", noLimiter},
 	// Issue #1582 M1: the worker predecessor-hold settle. Worker-authenticated; a call that
 	// reaches the proof spends the OWNER's forge quota (one branch-head read plus up to three
 	// compares, up to six on Forgejo, which compares both directions per candidate), so it
@@ -881,6 +893,9 @@ var wantRouteMounts = []routeMount{
 	{"POST", "/api/worker/runs/{id}/usage", noLimiter},
 	{"POST", "/api/worker/runs/{id}/proposals", noLimiter},
 	{"POST", "/api/worker/runs/{id}/publish", noLimiter},
+	// Issue #2545 step A: the failed run's held-work upload. Worker-authenticated, no per-user
+	// limiter; a process-wide slot cap bounds it instead (AcquireHeldPublishSlot).
+	{"POST", "/api/worker/runs/{id}/held-publication", noLimiter},
 	{"POST", "/api/worker/runs/{id}/review", noLimiter},
 	// PRD #400 M4a: the review run's diff-findings POST. Worker-authenticated, no per-user
 	// limiter, matching the judge's worker review POST above it.
@@ -892,8 +907,12 @@ var wantRouteMounts = []routeMount{
 	// PRD #1909 M4: the worker output-file upload, worker-authenticated and unlimited like the download above (bounded by the upload slots).
 	{"POST", "/api/worker/runs/{id}/files", noLimiter},
 	{"POST", "/api/worker/runs/{id}/state", noLimiter},
-	// Worker-authenticated, generation-fenced plan cross-check protocol.
+	// Worker-authenticated, generation-fenced, stage-dispatched cross-check protocol.
 	{"POST", "/api/worker/runs/{id}/cross-checks", noLimiter},
+	// Owned-worker dispositions are bounded and write-once, like the verdict callback.
+	{"POST", "/api/worker/runs/{id}/cross-checks/code/dispositions", noLimiter},
+	// Owned-worker status polling spends no provider or forge quota, like plan status.
+	{"GET", "/api/worker/runs/{id}/cross-checks/code/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/latest", noLimiter},
 	{"GET", "/api/worker/runs/{id}/cross-checks/plan/{round}", noLimiter},
 	{"POST", "/api/worker/runs/{id}/cross-check-verdict", noLimiter},

@@ -137,6 +137,9 @@ export interface FakePr {
   head: string;
   target: string;
   description: string;
+  /** The PR title: set from the create POST (unless adopted), `existingTitle` for an adopted PR,
+   *  and replaced by every successful title write. */
+  title: string;
 }
 
 /** PRD #1226 M4 (D5): options for the PR-head read (getMergeRequestHead). `head` is the SHA the
@@ -153,6 +156,17 @@ export interface FakeForgeOpts {
   /** PRD #1798 M6: an ADOPTED PR. The PR already carries this description, and the create POST
    *  (which a real forge answers with the existing PR) leaves it unchanged. */
   existing?: string;
+  /** The title an ADOPTED PR (`existing`) already carries (default "Existing PR title"). */
+  existingTitle?: string;
+  /** Leave `title` out of the GET detail, as a forge answering without one would. */
+  omitTitle?: boolean;
+  /** Status for a title-only PUT/PATCH (default 200); a non-2xx leaves the title unchanged and
+   *  makes updateMergeRequestTitle throw a ForgeError. Description writes keep `putStatus`. */
+  titleWriteStatus?: number;
+  /** Per-write statuses for title-only writes, consumed in order before `titleWriteStatus` applies. */
+  titleWriteStatuses?: number[];
+  /** A title-only write answers 2xx but leaves the title unchanged (a forge that drops the edit). */
+  titleWriteIgnored?: boolean;
   /** PRD #1798 M6: called after each successful body write with the fake PR (already updated), so a
    *  test can move the head or edit the description at a given write (or, by changing `headStatus`
    *  on the options object it passed, make later reads fail). */
@@ -185,7 +199,9 @@ function fakeTransport(
   const calls: MrCall[] = [];
   const reads: MrCall[] = [];
   const all: MrCall[] = [];
-  const pr: FakePr = { head: opts.head ?? "", target: opts.target ?? "main", description: opts.existing ?? "" };
+  const pr: FakePr = { head: opts.head ?? "", target: opts.target ?? "main", description: opts.existing ?? "",
+    title: opts.existingTitle ?? (opts.existing !== undefined ? "Existing PR title" : ""),
+  };
   const fetchFn: FetchFn = async (url, init) => {
     const call = { url, method: init.method, headers: init.headers, body: init.body };
     all.push(call);
@@ -197,22 +213,39 @@ function fakeTransport(
     if (init.method === "GET") {
       reads.push(call);
       const status = opts.headStatus ?? 200;
-      return { status, text: async () => JSON.stringify(detail(pr, pr.head)) };
+      const body = detail(pr, pr.head) as Record<string, unknown>;
+      if (!opts.omitTitle) body["title"] = pr.title;
+      return { status, text: async () => JSON.stringify(body) };
     }
     calls.push(call);
     // PRD #1225 (CodeRabbit !1254): the interlock reconcile rewrites the MR body (GitLab PUT,
     // Forgejo/GitHub PATCH). Answer 2xx so updateMergeRequestDescription succeeds.
     if (init.method === "PUT" || init.method === "PATCH") {
-      const status = opts.putStatus ?? 200;
-      if (status >= 200 && status < 300) {
-        const next = String((JSON.parse(init.body ?? "{}") as Record<string, unknown>)[field] ?? "");
-        pr.description = next;
-        opts.onWrite?.(pr, next);
+      const sent = JSON.parse(init.body ?? "{}") as Record<string, unknown>;
+      // A write carries a description, a title, or both; each field present is applied on its own
+      // (a title-only write never touches the description, a description-only write never the title).
+      const hasDescription = field in sent || !("title" in sent);
+      const hasTitle = "title" in sent;
+      let status = 200;
+      if (hasDescription) {
+        status = opts.putStatus ?? 200;
+        if (status >= 200 && status < 300) {
+          const next = String(sent[field] ?? "");
+          pr.description = next;
+          opts.onWrite?.(pr, next);
+        }
+      }
+      if (hasTitle) {
+        const titleStatus = hasDescription ? status : (opts.titleWriteStatuses?.shift() ?? opts.titleWriteStatus ?? 200);
+        if (titleStatus >= 200 && titleStatus < 300 && (hasDescription || !opts.titleWriteIgnored)) pr.title = String(sent["title"]);
+        status = titleStatus;
       }
       return { status, text: async () => "{}" };
     }
     if (opts.existing === undefined) {
-      pr.description = String((JSON.parse(init.body ?? "{}") as Record<string, unknown>)[field] ?? "");
+      const sent = JSON.parse(init.body ?? "{}") as Record<string, unknown>;
+      pr.description = String(sent[field] ?? "");
+      pr.title = String(sent["title"] ?? "");
     }
     return { status: 201, text: async () => JSON.stringify(created()) };
   };

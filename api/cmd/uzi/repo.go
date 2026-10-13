@@ -37,9 +37,10 @@ func newRepoCmd(env Env, gf *globalFlags) *cobra.Command {
 			}
 			rows := make([][]string, 0, len(repos))
 			for _, r := range repos {
-				rows = append(rows, []string{r.ID, r.PathWithNamespace, boolStr(r.Enabled), boolStr(r.DockerAllowlisted)})
+				rows = append(rows, []string{r.ID, r.PathWithNamespace, boolStr(r.Enabled), boolStr(r.DockerAllowlisted),
+					crossCheckGuidanceCell(r.CodeCrossCheckGuidance), boolStr(r.CrossCheckRepoInstructionsEnabled)})
 			}
-			return p.Table([]string{"ID", "PATH", "ENABLED", "DOCKER"}, rows)
+			return p.Table([]string{"ID", "PATH", "ENABLED", "DOCKER", "CHECK_GUIDANCE", "CHECK_REPO_INSTRUCTIONS"}, rows)
 		},
 	}
 
@@ -99,4 +100,14 @@ func confirmRemoveRepo(env Env, id string) (bool, error) {
 	}
 	ans := strings.ToLower(strings.TrimSpace(line))
 	return ans == "y" || ans == "yes", nil
+}
+
+// crossCheckGuidanceCell is the table cell for the owner's code cross-check
+// guidance: only whether it is set and its byte length, never the text.
+// `--json` carries the stored value; the CLI never writes guidance.
+func crossCheckGuidanceCell(g *string) string {
+	if g == nil || *g == "" {
+		return "none"
+	}
+	return fmt.Sprintf("set (%d bytes)", len(*g))
 }

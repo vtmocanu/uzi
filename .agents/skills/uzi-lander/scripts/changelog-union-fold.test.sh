@@ -203,6 +203,29 @@ cp "$WORK/hist.branch.md" "$WORK/redate.branch.md"
 printf '%s## [Unreleased]\n\n## [0.1.0] - 2026-01-02\n\n### Added\n\n- **old added**\n  old added desc\n' "$HEAD_" > "$WORK/redate.main.md"
 mkconflict redate; expect_refuse redate
 
+# 14c. RC-first: an rc.N cut folded [Unreleased] into the stable-keyed section an earlier
+#      candidate created; the section gained the ancestor bullet, so the fold is proven.
+RC_REL='## [0.2.0] - 2026-02-01
+
+### Added
+
+- **old added**
+  old added desc
+'
+printf '%s## [Unreleased]\n\n### Fixed\n\n- **rc2 fix**\n  rc2 desc\n\n%s' "$HEAD_" "$RC_REL" > "$WORK/rcfold.base.md"
+printf '%s## [Unreleased]\n\n%s\n### Fixed\n\n- **rc2 fix**\n  rc2 desc\n' "$HEAD_" "$RC_REL" > "$WORK/rcfold.main.md"
+printf '%s## [Unreleased]\n\n### Fixed\n\n- **rc2 fix**\n  rc2 desc\n\n- **new fix**\n  new desc\n\n%s' "$HEAD_" "$RC_REL" > "$WORK/rcfold.branch.md"
+printf '%s## [Unreleased]\n\n### Fixed\n\n- **new fix**\n  new desc\n\n%s\n### Fixed\n\n- **rc2 fix**\n  rc2 desc\n' "$HEAD_" "$RC_REL" > "$WORK/rcfold.want.md"
+mkconflict rcfold; expect_ok rcfold
+
+# 14d. Refusal (gain, not presence): the existing section already held the bullet in the
+#      ancestor and main only deleted the Unreleased entry; the section gained nothing.
+printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added desc\n\n%s' "$HEAD_" "$RC_REL" > "$WORK/nogain.base.md"
+printf '%s## [Unreleased]\n\n%s' "$HEAD_" "$RC_REL" > "$WORK/nogain.main.md"
+printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added desc\n\n- **new added**\n  new\n\n%s' "$HEAD_" "$RC_REL" > "$WORK/nogain.branch.md"
+mkconflict nogain; expect_refuse nogain
+grep -Fq 'fold unproven' <<<"$OUT" || fail "nogain: wrong refusal reason: $OUT"
+
 # 15. Refusal: markers in a plain file with no index stages stay the old refusal.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **a**\n||||||| b\n- **old**\n=======\n- **b**\n>>>>>>> x\n' > "$WORK/plain.md"
 cp "$WORK/plain.md" "$WORK/plain.before"
@@ -210,4 +233,4 @@ RC=0; OUT=$(bash "$SCRIPT" "$WORK/plain.md" 2>&1) || RC=$?
 [ "$RC" -eq 1 ] || fail "plain: expected exit 1, got $RC: $OUT"
 cmp -s "$WORK/plain.md" "$WORK/plain.before" || fail "plain: a refusal must leave the file untouched"
 
-echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, and the edited, deleted, unproven, unfolded, duplicate, released-change, prose and no-stage refusals"
+echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals"

@@ -256,7 +256,7 @@ func TestTUIDetailPlanGateBanner(t *testing.T) {
 }
 
 // M3 S3: awaiting_input gets a DISTINCT banner and NEVER offers y/n — those keys do
-// nothing at a clarification park (which is answered off-TUI).
+// nothing at a clarification park (where the owner answers with i).
 func TestTUIDetailInputBannerIsDistinctAndHasNoYesNo(t *testing.T) {
 	runID := "in-1"
 	m := tuiTestModel(t, &uzicli.FakeClient{}, runID)
@@ -720,6 +720,59 @@ func TestTUIDetailEscReturnsToBoard(t *testing.T) {
 
 // The whole untrusted surface goes through the sanitizer. This drives REAL model
 // state rather than calling the helpers directly, so it covers the wiring too.
+func TestTUIQuestionAnswerViewStripsHostileFields(t *testing.T) {
+	const hostile = "\x1b[2J\u202e\x07\x01"
+	payload := `{"questions":[{"header":` + quoteJSON(hostile+"header-safe") + `,"question":` + quoteJSON(hostile+"question-safe") + `,"options":[{"label":` + quoteJSON(hostile+"option-safe") + `,"description":` + quoteJSON(hostile+"description-safe") + `}]}]}`
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "hostile-question")
+	m = applyDetail(m, apitypes.RunDTO{ID: "hostile-question", Status: "running"}, []apitypes.MessageDTO{
+		{Seq: 1, Kind: "question", Payload: json.RawMessage(payload), CreatedAt: time.Now()},
+		{Seq: 2, Kind: "answer", Payload: json.RawMessage(`{"answers":[` + quoteJSON(hostile+"answer-safe") + `]}`), CreatedAt: time.Now()},
+	})
+	out := m.View().Content
+	assertNoRawControls(t, "structured question and answer", out)
+	// Exercise the pinned card itself, not just the transcript's sanitizer.
+	m.detail.run.Status = "awaiting_input"
+	m.detail.frames = m.detail.frames[:1]
+	for _, collapsed := range []bool{false, true} {
+		if collapsed {
+			m = cardUpdateZ(t, m)
+		}
+		raw := m.View().Content
+		assertNoRawControls(t, "question card", raw)
+		card := strings.Join(cardRows(raw), "\n")
+		for _, marker := range []string{"header-safe", "ANSWER REQUIRED"} {
+			if !strings.Contains(card, marker) {
+				t.Fatalf("hostile card marker %q never reached View: %s", marker, card)
+			}
+		}
+		if !collapsed {
+			for _, marker := range []string{"question-safe", "option-safe", "description-safe"} {
+				if !strings.Contains(card, marker) {
+					t.Fatalf("expanded card marker %q missing: %s", marker, card)
+				}
+			}
+		}
+	}
+	m.detail.frames[0].Payload = json.RawMessage(hostile + "raw-card-safe")
+	m = cardUpdateZ(t, m)
+	raw := m.View().Content
+	assertNoRawControls(t, "raw question card", raw)
+	card := strings.Join(cardRows(raw), "\n")
+	if !strings.Contains(card, "raw-card-safe") {
+		t.Fatalf("hostile raw card marker never reached View: %s", card)
+	}
+	for _, marker := range []string{"header-safe", "question-safe", "option-safe", "description-safe", "answer-safe"} {
+		if !strings.Contains(stripANSI(out), marker) {
+			t.Fatalf("hostile field %q never reached View:\n%s", marker, stripANSI(out))
+		}
+	}
+	for _, control := range []string{"\x1b[2J", "\u202e", "\x07", "\x01"} {
+		if strings.Contains(out, control) {
+			t.Errorf("hostile control %q reached View", control)
+		}
+	}
+}
+
 func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	now := time.Now()
 	// Hostile bytes at the FRONT: capCell/Plain truncate to 8-60 runes, so a payload at
@@ -817,6 +870,7 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// distinct "milesafe" tail, so only railMilestoneAgentLines' render of MilestoneAgent.AgentLabel
 	// can put it in the frame (the title yields "safe", the account label "credsafe").
 	hostileMileLabel := "\x1b[2J\u202E\x07\x01milesafe"
+	pct40 := 40
 	// A hostile per-run CredentialOverride.Label (PRD #1247 M8) exercises the crew rail's token line
 	// (railCredentialLine \u2192 railCredentialTokenLine \u2192 railOverrideMode \u2192 renderer.Plain). Its "ovrsafe"
 	// tail differs from every other marker so only THAT render path can put it in the frame. The
@@ -838,6 +892,12 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 		AnthropicSecretID: &secretID, AnthropicSecretLabel: &detailCredLabel,
 		Milestones:           []apitypes.Milestone{{ID: "m1", Title: nasty}},
 		MilestonesInProgress: []string{"m1"},
+		// PRD #2602: the PROGRESS block draws the active milestone's title (hostile above) and, when the
+		// id is not in the frozen list, the hostile id itself; Phase and the blocked-by id are server
+		// strings from untrusted text. All four go through renderer.Plain.
+		Progress: &apitypes.RunProgress{State: "percent", Pct: &pct40, MilestoneDone: 0, MilestoneTotal: 2,
+			ActiveMilestoneID: "m1", Phase: nasty + "phasesafe", MaybeBlockedByRunID: sptr("\u202E\x07\x01\x1bblk1"),
+			NowNote: &apitypes.ProgressNote{Text: nasty + "nowsafe", At: now}},
 		// A hostile per-milestone agent attribution (PRD #1224 M6). With m1 in progress AND
 		// attributed, the effective-attribution branch (D8) draws the DECLARED role
 		// (MilestoneAgent.Agent) and label (MilestoneAgent.AgentLabel) via railMilestoneAgentLines,
@@ -871,6 +931,9 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// via railMilestoneAgentLines' render of the attributed milestone's label (the title yields "safe",
 	// the account label "credsafe"). Its presence proves the PRD #1224 attribution render path ran and,
 	// paired with assertNoRawControls above, that it folded the hostile Agent/AgentLabel it drew.
+	if !strings.Contains(detailOut, "phasesafe") || !strings.Contains(detailOut, "blk1") || !strings.Contains(detailOut, "nowsafe") {
+		t.Fatalf("the crew rail PROGRESS block is not drawing Phase/MaybeBlockedByRunID, so this test is not exercising the PRD #2602 render path\n%s", detailOut)
+	}
 	if !strings.Contains(detailOut, "milesafe") {
 		t.Fatalf("the crew rail is not drawing MilestoneAgent attribution, so this test is not exercising the PRD #1224 render path\n%s", detailOut)
 	}
@@ -897,6 +960,18 @@ func TestTUIViewsStripControlBytesFromUntrustedText(t *testing.T) {
 	// label lives in TestRenderRunDetailCredentialOverrideSanitizes, the CLI render test.)
 	if strings.Contains(detailOut, "epochsafe") {
 		t.Fatalf("the TUI drew CredentialEpoch.Label — epochs are a CLI-only surface; a TUI epoch render must go through a sanitizer\n%s", detailOut)
+	}
+
+	// Issue #2705: a queued waiting_worker run's health_reason (it embeds a worker name) is drawn on
+	// the crew rail's waiting line (railWaitingLine) through renderer.Plain. The "waitsafe" tail is
+	// distinct from every other marker, so its survival proves THIS path put it in the frame.
+	waitReason := "waiting until 2026-07-12T12:19:00Z " + nasty + "waitsafe"
+	waiting := applyDetail(tuiTestModel(t, fake, runID), apitypes.RunDTO{ID: runID, Status: "queued",
+		Health: "waiting_worker", HealthReason: &waitReason, IssueTitle: nasty}, nil)
+	waitOut := waiting.View().Content
+	assertNoRawControls(t, "detail waiting line", waitOut)
+	if !strings.Contains(waitOut, "waitsafe") {
+		t.Fatalf("the crew rail is not drawing the waiting reason, so this test is not exercising railWaitingLine\n%s", waitOut)
 	}
 
 	// The ADMIN board is the only view that draws OwnerEmail (PRD #325 M2, B1). A hostile
@@ -1407,8 +1482,9 @@ func TestTUIBoardRowsFitNarrowWidth(t *testing.T) {
 }
 
 // The factory floor shows a milestone micro-bar on a milestone-structured run (milestoneMarker,
-// the web MilestoneBadge twin) — ▰ per done, ▱ per remaining — and NOTHING on a run with no
-// frozen list. A run that reported nothing has done=0, so it draws an all-empty ▱ bar (graphical 0/N).
+// sharing reported counts with web RunProgressCard / MilestoneRows) — ▰ per done,
+// ▱ per remaining — and NOTHING on a run with no frozen list. A run that reported nothing
+// has done=0, so it draws an all-empty ▱ bar (graphical 0/N).
 func TestTUIBoardMilestoneBadge(t *testing.T) {
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "structured",
@@ -1503,7 +1579,7 @@ func TestTUIBoardMilestoneBadgeCap(t *testing.T) {
 }
 
 // The board COST cell (boardCostSeg, PRD #650 / #1429 M5) branches on cost_status (D7): a
-// metered cost as "$N" (no decimal), a subscription-status run as "sub" (never "$0" — even a $0
+// metered cost as "$N" (no decimal), a subscription-status run as "n/a" (never "$0" — even a $0
 // with recorded tokens), an unreported/legacy-empty-status run as "n/a", a sub-dollar metered
 // cost as "<$1", and a nil-Usage run as a blank cell (the boardCredSeg convention).
 func TestTUIBoardCostCell(t *testing.T) {
@@ -1515,10 +1591,10 @@ func TestTUIBoardCostCell(t *testing.T) {
 		t.Errorf("cost cell: want whole-dollar $9 with no decimal, got %q", s)
 	}
 
-	// A subscription-status run (even at $0 with recorded tokens) → "sub", never "$0".
+	// A subscription-status run (even at $0 with recorded tokens) → "n/a", never "$0".
 	sub := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "sub") || strings.Contains(s, "$0") {
-		t.Errorf("cost cell: a subscription-status run must render sub not $0, got %q", s)
+	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$0") {
+		t.Errorf("cost cell: a subscription-status run must render n/a without dollars, got %q", s)
 	}
 
 	// An unreported-status run → "n/a", never a dollar figure.
@@ -1714,7 +1790,7 @@ func TestTUIBoardSummaryCountsFollowupPark(t *testing.T) {
 // belong. Mutation that reddens this: dropping the !r.IsRevising gate in boardSummary.
 func TestTUIBoardSummaryExcludesRevisingApproval(t *testing.T) {
 	genuine := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "awaiting_approval", IssueTitle: "plan gate"}}
-	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning"}, IsRevising: true}
+	revising := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "awaiting_approval", IssueTitle: "re-planning", IsRevising: true}}
 	fake := &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{genuine, revising}}
 	m := tuiTestModel(t, fake, "")
 	next, _ := m.Update(boardRunsMsg{reqID: m.board.waitID, runs: fake.Runs})
@@ -2291,7 +2367,7 @@ func spendModel(t *testing.T, usage *apitypes.UsageDTO) tuiModel {
 // TestTUIDetailHeadlineCost — PRD #650 M3 Part A / #1429 M5: the run-view status tag carries the
 // run's rolled-up cost, faint, beside the duration, branching on cost_status (D7) rather than
 // guessing from cost_usd == 0: "metered" renders the real dollar figure, "subscription" renders
-// the short "sub" label (never a dollar figure, never $0), anything else ("unreported", the pre-M1
+// the short "n/a" label (never a dollar figure, never $0), anything else ("unreported", the pre-M1
 // empty string) renders "n/a", and a pre-#40 nil-Usage run appends no cost token at all.
 func TestTUIDetailHeadlineCost(t *testing.T) {
 	header := func(m tuiModel) string { return stripANSI(strings.Join(m.detailHeaderLines(), "\n")) }
@@ -2300,10 +2376,10 @@ func TestTUIDetailHeadlineCost(t *testing.T) {
 		t.Errorf("headline status tag missing the cost $9.55:\n%s", h)
 	}
 
-	// A subscription-billed run (real token usage, no metered cost) → "sub", never "$0.00".
+	// A stored legacy subscription run (real token usage, no metered cost) → "n/a", never "$0.00".
 	sub := header(spendModel(t, &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}))
-	if !strings.Contains(sub, "sub") {
-		t.Errorf("a subscription-status run should render the sub label:\n%s", sub)
+	if !strings.Contains(sub, "n/a") {
+		t.Errorf("a subscription-status run should render the n/a label:\n%s", sub)
 	}
 	if strings.Contains(sub, "$0.00") || strings.Contains(sub, "$") {
 		t.Errorf("a subscription-status run must not render a dollar cost:\n%s", sub)
@@ -2375,7 +2451,7 @@ func TestTUIDetailSpendBlock(t *testing.T) {
 }
 
 // TestTUIDetailSpendDropsWhole — the SPEND block is whole-block-or-nothing: when the remaining
-// rail height cannot hold all three lines, renderSpend returns "" rather than a half-drawn block
+// rail height cannot hold all four lines, renderSpend returns "" rather than a half-drawn block
 // (header with no cache line), because joinColumns clamps the rail by dropping its bottom lines.
 func TestTUIDetailSpendDropsWhole(t *testing.T) {
 	m := spendModel(t, spendUsage())
@@ -2383,6 +2459,13 @@ func TestTUIDetailSpendDropsWhole(t *testing.T) {
 	// A large usedRows leaves no room: renderSpend returns "" (never a partial block).
 	if got := m.renderSpend(m.transcriptViewport()); got != "" {
 		t.Errorf("renderSpend must be empty when the rail height is exhausted, got %q", got)
+	}
+	// Three available rows cannot hold the amount, basis, and both token lines.
+	if got := m.renderSpend(m.transcriptViewport() - 4); got != "" {
+		t.Errorf("SPEND must drop whole with only three rows, got %q", got)
+	}
+	if got := stripANSI(m.renderSpend(m.transcriptViewport() - 5)); !strings.Contains(got, "API-equivalent") || !strings.Contains(got, "cache") {
+		t.Errorf("SPEND must fit whole with four rows, got %q", got)
 	}
 	// With generous room it renders the whole block.
 	full := stripANSI(m.renderSpend(0))
@@ -2412,13 +2495,13 @@ func TestTUIDetailSpendDropsWhole(t *testing.T) {
 }
 
 // TestTUIDetailSpendZeroCost — PRD #1429 M5: a subscription-status run WITH real token usage
-// shows the "Subscription" total in the SPEND block (never "—" or "$0.00") while the in/out/cache
+// shows the "n/a" total in the SPEND block (never "—" or "$0.00") while the in/out/cache
 // lines still render (the token breakdown does not depend on cost).
 func TestTUIDetailSpendZeroCost(t *testing.T) {
 	m := spendModel(t, &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 1000, OutputTokens: 50})
 	out := stripANSI(m.renderSpend(0))
-	if !strings.Contains(out, "Subscription") {
-		t.Errorf("a subscription-status SPEND total should render Subscription:\n%s", out)
+	if !strings.Contains(out, "n/a") {
+		t.Errorf("a subscription-status SPEND total should render n/a:\n%s", out)
 	}
 	if strings.Contains(out, "$0") || strings.Contains(out, "—") {
 		t.Errorf("a subscription-status SPEND total must not render a dollar figure or an em-dash:\n%s", out)
@@ -2447,7 +2530,7 @@ func TestTUIDetailSpendUnreportedCost(t *testing.T) {
 }
 
 // TestTUIBoardCostAsciiSurvives — PRD #650 M4 / #1429 M5: under an Ascii (NO_COLOR) colorprofile
-// downgrade the board's plain-text cost cues survive. The "$", digits, and the "sub" label are
+// downgrade the board's plain-text cost cues survive. The "$", digits, and the "n/a" label are
 // derived numerics/words, not coloured chrome — only the tungsten/faint accent is stripped
 // downstream at flush — so cost is never signalled by colour alone. Mirrors
 // TestBoardRateLimitStripAsciiSignalSurvives. NOTE: the colorprofile Writer strips SGR downstream
@@ -2457,16 +2540,16 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	// Two tokens so the credential gate clears (secretsMsg{count:2}); at width 120 the mile
 	// threshold (111) is under the terminal so every column, COST included, renders.
 	//
-	// The second run's IssueTitle deliberately avoids "sub"/"subscription" (unlike an earlier
+	// The second run's IssueTitle deliberately avoids "n/a"/"subscription" (unlike an earlier
 	// version of this fixture, "a subscription run") — that title text would satisfy a plain
-	// whole-frame strings.Contains(out, "sub") on its own, so a boardCostSeg regression that
-	// rendered "$0" instead of "sub" for a subscription-status run would go undetected. The
+	// whole-frame strings.Contains(out, "n/a") on its own, so a boardCostSeg regression that
+	// rendered "$0" instead of "n/a" for a subscription-status run would go undetected. The
 	// per-row assertion below additionally scopes the check to this run's OWN rendered line.
 	runs := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "aaaaaaaa-1", Kind: "issue", Status: "running", IssueTitle: "a real cost",
 			Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 12.0, InputTokens: 100}}}, // → "$12"
-		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a plan-billed run",
-			Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}, // → "sub"
+		{RunDTO: apitypes.RunDTO{ID: "bbbbbbbb-2", Kind: "issue", Status: "running", IssueTitle: "a plan-legacy run",
+			Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}, // → "n/a"
 	}
 	m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
 	m.width = 120
@@ -2485,13 +2568,13 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 		t.Errorf("Ascii-profile board dropped the plain cost cue %q:\n%s", "$12", out)
 	}
 
-	// The subscription run's "sub" cue must appear on ITS OWN row (found by its unique title,
-	// which carries no "sub"/"subscription" substring itself) — a $0/n/a regression in
-	// boardCostSeg would drop "sub" from this line even though other chrome elsewhere in the
+	// The subscription run's "n/a" cue must appear on ITS OWN row (found by its unique title,
+	// which carries no "n/a"/"subscription" substring itself) — a $0/n/a regression in
+	// boardCostSeg would drop "n/a" from this line even though other chrome elsewhere in the
 	// frame might coincidentally contain it.
 	var subRow string
 	for _, line := range strings.Split(out, "\n") {
-		if strings.Contains(line, "a plan-billed run") {
+		if strings.Contains(line, "a plan-legacy run") {
 			subRow = line
 			break
 		}
@@ -2499,8 +2582,8 @@ func TestTUIBoardCostAsciiSurvives(t *testing.T) {
 	if subRow == "" {
 		t.Fatalf("no board row found for the subscription run:\n%s", out)
 	}
-	if !strings.Contains(subRow, "sub") {
-		t.Errorf("Ascii-profile board dropped the plain cost cue %q on the subscription run's row:\n%s", "sub", subRow)
+	if !strings.Contains(subRow, "n/a") {
+		t.Errorf("Ascii-profile board dropped the plain cost cue %q on the subscription run's row:\n%s", "n/a", subRow)
 	}
 }
 

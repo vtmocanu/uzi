@@ -75,6 +75,11 @@ func TestGitLabListMergeRequestComments(t *testing.T) {
 	if !comments[0].CreatedAt.Before(comments[1].CreatedAt) {
 		t.Errorf("comments not oldest-first: %v then %v", comments[0].CreatedAt, comments[1].CreatedAt)
 	}
+	for _, c := range comments {
+		if c.IDNamespace != CommentNSNote {
+			t.Errorf("comment %d IDNamespace = %q, want %q (inline and top-level alike)", c.ID, c.IDNamespace, CommentNSNote)
+		}
+	}
 }
 
 // TestGitLabReplyMergeRequestComment pins the reply keyed on the reply anchor: a
@@ -236,6 +241,63 @@ func TestGitHubListMergeRequestComments(t *testing.T) {
 	}
 	if inline.Path == nil || *inline.Path != "api/x.go" || inline.Line == nil || *inline.Line != 42 {
 		t.Errorf("inline diff anchor wrong: path=%v line=%v", inline.Path, inline.Line)
+	}
+	if comments[0].IDNamespace != CommentNSIssueComment {
+		t.Errorf("top-level IDNamespace = %q, want %q", comments[0].IDNamespace, CommentNSIssueComment)
+	}
+	if summary.IDNamespace != CommentNSReview {
+		t.Errorf("review summary IDNamespace = %q, want %q", summary.IDNamespace, CommentNSReview)
+	}
+	if inline.IDNamespace != CommentNSReviewComment {
+		t.Errorf("inline IDNamespace = %q, want %q", inline.IDNamespace, CommentNSReviewComment)
+	}
+}
+
+// TestGitHubListMergeRequestCommentsSameIDDistinctNamespaces pins that an issue
+// comment and an inline review comment sharing one numeric id are both returned,
+// each in its own id namespace, so (IDNamespace, ID) stays unique.
+func TestGitHubListMergeRequestCommentsSameIDDistinctNamespaces(t *testing.T) {
+	m := newMockGitHub(t, map[string]http.HandlerFunc{
+		"/repos/acme/widgets/issues/13/comments": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1234, "body": "issue comment", "created_at": "2026-07-04T09:00:00Z",
+					"user": map[string]any{"id": 42, "login": "carol"}},
+			})
+		},
+		"/repos/acme/widgets/pulls/13/comments": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{
+				{"id": 1234, "body": "inline comment", "path": "api/x.go", "line": 1,
+					"commit_id": "h", "created_at": "2026-07-04T10:00:00Z",
+					"user": map[string]any{"id": 43, "login": "coderabbit"}},
+			})
+		},
+		"/repos/acme/widgets/pulls/13/reviews": func(w http.ResponseWriter, _ *http.Request) {
+			_ = json.NewEncoder(w).Encode([]map[string]any{})
+		},
+		graphqlRoute: func(w http.ResponseWriter, r *http.Request) {
+			_ = readGQL(t, r)
+			writeGQLData(w, map[string]any{
+				"repository": map[string]any{"pullRequest": map[string]any{
+					"reviewThreads": map[string]any{"nodes": []map[string]any{}},
+				}},
+			})
+		},
+	})
+	d := newGitHubDriver(t, m, "ghp_classicTokenValue1234567890")
+
+	comments, err := d.ListMergeRequestComments(context.Background(), 7, 13)
+	if err != nil {
+		t.Fatalf("ListMergeRequestComments: %v", err)
+	}
+	if len(comments) != 2 {
+		t.Fatalf("expected both same-id comments, got %d: %+v", len(comments), comments)
+	}
+	if comments[0].ID != 1234 || comments[1].ID != 1234 {
+		t.Fatalf("ids = %d, %d, want both 1234", comments[0].ID, comments[1].ID)
+	}
+	if comments[0].IDNamespace != CommentNSIssueComment || comments[1].IDNamespace != CommentNSReviewComment {
+		t.Errorf("namespaces = %q, %q, want %q, %q", comments[0].IDNamespace, comments[1].IDNamespace,
+			CommentNSIssueComment, CommentNSReviewComment)
 	}
 }
 
@@ -576,6 +638,10 @@ func TestForgejoListMergeRequestComments(t *testing.T) {
 	}
 	if !comments[0].CreatedAt.Before(comments[1].CreatedAt) || !comments[1].CreatedAt.Before(comments[2].CreatedAt) {
 		t.Errorf("comments not oldest-first: %v, %v, %v", comments[0].CreatedAt, comments[1].CreatedAt, comments[2].CreatedAt)
+	}
+	if comments[0].IDNamespace != CommentNSIssueComment || comments[1].IDNamespace != CommentNSReview || inline.IDNamespace != CommentNSReviewComment {
+		t.Errorf("namespaces = %q, %q, %q, want %q, %q, %q", comments[0].IDNamespace, comments[1].IDNamespace, inline.IDNamespace,
+			CommentNSIssueComment, CommentNSReview, CommentNSReviewComment)
 	}
 }
 

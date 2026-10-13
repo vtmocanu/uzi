@@ -105,6 +105,9 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -859,5 +862,110 @@ describe("Dashboard usage recency refresh (#2399)", () => {
     Object.defineProperty(document, "hidden", { configurable: true, get: () => false });
     await act(async () => { document.dispatchEvent(new Event("visibilitychange")); });
     expect(mockApi.getUsage).toHaveBeenCalledTimes(2);
+  });
+});
+
+// PRD #2602 M1: the recent-runs row carries the server-derived Progress cell beside the
+// milestone badge; a row without `progress` (pre-feature server) renders no cell.
+describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
+  it("shows `70%` with a progressbar for a percent run and nothing for a run without progress", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "p",
+          issue_title: "Percent run",
+          milestones: [
+            { id: "a", title: "A" },
+            { id: "b", title: "B" },
+            { id: "c", title: "C" },
+          ],
+          milestones_completed: ["a", "b"],
+          progress: {
+            state: "percent",
+            pct: 70,
+            milestone_done: 2,
+            milestone_total: 3,
+            active_milestone_id: "c",
+            phase: "",
+          },
+        }),
+        aRun({ id: "old", issue_title: "Pre-feature run" }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const row = screen.getByText("Percent run").closest("li")!;
+    const bar = within(row).getByRole("progressbar");
+    expect(bar.getAttribute("aria-valuenow")).toBe("70");
+    expect(bar.textContent).toBe("70%");
+    // The cell sits in the raised badge cluster right after the M2/3 badge.
+    expect(bar.closest("[data-run-progress]")?.parentElement?.previousElementSibling?.textContent).toBe("M2/3");
+    const old = screen.getByText("Pre-feature run").closest("li")!;
+    expect(old.querySelector("[data-run-progress]")).toBeNull();
+  });
+  it("a stalled cell replaces the health badge from sm up; phones keep the badge", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "s",
+          issue_title: "Stalled run",
+          status: "running",
+          health: "looping",
+          health_since: "2026-07-05T11:41:00Z",
+          progress: {
+            state: "stalled",
+            pct: null,
+            milestone_done: 1,
+            milestone_total: 3,
+            active_milestone_id: "b",
+            phase: "",
+          },
+        }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    const row = screen.getByText("Stalled run").closest("li")!;
+    // The cell is hidden below sm (its wrapper), the health badge only below sm.
+    const cell = row.querySelector('[data-run-progress="stalled"]')!;
+    expect(cell.parentElement?.className).toBe("hidden sm:contents");
+    expect(cell.textContent).toContain("(looping)");
+    const health = within(row).getByText(/^⚠ looping/);
+    expect(health.parentElement?.className).toBe("contents sm:hidden");
+  });
+});
+
+// Issue #2661: the dashboard polls the compact summary projection; tiles and the recent
+// list still render from rows that lack the four heavy detail keys.
+describe("Dashboard — summary run projection (#2661)", () => {
+  it("requests view=summary and renders a row without the heavy keys", async () => {
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRun({
+      issue_title: "Summary row title",
+      status: "running",
+    });
+    mockApi.listRuns.mockResolvedValue({ runs: [summary as never] });
+    renderDashboard();
+    await act(async () => {
+      await new Promise((r) => setTimeout(r, 0));
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
+    expect(screen.getByText("Summary row title")).toBeTruthy();
+  });
+
+  it("every listRuns call, including the poll tick, requests view=summary", async () => {
+    vi.useFakeTimers();
+    renderDashboard();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
   });
 });

@@ -320,7 +320,8 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 		// not validated either (an over-cap or malformed one is not a 400): they are discarded.
 		raw = apitypes.PrDescriptionFields{}
 	}
-	fields, err := SanitizePrDescriptionFields(ctx, raw)
+	var diagramReason string
+	fields, err := sanitizePrDescriptionFields(ctx, raw, func(reason string) { diagramReason = reason })
 	if err != nil {
 		return apitypes.PrDescriptionVersionDTO{}, err
 	}
@@ -352,6 +353,13 @@ func (s *Service) StagePrDescription(ctx context.Context, wkr store.Worker, runI
 		})
 		return err
 	})
+	if diagramReason != "" {
+		attrs := []any{"run_id", runID, "claim_generation", *req.ClaimGeneration, "reason", diagramReason}
+		if err == nil {
+			attrs = append(attrs, "version_id", out.ID)
+		}
+		slog.Warn("workersvc: dropped pr description diagram", attrs...)
+	}
 	if err != nil {
 		return apitypes.PrDescriptionVersionDTO{}, err
 	}

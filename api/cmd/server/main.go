@@ -29,6 +29,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/codexauth"
 	"github.com/vtmocanu/uzi/api/internal/codexusagepoller"
 	"github.com/vtmocanu/uzi/api/internal/config"
+	"github.com/vtmocanu/uzi/api/internal/dbdiskfull"
 	"github.com/vtmocanu/uzi/api/internal/fetchctl"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/handler"
@@ -198,7 +199,10 @@ func run() error {
 		return err
 	}
 
-	pool, err := store.OpenPool(ctx, cfg.DatabaseURL)
+	// diskFull records SQLSTATE 53100 write failures seen on the api pool; the admin
+	// health db check reads it.
+	diskFull := dbdiskfull.New(time.Now)
+	pool, err := store.OpenPool(ctx, cfg.DatabaseURL, store.WithQueryTracer(&dbdiskfull.Tracer{Signal: diskFull}))
 	if err != nil {
 		return err
 	}
@@ -305,6 +309,7 @@ func run() error {
 		RunTimeout:                    cfg.RunTimeout,
 		RunWallCeiling:                cfg.RunWallCeiling,
 		PlanCrossCheckTimeout:         cfg.PlanCrossCheckTimeout,
+		CodeCrossCheckTimeout:         cfg.CodeCrossCheckTimeout,
 		PlanCrossCheckMaxRevisions:    cfg.PlanCrossCheckMaxRevisions,
 		PlanCrossCheckMaxRevisionsSet: true,
 		RunIdleTimeout:                cfg.RunIdleTimeout,
@@ -333,6 +338,7 @@ func run() error {
 		DiskPressureThreshold:       cfg.DiskPressureThreshold,
 		WorkerAffinityGrace:         cfg.WorkerAffinityGrace,
 		WorkerAffinityCeiling:       cfg.WorkerAffinityCeiling,
+		WorkerStaleRequeueGrace:     cfg.WorkerStaleRequeueGrace,
 		WorkerSpreadGrace:           cfg.WorkerSpreadGrace,
 		WorkerBackgroundGrace:       cfg.WorkerBackgroundGrace,
 		SkillMaxBytes:               cfg.SkillMaxBytes,
@@ -366,6 +372,9 @@ func run() error {
 		// Data-volume-full park cap (PRD #1809 M5, D6): past this many COUNTED disk parks the run
 		// fails with fail_origin='data_volume_full'. 0 = unlimited. Preventive parks never count.
 		RunDiskParkMax: cfg.RunDiskParkMax,
+		// PRD #1733: elapsed-time bound on an unbroken provider-outage park streak; past it the next
+		// provider park becomes a paused 'provider_unavailable' hold. 0 disables the hold.
+		RunProviderParkMaxDuration: cfg.RunProviderParkMaxDuration,
 		// PRD #1296 D3/D4 durable-archive upload-retry window: the sweep flips a capture stuck
 		// in a non-terminal upload state past this to needs_action WITHOUT releasing its
 		// custody hold (source retained). Non-positive disables the pass.
@@ -377,6 +386,8 @@ func run() error {
 		// PRD #1867 failed-run salvage: the forge kinds whose failed runs the run_salvage
 		// pass enqueues (UZI_SALVAGE_FORGES). Empty is off; it gates only the enqueue.
 		SalvageForges: cfg.SalvageForges,
+		// Issue #2545 held-work publication step A switch (UZI_HELD_PUBLICATION, default on).
+		HeldPublication: cfg.HeldPublication,
 	})
 
 	// Job files (PRD #1909 M1): the bounded, sealed file store the /api/v1 upload and the worker
@@ -641,6 +652,7 @@ func run() error {
 	// the browser and Slack. PublishState never blocks (it enqueues); a Slack
 	// failure is logged redacted and never affects the run. Unconfigured users are
 	// dropped silently, so this is a strict no-op until linking is set up.
+	const notificationUserCap = notifysvc.DefaultUserCap
 	slackNotifier := slacksvc.NewNotifier(
 		q,
 		slackPoster,
@@ -648,8 +660,11 @@ func run() error {
 		slog.Default(),
 		// PRD #1189 M4: the near-timeout DM names the run's wall-clock deadline (needs the
 		// instance RUN_TIMEOUT for a run on the global default) and offers the `run extend`
-		// command unless the extension cap is exhausted or extending is disabled (cap 0).
+		// command with a duration within the per-request maximum and the run's remaining total-time room
+		// (nothing when extending is disabled, cap 0).
+		slacksvc.WithNotificationUserCap(notificationUserCap),
 		slacksvc.WithRunTimeout(cfg.RunTimeout),
+		slacksvc.WithRunWallCeiling(cfg.RunWallCeiling),
 		slacksvc.WithExtensionCap(settingsCache.RunExtensionCapSeconds),
 	)
 	// Notifications write seam (PRD #46 M2): the one place that creates notification
@@ -659,11 +674,11 @@ func run() error {
 	// event log with durable halt delivery; the Slack DM is what
 	// the user sees. Every producer below (handler, poller detectors, scheduler,
 	// reconcilers, usage engine) calls notifier.Notify or one of its helpers.
-	notifier := notifysvc.New(q, slackNotifier, notifysvc.DefaultUserCap, slog.Default())
+	notifier := notifysvc.New(q, slackNotifier, notificationUserCap, slog.Default())
 	// Slack redelivery (issue #1675): the halt DMs opt into durable delivery, and this
 	// re-enqueues the ones whose in-memory enqueue was dropped or whose post failed, via the
 	// sweeper pass registered below.
-	redeliverer := notifysvc.NewRedeliverer(q, slackNotifier, slog.Default())
+	redeliverer := notifysvc.NewRedeliverer(q, slackNotifier, slog.Default(), notifysvc.WithRedeliveryUserCap(notificationUserCap))
 
 	// Wire the mid-flight mr_rework abort (#853): when the MR-close watcher observes a
 	// merge/close, cancel any in-flight rework for that MR through workersvc's cancel path.
@@ -761,7 +776,9 @@ func run() error {
 	// store, box and settings cache already in scope, plus the ephemeral cap + default
 	// size knobs.
 	ephemeralProv := hostedsvc.NewEphemeralProvisioner(pool, q, box, settingsCache, hostedsvc.EphemeralConfig{
-		WorkerAffinityGrace: cfg.WorkerAffinityGrace,
+		WorkerAffinityGrace:     cfg.WorkerAffinityGrace,
+		WorkerStaleRequeueGrace: cfg.WorkerStaleRequeueGrace,
+		WorkerAffinityCeiling:   cfg.WorkerAffinityCeiling,
 		// Issue #1965: lane workers are provisioned only where the chart enabled the lane.
 		IsolatedLaneEnabled: cfg.IsolatedLaneEnabled(),
 		DockerEnabled:       cfg.WorkerDockerEnabled,
@@ -900,6 +917,14 @@ func run() error {
 		sweeper.Pass{
 			Name: "run_salvage",
 			Run:  wsvc.SweepSalvage,
+		},
+		// Held-work publication cleanup (issue #2545): reconcile of unknown creates and deletes, the
+		// retention expiry of acknowledged refs and the orphan delete of never-acknowledged ones.
+		// ALWAYS registered: UZI_HELD_PUBLICATION gates only new step A and B work, never cleanup,
+		// so refs already published are still released with the switch off.
+		sweeper.Pass{
+			Name: "held_publication",
+			Run:  wsvc.SweepHeldPublications,
 		},
 		// Stale fetch reservations (PRD #1906 M3): a reservation older than
 		// fetchctl.StaleReservationAge belongs to a fetch whose fetcher crashed or lost its
@@ -1092,30 +1117,38 @@ func run() error {
 	// debounced claimed fan-out is M6). Wired beside the custody-episode reconciler above: a
 	// standalone reconciler with a boot pass then a one-minute ticker.
 	healthSvc := healthsvc.New(healthsvc.Config{
-		WorkerEligibilityForHealth: wsvc.WorkerEligibilityForHealth,
-		ResidueQuarantine:          wsvc.ResidueQuarantineFor,
-		Store:                      q,
-		Pool:                       pool,
-		Settings:                   settingsCache,
-		SlackState:                 slackManager.State,
-		Now:                        time.Now,
-		HostedWorkerVersion:        cfg.HostedWorkerVersion,
-		RunningVersion:             version,
-		HeartbeatStale:             cfg.WorkerHeartbeatStale,
-		CustodyHoldLimit:           int32(workersvc.CustodyHoldLimit),
-		BootTime:                   time.Now(),
-		CIWatchMaxRefs:             cfg.CIWatchMaxRefs,
-		CIWatchRunWindow:           cfg.CIWatchRunWindow,
-		Registry:                   healthBeats,
-		ForgeSyncRegistry:          forgeHealth.ForgeSyncRegistry,
-		ForgeSyncInterval:          forgeHealth.ForgeSyncInterval,
+		WorkerEligibilityForHealth:   wsvc.WorkerEligibilityForHealth,
+		ResidueQuarantine:            wsvc.ResidueQuarantineFor,
+		Store:                        q,
+		Pool:                         pool,
+		DiskFull:                     diskFull,
+		DBStorageCapacityBytes:       cfg.DBStorageCapacityBytes,
+		Settings:                     settingsCache,
+		SlackState:                   slackManager.State,
+		Now:                          time.Now,
+		HostedWorkerVersion:          cfg.HostedWorkerVersion,
+		RunningVersion:               version,
+		HeartbeatStale:               cfg.WorkerHeartbeatStale,
+		CustodyHoldLimit:             int32(workersvc.CustodyHoldLimit),
+		RecoveryReadyPayloadPerOwner: cfg.RecoveryReadyPayloadPerOwner,
+		RecoveryInstanceBytes:        cfg.RecoveryInstanceBytes,
+		StoredFilesBudgetBytes:       cfg.StoredFilesBudgetBytes,
+		BootTime:                     time.Now(),
+		CIWatchMaxRefs:               cfg.CIWatchMaxRefs,
+		CIWatchRunWindow:             cfg.CIWatchRunWindow,
+		Registry:                     healthBeats,
+		ForgeSyncRegistry:            forgeHealth.ForgeSyncRegistry,
+		ForgeSyncInterval:            forgeHealth.ForgeSyncInterval,
 	})
 	// M6 wires the notice fan-out into the SAME reconciler: the persist-first notifysvc
 	// seam, the store (ListAdmins fan-out set + the atomic ClaimHealthEpisodeNotice slot),
 	// and the health-notification enablement gate (settingsCache.HealthEnabled — the SAME
 	// gate the custody-episode reconciler reuses, no new enable flag, D10). notifier and
 	// settingsCache are the same collaborators wired into custodyEpisodeRec above.
-	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default())
+	// WithEmergencySlack adds the in-memory disk-full DM for a database that refuses the
+	// episode-open/claim/persist writes (SQLSTATE 53100); see EpisodeReconciler for its limits.
+	healthEpisodeRec := healthsvc.NewEpisodeReconciler(healthSvc, q, notifier, settingsCache, slog.Default()).
+		WithEmergencySlack(slackNotifier, diskFull)
 	healthEpisodeInterval := time.Minute
 	bgWG.Add(1)
 	go func() {
@@ -1327,12 +1360,11 @@ func run() error {
 		agentSourceRunner.Start(ctx)
 	}()
 
-	// Upstream-release-check interval Runner (PRD #836 M2), wired exactly like the
-	// agent-source Runner: a panic-recovered background goroutine that sleeps
-	// ReleaseCheckInterval per tick and calls CheckForUpdate. The master enable gate is
-	// read inside CheckForUpdate (short-circuits to "disabled" with no egress), and the
-	// first tick only fires after one interval, so this never delays boot or calls
-	// github.com when the feature is off.
+	// Upstream-release-check Runner (PRD #836 M2): a panic-recovered background
+	// goroutine whose initial wait uses the persisted checked-at timestamp, with a
+	// one-minute boot delay for overdue checks. Later attempts wait a full interval.
+	// CheckForUpdate owns the master enable gate (disabled means no egress), so
+	// scheduling never delays boot or calls github.com when the feature is off.
 	releaseRec := releasecheck.NewReconciler(q, settingsCache, time.Now, slog.Default())
 	releaseRunner := releasecheck.NewRunner(releaseRec, settingsCache, slog.Default())
 	bgWG.Add(1)
@@ -1642,13 +1674,18 @@ func (g gateSubmitter) SubmitApproval(ctx context.Context, userID, runID uuid.UU
 // on to their slacksvc translations, keeping slacksvc free of a workersvc import:
 // ErrReviseCapReached (PRD #41, the "revision limit reached" ephemeral), ErrInvalidSelection
 // (PRD #37 M7, the gate stays open) and *GateRevisionMismatchError (PRD #1795 M5, the card's
-// revision is no longer the run's gate: the superseded notice). Any other error passes through.
+// revision is no longer the run's gate: the superseded notice), plus ErrApprovalMilestonesMoved (#2680,
+// mapped to the same superseded notice). Any other error passes through.
 func translateGateSubmitErr(err error) error {
 	var mismatch *workersvc.GateRevisionMismatchError
 	switch {
 	case err == nil:
 		return nil
 	case errors.As(err, &mismatch):
+		return slacksvc.ErrGateRevisionMismatch
+	case errors.Is(err, workersvc.ErrApprovalMilestonesMoved):
+		// Issue #2680: the plan's milestones moved under the approve, so the card no longer shows
+		// the plan on screen: the same superseded notice as a revision mismatch.
 		return slacksvc.ErrGateRevisionMismatch
 	case errors.Is(err, workersvc.ErrReviseCapReached):
 		return slacksvc.ErrReviseCapReached

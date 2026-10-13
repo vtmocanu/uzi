@@ -21,21 +21,89 @@ const settings = (over: Partial<UserSettings> = {}): UserSettings => ({
   appearance_mode: null, light_theme: null, dark_theme: null, typeface: null,
   cross_check_pins: [pin("claude"), pin("codex")], ...over,
 });
-const model = (family: string) => screen.getByLabelText(`${family} checker model`) as HTMLSelectElement;
-const effort = (family: string) => screen.getByLabelText(`${family} checker effort`) as HTMLSelectElement;
+const model = (family: string) => within(screen.getByRole("row", { name: /Plan cross-check/ })).getByLabelText(`${family} checker model`) as HTMLSelectElement;
+const effort = (family: string) => within(screen.getByRole("row", { name: /Plan cross-check/ })).getByLabelText(`${family} checker effort`) as HTMLSelectElement;
 const save = () => screen.getByRole("button", { name: "Save cross-check defaults" }) as HTMLButtonElement;
 beforeEach(() => vi.resetAllMocks());
 afterEach(cleanup);
 
 describe("checker defaults", () => {
-  it("has one accessible Plan row, exact headings, independent Defaults and editable dormant Claude", () => {
+  it("saves four independent stage/family drafts and normalizes the response", async () => {
+    const initial = settings({ cross_check_pins: [
+      pin("claude"), pin("codex"),
+      pin("claude", { stage: "code", model: "haiku", effort: "max" }),
+      pin("codex", { stage: "code", model: "gpt-6-sol", effort: "high" }),
+    ] });
+    render(<CrossCheckDefaults settings={initial} />);
+    const code = within(screen.getByRole("row", { name: /Code cross-check/ }));
+    fireEvent.change(model("Claude"), { target: { value: "sonnet" } });
+    fireEvent.change(effort("Codex"), { target: { value: "max" } });
+    fireEvent.change(code.getByLabelText("Code Claude checker model"), { target: { value: "inherit" } });
+    fireEvent.change(code.getByLabelText("Code Codex checker effort"), { target: { value: "" } });
+    mocked.putMySettings.mockResolvedValueOnce({ settings: settings({ cross_check_pins: [
+      pin("claude", { model: "sonnet" }), pin("codex", { effort: "max" }),
+      pin("claude", { stage: "code", effort: "max" }),
+      pin("codex", { stage: "code", model: "gpt-6-sol" }),
+    ] }) });
+    fireEvent.click(save());
+    await waitFor(() => expect(save().disabled).toBe(true));
+    expect(mocked.putMySettings).toHaveBeenCalledWith({ cross_check_pins: [
+      { stage: "plan", harness: "claude", model: "sonnet" },
+      { stage: "plan", harness: "codex", effort: "max" },
+      { stage: "code", harness: "claude", model: null },
+      { stage: "code", harness: "codex", effort: null },
+    ] });
+    expect((code.getByLabelText("Code Claude checker effort") as HTMLSelectElement).value).toBe("max");
+    expect((code.getByLabelText("Code Codex checker model") as HTMLSelectElement).value).toBe("gpt-6-sol");
+  });
+
+  it("defaults absent legacy code cells without inheriting plan pins or sending untouched cells", async () => {
+    render(<CrossCheckDefaults settings={settings({ cross_check_pins: [
+      pin("claude", { model: "sonnet", effort: "max" }), pin("codex", { model: "gpt-6-sol" }),
+    ] })} />);
+    const code = within(screen.getByRole("row", { name: /Code cross-check/ }));
+    for (const family of ["Claude", "Codex"]) {
+      expect((code.getByLabelText(`Code ${family} checker model`) as HTMLSelectElement).value).toBe("inherit");
+      expect((code.getByLabelText(`Code ${family} checker effort`) as HTMLSelectElement).value).toBe("");
+      expect(code.getByLabelText(`Code ${family} checker model`).textContent).toContain("Default · Unavailable (worker default)");
+    }
+    fireEvent.change(code.getByLabelText("Code Claude checker effort"), { target: { value: "high" } });
+    mocked.putMySettings.mockResolvedValueOnce({ settings: settings() });
+    fireEvent.click(save());
+    await waitFor(() => expect(mocked.putMySettings).toHaveBeenCalledWith({
+      cross_check_pins: [{ stage: "code", harness: "claude", effort: "high" }],
+    }));
+  });
+
+  it.each([["claude", "Claude", "gpt-6.1-sol"], ["codex", "Codex", "sonnet"]])(
+    "guards the code %s family while accepting a custom ID", (harness, family, invalid) => {
+      render(<CrossCheckDefaults settings={settings()} />);
+      const code = within(screen.getByRole("row", { name: /Code cross-check/ }));
+      fireEvent.change(code.getByLabelText(`Code ${family} checker model`), { target: { value: "custom" } });
+      const custom = screen.getByLabelText(`Custom code ${harness} checker model ID`);
+      fireEvent.change(custom, { target: { value: invalid } });
+      expect(screen.getByText("Choose a model from the checker's model family.")).toBeTruthy();
+      expect(save().disabled).toBe(true);
+      fireEvent.change(custom, { target: { value: "custom-checker" } });
+      expect(save().disabled).toBe(false);
+    },
+  );
+
+  it("has accessible Plan and Code rows, exact headings, independent Defaults and editable Claude", () => {
     render(<CrossCheckDefaults settings={settings()} onSaved={vi.fn()} />);
     const table = screen.getByRole("table", { name: "Cross-check defaults" });
-    expect(within(table).getAllByRole("row")).toHaveLength(2);
+    expect(within(table).getAllByRole("row")).toHaveLength(3);
+    for (const family of ["Claude", "Codex"]) {
+      const harness = family.toLowerCase();
+      expect(screen.getByLabelText(`${family} checker model`).id).toBe(`checker-${harness}-model`);
+      expect(screen.getByLabelText(`${family} checker effort`).id).toBe(`checker-${harness}-effort`);
+      expect(screen.getByLabelText(`Code ${family} checker model`).id).toBe(`checker-code-${harness}-model`);
+      expect(screen.getByLabelText(`Code ${family} checker effort`).id).toBe(`checker-code-${harness}-effort`);
+    }
     expect(within(table).getByRole("columnheader", { name: "Claude cross-checker" })).toBeTruthy();
     expect(within(table).getByRole("columnheader", { name: "Codex cross-checker" })).toBeTruthy();
     expect(screen.getByText("Checks leads running on the other model family")).toBeTruthy();
-    expect(screen.getByText("Used once Codex-lead runs are cross-checked")).toBeTruthy();
+    expect(screen.queryByText(/Used once Codex-lead runs are cross-checked/)).toBeNull();
     expect(within(model("Claude")).getByRole("option", { name: "Default · custom-template-model (worker default)" })).toBeTruthy();
     expect(within(model("Codex")).getByRole("option", { name: "Default · gpt-6.1-sol (worker default)" })).toBeTruthy();
     for (const family of ["Claude", "Codex"]) {

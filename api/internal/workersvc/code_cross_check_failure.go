@@ -1,0 +1,87 @@
+package workersvc
+
+import (
+	"context"
+	"encoding/json"
+	"errors"
+
+	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+// RecordCodeCrossCheckFailure retains a verified pair, or records an allowlisted
+// pre-snapshot failure with neither SHA. Retries cannot replace a frozen attempt.
+func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.Worker, leadID uuid.UUID, generation int64, base, head, reason string, inputs ...CodeCrossCheckInstructions) (store.CrossCheck, error) {
+	var result store.CrossCheck
+	input, inputErr := codeCrossCheckInstructions(inputs)
+	if inputErr != nil {
+		return result, inputErr
+	}
+	noSnapshot := base == "" && head == ""
+	if (noSnapshot && len(inputs) != 0) || s.txBeginner == nil || (noSnapshot && reason != "snapshot_failed" && reason != "worker_unsupported") ||
+		(!noSnapshot && (!validCodeSHA(base) || !validCodeSHA(head) || reason != "checker_unavailable")) {
+		return result, ErrCrossCheckRefused
+	}
+	tx, err := s.txBeginner.Begin(ctx)
+	if err != nil {
+		return result, err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	q := store.New(tx)
+	lead, err := q.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: leadID, WorkerID: pgconv.UUID(worker.ID)})
+	if err != nil || lead.UserID != worker.UserID || lead.ClaimGeneration != generation ||
+		lead.ClaimReleasedAt.Valid || !codeCrossCheckCustodyStatus(lead) ||
+		!lead.CodeCrossCheckRequired || !runkind.CodeCrossCheckable(lead.Kind) ||
+		lead.ReportOnly || lead.FixVerdict.String == "not_code" {
+		return result, ErrCrossCheckRefused
+	}
+	prior, err := q.GetCodeCrossCheck(ctx, leadID)
+	if err == nil {
+		if prior.LeadClaimGeneration != generation || prior.InterruptedAt.Valid ||
+			prior.BaseCommit.String != base || prior.HeadCommit.String != head ||
+			(noSnapshot && prior.ReasonClass.String != reason) || !input.matches(prior) {
+			return result, ErrCrossCheckInterrupted
+		}
+		return prior, nil
+	}
+	if !errors.Is(err, pgx.ErrNoRows) {
+		return result, err
+	}
+	params := store.InsertFailedCodeCrossCheckParams{
+		LeadRunID: leadID, WorkerID: pgconv.UUID(worker.ID), UserID: worker.UserID,
+		ClaimGeneration: generation, ReasonClass: reason, CodeContext: []byte("{}"),
+	}
+	if !noSnapshot {
+		frozen, freezeErr := freezeCodeCrossCheckInputs(ctx, q, lead, input)
+		if freezeErr != nil {
+			return result, freezeErr
+		}
+		params.GuidanceText = frozen.GuidanceText.String
+		params.RepoInstructionsCommit = frozen.RepoInstructionsCommit
+		params.RepoInstructionsEnabled = frozen.RepoInstructionsEnabled
+		params.RepoInstructionsText = frozen.RepoInstructionsText.String
+		params.BaseCommit = pgtype.Text{String: base, Valid: true}
+		params.HeadCommit = pgtype.Text{String: head, Valid: true}
+		params.CodeContext, err = json.Marshal(map[string]any{"issue_title": lead.IssueTitle, "issue_description": lead.IssueDescription})
+		if err != nil {
+			return result, err
+		}
+		frozen.BaseCommit, frozen.HeadCommit, frozen.CodeContext = params.BaseCommit, params.HeadCommit, params.CodeContext
+		params.CandidateDigest, err = codeCandidateDigest(frozen)
+		if err != nil {
+			return result, err
+		}
+	}
+	result, err = q.InsertFailedCodeCrossCheck(ctx, params)
+	if err != nil {
+		return result, err
+	}
+	if err = tx.Commit(ctx); err != nil {
+		return result, err
+	}
+	return result, nil
+}

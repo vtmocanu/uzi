@@ -20,6 +20,12 @@ available if your admin has turned hosting on for this instance.
 2. Pick a **type** and a **size** (below), optionally tick **Docker-capable**
    (see [Docker inside a worker](./worker-docker.md) — needs an instance
    whose admin has turned the docker tier on), then **Provision**.
+
+   A Docker-capable worker claims repo-bearing runs only for repos on the Docker worker repo allowlist,
+   which only an admin edits at **Admin → Instance → Docker worker repo allowlist**. A run on any other
+   repo stays queued unless another eligible (for example non-Docker) worker can claim it; repo-less
+   judge runs are not affected. See [Run health](./run-health.md#what-the-flags-mean).
+
 3. The new worker appears under **Your workers** right away and comes online
    on its own, usually within a few seconds — nothing to run, nothing to copy.
 
@@ -104,10 +110,16 @@ then failed an upgrade also shows in your own **Settings → Workers** — see
 
 ## Draining and cordoned
 
-When the cluster needs to roll a hosted worker that is still busy, it doesn't
-kill it out from under your runs. Instead it **cordons** (drains) the worker:
-the worker keeps finishing the runs it already has, but stops claiming new
-ones, then the cluster restarts it once it's idle.
+Persistent hosted workers roll one canary first in each owner's placement and
+capability pool. Workers waiting for their turn keep claiming runs on the old
+image. A stuck replacement holds further replacements in that pool; it does
+not trigger an automatic rollback. Size and worker type do not divide pools.
+
+When a busy worker is admitted for replacement, the cluster **cordons** (drains)
+it: it keeps finishing its existing runs but stops claiming new ones. It
+restarts once idle, or after the admitted turn's drain deadline. An operator
+can explicitly force a roll, accepting interrupted runs and possible loss of
+remaining capacity. A pool with one worker can have an outage during its roll.
 
 A cordoned worker shows a dashed **draining** or **cordoned** pill next to its
 status in the Workers list — **draining** while it's still finishing runs,
@@ -118,8 +130,10 @@ list` shows the same thing folded into the STATUS column, e.g. `online
 This is what explains an otherwise confusing moment: a worker that's online
 and shows a free run slot, but isn't picking up a run sitting in the queue.
 That's expected while it's cordoned — it isn't a bug, and it isn't stuck. It
-resumes claiming runs on its own once the roll finishes. There's no manual
-way to cordon a worker yourself; it's driven entirely by the cluster.
+resumes claiming when the roll-owned drain can safely be released. Independent
+maintenance or recovery fences can keep it cordoned. There is no user-facing
+manual cordon action; the cluster drives this process. Operators can follow the
+[hosted roll verification runbook](./hosted-worker-roll-verification.md).
 
 The Workers page's **Ephemeral workers → Docker-capable** preference adds
 Docker when auto-provisioning for repositories your admin allows; see
@@ -342,7 +356,7 @@ gauges, same [concurrency](./worker-setup.md#concurrent-runs) rules.
 
 ## Current Codex worker baseline
 
-The current Codex worker uses runtime 0.159.3 and defaults to `gpt-6.1-sol`
+The current Codex worker uses runtime 0.160.0 and defaults to `gpt-6.1-sol`
 when no worker-model override is set. Explicit model preferences remain
 unchanged. Both harnesses inherit medium reasoning effort; Claude and Codex
 keep separate overrides. See [Reasoning effort](worker-effort.md).

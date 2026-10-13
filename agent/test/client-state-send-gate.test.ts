@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, describe, it, mock } from "node:test";
 import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
@@ -15,6 +15,89 @@ import { WorkerClient, RequestError } from "../src/client.js";
 // loop, AbortSignal, 200/409 single-body ACK parse and terminal handling are preserved unchanged.
 
 const TOKEN = "worker-join-token-0123456789";
+const PROGRESS = "provider_progress_on_recovery_park_v1";
+const PROGRESS_FEATURES = ["claim_generation_fence", PROGRESS, "recovery_cause_data_volume_full", "recovery_cause_provider_outage"];
+const progressPark = { status: "recovery_wait" as const, claim_generation: 7,
+  recovery_cause: "data_volume_full", disk_park_preventive: true, provider_progress_turns: 2 };
+
+describe("provider progress recovery park contract", () => {
+  for (const cause of [undefined, "empty_turn", "data_volume_full"]) {
+    for (const count of [0, 2147483647]) {
+      it(`accepts int32 boundary ${count} with cause ${cause}`, async () => {
+        const s = await stateServer({ worker_id: "w", protocol_features: PROGRESS_FEATURES },
+          () => ({ status: 200, body: { run: { status: "recovery_wait" } } }));
+        try {
+          const c = clientFor(s.url);
+          await c.register("test");
+          await c.reportState("run", { status: "recovery_wait", claim_generation: 7,
+            recovery_cause: cause, provider_progress_turns: count });
+          assert.equal(s.posts.length, 1);
+          assert.equal(s.posts[0]!.body.provider_progress_turns, count);
+          assert.equal(s.posts[0]!.body.claim_generation, 7);
+        } finally { await s.close(); }
+      });
+    }
+  }
+
+  for (const features of [PROGRESS_FEATURES.filter(f => f !== PROGRESS), [PROGRESS]]) {
+    it(`omits evidence without negotiated progress/fence: ${features.join(",")}`, async () => {
+      const s = await stateServer({ worker_id: "w", protocol_features: features },
+        () => ({ status: 200, body: { run: { status: "recovery_wait" } } }));
+      try {
+        const c = clientFor(s.url);
+        await c.register("test");
+        await c.reportState("run", progressPark);
+        assert.equal(s.posts.length, 1);
+        assert.equal(s.posts[0]!.body.provider_progress_turns, undefined);
+      } finally { await s.close(); }
+    });
+  }
+
+  for (const reply of ["accepted", "validation", "second decode"] as const) {
+    it(`strict decode fallback is fenced and bounded: ${reply}`, async () => {
+      const s = await stateServer({ worker_id: "w", protocol_features: PROGRESS_FEATURES }, (_body, attempt) =>
+        reply === "validation"
+          ? { status: 400, body: { error: "invalid provider_progress_turns recovery park" } }
+          : attempt === 0 || reply === "second decode"
+            ? { status: 400, body: { error: "invalid request body" } }
+            : { status: 200, body: { run: { status: "recovery_wait" } } });
+      try {
+        const c = clientFor(s.url);
+        await c.register("test");
+        if (reply === "accepted") await c.reportState("run", progressPark);
+        else await assert.rejects(c.reportState("run", progressPark));
+        assert.equal(s.posts.length, reply === "validation" ? 1 : 2);
+        assert.deepEqual(s.posts[0]!.body, progressPark);
+        if (s.posts.length === 2) {
+          const { provider_progress_turns: _count, ...stripped } = progressPark;
+          assert.deepEqual(s.posts[1]!.body, stripped);
+        }
+        assert.equal(c.hasFeature(PROGRESS), reply === "validation");
+        for (const feature of PROGRESS_FEATURES.filter(f => f !== PROGRESS)) assert.equal(c.hasFeature(feature), true);
+      } finally { await s.close(); }
+    });
+  }
+
+  it("rejects malformed evidence before network without disabling features", async () => {
+    const s = await stateServer({ worker_id: "w", protocol_features: PROGRESS_FEATURES },
+      () => ({ status: 200, body: { run: { status: "recovery_wait" } } }));
+    try {
+      const c = clientFor(s.url);
+      await c.register("test");
+      const invalid = [
+        ...[-1, 0.5, 2147483648, NaN, Infinity, -Infinity].map(provider_progress_turns => ({ ...progressPark, provider_progress_turns })),
+        ...[undefined, 0, -1, 0.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1].map(claim_generation => ({ ...progressPark, claim_generation })),
+        ...["running", "completed", "paused"].map(status => ({ ...progressPark, status: status as "running" })),
+        ...["provider_outage", "vault_locked", "codex_account_unavailable", "forge_unreachable"].map(recovery_cause => ({ ...progressPark, recovery_cause })),
+      ];
+      for (const body of invalid) {
+        await assert.rejects(c.reportState("run", body), /invalid provider_progress_turns/);
+        for (const feature of PROGRESS_FEATURES) assert.equal(c.hasFeature(feature), true);
+      }
+      assert.equal(s.posts.length, 0);
+    } finally { await s.close(); }
+  });
+});
 
 // A raw skew server that answers /register with the given body and every /state POST via `respond`,
 // recording each posted body + the status it answered. Mirrors client-send-gate.test.ts's helper but
@@ -65,6 +148,52 @@ function clientFor(url: string): WorkerClient {
   return new WorkerClient(url, TOKEN, "0.1.0-test", nullLogger(), {
     sleep: async () => {},
     terminalRetrySchedule: [1, 1, 1],
+  });
+}
+
+for (const scenario of [
+  { name: "decode400->decode400 proven", replies: ["decode", "decode"], proven: true },
+  { name: "decode400->lostACK ambiguous", replies: ["decode", "lost", "lost", "lost", "lost"], proven: false },
+  { name: "lostACKretry->decode400->decode400 ambiguous", replies: ["lost", "decode", "decode"], proven: false },
+  { name: "generic400 ambiguous", replies: ["generic"], proven: false },
+  { name: "malformed400 ambiguous", replies: ["malformed", "malformed"], proven: false },
+  { name: "extra field400 ambiguous", replies: ["extra", "extra"], proven: false },
+  { name: "malformed400->decode400 ambiguous", replies: ["malformed", "decode"], proven: false },
+  { name: "overflow400 ambiguous", replies: ["overflow"], proven: false },
+  { name: "truncated400 ambiguous", replies: ["truncated"], proven: false },
+]) {
+  it("Unit 2: client " + scenario.name, async () => {
+    let attempts = 0;
+    const mocked = mock.method(globalThis, "fetch", async (input: unknown, init?: RequestInit) => {
+      if (String(input).endsWith("/register")) return Response.json({ worker_id: "worker-1", protocol_features: ["claim_generation_fence"] });
+      assert.ok(new Headers(init?.headers).get("Authorization"));
+      const reply = scenario.replies[attempts++];
+      if (reply === "lost") throw new Error("lost ACK");
+      if (reply === "truncated") return new Response(new ReadableStream({
+        start(controller) {
+          controller.enqueue(new TextEncoder().encode('{"error":"invalid request body"}'));
+        },
+        pull(controller) { controller.error(new Error("body disconnected")); },
+      }), { status: 400 });
+      const raw = reply === "overflow" ? '{"error":"invalid request body"}' + " ".repeat(4096)
+        : reply === "decode" ? '{"error":"invalid request body"}\n'
+        : reply === "generic" ? '{"error":"arbitrary refusal"}'
+        : reply === "extra" ? '{"error":"invalid request body","reason":"unknown"}'
+        : '{"error":"invalid request body"';
+      return new Response(raw, { status: 400 });
+    });
+    try {
+      const client = clientFor("http://unit2.test");
+      await client.register("unit2");
+      await assert.rejects(client.reportState("run-1", { status: "completed", claim_generation: 1 }),
+        (err: unknown) => {
+          assert.ok(err instanceof Error);
+          if (scenario.proven) assert.ok(err instanceof RequestError);
+          assert.equal(err.name === "StateReportUnappliedError", scenario.proven);
+          return true;
+        });
+      assert.equal(attempts, scenario.replies.length);
+    } finally { mocked.mock.restore(); }
   });
 }
 

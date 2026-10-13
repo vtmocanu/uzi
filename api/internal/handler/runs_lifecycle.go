@@ -454,6 +454,13 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	// Issues #750/#2760: the derived is_revising flag (and the Progress it changes), same
+	// unconditional lookup as the lists. A lookup error leaves it false.
+	if revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), []uuid.UUID{run.ID}); err != nil {
+		slog.Error("plan revising state", "run_id", run.ID, "error", err)
+	} else {
+		applyRevising(&dto, revising[run.ID])
+	}
 	h.overlayPlanCrossCheckSummary(r.Context(), user.ID, run, &dto)
 	// PRD #1064 M2: the server-derived "now" line. runToDTO stays pure, so the field is
 	// set here in the caller from the batched lookup (one run this time). null for a
@@ -465,8 +472,22 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 			slog.Error("current activity", "run_id", run.ID, "error", err)
 		} else {
 			dto.CurrentActivity = activity[run.ID]
+			setProgressPhase(&dto)
 		}
 	}
+	// PRD #2602: the "may be blocked by" hint, GetRun only (a list read never runs it).
+	// Best-effort: an error is logged and the field stays absent. Owner scoping lives in
+	// MaybeBlockedByRun (the run's owner, not this viewer).
+	if dto.Progress != nil {
+		if blocker, err := h.wsvc.MaybeBlockedByRun(r.Context(), run); err != nil {
+			slog.Error("maybe blocked by run", "run_id", run.ID, "error", err)
+		} else if blocker != nil {
+			id := blocker.String()
+			dto.Progress.MaybeBlockedByRunID = &id
+		}
+	}
+	// PRD #2603: the model-written Now line, GetRun only (a list read never runs it). Best-effort.
+	h.overlayNowNote(r.Context(), run, &dto)
 	// PRD #1590 D6: the derived owner action of a run held on its Codex account (null
 	// otherwise). Best-effort, and queried only for such a held run.
 	h.overlayCodexAccountActions(r.Context(), &dto)
@@ -897,6 +918,11 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 				"reason":                "gate_revision_mismatch",
 				"current_gate_revision": mismatch.Current,
 			})
+		case errors.Is(err, workersvc.ErrApprovalMilestonesMoved):
+			// Issue #2680: an unbound approve kept racing a republished milestone list (or the run
+			// left the plan gate while it retried). Nothing was written; distinct from
+			// gate_revision_mismatch, which names a revision the client sent.
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "approval_milestones_moved")
 		case errors.Is(err, workersvc.ErrExpectedGateRevisionNotApplicable):
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrRunNotFound):
@@ -946,10 +972,18 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 			httpx.Error(w, http.StatusBadRequest, err.Error())
 		case errors.Is(err, workersvc.ErrExtendDisabled),
 			errors.Is(err, workersvc.ErrExtensionCapExceeded),
-			errors.Is(err, workersvc.ErrExtendNotTimed):
-			// PRD #1189 M1: extending is off instance-wide, the request exceeds the per-run
-			// cap, or the run's kind never times out → 409. The service built the run-specific
-			// sentence (cap-exceeded names the remaining allowance), so surface it verbatim.
+			errors.Is(err, workersvc.ErrExtensionLimitReached),
+			errors.Is(err, workersvc.ErrExtendNotTimed),
+			errors.Is(err, workersvc.ErrWallParkChanged),
+			errors.Is(err, workersvc.ErrWallParkCrossCheckIneligible),
+			errors.Is(err, workersvc.ErrWallParkStopUnavailable),
+			errors.Is(err, workersvc.ErrProviderHoldStopUnavailable):
+			// PRD #1189 M1: extending is off instance-wide, the request exceeds the per-request
+			// maximum or would pass the total run-time limit, or the run's kind never times out; a
+			// wall-park extend whose park changed or whose cross-check can no longer resume (nothing
+			// extended), or a wall-park/provider-hold stop with nothing to finalize (issue #2750) → 409. The service
+			// built the run-specific sentence (cap-exceeded names the per-extension maximum,
+			// limit-reached the room left), so surface it verbatim.
 			httpx.Error(w, http.StatusConflict, err.Error())
 		case errors.Is(err, workersvc.ErrReviseCapReached):
 			httpx.Error(w, http.StatusConflict, "plan revision limit reached")

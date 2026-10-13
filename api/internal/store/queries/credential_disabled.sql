@@ -272,6 +272,18 @@ FROM runs
 WHERE id = @id AND user_id = @user_id
 FOR UPDATE;
 
+-- The set-token verb's run lock (PRD #1733). SetRunCredential reads a run unlocked, validates the
+-- override, then takes the owner's secret mutation lock; this re-reads the run FOR UPDATE under
+-- that lock so the verb can refuse (ErrCredentialSwitchRaced) when the run is no longer the row it
+-- observed: its status, status_since (any park or re-park restamps it) or claim_generation moved.
+-- Owner-scoped. Comparing status_since as well as status is what catches a run that left and
+-- re-entered the same status in between.
+-- name: LockRunForCredentialSwitch :one
+SELECT id, status, status_since, claim_generation
+FROM runs
+WHERE id = @id AND user_id = @user_id
+FOR UPDATE;
+
 -- Promoter step (3a): the recorded worker's Anthropic binding, the requirement source for an
 -- ordinary Claude run without a per-run override. Owner-scoped. holds_affinity mirrors
 -- ClaimRun's affinity pin on a queued run's own worker: the row exists and is draining or
@@ -409,5 +421,11 @@ RETURNING id, user_id, status;
 -- concurrent edit, disable or fire is never overwritten with a stale hold.
 -- name: RecordScheduleHeldFire :execrows
 UPDATE run_schedules
-SET last_fire = @last_fire, updated_at = now()
+SET last_fire = @last_fire,
+    -- recent_fires (issue #2519): same append rule as AdvanceSchedule (matched > 0, newest 10).
+    recent_fires = CASE
+      WHEN @last_fire::jsonb @@ '$.matched > 0'
+      THEN jsonb_path_query_array(jsonb_build_array(@last_fire::jsonb) || recent_fires, '$[0 to 9]')
+      ELSE recent_fires END,
+    updated_at = now()
 WHERE id = @id AND timing = 'once' AND status = 'active';

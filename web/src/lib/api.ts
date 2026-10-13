@@ -97,6 +97,7 @@ import type {
   PrivilegeReport,
   ProjectSyncOwnerKind,
   ProjectSyncStatus,
+  HeldPublications,
   RecoveryArchiveSummary,
   RecoveryCustodyHolds,
   ReleaseCheckStatus,
@@ -105,6 +106,7 @@ import type {
   RunInputKind,
   RunListItem,
   RunMessage,
+  RunSummaryItem,
   RunNowResponse,
   RunReview,
   RunSocketLike,
@@ -419,6 +421,54 @@ async function uploadBrandingLogo(slot: string, file: File): Promise<void> {
   }
 }
 
+// GET /api/runs. `view: "summary"` asks for the compact projection (RunSummaryItem:
+// no plan_md / repo_agents / issue_description / preserved_patch). Overload order is
+// load-bearing: the summary signature is first and the legacy one LAST, so
+// Awaited<ReturnType<typeof api.listRuns>> resolves to the legacy RunListItem[] shape.
+function listRuns(params: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+  view: "summary";
+}): Promise<{ runs: RunSummaryItem[] }>;
+function listRuns(params?: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+}): Promise<{ runs: RunListItem[] }>;
+function listRuns(params?: {
+  repoId?: string;
+  issueIid?: number;
+  passive?: boolean;
+  view?: "summary";
+}): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
+  const q = new URLSearchParams();
+  if (params?.repoId) q.set("repo_id", params.repoId);
+  if (params?.issueIid != null) q.set("issue_iid", String(params.issueIid));
+  if (params?.view) q.set("view", params.view);
+  const qs = q.toString();
+  // A passive poll (the hidden-tab favicon poll, #331) carries X-Uzi-Passive so
+  // the server authenticates it but does NOT slide the session forward on it.
+  return request<{ runs: RunListItem[] | RunSummaryItem[] }>(
+    "GET",
+    qs ? `/runs?${qs}` : "/runs",
+    undefined,
+    params?.passive ? { "X-Uzi-Passive": "1" } : undefined,
+  );
+}
+
+// GET /api/admin/runs, with the same opt-in summary projection as listRuns.
+function adminListRuns(params: { view: "summary" }): Promise<{ runs: RunSummaryItem[] }>;
+function adminListRuns(): Promise<{ runs: RunListItem[] }>;
+function adminListRuns(params?: {
+  view?: "summary";
+}): Promise<{ runs: RunListItem[] | RunSummaryItem[] }> {
+  return request<{ runs: RunListItem[] | RunSummaryItem[] }>(
+    "GET",
+    params?.view ? `/admin/runs?view=${params.view}` : "/admin/runs",
+  );
+}
+
 const realApi = {
   register: (email: string, password: string, displayName: string) =>
     request<SessionResponse>("POST", "/auth/register", {
@@ -535,6 +585,8 @@ const realApi = {
   // Flip the current user's autopilot opt-in (PRD #19 M3). Returns the updated user.
   setAutopilotEnabled: (enabled: boolean) =>
     request<{ user: User }>("PUT", "/me/autopilot", { enabled }),
+  setCodeCrossCheckEnabled: (code: boolean) =>
+    request<{ user: User; warning?: string }>("PUT", "/me/cross-check", { code }),
   setPlanCrossCheckEnabled: (plan: boolean) =>
     request<{ user: User; warning?: string }>("PUT", "/me/cross-check", { plan }),
   // Flip the current user's CI-autofix opt-in (PRD #71). Session identity only —
@@ -866,6 +918,13 @@ const realApi = {
     id: string,
     flags: { repo_skills_enabled?: boolean; repo_claudemd_enabled?: boolean },
   ) => request<{ repo: Repo }>("PATCH", `/repos/${id}`, flags),
+  // Code cross-check owner inputs (PRD #2170 M3). Owner or admin. Mutually exclusive
+  // in one request with the trust/devbox/caps/fold groups, so it is sent alone.
+  // A null guidance clears it; the server caps it at 8192 UTF-8 bytes.
+  setRepoCodeCrossCheckInputs: (
+    id: string,
+    inputs: { code_cross_check_guidance?: string | null; cross_check_repo_instructions_enabled?: boolean },
+  ) => request<{ repo: Repo }>("PATCH", `/repos/${id}`, inputs),
   // Tier-2 repo devbox.json opt-in (PRD #18 M5). Owner or admin.
   setRepoDevboxOptIn: (id: string, enabled: boolean) =>
     request<{ repo: Repo }>("PATCH", `/repos/${id}`, {
@@ -1132,24 +1191,7 @@ const realApi = {
   /** Queue a CI-fix run for a failed pipeline on a watched ref (PRD #6). */
   createCIFixRun: (repoId: string, ref: string) =>
     request<{ run: Run }>("POST", `/repos/${repoId}/ci-fix-runs`, { ref }),
-  listRuns: (params?: {
-    repoId?: string;
-    issueIid?: number;
-    passive?: boolean;
-  }) => {
-    const q = new URLSearchParams();
-    if (params?.repoId) q.set("repo_id", params.repoId);
-    if (params?.issueIid != null) q.set("issue_iid", String(params.issueIid));
-    const qs = q.toString();
-    // A passive poll (the hidden-tab favicon poll, #331) carries X-Uzi-Passive so
-    // the server authenticates it but does NOT slide the session forward on it.
-    return request<{ runs: RunListItem[] }>(
-      "GET",
-      qs ? `/runs?${qs}` : "/runs",
-      undefined,
-      params?.passive ? { "X-Uzi-Passive": "1" } : undefined,
-    );
-  },
+  listRuns,
   getRun: (id: string) => request<{ run: Run }>("GET", `/runs/${id}`),
   /** The caller's own token/cost usage (PRD #40): lifetime + last-7-days + run count. */
   getUsage: () => request<SelfUsage>("GET", "/usage"),
@@ -1192,6 +1234,10 @@ const realApi = {
   // attachment link, see runArchiveDownloadUrl.
   getRunArchives: (id: string) =>
     request<RecoveryArchiveSummary>("GET", `/runs/${id}/archives`),
+  // A failed run's held-work publications (issue #2545): RequireUser owner route. A server
+  // without it answers 404; the run-page panel treats any failure as "nothing to show".
+  getRunHeldPublications: (id: string) =>
+    request<HeldPublications>("GET", `/runs/${id}/held-publications`),
   // Owner custody holds (PRD #1349 M5/M6, D7/D8; #1371): the owner-wide hold listing plus the
   // aggregate safety-slot/decision/blocked counts that drive the board alert and the
   // Workers resolution surface. RequireUser (session cookie OR owner CLI Bearer), so it is
@@ -1800,7 +1846,7 @@ const realApi = {
 
   adminListWorkers: () =>
     request<{ workers: AdminWorker[] }>("GET", "/admin/workers"),
-  adminListRuns: () => request<{ runs: RunListItem[] }>("GET", "/admin/runs"),
+  adminListRuns,
   // Admin cross-user blocked-repos list (PRD #66 M9, D8). Returns the envelope with
   // checks_unknown so the page can say "unknown" rather than "none blocked" (R1).
   adminListBlockedRepos: () =>

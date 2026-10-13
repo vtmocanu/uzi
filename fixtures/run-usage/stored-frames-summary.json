@@ -1,0 +1,129 @@
+{
+  "note": "Authored (not recorded) for issue #2686: result-frames-summary.json with each progress_note and summary_usage payload as the server STORES it (normalizeProgressNotePayload / normalizeSummaryUsagePayload for a claude run): every model_usage entry carries the server-resolved costStatus and costUSD, priced from the standard table. Non-accounting frames are byte-for-byte the same as in result-frames-summary.json; TestRunUsageStoredSummaryFixtureMatchesNormalization keeps the two files from drifting.",
+  "run_id": "2686aaaa-0000-4000-8000-000000000001",
+  "frames": [
+    {
+      "seq": 1,
+      "kind": "status",
+      "payload": {
+        "event": "init",
+        "model": "claude-opus-4-8"
+      }
+    },
+    {
+      "seq": 5,
+      "kind": "status",
+      "payload": {
+        "event": "result",
+        "usage": {
+          "input_tokens": 1700,
+          "output_tokens": 2300,
+          "cache_read_input_tokens": 50000,
+          "cache_creation_input_tokens": 3000
+        },
+        "modelUsage": {
+          "claude-opus-4-8": {
+            "inputTokens": 1000,
+            "outputTokens": 2000,
+            "cacheReadInputTokens": 50000,
+            "cacheCreationInputTokens": 3000,
+            "costUSD": 1.5
+          },
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 700,
+            "outputTokens": 300,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.001
+          }
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "kind": "progress_note",
+      "payload": {
+        "text": "Reviewing the changes for the first milestone",
+        "milestone_id": "m1",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 400,
+            "outputTokens": 40,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.0006,
+            "costStatus": "metered"
+          }
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "intent",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 1200,
+            "outputTokens": 150,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.00195,
+            "costStatus": "metered"
+          }
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "plan",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 2000,
+            "outputTokens": 300,
+            "cacheReadInputTokens": 10000,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.0045,
+            "costStatus": "metered"
+          }
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "pr_description",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 3000,
+            "outputTokens": 500,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.0055,
+            "costStatus": "metered"
+          }
+        }
+      }
+    },
+    {
+      "seq": 14,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "pr_description",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 3500,
+            "outputTokens": 700,
+            "cacheReadInputTokens": 4000,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.0074,
+            "costStatus": "metered"
+          }
+        }
+      }
+    }
+  ]
+}

@@ -346,9 +346,9 @@ func TestWorkerNavigationFiniteAdminDenialRefetchesOwnScopes(t *testing.T) {
 		t.Fatal("old admin lookup cleared own request")
 	}
 	msgs := drainCmd(cmd)
-	if denied.adminLists != 1 || f.lists != 1 || f.ListRunsCalls != 1 || f.AdminListRunsCalls != 0 {
+	if denied.adminLists != 1 || f.lists != 1 || f.ListRunSummariesCalls != 1 || f.AdminListRunSummariesCalls != 0 {
 		t.Fatalf("fallback calls: admin workers=%d own workers=%d own runs=%d admin runs=%d",
-			denied.adminLists, f.lists, f.ListRunsCalls, f.AdminListRunsCalls)
+			denied.adminLists, f.lists, f.ListRunSummariesCalls, f.AdminListRunSummariesCalls)
 	}
 	var accepted bool
 	for _, msg := range msgs {
@@ -397,7 +397,7 @@ func TestWorkerNavigationBoardFallbackFetchesWhileHidden(t *testing.T) {
 			accepted = m.workers.loaded && len(m.workers.rows) == 1 && m.workers.waitID == 0
 		}
 	}
-	if !accepted || f.lists != 1 || f.ListRunsCalls != 1 {
+	if !accepted || f.lists != 1 || f.ListRunSummariesCalls != 1 {
 		t.Fatal("scope transition did not immediately fetch and accept own snapshot")
 	}
 }

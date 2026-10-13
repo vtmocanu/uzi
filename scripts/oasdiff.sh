@@ -119,7 +119,7 @@ MAX_ARCHIVE_BLOCKS=131072
 MAX_TAR_BYTES=268435456      # 256 MiB total decompressed tar stream.
 MAX_TAR_BLOCKS=262144
 mkdir -p "$DIR"
-TMP="$(mktemp -d)"
+TMP="$(mktemp -d "${TMPDIR:-/tmp}/oasdiff.XXXXXX")"
 cleanup() {
   rm -rf "$TMP"
 }

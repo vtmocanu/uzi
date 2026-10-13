@@ -29,10 +29,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -55,7 +79,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -66,6 +90,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -101,10 +149,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6-sol",
+        "resolved_model": "gpt-6-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "haiku",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -127,7 +199,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -138,6 +210,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "haiku",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6-sol",
+        "resolved_model": "gpt-6-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -181,10 +277,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "haiku",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -207,7 +327,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -218,6 +338,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "haiku",
+        "resolved_model": "haiku",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -268,10 +412,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -294,7 +462,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -305,6 +473,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -348,10 +540,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -374,7 +590,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -385,6 +601,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -428,10 +668,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -454,7 +718,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -465,6 +729,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -515,10 +803,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "opus",
+        "resolved_model": "opus",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -541,7 +853,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -552,6 +864,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "opus",
+        "resolved_model": "opus",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }
@@ -602,10 +938,34 @@
         "resolved_effort": "medium",
         "model_source": "worker default",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
         "harness": "codex",
         "model": null,
         "effort": null,
@@ -628,7 +988,7 @@
         "resolved_effort": "medium",
         "model_source": "pin",
         "effort_source": "worker default",
-        "active": false
+        "active": true
       },
       {
         "stage": "plan",
@@ -639,6 +999,30 @@
         "resolved_model": "gpt-6-astra",
         "resolved_effort": "medium",
         "model_source": "pin",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "claude",
+        "model": null,
+        "effort": null,
+        "worker_default_model": null,
+        "resolved_model": null,
+        "resolved_effort": "medium",
+        "model_source": "worker default",
+        "effort_source": "worker default",
+        "active": true
+      },
+      {
+        "stage": "code",
+        "harness": "codex",
+        "model": null,
+        "effort": null,
+        "worker_default_model": "gpt-6.1-sol",
+        "resolved_model": "gpt-6.1-sol",
+        "resolved_effort": "medium",
+        "model_source": "worker default",
         "effort_source": "worker default",
         "active": true
       }

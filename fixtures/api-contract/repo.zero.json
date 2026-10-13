@@ -1,4 +1,6 @@
 {
+  "code_cross_check_guidance": null,
+  "cross_check_repo_instructions_enabled": false,
   "id": "",
   "connection_id": "",
   "forge_project_id": 0,

@@ -1,0 +1,48 @@
+{
+  "note": "Authored for PRD #2603 by hand from result-frames-notes.json: one row per (model, lineage_epoch). The lead result frame sits at epoch 1 (one init before it); each progress_note row sits at its OWN seq (6 and 9) under the model prefix progress_note:, so it neither collapses into the lead's haiku row of the same leg nor into the other note. Note costs are the standard-table price of the note's tokens (haiku: $1/M input, $5/M output): 400*1e-6 + 40*5e-6 = 0.0006 and 500*1e-6 + 60*5e-6 = 0.0008. totals = SUM over rows per column.",
+  "rows": [
+    {
+      "model": "claude-opus-4-8",
+      "lineage_epoch": 1,
+      "input_tokens": 1000,
+      "cache_read_tokens": 50000,
+      "cache_creation_tokens": 3000,
+      "output_tokens": 2000,
+      "cost_usd": 1.5
+    },
+    {
+      "model": "claude-haiku-4-5-20251001",
+      "lineage_epoch": 1,
+      "input_tokens": 700,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 300,
+      "cost_usd": 0.001
+    },
+    {
+      "model": "progress_note:claude-haiku-4-5-20251001",
+      "lineage_epoch": 6,
+      "input_tokens": 400,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 40,
+      "cost_usd": 0.0006
+    },
+    {
+      "model": "progress_note:claude-haiku-4-5-20251001",
+      "lineage_epoch": 9,
+      "input_tokens": 500,
+      "cache_read_tokens": 0,
+      "cache_creation_tokens": 0,
+      "output_tokens": 60,
+      "cost_usd": 0.0008
+    }
+  ],
+  "totals": {
+    "input_tokens": 2600,
+    "cache_read_tokens": 50000,
+    "cache_creation_tokens": 3000,
+    "output_tokens": 2400,
+    "cost_usd": 1.5024
+  }
+}

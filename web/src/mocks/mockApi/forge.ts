@@ -10,6 +10,7 @@ import type {
   ToolAllowlistWriteInput,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import { CAPABILITY_VOCABULARY } from "../../lib/capabilityVocabulary";
 import {
   minsAgo,
@@ -25,19 +26,6 @@ import { delay, requireAdmin, requireSession } from "./shared";
 // settings → workers → secrets has no runtime edge back to forge. Read settings
 // only inside the method, after module initialization, to use the current value.
 import { settingsApi } from "./settings";
-
-// Match google/uuid.Parse v1.6.0, including arbitrary single-byte wrappers.
-// ASCII wrapper checks account for Go's UTF-8 byte length versus JS's UTF-16 length.
-function uuidIdentity(value: string): string | null {
-  let s = value;
-  if (s.length === 45 && /^urn:uuid:/i.test(s)) s = s.slice(9);
-  else if (s.length === 38 && s.charCodeAt(0) <= 0x7f && s.charCodeAt(37) <= 0x7f) s = s.slice(1, 37);
-  if (/^[0-9a-f]{32}$/i.test(s)) {
-    s = s.slice(0, 8) + "-" + s.slice(8, 12) + "-" + s.slice(12, 16) + "-" + s.slice(16, 20) + "-" + s.slice(20);
-  }
-  return /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(s) ? s.toLowerCase() : null;
-}
-
 
 // Classify guardrail block messages into coded findings + waivability, mirroring
 // privcheck.AllBlocksWaivable: a "could not read"/"unreadable" message is
@@ -100,6 +88,7 @@ repos = [
 ];
 // Cross-user admin-only fixtures leave the existing owner-list demo intact.
 // UUID IDs can round-trip through the settings validator.
+
 const dockerDemoRepos = [
   { id: "a1111111-1111-4111-8111-111111111111", path_with_namespace: "vtmocanu/uzi", enabled: true, connection_id: "conn-dana" },
   { id: "b2222222-2222-4222-8222-222222222222", path_with_namespace: "team-beta/retired", enabled: false, connection_id: "conn-dana" },
@@ -246,7 +235,7 @@ export const forgeApi = {
     requireAdmin();
     const { settings } = await settingsApi.getSettings();
     const trusted = new Set(settings.docker_repo_allowlist.split(",").map((id) => {
-      const token = id.replace(/^[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+|[\t\n\v\f\r \u0085\u00a0\u1680\u2000-\u200a\u2028\u2029\u202f\u205f\u3000]+$/g, "");
+      const token = trimAllowlistToken(id);
       return uuidIdentity(token) ?? token;
     }));
     return delay({
@@ -326,6 +315,39 @@ export const forgeApi = {
     if (!r) throw new ApiError(404, "repo not found");
     if (flags.repo_skills_enabled !== undefined) r.repo_skills_enabled = flags.repo_skills_enabled;
     if (flags.repo_claudemd_enabled !== undefined) r.repo_claudemd_enabled = flags.repo_claudemd_enabled;
+    return delay({ repo: { ...r } });
+  },
+  // PRD #2170 M3: the code cross-check owner inputs, its own exclusive PATCH group.
+  // Mirrors PatchRepo: a key from another group is a 400, an empty request is a 400,
+  // guidance over 8192 UTF-8 bytes is a 400, and a null guidance clears it.
+  setRepoCodeCrossCheckInputs: async (
+    id: string,
+    inputs: { code_cross_check_guidance?: string | null; cross_check_repo_instructions_enabled?: boolean },
+  ) => {
+    const r = repos.find((x) => x.id === id);
+    if (!r) throw new ApiError(404, "repo not found");
+    const own = new Set(["code_cross_check_guidance", "cross_check_repo_instructions_enabled"]);
+    const keys = Object.keys(inputs).filter((k) => (inputs as Record<string, unknown>)[k] !== undefined);
+    if (keys.some((k) => !own.has(k))) {
+      throw new ApiError(
+        400,
+        "code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request",
+      );
+    }
+    if (keys.length === 0) {
+      throw new ApiError(
+        400,
+        "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag",
+      );
+    }
+    const g = inputs.code_cross_check_guidance;
+    if (g !== undefined && g !== null && (typeof g !== "string" || new TextEncoder().encode(g).length > 8192)) {
+      throw new ApiError(400, "invalid code cross-check guidance");
+    }
+    if (g !== undefined) r.code_cross_check_guidance = g;
+    if (inputs.cross_check_repo_instructions_enabled !== undefined) {
+      r.cross_check_repo_instructions_enabled = inputs.cross_check_repo_instructions_enabled;
+    }
     return delay({ repo: { ...r } });
   },
   setRepoDevboxOptIn: async (id: string, enabled: boolean) => {

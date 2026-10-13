@@ -29,7 +29,9 @@ import {
 } from "../src/pr-description.js";
 import { PR_DESC_ACK_OUTCOMES, type PrDescriptionSize, type PrDescriptionState } from "../src/protocol.js";
 import type { PrSummaryClaim } from "../src/signals.js";
-import type { DeliverySummary } from "../src/summary-runner.js";
+import { SummaryRunner, type DeliverySummary, type DeliverySummaryInput } from "../src/summary-runner.js";
+import type { AdviceUsageSnapshot } from "../src/harness.js";
+import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { FakePrDescApi, clientFor } from "./fake-pr-desc-api.js";
 import { nullLogger } from "./helpers.js";
 
@@ -121,13 +123,15 @@ class FakeForge implements PublisherForge {
 class FakePass implements DeliveryPass {
   deadlines = 0;
   readonly calls: number[] = [];
+  readonly generations: (number | undefined)[] = [];
   constructor(private readonly out: DeliverySummary | null) {}
   deliverySummaryDeadline(): number {
     this.deadlines++;
     return 1_000_000;
   }
-  async generateDeliverySummary(input: { deadlineMs: number }): Promise<DeliverySummary | null> {
+  async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
     this.calls.push(input.deadlineMs);
+    this.generations.push(input.claimGeneration);
     return this.out;
   }
 }
@@ -174,21 +178,23 @@ interface Rig {
   emitted: string[];
   publisher: PrDescriptionPublisher;
   pass: FakePass | null;
+  diagnostics: Record<string, unknown>[];
 }
 
 function rig(pass: FakePass | null = new FakePass(SUMMARY)): Rig {
   const forge = new FakeForge();
   const emitted: string[] = [];
+  const diagnostics: Record<string, unknown>[] = [];
   const publisher = new PrDescriptionPublisher({
     forge,
     api: client,
     pass,
-    log: nullLogger(),
+    log: { ...nullLogger(), info: (message, fields) => { if (message === "PR description diagram") diagnostics.push(fields!); } },
     emit: (t) => emitted.push(t),
     sleep: async () => {},
     headLagRetryMs: 0,
   });
-  return { forge, emitted, publisher, pass };
+  return { forge, emitted, publisher, pass, diagnostics };
 }
 
 function apiWith(over: Partial<PublisherApi>): PublisherApi {
@@ -200,6 +206,67 @@ function apiWith(over: Partial<PublisherApi>): PublisherApi {
     ...over,
   };
 }
+
+describe("diagram diagnostics", () => {
+  it("forwards the publication generation to the editor", async () => {
+    const pass = new FakePass(SUMMARY);
+    const r = rig(pass);
+    await r.publisher.prepare(makeSpec({ claimGeneration: 7 }), { headSha: H1, targetBranch: "main" });
+    assert.deepEqual(pass.generations, [7]);
+  });
+
+  it("does not report a provisional cap reversed by the final interlock rewrite", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec({ interlockIssueIid: IID, completionCloses: false, completion: () => completion(false) }), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = "Closes #7\n" + "x".repeat(BODY_CAP_CHARS) + "\n" + renderBody(pub.region, completion(false));
+    await pub.publish(MR);
+    assert.match(r.forge.pr.description, /```mermaid/u);
+    assert.deepEqual(r.diagnostics, []);
+  });
+
+  it("rejects explicit null from a custom pass while absence remains eligible", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: null } as unknown as DeliverySummary));
+    await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.outcome, d.reason]), [["agent_parser", "dropped", "shape"]]);
+    assert.equal((stages()[0]!.fields as { summary: string }).summary, SUMMARY.summary);
+  });
+
+  it("reports a size-only body choice with explicit metadata", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    pub.initialBody(completion(true) + "x".repeat(BODY_CAP_CHARS));
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.outcome, d.reason]), [["body_cap", "dropped", "sizeonly"]]);
+  });
+  it("reports custom rejection without labels and only suppresses parsed zero-code diagrams", async () => {
+    for (const [diagram, expectedStage] of [[{ ...DIAGRAM, kind: "private response" }, "agent_parser"], [DIAGRAM, "zero_code"]] as const) {
+      const r = rig(new FakePass({ ...SUMMARY, diagram: diagram as typeof DIAGRAM }));
+      await r.publisher.prepare(makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: SIZE_LINE, size: { ...SIZE, code: ZERO } } }) }), { headSha: H1, targetBranch: "main" });
+      assert.equal(r.diagnostics.length, 1);
+      assert.equal(r.diagnostics[0]!.stage, expectedStage);
+      assert.equal(r.diagnostics[0]!.outcome, "dropped");
+      assert.equal(r.diagnostics[0]!.reason, expectedStage === "agent_parser" ? "kind" : "zero_code");
+      assert.equal(JSON.stringify(r.diagnostics).includes("private response"), false);
+      assert.equal(r.diagnostics[0]!.claim_generation, 1);
+    }
+  });
+
+  it("keeps unknown-size diagrams eligible and emits no zero-code suppression", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec({ facts: async () => ({ baseSha: BASE, size: { line: null, size: { ...SIZE, unavailable: true, code: ZERO } } }) }), { headSha: H1, targetBranch: "main" });
+    assert.match(pub.region, /```mermaid/u);
+    assert.deepEqual(r.diagnostics, []);
+  });
+
+  it("deduplicates initial-body and ordinary cap selection with the original version", async () => {
+    const r = rig(new FakePass({ ...SUMMARY, diagram: DIAGRAM }));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    const c = completion(true) + "x".repeat(BODY_CAP_CHARS - pub.region.length - completion(true).length + 30);
+    pub.initialBody(c);
+    pub.initialBody(c);
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason]), [["body_cap", "diagramless"]]);
+    assert.equal(r.diagnostics[0]!.version_id, [...api.versions.keys()][0]);
+  });
+});
 
 describe("api outage while publishing a PR description", () => {
   it("skips later advisory api calls after staging loses transport, so terminal reporting is not held by retries", async () => {
@@ -345,6 +412,7 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
     assert.ok(parsed.kind === "ok" && parsed.region?.includes(SIZE_TABLE));
     assert.equal(parsed.kind === "ok" && parsed.region?.includes("```mermaid"), false);
     assert.equal(api.state(MR)?.diagram_published, false);
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason, d.version_id]), [["body_cap", "diagramless", [...api.versions.keys()][0]]]);
   });
 
   it("restages when the renderer's 6 KiB cap omits a diagram", async () => {
@@ -352,6 +420,7 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
     const { pub } = await newPr(r);
     assert.ok(!pub.region.includes("```mermaid"));
     assert.ok(pub.region.includes("x".repeat(5850)));
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason, d.version_id]), [["region_cap", "region_bytes", [...api.versions.keys()][0]]]);
     assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
     assert.equal((stages()[1]!.fields as { diagram?: unknown }).diagram, undefined);
     assert.equal(api.calls.find((c) => c.op === "bind")!.body.region_has_diagram, false);
@@ -396,6 +465,7 @@ describe("publisher: staging and the fallback ladder (D8)", () => {
     assert.deepEqual(binds.map((c) => c.body.region_has_diagram), [true, false]);
     assert.deepEqual(stages().map((s) => s.source), ["generated", "generated"]);
     assert.deepEqual(api.acks(), ["skipped_snapshot_moved", "published"]);
+    assert.deepEqual(r.diagnostics.map((d) => [d.stage, d.reason, d.version_id]), [["body_cap", "diagramless", [...api.versions.keys()][0]]]);
     assert.equal(api.state(MR)?.diagram_published, false);
   });
 
@@ -954,6 +1024,99 @@ describe("publisher: refresh runs (D17) and the staleness line (D12)", () => {
   });
 });
 
+// ── Refresh runs and the code cross-check section ─────────────────────────────────────────────
+
+describe("publisher: refresh runs replace only the code cross-check section", () => {
+  const OLD_SECTION = { incomplete: "old run evidence" };
+  const FRESH_SECTION = { incomplete: "fresh run evidence" };
+  const block = (kindLine: string, section: { incomplete: string } | undefined, staleness?: { describedSha: string; headSha: string }): string =>
+    renderCompletionBlock({
+      branch: "agent/issue-7", closes: false, kindLine, staleness,
+      ...(section ? { kindSections: [[{ codeCrossCheck: section }]] } : {}),
+    });
+
+  for (const kindLine of ["Automated MR rework.", "Automated CI fix on the adopted branch."]) {
+    const refresh = (fresh: { incomplete: string } | undefined): PublicationSpec =>
+      makeSpec({ mode: "refresh", completion: (d) => block(kindLine, fresh, d) });
+
+    for (const [name, oldSection, fresh, expected] of [
+      ["swaps the old section for the fresh one", OLD_SECTION, FRESH_SECTION, FRESH_SECTION],
+      ["inserts the fresh section when the old block has none", undefined, FRESH_SECTION, FRESH_SECTION],
+      ["drops a stale old section the fresh run did not redo", OLD_SECTION, undefined, undefined],
+    ] as const) {
+      it(`${kindLine} ${name}; all other completion text is kept`, async () => {
+        const r = rig();
+        api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+        const oldBlock = block(kindLine, oldSection);
+        r.forge.pr.head = H2;
+        r.forge.pr.description = `${OLD_REGION}\n\n${oldBlock}`;
+        const pub = await r.publisher.prepare(refresh(fresh), { headSha: H2, targetBranch: "main" });
+        await pub.publish(MR);
+        const parsed = parseOwnedBlocks(r.forge.pr.description);
+        assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+        const written = parsed.completion!;
+        // Same block as a fresh render for the expected section (the region was refreshed, so no staleness pair).
+        assert.equal(written, block(kindLine, expected));
+        assert.ok(!written.includes("old run evidence"));
+      });
+    }
+  }
+
+  for (const [label, eol] of [["CRLF", "\r\n"], ["lone CR", "\r"]] as const) {
+    for (const [name, oldSection, fresh, expected] of [
+      ["replaces", OLD_SECTION, FRESH_SECTION, FRESH_SECTION],
+      ["inserts", undefined, FRESH_SECTION, FRESH_SECTION],
+      ["removes", OLD_SECTION, undefined, undefined],
+    ] as const) {
+      it(`${label} body: ${name} the section and keeps every other line ending`, async () => {
+        const r = rig();
+        api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+        const withEol = (t: string) => t.replace(/\n/gu, eol);
+        r.forge.pr.head = H2;
+        r.forge.pr.description = `${OLD_REGION}\n\n${withEol(block("Automated MR rework.", oldSection))}`;
+        const spec = makeSpec({ mode: "refresh", completion: (d) => block("Automated MR rework.", fresh, d) });
+        const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+        await pub.publish(MR);
+        const parsed = parseOwnedBlocks(r.forge.pr.description);
+        assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+        assert.equal(parsed.completion, withEol(block("Automated MR rework.", expected)));
+      });
+    }
+  }
+
+  it("a fresh run without a section keeps an old one that names the current head", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const current = `Code cross-check (checked \`${H2.slice(0, 7)}\`, Codex m): no findings`;
+    const oldBlock = renderCompletionBlock({
+      branch: "agent/issue-7", closes: false, kindLine: "Automated MR rework.",
+      kindSections: [[{ fixed: current }]],
+    });
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${OLD_REGION}\n\n${oldBlock}`;
+    const spec = makeSpec({ mode: "refresh", completion: (d) => block("Automated MR rework.", undefined, d) });
+    const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    const parsed = parseOwnedBlocks(r.forge.pr.description);
+    assert.ok(parsed.kind === "ok" && parsed.completion !== undefined);
+    assert.equal(parsed.completion, oldBlock);
+  });
+
+  it("a closing-reference completion keeps its Closes text while the section is swapped", async () => {
+    const r = rig();
+    api.seedPublished(MR, { sha256: regionSha256(OLD_REGION), headSha: H1 });
+    const withSection = (section: { incomplete: string }, staleness?: { describedSha: string; headSha: string }) =>
+      renderCompletionBlock({ issueIid: IID, branch: "agent/issue-7", closes: true, staleness, kindSections: [[{ codeCrossCheck: section }]] });
+    r.forge.pr.head = H2;
+    r.forge.pr.description = `${OLD_REGION}\n\n${withSection(OLD_SECTION)}`;
+    const spec = makeSpec({ mode: "refresh", completion: (d) => renderCompletionBlock({ issueIid: IID, branch: "agent/issue-7", closes: false, staleness: d, kindSections: [[{ codeCrossCheck: FRESH_SECTION }]] }) });
+    const pub = await r.publisher.prepare(spec, { headSha: H2, targetBranch: "main" });
+    await pub.publish(MR);
+    assert.equal(parseOwnedBlocks(r.forge.pr.description).kind === "ok" && (parseOwnedBlocks(r.forge.pr.description) as { completion?: string }).completion,
+      withSection(FRESH_SECTION));
+  });
+});
+
 // ── The interlock's reconcile ─────────────────────────────────────────────────────────────────
 
 describe("reconcileCompletion (the interlock's read-replace-write)", () => {
@@ -1443,5 +1606,76 @@ describe("publisher helpers", () => {
   it("every ack any test sent is one of the six api outcomes", () => {
     assert.ok(everyAck.length > 0);
     for (const a of everyAck) assert.ok((PR_DESC_ACK_OUTCOMES as readonly string[]).includes(a), a);
+  });
+});
+
+// ── Issue #2686: the editor pass's spend leaves the publisher as one usage report per pass ──────
+
+describe("publisher: editor-pass usage (issue #2686)", () => {
+  const usageOf = (n: number): AdviceUsageSnapshot => ({
+    "claude-haiku-4-5-20251001": { inputTokens: n, outputTokens: 1, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 },
+  });
+
+  /** A pass that, like SummaryRunner, reports one distinct usage snapshot per call. */
+  class UsagePass extends FakePass {
+    n = 0;
+    override async generateDeliverySummary(input: DeliverySummaryInput): Promise<DeliverySummary | null> {
+      const out = await super.generateDeliverySummary(input);
+      input.onUsage?.(usageOf(++this.n));
+      return out;
+    }
+  }
+
+  function usageRig(pass: DeliveryPass | null) {
+    const forge = new FakeForge();
+    const usage: AdviceUsageSnapshot[] = [];
+    const publisher = new PrDescriptionPublisher({
+      forge,
+      api: client,
+      pass,
+      log: nullLogger(),
+      emit: () => {},
+      emitUsage: (u) => void usage.push(u),
+      sleep: async () => {},
+      headLagRetryMs: 0,
+    });
+    return { forge, usage, publisher };
+  }
+
+  it("one editor pass reports its usage once", async () => {
+    const r = usageRig(new UsagePass(SUMMARY));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.deepEqual(r.usage, [usageOf(1)]);
+  });
+
+  it("a regeneration is a second pass: two independently counted reports", async () => {
+    const r = usageRig(new UsagePass(SUMMARY));
+    const pub = await r.publisher.prepare(makeSpec(), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    r.forge.pr.head = H2; // read 1 sees another head: the one regeneration
+    await pub.publish(MR);
+    assert.deepEqual(r.usage, [usageOf(1), usageOf(2)]);
+  });
+
+  it("a call whose deadline is spent makes no model call and reports no usage", async () => {
+    let modelCalls = 0;
+    const queryFn = (async function* () {
+      modelCalls++;
+      yield { type: "result", subtype: "success", is_error: false };
+    }) as unknown as SdkQueryFn;
+    const runner = new SummaryRunner(nullLogger(), { queryFn });
+    const spent: DeliveryPass = {
+      deliverySummaryDeadline: () => Date.now() - 1,
+      generateDeliverySummary: (input) => runner.generateDeliverySummary(input),
+    };
+    const r = usageRig(spent);
+    const claim = { run_id: RUN, summary_model: "haiku", secrets: { anthropic_oauth_token: "tok" } };
+    const pub = await r.publisher.prepare(makeSpec({ claim }), { headSha: H1, targetBranch: "main" });
+    r.forge.pr.description = pub.initialBody(completion(true));
+    await pub.publish(MR);
+    assert.equal(modelCalls, 0);
+    assert.deepEqual(r.usage, []);
   });
 });

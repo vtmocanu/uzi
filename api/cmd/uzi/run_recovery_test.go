@@ -385,6 +385,81 @@ func TestRunRecoveryCheckpointLineSanitizes(t *testing.T) {
 	}
 }
 
+func TestRunRecoveryHintFoldsRunID(t *testing.T) {
+	runID := "run\nwith\ttabs"
+	fc := &uzicli.FakeClient{
+		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
+			{ID: "hold-n", RunID: runID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
+		}},
+	}
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", runID)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	}
+	want := "1 hold(s) await a decision: discard with `uzi run discard run with tabs --hold <hold-id> --yes`"
+	for _, line := range strings.Split(out, "\n") {
+		if line == want {
+			return
+		}
+	}
+	t.Errorf("complete single-line hint %q missing from stdout: %q", want, out)
+}
+
+func TestRunRecoveryEmptyFoldsRunID(t *testing.T) {
+	runID := "run\nwith\ttabs"
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{}}
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", runID)
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	}
+	want := "run run with tabs has no retained custody holds\n"
+	if out != want {
+		t.Errorf("empty-holds stdout = %q, want %q", out, want)
+	}
+}
+
+func TestRunRecoveryJSONWarningFoldsRunID(t *testing.T) {
+	runID := "run\nwith\ttabs"
+	fc := &uzicli.FakeClient{
+		RecoveryHoldsResult: apitypes.RecoveryCustodyHoldsDTO{Holds: []apitypes.RecoveryCustodyHoldDTO{
+			{ID: "hold-n", RunID: runID, Generation: 1, State: "open", Attention: "needs_action", WorkerID: "w1"},
+		}},
+		RecoverySummaries: map[string]apitypes.RecoveryArchiveSummaryDTO{
+			runID: {Supported: true, Archives: []apitypes.RecoveryArchiveDTO{
+				{ID: "cap-legacy", HoldID: "", State: "available"},
+			}},
+		},
+		RunByID: map[string]apitypes.RunDTO{
+			runID: {ID: runID, Status: "completed"},
+		},
+	}
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", runID, "--json")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, want 0 (stderr: %s)", code, errb)
+	}
+	want := "uzi: 1 capture(s) carry no hold id (server predates it) and are not listed; 'uzi run get run with tabs' lists the available ones\n"
+	if errb != want {
+		t.Errorf("complete capture warning = %q, want %q", errb, want)
+	}
+	if strings.Contains(errb, "\t") || strings.Count(errb, "\n") != 1 || !strings.HasSuffix(errb, "\n") {
+		t.Errorf("capture warning must have no tabs and only a final newline: %q", errb)
+	}
+	var holds []struct {
+		ID       string            `json:"id"`
+		RunID    string            `json:"run_id"`
+		Captures []json.RawMessage `json:"captures"`
+	}
+	if err := json.Unmarshal([]byte(out), &holds); err != nil {
+		t.Fatalf("run recovery --json is not a hold array: %v\n%s", err, out)
+	}
+	if len(holds) != 1 || holds[0].ID != "hold-n" || holds[0].RunID != runID {
+		t.Fatalf("JSON holds = %+v, want the matching hold with raw run ID %q", holds, runID)
+	}
+	if holds[0].Captures == nil || len(holds[0].Captures) != 0 {
+		t.Errorf("JSON captures = %s, want [] with the unattributed capture omitted", out)
+	}
+}
+
 // TestRunRecoveryEmptyJSON proves --json emits [] (never null) for a run with no holds.
 func TestRunRecoveryEmptyJSON(t *testing.T) {
 	fc := &uzicli.FakeClient{RecoveryHoldsResult: recoveryHoldsFixture()}

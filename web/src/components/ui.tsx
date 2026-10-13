@@ -509,6 +509,9 @@ export const RUN_STATUS_TONES: Record<
    *  other involuntary holds, NOT the owner-pause info tone, and not pulsing: it does no
    *  work until the credential is enabled. Label below. */
   credential_disabled: { tone: "warning" },
+  // Provider holds are parked: owner attention and outage retry share a static warning.
+  provider_unavailable: { tone: "warning" },
+  provider_outage: { tone: "warning" },
   completed: { tone: "ok" },
   /** issue #1418: a StatusPill-ONLY pseudo-status for a `failed` run whose committed work
    *  is human-landable (server-derived landing_state === "needs_landing"). RunsList/RunView
@@ -559,6 +562,9 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   completion_blocked: "Completion blocked",
   // PRD #1732: kept in step with runBadge's matching label.
   credential_disabled: "waiting: credential disabled",
+  // Kept in step with runBadge's parked wording by the label-agreement test.
+  provider_unavailable: "provider unavailable: owner hold",
+  provider_outage: "waiting for provider",
 };
 
 export function StatusPill({ status }: { status: string }) {
@@ -590,11 +596,23 @@ const SPINNER_FRAMES = ["⠋", "⠙", "⠹", "⠸", "⠼", "⠴", "⠦", "⠧", 
 export function Spinner({ className = "" }: { className?: string }) {
   const [frame, setFrame] = useState(0);
   useEffect(() => {
-    const id = setInterval(
-      () => setFrame((f) => (f + 1) % SPINNER_FRAMES.length),
-      80,
-    );
-    return () => clearInterval(id);
+    const preference = typeof window.matchMedia === "function"
+      ? window.matchMedia("(prefers-reduced-motion: reduce)") : null;
+    let timer: ReturnType<typeof setInterval> | undefined;
+    const update = () => {
+      if (timer !== undefined) clearInterval(timer);
+      timer = undefined;
+      setFrame(0);
+      if (!preference?.matches) {
+        timer = setInterval(() => setFrame((f) => (f + 1) % SPINNER_FRAMES.length), 80);
+      }
+    };
+    update();
+    preference?.addEventListener?.("change", update);
+    return () => {
+      if (timer !== undefined) clearInterval(timer);
+      preference?.removeEventListener?.("change", update);
+    };
   }, []);
   return (
     <span
@@ -676,6 +694,7 @@ export function PageHeader({
   titleNode,
   description,
   actions,
+  actionsBesideTitle = false,
   backTo,
   backLabel,
 }: {
@@ -683,6 +702,8 @@ export function PageHeader({
   titleNode?: ReactNode;
   description?: ReactNode;
   actions?: ReactNode;
+  // Run-detail headers reserve a desktop title row for their compact controls.
+  actionsBesideTitle?: boolean;
   backTo?: string;
   backLabel?: string;
 }) {
@@ -696,8 +717,8 @@ export function PageHeader({
           <ArrowLeftIcon /> {backLabel ?? "Back"}
         </Link>
       )}
-      <div className="flex flex-wrap items-start justify-between gap-x-6 gap-y-3">
-        <div className="min-w-0">
+      <div className={cx("flex flex-wrap items-start justify-between gap-x-6 gap-y-3", actionsBesideTitle && "lg:flex-nowrap")}>
+        <div className={cx("min-w-0", actionsBesideTitle && "lg:flex-1")}>
           {titleNode ?? (
             <h1 className="text-xl font-semibold tracking-tight">{title}</h1>
           )}
@@ -706,7 +727,7 @@ export function PageHeader({
           )}
         </div>
         {actions && (
-          <div className="flex flex-wrap items-center gap-2">{actions}</div>
+          <div className={cx("flex flex-wrap items-center gap-2", actionsBesideTitle && "lg:shrink-0 lg:pt-6")}>{actions}</div>
         )}
       </div>
     </div>

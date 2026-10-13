@@ -9,8 +9,8 @@
 # that landed on main in the meantime (the exact thing check-migration-numbering.sh
 # reddens: goose panics `duplicate version N detected` at boot and in every *LiveDB
 # test). This helper renames the branch's new migration(s) to CONSECUTIVE numbers above
-# the live main head, rewrites the renamed migrations' OWN cross-reference comments, and
-# REPORTS every other reference (Go, docs, sibling migrations) for a human to fix by
+# the live main head, rewrites exact filename/stem references in their OWN comments, and
+# REPORTS unresolved comment numbers and every other reference (Go, docs, siblings) to fix by
 # hand; binary files in the diff are skipped with a notice. It is the mechanical form of CLAUDE.md's "numbers are assigned at merge time,
 # renumbered above the live head".
 #
@@ -59,28 +59,33 @@ die() {
 usage() {
   echo "usage: scripts/migration-renumber.sh" >&2
   echo "       scripts/migration-renumber.sh --rewrite-comments <mapfile> <sqlfile>" >&2
+  echo "       map rows: OLD<TAB>NEW<TAB>OLD_BASENAME (NNNNN_slug.sql, no path)" >&2
 }
 
-# map_is_valid <mapfile> -- require at least one unique `NNNNN NNNNN` pair and reject
-# every malformed nonblank line. A missing NEW value would otherwise store an empty mapping
+# map_is_valid <mapfile> -- require strict TAB-separated OLD NEW OLD_BASENAME rows,
+# unique five-digit OLD and NEW numbers, and a matching path-free basename.
+# A missing NEW value would otherwise store an empty mapping
 # and silently delete the OLD token from comment lines; an empty first awk input also makes
 # NR==FNR-style map detection consume the SQL input. This tree-writer fails closed on both.
 map_is_valid() {
-  awk '
-    NF == 0 { next }
-    NF != 2 || $1 !~ /^[0-9][0-9][0-9][0-9][0-9]$/ ||
-      $2 !~ /^[0-9][0-9][0-9][0-9][0-9]$/ || seen[$1]++ { bad=1; next }
+  awk -F"$TAB" '
+    NF != 3 || $1 !~ /^[0-9][0-9][0-9][0-9][0-9]$/ ||
+      $2 !~ /^[0-9][0-9][0-9][0-9][0-9]$/ ||
+      $3 !~ /^[0-9][0-9][0-9][0-9][0-9]_.+\.sql$/ ||
+      index($3, "/") || index($3, "\\") ||
+      substr($3,1,5) != $1 || seenold[$1]++ || seennew[$2]++ { bad=1; next }
     { found=1 }
     END { exit found && !bad ? 0 : 1 }
   ' "$1"
 }
 
 # rewrite_comments <mapfile> <sqlfile>
-# Rewrite <sqlfile> IN PLACE, applying the map (whitespace-separated `OLD NEW` per line)
-# to its COMMENT LINES ONLY. Simultaneous, token-exact: matches a MAXIMAL run of digits
-# and only remaps a run of EXACTLY 5 digits that is a map key -- so 100232 / 002321 never
-# match, and a mapped value inserted into the output is never re-scanned (true
-# simultaneous semantics). This is the SAME code path the main transform calls per renamed
+# Rewrite <sqlfile> IN PLACE using strict OLD<TAB>NEW<TAB>OLD_BASENAME rows.
+# Only exact basename/stem identities in COMMENT LINES are rewritten. Matched identities
+# are consumed whole; their slug digits and inserted values are never scanned again.
+# Unmatched old numbers in comments are reported to the optional diagnostics file
+# (stderr for the subcommand), including other slugs and ambiguous suffixes.
+# This is the SAME code path the main transform calls per renamed
 # file, and the internal --rewrite-comments subcommand so the M3 harness can drive it on a
 # fixture. (No literal single-quote and no `close` used as a name in the awk, deliberately.)
 rewrite_comments() {
@@ -89,19 +94,41 @@ rewrite_comments() {
   map_is_valid "$_map" || return 1
   _dir="$(dirname "$_f")"
   _tmp="$(mktemp "$_dir/.renum.XXXXXX")" || return 1
-  if awk -v mapfile="$_map" 'FILENAME==mapfile { m[$1]=$2; next }
+  if LC_ALL=C awk -F"$TAB" -v mapfile="$_map" -v diagnostics="${3:-/dev/stderr}" '
+    FILENAME==mapfile { m[$1]=$2; basename[$1]=$3; next }
+    function exact(line, pos, name,    after, tail) {
+      if (substr(line,pos,length(name)) != name) return 0
+      if (pos > 1 && substr(line,pos-1,1) ~ /[[:alnum:]_.-]/) return 0
+      after=substr(line,pos+length(name),1)
+      if (after ~ /[[:alnum:]_-]/) return 0
+      # A sentence period is punctuation; a dotted suffix belongs to the filename.
+      tail=substr(line,pos+length(name)+1,1)
+      if (after == "." && tail ~ /[[:alnum:]_.-]/) return 0
+      return 1
+    }
     {
       probe=$0
       sub(/^[[:space:]]+/, "", probe)
       if (substr(probe,1,2) != "--") { print; next }
-      out=""; rest=$0
+      out=""; rest=$0; offset=0; unresolved=0
       while (match(rest, /[0-9]+/)) {
         tok=substr(rest, RSTART, RLENGTH)
         out=out substr(rest, 1, RSTART-1)
-        if (length(tok)==5 && (tok in m)) out=out m[tok]; else out=out tok
-        rest=substr(rest, RSTART+RLENGTH)
+        replacement=tok; consumed=RLENGTH
+        if (length(tok)==5 && (tok in m)) {
+          name=basename[tok]; stem=name; sub(/\.sql$/, "", stem)
+          if (exact($0,offset+RSTART,name)) consumed=length(name)
+          else if (exact($0,offset+RSTART,stem)) consumed=length(stem)
+          else unresolved=1
+          if (consumed > RLENGTH)
+            replacement=m[tok] substr(rest,RSTART+RLENGTH,consumed-RLENGTH)
+        }
+        out=out replacement
+        offset+=RSTART+consumed-1
+        rest=substr(rest, RSTART+consumed)
       }
       print out rest
+      if (unresolved) print FILENAME ":" FNR "\t" out rest >> diagnostics
     }' "$_map" "$_f" > "$_tmp"; then
     mv "$_tmp" "$_f"
   else
@@ -129,7 +156,7 @@ case "${1:-}" in
     _sub_map="$2"
     _sub_f="$3"
     [ -f "$_sub_map" ] || die "--rewrite-comments: map file not found: $_sub_map"
-    map_is_valid "$_sub_map" || die "--rewrite-comments: map file is empty, whitespace-only, or malformed (expected unique NNNNN NNNNN pairs): $_sub_map"
+    map_is_valid "$_sub_map" || die "--rewrite-comments: map file is empty, whitespace-only, or malformed (expected strict OLD<TAB>NEW<TAB>OLD_BASENAME rows, unique five-digit OLD/NEW and matching NNNNN_slug.sql basename without a path): $_sub_map"
     [ -f "$_sub_f" ] || die "--rewrite-comments: sql file not found: $_sub_f"
     if rewrite_comments "$_sub_map" "$_sub_f"; then
       exit 0
@@ -262,8 +289,10 @@ awk -F"$TAB" -v head="$HEAD_NUM" '
     print oldnum "\t" newnum "\t" oldpath "\t" newpath "\t" tmppath
   }' "$WORKDIR/sorted" > "$WORKDIR/plan"
 
-# Derived views of the plan (each two-column form keeps every read var used).
-awk -F"$TAB" '{ print $1 " " $2 }'         "$WORKDIR/plan" > "$WORKDIR/map"      # OLD NEW
+# Derived views: identity map plus the unchanged two-phase path pairs.
+awk -F"$TAB" '{ base=$3; sub(/.*\//, "", base); print $1 "\t" $2 "\t" base }' \
+  "$WORKDIR/plan" > "$WORKDIR/map" # OLD NEW OLD_BASENAME
+map_is_valid "$WORKDIR/map" || die "generated identity map is malformed; nothing was renamed or edited"
 awk -F"$TAB" '{ print $3 "\t" $5 }'        "$WORKDIR/plan" > "$WORKDIR/phase1"   # oldpath -> tmppath
 awk -F"$TAB" '{ print $5 "\t" $4 }'        "$WORKDIR/plan" > "$WORKDIR/phase2"   # tmppath -> newpath
 awk -F"$TAB" '{ print $4 }'                "$WORKDIR/plan" > "$WORKDIR/newpaths"
@@ -302,7 +331,7 @@ while IFS="$TAB" read -r kind f; do
 "
     continue
   fi
-  hits="$(LC_ALL=C awk 'NR==FNR { m[$1]=$2; next }
+  hits="$(LC_ALL=C awk -F"$TAB" 'NR==FNR { m[$1]=$2; next }
     {
       rest=$0
       while (match(rest, /[0-9]+/)) {
@@ -331,9 +360,10 @@ while IFS="$TAB" read -r src dst; do
 done < "$WORKDIR/phase2"
 
 # ---- comment rewrite: one SIMULTANEOUS old->new pass over each renamed file ----------
+: > "$WORKDIR/unresolved"
 while IFS= read -r np; do
   [ -n "$np" ] || continue
-  rewrite_comments "$WORKDIR/map" "$np" || die "comment rewrite failed for $np"
+  rewrite_comments "$WORKDIR/map" "$np" "$WORKDIR/unresolved" || die "comment rewrite failed for $np"
 done < "$WORKDIR/newpaths"
 
 # ---- postflight report: other files are REPORTED, never auto-edited -----------------
@@ -351,6 +381,14 @@ if [ -n "$report" ]; then
     [ -n "$loc" ] || continue
     echo "  $loc  $sugg  | $content"
   done
+fi
+
+if [ -s "$WORKDIR/unresolved" ]; then
+  echo ""
+  echo "migration-renumber: POSTFLIGHT -- unresolved renamed-migration comments require manual review."
+  while IFS="$TAB" read -r loc content; do
+    echo "  $loc  | $content"
+  done < "$WORKDIR/unresolved"
 fi
 
 # ---- self-check: fail loudly if the mechanics did not hold ---------------------------
@@ -396,8 +434,8 @@ echo ""
 echo "migration-renumber: DONE -- renamed $N migration(s) above live main head $HEAD_NUM:"
 awk -F"$TAB" '{ print "  " $3 " -> " $4 }' "$WORKDIR/plan"
 echo ""
-if [ -n "$report" ]; then
-  echo "migration-renumber: postflight found OTHER references (listed above). They were NOT"
+if [ -n "$report" ] || [ -s "$WORKDIR/unresolved" ]; then
+  echo "migration-renumber: postflight found unresolved references (listed above). They were NOT"
   echo "  auto-edited and still need manual review. SUCCESS here means the MECHANICS are done"
   echo "  (rename + renamed-migration comment rewrite), NOT that those references were reviewed."
 else

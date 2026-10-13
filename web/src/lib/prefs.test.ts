@@ -74,15 +74,15 @@ describe("summaryCollapse (PRD #362 Decision 9)", () => {
   const DAY = 24 * 60 * 60 * 1000;
   const t0 = 1_700_000_000_000;
 
-  it("defaults to expanded when the run has no stored choice", () => {
-    expect(summaryCollapse.getCollapsed("run-1")).toBe(false);
+  it("returns undefined when the run has no stored choice", () => {
+    expect(summaryCollapse.getCollapsed("run-1")).toBeUndefined();
   });
 
   it("persists a collapse choice and reads it back after a reload (fresh read, no state)", () => {
     summaryCollapse.setCollapsed("run-1", true);
     expect(summaryCollapse.getCollapsed("run-1")).toBe(true);
     // Per-run: a different run is unaffected.
-    expect(summaryCollapse.getCollapsed("run-2")).toBe(false);
+    expect(summaryCollapse.getCollapsed("run-2")).toBeUndefined();
   });
 
   it("can be toggled back to expanded", () => {
@@ -95,7 +95,7 @@ describe("summaryCollapse (PRD #362 Decision 9)", () => {
     summaryCollapse.setCollapsed("stale", true, t0);
     // Re-touch a second run 8 days later; that write GCs 'stale' and re-stamps 'fresh'.
     summaryCollapse.setCollapsed("fresh", true, t0 + 8 * DAY);
-    expect(summaryCollapse.getCollapsed("stale", t0 + 8 * DAY)).toBe(false); // expired → default
+    expect(summaryCollapse.getCollapsed("stale", t0 + 8 * DAY)).toBeUndefined(); // expired → no stored choice
     expect(summaryCollapse.getCollapsed("fresh", t0 + 8 * DAY)).toBe(true); // still fresh
   });
 
@@ -113,10 +113,10 @@ describe("summaryCollapse (PRD #362 Decision 9)", () => {
     expect(JSON.parse(raw!)).not.toHaveProperty("stale");
   });
 
-  it("returns the default when the stored map is corrupt, without throwing", () => {
+  it("returns undefined when the stored map is corrupt, without throwing", () => {
     window.localStorage.setItem("uzi.summaryCollapse", "{not json");
     expect(() => summaryCollapse.getCollapsed("run-1")).not.toThrow();
-    expect(summaryCollapse.getCollapsed("run-1")).toBe(false);
+    expect(summaryCollapse.getCollapsed("run-1")).toBeUndefined();
   });
 });
 

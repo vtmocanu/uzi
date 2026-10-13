@@ -38,12 +38,12 @@ const HEALTH_FIELDS: {
     validate: validateHealthPercent,
   },
   {
-    // PRD #1189: the per-run wall-clock extension allowance. It lives in this card (below the
+    // PRD #1189: the per-request cap on a wall-clock extension. It lives in this card (below the
     // near-timeout percent) because it governs the SAME near-timeout moment, but it is NOT a
     // health threshold — its bounds are {0} ∪ [3600, 604800], so it carries its own validator.
     key: "run_extension_cap_seconds",
-    label: "Extension allowance per run (seconds)",
-    hint: "Total extra wall-clock time an owner may grant a run through Extend; 57600 = 16h. 0 turns extending off.",
+    label: "Maximum per extension (seconds)",
+    hint: "The most extra wall-clock time an owner may add to a run in one Extend. Owners can extend again; 57600 = 16h. 0 turns extending off.",
     validate: validateExtensionCapSeconds,
   },
   { key: "health_queued_seconds", label: "Stuck queued after (seconds)", validate: validateHealthSeconds },

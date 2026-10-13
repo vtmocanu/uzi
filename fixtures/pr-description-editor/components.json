@@ -1,0 +1,45 @@
+{
+  "id": "components",
+  "context": {
+    "issue": "Propagate invalidation from the API through the queue to the worker and cache.",
+    "prd": "Describe delivered behavior from visible evidence.",
+    "plan": "Implement the requested change.",
+    "previous": null,
+    "claims": "The agent reports the requested implementation.",
+    "commits": "Implement requested behavior",
+    "paths": "src/api.ts 1 0 [code]\nsrc/queue.ts 1 0 [code]\nsrc/worker.ts 1 0 [code]",
+    "diff": "+api.onUpdate(id => queue.send(id));\n+queue.onMessage(id => worker.invalidate(id));\n+worker.invalidate = id => cache.delete(id);",
+    "truncated": {
+      "issue": false,
+      "prd": false,
+      "plan": false,
+      "previous": false,
+      "claims": false,
+      "commits": false,
+      "paths": false,
+      "diff": false
+    },
+    "bytes": 432
+  },
+  "code": {
+    "unavailable": false,
+    "added": 7,
+    "deleted": 0
+  },
+  "lead": {
+    "verifiedAtSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "verification": [
+      {
+        "command": "npm run typecheck",
+        "result": "pass"
+      }
+    ]
+  },
+  "region": {
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "targetBranch": "main",
+    "sizeLine": "**Size:** small"
+  },
+  "completion": "Finished fixture change.",
+  "bodyPrefix": ""
+}

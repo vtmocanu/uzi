@@ -19,6 +19,28 @@ func (f *FakeClient) ListRuns(ctx context.Context) ([]apitypes.RunListItemDTO, e
 	return f.Runs, nil
 }
 
+// ListRunSummaries mirrors ListRuns over the same seeded f.Runs, projected through
+// apitypes.RunSummaryOf, with its own counter and recorded ctx (issue #2661).
+func (f *FakeClient) ListRunSummaries(ctx context.Context) ([]apitypes.RunSummaryItemDTO, error) {
+	f.LastListRunSummariesCtx = ctx
+	f.ListRunSummariesCalls++
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return summariesOf(f.Runs), nil
+}
+
+func summariesOf(items []apitypes.RunListItemDTO) []apitypes.RunSummaryItemDTO {
+	if items == nil {
+		return nil
+	}
+	out := make([]apitypes.RunSummaryItemDTO, len(items))
+	for i, it := range items {
+		out[i] = apitypes.RunSummaryOf(it)
+	}
+	return out
+}
+
 func (f *FakeClient) GetRun(ctx context.Context, id string) (apitypes.RunDTO, error) {
 	f.LastGetRunCtx = ctx
 	f.RunVerbCalls = append(f.RunVerbCalls, "get_run")

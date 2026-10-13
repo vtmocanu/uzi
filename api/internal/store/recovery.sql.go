@@ -34,7 +34,7 @@ SET manifest_bound = true,
 WHERE id = $5
   AND (manifest_bound = false OR (byte_size = $1 AND checksum = $2
     AND COALESCE(prerequisite_shas, '{}'::text[]) = COALESCE($4::text[], '{}'::text[])))
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal
 `
 
 type BindCaptureManifestParams struct {
@@ -90,6 +90,9 @@ func (q *Queries) BindCaptureManifest(ctx context.Context, arg BindCaptureManife
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }
@@ -301,6 +304,78 @@ func (q *Queries) ExpireReadyCaptures(ctx context.Context, now pgtype.Timestampt
 	return result.RowsAffected(), nil
 }
 
+const expireRedundantCapture = `-- name: ExpireRedundantCapture :many
+WITH flipped AS (
+    UPDATE recovery_captures c
+    SET state = 'expired', reason = 'published_redundant', reserved_bytes = NULL,
+        expires_at = LEAST(c.expires_at, now()), local_replica_worker_id = NULL,
+        redundancy_proof = $1::jsonb, updated_at = now()
+    WHERE c.id = $2 AND c.hold_id = $3 AND c.run_id = $4 AND c.user_id = $5
+      AND c.original_worker_id = $6::uuid AND c.state = 'available' AND c.manifest_bound
+      AND c.coverage_digest = $7::text AND c.source_sha = $8::text
+      AND EXISTS (SELECT 1 FROM recovery_custody_holds h JOIN runs r ON r.id = h.run_id AND r.user_id = h.user_id
+        WHERE h.id = c.hold_id AND h.original_worker_id = $6::uuid AND h.generation = $9
+          AND h.inventory_guarded AND h.state = 'released' AND h.completion_identity = $10::jsonb
+          AND r.status = 'completed' AND r.claim_generation = h.generation AND r.worker_id = h.original_worker_id
+          AND r.completion_final_head = h.completion_identity->>'final_head')
+    RETURNING c.id
+), deleted AS (
+    DELETE FROM recovery_capture_chunks WHERE capture_id IN (SELECT id FROM flipped)
+    RETURNING capture_id
+)
+SELECT id FROM flipped WHERE (SELECT count(*) FROM deleted) >= 0
+`
+
+type ExpireRedundantCaptureParams struct {
+	Proof          []byte    `json:"proof"`
+	ID             uuid.UUID `json:"id"`
+	HoldID         uuid.UUID `json:"hold_id"`
+	RunID          uuid.UUID `json:"run_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	WorkerID       uuid.UUID `json:"worker_id"`
+	CoverageDigest string    `json:"coverage_digest"`
+	SourceSha      string    `json:"source_sha"`
+	Generation     int64     `json:"generation"`
+	Identity       []byte    `json:"identity"`
+}
+
+// Issue #2625: the ONLY statement that writes reason 'published_redundant'. The caller holds the
+// worker, run, hold and capture locks and has re-verified the claim. Same shape as
+// FenceUnacceptedInventoryCapture: the guarded UPDATE returns the ids it flipped and the DELETE
+// removes chunks for those ids alone, so a row the guard or the WHERE refuses loses no bytes.
+// LEAST keeps expires_at in the past, so later updates of the expired final capture never trip the
+// guard's window arm; the local replica marker is cleared because the proof replaces it.
+func (q *Queries) ExpireRedundantCapture(ctx context.Context, arg ExpireRedundantCaptureParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, expireRedundantCapture,
+		arg.Proof,
+		arg.ID,
+		arg.HoldID,
+		arg.RunID,
+		arg.UserID,
+		arg.WorkerID,
+		arg.CoverageDigest,
+		arg.SourceSha,
+		arg.Generation,
+		arg.Identity,
+	)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []uuid.UUID{}
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			return nil, err
+		}
+		items = append(items, id)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const expireStalledUploads = `-- name: ExpireStalledUploads :execrows
 UPDATE recovery_captures
 SET state = 'needs_action', reason = 'upload_retry_window_exhausted', updated_at = now()
@@ -378,8 +453,101 @@ func (q *Queries) FenceUnacceptedInventoryCapture(ctx context.Context, arg Fence
 	return result.RowsAffected(), nil
 }
 
+const getArchiveRedundancyView = `-- name: GetArchiveRedundancyView :one
+SELECT c.id AS capture_id, c.run_id, c.user_id, c.original_worker_id AS capture_worker_id,
+    c.state AS capture_state, c.reason AS capture_reason, c.manifest_bound, c.source_sha, c.coverage_digest,
+    COALESCE(c.prerequisite_shas, '{}')::text[] AS prerequisite_shas,
+    c.redundancy_proof, c.redundancy_refused_at, c.redundancy_refusal,
+    h.id AS hold_id, h.generation AS hold_generation, h.state AS hold_state,
+    h.inventory_guarded, h.original_worker_id AS hold_worker_id, h.repo_id,
+    h.completion_identity,
+    r.status AS run_status, r.claim_generation AS run_generation, r.worker_id AS run_worker_id,
+    r.completion_final_head, r.mr_iid AS run_mr_iid
+FROM recovery_captures c
+JOIN recovery_custody_holds h ON h.id = c.hold_id AND h.run_id = c.run_id AND h.user_id = c.user_id
+JOIN runs r ON r.id = c.run_id AND r.user_id = c.user_id
+WHERE c.id = $1 AND c.run_id = $2 AND c.user_id = $3
+    AND c.original_worker_id = $4::uuid
+`
+
+type GetArchiveRedundancyViewParams struct {
+	CaptureID uuid.UUID `json:"capture_id"`
+	RunID     uuid.UUID `json:"run_id"`
+	UserID    uuid.UUID `json:"user_id"`
+	WorkerID  uuid.UUID `json:"worker_id"`
+}
+
+type GetArchiveRedundancyViewRow struct {
+	CaptureID           uuid.UUID          `json:"capture_id"`
+	RunID               uuid.UUID          `json:"run_id"`
+	UserID              uuid.UUID          `json:"user_id"`
+	CaptureWorkerID     pgtype.UUID        `json:"capture_worker_id"`
+	CaptureState        string             `json:"capture_state"`
+	CaptureReason       pgtype.Text        `json:"capture_reason"`
+	ManifestBound       bool               `json:"manifest_bound"`
+	SourceSha           string             `json:"source_sha"`
+	CoverageDigest      pgtype.Text        `json:"coverage_digest"`
+	PrerequisiteShas    []string           `json:"prerequisite_shas"`
+	RedundancyProof     []byte             `json:"redundancy_proof"`
+	RedundancyRefusedAt pgtype.Timestamptz `json:"redundancy_refused_at"`
+	RedundancyRefusal   pgtype.Text        `json:"redundancy_refusal"`
+	HoldID              uuid.UUID          `json:"hold_id"`
+	HoldGeneration      int64              `json:"hold_generation"`
+	HoldState           string             `json:"hold_state"`
+	InventoryGuarded    bool               `json:"inventory_guarded"`
+	HoldWorkerID        uuid.UUID          `json:"hold_worker_id"`
+	RepoID              pgtype.UUID        `json:"repo_id"`
+	CompletionIdentity  []byte             `json:"completion_identity"`
+	RunStatus           string             `json:"run_status"`
+	RunGeneration       int64              `json:"run_generation"`
+	RunWorkerID         pgtype.UUID        `json:"run_worker_id"`
+	CompletionFinalHead pgtype.Text        `json:"completion_final_head"`
+	RunMrIid            pgtype.Int8        `json:"run_mr_iid"`
+}
+
+// Issue #2625: everything the published-redundancy claim is checked against, in one read: the
+// capture, its hold with the frozen completion identity, and the run. No lock of its own; the
+// service takes the worker, run, hold and capture locks first and reads this under them.
+func (q *Queries) GetArchiveRedundancyView(ctx context.Context, arg GetArchiveRedundancyViewParams) (GetArchiveRedundancyViewRow, error) {
+	row := q.db.QueryRow(ctx, getArchiveRedundancyView,
+		arg.CaptureID,
+		arg.RunID,
+		arg.UserID,
+		arg.WorkerID,
+	)
+	var i GetArchiveRedundancyViewRow
+	err := row.Scan(
+		&i.CaptureID,
+		&i.RunID,
+		&i.UserID,
+		&i.CaptureWorkerID,
+		&i.CaptureState,
+		&i.CaptureReason,
+		&i.ManifestBound,
+		&i.SourceSha,
+		&i.CoverageDigest,
+		&i.PrerequisiteShas,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
+		&i.HoldID,
+		&i.HoldGeneration,
+		&i.HoldState,
+		&i.InventoryGuarded,
+		&i.HoldWorkerID,
+		&i.RepoID,
+		&i.CompletionIdentity,
+		&i.RunStatus,
+		&i.RunGeneration,
+		&i.RunWorkerID,
+		&i.CompletionFinalHead,
+		&i.RunMrIid,
+	)
+	return i, err
+}
+
 const getCaptureForOwner = `-- name: GetCaptureForOwner :one
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds FROM recovery_captures
+SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal FROM recovery_captures
 WHERE id = $1 AND run_id = $2 AND user_id = $3
 `
 
@@ -420,6 +588,9 @@ func (q *Queries) GetCaptureForOwner(ctx context.Context, arg GetCaptureForOwner
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }
@@ -487,7 +658,7 @@ func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustod
 }
 
 const getCustodyHoldForSettle = `-- name: GetCustodyHoldForSettle :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id FROM recovery_custody_holds
 WHERE id = $1 AND run_id = $2
 `
 
@@ -532,12 +703,16 @@ func (q *Queries) GetCustodyHoldForSettle(ctx context.Context, arg GetCustodyHol
 		&i.FinalCaptureID,
 		&i.FinalSourceSha,
 		&i.FinalCoverageDigest,
+		&i.CompletionIdentity,
+		&i.CompletedPublicationReceipt,
+		&i.CompletedPublicationReason,
+		&i.FinalPublicationID,
 	)
 	return i, err
 }
 
 const getFinalInventoryCapture = `-- name: GetFinalInventoryCapture :one
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds FROM recovery_captures
+SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal FROM recovery_captures
 WHERE id = $1 AND hold_id = $2 AND run_id = $3 AND user_id = $4
   AND original_worker_id = $5::uuid
 FOR UPDATE
@@ -585,12 +760,15 @@ func (q *Queries) GetFinalInventoryCapture(ctx context.Context, arg GetFinalInve
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }
 
 const getFinalInventoryHold = `-- name: GetFinalInventoryHold :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id FROM recovery_custody_holds
 WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3::uuid
   AND generation = $4
 ORDER BY id LIMIT 1 FOR NO KEY UPDATE
@@ -641,6 +819,10 @@ func (q *Queries) GetFinalInventoryHold(ctx context.Context, arg GetFinalInvento
 		&i.FinalCaptureID,
 		&i.FinalSourceSha,
 		&i.FinalCoverageDigest,
+		&i.CompletionIdentity,
+		&i.CompletedPublicationReceipt,
+		&i.CompletedPublicationReason,
+		&i.FinalPublicationID,
 	)
 	return i, err
 }
@@ -846,7 +1028,7 @@ func (q *Queries) ListCaptureSourceShasForHold(ctx context.Context, arg ListCapt
 }
 
 const listCapturesForRunOwner = `-- name: ListCapturesForRunOwner :many
-SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds FROM recovery_captures
+SELECT id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal FROM recovery_captures
 WHERE run_id = $1 AND user_id = $2
 ORDER BY created_at
 `
@@ -892,6 +1074,9 @@ func (q *Queries) ListCapturesForRunOwner(ctx context.Context, arg ListCapturesF
 			&i.CoverageDigest,
 			&i.LocalReplicaWorkerID,
 			&i.ReadyRetentionSeconds,
+			&i.RedundancyProof,
+			&i.RedundancyRefusedAt,
+			&i.RedundancyRefusal,
 		); err != nil {
 			return nil, err
 		}
@@ -919,6 +1104,9 @@ SELECT
     h.final_capture_id,
     h.final_source_sha,
     h.final_coverage_digest,
+    h.final_publication_id,
+    h.completed_publication_receipt,
+    h.completed_publication_reason,
     COALESCE(w.name, '')::text AS worker_name,
     f.has_available_capture, f.capture_state, f.run_status, f.recovery_wait_cause, f.attention, f.decision_needed,
     cr.ref AS checkpoint_ref,
@@ -944,30 +1132,33 @@ type ListCustodyHoldsForOwnerParams struct {
 }
 
 type ListCustodyHoldsForOwnerRow struct {
-	ID                      uuid.UUID          `json:"id"`
-	RunID                   uuid.UUID          `json:"run_id"`
-	Generation              int64              `json:"generation"`
-	State                   string             `json:"state"`
-	CreatedAt               pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt               pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt              pgtype.Timestamptz `json:"released_at"`
-	OriginalWorkerID        uuid.UUID          `json:"original_worker_id"`
-	TerminalRecordRejection pgtype.Text        `json:"terminal_record_rejection"`
-	InventoryGuarded        bool               `json:"inventory_guarded"`
-	FinalDisposition        pgtype.Text        `json:"final_disposition"`
-	FinalCaptureID          pgtype.UUID        `json:"final_capture_id"`
-	FinalSourceSha          pgtype.Text        `json:"final_source_sha"`
-	FinalCoverageDigest     pgtype.Text        `json:"final_coverage_digest"`
-	WorkerName              string             `json:"worker_name"`
-	HasAvailableCapture     bool               `json:"has_available_capture"`
-	CaptureState            string             `json:"capture_state"`
-	RunStatus               string             `json:"run_status"`
-	RecoveryWaitCause       string             `json:"recovery_wait_cause"`
-	Attention               string             `json:"attention"`
-	DecisionNeeded          bool               `json:"decision_needed"`
-	CheckpointRef           pgtype.Text        `json:"checkpoint_ref"`
-	CheckpointTip           pgtype.Text        `json:"checkpoint_tip"`
-	CheckpointState         pgtype.Text        `json:"checkpoint_state"`
+	ID                          uuid.UUID          `json:"id"`
+	RunID                       uuid.UUID          `json:"run_id"`
+	Generation                  int64              `json:"generation"`
+	State                       string             `json:"state"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt                  pgtype.Timestamptz `json:"released_at"`
+	OriginalWorkerID            uuid.UUID          `json:"original_worker_id"`
+	TerminalRecordRejection     pgtype.Text        `json:"terminal_record_rejection"`
+	InventoryGuarded            bool               `json:"inventory_guarded"`
+	FinalDisposition            pgtype.Text        `json:"final_disposition"`
+	FinalCaptureID              pgtype.UUID        `json:"final_capture_id"`
+	FinalSourceSha              pgtype.Text        `json:"final_source_sha"`
+	FinalCoverageDigest         pgtype.Text        `json:"final_coverage_digest"`
+	FinalPublicationID          pgtype.UUID        `json:"final_publication_id"`
+	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
+	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
+	WorkerName                  string             `json:"worker_name"`
+	HasAvailableCapture         bool               `json:"has_available_capture"`
+	CaptureState                string             `json:"capture_state"`
+	RunStatus                   string             `json:"run_status"`
+	RecoveryWaitCause           string             `json:"recovery_wait_cause"`
+	Attention                   string             `json:"attention"`
+	DecisionNeeded              bool               `json:"decision_needed"`
+	CheckpointRef               pgtype.Text        `json:"checkpoint_ref"`
+	CheckpointTip               pgtype.Text        `json:"checkpoint_tip"`
+	CheckpointState             pgtype.Text        `json:"checkpoint_state"`
 }
 
 // PRD #1349 M1 (D7): the owner-scoped, bounded hold list the web Workers surface and the
@@ -1022,6 +1213,9 @@ func (q *Queries) ListCustodyHoldsForOwner(ctx context.Context, arg ListCustodyH
 			&i.FinalCaptureID,
 			&i.FinalSourceSha,
 			&i.FinalCoverageDigest,
+			&i.FinalPublicationID,
+			&i.CompletedPublicationReceipt,
+			&i.CompletedPublicationReason,
 			&i.WorkerName,
 			&i.HasAvailableCapture,
 			&i.CaptureState,
@@ -1247,7 +1441,7 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, arg L
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection, h.inventory_guarded, h.final_disposition, h.final_capture_id, h.final_source_sha, h.final_coverage_digest,
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection, h.inventory_guarded, h.final_disposition, h.final_capture_id, h.final_source_sha, h.final_coverage_digest, h.completion_identity, h.completed_publication_receipt, h.completed_publication_reason, h.final_publication_id,
     CASE
         WHEN EXISTS (SELECT 1 FROM runs r
                        WHERE r.id = h.run_id
@@ -1276,34 +1470,38 @@ ORDER BY h.created_at ASC
 `
 
 type ListReleasableCustodyHoldsRow struct {
-	ID                         uuid.UUID          `json:"id"`
-	UserID                     uuid.UUID          `json:"user_id"`
-	RepoID                     pgtype.UUID        `json:"repo_id"`
-	RunID                      uuid.UUID          `json:"run_id"`
-	Generation                 int64              `json:"generation"`
-	State                      string             `json:"state"`
-	OriginalWorkerID           uuid.UUID          `json:"original_worker_id"`
-	OriginalWorkerIdentity     string             `json:"original_worker_identity"`
-	LiveWorkerID               pgtype.UUID        `json:"live_worker_id"`
-	LiveRunID                  pgtype.UUID        `json:"live_run_id"`
-	CreatedAt                  pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                  pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt                 pgtype.Timestamptz `json:"released_at"`
-	ReleaseEvidence            pgtype.Text        `json:"release_evidence"`
-	ReleasePushedSha           pgtype.Text        `json:"release_pushed_sha"`
-	ReleaseSourceSha           pgtype.Text        `json:"release_source_sha"`
-	ReleaseAdoptedSha          pgtype.Text        `json:"release_adopted_sha"`
-	ReleaseFinalHeadSha        pgtype.Text        `json:"release_final_head_sha"`
-	ReleaseSuccessorGeneration pgtype.Int8        `json:"release_successor_generation"`
-	ReleaseBranch              pgtype.Text        `json:"release_branch"`
-	ReleaseTarget              pgtype.Text        `json:"release_target"`
-	TerminalRecordRejection    pgtype.Text        `json:"terminal_record_rejection"`
-	InventoryGuarded           bool               `json:"inventory_guarded"`
-	FinalDisposition           pgtype.Text        `json:"final_disposition"`
-	FinalCaptureID             pgtype.UUID        `json:"final_capture_id"`
-	FinalSourceSha             pgtype.Text        `json:"final_source_sha"`
-	FinalCoverageDigest        pgtype.Text        `json:"final_coverage_digest"`
-	Reason                     string             `json:"reason"`
+	ID                          uuid.UUID          `json:"id"`
+	UserID                      uuid.UUID          `json:"user_id"`
+	RepoID                      pgtype.UUID        `json:"repo_id"`
+	RunID                       uuid.UUID          `json:"run_id"`
+	Generation                  int64              `json:"generation"`
+	State                       string             `json:"state"`
+	OriginalWorkerID            uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity      string             `json:"original_worker_identity"`
+	LiveWorkerID                pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID                   pgtype.UUID        `json:"live_run_id"`
+	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt                  pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence             pgtype.Text        `json:"release_evidence"`
+	ReleasePushedSha            pgtype.Text        `json:"release_pushed_sha"`
+	ReleaseSourceSha            pgtype.Text        `json:"release_source_sha"`
+	ReleaseAdoptedSha           pgtype.Text        `json:"release_adopted_sha"`
+	ReleaseFinalHeadSha         pgtype.Text        `json:"release_final_head_sha"`
+	ReleaseSuccessorGeneration  pgtype.Int8        `json:"release_successor_generation"`
+	ReleaseBranch               pgtype.Text        `json:"release_branch"`
+	ReleaseTarget               pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection     pgtype.Text        `json:"terminal_record_rejection"`
+	InventoryGuarded            bool               `json:"inventory_guarded"`
+	FinalDisposition            pgtype.Text        `json:"final_disposition"`
+	FinalCaptureID              pgtype.UUID        `json:"final_capture_id"`
+	FinalSourceSha              pgtype.Text        `json:"final_source_sha"`
+	FinalCoverageDigest         pgtype.Text        `json:"final_coverage_digest"`
+	CompletionIdentity          []byte             `json:"completion_identity"`
+	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
+	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
+	FinalPublicationID          pgtype.UUID        `json:"final_publication_id"`
+	Reason                      string             `json:"reason"`
 }
 
 // PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
@@ -1379,6 +1577,10 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 			&i.FinalCaptureID,
 			&i.FinalSourceSha,
 			&i.FinalCoverageDigest,
+			&i.CompletionIdentity,
+			&i.CompletedPublicationReceipt,
+			&i.CompletedPublicationReason,
+			&i.FinalPublicationID,
 			&i.Reason,
 		); err != nil {
 			return nil, err
@@ -1434,7 +1636,7 @@ const markCaptureFailed = `-- name: MarkCaptureFailed :one
 UPDATE recovery_captures
 SET state = 'needs_action', reason = $1, updated_at = now()
 WHERE id = $2 AND state IN ('preparing', 'uploading', 'needs_action')
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal
 `
 
 type MarkCaptureFailedParams struct {
@@ -1474,6 +1676,9 @@ func (q *Queries) MarkCaptureFailed(ctx context.Context, arg MarkCaptureFailedPa
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }
@@ -1482,7 +1687,7 @@ const markCaptureReady = `-- name: MarkCaptureReady :one
 UPDATE recovery_captures
 SET state = 'available', expires_at = $1, updated_at = now()
 WHERE id = $2 AND manifest_bound = true
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal
 `
 
 type MarkCaptureReadyParams struct {
@@ -1522,6 +1727,9 @@ func (q *Queries) MarkCaptureReady(ctx context.Context, arg MarkCaptureReadyPara
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }
@@ -1530,7 +1738,7 @@ const markCaptureState = `-- name: MarkCaptureState :one
 UPDATE recovery_captures
 SET state = $1, reason = $2, updated_at = now()
 WHERE id = $3
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal
 `
 
 type MarkCaptureStateParams struct {
@@ -1571,6 +1779,9 @@ func (q *Queries) MarkCaptureState(ctx context.Context, arg MarkCaptureStatePara
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }
@@ -1602,6 +1813,36 @@ func (q *Queries) ProtectFinalInventoryCapture(ctx context.Context, arg ProtectF
 		arg.ID,
 		arg.HoldID,
 		arg.SourceSha,
+		arg.CoverageDigest,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
+const recordArchiveRedundancyRefusal = `-- name: RecordArchiveRedundancyRefusal :execrows
+UPDATE recovery_captures SET redundancy_refused_at = now(), redundancy_refusal = $1::text
+WHERE id = $2 AND run_id = $3 AND user_id = $4 AND state = 'available'
+    AND coverage_digest = $5::text
+`
+
+type RecordArchiveRedundancyRefusalParams struct {
+	Reason         string    `json:"reason"`
+	ID             uuid.UUID `json:"id"`
+	RunID          uuid.UUID `json:"run_id"`
+	UserID         uuid.UUID `json:"user_id"`
+	CoverageDigest string    `json:"coverage_digest"`
+}
+
+// Issue #2625: remember a forge-derived refusal so a repeat claim inside the cool-down is answered
+// without a forge call. Touches nothing else; the capture stays available under its own TTL.
+func (q *Queries) RecordArchiveRedundancyRefusal(ctx context.Context, arg RecordArchiveRedundancyRefusalParams) (int64, error) {
+	result, err := q.db.Exec(ctx, recordArchiveRedundancyRefusal,
+		arg.Reason,
+		arg.ID,
+		arg.RunID,
+		arg.UserID,
 		arg.CoverageDigest,
 	)
 	if err != nil {
@@ -2068,7 +2309,7 @@ LIMIT 1
 ON CONFLICT (hold_id, idempotency_key) DO UPDATE SET updated_at = now()
 WHERE recovery_captures.coverage_digest IS NOT DISTINCT FROM EXCLUDED.coverage_digest
   AND recovery_captures.source_sha = EXCLUDED.source_sha
-RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds
+RETURNING id, hold_id, run_id, user_id, original_worker_id, original_worker_identity, source_sha, attempted_head_sha, idempotency_key, state, manifest_bound, byte_size, checksum, chunk_count, prerequisite_shas, reason, context, expires_at, created_at, updated_at, reserved_bytes, coverage_digest, local_replica_worker_id, ready_retention_seconds, redundancy_proof, redundancy_refused_at, redundancy_refusal
 `
 
 type ReserveCaptureExactParams struct {
@@ -2140,6 +2381,9 @@ func (q *Queries) ReserveCaptureExact(ctx context.Context, arg ReserveCaptureExa
 		&i.CoverageDigest,
 		&i.LocalReplicaWorkerID,
 		&i.ReadyRetentionSeconds,
+		&i.RedundancyProof,
+		&i.RedundancyRefusedAt,
+		&i.RedundancyRefusal,
 	)
 	return i, err
 }

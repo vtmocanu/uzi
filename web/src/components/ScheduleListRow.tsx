@@ -20,7 +20,7 @@ import { maskRepoPath } from "../lib/demoMask";
 import { humanizeCron } from "../lib/schedulePresets";
 import { nextFireOf } from "../lib/scheduleList";
 import { relativeFromNow } from "./ScheduleModal";
-import { LastRunOutcome, LastFireDetail, formatStamp } from "./LastRun";
+import { LastRunOutcome, LastFireDetail, RecentFiresPanel, formatStamp } from "./LastRun";
 import { AddAnotherRepo } from "./AddAnotherRepo";
 import { MoreActionsMenu, type MoreActionsItem } from "./MoreActionsMenu";
 import { Badge, Button, Toggle, cx } from "./ui";
@@ -113,6 +113,15 @@ export function ScheduleListRow({
   // A self_improve schedule is always auto-approved (server-forced), so it is not a user
   // option: suppress the chip and let the "defaults" fallback show instead.
   const showApprove = s.auto_approve && s.target !== "self_improve";
+  // Issue #2519: the recent fires that did something, newest first. Absent or null (an
+  // older server) reads as empty, which keeps the row on last_fire exactly as before. The
+  // cell SHOWS the newest recent fire when there is one: last_fire may be a newer
+  // capacity-blocked tick, or null (a serialization failure) while recent_fires is not.
+  const recent = s.recent_fires ?? [];
+  const shown = recent[0] ?? s.last_fire;
+  // The blocked line and note only accompany a non-empty list: with none, last_fire is
+  // what the cell shows, and its own badge already reads "Waiting for room".
+  const waitingSince = recent.length > 0 && s.last_fire?.capacity?.blocked ? s.last_fire.fired_at : undefined;
   const [expanded, setExpanded] = useState(false);
   const [addingRepo, setAddingRepo] = useState(false);
   const addPanelRef = useRef<HTMLTableCellElement>(null);
@@ -294,12 +303,14 @@ export function ScheduleListRow({
         {/* Last run */}
         <td className={cx(TD, FULL)}>
           <MobileLabel>Last run</MobileLabel>
-          {s.last_fire ? (
+          {shown ? (
             <LastRunOutcome
-              fire={s.last_fire}
+              fire={shown}
               expanded={expanded}
               onToggle={() => setExpanded((v) => !v)}
               panelId={`last-fire-${s.id}`}
+              label={recent.length > 0 ? "Recent fires" : "Last fire"}
+              waitingSince={waitingSince}
             />
           ) : s.last_fired_at ? (
             <div className="text-[12.5px] text-muted">{formatStamp(s.last_fired_at)}</div>
@@ -380,11 +391,15 @@ export function ScheduleListRow({
           </td>
         </tr>
       )}
-      {s.last_fire && expanded && (
+      {shown && expanded && (
         <tr className="block border-t border-edge md:table-row">
           {/* The id pairs with the disclosure's aria-controls; rendered only while expanded. */}
           <td id={`last-fire-${s.id}`} colSpan={SCHEDULE_COLS} className="block bg-raised/30 px-4 pb-4 pt-0 md:table-cell">
-            <LastFireDetail s={s} fire={s.last_fire} />
+            {recent.length > 0 ? (
+              <RecentFiresPanel s={s} fires={recent} panelId={`last-fire-${s.id}`} />
+            ) : (
+              <LastFireDetail s={s} fire={shown} />
+            )}
           </td>
         </tr>
       )}

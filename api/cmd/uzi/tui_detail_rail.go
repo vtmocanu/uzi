@@ -34,12 +34,14 @@ func (m tuiModel) renderLaneRail() string {
 	}
 	sb.WriteString(title + "\n")
 	sb.WriteString(m.railWorkerLine())
+	sb.WriteString(m.railWaitingLine())
 
 	if len(d.lanes) == 0 {
 		sb.WriteString(m.pal.faint.Render("(no activity yet)"))
 		// A milestone-structured run has a frozen list before any frame arrives (queued /
 		// just-claimed), so the block must show even with no lanes yet. usedRows for the budgeted
 		// blocks is counted BEFORE appendRailBlock, so the boundary is unmoved (D6/R3).
+		appendRailBlock(&sb, m.renderProgress())
 		appendRailBlock(&sb, m.renderMilestones())
 		if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
 			appendRailBlock(&sb, sp)
@@ -60,7 +62,7 @@ func (m tuiModel) renderLaneRail() string {
 		// Just the selected lane, so the reader still knows whose transcript is on screen while
 		// the milestones get the rest of the column.
 		if l, ok := d.selectedLane(); ok {
-			active := activeLaneKey(d.run.Status, d.frames)
+			active := activeLaneKey(d.run.Status, d.run.IsRevising, d.frames)
 			suffixes := laneSuffixes(d.lanes)
 			sb.WriteString(m.laneRow(l, true, m.laneCrewState(l, active, now), suffixes[l.Key], d.leadCtx, d.leadCtxOK && l.Key == laneLead))
 		}
@@ -70,6 +72,7 @@ func (m tuiModel) renderLaneRail() string {
 	// usedRows for renderSpend/railRateMeters is counted on the builder BEFORE appendRailBlock, so
 	// the whole-block-or-nothing budgets keep the exact boundary they had (D6/R3); appendRailBlock
 	// only collapses the previously double-drawn blank separator to one row.
+	appendRailBlock(&sb, m.renderProgress())
 	appendRailBlock(&sb, m.renderMilestones())
 	if sp := m.renderSpend(strings.Count(sb.String(), "\n") + 1); sp != "" {
 		appendRailBlock(&sb, sp)
@@ -93,6 +96,46 @@ func (m tuiModel) railWorkerLine() string {
 	}
 	text := struct{ runWorkerName string }{runWorkerName: *m.detail.run.WorkerName}
 	return m.pal.faint.Render("worker "+m.renderer.Plain(text.runWorkerName, 19)) + "\n"
+}
+
+// railWaitingMaxRows bounds the waiting explanation's height on the rail. Five rows keep the
+// stale-requeue pin reason's deadline AND a typical previous worker's name (up to about 50
+// characters) visible at laneRailWidth (issue #2705: the name is often shown nowhere else once
+// the run is queued); a longer user-chosen name is ellipsized.
+const railWaitingMaxRows = 5
+
+// railWaitingLabel leads the waiting explanation and stays faint; the reason follows it.
+const railWaitingLabel = "queued ▸ "
+
+// railWaitingLine explains why a queued run is waiting (issue #2705: for example a stale-requeued
+// run held for its returning worker, with the deadline). It draws only for a queued run whose
+// health is waiting_worker and carries a reason, wraps to railWaitingMaxRows rows within
+// laneRailWidth, and is also counted by railAutoFolded before the protected blocks. The reason is
+// server text but derived from worker names, so it goes through renderer.Plain (D7).
+func (m tuiModel) railWaitingLine() string {
+	run := m.detail.run
+	if run.Status != "queued" || run.Health != "waiting_worker" || run.HealthReason == nil || *run.HealthReason == "" {
+		return ""
+	}
+	text := struct{ runHealthReason string }{runHealthReason: *run.HealthReason}
+	plain := m.renderer.Plain(text.runHealthReason, laneRailWidth*railWaitingMaxRows+railWaitingMaxRows)
+	rows := wrapWords(railWaitingLabel+plain, laneRailWidth, railWaitingMaxRows)
+	if len(rows) == 0 {
+		return ""
+	}
+	var sb strings.Builder
+	for i, row := range rows {
+		if i == 0 {
+			// TrimSpace: wrapWords drops the label's trailing space when the reason's first word
+			// does not fit beside it, and the label must stay faint either way.
+			label := strings.TrimSpace(railWaitingLabel)
+			if rest, ok := strings.CutPrefix(row, label); ok {
+				row = m.pal.faint.Render(label) + rest
+			}
+		}
+		sb.WriteString(row + "\n")
+	}
+	return sb.String()
 }
 
 // appendRailBlock appends a protected rail block beneath the content already built, separated by
@@ -124,7 +167,7 @@ func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewS
 		return crewIdle
 	}
 	d := &m.detail
-	return crewStateFor(d.run.Status, d.run.Health, l.Key, active, l.LastActivity, now)
+	return crewStateFor(d.run.Status, d.run.IsRevising, d.run.Health, l.Key, active, l.LastActivity, now)
 }
 
 // expandedRoster renders every crew lane row (the expanded rail's roster) into one joined string,
@@ -138,7 +181,7 @@ func (m tuiModel) laneCrewState(l agentLane, active string, now time.Time) crewS
 // a subagent lane and the synthetic ALL lane never get it.
 func (m tuiModel) expandedRoster(now time.Time) string {
 	d := &m.detail
-	active := activeLaneKey(d.run.Status, d.frames)
+	active := activeLaneKey(d.run.Status, d.run.IsRevising, d.frames)
 	suffixes := laneSuffixes(d.lanes)
 	fill, hasCtx := d.leadCtx, d.leadCtxOK
 	var sb strings.Builder
@@ -165,6 +208,9 @@ func (m tuiModel) effectiveRailFolded(now time.Time) bool {
 // snapshot row under a 1-row header), and — PRD #1209 M3 — the CODEX block's floor (its 1-row header + the first shown Codex
 // account, the analog of the Claude own-account floor; railCodexFloorRows). Sibling Claude/Codex
 // accounts stay best-effort and drop bottom-up as today, so only the first of each is counted (D2).
+// The PROGRESS block (PRD #2602, above MILESTONES, no budget of its own) is counted in the height
+// so it cannot push MILESTONES off, but it is not protected content itself and never triggers a
+// fold on its own (specs/human.md names the closed set the rail folds to protect).
 // A run with no lanes has nothing to fold; a run with an empty required set (no milestone list, no
 // usage, no own account, no shown Codex account, no worker name) never folds either — its roster just clips at the
 // bottom exactly as today (D2/D5).
@@ -185,6 +231,7 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 	if len(d.lanes) == 0 {
 		return false
 	}
+	progress := m.renderProgress()
 	block := m.renderMilestones()
 	spend := d.run.Usage != nil
 	accountFloorRows := 0
@@ -198,22 +245,24 @@ func (m tuiModel) railAutoFolded(now time.Time) bool {
 		accountFloorRows++ // ACCOUNTS header
 	}
 	codexRows, hasCodex := m.railCodexFloorRows()
-	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" {
+	if block == "" && !spend && accountFloorRows == 0 && !hasCodex && m.railWorkerLine() == "" && m.railWaitingLine() == "" {
 		return false // empty required set: nothing below the roster to protect (D2/D5)
 	}
 	vp := m.transcriptViewport()
 	var sb strings.Builder
 	sb.WriteString("crew\n") // stand-in title row: only its trailing "\n" counts toward the budget
 	sb.WriteString(m.railWorkerLine())
+	sb.WriteString(m.railWaitingLine())
 	sb.WriteString(m.expandedRoster(now))
+	appendRailBlock(&sb, progress)
 	appendRailBlock(&sb, block)
 	if spend {
-		// renderSpend drops its 3 lines whole unless they + the 1-row separator fit under usedRows.
+		// renderSpend drops its 4 lines whole unless they + the 1-row separator fit under usedRows.
 		usedRows := strings.Count(sb.String(), "\n") + 1
-		if 3 > vp-usedRows-1 {
+		if 4 > vp-usedRows-1 {
 			return true
 		}
-		appendRailBlock(&sb, "x\nx\nx") // advance past SPEND's 3 rows so ACCOUNTS is measured below it
+		appendRailBlock(&sb, "x\nx\nx\nx") // advance past SPEND's 4 rows so ACCOUNTS is measured below it
 	}
 	if accountFloorRows > 0 {
 		// Protect the run-bound Codex snapshot even when its alias was deleted or
@@ -595,6 +644,7 @@ func (m tuiModel) milestoneRowCell(blink bool) string {
 // — the SAME rule the server runs for RunDTO.CurrentActivity — so the board DTO and the rail can
 // never disagree on what is happening now (D3). Returns nil when no tool_use frame exists.
 func railActivity(frames []laneFrame) *apitypes.RunActivity {
+	frames = presentationFrames(frames)
 	ra := make([]runactivity.Frame, 0, len(frames))
 	for i := range frames {
 		f := &frames[i]
@@ -634,7 +684,7 @@ func activityLabel(act *apitypes.RunActivity) string {
 }
 
 // renderMilestones is the crew rail's milestone progress block (the TUI twin of the web's
-// MilestoneChecklist and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
+// RunProgressCard / MilestoneRows and the CLI `uzi run get` milestoneRows): a compact `{done}/{total}`
 // summary and one row per milestone in FROZEN order — done ✓, not started ○, and the
 // in-progress milestone as a faint ◕ ⇄ ○ half-circle blink (milestoneRowCell; PRD #1136 D4/D5).
 //
@@ -645,9 +695,10 @@ func activityLabel(act *apitypes.RunActivity) string {
 // The count says neither "verified" nor "complete" (PRD #122 Decision 6): the worker only
 // REPORTS a milestone done and nothing in uzi has verified it, so the bare N/M and the ✓
 // glyph must not imply verification. A run that has reported nothing shows `–/N`, not a
-// `0/N` that reads as failure (matching the web's `–/N` treatment). `done` counts frozen
+// `0/N` that reads as failure (the web card reads `– of M reported`). `done` counts frozen
 // members present in the completed set, immune to a duplicate id and to a completed id
-// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses.
+// that names a milestone dropped after it was ticked — the same rule milestoneBadge uses
+// for the web card's `k of M reported complete`; CLI/TUI retain their compact count and layout.
 //
 // Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone.Title), so each goes
 // through renderer.Plain — the D7 obligation the lane rail's Role/Label already carry, and

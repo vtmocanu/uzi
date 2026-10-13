@@ -22,7 +22,8 @@
 // a recovery or salvage ref), and CreateRef (PRD #1810 D2, widened by PRD #1867) creates a
 // refs/uzi-recovery/* or refs/uzi-salvage/* ref with a single command whose Old is the
 // zero hash, so the remote's compare-and-swap refuses it whenever the ref already exists.
-// No path in this package sends a forced update.
+// SendHeldCreate (issue #2545) is the same single create-only command for a refs/uzi-held/*
+// ref, carrying the worker's pack. No path in this package sends a forced update.
 package pushbroker
 
 import (
@@ -34,6 +35,7 @@ import (
 	"fmt"
 	"io"
 	"net/http"
+	"strconv"
 	"strings"
 	"time"
 
@@ -107,7 +109,8 @@ var (
 	// "origin moved" outcome, not an error.
 	ErrNotDescendant = errors.New("pushbroker: declared tip does not descend origin tip")
 	// ErrTipMissing means the declared tip object is not present after applying the
-	// pack — the worker's pack did not actually contain the commit it named.
+	// pack — the worker's pack did not actually contain the commit it named. The caller maps it to a
+	// best-effort "tip_missing" skip.
 	ErrTipMissing = errors.New("pushbroker: declared tip not present after applying pack")
 	// ErrPackTooLarge means the worker's pack exceeds the budget along ANY of the axes
 	// scanPackBudget bounds: too many objects, an over-cap per-object inflated/declared
@@ -119,11 +122,12 @@ var (
 	// rather than OOMing the shared api (the reconstructed-size axis) OR pinning a core
 	// inflating instruction streams whose declared targets are tiny (the inflation-work
 	// axis — the variant a reconstructed-size-only budget waved through). The caller
-	// maps it to a best-effort "unsupported" skip.
+	// maps it to a best-effort "pack_too_large" skip; the returned error also wraps the
+	// packbudget.BudgetError naming the tripped bound, for the operator log.
 	ErrPackTooLarge = errors.New("pushbroker: pack exceeds inflation budget")
 	// ErrPackInvalid means the pack header or an object header could not be parsed —
 	// a genuinely malformed pack, distinct from an oversize one. The caller maps it to
-	// a best-effort "unsupported" skip (200), NOT a 5xx: worker input must not
+	// a best-effort "pack_invalid" skip (200), NOT a 5xx: worker input must not
 	// 500-storm the shared api.
 	ErrPackInvalid = errors.New("pushbroker: pack is malformed")
 	// ErrWorkflowScopeRejected means GitHub refused the checkpoint push because the
@@ -246,11 +250,23 @@ func SalvageRef(runID uuid.UUID) string {
 	return SalvageRefPrefix + runID.String()
 }
 
+// HeldRefPrefix is the uzi-owned namespace a FAILED run's held work (its commits after the last
+// checkpoint, WIP included) is published under before custody is released (issue #2545):
+// refs/uzi-held/<run-id>/<generation>. Keyed by run and claim generation, so a later
+// generation never collides, and outside refs/heads, so no CI watches it. Its refs are created
+// only through SendHeldCreate (never CreateRef) and removed only compare-and-swap (Delete).
+const HeldRefPrefix = "refs/uzi-held/"
+
+// HeldRef names the held ref for runID at claim generation: refs/uzi-held/<run-id>/<generation>.
+func HeldRef(runID uuid.UUID, generation int64) string {
+	return HeldRefPrefix + runID.String() + "/" + strconv.FormatInt(generation, 10)
+}
+
 // validManagedRef reports whether ref is a well-formed ref strictly under one of the
-// namespaces Delete and ListRefTips accept: checkpoint, recovery or salvage.
+// namespaces Delete and ListRefTips accept: checkpoint, recovery, salvage or held.
 func validManagedRef(ref string) bool {
 	return validRefUnder(ref, checkpointRefPrefix) || validRefUnder(ref, RecoveryRefPrefix) ||
-		validRefUnder(ref, SalvageRefPrefix)
+		validRefUnder(ref, SalvageRefPrefix) || validRefUnder(ref, HeldRefPrefix)
 }
 
 // Publish fetches origin's base objects, applies the worker's delta pack, verifies
@@ -274,7 +290,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	if tipHash.IsZero() {
 		// A malformed tip should have been rejected at the handler, but never trust
 		// it here: a zero hash can never be a valid checkpoint tip.
-		return Result{}, ErrTipMissing
+		return Result{}, fmt.Errorf("%w: zero declared tip", ErrTipMissing)
 	}
 
 	// A publish always declares a tip, so it is never a ref delete, and even a zero-object
@@ -283,7 +299,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// send origin a create/update with no pack, which origin answers "eof before pack
 	// header" and surfaces as a 500; refuse it as malformed (a best-effort skip) instead.
 	if len(o.Pack) == 0 {
-		return Result{}, ErrPackInvalid
+		return Result{}, fmt.Errorf("%w: empty pack", ErrPackInvalid)
 	}
 
 	// Step 1: BEFORE resolving anything into the unbounded in-memory storer, walk the
@@ -364,7 +380,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	declaredCommit, err := object.GetCommit(repo.Storer, tipHash)
 	if err != nil {
 		if errors.Is(err, plumbing.ErrObjectNotFound) {
-			return Result{}, ErrTipMissing
+			return Result{}, fmt.Errorf("%w: declared tip not in applied pack", ErrTipMissing)
 		}
 		return Result{}, fmt.Errorf("pushbroker: read declared tip: %w", err)
 	}
@@ -468,10 +484,10 @@ type DeleteOptions struct {
 	PAT      string
 	// Ref, when set, is the FULL name of the ref to delete and replaces
 	// refs/uzi-checkpoints/<Branch>. It must lie under refs/uzi-checkpoints/,
-	// refs/uzi-recovery/ or refs/uzi-salvage/ (PRD #1867) and be a well-formed ref name,
-	// else Delete returns ErrInvalidRef before any network I/O. Empty keeps the
-	// branch-derived name. A recovery or salvage ref is only ever CAS-deleted: Ref under
-	// either prefix with an empty ExpectedOldTip is ErrInvalidRef.
+	// refs/uzi-recovery/, refs/uzi-salvage/ (PRD #1867) or refs/uzi-held/ (issue #2545) and
+	// be a well-formed ref name, else Delete returns ErrInvalidRef before any network I/O.
+	// Empty keeps the branch-derived name. A recovery, salvage or held ref is only ever
+	// CAS-deleted: Ref under any of those prefixes with an empty ExpectedOldTip is ErrInvalidRef.
 	Ref string
 	// ExpectedOldTip is the tip this run last published to its checkpoint ref (the
 	// persisted runs.checkpoint_tip). When set, Delete takes a compare-and-swap path:
@@ -535,10 +551,12 @@ func Delete(ctx context.Context, o DeleteOptions) error {
 		if !validManagedRef(o.Ref) {
 			return ErrInvalidRef
 		}
-		// A recovery ref preserves a superseded run's only off-worker copy, and a salvage
-		// ref a failed run's archived tip: each is only ever removed compare-and-swap on
-		// its recorded tip, never unconditionally.
-		if o.ExpectedOldTip == "" && (strings.HasPrefix(o.Ref, RecoveryRefPrefix) || strings.HasPrefix(o.Ref, SalvageRefPrefix)) {
+		// A recovery ref preserves a superseded run's only off-worker copy, a salvage
+		// ref a failed run's archived tip, and a held ref a failed run's published work:
+		// each is only ever removed compare-and-swap on its recorded tip, never
+		// unconditionally.
+		if o.ExpectedOldTip == "" && (strings.HasPrefix(o.Ref, RecoveryRefPrefix) || strings.HasPrefix(o.Ref, SalvageRefPrefix) ||
+			strings.HasPrefix(o.Ref, HeldRefPrefix)) {
 			return ErrInvalidRef
 		}
 		ref = o.Ref
@@ -858,7 +876,7 @@ type ListRefsOptions struct {
 
 // ListRefTips lists origin once and returns the tips of those of refs it advertises
 // (an absent ref has no key; an empty origin yields an empty map). Every ref must lie
-// under refs/uzi-checkpoints/, refs/uzi-recovery/ or refs/uzi-salvage/, else
+// under refs/uzi-checkpoints/, refs/uzi-recovery/, refs/uzi-salvage/ or refs/uzi-held/, else
 // ErrInvalidRef before any network I/O. A read, never a write: a caller uses it to tell
 // the reasons CreateRef reported ErrSourceMissing apart, to pick a salvage source, or to
 // confirm a salvage delete (PRD #1867).
@@ -1014,6 +1032,12 @@ type forwardPackResult struct {
 	success  bool
 	rejected bool
 	reason   string // Authoritative raw rejection only; never a transport error.
+	// ng is true only when a complete, finalized report carried an explicit "ng <ref> <reason>"
+	// line for this command. It is narrower than rejected, which also covers a failed unpack
+	// reported with no ng line; a real receive-pack also answers an unpacker failure with an ng
+	// line, which is classified as refused (safe: nothing was applied). SendHeldCreate refuses a
+	// held create only on an ng.
+	ng bool
 }
 
 // forwardPack ships the worker's (non-thin) packfile to origin through a MANUAL
@@ -1103,6 +1127,7 @@ func receiveObservedPack(ctx context.Context, sess transport.ReceivePackSession,
 		case raw.marker == "ok":
 			outcome.success = true
 		}
+		outcome.ng = raw.marker == "ng"
 	}
 	if outcome.rejected && err == nil {
 		// The synthesized error omits the raw reason; classification uses reason only.
@@ -1131,9 +1156,9 @@ func scanPackBudget(ctx context.Context, pack []byte) error {
 	})
 	switch {
 	case errors.Is(err, packbudget.ErrTooLarge):
-		return ErrPackTooLarge
+		return fmt.Errorf("%w: %w", ErrPackTooLarge, err)
 	case errors.Is(err, packbudget.ErrInvalid):
-		return ErrPackInvalid
+		return fmt.Errorf("%w: %w", ErrPackInvalid, err)
 	}
 	return err
 }
@@ -1144,18 +1169,6 @@ func scanPackBudget(ctx context.Context, pack []byte) error {
 // refs and fetches only the subset that exists. Missing refs, an empty remote and
 // up-to-date are all tolerated (the primary M8 case is a branch never pushed).
 func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, branch, defaultBranch string) error {
-	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
-	if err != nil {
-		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
-			return nil // nothing to fetch; the storer stays empty and tips resolve zero
-		}
-		return fmt.Errorf("pushbroker: list: %w", err)
-	}
-	exists := make(map[plumbing.ReferenceName]bool, len(advertised))
-	for _, r := range advertised {
-		exists[r.Name()] = true
-	}
-
 	// Deduplicate: branch and defaultBranch can coincide, and defaultBranch may be
 	// empty (a repo-less/unknown default). Each head lands under refs/remotes/origin/*;
 	// the checkpoint namespace is mirrored 1:1.
@@ -1170,6 +1183,25 @@ func fetchBaseRefs(ctx context.Context, remote *git.Remote, auth transport.AuthM
 	addHead(defaultBranch)
 	if branch != "" {
 		want[checkpointRefPrefix+branch] = checkpointRefPrefix + branch
+	}
+	return fetchWantedRefs(ctx, remote, auth, want)
+}
+
+// fetchWantedRefs lists origin and shallow-fetches (depth 1) the subset of want (source ref ->
+// local destination ref) that origin advertises. Because a specific refspec for an
+// unadvertised ref fails the whole fetch, it fetches only the advertised subset. Missing refs,
+// an empty remote and up-to-date are all tolerated.
+func fetchWantedRefs(ctx context.Context, remote *git.Remote, auth transport.AuthMethod, want map[string]string) error {
+	advertised, err := remote.ListContext(ctx, &git.ListOptions{Auth: auth})
+	if err != nil {
+		if errors.Is(err, transport.ErrEmptyRemoteRepository) {
+			return nil // nothing to fetch; the storer stays empty and tips resolve zero
+		}
+		return fmt.Errorf("pushbroker: list: %w", err)
+	}
+	exists := make(map[plumbing.ReferenceName]bool, len(advertised))
+	for _, r := range advertised {
+		exists[r.Name()] = true
 	}
 
 	var specs []config.RefSpec

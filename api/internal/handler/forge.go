@@ -1,10 +1,12 @@
 package handler
 
 import (
+	"bytes"
 	"context"
 	"encoding/json"
 	"errors"
 	"fmt"
+	"io"
 	"log/slog"
 	"net/http"
 	"strings"
@@ -158,15 +160,16 @@ func capsOrEmpty(caps []string) []string {
 // repoToDTO stays here as the store→DTO mapper.
 func repoToDTO(r store.Repo) apitypes.RepoDTO {
 	dto := apitypes.RepoDTO{
-		ID:                  r.ID.String(),
-		ConnectionID:        r.ConnectionID.String(),
-		ForgeProjectID:      r.ForgeProjectID,
-		PathWithNamespace:   r.PathWithNamespace,
-		WebURL:              r.WebUrl,
-		Enabled:             r.Enabled,
-		RepoSkillsEnabled:   r.RepoSkillsEnabled,
-		RepoClaudemdEnabled: r.RepoClaudemdEnabled,
-		RepoDevboxOptIn:     r.RepoDevboxOptIn,
+		ID:                                r.ID.String(),
+		ConnectionID:                      r.ConnectionID.String(),
+		ForgeProjectID:                    r.ForgeProjectID,
+		PathWithNamespace:                 r.PathWithNamespace,
+		WebURL:                            r.WebUrl,
+		Enabled:                           r.Enabled,
+		RepoSkillsEnabled:                 r.RepoSkillsEnabled,
+		RepoClaudemdEnabled:               r.RepoClaudemdEnabled,
+		RepoDevboxOptIn:                   r.RepoDevboxOptIn,
+		CrossCheckRepoInstructionsEnabled: r.CrossCheckRepoInstructionsEnabled,
 		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
 		// owner's improve_uzi backlog + selects the uzi worker directive). Default false.
 		RepoFoldImproveUziBacklog: r.FoldImproveUziBacklog,
@@ -174,6 +177,9 @@ func repoToDTO(r store.Repo) apitypes.RepoDTO {
 		// so what the DTO surfaces is always a vocabulary-legal set. Normalized to a
 		// non-nil empty slice ([] over null) so the JSON shape is stable for the web.
 		RequiredCapabilities: capsOrEmpty(r.RequiredCapabilities),
+	}
+	if r.CodeCrossCheckGuidance.Valid {
+		dto.CodeCrossCheckGuidance = &r.CodeCrossCheckGuidance.String
 	}
 	if r.DefaultBranch.Valid {
 		dto.DefaultBranch = &r.DefaultBranch.String
@@ -520,12 +526,30 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, salvage)
 		return
 	}
+	// Issue #2545: a failed run's held-work publication keeps live_run_id (ON DELETE RESTRICT)
+	// while its refs/uzi-held ref may exist on the forge, and deleting the connection would also
+	// destroy the credential the retention delete needs. Refuse with a 409 naming the held refs.
+	held, err := h.q.CountLiveHeldPublicationsForConnection(r.Context(), store.CountLiveHeldPublicationsForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count held refs for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if held > 0 {
+		h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, held)
+		return
+	}
 	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
 	if err != nil {
 		// A sweep recorded a salvage row between the count above and this delete: the
 		// RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
 		if isSalvageRestrict(err) {
 			h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		// Same race for a held publication recorded between its count and this delete.
+		if isHeldRestrict(err) {
+			h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
 		slog.Error("delete connection", "error", err)
@@ -985,6 +1009,17 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		h.writeRepoSalvageConflict(r.Context(), w, id, user.ID, salvage)
 		return
 	}
+	// Issue #2545: the same guard for a live held-work publication ref of one of the repo's runs.
+	held, err := h.q.CountLiveHeldPublicationsForRepo(r.Context(), store.CountLiveHeldPublicationsForRepoParams{RepoID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count held refs for repo delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if held > 0 {
+		h.writeRepoHeldConflict(r.Context(), w, id, user.ID, held)
+		return
+	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
 	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
@@ -993,6 +1028,10 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		// the RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
 		if isSalvageRestrict(err) {
 			h.writeRepoSalvageConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		if isHeldRestrict(err) {
+			h.writeRepoHeldConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
 		slog.Error("delete repo", "error", err)
@@ -1112,7 +1151,101 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 	})
 }
 
+// heldRefListCap bounds how many live held publications a removal 409 names; the total is
+// always reported in held_count.
+const heldRefListCap = 5
+
+// heldRestrictConstraint is run_held_publications' live pointer FK (migration 00333). The
+// handlers match it by name so only a held restriction maps to the held 409.
+const heldRestrictConstraint = "run_held_publications_live_run_id_fkey"
+
+// isHeldRestrict reports whether err is the foreign-key violation (23503) raised when a delete
+// cascades onto a run that a live held publication still points at.
+func isHeldRestrict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == heldRestrictConstraint
+}
+
+// heldConflictRow is one live held publication a removal 409 names.
+type heldConflictRow struct {
+	RunID uuid.UUID
+	State string
+	Ref   string
+}
+
+// writeRepoHeldConflict writes the repo-removal held-publication 409 (owner-scoped). count < 0
+// means the guard raced: the count is re-read so the response still reports a total.
+func (h *Handler) writeRepoHeldConflict(ctx context.Context, w http.ResponseWriter, repoID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveHeldPublicationsForRepo(ctx, store.CountLiveHeldPublicationsForRepoParams{RepoID: repoID, UserID: userID})
+		if err != nil {
+			slog.Error("count held refs for repo delete", "error", err)
+		}
+		count = n
+	}
+	rows, err := h.q.ListLiveHeldPublicationRefsForRepo(ctx, store.ListLiveHeldPublicationRefsForRepoParams{RepoID: repoID, UserID: userID, Lim: heldRefListCap})
+	if err != nil {
+		slog.Error("list held refs for repo delete", "error", err)
+	}
+	named := make([]heldConflictRow, 0, len(rows))
+	for _, row := range rows {
+		named = append(named, heldConflictRow{RunID: row.RunID, State: row.State, Ref: row.Ref})
+	}
+	writeHeldConflict(w, "repo", count, named)
+}
+
+// writeConnectionHeldConflict is writeRepoHeldConflict for a forge connection removal.
+func (h *Handler) writeConnectionHeldConflict(ctx context.Context, w http.ResponseWriter, connID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveHeldPublicationsForConnection(ctx, store.CountLiveHeldPublicationsForConnectionParams{ConnectionID: connID, UserID: userID})
+		if err != nil {
+			slog.Error("count held refs for connection delete", "error", err)
+		}
+		count = n
+	}
+	rows, err := h.q.ListLiveHeldPublicationRefsForConnection(ctx, store.ListLiveHeldPublicationRefsForConnectionParams{ConnectionID: connID, UserID: userID, Lim: heldRefListCap})
+	if err != nil {
+		slog.Error("list held refs for connection delete", "error", err)
+	}
+	named := make([]heldConflictRow, 0, len(rows))
+	for _, row := range rows {
+		named = append(named, heldConflictRow{RunID: row.RunID, State: row.State, Ref: row.Ref})
+	}
+	writeHeldConflict(w, "connection", count, named)
+}
+
+// writeHeldConflict writes the removal 409 for live held publications. what is "repo" or
+// "connection", count the total number of live rows, rows the (at most heldRefListCap) rows
+// named. held_refs lists every named refs/uzi-held ref; held_count is the total. A lookup that
+// failed or raced still refuses: the count is floored at the number of rows named, and at 1.
+func writeHeldConflict(w http.ResponseWriter, what string, count int64, rows []heldConflictRow) {
+	refs := make([]string, 0, len(rows))
+	parts := make([]string, 0, len(rows)+1)
+	for _, row := range rows {
+		refs = append(refs, row.Ref)
+		parts = append(parts, row.Ref+" ("+row.State+")")
+	}
+	count = max(count, int64(len(rows)), 1)
+	named := ""
+	if len(parts) > 0 {
+		if int64(len(rows)) < count {
+			parts = append(parts, fmt.Sprintf("and %d more", count-int64(len(rows))))
+		}
+		named = " (" + strings.Join(parts, "; ") + ")"
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]any{
+		"error": fmt.Sprintf("this %s has %d held-work publication(s) of failed runs still on the forge%s; "+
+			"acknowledged refs clear at their retention expiry (or sooner with `uzi run held expire <run-id>`); refs in any other state "+
+			"(being created, reconciled or deleted) settle against the forge first; a ref that is then acknowledged follows the retention rule. "+
+			"Remove the %s after the block lifts", what, count, named, what),
+		"held_refs":  refs,
+		"held_count": count,
+	})
+}
+
 type patchRepoRequest struct {
+	CodeCrossCheckGuidance            json.RawMessage `json:"code_cross_check_guidance"`
+	CrossCheckRepoInstructionsEnabled *bool           `json:"cross_check_repo_instructions_enabled"`
 	// RepoSkillsEnabled is the repo-skills opt-in (PRD #16): load skills from the
 	// repo's own .claude/skills at run time. Pointer so an omitted field is a
 	// no-op rather than a silent disable.
@@ -1149,14 +1282,9 @@ func optBoolToPgtype(v *bool) pgtype.Bool {
 	return pgtype.Bool{Bool: *v, Valid: true}
 }
 
-// PatchRepo updates a repo's mutable opt-in settings. Three disjoint paths: the
-// trust flags (repo_skills_enabled and/or repo_claudemd_enabled, PRD #16/#246) —
-// which may be set together or individually in one atomic round-trip
-// (SetRepoTrustFlags) — repo_devbox_opt_in (PRD #18), and required_capabilities (the
-// static per-repo capability hint, PRD #84 M2). Each of the three is its own exclusive
-// path and no two can be combined in one request. At least one field must be present.
-// Authorization: the repo owner (via the owning connection) or an admin. A non-owned,
-// unknown id returns 404 for a non-admin; an admin may target any repo.
+// PatchRepo updates one of five exclusive settings groups for an owner or admin.
+// Guidance and checker-instruction consent form one atomic group. The router
+// mounts this handler under cookie authentication and CSRF enforcement.
 func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 	user, ok := mw.UserFromContext(r.Context())
 	if !ok {
@@ -1168,15 +1296,33 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	var req patchRepoRequest
-	if err := httpx.DecodeJSON(r, &req); err != nil {
+	raw, readErr := io.ReadAll(io.LimitReader(r.Body, (64<<10)+1))
+	if readErr != nil || len(raw) > 64<<10 || !utf8.Valid(raw) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	decoder := json.NewDecoder(bytes.NewReader(raw))
+	decoder.DisallowUnknownFields()
+	if err := decoder.Decode(&req); err != nil {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	if decoder.Decode(new(any)) != io.EOF {
+		httpx.Error(w, http.StatusBadRequest, "invalid request body")
+		return
+	}
+	guidancePresent := len(req.CodeCrossCheckGuidance) != 0
+	codeSet := guidancePresent || req.CrossCheckRepoInstructionsEnabled != nil
+	var guidance *string
+	if guidancePresent && (json.Unmarshal(req.CodeCrossCheckGuidance, &guidance) != nil || (guidance != nil && (len(*guidance) > 8192 || !utf8.ValidString(*guidance)))) {
+		httpx.Error(w, http.StatusBadRequest, "invalid code cross-check guidance")
 		return
 	}
 	devboxSet := req.RepoDevboxOptIn != nil
 	trustSet := req.RepoSkillsEnabled != nil || req.RepoClaudemdEnabled != nil
 	capsSet := req.RepoRequiredCapabilities != nil
 	foldSet := req.RepoFoldImproveUziBacklog != nil
-	// Each of the three settings groups is its own exclusive path — at most one per
+	// Each of the five settings groups is its own exclusive path — at most one per
 	// request. b2i counts how many are present so a combined request is rejected
 	// uniformly rather than pairwise.
 	b2i := func(b bool) int {
@@ -1185,18 +1331,24 @@ func (h *Handler) PatchRepo(w http.ResponseWriter, r *http.Request) {
 		}
 		return 0
 	}
-	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet)+b2i(foldSet) > 1 {
-		httpx.Error(w, http.StatusBadRequest, "repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
+	if b2i(devboxSet)+b2i(trustSet)+b2i(capsSet)+b2i(foldSet)+b2i(codeSet) > 1 {
+		httpx.Error(w, http.StatusBadRequest, "code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, and the trust flags cannot be combined in one request")
 		return
 	}
-	if !devboxSet && !trustSet && !capsSet && !foldSet {
-		httpx.Error(w, http.StatusBadRequest, "provide repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one of repo_skills_enabled or repo_claudemd_enabled")
+	if !devboxSet && !trustSet && !capsSet && !foldSet && !codeSet {
+		httpx.Error(w, http.StatusBadRequest, "provide code cross-check inputs, repo_devbox_opt_in, required_capabilities, repo_fold_improve_uzi_backlog, or at least one trust flag")
 		return
 	}
 
 	var repo store.Repo
 	var err error
 	switch {
+	case codeSet:
+		if user.IsAdmin {
+			repo, err = h.q.SetRepoCodeCrossCheckInputs(r.Context(), store.SetRepoCodeCrossCheckInputsParams{ID: id, GuidancePresent: guidancePresent, Guidance: pgconv.TextPtr(guidance), InstructionsEnabled: optBoolToPgtype(req.CrossCheckRepoInstructionsEnabled)})
+		} else {
+			repo, err = h.q.SetRepoCodeCrossCheckInputsForUser(r.Context(), store.SetRepoCodeCrossCheckInputsForUserParams{ID: id, UserID: user.ID, GuidancePresent: guidancePresent, Guidance: pgconv.TextPtr(guidance), InstructionsEnabled: optBoolToPgtype(req.CrossCheckRepoInstructionsEnabled)})
+		}
 	case trustSet:
 		// One atomic round-trip sets both trust columns; a nil field is left unchanged
 		// by the query's COALESCE, so the master toggle and each sub-toggle share this

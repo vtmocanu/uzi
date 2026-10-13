@@ -8,29 +8,31 @@ import tea "charm.land/bubbletea/v2"
 // owns the actions; the binding is settled here so it never moves), `a` is the admin
 // toggle only, `r` is refresh only.
 const (
-	keyQuit         = "q"
-	keyCtrlC        = "ctrl+c"
-	keyEnter        = "enter"
-	keyEsc          = "esc"
-	keyUp           = "up"
-	keyDown         = "down"
-	keyLeft         = "left"
-	keyRight        = "right"
-	keyTab          = "tab"
-	keyFilter       = "/"
-	keyHelp         = "?"
-	keyAdmin        = "a"
-	keyHideDone     = "h" // board: hide terminal (completed/failed/cancelled) runs, keeping active + needs-you
-	keyRefresh      = "r"
-	keyConfirmY     = "y"
-	keyConfirmN     = "n"
-	keyGoLive       = "g" // M5: re-attach the transcript follow (f is already follow-up)
-	keyCollapseCrew = "c" // fold the crew list to a summary so the milestone block is reachable
-	keyPageUp       = "pgup"
-	keyPageDown     = "pgdown"
-	keyHome         = "home"
-	keyEnd          = "end"
-	keySpaceName    = "space" // v2 names the space key "space", never " "
+	keyQuit             = "q"
+	keyCtrlC            = "ctrl+c"
+	keyEnter            = "enter"
+	keyEsc              = "esc"
+	keyUp               = "up"
+	keyDown             = "down"
+	keyLeft             = "left"
+	keyRight            = "right"
+	keyTab              = "tab"
+	keyFilter           = "/"
+	keyHelp             = "?"
+	keyAdmin            = "a"
+	keyHideDone         = "h" // board: hide terminal (completed/failed/cancelled) runs, keeping active + needs-you
+	keyRefresh          = "r"
+	keyConfirmY         = "y"
+	keyConfirmN         = "n"
+	keyGoLive           = "g" // M5: re-attach the transcript follow (f is already follow-up)
+	keyAnswerQuestion   = "i" // open the owner-only parked question composer
+	keyCollapseQuestion = "z" // fold / unfold the pending question card
+	keyCollapseCrew     = "c" // fold the crew list to a summary so the milestone block is reachable
+	keyPageUp           = "pgup"
+	keyPageDown         = "pgdown"
+	keyHome             = "home"
+	keyEnd              = "end"
+	keySpaceName        = "space" // v2 names the space key "space", never " "
 	// Tab and shift+tab cycle floor, workers, pulls, ci in both layouts.
 	keyViewFloor   = "1"
 	keyViewWorkers = "2"
@@ -93,6 +95,8 @@ func helpLines(v tuiView) []string {
 			"↑ / ↓      move within the focused pane (agents · scroll)",
 			"g          follow live: re-attach and jump to newest (live runs)",
 			"c          fold / unfold crew (auto-folds when blocks below do not fit)",
+			"z          fold / unfold pending questions (awaiting input)",
+			"i          answer parked questions (owner only)",
 			"W          open this run's worker",
 			"m          open the PR view for this run's merge request (when it has one)",
 		}, common...)
@@ -147,7 +151,10 @@ func helpLines(v tuiView) []string {
 		return append([]string{
 			"a          toggle the factory-wide admin board (needs a uza_ token)",
 			"h          hide finished runs; keep active and needs-you",
-			"+ after 7d cost means subscription/unreported costs excluded",
+			"cost       API-equivalent estimate",
+			"+ after 7d cost means the estimate is incomplete",
+			"           runs without estimates: tokens only",
+			"           unreported: recorded partials included",
 			"tab / shift+tab  floor · workers · pulls · ci",
 			"1 / 2 / 3 / 4  floor / workers / pulls / ci",
 		}, common...)

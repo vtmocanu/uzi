@@ -103,7 +103,7 @@ said why.
    `SlackNotifications.test.tsx` stubs `../lib/api` via `vi.mock` — the new
    state branches are exercised there with per-test stub responses (there is
    no scenario knob to add stories to; `mockScenario()` is OIDC-only).
-   `web/src/mocks/mockApi.ts` is updated separately for typecheck + demo-mode
+   `web/src/mocks/mockApi/settings.ts` is updated separately for typecheck + demo-mode
    parity: its persisted row type becomes
    `Omit<SlackLink, "state" | "workspace">` (workspace is server-derived,
    never persisted) with the value injected in `slackLinkResponse()`, and it
@@ -132,7 +132,7 @@ said why.
   3; the `unconfigured` alert reuses the existing `Alert` component
   (`tone="info"`, `Alert` at `ui.tsx:233`); hint lines use the existing
   muted/faint text classes. No new components.
-- `web/src/mocks/mockApi.ts` + `SlackNotifications.test.tsx` +
+- `web/src/mocks/mockApi/settings.ts` + `SlackNotifications.test.tsx` +
   `Settings.test.tsx` updated per Decision 5.
 
 ### Docs + specs
@@ -151,7 +151,7 @@ said why.
   extended. Validation: `curl /api/me/slack` on a token-less stack returns
   `"workspace":"unconfigured"`.
 - [x] **M2 — Web: self-explaining card states**: Decision 3 rendering,
-  `mockApi.ts` type + injection update (Decision 5), vitest via per-test
+  `mockApi/settings.ts` type + injection update (Decision 5), vitest via per-test
   `vi.mock` stubs for the state branches (alert shown; controls disabled only
   in `unconfigured`; workspace alert composes above the link-state helper;
   hint under disabled test-DM; pending helper; test-DM during `error`
@@ -175,7 +175,7 @@ said why.
 
 | Phase | Milestones | Depends on | Files touched |
 |---|---|---|---|
-| 1 (parallel) | M1 (api/), M2 (web/, against the four-value contract) | — | `handler/slack.go` + tests · `api.ts`, `SlackNotifications.tsx` + tests, `mockApi.ts` |
+| 1 (parallel) | M1 (api/), M2 (web/, against the four-value contract) | — | `handler/slack.go` + tests · `api.ts`, `SlackNotifications.tsx` + tests, `mockApi/settings.ts` |
 | 2 | M3 | M1–M2 | `docs/slack.md`, `specs/ai.md` |
 | 3 | M4 | M1–M3 | `deploy/chart/Chart.yaml`, git tag, `argo-apps` `apps/uzi/app.uzi.yaml` (cross-repo) |
 

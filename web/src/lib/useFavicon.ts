@@ -93,7 +93,7 @@ export function useFavicon({
     let alive = true;
     const poll = () => {
       api
-        .listRuns({ passive: true })
+        .listRuns({ passive: true, view: "summary" })
         .then(({ runs: latest }) => {
           if (!alive) return;
           // Seed the failed baseline on the first successful poll only.

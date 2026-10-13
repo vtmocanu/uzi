@@ -75,6 +75,10 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if req.Kind != "" && req.Kind != "fleet" && req.Kind != "readiness" {
+		httpx.Error(w, http.StatusBadRequest, "invalid report kind")
+		return
+	}
 	if len(req.Workers) > maxStatusReportWorkers {
 		httpx.Error(w, http.StatusBadRequest, "too many workers in report")
 		return
@@ -120,7 +124,14 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 				"worker_id", ws.ID, "phase", sanitizeSelfReported(ws.Phase, maxSelfReportedBytes))
 			continue
 		}
+		pacing, err := workersvc.NormalizePacingReport(ws.Pacing)
+		if err != nil {
+			dropped++
+			continue
+		}
 		n, err := h.wsvc.RecordRollHealth(r.Context(), workersvc.RollHealthReport{
+			Kind:                 req.Kind,
+			Pacing:               pacing,
 			WorkerID:             id,
 			Phase:                ws.Phase,
 			PhaseSince:           ws.PhaseSince,

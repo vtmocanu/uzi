@@ -9,6 +9,9 @@ import (
 	"errors"
 	"fmt"
 	"testing"
+
+	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/packbudget"
 )
 
 // These internal tests exercise the delta-aware inflation budget directly (the
@@ -34,6 +37,11 @@ func TestScanPackBudgetRejectsDeltaBomb(t *testing.T) {
 	}
 	if err := scanPackBudget(context.Background(), pack); !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("err = %v, want ErrPackTooLarge", err)
+	} else {
+		var be *packbudget.BudgetError
+		if !errors.As(err, &be) || be.Bound != packbudget.BoundObjectBytes {
+			t.Fatalf("err = %v, want a wrapped *packbudget.BudgetError with the per-object bound", err)
+		}
 	}
 }
 
@@ -129,6 +137,11 @@ func TestScanPackBudgetMalformed(t *testing.T) {
 	t.Run("bad_signature", func(t *testing.T) {
 		if err := scanPackBudget(context.Background(), []byte("NOPExxxxxxxxxxxxxxxx")); !errors.Is(err, ErrPackInvalid) {
 			t.Fatalf("err = %v, want ErrPackInvalid", err)
+		} else {
+			var ie *packbudget.InvalidError
+			if !errors.As(err, &ie) {
+				t.Fatalf("err = %v, want a wrapped *packbudget.InvalidError", err)
+			}
 		}
 	})
 	t.Run("truncated_body", func(t *testing.T) {
@@ -179,6 +192,28 @@ func TestPublishRejectsDeltaBomb(t *testing.T) {
 	})
 	if !errors.Is(err, ErrPackTooLarge) {
 		t.Fatalf("Publish err = %v, want ErrPackTooLarge", err)
+	}
+}
+
+// TestPrepareHeldPackRejectsDeltaBomb is the held-create twin of TestPublishRejectsDeltaBomb:
+// scanPackBudget runs before the remote is created or dialed, so the file:// CloneURL below is
+// never contacted and the bomb is refused with ErrPackTooLarge.
+func TestPrepareHeldPackRejectsDeltaBomb(t *testing.T) {
+	baseContent := []byte("base blob\n")
+	pack := assemblePack(t,
+		blobObject(t, baseContent),
+		refDeltaObject(t, blobOID(baseContent), deltaBody(uint64(len(baseContent)), 40<<20)),
+	)
+	p, err := PrepareHeldPack(context.Background(), HeldPackOptions{
+		CloneURL:   "file:///nonexistent/never-dialed.git",
+		RunID:      uuid.MustParse("3c1d7e52-9a4b-4f68-8d21-5e0b6a7c9d13"),
+		Generation: 1,
+		Branch:     "main",
+		Tip:        "1111111111111111111111111111111111111111",
+		Pack:       pack,
+	})
+	if !errors.Is(err, ErrPackTooLarge) || p != nil {
+		t.Fatalf("PrepareHeldPack = %v, %v; want nil, ErrPackTooLarge", p, err)
 	}
 }
 

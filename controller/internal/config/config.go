@@ -37,6 +37,8 @@ const (
 
 // Config holds the controller's runtime settings.
 type Config struct {
+	RollConcurrency   int
+	RollTargetVersion string
 	// APIBaseURL is the uzi api's base URL (scheme://host[:port], no path). https
 	// in k8s, where the api serves its TLS listener (Decision 4) — this is the hop
 	// that carries join tokens across a shared cluster's pod network.
@@ -337,10 +339,21 @@ func Load() (Config, error) {
 		WorkerDiskRecycleCooldown: parseDuration("UZI_WORKER_DISK_RECYCLE_COOLDOWN", time.Hour),
 	}
 
-	// The disk-pressure self-heal toggle (PRD #837 M4). DEFAULT TRUE: empty/unset leaves
-	// self-heal ON. A set but unparseable value is a BOOT error rather than a silent
-	// default — mirroring UZI_WORKER_FORCE_ROLL, an operator disabling self-heal by typo
-	// must not silently leave it on.
+	// Admission limits never silently accept an invalid override.
+	cfg.RollConcurrency = 1
+	cfg.RollTargetVersion = strings.TrimSpace(os.Getenv("UZI_WORKER_ROLL_TARGET_VERSION"))
+	if len(cfg.RollTargetVersion) > 128 {
+		return Config{}, fmt.Errorf("UZI_WORKER_ROLL_TARGET_VERSION exceeds 128 bytes")
+	}
+	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_ROLL_CONCURRENCY")); raw != "" {
+		n, err := strconv.Atoi(raw)
+		if err != nil || n <= 0 {
+			return Config{}, fmt.Errorf("UZI_WORKER_ROLL_CONCURRENCY must be a positive integer")
+		}
+		cfg.RollConcurrency = n
+	}
+	// The disk-pressure self-heal toggle (PRD #837 M4) defaults on. A malformed
+	// override is a boot error, so a typo cannot silently re-enable self-heal.
 	cfg.WorkerDiskRecycleEnabled = true
 	if raw := strings.TrimSpace(os.Getenv("UZI_WORKER_DISK_RECYCLE_ENABLED")); raw != "" {
 		enabled, err := strconv.ParseBool(raw)

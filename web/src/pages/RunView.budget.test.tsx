@@ -114,6 +114,9 @@ function run(over: Partial<Run>): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -302,5 +305,45 @@ describe("NearTimeoutPanel (PRD #1189)", () => {
       <NearTimeoutPanel run={run(budgeted({ health: "ok" }))} busy={false} canSteer onExtend={() => {}} onStop={() => {}} />,
     );
     expect(container.textContent).toBe("");
+  });
+});
+
+// PRD #2602 M2: the progress card mounts on the run page under the header's budget facts,
+// and stays absent when the server sends no progress.
+describe("RunView — progress card (PRD #2602 M2)", () => {
+  const ms = [
+    { id: "m1", title: "First" },
+    { id: "m2", title: "Second" },
+  ];
+  it("renders the card from run.progress with the sole frozen list", async () => {
+    const { container } = renderPage(
+      budgeted({
+        milestones: ms,
+        milestones_completed: ["m1"],
+        milestones_in_progress: ["m2"],
+        progress: {
+          state: "percent",
+          pct: 55,
+          milestone_done: 1,
+          milestone_total: 2,
+          active_milestone_id: "m2",
+          phase: "review",
+        },
+      }),
+    );
+    await screen.findByText("Add rate limiting");
+    expect(container.querySelector("[data-progress-pct]")?.textContent).toBe("≈about 55%");
+    expect(screen.getByText("1 of 2 reported complete")).toBeTruthy();
+    const cardEl = container.querySelector("[data-run-progress-card]") as HTMLElement;
+    const rows = cardEl.querySelector("ul");
+    expect(rows).not.toBeNull();
+    expect(container.querySelectorAll("ul")).toHaveLength(1);
+    expect(rows?.textContent).toContain("Second");
+  });
+
+  it("renders no card without progress", async () => {
+    const { container } = renderPage(budgeted({ progress: null }));
+    await screen.findByText("Add rate limiting");
+    expect(container.querySelector("[data-run-progress-card]")).toBeNull();
   });
 });

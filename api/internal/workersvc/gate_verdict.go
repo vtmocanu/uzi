@@ -84,13 +84,22 @@ func (s *Service) reviseNotWritten(ctx context.Context, userID, runID uuid.UUID,
 	return &GateRevisionMismatchError{Expected: *expected, Current: run.GateRevision}
 }
 
-// verdictNotWritten resolves a verdict write that affected no row on a seam whose only refusal
-// besides the expected-revision predicate is the run having vanished (the approve and live-poller
-// reject inserts) or, for the no-live-poller server-side reject alone, having finished. It re-reads the run, so a vanished run answers
+// verdictNotWritten resolves a verdict write that affected no row. Besides the expected-revision
+// predicate, the approve and live-poller reject seams can refuse a vanished run, and the
+// no-live-poller server-side reject can refuse a finished run. The selection-bearing approve also
+// has the contract-source refusal described below. It re-reads the run, so a vanished run answers
 // ErrRunNotFound. With an expected revision the answer is ALWAYS a *GateRevisionMismatchError
 // carrying the re-read's revision, even when that revision matches again (a publication and a
 // verdict can interleave around the re-read): the verdict was not written, and the client must
 // refetch rather than read success. Without one it returns fallback, the seam's own answer.
+//
+// The CreateApprovePlanInput seam has a third refusal (issue #2680): the contract-source
+// predicate, which refuses while the milestone list moved since the contract was built. BOUND, it
+// is always a *GateRevisionMismatchError here, including the supported Current == Expected case
+// (a candidate can move without a gate_revision bump). UNBOUND, submitApproval retries itself and
+// returns ErrApprovalMilestonesMoved on exhaustion, so that ErrNoRows never reaches this
+// function; its fallback (ErrRunNotFound) is reached only for a refusal the seam did not retry (a
+// vanished run).
 func (s *Service) verdictNotWritten(ctx context.Context, userID, runID uuid.UUID, expected *int64, fallback error) error {
 	run, err := s.GetRun(ctx, userID, runID)
 	if err != nil {

@@ -15,13 +15,15 @@ import (
 // (the prior checkpoint tip as parent[0], the real tip LAST), NOT realTip-first. The
 // broker's strict-descendant gate runs go-git `IsAncestor`, a parent[0]-first preorder
 // DFS, over its DEPTH-1 object store. This test reproduces that depth-1 store (the
-// branch-fork's parent `D_old` is absent) and asserts:
+// branch-fork's parent `D_old` is absent) and asserts three things:
 //
 //   - base-FIRST overlay  → accepted (IsAncestor finds base at parent[0] immediately and
 //     stops, never walking below base into the missing object).
 //   - realTip-FIRST overlay → rejected as a BENIGN skip (the walk dives into the real
 //     tip's chain first, runs off the depth-1 pack into the absent `D_old`, surfaces
 //     plumbing.ErrObjectNotFound, and descendsOrEqual maps it to (false, nil)).
+//   - RAW real tip (no chain over the prior overlay) → rejected: it is never a descendant of
+//     the prior overlay ref on any store, and on depth-1 the walk also runs off the pack.
 //
 // The original PRD draft specified realTip-first; that shipped broken (every second and
 // later sequential overlay skipped `not_descendant`, so a behind-on-workflows branch
@@ -76,6 +78,20 @@ func TestStrictDescendsOverlayParentOrderDepth1(t *testing.T) {
 		t.Fatalf("realtip-first overlay must NOT be accepted on a depth-1 store " +
 			"(the parent[0]-first walk runs off the pack before reaching the base) — " +
 			"this is the not_descendant regression the base-first parent order fixes")
+	}
+
+	// RAW realTipNew over the prior ref: refused (issue #2733). A tick or iteration checkpoint
+	// that packs the bare real tip, with no chain over the prior overlay, is never a descendant
+	// of prevRef on any store (prevRef is not among its ancestors); on this depth-1 store the
+	// walk additionally runs off the pack into the absent D_old and maps to (false, nil). The
+	// agent-side chain [prevRef, realTipNew] is what the base-first case above accepts.
+	ok, err = strictDescends(repo, prevRef, getCommit(t, repo, realTipNew))
+	if err != nil {
+		t.Fatalf("raw realTipNew: the shallow-boundary miss must map to (false, nil), got err: %v", err)
+	}
+	if ok {
+		t.Fatalf("a raw realTipNew must NOT be accepted over the prior overlay ref " +
+			"(it is why tick and iteration checkpoints are chained over the overlay)")
 	}
 }
 

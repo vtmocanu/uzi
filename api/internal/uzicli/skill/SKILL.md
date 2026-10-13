@@ -60,6 +60,18 @@ Anthropic token, autopilot, chat), answer from the docs embedded in this binary
 rather than guessing: `uzi docs search <query>` then `uzi docs show <slug>`. Offline,
 version-matched, no server needed — see *Onboarding & concepts* below.
 
+**Why is my run queued? (your own runs)**: `uzi run get <id> --json` and read `health` /
+`health_reason` (may be empty for the first `health_queued_seconds`, default 10 min); then
+`uzi worker list --json` and read each worker's `status`, `docker`, `active_runs`,
+`max_concurrent_runs` (a missing or null field is unknown, never "no"). If every online worker has
+`docker: true`, a repo-bearing run on a repo outside the Docker worker repo allowlist cannot be
+claimed: point to **Admin → Instance → Docker worker repo allowlist** (an admin edits it there;
+anyone else asks an admin). Then `uzi docs show run-health`.
+
+**On-screen labels**: name a web UI location only by the labels in `uzi docs`, never by a
+component name, a route path or an `/api/...` URL; if the docs do not name it, say the path is
+inferred.
+
 **`uzi tui` is not for you.** It is a full-screen, keyboard-driven UI for a human
 watching runs, and it refuses to start when stdout is not a terminal (exit 2). There
 is nothing it shows that the `--json` verbs do not: use `uzi run list --json` for the
@@ -157,6 +169,7 @@ uzi context rm <name>
 uzi run list
 uzi run get <run-id> [--field <name>]...
 uzi run logs <run-id> [--follow] [--after <seq>] [--tail <n>]
+uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <run-id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run review <run-id>
 uzi run create --repo <repo-id> --issue <issue-iid> [--wait-on-limit[=false]] [--mr-rework[=false]] [--plan-file <path>] [--agent-source own|repo] [--exclude-agents <a,b>] [--planned-commit <sha>] [--require-base] [--token <label>|auto|default|inherit] [--harness claude|codex]
@@ -181,6 +194,8 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
+uzi run held <run-id> [--json]
+uzi run held expire <run-id> [--yes]
 uzi run fetches <run-id> [--json]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--remove-label-on-dispatch[=false]] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
@@ -303,8 +318,9 @@ uzi version
   The default table shows the Claude and Codex plan cross-check cells, including
   active/inactive status, stored model/effort pins, worker default model,
   resolved model/effort, and their sources (`pin` or `worker default`, with
-  unrecognized sources shown as `unknown`). An inactive Claude cell is still shown; its stored pin
-  remains visible. Table rendering inspects at most twenty response cells and
+  unrecognized sources shown as `unknown`). Both cells are active: the Codex cell pins the
+  checker of a Claude-lead run and the Claude cell the checker of a Codex-lead run. A cell the
+  server reports inactive is still shown; its stored pin remains visible. Table rendering inspects at most twenty response cells and
   displays each harness once. `uzi settings get --json` returns the settings
   object at the top level, including `cross_check_pins` and source fields.
 
@@ -342,6 +358,15 @@ uzi version
   `milestones`, `own_agents`, `agent_exclusions`, `usage` (read those with
   `--json`) — is a usage error (exit 2); `--field` and `--json` are mutually
   exclusive.
+- `uzi run plan <run-id>` — print the latest plan Markdown verbatim; use
+  `--version N` to read a historical version (numbered from 1). `--diff` compares
+  against the immediately preceding plan only when feedback arrived between
+  those plans, including automatic feedback. With no base it prints the plan
+  and a note on stderr; an identical revision prints no diff and warns on stderr.
+  Comparisons ignore trailing CR/LF only and accept at most 200 KiB per plan;
+  plain output has no size cap. `--json` returns the version, nullable base version,
+  original plan Markdown, nullable diff, and whether feedback produced an identical
+  revision. Combine it with `--diff` for unified diff text in the JSON object.
 - `uzi run logs <run-id>` — the run's message history. `--follow` polls until the
   run reaches a terminal state (then exits 0, so a `--follow` on a finished run
   does not hang); `--after <seq>` resumes after a sequence number. In `--json`
@@ -564,12 +589,12 @@ uzi version
   wall-clock time so the sweep does not kill it at its current deadline (PRD #1189). `--by`
   takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit (`1d` = 24h); it
   must be positive (`0`, negative or unparseable is a usage error, exit 2). The added time
-  stacks on the frozen budget rather than replacing it, up to an admin-set per-run allowance.
+  stacks on the frozen budget rather than replacing it. `--by` is capped per request by an admin-set maximum per extension (default 16h), not per run: a run may be extended repeatedly, up to a technical total limit.
   Owner-only, and valid on any non-terminal run of a kind the sweep can time out (issue, task,
   prompt, self-improve, mr-rework, ci-fix), including a queued or parked one. A chat, judge or
   interactive-task run never times out, an over-cap request, or extending while the admin has
   turned extensions off, is a 409 (exit 5) with the server's message printed verbatim. Prints
-  the new deadline and the run's remaining extension allowance; `uzi run get` then shows the
+  the new deadline and the run's total extension (with the per-extension maximum); `uzi run get` then shows the
   extension on its `DEADLINE` row (`· +2h extended`).
 - `uzi run follow-up <run-id> [--message <text>]` — send a follow-up message. The
   message can also be piped on stdin instead of `--message`.
@@ -797,6 +822,16 @@ uzi version
   (without a TTY and without `--yes` it refuses and changes nothing). A cancelled prompt mutates
   nothing. An available archive is never deleted here (export it first). A foreign/absent/already
   settled hold is a 404 (exit 4).
+- `uzi run held <run-id> [--json]` — list a failed run's held-work publications: the forge refs
+  (`refs/uzi-held/<run-id>/<generation>`) its committed work was published to before custody was
+  released, with each ref's state, the tip it holds and when it is deleted. Fetch one before then
+  with `git fetch origin <ref>`. `uzi run recovery <run-id>` shows the same ref as a released
+  hold's held receipt. Owner-only (a foreign run is a 404, exit 4).
+- `uzi run held expire <run-id> [--yes]` — make the run's acknowledged held refs due for deletion
+  now; the server's cleanup deletes them shortly after (this command deletes nothing itself).
+  **Destructive:** fetch the work first. It prompts for confirmation interactively; `--yes` is
+  **required** for a non-interactive run (without a TTY and without `--yes` it refuses and
+  changes nothing).
 - `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
   (official-sources research): every web fetch it attempted, allowed or refused, with the
   reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only
@@ -1644,7 +1679,7 @@ into `file`/`dismiss`/`resolve`. `undo` keys on the `disposition_id` field (read
   instance setting: review bots (`BASE URL`/`FORGE USER ID`/`STATUS`) whose MR review
   comments the rework lane ingests though the bot is not a collaborator. Empty prints a
   note that third-party bot comments are withheld; a malformed entry is shown verbatim and
-  flagged. Edit in the web Admin Settings page; the CLI never writes.
+  flagged. Edit in the web UI at **Admin → Instance → Trusted review bots**; the CLI never writes.
 - `uzi admin egress-profile list|show <name>` (PRD #1906) — the read-only view of the
   instance's egress profiles: named site lists for official-sources research. `list`
   prints `NAME`/`HOSTS`/`OVERRIDES`/`UPDATED`/`DESCRIPTION`; `show` prints the profile's

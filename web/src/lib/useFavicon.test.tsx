@@ -107,7 +107,7 @@ describe("useFavicon", () => {
   it("#331: marks the favicon poll passive so the server skips the rolling refresh", async () => {
     renderHook(() => useFavicon({ enabled: true, appLogoSrc: null }));
     await flush(); // immediate seed poll
-    expect(listRuns).toHaveBeenCalledWith({ passive: true });
+    expect(listRuns).toHaveBeenCalledWith({ passive: true, view: "summary" });
   });
 
   it("#688: a failed REPLACEMENT logo load clears the stale base and reverts to the factory mark", async () => {

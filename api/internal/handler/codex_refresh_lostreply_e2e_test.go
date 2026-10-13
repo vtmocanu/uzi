@@ -81,12 +81,13 @@ func (q *lostReplyStore) release() {
 }
 
 type lostReplyProvider struct {
-	mu       sync.Mutex
-	vlt      *vault.Vault
-	owner    uuid.UUID
-	identity codexauth.Identity
-	inputs   []string
-	discover int
+	mu                 sync.Mutex
+	vlt                *vault.Vault
+	owner              uuid.UUID
+	identity           codexauth.Identity
+	inputs             []string
+	discover           int
+	accountUnavailable bool
 }
 
 func lostReplyAccess(n int) string  { return "access-canary-" + fmt.Sprint(n) }
@@ -105,6 +106,9 @@ func (f *lostReplyProvider) Refresh(_ context.Context, input string) (codexauth.
 	}
 	f.inputs = append(f.inputs, label)
 	if n == 1 {
+		if f.accountUnavailable {
+			return codexauth.RefreshResult{}, &codexauth.AuthError{Op: "refresh", StatusCode: http.StatusUnauthorized, OAuthCode: codexauth.OAuthCodeRefreshTokenReused}
+		}
 		f.vlt.Lock(f.owner)
 	}
 	next := lostReplyRefresh(n)
@@ -231,7 +235,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 	}
 	defer pool.Close()
 
-	for _, variant := range []string{"drop-first", "drop-both", "pending-retention"} {
+	for _, variant := range []string{"drop-first", "drop-both", "pending-retention", "account-unavailable"} {
 		t.Run(variant, func(t *testing.T) {
 			dir, err := os.MkdirTemp(filepath.Join(root, ".uzi/scratch"), "lostreply-")
 			if err != nil {
@@ -372,7 +376,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			if err := svc.FreezeCodexBinding(ctx, owner, run, secret.ID, "subscription"); err != nil {
 				t.Fatal(err)
 			}
-			provider := &lostReplyProvider{vlt: vlt, owner: owner, identity: identity}
+			provider := &lostReplyProvider{vlt: vlt, owner: owner, identity: identity, accountUnavailable: variant == "account-unavailable"}
 			svc.SetCodexRefresh(provider)
 			h := &Handler{q: q, pool: pool, box: box, wsvc: svc}
 			router := h.WorkerRoutes(mw.NewLimiter(10000, time.Minute, nil))
@@ -388,9 +392,12 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				var cause, session *string
 				var slot bool
 				var coord, sealing string
-				var gen int64
-				err := pool.QueryRow(ctx, `SELECT r.status,r.recovery_wait_cause,r.session_id,a.recovery_sealed IS NOT NULL,a.coord_state,a.sealed_with,a.generation
-					FROM runs r,codex_provider_account a WHERE r.id=$1 AND a.id=$2`, run, account.ID).Scan(&status, &cause, &session, &slot, &coord, &sealing, &gen)
+				var gen, claimGen int64
+				var workerID string
+				var reauth, capRevoked, failFree bool
+				var holdGenerations []int64
+				err := pool.QueryRow(ctx, `SELECT r.status,r.recovery_wait_cause,r.session_id,a.recovery_sealed IS NOT NULL,a.coord_state,a.sealed_with,a.generation,r.claim_generation,coalesce(r.worker_id::text,''),a.reauth_required,coalesce(octet_length(r.codex_cap_hash),0)=0,r.fail_origin IS NULL
+					FROM runs r,codex_provider_account a WHERE r.id=$1 AND a.id=$2`, run, account.ID).Scan(&status, &cause, &session, &slot, &coord, &sealing, &gen, &claimGen, &workerID, &reauth, &capRevoked, &failFree)
 				if err != nil {
 					return nil, err
 				}
@@ -408,6 +415,9 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 						return nil, err
 					}
 				}
+				if err := pool.QueryRow(ctx, `SELECT coalesce(array_agg(generation ORDER BY generation),ARRAY[]::bigint[]) FROM recovery_custody_holds WHERE run_id=$1 AND state='open'`, run).Scan(&holdGenerations); err != nil {
+					return nil, err
+				}
 				provider.mu.Lock()
 				inputs := append([]string(nil), provider.inputs...)
 				discover := provider.discover
@@ -415,7 +425,75 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				mu.Lock()
 				requests := permits
 				mu.Unlock()
-				return map[string]any{"status": status, "cause": cause, "session": session, "slot": slot, "coord": coord, "sealing": sealing, "generation": gen, "holds": holds, "captures": captures, "issued": issued, "consumed": consumed, "permit_requests": requests, "inputs": inputs, "discover": discover}, nil
+				return map[string]any{"claim_generation": claimGen, "worker_id": workerID, "hold_generations": holdGenerations, "reauth_required": reauth, "cap_revoked": capRevoked, "fail_free": failFree, "status": status, "cause": cause, "session": session, "slot": slot, "coord": coord, "sealing": sealing, "generation": gen, "holds": holds, "captures": captures, "issued": issued, "consumed": consumed, "permit_requests": requests, "inputs": inputs, "discover": discover}, nil
+			}
+			recoverAccount := func(before map[string]any) (map[string]any, error) {
+				if before["status"] != "recovery_wait" || before["issued"] != 0 || before["permit_requests"] != 0 || before["holds"] == 0 || !vlt.Unlocked(owner) || before["cap_revoked"] != true || before["fail_free"] != true {
+					return nil, errors.New("account park/custody/authority invariant failed")
+				}
+				durable, err := q.GetCodexProviderAccountByID(ctx, store.GetCodexProviderAccountByIDParams{ID: account.ID, UserID: owner})
+				if err != nil {
+					return nil, err
+				}
+				if durable.CoordState != "quarantined" || !durable.ReauthRequired || durable.Generation != 0 {
+					return nil, errors.New("account rejection was not authoritatively quarantined")
+				}
+				mu.Lock()
+				valid := len(attempts) == 1 && attempts[0].Generation == 0 && attempts[0].Operation != "" && len(quarantineCodes) == 1 && quarantineCodes[0] == http.StatusConflict && len(quarantineReplies) == 1
+				if valid {
+					var reply map[string]string
+					valid = json.Unmarshal([]byte(quarantineReplies[0]), &reply) == nil && reflect.DeepEqual(reply, map[string]string{"error": codexErrCredUnavailable, "reason": "codex_account_unavailable"})
+				}
+				mu.Unlock()
+				if !valid {
+					return nil, errors.New("account rejection did not return one typed 409")
+				}
+				provider.mu.Lock()
+				valid = reflect.DeepEqual(provider.inputs, []string{"0"})
+				provider.mu.Unlock()
+				if !valid {
+					return nil, errors.New("account rejection retried the provider")
+				}
+				login, err := json.Marshal(map[string]string{"access_token": lostReplyAccess(1), "refresh_token": lostReplyRefresh(1)})
+				if err != nil {
+					return nil, err
+				}
+				sealed, err := vlt.Seal(owner, store.KindCodexAuth, login)
+				if err != nil {
+					return nil, err
+				}
+				if n, err := q.BumpCodexMaterialRevision(ctx, store.BumpCodexMaterialRevisionParams{UserSecretID: secret.ID, UserID: owner, Status: "staging"}); err != nil || n != 1 {
+					return nil, fmt.Errorf("relogin material bump: %d %w", n, err)
+				}
+				var material int64
+				if err := pool.QueryRow(ctx, `SELECT material_revision FROM codex_credential_state WHERE user_secret_id=$1`, secret.ID).Scan(&material); err != nil {
+					return nil, err
+				}
+				if n, err := q.RefreshCodexAccountLogin(ctx, store.RefreshCodexAccountLoginParams{Sealed: sealed, SealedWith: store.SealedWithDEK, ID: account.ID, UserID: owner, FromGeneration: 0}); err != nil || n != 1 {
+					return nil, fmt.Errorf("same identity relogin: %d %w", n, err)
+				}
+				if n, err := q.LinkCodexCredentialState(ctx, store.LinkCodexCredentialStateParams{ProviderAccountID: pgconv.UUID(account.ID), UserSecretID: secret.ID, UserID: owner, MaterialRevision: material}); err != nil || n != 1 {
+					return nil, fmt.Errorf("same identity relink: %d %w", n, err)
+				}
+				loggedIn, err := inspect()
+				if err != nil {
+					return nil, err
+				}
+				if loggedIn["generation"] != int64(1) || loggedIn["reauth_required"] != false || loggedIn["status"] != "recovery_wait" || loggedIn["issued"] != 0 || loggedIn["permit_requests"] != 0 || loggedIn["captures"] != before["captures"] || !reflect.DeepEqual(loggedIn["hold_generations"], before["hold_generations"]) {
+					return nil, errors.New("relogin advanced run or custody before readmission")
+				}
+				res, err := svc.Sweep(ctx)
+				if err != nil || res.CodexAccountReadmitted != 1 || res.CodexAccountPromoted != 1 {
+					return nil, fmt.Errorf("account sweep readmitted=%d promoted=%d: %w", res.CodexAccountReadmitted, res.CodexAccountPromoted, err)
+				}
+				after, err := inspect()
+				if err != nil {
+					return nil, err
+				}
+				if after["status"] != "queued" || after["claim_generation"] != before["claim_generation"] || after["worker_id"] != before["worker_id"] || after["issued"] != 0 || after["permit_requests"] != 0 || after["fail_free"] != true || !reflect.DeepEqual(after["hold_generations"], before["hold_generations"]) {
+					return nil, errors.New("readmission changed affinity/generation/custody or minted authority")
+				}
+				return after, nil
 			}
 			control := func(action string) (map[string]any, error) {
 				before, err := inspect()
@@ -427,6 +505,9 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 				}
 				if action != "recover" {
 					return nil, errors.New("unknown fixture control")
+				}
+				if variant == "account-unavailable" {
+					return recoverAccount(before)
 				}
 				if before["status"] != "recovery_wait" || before["issued"] != 0 || before["permit_requests"] != 0 || before["holds"] == 0 || vlt.Unlocked(owner) {
 					return nil, errors.New("locked pre-sweep park/custody/authority invariant failed")
@@ -530,7 +611,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 					}
 				}
 				mu.Unlock()
-				if index > 0 && index <= 2 {
+				if index > 0 && (index <= 2 && variant != "account-unavailable" || index == 1 && variant == "account-unavailable") {
 					rec := httptest.NewRecorder()
 					router.ServeHTTP(rec, r)
 					mu.Lock()
@@ -538,7 +619,7 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 					quarantineCodes = append(quarantineCodes, rec.Code)
 					mu.Unlock()
 					// Only after the real handler has returned, including its durable write/quarantine.
-					if index == 1 || variant == "drop-both" {
+					if variant != "account-unavailable" && (index == 1 || variant == "drop-both") {
 						c, _, err := w.(http.Hijacker).Hijack()
 						if err == nil {
 							_ = c.Close()
@@ -589,7 +670,11 @@ func TestCodexRefreshLostReplyE2E(t *testing.T) {
 			}
 			mu.Lock()
 			seen := map[string]bool{attempts[0].Operation: true}
-			later := append([]lostReplyAttempt(nil), attempts[2:]...)
+			initialAttempts := 2
+			if variant == "account-unavailable" {
+				initialAttempts = 1
+			}
+			later := append([]lostReplyAttempt(nil), attempts[initialAttempts:]...)
 			mu.Unlock()
 			for i, attempt := range later {
 				if attempt.Operation == "" || seen[attempt.Operation] || attempt.Generation != int64(i+1) {

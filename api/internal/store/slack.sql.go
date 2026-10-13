@@ -101,7 +101,7 @@ func (q *Queries) CountRunPlanMessages(ctx context.Context, runID uuid.UUID) (in
 }
 
 const getConfirmedUserBySlackID = `-- name: GetConfirmedUserBySlackID :one
-SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled FROM users
+SELECT id, email, password_hash, display_name, is_admin, is_active, token_version, created_at, last_login, default_model, autopilot_enabled, theme, slack_member_id, slack_notify, slack_resolved_id, slack_link_confirmed_at, oidc_issuer, oidc_subject, judge_enabled, judge_anthropic_secret_id, wait_on_limit, ci_autofix_enabled, sidebar_token_ids, judge_model, summary_model, ephemeral_workers_enabled, default_effort, mr_rework_enabled, attribution_enabled, notify_early_limit_reset, schedules_paused, schedules_paused_until, judge_anthropic_bind_mode, appearance_mode, light_theme, dark_theme, typeface, default_harness, sidebar_codex_account_ids, default_claude_model, default_codex_model, default_codex_effort, ephemeral_docker_enabled, plan_cross_check_enabled, now_summary_enabled, code_cross_check_enabled FROM users
 WHERE slack_resolved_id = $1 AND slack_link_confirmed_at IS NOT NULL AND is_active = true
 `
 
@@ -159,6 +159,8 @@ func (q *Queries) GetConfirmedUserBySlackID(ctx context.Context, slackResolvedID
 		&i.DefaultCodexEffort,
 		&i.EphemeralDockerEnabled,
 		&i.PlanCrossCheckEnabled,
+		&i.NowSummaryEnabled,
+		&i.CodeCrossCheckEnabled,
 	)
 	return i, err
 }
@@ -271,6 +273,8 @@ SELECT r.id, r.user_id, r.status, r.issue_iid, r.issue_title,
        r.mr_iid, r.mr_web_url, r.branch, r.failure_reason, r.stop_kind, r.kind,
        r.health, r.plan_md,
        r.rate_limit_type, r.retry_not_before, r.limit_wait_count, r.status_since,
+       r.recovery_wait_cause, r.recovery_retry_not_before,
+       r.provider_park_count, r.provider_park_streak_started_at,
        r.milestones_frozen, r.milestones_completed, r.milestones_in_progress,
        r.checkpoint_tip,
        r.started_at, r.budget_wall_seconds, r.budget_paused_seconds, r.interactive,
@@ -304,44 +308,48 @@ WHERE r.id = $1
 `
 
 type GetSlackRunContextRow struct {
-	ID                     uuid.UUID          `json:"id"`
-	UserID                 uuid.UUID          `json:"user_id"`
-	Status                 string             `json:"status"`
-	IssueIid               pgtype.Int8        `json:"issue_iid"`
-	IssueTitle             string             `json:"issue_title"`
-	MrIid                  pgtype.Int8        `json:"mr_iid"`
-	MrWebUrl               pgtype.Text        `json:"mr_web_url"`
-	Branch                 pgtype.Text        `json:"branch"`
-	FailureReason          pgtype.Text        `json:"failure_reason"`
-	StopKind               pgtype.Text        `json:"stop_kind"`
-	Kind                   string             `json:"kind"`
-	Health                 string             `json:"health"`
-	PlanMd                 pgtype.Text        `json:"plan_md"`
-	RateLimitType          pgtype.Text        `json:"rate_limit_type"`
-	RetryNotBefore         pgtype.Timestamptz `json:"retry_not_before"`
-	LimitWaitCount         int32              `json:"limit_wait_count"`
-	StatusSince            pgtype.Timestamptz `json:"status_since"`
-	MilestonesFrozen       []byte             `json:"milestones_frozen"`
-	MilestonesCompleted    []byte             `json:"milestones_completed"`
-	MilestonesInProgress   []byte             `json:"milestones_in_progress"`
-	CheckpointTip          pgtype.Text        `json:"checkpoint_tip"`
-	StartedAt              pgtype.Timestamptz `json:"started_at"`
-	BudgetWallSeconds      pgtype.Int4        `json:"budget_wall_seconds"`
-	BudgetPausedSeconds    int32              `json:"budget_paused_seconds"`
-	Interactive            bool               `json:"interactive"`
-	BudgetExtensionSeconds int32              `json:"budget_extension_seconds"`
-	CheckpointTipAt        pgtype.Timestamptz `json:"checkpoint_tip_at"`
-	HoldReason             pgtype.Text        `json:"hold_reason"`
-	BudgetFinalizeSeconds  int32              `json:"budget_finalize_seconds"`
-	FailOrigin             pgtype.Text        `json:"fail_origin"`
-	GateRevision           int64              `json:"gate_revision"`
-	HasPreservedPatch      bool               `json:"has_preserved_patch"`
-	HasAvailableCapture    bool               `json:"has_available_capture"`
-	PathWithNamespace      string             `json:"path_with_namespace"`
-	WebUrl                 string             `json:"web_url"`
-	ForgeType              string             `json:"forge_type"`
-	RepoAgentNames         []string           `json:"repo_agent_names"`
-	RepoAgentFolder        string             `json:"repo_agent_folder"`
+	ID                          uuid.UUID          `json:"id"`
+	UserID                      uuid.UUID          `json:"user_id"`
+	Status                      string             `json:"status"`
+	IssueIid                    pgtype.Int8        `json:"issue_iid"`
+	IssueTitle                  string             `json:"issue_title"`
+	MrIid                       pgtype.Int8        `json:"mr_iid"`
+	MrWebUrl                    pgtype.Text        `json:"mr_web_url"`
+	Branch                      pgtype.Text        `json:"branch"`
+	FailureReason               pgtype.Text        `json:"failure_reason"`
+	StopKind                    pgtype.Text        `json:"stop_kind"`
+	Kind                        string             `json:"kind"`
+	Health                      string             `json:"health"`
+	PlanMd                      pgtype.Text        `json:"plan_md"`
+	RateLimitType               pgtype.Text        `json:"rate_limit_type"`
+	RetryNotBefore              pgtype.Timestamptz `json:"retry_not_before"`
+	LimitWaitCount              int32              `json:"limit_wait_count"`
+	StatusSince                 pgtype.Timestamptz `json:"status_since"`
+	RecoveryWaitCause           pgtype.Text        `json:"recovery_wait_cause"`
+	RecoveryRetryNotBefore      pgtype.Timestamptz `json:"recovery_retry_not_before"`
+	ProviderParkCount           int32              `json:"provider_park_count"`
+	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
+	MilestonesFrozen            []byte             `json:"milestones_frozen"`
+	MilestonesCompleted         []byte             `json:"milestones_completed"`
+	MilestonesInProgress        []byte             `json:"milestones_in_progress"`
+	CheckpointTip               pgtype.Text        `json:"checkpoint_tip"`
+	StartedAt                   pgtype.Timestamptz `json:"started_at"`
+	BudgetWallSeconds           pgtype.Int4        `json:"budget_wall_seconds"`
+	BudgetPausedSeconds         int32              `json:"budget_paused_seconds"`
+	Interactive                 bool               `json:"interactive"`
+	BudgetExtensionSeconds      int32              `json:"budget_extension_seconds"`
+	CheckpointTipAt             pgtype.Timestamptz `json:"checkpoint_tip_at"`
+	HoldReason                  pgtype.Text        `json:"hold_reason"`
+	BudgetFinalizeSeconds       int32              `json:"budget_finalize_seconds"`
+	FailOrigin                  pgtype.Text        `json:"fail_origin"`
+	GateRevision                int64              `json:"gate_revision"`
+	HasPreservedPatch           bool               `json:"has_preserved_patch"`
+	HasAvailableCapture         bool               `json:"has_available_capture"`
+	PathWithNamespace           string             `json:"path_with_namespace"`
+	WebUrl                      string             `json:"web_url"`
+	ForgeType                   string             `json:"forge_type"`
+	RepoAgentNames              []string           `json:"repo_agent_names"`
+	RepoAgentFolder             string             `json:"repo_agent_folder"`
 }
 
 // Everything the notifier renders into a run DM (content-minimized): owner,
@@ -436,6 +444,10 @@ func (q *Queries) GetSlackRunContext(ctx context.Context, id uuid.UUID) (GetSlac
 		&i.RetryNotBefore,
 		&i.LimitWaitCount,
 		&i.StatusSince,
+		&i.RecoveryWaitCause,
+		&i.RecoveryRetryNotBefore,
+		&i.ProviderParkCount,
+		&i.ProviderParkStreakStartedAt,
 		&i.MilestonesFrozen,
 		&i.MilestonesCompleted,
 		&i.MilestonesInProgress,

@@ -1,3 +1,4 @@
+import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -172,6 +173,61 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+});
+
+describe("SDK overflow wall expiry M1", () => {
+  for (const mode of ["finish", "cancel"] as const) it(
+    `SDK oversized wall cleanup cancels rearmed chunk on ${mode}`, async t => {
+      const clock = overflowClock(t);
+      const controller = new AbortController();
+      let turnSignal: AbortSignal | undefined;
+      let rearmed = false;
+      const queryFn: SdkQueryFn = params => (async function* () {
+        for await (const _ of params.prompt) { /* drain */ }
+        turnSignal = params.options.abortController!.signal;
+        clock.move(NATIVE_LIMIT); clock.deliver(d => d >= NATIVE_LIMIT); await drain();
+        rearmed = clock.pending().some(r => r.delay === REPRO_DELAY - NATIVE_LIMIT);
+        if (mode === "cancel") controller.abort();
+        else yield signalDone();
+        yield resultSuccess();
+      })();
+      const { ctx, spies } = makeCtx({ planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+        signal: controller.signal, config: { run_timeout_seconds: REPRO_DELAY / 1000 } });
+      const running = new SdkExecutor(nullLogger(), homeDir, { queryFn, timeoutNow: clock.now }).run(ctx);
+      if (mode === "cancel") await assert.rejects(running, { message: "run cancelled" });
+      else assert.equal((await running).walled, undefined);
+      assert.equal(rearmed, true, "cleanup starts with a live second chunk");
+      assert.equal(clock.pending().some(r => r.delay === REPRO_DELAY - NATIVE_LIMIT), false);
+      const aborted = turnSignal!.aborted;
+      const abortCalls = t.mock.method(AbortController.prototype, "abort");
+      clock.move(REPRO_DELAY - NATIVE_LIMIT); clock.deliver(); await drain();
+      assert.equal(abortCalls.mock.callCount(), 0, "old remainder cannot abort after cleanup");
+      assert.equal(turnSignal!.aborted, aborted);
+      assert.equal(spies.parkForWallCalls, 0, "cancel or finish cannot become a stale wall park");
+      clock.assertSafe();
+    },
+  );
+  it("SDK oversized wall rearms then parks once at full deadline", async t => {
+    const clock = overflowClock(t);
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      const signal = params.options.abortController!.signal;
+      clock.move(NATIVE_LIMIT); clock.deliver(d => d >= NATIVE_LIMIT); await drain();
+      assert.equal(signal.aborted, false, "first chunk is not the wall deadline");
+      clock.move(98_999_353); clock.deliver(d => d === 98_999_354); await drain();
+      assert.equal(signal.aborted, false);
+      clock.move(1); clock.deliver(d => d === 98_999_354); await drain();
+      assert.equal(signal.aborted, true, "full relative budget expires");
+      yield resultSuccess();
+    })();
+    const { ctx, spies } = makeCtx({ planApproved: true, approvedPlan: "approved", sessionId: "sess-1",
+      config: { run_timeout_seconds: REPRO_DELAY / 1000 } });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, timeoutNow: clock.now }).run(ctx);
+    assert.ok(result.walled);
+    assert.equal(spies.parkForWallCalls, 1);
+    clock.assertSafe();
+    assert.ok(clock.requests.filter(r => r.delay === NATIVE_LIMIT || r.delay === 98_999_354).every(r => r.unrefs === 1));
+  });
 });
 
 describe("SdkExecutor wall park (PRD #1497 M2)", () => {

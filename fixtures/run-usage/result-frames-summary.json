@@ -1,0 +1,119 @@
+{
+  "note": "Authored (not recorded) for issue #2686: one Claude leg whose lead result frame names claude-haiku-4-5-20251001 (the model the summary passes also use), one progress_note on the same model, and FOUR summary_usage frames in the SAME leg: the intent pass, the plan pass and two pr_description passes (a PR-description regeneration runs a second pass). summary_usage payloads carry only pass and model_usage (no event, no usage key: either would be read as a result frame). The frames carry no costUSD, so the server prices them from the standard Anthropic table.",
+  "run_id": "2686aaaa-0000-4000-8000-000000000001",
+  "frames": [
+    {
+      "seq": 1,
+      "kind": "status",
+      "payload": {
+        "event": "init",
+        "model": "claude-opus-4-8"
+      }
+    },
+    {
+      "seq": 5,
+      "kind": "status",
+      "payload": {
+        "event": "result",
+        "usage": {
+          "input_tokens": 1700,
+          "output_tokens": 2300,
+          "cache_read_input_tokens": 50000,
+          "cache_creation_input_tokens": 3000
+        },
+        "modelUsage": {
+          "claude-opus-4-8": {
+            "inputTokens": 1000,
+            "outputTokens": 2000,
+            "cacheReadInputTokens": 50000,
+            "cacheCreationInputTokens": 3000,
+            "costUSD": 1.5
+          },
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 700,
+            "outputTokens": 300,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0,
+            "costUSD": 0.001
+          }
+        }
+      }
+    },
+    {
+      "seq": 6,
+      "kind": "progress_note",
+      "payload": {
+        "text": "Reviewing the changes for the first milestone",
+        "milestone_id": "m1",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 400,
+            "outputTokens": 40,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    },
+    {
+      "seq": 7,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "intent",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 1200,
+            "outputTokens": 150,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    },
+    {
+      "seq": 8,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "plan",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 2000,
+            "outputTokens": 300,
+            "cacheReadInputTokens": 10000,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    },
+    {
+      "seq": 11,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "pr_description",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 3000,
+            "outputTokens": 500,
+            "cacheReadInputTokens": 0,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    },
+    {
+      "seq": 14,
+      "kind": "summary_usage",
+      "payload": {
+        "pass": "pr_description",
+        "model_usage": {
+          "claude-haiku-4-5-20251001": {
+            "inputTokens": 3500,
+            "outputTokens": 700,
+            "cacheReadInputTokens": 4000,
+            "cacheCreationInputTokens": 0
+          }
+        }
+      }
+    }
+  ]
+}

@@ -3,11 +3,13 @@ package workersvc
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
@@ -195,6 +197,196 @@ func TestSubmitApprovalNoRebuildWhenAlreadyFrozen(t *testing.T) {
 	if fs.createdApproval.CompletionContract != nil {
 		t.Fatalf("already-frozen run rebuilt a contract (%s); the Go guard must pass nil and defer to the store's idempotent guard", fs.createdApproval.CompletionContract)
 	}
+}
+
+// -------------------------------------------------------------------------
+// Issue #2680: the approve-time contract is bound to the milestone list the freeze reads.
+// -------------------------------------------------------------------------
+
+// interlockedApproveFixture is an awaiting_approval interlocked run whose snapshot source is
+// `a`; the returned fake's approvalHook is left for the test to set.
+func interlockedApproveFixture(t *testing.T, a []Milestone) (*fakeStore, *Service, uuid.UUID, uuid.UUID) {
+	t.Helper()
+	user, runID := uuid.New(), uuid.New()
+	fs := &fakeStore{
+		runByID: store.Run{
+			ID: runID, UserID: user, Status: "awaiting_approval",
+			CompletionContractVersion: interlockVersion(),
+		},
+		freezeSnapshot: store.GetRunMilestoneFreezeSnapshotRow{MilestonesCandidate: milestonesJSON(t, a...)},
+	}
+	return fs, New(fs, newBox(t), testParams()), user, runID
+}
+
+// moveSource is an approvalHook that models a candidate republished between the snapshot read
+// and the write: the FIRST `times` calls move the snapshot to the next list in `lists` (cycling)
+// and are refused with the 0-row result the real predicate returns.
+func moveSource(t *testing.T, times int, lists ...[]Milestone) func(*fakeStore, int) error {
+	return func(f *fakeStore, call int) error {
+		if call > times {
+			return nil
+		}
+		f.freezeSnapshot.MilestonesCandidate = milestonesJSON(t, lists[(call-1)%len(lists)]...)
+		return pgx.ErrNoRows
+	}
+}
+
+// An unbound approve whose source moved after the snapshot read is refused by the write and
+// retried: the second attempt rebuilds the contract from the new list, and the source passed to
+// the query is exactly the one the contract was built from.
+func TestSubmitApprovalRetriesWhenMilestonesMoved(t *testing.T) {
+	a := []Milestone{{ID: "a1", Title: "Old"}}
+	b := []Milestone{{ID: "b1", Title: "New one"}, {ID: "b2", Title: "New two"}}
+	fs, svc, user, runID := interlockedApproveFixture(t, a)
+	fs.approvalHook = moveSource(t, 1, b)
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if len(fs.approvals) != 2 {
+		t.Fatalf("write attempts = %d, want 2", len(fs.approvals))
+	}
+	if string(fs.approvals[0].ContractSource) != string(milestonesJSON(t, a...)) {
+		t.Errorf("first attempt source = %s, want the snapshot list a", fs.approvals[0].ContractSource)
+	}
+	last := fs.approvals[1]
+	if string(last.ContractSource) != string(milestonesJSON(t, b...)) {
+		t.Fatalf("second attempt source = %s, want the moved list b", last.ContractSource)
+	}
+	assertStructuralContract(t, last.CompletionContract, b)
+}
+
+// Every attempt refused: the approve ends in ErrApprovalMilestonesMoved after exactly
+// approveMilestoneAttempts writes (bounded), never a 404.
+func TestSubmitApprovalMilestonesMovedExhaustion(t *testing.T) {
+	a := []Milestone{{ID: "a1", Title: "A"}}
+	b := []Milestone{{ID: "b1", Title: "B"}}
+	fs, svc, user, runID := interlockedApproveFixture(t, a)
+	fs.approvalHook = moveSource(t, 100, b, a)
+
+	_, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn})
+	if !errors.Is(err, ErrApprovalMilestonesMoved) {
+		t.Fatalf("err = %v, want ErrApprovalMilestonesMoved", err)
+	}
+	if len(fs.approvals) != approveMilestoneAttempts {
+		t.Fatalf("write attempts = %d, want %d", len(fs.approvals), approveMilestoneAttempts)
+	}
+}
+
+// A bound approve is never retried: its refusal is the gate-revision mismatch, one attempt.
+func TestSubmitApprovalBoundRefusalIsNotRetried(t *testing.T) {
+	fs, svc, user, runID := interlockedApproveFixture(t, []Milestone{{ID: "a1", Title: "A"}})
+	fs.runByID.GateRevision = 3
+	fs.approvalHook = moveSource(t, 1, []Milestone{{ID: "b1", Title: "B"}})
+	rev := int64(3)
+
+	_, err := svc.SubmitInputWithOptions(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn},
+		SubmitInputOptions{ExpectedGateRevision: &rev})
+	var mismatch *GateRevisionMismatchError
+	if !errors.As(err, &mismatch) {
+		t.Fatalf("err = %v, want *GateRevisionMismatchError", err)
+	}
+	if mismatch.Expected != 3 || mismatch.Current != 3 {
+		t.Errorf("mismatch = %+v, want Expected == Current == 3 (moved without a revision bump)", mismatch)
+	}
+	if len(fs.approvals) != 1 {
+		t.Fatalf("write attempts = %d, want 1", len(fs.approvals))
+	}
+}
+
+// After a refused unbound attempt the run is re-read: terminal, left the gate, or vanished each
+// get their own answer, and nothing further is written.
+func TestSubmitApprovalRetryRereadsRun(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(f *fakeStore)
+		want error
+	}{
+		{"terminal", func(f *fakeStore) { f.runByID.Status = "completed" }, ErrRunTerminal},
+		{"left the gate", func(f *fakeStore) { f.runByID.Status = "running" }, ErrApprovalMilestonesMoved},
+		{"vanished", func(f *fakeStore) { f.runByIDErr = pgx.ErrNoRows }, ErrRunNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, svc, user, runID := interlockedApproveFixture(t, []Milestone{{ID: "a1", Title: "A"}})
+			fs.approvalHook = func(f *fakeStore, _ int) error {
+				tc.mut(f)
+				return pgx.ErrNoRows
+			}
+			_, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if len(fs.approvals) != 1 {
+				t.Fatalf("write attempts = %d, want 1", len(fs.approvals))
+			}
+		})
+	}
+}
+
+// The re-read also runs on the LAST refused attempt: a run that vanished or finished there is
+// classified as such, never as source contention.
+func TestSubmitApprovalLastRefusalStillRereadsRun(t *testing.T) {
+	cases := []struct {
+		name string
+		mut  func(f *fakeStore)
+		want error
+	}{
+		{"terminal", func(f *fakeStore) { f.runByID.Status = "completed" }, ErrRunTerminal},
+		{"vanished", func(f *fakeStore) { f.runByIDErr = pgx.ErrNoRows }, ErrRunNotFound},
+	}
+	for _, tc := range cases {
+		t.Run(tc.name, func(t *testing.T) {
+			fs, svc, user, runID := interlockedApproveFixture(t, []Milestone{{ID: "a1", Title: "A"}})
+			move := moveSource(t, 100, []Milestone{{ID: "b1", Title: "B"}}, []Milestone{{ID: "a1", Title: "A"}})
+			fs.approvalHook = func(f *fakeStore, call int) error {
+				if call == approveMilestoneAttempts {
+					tc.mut(f)
+				}
+				return move(f, call)
+			}
+			_, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn})
+			if !errors.Is(err, tc.want) {
+				t.Fatalf("err = %v, want %v", err, tc.want)
+			}
+			if len(fs.approvals) != approveMilestoneAttempts {
+				t.Fatalf("write attempts = %d, want %d", len(fs.approvals), approveMilestoneAttempts)
+			}
+		})
+	}
+}
+
+// A legacy run passes no ContractSource (the predicate never binds) and an ErrNoRows is not
+// retried: it is the pre-#2680 answer.
+func TestSubmitApprovalLegacyRunPassesNoSourceAndIsNotRetried(t *testing.T) {
+	fs, svc, user, runID := interlockedApproveFixture(t, []Milestone{{ID: "a1", Title: "A"}})
+	fs.runByID.CompletionContractVersion = pgtype.Int4{}
+	fs.approvalHook = func(*fakeStore, int) error { return pgx.ErrNoRows }
+
+	_, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn})
+	if !errors.Is(err, ErrRunNotFound) {
+		t.Fatalf("err = %v, want the unbound fallback ErrRunNotFound", err)
+	}
+	if len(fs.approvals) != 1 || fs.approvals[0].ContractSource != nil {
+		t.Fatalf("attempts = %d, source = %s; want one attempt with a nil source", len(fs.approvals), fs.approvals[0].ContractSource)
+	}
+}
+
+// An interlocked run with NO source at the snapshot passes a nil ContractSource (meaning "saw
+// none"); the retry after a candidate appears builds the contract from it.
+func TestSubmitApprovalNilSourceRetriesWhenCandidateAppears(t *testing.T) {
+	fs, svc, user, runID := interlockedApproveFixture(t, nil)
+	fs.freezeSnapshot.MilestonesCandidate = nil
+	b := []Milestone{{ID: "b1", Title: "B"}}
+	fs.approvalHook = moveSource(t, 1, b)
+
+	if _, err := svc.SubmitInput(context.Background(), user, runID, "approve_plan", "", &AgentSelection{Source: AgentSourceOwn}); err != nil {
+		t.Fatalf("SubmitInput: %v", err)
+	}
+	if len(fs.approvals) != 2 || fs.approvals[0].ContractSource != nil {
+		t.Fatalf("attempts = %d, first source = %s; want 2 with a nil first source", len(fs.approvals), fs.approvals[0].ContractSource)
+	}
+	assertStructuralContract(t, fs.approvals[1].CompletionContract, b)
 }
 
 // -------------------------------------------------------------------------

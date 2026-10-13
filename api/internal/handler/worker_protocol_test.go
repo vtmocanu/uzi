@@ -198,8 +198,8 @@ func TestWorkerClaimRunLaneAcceptsSnapshotBody(t *testing.T) {
 
 func TestWorkerClaimDisabledApiRejectsSnapshotBody(t *testing.T) {
 	// PRD #1390 D7: an api started with UZI_ACTIVE_SNAPSHOT_DISABLED 400s a claim that still carries
-	// the field (the generic 400 that triggers the worker's strip-and-retry) — but an OLD bodyless
-	// claim on the same api still succeeds (never a lost claim).
+	// the field (a generic 400; the worker's claim call does not strip-and-retry, it claims again on
+	// its next poll) — but an OLD bodyless claim on the same api still succeeds (never a lost claim).
 	h := newProtocolHandler(t, &protocolStore{claimErr: pgx.ErrNoRows})
 	h.cfg = config.Config{ActiveSnapshotDisabled: true}
 
@@ -1020,7 +1020,7 @@ func TestAdminWorkerDTOIncludesStats(t *testing.T) {
 
 func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 	// Decision 5 is ENFORCED, not just prose: stats_ columns are display-only, so the
-	// ONLY queries that may name one are the HeartbeatWorker writer and the worker-list
+	// raw-telemetry uses are limited to HeartbeatWorker and the worker-list
 	// DTO reads. Every other query — in ANY queries file, not just runtime.sql — that
 	// literally references stats_ would be a claim/scheduling/sweeper path keying on
 	// attacker-reported telemetry, exactly what must never happen. Scanning the whole
@@ -1032,7 +1032,7 @@ func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 		"ListAllWorkers":    true, // DTO read (admin); same rationale
 		// PRD #837 M4 — stats_disk_pressure_streak shares the stats_ prefix, so its two extra
 		// touchers land here too: RegisterWorker RESETS it on a fresh incarnation, and
-		// ListHostedWorkersForController is the ONE lifecycle reader (its debounced,
+		// ListHostedWorkersForController is the poll lifecycle reader (its debounced,
 		// freshness-gated disk_pressure derivation), allow-listed exactly like
 		// ReapEphemeralWorkers is for online_since. Neither feeds claim/scheduling.
 		"RegisterWorker":                 true,
@@ -1053,6 +1053,11 @@ func TestNoStatsColumnsInSchedulingQueries(t *testing.T) {
 			if allowed[name] {
 				continue
 			}
+			// Drain-release lifecycle checks preserve the debounced pressure fence only;
+			// raw display telemetry remains forbidden, including in these queries.
+			if name == "UncordonHostedWorker" || name == "UncordonHostedWorkerImageRoll" || name == "UncordonHostedWorkerPressureRecycle" {
+				block = strings.ReplaceAll(block, "stats_disk_pressure_streak", "")
+			}
 			if strings.Contains(block, "stats_") {
 				t.Fatalf("query %s in %s references a stats_ column; stats_* are display-only (Decision 5) and may appear only in HeartbeatWorker or the worker-list DTO queries", name, filepath.Base(f))
 			}
@@ -1064,6 +1069,7 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 	// PRD #837 M1 — the new stats_disk_* columns inherit the same display-only invariant
 	// as the other stats_ columns: written by HeartbeatWorker, read only via the
 	// worker-list DTO SELECTs' w.* expansion, NEVER by a claim/scheduling/sweeper query.
+	// The debounced streak alone also protects independent fences during drain release.
 	// The broader TestNoStatsColumnsInSchedulingQueries already guards the stats_ prefix;
 	// this sibling pins the disk columns SPECIFICALLY so the invariant is self-documenting
 	// and so a future reader (e.g. M4's ListHostedWorkersForController poll derivation) is
@@ -1075,7 +1081,7 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 		// PRD #837 M4 landed the streak column + its lifecycle reader:
 		//   * RegisterWorker RESETS stats_disk_pressure_streak on a fresh pod incarnation (a
 		//     WRITE, so a prior incarnation's streak never carries forward).
-		//   * ListHostedWorkersForController is the ONE allowed lifecycle READER — its poll
+		//   * ListHostedWorkersForController is the poll lifecycle READER — its poll
 		//     derives disk_pressure from the debounced, freshness-gated streak, allow-listed
 		//     exactly like ReapEphemeralWorkers is for online_since. It never orders/prefers a
 		//     worker for claiming, so the display-only invariant holds.
@@ -1095,6 +1101,10 @@ func TestNoDiskStatsColumnsInSchedulingQueries(t *testing.T) {
 		blocks := strings.Split(string(raw), "-- name:")
 		for _, block := range blocks[1:] { // blocks[0] is the file preamble
 			name := strings.Fields(block)[0]
+			// The release checks may retain the debounced lifecycle fence, never raw disk stats.
+			if name == "UncordonHostedWorker" || name == "UncordonHostedWorkerImageRoll" || name == "UncordonHostedWorkerPressureRecycle" {
+				block = strings.ReplaceAll(block, "stats_disk_pressure_streak", "")
+			}
 			if !strings.Contains(block, "stats_disk_") {
 				continue
 			}
@@ -1273,6 +1283,44 @@ func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
 	}
 	if *got.ClaimGeneration != 7 {
 		t.Fatalf("claim_generation = %d, want 7 (= run.ClaimGeneration)", *got.ClaimGeneration)
+	}
+}
+
+func TestWorkerRunOwnershipPauseDisposition(t *testing.T) {
+	for _, tc := range []struct {
+		name     string
+		hold     string
+		released bool
+	}{{"ordinary", "", false}, {"wall", "budget_exhausted", true}, {"released", "", true}} {
+		t.Run(tc.name, func(t *testing.T) {
+			runID := uuid.New()
+			run := store.Run{ID: runID, Status: "paused", ClaimGeneration: 7}
+			if tc.hold != "" {
+				run.HoldReason = pgtype.Text{String: tc.hold, Valid: true}
+			}
+			if tc.released {
+				run.ClaimReleasedAt = pgtype.Timestamptz{Time: time.Now(), Valid: true}
+			}
+			h := newProtocolHandler(t, &protocolStore{ownedRun: run})
+			rec := httptest.NewRecorder()
+			h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
+			var got struct {
+				Status          string  `json:"status"`
+				ClaimGeneration int64   `json:"claim_generation"`
+				HoldReason      *string `json:"hold_reason"`
+				ClaimReleased   *bool   `json:"claim_released"`
+			}
+			if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+				t.Fatal(err)
+			}
+			if rec.Code != 200 || got.Status != "paused" || got.ClaimGeneration != 7 ||
+				got.ClaimReleased == nil || *got.ClaimReleased != tc.released {
+				t.Fatalf("ownership: %d %s", rec.Code, rec.Body.String())
+			}
+			if (got.HoldReason == nil) != (tc.hold == "") || (got.HoldReason != nil && *got.HoldReason != tc.hold) {
+				t.Fatalf("hold: %s", rec.Body.String())
+			}
+		})
 	}
 }
 

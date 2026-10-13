@@ -1,12 +1,15 @@
 package hostedsvc
 
 import (
+	"context"
 	"encoding/json"
 	"os"
 	"path/filepath"
 	"testing"
 	"time"
 
+	"github.com/jackc/pgx/v5/pgtype"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
@@ -29,8 +32,23 @@ const wireContractFixture = "testdata/controller_poll_wire.json"
 // token is an obvious non-credential so secret scanners never flag the fixture.
 func samplePollResponse() PollResponse {
 	token := "uzw_EXAMPLE-NOT-A-REAL-TOKEN" //nolint:gosec // G101: a deliberate non-credential fixture value (see the doc comment above), not a hardcoded secret.
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	owner := "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa"
+	nonce := "registration-nonce"
+	version := "0.11.7"
+	pod := "bbbbbbbb-bbbb-bbbb-bbbb-bbbbbbbbbbbb"
+	reason := "image_roll"
+	never, previously := true, false
+	livenessUntil := at.Add(60 * time.Second)
 	return PollResponse{Workers: []DesiredWorker{
 		{
+			RollEvidence: &RollEvidence{
+				NeverRegistered: &previously, Version: 1, OwnerID: owner, Registered: true,
+				SchedulingCapabilities: []string{"docker"}, ProtocolCapabilities: []string{"cross_check_v1", "cross_check_lane_v1"},
+				OrdinaryCoverage: false, CheckerCoverage: true, RegisteredVersion: &version,
+				RegisterNonce: &nonce, PodUID: &pod, HeartbeatAt: &at, EvaluatedAt: at, ValidUntil: at.Add(45 * time.Second),
+				LivenessValidUntil: &livenessUntil,
+			},
 			ID:         "11111111-1111-1111-1111-111111111111",
 			Template:   "base",
 			Size:       "s",
@@ -61,10 +79,12 @@ func samplePollResponse() PollResponse {
 			JoinToken:   &token,
 		},
 		{
-			ID:         "22222222-2222-2222-2222-222222222222",
-			Template:   "jvm",
-			Size:       "l",
-			Generation: 4,
+			RollEvidence:   &RollEvidence{NeverRegistered: &never, Version: 1, OwnerID: owner, SchedulingCapabilities: []string{}, ProtocolCapabilities: []string{}, EvaluatedAt: at, ValidUntil: at},
+			DrainingReason: &reason,
+			ID:             "22222222-2222-2222-2222-222222222222",
+			Template:       "jvm",
+			Size:           "l",
+			Generation:     4,
 			// docker false: #58's plain single-container worker in the restricted
 			// namespace — both docker states on one wire so a drop of the field is a
 			// red build on both sides.
@@ -127,6 +147,69 @@ func TestPollResponseWireContract(t *testing.T) {
 	}
 	if string(got) != string(want) {
 		t.Fatalf("poll response wire shape drifted from the golden file.\n got:\n%s\nwant:\n%s", got, want)
+	}
+}
+
+func TestPollLivenessIndependentOfPromotionProof(t *testing.T) {
+	at := time.Date(2026, 1, 2, 3, 4, 5, 0, time.UTC)
+	fresh := pgtype.Timestamptz{Time: at.Add(-15 * time.Second), Valid: true}
+	stale := pgtype.Timestamptz{Time: at.Add(-60 * time.Second), Valid: true}
+	for _, tc := range []struct {
+		name      string
+		status    string
+		heartbeat pgtype.Timestamptz
+		proof     pgtype.Timestamptz
+		wantLife  bool
+	}{
+		{"legacy_online", "online", fresh, pgtype.Timestamptz{}, true},
+		{"online_stale", "online", stale, pgtype.Timestamptz{}, false},
+		{"online_at_cutoff", "online", pgtype.Timestamptz{Time: at.Add(-45 * time.Second), Valid: true}, pgtype.Timestamptz{}, false},
+		{"online_without_heartbeat", "online", pgtype.Timestamptz{}, pgtype.Timestamptz{}, false},
+		{"offline_fresh", "offline", fresh, pgtype.Timestamptz{}, false},
+		{"fresh_liveness_stale_proof", "online", fresh, stale, true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newFakeStore()
+			f.workers = []store.ListHostedWorkersForControllerRow{{
+				Status: tc.status, LastHeartbeatAt: tc.heartbeat, RollHeartbeatAt: tc.proof,
+				SnapshotRegisterNonce: pgtype.Text{String: "current-registration", Valid: true},
+			}}
+			got, err := New(f, nil, func() time.Time { return at }, 45*time.Second).Poll(context.Background())
+			if err != nil {
+				t.Fatal(err)
+			}
+			e := got.Workers[0].RollEvidence
+			if !e.Registered || e.PodUID != nil || !e.EvaluatedAt.Equal(at) {
+				t.Fatalf("legacy registration changed: %+v", e)
+			}
+			if tc.wantLife {
+				if e.LivenessValidUntil == nil || !e.LivenessValidUntil.Equal(at.Add(30*time.Second)) {
+					t.Fatalf("fresh API liveness missing: %+v", e)
+				}
+			} else if e.LivenessValidUntil != nil {
+				t.Fatalf("unsupported/expired API liveness: %+v", e)
+			}
+			if tc.proof.Valid {
+				if e.HeartbeatAt == nil || !e.HeartbeatAt.Equal(at.Add(-60*time.Second)) ||
+					!e.ValidUntil.Equal(at.Add(-15*time.Second)) {
+					t.Fatalf("ordinary heartbeat refreshed promotion proof: %+v", e)
+				}
+			} else if e.HeartbeatAt != nil || !e.ValidUntil.Equal(at) {
+				t.Fatalf("ordinary heartbeat manufactured promotion proof: %+v", e)
+			}
+			raw, err := json.Marshal(e)
+			if err != nil {
+				t.Fatal(err)
+			}
+			var fields map[string]json.RawMessage
+			if err := json.Unmarshal(raw, &fields); err != nil {
+				t.Fatal(err)
+			}
+			life, present := fields["liveness_valid_until"]
+			if !present || (!tc.wantLife && string(life) != "null") {
+				t.Fatalf("liveness must be explicitly nullable on the wire: %s", raw)
+			}
+		})
 	}
 }
 

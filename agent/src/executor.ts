@@ -118,6 +118,15 @@ export interface RunContext {
   runId: string;
   /** Current server claim fence; required to consume a checked plan approval. */
   claimGeneration?: number;
+  /** Claim support assertion; absent means false. The runner separately gates root and phase. */
+  parkRunSupported?: boolean;
+  /** Request a park and await its authoritative outcome or a racing owner answer. */
+  requestParkRun?(pausedAt: { completedCount: number; total?: number }): Promise<
+    { kind: "paused" } | { kind: "answer"; answers: string[] } | { kind: "cancel" }
+  >;
+  /** Issue #2686: true once this run's claim is fenced (lost), so accounting-only side messages
+   *  (summary_usage) are suppressed. Absent = never fenced (stub/test executors). */
+  claimFenced?(): boolean;
   /** Run kind (PRD #6). "issue" (default when absent) works issueIid's card;
    *  "ci_fix" diagnoses + fixes `pipeline`. */
   kind?: RunKind;
@@ -344,6 +353,9 @@ export interface RunContext {
   signal?: AbortSignal;
   /** Stable terminal cancellation, independent of rearmed pause lifecycles. */
   terminalLifecycleSignal?: AbortSignal;
+  /** Worker-local evidence after successful terminal, stream settlement and turn cleanup.
+   * Async handlers must check live ownership before writing; handler failures propagate. */
+  onModelTurnSettled?(processedEvents: number): Promise<void>;
   /**
    * M4 plan gate. Called by the executor after the lead submits a plan: the
    * runner posts /state awaiting_approval with the plan and returns the user's
@@ -459,8 +471,13 @@ export interface RunContext {
    * (`could not report progress`) and swallowed — an informational field never fails a run
    * (#122 additive-optional). Absent on the stub/test executors, in which case the executor
    * still folds the value into `latestProgress` and the turn-boundary report carries it.
+   *
+   * PRD #2603: the optional `frozen` is the frozen milestone list the progress is over (the
+   * observer's own list, which is the gate's list or the claim's on a pre-approved resume). The
+   * runner hands it to the Now-summary controller, which needs the titles and the order; it does
+   * not change the report.
    */
-  reportProgress?(progress: MilestoneProgress): Promise<void>;
+  reportProgress?(progress: MilestoneProgress, frozen?: readonly Milestone[]): Promise<void>;
   /**
    * PRD #122 M6: durably checkpoint the run's committed work at a milestone boundary.
    * The executor calls it from the implement loop when a milestone completes.
@@ -490,6 +507,15 @@ export interface RunContext {
    * Absent on the stub/test executors (treated as `proceed`).
    */
   secretRemediationGate?(): Promise<SecretRemediationDecision>;
+  /** Advisory code gate at a finalizing done exit; permits one repair pass. `repairAvailable: false` means no
+   *  implementation iteration remains: the gate must not start a repair (findings stay unreported) and never
+   *  extends the iteration budget. Absent is treated as available. */
+  codeCrossCheckGate?(completion: { interlocked: boolean; reportOnly?: boolean; repairAvailable?: boolean; notCode?: boolean; confirmedEmptyPrompt?: boolean }): Promise<import("./code-cross-check-gate.js").CodeCrossCheckDecision>;
+  /** Lead registration: worker-owned identity/generation; available only during the single repair. */
+  codeCrossCheckRepairActive?(): boolean;
+  codeCrossCheckRepair?(): Promise<import("./code-cross-check-contract.js").CodeCrossCheckRecord | undefined>;
+  reportCrossCheckDispositions?(batch: import("./code-cross-check-contract.js").CodeCrossCheckDispositionBatch): Promise<import("./code-cross-check-contract.js").CodeCrossCheckStatus>;
+  codeCrossCheckSummary?(): Promise<import("./code-cross-check-gate.js").CodeCrossCheckSummary | undefined>;
   /**
    * PRD #1190 M2: park the run for an owner-requested pause. Called by the implement loop at
    * the server-decided pause boundary (`served.pauseRequested` at the loop top) and when a
@@ -708,6 +734,7 @@ export interface RunContext {
 }
 
 export interface ExecutorResult {
+  codeCrossCheckSummary?: import("./code-cross-check-gate.js").CodeCrossCheckSummary;
   /** The branch to report as completed. The runner pushes it + opens the MR. */
   branch: string;
   /** ci_fix only (PRD #6): "not_code" when the agent judged the failure NOT a code
@@ -781,6 +808,8 @@ export interface ExecutorResult {
    *  it on an MR-path completion only. It is never part of any persisted message.
    *  StubExecutor never sets it. */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
    *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
    *  latched from the LAST successful generation of this run. Absent whenever that pass did not

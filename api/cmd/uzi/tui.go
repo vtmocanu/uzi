@@ -473,8 +473,9 @@ type tuiModel struct {
 	// hand-off on exit. Assigned from Env in newTUICmd's RunE on the real path; left nil on
 	// the --demo / direct-construction test paths, where the update prompt never runs. Read
 	// nil-safely — a nil brew reports unknown ownership and never upgrades.
-	brew       func(foreground bool, args ...string) (string, error)
-	executable func() (string, error)
+	brew             func(foreground bool, args ...string) (string, error)
+	executable       func() (string, error)
+	installedVersion func(string) (string, error)
 
 	// store and serverURL back the update prompt's per-version "don't remind me" dismissal
 	// (PRD #1251 M1), threaded from newTUICmd's RunE like client/showVersion. store is the
@@ -671,12 +672,22 @@ func (m tuiModel) fetchRunsCmd(admin bool, reqID uint64) tea.Cmd {
 		// INSIDE the closure so the cancel fires when the poll returns, not immediately.
 		ctx, cancel := context.WithTimeout(parent, boardPollTimeout)
 		defer cancel()
-		var runs []apitypes.RunListItemDTO
+		// The board polls the compact summary view (issue #2661): it never reads the
+		// heavy detail fields, so the server omits them. Rows are converted back to
+		// RunListItemDTO so the board code keeps its types.
+		var sums []apitypes.RunSummaryItemDTO
 		var err error
 		if admin {
-			runs, err = c.AdminListRuns(ctx)
+			sums, err = c.AdminListRunSummaries(ctx)
 		} else {
-			runs, err = c.ListRuns(ctx)
+			sums, err = c.ListRunSummaries(ctx)
+		}
+		var runs []apitypes.RunListItemDTO
+		if sums != nil {
+			runs = make([]apitypes.RunListItemDTO, len(sums))
+			for i, s := range sums {
+				runs[i] = s.ListItem()
+			}
 		}
 		return boardRunsMsg{runs: runs, admin: admin, err: err, reqID: reqID}
 	}
@@ -911,11 +922,15 @@ func pollFallbackCmd(runID string, gen uint64) tea.Cmd {
 func (m tuiModel) Update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	next, cmd := m.update(msg)
 	n := next.(tuiModel)
+	n.reconcileAnswer()
 	return n.reconcileWorkers(cmd)
 }
 
 func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 	switch msg := msg.(type) {
+	case answerResultMsg:
+		cmd := m.applyAnswerResult(msg)
+		return m, cmd
 	case tea.WindowSizeMsg:
 		m.width, m.height = msg.Width, msg.Height
 		m.renderer, _ = newTUIRenderer(m.transcriptWidth(), m.dark)
@@ -1005,7 +1020,7 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 		return m, tea.Batch(tea.RequestBackgroundColor, themeTickCmd())
 
 	case skewTickMsg:
-		if m.quitting || m.updatePrompt.showing {
+		if m.quitting {
 			return m, skewTickCmd()
 		}
 		return m, tea.Batch(m.fetchBuildInfoCmd(), skewTickCmd())
@@ -1324,14 +1339,20 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			return m, nil
 		}
 		// The asynchronous owner probe resolves before channel selection and latching.
-		return m, (&m).maybeShowUpdatePrompt(msg.latest, msg.latestRC)
+		cmd := m.maybeShowUpdatePrompt(msg.latest, msg.latestRC)
+		return m, cmd
+
+	case installedVersionMsg:
+		cmd := m.applyInstalledVersion(msg)
+		return m, cmd
 
 	case brewInfoMsg:
 		// Resolve the owner first, then compare only the matching release channel.
 		m.updatePrompt.owner = msg.owner
 		m.updatePrompt.brewKnown = true
 		m.updatePrompt.brewPending = false
-		return m, (&m).maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC)
+		cmd := m.maybeShowUpdatePrompt(m.updatePrompt.latest, m.updatePrompt.latestRC)
+		return m, cmd
 
 	case detailRunMsg:
 		// Drop a load that resolved for a run the user has since navigated away from:
@@ -1396,7 +1417,8 @@ func (m tuiModel) update(msg tea.Msg) (tea.Model, tea.Cmd) {
 			}
 			return m, nil
 		case pageBackfill:
-			return m, (&m).applyBackfillPage(msg.msgs, msg.err)
+			cmd := (&m).applyBackfillPage(msg.msgs, msg.err)
+			return m, cmd
 		case pageCatchup:
 			if msg.reqID != m.detail.catchupWaitID {
 				return m, nil // a superseded / stale catch-up reply
@@ -1679,7 +1701,8 @@ func (m tuiModel) filtering() bool {
 	return (m.view == viewWorkers && m.workers.filtering) ||
 		(m.view == viewBoard && m.board.filtering) ||
 		(m.view == viewPulls && m.pulls.filtering) ||
-		(m.view == viewCI && m.ci.filtering)
+		(m.view == viewCI && m.ci.filtering) ||
+		(m.view == viewDetail && (m.detail.steer.mode == steerTyping || m.detail.answer.open))
 }
 
 func (m tuiModel) transcriptWidth() int {
@@ -1853,6 +1876,12 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// dismissal degrades to session-only.
 			m.brew = env.Brew
 			m.executable = env.Executable
+			if probe := env.InstalledCLI; probe != nil {
+				m.installedVersion = func(formula string) (string, error) {
+					cli, err := probe(formula)
+					return cli.Version, err
+				}
+			}
 			m.store = env.Store
 			if s, serr := resolveSettings(env, gf); serr == nil {
 				m.serverURL = s.URL
@@ -1867,7 +1896,7 @@ func newTUICmd(env Env, gf *globalFlags) *cobra.Command {
 			// than running brew in the background, so the from-source compile output and any failure
 			// are visible and the running process is not left stale. Run it in the foreground now.
 			if fm, ok := final.(tuiModel); ok && fm.updatePrompt.pendingUpgrade {
-				return runPendingUpgrade(env, fm.updatePrompt.upgradeArgv)
+				return runPendingUpgrade(env, fm.updatePrompt.upgradeArgv, fm.updatePrompt.offeredTarget)
 			}
 			return nil
 		},

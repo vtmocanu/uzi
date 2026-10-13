@@ -356,7 +356,9 @@ describe("RunRunner — settle transfers the clone-only head into the trusted ba
       const freshClient = new FakeRecoveryClient();
       const newCoord = coordOver(root, freshClient);
       await newCoord.resumePending();
-      assert.throws(() => gitRead(bare, "rev-parse", "--verify", pinRef));
+      // issue #2263: this bundle imports a forge-reachable prerequisite (selfContained false), so the
+      // archive alone does not prove the head and the transient pin is deliberately retained.
+      assert.equal(gitRead(bare, "rev-parse", "--verify", pinRef), before[0]!.sourceSha);
       assert.equal(fs.existsSync(before[0]!.bundlePath!), false);
       assert.equal(freshClient.uploadCalls.length, 1, "the journaled bundle bytes were re-uploaded");
       const after = await newCoord.inspect(claim.run_id);

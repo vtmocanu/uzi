@@ -65,10 +65,8 @@ SELECT (EXISTS (
  WHERE cc.checker_run_id= @id AND cc.lead_claim_generation=lead.claim_generation
  AND lead.id=checker.target_run_id AND lead.user_id=checker.user_id
  AND lead.kind <> 'cross_check'
- AND lead.claim_released_at IS NULL AND lead.status IN ('claimed','running')
- AND cc.stage='plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage)
-      AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1))
- AND cc.verdict='pending' AND cc.deadline_at>now()
+ AND lead.claim_released_at IS NULL AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
+ AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND cc.deadline_at>now()
 ))::boolean;
 
 -- name: ParkWorkerMemoryPressure :one
@@ -117,10 +115,9 @@ WITH candidates AS MATERIALIZED (
     CROSS JOIN parent_lock_set locks
     WHERE cc.checker_run_id IN (SELECT id FROM candidates WHERE kind = 'cross_check')
       AND cc.lead_run_id = ANY(locks.ids)
-      AND cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage)
-      AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending'
+      AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL))
       AND cc.deadline_at > now()
-      AND lead.status IN ('claimed', 'running')
+      AND (lead.status IN ('claimed', 'running') OR (cc.stage = 'code' AND lead.status = 'awaiting_followup' AND lead.kind = 'task' AND lead.interactive))
       AND lead.claim_released_at IS NULL
       AND lead.claim_generation = cc.lead_claim_generation
     ORDER BY cc.lead_run_id

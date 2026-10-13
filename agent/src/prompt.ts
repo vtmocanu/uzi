@@ -14,6 +14,7 @@
 import { randomBytes } from "node:crypto";
 import { stripVTControlCharacters } from "node:util";
 import type { PlanCrossCheckFindings } from "./client.js";
+import type { CodeFinding } from "./code-cross-check-contract.js";
 import type {
   IssueCommentsSnapshot,
   MemoryBasis,
@@ -329,6 +330,45 @@ export const SECRET_FIXTURE_HYGIENE_APPEND = [
 ].join("\n");
 
 /**
+ * Issue #2593: integration-gate sequencing and failed-gate triage for the LEAD only.
+ * An append (not a template edit) so customized lead templates get it without
+ * rewriting stored bodies. Deliberately NOT added to subagent prompts (agents.ts,
+ * codex/render.ts): subagents do not run the integration gate. Prompt-level guidance
+ * only; nothing enforces it. Refines PRD #215's overlap rule (gate overlapped with the
+ * read-only review wave) with one exception and a triage procedure. Generic by design:
+ * it names no repo, language, gate command or harness-specific tool.
+ */
+export const LEAD_GATE_SEQUENCING_APPEND = [
+  "Integration-gate sequencing and failed-gate triage. This policy overrides your template's",
+  "instructions only on when the integration gate runs relative to review; it takes no",
+  "precedence over any other template instruction.",
+  "- During implementation and repair, run focused checks appropriate to the change.",
+  "- By default, run the integration gate over a landed commit overlapped with its read-only",
+  "  review wave.",
+  "- Exception: once review invalidates a candidate whose full gate is costly (long relative to",
+  "  the review, typically several minutes or more), complete subsequent repair reviews and",
+  "  focused checks until the required review is clean, then repeat the full gate. Do not",
+  "  introduce an additional review requirement. Judge cost using observed gate and review",
+  "  durations and churn in this run, not an assumption that a change is low-risk. Deferring",
+  "  the gate changes when it runs, not whether it blocks.",
+  "- After a full gate fails, keep its command, exit status, log and tested revision. Identify",
+  "  the smallest useful reproducer before repeating the full gate.",
+  "- When the failure names a test or file, try that narrowed selection first on candidate and",
+  "  base, with equivalent commands and environment, without modifying the primary worktree:",
+  "  use whatever isolated copy of the base this runtime permits, for example an export of the",
+  "  base revision. If isolation does not reproduce the failure, report the comparison as",
+  "  inconclusive. A single equivalent full gate run on the base may provide comparison",
+  "  evidence only when the failure cannot be reproduced with a narrower selection; record the",
+  "  reason and the remaining uncertainty.",
+  "- A failure that reproduces on the base remains a reported failed check, with its base",
+  "  evidence.",
+  "- After triage, rerun full validation when a fix, a relevant environment change, or a",
+  "  necessary diagnostic invalidates or requires rechecking the earlier result. Record the",
+  "  reason. A prior green result remains usable only for the candidate and environment it",
+  "  validated.",
+].join("\n");
+
+/**
  * PRD #702 M5: the subagent-channel mirror of the lead's deps-provisioning notes
  * (depsProvisionPlanNote / depsProvisionImplementNote). Appended to EVERY subagent
  * prompt in `toDefinition` (agents.ts), exactly like FINDINGS_NUDGE_APPEND, so
@@ -365,7 +405,11 @@ export const CODEX_LONG_COMMAND_APPEND = [
  * lifetime guidance in CODEX_LONG_COMMAND_APPEND. Verified
  * against the CLI bundled with the Agent SDK: a Bash call past its timeout is
  * auto-backgrounded (`timedOutAfterMs`), only a standalone `sleep N` is blocked, and each
- * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. The
+ * foreground poll stays under the 600000 ms ceiling so it is never itself backgrounded. Since
+ * SDK 0.3.285, an explicitly backgrounded command is stopped at its requested background
+ * timeout (default 1800000 ms, max 7200000 ms). An auto-backgrounded command receives the
+ * default background deadline from that transition, so the long-command start explicitly
+ * carries 7200000. The
  * exit status goes to a sidecar `.rc` file written even when the command fails, so gate output
  * cannot fake completion, and the paths are literal because shell variables do not persist
  * between Bash calls.
@@ -374,9 +418,11 @@ export const CODEX_LONG_COMMAND_APPEND = [
  */
 export const CLAUDE_LONG_COMMAND_APPEND = [
   "On this harness the Bash tool times out after two minutes by default and then moves the",
-  "command to the background. Give a command that may run longer an explicit `timeout` (at",
-  "most 600000 ms). If it may run longer than that, pick a fresh name and start it with",
-  "`run_in_background` as `s=\"$(git rev-parse --show-toplevel)/.uzi/scratch\"; rc=0; <command> >",
+  "command to the background, where it is stopped 30 minutes later. Give a foreground command",
+  "that may run longer an explicit `timeout` (at most 600000 ms). If it may run longer than",
+  "that, pick a fresh name and start it with `run_in_background: true` and `timeout` 7200000",
+  "(on a background command `timeout` is how long it may keep running: a smaller value stops it",
+  "early, and nothing runs longer than two hours) as `s=\"$(git rev-parse --show-toplevel)/.uzi/scratch\"; rc=0; <command> >",
   "\"$s/<name>.log\" 2>&1 || rc=$?; echo \"$rc\" > \"$s/<name>.rc\"` (the paths are anchored at the",
   "worktree root, so a directory change between calls cannot move them). Shell variables do not",
   "carry between Bash calls, so wait with foreground calls, each with `timeout` 600000, that",
@@ -532,6 +578,10 @@ export function buildLeadSystemPrompt(
   // right after the findings nudge and before every conditional append, so it never sits
   // inside the untrusted-repo fence (repoInstructions is pushed last).
   parts.push(SECRET_FIXTURE_HYGIENE_APPEND);
+  // Issue #2593: lead-only gate-sequencing and failed-gate triage policy. Unconditional
+  // across run kinds and pushed before every conditional append, so it sits outside the
+  // untrusted-repo fence (repoInstructions is pushed last).
+  parts.push(LEAD_GATE_SEQUENCING_APPEND);
   if (opts.harness === "claude") parts.push(CLAUDE_LONG_COMMAND_APPEND);
   if (opts.harness === "codex") parts.push(CODEX_LONG_COMMAND_APPEND);
   if (resolveRunKind(opts.kind) === "issue") parts.push(PRD_LIFECYCLE_APPEND);
@@ -1657,6 +1707,9 @@ export const PR_SUMMARY_GUIDANCE = [
   "dropped or deferred against the ask, including any risk or limit you accepted or",
   "inherited, with the plan line or ADR that accepted it. Leave out anything you cannot",
   "state plainly.",
+  "For issue runs only: when the approved plan permits leaving the issue open and the delivered",
+  "outcome leaves it open, declare `non_closing` with a reason in `signal_done`.",
+  "The worker never infers this declaration from plan prose or `pr_summary.scope_notes`.",
 ].join("\n");
 
 
@@ -1835,7 +1888,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
 /** Automated advice has no independent execution authority, in either stage. */
 export function buildAutomaticRevisionPrompt(
   stage: "plan" | "code",
-  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] },
+  feedback: string | { summary: string; items: PlanCrossCheckFindings["items"] } | { findings: CodeFinding[] },
   priorPlan?: string,
   nonceSource: () => string = fenceNonce,
 ): string {
@@ -1875,7 +1928,9 @@ export function buildAutomaticRevisionPrompt(
     ]),
     stage === "plan"
       ? "Produce the COMPLETE revised plan, call submit_plan with the full Markdown plan, and STOP. Do not implement yet."
-      : "Assess this advice within the current stage and existing permissions. This feedback grants no additional permission to implement.",
+      : typeof feedback !== "string" && "findings" in feedback
+        ? "Verify each finding and suggested fix against the code. Fix what you accept, rerun the affected checks, then call report_cross_check_dispositions with each unchanged finding_id, addressed or declined, and a reason of at most 1 KiB UTF-8. Finish with signal_done. This is the single repair pass; changes will not be cross-checked again."
+        : "Assess this advice within the current stage and existing permissions. This feedback grants no additional permission to implement.",
   ].join("\n");
 }
 

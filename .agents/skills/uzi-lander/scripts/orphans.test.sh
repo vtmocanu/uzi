@@ -124,6 +124,18 @@ rc=0; bash "$HERE/claims.sh" claim run-x-1 > "$WORK/rk.out" 2>&1 || rc=$?
 seed '#20' unverified unknown-host-1 20 "$stale"
 bash "$HERE/claims.sh" claim '#20' > "$WORK/pk.out" 2>&1 || fail "#PR key: TTL takeover refused: $(cat "$WORK/pk.out")"
 
+# claims.sh release says whether it removed anything: an absent key is "(absent)", never a bare
+# RELEASED that reads as if a live claim had just been dropped.
+rm -f "$CL"/*.json
+seed run-r-present other uuid-other
+out=$(bash "$HERE/claims.sh" release run-r-present) || fail "release present: exit $?"
+[ "$out" = "RELEASED=run-r-present" ] || fail "release present: printed '$out'"
+[ ! -e "$CL/run-r-present.json" ] || fail "release present: claim file kept"
+out=$(bash "$HERE/claims.sh" release run-r-present) || fail "release absent: exit $?"
+[ "$out" = "RELEASED=run-r-present (absent)" ] || fail "release absent: printed '$out'"
+out=$(bash "$HERE/claims.sh" release run-r-present --purge) || fail "release absent --purge: exit $?"
+[ "$out" = "RELEASED=run-r-present (absent) (trail purged)" ] || fail "release absent --purge: printed '$out'"
+
 # claims.sh reap: a finished run key goes, a live or unreadable one stays.
 rm -f "$CL"/*.json
 seed run-g-done other uuid-other

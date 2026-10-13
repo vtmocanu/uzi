@@ -84,6 +84,7 @@ see [Named contexts](#named-contexts) below.
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
 uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
+uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--agent-source own|repo] [--exclude-agents a,b]
@@ -110,6 +111,8 @@ uzi run export <id> --output <path> [--capture <id>]
 uzi run fetches <id> [--json]
 uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
+uzi run held <id> [--json]
+uzi run held expire <id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -171,15 +174,23 @@ uzi version
 Global flags: `--json`, `--url <url>`, `--quiet`, `--no-color`,
 `--context <name>`/`-c <name>`.
 
+Cost is a recorded **API-equivalent** comparison, not a bill: Claude uses
+its SDK figure and Codex uzi's pinned Standard table for either auth mode.
+Subscription users may consume purchased credits. `uzi run get` marks
+priced cost API-equivalent; legacy `subscription` reads `no estimate`,
+unreported reads `cost unavailable`, and neither shows per-run dollars even
+when a partial cost is stored. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+
 A few worth knowing:
 
 - **`uzi admin usage --window lifetime|last_7_days` selects the human report's
   window (default `lifetime`).** The factory summary and per-user rows use
-  the same window for usage-bearing runs, tokens, metered cost, outcomes and
+  the same window for usage-bearing runs, tokens, API-equivalent cost, outcomes and
   recoverable failures. Failure rate is failed runs divided by finished runs,
   including runs without usage; `RUNS` counts runs with usage. Cost shows
-  `$0.00` for metered zero and discloses subscription/unreported run counts
-  whose costs are excluded. Recoverable work may already have been landed.
+  `$0.00` for metered zero and discloses runs without a cost estimate and
+  unreported runs. Incomplete totals include recorded partial costs.
+  Recoverable work may already have been landed.
   `--json` returns the complete API response with both windows and additive
   per-user seven-day fields; the flag selects only the human report. Invalid
   window values are rejected before a request, including with `--json`.
@@ -329,18 +340,24 @@ A few worth knowing:
   of a kind the sweep can time out (issue, task, prompt, self-improve,
   mr-rework, ci-fix), including a queued or parked one — a chat, judge, or
   interactive-task run never times out, so extending one is a 409 (exit 5).
-  Extending past the admin's per-run allowance, or while an admin has
-  turned extending off entirely, is also a 409, with the server's message
-  (naming the remaining allowance) printed verbatim. On success it prints
-  the new deadline and the running total against the allowance, e.g.
-  `Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this
-  run: 2h of 16h allowed.` Owner-only.
+  `--by` is limited per request by the admin's maximum per extension
+  (default 16h), not per run: you may extend the same run repeatedly, and
+  each extension is an audited action. A request above that maximum, a
+  request past the run's technical total limit (see [How much time a run
+  can have in total](./run-health.md#how-much-time-a-run-can-have-in-total)),
+  or an extend while an admin has turned extending off entirely, is a 409
+  (exit 5) with the server's message printed verbatim (for example `+20h is
+  more than the 16h maximum per extension`). On success it prints the new
+  deadline and the run's total extension, e.g. `Extended <id> by 2h. 3h05m
+  left, times out 17:20. Extensions on this run: 18h total (up to 16h per
+  extension).` Owner-only.
 - **`run pause <id> [--now|--cancel]`** (PRD #1190) parks a running run on a
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
   milestone (or turn) already in flight, pushes a checkpoint, then parks;
-  `--now` drops the turn in flight and parks on the last checkpoint instead,
-  discarding whatever changed since; `--cancel` withdraws a pending request
+  `--now` interrupts the turn and attempts to checkpoint current work before
+  parking; preservation can fail or publish an older checkpoint (see the
+  activity feed). `--cancel` withdraws a pending request
   and leaves the run running. `--now` and `--cancel` are mutually exclusive.
   None of the three is synchronous — the park lands on the worker's next
   report, so watch `uzi run get <id>`. Owner-only, and valid only on a
@@ -348,7 +365,8 @@ A few worth knowing:
   run already parks between turns, an interactive task parks after every
   turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
-  naming the reason.
+  naming the reason. This existing command is also the compatibility path
+  when dependency parking requires an API or worker upgrade.
 - **`run resume <id>`** resumes a run the owner paused: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
   remaining budget (the clock stopped while paused, so resuming does not
@@ -391,6 +409,20 @@ A few worth knowing:
   past is rejected rather than applied to the current one, and calling it
   against a run that isn't currently parked fails outright instead of
   queuing.
+  During approved, non-interactive issue implementation, use
+  `uzi run answer <id> --message /park` to request a dependency pause.
+  After validation and consumption, trimmed non-empty answers must each be
+  exactly `/park`; a mixed batch is ordinary guidance to the lead.
+  With API and worker support, prose lets the lead continue actionable work
+  or call its lead-only `park_run` tool when no actionable work remains.
+  Planning, subagents, interactive runs and other run kinds are excluded.
+  Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
+  A failed publication instead asks a worker question in `awaiting_input`
+  (wall wait banked, slot held), with no provider turn or park retry until
+  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  An unattended run needing that decision stops with a trusted refusal.
+  See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
+  for compatibility, checkpoint and retention limits.
   **The CLI's derivation is narrower than the web's**: it always answers the
   *newest* question message in the feed, where the web additionally checks
   whether a newer `answer` has already closed it. That gap is real for one
@@ -518,9 +550,16 @@ A few worth knowing:
   ahead of them were skipped (it no longer suggests raising `--max-issues`:
   the fix is to clear those skips, and a higher cap also raises how many runs
   one fire can start). A label sweep also prints how many open issues
-  match its selector but aren't eligible (`ineligible_matched`), when known;
-  a never-fired schedule reads `Last fire: never fired`, and `--json` carries
-  the same detail under `.last_fire` (including `.last_fire.ineligible_matched`
+  match its selector but aren't eligible (`ineligible_matched`), when known.
+  After it, a **Recent fires** block lists the schedule's
+  last 10 scheduled fires that started or skipped something, newest first
+  (nothing is printed when there are none): each entry is a summary line
+  (`<RFC 3339 UTC stamp> · started N · skipped M`), then one line per started
+  issue (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt
+  schedule), then one line per skipped issue with its human reason label and
+  title.
+  A never-fired schedule reads `Last fire: never fired`, and `--json` carries
+  the same detail under `.last_fire` and the list under `.recent_fires` (including `.last_fire.ineligible_matched`
   when present — absent means unknown, not zero). `run-now` prints the
   matching per-candidate breakdown inline — a `Started N run(s)` header with
   the created run id(s), a line per started run, then an `Examined N
@@ -668,6 +707,92 @@ A few worth knowing:
   carries optional guidance (or pipe it on stdin); an empty guidance is a valid
   trigger as long as there is a new review comment. It prints the created `mr_rework`
   run; `--json` emits the `{"run": ...}` envelope, like `run create`.
+- **`run plan <run-id>` prints the latest plan Markdown verbatim.** It
+  appends no newline and does no terminal rendering or sanitation, even on a
+  TTY. `--version N` selects the Nth `plan` message in ascending `seq`
+  order, starting at 1. An integer outside `1..K` is a usage error
+  (`ExitUsage`, exit 2): `run has K plan version(s)`. A run with no plan
+  is not found (`ExitNotFound`, exit 4): `run has no plan`.
+  These version numbers count feed plans; they are not the approval
+  `gate_revision`. This read-only command changes no gate decisions; use
+  `--expected-gate-revision` on a verdict as described above.
+
+  **`--diff` compares a feedback revision with its immediate predecessor.**
+  For selected plan P, only the immediately preceding plan Q can be the
+  base, and at least one `plan_feedback` F must satisfy
+  `Q.seq < F.seq < P.seq`. Human and automatic feedback both qualify.
+  There is no backtracking to an older plan: a re-presentation without
+  intervening feedback has no base. Pending feedback after P creates no
+  new base and does not change an existing one. After two feedback rounds,
+  v3 compares with v2, not v1; selecting an earlier version uses only that
+  version's adjacent feedback interval.
+
+  The unified text diff has `--- vB` / `+++ vN` headers and
+  `@@ -start,count +start,count @@` hunks with up to three context lines
+  on each side. Comparison normalizes only trailing CR/LF characters;
+  meaningful spaces and interior text (including interior CR) are preserved.
+
+  - No base: stdout is the original plan, stderr says
+    `no revision base (no feedback preceded this version)`, exit 0.
+  - Identical after stripping trailing CR/LF: stdout is an empty diff,
+    stderr says
+    `This revision is identical to v{B}. Your requested changes were not applied.`,
+    exit 0.
+  - Either original side exceeds `200 * 1024` UTF-8 bytes: `--diff`
+    returns `ExitUsage` (exit 2), with empty stdout and
+    `plan too large to compare (limit 200 KiB)` through the standard CLI
+    error report on stderr. This cap also applies without a base;
+    without `--diff`, oversized plans print normally.
+
+  **`--json` emits one object** with `version`, `base_version` (number
+  or `null`), `plan_md`, `diff` (string or `null`) and
+  `identical_after_feedback` (boolean). `plan_md` preserves the original
+  Markdown string. Base and identical status are derived even without
+  `--diff`; `diff` is `null` unless `--diff` has a base, and `""`
+  for an identical comparison. With `--json --diff` and no base, stdout
+  contains only the object with `diff: null`; the no-base note remains
+  on stderr. Comparison notes and warnings never enter JSON stdout.
+
+  For a run `r` whose v1 is `alpha\nold\nomega\n`, followed by feedback
+  and v2 `alpha\nnew\nomega\n`:
+
+  ```sh
+  uzi run plan r                 # latest (v2)
+  uzi run plan r --version 1     # original (v1)
+  ```
+
+  Latest stdout (the stored string ends with a newline):
+
+  ```text
+  alpha
+  new
+  omega
+  ```
+
+  `uzi run plan r --version 2 --diff` prints:
+
+  ```diff
+  --- v1
+  +++ v2
+  @@ -1,3 +1,3 @@
+   alpha
+  -old
+  +new
+   omega
+  ```
+
+  `uzi run plan r --version 2 --diff --json` prints:
+
+  ```json
+  {"version":2,"base_version":1,"plan_md":"alpha\nnew\nomega\n","diff":"--- v1\n+++ v2\n@@ -1,3 +1,3 @@\n alpha\n-old\n+new\n omega\n","identical_after_feedback":false}
+  ```
+
+  In the web plan panel, **Show changes since vB** starts collapsed and
+  reveals line changes with added/removed counts. It uses the same feedback
+  base rule, but comparison is offered only when the newest feed plan text
+  exactly matches the displayed `run.plan_md`. Either side over 200 KiB
+  shows **Plan too large to compare**; an identical revision shows the
+  warning even while changes are collapsed.
 - **A message's content is under `payload`, not `body` or `content`.** Each
   `--json` line carries the text under `payload` (raw per-kind JSON); there is no
   `body`/`content` field, so reading either returns empty — indistinguishable from
@@ -805,7 +930,7 @@ A few worth knowing:
   bot's numeric forge user id) whose MR review comments the
   [MR rework](./mr-review-watcher.md#trusted-review-bots) lane may ingest although
   they are not repo collaborators. It is **read-only by design**: edit the list
-  from Admin Settings in the web UI or through the cookie-only
+  from **Admin → Instance → Trusted review bots** in the web UI or through the cookie-only
   `PUT /api/admin/settings`. The table has `BASE URL`, `FORGE USER ID` and
   `STATUS` (`ok`, or `malformed` when the entry is not parseable as
   `<url>#<id>`; the CLI is lenient, so an entry the server skips can still show
@@ -1080,6 +1205,80 @@ uzi run discard <run-id> --hold <hold-id> --yes
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
 
+### Fetching and expiring a failed run's held ref: `uzi run held`
+
+When a run ends `failed`, uzi first tries to publish its held work to your forge as
+`refs/uzi-held/<run-id>/<generation>` and release the worker's custody against that ref;
+the recovery archive above is the fallback. See
+[Publishing a failed run's held work](./run-recovery.md#publishing-a-failed-runs-held-work)
+for what is eligible, what is published, and when it falls back. Both commands are
+owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
+
+```
+uzi run held <run-id> [--json]
+```
+
+- **One row per publication, newest generation first.** Columns are `GEN`, `STATE`, `REF`,
+  `TIP` (short) and `EXPIRES` (UTC, RFC 3339; `-` when none is set). The states are
+  `prepared`, `invoked`, `created`, `create_unknown`, `refused`, `acknowledged`,
+  `delete_unknown`, `deleted` and `abandoned`. Below the table, a publication's `LastError`
+  prints as `gen <n>: <text>` and its refusal as `gen <n>: reason <code>`. When a ref may
+  still be on the forge (`acknowledged`, `created` or `delete_unknown`), it also prints
+  ``fetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire <run-id>` ``.
+- **No publication.** Prints `run <run-id> has no held publications` (nothing under
+  `--quiet`). That is also the answer for a run that was cancelled, parked, or failed on
+  an excluded origin, or whose work fell back to the archive before anything was sent to the forge. A refused
+  create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
+- **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
+  `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
+  `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty
+  result is `[]`, never `null`.
+- **Fetch it before it expires.** A ref is kept for `UZI_RECOVERY_READY_RETENTION` after its
+  release is acknowledged. Name a local branch so the commit stays reachable once the ref
+  is deleted:
+
+```
+git fetch origin refs/uzi-held/<run-id>/<generation>:refs/heads/recovered/<run-id>
+```
+
+`uzi run recovery <run-id>` also prints `hold <hold-id> held: <ref> @ <12-char tip>` for a
+hold that was released against a held publication (`held_ref` on the hold with `--json`).
+The run page shows the same refs in its **Held work** panel.
+
+```
+uzi run held expire <run-id> [--yes]
+```
+
+- **Ends the retention early.** It makes every **acknowledged** publication of the run due
+  for deletion now; the server's cleanup deletes each ref shortly after. The command deletes
+  nothing itself, and a publication that is not acknowledged is never touched.
+- **Destructive, so it confirms.** Once the ref is deleted, the work survives only in a
+  clone you fetched it into. Without `--yes` it prompts `[y/N]` on stderr (a bare Enter
+  aborts, printing `aborted` unless `--quiet`); with stdin not a terminal and no `--yes` it
+  refuses with exit 2 and changes nothing.
+- **Result.** `N held publication(s) of run <run-id> are due for deletion; the server deletes
+  each ref shortly`, or `run <run-id> has no acknowledged held publication to expire` when
+  there was nothing to do. `--json` prints the endpoint's object (`expired`, and the
+  affected `publications`).
+
+Held-ref cleanup does not depend on `UZI_HELD_PUBLICATION`: with the feature switched off,
+refs already published are still deleted at their expiry, and `uzi run held expire` still
+works.
+
+While a held ref may still exist, removing its repo or its forge connection is refused with a
+409. The error text (`connection` in place of `repo` for a connection removal) reads:
+
+```
+this repo has N held-work publication(s) of failed runs still on the forge (<ref> (<state>); ...);
+acknowledged refs clear at their retention expiry (or sooner with `uzi run held expire <run-id>`);
+refs in any other state (being created, reconciled or deleted) settle against the forge first; a
+ref that is then acknowledged follows the retention rule. Remove the repo after the block lifts
+```
+
+The body also carries `held_refs` (**at most 5** refs, each named with its state in the error
+text; any further ones are only counted, as `and N more`) and `held_count` (the true total).
+Retry the removal once the refs are deleted or settled.
+
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 
 Salvage is **off by default**. An operator turns it on per forge with
@@ -1307,10 +1506,11 @@ also the TUI's own fallback when the live channel is unreachable (below).
 ### Startup: an available update
 
 At startup, `uzi tui` checks for a newer release in the running CLI's channel
-and, if one exists, shows a modal on top of the board. A stable
-`uzi-cli` install checks stable releases; an `uzi-cli-rc` install checks the newer
-of the latest stable and latest release candidate, while staying on its opt-in
-formula. A stable install looks like this:
+and, when an upgrade is still needed, shows a modal on top of the board. If the
+formula-owned installed CLI already meets the offered release, it shows a restart
+hint instead. A stable `uzi-cli` install checks stable releases; an `uzi-cli-rc`
+install checks the newer of the latest stable and latest release candidate, while
+staying on its opt-in formula. A stable install needing an upgrade looks like this:
 
 ```
 ▲ Update available
@@ -1318,18 +1518,28 @@ uzi 0.83.0  →  0.85.0
 
 A newer release is available.
 
-▸ Update now  (brew upgrade uzi-cli)
+▸ Update now  (brew upgrade vtmocanu/tap/uzi-cli)
   Not now
   Don't remind me for 0.85.0
 ```
 
 - **A Homebrew install** gets the "Update now" action for the formula that owns
-  the running binary: `brew upgrade uzi-cli` for stable or
-  `brew upgrade uzi-cli-rc` for the RC channel, even when it currently runs a stable
-  version. Choosing it exits the TUI and runs the command in the foreground, so the source-build output and any failure stay
-  visible, then tells you to rerun
-  `uzi tui`. It never upgrades silently in the background while the TUI keeps
-  running. For an eligible **stamped** binary whose formula ownership cannot be
+  the running binary: `brew upgrade vtmocanu/tap/uzi-cli` for stable or
+  `brew upgrade vtmocanu/tap/uzi-cli-rc` for the RC channel, even when it currently
+  runs a stable version. These tap-qualified targets select uzi's stable and opt-in
+  RC formulae. Choosing it exits the TUI and runs Homebrew in the foreground, so
+  the source-build output and any failure stay visible. It does not force a tap
+  refresh: Homebrew inherits `HOMEBREW_AUTO_UPDATE_SECS` and
+  `HOMEBREW_NO_AUTO_UPDATE` from your environment. A zero exit from Homebrew is
+  not yet success: uzi verifies that the formula-owned installed CLI is at least
+  the offered version. If it is older, the command exits nonzero with
+  `Installed CLI is vY; requested vX was not reached. Try again later.`
+  (`vY` is installed; `vX` was offered). Verification errors also exit nonzero.
+  On verified success it restarts the TUI on the new version, running the
+  verified formula-owned binary with your original arguments (`--context` and
+  the rest). If that restart fails, the command exits nonzero saying the update
+  succeeded; run `uzi tui` yourself.
+  For an eligible **stamped** binary whose formula ownership cannot be
   proven, including a manually built binary, the prompt shows release notes
   without an upgrade action. It uses the binary's stamped `-rc.N` suffix to
   choose the information channel.
@@ -1346,6 +1556,15 @@ A newer release is available.
   later release re-prompts anyway); **"Not now"** (or `esc`) just closes the
   modal for this session, with nothing persisted, and it shows at most once
   per `uzi tui` invocation either way.
+- **An update installed outside the TUI** is detected after ownership is resolved,
+  on each successful five-minute build-info poll while a newer release is offered.
+  The local check runs even with the modal open, after "Not now", or for a dismissed
+  version; the existing modal gates still apply. If the formula-owned installed CLI
+  already meets or exceeds the offer, the modal closes and the footer shows the
+  actual version: `v<installed> installed, restart uzi to use it` (a narrow terminal
+  may shorten the hint). The running process keeps its old version until you restart
+  uzi yourself. Unknown ownership remains notes-only and runs no installed-CLI subprocess;
+  `UZI_VERSION_CHECK=0` and `--quiet` suppress these checks too.
 - **This is a third axis**, distinct from `version`'s own `update … available`
   row and from the CLI-vs-server skew banner above: it compares this CLI
   binary against the latest *published* release, not the CLI against the
@@ -1379,8 +1598,9 @@ A newer release is available.
   activity docs](./run-activity.md#milestones-and-the-now-line) describe for
   web and CLI. On your own board only, a right-aligned **COST** cell follows the micro-bar: `$N` in
   whole dollars (no cents, to keep the column width stable), `<$1` for a
-  real sub-dollar cost, `—` for a subscription-auth run the SDK prices at
-  $0, and a blank cell for a run with no recorded usage; it too is hidden on
+  real sub-dollar cost, `$0` for metered zero, `n/a` for a legacy
+  `subscription` or unreported run, and a blank cell for no recorded usage;
+  it too is hidden on
   a narrow terminal, dropping right after the micro-bar does so the title is
   never squeezed. `[h]` hides finished runs (completed/failed/cancelled),
   leaving the active and needs-you runs. The rows are grouped into three
@@ -1397,7 +1617,8 @@ A newer release is available.
   board, `$N 7d` is the rounded `Last7Days.CostUSD` from the server's
   `GET /api/usage` response, covering the last seven days even when runs
   are outside the visible list window. A `+` after the dollar amount means
-  subscription or unreported run costs are excluded from that amount;
+  the total is incomplete: legacy runs have no estimate, and unreported
+  runs may contribute recorded partial costs;
   `$0+ 7d` can therefore appear. The cost segment is hidden while the
   initial fetch is pending, after a failed fetch, or when a fully metered
   total rounds to zero. It never appears on the admin/factory board. Each
@@ -1430,8 +1651,9 @@ A newer release is available.
   [Run activity pane](./run-activity.md#lanes-one-per-actor-not-one-per-turn)
   for what a lane's dot means. The header's status tag folds in the run's
   cost beside the elapsed time — e.g. `● running · 41m · $9.55` (with cents,
-  since a single run's precision matters); `—` for a subscription-auth run
-  the SDK prices at $0, and nothing shown for a run with no recorded usage.
+  since a single run's precision matters); metered zero reads `$0.00`,
+  legacy `subscription` and unreported runs read `n/a`, and nothing is shown
+  for a run with no recorded usage.
   For a milestone-structured run the rail also shows a
   `MILESTONES {done}/{total}` block below the lanes, one row per approved
   milestone in order, marked `✓` reported complete, `○` not started, or —
@@ -2260,7 +2482,7 @@ you *do* parse `--json`, use `printf '%s'` (never `echo`) or write it to a file.
 A `null` or absent field prints an empty line (so a nil array field is an empty
 line, not an error). An unknown field, or a **non-scalar** one that is populated
 — any array or object field (e.g. `milestones`, `own_agents`, `agent_exclusions`,
-`usage`, `current_activity`), which you read with `--json` — is a usage error
+`usage`, `current_activity`, `progress`), which you read with `--json` — is a usage error
 (exit 2). `--field` and `--json` are mutually exclusive (two output modes).
 
 The model a schedule froze onto a run is readable this way too:
@@ -2290,13 +2512,13 @@ uzi settings get
 uzi settings get --json
 ```
 
-The human table shows the two Plan cross-check cells: stage, harness,
+The human table shows the Plan and Code cross-check cells: stage, harness,
 active/inactive status, stored model and effort, worker default model,
 resolved model and effort, and each resolved field's source. Stored null
-fields show `Default`; explicit choices show `Pin · value`. The Claude
-cell is inactive and editable in **Settings → Run defaults → Cross-check**;
-only Codex checkers for Claude leads execute today. CLI set/reset is deferred
-to #1703.
+fields show `Default`; explicit choices show `Pin · value`. All
+cells are active and editable in **Settings → Run defaults → Cross-check**:
+in each stage the Codex cell configures the checker of a Claude lead, the Claude cell the
+checker of a Codex lead. CLI set/reset is deferred to #1703.
 
 JSON returns the decoded account settings DTO, including
 `cross_check_pins`. Each cell has nullable stored
@@ -2307,6 +2529,13 @@ display as `pin` or `worker default`; missing or unfamiliar values show
 `unknown` in the human view. See
 [Configuration](./configuration.md#plan-cross-check-model-and-effort-pins)
 for resolution, validation and capability requirements.
+
+The human output ends with a `Now summary: on (default)`, `on` or `off` line:
+your own switch for the model-written [Now summary](./run-activity.md#now-summary)
+(`on (default)` means unset, which inherits on; the admin
+[kill switch](./admin-settings.md#run-summaries) can still turn it off for the
+instance). `--json` carries it as `now_summary_enabled` (`null` when unset). Change it in
+**Settings → Run defaults → Run summaries**; there is no CLI write verb for it.
 
 ### Plan cross-check evidence
 
@@ -2324,7 +2553,8 @@ unrecognized sources show `unknown`. JSON summary fields
 records. Settings changes do not rewrite this recorded evidence. A human
 revision changes the evidence prefix to `EARLIER_PLAN_CHECK_*` and adds a
 warning that the check does not certify the current plan. Missing cost stays
-unavailable; subscription usage is distinguished from metered spend.
+unavailable; legacy `subscription` usage reads `no estimate`. Priced Codex
+checks in either auth mode show API-equivalent cost, not a bill.
 
 The human view bounds findings to 20 items and sends displayed text through
 `Plain` for terminal/control sanitization. Use `uzi run get <id> --json` for
@@ -2339,6 +2569,39 @@ appends the refusal sub-code with underscores shown as spaces, e.g.
 A stored checker APPROVE and a current human gate can coexist: decide against
 the displayed gate revision, not historical findings. See
 [Cross-check](./cross-check.md) for fallbacks and terminal delivery failures.
+
+### Code cross-check evidence
+
+The [Code cross-check](./cross-check.md#code-cross-check) consent is set in
+**Settings → Run defaults → Cross-check**; there is no CLI write verb for it.
+
+`uzi run get <id>` prints a `CODE_CHECK` row for a run that took the setting
+at creation: `Pending`, `Completed` or `Incomplete`, or `Pending · evidence
+unavailable` / `Incomplete · outcome unavailable` when no summary is stored.
+The rows after it, all prefixed `CODE_CHECK_`, are `REASON` (the reason class
+with underscores shown as spaces), `CHECKED_SHA`, `CHECKER_ID`, `FAMILY`,
+`MODEL`, `EFFORT`, `COST` and, when owner guidance applied, `GUIDANCE`
+(`custom guidance applied (sha256 <12 hex>)`). `FINDINGS` reads `Findings
+unavailable` when the stored findings cannot be read (the dispositions then
+read `Dispositions unavailable`) or `No findings recorded` for an empty list. `DISPOSITIONS` reads `Pending
+report`, `Finalized` or `Dispositions unavailable`; once finalized on a
+completed check, `COUNTS` reads `N addressed, N declined, N not reported`.
+Each finding adds `_ID`, `_SEVERITY`, `_PATH`, `_TITLE` and `_DETAIL` rows
+(plus `_LINE` and, when reported, `_DISPOSITION` and `_DISPOSITION_REASON`),
+numbered from 1 and bounded to 20 findings; `CODE_CHECK_MORE` counts the
+rest. An interrupted attempt changes the prefix to `EARLIER_CODE_CHECK` and
+reads `Earlier attempt evidence · incomplete: interrupted`. Displayed text
+goes through the same terminal sanitization as the Plan rows.
+
+`uzi run get <id> --json` carries `code_cross_check_required` and the
+structured `code_cross_check_summary`.
+
+`uzi repo list` has two columns for the per-repository owner settings:
+`CHECK_GUIDANCE` is `none` or `set (N bytes)` and never prints the text, and
+`CHECK_REPO_INSTRUCTIONS` is the instructions toggle. `--json` carries the
+stored `code_cross_check_guidance` and `cross_check_repo_instructions_enabled`.
+The CLI never writes either; use the **Code cross-check** panel on the Repos
+page.
 
 A run's PRD-completion declaration is readable the same way:
 `uzi run get <id> --field prd_done_path` (the repo-relative path the run
@@ -2377,6 +2640,22 @@ uniquely-matching lane and role · label alone on the rest; an in-progress
 milestone the lead did not attribute gets no `NOW` row at all, just its
 plain mark in the `MILESTONES` block. A run with no effective attribution
 keeps the single global `NOW` row unchanged.
+`run get` also prints a `PROGRESS` row for a live run: the server-derived
+estimate, e.g. `≈70% · milestone 3 of 3` (`3 of 3 done` when no milestone is active), or a flag when a number would
+mislead: `stalled · since HH:MM` (UTC), `waits on you · plan gate|question|follow-up`,
+`parked · limit wait|pool wait|recovery wait|paused`, `queued` or `planning`
+(see [Progress estimate](./run-activity.md#progress-estimate)). A run waiting
+on a question can add ` · may be blocked by <id>` when the open question
+mentions an issue another live run of the same owner and repo is working (a
+hint, not a recorded dependency; see
+[May be blocked by](./run-activity.md#may-be-blocked-by)). While the model-written
+[Now summary](./run-activity.md#now-summary) is on and a note exists for the active
+milestone, a percent row appends ` · now: <text> (model summary, 2m ago)`; the text is
+untrusted model output printed as plain text, and `--json` carries it as
+`progress.now_note` (`text`, `at`), present only on this single-run read. The row is
+omitted when the run has no estimate and once the run is terminal. `--json` carries `progress` as an object (`null` for a terminal
+run), so `--field progress` is a usage error (exit 2) while the run is live
+and prints an empty line once it is terminal, as for `milestones`.
 `--json` carries the full `current_activity` object; `current_activity` is
 an object, so `--field current_activity` is the documented usage error
 above (exit 2) even when the run has one — read it with `--json` instead.
@@ -2426,7 +2705,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
-  it on a capped backoff until it recovers or you cancel it — see [Recovering
+  it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
+  typed `provider_outage` parks use the elapsed streak bound and can become
+  `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
   without an automatic timer. A Codex credential
@@ -2483,6 +2764,41 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
+
+### Provider outage recovery and owner hold
+
+`recovery_wait` with cause `provider_outage` is a typed provider retry.
+`run get` shows the count, streak start and next retry; `--json` carries
+`provider_park_count` and `provider_park_streak_started_at`. The counter
+belongs to the current streak, separately from the recovery backoff count.
+The default elapsed bound is 24h from the first park; operators can change
+`RUN_PROVIDER_PARK_MAX_DURATION` or use `0` to disable the hold while
+typing/counting remain enabled. Positive completed `productive_turns` on
+a provider park starts a new streak; the same evidence on an ordinary or
+disk recovery park (`provider_progress_turns`) clears an open streak. Owner Resume, early credential-driven
+promotion and credential switching clear it; automatic and vault-unlock
+promotion preserve it. Detection is at the next qualifying park, with no
+maximum overshoot promised.
+
+At the bound, `paused` with `hold_reason: provider_unavailable` means the
+run waits for its owner, without automatic retry or policy-driven failure.
+`run get` and the TUI show Resume, Cancel and server-gated Stop hints.
+Use `uzi run resume <id>` for a fresh attempt or `uzi run cancel <id>`.
+For eligible Stop, run `uzi run stop <id>` to set the scope ceiling, then,
+after success, `uzi run resume <id>`. There is no atomic Stop endpoint for
+this hold. It requires a non-interactive milestone issue run and at least
+one completed milestone; unavailable actions explain why. Existing
+completion-permit and budget checks apply, and a provider outage during
+finalization can open a new streak.
+
+The hold retains the claim, worker affinity and the issue lock for issue
+runs. Clone and HOME stay on the worker. Recovery depends on surviving
+worker storage or an available verified recovery copy; it does not promise
+that unpublished latest edits are available on another worker.
+`run wait` prints the provider retry/hold notice and continues waiting
+through `paused` unless `--until paused` is selected.
+See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for both harnesses, verified-capture limits and mixed-fleet compatibility.
 
 ### Worker recovery exhaustion
 
@@ -2754,7 +3070,7 @@ So every command now compares its own version against the server's and prints
 one line to **stderr** when it is behind:
 
 ```
-uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade uzi-cli
+uzi: CLI v0.11.8 is behind server 0.14.0; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli
 ```
 
 A CLI owned by the RC formula names that formula even when it runs a stable
@@ -2763,7 +3079,7 @@ version. Ownership is resolved from the executable's Homebrew path without runni
 For example:
 
 ```
-uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade uzi-cli-rc
+uzi: CLI v0.85.0-rc.2 is behind server 0.85.0-rc.3; some fields may be missing. Run: brew upgrade vtmocanu/tap/uzi-cli-rc
 ```
 
 - **stderr, never stdout.** `--json` output stays byte-exact and parseable.

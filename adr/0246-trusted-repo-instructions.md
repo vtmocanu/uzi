@@ -365,3 +365,61 @@ per root unchanged. `settingSources: []` is likewise untouched — neither root 
 read through the SDK's project loader. The net effect is that a repo on the
 cross-agent layout loads the same skills it always intended to, through the same
 controlled, symlink-refusing channel.
+
+## Amendment — PRD #2170: the code cross-checker as a second, separately consented recipient
+
+The decision above stands for the lead: only the lead receives the repo's
+`CLAUDE.md`, and "Subagents receive nothing" remains true of subagents. PRD
+[#2170](../prds/2170-code-cross-check.md) adds one more recipient, the read-only
+checker child of the opt-in Code cross-check ([docs](../docs/cross-check.md#code-cross-check)).
+It is not a subagent: it is a separate run on the other model family.
+
+- **Its own consent.** The per-repo flag `cross_check_repo_instructions_enabled`
+  (default off, written with the checker guidance through `PATCH /api/repos/{id}`,
+  owner or admin, cookie-only) controls it. The lead's `repo_claudemd_enabled`
+  is unchanged and neither implies the other; the check freezes the setting
+  when it is created.
+- **Fresh default-tip sourcing (#2788, 2026-10-12).** The approved follow-up
+  supersedes this amendment's interim base-commit decision. For a new check,
+  the worker freshly fetches the configured default branch (or uses
+  worker-owned default discovery) and freezes its lowercase 40-hex tip in
+  `repo_instructions_commit`, separately from the diff's `base_commit`.
+  The captured default commit remains the merge-base diff input. Both
+  completion paths enter fresh `reapForSink` quiescence; credentialed fetch
+  and durable `pinCodeSnapshot` remain within its held boundary/process
+  spawner. `fetchDefaultTip` validates the branch with `check-ref-format`
+  and uses `+refs/heads/<configured>:refs/remotes/origin/<configured>` under
+  the existing bare lock, rather than a run-selected source or stale tracking
+  ref. The worker reads the root `CLAUDE.md` at the acquired tip from its bare
+  repository with git plumbing, never the worktree the agent can write
+  (`agent/src/repo-instructions-at-commit.ts`). A symlink is followed only
+  inside that commit's tree: at most 8 hops, never outside the repo root or into
+  `.git/`, and the target must be a regular file. A file over 64 KiB is dropped,
+  never truncated, and line-leading `@` imports are stripped by the same helper
+  as the lead's reader.
+- **Framing.** The text reaches the checker as nonce-fenced advisory data in
+  its data prompt, with a fixed sentence that a `CLAUDE.md` change in the diff
+  is review evidence, not instruction. It does not enter the checker's trusted
+  brief; owner guidance is the only owner text that does.
+- **Frozen provenance.** Consent off still acquires a pin but reads no file.
+  Missing, unsafe or oversized files yield empty text with a successful pin.
+  Quiescence or acquisition failure is advisory `snapshot_failed`, with no
+  durable ref, metadata, instructions or invented SHA. A definite 4xx consent
+  race permits one re-read and at most one resubmit with the same pin, without
+  re-resolution; existing rows and child claims reuse frozen inputs without
+  fetching. A present pin binds the candidate digest even with consent off or
+  unchanged text, and polling/repair compare it explicitly. Status exposes
+  nullable pin metadata without instruction text. Legacy NULL/absent pins
+  retain historical digests and are not backfilled.
+- **Accepted limit.** An older fork no longer selects older instructions; the
+  acquired tip is frozen once, not refreshed after later branch changes.
+  Advisory fencing does not prevent semantic injection. Pre-existing unbounded
+  Git acquisition budgets remain outside this follow-up; it adds no acquisition
+  credential, source or background process and makes no stronger security claim.
+- **Rollout and rollback.** Deploy the api and migration 00329 before upgraded
+  workers. Old-worker omission is accepted as legacy. A new worker on an old
+  strict api gets bounded advisory refusal handling and publication proceeds,
+  without dropping the pin. Roll back workers before the api, retaining the
+  column, stored pins and digests; Down destroys provenance and is not a normal
+  rollback. Hosted acceptance remains pending; see the PRD's follow-up status.
+

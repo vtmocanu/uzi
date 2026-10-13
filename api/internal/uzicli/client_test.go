@@ -825,6 +825,8 @@ func TestHTTPClientOnlyReturnsExitError(t *testing.T) {
 		{"list-repos", func(c *HTTPClient) error { _, e := c.ListRepos(context.Background()); return e }},
 		{"admin-users", func(c *HTTPClient) error { _, e := c.AdminListUsers(context.Background()); return e }},
 		{"admin-runs", func(c *HTTPClient) error { _, e := c.AdminListRuns(context.Background()); return e }},
+		{"admin-run-summaries", func(c *HTTPClient) error { _, e := c.AdminListRunSummaries(context.Background()); return e }},
+		{"run-summaries", func(c *HTTPClient) error { _, e := c.ListRunSummaries(context.Background()); return e }},
 		{"admin-workers", func(c *HTTPClient) error { _, e := c.AdminListWorkers(context.Background()); return e }},
 		{"admin-cli-tokens", func(c *HTTPClient) error { _, e := c.AdminListCLITokens(context.Background()); return e }},
 		{"admin-products", func(c *HTTPClient) error { _, e := c.AdminListProducts(context.Background()); return e }},

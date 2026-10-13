@@ -103,6 +103,22 @@ export function makeFixture(files: Record<string, string> = {}, opts: { testName
   const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
   // Recorded before the git work so a later throw in makeFixture still leaves a created line.
   ledger("created", base, { file: process.argv[1] ?? null, test: opts.testName ?? null, site: callerSites() });
+  try {
+    // A setgid TMPDIR can lend makeFixture a foreign group and special bits.
+    // Normalize only this root before any descendants inherit its metadata.
+    if (process.platform !== "win32" && process.getuid && process.getgid) {
+      fs.chownSync(base, process.getuid(), process.getgid());
+    }
+    fs.chmodSync(base, 0o700);
+  } catch (error) {
+    try {
+      fs.rmSync(base, { recursive: true, force: true });
+      ledger("removed", base);
+    } catch {
+      // Cleanup must preserve the original normalization error.
+    }
+    throw error;
+  }
   const originPath = path.join(base, "origin");
   const dataDir = path.join(base, "data");
   fs.mkdirSync(originPath);

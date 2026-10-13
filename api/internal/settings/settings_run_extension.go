@@ -13,24 +13,25 @@ import (
 	"strings"
 )
 
-// runExtensionCapSecondsMin / runExtensionCapSecondsMax bound the per-run extension cap
-// (PRD #1189 D3): a value must be 0 (extending disabled) or within [min, max]. A cap under
+// runExtensionCapSecondsMin / runExtensionCapSecondsMax bound the per-request extension maximum
+// (PRD #1189 D3, #2735): a value must be 0 (extending disabled) or within [min, max]. A cap under
 // an hour is noise; over a week is effectively no cap.
 const (
 	runExtensionCapSecondsMin = 3600   // 1h
 	runExtensionCapSecondsMax = 604800 // 7d
 )
 
-// RunExtensionCapSeconds returns the TOTAL extra wall-clock seconds an owner may grant a
-// single run through Extend (PRD #1189). 0 means extending is disabled instance-wide.
+// RunExtensionCapSeconds returns the PER-REQUEST maximum of extra wall-clock seconds an owner
+// may grant a run in one Extend (PRD #1189, #2735); the cumulative total is not capped by it.
+// 0 means extending is disabled instance-wide.
 func (c *Cache) RunExtensionCapSeconds(ctx context.Context) (int, error) {
 	return c.intSetting(ctx, KeyRunExtensionCapSeconds)
 }
 
-// validateExtensionCapSeconds is the write-time gate for the extension cap (PRD #1189 D3):
+// validateExtensionCapSeconds is the write-time gate for the per-request extension maximum (PRD #1189 D3):
 // a base-10 integer that is either 0 (disable extending) or within
 // [runExtensionCapSecondsMin, runExtensionCapSecondsMax]. Negatives, non-integers, 1–3599,
-// and values above the 7-day cap are rejected. Bounds differ from validateHealthSeconds, so
+// and values above 7 days are rejected. Bounds differ from validateHealthSeconds, so
 // it is a separate validator by design, not a reuse.
 func validateExtensionCapSeconds(value string) error {
 	n, err := strconv.Atoi(strings.TrimSpace(value))

@@ -115,7 +115,7 @@ Open **Settings → Notifications**:
 
 If this instance has no Slack configured yet, the card shows an info alert
 saying so instead of a silently-disabled form — notifications can't be
-delivered until an admin sets it up under **Admin Settings → Slack**. All the
+delivered until an admin sets it up under **Admin → Instance → Slack**. All the
 card's controls (notify toggle, override field, **Save override**, and
 **Send test DM**) are disabled in that state; you can't cause a stuck link by
 clicking ahead of the admin.
@@ -285,11 +285,22 @@ with the bot, so the sender is already `uzi`. Glyph legend:
   page. **Guardrail override decided** fires when an admin approves or
   rejects your [guardrail override
   request](./admin-settings.md#guardrail-override-per-repo), and links the
-  Repos page. All three need Slack enabled and your account linked, like
+  Boards page. All three need Slack enabled and your account linked, like
   every DM here. If Slack does not take one of the two halt DMs the first
   time (a full queue, a Slack error), uzi retries it every few minutes for
   up to about a day, so you may rarely see one twice or a while after the
   halt; the override decision DM is not retried.
+
+  The internal notification event log has a nominal retention target of 200
+  rows per user. Pending halt DMs below the retry attempt cap are exempt;
+  rows tied at the retention timestamp boundary can also keep the total above
+  200. After a successful delivery stamp (including a terminal no-link outcome)
+  or the final retry claim, uzi attempts best-effort pruning of eligible older
+  rows, even if the final claim's stored render is corrupt. When pruning succeeds,
+  cleanup needs no later notification, so an idle user's log can converge toward
+  the target. Prune failures are logged without undoing delivery settlement or
+  retry exhaustion. There is no historical settled-backlog sweep or unconditional
+  cleanup guarantee.
 
 ## Markdown rendering
 

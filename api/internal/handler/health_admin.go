@@ -56,7 +56,10 @@ func (h *Handler) healthService() *healthsvc.Service {
 				HeartbeatStale:             h.cfg.WorkerHeartbeatStale,
 				// The custody admission ceiling ClaimRun/recovery gate on, so custody.holds
 				// never disagrees with the claim path. int32() is a compile-time conversion.
-				CustodyHoldLimit: int32(workersvc.CustodyHoldLimit),
+				CustodyHoldLimit:             int32(workersvc.CustodyHoldLimit),
+				RecoveryReadyPayloadPerOwner: h.cfg.RecoveryReadyPayloadPerOwner,
+				RecoveryInstanceBytes:        h.cfg.RecoveryInstanceBytes,
+				StoredFilesBudgetBytes:       h.cfg.StoredFilesBudgetBytes,
 				// controller.report's boot grace anchor (M2). A struct-literal test handler
 				// with a zero startedAt makes the grace not apply, the safe direction.
 				BootTime:         h.startedAt,

@@ -148,3 +148,19 @@ export async function stopStartedChannels(): Promise<void> {
   startedChannels.clear();
   await Promise.all(running.map((channel) => channel.stop()));
 }
+
+/** Wait for a fixture's actual event, with a diagnostic watchdog instead of a
+ *  short wall-clock poll that can cancel correct work under suite load. */
+export async function waitForTestEvent<T>(event: Promise<T>, label: string, timeoutMs = 30_000): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    return await Promise.race([
+      event,
+      new Promise<never>((_, reject) => {
+        timer = setTimeout(() => reject(new Error(`test event timed out: ${label}`)), timeoutMs);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}

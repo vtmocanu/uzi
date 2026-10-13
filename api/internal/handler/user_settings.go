@@ -54,8 +54,12 @@ type userSettingsDTO struct {
 	// MrReworkEnabled is the per-user opt-in to the MR review watcher (PRD #700 M5),
 	// which ships ON. null means "unset" = inherit the default-ON semantics (a
 	// NULL/absent user value is read as enabled); an explicit false is the opt-OUT.
-	MrReworkEnabled *bool    `json:"mr_rework_enabled"`
-	SidebarTokenIds []string `json:"sidebar_token_ids"`
+	MrReworkEnabled *bool `json:"mr_rework_enabled"`
+	// NowSummaryEnabled is the per-user switch for the model-written "Now" line on the run
+	// progress card (PRD #2603), which ships ON. null means unset = inherit the default-ON
+	// semantics; an explicit false is the opt-OUT. The instance kill-switch is separate.
+	NowSummaryEnabled *bool    `json:"now_summary_enabled"`
+	SidebarTokenIds   []string `json:"sidebar_token_ids"`
 	// SidebarCodexAccountIds lists the LINKED Codex subscription accounts the user
 	// surfaced on the sidebar rail (PRD #1209 M1, 00239) — the codex sibling of
 	// SidebarTokenIds. The default account always shows and is never listed here; empty
@@ -133,6 +137,7 @@ func (h *Handler) userSettingsResponse(w http.ResponseWriter, r *http.Request, u
 			SummaryModel:           textPtrValue(s.SummaryModel.Valid, s.SummaryModel.String),
 			Theme:                  textPtrValue(s.Theme.Valid, s.Theme.String),
 			MrReworkEnabled:        boolPtrValue(s.MrReworkEnabled),
+			NowSummaryEnabled:      boolPtrValue(s.NowSummaryEnabled),
 			SidebarTokenIds:        uuidStrings(s.SidebarTokenIds),
 			SidebarCodexAccountIds: uuidStrings(sidebarCodexIDs),
 			AppearanceMode:         textPtrValue(s.AppearanceMode.Valid, s.AppearanceMode.String),
@@ -211,6 +216,7 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		SummaryModel       json.RawMessage `json:"summary_model"`
 		Theme              json.RawMessage `json:"theme"`
 		MrReworkEnabled    json.RawMessage `json:"mr_rework_enabled"`
+		NowSummaryEnabled  json.RawMessage `json:"now_summary_enabled"`
 		SidebarTokenIds    json.RawMessage `json:"sidebar_token_ids"`
 		// The linked Codex accounts on the sidebar rail (PRD #1209 M1): same
 		// absent/present tri-state as sidebar_token_ids — absent leaves the stored set,
@@ -446,6 +452,21 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 		}
 	}
 
+	var nowVal pgtype.Bool
+	nowPresent := req.NowSummaryEnabled != nil
+	if nowPresent {
+		// Same tri-state as mr_rework_enabled (PRD #2603): present-bool sets the switch,
+		// present-null clears back to NULL = the default-ON state, a non-bool is a 400.
+		var raw *bool
+		if err := json.Unmarshal(req.NowSummaryEnabled, &raw); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid now_summary_enabled")
+			return
+		}
+		if raw != nil {
+			nowVal = pgtype.Bool{Bool: *raw, Valid: true}
+		}
+	}
+
 	var sidebarIDs []uuid.UUID
 	sidebarPresent := req.SidebarTokenIds != nil
 	if sidebarPresent {
@@ -665,6 +686,17 @@ func (h *Handler) PutMySettings(w http.ResponseWriter, r *http.Request) {
 			MrReworkEnabled: mrVal,
 		}); err != nil {
 			slog.Error("set user mr rework enabled", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if nowPresent {
+		if _, err := h.q.SetUserNowSummaryEnabled(r.Context(), store.SetUserNowSummaryEnabledParams{
+			ID:                user.ID,
+			NowSummaryEnabled: nowVal,
+		}); err != nil {
+			slog.Error("set user now summary enabled", "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

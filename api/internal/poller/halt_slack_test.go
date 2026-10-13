@@ -126,7 +126,7 @@ func TestMRReworkHaltPublishesSlackRunLink(t *testing.T) {
 	cand.Ref = pgtype.Text{String: hostileRef, Valid: true}
 	st := &mrwStore{
 		candidates: []store.ListMRReworkCandidatesRow{cand},
-		ledgers:    map[string]store.MrReworkLedger{hostileRef: {Ref: hostileRef, AttemptCount: 5, HighWater: 120}},
+		ledgers:    map[string]store.GetMRReworkLedgerRow{hostileRef: mrwRow(hostileRef, 5, 120)},
 	}
 	notifier := &mrwNotifier{}
 	f := landedForge(mrwComment(200, landed(), mrwHeadSHA))
@@ -163,7 +163,7 @@ func TestMRReworkHaltSlackNoBaseNoLink(t *testing.T) {
 	} {
 		st := &mrwStore{
 			candidates: []store.ListMRReworkCandidatesRow{mrwCand("success")},
-			ledgers:    map[string]store.MrReworkLedger{mrwRef: {Ref: mrwRef, AttemptCount: 5, HighWater: 120}},
+			ledgers:    map[string]store.GetMRReworkLedgerRow{mrwRef: mrwRow(mrwRef, 5, 120)},
 		}
 		notifier := &mrwNotifier{}
 		f := landedForge(mrwComment(200, landed(), mrwHeadSHA))

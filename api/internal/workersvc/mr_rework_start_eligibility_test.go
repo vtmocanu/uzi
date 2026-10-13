@@ -5,6 +5,7 @@ import (
 	"encoding/json"
 	"errors"
 	"slices"
+	"strconv"
 	"strings"
 	"testing"
 	"time"
@@ -78,11 +79,17 @@ const (
 // assessedResult runs the real assessor over comments with a fixed set of lookup answers.
 func assessedResult(t *testing.T, highWater int64, pending []int64, comments ...forge.MRComment) *ReviewSnapshotResult {
 	t.Helper()
+	return assessedResultState(t, testLedger(highWater, pending), comments...)
+}
+
+// assessedResultState is assessedResult against an arbitrary (multi-namespace) ledger state.
+func assessedResultState(t *testing.T, state ReviewLedgerState, comments ...forge.MRComment) *ReviewSnapshotResult {
+	t.Helper()
 	a := &ReviewAssessor{Store: nullReviewStore{}, Queue: nullReviewStore{}}
 	as, err := a.Begin(context.Background(), ReviewAssessParams{
 		RepoID: uuid.New(), Ref: "agent/issue-7", ProjectID: 42, BaseURL: "https://github.com", BotForgeUserID: 999,
 		Lookup:   answerLookup{eligibleAuthor: forge.AuthorEligible, outsiderAuthor: forge.AuthorNotEligible},
-		Comments: comments, HighWater: highWater, Pending: pending,
+		Comments: comments, Ledger: state,
 	})
 	if err != nil || as == nil {
 		t.Fatalf("Begin = %v, %v", as, err)
@@ -91,8 +98,27 @@ func assessedResult(t *testing.T, highWater int64, pending []int64, comments ...
 	return as.Snapshot(context.Background())
 }
 
+// testLedger is the single-namespace ledger state of the tests: one mark in testNS and pending
+// ids in testNS.
+func testLedger(mark int64, pending []int64) ReviewLedgerState {
+	st := ReviewLedgerState{Marks: map[string]int64{testNS: mark}, Pending: []CommentKey{}}
+	for _, id := range pending {
+		st.Pending = append(st.Pending, CommentKey{Namespace: testNS, ID: id})
+	}
+	return st
+}
+
+// testLedgerRow is testLedger as the stored (non-legacy) row.
+func testLedgerRow(mark int64, pending []int64) store.GetMRReworkLedgerRow {
+	return store.GetMRReworkLedgerRow{
+		Ref: "agent/issue-7", AttemptCount: 5,
+		CommentMarks:       marksJSON(strconv.FormatInt(mark, 10)),
+		PendingUnknownKeys: encodeKeys(testLedger(mark, pending).Pending),
+	}
+}
+
 func rc(id, author int64, body string) forge.MRComment {
-	return forge.MRComment{ID: id, AuthorForgeUserID: author, AuthorUsername: "u", Body: body, CreatedAt: time.Unix(id, 0), ReviewState: forge.ReviewCommentInline}
+	return forge.MRComment{ID: id, IDNamespace: testNS, AuthorForgeUserID: author, AuthorUsername: "u", Body: body, CreatedAt: time.Unix(id, 0), ReviewState: forge.ReviewCommentInline}
 }
 
 func reworkFixture(t *testing.T, highWater int64, pending []int64) (*fakeStore, *Service, uuid.UUID, uuid.UUID) {
@@ -102,7 +128,7 @@ func reworkFixture(t *testing.T, highWater int64, pending []int64) (*fakeStore, 
 		runByID:           reworkableSourceRun(runID, user, repo),
 		runByIDPlain:      reworkableSourceRun(runID, user, repo),
 		hasAnthropicToken: true,
-		mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", AttemptCount: 5, HighWater: highWater, PendingUnknownIds: pending},
+		mrReworkLedger:    testLedgerRow(highWater, pending),
 		repoRow:           aValidRepoRow(),
 		mrReworkRunResult: store.Run{ID: uuid.New(), Kind: "mr_rework", TriggerSource: "manual"},
 	}
@@ -177,7 +203,7 @@ func TestStartMRReworkEligibleProceedsAndRecordsPending(t *testing.T) {
 	if p.HighWater != 14 {
 		t.Fatalf("high_water = %d, want 14 (the eligible actionable id)", p.HighWater)
 	}
-	if !slices.Equal(p.PendingAdd, []int64{12}) {
+	if !slices.Equal(p.PendingAdd, []string{testNS + ":12"}) {
 		t.Fatalf("pending add = %v, want the author's single newest accepted id 12 (5 is at/below the old mark, 20 above the new one)", p.PendingAdd)
 	}
 	if p.PendingRemove == nil {
@@ -196,8 +222,8 @@ func TestStartMRReworkPendingIDCountsAsNew(t *testing.T) {
 		t.Fatalf("a pending comment whose author resolved must proceed: %v", err)
 	}
 	p := fs.mrReworkAndAdvanceParams
-	if p == nil || len(p.PendingRemove) != 1 || p.PendingRemove[0] != 7 {
-		t.Fatalf("params = %+v, want pending id 7 consumed", p)
+	if p == nil || len(p.PendingRemove) != 1 || p.PendingRemove[0] != testNS+":7" {
+		t.Fatalf("params = %+v, want pending key 7 consumed", p)
 	}
 }
 
@@ -224,7 +250,7 @@ func TestStartMRReworkRefusalDropsPendingIDsTheCapsEvicted(t *testing.T) {
 	if !errors.Is(err, ErrReworkNothingNew) {
 		t.Fatalf("err = %v, want ErrReworkNothingNew", err)
 	}
-	if len(fs.pendingRemovals) != 1 || len(fs.pendingRemovals[0].Ids) != 1 || fs.pendingRemovals[0].Ids[0] != 50 {
+	if len(fs.pendingRemovals) != 1 || len(fs.pendingRemovals[0].Keys) != 1 || fs.pendingRemovals[0].Keys[0] != testNS+":50" {
 		t.Fatalf("pending removals = %+v, want one removal of id 50", fs.pendingRemovals)
 	}
 	if fs.mrReworkAndAdvanceParams != nil {
@@ -253,7 +279,7 @@ func TestStartMRReworkGuidanceRemovesEvictedPendingIDsAtomically(t *testing.T) {
 		t.Fatal(err)
 	}
 	p := fs.mrReworkAndAdvanceParams
-	if p == nil || !slices.Contains(p.PendingRemove, 50) {
+	if p == nil || !slices.Contains(p.PendingRemove, testNS+":50") {
 		t.Fatalf("create params = %+v, want PendingRemove to include 50", p)
 	}
 	if len(fs.pendingRemovals) != 0 {
@@ -275,7 +301,7 @@ func TestStartMRReworkPlansAgainstThePreFetchLedger(t *testing.T) {
 	if p == nil {
 		t.Fatal("no run was created")
 	}
-	if slices.Contains(p.PendingRemove, 170) {
+	if slices.Contains(p.PendingRemove, testNS+":170") {
 		t.Fatalf("PendingRemove = %v: 170 was stored after the pre-fetch ledger read and must stay", p.PendingRemove)
 	}
 }

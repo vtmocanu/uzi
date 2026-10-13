@@ -46,6 +46,12 @@ func (c *Cache) ReleaseCheckInterval(ctx context.Context) (time.Duration, error)
 	return d, err
 }
 
+// ReleaseCheckedAt returns the raw persisted RFC3339 timestamp, or an empty string
+// when absent. The Runner interprets it when scheduling its initial check.
+func (c *Cache) ReleaseCheckedAt(ctx context.Context) (string, error) {
+	return c.get(ctx, KeyReleaseCheckedAt)
+}
+
 // ReleaseCheckToken returns the OPTIONAL upstream-check GitHub token in plaintext
 // (PRD #836 M1), or "" when unconfigured (the unauthenticated path). Same secret
 // precedence as SlackBotToken: an ENV overlay wins, else the sealed DB row is opened

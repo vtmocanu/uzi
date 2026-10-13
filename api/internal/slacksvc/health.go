@@ -191,17 +191,19 @@ func healthNudgeHead(health, reason string) string {
 //     omitted when deadline is nil (a run with no wall deadline never gets the slow flag,
 //     so this is only a defensive guard).
 //   - a second context line: `Extend: ` + a `uzi run extend <id> --by <dur>` code span —
-//     the duration FITS the remaining allowance (2h when there is room, else the remaining
-//     allowance floored to whole minutes), and the line is omitted when extending is exhausted
-//     (budget_extension_seconds >= extensionCap), turned off (extensionCap == 0), or the sliver
-//     left is under the 60s extend floor — so the DM never suggests a command that would 409.
+//     the duration FITS the largest extension this run can take now (2h when that is at least
+//     2h, else that maximum floored to whole minutes), and the line is omitted when extending is
+//     turned off (maxExtend == 0), the run is at the total-run-time limit, or the room left is
+//     under the 60s extend floor — so the DM never suggests a command that would 409.
+//     maxExtend is the caller's per-request maximum for this run: min(the admin per-request cap,
+//     workersvc.ExtensionRoomSeconds), 0 when extending is off.
 //
 // Both extras are entirely server-computed (a unix stamp, two durations, the run uuid,
 // and a fixed verb), so they carry no forge/worker text and need no escaping; the
 // <!date^…> token and the backticks are intentional Slack markup. deadline is computed
 // by the caller (workersvc.RunDeadline over the rc fields) so this file keeps no
 // workersvc import, and now is passed in so the durations are testable.
-func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextRow, deadline *time.Time, extensionCap int, now time.Time) (blocks []slack.Block, fallback string) {
+func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextRow, deadline *time.Time, maxExtend int, now time.Time) (blocks []slack.Block, fallback string) {
 	head := healthNudgeHead(health, reason)
 	section := head
 	if reason != "" {
@@ -217,11 +219,11 @@ func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextR
 			}
 			section += "\n" + line
 		}
-		if extensionCap > 0 {
-			// Render a duration that FITS the remaining allowance, not a fixed 2h: with less
-			// than 2h left the server 409s a `--by 2h`, so the nudge would suggest a command
-			// that fails. extendNudgeBy returns "" when under the 60s extend floor (line omitted).
-			if by := extendNudgeBy(extensionCap - int(rc.BudgetExtensionSeconds)); by != "" {
+		if maxExtend > 0 {
+			// Render a duration that FITS the per-request maximum for this run, not a fixed 2h:
+			// with a smaller maximum the server 409s a `--by 2h`, so the nudge would suggest a
+			// command that fails. extendNudgeBy returns "" when under the 60s extend floor.
+			if by := extendNudgeBy(maxExtend); by != "" {
 				extendCtx = "Extend: `uzi run extend " + rc.ID.String() + " --by " + by + "`"
 			}
 		}
@@ -241,9 +243,9 @@ func healthNudgeBlocks(health, reason, base string, rc store.GetSlackRunContextR
 
 // extendNudgeBy renders the `--by` duration for the near-timeout Extend command as a
 // Go-duration-parseable label with NO spaces ("2h", "1h58m", "45m"): the friendly 2h default
-// when the remaining allowance leaves room, otherwise the remaining allowance floored to whole
-// minutes so the suggested command always fits under the cap (a fixed 2h would 409 once under
-// two hours remain). Returns "" when the remaining allowance is under the 60s extend floor, so
+// when the maximum allows it, otherwise the maximum floored to whole
+// minutes so the suggested command always fits (a fixed 2h would 409 once the maximum is under
+// two hours). Returns "" when the maximum is under the 60s extend floor, so
 // the caller omits the line rather than suggest a command the server would reject. Mirrors
 // workersvc.extendDurationLabel without importing workersvc (this file keeps no workersvc
 // dependency — the deadline is computed by the caller).

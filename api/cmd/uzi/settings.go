@@ -13,7 +13,7 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 		RunE: func(cmd *cobra.Command, _ []string) error { return cmd.Help() },
 	}
 	cmd.AddCommand(&cobra.Command{
-		Use: "get", Short: "Show account settings and plan cross-check pins", Args: cobra.NoArgs,
+		Use: "get", Short: "Show account settings and cross-check pins", Args: cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, _ []string) error {
 			c, err := env.client(gf)
 			if err != nil {
@@ -27,9 +27,14 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 			if p.Format == uzicli.FormatJSON {
 				return p.JSON(settings)
 			}
-			return p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
+			if err := p.Table([]string{"STAGE", "HARNESS", "STATUS", "STORED MODEL", "WORKER DEFAULT MODEL",
 				"RESOLVED MODEL", "MODEL SOURCE", "STORED EFFORT", "RESOLVED EFFORT", "EFFORT SOURCE"},
-				settingsCrossCheckRows(settings))
+				settingsCrossCheckRows(settings)); err != nil {
+				return err
+			}
+			// PRD #2603: nil means the per-user switch was never set, which reads as on.
+			p.Println(settingsNowSummaryLine(settings))
+			return nil
 		},
 	})
 	return cmd
@@ -37,32 +42,44 @@ func newSettingsCmd(env Env, gf *globalFlags) *cobra.Command {
 
 func settingsCrossCheckRows(s apitypes.UserSettingsDTO) [][]string {
 	var rows [][]string
-	// Only the two plan cells are supported. Inspect at most twenty response
-	// cells and display each family once; malformed responses stay bounded.
-	for _, harness := range []string{"claude", "codex"} {
-		for _, cell := range s.CrossCheckPins[:min(len(s.CrossCheckPins), 20)] {
-			if cell.Stage != "plan" || cell.Harness != harness {
-				continue
+	// Inspect at most twenty response cells and display each stage/family once.
+	// Legacy responses contain only plan cells; absent cells are not invented.
+	for _, stage := range []string{"plan", "code"} {
+		for _, harness := range []string{"claude", "codex"} {
+			for _, cell := range s.CrossCheckPins[:min(len(s.CrossCheckPins), 20)] {
+				if cell.Stage != stage || cell.Harness != harness {
+					continue
+				}
+				status := "active"
+				if !cell.Active {
+					status = "inactive"
+				}
+				modelDefault := "unknown"
+				if harness == "claude" {
+					modelDefault = "SDK/account default"
+				}
+				rows = append(rows, []string{
+					stage, harness, status, settingsStoredPin(cell.Model),
+					crossCheckPlain(strOr(cell.WorkerDefaultModel, modelDefault)),
+					crossCheckPlain(strOr(cell.ResolvedModel, modelDefault)),
+					crossCheckSource(&cell.ModelSource), settingsStoredPin(cell.Effort),
+					crossCheckPlain(cell.ResolvedEffort), crossCheckSource(&cell.EffortSource),
+				})
+				break
 			}
-			status := "active"
-			if !cell.Active {
-				status = "inactive"
-			}
-			modelDefault := "unknown"
-			if harness == "claude" {
-				modelDefault = "SDK/account default"
-			}
-			rows = append(rows, []string{
-				"plan", harness, status, settingsStoredPin(cell.Model),
-				crossCheckPlain(strOr(cell.WorkerDefaultModel, modelDefault)),
-				crossCheckPlain(strOr(cell.ResolvedModel, modelDefault)),
-				crossCheckSource(&cell.ModelSource), settingsStoredPin(cell.Effort),
-				crossCheckPlain(cell.ResolvedEffort), crossCheckSource(&cell.EffortSource),
-			})
-			break
 		}
 	}
 	return rows
+}
+
+func settingsNowSummaryLine(s apitypes.UserSettingsDTO) string {
+	switch {
+	case s.NowSummaryEnabled == nil:
+		return "Now summary: on (default)"
+	case *s.NowSummaryEnabled:
+		return "Now summary: on"
+	}
+	return "Now summary: off"
 }
 
 func settingsStoredPin(pin *string) string {

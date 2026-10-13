@@ -201,11 +201,8 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	}
 	var req struct {
 		Version string `json:"version"`
-		// Name is accepted for wire compatibility (the M2 worker announces both
-		// name and version) but deliberately ignored: the authoritative worker
-		// name is the user-chosen label set at token issuance, not something the
-		// worker may overwrite. DecodeJSON rejects unknown fields, so this must be
-		// declared even though nothing reads it.
+		// Name never overwrites the user-chosen label. Hosted workers may carry
+		// reserved pod identity evidence in uzi-pod:<UUID>.
 		Name string `json:"name"`
 		// Template is the worker's self-reported image template (PRD #18). Unlike
 		// Name, it IS read + persisted (as template_reported): it is observability
@@ -303,7 +300,17 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 			slog.Warn("worker register active snapshot dropped: parse rejected", "worker_id", wkr.ID.String())
 		}
 	}
-	updated, registerNonce, err := h.wsvc.RegisterWithCrossCheckSlots(r.Context(), wkr, version, reported, advertisedCap, req.MaxCrossCheckSlots, req.Capabilities, req.ProtocolCapabilities, regSnapshot)
+	var podUID uuid.UUID
+	// UI sanitization must not turn a different (or truncated) build version into
+	// exact roll proof. Keep ordinary registration unchanged, but withhold the
+	// incarnation binding when the version cannot be preserved verbatim.
+	if wkr.Kind == "hosted" && version != "" && req.Version == version && strings.HasPrefix(req.Name, "uzi-pod:") {
+		candidate := strings.TrimPrefix(req.Name, "uzi-pod:")
+		if len(candidate) == 36 {
+			podUID, _ = uuid.Parse(candidate)
+		}
+	}
+	updated, registerNonce, err := h.wsvc.RegisterWithCrossCheckSlots(r.Context(), wkr, version, reported, advertisedCap, req.MaxCrossCheckSlots, req.Capabilities, req.ProtocolCapabilities, regSnapshot, podUID)
 	if err != nil {
 		slog.Error("worker register", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -357,7 +364,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	httpx.JSON(w, http.StatusOK, map[string]any{
 		"worker_id":         updated.ID.String(),
 		"worker":            dto,
-		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled),
+		"protocol_features": protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
 		"register_nonce":    registerNonce,
 		// worker_outbox_max_pending (PRD #1391 Run B M3c): the server's terminal_pending outbox cap,
 		// returned at register so the worker can size its own pending-outcome quota to match the
@@ -393,15 +400,18 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // through it — so advertising the token tells a fence-capable worker it may send the field. Returns
 // a fresh slice so a caller cannot mutate the advertised set.
 //
+// `recovery_held_publication_v1` (issue #2545) is appended last, in its own group, only while
+// heldPublicationEnabled (= cfg.HeldPublication, UZI_HELD_PUBLICATION).
+//
 // `active_run_snapshot` (PRD #1390 M2a) is appended in its own group, gated on
 // activeSnapshotEnabled (= !cfg.ActiveSnapshotDisabled). When the api is started with
 // UZI_ACTIVE_SNAPSHOT_DISABLED set (the D7 rollback simulation) the token is omitted and the
 // worker never sends the snapshot — the same shape an old worker sees.
-func protocolFeatures(activeSnapshotEnabled bool) []string {
+func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
 		{"dind_maintenance_v1"},
 		{"worker_memory_pressure_v1"},
-		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1"}, // PRD #1392 M1
+		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
 		{"heartbeat_outbox"},          // PRD #1391 M5, Run A
 		{"worker_residue_quarantine"}, // issue #2213: this api accepts the heartbeat's residue_quarantine member
 		{"claim_generation_fence"},    // PRD #1247 M5 (D11): this api fences message/report inserts on claim_generation for a credential_switch_v1 worker
@@ -410,6 +420,7 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// and stores the cause. Advertised UNCONDITIONALLY (no config gates the park): a worker
 		// must see it before sending the cause, because an older api 400s an unknown recovery_cause.
 		{"recovery_cause_vault_locked"},
+		{"recovery_cause_codex_account_unavailable"},
 		// PRD #1795 M1: this api accepts presentation_id / adopt_gate_revision on the
 		// awaiting_approval report and answers the allocated gate_revision on its ACK. A worker
 		// sends the new fields ONLY when it sees this token, because an older api's strict
@@ -421,6 +432,16 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 		// (no config gates the park; 0 only lifts the cap): a worker must see it before sending
 		// the cause or the flag, because an older api 400s both.
 		{"recovery_cause_data_volume_full"},
+		// PRD #1733: this api accepts {status:"recovery_wait", recovery_cause:"provider_outage"}
+		// with the optional productive_turns count, stores and counts the typed park, bounds an
+		// unbroken streak of them in elapsed time, and may answer the park with status "paused"
+		// (hold_reason provider_unavailable). Advertised UNCONDITIONALLY (RUN_PROVIDER_PARK_MAX_DURATION=0
+		// only lifts the hold): a worker sends the typed body ONLY after seeing this token, both
+		// because an older api's strict decoder 400s productive_turns and because only a worker
+		// that handles a "paused" ack may receive one.
+		{"recovery_cause_provider_outage"},
+		// Fenced ordinary and disk recovery parks can atomically consume completed-turn evidence.
+		{"provider_progress_on_recovery_park_v1"},
 		// PRD #1809 M6 (D8): this api accepts checkpoint_contains_latest on a park report (the
 		// /state limit_wait / recovery_wait / paused reports and the wall-park report) and stores
 		// it for display. Advertised UNCONDITIONALLY: an older api 400s the unknown field, so a
@@ -435,6 +456,12 @@ func protocolFeatures(activeSnapshotEnabled bool) []string {
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a
+	}
+	if heldPublicationEnabled {
+		// Issue #2545: this api accepts the step-A held-work upload. Its own group, separate from
+		// the worker capability of the same name, and omitted when UZI_HELD_PUBLICATION is off so
+		// a worker defers nothing and takes the archive path. Step B needs no advertisement.
+		groups = append(groups, []string{"recovery_held_publication_v1"})
 	}
 	seen := make(map[string]bool)
 	out := make([]string, 0)
@@ -1072,8 +1099,10 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 		// Feature gate, mirroring WorkerHeartbeat's D7 rule EXACTLY: a disabled api 400s a claim that
-		// still carries the field (the same generic 400 that triggers the worker's strip-and-retry);
-		// when enabled, parse the snapshot defensively (a malformed body drops to nil).
+		// still carries the field. The worker's claim call has no strip-and-retry: the 400 fails
+		// that poll and the worker claims again on its next poll with a fresh snapshot (without
+		// the field once a rollback strip-and-retry on another wire has cleared the negotiated
+		// features). When enabled, parse the snapshot defensively (a malformed body drops to nil).
 		var snapshot *workersvc.ActiveSnapshot
 		if h.cfg.ActiveSnapshotDisabled {
 			if req.ActiveSnapshot != nil {
@@ -1092,7 +1121,8 @@ func (h *Handler) WorkerClaim(w http.ResponseWriter, r *http.Request) {
 		}
 		if err != nil {
 			// An invalid/stale-epoch/wrong-nonce claim snapshot fails the claim CLOSED (D3): 400,
-			// no claim, no side effect. Same generic body the worker reads for its strip-and-retry.
+			// no claim, no side effect. The worker's claim call does not strip-and-retry: it claims
+			// again on its next poll with a fresh snapshot.
 			if errors.Is(err, workersvc.ErrActiveSnapshotInvalid) {
 				httpx.Error(w, http.StatusBadRequest, "invalid request body")
 				return
@@ -1392,6 +1422,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+		case errors.Is(err, workersvc.ErrRunWallExpired):
+			ack := h.workerStateAck(r, run)
+			ack["applied"] = false
+			ack["reason"] = "wall_expired"
+			httpx.JSON(w, http.StatusConflict, ack)
 		case errors.Is(err, workersvc.ErrJobNeverParks):
 			// The service error text already reads "invalid run state: a job run never parks (<state>)".
 			httpx.Error(w, http.StatusBadRequest, err.Error())
@@ -1422,10 +1457,26 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 		// run opted out) are server-side FAILURES delivered as 200s with
 		// status: "failed", where applied is TRUE. An applied-keyed branch leaks the
 		// disk on exactly those.
-		httpx.JSON(w, http.StatusConflict, h.workerStateAck(r, run))
+		ack := h.workerStateAck(r, run)
+		if req.RequireRunning {
+			ack["applied"] = false
+			if run.Status == "running" && run.PauseMode.String == "wall" {
+				ack["reason"] = "wall_pending"
+			}
+		}
+		httpx.JSON(w, http.StatusConflict, ack)
 		return
 	}
 	ack := h.workerStateAck(r, run)
+	if req.RequireRunning {
+		ack["applied"] = true
+	}
+	if result.CompletedPublicationReceipt != nil {
+		ack["completed_publication_receipt"] = result.CompletedPublicationReceipt
+	}
+	if result.CompletedPublicationReason != "" {
+		ack["completed_publication_reason"] = result.CompletedPublicationReason
+	}
 	if req.State == "credential_switch" {
 		// PRD #1247 M5b (BLOCKING-2 rework): the held-state credential-switch RELEASE applied — a
 		// FRESH requeue (status 'queued') OR an idempotent release after a reclaim (applied, status
@@ -1503,6 +1554,18 @@ func (h *Handler) WorkerRunInputs(w http.ResponseWriter, r *http.Request) {
 	// sends no marker; the worker then routes that reply at once instead of waiting on an ACK.
 	if res.Receipts {
 		body["receipts"] = true
+	}
+	// PRD #2603: the effective model-written Now-summary setting for THIS run's owner (instance
+	// switch AND the owner's own switch). One cheap read per poll: the instance key is a cache
+	// hit and the user switch is a primary-key read. Left out on the consume-nothing early
+	// returns (OwnerID unset) and on a read error; the worker reads a missing field as off, so a
+	// failed read can never spend a token.
+	if res.OwnerID != uuid.Nil {
+		if on, err := h.EffectiveNowSummary(r.Context(), res.OwnerID); err != nil {
+			slog.Warn("worker run inputs: now summary setting", "run_id", runID, "error", err)
+		} else {
+			body["now_summary"] = on
+		}
 	}
 	httpx.JSON(w, http.StatusOK, body)
 }
@@ -1621,7 +1684,11 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 	if !ok {
 		return
 	}
-	status, recoveryRetryNotBefore, claimGeneration, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
+	if _, cleanup := r.URL.Query()["purpose"]; cleanup {
+		h.workerCodeSnapshotCleanup(w, r, wkr, runID)
+		return
+	}
+	status, recoveryRetryNotBefore, claimGeneration, holdReason, claimReleased, err := h.wsvc.RunOwnership(r.Context(), wkr, runID)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrRunNotOwned) {
 			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
@@ -1644,7 +1711,7 @@ func (h *Handler) WorkerRunOwnership(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
-	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded}
+	body := map[string]any{"status": status, "claim_generation": claimGeneration, "inventory_guarded": guarded, "hold_reason": holdReason, "claim_released": claimReleased}
 	if recoveryRetryNotBefore != nil {
 		body["recovery_retry_not_before"] = recoveryRetryNotBefore
 	}
@@ -2203,17 +2270,28 @@ func (h *Handler) WorkerRunPublish(w http.ResponseWriter, r *http.Request) {
 	out := map[string]any{"published": res.Published, "ref": res.Ref}
 	if res.Skipped != "" {
 		// A benign non-publish outcome (origin moved / workflow-scope / unsupported /
-		// no-ref): a 200, not a fault. Log it at INFO with the mapped skip reason so the
-		// distribution of publish outcomes is observable by `reason` — the same label a
-		// checkpoint_publish_failures_total counter would carry — without adding a metrics
-		// dependency the api does not have (see the error arm above). INFO, not WARN:
-		// not_descendant is the common "origin advanced" case and must not read as an
-		// operator alert.
-		slog.Info("worker run publish skipped",
-			"run_id", runID.String(),
-			"worker_id", wkr.ID.String(),
-			"reason", res.Skipped,
-		)
+		// no-ref / tip_missing / pack_too_large / pack_invalid): a 200, not a fault. Log it
+		// with the mapped skip reason so the distribution of publish outcomes is observable by
+		// `reason` — the same label a checkpoint_publish_failures_total counter would carry —
+		// without adding a metrics dependency the api does not have (see the error arm above).
+		// A skip that carries a Detail (the broker refused the pack or tip) is an operator
+		// signal and logs at WARN with that content-free, scrubbed detail; the rest stay INFO
+		// (not_descendant is the common "origin advanced" case and must not read as an alert).
+		// Detail never goes on the wire: the response below stays the explicit map.
+		if res.Detail != "" {
+			slog.Warn("worker run publish refused",
+				"run_id", runID.String(),
+				"worker_id", wkr.ID.String(),
+				"reason", res.Skipped,
+				"detail", res.Detail,
+			)
+		} else {
+			slog.Info("worker run publish skipped",
+				"run_id", runID.String(),
+				"worker_id", wkr.ID.String(),
+				"reason", res.Skipped,
+			)
+		}
 		out["skipped"] = res.Skipped
 	}
 	httpx.JSON(w, http.StatusOK, out)

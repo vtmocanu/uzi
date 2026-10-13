@@ -514,6 +514,7 @@ print(f"PASS provider suppression rule/path/error surfaces families={len(provide
 # query would emit more than the scanner JSON bound. All subprocess argv is fixed.
 real_git = shutil.which("git", path=os.environ["PATH"])
 git_calls = scratch / "git-calls"
+lookup_timings = scratch / "lookup-timings"
 fake_git = repo / "bin/git"
 fake_git.write_text(r'''#!/usr/bin/env python3
 import json
@@ -532,14 +533,28 @@ assert args[:5] == ["--literal-pathspecs", "ls-files", "--error-unmatch", "--",
                    args[-1]] and len(args) == 5
 assert stat.S_ISCHR(os.fstat(1).st_mode) and stat.S_ISCHR(os.fstat(2).st_mode)
 mode = os.environ.get("LOOKUP_MODE")
+started = time.monotonic()
 if mode == "failure":
     sys.exit(128)
 if mode == "timeout":
     time.sleep(2)
-sys.exit(subprocess.run([os.environ["REAL_GIT"], *args]).returncode)
+if mode == "slow-success":
+    time.sleep(0.3)
+rc = subprocess.run([os.environ["REAL_GIT"], *args]).returncode
+if mode == "slow-success":
+    with open(os.environ["LOOKUP_TIMINGS"], "a") as output:
+        output.write(json.dumps({"elapsed": time.monotonic() - started,
+                                 "status": rc}) + "\n")
+sys.exit(rc)
 ''')
 fake_git.chmod(0o755)
-lookup_env = env | {"GIT_CALLS": str(git_calls), "REAL_GIT": real_git}
+lookup_env = env | {"GIT_CALLS": str(git_calls), "REAL_GIT": real_git,
+                    "LOOKUP_TIMINGS": str(lookup_timings)}
+
+# The canary plus 20 targets each have a one-second production lookup budget.
+# Allow that sequential envelope plus the existing six-second startup/render
+# margin; the reporter's individual timeout and query cap remain unchanged.
+REPORT_TIMEOUT = 21 * 1 + 6
 
 
 def lookup_report(data, raw=0, stage="tree", mode=None):
@@ -549,7 +564,7 @@ def lookup_report(data, raw=0, stage="tree", mode=None):
     result = subprocess.run(["python3", "-B", str(helper), "report", str(directory),
                              stage, "scripts/semgrep-canary.txt", "rules"],
                             cwd=repo, env=lookup_env | ({"LOOKUP_MODE": mode} if mode else {}),
-                            capture_output=True, timeout=6)
+                            capture_output=True, timeout=REPORT_TIMEOUT)
     queries = [json.loads(line) for line in git_calls.read_text().splitlines()]
     return result, queries
 
@@ -604,6 +619,29 @@ result, queries = lookup_report({"results": results, "errors": errors}, 1)
 assert result.returncode == 2 and len(queries) == 21
 assert all(query[-1] not in targets[20:] for query in queries)
 print("PASS error/result display query cap=21 single selected location", flush=True)
+
+# Every lookup succeeds within the reporter's one-second limit, but their
+# sequential batch legitimately exceeds the old six-second enclosing watchdog.
+lookup_timings.write_text("")
+started = time.monotonic()
+try:
+    result, queries = lookup_report({"results": results, "errors": errors}, 1,
+                                    mode="slow-success")
+except subprocess.TimeoutExpired as error:
+    raise AssertionError("slow report batch exceeded enclosing watchdog") from error
+elapsed = time.monotonic() - started
+timings = [json.loads(line) for line in lookup_timings.read_text().splitlines()]
+assert result.returncode == 2 and b"verdict=2" in result.stdout, result.stdout
+assert b"tracked_lookup_failure" not in result.stdout, result.stdout
+assert len(queries) == len(timings) == 21, (queries, timings)
+assert all(query[-1] in targets[:20] or query[-1] == "scripts/semgrep-canary.txt"
+           for query in queries), queries
+assert all(timing["status"] == 0 and timing["elapsed"] < 1
+           for timing in timings), timings
+assert elapsed > 6, elapsed
+print(f"PASS slow report batch queries=21 status=2 elapsed={elapsed:.3f} "
+      f"max_lookup={max(timing['elapsed'] for timing in timings):.3f}", flush=True)
+
 errors = [{"type": "ParseError", "rule_id": "r" * 160,
            "location": {"path": long_target, "start": {"line": 10000000}}}] * 20
 result, queries = lookup_report({"results": results, "errors": errors}, 1)

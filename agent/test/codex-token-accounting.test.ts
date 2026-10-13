@@ -351,7 +351,7 @@ describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evi
 
   // PRD #1551 (D5): a CUSTOM (unknown-to-the-price-table) worker-root model has no price row,
   // so under api_key it is `unreported` with FULL token totals (never a fabricated dollar), and
-  // under subscription it is `subscription` with token totals — same honest accounting as any
+  // under subscription it is also `unreported` with token totals — the same accounting as any
   // other unpriced model. This confirms opening custom root models needs no pricing-table change.
   const CUSTOM_MODEL = "gpt-7-custom-preview";
   it("(#1551) a custom (unknown-price) model under api_key is unreported with token totals retained", () => {
@@ -365,15 +365,16 @@ describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evi
     assert.ok(!("costUSD" in entry), "no dollar figure invented for an unknown model");
     assert.equal(entry.inputTokens, 300, "input tokens retained");
     assert.equal(entry.outputTokens, 200, "output tokens retained");
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 
-  it("(#1551) a custom (unknown-price) model under subscription is subscription with token totals", () => {
+  it("(#1551) a custom (unknown-price) model under subscription is unreported with token totals", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, CUSTOM_MODEL, false);
     acct.record(ROOT, usageEvidence(B, B, true));
     const entry = acct.aggregateByModel({ authMode: "subscription", now: API_KEY.now })![CUSTOM_MODEL]!;
-    assert.equal(entry.costStatus, "subscription", "subscription usage stays subscription even for an unknown model");
+    assert.equal(entry.costStatus, "unreported", "unknown models have no estimate under either auth mode");
+    assert.ok(!("costUSD" in entry));
     assert.equal(entry.inputTokens, 300, "input tokens retained");
     assert.equal(entry.outputTokens, 200, "output tokens retained");
   });
@@ -395,15 +396,16 @@ describe("CodexUsageAccountant: m3 fail-closed pricing on malformed required evi
     assert.equal(astra.inputTokens, 300, "uncached input retained");
     assert.equal(astra.outputTokens, 200, "output retained");
     // Run-level rollup: an unreported entry makes the api-key run unreported.
-    assert.deepEqual(deriveCodexRunCost(agg, "api_key"), { kind: "unreported" });
+    assert.deepEqual(deriveCodexRunCost(agg), { kind: "unreported" });
   });
 
-  it("a subscription run is unaffected by the evidence flag (still subscription, tokens retained)", () => {
+  it("a subscription run fails pricing closed on malformed evidence, tokens retained", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, false);
     acct.record(ROOT, usageEvidence(B, B, false));
     const astra = acct.aggregateByModel({ authMode: "subscription", now: API_KEY.now })![MODEL_ROOT]!;
-    assert.equal(astra.costStatus, "subscription", "the evidence gate only applies to the api-key pricing branch");
+    assert.equal(astra.costStatus, "unreported", "the evidence gate applies to both credential modes");
+    assert.ok(!("costUSD" in astra));
     assert.equal(astra.inputTokens, 300);
   });
 

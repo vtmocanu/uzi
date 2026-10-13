@@ -4,7 +4,6 @@ import (
 	"context"
 	"errors"
 	"html"
-	"log/slog"
 	"regexp"
 	"strings"
 	"unicode"
@@ -524,6 +523,11 @@ func isASCIIAlnum(c byte) bool {
 // entries. The returned slices are never nil. ctx is checked between fields: a cancelled request
 // stops sanitizing and returns ctx.Err().
 func SanitizePrDescriptionFields(ctx context.Context, in apitypes.PrDescriptionFields) (apitypes.PrDescriptionFields, error) {
+	return sanitizePrDescriptionFields(ctx, in, nil)
+}
+
+// sanitizePrDescriptionFields reports only a fixed rejection reason, never graph text.
+func sanitizePrDescriptionFields(ctx context.Context, in apitypes.PrDescriptionFields, rejected func(string)) (apitypes.PrDescriptionFields, error) {
 	out := apitypes.PrDescriptionFields{
 		Changes:        []string{},
 		ScopeNotes:     []apitypes.PrDescriptionScopeNote{},
@@ -597,8 +601,8 @@ func SanitizePrDescriptionFields(ctx context.Context, in apitypes.PrDescriptionF
 		}
 		var reason string
 		out.Diagram, reason = sanitizePrDescDiagram(in.Diagram)
-		if reason != "" {
-			slog.Warn("workersvc: dropped pr description diagram", "reason", reason)
+		if reason != "" && rejected != nil {
+			rejected(reason)
 		}
 	}
 	return out, nil

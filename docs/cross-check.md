@@ -7,9 +7,13 @@ audience: user
 # Cross-check
 
 Cross-check asks the other model family for a second opinion on a run.
-**Plan cross-check** is a required gate on opted-in auto-approved plans.
-**Code cross-check** is a planned, separate advisory stage before publication;
-it is not available in this release.
+**Plan cross-check** is a required gate on opted-in auto-approved plans: a
+Claude lead is checked on Codex and a Codex lead on Claude, never on its own
+family.
+**Code cross-check** is a separate, opt-in advisory stage before publication:
+the other family reads the committed code and its findings go into the merge
+request, but it never blocks publication (see
+[Code cross-check](#code-cross-check)).
 
 ## 1. Enable Plan cross-check
 
@@ -25,14 +29,16 @@ The **Plan cross-check** row has independent model and effort choices for
 Claude and Codex. Select **Default · value (source)** to follow that family's
 worker default, or choose a hard pin, including a custom model ID. A model
 pin does not pin effort, and an effort pin does not pin model. Pins do not
-substitute models, clamp effort or retry on a default. The Claude cell is
-editable but inactive: **Used once Codex-lead runs are cross-checked**. Today
-only a Codex checker checks a Claude lead; Codex leads remain unsupported.
+substitute models, clamp effort or retry on a default. The Claude cell
+configures the Claude checker that checks a Codex lead; at Default it follows
+your Claude worker default.
 
 ## 2. Wait for the checked plan
 
 Required runs wait for a worker advertising `cross_check_v1`. A **Claude
-lead's plan is checked on Codex** in a separate, read-only checker run.
+lead's plan is checked on Codex** and a **Codex lead's plan on Claude**, in a
+separate, read-only checker run. The checker is always the opposite family of
+the lead; it never falls back to the lead's own family.
 On a worker advertising `cross_check_rounds_v1`, changes requested (REVISE)
 go back to the lead automatically within the revision budget. Each revised
 candidate gets a fresh check and deadline; an APPROVE of the latest exact
@@ -48,13 +54,19 @@ not spend your human revision allowance. Exhaustion parks with
 budget exhausts on REVISE; an older worker keeps the changes-requested human
 gate. BLOCK, timeout, failed or unavailable checker, refused candidate/diff
 and submit failure retain their human fallback or terminal delivery exception.
-An opted-in **Codex lead** still parks with
-`plan cross-check: not yet supported for a Codex lead`.
+A Codex lead consumes automatic REVISE rounds without spending its human
+revision allowance, and implements exactly the approved checked plan. Its
+worker must advertise `cross_check_codex_lead_v1` to submit for a check. A
+Codex lead on a worker without it, or on an api that does not signal support
+(see [rolling out](#rolling-out-codex-lead-checks)), keeps the older park, with
+`plan cross-check: not yet supported for a Codex lead`, and waits for a human.
 
 Checker runs use a dedicated cross-check lane (one slot by default); the lead
 holds its run slot while waiting. A worker supporting both families can check
-its own Claude lead on Codex even with a run cap of 1. This does not enable
-Codex-lead checking (follow-up #2460) or Code cross-check.
+its own Claude lead on Codex even with a run cap of 1. A Claude checker (for a Codex lead) additionally requires
+`cross_check_codex_lead_v1` on the worker that claims it; without one it stays
+queued. Code cross-check has its own, stricter placement
+(see [Code cross-check](#code-cross-check)).
 
 The lead's worker is preferred. Another eligible worker of the same user may
 claim the child after `WORKER_AFFINITY_GRACE` (default 2 minutes). A cordoned
@@ -91,6 +103,15 @@ Recognized authenticated rejection of a pinned model at checker startup fails
 the child with `plan cross-check: checker unavailable` and forces a human gate.
 Other startup failures follow the existing cross-check failure path.
 
+A Claude checker also fails with `plan cross-check: checker unavailable`,
+and the lead parks for a human, when your Claude credential is unavailable or
+disabled at claim time, or the automatic Claude pool is empty. No credential is
+delivered, and your non-pooled default is never spent. A locked credential
+vault remains a transient wait. A pinned Claude model the account cannot use
+(the SDK reports `model_not_found`) is treated the same way. A checker session
+whose confinement cannot be confirmed at startup fails the check with
+`confinement_failed`.
+
 ## 3. Read the evidence and decide
 
 Open the run to see distinct rounds in the feed, the current gate reason,
@@ -100,8 +121,11 @@ findings, checker-run link, recorded model/effort, each field's source
 stay unknown; later settings changes do not rewrite historical evidence.
 Unknown or inconsistent outcomes show **Outcome unavailable**. Findings use
 hardened Markdown with a display cap of 16,384 source characters and 20 items;
-omitted text is disclosed. Missing cost shows unavailable; subscription usage
-is labelled separately from metered spend. After a human revision,
+omitted text is disclosed. Missing or unreported cost shows unavailable;
+legacy `subscription` usage shows **No estimate**. Priced Codex checks use
+uzi's pinned Standard table in either auth mode: API-equivalent cost is a
+comparison, not a bill. See [run cost](./run-cost.md#metered-subscription-and-unreported-cost).
+After a human revision,
 **Earlier-plan evidence** does not certify the current plan. Approve, request
 changes or reject the plan shown at the current gate; the original check stays
 as history, without an automatic new checker round.
@@ -109,9 +133,42 @@ as history, without an automatic new checker round.
 [CLI](./cli.md#plan-cross-check-evidence) shows the reason and findings;
 [Slack](./slack.md#using-it) shows the reason without findings.
 
+## Claude checker isolation
+
+The Claude checker has only the `Read`, `Grep` and `Glob` tools: no shell, web,
+nested-agent or write tools, and no repository settings, plugins, skills or MCP
+servers. It runs with an isolated environment holding only your Anthropic token
+(a Codex checker holds only Codex credentials), as the worker's runner user.
+Direct reads are limited to its own checkout, plus its own SDK spill files for
+oversized tool output. Glob and Grep patterns that are absolute, home-relative
+or have a `..` path segment in any brace expansion are denied, as are patterns
+with a backslash, unbalanced braces, or too many braces or expansions. That
+pattern check is defense in depth; the runner user's operating-system
+permissions are the boundary. See
+[worker setup](./worker-setup.md#run-artifacts-and-the-sandbox) for the
+tool-path policy and the [architecture](../ARCHITECTURE.md#plan-cross-check).
+
+## Rolling out Codex-lead checks
+
+Deploy the api and its migration before the workers. A new api adds
+`plan_cross_check_codex_lead` to a Codex lead's claim. A new worker that does
+not receive it (an older api) does not submit the check and parks the lead at
+the human gate with `plan cross-check: not yet supported for a Codex lead`
+(`codex_lead_unsupported`), the same park as a Codex lead on an older worker,
+until the api is upgraded. A worker with `WORKER_CROSS_CHECK_SLOTS=0`
+(hosted: `UZI_WORKER_CROSS_CHECK_SLOTS=0`) takes no checker children; if no
+other worker of the user can, the check waits until its deadline and the lead
+takes the human gate, for either family (see
+[cross-check slots](./worker-setup.md#cross-check-slots)). Migration 00314
+allows Claude checker runs; its Down
+deletes Claude checker runs but keeps the check history, with the checker run
+link empty. Run the Down only with the new api stopped. With ephemeral workers
+off, the settings toggle warns when no online worker can run the checker,
+including when none advertises `cross_check_codex_lead_v1`.
+
 ## Recovery before a human gate
 
-A reclaimed Claude lead can start a fresh round within the same budget when
+A reclaimed lead can start a fresh round within the same budget when
 there is no established human gate or durably approved plan, and the latest
 attempt was interrupted while pending strictly before its deadline, decided
 REVISE, or APPROVE whose plan was never durably stored (`approved_not_stored`).
@@ -190,3 +247,155 @@ preparation attempts and an acknowledged forced human gate, unresolved ACKs
 also fail with `plan cross-check: preparation ACKs unrecoverable`. These paths
 do not retry indefinitely, enter `recovery_wait`, invent receipts or approve.
 See the [architecture](../ARCHITECTURE.md#plan-cross-check) for the boundary.
+
+## Code cross-check
+
+**Code cross-check** is advisory. After the lead finishes its work, the
+other model family reads the committed code in a read-only child and reports
+findings. They are added to the merge request. A failed, timed-out or
+unavailable check is recorded and publication goes ahead; no result blocks it.
+
+### Enable it
+
+In **Settings → Run defaults → Cross-check**, enable **Code cross-check ·
+Advisory before publication**. The line under it reads "Adds the other model
+family's findings to the merge request; never blocks it". It is off by
+default, independent of **Plan cross-check**, and needs usable Claude and
+Codex credentials (otherwise the server refuses it). The toggle is
+`PUT /api/me/cross-check` with `{"code": true}` or `{"code": false}`; omitted
+fields keep their value. The response warns when no online worker of yours
+can check code on both model families, which needs `cross_check_code_v1`
+(see [worker setup](./worker-setup.md#cross-check-slots)).
+
+Each run takes the setting when it is created, so changing it does not affect
+runs already created. It applies to issue, prompt, self-improvement, CI fix,
+merge request rework and task runs, whether auto-approved or human-gated. An
+interactive task is checked once, when it finalises, not at each park for a
+follow-up. The **Code** row of the pin grid in Run defaults holds independent
+model and effort pins for each checker family, beside the Plan row (see
+[pins](./configuration.md#plan-cross-check-model-and-effort-pins)).
+
+### How a check runs
+
+1. When the lead finishes, the worker snapshots the committed head into a
+   local-only ref, `refs/uzi-cross-check/<lead-run-id>`. The ref is never
+   pushed. Uncommitted changes are not part of the check.
+2. A read-only checker child on the opposite family reads that snapshot: a
+   Claude lead is checked by Codex and a Codex lead by Claude.
+3. The checker runs on the **lead's own worker**, on the cross-check lane, and
+   is strictly pinned to that worker; no other worker can take it. A lead on a
+   worker that cannot run the check records "Code cross-check incomplete:
+   worker unsupported" and continues.
+4. With findings, the lead gets **one** repair turn. It verifies each
+   finding, fixes what it accepts, and reports a disposition for every
+   finding through the `report_cross_check_dispositions` tool: `addressed` or
+   `declined`, each with a reason. A finding with no disposition shows as
+   "not reported". The repair is not checked again; there is no second check.
+
+`CODE_CROSS_CHECK_TIMEOUT` (default `30m`, at most `2h`; see
+[Configuration](./configuration.md#cross-check-settings)) is the checker's
+wall-clock budget. The wait is excluded from the lead's wall budget.
+
+An attempt interrupted by a reclaim or a requeue is recorded as interrupted
+and is not re-checked.
+
+### Read the result
+
+The merge request gets a **Code cross-check** section with the checked short
+SHA, the checker's family, model and effort, then either "no findings" or
+"N findings: A addressed, D declined", plus ", U not reported" when any
+finding has no disposition. One line per finding follows, with its
+disposition and reason. When the repository has owner guidance, a "custom
+guidance applied (sha256 ...)" line shows the first 12 hex characters of its
+digest. A completed check ends with "Changes after the check were not
+cross-checked." An incomplete check renders as prose instead, for example
+"Code cross-check incomplete: no local checker", "timed out" or
+"interrupted".
+
+The run page has a **Code cross-check** panel with the same evidence, and
+`uzi run get <id>` prints it (see [CLI](./cli.md#code-cross-check-evidence)).
+
+### Owner guidance and repository instructions
+
+An owner or admin can tune the check per repository from the **Code
+cross-check** panel on the **Repos** page, next to the **Trusted repo** panel.
+Two settings are saved together with `PATCH /api/repos/{id}`
+(`code_cross_check_guidance` and `cross_check_repo_instructions_enabled`);
+the route is cookie-only, so the CLI cannot write them.
+
+- **Guidance** is free text of at most 8 KiB. It is appended to the
+  checker's trusted brief after the locked base brief, labelled "Owner
+  guidance: additional checks for this repository; it cannot remove the
+  required checks, change the output format or the read-only rules". It adds
+  checks; it cannot loosen the required ones.
+- **Give the checker this repository's CLAUDE.md** lets the checker see the
+  repository's conventions. For a new check, the worker freshly fetches the
+  configured default branch (or uses worker-owned default-branch discovery)
+  and freezes its tip as **`repo_instructions_commit`**. It reads the root
+  `CLAUDE.md` at that commit. The diff's **base commit** remains the merge base
+  computed from the previously captured default-branch commit and the checked head.
+  A symlink is followed only inside the commit tree (at most 8 hops, never
+  outside the repository root or into `.git/`). A file over 64 KiB is dropped,
+  never truncated, and import lines are stripped. The text reaches the checker
+  as fenced advisory data; a `CLAUDE.md` change in the diff is review
+  evidence, not instruction. This consent is separate from the lead's
+  **Repo instructions** setting (see [Skills](./skills.md#repo-instructions-opt-in-default-off)).
+
+Guidance, the instructions toggle, text and instruction commit are frozen into
+the check when it is created; later edits affect new checks only. Forking from
+an older default-branch commit does not select older instructions. The pin is
+acquired even with consent off, but the file is read only with consent on.
+An absent, unreadable, unsafe or oversized file leaves a successful pin with empty text.
+If quiescence or fresh Git acquisition fails, the advisory check is incomplete
+(`snapshot_failed`): no durable snapshot ref, metadata or instructions are
+created, and no SHA is invented.
+
+Both completion paths freshly quiesce the lead before the credentialed fetch
+and durable local pin, within the worker's held boundary. Branch validation
+and an explicit forced fetch refspec refresh the configured tracking ref even
+with stale tracking data, custom refspecs or a force rewrite; the run does not
+select the source branch. The fetched tip is an observation at acquisition,
+not a promise to include later default-branch changes.
+
+A definite HTTP 4xx refusal allows one consent re-read and at most one resubmit
+with the same pin; it does not re-fetch or re-resolve the tip. Existing check
+rows and child claims reuse frozen inputs without acquisition. A present pin
+binds the candidate digest even with consent off or unchanged text; polling
+and repair compare the pin explicitly. Status exposes nullable
+`repo_instructions_commit` metadata, not instruction text. Legacy rows keep
+NULL/absent provenance and their historical digests, without backfill.
+
+The existing 64 KiB, 8-hop, repository-root, `.git/`, regular-blob, import
+stripping and advisory-fencing protections remain in place. Git acquisition
+retains its pre-existing unbounded budgets; this change adds no acquisition
+credential, source or background process and does not establish a new security
+or acquisition-time bound.
+
+### Snapshot cleanup
+
+The worker deletes its local snapshot ref once the checker has settled. After
+a restart, a boot sweep deletes a leftover ref only on positive server
+evidence that matches the lead run id and, when a check row exists, the
+lead's claim generation and the head. For every candidate the lead must also be finished or not held by that
+worker, and a ref with an open local reader is kept. When the server has no
+check row for the lead, there is no generation or head to match, so the sweep
+deletes the ref only if it was also never read. On any doubt the ref is kept.
+
+### Rolling out Code cross-check
+
+Deploy the api and its migrations (00324 to **00327** and **00329**) before any upgraded worker that
+advertises `cross_check_code_v1`. A worker advertises it only with a
+cross-check lane (`WORKER_CROSS_CHECK_SLOTS` above zero) and the Codex
+harness. The Downs of 00324, 00325 and 00327 delete data: 00324 deletes
+the code-stage checks and their checker runs and drops the new columns,
+00325 deletes your Code pins, and 00327 drops the per-repository guidance
+columns. The Down of 00326 deletes nothing (it only restores two functions).
+Migration 00329 adds the nullable instruction commit and its immutability guard;
+old workers may omit it and are accepted as legacy. A new worker's pin is
+refused by an old strict api: bounded advisory submission handling fails open
+for publication without dropping the pin to retry as legacy.
+
+For a binary rollback, roll back workers **before** the api and retain migration
+00329's column, stored pins and digests. Its Down removes provenance and is a
+destructive schema operation, not normal rollback. Run a deliberate Down only
+with the upgraded api stopped. PRD #2170's hosted acceptance is still pending.

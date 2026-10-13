@@ -23,7 +23,7 @@ func TestPollSendsBearerOnAGetAndParsesDesiredState(t *testing.T) {
 		gotPath = r.URL.Path
 		gotMethod = r.Method
 		gotBody, _ = io.ReadAll(r.Body)
-		_, _ = io.WriteString(w, `{"workers":[{"id":"w1","template":"base","size":"s","generation":2,"join_token":"uzw_t"}]}`)
+		_, _ = io.WriteString(w, `{"workers":[{"id":"11111111-1111-1111-1111-111111111111","template":"base","size":"s","generation":2,"join_token":"uzw_t"}]}`)
 	}))
 	defer srv.Close()
 
@@ -45,7 +45,7 @@ func TestPollSendsBearerOnAGetAndParsesDesiredState(t *testing.T) {
 	if len(gotBody) != 0 {
 		t.Fatalf("request body = %q, want none", gotBody)
 	}
-	if len(resp.Workers) != 1 || resp.Workers[0].ID != "w1" || resp.Workers[0].Generation != 2 {
+	if len(resp.Workers) != 1 || resp.Workers[0].ID != "11111111-1111-1111-1111-111111111111" || resp.Workers[0].Generation != 2 {
 		t.Fatalf("workers = %+v", resp.Workers)
 	}
 	if resp.Workers[0].JoinToken == nil || *resp.Workers[0].JoinToken != "uzw_t" {

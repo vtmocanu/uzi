@@ -24,8 +24,9 @@ import (
 //   - .github/workflows/release.yml build matrix — TestWorkflowMatricesMatchNames
 //   - release.yml assert-worker-pin loop         — TestReleaseScriptWorkerListsMatchNames
 //   - release-verify.sh guard-4 loop             — TestReleaseScriptWorkerListsMatchNames
+//   - release-cut.sh pre-flight loop              — TestReleaseScriptWorkerListsMatchNames
 //
-// The last two are the hand-written worker lists in the release-train's PUBLISHED-pin
+// The last three are the hand-written worker lists in the release-train's PUBLISHED-pin
 // guards (issue: an unpublished worker image, 2026-09-19). A template in Names but absent
 // from one of those loops is never checked for a published image, so the guard silently
 // misses it — the same drift class this file exists to catch.
@@ -197,7 +198,8 @@ func markedForLists(t *testing.T, path string) [][]string {
 
 // TestReleaseScriptWorkerListsMatchNames pins the release-train's PUBLISHED-pin guard
 // lists to workertmpl.Names: release.yml's assert-worker-pin loop (template short names)
-// and release-verify.sh's guard-4 loop (agent-<name> image repos).
+// and the worker-pin loops in release-verify.sh and release-cut.sh (agent-<name>
+// image repos).
 func TestReleaseScriptWorkerListsMatchNames(t *testing.T) {
 	names := sortedNames()
 	agentNames := make([]string, len(names))
@@ -212,6 +214,7 @@ func TestReleaseScriptWorkerListsMatchNames(t *testing.T) {
 	}{
 		{filepath.Join(repoRoot, ".github", "workflows", "release.yml"), names},
 		{filepath.Join(repoRoot, ".agents", "skills", "uzi-release", "scripts", "release-verify.sh"), agentNames},
+		{filepath.Join(repoRoot, ".agents", "skills", "uzi-release", "scripts", "release-cut.sh"), agentNames},
 	}
 	for _, c := range cases {
 		lists := markedForLists(t, c.path)

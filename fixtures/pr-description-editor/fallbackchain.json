@@ -1,0 +1,45 @@
+{
+  "id": "fallbackchain",
+  "context": {
+    "issue": "Use cached metadata, then the primary service, then the local default.",
+    "prd": "Describe delivered behavior from visible evidence.",
+    "plan": "Implement the requested change.",
+    "previous": null,
+    "claims": "The agent reports the requested implementation.",
+    "commits": "Implement requested behavior",
+    "paths": "src/resolve.ts 7 0 [code]",
+    "diff": "+function resolve() {\n+  const cached = cache.read();\n+  if (cached) return cached;\n+  const remote = primary.read();\n+  if (remote) return remote;\n+  return defaults.read();\n+}",
+    "truncated": {
+      "issue": false,
+      "prd": false,
+      "plan": false,
+      "previous": false,
+      "claims": false,
+      "commits": false,
+      "paths": false,
+      "diff": false
+    },
+    "bytes": 428
+  },
+  "code": {
+    "unavailable": false,
+    "added": 7,
+    "deleted": 0
+  },
+  "lead": {
+    "verifiedAtSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "verification": [
+      {
+        "command": "npm run typecheck",
+        "result": "pass"
+      }
+    ]
+  },
+  "region": {
+    "headSha": "aaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaaa",
+    "targetBranch": "main",
+    "sizeLine": "**Size:** small"
+  },
+  "completion": "Finished fixture change.",
+  "bodyPrefix": ""
+}

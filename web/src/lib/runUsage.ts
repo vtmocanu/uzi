@@ -11,8 +11,9 @@
 //     persisted `init` frame; duration_ms / num_turns are PER-INVOCATION (they read
 //     different CLI state), so they are taken raw per phase and summed for the total.
 //   • Assistant frames carry the API call's PER-CALL message.usage, attached by the
-//     worker to exactly one emitted message per SDK frame. Those SUM directly, per
-//     agent. This is a PURE reduction over the seq-deduped message list, recomputed
+//     worker to exactly one emitted message per SDK frame. Claude attribution sums
+//     deduplicated lane/usage signatures; Codex accounting statuses sum distinct
+//     response UUIDs. Both group by role. This is a PURE reduction, recomputed
 //     from state — never an incremental accumulator, which would double-count on the
 //     ws→reconnect→REST-replay overlap.
 //
@@ -95,15 +96,17 @@
 // the React components are thin.
 
 import type { RunMessage } from "./api";
+import type { CostStatus } from "./apiTypes";
+import { isAccountingStatus } from "./accountingStatus";
 
 export interface PhaseUsage {
   /** seq of the result-frame message, so the finish line can look up its delta. */
   seq: number;
   /** "Plan" for the first phase, "Implement · iteration N" after. */
   label: string;
-  /** Per-invocation, taken raw from the frame (not cumulative). */
-  turns: number;
-  durationMs: number;
+  /** Per-invocation finite evidence, or null when absent/nonfinite (not cumulative). */
+  turns: number | null;
+  durationMs: number | null;
   /** Per-phase figures: Σ over the frame's `modelUsage` models, per COLUMN, of (this
    *  frame's value − that model's running HIGH-WATER MARK WITHIN THE LEG), each clamped
    *  at 0. The mark resets at every `init` frame (PRD #1079), so for the common case of
@@ -164,10 +167,23 @@ export interface RunUsage {
     cached: number;
     out: number;
     costUsd: number;
-    turns: number;
-    durationMs: number;
+    turns: number | null;
+    durationMs: number | null;
     phaseCount: number;
   };
+  /** PRD #2603: the Now-summary notes' usage, ALREADY INCLUDED in `total` but absent from
+   *  every phase row; the panel renders it as its own row so Run total equals the sum of
+   *  the displayed rows. All zero when the run has no note usage.
+   *
+   *  `costUsd` sums only the entries the server stored as `costStatus: "metered"` (the
+   *  server-resolved cost, so it matches run_usage; the client has no price table).
+   *  `costStatus` is the display status of that sum: "metered" when every entry is metered,
+   *  "subscription" when every entry is subscription, "" (rendered as unavailable) for a
+   *  mix, any unreported entry, or no entries at all. */
+  noteTotal: { fresh: number; cached: number; out: number; costUsd: number; costStatus: CostStatus | "" };
+  /** Issue #2686: the SummaryRunner passes' (intent / plan / PR description) usage, shaped
+   *  and resolved exactly like `noteTotal`. Included in `total`; rendered as its own row. */
+  summaryTotal: { fresh: number; cached: number; out: number; costUsd: number; costStatus: CostStatus | "" };
   /** cached / (fresh + cached) in [0,1] — the UNROUNDED truth.
    *
    *  NOT what the strip renders: `Math.round(this * 100)` reads "100% from cache" at
@@ -193,8 +209,8 @@ export interface RunUsage {
   // confirmed a billed total. `agent_instance` is null on the lead lane, so two
   // byte-identical lead calls collapse to one record — the #194-validated key. A
   // subagent invocation carries a distinct `agent_instance`, so its calls never
-  // collapse into another lane's. This dedup is applied ONLY here; the confirmed
-  // per-agent sum (`agents`/`agentTotal`) counts every frame raw and is unchanged.
+  // collapse into another lane's. Claude confirmed attribution shares this signature;
+  // Codex confirmed attribution uses response UUIDs, while live keeps this signature.
   //
   // 🔴 THERE IS DELIBERATELY NO `out` AND NO COST FIELD on any live aggregate. Per-call
   // `output_tokens` is a message_start snapshot that captures only 1-4% of the true
@@ -262,6 +278,21 @@ function rec(v: unknown): Record<string, unknown> | undefined {
 function num(v: unknown): number {
   return typeof v === "number" && Number.isFinite(v) ? v : 0;
 }
+function finiteNumber(v: unknown): number | null {
+  return typeof v === "number" && Number.isFinite(v) ? v : null;
+}
+
+/** Preserve the live lane signature exactly, including nullable wire buckets. */
+function usageSignature(m: RunMessage, raw: Record<string, unknown>): string {
+  return JSON.stringify([
+    m.agent_instance,
+    num(raw["input_tokens"]),
+    num(raw["cache_read_input_tokens"]),
+    num(raw["cache_creation_input_tokens"]),
+    num(raw["output_tokens"]),
+  ]);
+}
+
 function str(v: unknown): string | undefined {
   return typeof v === "string" ? v : undefined;
 }
@@ -323,6 +354,28 @@ interface ModelFigures {
   cached: number; // cacheReadInputTokens
   out: number; // outputTokens
   costUsd: number; // costUSD, quantized to microdollars (see quantizeCost)
+}
+
+/** `maxProgressNoteModels` (progress_note.go): model_usage entries kept per progress_note
+ *  and per summary_usage message (the server's normalizers share the cap). */
+const MAX_NOTE_MODELS = 4;
+
+interface SideAcc {
+  total: RunUsage["noteTotal"];
+  entries: number;
+  metered: number;
+  subscription: number;
+  seen: Set<number>;
+}
+
+function newSideAcc(): SideAcc {
+  return {
+    total: { fresh: 0, cached: 0, out: 0, costUsd: 0, costStatus: "" },
+    entries: 0,
+    metered: 0,
+    subscription: 0,
+    seen: new Set<number>(),
+  };
 }
 
 const ZERO_MODEL: ModelFigures = { input: 0, cacheCreation: 0, cached: 0, out: 0, costUsd: 0 };
@@ -532,6 +585,34 @@ function primaryModel(counts: Record<string, number>): { model: string | null; o
   return { model: entries[0][0], otherModels: entries.length - 1 };
 }
 
+/** True when a side total (Now notes or intent/plan/PR summaries) recorded any spend: the
+ *  one predicate behind the panel's side rows and `hasSideUsage`, so they cannot drift. */
+export function hasSpend(t: RunUsage["noteTotal"]): boolean {
+  return t.fresh + t.cached + t.out > 0 || t.costUsd > 0;
+}
+
+/** True when a summary pass or a Now note recorded spend, whether or not a result frame did. `hasConfirmed` is left alone (it means a result frame landed), so a
+ *  lead that failed before any result frame still earns the usage panel through this. */
+export function hasSideUsage(usage: RunUsage): boolean {
+  return hasSpend(usage.noteTotal) || hasSpend(usage.summaryTotal);
+}
+
+/** Shared by the full panel and its progress-card link. Tails alone have no panel. */
+export function usagePanelVisible(usage: RunUsage): boolean {
+  return usage.hasConfirmed || usage.hasLiveTokens || hasSideUsage(usage);
+}
+
+/** The side-only table and footer use the same rows and status, including mixed unknowns. */
+export function sideUsage(usage: RunUsage) {
+  const rows = [
+    { label: "Now summaries", t: usage.noteTotal },
+    { label: "Intent, plan & PR summaries", t: usage.summaryTotal },
+  ].filter(r => hasSpend(r.t));
+  const status = rows.length === 0 || rows.some(r => r.t.costStatus !== rows[0]!.t.costStatus)
+    ? "" : rows[0]!.t.costStatus;
+  return { rows, status };
+}
+
 /**
  * Reduce a run's message list into its usage surfaces. Pure: same messages (and
  * `opts`) → same result, so React just re-runs it as the stream grows (Decision 9
@@ -557,10 +638,11 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
   // The LIVE aggregate (issue #237), DEDUPED by `(agent_instance, usage)`. All state
   // is local to this one call — the reduction stays pure and idempotent under the
   // ws→reconnect→REST-replay overlap, exactly like the confirmed accumulators. The
-  // dedup NEVER touches the raw `agents`/`agentTotal` sum above: those count every
-  // frame. `Map` (not `{}`) for both bucket maps because agent/model ids are untrusted
+  // confirmed attribution has its own set: Claude shares the signature, Codex uses
+  // response UUIDs. `Map` (not `{}`) because agent/model ids are untrusted
   // payload (same rationale as `agentMap`/`readModelUsage`).
   const seenLiveKeys = new Set<string>();
+  const seenConfirmedKeys = new Set<string>();
   const liveTotal = { fresh: 0, cached: 0 };
   const liveByAgentMap = new Map<string, { fresh: number; cached: number }>();
   const liveByModelMap = new Map<string, { fresh: number; cached: number }>();
@@ -597,6 +679,62 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
   // derived from this map.
   const modelSums = new Map<string, ModelFigures>();
   let implIteration = 0;
+  // PRD #2603: the Now-summary notes' usage. It joins the model sums and the billed total
+  // below but never a phase row or a per-agent row. `seenNoteSeqs` makes a replayed note
+  // (ws -> REST overlap) count once, as the server's per-seq row does.
+  const noteAcc = newSideAcc();
+  const summaryAcc = newSideAcc();
+  const noteTotal = noteAcc.total;
+  const summaryTotal = summaryAcc.total;
+  // Folds one accounting-only message (progress_note / summary_usage) into modelSums
+  // under `<prefix>:<model>` and into `acc`. A replayed seq counts once, as the server's
+  // per-seq row does.
+  function foldSideUsage(
+    acc: SideAcc,
+    prefix: string,
+    seq: number,
+    payload: Record<string, unknown> | null | undefined,
+  ): void {
+    if (acc.seen.has(seq)) return;
+    acc.seen.add(seq);
+    const nu = rec(payload?.["model_usage"]);
+    if (!nu) return;
+    // The stored payload is already normalised by the server; this re-cap to the first
+    // MAX_NOTE_MODELS in sorted name order is only defensive.
+    const names = Object.keys(nu).filter((k) => k !== "").sort().slice(0, MAX_NOTE_MODELS);
+    for (const raw of names) {
+      const e = rec(nu[raw]);
+      if (!e) continue;
+      const meteredCost =
+        e["costStatus"] === "metered" && typeof e["costUSD"] === "number" && Number.isFinite(e["costUSD"]);
+      const cur: ModelFigures = {
+        input: tokens(e["inputTokens"]),
+        cacheCreation: tokens(e["cacheCreationInputTokens"]),
+        cached: tokens(e["cacheReadInputTokens"]),
+        out: tokens(e["outputTokens"]),
+        // The server stores the cost it resolved as costStatus + costUSD, so only a
+        // "metered" entry carries a dollar figure; anything else adds tokens and no cost,
+        // and is shown unavailable.
+        costUsd: meteredCost ? quantizeCost(e["costUSD"]) : 0,
+      };
+      acc.entries++;
+      if (meteredCost) acc.metered++;
+      else if (e["costStatus"] === "subscription") acc.subscription++;
+      const key = capModelID(`${prefix}:${raw}`);
+      const sum = modelSums.get(key) ?? ZERO_MODEL;
+      modelSums.set(key, {
+        input: sum.input + cur.input,
+        cacheCreation: sum.cacheCreation + cur.cacheCreation,
+        cached: sum.cached + cur.cached,
+        out: sum.out + cur.out,
+        costUsd: sum.costUsd + cur.costUsd,
+      });
+      acc.total.fresh += cur.input + cur.cacheCreation;
+      acc.total.cached += cur.cached;
+      acc.total.out += cur.out;
+      acc.total.costUsd += cur.costUsd;
+    }
+  }
   // Whether ANY init frame has been seen yet: the run's FIRST init never opens a new
   // lineage (lineage 0 is the initial session whether or not its first init is flagged).
   let sawInit = false;
@@ -620,6 +758,22 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       prevByModel.clear();
       if (payload["fresh_session"] === true && sawInit) lineageR.clear();
       sawInit = true;
+    }
+
+    // PRD #2603: a progress_note's model_usage folds under `progress_note:<model>`, one
+    // row per note (the server's lineage_epoch is the note's own seq), so it is summed,
+    // never max-merged with the run's own frame of the same model. It never reaches the
+    // per-agent branch below.
+    if (m.kind === "progress_note") {
+      foldSideUsage(noteAcc, "progress_note", m.seq, payload);
+      continue;
+    }
+    // Issue #2686: a SummaryRunner pass's usage folds the same way under
+    // `summary_pass:<model>` (lineage_epoch = the message's seq, so each pass is its own
+    // row and passes SUM). Never a phase row or a per-agent row.
+    if (m.kind === "summary_usage") {
+      foldSideUsage(summaryAcc, "summary_pass", m.seq, payload);
+      continue;
     }
 
     if (isResultFrame(m)) {
@@ -706,8 +860,8 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       const phase: PhaseUsage = {
         seq: m.seq,
         label,
-        turns: num(payload?.["num_turns"]),
-        durationMs: num(payload?.["duration_ms"]),
+        turns: finiteNumber(payload?.["num_turns"]),
+        durationMs: finiteNumber(payload?.["duration_ms"]),
         fresh,
         cached,
         out,
@@ -719,8 +873,8 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
       continue;
     }
 
-    // Per-agent: assistant-frame per-call usage (never a result frame — that would
-    // fold the cumulative total into the sum). One usage record per SDK frame.
+    // Per-agent: deduplicated per-call assistant usage, including Codex accounting
+    // statuses. Result frames already continued above and never enter attribution.
     if (payload && "usage" in payload) {
       const u = readUsage(payload["usage"]);
       if (u) {
@@ -741,31 +895,28 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
           const ctx = readContext(payload["context"]);
           if (ctx) leadContext = ctx;
         }
-        const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: newModelCounts() };
-        acc.fresh += u.fresh;
-        acc.cached += u.cached;
-        acc.out += u.out;
-        // PRD #93 Decision 2: `model` is CO-GATED with `usage` by the worker — it
-        // rides the same surviving frame — so it is read only here, inside the
-        // counted branch. A model-only frame therefore never creates an agent row,
-        // and the strip's init model (a different path) never leaks in.
+        const liveKey = usageSignature(m, rec(payload["usage"]) ?? {});
+        const accounting = isAccountingStatus(m);
+        const responseId = payload["usage_response_id"];
+        // Dedicated accounting records require their UUID identity; never fall back
+        // to a usage signature when it is absent or malformed.
+        if (accounting && (typeof responseId !== "string" || responseId.length !== 36 ||
+          !/^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(responseId))) continue;
+        const confirmedKey = accounting ? `codex:${responseId}` : `claude:${liveKey}`;
         const fm = str(payload["model"]);
-        if (fm) acc.modelCounts[fm] = (acc.modelCounts[fm] ?? 0) + 1;
-        agentMap.set(agent, acc);
+        if (!seenConfirmedKeys.has(confirmedKey)) {
+          seenConfirmedKeys.add(confirmedKey);
+          const acc = agentMap.get(agent) ?? { agent, fresh: 0, cached: 0, out: 0, modelCounts: newModelCounts() };
+          acc.fresh += u.fresh;
+          acc.cached += u.cached;
+          acc.out += u.out;
+          // Model frequencies count only attributed records; model-only frames and
+          // replayed records cannot create or change an agent's primary model.
+          if (fm) acc.modelCounts[fm] = (acc.modelCounts[fm] ?? 0) + 1;
+          agentMap.set(agent, acc);
+        }
 
-        // LIVE surface (issue #237): a SEPARATE dedup pass on the SAME frame. The raw
-        // `acc.*` above already counted this frame unconditionally; the live buckets
-        // count it only once per `(agent_instance, usage)` signature. The key is built
-        // from the RAW usage fields (not the folded `u`), so two calls collapse only
-        // when their four wire columns are byte-identical on the same lane.
-        const rawUsage = rec(payload["usage"]) ?? {};
-        const liveKey = JSON.stringify([
-          m.agent_instance,
-          num(rawUsage["input_tokens"]),
-          num(rawUsage["cache_read_input_tokens"]),
-          num(rawUsage["cache_creation_input_tokens"]),
-          num(rawUsage["output_tokens"]),
-        ]);
+        // Live retains the existing lane/usage signature for both harnesses.
         if (!seenLiveKeys.has(liveKey)) {
           seenLiveKeys.add(liveKey);
           liveTotal.fresh += u.fresh;
@@ -785,18 +936,27 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     }
   }
 
-  const total = phases.reduce(
+  const total = phases.reduce<RunUsage["total"]>(
     (t, p) => ({
       fresh: t.fresh + p.fresh,
       cached: t.cached + p.cached,
       out: t.out + p.out,
       costUsd: t.costUsd + p.costUsd,
-      turns: t.turns + p.turns,
-      durationMs: t.durationMs + p.durationMs,
+      turns: t.turns === null || p.turns === null ? null : finiteNumber(t.turns + p.turns),
+      durationMs: t.durationMs === null || p.durationMs === null ? null : finiteNumber(t.durationMs + p.durationMs),
       phaseCount: t.phaseCount + 1,
     }),
     { fresh: 0, cached: 0, out: 0, costUsd: 0, turns: 0, durationMs: 0, phaseCount: 0 },
   );
+
+  for (const acc of [noteAcc, summaryAcc]) {
+    if (acc.entries > 0 && acc.metered === acc.entries) acc.total.costStatus = "metered";
+    else if (acc.entries > 0 && acc.subscription === acc.entries) acc.total.costStatus = "subscription";
+    total.fresh += acc.total.fresh;
+    total.cached += acc.total.cached;
+    total.out += acc.total.out;
+    total.costUsd += acc.total.costUsd;
+  }
 
   const inTotal = total.fresh + total.cached;
   const agents: AgentUsage[] = [...agentMap.values()].map((a) => ({ ...a, ...primaryModel(a.modelCounts) }));
@@ -828,6 +988,8 @@ export function deriveRunUsage(messages: RunMessage[], opts?: { harness?: string
     hasConfirmed: phases.length > 0,
     phases,
     total,
+    noteTotal,
+    summaryTotal,
     modelTotals,
     cacheHitRatio: inTotal > 0 ? total.cached / inTotal : 0,
     model,

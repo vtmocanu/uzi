@@ -19,6 +19,7 @@ import { RUNNER_UID, killRunnerGroup, runnerCommand, runnerPath, runnerTmpdir, u
 import { unmarkedSpawnEnv, workerSpawnEnv } from "./worker-spawn-mark.js";
 import { rmRunnerTeardownTree } from "./rmtree.js";
 import { withForgeRetry } from "./forge-retry.js";
+import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
   attemptClonePath,
@@ -29,7 +30,9 @@ import {
   parseAttemptPath,
   parseRetainedArtifactName,
 } from "./attempt-path.js";
+import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { sanitizeForLog } from "./run-quiescence.js";
+import { RECOVERY_DECODED_LIMIT, validateRecoveryDecodedLimitBytes, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
 import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
 
 import {
@@ -45,6 +48,72 @@ import {
 import { lookupAttributes, type PathAttributes } from "./pr-size.js";
 
 const execFileAsync = promisify(execFile);
+
+// Use an absolute end assertion: JavaScript's $ also accepts a trailing newline.
+const codePattern = (pattern: RegExp): { test(value: unknown): boolean } => ({
+  test: value => typeof value === "string" && pattern.test(value),
+});
+const CODE_ID = codePattern(/^[A-Za-z0-9_-]{1,128}(?![\s\S])/);
+const CODE_SHA = codePattern(/^[a-f0-9]{40}(?![\s\S])/);
+const CODE_UUID = codePattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
+const CODE_READER_KEY = codePattern(/^cross-check-[A-Za-z0-9_-]{1,128}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
+const CODE_MAX_READERS = 128;
+type LocalMetadataDirectory = "uzi-owed" | "uzi-code-snapshots";
+const codeGeneration = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
+const codeTerminal = (value: string): boolean => ["completed", "failed", "cancelled"].includes(value);
+
+export interface CodeSnapshotReaderProof {
+  childId: string;
+  childGeneration: number;
+  terminalStatus: "completed" | "failed" | "cancelled";
+  cleanupConfirmed: true;
+}
+export interface CodeSnapshotFreshReceipt {
+  leadId: string;
+  head: string;
+  pinGeneration: number;
+  receiptId: string;
+}
+interface CodeSnapshotMetadata {
+  version: 1;
+  leadId: string;
+  head: string;
+  pinGeneration: number;
+  receiptId: string;
+  latestChild: { childId: string; childGeneration: number } | null;
+  readers: Array<{ readerKey: string; childId: string; childGeneration: number; state: "OPEN" | "CLOSED" }>;
+}
+export interface CodeSnapshotBootCandidate {
+  barePath: string;
+  leadId: string;
+  head: string;
+  metadataToken: string;
+  metadata: CodeSnapshotMetadata;
+}
+export interface CodeSnapshotRetirementProof {
+  /** Server evidence. `pinGeneration` is the lead claim generation the SERVER reports for the
+   *  code row and must equal the generation this snapshot was pinned at. `no_row` is the
+   *  server's valid "no code row" answer: boot-only, and it carries no head or generation. */
+  sealedOutcome: {
+    persisted: true;
+    sealed: true;
+    stage: "code";
+    leadId: string;
+    head: string;
+    pinGeneration: number;
+    outcome: "completed" | "failed";
+  } | {
+    persisted: true;
+    sealed: true;
+    stage: "code";
+    leadId: string;
+    outcome: "no_row";
+  };
+  child?: { childId: string; childGeneration: number; terminalStatus: "completed" | "failed" | "cancelled" };
+  freshNoReader?: { receipt: CodeSnapshotFreshReceipt; serverAtomicallyTerminalNoChild: true };
+  bootCandidate?: CodeSnapshotBootCandidate;
+  leadDisposition?: "terminal" | "foreign";
+}
 
 /** A child's stdout re-exposed so its end waits for the exit status. Node ends a child's
  *  stdout BEFORE `close`, so a consumer of the raw stream reads a clean (possibly empty)
@@ -543,6 +612,8 @@ export interface CheckpointRange {
 
 /** issue #1597 M2: optional GitCache construction knobs. */
 export interface GitCacheOptions {
+  /** Cumulative decoded object bytes per recovery operation. */
+  recoveryDecodedLimitBytes?: number;
   /** Physical terminal custody, rooted at the configured outbox by the caller. */
   terminalRecordProtection?: (runId: string) => Promise<boolean>;
   /** The gitleaks executable. Default `"gitleaks"` (PATH outside a boundary scope, the image's
@@ -552,6 +623,10 @@ export interface GitCacheOptions {
   /** Test-only override of {@link MAX_OWED_CANDIDATES_PER_RUN} so the cap boundary is cheap to
    *  exercise. Production never passes it. */
   maxOwedCandidates?: number;
+  /** issue #2733 — test-only overrides of {@link CHECKPOINT_CHAIN_MAX_WRAPPERS} /
+   *  {@link CHECKPOINT_CHAIN_MAX_DIFF_BYTES} so the bound-exhaustion refusals are cheap to exercise.
+   *  Production never passes it. */
+  checkpointChainBounds?: { maxWrappers?: number; maxDiffBytes?: number };
   /** Test-only stand-in for runner-clone scratch provisioning, for the non-Linux dev loop.
    *  Production never passes it, so the real provisioner runs and fails closed off Linux. */
   scratchProvisioner?: (clonePath: string) => Promise<void>;
@@ -586,6 +661,17 @@ export interface GitCacheOptions {
  *  children together), enforced by OUR kill of the children — never by gitleaks' own `--timeout`
  *  (see runCheckpointGitleaks). The scan never runs inside a Codex permit (see runner.ts). */
 export const CHECKPOINT_SCAN_TIMEOUT_MS = 60_000;
+
+/** issue #2733 — bounds on {@link GitCache.verifyWrapperOnlyHistory}. A history longer than
+ *  MAX_WRAPPERS un-published wrappers, or one wrapper whose workflow diff listing exceeds
+ *  MAX_DIFF_BYTES, is refused (no chain; the raw tip ships as before) rather than verified
+ *  unboundedly. The chain grows by one wrapper per checkpoint publish after the first overlay,
+ *  for the life of the ref (each chain commit `[P, N]` keeps P reachable), and every pack
+ *  re-sends the whole chain beyond the floor. At the default 5-minute tick that is roughly 12
+ *  wrappers an hour, so 4096 is about 14 days of continuous publishing, far above any honest
+ *  run; 1 MiB of changed-path names is far above any honest workflow directory. */
+const CHECKPOINT_CHAIN_MAX_WRAPPERS = 4096;
+const CHECKPOINT_CHAIN_MAX_DIFF_BYTES = 1024 * 1024;
 
 // issue #1597 M2 (review item 6) — pre-scan SIZE CAPS on what gitleaks will read for a checkpoint
 // scan: the new AND old side of every blob the scanned commits touch (`git log --raw`), so a
@@ -773,6 +859,9 @@ const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 /** A full 40-hex commit SHA (issue #1597 M2: pinned checkpoint ranges are validated with it). */
 const SHA40_RE = /^[0-9a-f]{40}$/;
 
+/** How long an aborted prepared ref transaction may take to exit on its own before it is killed. */
+const PREPARED_ABORT_GRACE_MS = 5_000;
+
 /** PRD #1798 M5: the bound on a {@link GitCache.readBare} read. */
 export interface BoundedReadOptions {
   /** Stop reading once more than this many stdout bytes arrived (the kept prefix is at most this).
@@ -793,9 +882,16 @@ interface SpawnGitOptions {
   /** Inside a boundary scope: forwarded as BoundaryProcessRequest.timeoutMs, so the spawner
    *  terminates the child's process group when it elapses. Ignored outside a scope. */
   timeoutMs?: number;
+  /** Native producer only: retain this cause when its own deadline kills a still-running child. */
+  nativeTimeoutError?: Error;
   /** Cap on the stderr kept for the failure message (both paths). Default: the boundary path keeps
    *  up to GIT_MAX_BUFFER, the plain path keeps all of it. */
   stderrMaxBytes?: number;
+  /** Trusted verifier traversal environment; never sourced from repository config. */
+  env?: NodeJS.ProcessEnv;
+  cancelOnAbandon?: boolean;
+  /** Private ref transactions write prepare first and commit only after locked inspection. */
+  keepStdinOpen?: boolean;
 }
 
 /** PRD #1798 M5: a bounded read's stdout, and whether the bound cut it. */
@@ -855,6 +951,25 @@ function settlementPinBase(runId: string, holdId: string): string | null {
   if (rid === "" || hid === "") return null;
   return `${SETTLE_PIN_PREFIX}${rid}/${hid}/`;
 }
+/** Authenticated archived-record callers only; generation must already be normalized. */
+export interface ArchivedRecoveryPinCleanup {
+  runId: string;
+  generation: number;
+  sourceSha: string;
+  recoveryPinBareDir?: string;
+  bareDir?: string;
+  signal?: AbortSignal;
+  /** Absolute wall-clock deadline in milliseconds. */
+  deadline?: number;
+  /** Synchronous journal/execution eligibility check, called immediately before mutation. */
+  isEligible: () => boolean;
+}
+export type ArchivedRecoveryPinCleanupResult =
+  | { state: "deleted" | "already_absent" }
+  | { state: "retained"; reason: "invalid_identity" | "unsafe_metadata" | "ambiguous" |
+      "scan_limit" | "target_changed" | "ineligible" | "cancelled" | "deadline" | "git_failure" };
+const recoveryPinAttributionLocks = new RunDiskLocks();
+
 function recoveryPinRef(runId: string, generation: number): string {
   const rid = runId.replace(/[^A-Za-z0-9_-]/g, "-");
   return `${RECOVERY_PIN_PREFIX}${rid}/${generation}`;
@@ -1040,10 +1155,22 @@ function recoveryCaptureKey(branch: string): string {
 /** The recovery-capture journal value (one per branch, in the bare's `config --local`). A
  *  Docker-wired worker (issue #1783 M2) adds the attempt id; an entry an older worker wrote has
  *  none, and is still read. */
-export interface RecoveryJournalEntry {
-  runId: string;
-  clonePath: string;
-  attemptId?: string;
+export class ForeignRetainedRecoveryError extends Error {
+  constructor() { super("foreign retained recovery"); }
+}
+
+export class RetainedRecoveryBlockedError extends Error {
+  readonly reason = "source_missing";
+  constructor(readonly barePath: string, readonly branch: string, readonly key: string,
+    readonly journal: RecoveryJournalEntry) {
+    super("known recovery source is missing");
+    this.name = "RetainedRecoveryBlockedError";
+  }
+}
+
+export interface RecoveryJournalEntry extends RecoverySource {
+  recovery?: RecoveryProgress;
+  retainedSources?: RecoverySource[];
 }
 
 // issue #1783 M2 — the per-branch ATTEMPT LEDGER, a MULTI-VALUED `config --local` key in the
@@ -1087,9 +1214,35 @@ function parseRecoveryJournal(value: string): RecoveryJournalEntry {
   if (attemptId !== undefined && (typeof attemptId !== "string" || !ATTEMPT_ID_RE.test(attemptId))) {
     throw new Error("invalid retained recovery clone journal");
   }
-  return attemptId === undefined
-    ? { runId: parsed.runId, clonePath: parsed.clonePath }
-    : { runId: parsed.runId, clonePath: parsed.clonePath, attemptId };
+  const o = parsed as Record<string, unknown>;
+  if (Object.keys(o).some(k => !["runId", "clonePath", "attemptId", "restoreTip", "recovery", "retainedSources"].includes(k))) {
+    throw new Error("invalid retained recovery clone journal");
+  }
+  // Legacy callers classify a mismatched attempt id as CapturePathMismatchError.
+  // Episode descriptors require strict identity before they can authorize any write.
+  const source: RecoverySource = { ...recoverySource({ runId: parsed.runId, clonePath: parsed.clonePath,
+    ...(o.recovery !== undefined || o.retainedSources !== undefined ? { attemptId } : {}),
+    ...(o.restoreTip === undefined ? {} : { restoreTip: o.restoreTip }) }),
+    ...(attemptId === undefined ? {} : { attemptId }) };
+  const recovery = o.recovery === undefined ? undefined : recoveryProgress(o.recovery);
+  let retainedSources: RecoverySource[] | undefined;
+  if (o.retainedSources !== undefined) {
+    if (!Array.isArray(o.retainedSources)) throw new Error("invalid retained sources");
+    retainedSources = o.retainedSources.map(recoverySource);
+  }
+  if (recovery && !sameRecoverySource(source, recovery.source) &&
+      !(recovery.successor && sameRecoverySource(source, recovery.successor)) &&
+      !retainedSources?.some(s => sameRecoverySource(source, s))) throw new Error("recovery source identity mismatch");
+  if (recovery?.stage === "ready-for-model" &&
+      (!recovery.successor || !sameRecoverySource(source, recovery.successor))) throw new Error("recovery successor identity mismatch");
+  if (recovery && ["captured", "adopting", "ready-for-model"].includes(recovery.stage) &&
+      source.restoreTip !== recovery.restoreTip) throw new Error("recovery restore tip mismatch");
+  if (recovery && ["adopting", "ready-for-model"].includes(recovery.stage) &&
+      recovery.successor?.restoreTip !== recovery.restoreTip) throw new Error("recovery successor tip mismatch");
+  if (recovery && (recovery.source.runId !== source.runId ||
+      (recovery.successor && recovery.successor.runId !== source.runId))) throw new Error("recovery run identity mismatch");
+  if (retainedSources?.some(s => s.runId !== source.runId)) throw new Error("retained run identity mismatch");
+  return { ...source, ...(recovery ? { recovery } : {}), ...(retainedSources ? { retainedSources } : {}) };
 }
 
 function parseAttemptLedgerEntry(value: string): AttemptLedgerEntry | undefined {
@@ -1409,6 +1562,17 @@ export interface RecoveryCoverage {
   originalShas: string[];
   currentSha: string;
 }
+/** Issue #2625: the objects an archive-redundancy claim carries, read back from a bare repo.
+ *  Bodies are standard padded base64 of raw `git cat-file commit` bytes. */
+export interface RecoveryCoverageClaim {
+  coverageDigest: string;
+  roots: string[];
+  currentSha: string;
+  tree: string;
+  aggregateObjects: string[];
+  currentObject: string;
+  witnessObject?: string;
+}
 type TrackingReceipt = {
   version: 1; branch: string; runId: string; generation: number | null; context: string;
   trackingSha: string; phase: "pending" | "committed";
@@ -1481,10 +1645,52 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  // Fresh no-child authority exists only in the GitCache invocation that created the pin.
+  // At capacity, pinning still works but returns no retirement receipt (retention).
+  private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
+  private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number }>();
+
+  /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
+  async withReportProofBudget<T>(budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>): Promise<T> {
+    const parent = this.reportProofs.getStore();
+    const deadline = Math.min(budget.deadline, parent?.deadline ?? Infinity);
+    const timeout = new AbortController();
+    const signal = AbortSignal.any([budget.signal, timeout.signal, ...(parent ? [parent.signal] : [])]);
+    const timer = setTimeout(() => timeout.abort(new Error("report proof deadline")), Math.max(0, deadline - Date.now()));
+    try {
+      if (Date.now() >= deadline) timeout.abort(new Error("report proof deadline"));
+      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0 }, action);
+    } finally { clearTimeout(timer); }
+  }
+
+  private checkReportProof(): void {
+    const budget = this.reportProofs.getStore();
+    budget?.signal.throwIfAborted();
+    if (budget && Date.now() >= budget.deadline) throw new Error("report proof deadline");
+  }
+  readonly recoveryDecodedLimitBytes: number;
+  private readonly recoveryOperations = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; closureBudget: ClosureBudget }>();
+
+  /** Local recovery clock, including queued locks and actual child settlement. */
+  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+    const parent = this.recoveryOperations.getStore();
+    deadline = Math.min(deadline, parent?.deadline ?? Infinity);
+    const timeout = new AbortController();
+    const combined = AbortSignal.any([signal, timeout.signal, ...(parent ? [parent.signal] : [])]);
+    const timer = setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()));
+    if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
+    try {
+      combined.throwIfAborted();
+      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes } }, () => action(combined));
+    } finally { clearTimeout(timer); }
+  }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
   private readonly maxOwedCandidates: number;
+  /** issue #2733: the checkpoint-chain verifier bounds (see {@link GitCacheOptions.checkpointChainBounds}). */
+  private readonly chainMaxWrappers: number;
+  private readonly chainMaxDiffBytes: number;
   /** See {@link GitCacheOptions.scratchProvisioner}; undefined in production. */
   private readonly scratchProvisioner: ((clonePath: string) => Promise<void>) | undefined;
   /** See {@link GitCacheOptions.retentionDelete}; undefined in production. */
@@ -1510,8 +1716,11 @@ export class GitCache {
     private readonly retry?: { schedule?: number[]; sleep?: (ms: number) => Promise<void> },
     opts: GitCacheOptions = {},
   ) {
+    this.recoveryDecodedLimitBytes = validateRecoveryDecodedLimitBytes(opts.recoveryDecodedLimitBytes === undefined ? RECOVERY_DECODED_LIMIT : opts.recoveryDecodedLimitBytes);
     this.gitleaksBin = opts.gitleaksBin ?? "gitleaks";
     this.maxOwedCandidates = opts.maxOwedCandidates ?? MAX_OWED_CANDIDATES_PER_RUN;
+    this.chainMaxWrappers = opts.checkpointChainBounds?.maxWrappers ?? CHECKPOINT_CHAIN_MAX_WRAPPERS;
+    this.chainMaxDiffBytes = opts.checkpointChainBounds?.maxDiffBytes ?? CHECKPOINT_CHAIN_MAX_DIFF_BYTES;
     this.scratchProvisioner = opts.scratchProvisioner;
     this.retentionDeleteSeam = opts.retentionDelete;
     this.canonicalFreeSeam = opts.canonicalFree;
@@ -1627,7 +1836,10 @@ export class GitCache {
     } catch {
       return undefined;
     }
-    if (!(await isBareRepo(barePath))) return undefined;
+    if (this.reportProofs.getStore()) {
+      try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
+      catch { return undefined; }
+    } else if (!(await isBareRepo(barePath))) return undefined;
     return barePath;
   }
 
@@ -1685,6 +1897,12 @@ export class GitCache {
       const c = ch.charCodeAt(0);
       if (c < 0x21 || c > 0x7e) return false;
     }
+    return (await this.tryGit(barePath, ["check-ref-format", `refs/heads/${name}`])) === 0;
+  }
+
+  /** Validate a remote branch as a literal ref while preserving Unicode names. */
+  private async isRemoteBranchName(barePath: string, name: string): Promise<boolean> {
+    if (!name || name.startsWith("-")) return false;
     return (await this.tryGit(barePath, ["check-ref-format", `refs/heads/${name}`])) === 0;
   }
 
@@ -1892,6 +2110,11 @@ export class GitCache {
     barePath: string, branch: string, group: PublicationCandidate, pat: string,
     scope: string | undefined, username?: string,
   ): Promise<void> {
+    if (!(await this.isRemoteBranchName(barePath, branch))) {
+      throw new ScratchPublicationError("invalid remote branch", undefined, {
+        kind: "floor_unverified", step: "floor_refresh",
+      });
+    }
     const remoteRef = `refs/heads/${branch}`;
     const scratchRef = `refs/uzi-publication-floor/${branch}`;
     const refuse = (kind: ScratchPublicationKind): never => {
@@ -1900,7 +2123,7 @@ export class GitCache {
       });
     };
     const observe = async (): Promise<string | null> => {
-      const listed = (await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username)).trim();
+      const listed = (await this.runGit(barePath, ["ls-remote", "--", "origin", remoteRef], pat, scope, username)).trim();
       if (!listed) return null;
       const oid = listed.slice(0, 40);
       if (!SHA40_RE.test(oid) || listed !== `${oid}\t${remoteRef}`) refuse("floor_unverified");
@@ -1919,7 +2142,7 @@ export class GitCache {
         if (await observe() !== null) refuse("remote_changed_during_refresh");
         return;
       }
-      await this.runGit(barePath, ["fetch", "--refmap=", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
+      await this.runGit(barePath, ["fetch", "--refmap=", "--", "origin", `+${remoteRef}:${scratchRef}`], pat, scope, username);
       const fetched = await this.resolveCommitStrict(barePath, scratchRef).catch((error: unknown) => {
         if (error instanceof RunResidueBlockedError || isAbortLike(error)) throw error;
         throw new ScratchPublicationError("cannot verify fresh remote floor", error, {
@@ -2002,18 +2225,37 @@ export class GitCache {
   }
 
   /** A report-only checker owns a fresh clone and selects only the immutable candidate SHA. */
-  async runnerCloneAtCommit(barePath: string, baseCommit: string, runId: string): Promise<string> {
-    if (!/^[a-f0-9]{40}$/.test(baseCommit) || !/^[a-zA-Z0-9_-]+$/.test(runId)) {
+  async runnerCloneAtCommit(barePath: string, baseCommit: string, runId: string, codeLeadRunId?: string, childGeneration = 0): Promise<string> {
+    if (!CODE_SHA.test(baseCommit) || !CODE_ID.test(runId) || !codeGeneration(childGeneration)) {
       throw new Error("invalid exact-commit checker identity");
     }
-    return this.withLock(barePath, async () => {
+    if (codeLeadRunId !== undefined) await this.assertOwedBare(barePath);
+    const clone = async (): Promise<string> => {
+      const key = `cross-check-${runId}-${randomUUID()}`;
       const resolved = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseCommit}^{commit}`])).trim();
       if (resolved !== baseCommit) throw new Error("checker base commit unavailable");
-      const key = `cross-check-${runId}-${randomUUID()}`;
+      if (codeLeadRunId !== undefined) {
+        if (!CODE_ID.test(codeLeadRunId) || !CODE_UUID.test(runId)) throw new Error("invalid code snapshot reader identity");
+        const tip = (await this.runGit(barePath, ["rev-parse", "--verify", `refs/uzi-cross-check/${codeLeadRunId}`])).trim();
+        if (tip !== baseCommit) throw new Error("code snapshot ref moved");
+        const metadata = await this.readCodeSnapshotMetadata(barePath, codeLeadRunId);
+        if (!metadata || metadata.head !== baseCommit) throw new Error("code snapshot metadata unavailable");
+        const latest = metadata.latestChild;
+        if (latest && (childGeneration < latest.childGeneration ||
+            (childGeneration === latest.childGeneration && runId !== latest.childId))) {
+          throw new Error("code snapshot child generation conflicts");
+        }
+        if (metadata.readers.length >= CODE_MAX_READERS) throw new Error("code snapshot reader limit");
+        metadata.latestChild = { childId: runId, childGeneration };
+        metadata.readers.push({ readerKey: key, childId: runId, childGeneration, state: "OPEN" });
+        // Durable OPEN precedes even mkdir/clone. Failed launches retain their OPEN entry.
+        await this.writeCodeSnapshotMetadata(barePath, metadata);
+        this.codeSnapshotFreshReceipts.delete(metadata.receiptId);
+      }
       const clonePath = this.runnerClonePath(barePath, key);
       await fs.mkdir(path.dirname(clonePath), { recursive: true });
       try {
-        await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+        await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", "--", barePath, clonePath]);
         await this.disableAutoMaintenance(clonePath, true);
         await this.runGitAsRunner(clonePath, ["checkout", "--detach", baseCommit]);
         await this.materializeRunnerClone(clonePath, [baseCommit]);
@@ -2025,7 +2267,9 @@ export class GitCache {
           this.log.warn("checker clone cleanup failed", { error: gitErrorMessage(cleanup) }));
         throw err;
       }
-    });
+    };
+    return this.withLock(barePath, () => codeLeadRunId === undefined
+      ? clone() : this.withCodeSnapshotFence(barePath, codeLeadRunId, clone));
   }
 
   /**
@@ -2142,7 +2386,7 @@ export class GitCache {
       // recovery capture failed. The journal is in WORKER-owned bare config, never
       // in the runner-owned clone. An unreadable journal fails closed before rm.
       const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending && await this.pathPresent(pending.clonePath)) {
+      if (pending) {
         // issue #1315 — three fail-closed cases. The git layer NEVER probes owner
         // status and NEVER disposes; it only classifies. Only Case B is reclaimable,
         // and only the runner reclaims, after an authoritative owner probe.
@@ -2160,9 +2404,14 @@ export class GitCache {
           throw new ForeignCaptureBlockedError(clonePath, branch, pending.runId);
         }
         // Case C: this run's own retained work — capture before reseeding.
+        if (!await this.pathPresent(pending.clonePath)) throw new Error("known recovery source is missing; nothing seeded");
         throw new PendingRecoveryCaptureError(clonePath, branch);
       }
       // issue #1783 M3: the journal cases above ran first and threw with the path untouched.
+      if (await this.readRecoveryAttemptMode(barePath, key)) {
+        throw new Error("recovered key requires a fresh attempt path");
+      }
+      if ((await this.journaledClonePaths(barePath)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
     });
@@ -2338,8 +2587,8 @@ export class GitCache {
    *     PendingRecoveryCaptureError(journaledPath).
    *   - B′ the same key, another run → ForeignCaptureBlockedError(journaledPath).
    *   - A′ a different key, or a path that parses as neither → CapturePathMismatchError.
-   * A journal whose path is gone (lstat ENOENT, e.g. after a pod restart) is ignored exactly as
-   * today, and overwritten by the new attempt's journal.
+   * Mismatch and foreign-owner classification precede the source-presence check. This run's own
+   * journal whose known source path is gone fails closed; it is never overwritten by a seed.
    */
   private async attemptCloneForBranch(
     barePath: string,
@@ -2361,7 +2610,7 @@ export class GitCache {
       const canonical = this.runnerClonePath(barePath, key);
       const clonePath = attemptClonePath(canonical, attempt.attemptId);
       const pending = await this.readRecoveryCapture(barePath, branch);
-      if (pending && await this.pathPresent(pending.clonePath)) {
+      if (pending) {
         const shape = this.clonePathShape(pending.clonePath, canonical);
         const idMismatch =
           pending.attemptId !== undefined && (shape?.attemptId ?? "") !== pending.attemptId;
@@ -2371,6 +2620,7 @@ export class GitCache {
         if (pending.runId !== runId) {
           throw new ForeignCaptureBlockedError(pending.clonePath, branch, pending.runId);
         }
+        if (!await this.pathPresent(pending.clonePath)) throw new Error("known recovery source is missing; nothing seeded");
         throw new PendingRecoveryCaptureError(pending.clonePath, branch);
       }
       // The attempt id carries 64 random bits: an existing path is not a collision to paper
@@ -2415,12 +2665,13 @@ export class GitCache {
         throw err;
       }
       attempt.onSeeded?.(clonePath);
-      await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) =>
+      await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) => {
+        this.checkRecoveryInterruption();
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
           key,
           error: gitErrorMessage(err),
-        }),
-      );
+        });
+      });
       return { ...seeded, attemptId: attempt.attemptId };
     });
   }
@@ -2770,7 +3021,7 @@ export class GitCache {
     runId: string | undefined,
     resume: boolean,
     expectedCheckpointTip: string | undefined,
-    opts?: { selfContained?: boolean },
+    opts?: { selfContained?: boolean; recoveryTip?: string },
   ): Promise<RunnerClone> {
     // (A bare block: the body below kept its original indentation when issue #1783 M2 lifted it
     // out of runnerCloneForBranch's lock callback, so its diff stays reviewable.)
@@ -2953,6 +3204,13 @@ export class GitCache {
           }
         }
       }
+      if (opts?.recoveryTip) {
+        if (!SHA40_RE.test(opts.recoveryTip) || !defaultRef ||
+            !await this.sharesHistory(barePath, opts.recoveryTip, defaultRef)) throw new Error("recovery history cannot be verified");
+        baseRef = opts.recoveryTip;
+        seededFrom = "tracking";
+        checkpointSetAside = false;
+      }
       let baseSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
       // PRD #1062 M2 (#1036) — peel a `.github/workflows` overlay transport wrapper. When the
       // adopted base is a `ckpt(overlay):` commit (built by checkpointPack for a branch behind
@@ -3001,8 +3259,23 @@ export class GitCache {
             ? (await this.tryGitStdout(barePath, ["diff", "--name-only", realTip, overlaySha])).trim()
             : "";
         const changedPaths = changed === "" ? [] : changed.split("\n");
+        // issue #2733: the other genuine shape is a TREE-EQUAL chain (`[P, N]` whose workflow
+        // subtree caught up with N's): an empty diff to its last parent. It peels only when it is
+        // merge-shaped and every commit it adds beyond that parent verifies as a workflow-only
+        // wrapper; anything unverifiable stays unpeeled.
+        let treeEqualChain = false;
+        if (/^[0-9a-f]{40}$/.test(realTip) && changedPaths.length === 0 && nParents >= 2) {
+          const [wrapperTree, tipTree] = [
+            await this.tryGitStdout(barePath, ["rev-parse", `${overlaySha}^{tree}`]),
+            await this.tryGitStdout(barePath, ["rev-parse", `${realTip}^{tree}`]),
+          ];
+          treeEqualChain =
+            SHA40_RE.test(wrapperTree) && wrapperTree === tipTree &&
+            (await this.verifyWrapperOnlyHistory(barePath, overlaySha, realTip, 1));
+        }
         const isOverlayStructure =
-          changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/"));
+          treeEqualChain ||
+          (changedPaths.length > 0 && changedPaths.every((p) => p.startsWith(".github/workflows/")));
         if (/^[0-9a-f]{40}$/.test(realTip) && isOverlayStructure) {
           baseSha = realTip;
           this.log.info("runner clone: peeled .github/workflows overlay wrapper to its realTip", {
@@ -3082,7 +3355,7 @@ export class GitCache {
       // skips populating the stale default so we check the agent branch out at the
       // resolved base SHA (reachable via the alternate) in one step. No PAT (local op).
       // A Codex (selfContained) clone is dissociated from the bare after setup, below.
-      await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", barePath, clonePath]);
+      await this.runGitAsRunner(undefined, ["clone", "--shared", "--no-checkout", "--", barePath, clonePath]);
       // Issue #134 (production half of #127). ONE detached `git maintenance run --auto
       // --detach` per object-writing command (fetch/commit/push) outlives the git we awaited
       // and keeps writing inside `.git`; it spawns a repack/pack-objects subtree only once
@@ -3931,6 +4204,283 @@ export class GitCache {
    * same posture `refs/uzi-runner` / `refs/uzi-archive` rely on to survive gc), so the anchored
    * object stays reachable through bundle production even after the tracking ref moves.
    */
+  /** Local-only code snapshot. The caller supplies the literal head it imported from its quiescent clone. */
+  async pinCodeSnapshot(barePath: string, runId: string, head: string, defaultCommit: string, pin = true, pinGeneration = 0): Promise<{ head_commit: string; base_commit: string; freshReceipt?: CodeSnapshotFreshReceipt }> {
+    if (!CODE_ID.test(runId) || !CODE_SHA.test(head) || !CODE_SHA.test(defaultCommit) || !codeGeneration(pinGeneration))
+      throw new Error("invalid code snapshot identity");
+    await this.assertOwedBare(barePath);
+    const operation = async (): Promise<{ head_commit: string; base_commit: string; freshReceipt?: CodeSnapshotFreshReceipt }> => {
+      for (const commit of [head, defaultCommit]) {
+        if ((await this.runGit(barePath, ["rev-parse", "--verify", `${commit}^{commit}`])).trim() !== commit)
+          throw new Error("code snapshot object unavailable");
+      }
+      const base = (await this.runGit(barePath, ["merge-base", defaultCommit, head])).trim();
+      if (!CODE_SHA.test(base) || (await this.runGit(barePath, ["rev-parse", "--verify", `${base}^{commit}`])).trim() !== base)
+        throw new Error("code snapshot merge base unavailable");
+      if (!pin) return { head_commit: head, base_commit: base };
+      const ref = `refs/uzi-cross-check/${runId}`;
+      const existing = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", "-q", ref])).trim();
+      if (existing !== "" && existing !== head) throw new Error("code snapshot ref moved");
+      const old = await this.readCodeSnapshotMetadata(barePath, runId);
+      if (old || existing !== "") {
+        if (!old || existing !== head || old.head !== head || old.pinGeneration !== pinGeneration)
+          throw new Error("code snapshot identity unavailable or changed");
+        return { head_commit: head, base_commit: base };
+      }
+      const receiptId = randomUUID();
+      // Metadata first: an interrupted create can never acquire fresh-empty authority later.
+      await this.writeCodeSnapshotMetadata(barePath, {
+        version: 1, leadId: runId, head, pinGeneration, receiptId, latestChild: null, readers: [],
+      });
+      await this.runGit(barePath, ["update-ref", ref, head, ""]);
+      if (this.codeSnapshotFreshReceipts.size >= 256) return { head_commit: head, base_commit: base };
+      this.codeSnapshotFreshReceipts.add(receiptId);
+      return { head_commit: head, base_commit: base,
+        freshReceipt: { leadId: runId, head, pinGeneration, receiptId } };
+    };
+    return this.withLock(barePath, () => pin
+      ? this.withCodeSnapshotFence(barePath, runId, operation) : operation());
+  }
+
+  async codeSnapshotTip(barePath: string, runId: string): Promise<string> {
+    if (!CODE_ID.test(runId)) throw new Error("invalid code snapshot owner");
+    return this.withLock(barePath, async () => (await this.runGit(barePath,
+      ["rev-parse", "--verify", `refs/uzi-cross-check/${runId}^{commit}`])).trim());
+  }
+
+  /** Cooperating CODE writers attempt once, without waiting or reaping another fence.
+   * Any failure retains this fence; no sibling lead is blocked by its pathname.
+   * The owned private bare excludes repo actors; hostile same-UID replacement is unsupported. */
+  private async withCodeSnapshotFence<T>(barePath: string, leadId: string, fn: () => Promise<T>): Promise<T> {
+    if (!CODE_ID.test(leadId)) throw new Error("invalid code snapshot fence owner");
+    const dir = await this.ensureOwedDirectory(barePath, "uzi-code-snapshots");
+    const name = path.join(dir, `code-snapshot-${leadId}.fence`);
+    // Exclusive creation is cross-process authority. Existing, busy and stale all fail closed.
+    const file = await fs.open(name, fsConstants.O_WRONLY | fsConstants.O_CREAT |
+      fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
+    try {
+      const held = await file.stat();
+      const safe = (st: Stats): boolean => st.isFile() && st.uid === process.getuid?.() &&
+        (st.mode & 0o077) === 0;
+      if (!safe(held)) throw new Error("unsafe code snapshot fence");
+      await file.sync();
+      const directory = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
+      try {
+        await directory.sync();
+        const result = await fn();
+        const current = await fs.lstat(name);
+        if (!safe(current) || current.dev !== held.dev || current.ino !== held.ino)
+          throw new Error("code snapshot fence replaced");
+        await fs.unlink(name);
+        await directory.sync();
+        return result;
+      } finally { await directory.close(); }
+    } finally { await file.close(); }
+  }
+
+  private codeSnapshotName(leadId: string): string {
+    return `code-snapshot-${leadId}.json`;
+  }
+
+  private codeSnapshotToken(metadata: CodeSnapshotMetadata): string {
+    return createHash("sha256").update(JSON.stringify(metadata)).digest("hex");
+  }
+
+  private async readCodeSnapshotMetadata(barePath: string, leadId: string): Promise<CodeSnapshotMetadata | undefined> {
+    const raw = await this.readOwedFile(barePath, this.codeSnapshotName(leadId), "uzi-code-snapshots");
+    if (raw === undefined) return undefined;
+    const m = raw as CodeSnapshotMetadata;
+    const keys = (v: object): string => Object.keys(v).sort().join(",");
+    if (!m || keys(m) !== "head,latestChild,leadId,pinGeneration,readers,receiptId,version" ||
+        m.version !== 1 || m.leadId !== leadId || !CODE_ID.test(m.leadId) || !CODE_SHA.test(m.head) ||
+        !codeGeneration(m.pinGeneration) || !CODE_UUID.test(m.receiptId) ||
+        !Array.isArray(m.readers) || m.readers.length > CODE_MAX_READERS ||
+        (m.latestChild !== null && (!m.latestChild || keys(m.latestChild) !== "childGeneration,childId" ||
+          !CODE_UUID.test(m.latestChild.childId) || !codeGeneration(m.latestChild.childGeneration)))) {
+      throw new Error("invalid code snapshot metadata");
+    }
+    const seen = new Set<string>();
+    for (const r of m.readers) {
+      if (!r || keys(r) !== "childGeneration,childId,readerKey,state" ||
+          !CODE_UUID.test(r.childId) || !codeGeneration(r.childGeneration) ||
+          !CODE_READER_KEY.test(r.readerKey) || !r.readerKey.startsWith(`cross-check-${r.childId}-`) ||
+          !["OPEN", "CLOSED"].includes(r.state) || seen.has(r.readerKey) || !m.latestChild ||
+          r.childGeneration > m.latestChild.childGeneration ||
+          (r.childGeneration === m.latestChild.childGeneration && r.childId !== m.latestChild.childId)) {
+        throw new Error("invalid code snapshot reader history");
+      }
+      seen.add(r.readerKey);
+    }
+    if ((m.latestChild === null) !== (m.readers.length === 0) ||
+        (m.latestChild && !m.readers.some(r => r.childId === m.latestChild!.childId &&
+          r.childGeneration === m.latestChild!.childGeneration))) throw new Error("missing code snapshot reader history");
+    return m;
+  }
+
+  private async writeCodeSnapshotMetadata(barePath: string, metadata: CodeSnapshotMetadata): Promise<void> {
+    if (metadata.readers.length > CODE_MAX_READERS || Buffer.byteLength(JSON.stringify(metadata)) + 1 > 65536)
+      throw new Error("code snapshot metadata limit");
+    await this.writeOwedFile(barePath, this.codeSnapshotName(metadata.leadId), metadata, "uzi-code-snapshots");
+  }
+
+  /** Caller proves cleanup of this exact reader and exact server child terminality separately. */
+  async closeCodeSnapshotReader(barePath: string, leadId: string, checkoutOrKey: string,
+    proof: CodeSnapshotReaderProof): Promise<void> {
+    const evidence = proof && structuredClone(proof);
+    if (!CODE_ID.test(leadId) || !evidence || evidence.cleanupConfirmed !== true ||
+        !CODE_UUID.test(evidence.childId) || !codeGeneration(evidence.childGeneration) || !codeTerminal(evidence.terminalStatus))
+      throw new Error("code snapshot reader close proof required");
+    const readerKey = path.basename(checkoutOrKey);
+    if (!CODE_READER_KEY.test(readerKey) ||
+        (checkoutOrKey !== readerKey && checkoutOrKey !== this.runnerClonePath(barePath, readerKey)))
+      throw new Error("invalid code snapshot checkout identity");
+    await this.assertOwedBare(barePath);
+    await this.withLock(barePath, () => this.withCodeSnapshotFence(barePath, leadId, async () => {
+      const m = await this.readCodeSnapshotMetadata(barePath, leadId);
+      const r = m?.readers.find(entry => entry.readerKey === readerKey &&
+        entry.childId === evidence.childId && entry.childGeneration === evidence.childGeneration);
+      if (!m || !r) throw new Error("code snapshot reader proof mismatch");
+      r.state = "CLOSED";
+      await this.writeCodeSnapshotMetadata(barePath, m);
+    }));
+  }
+
+  /** No proof is retention. Boot tokens are observations, revalidated against disk under the bare lock. */
+  async deleteCodeSnapshot(barePath: string, runId: string, head: string,
+    proof?: CodeSnapshotRetirementProof): Promise<void> {
+    if (!CODE_ID.test(runId) || !CODE_SHA.test(head)) throw new Error("invalid code snapshot identity");
+    if (!proof) throw new Error("code snapshot retirement proof required");
+    // Snapshot caller evidence before awaiting: it must not change during the final CAS.
+    const evidence = structuredClone(proof);
+    await this.assertOwedBare(barePath);
+    await this.withLock(barePath, () => this.withCodeSnapshotFence(barePath, runId, async () => {
+      const m = await this.readCodeSnapshotMetadata(barePath, runId);
+      const outcome = evidence.sealedOutcome;
+      const noRow = outcome?.outcome === "no_row";
+      const decided = outcome && outcome.outcome !== "no_row" ? outcome : undefined;
+      if (!m || m.head !== head || !outcome || outcome.persisted !== true || outcome.sealed !== true || outcome.stage !== "code" ||
+          outcome.leadId !== runId || m.readers.some(r => r.state !== "CLOSED") ||
+          !(noRow ? !!evidence.bootCandidate && !evidence.child && !evidence.freshNoReader &&
+                    m.latestChild === null && m.readers.length === 0
+            : !!decided && decided.head === head && decided.pinGeneration === m.pinGeneration &&
+              ["completed", "failed"].includes(decided.outcome)))
+        throw new Error("code snapshot retirement evidence incomplete");
+      const token = this.codeSnapshotToken(m);
+      const boot = evidence.bootCandidate;
+      if (boot && (boot.barePath !== barePath || boot.leadId !== runId || boot.head !== head ||
+          boot.metadataToken !== token || !["terminal", "foreign"].includes(evidence.leadDisposition ?? "")))
+        throw new Error("code snapshot boot evidence changed");
+      if (noRow) {
+        // The server has no code row for this lead, and the guard above already required that local
+        // metadata records no child or reader history, so nothing ever read this ref.
+      } else if (m.latestChild) {
+        const child = evidence.child;
+        if (evidence.freshNoReader || !child || child.childId !== m.latestChild.childId ||
+            child.childGeneration !== m.latestChild.childGeneration || !codeTerminal(child.terminalStatus))
+          throw new Error("code snapshot latest child proof required");
+      } else if (boot && !evidence.child && !evidence.freshNoReader) {
+        // Boot observation of a ref no child ever read: the caller's server evidence names
+        // no claimed child that can still run, and the decided row/lead identity matched above.
+      } else {
+        const fresh = evidence.freshNoReader;
+        const receipt = fresh?.receipt;
+        if (boot || evidence.child || !fresh || fresh.serverAtomicallyTerminalNoChild !== true ||
+            !receipt || receipt.leadId !== runId || receipt.head !== head ||
+            receipt.pinGeneration !== m.pinGeneration || receipt.receiptId !== m.receiptId ||
+            !this.codeSnapshotFreshReceipts.has(receipt.receiptId) || m.readers.length !== 0)
+          throw new Error("code snapshot fresh no-reader receipt required");
+      }
+      const tip = (await this.runGit(barePath, ["rev-parse", "--verify", `refs/uzi-cross-check/${runId}`])).trim();
+      const current = await this.readCodeSnapshotMetadata(barePath, runId);
+      if (!current || this.codeSnapshotToken(current) !== token || tip !== head)
+        throw new Error("code snapshot changed before retirement");
+      await this.runGit(barePath, ["update-ref", "-d", `refs/uzi-cross-check/${runId}`, head]);
+      await this.removeOwedFile(barePath, this.codeSnapshotName(runId), false, "uzi-code-snapshots");
+      this.codeSnapshotFreshReceipts.delete(m.receiptId);
+    }));
+  }
+
+  /** A closed-reader observation for one known lead, freshly read from the owned bare. */
+  async codeSnapshotCandidate(barePath: string, leadId: string): Promise<CodeSnapshotBootCandidate | undefined> {
+    if (!CODE_ID.test(leadId)) throw new Error("invalid code snapshot owner");
+    await this.assertOwedBare(barePath);
+    return this.withLock(barePath, async () => {
+      const metadata = await this.readCodeSnapshotMetadata(barePath, leadId);
+      if (!metadata || metadata.readers.some(r => r.state !== "CLOSED")) return undefined;
+      const head = (await this.runGit(barePath, ["rev-parse", "--verify", `refs/uzi-cross-check/${leadId}`])).trim();
+      if (head !== metadata.head) throw new Error("code snapshot ref moved");
+      return { barePath, leadId, head, metadataToken: this.codeSnapshotToken(metadata), metadata };
+    });
+  }
+
+  /** At most 256 bares and 256 refs per bare, no retries, within one 30s deadline.
+   * Unreadable bares do not block siblings; cancellation discards observations and retains refs. */
+  async discoverCodeSnapshots(signal?: AbortSignal, timeoutMs = 30_000): Promise<CodeSnapshotBootCandidate[]> {
+    if (!Number.isFinite(timeoutMs) || timeoutMs <= 0) throw new Error("invalid discovery deadline");
+    const controller = new AbortController();
+    const timer = setTimeout(() => controller.abort(), Math.min(timeoutMs, 30_000));
+    const passSignal = AbortSignal.any([controller.signal, ...(signal ? [signal] : [])]);
+    const deadline = Date.now() + Math.min(timeoutMs, 30_000);
+    let onAbort!: () => void;
+    const cancelled = new Promise<CodeSnapshotBootCandidate[]>((resolve) => {
+      onAbort = () => resolve([]);
+      if (passSignal.aborted) onAbort();
+      else passSignal.addEventListener("abort", onAbort, { once: true });
+    });
+    // Late filesystem completions only finish reads; no cancelled observation reaches cleanup.
+    const discover = async (): Promise<CodeSnapshotBootCandidate[]> => {
+      const result: CodeSnapshotBootCandidate[] = [];
+      if (passSignal.aborted) return [];
+      let directory: Awaited<ReturnType<typeof fs.opendir>>;
+      try { directory = await fs.opendir(this.reposRoot); }
+      catch (cause) {
+        if ((cause as NodeJS.ErrnoException).code === "ENOENT") return [];
+        throw cause;
+      }
+      let count = 0;
+      for await (const entry of directory) {
+        if (passSignal.aborted || ++count > 256) break;
+        const barePath = path.join(path.resolve(this.reposRoot), entry.name);
+        try {
+          await this.assertOwedBare(barePath,
+            { maxBytes: 32, timeoutMs: deadline - Date.now(), signal: passSignal });
+          await this.withLock(barePath, async () => {
+            if (passSignal.aborted) return;
+            const read = await this.readBare(barePath,
+              ["for-each-ref", "--count=257", "--format=%(refname) %(objectname)", "refs/uzi-cross-check/"],
+              { maxBytes: 65536, timeoutMs: deadline - Date.now(), signal: passSignal });
+            if (read.truncated || passSignal.aborted) return;
+            const output = read.text;
+            const lines = output.split("\n").filter(Boolean);
+            if (lines.length > 256) return;
+            for (const line of lines) {
+              if (passSignal.aborted) return;
+              const parts = line.split(" ");
+              const leadId = parts[0]?.slice("refs/uzi-cross-check/".length);
+              if (parts.length !== 2 || !parts[0]?.startsWith("refs/uzi-cross-check/") ||
+                  !leadId || !CODE_ID.test(leadId) || !CODE_SHA.test(parts[1]!)) continue;
+              try {
+                const metadata = await this.readCodeSnapshotMetadata(barePath, leadId);
+                if (passSignal.aborted || !metadata || metadata.head !== parts[1] || metadata.readers.some(r => r.state === "OPEN")) continue;
+                result.push({ barePath, leadId, head: metadata.head, metadataToken: this.codeSnapshotToken(metadata), metadata });
+              } catch { /* Unknown or malformed metadata retains this exact ref. */ }
+            }
+          }, passSignal);
+        } catch (cause) {
+          this.log.warn("code snapshot boot discovery retained unsafe or unreadable bare", {
+            bare: barePath, error: gitErrorMessage(cause),
+          });
+        }
+      }
+      return passSignal.aborted ? [] : result;
+    };
+    try { return await Promise.race([discover(), cancelled]); }
+    finally {
+      clearTimeout(timer);
+      passSignal.removeEventListener("abort", onAbort);
+    }
+  }
+
   async anchorRecoveryHead(
     barePath: string,
     runId: string,
@@ -3940,14 +4490,19 @@ export class GitCache {
     if (!/^[0-9a-f]{40}$/.test(sha)) return false;
     const pinRef = recoveryPinRef(runId, generation);
     try {
-      return await this.withLock(barePath, async () => {
-        const present = (
-          await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
-        ).trim();
-        if (present !== sha) return false;
-        await this.runGit(barePath, ["update-ref", pinRef, sha]);
-        return true;
-      });
+      const root = await fs.realpath(this.reposRoot);
+      const rootStat = await fs.lstat(root);
+      return await recoveryPinAttributionLocks.withLock(
+        JSON.stringify([root, rootStat.dev, rootStat.ino, pinRef]),
+        () => this.withLock(barePath, async () => {
+          const present = (
+            await this.runGit(barePath, ["rev-parse", "--verify", `${sha}^{commit}`]).catch(() => "")
+          ).trim();
+          if (present !== sha) return false;
+          await this.runGit(barePath, ["update-ref", pinRef, sha]);
+          return true;
+        }),
+      );
     } catch (err) {
       this.log.warn("recovery: could not anchor the verified restore-point head in the trusted bare", {
         bare: barePath,
@@ -4121,13 +4676,484 @@ export class GitCache {
   }
 
   /**
-   * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
-   * replacement exists (the bundle was archived, or the head is already forge-published). Never
-   * throws: a failed cleanup only leaves a harmless ref on the long-lived bare (the same
-   * never-deleted posture `refs/uzi-runner` already carries, PRD #218).
+   * True when every present component of the pin's loose ref and reflog paths is a real directory
+   * (or, for the leaf, a regular file) and none is a symlink. Absent entries are fine; checking
+   * stops below the first absent level. Git unlinks these paths by name, so a symlinked component
+   * would let `update-ref -d` delete a file in another repository.
    */
-  async deleteRecoveryPin(barePath: string, runId: string, generation: number): Promise<void> {
-    await this.tryGit(barePath, ["update-ref", "-d", recoveryPinRef(runId, generation)]);
+  private async recoveryPinMetadataSafe(barePath: string, pinRef: string): Promise<boolean> {
+    // A repository redirect would point Git's ref store at another repository entirely, and a
+    // symlinked packed-refs would let Git rewrite another repository's file through its lock.
+    for (const redirect of [".git", "commondir", "gitdir", "reftable"]) {
+      try { await fs.lstat(path.join(barePath, redirect)); return false; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    }
+    // packed-refs is rewritten through its lock, and logs/HEAD is appended to when HEAD names the
+    // pin: each must be a regular file (never a symlink) or absent.
+    for (const file of ["packed-refs", "logs/HEAD"]) {
+      try {
+        const st = await fs.lstat(path.join(barePath, file));
+        // logs/HEAD is appended through, so a hard link to another file is refused as well.
+        if (!st.isFile() || (file === "logs/HEAD" && st.nlink !== 1)) return false;
+      } catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") return false; }
+    }
+    const parts = pinRef.split("/");
+    for (const top of ["logs", ""]) {
+      let cur = barePath;
+      const comps = top ? [top, ...parts] : parts;
+      for (let i = 0; i < comps.length; i++) {
+        cur = path.join(cur, comps[i]!);
+        let st: Stats;
+        try { st = await fs.lstat(cur); } catch (err) {
+          if ((err as NodeJS.ErrnoException).code === "ENOENT") break;
+          return false;
+        }
+        if (st.isSymbolicLink()) return false;
+        const leaf = i === comps.length - 1;
+        if (leaf ? !st.isFile() : !st.isDirectory()) return false;
+      }
+    }
+    return true;
+  }
+
+  /**
+   * issue #1507 — best-effort remove a pin ref planted by {@link anchorRecoveryHead}, once a durable
+   * replacement exists (the bundle was archived, or the head is already forge-published). A failed
+   * cleanup only leaves a harmless ref on the long-lived bare (the same never-deleted posture
+   * `refs/uzi-runner` already carries, PRD #218); only a Git boundary abort propagates.
+   */
+  async deleteRecoveryPin(barePath: string, runId: string, generation: number, expectedSha?: string): Promise<void> {
+    if (expectedSha === undefined) {
+      const pinRef = recoveryPinRef(runId, generation);
+      // No lock is taken here: callers may already hold this bare's lock, as before.
+      let safe = false;
+      try { safe = await this.recoveryPinMetadataSafe(barePath, pinRef); }
+      catch { safe = false; }
+      if (!safe) {
+        this.log.warn("recovery: recovery pin retained", {
+          bare: barePath, run_id: runId, generation, reason: "unsafe_metadata",
+        });
+        return;
+      }
+      // Residual userspace TOCTOU: a symlink planted between the check above and Git's
+      // unlink of the ref or reflog is not detected here (same as the archived path).
+      // tryGit keeps its own failure handling, including boundary-abort propagation.
+      await this.tryGit(barePath, ["update-ref", "-d", pinRef]);
+      return;
+    }
+    const root = path.resolve(this.reposRoot);
+    if (!path.isAbsolute(barePath) || path.resolve(barePath) !== barePath || path.dirname(barePath) !== root) {
+      this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: "invalid_identity" });
+      return;
+    }
+    // Pins are kept while the residue-quarantine latch is set; checked again at every commit gate.
+    if (residueQuarantine() !== undefined) {
+      this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: "quarantined" });
+      return;
+    }
+    const result = await this.cleanupArchivedRecoveryPin({
+      runId, generation, sourceSha: expectedSha, recoveryPinBareDir: path.basename(barePath),
+      isEligible: () => residueQuarantine() === undefined,
+    });
+    if (result.state === "retained") {
+      this.log.warn("recovery: recovery pin retained", { bare: barePath, run_id: runId, generation, reason: result.reason });
+    }
+  }
+
+  /**
+   * One attempt, no retries or backfill. Attribution precedes the bare lock; failures retain the
+   * pin. Metadata limits are admission limits, not isolation of Git's internal resource use.
+   */
+  async cleanupArchivedRecoveryPin(input: ArchivedRecoveryPinCleanup): Promise<ArchivedRecoveryPinCleanupResult> {
+    type Reason = Extract<ArchivedRecoveryPinCleanupResult, { state: "retained" }>["reason"];
+    const refuse = (reason: Reason): never => { throw new Error(reason); };
+    const unsafeNameChar = (name: string): boolean =>
+      [...name].some(c => c === "\\" || c.charCodeAt(0) < 0x20 || c.charCodeAt(0) === 0x7f);
+    if (!CODE_ID.test(input.runId) || !codeGeneration(input.generation) || !CODE_SHA.test(input.sourceSha) ||
+        typeof input.isEligible !== "function" ||
+        (input.deadline !== undefined && !Number.isFinite(input.deadline))) {
+      return { state: "retained", reason: "invalid_identity" };
+    }
+    const deadline = Math.min(Date.now() + 30_000, input.deadline ?? Infinity);
+    const stop = new AbortController();
+    const abort = () => stop.abort();
+    input.signal?.addEventListener("abort", abort, { once: true });
+    if (input.signal?.aborted) abort();
+    const timer = setTimeout(abort, Math.max(0, deadline - Date.now()));
+    const check = (): void => {
+      if (input.signal?.aborted) refuse("cancelled");
+      if (Date.now() >= deadline || stop.signal.aborted) refuse("deadline");
+    };
+    // Racing only bounds the caller's wait. Every continuation checks again, so a late filesystem
+    // completion cannot enter a Git mutation. Locks remain held until that continuation settles.
+    const bounded = async <T>(work: Promise<T>): Promise<T> => {
+      try { check(); }
+      catch (error) { void work.catch(() => undefined); throw error; }
+      let onAbort!: () => void;
+      const cancelled = new Promise<never>((_resolve, reject) => {
+        onAbort = () => reject(new Error(input.signal?.aborted ? "cancelled" : "deadline"));
+        stop.signal.addEventListener("abort", onAbort, { once: true });
+        if (stop.signal.aborted) onAbort();
+      });
+      try { const result = await Promise.race([work, cancelled]); check(); return result; }
+      finally { stop.signal.removeEventListener("abort", onAbort); }
+    };
+    const activeChildren = new Set<Promise<number>>();
+    let consumed = 0;
+    // Directories compare dev/ino/mode/uid/gid only: size, mtime and ctime change whenever a
+    // sibling entry is created or removed, which is not a swap. Files compare in full.
+    const identity = (st: Stats): string =>
+      (st.isDirectory() ? [st.dev, st.ino, st.mode, st.uid, st.gid]
+        : [st.dev, st.ino, st.mode, st.uid, st.gid, st.size, st.mtimeMs, st.ctimeMs]).join(":");
+    const safe = (st: Stats): boolean => st.uid === process.getuid?.() && !(st.mode & 0o002) &&
+      (!(st.mode & 0o020) || (st.gid === process.getgid?.() && !(uidSplitActive() && st.gid === RUNNER_UID)));
+    type Evidence = Map<string, string | null>;
+    const remember = async (p: string, evidence: Evidence, directory: boolean): Promise<Stats | undefined> => {
+      check();
+      let st: Stats;
+      try { st = await bounded(fs.lstat(p)); }
+      catch (error) {
+        if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error;
+        evidence.set(p, null); return undefined;
+      }
+      if (st.isSymbolicLink() || !safe(st) || (directory ? !st.isDirectory() : !st.isFile())) refuse("unsafe_metadata");
+      const handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW |
+        (directory ? fsConstants.O_DIRECTORY : fsConstants.O_NONBLOCK));
+      try {
+        check();
+        if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata");
+      } finally { await handle.close(); }
+      evidence.set(p, identity(st));
+      return st;
+    };
+    const metadata = async (p: string, limit: number, evidence: Evidence): Promise<string | undefined> => {
+      const st = await remember(p, evidence, false);
+      if (!st) return undefined;
+      if (st.size > limit || consumed + st.size > 32 * 1024 * 1024) refuse("unsafe_metadata");
+      const handle = await fs.open(p, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      try {
+        check();
+        if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata");
+        // Read at most limit+1, never readFile: growth cannot turn an admitted file into an
+        // unbounded allocation. Account every byte read across all candidates and revalidation.
+        const buffer = Buffer.alloc(Math.min(limit + 1, 32 * 1024 * 1024 - consumed + 1));
+        let bytes = 0;
+        while (bytes < buffer.length) {
+          const read = await bounded(handle.read(buffer, bytes, buffer.length - bytes, bytes));
+          if (!read.bytesRead) break;
+          bytes += read.bytesRead;
+        }
+        consumed += bytes;
+        if (bytes > limit || consumed > 32 * 1024 * 1024 ||
+            identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata");
+        return buffer.subarray(0, bytes).toString("utf8");
+      } finally { await handle.close(); }
+    };
+    // `pinCommonDir` is false only for the identity probe: Git 2.54 reports
+    // `--is-bare-repository` as false whenever GIT_COMMON_DIR is set, so that probe relies on
+    // `--git-dir` plus the admitted absence of a `commondir` file. gitEnv() is a replacement
+    // environment, so GIT_DIR/GIT_OBJECT_DIRECTORY/GIT_ALTERNATE_OBJECT_DIRECTORIES from the
+    // process cannot reach any probe or mutation.
+    const probe = async (cwd: string, args: string[], stdin?: string, pinCommonDir = true): Promise<string> => {
+      check();
+      const isBareProbe = cwd !== root;
+      const child = await this.spawnGit(cwd,
+        [...(isBareProbe ? ["--git-dir", cwd] : []), "--no-replace-objects", ...args], stdin, {
+        timeoutMs: deadline - Date.now(), stderrMaxBytes: 65536, cancelOnAbandon: true,
+        env: { GIT_CONFIG_GLOBAL: "/dev/null", ...(isBareProbe && pinCommonDir ? { GIT_COMMON_DIR: cwd } : {}) },
+      });
+      activeChildren.add(child.exited);
+      let bytes = 0;
+      const chunks: Buffer[] = [];
+      const onAbort = () => child.cancel();
+      stop.signal.addEventListener("abort", onAbort, { once: true });
+      if (stop.signal.aborted) onAbort();
+      try {
+        for await (const chunk of child.stdout) {
+          check();
+          const b = Buffer.from(chunk);
+          bytes += b.length;
+          if (bytes > 65536) { child.cancel(); refuse("unsafe_metadata"); }
+          chunks.push(b);
+        }
+        if (await child.exited !== 0) refuse("git_failure");
+        check();
+        return Buffer.concat(chunks).toString("utf8");
+      } finally {
+        stop.signal.removeEventListener("abort", onAbort);
+        child.cancel();
+        await child.exited;
+        activeChildren.delete(child.exited);
+      }
+    };
+    const revalidate = async (evidence: Evidence): Promise<void> => {
+      for (const [p, expected] of evidence) {
+        check();
+        let current: Stats | undefined;
+        try { current = await bounded(fs.lstat(p)); }
+        catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+        if ((current ? identity(current) : null) !== expected) refuse("unsafe_metadata");
+      }
+    };
+    const root = path.resolve(this.reposRoot);
+    const ref = recoveryPinRef(input.runId, input.generation);
+    const rootEvidence: Evidence = new Map();
+    const candidate = async (name: string): Promise<{ bare: string; tip?: string; packedTip?: string; evidence: Evidence }> => {
+      if (!name || name !== path.basename(name) || name === "." || name === ".." ||
+          unsafeNameChar(name)) refuse("invalid_identity");
+      const bare = path.join(root, name);
+      const evidence: Evidence = new Map(rootEvidence);
+      if (!await remember(bare, evidence, true)) refuse("unsafe_metadata");
+      if (await bounded(fs.realpath(bare)) !== bare) refuse("unsafe_metadata");
+      const config = await metadata(path.join(bare, "config"), 1024 * 1024, evidence);
+      if (config === undefined) refuse("unsafe_metadata");
+      // A cached bare must not redirect Git to another repository or common ref store.
+      // Record absence so a redirect planted while a transaction starts also refuses.
+      for (const redirect of [".git", "commondir", "gitdir"]) {
+        if (await remember(path.join(bare, redirect), evidence, false)) refuse("unsafe_metadata");
+      }
+      // Parse admitted bytes without includes BEFORE any repository probe can read config.
+      const keys = await probe(root, ["config", "--file", "-", "--no-includes", "--name-only", "--list"], config);
+      if (keys.split("\n").some(k => /^(include\.|includeif\.|core\.(worktree|hookspath|sshcommand)$|extensions\.(refstorage|worktreeconfig)$)/i.test(k))) {
+        refuse("unsafe_metadata");
+      }
+      const gitIdentity = (await probe(bare,
+        ["rev-parse", "--absolute-git-dir", "--git-common-dir", "--is-bare-repository"], undefined, false)).trimEnd().split("\n");
+      if (gitIdentity.length !== 3 || gitIdentity[0] !== bare || gitIdentity[1] !== bare || gitIdentity[2] !== "true") {
+        refuse("unsafe_metadata");
+      }
+      const packed = await metadata(path.join(bare, "packed-refs"), 16 * 1024 * 1024, evidence);
+      let packedTip: string | undefined;
+      for (const line of packed?.split("\n") ?? []) {
+        if (!line || line.startsWith("#") || line.startsWith("^")) continue;
+        const parts = line.split(" ");
+        if (parts.length !== 2 || !CODE_SHA.test(parts[0])) refuse("unsafe_metadata");
+        if (parts[1] === ref) {
+          if (packedTip !== undefined) refuse("unsafe_metadata");
+          packedTip = parts[0];
+        }
+      }
+      let parentMissing = false;
+      for (const dir of ["refs", "refs/uzi-recovery-pin", `refs/uzi-recovery-pin/${input.runId}`]) {
+        if (!await remember(path.join(bare, dir), evidence, true)) { parentMissing = true; break; }
+      }
+      const loose = parentMissing ? undefined : await metadata(path.join(bare, ref), 1024, evidence);
+      // Git's delete also unlinks the reflog and follows a symlinked intermediate directory, so
+      // the logs chain gets the same nofollow safe-owner admission (absent allowed, stop at the
+      // first absent level) and the reflog file itself must be a regular safe file or absent.
+      let logsMissing = false;
+      let logsLevel = 0;
+      for (const dir of ["logs", "logs/refs", "logs/refs/uzi-recovery-pin", `logs/refs/uzi-recovery-pin/${input.runId}`]) {
+        if (!await remember(path.join(bare, dir), evidence, true)) { logsMissing = true; break; }
+        logsLevel++;
+      }
+      if (!logsMissing) await remember(path.join(bare, "logs", ref), evidence, false);
+      // A HEAD naming the pin makes Git append a HEAD reflog entry through logs/HEAD.
+      // Git appends through it rather than replacing it, so a hard link to another file refuses too.
+      if (logsLevel > 0 && ((await remember(path.join(bare, "logs/HEAD"), evidence, false))?.nlink ?? 1) !== 1) {
+        refuse("unsafe_metadata");
+      }
+      let tip = packedTip;
+      if (loose !== undefined) {
+        if (!/^[a-f0-9]{40}\n?(?![\s\S])/.test(loose)) refuse("unsafe_metadata");
+        tip = loose.trim();
+      }
+      await revalidate(evidence);
+      return { bare, tip, packedTip, evidence };
+    };
+    // Discovery admission and probes use the same bare lock as the selected mutation. The
+    // selected candidate is re-read directly while that lock is already held.
+    const discoverCandidate = async (name: string) => {
+      if (!name || name !== path.basename(name) || name === "." || name === ".." ||
+          unsafeNameChar(name)) refuse("invalid_identity");
+      return this.withLock(path.join(root, name), () => candidate(name), stop.signal);
+    };
+    const attempt = async (): Promise<ArchivedRecoveryPinCleanupResult> => {
+      check();
+      // Ancestors are opened nofollow too; ownership restrictions apply to the private root.
+      let ancestor = path.parse(root).root;
+      for (const part of root.slice(ancestor.length).split(path.sep)) {
+        ancestor = path.join(ancestor, part);
+        const st = await bounded(fs.lstat(ancestor));
+        if (!st.isDirectory() || st.isSymbolicLink()) refuse("unsafe_metadata");
+        const handle = await fs.open(ancestor, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_DIRECTORY);
+        try { check(); if (identity(await bounded(handle.stat())) !== identity(st)) refuse("unsafe_metadata"); }
+        finally { await handle.close(); }
+        // Parent content may change independently; directory identity excludes size and times.
+        if (ancestor === root) rootEvidence.set(root, identity(st));
+      }
+      const rootStat = await remember(root, rootEvidence, true);
+      if (!rootStat || await bounded(fs.realpath(root)) !== root) return refuse("unsafe_metadata");
+      const key = JSON.stringify([root, rootStat.dev, rootStat.ino, ref]);
+      return recoveryPinAttributionLocks.withLock(key, async () => {
+        check();
+        const explicit = input.recoveryPinBareDir ?? input.bareDir;
+        if (input.recoveryPinBareDir !== undefined && input.bareDir !== undefined &&
+            input.recoveryPinBareDir !== input.bareDir) refuse("invalid_identity");
+        let selected: Awaited<ReturnType<typeof candidate>> | undefined;
+        if (explicit !== undefined) selected = await discoverCandidate(explicit);
+        else {
+          const directory = await fs.opendir(root);
+          try {
+            check();
+            let count = 0;
+            // Stream to completion: failure, cap, or any unsafe sibling refuses the whole proof.
+            for (;;) {
+              const entry = await bounded(directory.read());
+              if (!entry) break;
+              if (++count > 256) refuse("scan_limit");
+              const found = await discoverCandidate(entry.name);
+              if (found.tip !== undefined) {
+                if (selected) refuse("ambiguous");
+                selected = found;
+              }
+            }
+          } finally { await directory.close(); }
+          await revalidate(rootEvidence);
+        }
+        if (!selected) return { state: "already_absent" };
+        const chosen = selected;
+        return this.withLock(chosen.bare, async () => {
+          check();
+          await revalidate(chosen.evidence);
+          const current = await candidate(path.basename(chosen.bare));
+          if (current.tip !== chosen.tip) refuse("target_changed");
+          if (current.tip === undefined) return { state: "already_absent" };
+          if (current.tip !== input.sourceSha) refuse("target_changed");
+          // Type only: a bounded header read, never a commit decode. Trees, blobs, tags and missing
+          // objects (non-zero exit) all retain the pin.
+          // A missing object makes cat-file exit non-zero, which surfaces as Git's own stream error.
+          const objectType = await probe(chosen.bare, ["cat-file", "-t", input.sourceSha]).catch((error: unknown): string => {
+            if (["cancelled", "deadline", "unsafe_metadata"].includes((error as Error).message)) throw error;
+            return "";
+          });
+          if (objectType !== "commit\n") refuse("target_changed");
+          await revalidate(current.evidence);
+          check();
+          if (!input.isEligible()) refuse("ineligible");
+          check();
+          // Git's old-SHA comparison can resolve a symbolic ref even with no-deref.
+          // Prepare holds the exact ref lock while we independently prove directness.
+          const child = await this.spawnGit(chosen.bare, ["--git-dir", chosen.bare, "--no-replace-objects", "update-ref", "--stdin"],
+            `option no-deref\ndelete ${ref} ${input.sourceSha}\nprepare\n`, {
+              // The native timeout is only a backstop past the caller deadline: the teardown below gets
+              // PREPARED_ABORT_GRACE_MS to let Git exit on its own before anything sends SIGTERM.
+              keepStdinOpen: true, timeoutMs: Math.max(1, deadline - Date.now()) + PREPARED_ABORT_GRACE_MS,
+              stderrMaxBytes: 65536, cancelOnAbandon: true,
+              env: { GIT_CONFIG_GLOBAL: "/dev/null", GIT_COMMON_DIR: chosen.bare },
+            }).catch(() => refuse("git_failure"));
+          activeChildren.add(child.exited);
+          // SIGTERM between Git's O_EXCL create of the ref lock and arming its tempfile cleanup would
+          // leave a stale `<ref>.lock` that this code did not remove and must never delete. So an
+          // uncommitted transaction is ended with `abort` on stdin and Git exits by itself; the signal
+          // is only a fallback after PREPARED_ABORT_GRACE_MS. The caller's bound can therefore stretch
+          // by up to that grace, in this teardown only. cancelOnAbandon (boundary abandon) may still
+          // kill the child; that path is left unchanged.
+          let committed = false;
+          let abortSent = false;
+          const sendAbort = (): void => {
+            if (committed || abortSent) return;
+            abortSent = true;
+            try { child.stdin?.end("abort\n"); } catch { /* stdin already closed: Git is exiting */ }
+          };
+          const onAbort = sendAbort;
+          stop.signal.addEventListener("abort", onAbort, { once: true });
+          if (stop.signal.aborted) onAbort();
+          try {
+            check();
+            if (!child.stdin) refuse("git_failure");
+            const output = child.stdout[Symbol.asyncIterator]();
+            let response = "";
+            let bytes = 0;
+            while (!response.includes("\n")) {
+              const chunk = await bounded(output.next());
+              if (chunk.done) refuse("git_failure");
+              const buffer = Buffer.from(chunk.value);
+              bytes += buffer.length;
+              if (bytes > 65536) refuse("git_failure");
+              response += buffer.toString("utf8");
+            }
+            if (response !== "prepare: ok\n") refuse("git_failure");
+            // Last caller decision before the redirect/evidence re-check, so anything planted while
+            // eligibility ran is still caught before commit.
+            check();
+            if (!input.isEligible()) refuse("ineligible");
+            check();
+            // Parent directories may acquire new lock entries; their inode/ownership must
+            // still match admission. File evidence (except the raced ref) must match fully.
+            for (const [p, expected] of current.evidence) {
+              if (p === path.join(chosen.bare, ref)) continue;
+              let st: Stats | undefined;
+              try { st = await bounded(fs.lstat(p)); }
+              catch (error) { if ((error as NodeJS.ErrnoException).code !== "ENOENT") throw error; }
+              if (expected === null) {
+                if (st && (!st.isDirectory() || ![
+                  path.join(chosen.bare, "refs"), path.join(chosen.bare, "refs/uzi-recovery-pin"),
+                  path.join(chosen.bare, `refs/uzi-recovery-pin/${input.runId}`),
+                ].includes(p))) refuse("unsafe_metadata");
+              } else if (!st || (st.isDirectory()
+                ? identity(st).split(":").slice(0, 5).join(":") !== expected.split(":").slice(0, 5).join(":")
+                : identity(st) !== expected)) refuse("unsafe_metadata");
+            }
+            for (const dir of ["refs", "refs/uzi-recovery-pin", `refs/uzi-recovery-pin/${input.runId}`]) {
+              if (!await remember(path.join(chosen.bare, dir), new Map(), true)) refuse("unsafe_metadata");
+            }
+            const loose = await metadata(path.join(chosen.bare, ref), 1024, new Map());
+            if (loose === undefined) {
+              if (current.packedTip !== input.sourceSha) refuse("target_changed");
+            } else if (loose !== input.sourceSha && loose !== input.sourceSha + "\n") refuse("target_changed");
+            // Synchronous final recheck: nothing is awaited between it and the commit write.
+            check();
+            if (!input.isEligible()) refuse("ineligible");
+            check();
+            child.stdin!.end("commit\n");
+            committed = true;
+            response = "";
+            for (;;) {
+              const chunk = await bounded(output.next());
+              if (chunk.done) break;
+              const buffer = Buffer.from(chunk.value);
+              bytes += buffer.length;
+              if (bytes > 65536) refuse("git_failure");
+              response += buffer.toString("utf8");
+            }
+            if (response !== "commit: ok\n" || await child.exited !== 0) refuse("git_failure");
+          } catch (error) {
+            const message = error instanceof Error ? error.message : "";
+            if (["unsafe_metadata", "target_changed", "ineligible", "cancelled", "deadline", "git_failure"].includes(message)) throw error;
+            refuse("git_failure");
+          } finally {
+            stop.signal.removeEventListener("abort", onAbort);
+            if (committed) child.cancel();
+            else {
+              sendAbort();
+              let graceTimer: ReturnType<typeof setTimeout> | undefined;
+              const exitedInGrace = await Promise.race([
+                child.exited.then(() => true, () => true),
+                new Promise<boolean>(resolve => { graceTimer = setTimeout(() => resolve(false), PREPARED_ABORT_GRACE_MS); }),
+              ]);
+              clearTimeout(graceTimer);
+              if (!exitedInGrace) child.cancel();
+            }
+            await child.exited;
+            activeChildren.delete(child.exited);
+          }
+          return { state: "deleted" };
+        }, stop.signal);
+      }, stop.signal);
+    };
+    try { return await bounded(attempt()); }
+    catch (error) {
+      const message = error instanceof Error ? error.message : "";
+      const reasons: Reason[] = ["invalid_identity", "unsafe_metadata", "ambiguous", "scan_limit",
+        "target_changed", "ineligible", "cancelled", "deadline", "git_failure"];
+      return { state: "retained", reason: input.signal?.aborted ? "cancelled" :
+        Date.now() >= deadline ? "deadline" : reasons.includes(message as Reason) ? message as Reason : "unsafe_metadata" };
+    } finally {
+      clearTimeout(timer);
+      input.signal?.removeEventListener("abort", abort);
+      await Promise.all(activeChildren);
+    }
   }
 
   /**
@@ -4195,18 +5221,671 @@ export class GitCache {
     await this.withLock(barePath, async () => {
       // issue #1783 M2: a Docker-wired worker also journals the attempt id (the same id its path
       // and marker carry). Absent ⇒ today's `{ runId, clonePath }` byte-for-byte.
-      const value: RecoveryJournalEntry = attemptId === undefined ? { runId, clonePath } : { runId, clonePath, attemptId };
+      await this.assertRecoveryBare(barePath);
+      const source = recoverySource({ runId, clonePath, ...(attemptId === undefined ? {} : { attemptId }) });
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending && !sameRecoverySource(pending, source)) throw new Error("recovery attribution cannot be overwritten");
+      const value: RecoveryJournalEntry = { ...pending, ...source };
       await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), JSON.stringify(value)]);
+    });
+  }
+
+  private recoverySources(journal: RecoveryJournalEntry): RecoverySource[] {
+    const sources = [journal, ...(journal.retainedSources ?? []),
+      ...(journal.recovery ? [journal.recovery.source, ...(journal.recovery.successor ? [journal.recovery.successor] : [])] : [])];
+    return sources.filter((s, i) => sources.findIndex(p => sameRecoverySource(p, s)) === i);
+  }
+
+  /** Protected records are custody evidence only, never seed/adoption authority. */
+  private async protectedRecoveries(barePath: string, selectedRunId?: string): Promise<Array<{ branch: string; key: string; journal: RecoveryJournalEntry }>> {
+    await this.assertRecoveryBare(barePath);
+    const records: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
+    const seen = new Set<string>();
+    const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+    for (const item of config.split("\0")) {
+      const nl = item.indexOf("\n");
+      const name = nl < 0 ? item : item.slice(0, nl);
+      if (selectedRunId !== undefined ? name !== `uzi-retained.${selectedRunId}.journal` : !name.startsWith("uzi-retained.")) continue;
+      const match = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
+      if (!match || seen.has(name) || nl < 0) throw new Error("invalid protected recovery descriptor");
+      seen.add(name);
+      const record = JSON.parse(item.slice(nl + 1));
+      if (!record || typeof record !== "object" || Array.isArray(record) || record.version !== 1 ||
+          Object.keys(record).sort().join(",") !== "branch,journal,key,version" ||
+          typeof record.branch !== "string" || !record.branch || typeof record.key !== "string" ||
+          !/^[A-Za-z0-9_-]+$/.test(record.key)) throw new Error("invalid protected recovery descriptor");
+      const journal = parseRecoveryJournal(JSON.stringify(record.journal));
+      if (journal.runId !== match[1] || (!journal.recovery && !journal.retainedSources?.length)) throw new Error("protected recovery run mismatch");
+      await this.runGit(barePath, ["check-ref-format", "--branch", record.branch]);
+      await this.attributedRecovery(barePath, record.branch, record.key, journal, journal);
+      const active = await this.readRecoveryCapture(barePath, record.branch);
+      if (active?.runId === journal.runId && JSON.stringify(active) !== JSON.stringify(journal)) {
+        throw new Error("conflicting active and protected recovery descriptor");
+      }
+      records.push({ branch: record.branch, key: record.key, journal });
+    }
+    return records;
+  }
+
+  /** Validate the complete active snapshot before proving terminal source quiescence. */
+  async terminalRetainedSnapshot(barePath: string, branch: string, key: string, expected: Pick<RecoverySource, "runId" | "clonePath">):
+    Promise<{ journal: RecoveryJournalEntry; paths: string[] } | undefined> {
+    return this.withLock(barePath, async () => {
+      await this.protectedRecoveries(barePath);
+      const journal = await this.readRecoveryCapture(barePath, branch);
+      if (!journal || journal.runId !== expected.runId || journal.clonePath !== expected.clonePath) throw new Error("recovery identity changed");
+      if (!journal.recovery && !journal.retainedSources?.length) return undefined;
+      await this.checkedRecovery(barePath, branch, key, journal, true);
+      return { journal, paths: this.recoverySources(journal).map(s => s.clonePath) };
+    });
+  }
+
+  /** One bounded pass under the bare lock. A failure stops detachment, keeping active
+   * or both descriptors; no pins, bytes or server custody are released. */
+  async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
+    expected = parseRecoveryJournal(JSON.stringify(expected));
+    await this.withLock(barePath, async () => {
+      const records = await this.protectedRecoveries(barePath);
+      const prior = records.find(r => r.journal.runId === expected.runId);
+      const value = JSON.stringify({ version: 1, branch, key, journal: expected });
+      if (prior && JSON.stringify({ version: 1, ...prior }) !== value) throw new Error("conflicting protected recovery descriptor");
+      const current = await this.readRecoveryCapture(barePath, branch);
+      if (prior) await this.checkedRecovery(barePath, branch, key, expected, true, prior.journal);
+      if (prior && (!current || current.runId !== expected.runId)) return;
+      if (!current || JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("terminal recovery snapshot changed");
+      await this.checkedRecovery(barePath, branch, key, expected, true);
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+      const marker = await this.readRecoveryAttemptMode(barePath, key);
+      if (!marker) await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+      if (!await this.readRecoveryAttemptMode(barePath, key)) throw new Error("attempt mode persistence failed");
+      if (!prior) await this.runGit(barePath, ["config", "--local", `uzi-retained.${expected.runId}.journal`, value]);
+      const readback = (await this.protectedRecoveries(barePath)).find(r => r.journal.runId === expected.runId);
+      if (!readback || JSON.stringify({ version: 1, ...readback }) !== value) throw new Error("protected recovery readback mismatch");
+      await this.checkedRecovery(barePath, branch, key, expected, true, readback.journal);
+      for (const source of this.recoverySources(expected)) {
+        if (source.attemptId) await this.appendAttemptLedger(barePath, branch, {
+          attemptId: source.attemptId, runId: source.runId, clonePath: source.clonePath, state: "reclaimed",
+        });
+      }
+      const final = await this.readRecoveryCapture(barePath, branch);
+      if (!final || JSON.stringify(final) !== JSON.stringify(expected)) throw new Error("terminal recovery snapshot changed");
+      await this.checkedRecovery(barePath, branch, key, expected, true);
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+    });
+  }
+
+  private async assertRecoveryBare(barePath: string): Promise<void> {
+    const st = await fs.lstat(path.join(barePath, "config"));
+    if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+        ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
+      throw new Error("unsafe recovery bare config");
+    }
+    if (await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) throw new Error("invalid recovery bare");
+    await this.assertOwedBare(barePath);
+    const entries = await this.runGit(barePath, ["config", "--local", "--no-includes", "--name-only", "--list"]);
+    if (entries.split("\n").some(k => /^(include\.|includeif\.|core\.worktree$|core\.hookspath$|core\.sshcommand$)/i.test(k))) {
+      throw new Error("unsafe recovery bare config");
+    }
+  }
+
+  private async checkedRecovery(
+    barePath: string, branch: string, key: string, expected: RecoverySource, allowMissing = false,
+    detached?: RecoveryJournalEntry,
+  ): Promise<RecoveryJournalEntry> {
+    const { journal, repair } = await this.attributedRecovery(barePath, branch, key, expected, detached, true);
+    let missing = false;
+    // One pass over the recorded sources, no retries. Any unsafe sibling refuses discovery.
+    for (const source of this.recoverySources(journal)) {
+      let absent = false;
+      for (const dir of [path.resolve(this.runnerRoot), path.dirname(source.clonePath), source.clonePath]) {
+        try {
+          const st = await fs.lstat(dir);
+          if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe recovery source path");
+        } catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          if (repair && sameRecoverySource(source, repair) && dir !== source.clonePath) {
+            throw new Error("unsafe recovery successor ancestor");
+          }
+          absent = true;
+          break;
+        }
+      }
+      if (repair && sameRecoverySource(source, repair) && !absent) {
+        throw new Error("recovery successor already exists without attribution");
+      }
+      if (absent) {
+        if (journal.recovery?.successor && sameRecoverySource(source, journal.recovery.successor) &&
+            !sameRecoverySource(source, journal)) continue; // identity was journaled before creation
+        missing = true; continue;
+      }
+      const st = await fs.lstat(path.join(source.clonePath, ".git"));
+      if (!st.isDirectory() || st.isSymbolicLink()) throw new Error("unsafe recovery source path");
+    }
+    if (missing && (!allowMissing || repair)) throw new RetainedRecoveryBlockedError(barePath, branch, key, journal);
+    // checkedRecovery callers hold the bare lock. All siblings and real ancestors
+    // have been validated, and the successor leaf was affirmatively ENOENT.
+    if (repair) await this.appendAttemptLedger(barePath, branch, {
+      attemptId: repair.attemptId!, runId: repair.runId, clonePath: repair.clonePath, state: "live",
+    });
+    return journal;
+  }
+
+  /** Attribution only: indexing cannot repair legacy evidence or confer execution authority. */
+  private async attributedRecovery(
+    barePath: string, branch: string, key: string, expected: RecoverySource,
+    detached?: RecoveryJournalEntry, allowLegacyRepair = false,
+  ): Promise<{ journal: RecoveryJournalEntry; repair?: RecoverySource }> {
+    await this.assertRecoveryBare(barePath);
+    recoverySource({ runId: expected.runId, clonePath: expected.clonePath,
+      ...(expected.attemptId === undefined ? {} : { attemptId: expected.attemptId }) });
+    const journal = detached ?? await this.readRecoveryCapture(barePath, branch);
+    if (!journal || !sameRecoverySource(journal, expected)) throw new Error("recovery identity changed");
+    if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("invalid recovery key");
+    const canonical = this.runnerClonePath(barePath, key);
+    if (journal.recovery || journal.retainedSources?.length || detached) {
+      const sources = this.recoverySources(journal);
+      for (const [ledgerBranch, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+        const entry = parseAttemptLedgerEntry(raw);
+        if (!entry) throw new Error(journal.recovery?.stage === "adopting"
+          ? "unreadable or conflicting recovery successor ledger" : "unreadable recovery source ledger");
+        for (const source of sources) {
+          if ((entry.attemptId === source.attemptId || entry.clonePath === source.clonePath) &&
+              (ledgerBranch !== branch || entry.attemptId !== source.attemptId || entry.runId !== source.runId || entry.clonePath !== source.clonePath)) {
+            throw new Error("conflicting recovery source ledger");
+          }
+        }
+      }
+    }
+    let repair: RecoverySource | undefined;
+    for (const source of this.recoverySources(journal)) {
+      const shape = this.clonePathShape(source.clonePath, canonical);
+      if (!shape || shape.attemptId !== source.attemptId || source.runId !== journal.runId) {
+        throw new Error("recovery source does not belong to this key");
+      }
+      if (await this.classifyOwnerClonePath(barePath, branch, key, source.runId, source.clonePath)) continue;
+      // Old prepareRecoverySuccessor wrote adopting before its ledger entry. Only
+      // that distinct, not-yet-created successor can recover the missing attribution.
+      if (!allowLegacyRepair || detached || journal.recovery?.stage !== "adopting" || !journal.recovery.successor ||
+          !sameRecoverySource(source, journal.recovery.successor) ||
+          sameRecoverySource(source, journal) || !source.attemptId) {
+        throw new Error("recovery source does not belong to this key");
+      }
+      // One ledger scan, no retries; malformed evidence or any conflicting
+      // identity (including another branch) refuses repair before any append.
+      for (const [, raw] of await this.readAllAttemptLedgerRaw(barePath)) {
+        const entry = parseAttemptLedgerEntry(raw);
+        if (!entry || entry.attemptId === source.attemptId || entry.clonePath === source.clonePath) {
+          throw new Error("unreadable or conflicting recovery successor ledger");
+        }
+      }
+      repair = source;
+    }
+    return { journal, ...(repair ? { repair } : {}) };
+  }
+
+  private checkRecoveryInterruption(): void {
+    const operation = this.recoveryOperations.getStore();
+    operation?.signal.throwIfAborted();
+    if (operation && Date.now() >= operation.deadline) throw new Error("recovery deadline exhausted");
+  }
+
+  /** Finite source/probe pass, no retries. A failed source never hides sibling attribution. */
+  private async recoveryPhysicalFailure(journal: RecoveryJournalEntry): Promise<InventoryReadCause | undefined> {
+    let failure: InventoryReadCause | undefined;
+    for (const source of this.recoverySources(journal)) {
+      const probes: Array<[string, InventoryReadCause]> = [
+        [path.resolve(this.runnerRoot), "clone_ancestor_invalid"],
+        [path.dirname(source.clonePath), "clone_ancestor_invalid"],
+        [source.clonePath, "clone_path_invalid"],
+        [path.join(source.clonePath, ".git"), "clone_head_unreadable"],
+      ];
+      for (const [dir, cause] of probes) {
+        this.checkRecoveryInterruption();
+        let st: Stats;
+        try { st = await fs.lstat(dir); }
+        catch (error) {
+          this.checkRecoveryInterruption();
+          const code = (error as NodeJS.ErrnoException).code;
+          // Only filesystem probe errors are isolated; synthetic/interrupt failures propagate.
+          if (!code || !["ENOENT", "ENOTDIR", "EACCES", "EPERM", "EIO", "ELOOP", "ESTALE"].includes(code)) throw error;
+          failure ??= cause;
+          break;
+        }
+        this.checkRecoveryInterruption();
+        if (!st.isDirectory() || st.isSymbolicLink()) { failure ??= cause; break; }
+      }
+    }
+    return failure;
+  }
+
+  private warnRecoveryPhysicalFailure(): void {
+    this.log.warn("recovery custody discovery: incomplete physical evidence; attribution remains protected");
+  }
+
+  private async writeRecovery(barePath: string, branch: string, journal: RecoveryJournalEntry, guard?: () => void | Promise<void>): Promise<void> {
+    const value = JSON.stringify(journal);
+    parseRecoveryJournal(value);
+    await this.assertRecoveryBare(barePath);
+    if (guard) await guard();
+    await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), value]);
+  }
+
+  private async recoveryClockCurrent(barePath: string, branch: string, journal: RecoveryJournalEntry, handoffComplete = false): Promise<boolean> {
+    const recovery = journal.recovery!;
+    const now = Date.now();
+    const invalid = !Number.isSafeInteger(now) || now < recovery.startedAt;
+    if (invalid || (!handoffComplete && now >= recovery.deadline)) {
+      await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...recovery,
+        stage: "blocked", blocker: invalid ? "clock_invalid" : "budget_exhausted" } });
+      return false;
+    }
+    return true;
+  }
+
+  /** Credential-free effective path mode, independent of recovery journal disposition. */
+  async recoveryAttemptMode(repoUrl: string, key: string): Promise<boolean> {
+    return this.readRecoveryAttemptMode(this.barePathFor(repoUrl), key);
+  }
+
+  private async readRecoveryAttemptMode(barePath: string, key: string): Promise<boolean> {
+    if (!/^[A-Za-z0-9_-]+$/.test(key)) throw new Error("invalid recovery key");
+    await this.assertRecoveryBare(barePath);
+    // A successful list distinguishes absence from an unreadable config. Reject
+    // duplicate, valueless and unknown markers rather than selecting canonical.
+    const marker = `uzi-attemptmode.${key}.enabled`;
+    const entries = (await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]))
+      .split("\0").filter(item => item === marker || item.startsWith(marker + "\n"));
+    if (entries.length === 0) return false;
+    if (entries.length !== 1 || entries[0] !== marker + "\ntrue") throw new Error("invalid recovery attempt mode");
+    return true;
+  }
+
+  /** Credential-free discovery before ensureClone/preflight. No remote reads or creation.
+   * A recorded successor is evidence only: every claim must reserve a new iteration. */
+  async discoverRetainedRecovery(
+    repoUrl: string, branch: string, key: string, runId: string,
+  ): Promise<{ barePath: string; journal: RecoveryJournalEntry } | undefined> {
+    const barePath = this.barePathFor(repoUrl);
+    if (!await this.pathPresent(barePath)) return undefined;
+    await this.assertRecoveryBare(barePath);
+    return this.withLock(barePath, async () => {
+      const journal = await this.readRecoveryCapture(barePath, branch);
+      if (!journal) return undefined;
+      if (journal.runId !== runId) throw new ForeignRetainedRecoveryError();
+      await this.checkedRecovery(barePath, branch, key, journal);
+      return { barePath, journal };
+    });
+  }
+
+  /** Precharge one of three total iterations before capture. Legacy journals start at zero.
+   * Recreated workers and fresh successors use the original five-minute episode deadline.
+   * recoveryRetryMs is the existing base (1..30000ms). Returned backoff is base times
+   * 2^(charged attempts - 1), capped at 16x base; caller sleeps outside lock/deadline. */
+  async reserveRecoveryIteration(
+    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000,
+  ): Promise<RecoveryProgress> {
+    if (!Number.isSafeInteger(recoveryRetryMs) || recoveryRetryMs < 1 || recoveryRetryMs > 30_000) throw new Error("invalid recovery backoff");
+    return this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const old = journal.recovery;
+      if (old?.stage === "blocked") throw new Error("recovery episode is blocked");
+      const now = Date.now();
+      if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(now + 300_000) || (old && now < old.startedAt)) {
+        if (old) await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "clock_invalid" } });
+        throw new Error("invalid recovery clock");
+      }
+      if (old && (old.attempts >= 3 || now >= old.deadline)) {
+        await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "budget_exhausted" } });
+        throw new Error("recovery budget exhausted");
+      }
+      const source = old?.source ?? recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+        ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) });
+      const recovery: RecoveryProgress = {
+        ...old, version: 1, source, attempts: (old?.attempts ?? 0) + 1,
+        startedAt: old?.startedAt ?? now, deadline: old?.deadline ?? now + 300_000,
+        backoffMs: recoveryRetryMs * 2 ** Math.min(old?.attempts ?? 0, 4), stage: "capturing",
+      };
+      await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+      await this.writeRecovery(barePath, branch, { ...journal, recovery });
+      return recovery;
+    });
+  }
+
+  /** Check every recorded source against its existing restore pin; one incomplete source refuses all. */
+  async verifiedRetainedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      if (JSON.stringify(journal) !== JSON.stringify(expected)) return false;
+      // The finite descriptor and caller's shared recovery-operation deadline bound this pass.
+      for (const source of this.recoverySources(journal)) {
+        const tip = source.restoreTip ?? (journal.recovery && sameRecoverySource(source, journal.recovery.source)
+          ? journal.recovery.restoreTip : undefined);
+        if (!tip || !await this.verifiedRecoverySourceBytes(barePath, source, tip)) return false;
+      }
+      return true;
+    });
+  }
+
+  async verifiedRecoveryRestorePoint(barePath: string, branch: string, key: string, expected: RecoverySource, tip: string): Promise<boolean> {
+    return this.withLock(barePath, async () => {
+      await this.checkedRecovery(barePath, branch, key, expected);
+      return this.verifiedRecoverySourceBytes(barePath, expected, tip);
+    });
+  }
+
+  private async verifiedRecoverySourceBytes(barePath: string, expected: RecoverySource, tip: string): Promise<boolean> {
+      if (!await this.verifyRecoveryClosure(barePath, tip)) return false;
+      if (await this.revParse(barePath, `refs/uzi-recovery-episode/${expected.runId}/${tip}`) !== tip) return false;
+      const head = (await this.runGitAsRunner(expected.clonePath, ["rev-parse", "HEAD"])).trim();
+      const tree = (await this.runGitAsRunner(expected.clonePath, ["write-tree"])).trim();
+      const expectedTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      return tree === expectedTree && await this.isAncestor(barePath, head, tip) &&
+        (await this.runGitAsRunner(expected.clonePath, ["diff", "--name-only"])).trim() === "" &&
+        (await this.runGitAsRunner(expected.clonePath, ["ls-files", "--others", "--exclude-standard"])).trim() === "";
+  }
+
+  async verifyRecoveryClosure(barePath: string, tip: string): Promise<boolean> {
+    const operation = this.recoveryOperations.getStore();
+    operation?.signal.throwIfAborted();
+    if (!SHA40_RE.test(tip)) return false;
+    const budget = operation?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes };
+    // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
+    const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
+      GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+    const read = async (args: string[], input?: string): Promise<string> =>
+      (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
+        { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
+    let producer: Awaited<ReturnType<GitCache["spawnGit"]>> | undefined;
+    try {
+      if ((await read(["rev-parse", "--verify", `${tip}^{commit}`])).trim() !== tip) return false;
+      const listing = await read(["rev-list", "--objects", "--no-object-names", "--missing=error", tip]);
+      if (!listing.endsWith("\n")) return false;
+      const oids = listing.slice(0, -1).split("\n");
+      // Each SHA-only record occupies 41 bytes within the existing 64 MiB output cap.
+      if (oids.length > Math.floor(GIT_MAX_BUFFER / 41) || oids.some(oid => !SHA40_RE.test(oid)) ||
+          new Set(oids).size !== oids.length || !oids.includes(tip)) return false;
+      const input = oids.join("\n") + "\n";
+      const metadata = await read(["cat-file", "--batch-check"], input);
+      const rows = metadata.split("\n");
+      if (rows.pop() !== "" || rows.length !== oids.length) return false;
+      const objects: ClosureObject[] = [];
+      let declared = 0;
+      for (let i = 0; i < rows.length; i++) {
+        const match = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(rows[i]!);
+        if (!match || match[1] !== oids[i]) return false;
+        const size = Number(match[3]);
+        if (!Number.isSafeInteger(size) || size > budget.limit - budget.delivered - declared) {
+          throw new RecoveryClosureLimitError(budget.limit);
+        }
+        declared += size;
+        objects.push({ oid: match[1]!, type: match[2]!, size });
+      }
+      operation?.signal.throwIfAborted();
+      producer = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"], input,
+        { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true });
+      await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
+      if (await producer.exited !== 0) return false;
+      operation?.signal.throwIfAborted();
+      return true;
+    } catch (error) {
+      // Abandoning the pipe cancels the exact owned producer; settlement precedes lock release.
+      if (producer) { producer.cancel(); producer.stdout.destroy(); await producer.exited; }
+      operation?.signal.throwIfAborted();
+      if (error instanceof RecoveryClosureLimitError) {
+        this.log.warn(error.message);
+        throw error;
+      }
+      return false;
+    }
+  }
+
+  /** Verify the local captured commit's complete object closure and pin BEFORE journaling.
+   * Thin bundles imported with local prerequisites are valid here; publication is separate. */
+  async recordRecoveryCapture(
+    barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number, tip: string,
+  ): Promise<void> {
+    if (!SHA40_RE.test(tip)) throw new Error("invalid recovery tip");
+    await this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const recovery = journal.recovery;
+      if (!recovery || recovery.stage !== "capturing" || recovery.attempts !== iteration ||
+          !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
+      if (!await this.verifyRecoveryClosure(barePath, tip)) throw new Error("captured object closure is invalid");
+      const sourceHead = (await this.runGitAsRunner(expected.clonePath, ["rev-parse", "HEAD"])).trim();
+      if (!SHA40_RE.test(sourceHead) || !await this.isAncestor(barePath, sourceHead, tip)) throw new Error("captured history does not cover source");
+      await this.runGit(barePath, ["update-ref", "--no-deref", `refs/uzi-recovery-episode/${journal.runId}/${tip}`, tip]);
+      if (!await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("capture iteration is not current");
+      await this.writeRecovery(barePath, branch, { ...journal, restoreTip: tip,
+        recovery: { ...recovery, restoreTip: tip, stage: "captured" } });
+    });
+  }
+
+  /** Store only a bounded worker reason code, never provider output or exception text.
+   * expectedEpisode null requires absence; omission preserves legacy unguarded callers. */
+  async blockRecoveryEpisode(
+    barePath: string, branch: string, key: string, expected: RecoverySource,
+    reason: RecoveryBlocker, expectedEpisode?: Pick<RecoveryProgress, "startedAt" | "deadline" | "attempts"> | null,
+    guard?: () => void,
+  ): Promise<void> {
+    if (!["capture_failed", "source_missing", "adoption_failed", "budget_exhausted", "clock_invalid", "oversize", "prerequisites_unavailable", "quiescence_failed", "preservation_failed", "decoded_history_limit"].includes(reason)) throw new Error("invalid blocker");
+    await this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected, true);
+      guard?.();
+      if (expectedEpisode === null && journal.recovery) throw new Error("recovery episode changed");
+      if (expectedEpisode && (!journal.recovery ||
+          journal.recovery.startedAt !== expectedEpisode.startedAt ||
+          journal.recovery.deadline !== expectedEpisode.deadline ||
+          journal.recovery.attempts !== expectedEpisode.attempts)) throw new Error("recovery episode changed");
+      if (journal.recovery?.stage === "blocked") return;
+      const now = Date.now();
+      // Without an episode only a proven missing source can create the terminal record.
+      if (!journal.recovery) {
+        let missing = false;
+        for (const source of this.recoverySources(journal)) {
+          if (!await this.pathPresent(source.clonePath)) missing = true;
+        }
+        if (reason !== "source_missing" || !missing) throw new Error("no reserved recovery episode");
+      }
+      if (!journal.recovery && (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(now + 300_000))) throw new Error("invalid recovery clock");
+      const recovery: RecoveryProgress = journal.recovery ?? {
+        version: 1, source: recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+          ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) }),
+        attempts: 3, startedAt: now, deadline: now + 300_000, backoffMs: 0, stage: "blocked",
+      };
+      await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+      await this.writeRecovery(barePath, branch, { ...journal,
+        recovery: { ...recovery, stage: "blocked", blocker: reason } }, guard);
+      guard?.();
+    });
+  }
+
+  /** Fresh successor, local-only under one bare lock. Never executes in a predecessor.
+   * Adopting + successor identity land before clone creation; failure leaves that evidence.
+   * Ready and attribution handoff land in ONE config write only after tip/tree/history checks.
+   * This return value is usable only by the current caller, never by rediscovery after reclaim. */
+  async prepareRecoverySuccessor(
+    barePath: string, branch: string, key: string, expected: RecoverySource, iteration: number,
+    attemptId: string, opts?: { selfContained?: boolean },
+  ): Promise<RunnerClone> {
+    if (!ATTEMPT_ID_RE.test(attemptId)) throw new Error("invalid successor attempt");
+    return this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      const recovery = journal.recovery;
+      if (!recovery || recovery.stage !== "captured" || recovery.attempts !== iteration ||
+          !recovery.restoreTip || !await this.recoveryClockCurrent(barePath, branch, journal)) throw new Error("successor iteration is not current");
+      const tip = recovery.restoreTip;
+      const pin = `refs/uzi-recovery-episode/${journal.runId}/${tip}`;
+      if ((await this.runGit(barePath, ["rev-parse", "--verify", pin])).trim() !== tip) throw new Error("recovery pin changed");
+      const clonePath = attemptClonePath(this.runnerClonePath(barePath, key), attemptId);
+      if (await this.pathPresent(clonePath) || (await this.readAttemptLedger(barePath, branch)).has(attemptId)) throw new Error("successor identity already used");
+      const successor: RecoverySource = { runId: journal.runId, clonePath, attemptId, restoreTip: tip };
+      const existingSources: RecoverySource[] = [];
+      for (const s of this.recoverySources(journal)) {
+        if (await this.pathPresent(s.clonePath)) existingSources.push(s);
+      }
+      const retainedSources = existingSources.map(s => recoverySource({
+        runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
+        ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
+      }));
+      await this.appendAttemptLedger(barePath, branch, { attemptId, runId: successor.runId, clonePath, state: "live" });
+      await this.writeRecovery(barePath, branch, { ...journal, retainedSources,
+        recovery: { ...recovery, successor, stage: "adopting" } });
+      const seeded = await this.seedRunnerClone(barePath, branch, clonePath, journal.runId, true, undefined,
+        { ...opts, recoveryTip: tip });
+      const head = (await this.runGitAsRunner(clonePath, ["rev-parse", "HEAD"])).trim();
+      const tree = (await this.runGitAsRunner(clonePath, ["write-tree"])).trim();
+      const expectedTree = (await this.runGit(barePath, ["rev-parse", `${tip}^{tree}`])).trim();
+      const marker = await this.isWipParkMarker(barePath, tip);
+      const expectedHead = marker ? (await this.runGit(barePath, ["rev-parse", `${tip}^`])).trim() : tip;
+      if (head !== expectedHead || tree !== expectedTree ||
+          (await this.runGitAsRunner(clonePath, ["diff", "--name-only"])).trim() !== "" ||
+          !await this.isAncestor(barePath, expectedHead, tip)) throw new Error("successor recovery verification failed");
+      if (!await this.recoveryClockCurrent(barePath, branch, { ...journal, retainedSources,
+        recovery: { ...recovery, successor, stage: "adopting" } })) throw new Error("successor iteration is not current");
+      await this.writeRecovery(barePath, branch, { ...successor, retainedSources,
+        recovery: { ...recovery, successor, stage: "ready-for-model" } });
+      return { ...seeded, attemptId };
+    });
+  }
+
+  /** The only budget reset. Call AFTER a successfully settled model turn, with actual
+   * processing evidence from the worker. A failed journal write keeps the old budget.
+   * This does not release source/pin/custody; explicit owner disposition is separate. */
+  async completeRecoveryEpisode(
+    barePath: string, branch: string, key: string, expected: RecoverySource,
+    evidence: { settled: true; processedEvents: number; attemptId: string },
+    guard?: () => void,
+  ): Promise<RecoveryJournalEntry> {
+    if (evidence.settled !== true || !Number.isSafeInteger(evidence.processedEvents) ||
+        evidence.processedEvents <= 0 || evidence.attemptId !== expected.attemptId) throw new Error("model processing evidence required");
+    return this.withLock(barePath, async () => {
+      const journal = await this.checkedRecovery(barePath, branch, key, expected);
+      if (journal.recovery?.stage !== "ready-for-model" ||
+          !journal.recovery.successor || !sameRecoverySource(journal, journal.recovery.successor)) throw new Error("episode cannot complete");
+      if (!await this.recoveryClockCurrent(barePath, branch, journal, true)) throw new Error("episode cannot complete: invalid recovery clock");
+      const { recovery: _completed, ...retained } = journal;
+      await this.writeRecovery(barePath, branch, retained, guard);
+      return retained;
+    });
+  }
+
+  /** Explicit owner discard only: drops worker attribution and episode pins without deleting
+   * predecessor paths or claiming remote publication. Caller must separately release custody. */
+  async discardRetainedRecovery(
+    barePath: string, branch: string, key: string, expected: RecoverySource, ownerDiscard: true,
+  ): Promise<void> {
+    if (ownerDiscard !== true) throw new Error("explicit owner discard required");
+    await this.withLock(barePath, async () => {
+      recoverySource({ runId: expected.runId, clonePath: expected.clonePath,
+        ...(expected.attemptId === undefined ? {} : { attemptId: expected.attemptId }) }); // Validate before constructing the descriptor key.
+      const protectedRecord = (await this.protectedRecoveries(barePath, expected.runId))[0];
+      if (protectedRecord && (protectedRecord.branch !== branch || protectedRecord.key !== key ||
+          !sameRecoverySource(protectedRecord.journal, expected))) throw new Error("protected recovery identity changed");
+      const journal = await this.checkedRecovery(barePath, branch, key, expected, true, protectedRecord?.journal);
+      for (const source of this.recoverySources(journal)) {
+        if (!this.clonePathShape(source.clonePath, this.runnerClonePath(barePath, key))) throw new Error("recovery key mismatch");
+      }
+      // The worker-owned run namespace retains attribution for every capture, including
+      // superseded tips and pins created before a failed journal write. Validate the
+      // complete snapshot before deleting anything; sibling run namespaces are excluded.
+      const prefix = `refs/uzi-recovery-episode/${journal.runId}/`;
+      // Loose enumeration is specific to the files backend. --list also succeeds
+      // for an absent setting, without treating a failed config read as absence.
+      const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+      for (const entry of config.split("\0")) {
+        const separator = entry.indexOf("\n");
+        const name = separator < 0 ? entry : entry.slice(0, separator);
+        if (name.toLowerCase() === "extensions.refstorage" &&
+            (separator < 0 || entry.slice(separator + 1) !== "files")) throw new Error("unsupported recovery ref backend");
+      }
+      // Probe outer-to-inner before Git or readdir traverses the loose namespace.
+      // Missing ancestors allow packed-only pins; unsafe ancestors refuse cleanup.
+      let looseDir: string | undefined = barePath;
+      for (const part of ["refs", "uzi-recovery-episode", journal.runId]) {
+        looseDir = path.join(looseDir, part);
+        let st: Stats;
+        try { st = await fs.lstat(looseDir); }
+        catch (err) {
+          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+          looseDir = undefined;
+          break;
+        }
+        if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+            ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
+          throw new Error("unsafe recovery pin namespace");
+        }
+      }
+      const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", prefix]);
+      const pins = listing.trim().split("\n").filter(Boolean).map(line => {
+        const [ref, oid, symref, extra] = line.split("\0");
+        const tip = ref?.startsWith(prefix) ? ref.slice(prefix.length) : "";
+        if (ref === undefined || symref !== "" || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
+        return { ref, tip };
+      });
+      // Git omits dangling symbolic and broken loose refs. One flat pass, no retries:
+      // every loose ref must appear in the validated direct-pin snapshot before deletion.
+      // Any failed sibling check refuses the entire discard and keeps all attribution.
+      if (looseDir !== undefined) {
+        const directRefs = new Set(pins.map(pin => pin.ref));
+        for (const name of await fs.readdir(looseDir)) {
+          const st = await fs.lstat(path.join(looseDir, name));
+          if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+              ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
+            throw new Error("invalid recovery pin identity");
+          }
+          // Git's regular SHA lock files are not refs; leave deletion to report contention.
+          if (name.endsWith(".lock") && SHA40_RE.test(name.slice(0, -5))) continue;
+          if (!SHA40_RE.test(name) || !directRefs.has(prefix + name)) throw new Error("invalid recovery pin identity");
+        }
+      }
+      // One attempt per enumerated pin, no retries. The first failed delete stops
+      // cleanup and keeps the journal; a later explicit discard can retry remaining pins.
+      for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "--no-deref", "-d", ref, tip]);
+      if (protectedRecord) {
+        await this.runGit(barePath, ["config", "--local", "--unset-all", `uzi-retained.${expected.runId}.journal`]);
+        const active = await this.readRecoveryCapture(barePath, branch);
+        if (active && JSON.stringify(active) === JSON.stringify(journal)) {
+          await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        }
+      } else {
+        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      }
     });
   }
 
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
    * no retries, and any failed sibling read refuses the whole verification.
    * Runner config is never consulted, and every traversed component rejects symlinks. */
-  async readInventoryCloneHeads(barePath: string, runId: string): Promise<
-    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
+  async readInventoryCloneHeads(barePath: string, runId: string, underLock = false): ReturnType<GitCache["readInventoryCloneHeadsUnderLock"]> {
+    if (underLock) return this.readInventoryCloneHeadsUnderLock(barePath, runId);
+    try {
+      return await this.withLock(barePath, () => this.readInventoryCloneHeadsUnderLock(barePath, runId));
+    } catch (err) {
+      this.checkRecoveryInterruption();
+      if (this.reportProofs.getStore()) throw err;
+      return { kind: "unknown", cause: "other" };
+    }
+  }
+
+  /** Observational variant: the caller already holds B. */
+  async readInventoryCloneHeadsUnderLock(barePath: string, runId: string): Promise<
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }>; foreignOwners: string[] } | { kind: "unknown"; cause?: InventoryReadCause }
   > {
     let cause: InventoryReadCause = "other";
+    let physicalFailure = false;
+    let ownPhysicalFailure: InventoryReadCause | undefined;
+    const ownRetainedPaths = new Set<string>();
+    const inspect = async (journal: RecoveryJournalEntry) => {
+      if (journal.runId === runId) {
+        for (const source of this.recoverySources(journal)) ownRetainedPaths.add(source.clonePath);
+      }
+      const failure = await this.recoveryPhysicalFailure(journal);
+      if (failure) {
+        physicalFailure = true;
+        if (journal.runId === runId) ownPhysicalFailure ??= failure;
+      }
+    };
     function refuse(failure: InventoryReadCause, message: string): never {
       cause = failure;
       throw new Error(message);
@@ -4218,10 +5897,16 @@ export class GitCache {
     try {
       if (typeof runId !== "string" || !OWED_RUN_ID.test(runId) ||
           await atFailure("git_or_filesystem_error", () => this.resolveRecoveryBareDir(path.basename(barePath))) !== barePath) return { kind: "unknown", cause };
-      return await this.withLock(barePath, async () => {
+      {
         const paths = new Map<string, { branch: string; runId: string }>();
         const foreignOwners = new Set<string>();
+        // Keep the initial config read in its operation-scoped error classifier.
         const config = await atFailure("git_or_filesystem_error", () => this.runGit(barePath, ["config", "--local", "--null", "--list"]));
+        for (const record of await this.protectedRecoveries(barePath)) {
+          await inspect(record.journal);
+          if (record.journal.runId !== runId) { foreignOwners.add(record.journal.runId); continue; }
+          for (const source of this.recoverySources(record.journal)) paths.set(source.clonePath, { branch: record.branch, runId });
+        }
         const entries = config.split("\0");
         const journals = new Map<string, string>();
         for (const item of entries) {
@@ -4234,15 +5919,31 @@ export class GitCache {
           // Retirement clears this key to empty. Like readRecoveryCapture, the
           // latest value is authoritative; nonempty invalid attribution still refuses FINAL.
           if (value === "") continue;
-          const journal = await atFailure("attribution_unreadable", () => this.readRecoveryCapture(barePath, branch, entries));
+          const journal = await (async () => {
+            try { return await this.readRecoveryCapture(barePath, branch, entries); }
+            catch (err) {
+              cause = err instanceof InvalidRecoveryClonePathError ? "clone_path_invalid" : "attribution_unreadable";
+              throw err;
+            }
+          })();
           if (!journal) refuse("attribution_unreadable", "unreadable recovery attribution");
           if (journal.attemptId !== undefined &&
               (parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot))?.attemptId ?? "") !== journal.attemptId) {
             refuse("clone_path_invalid", "recovery attempt identity disagrees with clone path");
           }
+          if (journal.recovery || journal.retainedSources?.length) {
+            const primary = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
+            await this.attributedRecovery(barePath, branch, primary?.key ?? path.basename(journal.clonePath), journal);
+            await inspect(journal);
+          }
           if (journal.runId !== runId) { foreignOwners.add(journal.runId); continue; }
-          paths.set(journal.clonePath, { branch, runId });
+          for (const source of this.recoverySources(journal)) {
+            if (source.attemptId !== undefined &&
+                parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot))?.attemptId !== source.attemptId) throw new Error("retained source identity mismatch");
+            paths.set(source.clonePath, { branch, runId });
+          }
         }
+        if (ownPhysicalFailure) refuse(ownPhysicalFailure, "incomplete retained recovery source");
         // Unlike advisory backup readers, FINAL cannot skip malformed ledger evidence.
         for (const [, raw] of await atFailure("git_or_filesystem_error", () => this.readAllAttemptLedgerRaw(barePath))) {
           if (!parseAttemptLedgerEntry(raw)) refuse("attribution_unreadable", "unreadable attempt attribution");
@@ -4252,7 +5953,7 @@ export class GitCache {
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
         const heads = new Set<string>();
-        const clones: Array<{ clonePath: string; branch: string; runId: string }> = [];
+        const clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }> = [];
         clonePaths: for (const [clone, owner] of paths) {
           const parsed = parseAttemptPath(clone, path.resolve(this.runnerRoot));
           const key = parsed?.key ?? path.basename(clone);
@@ -4263,17 +5964,25 @@ export class GitCache {
           const root = path.resolve(this.runnerRoot);
           if (!path.isAbsolute(clone) || path.resolve(clone) !== clone ||
               path.dirname(path.dirname(clone)) !== root) refuse("clone_path_invalid", "unsafe clone path");
-          // After attribution validation, probe outer-to-inner: ENOENT skips this clone
-          // without reading descendants; every existing ancestor must be a non-symlink directory.
+          // Probe outer-to-inner; report proofs and retained sources require presence.
           for (const dir of [root, path.dirname(clone)]) {
             let st: Stats;
             try { st = await fs.lstat(dir); }
-            catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue clonePaths; cause = "clone_ancestor_invalid"; throw err; }
+            catch (err) {
+              if ((err as NodeJS.ErrnoException).code === "ENOENT" && !ownRetainedPaths.has(clone) && !this.reportProofs.getStore()) continue clonePaths;
+              cause = "clone_ancestor_invalid"; throw err;
+            }
             if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_ancestor_invalid", "unsafe clone parent");
           }
           let st: Stats;
           try { st = await fs.lstat(clone); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code === "ENOENT") continue; cause = "git_or_filesystem_error"; throw err; }
+          catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT" &&
+                !ownRetainedPaths.has(clone) && !this.reportProofs.getStore()) continue;
+            cause = (err as NodeJS.ErrnoException).code === "ENOENT" && ownRetainedPaths.has(clone)
+              ? "clone_path_invalid" : "git_or_filesystem_error";
+            throw err;
+          }
           if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
           const head = await atFailure("clone_head_unreadable", async () => {
             const gitdir = path.join(clone, ".git");
@@ -4311,12 +6020,18 @@ export class GitCache {
             return head;
           });
           heads.add(head);
-          clones.push({ clonePath: clone, ...owner });
+          clones.push({ clonePath: clone, ...owner,
+            ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
         }
         return { kind: "verified", heads: [...heads], clones, foreignOwners: [...foreignOwners] };
-      });
-    } catch {
+      }
+    } catch (error) {
+      this.checkRecoveryInterruption();
+      if (error instanceof Error && (error.name === "AbortError" || error.name === "TimeoutError")) throw error;
       return { kind: "unknown", cause };
+    } finally {
+      this.checkRecoveryInterruption();
+      if (physicalFailure) this.warnRecoveryPhysicalFailure();
     }
   }
 
@@ -4335,15 +6050,34 @@ export class GitCache {
    *  never deletes a journaled path). Throws on an unreadable config or a malformed journal. */
   private async journaledClonePaths(barePath: string): Promise<Set<string>> {
     const out = new Set<string>();
-    for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
-      const nl = item.indexOf("\n");
-      if (nl < 0) continue;
-      const k = item.slice(0, nl);
-      if (!/^uzi-recovery\..+\.clone$/.test(k)) continue;
-      const v = item.slice(nl + 1);
-      if (v) out.add(parseRecoveryJournal(v).clonePath);
+    let physicalFailure = false;
+    try {
+      for (const record of await this.protectedRecoveries(barePath)) {
+        if (await this.recoveryPhysicalFailure(record.journal)) physicalFailure = true;
+        for (const source of this.recoverySources(record.journal)) out.add(source.clonePath);
+      }
+      for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
+        const nl = item.indexOf("\n");
+        if (nl < 0) continue;
+        const k = item.slice(0, nl);
+        if (!/^uzi-recovery\..+\.clone$/.test(k)) continue;
+        const v = item.slice(nl + 1);
+        if (v) {
+          const journal = parseRecoveryJournal(v);
+          if (journal.recovery || journal.retainedSources?.length) {
+            const primary = parseAttemptPath(journal.clonePath, path.resolve(this.runnerRoot));
+            const branch = k.slice("uzi-recovery.".length, -".clone".length);
+            await this.attributedRecovery(barePath, branch, primary?.key ?? path.basename(journal.clonePath), journal);
+            if (await this.recoveryPhysicalFailure(journal)) physicalFailure = true;
+          }
+          for (const source of this.recoverySources(journal)) out.add(source.clonePath);
+        }
+      }
+      return out;
+    } finally {
+      this.checkRecoveryInterruption();
+      if (physicalFailure) this.warnRecoveryPhysicalFailure();
     }
-    return out;
   }
 
   /** issue #1783 M2: append one attempt-ledger value (see {@link attemptLedgerKey}). Lock-free:
@@ -4393,6 +6127,7 @@ export class GitCache {
       if (kept.length === raw.length && kept.every((v, i) => v === raw[i])) return;
       await this.rewriteLedgerAtomically(barePath, key, kept);
     } catch (err) {
+      this.checkRecoveryInterruption();
       this.log.warn("attempt ledger compaction failed; the ledger is left as it was", { branch, error: gitErrorMessage(err) });
     }
   }
@@ -4475,9 +6210,9 @@ export class GitCache {
     const out: Array<[string, string]> = [];
     for (const item of (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0")) {
       const nl = item.indexOf("\n");
-      if (nl < 0) continue;
-      const m = /^uzi-attempts\.(.+)\.entry$/.exec(item.slice(0, nl));
-      if (m) out.push([m[1]!, item.slice(nl + 1)]);
+      const m = /^uzi-attempts\.(.+)\.entry$/.exec(nl < 0 ? item : item.slice(0, nl));
+      // Valueless ledger keys remain malformed evidence for strict readers.
+      if (m) out.push([m[1]!, nl < 0 ? "" : item.slice(nl + 1)]);
     }
     return out;
   }
@@ -4535,6 +6270,7 @@ export class GitCache {
       if (pending?.runId !== runId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, runId);
       }
+      // Episodes retain source attribution/accounting; ordinary legacy release still clears.
       // issue #2213: a latch that landed during the lock wait / journal read keeps the journal.
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       const attemptId = pending.attemptId ?? parseAttemptPath(clonePath, path.resolve(this.runnerRoot))?.attemptId;
@@ -4553,7 +6289,15 @@ export class GitCache {
       // nothing is awaited between it and the clear's runGit.
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
       try {
-        await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        const retainedSources = this.recoverySources(pending).map(s => recoverySource({
+          runId: s.runId, clonePath: s.clonePath, ...(s.attemptId ? { attemptId: s.attemptId } : {}),
+          ...(s.restoreTip ? { restoreTip: s.restoreTip } : {}),
+        }));
+        if (pending.recovery || pending.retainedSources?.length) {
+          await this.writeRecovery(barePath, branch, { ...pending, retainedSources });
+        } else {
+          await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        }
       } catch (err) {
         throw new AttemptReleaseError("journal", err);
       }
@@ -4611,6 +6355,11 @@ export class GitCache {
     sourceSha?: string,
     /** Judge the actual candidate after overlay/floor validation, before starting a producer. */
     beforePack?: (wantedSha: string) => Promise<void>,
+    /** issue #2733: the checkpoint ref tips this run knows, in preference order (attempted, then
+     *  confirmed). When no overlay wrapper was built, the raw tip is chained over the first one
+     *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
+     *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
+    chainFrom?: readonly (string | undefined)[],
   ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
@@ -4629,6 +6378,14 @@ export class GitCache {
         wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay, onStep) ?? wanted;
         onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wanted);
+      }
+      if (wanted === pinned.tipSha && chainFrom) {
+        const chain = await this.buildCheckpointChain(barePath, branch, pinned.tipSha, chainFrom, onStep);
+        if (chain) {
+          wanted = chain;
+          onStep?.("scratch_preflight");
+          await this.scratchPublicationPreflight(barePath, branch, wanted);
+        }
       }
       await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
       await beforePack?.(wanted);
@@ -4673,6 +6430,17 @@ export class GitCache {
       const ov = await this.buildWorkflowOverlay(barePath, branch, realTip, overlay, onStep);
       if (ov) {
         wantRev = ov;
+        onStep?.("scratch_preflight");
+        await this.scratchPublicationPreflight(barePath, branch, wantRev);
+      }
+    }
+    // issue #2733 — no overlay wrapper was produced (none requested, or the branch is not behind
+    // on workflows): chain the raw tip over the prior checkpoint tip when that is what keeps it a
+    // strict descendant of the remote ref. The floor and the #1964 hold below judge the chain.
+    if (wantRev === realTip && chainFrom) {
+      const chain = await this.buildCheckpointChain(barePath, branch, realTip, chainFrom, onStep);
+      if (chain) {
+        wantRev = chain;
         onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wantRev);
       }
@@ -4726,10 +6494,19 @@ export class GitCache {
   async resolveCheckpointRange(
     barePath: string,
     branch: string,
-    opts: { confirmedTip?: string; extraFloors?: string[] } = {},
+    opts: { confirmedTip?: string; extraFloors?: string[]; tipSha?: string } = {},
   ): Promise<CheckpointRange | null> {
     try {
-      const tipSha = await this.trackingTip(barePath, branch);
+      // Issue #2545: a held publication names its tip explicitly (the frozen record's aggregate
+      // commit, which is no branch's tracking ref). It must resolve to itself as a commit; every
+      // floor rule below is unchanged.
+      let tipSha: string | null;
+      if (opts.tipSha !== undefined) {
+        tipSha = SHA40_RE.test(opts.tipSha) && (await this.revParse(barePath, `${opts.tipSha}^{commit}`)) === opts.tipSha
+          ? opts.tipSha : null;
+      } else {
+        tipSha = await this.trackingTip(barePath, branch);
+      }
       if (!tipSha) return null;
       const excludeRef = await this.checkpointExcludeRef(barePath, branch, tipSha);
       const excludeSha = await this.revParse(barePath, `${excludeRef}^{commit}`);
@@ -4783,7 +6560,9 @@ export class GitCache {
    * Park/shutdown/pause/capture publishes are NOT scanned by design: the api pushes them UNSCANNED
    * to the forge's refs/uzi-checkpoints/<branch> (Service.Publish in
    * api/internal/workersvc/service.go) — they are the run's last chance to be durable, and a blocked or slow scan
-   * there would lose the work outright. This scan guards the frequent mid-run stream only.
+   * there would lose the work outright. This scan guards the frequent mid-run stream only, plus
+   * the ONE scanned exception: a failed run's held publication (issue #2545), which uploads
+   * work the worker would otherwise archive, so an untrusted result there simply archives instead.
    *
    * Same instrument discipline as the finalize {@link secretScanRange}: gitleaks' embedded default
    * ruleset via an explicit config, the three silencers disabled (`--ignore-gitleaks-allow`, the
@@ -4903,6 +6682,57 @@ export class GitCache {
       return untrusted("scan_untrusted", { error: gitErrorMessage(err) });
     } finally {
       await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * Issue #2545 — does any commit of the SCANNED range author a change under `.github/workflows/`?
+   * The held publication is created with the stored credential, which may lack the forge's workflow
+   * scope, so such a range is archived rather than pushed. The revisions are exactly the scan's
+   * (`tip ^exclude ^floors`), so content already public is not counted.
+   *
+   * Each commit is judged by its OWN changes: a non-merge commit by a path-limited full-history
+   * walk, a merge by its contribution (`diff-tree -c`: only paths that differ from EVERY parent), so
+   * a branch that merely merged a newer default branch, or that is stale against it, is `clean`.
+   * `unknown` (a git error, the merge cap, the deadline) is treated as touching by the caller.
+   * Never throws.
+   */
+  async rangeTouchesWorkflows(
+    barePath: string,
+    range: CheckpointRange,
+    opts: { deadlineMs?: number } = {},
+  ): Promise<"touches" | "clean" | "unknown"> {
+    const floors = range.scanFloorShas ?? [];
+    if (!SHA40_RE.test(range.tipSha) || !SHA40_RE.test(range.excludeSha) || floors.some((f) => !SHA40_RE.test(f))) {
+      return "unknown";
+    }
+    const deadlineAt = Date.now() + (opts.deadlineMs ?? CHECKPOINT_SCAN_TIMEOUT_MS);
+    const remaining = (): number => Math.max(1, deadlineAt - Date.now());
+    const revs = [range.tipSha, `^${range.excludeSha}`, ...floors.map((f) => `^${f}`)];
+    const pathspec = ["--", ".github/workflows"];
+    try {
+      const plain = await this.execScoped("git", withDir(barePath, [
+        "rev-list", "--no-merges", "--full-history", "--max-count=1", ...revs, ...pathspec,
+      ]), { env: gitEnv(), timeout: remaining(), maxBuffer: 4_096 });
+      if (plain.stdout.trim() !== "") return "touches";
+      const merged = await this.execScoped("git", withDir(barePath, ["rev-list", "--merges", ...revs]), {
+        env: gitEnv(), timeout: remaining(),
+      });
+      const merges = merged.stdout.split("\n").map((l) => l.trim()).filter(Boolean);
+      if (merges.some((sha) => !SHA40_RE.test(sha)) || merges.length > CHECKPOINT_SCAN_MAX_MERGES) return "unknown";
+      for (const merge of merges) {
+        if (Date.now() >= deadlineAt) return "unknown";
+        const contribution = await this.execScoped("git", withDir(barePath, [
+          "diff-tree", "-c", "-r", "--name-only", "--no-commit-id", merge, ...pathspec,
+        ]), { env: gitEnv(), timeout: remaining(), maxBuffer: 64 * 1024 });
+        if (contribution.stdout.trim() !== "") return "touches";
+      }
+      return "clean";
+    } catch (err) {
+      this.log.warn("workflow-change probe failed; treating the range as touching workflows", {
+        bare: barePath, error: gitErrorMessage(err),
+      });
+      return "unknown";
     }
   }
 
@@ -5190,6 +7020,63 @@ export class GitCache {
     if (changed === null) return null;
     if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
 
+    try {
+      // Parent order: base (a prior overlay tip) FIRST, realTip LAST — see the method doc and
+      // the PRD's broker note. A missing / non-40-hex prevCheckpointTip ⇒ single parent realTip.
+      const parents: string[] = [];
+      const prev = overlay.prevCheckpointTip;
+      if (prev && /^[0-9a-f]{40}$/.test(prev)) parents.push(prev);
+      parents.push(realTip);
+      const ovSha = await this.synthesizeWorkflowWrapper(
+        barePath,
+        realTip,
+        defaultTip,
+        parents,
+        `${OVERLAY_COMMIT_PREFIX} align .github/workflows with ${defaultTip} (realTip ${realTip.slice(0, 12)})`,
+        // If the synthesised root equals realTip's own tree the branch is not actually behind
+        // (e.g. realTip has no `.github` and the default has none) ⇒ ship realTip.
+        false,
+      );
+      if (ovSha === null) return null;
+      this.log.info("checkpoint overlay built (.github/workflows aligned to default)", {
+        branch,
+        real_tip: realTip,
+        default_tip: defaultTip,
+        overlay_sha: ovSha,
+        parents: parents.length,
+      });
+      return ovSha;
+    } catch (e) {
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
+        branch,
+        error: gitErrorMessage(e),
+      });
+      return null;
+    }
+  }
+
+  /**
+   * Shared object-DB synthesis of a `.github/workflows` transport wrapper, used by
+   * {@link buildWorkflowOverlay} (workflows from the default tip) and {@link buildCheckpointChain}
+   * (workflows from the prior checkpoint tip). The wrapper's tree is `realTip`'s with its
+   * `.github/workflows` subtree swapped for `workflowSource`'s (dropped when the source has none);
+   * its parents are `parents` (base FIRST, realTip LAST); its identity and committer date are
+   * deterministic (realTip's own date) so a no-new-work rebuild yields the same OID.
+   *
+   * Pure object-DB work via a TEMP INDEX (no live worktree, no filter drivers, no runner-clone
+   * perturbation). Worker-uid, base git env, NO PAT. Returns null when `keepTreeEqual` is false and
+   * the synthesised root equals `realTip`'s tree (nothing to align). Errors propagate to the caller.
+   */
+  private async synthesizeWorkflowWrapper(
+    barePath: string,
+    realTip: string,
+    workflowSource: string,
+    parents: string[],
+    message: string,
+    keepTreeEqual: boolean,
+  ): Promise<string | null> {
     // Temp index + empty throwaway work-tree, both cleaned up in the finally. The work-tree is
     // required ONLY by `read-tree --prefix` (it refuses in a bare repo); WITHOUT `-u` nothing is
     // checked out into it, so no `.gitattributes` filter/smudge driver ever fires — a security
@@ -5208,42 +7095,31 @@ export class GitCache {
         ["rm", "--cached", "-r", "--ignore-unmatch", ".github/workflows"],
         idxEnv,
       );
-      // Restore the default's workflow subtree ONLY when the default actually has one; an empty
-      // ls-tree means the default deleted its whole `.github/workflows/`, and the rm above
-      // already equalised to "none" (the #627 deleted-workflows edge).
-      const defaultWfTree = (
-        await this.runGit(barePath, ["ls-tree", defaultTip, "--", ".github/workflows"])
+      // Restore the source's workflow subtree ONLY when the source actually has one; an empty
+      // ls-tree means it has no `.github/workflows/`, and the rm above already equalised to
+      // "none" (the #627 deleted-workflows edge).
+      const sourceWfTree = (
+        await this.runGit(barePath, ["ls-tree", workflowSource, "--", ".github/workflows"])
       ).trim();
-      if (defaultWfTree.length > 0) {
+      if (sourceWfTree.length > 0) {
         await this.runGitWithEnv(
           barePath,
-          ["read-tree", "--prefix=.github/workflows", `${defaultTip}:.github/workflows`],
+          ["read-tree", "--prefix=.github/workflows", `${workflowSource}:.github/workflows`],
           { ...idxEnv, GIT_WORK_TREE: tmpWork },
         );
       }
       const newRoot = (await this.runGitWithEnv(barePath, ["write-tree"], idxEnv)).trim();
       if (!/^[0-9a-f]{40}$/.test(newRoot)) return null;
-      // If the synthesised root equals realTip's own tree the branch is not actually behind
-      // (e.g. realTip has no `.github` and the default has none) ⇒ ship realTip.
       const realTipTree = (await this.runGit(barePath, ["rev-parse", `${realTip}^{tree}`])).trim();
-      if (newRoot === realTipTree) return null;
+      if (!keepTreeEqual && newRoot === realTipTree) return null;
       // Deterministic committer date = realTip's own, so a no-new-work rebuild is byte-identical.
       const committerDate = (
         await this.runGit(barePath, ["show", "-s", "--format=%cI", realTip])
       ).trim();
-      // Parent order: base (a prior overlay tip) FIRST, realTip LAST — see the method doc and
-      // the PRD's broker note. A missing / non-40-hex prevCheckpointTip ⇒ single parent realTip.
-      const parents: string[] = [];
-      const prev = overlay.prevCheckpointTip;
-      if (prev && /^[0-9a-f]{40}$/.test(prev)) parents.push(prev);
-      parents.push(realTip);
       const commitArgs = ["-c", "commit.gpgsign=false", "commit-tree", newRoot];
       for (const p of parents) commitArgs.push("-p", p);
-      commitArgs.push(
-        "-m",
-        `${OVERLAY_COMMIT_PREFIX} align .github/workflows with ${defaultTip} (realTip ${realTip.slice(0, 12)})`,
-      );
-      const ovSha = (
+      commitArgs.push("-m", message);
+      const sha = (
         await this.runGitWithEnv(barePath, commitArgs, {
           ...idxEnv,
           GIT_AUTHOR_NAME: AGENT_GIT_IDENTITY.name,
@@ -5254,26 +7130,166 @@ export class GitCache {
           GIT_COMMITTER_DATE: committerDate,
         })
       ).trim();
-      if (!/^[0-9a-f]{40}$/.test(ovSha)) return null;
-      this.log.info("checkpoint overlay built (.github/workflows aligned to default)", {
+      return /^[0-9a-f]{40}$/.test(sha) ? sha : null;
+    } finally {
+      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
+      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * issue #2733 — chain a RAW checkpoint tip over a prior checkpoint-ref tip P, chosen from the ordered
+   * candidate list `chainFrom` (attempted, then confirmed: the first that is not already contained
+   * in realTip and verifies as wrapper-only), or
+   * return null to ship `realTip` as today. Called only when no overlay wrapper was built.
+   *
+   * Why: after an overlay publish the remote checkpoint ref sits at P, a `ckpt(overlay):` wrapper
+   * whose parent[0] chain does NOT contain later raw work N. The broker takes a publish only when
+   * the declared tip strictly descends the ref, so a raw N is refused `not_descendant` and the
+   * ref wedges. The chain commit `C = [P, N]` (base first, realTip last, like the overlay) has P's
+   * `.github/workflows` subtree and N's everything else, so it descends P and changes no workflow
+   * file relative to the ref it advances. Credential-free and fetch-free (no PAT), so it is safe
+   * while the agent tree is alive.
+   *
+   * Guards, all fail-soft to null (a boundary abort propagates):
+   *  - A candidate is 40-hex and resolves locally; candidate === realTip or an ancestor of realTip
+   *    needs no chain and is skipped, as is a candidate that fails the wrapper-only check below.
+   *  - GATE 3 (as in the overlay): the branch must not itself modify a workflow file.
+   *  - {@link verifyWrapperOnlyHistory}(P, realTip): everything P adds beyond realTip is a verified
+   *    workflow-only wrapper, so the pack carries no new non-workflow content beyond realTip's own
+   *    history. That is not "nothing unscanned": P's workflow blobs come from the default branch,
+   *    and the unpinned park/shutdown sinks publish realTip's history unscanned anyway.
+   * When lastParent(P) === realTip nothing is new since P: P itself is returned (a re-declare).
+   * The chain tree MAY equal realTip's tree (the branch caught up with main's workflows): it is
+   * still emitted so the ref keeps advancing. The structural check is not provenance: ADR-1036's
+   * accepted-residual forgery case applies unchanged.
+   */
+  private async buildCheckpointChain(
+    barePath: string,
+    branch: string,
+    realTip: string,
+    chainFrom: readonly (string | undefined)[],
+    onStep?: (step: BoundaryStep) => void,
+  ): Promise<string | null> {
+    if (!SHA40_RE.test(realTip)) return null;
+    try {
+      onStep?.("checkpoint_overlay");
+      // GATE 3 is candidate-independent: the branch must not itself modify a workflow file.
+      const changed = await this.changedFiles(barePath, realTip);
+      if (changed === null) return null;
+      if (changed.some((file) => file.startsWith(".github/workflows/"))) return null;
+      // First candidate that is not already contained in realTip AND verifies as a wrapper-only
+      // history over it. A raw tip that shipped ambiguously (the attempted tip) becomes an ancestor
+      // of the next raw tip, and chaining from it would be a no-op the broker refuses
+      // `not_descendant` forever; an attempted tip the agent amended away is no longer a wrapper
+      // of realTip, so a failing candidate falls through to the next (the confirmed tip).
+      let prev: string | undefined;
+      for (const cand of chainFrom) {
+        if (!cand || !SHA40_RE.test(cand) || cand === realTip) continue;
+        if ((await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${cand}^{commit}`])) !== cand) continue;
+        if (await this.isAncestor(barePath, cand, realTip)) continue;
+        if (!(await this.verifyWrapperOnlyHistory(barePath, cand, realTip))) continue;
+        prev = cand;
+        break;
+      }
+      if (prev === undefined) return null;
+      const lastParent = (
+        await this.tryGitStdout(barePath, ["rev-list", "--parents", "-n", "1", prev])
+      ).split(/\s+/).filter(Boolean).pop();
+      if (lastParent === realTip) return prev;
+      const chain = await this.synthesizeWorkflowWrapper(
+        barePath,
+        realTip,
+        prev,
+        [prev, realTip],
+        `${OVERLAY_COMMIT_PREFIX} chain .github/workflows from checkpoint ${prev.slice(0, 12)} (realTip ${realTip.slice(0, 12)})`,
+        true,
+      );
+      if (chain === null) return null;
+      this.log.info("checkpoint chain built over the prior checkpoint tip", {
         branch,
         real_tip: realTip,
-        default_tip: defaultTip,
-        overlay_sha: ovSha,
-        parents: parents.length,
+        chain_from: prev,
+        chain_sha: chain,
       });
-      return ovSha;
+      return chain;
     } catch (e) {
+      if (e instanceof RunResidueBlockedError) throw e;
       const abort = this.boundaryAbortError(e);
       if (abort) throw abort;
-      this.log.warn("checkpoint overlay synthesis failed — shipping realTip", {
+      this.log.warn("checkpoint chain synthesis failed — shipping realTip", {
         branch,
         error: gitErrorMessage(e),
       });
       return null;
-    } finally {
-      await fs.rm(tmpIdx, { force: true }).catch(() => undefined);
-      await fs.rm(tmpWork, { recursive: true, force: true }).catch(() => undefined);
+    }
+  }
+
+  /**
+   * issue #2733 — is every commit reachable from `tip` but not from `excludeTip` a verified
+   * `ckpt(overlay):` wrapper that differs from its LAST parent only under `.github/workflows/`?
+   * Shared by {@link buildCheckpointChain} (tip = P, excludeTip = the raw real tip) and the
+   * adoption peel of a tree-equal chain (tip = the candidate, excludeTip = its last parent).
+   *
+   * A parent outside the listed set is reachable from `excludeTip` by construction, so when every
+   * listed commit verifies, `tip ^excludeTip` carries no content beyond `excludeTip`'s own history
+   * except workflow-subtree swaps. Per wrapper: subject prefix, at least one parent, a resolvable
+   * last parent L, and an explicit two-tree `diff-tree -r -z --no-renames --name-only L W` whose
+   * every path is under `.github/workflows/`; an EMPTY diff counts only for a merge-shaped
+   * (>= 2 parents) wrapper. Anything unreadable, malformed, truncated or over a bound
+   * ({@link CHECKPOINT_CHAIN_MAX_WRAPPERS}, {@link CHECKPOINT_CHAIN_MAX_DIFF_BYTES}) answers false.
+   * A boundary abort propagates. Nothing is cached: every call re-reads each wrapper's trees, so an
+   * object that has since gone missing from this bare still answers false.
+   */
+  private async verifyWrapperOnlyHistory(
+    barePath: string,
+    tip: string,
+    excludeTip: string,
+    /** Extra wrappers allowed over the bound: the adoption peel verifies a chain commit that sits
+     *  one above the MAX-wrapper history it was built over, so it passes 1. */
+    headroom = 0,
+  ): Promise<boolean> {
+    try {
+      if (!SHA40_RE.test(tip) || !SHA40_RE.test(excludeTip)) return false;
+      const listed = await this.execScoped(
+        "git",
+        withDir(barePath, [
+          "log", "-z", "--format=%H%x1f%P%x1f%s", tip, `^${excludeTip}`,
+          `--max-count=${this.chainMaxWrappers + headroom + 1}`,
+        ]),
+        { env: gitEnv(), timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER },
+      );
+      const out = listed.stdout;
+      if (out === "") return true;
+      if (!out.endsWith("\0")) return false;
+      const records = out.slice(0, -1).split("\0");
+      if (records.length > this.chainMaxWrappers + headroom) return false;
+      for (const record of records) {
+        const fields = record.split("\x1f");
+        if (fields.length !== 3) return false;
+        const [oid, parentField, subject] = fields as [string, string, string];
+        if (!SHA40_RE.test(oid)) return false;
+        const parents = parentField === "" ? [] : parentField.split(" ");
+        if (parents.some((p) => !SHA40_RE.test(p))) return false;
+        if (!subject.startsWith(OVERLAY_COMMIT_PREFIX) || parents.length < 1) return false;
+        // A missing last parent makes `diff-tree` below fail, which answers false.
+        const last = parents[parents.length - 1]!;
+        const diff = await this.execScoped(
+          "git",
+          withDir(barePath, ["diff-tree", "-r", "-z", "--no-renames", "--name-only", last, oid]),
+          { env: gitEnv(), timeout: GIT_TIMEOUT_MS, maxBuffer: this.chainMaxDiffBytes },
+        );
+        if (diff.stdout !== "" && !diff.stdout.endsWith("\0")) return false;
+        const paths = diff.stdout === "" ? [] : diff.stdout.slice(0, -1).split("\0");
+        if (paths.length === 0 && parents.length < 2) return false;
+        if (!paths.every((p) => p.startsWith(".github/workflows/"))) return false;
+      }
+      return true;
+    } catch (e) {
+      if (e instanceof RunResidueBlockedError) throw e;
+      const abort = this.boundaryAbortError(e);
+      if (abort) throw abort;
+      return false;
     }
   }
 
@@ -5324,15 +7340,59 @@ export class GitCache {
    * the whole validate→rename→clear sequence under one lock via readRecoveryCapture
    * (lock-free) + a direct runGit config write.
    */
+  /** Credential-free exact prior retirement proof. Absence alone is never attribution. */
+  async completionSourceAlreadyRetired(barePath: string, branch: string, runId: string,
+    clonePath: string, attemptId: string | undefined): Promise<boolean> {
+    if (!attemptId) return false;
+    return this.withLock(barePath, async () => {
+      const entry = (await this.readAttemptLedger(barePath, branch)).get(attemptId);
+      if (entry?.runId !== runId || entry.clonePath !== clonePath || entry.state !== "retired") return false;
+      const open = async (): Promise<boolean> =>
+        !await this.hasPhysicalTerminalProtection(runId) && residueQuarantine() === undefined;
+      if (!await open()) return false;
+      const pending = await this.readRecoveryCapture(barePath, branch);
+      if (pending && (pending.runId !== runId || pending.clonePath !== clonePath || pending.attemptId !== attemptId))
+        return false; // A successor/adoption owns this branch now.
+      if (pending?.recovery || pending?.retainedSources?.length) return false;
+      try { await fs.lstat(clonePath); return false; }
+      catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+      if (!await open()) return false;
+      // Durable retirement already proves disposal; only finish this exact old journal.
+      if (pending) await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+      return true;
+    });
+  }
+
   async retireRunnerClone(
     barePath: string,
     clonePath: string,
     branch: string,
     ownerRunId: string,
-    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics },
+    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
+        acknowledged: () => Promise<boolean> };
+      completionSource?: { expectedHead: string; canDelete: () => boolean } },
+  ): Promise<RunnerCloneRetireResult> {
+    if (opts.completionSource && opts.verifiedSuccessor) throw new Error("retirement authorities are mutually exclusive");
+    // Completion retains adoption exclusion through holding/scratch disposal as well.
+    if (opts.completionSource) return this.withLock(barePath,
+      () => this.retireRunnerCloneImpl(barePath, clonePath, branch, ownerRunId, opts, true));
+    return this.retireRunnerCloneImpl(barePath, clonePath, branch, ownerRunId, opts);
+  }
+
+  private async retireRunnerCloneImpl(
+    barePath: string,
+    clonePath: string,
+    branch: string,
+    ownerRunId: string,
+    opts: { discard: boolean; attemptId?: string; orphanDiagnostics?: OrphanDiagnostics;
+      verifiedSuccessor?: { key: string; generation: number; expected: RecoveryJournalEntry;
+        acknowledged: () => Promise<boolean> };
+      completionSource?: { expectedHead: string; canDelete: () => boolean } },
+    bareLockHeld = false,
   ): Promise<RunnerCloneRetireResult> {
     let stage: OrphanRetireStage = "journal_read";
-    const result = await this.withLock(barePath, async (): Promise<{ holding?: string; scratch?: string; disposition: RunnerCloneRetireResult }> => {
+    const retire = async (): Promise<{ holding?: string; scratch?: string; renamed: boolean; disposition: RunnerCloneRetireResult }> => {
       // 1. Pre-rename pair validation. Require the EXACT (ownerRunId, clonePath) pair
       //    to STILL be journaled before moving anything. A missing/malformed journal, or
       //    a lock-gap rewrite to a different runId/path, moves NOTHING and fails closed.
@@ -5340,6 +7400,57 @@ export class GitCache {
       stage = "journal_validation";
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
+      }
+      const verified = opts.verifiedSuccessor;
+      let anchored: RecoveryJournalEntry | undefined;
+      if (verified) {
+        if (!opts.discard || !opts.attemptId || pending.attemptId !== opts.attemptId ||
+            !Number.isSafeInteger(verified.generation) || verified.generation <= 0 ||
+            typeof verified.acknowledged !== "function" ||
+            !ATTEMPT_ID_RE.test(opts.attemptId) || !opts.attemptId.includes(`-g${verified.generation}-`) || pending.recovery ||
+            !pending.retainedSources?.length || JSON.stringify(pending) !== JSON.stringify(verified.expected)) {
+          throw new Error("completed successor identity or predecessor set changed");
+        }
+        await this.checkedRecovery(barePath, branch, verified.key, pending);
+        const predecessors = pending.retainedSources.filter(s => !sameRecoverySource(s, pending));
+        if (!predecessors.length || predecessors.length !== pending.retainedSources.length) {
+          throw new Error("invalid successor predecessor set");
+        }
+        anchored = { ...predecessors[0]!, retainedSources: predecessors.length === 1 ? predecessors : predecessors.slice(1) };
+      } else if (pending.recovery || pending.retainedSources?.length) {
+        throw new Error("recovery sources require explicit verified disposition before retirement");
+      }
+      // Each check reads authority once through the trusted runner callback, no retries.
+      // A failed check blocks this retirement alone and never releases predecessor evidence.
+      const checkSuccessor = async (expected: RecoveryJournalEntry) => {
+        if (!verified) return;
+        if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
+          throw new Error("verified successor FINAL authority unavailable");
+        }
+        const ledger = (await this.readAttemptLedger(barePath, branch)).get(opts.attemptId!);
+        if (ledger?.runId !== ownerRunId || ledger.clonePath !== clonePath || ledger.state !== "live") {
+          throw new Error("successor ledger identity changed");
+        }
+        const current = await this.checkedRecovery(barePath, branch, verified.key, expected);
+        if (JSON.stringify(current) !== JSON.stringify(expected)) throw new Error("successor predecessor set changed");
+        if (await verified.acknowledged() !== true) throw new Error("verified successor FINAL authority unavailable");
+        // The authority callback awaits physical journals; revalidate mutable identity after it.
+        const afterLedger = (await this.readAttemptLedger(barePath, branch)).get(opts.attemptId!);
+        if (afterLedger?.runId !== ownerRunId || afterLedger.clonePath !== clonePath || afterLedger.state !== "live")
+          throw new Error("successor ledger identity changed");
+        const afterJournal = await this.checkedRecovery(barePath, branch, verified.key, expected);
+        if (JSON.stringify(afterJournal) !== JSON.stringify(expected)) throw new Error("successor predecessor set changed");
+        if (await this.hasPhysicalTerminalProtection(ownerRunId)) throw new Error("verified successor FINAL authority unavailable");
+        if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+      };
+      if (opts.completionSource) {
+        // Exact ownership and expected HEAD are checked while adoption shares this bare lock.
+        const parsed = parseAttemptPath(clonePath, path.resolve(this.runnerRoot));
+        const key = parsed?.key ?? path.basename(clonePath);
+        if (pending.attemptId !== opts.attemptId ||
+            !await this.classifyOwnerClonePath(barePath, branch, key, ownerRunId, clonePath) ||
+            await this.worktreeHead(clonePath) !== opts.completionSource.expectedHead ||
+            !opts.completionSource.canDelete()) throw new Error("completion source attribution changed");
       }
       // 2. Containment. Only ever move a path strictly UNDER runnerRoot. Resolve both
       //    sides and require a path-separator boundary so a sibling like
@@ -5375,6 +7486,18 @@ export class GitCache {
       stage = "rename";
       // issue #2213: a latch that landed during the awaits above keeps the clone; nothing moved.
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+      if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+      if (anchored) {
+        await checkSuccessor(pending);
+        await this.writeRecovery(barePath, branch, anchored, () => checkSuccessor(pending));
+        // Git config publishes atomically; sync both the file and its directory before
+        // moving the successor so a crash always leaves a discoverable predecessor.
+        for (const target of [path.join(barePath, "config"), barePath]) {
+          const handle = await fs.open(target, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+          try { await handle.sync(); } finally { await handle.close(); }
+        }
+        await checkSuccessor(anchored);
+      }
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
@@ -5394,7 +7517,9 @@ export class GitCache {
             // socket / FIFO the clone may carry. No holdingDest is used on this path.
             stage = "intra_device_rename";
             const scratchParent = await this.createRetireScratchParent();
-            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent);
+            if (opts.completionSource && !opts.completionSource.canDelete()) throw new Error("completion cleanup exclusion changed");
+            renamed = await this.renameIntoScratchUnlessLatched(clonePath, scratchParent, undefined,
+              anchored ? () => checkSuccessor(anchored!) : undefined);
             scratch = scratchParent;
           } else {
             // Rare foreign-orphan reclaim: the quarantine is RETAINED FOREVER, so
@@ -5462,7 +7587,7 @@ export class GitCache {
       //    concurrent successor must never have its journal cleared by us.
       stage = "journal_clear";
       const still = await this.readRecoveryCapture(barePath, branch);
-      if (residueQuarantine() !== undefined) {
+      if (residueQuarantine() !== undefined || (opts.completionSource && !opts.completionSource.canDelete())) {
         // issue #2213: a latch landed after the move. Undo it (best-effort), keep the journal and
         // dispose of nothing; the latched worker keeps the clone at its journaled path.
         const movedTo = renamed ? (exdev ? (scratch ? path.join(scratch, "clone") : undefined) : holdingDest) : undefined;
@@ -5481,14 +7606,17 @@ export class GitCache {
         }
         throw new CloneRetainedByQuarantineError();
       }
-      if (still?.runId === ownerRunId && still.clonePath === clonePath) {
+      if (anchored) await checkSuccessor(anchored);
+      if (!verified && !opts.completionSource && still?.runId === ownerRunId && still.clonePath === clonePath) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
+      // Completion keeps its existing journal until physical disposal succeeds, so a caught
+      // disposal failure can restore the exact canonical source under the held bare lock.
       // issue #1783 M2: an attempt clone the owner's terminal retire disposed of is `retired` in
       // the ledger (its id is never reused). Contained: by here the clone is moved and the journal
       // cleared, so a failed append must neither fail the completed retire nor skip step 6's
       // disposal of the holding copy.
-      if (opts.attemptId !== undefined) {
+      if (opts.attemptId !== undefined && !opts.completionSource) {
         await this.appendAttemptLedger(barePath, branch, { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" }).catch(
           (err: unknown) =>
             this.log.warn("retireRunnerClone: could not record the attempt as retired; the gone path is compacted later", {
@@ -5498,20 +7626,23 @@ export class GitCache {
             }),
         );
       }
-      return { holding, scratch, disposition: holding ? "quarantined" : "source-already-absent" };
-    }).catch((error: unknown) => {
+      return { holding, scratch, renamed, disposition: holding ? "quarantined" : "source-already-absent" };
+    };
+    const result = await (bareLockHeld ? retire() : this.withLock(barePath, retire)).catch((error: unknown) => {
       if (opts.orphanDiagnostics) emitOrphanDiagnostic(opts.orphanDiagnostics, clonePath, "orphan_retirement_failed", stage, "canonical_retirement_failure", error);
       throw error;
     });
-    // 6. Disposal, OUTSIDE the lock. Terminal trash (discard) — best-effort delete the
+    // 6. Normal retirement disposes outside its lock; completion keeps the outer bare lock.
+    //    Terminal trash (discard) — best-effort delete the
     //    holding dir. Foreign quarantine (!discard) — RETAIN it forever (never delete).
     //    Always best-effort delete the intra-device scratch parent (issue #1354): by here
     //    the canonical is already free and the journal already cleared, so a partial
     //    scratch rm is harmless residue.
     const { holding, scratch } = result;
-    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId);
+    const protectedNow = await this.hasPhysicalTerminalProtection(ownerRunId) ||
+      (opts.completionSource !== undefined && !opts.completionSource.canDelete());
     // issue #2213: a latch that landed during the protection read keeps the holding and scratch dirs.
-    if (residueQuarantine() !== undefined) {
+    if (!opts.completionSource && residueQuarantine() !== undefined) {
       if (holding || scratch) {
         this.log.warn("retireRunnerClone: worker residue quarantine latched after the journal clear; the holding/scratch dirs are retained, not disposed", {
           run_id: ownerRunId,
@@ -5522,7 +7653,99 @@ export class GitCache {
       }
       return result.disposition;
     }
+    if (opts.completionSource) {
+      const open = (): void => {
+        if (protectedNow || residueQuarantine() !== undefined || !opts.completionSource!.canDelete())
+          throw new Error("completion disposal protection changed");
+      };
+      try {
+        if (!result.renamed || !opts.discard) throw new Error("completion disposal was not established");
+        open();
+        if (holding && opts.discard) await fs.rm(holding, { recursive: true, force: true });
+        open();
+        if (scratch) await fs.rm(scratch, { recursive: true, force: true });
+        open();
+        // Full disposal succeeded in this held lock. Retry only a metadata write, once;
+        // every attempt rechecks exact ownership and exclusion. Failure keeps the receipt.
+        const finishMetadata = async (): Promise<void> => {
+          const pending = await this.readRecoveryCapture(barePath, branch);
+          if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
+            throw new Error("completion source journal changed");
+          const canonicalAbsent = await fs.lstat(clonePath).then(() => false, (err: NodeJS.ErrnoException) => {
+            if (err.code === "ENOENT") return true;
+            throw err;
+          });
+          if (!canonicalAbsent || await this.hasPhysicalTerminalProtection(ownerRunId))
+            throw new Error("completion metadata protection changed");
+          open();
+          if (opts.attemptId !== undefined) {
+            const entry = (await this.readAttemptLedger(barePath, branch)).get(opts.attemptId);
+            open();
+            if (entry?.runId !== ownerRunId || entry.clonePath !== clonePath)
+              throw new Error("completion attempt ledger changed");
+            if (entry.state !== "retired") {
+              try {
+                await this.appendAttemptLedger(barePath, branch,
+                  { attemptId: opts.attemptId, runId: ownerRunId, clonePath, state: "retired" });
+              } catch (error) { return retryWrite(error); }
+            }
+          }
+          const still = await this.readRecoveryCapture(barePath, branch);
+          if (still?.runId !== ownerRunId || still.clonePath !== clonePath || still.attemptId !== opts.attemptId)
+            throw new Error("completion source journal changed");
+          open();
+          try { await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]); }
+          catch (error) { return retryWrite(error); }
+        };
+        let retried = false;
+        const retryWrite = async (error: unknown): Promise<void> => {
+          if (retried || (error as NodeJS.ErrnoException).code !== "EIO") throw error;
+          retried = true;
+          await finishMetadata();
+        };
+        await finishMetadata();
+      } catch (error) {
+        // One rollback attempt, still under adoption exclusion. Partial deletion or a failed
+        // proof/rename retains the journal and remaining residue; no new crash discovery.
+        const movedTo = scratch ? path.join(scratch, "clone") : holding;
+        if (movedTo) {
+          try {
+            const pending = await this.readRecoveryCapture(barePath, branch);
+            if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath || pending.attemptId !== opts.attemptId)
+              throw new Error("completion rollback journal changed");
+            const canonicalAbsent = await fs.lstat(clonePath).then(() => false, (err: NodeJS.ErrnoException) => {
+              if (err.code === "ENOENT") return true;
+              throw err;
+            });
+            const stat = await fs.lstat(movedTo);
+            if (!canonicalAbsent || !stat.isDirectory() || stat.isSymbolicLink() ||
+                await this.worktreeHead(movedTo) !== opts.completionSource.expectedHead)
+              throw new Error("completion rollback source cannot be verified");
+            await fs.rename(movedTo, clonePath);
+            if (scratch) await fs.rmdir(scratch).catch(() => undefined);
+          } catch (rollbackError) {
+            this.log.warn("retireRunnerClone: completion rollback retained residue", {
+              clone: clonePath, retained_at: movedTo, error: gitErrorMessage(rollbackError),
+            });
+          }
+        }
+        throw error;
+      }
+      return result.disposition;
+    }
+    // Recheck trusted FINAL proof separately for each disposal; no retries. A refusal
+    // retains the moved successor and does not affect predecessor paths or episode pins.
+    const checkDisposal = async () => {
+      if (opts.verifiedSuccessor && await opts.verifiedSuccessor.acknowledged() !== true) {
+        throw new Error("verified successor FINAL authority unavailable");
+      }
+      if (await this.hasPhysicalTerminalProtection(ownerRunId)) {
+        throw new Error("verified successor FINAL authority unavailable");
+      }
+      if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+    };
     if (holding && opts.discard && !protectedNow) {
+      if (opts.verifiedSuccessor) await checkDisposal();
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {
           path: holding,
@@ -5531,6 +7754,7 @@ export class GitCache {
       );
     }
     if (scratch && !protectedNow) {
+      if (opts.verifiedSuccessor) await checkDisposal();
       await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
     }
     return result.disposition;
@@ -5554,12 +7778,15 @@ export class GitCache {
    *  latch read issued with nothing awaited before the rename. On a latch nothing moved: the empty
    *  scratch parent (and the completed off-tree copy at `copy`, if any) are removed best-effort and
    *  the canonical clone stays. */
-  private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string): Promise<boolean> {
+  private async renameIntoScratchUnlessLatched(clonePath: string, scratchParent: string, copy?: string,
+    guard?: () => Promise<void>): Promise<boolean> {
     if (residueQuarantine() !== undefined) {
       await fs.rm(scratchParent, { recursive: true, force: true }).catch(() => undefined);
       if (copy) await fs.rm(copy, { recursive: true, force: true }).catch(() => undefined);
       throw new CloneRetainedByQuarantineError();
     }
+    if (guard) await guard();
+    if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     return this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
   }
 
@@ -5610,6 +7837,62 @@ export class GitCache {
     }
   }
 
+  /**
+   * The commit messages a push of `tip` would publish: every commit reachable from `tip` and not
+   * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
+   * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on
+   * any failure to resolve the base, run git or parse its output, so callers fail CLOSED and
+   * refuse to publish rather than treat unreadable history as clean. A commit whose `%e` encoding
+   * is non-empty and not UTF-8 (git re-encodes `--format` output to UTF-8 and such a header can
+   * blank or garble `%B`, so `%e` is the gate), or whose object holds a NUL byte, also yields null.
+   */
+  async publishedCommitMessages(barePath: string, tip: string): Promise<{ sha: string; message: string }[] | null> {
+    try {
+      if (!SHA40_RE.test(tip)) return null;
+      const baseRef = await this.defaultBranchRef(barePath);
+      // Read through the same hardened view verifyRecoveryClosure uses: replacement refs, grafts, a
+      // shallow file and lazy fetches must not change which commits or messages this reads.
+      const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null", GIT_GRAFT_FILE: "/dev/null",
+        GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
+      const read = async (args: string[], input?: string): Promise<string> =>
+        (await this.execScoped("git", withDir(barePath, ["--no-replace-objects", ...args]),
+          { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
+      // git re-encodes `--format` output to UTF-8, and a non-UTF-8 `encoding` header can blank or
+      // garble `%B`, so the `%e` refusal below is the gate: never drop it as redundant. `--format`
+      // output under `--encoding=none` is still not the raw message bytes. `%e` is git's own
+      // per-commit reading of that header (empty when absent), so no framing can be forged in a
+      // message to hide it. `-z` with %x00 between fields yields a flat NUL-delimited stream of
+      // (sha, encoding, message) triples. A commit OBJECT can still carry a NUL inside its message
+      // (git hash-object --literally writes one, and %B stops printing at it), which would hide the
+      // text after it; a literal NUL is written as a \u escape (never a raw control byte in source).
+      const out = await read(["log", "--encoding=none", "-z", "--format=%H%x00%e%x00%B", `${baseRef}..${tip}`]);
+      const tokens = out.split("\u0000");
+      // The trailing NUL from `-z` leaves one empty final token.
+      if (tokens.pop() !== "") return null;
+      if (tokens.length % 3 !== 0) return null;
+      const commits: { sha: string; message: string }[] = [];
+      for (let i = 0; i < tokens.length; i += 3) {
+        const sha = tokens[i]!;
+        if (!SHA40_RE.test(sha)) return null;
+        // A declared non-UTF-8 encoding means the message bytes are not text we can scan: refuse.
+        const enc = tokens[i + 1]!.trim();
+        if (enc !== "" && !/^utf-?8$/i.test(enc)) return null;
+        commits.push({ sha, message: tokens[i + 2]! });
+      }
+      // Read each commit object raw: a NUL in its bytes would hide the message text after it from
+      // %B, so fail closed. `cat-file commit` exits non-zero on a missing object, and the content
+      // must open with a tree header; `cat-file --batch` instead answers `<sha> missing` with exit 0,
+      // which a NUL-only check would accept as clean.
+      for (const { sha } of commits) {
+        const raw = await read(["cat-file", "commit", sha]);
+        if (!/^tree [0-9a-f]{40}\n/.test(raw) || raw.includes("\u0000")) return null;
+      }
+      return commits;
+    } catch {
+      return null;
+    }
+  }
+
   /** Pushed workflow blobs must match the fresh default or the current remote target, per path. */
   async branchWorkflowFiles(
     barePath: string,
@@ -5653,12 +7936,12 @@ export class GitCache {
         try {
           if (!(await this.isPlainBranchName(barePath, branch))) return { kind: "unavailable" } as const;
           const remoteRef = `refs/heads/${branch}`;
-          const listed = await this.runGit(barePath, ["ls-remote", "origin", remoteRef], pat, scope, username);
+          const listed = await this.runGit(barePath, ["ls-remote", "--", "origin", remoteRef], pat, scope, username);
           if (listed === "") return { kind: "absent" } as const;
           const match = /^([0-9a-f]{40})\t([^\n]+)\n?$/.exec(listed);
           if (!match || match[2] !== remoteRef) return { kind: "unavailable" } as const;
           await this.runGit(barePath, ["fetch", "--refmap=", "--no-tags", "--no-write-fetch-head",
-            "origin", `+${remoteRef}:${tempRef}`], pat, scope, username);
+            "--", "origin", `+${remoteRef}:${tempRef}`], pat, scope, username);
           const sha = await this.resolveCommitStrict(barePath, tempRef);
           return sha === match[1] ? { kind: "present", sha } as const : { kind: "unavailable" } as const;
         } catch (cause) {
@@ -5793,9 +8076,11 @@ export class GitCache {
       if (status.length !== 0) return null;
       const ignored = await read(["ls-files", "-z", "--others", "--ignored", "--exclude-standard", "--", ":(glob)**/.gitignore", ":(exclude).uzi/scratch/**"]);
       if (ignored.split("\0").some(entry => entry && !entry.startsWith(".uzi/scratch/"))) return null;
+      const report = this.reportProofs.getStore();
+      const args = ["-e", CANCEL_CONTENT_HELPER, cwd, ...(report ? [String(report.deadline)] : [])];
       const wrapped = this.boundaryProcesses.getStore()
-        ? { command: process.execPath, args: ["-e", CANCEL_CONTENT_HELPER, cwd] }
-        : runnerCommand(process.execPath, ["-e", CANCEL_CONTENT_HELPER, cwd]);
+        ? { command: process.execPath, args }
+        : runnerCommand(process.execPath, args);
       const input = JSON.stringify(manifest);
       if (Buffer.byteLength(input) > 2 * 1024 * 1024) return null;
       const proof = await this.execScoped(wrapped.command, wrapped.args, {
@@ -6032,8 +8317,10 @@ export class GitCache {
     const timeoutMs = opts.timeoutMs ?? GIT_TIMEOUT_MS;
     if (Number.isNaN(timeoutMs) || timeoutMs <= 0) throw new Error(`${what} has no time left`);
     if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
+    const deadlineError = new Error(`${what} exceeded ${timeoutMs}ms`);
     const { stdout } = await this.spawnGit(barePath, [...args], undefined, {
       timeoutMs,
+      nativeTimeoutError: deadlineError,
       stderrMaxBytes: READ_BARE_STDERR_MAX_BYTES,
     });
     return new Promise<BoundedRead>((resolve, reject) => {
@@ -6079,7 +8366,7 @@ export class GitCache {
       stdout.on("data", onData);
       stdout.once("end", onEnd);
       stdout.once("error", onError);
-      timer = setTimeout(() => finish(undefined, new Error(`${what} exceeded ${timeoutMs}ms`)), timeoutMs);
+      timer = setTimeout(() => finish(undefined, deadlineError), timeoutMs);
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
@@ -6238,6 +8525,7 @@ export class GitCache {
     branch: string,
     creds?: { pat?: string; cloneUrl?: string; username?: string },
   ): Promise<string | null> {
+    if (!(await this.isRemoteBranchName(barePath, branch))) return null;
     const originRef = `refs/remotes/origin/${branch}`;
     if (!(await this.refExists(barePath, originRef))) {
       // FIRST push: the whole branch is new, so the default branch is the floor.
@@ -6260,7 +8548,7 @@ export class GitCache {
             // `+refs/heads/*:refs/remotes/origin/*` refspec, so this fetch does NOT
             // opportunistically clobber refs/remotes/origin/<branch> (the NON-CLOBBER
             // invariant above) — only the explicit scratch ref is written.
-            ["fetch", "--refmap=", "origin", `+refs/heads/${branch}:${scratchRef}`],
+            ["fetch", "--refmap=", "--", "origin", `+refs/heads/${branch}:${scratchRef}`],
             creds?.pat,
             scope,
             creds?.username,
@@ -6471,7 +8759,7 @@ export class GitCache {
    * `defaultBranchRef`'s frozen-mirror fallback rungs (N2): those can resolve to a stale
    * `refs/heads/main` mirror fixed at first clone, which is exactly what this method exists
    * to bypass. We read `refs/remotes/origin/<default>` (which this fetch just updated),
-   * falling back to `FETCH_HEAD`, and validate a 40-hex OID before returning.
+   * using an explicit destination refspec, and validate a lowercase 40-hex OID before returning.
    */
   async fetchDefaultTip(
     barePath: string,
@@ -6484,24 +8772,17 @@ export class GitCache {
     const scope = cloneUrl ? httpScopeForUrl(cloneUrl) : undefined;
     return this.withLock(barePath, async () => {
       onLockAcquired?.();
-      await this.runGit(barePath, ["fetch", "origin", defaultBranch], pat, scope, username);
-      // The configured refspec (+refs/heads/*:refs/remotes/origin/*) means a named-branch
-      // fetch updates the remote-tracking ref; read the fresh tip off it.
-      let sha = (
+      if (!(await this.isRemoteBranchName(barePath, defaultBranch))) throw new Error("invalid remote branch");
+      // Explicitly refresh the destination even when remote.origin.fetch does not map it.
+      await this.runGit(barePath, ["fetch", "--", "origin",
+        `+refs/heads/${defaultBranch}:refs/remotes/origin/${defaultBranch}`], pat, scope, username);
+      const sha = (
         await this.runGit(barePath, [
           "rev-parse",
           "--verify",
           `refs/remotes/origin/${defaultBranch}^{commit}`,
         ]).catch(() => "")
       ).trim();
-      if (!/^[0-9a-f]{40}$/.test(sha)) {
-        // Fallback: some server/refspec shapes leave only FETCH_HEAD current.
-        sha = (
-          await this.runGit(barePath, ["rev-parse", "--verify", "FETCH_HEAD^{commit}"]).catch(
-            () => "",
-          )
-        ).trim();
-      }
       if (!/^[0-9a-f]{40}$/.test(sha)) {
         throw new Error(
           `fetchDefaultTip: could not resolve a 40-hex tip for origin/${defaultBranch}`,
@@ -7107,7 +9388,7 @@ export class GitCache {
     // non-empty dir → a deterministic "already exists" failure (permanent), converting a
     // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
-      await this.runGit(undefined, ["clone", "--bare", repoUrl, dest], pat, scope, username);
+      await this.runGit(undefined, ["clone", "--bare", "--", repoUrl, dest], pat, scope, username);
       // Convert the mirror refspec to remote-tracking so future fetches write to
       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
@@ -7642,6 +9923,14 @@ export class GitCache {
     identity: BoundaryProcessRequest["identity"] = "worker_pat",
   ): Promise<{ stdout: string; stderr: string }> {
     const boundary = this.boundaryProcesses.getStore();
+    this.checkReportProof();
+    const report = this.reportProofs.getStore();
+    if (report) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, report.deadline - Date.now())) };
+    const recovery = this.recoveryOperations.getStore();
+    recovery?.signal.throwIfAborted();
+    const operationSignals = [report?.signal, recovery?.signal].filter((s): s is AbortSignal => s !== undefined);
+    const operationSignal = operationSignals.length ? AbortSignal.any(operationSignals) : undefined;
+    if (recovery) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, recovery.deadline - Date.now())) };
     const { input, ...execOptions } = options;
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
@@ -7649,13 +9938,25 @@ export class GitCache {
       assertNoCredentialedGitWhileQuarantined(options.env);
       // issue #1597 M2: optional stdin (the checkpoint scan's cat-file / gitleaks stdin). An EPIPE on
       // an early-exiting child is swallowed here; the exit status carries the failure.
-      const pending = execFileAsync(command, args, execOptions);
+      const pending = execFileAsync(command, args, { ...execOptions,
+        ...(operationSignal ? { signal: operationSignal, ...(report ? { killSignal: "SIGKILL" as const } : {}) } : {}),
+      });
+      const closed = new Promise<void>(resolve => pending.child.once("close", () => resolve()));
+      let killTimer: ReturnType<typeof setTimeout> | undefined;
+      const abort = () => { killTimer = setTimeout(() => pending.child.kill("SIGKILL"), 1_000); };
+      operationSignal?.addEventListener("abort", abort, { once: true });
       if (input !== undefined) {
         pending.child.stdin?.on("error", () => undefined);
         pending.child.stdin?.end(input);
       }
-      const result = await pending;
-      return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      try {
+        const result = await pending;
+        return { stdout: String(result.stdout), stderr: String(result.stderr) };
+      } finally {
+        await closed;
+        if (killTimer) clearTimeout(killTimer);
+        operationSignal?.removeEventListener("abort", abort);
+      }
     }
     const cwd = options.cwd ?? (identity === "command" ? commandCwd(args) : "/");
     const executable = resolveBoundaryExecutable(command);
@@ -7664,9 +9965,9 @@ export class GitCache {
       throw new CheckpointSoftDeadlineError();
     }
     const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
-    const childTimeout = remainingSoft === undefined
-      ? options.timeout
-      : Math.min(options.timeout ?? Infinity, remainingSoft);
+    const childTimeout = recovery
+      ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, Math.max(1, recovery.deadline - Date.now()))
+      : remainingSoft === undefined ? options.timeout : Math.min(options.timeout ?? Infinity, remainingSoft);
     // issue #2213: as above, on the Codex boundary path. boundary.spawn is awaited and its own
     // chain (the tick spawner's lock snapshot, the safety spawn boundary) awaits before the actual
     // spawn, so this check is early; TickSpawner.spawnWith and launchCodexEffectRoot repeat it
@@ -7681,6 +9982,10 @@ export class GitCache {
     } catch (cause) {
       throw this.boundaryAbortError(cause) ?? cause;
     }
+    let cancellation: Promise<unknown> | undefined;
+    const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+    recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+    if (recovery?.signal.aborted) abortRecovery();
     process.stdin?.on("error", () => undefined);
     process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
@@ -7747,7 +10052,21 @@ export class GitCache {
     let terminal: { readonly code: number; readonly softTimedOut?: true };
     // A collector can close/error before a timed-out child is fully disposed.
     // Keep the bare lock until the safety owner has verified full-root reap.
+    let reportCancellation: Promise<void> | undefined;
+    const cancelReportChild = () => {
+      reportCancellation ??= Promise.resolve().then(() => process.cancel());
+      // Observe rejection immediately; completion below remains the settlement proof.
+      void reportCancellation.catch(() => undefined);
+    };
+    report?.signal.addEventListener("abort", cancelReportChild, { once: true });
+    if (report?.signal.aborted) cancelReportChild();
     const settled = await Promise.allSettled([collect(process.stdout), collect(process.stderr), process.completed] as const);
+    report?.signal.removeEventListener("abort", cancelReportChild);
+    recovery?.signal.removeEventListener("abort", abortRecovery);
+    const cancellations = await Promise.allSettled([reportCancellation, cancellation]);
+    for (const result of cancellations) if (result.status === "rejected") throw result.reason;
+    this.checkReportProof();
+    recovery?.signal.throwIfAborted();
     if (settled[2].status === "rejected") {
       throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
     }
@@ -7858,19 +10177,21 @@ export class GitCache {
     args: string[],
     stdin?: string,
     opts: SpawnGitOptions = {},
-  ): Promise<{ child?: ChildProcess; stdout: Readable; exited: Promise<number> }> {
-    const env = gitEnv();
+  ): Promise<{ child?: ChildProcess; stdin?: Writable; stdout: Readable; exited: Promise<number>; cancel: () => void }> {
+    const env = { ...gitEnv(), ...opts.env };
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    recovery?.signal.throwIfAborted();
     if (boundary) {
       if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
       if (boundary.softSignal?.aborted || (boundary.softDeadlineAt !== undefined && Date.now() >= boundary.softDeadlineAt)) {
         throw new CheckpointSoftDeadlineError();
       }
       const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
-      const childTimeout = remainingSoft === undefined
-        ? opts.timeoutMs
-        : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
+      const childTimeout = recovery
+        ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, Math.max(1, recovery.deadline - Date.now()))
+        : remainingSoft === undefined ? opts.timeoutMs : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
       let process: BoundaryProcessHandle;
       try {
         process = await boundary.spawn({
@@ -7895,7 +10216,9 @@ export class GitCache {
         stderrChunks.push(kept);
         stderrBytes += kept.length;
       });
-      const gated = exitGatedStream(process.stdout, undefined, true);
+      let cancellation: Promise<unknown> | undefined;
+      const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
+      const gated = exitGatedStream(process.stdout, opts.cancelOnAbandon ? abortRecovery : undefined, true);
       process.completed.then(({ code, softTimedOut }) => {
         if (softTimedOut) {
           gated.exited(new CheckpointSoftDeadlineError());
@@ -7909,17 +10232,45 @@ export class GitCache {
       // A child that exits before reading its stdin (e.g. its repo vanished) must not surface an
       // uncaught EPIPE; the exit status already errors the stream with the failure.
       process.stdin?.on("error", () => undefined);
-      process.stdin?.end(stdin ?? "");
-      const exited = process.completed.then(({ code }) => code, () => -1);
-      return { stdout: gated.out, exited };
+      if (opts.keepStdinOpen) process.stdin?.write(stdin ?? "");
+      else process.stdin?.end(stdin ?? "");
+      recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+      if (recovery?.signal.aborted) abortRecovery();
+      const exited = process.completed.then(({ code }) => code, () => -1).finally(async () => {
+        recovery?.signal.removeEventListener("abort", abortRecovery);
+        await cancellation;
+      });
+      return { stdin: opts.keepStdinOpen ? process.stdin ?? undefined : undefined, stdout: gated.out, exited, cancel: abortRecovery };
     }
     const child = spawn("git", withDir(cwd, args), { env });
+    let killTimer: ReturnType<typeof setTimeout> | undefined;
+    const abortRecovery = () => {
+      if (killTimer || child.exitCode !== null || child.signalCode !== null) return;
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
+    };
+    recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+    const timeoutMs = recovery ? Math.min(opts.timeoutMs ?? Infinity, Math.max(1, recovery.deadline - Date.now())) : opts.timeoutMs;
+    let timeoutError: Error | undefined;
+    const timeout = timeoutMs === undefined ? undefined : setTimeout(() => {
+      if (timeoutMs === opts.timeoutMs && !killTimer && child.exitCode === null && child.signalCode === null) {
+        timeoutError = opts.nativeTimeoutError;
+      }
+      abortRecovery();
+    }, timeoutMs);
+    child.once("close", () => {
+      recovery?.signal.removeEventListener("abort", abortRecovery);
+      if (timeout) clearTimeout(timeout);
+      if (killTimer) clearTimeout(killTimer);
+    });
+    if (recovery?.signal.aborted) abortRecovery();
     const exited = new Promise<number>((resolve) => {
       child.once("error", () => resolve(-1));
       child.once("close", (code) => resolve(code ?? -1));
     });
     const gated = exitGatedStream(child.stdout as Readable, () => {
-      if (child.exitCode === null && child.signalCode === null) child.kill();
+      if (opts.cancelOnAbandon) abortRecovery();
+      else if (child.exitCode === null && child.signalCode === null) child.kill();
     });
     const stderrChunks: Buffer[] = [];
     const stderrCap = opts.stderrMaxBytes;
@@ -7936,16 +10287,18 @@ export class GitCache {
     });
     child.on("error", (err) => gated.exited(err));
     child.on("close", (code) => {
-      if (code !== 0) {
+      if (timeoutError) gated.exited(timeoutError);
+      else if (code !== 0) {
         const detail = Buffer.concat(stderrChunks).toString().trim();
         gated.exited(new Error(`git ${args.join(" ")} exited ${code ?? "signal"}${detail ? `: ${detail}` : ""}`));
       } else gated.exited();
     });
     if (child.stdin) {
       child.stdin.on("error", () => undefined); // see the scoped branch above
-      child.stdin.end(stdin ?? "");
+      if (opts.keepStdinOpen) child.stdin.write(stdin ?? "");
+      else child.stdin.end(stdin ?? "");
     }
-    return { child, stdout: gated.out, exited };
+    return { child, stdin: opts.keepStdinOpen ? child.stdin ?? undefined : undefined, stdout: gated.out, exited, cancel: abortRecovery };
   }
 
   /**
@@ -8113,8 +10466,17 @@ export class GitCache {
     };
     const stderrText = (): string => Buffer.concat(stderrChunks).toString().trim();
     const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    recovery?.signal.throwIfAborted();
     if (boundary) {
-      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command" });
+      const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command",
+        ...(recovery ? { timeoutMs: Math.max(1, recovery.deadline - Date.now()) } : {}),
+      });
+      let cancellation: Promise<unknown> | undefined;
+      const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+      recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+      if (recovery?.signal.aborted) abortRecovery();
+      void process.completed.finally(() => recovery?.signal.removeEventListener("abort", abortRecovery)).catch(() => undefined);
       if (!process.stdin) {
         // Nothing can be streamed; still settle the root before reporting.
         await process.completed.catch(() => undefined);
@@ -8127,11 +10489,19 @@ export class GitCache {
       const exited = process.completed.then(
         ({ code }) => ({ code, stderr: stderrText() }),
         (error: unknown) => ({ code: -1, stderr: stderrText() || gitErrorMessage(error) }),
-      );
+      ).finally(async () => { await cancellation; });
       return { stdin, exited, abort: () => stdin.destroy() };
     }
     const wrapped = runnerCommand("git", withDir(cwd, args));
     const child = spawn(wrapped.command, wrapped.args, { env, stdio: ["pipe", "pipe", "pipe"] });
+    const abortRecovery = () => { child.stdin.destroy(); child.kill("SIGKILL"); };
+    recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
+    const timer = recovery ? setTimeout(abortRecovery, Math.max(1, recovery.deadline - Date.now())) : undefined;
+    child.once("close", () => {
+      recovery?.signal.removeEventListener("abort", abortRecovery);
+      if (timer) clearTimeout(timer);
+    });
+    if (recovery?.signal.aborted) abortRecovery();
     child.stdin.on("error", () => undefined);
     child.stdout.resume();
     child.stderr.on("data", keepStderr);
@@ -8220,7 +10590,7 @@ export class GitCache {
   }
 
   /** Worker-only directories are the ownership root; runner-provided Git config is not. */
-  private async assertOwedBare(barePath: string): Promise<void> {
+  private async assertOwedBare(barePath: string, readOptions?: BoundedReadOptions): Promise<void> {
     const root = path.resolve(this.reposRoot);
     if (typeof barePath !== "string" || path.dirname(barePath) !== root || path.resolve(barePath) !== barePath) {
       throw new Error("owed candidates require a known worker bare path");
@@ -8232,7 +10602,9 @@ export class GitCache {
           ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() ||
             (uidSplitActive() && st.gid === RUNNER_UID)))) throw new Error("unsafe worker bare directory");
     }
-    if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") {
+    const args = ["rev-parse", "--is-bare-repository"];
+    const read = readOptions ? await this.readBare(barePath, args, readOptions) : undefined;
+    if (read?.truncated || (read ? read.text : await this.runGit(barePath, args)).trim() !== "true") {
       throw new Error("owed candidates require a bare repository");
     }
   }
@@ -8304,13 +10676,15 @@ export class GitCache {
     }
   }
 
-  private owedDirectory(barePath: string): string { return path.join(barePath, "uzi-owed"); }
+  private owedDirectory(barePath: string, directoryName: LocalMetadataDirectory = "uzi-owed"): string {
+    return path.join(barePath, directoryName);
+  }
   private receiptName(branch: string): string {
     return createHash("sha256").update(branch).digest("hex");
   }
 
-  private async ensureOwedDirectory(barePath: string): Promise<string> {
-    const dir = this.owedDirectory(barePath);
+  private async ensureOwedDirectory(barePath: string, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<string> {
+    const dir = this.owedDirectory(barePath, directoryName);
     try {
       await fs.mkdir(dir, { mode: 0o700 });
       const parent = await fs.open(barePath, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
@@ -8326,8 +10700,8 @@ export class GitCache {
   }
 
   /** ENOENT alone means absent. Bounded regular-file no-follow read, worker ownership required. */
-  private async readOwedFile(barePath: string, name: string): Promise<unknown | undefined> {
-    const dir = this.owedDirectory(barePath);
+  private async readOwedFile(barePath: string, name: string, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<unknown | undefined> {
+    const dir = this.owedDirectory(barePath, directoryName);
     try {
       const st = await fs.lstat(dir);
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
@@ -8349,16 +10723,31 @@ export class GitCache {
       if (!st.isFile() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0 || st.size > 65536) {
         throw new Error("unsafe owed metadata file");
       }
+      const before = await file.stat({ bigint: true });
       const buf = Buffer.alloc(65537);
-      const { bytesRead } = await file.read(buf, 0, buf.length, 0);
-      if (bytesRead > 65536) throw new Error("oversized owed metadata");
-      return JSON.parse(buf.toString("utf8", 0, bytesRead)) as unknown;
+      let length = 0;
+      // At most cap+1 nonempty reads; only complete EOF permits JSON parsing.
+      while (length < buf.length) {
+        this.checkReportProof();
+        const { bytesRead } = await file.read(buf, length, buf.length - length, null);
+        if (!bytesRead) break;
+        length += bytesRead;
+        const budget = this.reportProofs.getStore();
+        if (budget && (budget.owedBytes += bytesRead) > 32 * 1024 * 1024) throw new Error("owed byte budget");
+      }
+      if (length > 65536) throw new Error("oversized owed metadata");
+      const after = await file.stat({ bigint: true });
+      const named = await fs.lstat(path.join(dir, name), { bigint: true });
+      if (before.dev !== named.dev || before.ino !== named.ino || named.isSymbolicLink() ||
+          before.size !== after.size || before.mtimeNs !== after.mtimeNs || before.ctimeNs !== after.ctimeNs ||
+          before.mtimeNs !== named.mtimeNs || before.ctimeNs !== named.ctimeNs) throw new Error("owed metadata changed");
+      return JSON.parse(buf.toString("utf8", 0, length)) as unknown;
     } finally { await file.close(); }
   }
 
   /** Temp is exclusive/no-follow, synced before rename; rename and directory sync precede readback. */
-  private async writeOwedFile(barePath: string, name: string, value: unknown): Promise<void> {
-    const dir = await this.ensureOwedDirectory(barePath);
+  private async writeOwedFile(barePath: string, name: string, value: unknown, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<void> {
+    const dir = await this.ensureOwedDirectory(barePath, directoryName);
     const temp = path.join(dir, `.tmp-${randomUUID()}`);
     const file = await fs.open(temp, fsConstants.O_WRONLY | fsConstants.O_CREAT |
       fsConstants.O_EXCL | fsConstants.O_NOFOLLOW, 0o600);
@@ -8368,18 +10757,18 @@ export class GitCache {
     } finally { await file.close(); }
     try {
       // Read an existing destination to reject symlinks, FIFOs and foreign-owned files.
-      await this.readOwedFile(barePath, name);
+      await this.readOwedFile(barePath, name, directoryName);
       await fs.rename(temp, path.join(dir, name));
       const directory = await fs.open(dir, fsConstants.O_RDONLY | fsConstants.O_DIRECTORY | fsConstants.O_NOFOLLOW);
       try { await directory.sync(); } finally { await directory.close(); }
-      if (JSON.stringify(await this.readOwedFile(barePath, name)) !== JSON.stringify(value)) {
+      if (JSON.stringify(await this.readOwedFile(barePath, name, directoryName)) !== JSON.stringify(value)) {
         throw new Error("owed metadata readback mismatch");
       }
     } finally { await fs.rm(temp, { force: true }); }
   }
 
-  private async removeOwedFile(barePath: string, name: string, allowMissing = false): Promise<void> {
-    const dir = this.owedDirectory(barePath);
+  private async removeOwedFile(barePath: string, name: string, allowMissing = false, directoryName: LocalMetadataDirectory = "uzi-owed"): Promise<void> {
+    const dir = this.owedDirectory(barePath, directoryName);
     try { await fs.unlink(path.join(dir, name)); }
     catch (err) {
       if (allowMissing && (err as NodeJS.ErrnoException).code === "ENOENT") return;
@@ -8698,7 +11087,22 @@ export class GitCache {
       if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o077) !== 0) {
         throw new Error("unsafe owed discovery directory");
       }
-      const names = await fs.readdir(dir);
+      const names: string[] = [];
+      if (this.reportProofs.getStore()) {
+        const directory = await fs.opendir(dir);
+        try {
+          for (;;) {
+            this.checkReportProof();
+            const entry = await directory.read();
+            if (!entry) break;
+            if (names.length >= 1024) throw new Error("owed entry budget");
+            names.push(entry.name);
+          }
+        } finally { await directory.close(); }
+        const after = await fs.lstat(dir);
+        if (st.dev !== after.dev || st.ino !== after.ino || st.mtimeMs !== after.mtimeMs ||
+            st.ctimeMs !== after.ctimeMs) throw new Error("owed directory changed");
+      } else names.push(...await fs.readdir(dir));
       for (const name of names) {
         if (!/^(?:context-[0-9a-f]{64}|candidate-[A-Za-z0-9_-]+-[0-9a-f]{40}-[0-9a-f]{64}|(?:governed|receipt)-[0-9a-f]{64})\.json$/.test(name) &&
             !/^\.tmp-[0-9a-f-]{36}$/.test(name)) throw new Error("unknown owed metadata entry");
@@ -8735,7 +11139,7 @@ export class GitCache {
     return { names, contexts, records };
   }
 
-  private async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
+  async enumerateOwedUnderLock(barePath: string, runId: string, metadata?: OwedMetadata): Promise<OwedCandidate[]> {
     const loaded = metadata ?? await this.readOwedMetadataUnderLock(barePath);
     const records = loaded.records.filter((r) => r.runId === runId);
     const out = await this.runGit(barePath, ["for-each-ref", "--format=%(refname) %(objectname)", `refs/uzi-owed/${runId}/`]);
@@ -8830,7 +11234,8 @@ export class GitCache {
   async cleanupRecoveryGeneration(barePath: string, context: PositiveOwedCandidateContext,
     roots: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>,
     coveragePins: Array<{ fingerprint: string; sha: string; coveredHeads?: string[] }>, recoverySources: string[],
-    coveringSha: string, canDelete: () => boolean = () => true): Promise<"removed" | "retained"> {
+    coveringSha: string, canDelete: () => boolean = () => true,
+    authority: "archive" | "completion" | "completion-check" = "archive"): Promise<"removed" | "retained" | "verified"> {
     await this.validateOwedContext(barePath, context.branch, context);
     if (!Number.isSafeInteger(context.generation) || context.generation <= 0) return "retained";
     await this.assertOwedBare(barePath);
@@ -8875,7 +11280,7 @@ export class GitCache {
       for (const record of exact) {
         if ("origin" in record.c || !roots.some(root => root.sha === record.sha &&
             root.contexts.some(c => !("origin" in c) && this.contextName(c) === record.contextName))) return "retained";
-        if (await this.ancestry(barePath, record.sha, coveringSha) !== "ancestor") return "retained";
+        if (authority === "archive" && await this.ancestry(barePath, record.sha, coveringSha) !== "ancestor") return "retained";
       }
       const ownedPins = allRefs.filter(p => p.ref.startsWith(`refs/uzi-coverage/${context.runId}/${context.generation}/`) ||
         p.ref === recoveryPinRef(context.runId, context.generation));
@@ -8890,7 +11295,7 @@ export class GitCache {
         const heads = coveragePins.find(p => p.sha === pin.sha)?.coveredHeads ?? [pin.sha];
         if (!heads.length) return "retained";
         for (const head of heads) {
-          if (!OWED_OID.test(head) || await this.ancestry(barePath, head, coveringSha) !== "ancestor") return "retained";
+          if (!OWED_OID.test(head) || (authority === "archive" && await this.ancestry(barePath, head, coveringSha) !== "ancestor")) return "retained";
         }
       }
       const open = (): void => {
@@ -8902,6 +11307,7 @@ export class GitCache {
         await this.runGit(barePath, ["update-ref", "-d", ref, sha]);
         if (await this.checkedRefSha(barePath, ref) !== undefined) throw new Error("recovery cleanup ref deletion mismatch");
       };
+      if (authority === "completion-check") { open(); return "verified"; }
       for (const pin of ownedPins) await deleteRef(pin.ref, pin.sha);
       for (const sha of new Set(exact.map(r => r.sha))) {
         const ref = `refs/uzi-owed/${context.runId}/${sha}`;
@@ -9012,6 +11418,104 @@ export class GitCache {
     });
   }
 
+  /**
+   * Issue #2625: read, never write, the claim that a coverage aggregate built by
+   * {@link buildRecoveryCoverage} is redundant with a published branch. Returns undefined (no claim)
+   * for anything that does not verify locally, so a caller can only ever send a claim the api's
+   * strict checks are expected to accept. Walks from `sourceSha` through commits whose message is
+   * exactly the coverage message for `fingerprint`; every other commit reached is a leaf and the
+   * leaves must be exactly roots + currentSha. When `witnessHead` is given and does not already
+   * contain `currentSha`, it is attached as the WIP witness only if its tree equals the current tree
+   * and every parent of `currentSha` is its ancestor.
+   */
+  async readRecoveryCoverageClaim(barePath: string, opts: {
+    sourceSha: string; fingerprint: string; roots: string[]; currentSha: string; witnessHead?: string;
+  }): Promise<RecoveryCoverageClaim | undefined> {
+    const { sourceSha, fingerprint, roots, currentSha, witnessHead } = opts;
+    const MAX_HEADS = 64, MAX_AGGREGATES = 8, MAX_OBJECT_BYTES = 64 * 1024;
+    const strictlySorted = roots.every((r, i) => i === 0 || roots[i - 1]! < r);
+    const heads = [...new Set([...roots, currentSha])].sort();
+    if (!OWED_OID.test(sourceSha) || !OWED_OID.test(currentSha) || !/^[0-9a-f]{64}$/.test(fingerprint) ||
+        !roots.length || !roots.every(r => OWED_OID.test(r)) || !strictlySorted ||
+        (witnessHead !== undefined && !OWED_OID.test(witnessHead)) || heads.length > MAX_HEADS) return undefined;
+    const coverageMessage = new RegExp(`^uzi recovery coverage ${fingerprint} round (0|[1-9][0-9]*) batch (0|[1-9][0-9]*)\\n$`);
+    const gitObjectId = (body: Buffer): string =>
+      createHash("sha1").update(Buffer.concat([Buffer.from(`commit ${body.length}\0`), body])).digest("hex");
+    try {
+      return await this.withLock(barePath, async () => {
+        // `git cat-file` output is decoded as UTF-8 by the exec plumbing; a body that does not survive
+        // the round trip back to its own object id is refused rather than sent corrupted.
+        const readCommit = async (sha: string): Promise<{ body: Buffer; tree: string; parents: string[]; message: string } | undefined> => {
+          const body = Buffer.from(await this.runGit(barePath, ["--no-replace-objects", "cat-file", "commit", sha]), "utf8");
+          if (body.length > MAX_OBJECT_BYTES || gitObjectId(body) !== sha) return undefined;
+          const text = body.toString("utf8");
+          const split = text.indexOf("\n\n");
+          if (split < 0) return undefined;
+          const header = text.slice(0, split).split("\n");
+          const tree = /^tree ([0-9a-f]{40})$/.exec(header[0] ?? "")?.[1];
+          if (!tree) return undefined;
+          const parents: string[] = [];
+          for (let i = 1; i < header.length; i++) {
+            const parent = /^parent ([0-9a-f]{40})$/.exec(header[i]!)?.[1];
+            if (!parent) break;
+            parents.push(parent);
+          }
+          return { body, tree, parents, message: text.slice(split + 2) };
+        };
+        const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", `${currentSha}^{tree}`])).trim();
+        if (!OWED_OID.test(tree) ||
+            createHash("sha256").update(JSON.stringify({ roots, currentSha, tree })).digest("hex") !== fingerprint) return undefined;
+        const aggregates: Array<{ round: number; batch: number; body: Buffer }> = [];
+        const leaves = new Set<string>();
+        const seen = new Set<string>();
+        const queue = [sourceSha];
+        while (queue.length) {
+          const sha = queue.shift()!;
+          if (seen.has(sha)) continue;
+          seen.add(sha);
+          if (seen.size > MAX_AGGREGATES + MAX_HEADS) return undefined;
+          const commit = await readCommit(sha);
+          if (!commit) return undefined;
+          const m = coverageMessage.exec(commit.message);
+          if (!m) {
+            if (sha === sourceSha) return undefined;
+            leaves.add(sha);
+            continue;
+          }
+          if (commit.tree !== tree) return undefined;
+          aggregates.push({ round: Number(m[1]), batch: Number(m[2]), body: commit.body });
+          if (aggregates.length > MAX_AGGREGATES) return undefined;
+          queue.push(...commit.parents);
+        }
+        if (!aggregates.length || [...leaves].sort().join(",") !== heads.join(",")) return undefined;
+        const current = await readCommit(currentSha);
+        if (!current || current.tree !== tree) return undefined;
+        let witnessObject: string | undefined;
+        if (witnessHead !== undefined) {
+          const containment = await this.ancestry(barePath, currentSha, witnessHead);
+          if (containment === "unknown") return undefined;
+          if (containment === "divergent") {
+            const witness = await readCommit(witnessHead);
+            if (!witness || witness.tree !== tree) return undefined;
+            for (const parent of current.parents) {
+              if (await this.ancestry(barePath, parent, witnessHead) !== "ancestor") return undefined;
+            }
+            witnessObject = witness.body.toString("base64");
+          }
+        }
+        aggregates.sort((a, b) => a.round - b.round || a.batch - b.batch);
+        return {
+          coverageDigest: fingerprint, roots: [...roots], currentSha, tree,
+          aggregateObjects: aggregates.map(a => a.body.toString("base64")),
+          currentObject: current.body.toString("base64"),
+          ...(witnessObject === undefined ? {} : { witnessObject }),
+        };
+      });
+    } catch {
+      return undefined;
+    }
+  }
+
   private async tryGitStdout(cwd: string | undefined, args: string[]): Promise<string> {
     try {
       const { stdout } = await this.execScoped("git", withDir(cwd, args), { env: gitEnv(), timeout: GIT_TIMEOUT_MS });
@@ -9028,9 +11532,16 @@ export class GitCache {
    * promptly and forfeits its slot without running `fn`. The stored chain still
    * waits for the prior holder before it settles, so a cancelled waiter can never
    * let a later mutation overtake the holder and violate serialization. */
-  private withLock<T>(key: string, fn: () => Promise<T>): Promise<T> {
+  private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
-    const scope = this.boundaryProcesses.getStore();
+    const boundary = this.boundaryProcesses.getStore();
+    const recovery = this.recoveryOperations.getStore();
+    const report = this.reportProofs.getStore();
+    this.checkReportProof();
+    this.checkRecoveryInterruption();
+    const signals = [boundary?.signal, recovery?.signal, report?.signal].filter((s): s is AbortSignal => s !== undefined);
+    const scope = signals.length ? { signal: AbortSignal.any(signals) } : undefined;
+    const softSignal = boundary?.softSignal;
     let started = false;
     let settled = false;
     let removeAbortListener = (): void => {};
@@ -9044,24 +11555,26 @@ export class GitCache {
       if (started || settled) return;
       settled = true;
       removeAbortListener();
-      rejectResult(scope?.signal.aborted
+      rejectResult(signal?.aborted ? new Error(GIT_LOCK_WAIT_ABORT_MESSAGE) : scope?.signal.aborted
         ? new GitBoundaryAbortError(GIT_LOCK_WAIT_ABORT_MESSAGE)
         : new CheckpointSoftDeadlineError());
     };
-    if (scope) {
+    if (scope || signal) {
       removeAbortListener = (): void => {
-        scope.signal.removeEventListener("abort", abortBeforeAcquisition);
-        scope.softSignal?.removeEventListener("abort", abortBeforeAcquisition);
+        signal?.removeEventListener("abort", abortBeforeAcquisition);
+        scope?.signal.removeEventListener("abort", abortBeforeAcquisition);
+        softSignal?.removeEventListener("abort", abortBeforeAcquisition);
       };
-      if (scope.signal.aborted || scope.softSignal?.aborted) abortBeforeAcquisition();
+      if (signal?.aborted || scope?.signal.aborted || softSignal?.aborted) abortBeforeAcquisition();
       else {
-        scope.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
-        scope.softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        signal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        scope?.signal.addEventListener("abort", abortBeforeAcquisition, { once: true });
+        softSignal?.addEventListener("abort", abortBeforeAcquisition, { once: true });
       }
     }
     const run = async (): Promise<void> => {
       if (settled) return;
-      if (scope?.signal.aborted || scope?.softSignal?.aborted) {
+      if (signal?.aborted || scope?.signal.aborted || softSignal?.aborted) {
         abortBeforeAcquisition();
         return;
       }
@@ -9076,8 +11589,8 @@ export class GitCache {
       // issue #1597 M2: a scope's pre-release hook runs while this lock is STILL held (the chain
       // below does not advance until `run` returns), so a cancelled tick can settle its children and
       // reconcile lock files before any other bare mutation starts. It never fails the op.
-      if (scope?.beforeLockRelease) {
-        await scope.beforeLockRelease(key).catch(() => undefined);
+      if (boundary?.beforeLockRelease) {
+        await boundary.beforeLockRelease(key).catch(() => undefined);
       }
       settled = true;
       if (outcome.ok) resolveResult(outcome.value);
@@ -9099,7 +11612,7 @@ const CANCEL_CONTENT_HELPER = String.raw`
 const fs = require("node:fs");
 const { createHash } = require("node:crypto");
 const C = fs.constants, O_PATH = 0x200000;
-const root = process.argv[1], deadline = Date.now() + 28000;
+const root = process.argv[1], deadline = process.argv[2] === undefined ? Date.now() + 28000 : Number(process.argv[2]);
 const fds = new Set();
 let total = 0;
 function check() { if (Date.now() > deadline) throw Error("content deadline"); }
@@ -10323,7 +12836,9 @@ async function isBareRepo(p: string): Promise<boolean> {
  *   /tmp/fx/origin                   -> tmp+fx+origin.git    (local path, hostless)
  */
 export function bareDirName(rawUrl: string): string {
-  const trimmed = rawUrl.replace(/\/+$/, "");
+  let end = rawUrl.length;
+  while (end > 0 && rawUrl[end - 1] === "/") end--;
+  const trimmed = rawUrl.slice(0, end);
   const [host, repoPath] = splitHostAndPath(trimmed);
   const parts: string[] = [];
   const normHost = host.trim().toLowerCase().replaceAll(":", "%3A");

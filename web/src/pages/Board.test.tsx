@@ -2355,6 +2355,18 @@ describe("Board attention strip — a run appears in exactly one bucket (#182)",
   const strip = () =>
     screen.getByText(/needs approval|needs an answer|awaiting follow-up|looks? stuck|look stuck/);
 
+  // Issue #2661: the board's run read uses the compact summary projection; the fixture
+  // below already carries none of the four heavy keys (plan_md, repo_agents,
+  // issue_description, preserved_patch), as a summary row does, and the strip renders.
+  it("requests the summary view and renders the strip from a summary row (#2661)", async () => {
+    mockApi.listRuns.mockResolvedValue({
+      runs: [aRun({ id: "run-9", status: "awaiting_approval", health: "ok", issue_iid: 7 })],
+    });
+    renderBoard();
+    await screen.findByText("1 run needs approval");
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ repoId: "repo-1", view: "summary" });
+  });
+
   it("does not double-list an awaiting_approval run flagged waiting_worker", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [aRun({ id: "run-1", status: "awaiting_approval", health: "waiting_worker", issue_iid: 7 })],

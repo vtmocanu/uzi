@@ -94,7 +94,7 @@ func (s *Service) CreateAutoMRReworkRun(ctx context.Context, userID, repoID uuid
 }
 
 // CreateAutoMRReworkRunAndAdvance is the review watcher's create (issue #2347): the automatic
-// mr_rework run INSERT, the cycle's ledger advance (high-water, pending delta; the caller's
+// mr_rework run INSERT, the cycle's ledger advance (per-namespace marks, pending delta; the caller's
 // attempt counting is part of the ledger upsert) and a re-validation of the decision all
 // happen in ONE transaction under the run-branch lock. res is the finished assessment and
 // must be non-nil: its snapshot rides the run, PlanAssessed supplies the advance, and
@@ -119,15 +119,15 @@ func (s *Service) CreateAutoMRReworkRunAndAdvance(ctx context.Context, userID, r
 // one-active-mr_rework-per-MR index). auto_approve stays true — a rework has no CI-config
 // dimension and the owner has just read the findings (Decision 4).
 //
-// The non-counting ledger high-water advance is now folded into the create as ONE atomic
-// statement (CreateManualMRReworkRunAndAdvance): highWater is the max actionable comment id
-// StartMRReworkForRun computed, and Postgres commits the run INSERT and the advance together
-// or rolls both back. Previously the advance was a separate best-effort call whose failure
-// was only logged — a review finding, since a create that returned success with an
-// unadvanced ledger let the automatic watcher re-fire on the same comments (see
-// StartMRReworkForRun).
+// The non-counting ledger mark advance is now folded into the create as ONE atomic
+// statement (CreateManualMRReworkRunAndAdvance): the plan's MaxActionable marks (the max
+// actionable comment id per namespace, ADR-1199) are what StartMRReworkForRun computed, and
+// Postgres commits the run INSERT and the advance together or rolls both back. Previously
+// the advance was a separate best-effort call whose failure was only logged — a review
+// finding, since a create that returned success with an unadvanced ledger let the automatic
+// watcher re-fire on the same comments (see StartMRReworkForRun).
 //
-// plan carries the ledger's pending_unknown_ids delta (issue #2347) that rides the same atomic
+// plan carries the ledger's pending_unknown_keys delta (issue #2347) that rides the same atomic
 // statement as the advance. recheck, when non-nil, re-validates freshness under the create
 // lock (see reworkRecheck); nil skips it (guidance-driven triggers).
 func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, plan ReviewPlan, recheck *reworkRecheck) (store.Run, error) {
@@ -139,19 +139,19 @@ func (s *Service) CreateManualMRReworkRun(ctx context.Context, userID, repoID uu
 // the atomic INSERT … WHERE NOT EXISTS cross-kind guard, the 23505 mappings, the queued
 // notify) is identical, so the two paths cannot drift.
 //
-// manual discriminates the two callers (its MaxActionableID is the high-water to advance to):
+// manual discriminates the two callers (its MaxActionable marks are what to advance to):
 //   - nil (automatic path): CreateAutoMRReworkRun, stamping trigger_source=triggerSource. When
 //     advance is non-nil the cycle's ledger upsert runs on the same transaction right after
 //     the insert, so the run and the advance commit or roll back together; with a nil advance
 //     the ledger is not written here.
 //   - non-nil (manual path): CreateManualMRReworkRunAndAdvance, which stamps
-//     trigger_source='manual' in SQL AND folds the non-counting high-water advance
+//     trigger_source='manual' in SQL AND folds the non-counting mark advance
 //     (GREATEST(*highWater), halt_notified reset) into the SAME atomic statement, so the run
 //     and the ledger commit together or not at all. triggerSource is unused in this branch.
 //
 // recheck, when non-nil, runs inside the transaction after the branch lock and the active
 // issue-run check: it reads the CURRENT ledger row (no row is a zero row) and refuses with
-// ErrMRReworkCapReached (enforceCap) or, when no eligible comment is above its high-water or
+// ErrMRReworkCapReached (enforceCap) or, when no eligible comment is above its namespace's mark or
 // pending set any more, ErrReworkPermissionUnknown / ErrReworkNothingNew.
 func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUID, ref string, mrIID int64, sourceRunID uuid.UUID, title, description string, snapshot *ReviewCommentsSnapshot, triggerSource string, manual, advance *ReviewPlan, recheck *reworkRecheck) (store.Run, error) {
 	// Repo-ownership / existence check, mirroring createCIFixRun so an unknown repo is
@@ -216,8 +216,23 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 				return store.Run{}, ErrBranchInUse
 			}
 		}
+		// Whenever this create writes the ledger (manual always; auto with an advance) the
+		// current row is read here, under the branch lock. A LEGACY row (comment_marks NULL,
+		// written before ADR-1199) has no namespaced state to advance: the write would be
+		// refused or, worse, would mix scalar and namespaced state, so nothing is created and
+		// the caller re-reads and bootstraps it (BootstrapReviewLedger).
+		var cur store.GetMRReworkLedgerRow
+		if recheck != nil || manual != nil || advance != nil {
+			var err error
+			if cur, err = readReworkLedger(ctx, q, repoID, ref); err != nil {
+				return store.Run{}, err
+			}
+			if cur.Legacy && (manual != nil || advance != nil) {
+				return store.Run{}, ErrReworkLedgerChanged
+			}
+		}
 		if recheck != nil {
-			if err := recheckReworkLedger(ctx, q, repoID, ref, recheck); err != nil {
+			if err := recheckReworkLedger(cur, recheck); err != nil {
 				return store.Run{}, err
 			}
 		}
@@ -242,20 +257,27 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			if err != nil || advance == nil {
 				return run, err
 			}
-			if err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
+			n, err := q.UpsertMRReworkLedger(ctx, store.UpsertMRReworkLedgerParams{
 				RepoID:              repoID,
 				Ref:                 ref,
 				HighWater:           advance.MaxActionableID,
-				PendingAdd:          nonNilIDs(advance.PendingAdd),
-				PendingRemove:       nonNilIDs(advance.PendingRemove),
-				PendingSuperseded:   nonNilIDs(advance.PendingSuperseded),
-				PendingSupersededBy: nonNilIDs(advance.PendingSupersededBy),
-			}); err != nil {
+				Marks:               encodeMarks(advance.MaxActionable),
+				PendingAdd:          encodeKeys(advance.PendingAdd),
+				PendingRemove:       encodeKeys(advance.PendingRemove),
+				PendingSuperseded:   encodeKeys(advance.PendingSuperseded),
+				PendingSupersededBy: encodeKeys(advance.PendingSupersededBy),
+			})
+			if err != nil {
 				return store.Run{}, fmt.Errorf("advance mr rework ledger: %w", err)
+			}
+			if n == 0 {
+				// The row turned legacy-only between the read above and the write; returning
+				// an error rolls the run INSERT back with it.
+				return store.Run{}, ErrReworkLedgerChanged
 			}
 			return run, nil
 		}
-		// Manual (on-demand) path: the run INSERT and the non-counting high-water advance
+		// Manual (on-demand) path: the run INSERT and the non-counting mark advance
 		// commit atomically as ONE statement — trigger_source='manual' is hard-coded in the
 		// query, so it is not a param here (PRD #1202 review-finding hardening).
 		return q.CreateManualMRReworkRunAndAdvance(ctx, store.CreateManualMRReworkRunAndAdvanceParams{
@@ -269,10 +291,11 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 			ReviewComments:      reviewJSON,
 			WaitOnLimit:         waitOnLimit,
 			HighWater:           manual.MaxActionableID,
-			PendingAdd:          nonNilIDs(manual.PendingAdd),
-			PendingRemove:       nonNilIDs(manual.PendingRemove),
-			PendingSuperseded:   nonNilIDs(manual.PendingSuperseded),
-			PendingSupersededBy: nonNilIDs(manual.PendingSupersededBy),
+			Marks:               encodeMarks(manual.MaxActionable),
+			PendingAdd:          encodeKeys(manual.PendingAdd),
+			PendingRemove:       encodeKeys(manual.PendingRemove),
+			PendingSuperseded:   encodeKeys(manual.PendingSuperseded),
+			PendingSupersededBy: encodeKeys(manual.PendingSupersededBy),
 			// PRD #1429 M2 (D4): the inherited source-run harness, frozen in-tx.
 			Harness: string(resolved.Harness),
 		})
@@ -309,23 +332,35 @@ func (s *Service) createMRReworkRun(ctx context.Context, userID, repoID uuid.UUI
 	return run, nil
 }
 
-// recheckReworkLedger is the in-transaction re-validation of a create decision (issue #2347).
-// It must run under the run-branch lock so a competing create has committed or is waiting.
-// Deltas stay with the pre-listing plan; only freshness and the cap are judged on the row read
-// here. A missing row is a zero row and must not escape as pgx.ErrNoRows, which the caller
-// would map to ErrBranchInUse.
-func recheckReworkLedger(ctx context.Context, q Store, repoID uuid.UUID, ref string, rc *reworkRecheck) error {
+// readReworkLedger reads the current ledger row under the run-branch lock. A missing row is a
+// zero row (non-legacy, empty) and must not escape as pgx.ErrNoRows, which the caller would map
+// to ErrBranchInUse.
+func readReworkLedger(ctx context.Context, q Store, repoID uuid.UUID, ref string) (store.GetMRReworkLedgerRow, error) {
 	cur, err := q.GetMRReworkLedger(ctx, store.GetMRReworkLedgerParams{RepoID: repoID, Ref: ref})
 	if err != nil {
 		if !errors.Is(err, pgx.ErrNoRows) {
-			return fmt.Errorf("read mr rework ledger: %w", err)
+			return store.GetMRReworkLedgerRow{}, fmt.Errorf("read mr rework ledger: %w", err)
 		}
-		cur = store.MrReworkLedger{}
+		return store.GetMRReworkLedgerRow{}, nil
+	}
+	return cur, nil
+}
+
+// recheckReworkLedger is the in-transaction re-validation of a create decision (issue #2347).
+// It must run under the run-branch lock so a competing create has committed or is waiting, on
+// the row readReworkLedger returned. Deltas stay with the pre-listing plan; only freshness and
+// the cap are judged on that row.
+func recheckReworkLedger(cur store.GetMRReworkLedgerRow, rc *reworkRecheck) error {
+	state, err := LedgerStateFromRow(cur)
+	if err != nil {
+		// A legacy row is refused earlier, under the lock; what reaches here is a stored
+		// ledger that does not decode, which a retry cannot fix.
+		return fmt.Errorf("decode mr rework ledger: %w", err)
 	}
 	if rc.enforceCap && int(cur.AttemptCount) >= rc.capLimit {
 		return ErrMRReworkCapReached
 	}
-	if !rc.fresh.HasNewAgainst(cur.HighWater, cur.PendingUnknownIds) {
+	if !rc.fresh.HasNewAgainst(state) {
 		if rc.fresh.PlanAssessed().UnknownNew > 0 {
 			return ErrReworkPermissionUnknown
 		}
@@ -356,15 +391,15 @@ var (
 	// or ran out of time), and no guidance was given. Retrying later can succeed, which is what
 	// distinguishes it from ErrReworkNothingNew.
 	ErrReworkPermissionUnknown = errors.New("the new review comments are from authors whose repository access could not be verified yet; try again shortly, or give guidance")
+	// ErrReworkLedgerChanged (ADR-1199): the MR's ledger row is legacy, or changed under a
+	// bootstrap or an advance, so nothing was created or written. Retrying re-reads the row
+	// (and bootstraps a legacy one) and succeeds.
+	ErrReworkLedgerChanged = errors.New("the review comment state changed while this request ran; try again")
+	// ErrReviewLedgerBootstrapOverflow: upgrading a legacy ledger row would expand its pending
+	// ids past ReviewPendingCap (an id present in several comment namespaces becomes one key per
+	// namespace). The row is left untouched; an operator must reset it.
+	ErrReviewLedgerBootstrapOverflow = errors.New("this merge request's review ledger is too large to upgrade automatically; an operator must reset it (see docs/mr-review-watcher.md)")
 )
-
-// nonNilIDs makes a nil id slice an empty one so the pgx array parameter is never NULL.
-func nonNilIDs(ids []int64) []int64 {
-	if ids == nil {
-		return []int64{}
-	}
-	return ids
-}
 
 // StartMRReworkForRun mints an ON-DEMAND mr_rework run for a completed run's still-open MR,
 // past the automatic cap, with optional owner guidance (PRD #1202). It OWNS the run-state
@@ -383,7 +418,7 @@ func nonNilIDs(ids []int64) []int64 {
 // res is the finished author assessment of the MR's review comments the handler built from
 // the forge (nil is fine — a guidance-only trigger still proceeds). Its snapshot carries
 // ELIGIBLE comments only (issue #2347). On success it advances the consumed
-// high-water WITHOUT spending an automatic cycle (GREATEST/advance-only, attempt_count
+// marks WITHOUT spending an automatic cycle (GREATEST/advance-only, attempt_count
 // untouched) and resets the halt latch (halt_notified→false, unconditional even on a
 // guidance-only cycle) — Decision 1/9 — so the automatic watcher never re-fires on the same
 // comments and a genuinely-new comment that later hits the cap is announced once more.
@@ -452,7 +487,7 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	}
 
 	// What the assessed snapshot means for the ledger row the assessment began with (read by the
-	// handler BEFORE it listed the comments, so a pending id absent from the listing is gone;
+	// handler BEFORE it listed the comments, so a pending key absent from the listing is gone;
 	// the DELTAS come from that pre-listing row, while freshness is re-validated against the
 	// current row under the create lock), computed EXACTLY as the detector does
 	// (ReviewSnapshotResult.Plan): only an eligible actionable comment counts, and
@@ -468,7 +503,7 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	// (Decision 3: guidance alone is a valid trigger). When the reason is that the new
 	// comments' authors could not be verified yet, say so: that one is worth retrying.
 	if !plan.HasNew && strings.TrimSpace(guidance) == "" {
-		// Pending ids the caps evicted fall back to human review even though no run is created
+		// Pending keys the caps evicted fall back to human review even though no run is created
 		// (with guidance the create below removes them in its own statement).
 		// Best-effort, like the watcher: a failed removal must not turn the 409 refusal into a 500.
 		// The next tick retries the same removal, so only the error text (no comment bodies) is logged.
@@ -488,8 +523,8 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	description := ComposeRunDescription(body, guidance)
 	title := fmt.Sprintf("Rework MR review (on demand): %s (!%d)", ref, mrIID)
 
-	// The create and the non-counting high-water advance are ONE atomic statement
-	// (CreateManualMRReworkRunAndAdvance): plan.MaxActionableID is the mark to advance to
+	// The create and the non-counting mark advance are ONE atomic statement
+	// (CreateManualMRReworkRunAndAdvance): plan.MaxActionable are the marks to advance to
 	// (UNCONDITIONAL — GREATEST keeps it where it is on a guidance-only trigger, and the
 	// advance is what resets halt_notified for the new halt episode, Decision 9). Postgres
 	// commits the run and the advance together or rolls both back, so a returned run can
@@ -511,14 +546,14 @@ func (s *Service) StartMRReworkForRun(ctx context.Context, userID, runID uuid.UU
 	return run, nil
 }
 
-// dropEvictedPending removes the pending ids the snapshot caps evicted from the ledger's
-// pending set without creating a run or spending a cycle (RemoveMRReworkPendingIDs).
+// dropEvictedPending removes the pending keys the snapshot caps evicted from the ledger's
+// pending set without creating a run or spending a cycle (RemoveMRReworkPendingKeys).
 func (s *Service) dropEvictedPending(ctx context.Context, repoID uuid.UUID, ref string, plan ReviewPlan) error {
 	if len(plan.PendingEvicted) == 0 {
 		return nil
 	}
-	if err := s.q.RemoveMRReworkPendingIDs(ctx, store.RemoveMRReworkPendingIDsParams{RepoID: repoID, Ref: ref, Ids: plan.PendingEvicted}); err != nil {
-		return fmt.Errorf("drop evicted pending review comment ids: %w", err)
+	if err := s.q.RemoveMRReworkPendingKeys(ctx, store.RemoveMRReworkPendingKeysParams{RepoID: repoID, Ref: ref, Keys: encodeKeys(plan.PendingEvicted)}); err != nil {
+		return fmt.Errorf("drop evicted pending review comment keys: %w", err)
 	}
 	return nil
 }

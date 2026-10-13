@@ -99,8 +99,8 @@ type InsertNotificationParams struct {
 // Notifications event log (PRD #46 Decision 6; read path retired by PRD #1650 D1/D4).
 // The table is generic (kind + payload jsonb) so any producer can record an event
 // without a schema change. Nothing reads it back to a user any more: it is a pruned,
-// write-only event log (not a durable audit log; PruneNotificationsForUser caps it per
-// user).
+// write-only event log (not a durable audit log; PruneNotificationsForUser applies
+// nominal per-user retention, with pending durable exemptions and timestamp ties).
 // The read_at column stays in the schema but nothing sets or reads it.
 // Exception (issue #1675): durable halt kinds carry a stored Slack render in slack_render
 // and are read back by the Slack redelivery sweep (ClaimPendingSlackNotifications), so
@@ -172,8 +172,9 @@ type PruneNotificationsForUserParams struct {
 	Keep        int32     `json:"keep"`
 }
 
-// Per-user retention cap (PRD #46 Decision 6: pruning ships with the table). Keeps
-// the newest @keep rows for a user and deletes the rest. The inner subquery takes
+// Nominal per-user retention (PRD #46 Decision 6: pruning ships with the table).
+// Keeps the newest @keep rows for a user, plus timestamp ties and pending durable
+// exemptions, and deletes eligible older rows. The inner subquery takes
 // the newest @keep rows in a total order (created_at DESC, id DESC)
 // via idx_notifications_user_created — a bounded index read of @keep rows, not a
 // scan — and `min(created_at)` over them is the boundary: the created_at of the
@@ -181,10 +182,13 @@ type PruneNotificationsForUserParams struct {
 // strictly older than that boundary. When the user has @keep or fewer rows the
 // boundary is the oldest existing row, so `created_at <` it deletes nothing (at
 // exactly @keep ⇒ no deletion). The comparison is created_at-only, so rows tied at
-// the boundary's created_at are all kept — a small keep-slightly-more residual
-// accepted for v1 (M6 pins exact semantics). Called best-effort by notifysvc after
-// each insert, so an active user's event log can never grow without bound while an
-// idle one is never touched.
+// the boundary's created_at are all kept, so retention may exceed the nominal
+// @keep target (200 by default). Called best-effort after each insert, a successful
+// Slack delivery stamp, and a final retry claim, before render decoding (issue #2076).
+// Successful settlement pruning removes eligible older rows even for an idle user
+// with no later Notify, including final claims with corrupt renders. Prune failures
+// are logged without undoing delivery settlement or attempt exhaustion; cleanup is
+// not guaranteed and there is no historical settled-backlog sweep.
 // Issue #1675: a durable row still awaiting Slack delivery (slack_render set, not
 // delivered, attempts below @max_attempts) is never deleted, so the redelivery sweep
 // can still find it. A delivered row, or one at/over @max_attempts (given up), prunes

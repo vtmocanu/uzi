@@ -21,6 +21,7 @@ import (
 	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgconn"
 
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/secretbox"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -91,7 +92,7 @@ type Limits struct {
 	ReadyPayloadPerOwner   int64         // ready payload byte quota per owner.
 	InstanceBytes          int64         // instance-wide byte quota (scoped to the affected owner on breach).
 	MaxCapturesPerClaim    int           // captures admitted under one hold.
-	MaxCapturesPerOwner    int           // retained (non-discarded) captures per owner.
+	MaxCapturesPerOwner    int           // retained (non-discarded, non-expired) captures per owner.
 	ReadyRetention         time.Duration // ready-artifact TTL, begins at durable capture.
 	MaxConcurrentUploads   int           // concurrent uploads per API process.
 	MaxConcurrentDownloads int           // concurrent downloads per API process.
@@ -136,6 +137,18 @@ type Service struct {
 	// its last hold is settled. Nil (the default, and every test that does not wire it) is a
 	// no-op; the sweeper's reconciliation pass is the backstop either way.
 	custodySettled func(runID uuid.UUID)
+	// Held-publication FINAL (issue #2545, held_final.go). heldEnabled is UZI_HELD_PUBLICATION
+	// and heldRemote derives the run's forge connection; both are wired by SetHeldPublication
+	// (unset: step B reports held_publication_unsupported). heldListFn is the broker listing,
+	// pushbroker.ListRefTips unless a test replaces it; the two hooks are test-only seams
+	// between the unlocked forge recheck and the locked transaction, and just before the
+	// acknowledge write.
+	heldEnabled     bool
+	heldRemote      HeldRemoteFunc
+	heldListFn      func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	heldPreLockHook func()
+	heldListAllow   func(workerID uuid.UUID) bool
+	heldPreAckHook  func(tx pgx.Tx)
 }
 
 // SetCustodySettledHook wires the post-commit custody-settlement hook (PRD #1810 D3). Call once
@@ -182,8 +195,13 @@ func New(st Store, pool DB, box *secretbox.Box, limits Limits, now func() time.T
 		now:      now,
 		uploads:  make(chan struct{}, up),
 		download: make(chan struct{}, down),
+		// Step B's forge recheck (held_final.go) lists through the broker.
+		heldListFn: pushbroker.ListRefTips,
 	}
 }
+
+// RequestDeadline returns the normalized upload/download request limit.
+func (s *Service) RequestDeadline() time.Duration { return s.limits.RequestDeadline }
 
 // acquire takes one slot from sem or fails when ctx is done (deadline/cancel). It never
 // blocks unboundedly: the request deadline the caller applies bounds the wait.

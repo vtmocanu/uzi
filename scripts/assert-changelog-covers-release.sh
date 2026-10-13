@@ -26,9 +26,11 @@
 # and covers merges that reached main without a PR.
 #
 # WHAT IT CHECKS. For each first-parent merge in <prev-tag>..<ref> that changed
-# shipping code, at least one issue/PRD number from its branch name or commit body
-# must appear in the CHANGELOG section for the version being released. That matches
-# how entries are actually written here ("(issue #148)", "(PRD #121)", "(#60)").
+# shipping code, at least one explicit subject identity (#N, issue N/issue-N,
+# PRD N/PRD #N) or same-repo body closing reference (for example, Fixes #N)
+# must appear in the CHANGELOG section for the version being released. Subject
+# identities embedded in URLs/paths count; bare slash numbers and body prose do not.
+# That matches how entries are actually written here ("(issue #148)", "(PRD #121)", "(#60)").
 # When none does and `gh` is available, an issue the subject's PR "(#N)" closes on
 # GitHub also counts (see the closing-issues lookup below).
 #
@@ -152,6 +154,7 @@ CHANGELOG_FILE="$WORK/changelog.md"
 SECTION_FILE="$WORK/section.md"
 SUBJECT_FILE="$WORK/subject.txt"
 BODY_FILE="$WORK/body.txt"
+CLOSING_BODY_FILE="$WORK/closing-body.txt"
 
 # The body of this version's section, so a number cited under an OLDER version
 # cannot satisfy a merge that landed in this one.
@@ -193,6 +196,7 @@ while read -r sha; do
   # writer to SIGPIPE. `subject` is still needed as a string for the reports.
   git log -1 --format=%s "$sha" > "$SUBJECT_FILE"
   git log -1 --format=%B "$sha" > "$BODY_FILE"
+  git log -1 --format=%b "$sha" > "$CLOSING_BODY_FILE"
   subject="$(cat "$SUBJECT_FILE")"
 
   grep -qiE '^Changelog:[[:space:]]*none' "$BODY_FILE" && continue
@@ -204,13 +208,27 @@ while read -r sha; do
   # comments-only commit to upgrade.go was one of two hits.
   grep -qE '^docs(\([^)]*\))?:' "$SUBJECT_FILE" && continue
 
-  files="$(git diff --name-only "$sha^1" "$sha" 2>/dev/null || git show --name-only --format= "$sha")"
+  # At most two listing attempts per SHA; drain even after classification, then
+  # require producer success before applying exemptions or checking citations.
+  exec {files_fd}< <(
+    listing_tmp="$(mktemp)" || exit 1
+    listing_rc=0
+    if git diff --name-only -z "$sha^1" "$sha" > "$listing_tmp" 2>/dev/null ||
+       git show --name-only --format= -z "$sha" > "$listing_tmp"; then
+      cat "$listing_tmp" || listing_rc=$?
+    else
+      listing_rc=$?
+    fi
+    rm -f "$listing_tmp"
+    exit "$listing_rc"
+  )
+  files_pid=$!
 
   touched_changelog=0
   touched_shipping=0
   touched_nonmeta=0
   shipping_example=""
-  while read -r f; do
+  while IFS= read -r -d '' f; do
     [ -n "$f" ] || continue
     if [ "$f" = "CHANGELOG.md" ]; then
       touched_changelog=1
@@ -224,9 +242,12 @@ while read -r sha; do
       CHANGELOG.md|deploy/chart/Chart.yaml|deploy/chart/values.yaml|scripts/assert-worker-tag-decoupled.sh) ;;
       *) touched_nonmeta=1 ;;
     esac
-  done <<EOF
-$files
-EOF
+  done <&"$files_fd"
+  exec {files_fd}<&-
+  if ! wait "$files_pid"; then
+    echo "assert-changelog-covers-release: could not list changed paths for $sha" >&2
+    exit 1
+  fi
 
   # A `chore(release):` commit is the release commit itself — a mechanical version bump —
   # and never cites an issue. Today's single-step cut always folds CHANGELOG, so it was
@@ -240,28 +261,36 @@ EOF
   [ "$touched_shipping" = 1 ] || continue
   [ "$touched_changelog" = 0 ] || continue
 
-  # Issue/PRD numbers this merge claims, from the branch name and the message.
-  # `chore/release-0.11.10` yields nothing, by design: the `/<digits>-` form needs
-  # digits immediately after the slash.
-  #
-  # BOTH greps need the `|| true`, and the second one is the easy half to miss:
-  # a merge citing no issue number is the case this gate exists to REPORT, and
-  # under `set -euo pipefail` an unguarded `grep` returning 1 makes the whole
-  # command substitution fail, which aborts an ASSIGNMENT (the POSIX distinction
-  # -- a substitution inside a simple command would not). Measured 2026-08-03
-  # cutting v0.14.0: the run died at `fix/agent-test-timeout-knife-edge`, whose
-  # message carries `!161` and `120000` but no `#`-prefixed number, printing the
-  # "Checking ..." header and then exiting 1 with nothing else -- so every merge
-  # after it in the window went unchecked and the operator was told nothing. It
-  # fails CLOSED, which is why it was survivable, but a gate that reports less
-  # than it claims is the exact defect the `--match 'v[0-9]*'` comment above
-  # exists to prevent, arriving through the shell instead of through git.
-  #
-  # These two are `-o`, not `-q`: they read to EOF and never exit early, so no
-  # writer can be SIGPIPEd and the file-not-pipe rule above does not apply to
-  # them. `-h` because `-o` over two files would prefix each hit with a filename.
-  refs="$( { grep -hoiE '(issue[-/ ]?|prd[ -]?#?|#|/)[0-9]+' "$SUBJECT_FILE" "$BODY_FILE" || true; } \
-           | { grep -oE '[0-9]+' || true; } | sort -un )"
+  # Subject identities and body closing references have distinct grammars. Keep
+  # %B for Changelog: none above, but parse only %b as body: squash subcommit
+  # subjects and unrelated prose must not supply the merge identity.
+  # POSIX awk emits nothing (and succeeds) when there are no refs, preserving
+  # the zero-ref diagnostic under set -euo pipefail. All grep -q calls stay on files.
+  # Scan each position without consuming boundaries so adjacent refs survive;
+  # inspect the character after the full numeric token to reject partial numbers.
+  refs="$(awk '
+    function extract(text, body,    i, rest, token, pattern, before, after) {
+      text = tolower(text)
+      if (body)
+        pattern = "^(close|closes|closed|fix|fixes|fixed|resolve|resolves|resolved)[[:space:]]+#[0-9]+"
+      else
+        pattern = "^(#[0-9]+|issue([[:space:]]+|-)[0-9]+|prd[[:space:]]+#?[0-9]+)"
+      for (i = 1; i <= length(text); i++) {
+        rest = substr(text, i)
+        if (!match(rest, pattern)) continue
+        token = substr(rest, 1, RLENGTH)
+        before = i > 1 ? substr(text, i - 1, 1) : ""
+        after = substr(rest, RLENGTH + 1, 1)
+        if ((body || substr(token, 1, 1) != "#") && before ~ /[[:alnum:]_]/) continue
+        if (after ~ /[[:alnum:]_]/) continue
+        sub(/^[^0-9]*/, "", token)
+        print token
+      }
+    }
+    FILENAME == ARGV[1] { subject = subject $0 "\n"; next }
+    { body = body $0 "\n" }
+    END { extract(subject, 0); extract(body, 1) }
+  ' "$SUBJECT_FILE" "$CLOSING_BODY_FILE" | sort -un)"
 
   short="$(git rev-parse --short "$sha")"
 

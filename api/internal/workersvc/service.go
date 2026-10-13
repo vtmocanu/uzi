@@ -86,10 +86,12 @@ var terminalStatuses = map[string]bool{"completed": true, "failed": true, "cance
 
 // Sentinel errors mapped to HTTP status codes by the handlers.
 var (
-	ErrRunNotFound   = errors.New("run not found")
-	ErrRunNotOwned   = errors.New("run not owned by worker")
-	ErrRepoNotFound  = errors.New("repo not found")
-	ErrIssueNotFound = errors.New("issue not found")
+	ErrRunNotFound = errors.New("run not found")
+	ErrRunNotOwned = errors.New("run not owned by worker")
+	// ErrRunWallExpired refuses an ordinary pause or guarded question at the run deadline.
+	ErrRunWallExpired = errors.New("run wall deadline expired")
+	ErrRepoNotFound   = errors.New("repo not found")
+	ErrIssueNotFound  = errors.New("issue not found")
 	// ErrNotPRDIssue rejects a run on an issue that does not carry the configured
 	// run-eligibility label (PRD #764 M1: the uzi_label) → 422. This is now the SINGLE
 	// eligibility gate — an issue without the uzi_label is not uzi's to run, PRD link
@@ -136,6 +138,10 @@ var (
 	// param) bypasses ONLY this guard, never the active-run gate.
 	ErrOpenMRExists = errors.New("issue already has an open MR")
 	ErrRunTerminal  = errors.New("run has already finished")
+	// ErrApprovalMilestonesMoved is the unbound approve's answer (issue #2680) when the plan's
+	// milestone list kept changing between the contract build and the freeze, or the run left the
+	// plan gate while the approve retried: nothing was written. → 409 approval_milestones_moved.
+	ErrApprovalMilestonesMoved = errors.New("the plan's milestones changed while approving; re-read the plan and approve again")
 	// ErrStopNotInteractive rejects a `stop` on a run that is not an interactive task
 	// (PRD #517 M4) → 409. A graceful stop is honored ONLY by the interactive-task park:
 	// no other run kind reads the stop flag, so a stop on a plan-gated / chat /
@@ -176,20 +182,36 @@ var (
 	// so CreateRunInput can map it to 400 with the reason verbatim, rather than letting an
 	// invalid mode fall through to the 500 default arm.
 	ErrInvalidPauseMode = errors.New("invalid pause mode")
-	// The four `extend` sentinels (PRD #1189 M1). ErrInvalidExtension rejects a body that is
+	// The `extend` sentinels (PRD #1189 M1, #2735). ErrInvalidExtension rejects a body that is
 	// not a whole number of seconds >= 60 → 400. ErrExtendDisabled is the admin off-switch
-	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the per-run cap gate,
-	// whose message names the remaining allowance → 409. ErrExtendNotTimed rejects a run of a
-	// kind that never times out (chat/judge/interactive) → 409. The last two are disambiguated
-	// from a 0-row CreateExtendInput by extendRefusalReason over the already-fetched run.
-	ErrInvalidExtension     = errors.New("invalid extension")
-	ErrExtendDisabled       = errors.New("extending runs is turned off")
-	ErrExtensionCapExceeded = errors.New("extension cap exceeded")
-	ErrExtendNotTimed       = errors.New("this run has no wall-clock timeout to extend")
+	// (run_extension_cap_seconds = 0) → 409. ErrExtensionCapExceeded is the PER-REQUEST gate: one
+	// request may not exceed run_extension_cap_seconds (the cumulative total is not capped by it),
+	// → 409. ErrExtensionLimitReached is the admission gate: the request must fit the room
+	// under MaxRunWallSeconds after wall, extension and finalize reserves, → 409. ErrExtendNotTimed
+	// rejects a run of a kind that never times out (chat/judge/interactive) → 409. The last three
+	// are disambiguated from a 0-row CreateExtendInput by extendRefusalReason over the
+	// already-fetched run.
+	ErrInvalidExtension      = errors.New("invalid extension")
+	ErrExtendDisabled        = errors.New("extending runs is turned off")
+	ErrExtensionCapExceeded  = errors.New("extension cap exceeded")
+	ErrExtensionLimitReached = errors.New("total run time limit reached")
+	ErrExtendNotTimed        = errors.New("this run has no wall-clock timeout to extend")
 	// ErrWallParkStopUnavailable (PRD #1497 M1, D9) rejects a `stop` on a budget_exhausted wall park
 	// that has nothing to finalize (zero completed milestones), is not a milestone issue run, or has
 	// already used its one-time finalize allowance. It names the choices that remain: extend or cancel.
 	ErrWallParkStopUnavailable = errors.New("this parked run has nothing to finalize; extend it to keep working, or cancel it")
+	// ErrProviderHoldStopUnavailable (PRD #1733) rejects a `stop` on a provider_unavailable hold with
+	// no completed milestone: the stop is the scope-ceiling write, and a ceiling of 0 would resume
+	// the run only to finalize nothing. It names the choices that remain: resume or cancel. → 409.
+	ErrProviderHoldStopUnavailable = errors.New("this run has no completed milestone to finalize; resume it to try again, or cancel it")
+	// ErrWallParkChanged rejects an `extend` on a budget_exhausted wall park whose run changed
+	// between the owner's read and the extend statement (resumed, paused by its owner, finished,
+	// or otherwise no longer held at its time budget). Nothing was extended or resumed. → 409.
+	ErrWallParkChanged = errors.New("this run is no longer parked at its time budget; nothing was extended")
+	// ErrWallParkCrossCheckIneligible rejects an `extend` on a wall-parked plan cross-check whose
+	// lead's plan check is no longer pending (decided, expired, or its lead moved on), so the
+	// checker cannot resume. Nothing was extended or resumed. → 409.
+	ErrWallParkCrossCheckIneligible = errors.New("this plan cross-check can no longer resume: its lead's plan check is no longer pending; nothing was extended")
 	// ErrReviseCapReached rejects a revise_plan once the run has hit
 	// PLAN_MAX_REVISIONS persisted revisions (PRD #41). Counted over ALL
 	// revise_plan rows for the run (a consumed revise still counts), so the cap is
@@ -463,6 +485,10 @@ type Store interface {
 	// run, guarded (embedded) on the worker holding no non-terminal run (PRD #529 M4).
 	DeleteEphemeralWorkerForRun(ctx context.Context, arg store.DeleteEphemeralWorkerForRunParams) (int64, error)
 	CountWorkerNonTerminalRuns(ctx context.Context, arg store.CountWorkerNonTerminalRunsParams) (int64, error)
+	// Issue #2602: the run-detail blocked-by hint (MaybeBlockedByRun).
+	GetLatestRunQuestion(ctx context.Context, runID uuid.UUID) ([]byte, error)
+	RunQuestionAnswerExists(ctx context.Context, arg store.RunQuestionAnswerExistsParams) (bool, error)
+	GetMaybeBlockingRun(ctx context.Context, arg store.GetMaybeBlockingRunParams) (uuid.UUID, error)
 	MarkStaleWorkersOffline(ctx context.Context, cutoff pgtype.Timestamptz) (int64, error)
 
 	// Runs.
@@ -476,11 +502,15 @@ type Store interface {
 	// (what is new since the last cycle) and advances the consumed high-water WITHOUT
 	// spending an automatic cycle; UserHasEnabledAnthropicToken is the door-check that the
 	// owner can pay for the run the endpoint would mint.
-	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.MrReworkLedger, error)
-	RemoveMRReworkPendingIDs(ctx context.Context, arg store.RemoveMRReworkPendingIDsParams) error
+	GetMRReworkLedger(ctx context.Context, arg store.GetMRReworkLedgerParams) (store.GetMRReworkLedgerRow, error)
+	RemoveMRReworkPendingKeys(ctx context.Context, arg store.RemoveMRReworkPendingKeysParams) error
 	// UpsertMRReworkLedger records an automatic cycle (issue #2347): the watcher's create runs
-	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance).
-	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) error
+	// it in the same transaction as the run INSERT (CreateAutoMRReworkRunAndAdvance). It returns
+	// the rows written; 0 means the row is legacy (ADR-1199) and nothing was written.
+	UpsertMRReworkLedger(ctx context.Context, arg store.UpsertMRReworkLedgerParams) (int64, error)
+	// BootstrapMRReworkLedgerMarks upgrades a legacy ledger row to the namespaced state once
+	// (Service.BootstrapReviewLedger); 0 rows means the row moved or was already upgraded.
+	BootstrapMRReworkLedgerMarks(ctx context.Context, arg store.BootstrapMRReworkLedgerMarksParams) (int64, error)
 	// CreateManualMRReworkRunAndAdvance folds the on-demand run INSERT and the non-counting
 	// high-water advance into ONE atomic statement (PRD #1202, review-finding hardening):
 	// Postgres commits BOTH or NEITHER, so a create can never leave an unadvanced ledger that
@@ -876,6 +906,11 @@ type Store interface {
 	// recovery_retry_not_before guard, mirroring PromoteRecoveryWaitRuns' mutation set. A
 	// 0-row result is a raced no-op (409).
 	PromoteRecoveryWaitRunNow(ctx context.Context, arg store.PromoteRecoveryWaitRunNowParams) (int64, error)
+	// LockRunForCredentialSwitch and ResetProviderParkStreakForOwner are SetRunCredential's
+	// single-transaction pieces (PRD #1733): the row lock that detects a raced run, and the
+	// fenced streak clear for the statuses whose promote does not fold it in.
+	LockRunForCredentialSwitch(ctx context.Context, arg store.LockRunForCredentialSwitchParams) (store.LockRunForCredentialSwitchRow, error)
+	ResetProviderParkStreakForOwner(ctx context.Context, arg store.ResetProviderParkStreakForOwnerParams) (int64, error)
 	// PRD #1190 M1 pause/resume. SetRunPaused parks a running run on the owner's request
 	// (positive source guard, like SetRunLimitWait); ResumePausedRun promotes it back
 	// (paused → queued) with gate-park accounting; ClearPauseRequest clears a pending
@@ -1019,9 +1054,10 @@ type Store interface {
 	CountOnlineWorkersClaimableForRun(ctx context.Context, arg store.CountOnlineWorkersClaimableForRunParams) (store.CountOnlineWorkersClaimableForRunRow, error)
 	// ExtendAndResumeWallPark / StopWallPark (PRD #1497 M1, D7/D9) are the owner's Extend and Stop on
 	// a budget_exhausted wall park, each in one statement: bank the overrun, resume, and (Stop) cap
-	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the new total
-	// extension; StopWallPark returns the run id (0 rows / ErrNoRows on refusal).
-	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (int32, error)
+	// the scope + grant the 1800s finalize allowance. ExtendAndResumeWallPark returns the
+	// post-update budget row (pgx.ErrNoRows on refusal); StopWallPark returns the run id (0 rows /
+	// ErrNoRows on refusal).
+	ExtendAndResumeWallPark(ctx context.Context, arg store.ExtendAndResumeWallParkParams) (store.ExtendAndResumeWallParkRow, error)
 	StopWallPark(ctx context.Context, arg store.StopWallParkParams) (uuid.UUID, error)
 	// StampCompletionBudgetExhausted (PRD #1226 M4, D3) arms the server-side served
 	// `budget_exhausted` steer on EXACTLY the post-attempt live-worker interlocked rows
@@ -1357,6 +1393,7 @@ type Params struct {
 	PlanCrossCheckMaxRevisions int32
 	// Presence distinguishes an explicitly disabled budget from an unwired service.
 	PlanCrossCheckMaxRevisionsSet bool
+	CodeCrossCheckTimeout         time.Duration
 	PlanCrossCheckTimeout         time.Duration
 	RunTimeout                    time.Duration
 	RunWallCeiling                time.Duration
@@ -1411,6 +1448,10 @@ type Params struct {
 	// the run lane's @affinity_cutoff, distinct from WorkerAffinityGrace which stays the
 	// chat lane's grace (ClaimChatRun gets no liveness short-circuit in M1's scope).
 	WorkerAffinityCeiling time.Duration
+	// WorkerStaleRequeueGrace (#2705): how long ClaimRun keeps a run the stale-worker sweeper
+	// requeued pinned to its previous worker (while that worker's row exists). Zero or negative
+	// disables the pin (NULL cutoff); the zero value keeps existing tests unaffected.
+	WorkerStaleRequeueGrace time.Duration
 	// WorkerSpreadGrace (PRD #216): a queued run older than this is exempt from the
 	// fleet-aware spread (fail-open), so a run can never be stranded by deferral.
 	WorkerSpreadGrace time.Duration
@@ -1549,6 +1590,12 @@ type Params struct {
 	// server-derived fail_origin='data_volume_full' instead of parking when a COUNTED park would
 	// take disk_park_count past it. A preventive park is neither counted nor capped. 0 = unlimited.
 	RunDiskParkMax int
+	// RunProviderParkMaxDuration (PRD #1733), mirrored from config RUN_PROVIDER_PARK_MAX_DURATION.
+	// The elapsed-time bound on an unbroken streak of typed provider_outage parks: the first
+	// such park at or past it becomes a paused 'provider_unavailable' owner hold instead of a
+	// recovery_wait (parkProviderOutage). It never fails a run. The ZERO VALUE disables the hold
+	// (typing and counting stay on); the 24h default lives in config.go.
+	RunProviderParkMaxDuration time.Duration
 
 	// RunGateRefusalMax (PRD #1795 M1), mirrored from config RUN_GATE_REFUSAL_MAX. The refusal
 	// cap on plan-gate re-presentation: a refused awaiting_approval report counts once per claim
@@ -1581,6 +1628,11 @@ type Params struct {
 	// the list, and a pending row there settles 'disabled' after a CAS delete of any unrecorded
 	// copy. Empty (the zero value) is off.
 	SalvageForges []string
+
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) carries config.Config.HeldPublication.
+	// It gates step A only (held_publish.go). The zero value is off; the default-on lives in
+	// config.go where the env is read.
+	HeldPublication bool
 }
 
 // Broadcaster receives run events after they are persisted, for live fan-out to
@@ -1836,6 +1888,10 @@ type Service struct {
 	// leaseAtOverride pins Claim's @lease_at admission instant. TEST-ONLY: unexported, zero in
 	// production (Valid false), so Claim always reads LeaseClockNow. See claimLeaseAt.
 	leaseAtOverride pgtype.Timestamptz
+	// beforeCredentialSwitchTx runs in setCredentialAndPromote after SetRunCredential's unlocked
+	// read and before its transaction begins. TEST-ONLY: unexported and nil in production; a test
+	// uses it to move the run in that window and prove the switch is refused.
+	beforeCredentialSwitchTx func()
 	// leaseClaimProbe, when set by a test, is told the outcome of every claim that ran through a
 	// lease: whether ClaimRun admitted a run through it and whether the rebind applied. TEST-ONLY:
 	// nil in production.
@@ -1903,7 +1959,22 @@ type Service struct {
 	salvageCreateRefFn   func(ctx context.Context, o pushbroker.CreateRefOptions) error
 	salvageDeleteRefFn   func(ctx context.Context, o pushbroker.DeleteOptions) error
 	salvagePassBudget    time.Duration
-	salvageLeadPending   bool
+	// heldPrepareFn / heldSendFn / heldListFn are step A's broker seams (issue #2545): the
+	// read-only pack pre-verify, the single create-only push and the reconcile listing. They
+	// default to pushbroker.PrepareHeldPack, SendHeldCreate and ListRefTips (set in New); tests
+	// stub them with a fake forge. heldSlots is the process-wide step-A semaphore.
+	// heldOutcomeHook, when set, runs inside tx2 before its commit (fault injection).
+	heldPrepareFn   func(ctx context.Context, o pushbroker.HeldPackOptions) (*pushbroker.PreparedHeldPack, error)
+	heldSendFn      func(ctx context.Context, p *pushbroker.PreparedHeldPack) (pushbroker.HeldCreateOutcome, error)
+	heldListFn      func(ctx context.Context, o pushbroker.ListRefsOptions, refs ...string) (map[string]string, error)
+	heldSlots       chan struct{}
+	heldOutcomeHook func() error
+	// heldDeleteFn is the held cleanup's CAS delete (default pushbroker.Delete); heldCleanupHook,
+	// when set, runs inside the cleanup transaction after the run lock and before any forge call
+	// (test fault injection). Both belong to SweepHeldPublications (held_cleanup.go).
+	heldDeleteFn       func(ctx context.Context, o pushbroker.DeleteOptions) error
+	heldCleanupHook    func(stage string)
+	salvageLeadPending bool
 	// createRefFn is the go-git recovery-ref CREATOR (PRD #1810 M3, D2): supersession preserves
 	// a retained checkpoint tip under refs/uzi-recovery/<run id> before freeing the branch ref.
 	// Defaults to pushbroker.CreateRef (set in New); tests stub it with an in-memory forge.
@@ -2182,6 +2253,25 @@ func (s *Service) notify(runID uuid.UUID, status string) {
 // defaultClaimGrace is the claimed-but-never-started reclaim window (PRD: 5m).
 const defaultClaimGrace = 5 * time.Minute
 
+// MaxRunWallSeconds is the retained extension-admission limit in seconds (about 24.8 days).
+// Extend room subtracts the reserved wall, existing extensions and finalize allowance from it.
+// It is not an absolute cap on served totals: later configuration increases are honored without
+// clamping by the worker's shared chunked monotonic relative timers (#2761). Native chunks are
+// at most 2147483646 ms; executor elapsed accounting and absolute-time predicates are unchanged.
+const MaxRunWallSeconds = math.MaxInt32 / 1000
+
+// MaxRunWallCeiling is the largest RUN_WALL_CEILING the configuration can ever have: the
+// config.Load validator refuses an explicit value above it, and the derived default is capped at
+// it. The extend bound reserves max(frozen wall, it) for every run, because plan approval can
+// scale a NULL wall up to a ceiling raised after the extension was granted.
+// TestMaxRunWallCeilingMatchesConfigValidator keeps it equal to that validator's bound.
+const MaxRunWallCeiling = 72 * time.Hour
+
+// WallParkFinalizeSeconds is the one-time finalize allowance StopWallPark grants (SQL literal
+// budget_finalize_seconds = 1800). Extension admission reserves it before Stop grants it;
+// a LiveDB test pins it against the SQL. This reserve does not cap later served totals.
+const WallParkFinalizeSeconds = 1800
+
 // defaultDispatchGrace is the undispatched-task-run reaper window (issue #1367): a
 // kind='task' (handoff) run may sit queued+undispatched this long before the sweep
 // terminalizes it. Deliberately larger than defaultClaimGrace — a local push+dispatch
@@ -2211,6 +2301,11 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		salvageListRefTipsFn: pushbroker.ListRefTips,
 		salvageCreateRefFn:   pushbroker.CreateRef,
 		salvageDeleteRefFn:   pushbroker.Delete,
+		heldPrepareFn:        pushbroker.PrepareHeldPack,
+		heldSendFn:           pushbroker.SendHeldCreate,
+		heldListFn:           pushbroker.ListRefTips,
+		heldDeleteFn:         pushbroker.Delete,
+		heldSlots:            make(chan struct{}, heldPublishMaxConcurrent),
 		createRefFn:          pushbroker.CreateRef,
 		listRefTipsFn:        pushbroker.ListRefTips,
 		background:           func(fn func()) { go fn() },
@@ -2224,6 +2319,15 @@ func New(q Store, box *secretbox.Box, p Params) *Service {
 		retentionPassBudget:           retentionPassBudget,
 		retentionSweepOpTimeout:       retentionSweepOpTimeout,
 	}
+}
+
+// SetClock overrides the service clock for deterministic deadline checks. Configure
+// it before serving requests; a nil clock restores time.Now.
+func (s *Service) SetClock(now func() time.Time) {
+	if now == nil {
+		now = time.Now
+	}
+	s.now = now
 }
 
 // -------------------------------------------------------------------------
@@ -2269,7 +2373,11 @@ func (s *Service) Register(ctx context.Context, wkr store.Worker, version, templ
 }
 
 // RegisterWithCrossCheckSlots validates the independently advertised checker budget.
-func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns, maxCrossCheckSlots *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot) (store.Worker, string, error) {
+func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Worker, version, template string, maxConcurrentRuns, maxCrossCheckSlots *int, capabilities []string, protocolCapabilities []string, snapshot *ActiveSnapshot, podUID ...uuid.UUID) (store.Worker, string, error) {
+	var registeredPodUID pgtype.UUID
+	if wkr.Kind == "hosted" && len(podUID) == 1 && podUID[0] != uuid.Nil {
+		registeredPodUID = pgconv.UUID(podUID[0])
+	}
 	if maxCrossCheckSlots != nil && (*maxCrossCheckSlots < 0 || *maxCrossCheckSlots > 16) {
 		return store.Worker{}, "", errors.New("max_cross_check_slots must be between 0 and 16")
 	}
@@ -2307,6 +2415,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	// it here — which correctly makes it unable to claim an interlocked run.
 	protocolCaps := capability.FilterProtocol(protocolCapabilities)
 	regParams := store.RegisterWorkerParams{
+		RegisteredPodUid:      registeredPodUID,
 		Version:               pgconv.TextOrNull(version),
 		TemplateReported:      pgconv.TextOrNull(template),
 		Capabilities:          storedCaps,
@@ -2685,6 +2794,14 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		missingRequeued []store.FrozenRequeueRunsMissingFromSnapshotRow
 	)
 	if applied {
+		if updated.Kind == "hosted" && updated.RegisteredPodUid.Valid {
+			updated.RollHeartbeatAt, err = qtx.StampWorkerRollHeartbeat(ctx, store.StampWorkerRollHeartbeatParams{
+				ID: updated.ID, RegisterNonce: updated.SnapshotRegisterNonce, SnapshotEpoch: snapshot.SnapshotEpoch,
+			})
+			if err != nil {
+				return store.Worker{}, err
+			}
+		}
 		frozen, parents, err := locks.parameters()
 		if err != nil {
 			return store.Worker{}, err
@@ -3079,6 +3196,7 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		WorkerID:                 pgconv.UUID(wkr.ID),
 		UserID:                   wkr.UserID,
 		AffinityCutoff:           pgconv.Time(claimNow.Add(-s.p.WorkerAffinityCeiling)),
+		StaleRequeueCutoff:       StaleRequeueCutoff(claimNow, s.p.WorkerStaleRequeueGrace),
 		CrossCheckEvaluatedAt:    pgconv.Time(claimNow),
 		CrossCheckAffinityCutoff: pgconv.Time(claimNow.Add(-s.p.WorkerAffinityGrace)),
 		IsDockerWorker:           isDocker,
@@ -3626,7 +3744,11 @@ func branchMovedStopReason(reason *string) string {
 type StateRequest struct {
 	RegisterNonce string `json:"register_nonce,omitempty"`
 	MemoryEpisode *int64 `json:"memory_episode,omitempty"`
-	State         string `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
+	// RequireRunning fences a question write against a flight that has already parked.
+	RequireRunning bool `json:"require_running,omitempty"`
+	// CompletionFinalHead is the durably delivered final SHA, negotiated separately from permits.
+	CompletionFinalHead *string `json:"completion_final_head,omitempty"`
+	State               string  `json:"status"` // running|awaiting_approval|awaiting_input|awaiting_followup|limit_wait|recovery_wait|paused|pause_failed|credential_switch|completed|failed
 	// ClaimGeneration is the runs.claim_generation the worker believes it holds (PRD #1247
 	// M5, D3). A CAPABILITY worker (credential_switch_v1) stamps it on EVERY mutating report;
 	// SetState then fences the transition atomically on `claim_generation = @gen AND
@@ -3900,6 +4022,18 @@ type StateRequest struct {
 	// (validateDiskParkPreventive). httpx.DecodeJSON rejects unknown fields, so a worker sends it
 	// only once the api advertises the recovery_cause_data_volume_full feature.
 	DiskParkPreventive *bool `json:"disk_park_preventive"`
+	// ProductiveTurns qualifies a recovery_cause "provider_outage" park (PRD #1733): the number
+	// of model turns the PARKING FLIGHT completed without error since its claim. A positive value
+	// is progress and starts a new provider-park streak at this park; zero or absent continues
+	// the open streak. Only valid with status recovery_wait and that cause, and never negative:
+	// SetState rejects anything else as ErrInvalidState (400, never a decode error) before any
+	// SQL (validateProviderPark), so a worker can tell this api's validation refusal from an older
+	// api's strict-decode refusal of the unknown field. httpx.DecodeJSON rejects unknown fields,
+	// so a worker sends it only once the api advertises the recovery_cause_provider_outage feature.
+	ProductiveTurns *int32 `json:"productive_turns"`
+
+	// ProviderProgressTurns consumes completed turns only with a fenced ordinary or disk park.
+	ProviderProgressTurns *int32 `json:"provider_progress_turns"`
 	// CheckpointContainsLatest is the worker's durability report on a PARK (PRD #1809 M6, D8):
 	// true when the checkpoint the park published contains the run's latest committed work, false
 	// when it does not (the recovery pin or the fetch-back failed, so the only copy of the latest
@@ -3994,24 +4128,44 @@ func (s *Service) SetStateReport(ctx context.Context, wkr store.Worker, runID uu
 }
 
 func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUID, req StateRequest, gateRevisionOut *int64, reconciliationOut **LeadReconciliation) (run store.Run, applied bool, err error) {
+	if req.RequireRunning && (req.State != "awaiting_input" || req.ClaimGeneration == nil || *req.ClaimGeneration <= 0) {
+		return store.Run{}, false, fmt.Errorf("%w: require_running requires awaiting_input and positive claim_generation", ErrInvalidState)
+	}
 	// PRD #1392 M1: validate the TYPED recovery cause against the server enum BEFORE any state
 	// SQL, so an unknown non-nil value is a loud 400 (ErrInvalidState) rather than a
 	// constraint violation at the park write. Absent (nil) is fine (an ordinary report or a
-	// legacy untyped park). Only forge_unreachable triggers the dedicated park transaction
-	// below; empty_turn/provider_outage are accepted here (reserved, D9) but take the ordinary
-	// untyped park, which writes cause NULL. vault_locked (issue #1766 M2) takes the same
+	// legacy untyped park). forge_unreachable and provider_outage use dedicated park
+	// transactions below; provider_outage carries its own streak accounting (PRD #1733).
+	// empty_turn remains reserved (D9) and takes the ordinary untyped park, which writes
+	// cause NULL. vault_locked (issue #1766 M2) takes the same
 	// ordinary park, which persists that one cause. data_volume_full (PRD #1809 M5) takes its
 	// own counted park transaction; disk_park_preventive is valid only alongside it.
+	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable &&
+		!slices.Contains(wkr.ProtocolCapabilities, capability.CodexAccountParkV1) {
+		return store.Run{}, false, fmt.Errorf("%w: codex account park capability required", ErrInvalidState)
+	}
+	// The account park requires a generation regardless of credential-switch capability.
+	// Validate before the generic generation fence so this malformed request stays a 400.
+	if req.State == "recovery_wait" && req.RecoveryCause != nil &&
+		*req.RecoveryCause == recoveryCauseCodexAccountUnavailable && req.ClaimGeneration == nil {
+		return store.Run{}, false, fmt.Errorf("%w: account park requires claim_generation", ErrInvalidState)
+	}
 	if req.RecoveryCause != nil && serverRecoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: recovery_cause %q is server-only", ErrInvalidState, *req.RecoveryCause)
 	}
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
 	}
+	if err := validateCompletedPublicationReport(wkr, req); err != nil {
+		return store.Run{}, false, err
+	}
 	if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseWorkerMemoryPressure {
 		return s.parkWorkerMemoryPressure(ctx, wkr, runID, req)
 	}
 	if err := validateDiskParkPreventive(req); err != nil {
+		return store.Run{}, false, err
+	}
+	if err := validateProviderPark(req); err != nil {
 		return store.Run{}, false, err
 	}
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
@@ -4161,7 +4315,7 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.ClaimGeneration == nil && stateUsesForUpdateFence(req.State, owned) && owned.ClaimReleasedAt.Valid {
 		return owned, false, ErrStaleClaim
 	}
-	if req.ClaimGeneration != nil && stateUsesForUpdateFence(req.State, owned) {
+	if req.ClaimGeneration != nil && (req.RequireRunning || stateUsesForUpdateFence(req.State, owned)) {
 		if s.txBeginner == nil {
 			return store.Run{}, false, fmt.Errorf("state fence unavailable: no tx beginner wired for run %s", runID)
 		}
@@ -4171,18 +4325,16 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		}
 		fenceTx = tx
 		qtx := store.New(tx)
-		// PRD #2006: an ephemeral worker's terminal report locks the WORKER row before the run
-		// row, the canonical order Claim, Register, Heartbeat and the sweepers use, so the lease
-		// entry below serializes against a claim, a cordon and the reaper. Only a terminal fenced
-		// report on an ephemeral worker with the lease on; every other report is unchanged.
-		if s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed") {
+		// Completed publication and ephemeral leasing serialize on the worker before the run.
+		// Keep leasing conditional on an ephemeral terminal report with the lease enabled.
+		leaseFence = s.ephemeralLease > 0 && wkr.Ephemeral && (req.State == "completed" || req.State == "failed")
+		if leaseFence || completedPublicationCapable(wkr, req) {
 			if _, werr := qtx.GetWorkerForUpdate(ctx, wkr.ID); werr != nil {
 				if errors.Is(werr, pgx.ErrNoRows) {
 					return store.Run{}, false, ErrRunNotOwned // the worker row is gone: the run left it
 				}
 				return store.Run{}, false, werr
 			}
-			leaseFence = true
 		}
 		locked, lerr := qtx.GetRunOwnedByWorkerForUpdate(ctx, store.GetRunOwnedByWorkerForUpdateParams{ID: runID, WorkerID: pgconv.UUID(wkr.ID)})
 		if lerr != nil {
@@ -4198,6 +4350,31 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			// released this claim. Return the LOCKED row so the handler can render it beside the
 			// stale_claim disposition. The deferred Rollback releases the lock.
 			return locked, false, ErrStaleClaim
+		}
+		if req.RequireRunning {
+			if locked.PauseMode.String == "wall" || PendingCredentialSwitchSignal(locked) != nil {
+				return locked, false, nil
+			}
+			if locked.Status == "awaiting_input" {
+				var qid string
+				if req.OpenQuestionID != nil {
+					clean, _ := stripNUL(*req.OpenQuestionID)
+					qid = strings.TrimSpace(clean)
+				}
+				// The same accepted question can be replayed after a lost ACK. Return
+				// under the lock without repeating accounting or transition fan-out.
+				if qid != "" && len([]rune(qid)) <= maxQuestionIDRunes && locked.OpenQuestionID.Valid && locked.OpenQuestionID.String == qid {
+					return locked, true, nil
+				}
+				return locked, false, nil
+			}
+			if locked.Status != "running" {
+				return locked, false, nil
+			}
+			deadline := RunDeadline(locked.StartedAt, locked.BudgetWallSeconds, locked.BudgetPausedSeconds, locked.Kind, locked.Interactive, locked.Status, s.p.RunTimeout, locked.BudgetExtensionSeconds, locked.BudgetFinalizeSeconds)
+			if deadline != nil && !s.now().Before(*deadline) {
+				return locked, false, ErrRunWallExpired
+			}
 		}
 		// Locked and current: the arms below mutate through the tx, and the lock is held
 		// until the post-mutation commit, so no ClaimRun/release can interleave. Use the
@@ -4244,6 +4421,8 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// terminal and scope-directed: 'applied' if the re-read carries stop_kind scope_capped,
 	// 'declined' otherwise.
 	var settleScopeDisposition string
+	// providerHeld marks a typed provider park that parkProviderOutage turned into the paused hold (PRD #1733).
+	var providerHeld bool
 	switch req.State {
 	case "running":
 		// RC1 (issue #1197): an AUTOPILOT run auto-approves its own plan and NEVER reports
@@ -4592,7 +4771,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// Interlocked completion derives its stamp from the locked row; leave audit
 		// settlement to the committed reread below, including directives racing owned.
 		completedParams := store.SetRunCompletedParams{
-			Branch: stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
+			CompletionFinalHead:  completedPublicationHead(wkr, req),
+			CompletionGeneration: pgconv.Int8Ptr(req.ClaimGeneration),
+			Branch:               stripNULParam(req.Branch), MrIid: pgconv.Int8Ptr(req.MrIID), MrWebUrl: stripNULParam(req.MrWebURL), SessionID: sessionID,
 			FixVerdict:  clampWireFixVerdict(req.FixVerdict),
 			PrdDonePath: clampWirePRDDonePath(owned, req.PrdDonePath),
 			// Checker report-only is a server-owned kind invariant. Checker
@@ -4705,7 +4886,28 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 		// lifecycle); it is NOT a usage limit — see setRecoveryWait / recoverywait.go. Issue
 		// #1766 M2: a vault_locked report parks here too and is the one cause this park stores;
 		// the timer promoter re-queues it and Claim holds it idle while the vault stays locked.
-		rows, err = s.setRecoveryWait(ctx, owned, wkr, req, sessionID)
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseCodexAccountUnavailable {
+			var crun store.Run
+			crun, rows, err = s.parkRunningCodexAccountUnavailable(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return crun, false, err
+			}
+			break
+		}
+		// PRD #1733: the TYPED provider-transient park is its own locked transaction too, because
+		// the streak and the hold decision need one snapshot. Only the typed cause routes here;
+		// an untyped or empty-turn park falls through to setRecoveryWait below, which clears the
+		// streak only on positive fenced progress evidence. A held outcome leaves the run 'paused',
+		// so its durability report is stored against that status below.
+		if req.RecoveryCause != nil && *req.RecoveryCause == recoveryCauseProviderOutage {
+			var prun store.Run
+			prun, rows, providerHeld, err = s.parkProviderOutage(ctx, wkr, owned, req, sessionID)
+			if err != nil {
+				return prun, false, err
+			}
+			break
+		}
+		rows, err = s.setRecoveryWait(ctx, s.q, recoveryCauseStored(req.RecoveryCause), owned, wkr, req, sessionID)
 	case "paused":
 		// PRD #1190 M1: the owner-requested park. SetRunPaused has the SAME positive-source-guard
 		// ack contract as limit_wait — the worker keys off the RETURNED status being literally
@@ -4882,7 +5084,13 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	// PRD #1809 M6 (D8): an applied park records its checkpoint-durability report before the
 	// re-read, so the returned run carries it.
 	if rows > 0 {
-		s.recordCheckpointDurability(ctx, wkr, owned, req)
+		if providerHeld {
+			// The bounded provider park left the run 'paused', not 'recovery_wait': store the
+			// durability report against the status the run actually holds.
+			s.setCheckpointDurability(ctx, wkr, owned, "paused", req.CheckpointContainsLatest)
+		} else {
+			s.recordCheckpointDurability(ctx, wkr, owned, req)
+		}
 	}
 	// Re-read so the worker sees the authoritative status. Ownership already
 	// held above, so 0 rows means the transition was not applied under either branch
@@ -5312,6 +5520,11 @@ type ConsumeInputsResult struct {
 	// #1673). Absent, the reply was consumed on read: an older api pod mid-roll, or a legacy
 	// worker, and the worker routes it with no receipts.
 	Receipts bool
+	// OwnerID is the run owner's user id, set only on the paths that return the normal inputs
+	// reply (not on the pending-switch or released-claim early returns). The handler resolves the
+	// per-run now-summary setting for THIS user, never the caller's (PRD #2603); a nil id means
+	// "omit the field", which the worker reads as off.
+	OwnerID uuid.UUID
 }
 
 // ConsumeInputs returns steering inputs for a run the worker owns, FIFO.
@@ -5358,7 +5571,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 		for _, row := range rows {
 			out = append(out, inputDTO(row.ID, row.Kind, row.Body, row.CreatedAt, row.GateBinding, row.GateRevision))
 		}
-		return ConsumeInputsResult{Inputs: out, Receipts: true}, nil
+		return ConsumeInputsResult{Inputs: out, Receipts: true, OwnerID: run.UserID}, nil
 	}
 	rows, err := s.q.ConsumeRunInputs(ctx, runID)
 	if err != nil {
@@ -5381,7 +5594,7 @@ func (s *Service) ConsumeInputs(ctx context.Context, wkr store.Worker, runID uui
 	if consumedFollowUp && s.bcast != nil {
 		s.bcast.PublishInput(runID)
 	}
-	return ConsumeInputsResult{Inputs: out}, nil
+	return ConsumeInputsResult{Inputs: out, OwnerID: run.UserID}, nil
 }
 
 // ConsumedFollowUps returns the already-consumed follow_up inputs of a run the worker owns,
@@ -5568,10 +5781,10 @@ func (s *Service) ListMemoryForRun(ctx context.Context, wkr store.Worker, runID 
 // forge pre-clone park (PRD #1392 M1, D10) uses the retry stamp to reconcile an unknown park
 // outcome after a transport failure — so a reconciled park can still quote its retry time. The
 // stamp is nil for a run that is not recovery-parked.
-func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, err error) {
+func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid.UUID) (status string, recoveryRetryNotBefore *time.Time, claimGeneration int64, holdReason *string, claimReleased bool, err error) {
 	run, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
-		return "", nil, 0, err
+		return "", nil, 0, nil, false, err
 	}
 	var retry *time.Time
 	if run.RecoveryRetryNotBefore.Valid {
@@ -5582,7 +5795,13 @@ func (s *Service) RunOwnership(ctx context.Context, wkr store.Worker, runID uuid
 	// (additive), so the run-lane claim router can proceed ONLY on a claimed/running row AT
 	// the claim's generation and end the attempt on a DIFFERENT generation. It already lives
 	// on the store.Run this read returns — no new query.
-	return run.Status, retry, run.ClaimGeneration, nil
+	// The explicit pause caller must distinguish an ordinary pause from a wall
+	// hold or released claim after a lost ACK. All fields come from this same read.
+	if run.HoldReason.Valid {
+		reason := run.HoldReason.String
+		holdReason = &reason
+	}
+	return run.Status, retry, run.ClaimGeneration, holdReason, run.ClaimReleasedAt.Valid, nil
 }
 
 func (s *Service) runOwnedByWorker(ctx context.Context, runID uuid.UUID, wkr store.Worker) (store.Run, error) {
@@ -5836,14 +6055,17 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
-// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "workflow_scope" |
-// "superseded"); it
+// advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
 	Published bool
 	Ref       string
 	Skipped   string
+	// Detail is a bounded, content-free reason behind Skipped (the broker's error text with
+	// secrets scrubbed), for the operator log only. It is never serialized to the worker.
+	Detail string
 }
 
 // Publish is the api side of the M8 brokered origin push: the worker ships a delta
@@ -5854,7 +6076,7 @@ type PublishResult struct {
 // authorization is server-derived.
 //
 // It returns a benign PublishResult skip (nil error) for the outcomes the worker
-// treats as "origin moved, nothing to do" — a diverged tip or an unsupported pack —
+// treats as "origin moved, nothing to do" — a diverged tip or an unusable pack —
 // and an error only for a genuine 5xx (misconfig, decrypt failure, transport fault)
 // the worker ignores as best-effort.
 func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID, tipOid string, pack []byte) (PublishResult, error) {
@@ -6135,13 +6357,17 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
-	case errors.Is(err, pushbroker.ErrTipMissing),
-		errors.Is(err, pushbroker.ErrPackTooLarge),
-		errors.Is(err, pushbroker.ErrPackInvalid):
-		// A tip the pack never delivered, a pack over the reconstruction budget, or a
-		// malformed pack: all best-effort "unsupported" skips — never a 5xx. Neither an
-		// over-budget nor a malformed worker pack may OOM or 5xx-storm the shared api.
-		return PublishResult{Published: false, Ref: ref, Skipped: "unsupported"}, false, nil
+	case errors.Is(err, pushbroker.ErrTipMissing):
+		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
+		// broker's content-free reason for the operator log (never serialized to the worker).
+		return PublishResult{Published: false, Ref: ref, Skipped: "tip_missing", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackTooLarge):
+		// A pack over the reconstruction budget: a best-effort skip. A worker pack may not
+		// OOM or 5xx-storm the shared api.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_too_large", Detail: secretscrub.Scrub(err.Error())}, false, nil
+	case errors.Is(err, pushbroker.ErrPackInvalid):
+		// A malformed (or empty) pack: a best-effort skip, never a 5xx.
+		return PublishResult{Published: false, Ref: ref, Skipped: "pack_invalid", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	default:
 		// A genuine 5xx from the go-git broker (transport fault, non-sentinel
 		// go-git error). This is the ONE forge-touching path whose error does NOT
@@ -7352,7 +7578,14 @@ func (s *Service) hasLivePoller(ctx context.Context, run store.Run) (bool, error
 	// other runs, but it is NOT polling this parked run (the worker parked it and awaits the
 	// server-owned promotion), so a cancel routed to a poller would sit unconsumed. It must
 	// go server-side too, so it reads as "no live poller" here alongside the other parks.
-	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || !run.WorkerID.Valid {
+	//
+	// Issue #1969: paused is a park of the same shape for EVERY hold_reason. An owner pause
+	// (NULL), a completion_blocked hold and a worker-side budget_exhausted wall park all end the
+	// worker's flight once the park lands; a server wall park and a credential_disabled park
+	// release the claim. Resume always requeues for a fresh claim, so no executor is polling a
+	// paused run even while its kept worker heartbeats for other runs, and a cancel enqueued here
+	// would never be consumed (the run would stay paused, still holding its branch).
+	if run.Status == "queued" || run.Status == "limit_wait" || run.Status == "pool_wait" || run.Status == "recovery_wait" || run.Status == "paused" || !run.WorkerID.Valid {
 		return false, nil
 	}
 	wkr, err := s.q.GetWorkerByID(ctx, uuid.UUID(run.WorkerID.Bytes))

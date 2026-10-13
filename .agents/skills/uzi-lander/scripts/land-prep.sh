@@ -126,6 +126,9 @@ fi
 
 log() { printf '%s [land-prep #%s] %s\n' "$(date +%H:%M:%S)" "$PR" "$*"; }
 HERE=$(cd "$(dirname "$0")" && pwd) || exit 3
+# shellcheck source=lib/net-retry.sh
+. "$HERE/lib/net-retry.sh"
+net_retry_install
 
 # ---- PR coordinates ---------------------------------------------------------------------
 pj=$(gh pr view "$PR" --repo "$REPO" --json state,headRefName,baseRefName,headRefOid,headRepository,headRepositoryOwner 2>/dev/null) \

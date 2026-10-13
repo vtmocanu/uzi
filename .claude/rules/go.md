@@ -36,11 +36,13 @@ cd api && go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate
 
 | file | read by |
 |---|---|
+| `agent/src/codex/codex-pricing.json` | `api/internal/codexprice/codexprice_test.go` (byte-equality mirror guard; run with `-count=1`) |
 | `fixtures/judge-fidelity/{cases,expected}.json` | `api/internal/workersvc/judge_backlog_fidelity_test.go` |
 | `fixtures/run-usage/` | `api/internal/workersvc/run_usage_contract_test.go`, `web/src/lib/runUsageContract.test.ts` |
 | `fixtures/split-secret-redaction/cases.json` | `api/internal/termsafe/split_secret_fixture_test.go`, `agent/test/redact.test.ts` |
 | `fixtures/api-contract/` | `api/internal/apitypes/contract_test.go`, `api/internal/handler/contract_test.go`, `web/src/lib/apiContract.test.ts` |
 | `fixtures/claims/resume-unapproved-no-session.json` | `api/internal/workersvc/resume_unapproved_claim_livedb_test.go`, `agent/test/runner-gate-verdict-interruption.test.ts` |
+| `fixtures/recovery-archive-redundancy/vectors.json` | `api/internal/workersvc/archive_redundancy_test.go`, `agent/test/recovery-archive-redundancy.test.ts` |
 | `api/internal/hostedsvc/testdata/` | the controller's contract goldens, the other way |
 
 - Two `api` packages read `fixtures/api-contract/`, so `-count=1` must cover the whole `go test ./...`, not one package.

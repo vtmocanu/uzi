@@ -18,6 +18,7 @@ func TestResolveCrossCheckPins(t *testing.T) {
 		{"claude template", "claude", nil, nil, nil, nil, ptr("sonnet"), ptr("sonnet"), "medium", "worker default", "worker default"},
 		{"claude sdk", "claude", nil, nil, nil, nil, nil, nil, "medium", "worker default", "worker default"},
 		{"claude lane", "claude", nil, nil, ptr("haiku"), ptr("max"), ptr("sonnet"), ptr("haiku"), "max", "worker default", "worker default"},
+		{"claude ignores codex template", "claude", nil, nil, nil, nil, ptr("gpt-6.1-sol"), nil, "medium", "worker default", "worker default"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			got := ResolveCrossCheck(tc.harness, tc.model, tc.effort, tc.workerModel, tc.workerEffort, tc.template)

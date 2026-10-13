@@ -65,6 +65,13 @@ func New(q Store, box *secretbox.Box, now func() time.Time, heartbeatStale time.
 	return &Service{q: q, box: box, now: now, heartbeatStale: heartbeatStale}
 }
 
+// WithStore binds the service to the caller's transaction while preserving its configuration.
+func (s *Service) WithStore(q Store) *Service {
+	copy := *s
+	copy.q = q
+	return &copy
+}
+
 // tokenAAD is the additional authenticated data every pending join token is
 // sealed under (secretbox.SealWithAAD, whose doc names exactly this use: "so a
 // DB-write operator cannot swap a ciphertext onto a different owner/kind and have
@@ -181,20 +188,57 @@ func ExpirePendingTokens(ctx context.Context, q ExpiryStore, ttl time.Duration) 
 // proved it holds the token, or whose buffer expired unread, gets a nil JoinToken
 // and is reconciled without one.
 func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
+	evaluatedAt := s.now()
 	rows, err := s.q.ListHostedWorkersForController(ctx, store.ListHostedWorkersForControllerParams{
 		DiskPressureMinStreak: diskPressureMinStreak,
 		// The freshness cutoff for the disk_pressure derivation: now()-heartbeatStale, the
 		// SAME staleness bound the claim path builds its @heartbeat_cutoff from
 		// (workersvc: s.now().Add(-s.p.WorkerHeartbeatStale)).
-		HeartbeatCutoff: pgconv.Time(s.now().Add(-s.heartbeatStale)),
+		HeartbeatCutoff: pgconv.Time(evaluatedAt.Add(-s.heartbeatStale)),
 	})
 	if err != nil {
 		return PollResponse{}, fmt.Errorf("hostedsvc: list hosted workers: %w", err)
 	}
+	if len(rows) > 512 {
+		return PollResponse{}, fmt.Errorf("hostedsvc: fleet exceeds complete snapshot limit")
+	}
 	out := PollResponse{Workers: make([]DesiredWorker, 0, len(rows))}
 	for _, row := range rows {
+		evidence := &RollEvidence{
+			Version: 1, OwnerID: row.UserID.String(), Registered: row.SnapshotRegisterNonce.Valid,
+			SchedulingCapabilities: append([]string{}, row.Capabilities...),
+			ProtocolCapabilities:   append([]string{}, row.ProtocolCapabilities...),
+			OrdinaryCoverage:       row.OrdinaryCoverage, CheckerCoverage: row.CheckerCoverage,
+			EvaluatedAt: evaluatedAt, ValidUntil: evaluatedAt,
+		}
+		never := row.Status == "offline" && !row.LastHeartbeatAt.Valid && !row.Version.Valid &&
+			!row.SnapshotRegisterNonce.Valid && !row.RegisteredPodUid.Valid && !row.RollHeartbeatAt.Valid
+		evidence.NeverRegistered = &never
+		if row.Version.Valid {
+			v := row.Version.String
+			evidence.RegisteredVersion = &v
+		}
+		if row.SnapshotRegisterNonce.Valid {
+			v := row.SnapshotRegisterNonce.String
+			evidence.RegisterNonce = &v
+		}
+		if row.RegisteredPodUid.Valid {
+			v := uuid.UUID(row.RegisteredPodUid.Bytes).String()
+			evidence.PodUID = &v
+		}
+		if row.Status == "online" && row.LastHeartbeatAt.Valid {
+			until := row.LastHeartbeatAt.Time.Add(s.heartbeatStale)
+			if until.After(evaluatedAt) {
+				evidence.LivenessValidUntil = &until
+			}
+		}
+		if row.RollHeartbeatAt.Valid {
+			at := row.RollHeartbeatAt.Time
+			evidence.HeartbeatAt = &at
+			evidence.ValidUntil = at.Add(s.heartbeatStale)
+		}
 		dw := DesiredWorker{
-			ID:         row.ID.String(),
+			RollEvidence: evidence, ID: row.ID.String(),
 			Template:   row.TemplateDeclared.String,
 			Size:       row.HostedSize.String,
 			Generation: row.HostedGeneration,
@@ -227,6 +271,10 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			// Busy/DrainingSince, that M4b's controller consumes so ordinary teardown and the
 			// data-PVC recycle path both keep a custody-held worker (and its PVC) alive.
 			CustodyHeld: row.CustodyHeld,
+		}
+		if row.DrainingReason.Valid {
+			v := row.DrainingReason.String
+			dw.DrainingReason = &v
 		}
 		if row.DrainingSince.Valid {
 			t := row.DrainingSince.Time
@@ -266,7 +314,27 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 // not reset the drain-deadline clock. Returns found=false (no error) when no hosted
 // worker has that id — the handler answers 404 — so a controller cordoning a worker
 // the api has since dropped gets a clean, actionable negative rather than a 500.
-func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID) (bool, error) {
+func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID, reason ...string) (bool, error) {
+	if len(reason) > 0 && reason[0] == "pressure_recycle" {
+		q, ok := s.q.(interface {
+			CordonHostedWorkerPressureRecycle(context.Context, uuid.UUID) (int64, error)
+		})
+		if !ok {
+			return false, fmt.Errorf("hostedsvc: pressure recycle drain unavailable")
+		}
+		rows, err := q.CordonHostedWorkerPressureRecycle(ctx, workerID)
+		return rows > 0, err
+	}
+	if len(reason) > 0 && reason[0] == "image_roll" {
+		q, ok := s.q.(interface {
+			CordonHostedWorkerImageRoll(context.Context, uuid.UUID) (int64, error)
+		})
+		if !ok {
+			return false, fmt.Errorf("hostedsvc: image roll drain unavailable")
+		}
+		rows, err := q.CordonHostedWorkerImageRoll(ctx, workerID)
+		return rows > 0, err
+	}
 	rows, err := s.q.CordonHostedWorker(ctx, workerID)
 	if err != nil {
 		return false, fmt.Errorf("hostedsvc: cordon hosted worker: %w", err)
@@ -289,7 +357,27 @@ func (s *Service) Cordon(ctx context.Context, workerID uuid.UUID) (bool, error) 
 // already-clear worker is a harmless no-op. Returns found=false (no error) when no
 // hosted worker has that id — the handler answers 404 — so a controller uncordoning a
 // worker the api has since dropped gets a clean, actionable negative rather than a 500.
-func (s *Service) Uncordon(ctx context.Context, workerID uuid.UUID) (bool, error) {
+func (s *Service) Uncordon(ctx context.Context, workerID uuid.UUID, reason ...string) (bool, error) {
+	if len(reason) > 0 && reason[0] == "pressure_recycle" {
+		q, ok := s.q.(interface {
+			UncordonHostedWorkerPressureRecycle(context.Context, uuid.UUID) (int64, error)
+		})
+		if !ok {
+			return false, fmt.Errorf("hostedsvc: pressure recycle clear unavailable")
+		}
+		rows, err := q.UncordonHostedWorkerPressureRecycle(ctx, workerID)
+		return rows > 0, err
+	}
+	if len(reason) > 0 && reason[0] == "image_roll" {
+		q, ok := s.q.(interface {
+			UncordonHostedWorkerImageRoll(context.Context, uuid.UUID) (int64, error)
+		})
+		if !ok {
+			return false, fmt.Errorf("hostedsvc: image roll clear unavailable")
+		}
+		rows, err := q.UncordonHostedWorkerImageRoll(ctx, workerID)
+		return rows > 0, err
+	}
 	rows, err := s.q.UncordonHostedWorker(ctx, workerID)
 	if err != nil {
 		return false, fmt.Errorf("hostedsvc: uncordon hosted worker: %w", err)

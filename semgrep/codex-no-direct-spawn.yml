@@ -1,8 +1,10 @@
 # DARK CODEX GUARD (issue #1171 M5) -- no raw child_process spawn in
-# agent/src/codex/** outside the sanctioned launcher and boot-time Landlock probe.
+# agent/src/codex/** outside the sanctioned launcher, boot-time Landlock probe,
+# and evaluator-only same-identity app-server leaf.
 #
-# The general rule covers every Codex provider file except the supervisor launcher and
-# codex-capability.ts. The capability-specific rule then covers ONLY codex-capability.ts,
+# The general rule covers every Codex provider file except the supervisor launcher,
+# codex-capability.ts and the evaluator-only pr-description-eval-launch.ts.
+# The capability-specific rule then covers ONLY codex-capability.ts,
 # with exact exceptions for its sanctioned import, fixed spawnSync probe and injectable
 # test seam. Splitting the rules is load-bearing: pattern-not exceptions are global to a
 # rule, so putting them on the general rule would also allow those forms in broker.ts or
@@ -12,6 +14,8 @@
 # arbitrary local callee. Semgrep matches destructured imports by subset, so the exact
 # sanctioned import exception also suppresses a superset with extra named bindings. The third
 # rule rejects every extra named binding, aliased or unaliased, in codex-capability.ts.
+# The evaluator leaf has its own exact import and fixed launch exceptions, with companion
+# rules rejecting supersets. These exceptions cannot leak into other Codex files.
 # Other files need no companion: their general rule flags every child_process import directly.
 #
 # RELIABILITY BOUNDARY. This is a syntactic, file-glob-scoped gate. It cannot trace a spawn
@@ -41,6 +45,8 @@ rules:
         # Covered by codex-capability-no-extra-direct-spawn below, where its exact
         # exceptions cannot leak into any other provider file.
         - /agent/src/codex/codex-capability.ts
+        # Evaluator-only leaf: exact import/call and superset companions below.
+        - /agent/src/codex/pr-description-eval-launch.ts
     pattern-either:
       # Bare-callee forms from destructured imports.
       - pattern: spawn(...)
@@ -121,3 +127,68 @@ rules:
           - pattern: import { ... } from "node:child_process"
           - pattern: import { ... } from "child_process"
       - pattern-not-regex: '(?ms)^[ \t]*import[ \t]*\{[ \t\r\n]*spawnSync[ \t\r\n]*,[ \t\r\n]*type[ \t]+SpawnSyncReturns[ \t\r\n]*\}[ \t\r\n]*from[ \t\r\n]*["'']node:child_process["''][ \t]*;?[ \t]*$'
+
+  - id: codex-evaluator-no-extra-direct-spawn
+    languages: [typescript]
+    severity: ERROR
+    message: >-
+      The evaluator leaf permits only its fixed same-identity app-server launch.
+      Other child_process imports or process calls widen this local seam.
+    paths:
+      include:
+        - /agent/src/codex/pr-description-eval-launch.ts
+    patterns:
+      - pattern-either:
+          # Bare-callee forms from destructured imports.
+          - pattern: spawn(...)
+          - pattern: spawnSync(...)
+          - pattern: exec(...)
+          - pattern: execSync(...)
+          - pattern: execFile(...)
+          - pattern: execFileSync(...)
+          - pattern: fork(...)
+          # Namespace-member forms whose names do not collide with common methods.
+          # Deliberately omit $NS.exec/$NS.execSync so regexp.exec(...) does not fire.
+          - pattern: $NS.spawn(...)
+          - pattern: $NS.spawnSync(...)
+          - pattern: $NS.execFile(...)
+          - pattern: $NS.execFileSync(...)
+          - pattern: $NS.fork(...)
+          # Imports catch arbitrary aliases and namespace names.
+          - pattern: import * as $X from "node:child_process"
+          - pattern: import * as $X from "child_process"
+          - pattern: import { ... } from "node:child_process"
+          - pattern: import { ... } from "child_process"
+          - pattern: import $X from "node:child_process"
+          - pattern: import $X from "child_process"
+          - pattern: import "node:child_process"
+          - pattern: import "child_process"
+          - pattern: ($SEAM ?? spawn)(...)
+      - pattern-not: 'import { spawn, type ChildProcess } from "node:child_process"'
+      - pattern-not: '(testSeams.spawn ?? spawn)(CODEX_BIN, [...PROVIDER_CHILD_ARGV], { cwd, env, stdio: ["pipe", "pipe", "pipe"] })'
+
+  - id: codex-evaluator-exact-child-process-import
+    languages: [typescript]
+    severity: ERROR
+    message: The evaluator permits exactly spawn plus type-only ChildProcess from node:child_process.
+    paths:
+      include:
+        - /agent/src/codex/pr-description-eval-launch.ts
+    patterns:
+      - pattern-either:
+          - pattern: import { ... } from "node:child_process"
+          - pattern: import { ... } from "child_process"
+      - pattern-not-regex: '(?ms)^[ \t]*import[ \t]*\{[ \t\r\n]*spawn[ \t\r\n]*,[ \t\r\n]*type[ \t]+ChildProcess[ \t\r\n]*\}[ \t\r\n]*from[ \t\r\n]*["'']node:child_process["''][ \t]*;?[ \t]*$'
+
+  # Object patterns match subsets too. Require the entire fixed call spelling,
+  # so extra argv/options cannot ride along with a structurally sanctioned call.
+  - id: codex-evaluator-exact-launch
+    languages: [typescript]
+    severity: ERROR
+    message: The evaluator launch must retain CODEX_BIN, PROVIDER_CHILD_ARGV and controlled stdio/options.
+    paths:
+      include:
+        - /agent/src/codex/pr-description-eval-launch.ts
+    patterns:
+      - pattern: ($SEAM ?? spawn)(...)
+      - pattern-not-regex: '\(testSeams\.spawn[ \t\r\n]*\?\?[ \t\r\n]*spawn\)[ \t\r\n]*\(CODEX_BIN,[ \t\r\n]*\[\.\.\.PROVIDER_CHILD_ARGV\],[ \t\r\n]*\{[ \t\r\n]*cwd,[ \t\r\n]*env,[ \t\r\n]*stdio:[ \t\r\n]*\["pipe",[ \t\r\n]*"pipe",[ \t\r\n]*"pipe"\],[ \t\r\n]*\}[ \t\r\n]*\)'

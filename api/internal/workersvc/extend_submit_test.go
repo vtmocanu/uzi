@@ -117,18 +117,82 @@ func TestSubmitInputExtendDisabled(t *testing.T) {
 	}
 }
 
-// TestSubmitInputExtendOverCapRequest: a single request larger than the WHOLE cap can never
-// apply and is refused as ErrExtensionCapExceeded BEFORE the CTE (guarding the int32 overflow
-// the addition would otherwise risk), so CreateExtendInput is never called.
+// TestSubmitInputExtendOverCapRequest: the cap is a PER-REQUEST maximum (#2735). A single
+// request larger than it can never apply and is refused as ErrExtensionCapExceeded BEFORE the
+// CTE, with a message naming the per-extension maximum (no remaining-allowance arithmetic), so
+// CreateExtendInput is never called. A run already extended past the cap in total is NOT
+// refused for that: a second request within the cap reaches the CTE.
 func TestSubmitInputExtendOverCapRequest(t *testing.T) {
 	fs, svc, user, runID := extendRunFixture(t, 57600)
 
-	_, err := svc.SubmitInput(context.Background(), user, runID, "extend", "57601", nil)
+	_, err := svc.SubmitInput(context.Background(), user, runID, "extend", "57660", nil)
 	if !errors.Is(err, ErrExtensionCapExceeded) {
 		t.Fatalf("err = %v, want ErrExtensionCapExceeded", err)
 	}
+	if got, want := err.Error(), "extension cap exceeded: +16h1m is more than the 16h maximum per extension"; got != want {
+		t.Fatalf("message = %q, want %q", got, want)
+	}
 	if fs.createdExtend != nil {
-		t.Fatalf("a request larger than the whole cap must not reach the CTE, got %+v", fs.createdExtend)
+		t.Fatalf("a request larger than the cap must not reach the CTE, got %+v", fs.createdExtend)
+	}
+}
+
+// TestSubmitInputExtendPastOldCumulativeCap: with the cap per request, a run already extended
+// to 55000s accepts another 7200s (the old cumulative rule refused it) and the write carries
+// the technical-bound parameters.
+func TestSubmitInputExtendPastOldCumulativeCap(t *testing.T) {
+	fs, svc, user, runID := extendRunFixture(t, 57600)
+	fs.runByID.BudgetExtensionSeconds = 55000
+	fs.extendReturn = 62200
+
+	res, err := svc.SubmitInput(context.Background(), user, runID, "extend", "7200", nil)
+	if err != nil {
+		t.Fatalf("SubmitInput extend past the old cumulative cap: %v", err)
+	}
+	if res.ExtensionSeconds == nil || *res.ExtensionSeconds != 62200 {
+		t.Fatalf("ExtensionSeconds = %v, want 62200", res.ExtensionSeconds)
+	}
+	w := fs.createdExtend
+	if w == nil {
+		t.Fatal("CreateExtendInput not called")
+	}
+	if w.MaxWallSeconds != 2147483 || w.FinalizeAllowanceSeconds != 1800 || w.BaseWallUpperSeconds != 72*3600 {
+		t.Fatalf("bound params = max %d finalize %d baseWall %d, want 2147483 / 1800 / 259200 (the 72h maximum ceiling)", w.MaxWallSeconds, w.FinalizeAllowanceSeconds, w.BaseWallUpperSeconds)
+	}
+	if !w.Body.Valid || w.Body.String != "extend +2h (max 16h per extension)" {
+		t.Fatalf("audit body = %+v, want %q", w.Body, "extend +2h (max 16h per extension)")
+	}
+}
+
+// TestSubmitInputExtendOverRoomRefusedBeforeCTE: a request within the per-request cap but
+// beyond the room left under MaxRunWallSeconds is ErrExtensionLimitReached without a write,
+// naming the total-time limit and the room left.
+func TestSubmitInputExtendOverRoomRefusedBeforeCTE(t *testing.T) {
+	fs, svc, user, runID := extendRunFixture(t, 604800)
+	// testParams: RunTimeout 2h, RunWallCeiling 8h, reserved at the 72h maximum -> room = 2147483 - 259200 - 1800 - ext.
+	fs.runByID.BudgetExtensionSeconds = 2147483 - 259200 - 1800 - 3600 // 3600s of room left
+
+	_, err := svc.SubmitInput(context.Background(), user, runID, "extend", "3660", nil)
+	if !errors.Is(err, ErrExtensionLimitReached) {
+		t.Fatalf("err = %v, want ErrExtensionLimitReached", err)
+	}
+	if got, want := err.Error(), "total run time limit reached: +1h1m would take this run past the 24d 20h 31m 23s limit on total run time (1h left)"; got != want {
+		t.Fatalf("message = %q, want %q", got, want)
+	}
+	if fs.createdExtend != nil {
+		t.Fatalf("an over-room request must not reach the CTE, got %+v", fs.createdExtend)
+	}
+	// Exactly the room left applies (the pre-check allows it).
+	fs.extendReturn = 2147483 - 259200 - 1800
+	res, err := svc.SubmitInput(context.Background(), user, runID, "extend", "3600", nil)
+	if err != nil {
+		t.Fatalf("a request exactly filling the room must reach the CTE and apply: %v", err)
+	}
+	if fs.createdExtend == nil || fs.createdExtend.Secs != 3600 {
+		t.Fatalf("the exact-room request must be written via CreateExtendInput with secs=3600, got %+v", fs.createdExtend)
+	}
+	if res.ExtensionSeconds == nil || *res.ExtensionSeconds != int(fs.extendReturn) {
+		t.Fatalf("result ExtensionSeconds = %v, want the CTE total %d", res.ExtensionSeconds, fs.extendReturn)
 	}
 }
 
@@ -217,16 +281,15 @@ func TestSubmitInputExtendCTERefusal(t *testing.T) {
 		}
 	})
 
-	t.Run("column over cap maps to ErrExtensionCapExceeded", func(t *testing.T) {
+	t.Run("0 rows within cap and room maps to ErrExtensionLimitReached", func(t *testing.T) {
 		fs, svc, user, runID := extendRunFixture(t, 57600)
-		// Already extended to 55000s; a further 7200 would push past 57600, so the CTE's
-		// cap predicate refuses (0 rows) even though 7200 <= the whole cap.
-		fs.runByID.BudgetExtensionSeconds = 55000
+		// The pre-check passed on the snapshot but the CTE refused (a concurrent extend consumed
+		// the room): the residual cause is the total-time limit, never the per-request cap.
 		fs.extendErr = pgx.ErrNoRows
 
 		_, err := svc.SubmitInput(context.Background(), user, runID, "extend", "7200", nil)
-		if !errors.Is(err, ErrExtensionCapExceeded) {
-			t.Fatalf("err = %v, want ErrExtensionCapExceeded", err)
+		if !errors.Is(err, ErrExtensionLimitReached) {
+			t.Fatalf("err = %v, want ErrExtensionLimitReached", err)
 		}
 	})
 }
@@ -263,12 +326,12 @@ func TestSubmitInputExtendTerminalRefusedAtTopGuard(t *testing.T) {
 }
 
 // TestExtendRefusalReason pins the three 409 classes a 0-row CreateExtendInput collapses into
-// (PRD #1189 M1), decided from the already-fetched run row — mirroring TestPauseRefusalReason.
-// Terminal first, then a kind that never times out (chat/judge/interactive task), then the
-// residual cap cause, whose message names the remaining allowance.
+// (PRD #1189 M1, #2735), decided from the already-fetched run row — mirroring
+// TestPauseRefusalReason. Terminal first, then a kind that never times out (chat/judge/
+// interactive task), then the per-request cap, then the residual total-time-limit cause.
 func TestExtendRefusalReason(t *testing.T) {
 	t.Run("terminal maps to ErrRunTerminal", func(t *testing.T) {
-		err := extendRefusalReason(store.Run{Status: "failed", Kind: runkind.Issue}, 7200, 57600)
+		err := extendRefusalReason(store.Run{Status: "failed", Kind: runkind.Issue}, 7200, 57600, 2*time.Hour, 8*time.Hour)
 		if !errors.Is(err, ErrRunTerminal) {
 			t.Fatalf("err = %v, want ErrRunTerminal", err)
 		}
@@ -282,20 +345,30 @@ func TestExtendRefusalReason(t *testing.T) {
 		{"interactive task", store.Run{Status: "running", Kind: runkind.Task, Interactive: true}},
 	} {
 		t.Run(tc.name+" maps to ErrExtendNotTimed", func(t *testing.T) {
-			err := extendRefusalReason(tc.run, 7200, 57600)
+			err := extendRefusalReason(tc.run, 7200, 57600, 2*time.Hour, 8*time.Hour)
 			if !errors.Is(err, ErrExtendNotTimed) {
 				t.Fatalf("err = %v, want ErrExtendNotTimed", err)
 			}
 		})
 	}
-	t.Run("over-cap maps to ErrExtensionCapExceeded and names the remaining allowance", func(t *testing.T) {
-		// Already extended to 55000s of a 57600s cap → 2600s (43m) of allowance remains.
-		err := extendRefusalReason(store.Run{Status: "running", Kind: runkind.Issue, BudgetExtensionSeconds: 55000}, 7200, 57600)
+	t.Run("over-cap maps to ErrExtensionCapExceeded and names the per-extension maximum", func(t *testing.T) {
+		// A cumulative total already past the cap is irrelevant: only the request is compared.
+		err := extendRefusalReason(store.Run{Status: "running", Kind: runkind.Issue, BudgetExtensionSeconds: 55000}, 57660, 57600, 2*time.Hour, 8*time.Hour)
 		if !errors.Is(err, ErrExtensionCapExceeded) {
 			t.Fatalf("err = %v, want ErrExtensionCapExceeded", err)
 		}
-		if got := err.Error(); got != "extension cap exceeded: 2h exceeds the remaining extension cap (43m left of 16h)" {
-			t.Fatalf("message = %q, want it to name the remaining allowance (43m of 16h)", got)
+		if got := err.Error(); got != "extension cap exceeded: +16h1m is more than the 16h maximum per extension" {
+			t.Fatalf("message = %q", got)
+		}
+	})
+	t.Run("within cap maps to ErrExtensionLimitReached and names the room left", func(t *testing.T) {
+		run := store.Run{Status: "running", Kind: runkind.Issue, BudgetExtensionSeconds: 2147483 - 259200 - 1800 - 3600}
+		err := extendRefusalReason(run, 7200, 57600, 2*time.Hour, 8*time.Hour)
+		if !errors.Is(err, ErrExtensionLimitReached) {
+			t.Fatalf("err = %v, want ErrExtensionLimitReached", err)
+		}
+		if got := err.Error(); got != "total run time limit reached: +2h would take this run past the 24d 20h 31m 23s limit on total run time (1h left)" {
+			t.Fatalf("message = %q", got)
 		}
 	})
 }

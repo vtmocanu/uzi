@@ -827,6 +827,35 @@ func TestHasLivePollerIsFalseForAParkedRun(t *testing.T) {
 	}
 }
 
+// TestHasLivePollerIsFalseForAPausedRun pins issue #1969: a paused run keeps its worker_id, and
+// that worker keeps heartbeating for its other runs, but no executor polls the paused run for ANY
+// hold_reason, so a cancel must read "no live poller" and apply server-side.
+func TestHasLivePollerIsFalseForAPausedRun(t *testing.T) {
+	wkrID := uuid.New()
+	fs := &fakeStore{workerByID: store.Worker{
+		ID: wkrID, LastHeartbeatAt: pgtype.Timestamptz{Time: parkNow, Valid: true},
+	}}
+	svc := New(fs, newBox(t), testParams())
+	svc.now = func() time.Time { return parkNow }
+
+	for _, hold := range []pgtype.Text{
+		{},
+		{String: "credential_disabled", Valid: true},
+		{String: "budget_exhausted", Valid: true},
+		{String: "completion_blocked", Valid: true},
+	} {
+		paused := store.Run{ID: uuid.New(), Status: "paused", HoldReason: hold, WorkerID: pgtype.UUID{Bytes: wkrID, Valid: true}}
+		live, err := svc.hasLivePoller(context.Background(), paused)
+		if err != nil {
+			t.Fatalf("hold_reason %q: hasLivePoller: %v", hold.String, err)
+		}
+		if live {
+			t.Fatalf("hold_reason %q: a paused run reported a live poller, so a cancel would be "+
+				"enqueued for a worker that never consumes it", hold.String)
+		}
+	}
+}
+
 // parkBroadcaster records run IDS alongside statuses, which fakeBroadcaster does not.
 // The pairing is what the promotion assertion needs: "two `queued` events happened"
 // would pass against a pass that published the wrong runs.

@@ -39,7 +39,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 			lead.GatePresentationID.Valid && uuid.UUID(lead.GatePresentationID.Bytes) == *req.PresentationID
 		retained := lead.Status == "awaiting_approval" && !lead.AutoApprove &&
 			(lead.PlanCrossCheckGateReason.String == reason || current)
-		if !lead.PlanCrossCheckRequired || (!active && !retained) || lead.Harness != string(HarnessClaude) ||
+		if !lead.PlanCrossCheckRequired || (!active && !retained) || !isCrossCheckLeadHarness(lead.Harness) ||
 			req.ClaimGeneration == nil || *req.ClaimGeneration != lead.ClaimGeneration ||
 			lead.ClaimReleasedAt.Valid || lead.WorkerID != pgconv.UUID(worker.ID) || lead.UserID != worker.UserID {
 			return ErrInvalidState
@@ -101,7 +101,12 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		if !ok {
 			return ErrInvalidState
 		}
-		harness := HarnessCodex
+		// The checker is the lead's OPPOSITE family, so an unusable credential of that
+		// family (never the lead's own) is what attests the checker unavailable.
+		harness, known := oppositeHarness(lead.Harness)
+		if !known {
+			return ErrInvalidState
+		}
 		_, err := s.resolveRunHarnessQ(ctx, lead.UserID, &harness, resolver)
 		if errors.Is(err, ErrNoCredentialForHarness) || errors.Is(err, ErrHarnessCredentialDisabled) {
 			return nil
@@ -115,7 +120,7 @@ func (s *Service) validatePlanCrossCheckGateReason(ctx context.Context, q Store,
 		return nil
 	case "planning_diff_refused":
 		// This bounded declaration attests capture failure; it never authorizes a pass.
-		if lead.Harness != string(HarnessClaude) || worker.IsolatedLane {
+		if !isCrossCheckLeadHarness(lead.Harness) || worker.IsolatedLane {
 			return ErrInvalidState
 		}
 		switch req.PlanCrossCheckDiffRefusal {

@@ -42,6 +42,12 @@
 # (status, health, health_reason, health_since, worker, worker_status, heartbeat age) and
 # exits 4. The stop means "investigate": stalled health does not prove the run is dead and a
 # stale heartbeat does not prove work was lost.
+# An exit-4 stop ends coverage, so it also prints REARM=<command>: the same watch (arguments and
+# effective WATCH_* settings), re-launched with WATCH_ATTENTION_ACK set to the observed health episode. Investigate, then run that line
+# in the background; never leave a watched run unpolled. WATCH_ATTENTION_ACK is a comma list of
+# `<health>@<health_since>` episodes whose health signal is ignored (a run that stays stalled in
+# the SAME episode, e.g. a long test suite, then stops only on the stop set, a NEW non-ok episode,
+# or a stale heartbeat, which is never acked).
 # Exit codes: 0 stop-set state or ELAPSED (unchanged), 4 needs_attention.
 set -u
 RID="${1:?usage: watch-run.sh <run-id> [stop-csv] [interval] [max] [min-plan-seq]}"
@@ -56,6 +62,7 @@ MIN_PLAN_SEQ="${5:-}"
 ATTN_POLLS="${WATCH_ATTENTION_POLLS:-3}"
 HB_STALE="${WATCH_HEARTBEAT_STALE_SECS:-180}"
 ATTN_IGNORE="${WATCH_ATTENTION_IGNORE_HEALTH:-slow}"
+ATTN_ACK="${WATCH_ATTENTION_ACK:-}"
 
 max_plan_seq() {
   uzi run logs "$RID" --json 2>/dev/null \
@@ -72,9 +79,16 @@ attention_check() {
   reason="$(printf '%s' "$rj" | jq -r '(.health_reason // "")|gsub("\n";" ")|.[0:200]')"
   since="$(printf '%s' "$rj" | jq -r '.health_since // ""')"
   wid="$(printf '%s' "$rj" | jq -r '.worker_id // ""')"
+  ATTN_EPISODE=""
   case "$health" in
     ''|ok) ;;
-    *) case ",$ATTN_IGNORE," in *",$health,"*) ;; *) dat=1 ;; esac ;;
+    *) case ",$ATTN_IGNORE," in
+         *",$health,"*) ;;
+         *) case ",$ATTN_ACK," in
+              *",$health@$since,"*) ;;
+              *) dat=1; ATTN_EPISODE="$health@$since" ;;
+            esac ;;
+       esac ;;
   esac
   if [ -n "$wid" ] && { [ "$status" = running ] || [ "$status" = claimed ]; }; then
     wl="$(uzi worker list --json 2>/dev/null)" || wl=""
@@ -131,6 +145,11 @@ while [ "$i" -lt "$MAX" ]; do
           printf 'STOP=needs_attention\n'
           printf 'EVIDENCE %s consecutive_polls=%s\n' "$ATTN_EVIDENCE" "$attn"
           printf 'NOTE investigate only: stalled health does not prove the run is dead and a stale heartbeat does not prove work was lost; this poller changed nothing\n'
+          ack="$ATTN_ACK"
+          if [ -n "$ATTN_EPISODE" ]; then ack="${ack:+$ack,}$ATTN_EPISODE"; fi
+          printf 'REARM=WATCH_ATTENTION_ACK=%q WATCH_ATTENTION_POLLS=%q WATCH_HEARTBEAT_STALE_SECS=%q WATCH_ATTENTION_IGNORE_HEALTH=%q %q %q %q %q %q %q\n' \
+            "$ack" "$ATTN_POLLS" "$HB_STALE" "$ATTN_IGNORE" "$0" "$RID" "$STOP" "$INT" "$MAX" "$MIN_PLAN_SEQ"
+          printf 'NOTE coverage ended: after investigating, run the REARM line in the background (a stale heartbeat is never acked and stops again)\n'
           exit 4
         fi
       else

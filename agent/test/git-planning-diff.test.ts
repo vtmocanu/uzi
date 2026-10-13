@@ -1,9 +1,5 @@
-import { describe, it } from "node:test";
-import fs from "node:fs/promises";
+import { after, describe, it } from "node:test";
 import path from "node:path";
-import os from "node:os";
-import { execFile } from "node:child_process";
-import { promisify } from "node:util";
 import assert from "node:assert/strict";
 import { PassThrough, Readable } from "node:stream";
 import { getEventListeners } from "node:events";
@@ -12,10 +8,12 @@ import { crc32, deflateSync } from "node:zlib";
 import { GitCache, PLANNING_REFUSAL_TOKENS, classifyPlanningCaptureError, gitEnv } from "../src/git.js";
 import type { BoundaryProcessHandle, BoundaryProcessRequest } from "../src/harness.js";
 import { TickSpawner } from "../src/tick-spawner.js";
-import { runnerPath, runnerTmpdir } from "../src/runner-uid.js";
+import { RUNNER_UID, runnerPath, runnerTmpdir, uidSplitActive } from "../src/runner-uid.js";
 import { nullLogger } from "./helpers.js";
 import { commandSandboxArgv } from "../src/codex/codex-executor.js";
 import { probeLandlockAvailability } from "../src/codex/codex-capability.js";
+
+import { PlanningFixtureIO, planningExec, planningGitEnv } from "./planning-fixture-io.js";
 
 const cap = 512 * 1024;
 const git = new GitCache(process.cwd(), nullLogger());
@@ -42,7 +40,10 @@ function run(handle: BoundaryProcessHandle, signal = new AbortController().signa
     () => git.readBoundedPlanningOutput(process.cwd(), [process.execPath], 2000));
 }
 
-const exec = promisify(execFile);
+const fixtureIO = new PlanningFixtureIO();
+const fs = fixtureIO.fs;
+const exec = planningExec;
+after(async () => { await fixtureIO.close(); });
 async function directoryBytes(dir: string): Promise<number> {
   let bytes = 0;
   for (const entry of await fs.readdir(dir, { withFileTypes: true })) {
@@ -63,6 +64,14 @@ async function assertRefused(pending: Promise<unknown>, refusal: string, diagnos
   const got = await refusalOf(pending);
   assert.deepEqual({ refusal: got.refusal, diagnostic: got.diagnostic }, { refusal, diagnostic });
 }
+// TickSpawner enters cwd before runnerCommand switches identity. Launch from the
+// worker cwd, then enter the private clone inside the trusted Node capture helper.
+function captureSpawnRequest(request: BoundaryProcessRequest): BoundaryProcessRequest {
+  const argv = [...request.argv];
+  assert.equal(argv[1], "-e");
+  argv[2] = `process.chdir(${JSON.stringify(request.cwd)});\n` + argv[2];
+  return { ...request, cwd: process.cwd(), argv };
+}
 async function fixture(options: {
   seed?: (seed: string) => Promise<void>; shared?: boolean; meter?: boolean; sandbox?: boolean;
   limits?: { snapshotLimit: number; totalLimit: number };
@@ -80,55 +89,56 @@ async function fixture(options: {
   capture: (signal?: AbortSignal) => Promise<Buffer>;
   dispose: () => Promise<void>;
 }> {
-  const tempRoot = await fs.realpath(os.tmpdir());
-  const data = await fs.mkdtemp(path.join(tempRoot, "planning-fixture-"));
-  const seed = path.join(data, "seed");
-  const clone = path.join(data, "runner", "repo", "issue-1");
-  await fs.mkdir(seed);
-  const run = async (cwd: string, ...args: string[]): Promise<string> =>
-    (await exec("git", ["-C", cwd, ...args], { env: gitEnv(), timeout: 5000 })).stdout;
-  await run(seed, "init", "--quiet", "--template=");
-  await fs.writeFile(path.join(seed, "tracked"), "base\n");
-  await fs.writeFile(path.join(seed, "deleted"), "delete me\n");
-  await fs.writeFile(path.join(seed, ".gitignore"), "ignored\nignored-dir/\n");
-  await options.seed?.(seed);
-  await run(seed, "add", ".");
-  await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
-  await fs.mkdir(path.dirname(clone), { recursive: true });
-  await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", seed, clone);
-  if (options.looseObjects) {
-    // A clone keeps its fetched objects in a pack, so write the tiny loose objects directly.
-    const hashing = exec("git", ["-C", clone, "hash-object", "-w", "--stdin"], { env: gitEnv(), timeout: 30000 });
-    hashing.child.stdin?.end("loose\n");
-    await hashing;
-    const paths: string[] = [];
-    for (let i = 0; i < options.looseObjects; i++) {
-      const file = path.join(data, "loose-" + i);
-      await fs.writeFile(file, "small " + i + "\n");
-      paths.push(file);
+  const data = await fixtureIO.temporaryDirectory("planning-fixture-");
+  try {
+    const seed = path.join(data, "seed");
+    const clone = path.join(data, "runner", "repo", "issue-1");
+    await fs.mkdir(seed);
+    const run = async (cwd: string, ...args: string[]): Promise<string> =>
+      (await exec("git", ["-C", cwd, ...args], { env: planningGitEnv(), timeout: 5000 })).stdout;
+    await run(seed, "init", "--quiet", "--template=");
+    await fs.writeFile(path.join(seed, "tracked"), "base\n");
+    await fs.writeFile(path.join(seed, "deleted"), "delete me\n");
+    await fs.writeFile(path.join(seed, ".gitignore"), "ignored\nignored-dir/\n");
+    await options.seed?.(seed);
+    await run(seed, "add", ".");
+    await run(seed, "-c", "user.name=Fixture", "-c", "user.email=fixture@example.invalid", "commit", "-qm", "base");
+    await fs.mkdir(path.dirname(clone), { recursive: true });
+    await run(seed, "clone", "--quiet", options.shared ? "--shared" : "--no-local", seed, clone);
+    if (options.looseObjects) {
+      // A clone keeps its fetched objects in a pack, so write the tiny loose objects directly.
+      const hashing = exec("git", ["-C", clone, "hash-object", "-w", "--stdin"], { env: planningGitEnv(), timeout: 30000 });
+      hashing.child.stdin?.end("loose\n");
+      await hashing;
+      const paths: string[] = [];
+      for (let i = 0; i < options.looseObjects; i++) {
+        const file = path.join(data, "loose-" + i);
+        await fs.writeFile(file, "small " + i + "\n");
+        paths.push(file);
+      }
+      const bulk = exec("git", ["-C", clone, "hash-object", "-w", "--stdin-paths"], { env: planningGitEnv(), timeout: 60000 });
+      bulk.child.stdin?.end(paths.join("\n") + "\n");
+      await bulk;
     }
-    const bulk = exec("git", ["-C", clone, "hash-object", "-w", "--stdin-paths"], { env: gitEnv(), timeout: 60000 });
-    bulk.child.stdin?.end(paths.join("\n") + "\n");
-    await bulk;
-  }
-  const base = (await run(clone, "rev-parse", "HEAD")).trim();
-  const cache = new GitCache(data, nullLogger());
-  if (options.limits) cache.setPlanningLimitsForTest(options.limits);
-  const tmp = path.join(data, "private-tmp");
-  if (options.privateTmp) await fs.mkdir(tmp, { mode: 0o700 });
-  return {
-    data, tmp, clone, base, cache, git: (...args) => run(clone, ...args),
-    capture: async (signal = new AbortController().signal) => {
-      const owner = new TickSpawner({ signal, killGraceMs: options.killGraceMs ?? 100 });
-      const privateTmp = options.sandbox
-        ? await fs.mkdtemp(path.join(await fs.realpath(os.tmpdir()), "planning-command-")) : undefined;
-      try {
-        return await cache.withBoundaryProcessSpawner((request) => {
-          if (privateTmp) {
-            const argv = [...request.argv];
-            assert.equal(argv[1], "-e");
-            // Prove enforced read confinement in the same process that captures the checkout.
-            argv[2] = `
+    const base = (await run(clone, "rev-parse", "HEAD")).trim();
+    const cache = new GitCache(data, nullLogger());
+    if (options.limits) cache.setPlanningLimitsForTest(options.limits);
+    const tmp = path.join(data, "private-tmp");
+    if (options.privateTmp) await fs.mkdir(tmp, { mode: 0o700 });
+    return {
+      data, tmp, clone, base, cache, git: (...args) => run(clone, ...args),
+      capture: async (signal = new AbortController().signal) => {
+        const owner = new TickSpawner({ signal, killGraceMs: options.killGraceMs ?? 100 });
+        const privateTmp = options.sandbox
+          ? await fixtureIO.temporaryDirectory("planning-command-") : undefined;
+        try {
+          if (privateTmp) await assertOwned(privateTmp, 0o700);
+          return await cache.withBoundaryProcessSpawner((request) => {
+            if (privateTmp) {
+              const argv = [...request.argv];
+              assert.equal(argv[1], "-e");
+              // Prove enforced read confinement in the same process that captures the checkout.
+              argv[2] = `
 const denyFs = require("node:fs");
 for (const denied of ["/", ${JSON.stringify(path.join(data, "seed", "tracked"))}]) {
   let deniedError;
@@ -137,21 +147,23 @@ for (const denied of ["/", ${JSON.stringify(path.join(data, "seed", "tracked"))}
   if (deniedError?.code !== "EACCES") throw Error("required sandbox did not deny " + denied);
 }
 ` + argv[2];
-            return owner.spawn({
-              ...request,
-              argv: ["/usr/local/bin/uzi-codex-command-sandbox",
-                ...commandSandboxArgv(clone, clone, argv[0]!, argv.slice(1), privateTmp, "required")],
-              env: { ...request.env, HOME: privateTmp, TMPDIR: privateTmp },
-            });
-          }
-          const spawnRequest = options.privateTmp ? { ...request, env: { ...request.env, TMPDIR: tmp } } : request;
-          if (!options.meter && !options.hook) return owner.spawn(spawnRequest);
-          // Instrument only the trusted inline capture program, preserving its argv and body.
-          const argv = [...spawnRequest.argv];
-          assert.equal(argv[1], "-e");
-          const metricPath = path.join(data, "read-metrics.json");
-          const hook = (options.hook ?? "").replaceAll("__DATA__", JSON.stringify(data));
-          argv[2] = hook + (options.meter ? `
+              return owner.spawn({
+                ...request,
+                // The sandbox enters its explicit clone cwd after the identity switch.
+                cwd: process.cwd(),
+                argv: ["/usr/local/bin/uzi-codex-command-sandbox",
+                  ...commandSandboxArgv(clone, clone, argv[0]!, argv.slice(1), privateTmp, "required")],
+                env: { ...request.env, HOME: privateTmp, TMPDIR: privateTmp },
+              });
+            }
+            const spawnRequest = options.privateTmp ? { ...request, env: { ...request.env, TMPDIR: tmp } } : request;
+            if (!options.meter && !options.hook) return owner.spawn(captureSpawnRequest(spawnRequest));
+            // Instrument only the trusted inline capture program, preserving its argv and body.
+            const argv = [...spawnRequest.argv];
+            assert.equal(argv[1], "-e");
+            const metricPath = path.join(data, "read-metrics.json");
+            const hook = (options.hook ?? "").replaceAll("__DATA__", JSON.stringify(data));
+            argv[2] = hook + (options.meter ? `
 const meterFs = require("node:fs");
 const meterCp = require("node:child_process");
 const readMetrics = { source: 0, diff: 0, diffSpawned: 0, diffClosed: 0 };
@@ -186,20 +198,61 @@ meterCp.spawn = function(...args) {
 };
 process.on("exit", () => meterFs.writeFileSync(${JSON.stringify(metricPath)}, JSON.stringify(readMetrics)));
 ` : "") + argv[2];
-          return owner.spawn({ ...spawnRequest, argv });
-        }, signal, () => cache.capturePlanningDiff(clone, base));
-      } finally {
-        await owner.settled();
-        assert.deepEqual(owner.survivors(), []);
-        if (privateTmp) await fs.rm(privateTmp, { recursive: true, force: true });
-      }
-    },
-    dispose: () => fs.rm(data, { recursive: true, force: true }),
-  };
+            return owner.spawn(captureSpawnRequest({ ...spawnRequest, argv }));
+          }, signal, () => cache.capturePlanningDiff(clone, base));
+        } finally {
+          await owner.settled();
+          assert.deepEqual(owner.survivors(), []);
+          if (privateTmp) await fs.rm(privateTmp, { recursive: true, force: true });
+        }
+      },
+      dispose: () => fs.rm(data, { recursive: true, force: true }),
+    };
+  } catch (error) {
+    await fs.rm(data, { recursive: true, force: true });
+    throw error;
+  }
+}
+
+// Assert from the runner's own IO channel; split fixture leaves stay private.
+async function assertOwned(file: string, mode?: number): Promise<void> {
+  const stat = await fs.stat(file);
+  assert.equal(stat.uid, uidSplitActive() ? RUNNER_UID : process.getuid!());
+  if (mode !== undefined) assert.equal(stat.mode & 0o777, mode);
 }
 
 // Native capture walks Linux /proc/<pid>/fd paths (src/git.ts); Linux CI runs this block.
 describe("Unit2 runner source capture", { skip: process.platform !== "linux" && "Linux /proc capture required" }, () => {
+  it("cleans a fixture whose seed callback fails", async () => {
+    let data = "";
+    await assert.rejects(fixture({ seed: async seed => {
+      data = path.dirname(seed);
+      await fs.mkdir(path.join(data, "partial"), { mode: 0o700 });
+      throw new Error("seed setup failed");
+    } }), /seed setup failed/);
+    assert.ok(data);
+    await assert.rejects(fs.stat(data), { code: "ENOENT" });
+  });
+
+  it("owns fixture roots, private tmp, late state and capture hook outputs", async () => {
+    const f = await fixture({ privateTmp: true, meter: true,
+      hook: 'require("node:fs").writeFileSync(__DATA__ + "/hook.json", JSON.stringify({ cwd: process.cwd(), uid: process.getuid() }));' });
+    try {
+      await assertOwned(f.data, 0o700);
+      await assertOwned(f.tmp, 0o700);
+      await fs.mkdir(path.join(f.data, "late-state"), { mode: 0o700 });
+      await fs.writeFile(path.join(f.clone, "tracked"), "owned change\\n");
+      await f.git("add", "tracked");
+      await f.capture();
+      assert.deepEqual(JSON.parse(await fs.readFile(path.join(f.data, "hook.json"), "utf8")), {
+        cwd: f.clone, uid: uidSplitActive() ? RUNNER_UID : process.getuid!(),
+      });
+      for (const file of [f.clone, path.join(f.clone, ".git/index"),
+        path.join(f.data, "hook.json"), path.join(f.data, "read-metrics.json")]) await assertOwned(file);
+      await assertOwned(path.join(f.data, "late-state"), 0o700);
+    } finally { await f.dispose(); }
+  });
+
   it("captures under the enforced required command sandbox", async (t) => {
     if (process.platform !== "linux") { t.skip("Linux command sandbox required"); return; }
     try { await fs.access("/usr/local/bin/uzi-codex-command-sandbox", fs.constants.X_OK); }
@@ -239,10 +292,10 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
           // Applying the public patch must reproduce the new path shape and bytes.
           const target = path.join(f.data, "apply");
           await exec("git", ["clone", "--quiet", "--no-local", path.join(f.data, "seed"), target],
-            { env: gitEnv(), timeout: 5000 });
+            { env: planningGitEnv(), timeout: 5000 });
           const patchPath = path.join(f.data, "replacement.patch");
           await fs.writeFile(patchPath, patch);
-          await exec("git", ["-C", target, "apply", patchPath], { env: gitEnv(), timeout: 5000 });
+          await exec("git", ["-C", target, "apply", patchPath], { env: planningGitEnv(), timeout: 5000 });
           assert.equal(await fs.readFile(path.join(target, fileFirst ? "a/b" : "a"), "utf8"), "new replacement\n");
           if (!fileFirst) await assert.rejects(fs.stat(path.join(target, "a/b")), { code: "ENOTDIR" });
         } finally { await f.dispose(); }
@@ -365,7 +418,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
           // Prove Git serves the forged body; rejection must come from capture authentication.
           const { type, oid } = forged;
           const served = (await exec("git", ["-C", f.clone, "cat-file", type, oid],
-            { env: gitEnv(), timeout: 5000, encoding: "buffer" })).stdout;
+            { env: planningGitEnv(), timeout: 5000, encoding: "buffer" })).stdout;
           assert.notEqual(createHash("sha1").update(type + " " + served.length + "\0").update(served).digest("hex"), oid);
         }
         await assert.rejects(f.capture(), kind.startsWith("forged") ? /UZI-PLANNING-REFUSAL base_object_integrity/ : /ELOOP|ENOTDIR/);
@@ -573,12 +626,12 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
     const f = await fixture();
     try {
       const fifo = path.join(f.data, "hostile-config");
-      await exec("mkfifo", [fifo], { env: gitEnv(), timeout: 5000 });
+      await exec("mkfifo", [fifo], { env: planningGitEnv(), timeout: 5000 });
       await f.git("config", "include.path", fifo);
       await fs.writeFile(path.join(f.clone, "tracked"), "include-safe change\n");
       assert.match((await f.capture()).toString(), /\+include-safe change/);
       await fs.unlink(path.join(f.clone, ".git/config"));
-      await exec("mkfifo", [path.join(f.clone, ".git/config")], { env: gitEnv(), timeout: 5000 });
+      await exec("mkfifo", [path.join(f.clone, ".git/config")], { env: planningGitEnv(), timeout: 5000 });
       assert.match((await f.capture()).toString(), /\+include-safe change/);
     } finally { await f.dispose(); }
   });
@@ -605,7 +658,7 @@ describe("Unit2 runner source capture", { skip: process.platform !== "linux" && 
       await fs.unlink(path.join(f.clone, ".gitignore"));
       await fs.writeFile(path.join(f.clone, ".gitignore"), "");
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal });
-      await assert.rejects(f.cache.withBoundaryProcessSpawner(owner.spawn, ac.signal,
+      await assert.rejects(f.cache.withBoundaryProcessSpawner(req => owner.spawn(captureSpawnRequest(req)), ac.signal,
         () => f.cache.capturePlanningDiff(f.clone, "0".repeat(40))), /UZI-PLANNING-REFUSAL base_object_type_mismatch/);
       await owner.settled();
       assert.deepEqual(owner.survivors(), []);
@@ -760,7 +813,7 @@ process.on("exit", () => hookFs.writeFileSync(__DATA__ + "/hook.json", JSON.stri
   const seedGitlink = async (seed: string): Promise<void> => {
     const sub = path.join(seed, "submodule");
     await fs.mkdir(sub);
-    const inner = (...args: string[]): Promise<unknown> => exec("git", ["-C", sub, ...args], { env: gitEnv(), timeout: 5000 });
+    const inner = (...args: string[]): Promise<unknown> => exec("git", ["-C", sub, ...args], { env: planningGitEnv(), timeout: 5000 });
     await inner("init", "--quiet", "--template=");
     await fs.writeFile(path.join(sub, "inner"), "inner\n");
     await inner("add", "inner");
@@ -997,7 +1050,7 @@ snapFs.readSync = function(...args) {
       await assert.rejects(f.cache.capturePlanningDiff(f.clone, "HEAD"), /40-hex/);
       const ac = new AbortController(), owner = new TickSpawner({ signal: ac.signal, killGraceMs: 100 });
       const pending = f.cache.withBoundaryProcessSpawner(async req => {
-        const handle = await owner.spawn(req);
+        const handle = await owner.spawn(captureSpawnRequest(req));
         ac.abort();
         return handle;
       }, ac.signal, () => f.cache.capturePlanningDiff(f.clone, f.base));

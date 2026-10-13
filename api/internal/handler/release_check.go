@@ -73,6 +73,7 @@ func (h *Handler) PostReleaseCheck(w http.ResponseWriter, r *http.Request) {
 	// the release-check Result and PostAgentSourceUpdateCheck use.
 	if res.Status == "error" {
 		dto.Status = "error"
+		dto.Partial = res.Partial
 		if res.Message != "" {
 			dto.Message = termsafe.SanitizeTTY(res.Message)
 		}

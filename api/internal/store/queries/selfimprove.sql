@@ -49,7 +49,7 @@
 -- string(HarnessClaude) as a mechanical stopgap.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_iid, issue_title, issue_description, auto_approve, wait_on_limit, model, override_subagent_model, mr_rework_enabled, required_capabilities, trigger_source, harness, plan_cross_check_required
-) VALUES (
+, code_cross_check_required) VALUES (
     @user_id, @repo_id::uuid, 'self_improve', @issue_iid, @issue_title, @issue_description, true, @wait_on_limit, sqlc.narg('model'), @override_subagent_model, sqlc.narg('mr_rework_enabled'),
     -- required_capabilities (PRD #84 M2, issue #512 M1): a self_improve run is REPO-BEARING
     -- (it targets uzi's own repo, the likeliest to require docker to build/test), so it must
@@ -58,7 +58,7 @@ INSERT INTO runs (
     -- subquery reusing @repo_id, so no new Go struct field. Same expression CreateRun uses.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'self_improve', @harness,
     (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)
-)
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
 RETURNING *;
 
 -- name: CountActiveSelfImproveRunsForRepo :one

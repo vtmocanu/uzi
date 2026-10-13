@@ -96,9 +96,12 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 			saved = store.SlackRunMessage{RunID: rc.ID, ChannelID: channel, RootTs: ts}
 		}
 		anchor = saved
-		// A park that is this run's FIRST Slack event: the root just posted IS the ⏸️ Paused
-		// line, so stamp the marker now so the eventual resume can be posted (PRD #1116).
-		n.recordLimitPause(ctx, rc)
+		// The first root announces the park (PRD #1116). Provider holds require a
+		// saved anchor before stamping delivery; other parks retain the legacy
+		// marker attempt even when the anchor write fails.
+		if !providerHold(rc) || uerr == nil {
+			n.recordLimitPause(ctx, rc)
+		}
 	case err != nil:
 		n.logf("load anchor", err)
 		return
@@ -107,18 +110,27 @@ func (n *Notifier) handle(ctx context.Context, ev stateEvent) {
 		if uerr := n.poster.UpdateBlocks(ctx, existing.ChannelID, existing.RootTs, fallback, blocks); uerr != nil {
 			n.logf("update root", uerr)
 		}
-		if tblocks, tfallback, tok := renderThreadBlocks(rc, base); tok {
+		// State events are serial, but can be late or repeated. The fetched hold and
+		// its status_since identify the announcement, rather than ev.status.
+		holdAnnounced := providerHold(rc) && existing.ParkKind.String == "paused" &&
+			existing.LimitPausedAt.Valid && rc.StatusSince.Valid &&
+			existing.LimitPausedAt.Time.Equal(rc.StatusSince.Time)
+		if tblocks, tfallback, tok := renderThreadBlocks(rc, base); tok && !holdAnnounced {
 			if _, perr := n.poster.PostBlocks(ctx, existing.ChannelID, existing.RootTs, tfallback, tblocks); perr != nil {
 				n.logf("post thread event", perr)
+			} else if providerHold(rc) {
+				// For provider holds, replace the prior marker only after delivery;
+				// a failed post stays retryable and a duplicate needs no write.
+				n.recordLimitPause(ctx, rc)
 			}
 		}
-		// Resume-then-progress: consume a PRIOR park's marker (post ▶️ Resumed on the first
-		// running), then stamp THIS event's marker if it is itself a park, before the
-		// milestone line (PRD #1116). handleLimitResume reads `existing` (the marker from a
-		// prior park); recordLimitPause is a no-op unless this event IS a park (limit_wait or
-		// paused), so on a resume event these do not conflict.
+		// Resume-then-progress: consume a PRIOR park's marker before the milestone
+		// line (PRD #1116). Nonprovider parks retain the legacy recordLimitPause
+		// call after handleLimitResume, including when their thread post fails.
 		n.handleLimitResume(ctx, rc, existing, base)
-		n.recordLimitPause(ctx, rc)
+		if !providerHold(rc) {
+			n.recordLimitPause(ctx, rc)
+		}
 		n.handleMilestone(ctx, rc, existing)
 	}
 
@@ -558,6 +570,9 @@ func rootBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Blo
 		slack.NewTextBlockObject(slack.MarkdownType, sectionText, false, false), nil, nil)}
 
 	var ctxElems []slack.MixedElement
+	if detail := providerStateDetail(rc); detail != "" {
+		ctxElems = append(ctxElems, threadMrkdwnElem(ScrubSecrets(detail)))
+	}
 	if done, total, ok := milestoneCounts(rc); ok {
 		ctxElems = append(ctxElems, slack.NewTextBlockObject(slack.MarkdownType,
 			fmt.Sprintf("🧩 %d/%d milestones", done, total), false, false))
@@ -579,6 +594,46 @@ func rootBlocks(rc store.GetSlackRunContextRow, base string) (blocks []slack.Blo
 
 	fallback = fmt.Sprintf("%s · %s#%d — %s", label, repo, iid(rc.IssueIid), title)
 	return blocks, fallback
+}
+
+func providerHold(rc store.GetSlackRunContextRow) bool {
+	return rc.Status == "paused" && rc.HoldReason.Valid && rc.HoldReason.String == "provider_unavailable"
+}
+
+// providerStateDetail uses only the stored provider projection. Generic recovery
+// never inherits provider wording from counters or a worker-supplied failure reason.
+func providerStateDetail(rc store.GetSlackRunContextRow) string {
+	hold := providerHold(rc)
+	if !hold && (rc.Status != "recovery_wait" || !rc.RecoveryWaitCause.Valid || rc.RecoveryWaitCause.String != "provider_outage") {
+		return ""
+	}
+	var parts []string
+	if rc.ProviderParkCount > 0 {
+		parts = append(parts, fmt.Sprintf("provider parks: %d", rc.ProviderParkCount))
+	}
+	if rc.ProviderParkStreakStartedAt.Valid {
+		parts = append(parts, "streak started "+rc.ProviderParkStreakStartedAt.Time.UTC().Format(time.RFC3339))
+	}
+	if !hold && rc.RecoveryRetryNotBefore.Valid {
+		parts = append(parts, "next retry "+rc.RecoveryRetryNotBefore.Time.UTC().Format(time.RFC3339))
+	}
+	if hold {
+		parts = append(parts, "Automatic provider retries are on hold. Resume to try again, or Cancel from the run page.")
+		done, _, milestones := milestoneCounts(rc)
+		switch {
+		case rc.Kind != runkind.Issue || rc.Interactive || !milestones:
+			parts = append(parts, "Stop unavailable: requires a non-interactive milestone issue run.")
+		case done < 1:
+			parts = append(parts, "Stop unavailable: no completed milestones.")
+		default:
+			parts = append(parts, "To Stop: set the scope ceiling to completed milestones with `uzi run stop "+rc.ID.String()+"`, then Resume to finalize at that ceiling.")
+		}
+		parts = append(parts, "Retained work depends on the worker or a verified recovery capture.")
+		if rc.Kind == runkind.Issue {
+			parts = append(parts, "The issue claim remains held.")
+		}
+	}
+	return strings.Join(parts, " · ")
 }
 
 // mrContextElem is the MR/PR context element for the root — `🔀 <url|MR !N>` in the
@@ -845,6 +900,14 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		return blocks, fmt.Sprintf("Paused · usage limit · %s#%d", repo, iid(rc.IssueIid)), true
 
 	case "paused":
+		if providerHold(rc) {
+			blocks = []slack.Block{threadSectionBlock("⚠️ *Needs your attention · provider unavailable*"),
+				slack.NewContextBlock("slack_thread_provider_hold_ctx", threadMrkdwnElem(ScrubSecrets(providerStateDetail(rc))))}
+			if el, has := linkElem(); has {
+				blocks = append(blocks, slack.NewContextBlock("slack_thread_provider_link_ctx", el))
+			}
+			return blocks, fmt.Sprintf("Needs your attention · provider unavailable · %s#%d", repo, iid(rc.IssueIid)), true
+		}
 		// PRD #1190 M1: the owner-requested park. Led with "‖ Paused by you" so a reader can
 		// tell a user pause from the ⏸️ usage-limit line above. The last checkpoint-published
 		// branch tip (checkpoint_tip) rides the detail as `checkpoint <short>` — its first 7
@@ -971,7 +1034,15 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 		return "💬", "Awaiting your follow-up"
 	case "limit_wait":
 		return "⏸️", "Paused · usage limit"
+	case "paused":
+		if providerHold(rc) {
+			return "⚠️", "Needs your attention · provider unavailable"
+		}
+		return "", rc.Status
 	case "recovery_wait":
+		if rc.RecoveryWaitCause.Valid && rc.RecoveryWaitCause.String == "provider_outage" {
+			return "🔄", "Recovering · provider outage"
+		}
 		// issue #1197: a transient-recovery park that auto-resumes on a capped backoff.
 		// Without this case the default arm below renders the raw enum `recovery_wait` on
 		// the root line of a user-facing DM (Slack has no _→space fallback, PRD #88 M3

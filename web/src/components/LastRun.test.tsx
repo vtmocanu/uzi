@@ -6,16 +6,167 @@
 // pause branch is discriminating in both directions. Issue #1543 adds the
 // ineligible_matched note and the generic (no raise-the-cap) cap-hint copy.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
+import { act, cleanup, render, screen } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { LastFireDetail, LastRunOutcome } from "./LastRun";
-import type { LastFire, LastFireSkip, Schedule } from "../lib/api";
+import { api, ApiError, type LastFire, type LastFireSkip, type Schedule } from "../lib/api";
+import { mockRuns } from "../mocks/data/runs";
+vi.mock("../lib/api", async (original) => {
+  const actual = await original<typeof import("../lib/api")>();
+  return { ...actual, api: { ...actual.api, getRun: vi.fn().mockRejectedValue(new actual.ApiError(404, "Not found")) } };
+});
 
 // LastFireDetail reads useAuth().uziLabel for the cap hint; a minimal stub keeps it out of
 // an AuthProvider.
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ uziLabel: "uzi" }) }));
 
-afterEach(cleanup);
+afterEach(() => { cleanup(); vi.mocked(api.getRun).mockReset().mockRejectedValue(new ApiError(404, "Not found")); });
+
+function startedFire(id: string): LastFire {
+  return { ...fire([]), matched: 1, started: [{ run_id: id, issue_iid: 1, title: "Snapshot title",
+    web_url: null, selector_label: "scheduled", label_removed: true, label_remove_failed: false }] };
+}
+function pendingRun() {
+  let resolve!: (value: Awaited<ReturnType<typeof api.getRun>>) => void;
+  const promise = new Promise<Awaited<ReturnType<typeof api.getRun>>>((done) => { resolve = done; });
+  return { promise, resolve };
+}
+it("LastRun reads only displayed started runs and preserves immutable fire snapshot", async () => {
+  const snapshot = startedFire("A");
+  const saved = JSON.stringify(snapshot);
+  vi.mocked(api.getRun).mockResolvedValueOnce({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: "provider_unavailable" } });
+  const collapsed = render(<MemoryRouter><LastRunOutcome fire={snapshot} expanded={false} onToggle={() => {}} panelId="panel" /></MemoryRouter>);
+  expect(api.getRun).not.toHaveBeenCalled();
+  collapsed.unmount();
+  renderDetail(snapshot);
+  await act(async () => {});
+  expect(api.getRun).toHaveBeenCalledExactlyOnceWith("A");
+  expect(screen.getByText("Current: provider unavailable: owner hold")).toBeTruthy();
+  expect(screen.getByRole("link", { name: "View owner actions" }).getAttribute("href")).toBe("/runs/A");
+  expect(screen.getByText("Snapshot title")).toBeTruthy();
+  expect(JSON.stringify(snapshot)).toBe(saved);
+});
+it.each([404, 403])("LastRun current read refusal %s stays unknown without retries", async (status) => {
+  vi.mocked(api.getRun).mockRejectedValueOnce(new ApiError(status, "Refused"));
+  renderDetail(startedFire("A"));
+  expect(screen.getByText("Loading current state…")).toBeTruthy();
+  await act(async () => {});
+  expect(screen.getByText("Current state unavailable")).toBeTruthy();
+  expect(api.getRun).toHaveBeenCalledOnce();
+});
+it("LastRun stale guard ignores replaced expansion responses and new run loading identity", async () => {
+  const old = pendingRun();
+  const newer = pendingRun();
+  vi.mocked(api.getRun).mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+  const view = renderDetail(startedFire("A"));
+  view.rerender(<MemoryRouter><LastFireDetail s={sched()} fire={startedFire("B")} /></MemoryRouter>);
+  await act(async () => newer.resolve({ run: { ...mockRuns[0], id: "B", status: "running" } }));
+  expect(screen.getByText("Current: running")).toBeTruthy();
+  await act(async () => old.resolve({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: "provider_unavailable" } }));
+  expect(screen.getByText("Current: running")).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "View owner actions" })).toBeNull();
+});
+it("LastRun ignores response identity mismatch and retires read on unmount", async () => {
+  const pending = pendingRun();
+  vi.mocked(api.getRun).mockReturnValueOnce(pending.promise);
+  const view = renderDetail(startedFire("A"));
+  await act(async () => pending.resolve({ run: { ...mockRuns[0], id: "B", status: "paused" } }));
+  expect(screen.getByText("Loading current state…")).toBeTruthy();
+  view.unmount();
+  expect(api.getRun).toHaveBeenCalledOnce();
+});
+
+it("LastRun caps a 1000-entry expanded fire at four total and in-flight reads while preserving snapshots and links", async () => {
+  const snapshot = startedFire("entry-0");
+  snapshot.started = Array.from({ length: 1000 }, (_, index) => ({
+    ...snapshot.started[0], run_id: `entry-${index}`, title: `Snapshot ${index}`,
+  }));
+  const saved = JSON.stringify(snapshot);
+  const requests = Array.from({ length: 4 }, pendingRun);
+  let inFlight = 0;
+  let peak = 0;
+  vi.mocked(api.getRun).mockImplementation((id) => {
+    inFlight++;
+    peak = Math.max(peak, inFlight);
+    const index = Number(id.slice("entry-".length));
+    return (requests[index]?.promise ?? new Promise<Awaited<ReturnType<typeof api.getRun>>>(() => {}))
+      .finally(() => { inFlight--; });
+  });
+  const collapsed = render(<MemoryRouter><LastRunOutcome fire={snapshot} expanded={false} onToggle={() => {}} panelId="panel" /></MemoryRouter>);
+  expect(api.getRun).not.toHaveBeenCalled();
+  collapsed.unmount();
+  const view = renderDetail(snapshot);
+  expect(vi.mocked(api.getRun).mock.calls.map(([id]) => id)).toEqual(["entry-0", "entry-1", "entry-2", "entry-3"]);
+  expect(inFlight).toBe(4);
+  expect(peak).toBe(4);
+  expect(screen.getAllByText("Open run for current state")).toHaveLength(996);
+  expect(screen.getByText("Current state is checked for only the first four started entries in each expanded fire.")).toBeTruthy();
+  for (const index of [4, 999]) {
+    const title = screen.getByText(`Snapshot ${index}`);
+    expect(title.closest(".rounded-lg")?.querySelector("a[href='/runs/entry-" + index + "']")).toBeTruthy();
+    expect(title.closest(".rounded-lg")?.textContent).toContain("scheduled removed");
+  }
+  await act(async () => {
+    requests.forEach((request, index) => request.resolve({ run: { ...mockRuns[0], id: `entry-${index}`, status: "running" } }));
+  });
+  expect(inFlight).toBe(0);
+  expect(api.getRun).toHaveBeenCalledTimes(4);
+  view.rerender(<MemoryRouter><LastFireDetail s={sched()} fire={snapshot} /></MemoryRouter>);
+  await act(async () => {});
+  expect(api.getRun).toHaveBeenCalledTimes(4);
+  expect(JSON.stringify(snapshot)).toBe(saved);
+});
+
+it("LastRun caps multiple expanded fires independently at four reads each", async () => {
+  const snapshots = ["A", "B"].map((prefix) => {
+    const snapshot = startedFire(prefix);
+    snapshot.started = Array.from({ length: 6 }, (_, index) => ({
+      ...snapshot.started[0], run_id: `${prefix}-${index}`,
+    }));
+    return snapshot;
+  });
+  vi.mocked(api.getRun).mockImplementation(() => new Promise(() => {}));
+  render(<MemoryRouter>{snapshots.map((snapshot, index) =>
+    <LastFireDetail key={index} s={sched()} fire={snapshot} />)}</MemoryRouter>);
+  expect(vi.mocked(api.getRun).mock.calls.map(([id]) => id)).toEqual(["A-0", "A-1", "A-2", "A-3", "B-0", "B-1", "B-2", "B-3"]);
+  expect(screen.getAllByText("Current state is checked for only the first four started entries in each expanded fire.")).toHaveLength(2);
+  expect(screen.getAllByText("Open run for current state")).toHaveLength(4);
+});
+
+it("LastRun bounds reads to displayed started siblings and never polls", async () => {
+  vi.useFakeTimers();
+  try {
+    const snapshot = startedFire("A");
+    snapshot.started.push({ ...snapshot.started[0], run_id: "B" });
+    snapshot.skips.push({ issue_iid: 9, title: "Skipped", reason: "already_running", web_url: null });
+    vi.mocked(api.getRun).mockRejectedValueOnce(new ApiError(403, "Refused"))
+      .mockResolvedValueOnce({ run: { ...mockRuns[0], id: "B", status: "recovery_wait", recovery_wait_cause: "provider_outage" } });
+    const view = renderDetail(snapshot);
+    await act(async () => {});
+    expect(vi.mocked(api.getRun).mock.calls.map(([id]) => id)).toEqual(["A", "B"]);
+    expect(screen.getByText("Current state unavailable")).toBeTruthy();
+    expect(screen.getByText("Current: waiting for provider")).toBeTruthy();
+    view.rerender(<MemoryRouter><LastFireDetail s={sched()} fire={snapshot} /></MemoryRouter>);
+    await act(async () => { await vi.advanceTimersByTimeAsync(120000); });
+    expect(api.getRun).toHaveBeenCalledTimes(2);
+  } finally {
+    vi.useRealTimers();
+  }
+});
+
+it("LastRun collapse retires pending read and re-expansion reads once afresh", async () => {
+  const old = pendingRun();
+  const newer = pendingRun();
+  vi.mocked(api.getRun).mockReturnValueOnce(old.promise).mockReturnValueOnce(newer.promise);
+  const view = renderDetail(startedFire("A"));
+  view.unmount();
+  renderDetail(startedFire("A"));
+  await act(async () => newer.resolve({ run: { ...mockRuns[0], id: "A", status: "running" } }));
+  await act(async () => old.resolve({ run: { ...mockRuns[0], id: "A", status: "paused", hold_reason: "provider_unavailable" } }));
+  expect(screen.getByText("Current: running")).toBeTruthy();
+  expect(screen.queryByRole("link", { name: "View owner actions" })).toBeNull();
+  expect(api.getRun).toHaveBeenCalledTimes(2);
+});
 
 function sched(over: Partial<Schedule> = {}): Schedule {
   return {

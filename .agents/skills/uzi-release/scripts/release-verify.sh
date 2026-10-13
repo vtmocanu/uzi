@@ -58,21 +58,16 @@ ROOT="$(git rev-parse --show-toplevel 2>/dev/null)" || { echo "release-verify: n
 . "$ROOT/scripts/lib/release-mode.sh"
 MODE="$(release_mode "$VERSION")"
 
-# Owner/repo from the checkout so a fork works unedited.
-read -r OWNER REPO < <(gh repo view --json owner,name --jq '.owner.login + " " + .name' 2>/dev/null)
+# shellcheck source=scripts/lib/ghcr.sh
+. "$ROOT/scripts/lib/ghcr.sh"
+# Compatibility: verification historically refuses only an empty identity,
+# even when gh returns valid stdout with a nonzero status.
+ghcr_resolve_owner; owner_rc=$?
+: "$owner_rc"
 if [ -z "${OWNER:-}" ] || [ -z "${REPO:-}" ]; then
   echo "release-verify: could not resolve owner/repo via gh (are you in the checkout, authed?)" >&2
   exit 3
 fi
-
-# GHCR packages live under /users/<login> for a User owner and /orgs/<login> for an
-# Organization; picking the wrong one 404s and would report a published artifact as
-# missing. Select by owner type so a fork under an org verifies too.
-OWNER_KIND="$(gh api "users/${OWNER}" --jq '.type' 2>/dev/null)"
-case "$OWNER_KIND" in
-  Organization) PKG_OWNER_PATH="orgs/${OWNER}" ;;
-  *)            PKG_OWNER_PATH="users/${OWNER}" ;;   # User (the default; also the fallback if type is unreadable)
-esac
 
 fails=0
 pass() { printf '  PASS  %s\n' "$1"; }
@@ -81,23 +76,6 @@ fail() { printf '  FAIL  %s\n' "$1"; fails=$((fails+1)); }
 echo "=== verifying $TAG on $OWNER/$REPO ==="
 
 # --- 1. image version tags on GHCR --------------------------------------------
-# A user's container package: /users/<owner>/packages/container/<repo>%2F<img>/versions
-# rc 0 = $VERSION is among the image's tags; 1 = not found; 2 = query error (a
-# transient gh/network blip must not be misreported as "not published"). --paginate
-# walks every version page (the wanted tag is newest so usually page 1, but do not
-# rely on it). Membership is tested in pure bash — no `printf | grep -q`, which can
-# SIGPIPE-flake under pipefail (see assert-changelog-covers-release.sh).
-# img_has_tag <img> [wanted-tag] -> membership of <wanted-tag> (default $VERSION) among
-# <img>'s GHCR tags. The optional second arg lets check 5 reuse this for the worker pin,
-# which is NOT $VERSION (it may name an older published tag, or an RC inside a stable).
-img_has_tag() {
-  local img="$1" want="${2:-$VERSION}" enc tags rc
-  enc="${REPO}%2F${img}"
-  tags="$(gh api --paginate "/${PKG_OWNER_PATH}/packages/container/${enc}/versions" \
-        --jq '.[].metadata.container.tags[]' 2>/dev/null)"; rc=$?
-  [ "$rc" -ne 0 ] && return 2
-  case $'\n'"$tags"$'\n' in (*$'\n'"$want"$'\n'*) return 0 ;; (*) return 1 ;; esac
-}
 for img in api web controller agent-base agent-jvm; do
   img_has_tag "$img"; r=$?
   case $r in
@@ -182,13 +160,9 @@ fi
 # scripts/worker-tag-autobump.sh's read_pin (workers.docker/controller image tags sit
 # deeper and must not match). Worker template images: keep equal to
 # api/internal/workertmpl.Names.
-PIN="$(git show "$TAG:deploy/chart/values.yaml" 2>/dev/null | awk '
-  /^workers:/ { inw=1; next }
-  inw && /^[^[:space:]]/ { inw=0 }
-  inw && /^  image:/ { inimg=1; next }
-  inw && inimg && /^  [^[:space:]]/ { inimg=0 }
-  inw && inimg && /^    tag:[[:space:]]/ { v=$2; gsub(/"/,"",v); print v; exit }
-')"
+PIN="$(ghcr_read_pin "$TAG")"; pin_rc=$?
+# Compatibility: preserve the existing empty-pin FAIL handling and output.
+: "$pin_rc"
 if [ -z "$PIN" ]; then
   fail "could not read workers.image.tag from ${TAG}:deploy/chart/values.yaml (is the tag present locally? run: git fetch --tags origin)"
 else
@@ -201,6 +175,22 @@ else
     esac
   done
 fi
+
+# Publish-time coverage is the release proof; the tagged SHA may inherit main CI.
+for gate in assert-ci-coverage assert-release-metadata assert-tag-smoke; do
+  result="$(gh api "repos/${OWNER}/${REPO}/actions/runs/${RELRUN}/jobs?per_page=100" \
+    --jq ".jobs[] | select(.name == \"${gate}\") | .conclusion" 2>/dev/null)"
+  if [ "$result" = success ]; then
+    if [ "$gate" = assert-ci-coverage ] &&
+       python3 -I "$ROOT/scripts/release-ci-coverage.py" annotation "$TAG" --tag "$TAG" >/dev/null 2>&1; then
+      pass "assert-ci-coverage accepted UNVERIFIED hotfix: no full CI evidence (run $RELRUN)"
+    else
+      pass "$gate green (run $RELRUN)"
+    fi
+  else
+    fail "$gate not proven successful (run $RELRUN, result '$result')"
+  fi
+done
 
 # --- 6. agent image identity gate ran green (#1720) ----------------------------
 if [ -z "${RELRUN:-}" ]; then

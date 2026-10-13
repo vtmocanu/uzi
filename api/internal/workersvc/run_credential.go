@@ -137,12 +137,12 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 			}
 			break
 		}
-		fallthrough
-	case "queued", "limit_wait", "pool_wait", "recovery_wait":
-		// Write the override columns FIRST (idempotent, harmless if the transition then
-		// finds 0 rows), then the state-specific transition. The write runs under the user's
-		// secret mutation lock and re-checks a pin's enablement after it (PRD #1732 D5), so a
-		// disable racing the validation above refuses it and nothing is written.
+		// Any other paused run (an owner pause, a completion or wall hold, or the provider
+		// hold): write the override FIRST (idempotent, harmless if the resume then finds 0
+		// rows), then resume. The write runs under the user's secret mutation lock and
+		// re-checks a pin's enablement after it (PRD #1732 D5), so a disable racing the
+		// validation above refuses it and nothing is written. ResumePausedRun clears a
+		// provider hold's streak in its own statement.
 		if werr := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
 			if _, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
 				Mode:     pgOverrideMode(resolved),
@@ -156,7 +156,15 @@ func (s *Service) SetRunCredential(ctx context.Context, userID, runID uuid.UUID,
 		}); werr != nil {
 			return SetRunCredentialResult{}, werr
 		}
-		if terr := s.applyCredentialTransition(ctx, userID, runID, run.Status); terr != nil {
+		if terr := s.resumePausedForCredential(ctx, userID, runID); terr != nil {
+			return SetRunCredentialResult{}, terr
+		}
+	case "queued", "limit_wait", "pool_wait", "recovery_wait":
+		// PRD #1733 (R2): the override write, the state-specific early promote and the provider
+		// park streak clear are ONE transaction under the owner's secret mutation lock and the
+		// run's row lock, so a refused switch (a disabled pin, a 0-row promote, a run that moved
+		// since it was read) changes nothing at all and a newer streak is never erased.
+		if terr := s.setCredentialAndPromote(ctx, run, userID, resolved); terr != nil {
 			return SetRunCredentialResult{}, terr
 		}
 	case "awaiting_approval", "awaiting_input", "awaiting_followup", "running":
@@ -265,67 +273,116 @@ func (s *Service) stampHeldStateSwitch(ctx context.Context, run store.Run, userI
 	})
 }
 
-// applyCredentialTransition performs the state-specific transition after the override
-// columns are written (PRD #1247 M4, D4). queued does nothing more; each parked state runs
-// its own owner-scoped promote (the limit_wait/recovery_wait early promotes return the run
-// to queued WITHOUT waiting for its retry window; pool_wait uses the existing
-// PromotePoolWaitRun; paused uses ResumePausedRun, which banks the budget and keeps the
-// wall). A 0-row promote is a raced claim/cancel → ErrCredentialSwitchRaced (409).
+// setCredentialAndPromote is the single-transaction set-token write for a queued or parked run
+// (PRD #1733, R2). Under the user's secret mutation lock it locks the run row (owner-scoped) and
+// requires it to be the row SetRunCredential observed (same status, status_since and claim
+// generation), else ErrCredentialSwitchRaced; then writes the override, re-checks a pin's
+// enablement, performs the state-specific early promote and clears the provider-park streak.
+// Every 0-row step is ErrCredentialSwitchRaced and rolls the whole transaction back, override
+// included, so nothing is half-applied and no post-commit write can erase a newer streak. A
+// recovery_wait promote folds the streak reset into PromoteRecoveryWaitRunNow's own UPDATE; the
+// other statuses clear it with ResetProviderParkStreakForOwner, fenced on the promoted status.
+// The automatic promotions (PromoteRecoveryWaitRuns, vault unlock) never come through here and
+// preserve the streak.
 //
-// Each of the four promote transitions writes a kind='resume' audit row exactly as
-// ResumeRunNow does — a server-only kind excluded from ConsumeRunInputs, so the worker
-// never drains it. 'set_token' is deliberately NOT reused as a new kind: it is absent from
-// the run_inputs kind CHECK, so a distinct audit kind would need a migration (out of M4's
-// scope), and 'resume' already means exactly "this run was moved back to queued". The
-// queued branch performs no transition, so it writes no audit row.
-func (s *Service) applyCredentialTransition(ctx context.Context, userID, runID uuid.UUID, status string) error {
-	switch status {
-	case "queued":
-		// The next claim honours the override; nothing else to do.
-		return nil
-	case "limit_wait":
-		rows, err := s.q.PromoteLimitWaitRunNow(ctx, store.PromoteLimitWaitRunNowParams{ID: runID, UserID: userID})
+// The best-effort `resume` audit row is written after the commit for the three parked statuses
+// (a queued run has no transition to audit), as before.
+func (s *Service) setCredentialAndPromote(ctx context.Context, observed store.Run, userID uuid.UUID, resolved *CredentialOverride) error {
+	if s.beforeCredentialSwitchTx != nil {
+		s.beforeCredentialSwitchTx()
+	}
+	runID := observed.ID
+	if err := s.withSecretMutation(ctx, userID, func(q secretMutationQueries) error {
+		locked, err := q.LockRunForCredentialSwitch(ctx, store.LockRunForCredentialSwitchParams{ID: runID, UserID: userID})
 		if err != nil {
-			return fmt.Errorf("promote limit_wait run: %w", err)
-		}
-		if rows == 0 {
-			return ErrCredentialSwitchRaced
-		}
-	case "pool_wait":
-		rows, err := s.q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: runID, UserID: userID})
-		if err != nil {
-			return fmt.Errorf("promote pool_wait run: %w", err)
-		}
-		if rows == 0 {
-			return ErrCredentialSwitchRaced
-		}
-	case "recovery_wait":
-		rows, err := s.q.PromoteRecoveryWaitRunNow(ctx, store.PromoteRecoveryWaitRunNowParams{ID: runID, UserID: userID})
-		if err != nil {
-			return fmt.Errorf("promote recovery_wait run: %w", err)
-		}
-		if rows == 0 {
-			return ErrCredentialSwitchRaced
-		}
-	case "paused":
-		// PRD #1497 M1: the set-token resume preserves its prior behaviour of resuming any paused run
-		// (AllowCompletionBlockedHold so a completion hold still resumes here as before). A
-		// budget_exhausted wall park with no remaining budget is refused by the budget guard (0 rows
-		// -> ErrCredentialSwitchRaced); the owner extends such a run rather than set-token-ing it.
-		if _, err := s.q.ResumePausedRun(ctx, store.ResumePausedRunParams{
-			ID:                         runID,
-			UserID:                     userID,
-			AllowCompletionBlockedHold: true,
-			GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
-		}); err != nil {
 			if errors.Is(err, pgx.ErrNoRows) {
 				return ErrCredentialSwitchRaced
 			}
-			return fmt.Errorf("resume paused run: %w", err)
+			return fmt.Errorf("lock run for credential switch: %w", err)
+		}
+		if locked.Status != observed.Status || locked.ClaimGeneration != observed.ClaimGeneration ||
+			locked.StatusSince.Valid != observed.StatusSince.Valid || !locked.StatusSince.Time.Equal(observed.StatusSince.Time) {
+			return ErrCredentialSwitchRaced
+		}
+		if _, err := q.SetRunCredentialOverride(ctx, store.SetRunCredentialOverrideParams{
+			Mode:     pgOverrideMode(resolved),
+			SecretID: pgOverrideSecretID(resolved),
+			ID:       runID,
+			UserID:   userID,
+		}); err != nil {
+			return fmt.Errorf("set run credential override: %w", err)
+		}
+		if err := lockPinnedOverrideEnabled(ctx, q, userID, resolved, ErrCredentialOverrideSecretNotFound); err != nil {
+			return err
+		}
+		var rows int64
+		switch observed.Status {
+		case "queued":
+			// The next claim honours the override; the run stays queued.
+		case "limit_wait":
+			if rows, err = q.PromoteLimitWaitRunNow(ctx, store.PromoteLimitWaitRunNowParams{ID: runID, UserID: userID}); err != nil {
+				return fmt.Errorf("promote limit_wait run: %w", err)
+			}
+			if rows == 0 {
+				return ErrCredentialSwitchRaced
+			}
+		case "pool_wait":
+			if rows, err = q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: runID, UserID: userID}); err != nil {
+				return fmt.Errorf("promote pool_wait run: %w", err)
+			}
+			if rows == 0 {
+				return ErrCredentialSwitchRaced
+			}
+		case "recovery_wait":
+			// The streak reset is part of this UPDATE (the owner's early promote).
+			if rows, err = q.PromoteRecoveryWaitRunNow(ctx, store.PromoteRecoveryWaitRunNowParams{ID: runID, UserID: userID}); err != nil {
+				return fmt.Errorf("promote recovery_wait run: %w", err)
+			}
+			if rows == 0 {
+				return ErrCredentialSwitchRaced
+			}
+			return nil
+		}
+		// queued / limit_wait / pool_wait: every one is 'queued' after its transition.
+		if rows, err = q.ResetProviderParkStreakForOwner(ctx, store.ResetProviderParkStreakForOwnerParams{ID: runID, UserID: userID, Status: "queued"}); err != nil {
+			return fmt.Errorf("reset provider park streak: %w", err)
+		}
+		if rows == 0 {
+			return ErrCredentialSwitchRaced
+		}
+		return nil
+	}); err != nil {
+		return err
+	}
+	if observed.Status != "queued" {
+		// Best-effort audit row (the transition already committed, so a failed audit write
+		// must not fail the verb).
+		if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
+			slog.Warn("set run credential: write resume audit row", "run", runID, "error", err)
 		}
 	}
-	// Best-effort audit row for the four promote transitions (the transition already
-	// committed, so a failed audit write must not fail the verb).
+	return nil
+}
+
+// resumePausedForCredential is the paused arm of `uzi run set-token`: it resumes any paused run
+// the way the owner's resume does (PRD #1497 M1), with AllowCompletionBlockedHold so a completion
+// hold still resumes here as before. A budget_exhausted wall park with no remaining budget is
+// refused by the budget guard (0 rows -> ErrCredentialSwitchRaced); the owner extends such a run
+// rather than set-token-ing it. A provider hold's streak is cleared by ResumePausedRun itself.
+func (s *Service) resumePausedForCredential(ctx context.Context, userID, runID uuid.UUID) error {
+	if _, err := s.q.ResumePausedRun(ctx, store.ResumePausedRunParams{
+		ID:                         runID,
+		UserID:                     userID,
+		AllowCompletionBlockedHold: true,
+		GlobalTimeoutSeconds:       int32(s.p.RunTimeout.Seconds()),
+	}); err != nil {
+		if errors.Is(err, pgx.ErrNoRows) {
+			return ErrCredentialSwitchRaced
+		}
+		return fmt.Errorf("resume paused run: %w", err)
+	}
+	// Best-effort audit row (the transition already committed, so a failed audit write must not
+	// fail the verb).
 	if _, err := s.q.CreateRunInput(ctx, store.CreateRunInputParams{RunID: runID, Kind: "resume", Body: pgtype.Text{}}); err != nil {
 		slog.Warn("set run credential: write resume audit row", "run", runID, "error", err)
 	}

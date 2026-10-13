@@ -453,6 +453,9 @@ func (s *Service) CoordinatedCodexRefresh(ctx context.Context, wkr store.Worker,
 	operationDeadline := time.Now().Add(operationBudget)
 	operationCtx, cancel := context.WithDeadline(ctx, operationDeadline)
 	defer cancel()
+	// Decoration covers every state refusal, including authorization's early returns.
+	// This defer runs before cancel, inside the operation's bounded context.
+	defer func() { err = s.decorateCodexAccountHold(operationCtx, wkr, runID, capability, err) }()
 	leaseDeadline := s.codexNow().Add(operationBudget)
 	providerDeadline := operationDeadline.Add(-codexRefreshCommitReserve)
 

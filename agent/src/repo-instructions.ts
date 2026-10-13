@@ -53,11 +53,27 @@ export function repoInstructionsPath(clonePath: string): string {
  *  post-sanitization), an UNSAFE symlink (escapes the clone tree, is broken, loops,
  *  or resolves to a non-file) or a non-regular file — never read (`symlinked`), or a
  *  read failure (e.g. EACCES, transient FS error). Trace-logged by the caller. */
-type RepoInstructionsDrop = "absent" | "too_large" | "symlinked" | "read_error";
+export type RepoInstructionsDrop = "absent" | "too_large" | "symlinked" | "read_error";
 
 /** Visible marker left in place of a stripped line-leading `@`-import, so the
  *  structural transform is auditable in the injected text. */
 const IMPORT_STRIPPED_MARKER = "<!-- uzi: @-import stripped -->";
+
+/**
+ * The structural transforms shared by every reader of the root CLAUDE.md (the clone reader
+ * {@link readRepoInstructions} and the commit reader in repo-instructions-at-commit.ts): normalize
+ * CRLF/CR to LF, then replace LINE-LEADING `@<path>` import lines (e.g. `@./foo.md`, `@docs/x.md`,
+ * `@~/y`) with a visible marker. Scoped to the leading token only; an inline `@ref` mid-line is
+ * left. The marker is longer than the line it replaces, so the CALLER must re-check the result
+ * against its byte cap.
+ */
+export function sanitizeRepoInstructionsText(raw: string): string {
+  const normalized = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
+  return normalized
+    .split("\n")
+    .map((line) => (/^\s*@\S+/.test(line) ? IMPORT_STRIPPED_MARKER : line))
+    .join("\n");
+}
 
 /**
  * Resolve the root CLAUDE.md to the canonical, in-tree path to read.
@@ -206,14 +222,7 @@ export async function readRepoInstructions(
     // Bound the RESOLVED target's size before reading it.
     if (st.size > maxBytes) return { dropped: "too_large" };
 
-    const raw = await fh.readFile("utf8");
-    const normalized = raw.replace(/\r\n/g, "\n").replace(/\r/g, "\n");
-    // Strip LINE-LEADING `@<path>` import lines (e.g. `@./foo.md`, `@docs/x.md`,
-    // `@~/y`). Scoped to the leading token only; an inline `@ref` mid-line is left.
-    sanitized = normalized
-      .split("\n")
-      .map((line) => (/^\s*@\S+/.test(line) ? IMPORT_STRIPPED_MARKER : line))
-      .join("\n");
+    sanitized = sanitizeRepoInstructionsText(await fh.readFile("utf8"));
   } catch {
     return { dropped: "read_error" };
   } finally {

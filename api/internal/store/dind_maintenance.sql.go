@@ -28,6 +28,10 @@ UPDATE workers SET maintenance_id = $1, maintenance_nonce = $2,
  maintenance_phase = $3, maintenance_deployment_uid = $4,
  maintenance_pvc_uid = $5, maintenance_register_nonce = $6,
  maintenance_fenced = $7, maintenance_ready_ack = $8,
+ draining_reason = CASE
+   WHEN $3::text = 'requested' AND draining_since IS NULL THEN NULL
+   WHEN $3::text IN ('cancelled','complete') AND maintenance_owns_drain THEN NULL
+   ELSE draining_reason END,
  draining_since = CASE
    WHEN $3::text = 'requested' THEN COALESCE(draining_since, now())
    WHEN $3::text IN ('cancelled','complete') AND maintenance_owns_drain THEN NULL
@@ -42,7 +46,7 @@ UPDATE workers SET maintenance_id = $1, maintenance_nonce = $2,
  dind_meter_at = CASE WHEN $12::boolean THEN NULL ELSE dind_meter_at END,
  dind_below_threshold = CASE WHEN $12::boolean THEN false ELSE dind_below_threshold END,
  updated_at = now()
-WHERE id = $13 RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots
+WHERE id = $13 RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason
 `
 
 type SetDindMaintenanceParams struct {
@@ -147,6 +151,9 @@ func (q *Queries) SetDindMaintenance(ctx context.Context, arg SetDindMaintenance
 		&i.MaintenanceAckAt,
 		&i.MaintenanceActivityFloor,
 		&i.MaxCrossCheckSlots,
+		&i.RegisteredPodUid,
+		&i.RollHeartbeatAt,
+		&i.DrainingReason,
 	)
 	return i, err
 }

@@ -43,10 +43,11 @@
   // ever committed. It is a system utility, not a project dependency. Unlike the mkfifo
   // test, that suite does NOT skip without it: it proves the fetch tool's certificate
   // check, so a missing openssl fails it loudly. `task` is the system gate runner used by the confinement delegation.
-  "ignoreBinaries": ["mkfifo", "openssl", "task"],
+  // go runs the existing real sanitizer helper for the opt-in offline evaluator.
+  "ignoreBinaries": ["mkfifo", "openssl", "task", "go"],
 
-  // The root Taskfile deliberately owns this opt-in proof recipe.
-  "entry": ["test/cross-check-confinement-packaged.probe.ts"],
+  // The confinement probe and standalone editor evaluator are opt-in entries.
+  "entry": ["test/cross-check-confinement-packaged.probe.ts", "src/pr-description-eval-cli.ts"],
 
   // An exported type/interface referenced only within its OWN declaring file is
   // legitimate in-file contract surface, not dead-export debt: the src/protocol.ts

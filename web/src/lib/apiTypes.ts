@@ -16,6 +16,8 @@ export interface User {
   autopilot_enabled: boolean;
   // Per-user consent for the required plan cross-check on new auto-approved runs.
   plan_cross_check_enabled?: boolean;
+  /** Independent advisory code-check consent; absent on older APIs means disabled. */
+  code_cross_check_enabled?: boolean;
   // judge_enabled is the per-user opt-in to run retrospectives (PRD #46). Default
   // false; the user toggles their own from Settings, an admin can force any user's.
   judge_enabled: boolean;
@@ -131,7 +133,7 @@ export interface SecretMeta {
 // the per-user UI theme override; null means "use the instance default" (PRD
 // #21).
 export interface CrossCheckPinDTO {
-  stage: "plan";
+  stage: "plan" | "code";
   harness: Harness;
   model: string | null;
   effort: string | null;
@@ -198,6 +200,10 @@ export interface UserSettings {
    *  the user opted this account out, so the watcher stops auto-reworking their MRs.
    *  The admin global kill-switch is separate. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user switch for the model-written "Now" line on the run progress card (PRD #2603);
+   *  default ON. null/absent reads as enabled; an explicit false opts this account out. The
+   *  instance kill-switch (AppSettings.now_summary_enabled) is separate. */
+  now_summary_enabled?: boolean | null;
   /** Per-user default harness (PRD #1429 M1 / D3); null = "no preference", so implicit run
    *  creation falls through the D11 resolver. One of claude|codex when set; the web Run
    *  Defaults page writes it. */
@@ -208,7 +214,7 @@ export interface UserSettings {
 // is applied (null clears it), a field absent is left unchanged — so the model
 // card and the Appearance picker save independently over the one endpoint.
 export interface UserSettingsPatch {
-  cross_check_pins?: { stage: "plan"; harness: Harness; model?: string | null; effort?: string | null }[];
+  cross_check_pins?: { stage: "plan" | "code"; harness: Harness; model?: string | null; effort?: string | null }[];
   /** @deprecated PRD #1551 D3: the legacy single-model field. New clients (the grouped
    *  Run Defaults card) send default_claude_model / default_codex_model instead and never
    *  send this. Kept only for the bounded stale-client bridge, where the server routes it
@@ -246,6 +252,9 @@ export interface UserSettingsPatch {
   /** Per-user MR-review-watcher opt-in (PRD #700 M6); present-false opts out,
    *  present-true (or null clearing back to the default-ON) re-enables. */
   mr_rework_enabled?: boolean | null;
+  /** Per-user "Now" summary switch (PRD #2603); present-false opts out, present-true (or
+   *  null clearing back to the default-ON) re-enables. */
+  now_summary_enabled?: boolean | null;
   /** Per-user default harness (PRD #1429 M1 / D3); present-value sets the pin (claude|codex),
    *  present-null clears back to "no preference", absent leaves it unchanged. */
   default_harness?: Harness | null;
@@ -508,6 +517,9 @@ export interface PipelineStatus {
 }
 
 export interface Repo {
+  /** Separate checker consent; absent on older APIs means off. */
+  cross_check_repo_instructions_enabled?: boolean;
+  code_cross_check_guidance?: string | null;
   id: string;
   connection_id: string;
   forge_project_id: number;
@@ -1001,6 +1013,11 @@ export interface AppSettings {
   // "true"). When OFF, no user's failed pipeline is auto-fixed regardless of their
   // per-user opt-in — the admin per-user CI-autofix toggle is inert while it is off.
   ci_autofix_enabled: string;
+  // Instance-wide kill-switch for the model-written "Now" summary on the run progress card
+  // (PRD #2603). The text "true"/"false" (default "true"). When OFF, no run shows or
+  // generates a summary regardless of a user's per-user setting. Optional so a response from
+  // an older server (and fixtures that predate the key) still type-check.
+  now_summary_enabled?: string;
   // Ephemeral worker auto-provisioning instance kill-switch (PRD #529 / #649 M1).
   // The text "true"/"false" (default "false"). When OFF, no run ever auto-provisions
   // a throwaway hosted worker regardless of a user's per-account opt-in; when ON,
@@ -1032,8 +1049,8 @@ export interface AppSettings {
   health_queued_seconds: string;
   health_approval_seconds: string;
   health_nudge_cooldown_seconds: string;
-  // Per-run wall-clock extension allowance (PRD #1189): the total extra time an owner may
-  // grant one run through Extend, integer seconds as a string. 0 turns extending off
+  // Per-request wall-clock extension cap (PRD #1189, #2735): the most extra time an owner may
+  // add to a run in one Extend (the cumulative total is not capped), integer seconds as a string. 0 turns extending off
   // instance-wide. Its bounds differ from the health-seconds keys ({0} ∪ [3600, 604800]),
   // so it carries its OWN client validator in HealthSettingsCard, not validateHealthSeconds.
   run_extension_cap_seconds: string;
@@ -1476,6 +1493,8 @@ export interface ReleaseCheckStatus {
   // reason on error, empty otherwise.
   status: string;
   message?: string;
+  // Check now persisted stable facts, but the RC fetch failed.
+  partial?: boolean;
 }
 
 // HealthDoc is the admin-health document (PRD #1484 M1): the response of
@@ -1996,6 +2015,13 @@ export interface Schedule {
   // fired (or a parked/transient fire left the prior summary — or none — in place, since
   // only the success/benign advance path persists).
   last_fire: LastFire | null;
+  // Issue #2519: the last (up to 10) scheduled fires that did something (matched > 0),
+  // newest first, each shaped like last_fire. last_fire stays the latest persisted tick,
+  // so it can be a capacity-blocked tick (matched 0) newer than recent_fires[0]. The
+  // server always emits an array; OPTIONAL and nullable because an older server omits it
+  // (and the zero fixture carries null). Absent or null reads as empty, so the row falls
+  // back to last_fire exactly as before.
+  recent_fires?: LastFire[] | null;
   /** PRD #1247 M1 (D5): the schedule's per-run credential override. null = inherit (the
    *  fired run follows the worker binding), else the {mode, label} a fired run stamps onto
    *  itself. Twin of Run.credential_override; null for every schedule until M6 wires it.
@@ -2244,7 +2270,22 @@ export interface WorkerRunDisk {
   sampled_at: string;
 }
 
+// Fresh, read-only controller diagnostics. The Go DTO carries opaque JSON;
+// members are optional for skew and its recorded empty-object contract fixture.
+export interface WorkerRollPacing {
+  state?: "active" | "held" | "waiting_evidence" | "override";
+  target_image?: string;
+  target_version?: string;
+  canary_id?: string;
+  blocking_worker_id?: string;
+  blocking_reason?: string;
+  retained_image?: string;
+  retained_version?: string;
+}
+
 export interface Worker {
+  // Omitted when absent, invalid or older than the API's independent receipt TTL.
+  roll_pacing?: WorkerRollPacing;
   id: string;
   name: string;
   status: string; // "offline" | "online"
@@ -2609,6 +2650,26 @@ export type RunPriority = "normal" | "background" | "expedited" | "restored";
 // convention here, mirroring FixVerdict/AgentSource, which ARE imported elsewhere).
 type PlanSource = "agent" | "seeded";
 
+/** PRD #2602: the run progress estimate (RunDTO.progress). `state` is a closed set; treat an
+ *  unknown value as "none". `pct` is set only when state is "percent". `phase` is
+ *  implement|review|validate or "" (set only where current_activity is). */
+export interface RunProgress {
+  state: "percent" | "waiting" | "parked" | "queued" | "stalled" | "planning" | "none";
+  pct: number | null;
+  milestone_done: number;
+  milestone_total: number;
+  active_milestone_id: string;
+  phase: "implement" | "review" | "validate" | "";
+  // GetRun only, while awaiting_input: a live run of the same owner and repo the open
+  // question mentions as #<issue>. A hint from untrusted text, not a recorded dependency.
+  maybe_blocked_by_run_id?: string;
+  // GetRun only (PRD #2603): the newest model-written one-sentence summary for the active
+  // milestone, present only while state is "percent" and the run owner's setting is on.
+  // `text` is model-authored UNTRUSTED plain text (render as text, never Markdown); `at` is
+  // when the worker posted it.
+  now_note?: { text: string; at: string } | null;
+}
+
 // Milestone is one item of a milestone-structured run (PRD #122): a stable id and a
 // human title. The title is REPO/agent-authored UNTRUSTED text — safe as JSX (React
 // escapes it) but it must never be rendered through <Markdown> or interpolated into an
@@ -2696,7 +2757,8 @@ export interface CompletionAccepted {
 export type Harness = "claude" | "codex";
 
 // CostStatus is a run's folded cost-observability marker (PRD #1429 M1 / D7): metered rows
-// carry a real dollar cost, subscription/unreported rows do NOT, so a reader keys on this
+// carry a recorded API-equivalent estimate; subscription means no estimate recorded.
+// Unreported run cost is unavailable (aggregates retain recorded partials), so a reader keys on this
 // rather than reading a placeholder cost_usd 0 as a real total. Same forward-compat rule as
 // Harness — render an unrecognised value honestly.
 export type CostStatus = "metered" | "subscription" | "unreported";
@@ -2790,6 +2852,13 @@ export interface Run {
       recorded_at: string;
     } | null;
   };
+  /** Persisted memory intervention allowance for an owner-only memory hold; distinct from requeues. */
+  memory_hold?: {
+    episode: number;
+    used: number;
+    max: number | null;
+    remaining: number | null;
+  };
   requeue_count: number;
   iteration_count: number;
   /** issue #321: server-computed planning-phase display flag — true only while a run is
@@ -2799,6 +2868,16 @@ export interface Run {
    *  omits the key, and an absent value reads as not-planning (isPlanningRun requires
    *  `=== true`). RunListItem extends Run, so list rows inherit it. */
   is_planning?: boolean;
+  /** issue #750/#2760: server-computed plan-revise display flag — true while the run's
+   *  latest {plan, plan_revising} message is a plan_revising (a "revise" replan in
+   *  flight). Meaningful only with status awaiting_approval: isRevisingRun combines the
+   *  two. OPTIONAL for the SAME rollout skew as is_planning: a pre-feature api pod omits
+   *  the key, and an absent value reads as not-revising. */
+  is_revising?: boolean;
+  /** PRD #2602: server-derived progress estimate; null for a terminal run. OPTIONAL for the
+   *  same api/web rollout skew as is_planning: a pre-feature api omits the key, and absent
+   *  renders no progress. */
+  progress?: RunProgress | null;
   /** PRD #19: an autopilot run (poller-started, plan auto-approved). Drives the
    *  "autopilot" badge; a manually-started run is false. */
   auto_approve: boolean;
@@ -2808,12 +2887,16 @@ export interface Run {
   issue_input_reason?: string | null;
   /** The run's snapshot of the owner's plan cross-check setting. */
   plan_cross_check_required: boolean;
+  /** Independent creation-time code-check consent snapshot. */
+  code_cross_check_required?: boolean;
   /** Persisted forced-gate reason; optional for older server and mock responses. */
   plan_cross_check_gate_reason?: string | null;
   /** Planning-diff refusal sub-code; set only while the gate reason is planning_diff_refused. */
   plan_cross_check_diff_refusal?: string | null;
   /** Owner detail only. Historical findings describe an earlier plan. */
   plan_cross_check_summary?: PlanCrossCheckSummary;
+  /** Owner-only persisted code evidence, independent of plan approval. */
+  code_cross_check_summary?: CodeCrossCheckSummary;
   /** issue #857: what/how/who started the run (manual, autopilot, schedule,
    *  self_improve, ci_fix, mr_rework, chat, task, task_review, then_fix, judge,
    *  judge_rerun, resume, cross_check). A NOT NULL server column (DEFAULT 'manual'), so it is
@@ -3046,7 +3129,7 @@ export interface Run {
    *
    *  `budget_extension_seconds` is the owner-granted extension added ON TOP of the frozen
    *  budget (0 when never extended). `budget_extension_cap_seconds` is the effective admin
-   *  cap (run_extension_cap_seconds; 0 = disabled), served here so the Extend chooser needs
+   *  PER-REQUEST maximum (run_extension_cap_seconds; each Extend must be <= it; 0 = disabled), served here so the Extend chooser needs
    *  no separate admin-settings read.
    *
    *  `budget_total_seconds` is COALESCE(budget_wall_seconds, RUN_TIMEOUT) + extension, so a
@@ -3061,7 +3144,7 @@ export interface Run {
   budget_extension_cap_seconds?: number;
   /** PRD #1497 M1: the one-time finalize allowance the Stop action grants a wall-parked milestone
    *  issue run (0, or 1800 once granted). It lives OUTSIDE budget_extension_seconds (the owner
-   *  extension cap never sees it) and is the THIRD term of budget_total_seconds. Optional for
+   *  extension never includes it) and is the THIRD term of budget_total_seconds. Optional for
    *  rollout skew: a pre-feature api pod omits the key. */
   budget_finalize_seconds?: number;
   budget_total_seconds?: number | null;
@@ -3165,8 +3248,8 @@ export interface Run {
    *  next retry, `recovery_retry_not_before`, once the vault is unlocked, and waits `queued`
    *  while it stays locked), and "data_volume_full" (PRD #1809 M5: the worker's data volume
    *  was full or about to fill; the run resumes at its next retry, see disk_park_count);
-   *  "empty_turn"/"provider_outage"
-   *  are reserved. Render an unrecognised value honestly (a
+   *  "provider_outage" is a counted provider interruption with a scheduled retry;
+   *  "empty_turn" remains reserved. Render an unrecognised value honestly (a
    *  newer server may ship a cause this build has not heard of), the same rule as
    *  rate_limit_type. */
   recovery_wait_cause: string | null;
@@ -3208,6 +3291,8 @@ export interface Run {
    *  from forge_park_count. A preventive disk park (the worker stopped the run before its
    *  data volume filled) does not count. 0 for a run that has never taken a counted disk park. */
   disk_park_count?: number;
+  provider_park_count: number;
+  provider_park_streak_started_at: string | null;
   /** PRD #1809 M6 (D8): the worker's report, on the run's latest park, of whether the checkpoint
    *  that park published contains the run's latest committed work. false: it does not (the worker
    *  keeps the latest work under its custody hold). Absent when not reported. The server clears
@@ -3294,7 +3379,9 @@ export interface Run {
    *  `hold_reason` names why a `paused` run is server-held, else null: 'completion_blocked' for
    *  a completion hold, 'credential_disabled' for a run waiting on a disabled credential
    *  (PRD #1732 D14; resumes on Enable, never on a plain Resume), 'budget_exhausted' for a
-   *  wall-clock park (PRD #1497). Render an unrecognised value honestly.
+   *  wall-clock park (PRD #1497), and 'provider_unavailable' for a provider outage bound
+   *  reached (PRD #1733; owner Resume, scoped Stop when permitted, or Cancel).
+   *  Render an unrecognised value honestly.
    *  `hold_context` is the constant "unavailable(same_worker_only)" ONLY while held, else null:
    *  the UI/CLI state the hold's durability HONESTLY from it — the hold is same-worker-only and
    *  must NOT be shown as cross-worker durable.
@@ -3315,6 +3402,9 @@ export interface Run {
    *  a completed milestone and the finalize allowance unused). Both OPTIONAL for rollout skew. */
   worker_name?: string | null;
   can_stop_at_wall?: boolean;
+  /** Server authorization/eligibility hint for scoped Stop at a provider hold; absent or
+   *  false must never be treated as permission. Scope success precedes owner Resume. */
+  can_stop_at_provider_hold: boolean;
   completion_phase?: "checking" | "reworking" | "blocked" | "";
   /** PRD #1227 M1: the owner-decision contract projection — contract-derived (no extra DB read),
    *  all OPTIONAL for api/web rollout skew exactly like the completion block above; the server
@@ -3491,6 +3581,33 @@ export interface PlanCrossCheckFinding {
   rationale: string;
 }
 
+export interface CodeCrossCheckSummary {
+  custom_guidance_applied?: boolean;
+  guidance_digest?: string;
+  repo_instructions_enabled?: boolean;
+  repo_instructions_digest?: string;
+  repo_instructions_commit?: string | null;
+  usage?: RunUsage | null;
+  stage: string;
+  round: number;
+  candidate_generation: number;
+  base_commit: string | null;
+  head_commit: string | null;
+  candidate_digest: string;
+  checker_run_id: string | null;
+  checker_harness: string | null;
+  checker_model: string | null;
+  checker_effort: string | null;
+  outcome: string;
+  reason_class: string | null;
+  findings: unknown;
+  /** Older APIs may omit this field; validate its untrusted contents before display. */
+  dispositions?: unknown;
+  interrupted_at: string | null;
+  finalized_at: string | null;
+  deadline_at: string;
+}
+
 export interface PlanCrossCheckSummary {
   round: number;
   verdict: string;
@@ -3516,14 +3633,14 @@ export interface RunUsage {
   output_tokens: number;
   cost_usd: number;
   /** The run's folded per-run cost_status (PRD #1429 M1 / D7): render dollars only for
-   *  "metered"; "subscription" is labelled subscription usage; "unreported" shows tokens
+   *  "metered" (recorded API-equivalent); "subscription" means no estimate recorded; "unreported" shows tokens
    *  with cost unavailable. On a PER-RUN bundle (a run's usage) it is the real status; on a
    *  per-WINDOW aggregate (SelfUsage.lifetime/last_7_days) a single status does not apply and
    *  it is "" — the window's truth is the subscription/unreported counts on SelfUsage. */
   cost_status: CostStatus | "";
 }
 
-// UsageTail is the estimated, not metered, usage of an interrupted Claude session (issue
+// UsageTail is the estimated usage outside the recorded total of an interrupted Claude session (issue
 // #2014). cost_usd is null (never 0) when cost_status is "unpriced". coverage_reasons is a
 // closed set today (see lib/usageTail.ts) but a newer server may add one: render unknown
 // reasons honestly.
@@ -3553,14 +3670,13 @@ export interface UsageTail {
 // RunListItem is a run row for the index + admin overview: the run plus display
 // context. owner_email is present only on the admin (all-users) list.
 // RunListItem is the LIST row — GET /api/runs. It extends Run, and that inheritance is a
-// trap worth naming: on the Go side RunDTO and RunListItemDTO are SEPARATE structs, so a
-// field added to one is simply absent from the other. Here, a field added to `Run` is
-// silently inherited by RunListItem, so putting a list-only field at the wrong level
-// compiles fine and quietly claims that GET /runs/{id} returns something the API never
-// sends. Nothing fails at runtime until a caller reads the missing field.
-//
-// So: a field the API puts on RunListItemDTO belongs HERE, not on Run. (PRD #98 M4's judge
-// badge fields were caught doing exactly this, by tsc via the run-view fixtures.)
+// trap worth naming: here, a field added to `Run` is silently inherited by RunListItem,
+// so putting a list-only field at the wrong level compiles fine and quietly claims that
+// GET /runs/{id} returns something the API never sends. On the Go side RunListItemDTO
+// EMBEDS RunDTO, so the list row carries every RunDTO key; the rule that still holds is
+// that a field the API puts on RunListItemDTO alone belongs HERE, not on Run. (PRD #98
+// M4's judge badge fields were caught doing exactly this, by tsc via the run-view
+// fixtures.) The compact projection of this row is RunSummaryItem (?view=summary).
 export interface RunListItem extends Run {
   /** Judge badge (PRD #98 M4). judge_verdict is the run's review verdict, null when
    *  the run was never judged — rendered as NO badge, never a neutral one, since
@@ -3572,19 +3688,19 @@ export interface RunListItem extends Run {
   judge_verdict: JudgeVerdict | null;
   judge_todo_count: number;
 
-  /** issue #750: server-computed plan-revise display flag on the LIST row (it rides
-   *  RunListItemDTO, deliberately NOT RunDTO — the detail page keeps its own
-   *  derivePlanRevision panel). True while the run's latest {plan, plan_revising} message
-   *  is a plan_revising — a "revise" replan in flight. The server does NOT status-gate
-   *  it, so a client combines it with status (isRevisingRun requires status ===
-   *  "awaiting_approval" AND `=== true`). OPTIONAL for rollout skew: a pre-feature api
-   *  pod omits the key, and an absent value reads as not-revising. */
-  is_revising?: boolean;
-
   repo_path: string;
   worker_name: string | null;
   owner_email?: string;
 }
+
+/** The compact run-list row served by GET /api/runs?view=summary and
+ *  GET /api/admin/runs?view=summary (Go RunSummaryItemDTO): exactly RunListItem minus the
+ *  four heavy, detail-only text fields. Every list surface that renders badges, durations
+ *  or ordering reads only these keys; the run detail page fetches the full Run. */
+export type RunSummaryItem = Omit<
+  RunListItem,
+  "plan_md" | "repo_agents" | "issue_description" | "preserved_patch"
+>;
 
 // RunOutcomes is the failed-run rate aggregate for one scope+window (PRD #1293).
 // Counted over `runs` directly, NOT the usage rollup (D1): a run that fails before
@@ -3633,7 +3749,8 @@ export interface SelfUsage {
   outcomes: { lifetime: RunOutcomes; last_7_days: RunOutcomes };
   /** PRD #1429 M1 / D7: the per-window subscription/unreported run counts, so a mixed
    *  aggregate can disclose that a non-metered component makes the numeric dollar total
-   *  incomplete rather than presenting a partial sum as complete. Lifetime AND last-seven. */
+   *  incomplete rather than presenting a partial sum as complete. Recorded partial costs from
+   *  unreported runs remain included. Subscription rows have no estimate. Lifetime AND last-seven. */
   lifetime_subscription_run_count: number;
   lifetime_unreported_run_count: number;
   last7_subscription_run_count: number;
@@ -4416,6 +4533,8 @@ export type RunInputKind =
   | "reject_plan"
   | "revise_plan"
   | "cancel"
+  /** Server-side milestone ceiling; body is the completed milestone count. */
+  | "scope"
   | "answer"
   /** PRD #1190: an owner's pause request (`pause`, body = the mode "milestone"|"now")
    *  and its withdrawal (`pause_cancel`), both POSTed to /runs/{id}/inputs. `resume` is
@@ -4811,8 +4930,27 @@ export interface RecoveryArchiveSummary {
 // checkpoint lives on origin: the branch checkpoint ref, or refs/uzi-recovery/<run id> once
 // superseded; all three are absent when the run has no live retention record.
 export interface RecoveryCustodyHold {
+  // Publication proof is independent of capture coverage and physical retirement.
+  // Older servers omit both fields.
+  completed_publication_receipt?: {
+    hold_id: string;
+    run_id: string;
+    owner_id: string;
+    worker_id: string;
+    generation: number;
+    final_head: string;
+    repo_id: string;
+    connection_id: string;
+    project_id: number;
+    forge_type: string;
+    base_url: string;
+    branch: string;
+    mr_iid: number | null;
+    observed_branch_head: string;
+  };
+  completed_publication_reason?: string;
   inventory_guarded: boolean;
-  final_receipt?: { kind: string; capture_id?: string; source_sha?: string; coverage_digest: string };
+  final_receipt?: { kind: string; capture_id?: string; publication_id?: string; source_sha?: string; coverage_digest: string };
   terminal_record_rejection?: string;
   id: string;
   run_id: string;
@@ -4829,6 +4967,9 @@ export interface RecoveryCustodyHold {
   checkpoint_ref?: string;
   checkpoint_tip?: string;
   checkpoint_state?: string;
+  // Issue #2545: a hold released by held publication names its publication and forge ref.
+  final_publication_id?: string;
+  held_ref?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the
@@ -4840,6 +4981,33 @@ export interface RecoveryCustodyAggregate {
   custody_hold_limit: number;
   decision_needed: number;
   blocked_runs: number;
+}
+
+// HeldPublication is one held-work publication of a failed run (issue #2545), mirroring
+// apitypes.HeldPublicationDTO. state is a server enum (prepared, invoked, created,
+// create_unknown, refused, acknowledged, delete_unknown, deleted, abandoned); treat an
+// unknown value as opaque. Every optional field is omitted by the server when unset.
+export interface HeldPublication {
+  id: string;
+  run_id: string;
+  generation: number;
+  ref: string;
+  tip: string;
+  state: string;
+  created_at: string;
+  ref_created_at?: string;
+  acknowledged_at?: string;
+  expires_at?: string;
+  owner_expired_at?: string;
+  deleted_at?: string;
+  last_error?: string;
+  refusal_reason?: string;
+}
+
+// HeldPublications is the owner GET /api/runs/{id}/held-publications response. publications
+// is always an array on the wire, never null.
+export interface HeldPublications {
+  publications: HeldPublication[];
 }
 
 // RecoveryCustodyHolds is the owner GET /api/recovery/holds response (M5 populates the

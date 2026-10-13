@@ -12,6 +12,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/forgesvc"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/runprogress"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -198,7 +199,7 @@ func credentialSwitchState(r store.Run) *string {
 // explicitly so this mapper stays a PURE function of its inputs — no now()/config
 // reaches into it. globalTimeout is the instance RUN_TIMEOUT (h.cfg.RunTimeout),
 // passed in the same way, so RunDeadline can be computed here without config access
-// (PRD #1170). extensionCapSeconds is the effective admin extension cap (PRD #1189,
+// (PRD #1170). extensionCapSeconds is the effective admin per-request extension maximum (PRD #1189, #2735,
 // RunExtensionCapSeconds; 0 = extending disabled) and now is the wall-clock instant used
 // for budget_used_seconds — both passed in so this mapper stays pure.
 // forgeParkMax is the effective forge-unreachable park cap (PRD #1392 M1,
@@ -224,12 +225,14 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		Status:         r.Status,
 		RequeueCount:   r.RequeueCount,
 		WorkerRecovery: workerRecoveryDTO(r, automaticRequeueLimit),
+		MemoryHold:     memoryHoldDTO(r),
 		IterationCount: r.IterationCount,
 		IsPlanning: isPlanningPhase(r.Kind, r.Status, r.IterationCount,
 			r.PlanMd.Valid && strings.TrimSpace(r.PlanMd.String) != ""),
 		AutoApprove:               r.AutoApprove,
 		AutoApproveBlockedReasons: nonNilStrings(r.AutoApproveBlockedReasons),
 		IssueInputReason:          textPtrValue(r.IssueInputReason.Valid, r.IssueInputReason.String),
+		CodeCrossCheckRequired:    r.CodeCrossCheckRequired,
 		PlanCrossCheckRequired:    r.PlanCrossCheckRequired,
 		PlanCrossCheckGateReason:  textPtrValue(r.PlanCrossCheckGateReason.Valid, r.PlanCrossCheckGateReason.String),
 		PlanCrossCheckDiffRefusal: textPtrValue(r.PlanCrossCheckDiffRefusal.Valid && r.PlanCrossCheckGateReason.String == "planning_diff_refused", r.PlanCrossCheckDiffRefusal.String),
@@ -310,6 +313,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		ForgeParkMax:           forgeParkMax,
 		// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 		DiskParkCount: int(r.DiskParkCount),
+		// PRD #1733: the open provider-park streak (count, and when it began; null when none).
+		ProviderParkCount:           int(r.ProviderParkCount),
+		ProviderParkStreakStartedAt: timePtr(r.ProviderParkStreakStartedAt.Valid, r.ProviderParkStreakStartedAt.Time),
 		// PRD #1809 M6 (D8): the latest park's checkpoint-durability report (absent = not reported).
 		CheckpointContainsLatest: boolPtrValue(r.CheckpointContainsLatest),
 		// PRD #300: the per-schedule model a schedule froze onto this run at fire time.
@@ -436,6 +442,9 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	} else {
 		dto.MilestonesInProgress = inProgress
 	}
+	// PRD #2602: the progress estimate, from the row-only inputs decoded above. Phase is
+	// filled by the callers that also set CurrentActivity.
+	deriveProgress(&dto)
 	// PRD #1224: the validated per-milestone agent attribution. Degrades to nil on a decode
 	// error (the stored value is the already-validated subset), same as the id arrays above.
 	if agents, err := workersvc.DecodeMilestoneAgents(r.MilestonesAgents); err != nil {
@@ -452,7 +461,7 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 		dto.BudgetWallSeconds = &v
 	}
 	// PRD #1189: the owner-granted extension (NOT NULL DEFAULT 0 → plain int) and the
-	// effective admin cap, so the Extend chooser and the CLI need no second settings call.
+	// effective admin per-request maximum, so the Extend chooser and the CLI need no second settings call.
 	// The cap is the same value RunExtensionCapSeconds returns (0 = extending disabled).
 	dto.BudgetExtensionSeconds = int(r.BudgetExtensionSeconds)
 	dto.BudgetExtensionCapSeconds = extensionCapSeconds
@@ -501,6 +510,11 @@ func runToDTO(r store.Run, priorityClass string, globalTimeout time.Duration, ex
 	// after MilestonesCompleted is decoded above so len() is the real completed count.
 	dto.CanStopAtWall = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "budget_exhausted" &&
 		r.Kind == "issue" && !r.Interactive && r.BudgetFinalizeSeconds == 0 && len(dto.MilestonesCompleted) >= 1
+	// PRD #1733: the server-derived Stop gate for a provider hold — a paused 'provider_unavailable'
+	// milestone ISSUE run with >= 1 completed milestone (Stop is the scope ceiling plus the owner's
+	// resume, which would finalize nothing otherwise; SubmitInput refuses the same case).
+	dto.CanStopAtProviderHold = r.Status == "paused" && r.HoldReason.Valid && r.HoldReason.String == "provider_unavailable" &&
+		r.Kind == "issue" && !r.Interactive && len(dto.MilestonesCompleted) >= 1
 	// PRD #634 M2: the operator scope ceiling rides the running-report ACK and the claim
 	// payload (both built here) so the worker honors it at the loop top and across a
 	// re-claim. pgtype.Int4 → *int, null (unbounded) when no scope directive was written.
@@ -601,7 +615,7 @@ func landingStateOverlay(failOrigin *string, hasPreservedPatch, hasAvailableCapt
 	return workersvc.DeriveLandingState(failOrigin, hasPreservedPatch, hasAvailableCapture)
 }
 
-// runExtensionCapSeconds reads the per-run extension cap (PRD #1189) best-effort for the DTO:
+// runExtensionCapSeconds reads the per-request extension maximum (PRD #1189, #2735) best-effort for the DTO:
 // a nil settings cache or a read error reads as 0 (extending disabled / unknown), so a
 // momentarily-unreadable setting never fails a run read — the client falls back to plain
 // elapsed and the Extend button does not render (rollout-skew safe).
@@ -754,6 +768,53 @@ func workerRecoveryDTO(r store.Run, limit int) *apitypes.WorkerRecoveryDTO {
 				PublicationUncertain: true, CaptureUncertain: true, CustodyUncertain: true}
 		}
 		dto.Evidence = &evidence
+	}
+	return dto
+}
+
+// setProgressPhase fills Progress.Phase from the run's current-activity role (PRD
+// #2602). It runs after CurrentActivity is overlaid, since runToDTO has no activity;
+// a nil Progress (terminal run) or nil CurrentActivity leaves the phase empty.
+func setProgressPhase(dto *apitypes.RunDTO) {
+	if dto.Progress != nil && dto.CurrentActivity != nil {
+		dto.Progress.Phase = runprogress.Phase(dto.CurrentActivity.Agent)
+	}
+}
+
+// deriveProgress (re)builds dto.Progress from the DTO's own fields (PRD #2602), so
+// applyRevising can re-run it once IsRevising is known. Phase is left empty.
+func deriveProgress(dto *apitypes.RunDTO) {
+	frozenIDs := make([]string, 0, len(dto.Milestones))
+	for _, m := range dto.Milestones {
+		frozenIDs = append(frozenIDs, m.ID)
+	}
+	dto.Progress = runprogress.Derive(runprogress.Input{
+		Kind: dto.Kind, Status: dto.Status, Health: dto.Health,
+		IsPlanning: dto.IsPlanning, IsRevising: dto.IsRevising,
+		FrozenIDs: frozenIDs, Completed: dto.MilestonesCompleted, InProgress: dto.MilestonesInProgress,
+	})
+}
+
+// applyRevising stamps the derived is_revising flag (issues #750, #2760) and re-derives
+// Progress, since a revising awaiting_approval run is planning, not waiting. It rebuilds
+// Progress from scratch, so it must run before setProgressPhase, MaybeBlockedByRunID and
+// overlayNowNote, which refine the Progress it replaces.
+func applyRevising(dto *apitypes.RunDTO, revising bool) {
+	dto.IsRevising = revising
+	deriveProgress(dto)
+}
+
+// memoryHoldDTO projects persisted episode accounting only for an owner memory hold.
+func memoryHoldDTO(r store.Run) *apitypes.MemoryHoldDTO {
+	if r.Status != "recovery_wait" || !r.RecoveryWaitCause.Valid || r.RecoveryWaitCause.String != "worker_memory_pressure" {
+		return nil
+	}
+	dto := &apitypes.MemoryHoldDTO{Episode: r.MemoryEpisode, Used: r.MemoryInterventionCount}
+	var policy workersvc.MemoryPolicy
+	if json.Unmarshal(r.MemoryPolicy, &policy) == nil && policy.Version == 1 && policy.MaxInterventions > 0 && policy.MaxInterventions <= 9999 {
+		limit := policy.MaxInterventions
+		remaining := max(int32(0), limit-r.MemoryInterventionCount)
+		dto.Max, dto.Remaining = &limit, &remaining
 	}
 	return dto
 }

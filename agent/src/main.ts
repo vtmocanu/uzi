@@ -1,9 +1,9 @@
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind } from "./config.js";
+import { loadConfig, MAX_CONCURRENT_RUNS_SOFT_CEILING, type ExecutorKind, type Config } from "./config.js";
 import { createLogger, type Logger } from "./log.js";
 import { WorkerClient, RequestError } from "./client.js";
-import { GitCache } from "./git.js";
+import { GitCache, type GitCacheOptions } from "./git.js";
 import { StubExecutor } from "./executor.js";
 import { SdkExecutor } from "./sdk-executor.js";
 import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
@@ -19,8 +19,10 @@ import { IsolatedExecutor } from "./isolated-executor.js";
 import { IsolatedRunner } from "./isolated-runner.js";
 import { ReviewRunner } from "./review-runner.js";
 import { CrossCheckRunner } from "./cross-check-runner.js";
+import { stubClaudeCrossCheckQueryFn } from "./claude-cross-check.js";
 import { SummaryRunner } from "./summary-runner.js";
 import { stubJudgeQueryFn } from "./judge-runner-stub.js";
+import { defaultQueryFn } from "./sdk-messages.js";
 import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
@@ -44,6 +46,17 @@ import { reapCodexCommandOrphans, type ReapOrphansResult } from "./codex/launche
 import { SECRET_PATH_PREFIXES, workerSecretDenyPaths } from "./guardrails.js";
 import type { ClaimCodexSecrets } from "./protocol.js";
 import type { CommandSandboxMode } from "./config.js";
+
+export function buildWorkerGitCache(
+  config: Pick<Config, "dataDir" | "recoveryDecodedLimitBytes">,
+  log: Logger,
+  terminalRecordProtection: GitCacheOptions["terminalRecordProtection"],
+): GitCache {
+  return new GitCache(config.dataDir, log, undefined, {
+    recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
+    terminalRecordProtection,
+  });
+}
 
 /**
  * Issue #1598: the worker-startup pass of the Codex command orphan reaper (command tmps
@@ -412,9 +425,7 @@ async function main(): Promise<void> {
   const client = new WorkerClient(config.apiUrl, config.workerToken, config.version, log, {
     httpTimeoutMs: config.httpTimeoutMs,
   });
-  const git = new GitCache(config.dataDir, log, undefined, {
-    terminalRecordProtection: (runId) => outbox.hasPhysicalTerminalProtection(runId),
-  });
+  const git = buildWorkerGitCache(config, log, (runId) => outbox.hasPhysicalTerminalProtection(runId));
 
   // PRD #1809 D6: the data-volume guard. It classifies a failed write as data-volume disk-full
   // (the bare clone/fetch, the fetch-back, the outbox reserve), preflights the volume at claim and
@@ -578,6 +589,10 @@ async function main(): Promise<void> {
     // Under the stub executor the pass never runs: the e2e spends nothing on either harness (the
     // Codex advice path takes no queryFn, so a stub queryFn could not neutralize it).
     skipDeliverySummary: config.executor === "stub",
+    // PRD #2603: the model-written "Now" summary shares the advice passes' HOME root and the
+    // production Codex factory. Omitted under the stub executor (an e2e spends nothing); a missing
+    // value means off.
+    ...(config.executor === "stub" ? {} : { nowSummary: { homeRoot: sdkHomeRoot, queryFn: defaultQueryFn, codexAdviceHarnessFactory } }),
     diskLocks,
     queueTerminalRejectionReconciliation: (runId, generation) => terminalRejections.queueReconciliation(runId, generation),
     cachesDropped,
@@ -654,6 +669,10 @@ async function main(): Promise<void> {
     homeRoot: sdkHomeRoot, modelTimeoutMs: config.crossCheckModelTimeoutMs,
     pollMs: config.pollIntervalMs, activeRuns, outbox,
     outboxTerminalMaxBytes: config.outboxTerminalMaxBytes, gapFillMax: config.gapFillMax,
+    // PRD #2460: the Claude checker's path guard denies the same worker-credential set as the other
+    // read-only Claude lanes. Under UZI_EXECUTOR=stub its model call is a canned APPROVE (no network).
+    secretPaths: [...SECRET_PATH_PREFIXES, ...workerSecretDenyPaths(config.workerTokenFile)],
+    ...(config.executor === "stub" ? { claudeQueryFn: stubClaudeCrossCheckQueryFn } : {}),
   });
 
   // The review lane (PRD #400 M4b): a slim runner for a `task` claim carrying a

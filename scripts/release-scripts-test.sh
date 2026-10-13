@@ -25,6 +25,9 @@
 #     reading the `[0.2.0]` body
 #
 # M2a/M2b extend this file to drive release-cut.sh through its verbs.
+# --shipping-paths-only runs the #1466 regressions without the full release suite.
+# --identity-only [oracle-path] runs identity fixtures, optionally against a frozen oracle.
+# --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -32,7 +35,14 @@
 set -uo pipefail
 
 SCRIPTS_DIR="$(cd "$(dirname "$0")" && pwd)"
+TMPDIR="$(cd "$SCRIPTS_DIR/.." && pwd)/.uzi/scratch"
+mkdir -p "$TMPDIR"
+export TMPDIR
 ORACLE="$SCRIPTS_DIR/assert-changelog-covers-release.sh"
+[ "${1:-}" != "--identity-only" ] || ORACLE="${2:-$ORACLE}"
+# Supply a frozen verifier explicitly for exact parity; otherwise assert current behavior.
+GHCR_BASELINE="${GHCR_BASELINE_VERIFY:-}"
+[ "${1:-}" != "--ghcr-only" ] || GHCR_BASELINE="${GHCR_BASELINE_VERIFY:-${2:-}}"
 SECTION="$SCRIPTS_DIR/changelog-section.sh"
 
 for s in "$ORACLE" "$SECTION"; do
@@ -65,13 +75,42 @@ GH_STUB="$(mktemp -d)"
 trap 'rm -rf "$REPO" "$GH_STUB"' EXIT
 cat > "$GH_STUB/gh" <<'STUB'
 #!/usr/bin/env bash
+# New release queries are isolated from the #1327 closing-issue response.
+if [ "${GHCR_STUB:-}" = 1 ]; then
+  [ -z "${GHCR_QUERY_LOG:-}" ] || printf '%s\n' "$*" >> "$GHCR_QUERY_LOG"
+  endpoint=""
+  for arg in "$@"; do
+    case "$arg" in */packages/container/*/versions) endpoint="$arg" ;; esac
+  done
+  if [ -n "$endpoint" ]; then
+    case "$endpoint" in
+      *uzi%2Fagent-base/versions) out="${GHCR_BASE_OUT-}"; rc="${GHCR_BASE_RC:-1}" ;;
+      *uzi%2Fagent-jvm/versions) out="${GHCR_JVM_OUT-}"; rc="${GHCR_JVM_RC:-1}" ;;
+      *) out="${GHCR_OTHER_OUT-}"; rc="${GHCR_OTHER_RC:-1}" ;;
+    esac
+    printf '%s\n' "$out"; exit "$rc"
+  fi
+  case "$*" in
+    'repo view --json owner,name '*)
+      printf '%s\n' "${GHCR_IDENTITY-test uzi}"; exit "${GHCR_IDENTITY_RC:-1}" ;;
+    'api users/test --jq .type')
+      printf '%s\n' "${GHCR_KIND-User}"; exit "${GHCR_KIND_RC:-1}" ;;
+    'run list '*) printf '123\n'; exit 0 ;;
+    'run view 123 --log') printf 'Pushing signature to: fixture\n'; exit 0 ;;
+    *'/releases/latest '*) printf 'v0.2.0\n'; exit 0 ;;
+    *'/actions/runs/123/jobs'*)
+      case "$*" in *'| length'*) printf '1\n' ;; *) printf 'success\n' ;; esac
+      exit 0 ;;
+    *) exit 1 ;; # Unconfigured release queries fail closed.
+  esac
+fi
 [ -n "${GH_STUB_OUT:-}" ] || exit 1
 [ -z "${GH_STUB_LOG:-}" ] || printf '%s\n' "$*" >> "$GH_STUB_LOG"
 printf '%s\n' "$GH_STUB_OUT"
 STUB
 chmod +x "$GH_STUB/gh"
 export PATH="$GH_STUB:$PATH"
-unset GH_STUB_OUT GH_STUB_LOG
+unset GH_STUB_OUT GH_STUB_LOG GHCR_STUB GHCR_QUERY_LOG
 export GH_REPO=test/uzi
 
 DATE_N=0
@@ -299,6 +338,106 @@ oracle_prev() {
 # oracle_run <ref> <version> — run with derived PREV; echoes rc into $? via caller
 oracle_run() { ( cd "$REPO" && bash "$ORACLE" "$1" "" "$2" >/dev/null 2>&1 ); }
 
+# Identity extraction uses the real oracle, git history and the offline gh stub.
+identity_fixture() {
+  git_c init -q
+  git_c config user.email t@example.com
+  git_c config user.name test
+  git_c symbolic-ref HEAD refs/heads/main
+  put api/base.go <<<'package main'
+  chart 0.1.0
+  put CHANGELOG.md <<<'## [0.1.0]
+- Initial'
+  commit "chore(release): v0.1.0"
+  git_c tag v0.1.0
+}
+
+identity_case() { # label subject body expected-rc expected-refs [escape]
+  local label="$1" subject="$2" body="$3" expected="$4" refs="$5" escape="${6:-}"
+  local short citation out rc diagnostic
+  git_c reset -q --hard v0.1.0
+  put api/change.go <<<'package main // change'
+  if [ "$escape" = touched ]; then put CHANGELOG.md <<<'## [0.1.0]
+- Changed'; fi
+  commit "$subject
+
+$body"
+  short="$(git_c rev-parse --short HEAD)"
+  citation="#1317"
+  [ "$escape" != sha ] || citation="$short"
+  put CHANGELOG.md <<<"## [0.2.0]
+- Released ($citation)
+
+## [0.1.0]
+- Initial"
+  chart 0.2.0
+  commit "chore(release): v0.2.0"
+  out="$(cd "$REPO" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; rc=$?
+  assert_eq "$label exit" "$expected" "$rc"
+  if [ "$expected" = 1 ]; then
+    if [ -z "$refs" ]; then
+      diagnostic="        changed api/change.go but cites no issue number; cite #<issue> or the short SHA $short in the section"
+    else
+      diagnostic="        changed api/change.go; neither $refs nor the short SHA $short appears in the section"
+    fi
+    assert_eq "$label diagnostic" "$diagnostic" "$(printf '%s\n' "$out" | sed -n '/^        changed /p')"
+    assert_contains "$label failure header" "FAIL: merges not accounted for in the [0.2.0] section:" "$out"
+    assert_contains "$label commit identity" "  $short  $subject" "$out"
+  fi
+}
+
+identity_regressions() {
+  local REPO
+  REPO="$(mktemp -d)"
+  identity_fixture
+  identity_case "unrelated issue prose" "Ship (#902)" "Unrelated issue #1317" 1 "#902"
+  identity_case "unrelated issue prose without subject refs" "Ship" "Unrelated issue #1317" 1 ""
+  identity_case "see prose without subject refs" "Ship" "See #1317" 1 ""
+  local subject body keyword
+  for body in "other/repo#1317" "Closes other/repo#1317" "Fixes test/uzi#1317" "agent/issue-1317" \
+    "See api/1317/change.go" "See 2026/1317/11" "See https://example.com/issues/1317" \
+    "* Prior change (#1317)" "encloses #1317" "prefixes #1317" "unresolved #1317" \
+    "Fixes#1317" "ClosesSuffix #1317" "xFixes #1317" "Fixes #1317suffix" "Closes #1317x" "Resolved #1317suffix"; do
+    identity_case "body rejected: $body" "Ship" "$body" 1 ""
+  done
+  for subject in "Ship api/1317/change.go" "Ship 2026/1317/11" \
+    "Ship https://example.com/issues/1317" "Ship issue-1317suffix" \
+    "Ship PRD 1317suffix" "Ship #1317suffix" "Ship tissue-1317" "Ship xPRD 1317"; do
+    identity_case "subject rejected: $subject" "$subject" "" 1 ""
+  done
+  identity_case "zero refs" "Ship" "" 1 ""
+  for subject in "Ship (#1317)" "Ship #1317" "Ship issue 1317" "Ship ISSUE-1317" \
+    "Ship PRD 1317" "Ship pRd #1317" "Merge agent/issue-1317" \
+    "Ship https://example.com/issue-1317" "Ship api/PRD 1317/file" \
+    "Ship https://example.com/page#1317" "Ship api/file#1317" \
+    "Ship #902,#1317" "Ship #902#1317" "Ship issue-902;issue-1317" "Ship PRD 902,PRD #1317"; do
+    identity_case "subject accepted: $subject" "$subject" "" 0 ""
+  done
+  for keyword in close cLoSeS CLOSED fix FiXeS FIXED resolve ReSoLvEs RESOLVED; do
+    identity_case "body keyword: $keyword" "Ship" "$keyword #1317" 0 ""
+  done
+  identity_case "body newline whitespace" "Ship" $'Fixes\n#1317' 0 ""
+  identity_case "adjacent body references" "Ship" "Fixes #902;Closes #1317" 0 ""
+  identity_case "space adjacent body references" "Ship" "Fixes #902 fixes #1317" 0 ""
+  identity_case "squash subcommit subjects" "Ship (#902)" $'* First change (#1317)\n* Second change (#1318)' 1 "#902"
+  identity_case "union and dedup diagnostic" "Ship #902,issue-903,#902" "Fixes #904;Closes #903" 1 "#902, #903, #904"
+  identity_case "SHA without refs" "Ship" "" 0 "" sha
+  identity_case "SHA with wrong refs" "Ship (#902)" "Fixes #903" 0 "" sha
+  identity_case "Changelog none body" "Ship" "Changelog: none" 0 ""
+  identity_case "Changelog none subject" "Changelog: none" "" 0 ""
+  identity_case "CHANGELOG touched" "Ship" "" 0 "" touched
+  rm -rf "$REPO"
+}
+
+if [ "${1:-}" = "--identity-only" ]; then
+  identity_regressions
+  echo "=== release-scripts-test: $PASSES passed, $FAILS failed ==="
+  [ "$FAILS" -eq 0 ]
+  exit $?
+fi
+
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ]; then
+identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
 
@@ -398,6 +537,8 @@ assert_contains "stable body accumulates rc.2 (Y)" "Feature Y" "$b_stable"
 b_rc3="$( cd "$REPO" && bash "$SECTION" body 0.4.0-rc.3 2>&1 )"
 assert_contains "re-spin rc.3 with no new bullets says so" "No changelog changes since v0.4.0-rc.2" "$b_rc3"
 
+fi
+
 # =============================================================================
 # M2: release-cut.sh state machine (D1) + lockstep promote (D5)
 # =============================================================================
@@ -422,9 +563,11 @@ seed_repo() {
   for s in worker-tag-autobump changelog-links assert-changelog-covers-release changelog-section assert-worker-tag-decoupled; do
     [ -f "$SCRIPTS_DIR/$s.sh" ] && { cp "$SCRIPTS_DIR/$s.sh" "$d/scripts/$s.sh"; chmod +x "$d/scripts/$s.sh"; }
   done
-  # The shared shipping-path lib the oracle and release-cut both source.
+  # The shared shipping-path lib used by the oracle, release-cut and autobump.
   cp "$SCRIPTS_DIR/lib/shipping-paths.sh" "$d/scripts/lib/shipping-paths.sh"
   cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
+  cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
+  [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
 name: uzi
@@ -467,7 +610,7 @@ put_changelog() { # put_changelog <dir> ; stdin -> CHANGELOG.md, committed
 }
 run_rc() { # run_rc <dir> <args...>  -> sets RC_RC / RC_OUT
   local d="$1"; shift
-  RC_OUT="$( cd "$d" && UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
+  RC_OUT="$( cd "$d" && UZI_RELEASE_OFFLINE_FIXTURE=1 UZI_CHANGELOG_REPO_URL="https://github.com/vtmocanu/uzi" bash "$RC" "$@" 2>&1 )"; RC_RC=$?
 }
 chart_ver()   { awk '/^version:/{print $2; exit}' "$1/deploy/chart/Chart.yaml"; }
 pin_tag()     { awk '/^workers:/{w=1} w&&/^    tag:/{gsub(/"/,"",$2);print $2;exit}' "$1/deploy/chart/values.yaml"; }
@@ -486,6 +629,503 @@ add_origin() {
   git -C "$d" push -q origin main --tags
 }
 push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
+
+# #1466: public release seams, with independent fixtures for each runtime surface.
+shipping_path_regressions() {
+  # shellcheck source=scripts/lib/shipping-paths.sh
+  . "$SCRIPTS_DIR/lib/shipping-paths.sh"
+  local expected="agent/src agent/package.json agent/package-lock.json agent/tsconfig.json agent/bin agent/templates agent/devbox-global agent/codex"
+  assert_eq "shared runtime set stays exact" "$expected" "$AGENT_PATHS"
+  local p d out status subject
+  for p in $expected; do
+    if is_shipping "$p"; then pass "runtime entry $p ships"; else fail "runtime entry $p ships"; fi
+    if is_shipping "$p/nested/runtime.txt"; then pass "runtime descendant $p ships"; else fail "runtime descendant $p ships"; fi
+    if is_shipping "${p}-near/runtime.txt"; then fail "runtime boundary $p excludes near miss"; else pass "runtime boundary $p excludes near miss"; fi
+  done
+  for p in api/x.go controller/x.go web/src/x.ts deploy/chart/values.yaml docs/cli.md; do
+    if is_shipping "$p"; then pass "existing shipping $p"; else fail "existing shipping $p"; fi
+  done
+  for p in api/x_test.go agent/src/foo.test.ts web/src/foo.test.tsx api/testdata/x agent/test/x.ts agent/templates/test/x agent/codex/x_test.go e2e/x fixtures/x .agents/skills/x prds/x.md agent/README.md; do
+    if is_shipping "$p"; then fail "excluded $p"; else pass "excluded $p"; fi
+  done
+
+  # Finite two-case loop: each failure is tallied and the sibling fixture still runs.
+  for p in agent/templates/base/runtime.txt agent/codex/runtime.txt; do
+    d="$(mktemp -d)"; seed_repo "$d"
+    mkdir -p "$d/$(dirname "$p")"; echo 'runtime change' > "$d/$p"
+    git -C "$d" add "$p"
+    subject="Update $p (#1466)"
+    gcommit "$d" "$subject"  # one-parent squash merge, no CHANGELOG in this commit
+    put_changelog "$d" <<'MD'
+# Changelog
+
+## [Unreleased]
+
+## [0.2.0] - 2026-10-01
+### Fixed
+- Unrelated fix (#999)
+
+## [0.1.0] - 2026-09-01
+### Added
+- Initial (#100)
+MD
+    status=0
+    out="$(cd "$d" && bash scripts/assert-changelog-covers-release.sh HEAD v0.1.0 0.2.0-rc.1 2>&1)" || status=$?
+    assert_eq "uncited $p squash merge rejected" "1" "$status"
+    assert_contains "oracle names $p subject" "$subject" "$out"
+    assert_contains "oracle names $p path" "changed $p" "$out"
+    sed 's/Unrelated fix (#999)/Runtime fix (#1466)/' "$d/CHANGELOG.md" > "$d/CHANGELOG.tmp"
+    mv "$d/CHANGELOG.tmp" "$d/CHANGELOG.md"
+    git -C "$d" add CHANGELOG.md; gcommit "$d" "docs: cite runtime fix"
+    status=0
+    out="$(cd "$d" && bash scripts/assert-changelog-covers-release.sh HEAD v0.1.0 0.2.0-rc.1 2>&1)" || status=$?
+    assert_eq "cited $p squash merge accepted" "0" "$status"
+    rm -rf "$d"
+  done
+
+  d="$(mktemp -d)"; seed_repo "$d"; add_origin "$d"; add_feature "$d" 201
+  put_changelog "$d" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- Feature 201 (#201)
+
+## [0.1.0] - 2026-09-01
+### Added
+- Initial (#100)
+MD
+  run_rc "$d" 0.2.0
+  assert_eq "templates promote fixture first RC succeeds" "0" "$RC_RC"
+  git -C "$d" tag v0.2.0-rc.1; push_tag_to_origin "$d" v0.2.0-rc.1
+  mkdir -p "$d/agent/templates/base"; echo 'runtime change' > "$d/agent/templates/base/runtime.txt"
+  git -C "$d" add agent/templates/base/runtime.txt; gcommit "$d" "Update worker template (#1466)"
+  run_rc "$d" 0.3.0 --promote
+  assert_eq "templates-only empty Unreleased refuses next RC" "3" "$RC_RC"
+  assert_contains "templates-only reaches main-half empty refusal" "[Unreleased] is empty and no --changelog-file given" "$RC_OUT"
+  if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "templates-only empty refusal rolls stable tag back"
+  else
+    pass "templates-only empty refusal rolls stable tag back"
+  fi
+  assert_eq "templates-only empty refusal leaves chart at prior RC" "0.2.0-rc.1" "$(chart_ver "$d")"
+  awk '{print} /^## \[Unreleased\]/ {print "### Fixed"; print "- Runtime template (#1466)"}' "$d/CHANGELOG.md" > "$d/CHANGELOG.tmp"
+  mv "$d/CHANGELOG.tmp" "$d/CHANGELOG.md"
+  git -C "$d" add CHANGELOG.md; gcommit "$d" "docs: cite runtime template"
+  run_rc "$d" 0.3.0 --promote
+  assert_eq "cited templates-only promote succeeds" "0" "$RC_RC"
+  assert_eq "cited templates-only cuts next RC" "0.3.0-rc.1" "$(chart_ver "$d")"
+  if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "cited templates-only creates stable"; else fail "cited templates-only creates stable"; fi
+  rm -rf "$d" "$d.origin.git"
+
+  if grep -qE '^[[:space:]]*AGENT_PATHS=' "$SCRIPTS_DIR/worker-tag-autobump.sh"; then
+    fail "autobump has no private AGENT_PATHS assignment"
+  else
+    pass "autobump has no private AGENT_PATHS assignment"
+  fi
+  assert_contains "autobump sources shipping library" '/lib/shipping-paths.sh"' "$(cat "$SCRIPTS_DIR/worker-tag-autobump.sh")"
+  # Override only the fixture-local library. A non-agent sentinel proves both actual
+  # Git diff selection and changed-path reporting consume that library's pathspecs.
+  d="$(mktemp -d)"; seed_repo "$d"
+  printf '\nAGENT_PATHS="runtime-sentinel"\n' >> "$d/scripts/lib/shipping-paths.sh"
+  mkdir -p "$d/agent/src"; echo 'raw runtime test' > "$d/agent/src/foo.test.ts"
+  git -C "$d" add scripts/lib/shipping-paths.sh agent/src/foo.test.ts
+  gcommit "$d" "test: fixture-local pathspec selection"
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+  assert_eq "autobump ignores paths outside sentinel set" "0" "$status"
+  echo 'runtime change' > "$d/runtime-sentinel"
+  git -C "$d" add runtime-sentinel; gcommit "$d" "test: selected sentinel"
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh --check 0.2.0 2>&1)" || status=$?
+  assert_eq "autobump check selects fixture sentinel" "1" "$status"
+  assert_contains "autobump changed-path diff reports sentinel" "runtime-sentinel" "$out"
+  status=0
+  out="$(cd "$d" && bash scripts/worker-tag-autobump.sh 0.2.0 2>&1)" || status=$?
+  assert_eq "autobump edit selects fixture sentinel" "0" "$status"
+  assert_eq "sentinel change bumps worker pin" "0.2.0" "$(pin_tag "$d")"
+  rm -rf "$d"
+}
+
+# #1464 M1: production remains untouched until M2. Named cases also form the
+# priority/pin-selection mutation seams; do not mutate scripts in this fixture.
+ghcr_snapshot() {
+  git -C "$1" symbolic-ref HEAD
+  git -C "$1" rev-parse HEAD
+  git -C "$1" for-each-ref --format='%(refname) %(objectname)'
+  git -C "$1" rev-list --all | sort
+  git -C "$1" status --porcelain
+  git -C "$1" diff HEAD
+}
+ghcr_absent() {
+  case "$3" in *"$2"*) fail "$1 (unexpected '$2')" ;; *) pass "$1" ;; esac
+}
+ghcr_defaults() {
+  export GHCR_STUB=1 GHCR_IDENTITY='test uzi' GHCR_IDENTITY_RC=0
+  export GHCR_KIND=User GHCR_KIND_RC=0
+  export GHCR_BASE_OUT=0.1.1 GHCR_JVM_OUT=0.1.1 GHCR_BASE_RC=0 GHCR_JVM_RC=0
+  export GHCR_OTHER_OUT=0.2.0 GHCR_OTHER_RC=0
+}
+ghcr_cut_seed() {
+  local d="$1" mode="$2"
+  seed_repo "$d"
+  # Keep autobump deterministic: the HEAD pin has a locally published Git tag,
+  # while GHCR responses independently decide whether its images were published.
+  git -C "$d" tag v0.1.1
+  if [ "$mode" = promote ] || [ "$mode" = skip-promote ] || [ "$mode" = promote-only ]; then
+    # A published RC with a tag-tree pin distinct from the current HEAD pin.
+    sed 's/0.1.0/0.2.0-rc.1/g' "$d/deploy/chart/Chart.yaml" > "$d/chart.tmp"
+    mv "$d/chart.tmp" "$d/deploy/chart/Chart.yaml"
+    git -C "$d" add deploy/chart/Chart.yaml
+    gcommit "$d" "chore(release): v0.2.0-rc.1"
+    git -C "$d" tag v0.2.0-rc.1
+    add_origin "$d"; push_tag_to_origin "$d" v0.2.0-rc.1
+  fi
+  # Nested tags must not be selected, even when they precede workers.image.
+  cat > "$d/deploy/chart/values.yaml" <<'YAML'
+workers:
+  docker:
+    image:
+      tag: "docker-decoy"
+  controller:
+    image:
+      tag: "controller-decoy"
+  image:
+    repository: ghcr.io/test/uzi/agent-base
+    tag: "0.1.1"
+other:
+  image:
+    tag: "other-decoy"
+YAML
+  git -C "$d" add deploy/chart/values.yaml
+  gcommit "$d" "test: current HEAD worker pin (#201)"
+  if [ "$mode" != promote-only ] && [ "$mode" != auto-promote-only ]; then add_feature "$d" 201; fi
+  put_changelog "$d" <<'MD'
+# Changelog
+
+## [Unreleased]
+### Added
+- Feature 201 (#201)
+
+## [0.2.0] - 2026-10-01
+### Added
+- Initial RC (#100)
+
+## [0.1.0] - 2026-09-01
+### Added
+- Initial (#100)
+MD
+  if [ "$mode" = auto-promote-only ]; then
+    # The implicit promote-only route requires empty Unreleased as well as no
+    # shipping commits since the RC.
+    awk '/^## \[Unreleased\]/ {print; skip=1; next}
+         skip && /^## \[/ {skip=0}
+         !skip {print}' "$d/CHANGELOG.md" > "$d/changelog.tmp"
+    mv "$d/changelog.tmp" "$d/CHANGELOG.md"
+    git -C "$d" add CHANGELOG.md
+    sed 's/0.1.0/0.2.0-rc.1/g' "$d/deploy/chart/Chart.yaml" > "$d/chart.tmp"
+    mv "$d/chart.tmp" "$d/deploy/chart/Chart.yaml"
+    git -C "$d" add deploy/chart/Chart.yaml
+    gcommit "$d" "chore(release): v0.2.0-rc.1"
+    git -C "$d" tag v0.2.0-rc.1
+    add_origin "$d"; push_tag_to_origin "$d" v0.2.0-rc.1
+  fi
+}
+ghcr_queries() {
+  local label="$1" log="$2" owner="$3" text
+  text="$(cat "$log")"
+  assert_contains "$label identity lookup" 'repo view --json owner,name' "$text"
+  assert_contains "$label owner type lookup" 'api users/test --jq .type' "$text"
+  local image line endpoint matched count
+  # Each worker endpoint must be queried exactly once; argument order is unrestricted.
+  for image in agent-base agent-jvm; do
+    endpoint="/${owner}/packages/container/uzi%2F${image}/versions"
+    matched=""; count=0
+    while IFS= read -r line; do
+      case "$line" in *"$endpoint"*) matched="$line"; count=$((count + 1)) ;; esac
+    done < "$log"
+    assert_eq "$label $image queried once" 1 "$count"
+    assert_contains "$label $image endpoint" "$endpoint" "$matched"
+    assert_contains "$label $image pagination" --paginate "$matched"
+    assert_contains "$label $image tag projection" '.[].metadata.container.tags[]' "$matched"
+  done
+  ghcr_absent "$label no unrelated package" 'uzi%2Fapi/' "$text"
+}
+ghcr_outcome() {
+  local label="$1" image="$2" outcome="$3" output="$4" line found=""
+  [ "$outcome" != error ] || outcome="query error"
+  # Match image and outcome on one line, without prescribing punctuation or URI form.
+  while IFS= read -r line; do
+    case "$line" in *"$image"*) case "$line" in *"$outcome"*) found=1; break ;; esac ;; esac
+  done <<< "$output"
+  if [ -n "$found" ]; then pass "$label $image $outcome"; else fail "$label $image $outcome"; fi
+}
+ghcr_cut_case() {
+  local name="$1" mode="$2" base="$3" jvm="$4" d log before head_before version verb owner out_lower
+  local failures_before="$FAILS"
+  # M2 mutation runners may select one named priority/pin case without changing fixtures.
+  [ -z "${GHCR_CASE_FILTER:-}" ] || [ "$name" = "$GHCR_CASE_FILTER" ] || return 0
+  d="$(mktemp -d)"; ghcr_cut_seed "$d" "$mode"; ghcr_defaults
+  log="$(mktemp)"; export GHCR_QUERY_LOG="$log"
+  case "$base" in absent) GHCR_BASE_OUT=0.2.0 ;; error) GHCR_BASE_RC=7 ;; esac
+  case "$jvm" in absent) GHCR_JVM_OUT=0.2.0 ;; error) GHCR_JVM_RC=7 ;; esac
+  owner=users/test
+  case "$name" in
+    org-present) GHCR_KIND=Organization; owner=orgs/test ;;
+    kind-fallback-present) GHCR_KIND=''; GHCR_KIND_RC=7 ;;
+    identity-rc-present) GHCR_IDENTITY_RC=7 ;;
+    identity-rc-missing) GHCR_IDENTITY_RC=7; GHCR_BASE_OUT=0.2.0 ;;
+    unresolved-owner) GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7 ;;
+    empty-head-pin)
+      sed 's/tag: "0.1.1"/tag: ""/' "$d/deploy/chart/values.yaml" > "$d/values.tmp"
+      mv "$d/values.tmp" "$d/deploy/chart/values.yaml"
+      git -C "$d" add deploy/chart/values.yaml; gcommit "$d" "test: empty HEAD pin (#201)" ;;
+    unreadable-head-pin)
+      git -C "$d" rm -q deploy/chart/values.yaml; gcommit "$d" "test: missing HEAD pin (#201)" ;;
+  esac
+  before="$(ghcr_snapshot "$d")"
+  head_before="$(git -C "$d" rev-parse HEAD)"
+  version=0.2.0; verb=""
+  case "$mode" in
+    stable) verb=--stable ;;
+    promote|skip-promote) version=0.3.0; verb="--$mode" ;;
+    promote-only) verb=--promote-only ;;
+    auto-promote-only) version=0.3.0; verb=--promote ;;
+  esac
+  if [ -n "$verb" ]; then run_rc "$d" "$version" "$verb"; else run_rc "$d" "$version"; fi
+  out_lower="$(printf '%s' "$RC_OUT" | tr '[:upper:]' '[:lower:]')"
+  if [ "$base" != absent ] && [ "$jvm" != absent ] &&
+     [ "$name" != empty-head-pin ] && [ "$name" != unreadable-head-pin ]; then
+    assert_eq "$name succeeds" 0 "$RC_RC"
+    case "$name" in
+      both-error|present-error|unresolved-owner|identity-rc-present|identity-rc-missing)
+        assert_contains "$name warning diagnostic" 'warning:' "$out_lower"
+        assert_contains "$name publish gate warning" 'publish gate' "$out_lower"
+        assert_contains "$name warning selects HEAD pin" 0.1.1 "$RC_OUT"
+        ghcr_absent "$name no publication repair on error" "the pinned tag's publication did not complete" "$RC_OUT" ;;
+      *) ghcr_absent "$name present is silent" 'worker pin pre-flight' "$RC_OUT" ;;
+    esac
+    if [ "$mode" = promote-only ]; then
+      assert_eq "$name no owner/package queries" "" "$(cat "$log")"
+      assert_eq "$name keeps main chart" 0.2.0-rc.1 "$(chart_ver "$d")"
+      assert_eq "$name clean tree" "" "$(git -C "$d" status --porcelain)"
+    else
+      if [ "$name" = unresolved-owner ] || [ "$name" = identity-rc-present ] || [ "$name" = identity-rc-missing ]; then
+        assert_contains "$name identity attempted" 'repo view --json owner,name' "$(cat "$log")"
+        ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
+      else
+        ghcr_queries "$name" "$log" "$owner"
+      fi
+      assert_eq "$name committed clean tree" "" "$(git -C "$d" status --porcelain)"
+      if [ "$mode" = auto-promote-only ]; then
+        assert_eq "$name keeps main chart" 0.2.0-rc.1 "$(chart_ver "$d")"
+        if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "$name stable tag created"; else fail "$name stable tag created"; fi
+      else
+        assert_eq "$name cuts intended version" "$([ "$mode" = stable ] && echo "$version" || echo "$version-rc.1")" "$(chart_ver "$d")"
+        if [ "$head_before" != "$(git -C "$d" rev-parse HEAD)" ]; then pass "$name committed cut"; else fail "$name committed cut"; fi
+      fi
+      if [ "$mode" = promote ]; then
+        if git -C "$d" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then pass "$name stable tag created"; else fail "$name stable tag created"; fi
+      fi
+    fi
+  else
+    assert_eq "$name refuses" 3 "$RC_RC"
+    assert_contains "$name preflight diagnostic" 'worker pin pre-flight' "$RC_OUT"
+    assert_eq "$name HEAD tags refs reachable commits and tree unchanged" "$before" "$(ghcr_snapshot "$d")"
+    assert_eq "$name clean tree after refusal" "" "$(git -C "$d" status --porcelain)"
+    case "$name" in
+      empty-head-pin|unreadable-head-pin)
+        ghcr_absent "$name no package queries" '/packages/container/' "$(cat "$log")"
+        assert_contains "$name instrument failure diagnostic" 'instrument' "$out_lower"
+        assert_contains "$name pin read failure diagnostic" 'read' "$out_lower" ;;
+      *)
+        ghcr_queries "$name" "$log" "$owner"
+        ghcr_outcome "$name" agent-base "$base" "$RC_OUT"
+        ghcr_outcome "$name" agent-jvm "$jvm" "$RC_OUT"
+        # Absent outranks error regardless of image order.
+        assert_contains "$name absent priority" absent "$RC_OUT"
+        assert_contains "$name publication repair" "the pinned tag's publication did not complete" "$RC_OUT"
+        assert_contains "$name release workflow repair" 'release.yml' "$RC_OUT"
+        assert_contains "$name verify repair hint" 'verify' "$out_lower"
+        assert_contains "$name rerun cut hint" 're-run' "$out_lower"
+        assert_contains "$name cut repair hint" 'cut' "$out_lower"
+        assert_contains "$name selects HEAD pin rather than requested version or RC tree" 0.1.1 "$RC_OUT" ;;
+    esac
+  fi
+  printf 'GHCR_CASE=%s RELEASE_EXIT=%s ASSERTION_FAILURES=%s\n' "$name" "$RC_RC" "$((FAILS - failures_before))"
+  rm -rf "$d" "$d.origin.git"; rm -f "$log"
+}
+ghcr_verify_case() {
+  local name="$1" baseline="$2" record="$3" d old new oldrc newrc querylog owner want=1
+  local failures_before="$FAILS"
+  [ -z "${GHCR_CASE_FILTER:-}" ] || [ "verify-$name" = "$GHCR_CASE_FILTER" ] || return 0
+  d="$(mktemp -d)"; seed_repo "$d"; ghcr_defaults
+  export GHCR_BASE_OUT=$'0.2.0\n0.1.0' GHCR_JVM_OUT=$'0.2.0\n0.1.0'
+  case "$name" in
+    present) want=0 ;;
+    org-present) want=0; GHCR_KIND=Organization ;;
+    kind-fallback-present) want=0; GHCR_KIND=''; GHCR_KIND_RC=7 ;;
+    identity-rc-present) want=0; GHCR_IDENTITY_RC=7 ;;
+    unresolved-owner) want=3; GHCR_IDENTITY=''; GHCR_IDENTITY_RC=7 ;;
+    image-absent) GHCR_BASE_OUT=0.1.0 ;;
+    image-error) GHCR_BASE_RC=7 ;;
+    pin-absent) GHCR_BASE_OUT=0.2.0 ;;
+    pin-error) GHCR_JVM_RC=7 ;;
+    empty-pin)
+      sed 's/tag: "0.1.0"/tag: ""/' "$d/deploy/chart/values.yaml" > "$d/values.tmp"
+      mv "$d/values.tmp" "$d/deploy/chart/values.yaml" ;;
+    unreadable-pin) rm "$d/deploy/chart/values.yaml" ;;
+    nested-pin)
+      want=0
+      cat > "$d/deploy/chart/values.yaml" <<'YAML'
+workers:
+  docker:
+    image:
+      tag: "docker-decoy"
+  controller:
+    image:
+      tag: "controller-decoy"
+  image:
+    tag: "0.1.0"
+YAML
+      ;;
+  esac
+  git -C "$d" add deploy/chart/values.yaml
+  git -C "$d" diff --cached --quiet || gcommit "$d" "test: verifier pin"
+  git -C "$d" tag v0.2.0
+  old="$(mktemp)"; new="$(mktemp)"; querylog="$(mktemp)"
+  export GHCR_QUERY_LOG="$querylog"
+  if [ -n "$baseline" ]; then
+    oldrc=0; (cd "$d" && bash "$baseline" 0.2.0) > "$old" 2>&1 || oldrc=$?
+    { printf '=== baseline %s ===\nEXIT=%s\n' "$name" "$oldrc"; cat "$old"; } >> "$record"
+    assert_eq "verify $name baseline status" "$want" "$oldrc"
+  fi
+  : > "$querylog"
+  newrc=0; (cd "$d" && bash "$REPO_ROOT/.agents/skills/uzi-release/scripts/release-verify.sh" 0.2.0) > "$new" 2>&1 || newrc=$?
+  { printf '=== current %s ===\nEXIT=%s\n' "$name" "$newrc"; cat "$new"; } >> "$record"
+  assert_eq "verify $name current status" "$want" "$newrc"
+  if [ -n "$baseline" ]; then
+    assert_eq "verify $name unchanged status" "$oldrc" "$newrc"
+    if cmp -s "$old" "$new"; then pass "verify $name exact baseline output"; else fail "verify $name exact baseline output"; fi
+  fi
+  if [ "$name" = unresolved-owner ]; then
+    ghcr_absent "verify $name no package queries" '/packages/container/' "$(cat "$querylog")"
+  else
+    owner=users/test; [ "$name" != org-present ] || owner=orgs/test
+    # Verifier also checks the release artifacts; only inspect the worker endpoints here.
+    local image endpoint matched line
+    for image in agent-base agent-jvm; do
+      endpoint="/${owner}/packages/container/uzi%2F${image}/versions"; matched=""
+      while IFS= read -r line; do
+        case "$line" in *"$endpoint"*) matched="$line"; break ;; esac
+      done < "$querylog"
+      assert_contains "verify $name $image owner endpoint" "$endpoint" "$matched"
+      assert_contains "verify $name $image pagination" --paginate "$matched"
+    done
+  fi
+  case "$name" in
+    image-absent) assert_contains "verify $name membership assertion" 'agent-base:0.2.0 NOT found' "$(cat "$new")" ;;
+    pin-absent) assert_contains "verify $name membership assertion" 'agent-base:0.1.0 NOT on GHCR' "$(cat "$new")" ;;
+    image-error|pin-error) assert_contains "verify $name honest query error" 'could not query GHCR' "$(cat "$new")" ;;
+    unresolved-owner) assert_contains "verify $name identity failure" 'could not resolve owner/repo via gh' "$(cat "$new")" ;;
+    empty-pin|unreadable-pin) assert_contains "verify $name unreadable assertion" 'could not read workers.image.tag' "$(cat "$new")" ;;
+  esac
+  printf 'GHCR_CASE=verify-%s VERIFY_EXIT=%s ASSERTION_FAILURES=%s\n' "$name" "$newrc" "$((FAILS - failures_before))"
+  rm -rf "$d"; rm -f "$old" "$new" "$querylog"
+  unset GHCR_QUERY_LOG
+}
+# Direct helper contract: the verifier intentionally ignores the pin reader's status.
+ghcr_reader_case() {
+  local name="$1" record="$2" d out rc=0 failures_before="$FAILS" rev
+  [ -z "${GHCR_CASE_FILTER:-}" ] || [ "reader-$name" = "$GHCR_CASE_FILTER" ] || return 0
+  d="$(mktemp -d)"; seed_repo "$d"
+  if [ "$name" = large-pin ]; then
+    # Finite suffix larger than pipe buffers exposes early-reader SIGPIPE.
+    awk 'BEGIN {for(i=0;i<100000;i++) print "# pin reader suffix"}' >> "$d/deploy/chart/values.yaml"
+    git -C "$d" add deploy/chart/values.yaml; gcommit "$d" "test: large pin reader input"
+    rev=HEAD
+  else
+    rev=refs/tags/missing-fixture-revision
+  fi
+  out="$(
+    cd "$d" || exit 1
+    set -o pipefail
+    # shellcheck source=scripts/lib/ghcr.sh
+    . "$d/scripts/lib/ghcr.sh" && ghcr_read_pin "$rev"
+  )" || rc=$?
+  { printf '=== reader %s ===\nEXIT=%s\n' "$name" "$rc"; printf '%s\n' "$out"; } >> "$record"
+  if [ "$name" = large-pin ]; then
+    assert_eq "reader $name exact pin" 0.1.0 "$out"
+    assert_eq "reader $name status under pipefail" 0 "$rc"
+  else
+    if [ "$rc" -ne 0 ]; then pass "reader $name nonzero status"; else fail "reader $name nonzero status"; fi
+    assert_eq "reader $name no pin" "" "$out"
+  fi
+  printf 'GHCR_CASE=reader-%s READER_EXIT=%s ASSERTION_FAILURES=%s\n' "$name" "$rc" "$((FAILS - failures_before))"
+  rm -rf "$d"
+}
+ghcr_regressions() {
+  local baseline="$GHCR_BASELINE" record name
+  if [ -n "$baseline" ]; then
+    [ -f "$baseline" ] || { fail "supplied frozen verifier unavailable: $baseline"; return; }
+    # Verifier calls run inside fixtures, so resolve a supplied path first.
+    baseline="$(cd "$(dirname "$baseline")" && pwd)/$(basename "$baseline")"
+    record="$(mktemp "$TMPDIR/ghcr-baseline.XXXXXX")"
+    echo "GHCR_BASELINE_LOG=$record"
+  else
+    record="$(mktemp "$TMPDIR/ghcr-current.XXXXXX")"
+    echo "GHCR_CURRENT_LOG=$record"
+    echo "  No frozen baseline supplied; asserting current verifier behavior only."
+  fi
+  # Finite scenario matrices: assertion failures never prevent sibling scenarios.
+  ghcr_cut_case missing-base default absent present
+  ghcr_cut_case missing-jvm default present absent
+  ghcr_cut_case absent-error default absent error
+  ghcr_cut_case error-absent default error absent
+  ghcr_cut_case both-error default error error
+  ghcr_cut_case present-error default present error
+  ghcr_cut_case unresolved-owner default present present
+  ghcr_cut_case empty-head-pin default present present
+  ghcr_cut_case unreadable-head-pin default present present
+  ghcr_cut_case present default present present
+  ghcr_cut_case org-present default present present
+  ghcr_cut_case kind-fallback-present default present present
+  ghcr_cut_case identity-rc-present default present present
+  ghcr_cut_case identity-rc-missing default present present
+  ghcr_cut_case stable-refusal stable absent present
+  ghcr_cut_case stable-present stable present present
+  ghcr_cut_case skip-refusal skip-promote absent present
+  ghcr_cut_case skip-present skip-promote present present
+  ghcr_cut_case promote-refusal promote absent present
+  ghcr_cut_case promote-present promote present present
+  ghcr_cut_case promote-only-present promote-only present present
+  ghcr_cut_case auto-promote-only-present auto-promote-only present present
+  for name in present org-present kind-fallback-present identity-rc-present unresolved-owner image-absent image-error pin-absent pin-error empty-pin unreadable-pin nested-pin; do
+    ghcr_verify_case "$name" "$baseline" "$record"
+  done
+  if [ -f "$SCRIPTS_DIR/lib/ghcr.sh" ]; then
+    ghcr_reader_case large-pin "$record"
+    ghcr_reader_case missing-revision "$record"
+  else
+    echo "  SKIP large-pin / missing-revision helper fixtures until scripts/lib/ghcr.sh exists"
+  fi
+  [ -z "${GHCR_CASE_FILTER:-}" ] || [ "$((PASSES + FAILS))" -gt 0 ] || fail "unknown GHCR_CASE_FILTER: $GHCR_CASE_FILTER"
+  unset GHCR_STUB GHCR_QUERY_LOG GHCR_IDENTITY GHCR_IDENTITY_RC GHCR_KIND GHCR_KIND_RC
+  unset GHCR_BASE_OUT GHCR_BASE_RC GHCR_JVM_OUT GHCR_JVM_RC GHCR_OTHER_OUT GHCR_OTHER_RC
+}
+if [ "${1:-}" != "--shipping-paths-only" ]; then ghcr_regressions; fi
+if [ "${1:-}" = "--ghcr-only" ]; then
+  echo "=== GHCR regressions: $PASSES passed, $FAILS failed ==="
+  [ "$FAILS" -eq 0 ]
+  exit $?
+fi
+
+shipping_path_regressions
+if [ "${1:-}" = "--shipping-paths-only" ]; then
+  echo "=== shipping-path regressions: $PASSES passed, $FAILS failed ==="
+  [ "$FAILS" -eq 0 ]
+  exit $?
+fi
 
 echo "=== M2: release-cut first RC ==="
 S1="$(mktemp -d)"; seed_repo "$S1"; add_feature "$S1" 201
@@ -817,7 +1457,7 @@ if has_heading "$S8P" 0.3.0; then fail "promote-only opens NO [0.3.0] section"; 
 echo "=== M2b: --promote-only (stable from the RC commit, NO next candidate, main untouched) ==="
 # The 0.83.1 case: SHIPPING work landed on main after the RC, it must not ride into the
 # stable, and no next candidate is wanted yet. --promote would cut v0.3.0-rc.1 in lockstep
-# (and, with an empty [Unreleased], fail and roll the stable back); --promote-only tags
+# (and, with empty [Unreleased] and no draft, refuse before tagging); --promote-only tags
 # v0.2.0 from the RC commit and stops, whatever main carries. Same setup as S8.
 S8O="$(mktemp -d)"; seed_repo "$S8O"; add_origin "$S8O"; add_feature "$S8O" 201
 put_changelog "$S8O" <<'MD'
@@ -1126,27 +1766,6 @@ assert_contains "abort names the non-allowlisted file" "non-allowlisted file:" "
 if git -C "$S9" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "aborted promote leaves NO v0.2.0 tag"; else pass "aborted promote leaves NO v0.2.0 tag"; fi
 if git -C "$S9" rev-parse -q --verify refs/heads/release/0.2.0 >/dev/null; then fail "aborted promote leaves NO release/0.2.0 branch"; else pass "aborted promote leaves NO release/0.2.0 branch"; fi
 
-echo "=== M2b: --promote rolls back the local stable tag when the main half fails ==="
-S10="$(mktemp -d)"; seed_repo "$S10"; add_origin "$S10"; add_feature "$S10" 201
-put_changelog "$S10" <<'MD'
-# Changelog
-
-## [Unreleased]
-### Added
-- **Feature 201** (#201)
-
-## [0.1.0] - 2026-09-01
-### Added
-- **Initial** (#100)
-MD
-run_rc "$S10" 0.2.0; git -C "$S10" tag v0.2.0-rc.1; push_tag_to_origin "$S10" v0.2.0-rc.1
-add_feature "$S10" 301               # merges since the RC, so NOT the promote-only path
-# but leave [Unreleased] EMPTY and pass no --changelog-file, so the main-half fold fails
-# AFTER promote_inflight has already tagged v0.2.0. The trap must roll that tag back.
-run_rc "$S10" 0.3.0 --promote
-if [ "$RC_RC" -ne 0 ]; then pass "promote main-half failure exits nonzero"; else fail "promote main-half failure exits nonzero"; fi
-if git -C "$S10" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then fail "failed promote leaves NO local v0.2.0 tag (rolled back)"; else pass "failed promote leaves NO local v0.2.0 tag (rolled back)"; fi
-
 echo "=== M2c: worker-tag-autobump — a pin naming a MISSING tag is repinned, never failed open ==="
 # The 0.83.0-rc.7 forward trap: after the local-only rc.7 tag was deleted, the pin named a
 # tag that no longer existed and the old autobump FAILED OPEN (left the dead pin, shipped
@@ -1322,11 +1941,299 @@ git -C "$SDH" add -A; gcommit "$SDH" "fix(deps): bump x and adapt (#350)"
 feature_201_changelog "$SDH"
 run_rc "$SDH" 0.2.0
 assert_eq "a dependency merge that also changes source is not auto-cited (cut fails)" "1" "$RC_RC"
-rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI"
+# An agent npm bump (manifest + lockfile, Renovate-typed) is cited in bulk too; the Codex
+# runtime lock is not a dependency manifest, so an uncited Codex bump still fails the cut.
+SDJ="$(mktemp -d)"; seed_repo "$SDJ"; add_feature "$SDJ" 201
+mkdir -p "$SDJ/agent"; echo '{"dependencies":{"y":"1"}}' > "$SDJ/agent/package.json"; echo '{"y":1}' > "$SDJ/agent/package-lock.json"
+git -C "$SDJ" add -A; gcommit "$SDJ" "fix(deps): update dependency y to v1 (#360)"
+feature_201_changelog "$SDJ"
+run_rc "$SDJ" 0.2.0
+assert_eq "agent npm dependency merge exits 0" "0" "$RC_RC"
+assert_contains "agent npm dependency merge is auto-cited" "#360" "$(dep_bullet "$SDJ")"
+SDK="$(mktemp -d)"; seed_repo "$SDK"; add_feature "$SDK" 201
+add_dep "$SDK" agent/codex/codex-package.lock "chore(deps): update codex runtime (#370)"
+feature_201_changelog "$SDK"
+run_rc "$SDK" 0.2.0
+assert_eq "a Codex runtime lock bump is not auto-cited (cut fails)" "1" "$RC_RC"
+assert_contains "oracle names the Codex runtime merge" "(#370)" "$RC_OUT"
+rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI" "$SDJ" "$SDK"
 
-rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$S10" "$SA" "$SB" "$SC" "$SD" "$SE" \
-       "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$S10.origin.git" "$SD.origin.git" "$SE.origin.git" \
+rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$SA" "$SB" "$SC" "$SD" "$SE" \
+       "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$SD.origin.git" "$SE.origin.git" \
        "$S8R.draft.md" "$SBH" "$SBH.origin.git"
+
+echo "=== #1468 M1: NUL paths and checked listing producers ==="
+LIST_SHIM="$(mktemp -d)"
+export LIST_REAL_GIT
+LIST_REAL_GIT="$(command -v git)"
+cat > "$LIST_SHIM/git" <<'STUB'
+#!/usr/bin/env bash
+# Record stable-tag creation attempts; delegate all non-listing operations unchanged.
+if [ "${1:-}" = tag ] && [ "${2:-}" = -a ] && [ "${3:-}" = v0.2.0 ] && [ -n "${PROMOTE_ATTEMPT_LOG:-}" ]; then
+  printf 'v0.2.0\n' >> "$PROMOTE_ATTEMPT_LOG"
+fi
+# Intercept only path listings for this fixture's selected commit.
+listing=0
+case "${1:-}" in
+  diff|show)
+    for arg in "$@"; do
+      [ "$arg" != --name-only ] || listing=1
+    done
+    ;;
+esac
+if [ "$listing" = 1 ] && [ "${!#}" = "${LIST_SHA:-}" ]; then
+  case "${LIST_MODE:-}" in
+    fallback) [ "$1" != diff ] || exit 71 ;;
+    fallback_prefix)
+      if [ "$1" = diff ]; then printf 'prds/'; exit 71; fi
+      ;;
+    fallback_changelog)
+      if [ "$1" = diff ]; then printf 'CHANGELOG.md\0'; exit 71; fi
+      ;;
+    fail) exit 72 ;;
+    partial)
+      printf 'api/go.mod\0api/é.go\0'
+      exit 73
+      ;;
+    large)
+      # 20,000 records exceed pipe capacity; success requires draining all of them.
+      printf 'api/é.go\0'
+      for ((i=0; i<20000; i++)); do
+        printf 'prds/nonshipping-record-%08d-padding-padding-padding.md\0' "$i" || exit 74
+      done
+      printf 'drained\n' >> "$LIST_LOG"
+      exit 0
+      ;;
+  esac
+fi
+exec "$LIST_REAL_GIT" "$@"
+STUB
+chmod +x "$LIST_SHIM/git"
+export PATH="$LIST_SHIM:$PATH"
+export LIST_SHA LIST_MODE LIST_LOG
+listing_failure() {
+  if [ "$2" -ne 0 ]; then pass "$1 refuses"; else fail "$1 refuses"; fi
+  assert_contains "$1 names SHA" "$LIST_SHA" "$3"
+  assert_contains "$1 explains listing failure" "list" "$3"
+}
+unusual_feature() {
+  local d="$1" path="$2"
+  printf 'package main\n' > "$d/$path"
+  git -C "$d" add -- "$path"
+  gcommit "$d" 'feat: unusual path (#1468)'
+}
+published_rc() {
+  seed_repo "$1"; add_origin "$1"; add_feature "$1" 201
+  feature_201_changelog "$1"
+  run_rc "$1" 0.2.0
+  assert_eq "listing fixture initial RC succeeds" 0 "$RC_RC"
+  git -C "$1" tag v0.2.0-rc.1
+  push_tag_to_origin "$1" v0.2.0-rc.1
+}
+# Snapshot every tracked file, plus index/worktree status, to prove refusal is inert.
+promote_snapshot() {
+  ( cd "$1" && git ls-files -z | xargs -0 cksum && git status --porcelain )
+}
+no_promote_attempt() {
+  assert_eq "$1 never attempts a stable tag" "" "$(cat "$PROMOTE_ATTEMPT_LOG")"
+  if git -C "$2" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+    fail "$1 leaves stable tag absent"
+  else
+    pass "$1 leaves stable tag absent"
+  fi
+}
+assert_absent() {
+  case "$3" in
+    *"$2"*) fail "$1 (unexpected '$2')" ;;
+    *) pass "$1" ;;
+  esac
+}
+echo "=== #1468 M2: empty-body promotion preflight ==="
+export PROMOTE_ATTEMPT_LOG
+for history in feature docs dependency; do
+  S10="$(mktemp -d)"; published_rc "$S10"
+  case "$history" in
+    feature) add_feature "$S10" 301 ;;
+    docs)
+      mkdir -p "$S10/docs"
+      printf 'CLI shipping documentation\n' > "$S10/docs/cli.md"
+      git -C "$S10" add -- docs/cli.md
+      gcommit "$S10" 'docs(cli): clarify usage (#1468)'
+      ;;
+    dependency) add_dep "$S10" api/go.mod 'fix(deps): bump x (#1468)' ;;
+  esac
+  shipping_sha="$(git -C "$S10" rev-parse HEAD)"
+  before="$(promote_snapshot "$S10")"
+  PROMOTE_ATTEMPT_LOG="$S10.attempt.log"; : > "$PROMOTE_ATTEMPT_LOG"
+  run_rc "$S10" 0.3.0 --promote
+  assert_eq "$history empty-body promote exits 3" 3 "$RC_RC"
+  assert_contains "$history refusal names shipping SHA" "$shipping_sha" "$RC_OUT"
+  assert_contains "$history refusal offers next candidate entries" 'next candidate' "$RC_OUT"
+  assert_contains "$history refusal offers writing entries" 'write' "$RC_OUT"
+  assert_contains "$history refusal offers draft" '--changelog-file' "$RC_OUT"
+  assert_absent "$history refusal emits no promotion" 'promoted:' "$RC_OUT"
+  assert_absent "$history refusal emits no rollback" 'rolled back' "$RC_OUT"
+  assert_eq "$history refusal keeps HEAD" "$shipping_sha" "$(git -C "$S10" rev-parse HEAD)"
+  assert_eq "$history refusal keeps files and index" "$before" "$(promote_snapshot "$S10")"
+  no_promote_attempt "$history refusal" "$S10"
+  case "$history" in
+    feature)
+      # Supplying a draft bypasses preflight, but later validation must still roll back.
+      printf '## [0.4.0]\n### Added\n- Wrong base (#301)\n' > "$S10.draft.md"
+      : > "$PROMOTE_ATTEMPT_LOG"
+      run_rc "$S10" 0.3.0 --promote --changelog-file "$S10.draft.md"
+      assert_eq "bad supplied draft fails later" 3 "$RC_RC"
+      assert_eq "bad draft attempted stable tag" v0.2.0 "$(cat "$PROMOTE_ATTEMPT_LOG")"
+      assert_contains "bad draft rolls back stable tag" 'rolled back the local promote tag v0.2.0' "$RC_OUT"
+      if git -C "$S10" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+        fail "bad draft leaves stable tag absent"
+      else
+        pass "bad draft leaves stable tag absent"
+      fi
+      ;;
+    docs)
+      : > "$PROMOTE_ATTEMPT_LOG"
+      run_rc "$S10" 0.2.0 --promote-only
+      assert_eq "docs history explicit promote-only succeeds" 0 "$RC_RC"
+      assert_eq "explicit promote-only keeps HEAD" "$shipping_sha" "$(git -C "$S10" rev-parse HEAD)"
+      assert_eq "explicit promote-only keeps files and index" "$before" "$(promote_snapshot "$S10")"
+      assert_eq "explicit promote-only attempts stable tag once" v0.2.0 "$(cat "$PROMOTE_ATTEMPT_LOG")"
+      ;;
+    dependency)
+      # Use the same post-RC dependency history in an independent plain-cut fixture.
+      SDP="$(mktemp -d)"; published_rc "$SDP"
+      add_dep "$SDP" api/go.mod 'fix(deps): bump x (#1468)'
+      PROMOTE_ATTEMPT_LOG="$SDP.attempt.log"; : > "$PROMOTE_ATTEMPT_LOG"
+      run_rc "$SDP" 0.2.0
+      assert_eq "paired plain dependency-only cut succeeds" 0 "$RC_RC"
+      assert_contains "paired plain cut autocites dependency" '#1468' "$(dep_bullet "$SDP")"
+      no_promote_attempt "paired plain cut" "$SDP"
+      rm -rf "$SDP" "$SDP.origin.git" "$SDP.attempt.log"
+      ;;
+  esac
+  rm -rf "$S10" "$S10.origin.git" "$S10.attempt.log" "$S10.draft.md"
+done
+# Empty Unreleased plus a correctly based draft may promote and cut the next candidate.
+S10="$(mktemp -d)"; published_rc "$S10"
+mkdir -p "$S10/docs"
+printf 'CLI shipping documentation\n' > "$S10/docs/cli.md"
+git -C "$S10" add -- docs/cli.md
+gcommit "$S10" 'docs(cli): clarify usage (#1468)'
+printf '## [0.3.0]\n### Changed\n- CLI usage (#1468)\n' > "$S10.draft.md"
+PROMOTE_ATTEMPT_LOG="$S10.attempt.log"; : > "$PROMOTE_ATTEMPT_LOG"
+run_rc "$S10" 0.3.0 --promote --changelog-file "$S10.draft.md"
+assert_eq "empty-body promote with valid draft succeeds" 0 "$RC_RC"
+assert_eq "valid draft advances main chart" 0.3.0-rc.1 "$(chart_ver "$S10")"
+assert_eq "valid draft attempts stable tag once" v0.2.0 "$(cat "$PROMOTE_ATTEMPT_LOG")"
+assert_contains "valid draft preserves citation" 'CLI usage ([#1468](https://github.com/vtmocanu/uzi/pull/1468))' "$(cat "$S10/CHANGELOG.md")"
+rm -rf "$S10" "$S10.origin.git" "$S10.attempt.log" "$S10.draft.md"
+unset PROMOTE_ATTEMPT_LOG
+
+# Each oracle path is the ONLY shipping path on its commit.
+for unusual in 'api/é.go' $'api/new\n"quote.go'; do
+  LN="$(mktemp -d)"; seed_repo "$LN"
+  unusual_feature "$LN" "$unusual"
+  printf '# Changelog\n\n## [0.2.0]\n### Added\n- Other (#201)\n' | put_changelog "$LN"
+  out="$(cd "$LN" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; status=$?
+  assert_eq "oracle flags uncited unusual path $unusual" 1 "$status"
+  assert_contains "oracle reports unusual commit" 'feat: unusual path (#1468)' "$out"
+  rm -rf "$LN"
+done
+for consumer in oracle shipping dependency; do
+  for mode in fallback fallback_prefix fallback_changelog fail partial large; do
+    # Large output is a shipping-drain probe, not another failure mode.
+    [ "$mode" != large ] || [ "$consumer" = shipping ] || continue
+    LN="$(mktemp -d)"
+    LIST_SHA=""; LIST_MODE=""
+    if [ "$consumer" = shipping ]; then
+      published_rc "$LN"
+      unusual_feature "$LN" 'api/é.go'
+      LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
+      # Empty Unreleased exposes a mistaken promote-only classification.
+    else
+      seed_repo "$LN"
+      if [ "$consumer" = dependency ]; then
+        add_dep "$LN" api/go.mod 'fix(deps): bump x (#1468)'
+      else
+        unusual_feature "$LN" 'api/é.go'
+      fi
+      LIST_SHA="$(git -C "$LN" rev-parse HEAD)"
+      if [ "$consumer" = dependency ]; then
+        feature_201_changelog "$LN"
+      elif [ "$mode" = fallback_prefix ] || [ "$mode" = fallback_changelog ]; then
+        # Successful show lists an uncited shipping path; failed diff cannot exempt it.
+        printf '# Changelog\n\n## [0.2.0]\n### Added\n- Other (#201)\n' | put_changelog "$LN"
+      else
+        printf '# Changelog\n\n## [Unreleased]\n### Added\n- Other (#201)\n\n## [0.2.0]\n### Added\n- Cited (#1468)\n' | put_changelog "$LN"
+      fi
+    fi
+    before="$(git -C "$LN" rev-parse HEAD)"
+    before_reflog="$(git -C "$LN" reflog --format=%H HEAD)"
+    LIST_MODE="$mode"; LIST_LOG="$LN.producer.log"
+    if [ "$consumer" = oracle ]; then
+      out="$(cd "$LN" && bash "$ORACLE" HEAD v0.1.0 0.2.0 2>&1)"; status=$?
+    else
+      if [ "$consumer" = shipping ]; then
+        run_rc "$LN" 0.2.0 --promote-only
+      else
+        run_rc "$LN" 0.2.0
+      fi
+      out="$RC_OUT"; status="$RC_RC"
+    fi
+    case "$consumer:$mode" in
+      oracle:fallback_prefix|oracle:fallback_changelog)
+        assert_eq "oracle $mode refuses uncited shipping path" 1 "$status"
+        assert_contains "oracle $mode reports the real shipping commit" 'feat: unusual path (#1468)' "$out"
+        ;;
+      *:fallback|*:fallback_prefix|*:fallback_changelog|*:large)
+        assert_eq "$consumer $mode succeeds" 0 "$status"
+        if [ "$consumer" = shipping ]; then
+          assert_contains "shipping $mode counts the unusual commit once" '1 shipping commit(s)' "$out"
+        fi
+        if [ "$consumer" = dependency ]; then
+          assert_contains "dependency $mode retains manifest autocitation" '#1468' "$(dep_bullet "$LN")"
+        fi
+        if [ "$mode" = large ]; then
+          assert_eq "large producer completed without SIGPIPE" drained "$(cat "$LIST_LOG")"
+        fi
+        ;;
+      *)
+        listing_failure "$consumer $mode" "$status" "$out"
+        assert_eq "$consumer $mode creates no release commit" "$before" "$(git -C "$LN" rev-parse HEAD)"
+        if [ "$consumer" = dependency ]; then
+          assert_eq "dependency $mode does not create then roll back a release commit" "$before_reflog" "$(git -C "$LN" reflog --format=%H HEAD)"
+        fi
+        if git -C "$LN" rev-parse -q --verify refs/tags/v0.2.0 >/dev/null; then
+          fail "$consumer $mode creates no stable tag"
+        else
+          pass "$consumer $mode creates no stable tag"
+        fi
+        ;;
+    esac
+    LIST_SHA=""; LIST_MODE=""
+    rm -rf "$LN" "$LN.origin.git" "$LN.producer.log"
+  done
+done
+# Source + manifest in ONE dependency-typed commit must never gain an autocitation.
+LN="$(mktemp -d)"; seed_repo "$LN"; add_feature "$LN" 201
+printf '// bump\n' > "$LN/api/go.mod"
+printf 'package main\n' > "$LN/api/é.go"
+git -C "$LN" add -- api/go.mod api/é.go
+gcommit "$LN" 'fix(deps): bump and adapt (#1468)'
+feature_201_changelog "$LN"
+run_rc "$LN" 0.2.0
+assert_eq "Unicode source plus manifest is not autocited" 1 "$RC_RC"
+assert_eq "Unicode source plus manifest has no Routine bullet" 0 "$(dep_bullets "$LN")"
+rm -rf "$LN"
+# With entries, Unicode work after a published RC reaches the next main-half cut.
+LN="$(mktemp -d)"; published_rc "$LN"
+unusual_feature "$LN" 'api/é.go'
+printf '# Changelog\n\n## [Unreleased]\n### Added\n- Unicode (#1468)\n\n## [0.2.0]\n### Added\n- Feature (#201)\n\n## [0.1.0]\n- Initial (#100)\n' | put_changelog "$LN"
+run_rc "$LN" 0.3.0 --promote
+assert_eq "Unicode work with entries promotes and cuts main" 0 "$RC_RC"
+assert_eq "Unicode work advances main chart" 0.3.0-rc.1 "$(chart_ver "$LN")"
+rm -rf "$LN" "$LN.origin.git" "$LIST_SHIM"
+unset LIST_SHA LIST_MODE LIST_LOG LIST_REAL_GIT
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh

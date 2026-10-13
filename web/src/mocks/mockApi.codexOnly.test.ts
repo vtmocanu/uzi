@@ -50,7 +50,7 @@ describe("the default scenario is unaffected by the codex-only overlay (negative
   // PRD #1653 M4: the default scenario seeds Codex runs among Claude runs, so the harness
   // chip shows both providers offline; the overlay leaves them as seeded. PRD #1732 added
   // the second: a Codex run held on its disabled frozen alias.
-  const SEEDED_CODEX = ["run-cred-disabled-codex", "run-rework-capped"];
+  const SEEDED_CODEX = ["run-closed", "run-cred-disabled-codex", "run-rework-capped"];
   it("every listed run reads harness claude except the seeded Codex runs", async () => {
     const { runs } = await mockApi.listRuns();
     expect(runs.length).toBeGreaterThan(1);

@@ -282,6 +282,52 @@ async function hangUntilAborted(pack: Readable, signal?: AbortSignal): Promise<n
   throw e;
 }
 
+/** A publisher that behaves like the api broker's strict-descendant rule (pushbroker.Publish): apply
+ *  the pack, answer published when the declared tip already IS the ref (AlreadyCurrent), refuse
+ *  `not_descendant` (a 2xx skip) when the ref is set and the tip does not descend it, else advance
+ *  the ref with a compare-and-swap. `ack` lets a call model a lost ACK: `landed` advances the ref
+ *  and answers HTTP 500; `dropped` answers HTTP 500 without landing. Every answer is recorded.
+ *  It uses `merge-base --is-ancestor` only as an oracle for descent; the parent ORDER the real
+ *  depth-1 broker depends on is pinned by explicit parent assertions in the tests. */
+function brokerPublish(
+  originPath: string,
+  ref: string,
+  ack: (call: number) => "landed" | "dropped" | undefined = () => undefined,
+): { impl: Parameters<typeof stubPublish>[0]; answers: Array<{ call: number; tip: string; answer: unknown }> } {
+  const answers: Array<{ call: number; tip: string; answer: unknown }> = [];
+  const impl: Parameters<typeof stubPublish>[0] = async (call, tip, pack) => {
+    const bytes = await drain(pack);
+    const lose = ack(call);
+    let answer: unknown;
+    if (lose === "dropped") {
+      answer = { ok: false, httpStatus: 500 };
+    } else {
+      gitIn(originPath, ["index-pack", "--stdin", "--fix-thin"], bytes);
+      const cur = refOr(originPath, ref);
+      if (cur === tip) {
+        answer = { ok: true, body: { published: true, ref } };
+      } else if (cur !== null && !isAncestorIn(originPath, cur, tip)) {
+        answer = { ok: true, body: { published: false, ref, skipped: "not_descendant" } };
+      } else {
+        gitIn(originPath, ["update-ref", ref, tip, cur ?? ""]);
+        answer = lose === "landed" ? { ok: false, httpStatus: 500 } : { ok: true, body: { published: true, ref } };
+      }
+    }
+    answers.push({ call, tip, answer });
+    return answer;
+  };
+  return { impl, answers };
+}
+
+function isAncestorIn(dir: string, ancestor: string, descendant: string): boolean {
+  try {
+    execFileSync("git", ["-C", dir, "merge-base", "--is-ancestor", ancestor, descendant], { env: GIT_ENV });
+    return true;
+  } catch {
+    return false;
+  }
+}
+
 function mkGit(dataDir: string, gitleaksBin?: string, log: Logger = nullLogger()): GitCache {
   fs.mkdirSync(dataDir, { recursive: true });
   return new GitCache(dataDir, log, undefined, testGitCacheOptions({ gitleaksBin: gitleaksBin ?? defaultGitleaksShim() }));
@@ -583,7 +629,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     assert.equal(off.recovered, false, "without the tick worker B cold-starts without A's commit");
   });
 
-  it("(b) same-worker adoption: a failed publish still leaves the tick's fetch-back in the bare, which a re-claim adopts", async () => {
+  it("(b) same-worker missing source: a failed publish retains fetch-back but a re-claim cannot seed without its known source", async () => {
     const tmp = scratchDir("same");
     const shim = writeShim(tmp, "detect");
     const ctl = control();
@@ -613,19 +659,48 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       assert.equal(await ctl.fire(), "publish_failed:rejected");
       const bare = g.barePathFor(fx.originPath);
       assert.equal(refOr(bare, `refs/uzi-runner/${branch}`), sha, "the tick fetched the commit into the bare");
-      // The runner clone is lost (e.g. an emptyDir on a pod roll); the bare survives.
+      const retained = await g.discoverRetainedRecovery(fx.originPath, branch, `issue-${iid}`, claim.run_id);
+      assert.ok(retained, "the worker journal attributes the retained source");
+      const journalBefore = retained.journal;
+      assert.equal(fs.readFileSync(path.join(journalBefore.clonePath, "SAME.txt"), "utf8"), "same-worker work\n");
+      // The known source is lost; cached objects alone do not authorize reseeding.
       fs.rmSync(path.join(dataDir, "runner"), { recursive: true, force: true });
-      let adopted = false;
+      // A remains suspended with its manual tick stopped, modeling abrupt source loss.
+      // Its shutdown is deferred to teardown so graceful retirement cannot erase the journal.
+      const claimB = { ...claim, claim_generation: 2, last_seq: api.messages(claim.run_id).at(-1)?.seq ?? 0 };
+      api.setOwnershipStatus(claim.run_id, "running", 2);
+      let modelRan = false;
+      const { logger, lines } = recordingLogger();
       const runnerB = mkRunner(
         mkGit(dataDir, shim),
-        turn(async (ctx) => {
-          adopted = fs.existsSync(path.join(ctx.worktreePath, "SAME.txt"));
+        turn(async () => {
+          modelRan = true;
         }),
         undefined,
         { checkpointTickIntervalMs: 0 },
+        logger,
       );
-      await runnerB.execute(claim);
-      assert.equal(adopted, true, "the re-claim seeded from refs/uzi-runner/<branch> (the tick's fetch-back)");
+      await runnerB.execute(claimB);
+      assert.equal(modelRan, false, "a missing known source prevents model execution");
+      assert.equal(fs.existsSync(path.join(dataDir, "runner")), false, "the re-claim did not reseed");
+      assert.equal(refOr(bare, `refs/uzi-runner/${branch}`), sha, "cached work remains pinned");
+      assert.equal(gitIn(bare, ["show", `${sha}:SAME.txt`]), "same-worker work");
+      const journalAfter = JSON.parse(gitIn(bare, ["config", `uzi-recovery.${branch}.clone`]));
+      const { recovery, ...identity } = journalAfter;
+      assert.deepEqual(identity, journalBefore, "source identity and pins remain attributed");
+      assert.equal(recovery.stage, "blocked");
+      assert.equal(recovery.blocker, "source_missing");
+      assert.equal(recovery.attempts, 3, "missing source exhausts the durable budget");
+      assert.equal(recovery.deadline - recovery.startedAt, 300_000);
+      assert.equal(recovery.backoffMs, 0);
+      assert.equal(recovery.source.runId, claim.run_id);
+      assert.equal(recovery.source.clonePath, journalBefore.clonePath);
+      assert.equal(await g.recoveryAttemptMode(fx.originPath, `issue-${iid}`), true);
+      assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "recovery_wait"), false);
+      assert.equal(finalStatus(claim.run_id), "failed");
+      assert.ok((lines as Array<Record<string, unknown>>).some(line =>
+        line.msg === "run failed" && line.error === "Retained recovery blocked: required source is missing; local work and custody retained"),
+      "the exact missing-source failure is visible");
     } finally {
       pub.restore();
       runnerA.shutdown();
@@ -2406,12 +2481,8 @@ describe("issue #1963 confirmed real checkpoint scan floors", () => {
         claim.repo = { ...claim.repo!, url: "https://github.com/org/repo", forge_type: "github" };
         const { github } = fakeGitHub();
         const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
-        const pub = stubPublish(async (_n, tip, pack) => {
-          const bytes = await drain(pack);
-          gitIn(fx.originPath, ["index-pack", "--stdin", "--fix-thin"], bytes);
-          gitIn(fx.originPath, ["update-ref", checkpointRef, tip]);
-          return { ok: true, body: { published: true, ref: checkpointRef } };
-        });
+        const broker = brokerPublish(fx.originPath, checkpointRef);
+        const pub = stubPublish(broker.impl);
         // Fixed, high-entropy runtime fixture; neither source fragment is a full provider token.
         const secret = "gh" + "p_" + "aB3dE7fG9hJ2kL5mN8pQ1rS4tU6vW0xY2zA7";
         const progress = { completed: ["m1"], in_progress: [] };
@@ -2440,6 +2511,25 @@ describe("issue #1963 confirmed real checkpoint scan floors", () => {
             }
             assert.equal(pub.count(), 2, `${label}: clean N after confirmed overlay must publish`);
             const range = ranges[0]!;
+            // issue #2733: N is published as a chain [O, N] over the confirmed overlay, so the broker
+            // sees a strict descendant of the ref instead of refusing `not_descendant`.
+            const chain = pub.tips[1]!;
+            assert.deepEqual(
+              gitIn(fx.originPath, ["rev-list", "--parents", "-n", "1", chain]).split(" ").slice(1),
+              [overlay, newTip],
+              "the chain's parents are [O, N], base first",
+            );
+            assert.equal(gitIn(fx.originPath, ["rev-parse", checkpointRef]), chain, "the ref advanced to the chain");
+            assert.equal(
+              gitIn(fx.originPath, ["rev-parse", `${chain}:.github/workflows`]),
+              gitIn(fx.originPath, ["rev-parse", `${overlay}:.github/workflows`]),
+              "the chain carries O's workflow subtree",
+            );
+            assert.deepEqual(
+              broker.answers.map((a) => (a.answer as { body?: { published?: boolean } }).body?.published),
+              [true, true],
+              "no publish was refused",
+            );
             assert.equal(range.tipSha, newTip);
             assert.ok(range.scanFloorShas?.includes(realTip), "confirmed R is admitted as a scan floor");
             assert.equal(range.scanFloorShas?.includes(overlay), false, "O is not an ancestor of N");
@@ -2502,6 +2592,237 @@ describe("issue #1963 confirmed real checkpoint scan floors", () => {
         pub.restore();
       }
     });
+  });
+});
+
+describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () => {
+  const workflow = ".github/workflows/ci.yml";
+  const progress = { completed: ["m1"], in_progress: [] };
+  const parentsIn = (dir: string, sha: string): string[] =>
+    gitIn(dir, ["rev-list", "--parents", "-n", "1", sha]).split(" ").slice(1);
+  const githubClaim = (iid: number) => {
+    const claim = gitlabClaim(iid);
+    claim.repo = { ...claim.repo!, url: "https://github.com/org/repo", forge_type: "github" };
+    return claim;
+  };
+
+  /** Milestone reap publish builds overlay O (answered per `firstAck`), then a clean N is published
+   *  at the tick or the iteration boundary: it must advance the ref past O. */
+  for (const boundary of ["tick", "iteration"] as const) {
+    for (const firstAck of ["clean", "landed"] as const) {
+      it(`${boundary}: a raw publish after a ${firstAck === "clean" ? "clean-ACK" : "lost-ACK (O landed)"} overlay advances the ref`, async () => {
+        const iid = 2733_000 + (boundary === "tick" ? 0 : 10) + ["clean", "landed"].indexOf(firstAck);
+        commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+        const g = mkGit(fx.dataDir);
+        const ctl = control();
+        const claim = githubClaim(iid);
+        const { github } = fakeGitHub();
+        const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+        const broker = brokerPublish(fx.originPath, checkpointRef, (call) =>
+          call === 0 && firstAck !== "clean" ? firstAck : undefined);
+        const pub = stubPublish(broker.impl);
+        try {
+          await mkRunner(g, turn(async (ctx) => {
+            const realTip = commitIn(ctx.worktreePath, "r.txt", "real\n");
+            commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+            await ctx.checkpoint!({ reap: true, progress });
+            assert.equal(pub.count(), 1, "the milestone publish was attempted");
+            const overlay = pub.tips[0]!;
+            assert.equal(
+              parentsIn(g.barePathFor(fx.originPath), overlay).at(-1),
+              realTip,
+              "milestone built an overlay over R",
+            );
+            assert.equal(
+              refOr(fx.originPath, checkpointRef),
+              overlay,
+              "the ref holds O",
+            );
+            const newTip = commitIn(ctx.worktreePath, "new.txt", "clean new work\n");
+            ctl.advance(INTERVAL_MS + 1);
+            if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
+            else await ctx.checkpoint!({ reap: false, progress });
+            assert.equal(pub.count(), 2);
+            const chain = pub.tips[1]!;
+            assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, newTip], "chain parents are [O, N]");
+            assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
+            const second = (broker.answers[1]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+            assert.deepEqual([second?.published, second?.skipped], [true, undefined], "no not_descendant refusal");
+          }), ctl, { github }).execute(claim);
+          if (turnErrors.length > 0) throw turnErrors[0];
+        } finally {
+          pub.restore();
+        }
+      });
+    }
+  }
+
+  // The ref sits at a CONFIRMED overlay O1; a second overlay milestone O2 is dropped (500, not
+  // landed), so the attempted tip is O2 while the ref is still O1. A raw N then must not be refused
+  // `not_descendant`: it chains over O2 (which descends O1).
+  for (const boundary of ["tick", "iteration"] as const) {
+    it(`${boundary}: a raw publish after a lost-ACK second overlay (O2 not landed) advances the ref`, async () => {
+      const iid = 2733_002 + (boundary === "tick" ? 0 : 10);
+      commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+      const g = mkGit(fx.dataDir);
+      const ctl = control();
+      const claim = githubClaim(iid);
+      const { github } = fakeGitHub();
+      const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+      const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+      const pub = stubPublish(broker.impl);
+      try {
+        await mkRunner(g, turn(async (ctx) => {
+          commitIn(ctx.worktreePath, "r1.txt", "real 1\n");
+          commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid} a\n`);
+          await ctx.checkpoint!({ reap: true, progress });
+          const o1 = pub.tips[0]!;
+          assert.equal(refOr(fx.originPath, checkpointRef), o1, "O1 is confirmed");
+          const r2 = commitIn(ctx.worktreePath, "r2.txt", "real 2\n");
+          commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid} b\n`);
+          await ctx.checkpoint!({ reap: true, progress });
+          assert.equal(pub.count(), 2, "the second milestone publish was attempted");
+          const o2 = pub.tips[1]!;
+          assert.equal(parentsIn(g.barePathFor(fx.originPath), o2).at(-1), r2, "milestone 2 built an overlay over R2");
+          assert.equal(refOr(fx.originPath, checkpointRef), o1, "O2 was dropped: the ref still sits at O1");
+          const newTip = commitIn(ctx.worktreePath, "new.txt", "clean new work\n");
+          ctl.advance(INTERVAL_MS + 1);
+          if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
+          else await ctx.checkpoint!({ reap: false, progress });
+          assert.equal(pub.count(), 3);
+          const chain = pub.tips[2]!;
+          const chainParents = parentsIn(fx.originPath, chain);
+          assert.equal(chainParents[0], o2, "chain's first parent is O2");
+          assert.equal(chainParents.at(-1), newTip, "chain's last parent is N");
+          assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
+          const last = (broker.answers[2]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+          assert.deepEqual([last?.published, last?.skipped], [true, undefined], "no not_descendant refusal");
+        }), ctl, { github }).execute(claim);
+        if (turnErrors.length > 0) throw turnErrors[0];
+      } finally {
+        pub.restore();
+      }
+    });
+  }
+
+  it("a raw tip that shipped ambiguously does not shadow the confirmed overlay on the next tick", async () => {
+    const iid = 2733_070;
+    commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+    const g = mkGit(fx.dataDir);
+    const ctl = control();
+    const claim = githubClaim(iid);
+    const { github } = fakeGitHub();
+    const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+    const pub = stubPublish(broker.impl);
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "r.txt", "real\n");
+        commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+        await ctx.checkpoint!({ reap: true, progress });
+        const overlay = pub.tips[0]!;
+        assert.equal(refOr(fx.originPath, checkpointRef), overlay, "O is confirmed");
+        // Force one refused chain so raw N ships and its ACK is lost: attempted = N, confirmed = O.
+        const hook = g as unknown as { buildCheckpointChain: (...a: unknown[]) => Promise<string | null> };
+        const realBuild = hook.buildCheckpointChain.bind(g);
+        hook.buildCheckpointChain = async () => null;
+        const n = commitIn(ctx.worktreePath, "n.txt", "raw N\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.notEqual(await ctl.fire(), "published", "raw N is not acknowledged");
+        assert.equal(pub.tips[1], n, "raw N shipped");
+        hook.buildCheckpointChain = realBuild;
+        const n2 = commitIn(ctx.worktreePath, "n2.txt", "raw N2\n");
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published", "the next tick must advance, not wedge on not_descendant");
+        const chain = pub.tips[2]!;
+        assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, n2], "chained over the confirmed overlay");
+        assert.equal(refOr(fx.originPath, checkpointRef), chain);
+      }), ctl, { github }).execute(claim);
+      if (turnErrors.length > 0) throw turnErrors[0];
+    } finally {
+      pub.restore();
+    }
+  });
+
+  it("reap fallback: a failed default fetch (no overlay) still chains over the prior overlay", async () => {
+    const iid = 2733_050;
+    commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+    const g = mkGit(fx.dataDir);
+    const ctl = control();
+    const claim = githubClaim(iid);
+    const { github } = fakeGitHub();
+    const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const broker = brokerPublish(fx.originPath, checkpointRef);
+    const pub = stubPublish(broker.impl);
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        commitIn(ctx.worktreePath, "r.txt", "real\n");
+        commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+        await ctx.checkpoint!({ reap: true, progress });
+        const overlay = pub.tips[0]!;
+        assert.equal(refOr(fx.originPath, checkpointRef), overlay);
+        const newTip = commitIn(ctx.worktreePath, "new.txt", "more\n");
+        (g as unknown as { fetchDefaultTip: unknown }).fetchDefaultTip = async () => {
+          throw new Error("default fetch unavailable");
+        };
+        await ctx.checkpoint!({ reap: true, progress });
+        const chain = pub.tips[1]!;
+        assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, newTip]);
+        assert.equal(refOr(fx.originPath, checkpointRef), chain);
+      }), ctl, { github }).execute(claim);
+      if (turnErrors.length > 0) throw turnErrors[0];
+    } finally {
+      pub.restore();
+    }
+  });
+
+  it("a flagged commit reachable only through the chain base is held, not published", async () => {
+    const iid = 2733_060;
+    commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# base ${iid}\n`);
+    const g = mkGit(fx.dataDir);
+    const ctl = control();
+    const claim = githubClaim(iid);
+    const { github } = fakeGitHub();
+    const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
+    const broker = brokerPublish(fx.originPath, checkpointRef);
+    const pub = stubPublish(broker.impl);
+    const secret = "gh" + "p_" + "aB3dE7fG9hJ2kL5mN8pQ1rS4tU6vW0xY2zA7";
+    try {
+      await mkRunner(g, turn(async (ctx) => {
+        const clean = commitIn(ctx.worktreePath, "r.txt", "real\n");
+        commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
+        await ctx.checkpoint!({ reap: true, progress });
+        const overlay = pub.tips[0]!;
+        const flagged = commitIn(ctx.worktreePath, "leak.env", `TOKEN=${secret}\n`);
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "secret_found", "the tick flags the secret commit");
+        gitIn(ctx.worktreePath, ["reset", "-q", "--hard", clean]);
+        const rewritten = commitIn(ctx.worktreePath, "new.txt", "clean rewrite\n");
+        // A chain whose base reaches the flagged commit through its first parent only.
+        const bare = g.barePathFor(fx.originPath);
+        const resurrect = (g as unknown as { buildCheckpointChain: unknown });
+        const realBuild = (resurrect.buildCheckpointChain as (...a: unknown[]) => Promise<string | null>).bind(g);
+        resurrect.buildCheckpointChain = async (_bare: string, _branch: string, realTip: string) => {
+          const tree = gitIn(bare, ["rev-parse", `${realTip}^{tree}`]);
+          return gitIn(bare, [...IDENT, "commit-tree", tree, "-p", flagged, "-p", realTip, "-m", "ckpt(overlay): resurrect"]);
+        };
+        ctl.advance(INTERVAL_MS + 1);
+        assert.notEqual(await ctl.fire(), "published", "the actual candidate reaches the flagged commit");
+        assert.equal(pub.count(), 1, "nothing was published past the milestone overlay");
+        assert.equal(refOr(fx.originPath, checkpointRef), overlay);
+        // Restore the real builder: O's history is clean, so the clean rewrite chains over O and
+        // publishes; the flagged commit is not in the chain.
+        resurrect.buildCheckpointChain = realBuild;
+        ctl.advance(INTERVAL_MS + 1);
+        assert.equal(await ctl.fire(), "published");
+        const chain = pub.tips[1]!;
+        assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, rewritten]);
+        assert.equal(refOr(fx.originPath, `${flagged}^{commit}`), null, "the flagged commit never reached origin");
+      }), ctl, { github }).execute(claim);
+      if (turnErrors.length > 0) throw turnErrors[0];
+    } finally {
+      pub.restore();
+    }
   });
 });
 

@@ -113,6 +113,9 @@ services:
       # requeue in the PRD #42 M5 mid-run-kill step is bounded with no extra recreate,
       # still 3× the 5s heartbeat interval so a live worker is never spuriously swept.
       WORKER_HEARTBEAT_STALE: ${E2E_WORKER_HEARTBEAT_STALE:-45s}
+      # Issue #2705: the stale-requeue grace is off in e2e so the phases that stale-requeue a run
+      # and then claim it from a peer keep their timing; the live-DB tests cover the pin.
+      WORKER_STALE_REQUEUE_GRACE: ${E2E_WORKER_STALE_REQUEUE_GRACE:-0s}
       # Run-liveness sweep cadence (PRD #97 M6 / #100): shrunk from the shipped 15s
       # default so stall/loop detection latency (threshold + one tick) and the #42
       # worker-loss requeue are bounded by ~2s rather than ~15s. Product knob added in

@@ -101,11 +101,11 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 				renderedFooter := view[strings.LastIndex(view, "\n")+1:]
 				for _, got := range []string{footer, renderedFooter} {
 					if !strings.Contains(got, "+ partial") ||
-						!strings.Contains(got, "enter/→ open") || !strings.Contains(got, "/ filter") ||
+						!strings.Contains(got, "enter/→ open") || !strings.Contains(got, "? keys") ||
 						!strings.Contains(got, "q quit") || !strings.Contains(got, "v0.63.0") {
 						t.Errorf("width %d footer lost cost cue, key hint, or version: %q", width, got)
 					}
-					if !strings.Contains(got, "a factory") {
+					if width >= 100 && (!strings.Contains(got, "a factory") || !strings.Contains(got, "/ filter")) {
 						t.Errorf("width %d footer lost factory hint: %q", width, got)
 					}
 					if width >= 100 && (!strings.Contains(got, "r refresh") || !strings.Contains(got, "? keys")) {
@@ -124,8 +124,11 @@ func TestTUIBoardMarkedCostLegendRenderedAtOrdinaryWidths(t *testing.T) {
 }
 
 func TestTUIBoardHelpExplainsMarkedCost(t *testing.T) {
-	if got := strings.Join(helpLines(viewBoard), "\n"); !strings.Contains(got, "+ after 7d cost means subscription/unreported costs excluded") {
-		t.Fatalf("board help missing marked-cost explanation: %q", got)
+	got := strings.Join(helpLines(viewBoard), "\n")
+	for _, want := range []string{"API-equivalent estimate", "+ after 7d cost means the estimate is incomplete", "runs without estimates: tokens only", "unreported: recorded partials included"} {
+		if !strings.Contains(got, want) {
+			t.Fatalf("board help missing %q: %q", want, got)
+		}
 	}
 }
 

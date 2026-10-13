@@ -140,6 +140,32 @@ export function isRevisingRun(run: { status: string; is_revising?: boolean }): b
   return run.status === "awaiting_approval" && run.is_revising === true;
 }
 
+// PARK_LABELS is today's wording for each parked (held, not working) effective status:
+// the single source runBadge's pills and the PRD #2602 progress cell's parked text both
+// use, so the board badge and the progress cell can never name one park two ways. The
+// paused pill prefixes its "‖" glyph at the call site; the progress cell prints the bare
+// label as screen-reader text, since the pill beside it already shows the park.
+const PARK_LABELS = {
+  limit_wait: "limit wait",
+  pool_wait: "waiting for pool",
+  recovery_wait: "recovery wait",
+  worker_requeue_exhausted: "recovery needs decision",
+  paused: "paused",
+  credential_disabled: "waiting: credential disabled",
+  provider_unavailable: "provider unavailable: owner hold",
+  provider_outage: "waiting for provider",
+  completion_blocked: "Completion blocked",
+} as const;
+
+// parkLabel names a parked run's hold in today's words (PRD #2602 rule 3: "surfaces keep
+// today's park wording"). It folds through effectiveRunStatus so a credential or
+// completion hold (raw status "paused") and an exhausted recovery read as they do on the
+// status pill. An unlisted status falls back to its de-underscored enum, never "".
+export function parkLabel(run: Parameters<typeof effectiveRunStatus>[0]): string {
+  const eff = effectiveRunStatus(run);
+  return (PARK_LABELS as Record<string, string>)[eff] ?? eff.replace(/_/g, " ");
+}
+
 // effectiveRunStatus is the status a run should RENDER as: "planning" while it is in
 // its planning phase, "revising" while it is re-planning after a revise, else its raw
 // status. This is the single seam every status surface flows through so the planning and
@@ -157,6 +183,8 @@ export function effectiveRunStatus(
     recovery_wait_cause?: string | null;
   },
 ): string {
+  if (run.status === "paused" && run.hold_reason === "provider_unavailable") return "provider_unavailable";
+  if (run.status === "recovery_wait" && run.recovery_wait_cause === "provider_outage") return "provider_outage";
   if (isPlanningRun(run)) return "planning";
   if (isRevisingRun(run)) return "revising";
   // PRD #1226 M5 (D8): completion_phase is a SINGLE server-computed field — render it,
@@ -297,7 +325,7 @@ export function runStatusTone(
   if (status === "completion_checking" || status === "completion_reworking") return "info";
   if (status === "completion_blocked") return "warning";
   // PRD #1732: held on a disabled credential. Warn like the other involuntary holds.
-  if (status === "credential_disabled") return "warning";
+  if (status === "credential_disabled" || status === "provider_unavailable" || status === "provider_outage") return "warning";
   if (status === "awaiting_approval" || status === "awaiting_input")
     return "warning";
   // PRD #517: an interactive run parked awaiting the owner's next follow-up.
@@ -543,17 +571,23 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "completion_blocked":
       return {
         kind: "badge",
-        label: "Completion blocked",
+        label: PARK_LABELS.completion_blocked,
         tone: "warning",
         pulse: false,
       };
     // PRD #1732 D14: held because a credential it needs is disabled. Static warn, like the
     // other holds; the label is StatusPill's RUN_STATUS_LABELS word, so the pill and the
     // board badge agree (asserted by the ui.test.tsx label-agreement loop).
+    case "provider_unavailable":
+      return { kind: "badge", label: PARK_LABELS.provider_unavailable, tone: "warning", pulse: false,
+        title: "Automatic provider retries have stopped. The run waits for its owner; open the run for Resume, Stop availability and Cancel." };
+    case "provider_outage":
+      return { kind: "badge", label: PARK_LABELS.provider_outage, tone: "warning", pulse: false,
+        title: "Provider outage. Open the run for park count, streak start and next retry." };
     case "credential_disabled":
       return {
         kind: "badge",
-        label: "waiting: credential disabled",
+        label: PARK_LABELS.credential_disabled,
         tone: "warning",
         pulse: false,
         title: "A credential this run needs is disabled. It resumes by itself when you enable it.",
@@ -607,7 +641,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "limit_wait":
       return {
         kind: "badge",
-        label: "limit wait",
+        label: PARK_LABELS.limit_wait,
         tone: "warning",
         pulse: false,
         title:
@@ -622,7 +656,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "pool_wait":
       return {
         kind: "badge",
-        label: "waiting for pool",
+        label: PARK_LABELS.pool_wait,
         tone: "warning",
         pulse: false,
         title:
@@ -632,7 +666,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "worker_requeue_exhausted":
       return {
         kind: "badge",
-        label: "recovery needs decision",
+        label: PARK_LABELS.worker_requeue_exhausted,
         tone: "warning",
         pulse: false,
         title: [
@@ -647,7 +681,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "recovery_wait":
       return {
         kind: "badge",
-        label: "recovery wait",
+        label: PARK_LABELS.recovery_wait,
         tone: "warning",
         pulse: false,
         title:
@@ -661,7 +695,7 @@ export function runBadge(run: LatestRun & Partial<Pick<Run, "recovery_wait_cause
     case "paused":
       return {
         kind: "badge",
-        label: "‖ paused",
+        label: `‖ ${PARK_LABELS.paused}`,
         tone: "info",
         pulse: false,
         title: "Paused by its owner. Resume it from the run page or with `uzi run resume`.",
@@ -725,7 +759,7 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
   // NOT by reducing over milestones_completed. Both clamp to frozen membership, but
   // iterating frozen also makes `done` immune to a duplicate id in the completed set
   // (which would otherwise let the badge read M8/7): each frozen id is counted at most
-  // once by construction, matching MilestoneChecklist's counter (its single source).
+  // once by construction. RunProgressCard uses this count as its single source.
   // PRD #265 M2: null (or absent) ⇒ nothing was ever reported; an array (even []) ⇒ a
   // real reported count. `?? []` still drives the `done` tally, but `reported` keeps the
   // null-vs-[] distinction the wire already carries (apitypes nil → JSON null) instead of
@@ -737,13 +771,13 @@ export function milestoneBadge(run: MilestoneCounted): MilestoneProgress | null 
 }
 
 // milestoneBadgeText renders the compact pill's label + tooltip from a MilestoneProgress,
-// so the board (Dashboard/RunsList) and the run header stay in lockstep (PRD #265 M2). A
+// so the board (Dashboard/RunsList) stays in lockstep (PRD #265 M2). A
 // reported run shows `M{done}/{total}`; an unreported one shows an en-dash numerator and
 // says so in the tooltip, never a `0/N` that reads as failure on a done run.
 //
 // PRD #1064 M3: `inProgress` appends a `◐` in-progress marker to the label when the run
 // has at least one milestone in progress — the same "something is happening now" signal
-// the run-view checklist header and the TUI carry. It defaults to false so every existing
+// the run-view row marks and the TUI carry. It defaults to false so every existing
 // caller (and the not-in-progress case) renders exactly the pre-#1064 label.
 export function milestoneBadgeText(
   p: MilestoneProgress,
@@ -784,7 +818,7 @@ export function firstInProgressMilestoneId(run: {
 //
 // The completed re-filter mirrors the Go/TUI helper (api/cmd/uzi/tui_detail_rail.go
 // effectiveMilestoneAgents, which likewise excludes `completed[ma.ID]`) and the render's OWN
-// done-precedence: MilestoneChecklist marks a milestone ✓ done whenever its id is in
+// done-precedence: MilestoneRows marks a milestone ✓ done whenever its id is in
 // milestones_completed, ahead of in-progress. The server validates milestones_completed and
 // milestones_in_progress INDEPENDENTLY, so an id can be reported in BOTH — and a done milestone
 // must never show a live "now working" strip. Excluding completed ids here keeps that suppression
@@ -893,6 +927,7 @@ export function needsHumanAttention(status: string): boolean {
     isAwaitingApproval(status) ||
     isAwaitingInput(status) ||
     isAwaitingFollowup(status) ||
-    status === "worker_requeue_exhausted"
+    status === "worker_requeue_exhausted" ||
+    status === "provider_unavailable"
   );
 }

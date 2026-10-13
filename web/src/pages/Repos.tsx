@@ -7,7 +7,7 @@ import { api, ApiError, isHttpsUrl, type ForgeConnection, type GuardrailFinding,
 import { errorMessage } from "../lib/apiError";
 import { repoFindings } from "../lib/privilege";
 import { useAuth } from "../auth/AuthContext";
-import { Alert, Badge, Button, Card, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
+import { Alert, Badge, Button, Card, cx, EmptyState, Input, ListSkeleton, PageHeader, Select, Textarea, Toggle } from "../components/ui";
 import { PipelineBadge } from "../components/PipelineBadge";
 import { RepoSetupChip } from "../components/RepoSetupChip";
 import { Modal } from "../components/Modal";
@@ -62,6 +62,24 @@ export function Repos() {
   const [skillsBusyId, setSkillsBusyId] = useState<string | null>(null);
   const [claudemdBusyId, setClaudemdBusyId] = useState<string | null>(null);
   const [trustBusyId, setTrustBusyId] = useState<string | null>(null);
+  // The repo whose "Code cross-check" panel is expanded (PRD #2170 M3). Like the
+  // Trusted-repo panel it renders OUTSIDE the scrolling table. Its two inputs are a
+  // draft saved together in one PATCH: owner guidance and the checker's own
+  // CLAUDE.md consent (separate from the lead's Repo instructions above).
+  const [crossCheckRepoId, setCrossCheckRepoId] = useState<string | null>(null);
+  const [guidanceDraft, setGuidanceDraft] = useState("");
+  const [checkerClaudemdDraft, setCheckerClaudemdDraft] = useState(false);
+  const [crossCheckBusy, setCrossCheckBusy] = useState(false);
+  // The panel's current repo and the latest save, read after an await: a save that resolves
+  // after the owner opened another repo's panel must not write into that repo's draft.
+  const crossCheckRepoIdRef = useRef<string | null>(null);
+  crossCheckRepoIdRef.current = crossCheckRepoId;
+  const crossCheckSaveSeq = useRef(0);
+  // Inline, inside the panel (like the Project-sync panel): a refusal belongs next
+  // to the field it is about, not in the page Alert far above the table.
+  const [crossCheckError, setCrossCheckError] = useState("");
+  // "Saved" confirmation, cleared by the next edit so it never describes a draft.
+  const [crossCheckSaved, setCrossCheckSaved] = useState(false);
   // Tool profile picker (PRD #18 M4): the repo whose package picker is open, the
   // admin allowlist (loaded once), the currently-selected package strings for the
   // open repo, and the in-flight save.
@@ -147,9 +165,16 @@ export function Repos() {
   // trigger so focus returns to it on close, and move focus into the panel on open.
   const syncTriggerRef = useRef<HTMLButtonElement | null>(null);
   const syncPanelRef = useRef<HTMLDivElement | null>(null);
+  // Code cross-check panel focus: return to the cell trigger on close, and move
+  // focus to the guidance field (the panel's first input) on open.
+  const crossCheckTriggerRef = useRef<HTMLButtonElement | null>(null);
+  const crossCheckPanelRef = useRef<HTMLDivElement | null>(null);
   useEffect(() => {
     if (trustRepoId) trustPanelRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [trustRepoId]);
+  useEffect(() => {
+    if (crossCheckRepoId) crossCheckPanelRef.current?.querySelector<HTMLTextAreaElement>("textarea")?.focus();
+  }, [crossCheckRepoId]);
   useEffect(() => {
     if (confirmTrustId) confirmTrustRef.current?.querySelector<HTMLButtonElement>("button")?.focus();
   }, [confirmTrustId]);
@@ -161,6 +186,58 @@ export function Repos() {
     setTrustRepoId(null);
     setConfirmTrustId(null);
     trustTriggerRef.current?.focus();
+  };
+
+  // Open (or close, on a second click) the Code cross-check panel, seeding the
+  // draft from the repo's saved inputs so an abandoned edit never carries over.
+  const toggleCrossCheck = (repo: Repo, trigger: HTMLButtonElement) => {
+    crossCheckTriggerRef.current = trigger;
+    setCrossCheckError("");
+    setCrossCheckSaved(false);
+    // Any save still in flight is superseded: it no longer owns the draft or the busy flag.
+    crossCheckSaveSeq.current++;
+    setCrossCheckBusy(false);
+    if (crossCheckRepoId === repo.id) {
+      setCrossCheckRepoId(null);
+      return;
+    }
+    setGuidanceDraft(repo.code_cross_check_guidance ?? "");
+    setCheckerClaudemdDraft(repo.cross_check_repo_instructions_enabled ?? false);
+    setCrossCheckRepoId(repo.id);
+  };
+
+  const closeCrossCheck = () => {
+    setCrossCheckRepoId(null);
+    setCrossCheckError("");
+    crossCheckTriggerRef.current?.focus();
+  };
+
+  // One PATCH for both inputs. A blank field clears the guidance (null), so an
+  // empty or whitespace-only text never reaches the checker's brief.
+  const saveCrossCheck = async (repo: Repo) => {
+    const seq = ++crossCheckSaveSeq.current;
+    // True only while this repo's panel is still the one open (and this is the latest save).
+    const current = () => crossCheckRepoIdRef.current === repo.id && crossCheckSaveSeq.current === seq;
+    setCrossCheckError("");
+    setCrossCheckSaved(false);
+    setCrossCheckBusy(true);
+    try {
+      const { repo: updated } = await api.setRepoCodeCrossCheckInputs(repo.id, {
+        code_cross_check_guidance: guidanceDraft.trim() === "" ? null : guidanceDraft,
+        cross_check_repo_instructions_enabled: checkerClaudemdDraft,
+      });
+      // The saved row is the repo's own truth wherever the panel is.
+      setRepos((prev) => prev.map((r) => (r.id === updated.id ? updated : r)));
+      if (current()) {
+        setGuidanceDraft(updated.code_cross_check_guidance ?? "");
+        setCheckerClaudemdDraft(updated.cross_check_repo_instructions_enabled ?? false);
+        setCrossCheckSaved(true);
+      }
+    } catch (err) {
+      if (current()) setCrossCheckError(errorMessage(err, "Save failed"));
+    } finally {
+      if (crossCheckSaveSeq.current === seq) setCrossCheckBusy(false);
+    }
   };
 
   // Load the repo's Projects-sync status (PRD #534). A 404 is the expected "not
@@ -770,6 +847,16 @@ export function Repos() {
   const anyTrustBusy =
     trustRepo != null &&
     (skillsBusyId === trustRepo.id || claudemdBusyId === trustRepo.id || trustBusyId === trustRepo.id);
+  // The repo whose Code cross-check panel is expanded, and its draft's state:
+  // the UTF-8 byte size the server caps, and whether the draft differs from what
+  // is saved (blank and null are the same saved value).
+  const crossCheckRepo = repos.find((r) => r.id === crossCheckRepoId) ?? null;
+  const guidanceBytes = utf8Bytes(guidanceDraft);
+  const guidanceOverCap = guidanceBytes > GUIDANCE_MAX_BYTES;
+  const crossCheckDirty =
+    crossCheckRepo != null &&
+    ((guidanceDraft.trim() === "" ? null : guidanceDraft) !== (crossCheckRepo.code_cross_check_guidance || null) ||
+      checkerClaudemdDraft !== (crossCheckRepo.cross_check_repo_instructions_enabled ?? false));
   // The repo whose tool-profile picker is expanded (rendered below the table).
   const toolsRepo = repos.find((r) => r.id === toolsRepoId) ?? null;
   // The repo whose Allow-anyway modal is open, and the exact block findings it will
@@ -887,6 +974,7 @@ export function Repos() {
                     <th className="px-4 py-3 font-medium">Default branch</th>
                     <th className="px-4 py-3 font-medium">Status</th>
                     <th className="px-4 py-3 font-medium">Trusted repo</th>
+                    <th className="px-4 py-3 font-medium">Code cross-check</th>
                     <th className="px-4 py-3 font-medium">Tools</th>
                     <th className="px-4 py-3 font-medium">Project sync</th>
                     <th className="px-4 py-3 text-right font-medium">Actions</th>
@@ -895,7 +983,7 @@ export function Repos() {
                 <tbody className="divide-y divide-edge">
                   {repos.length === 0 ? (
                     <tr>
-                      <td colSpan={7} className="px-4 py-6 text-center text-faint">
+                      <td colSpan={8} className="px-4 py-6 text-center text-faint">
                         {refreshing ? "Loading…" : "No projects found for this bot."}
                       </td>
                     </tr>
@@ -1118,6 +1206,26 @@ export function Repos() {
                                 }}
                               >
                                 {trustRepoId === r.id ? "Close" : "Manage"}
+                              </Button>
+                            </div>
+                          )}
+                        </td>
+                        <td className="px-4 py-3">
+                          {!r.enabled ? (
+                            <span className="text-xs text-faint">—</span>
+                          ) : (
+                            <div className="flex flex-wrap items-center gap-2">
+                              <Badge tone={crossCheckInputsLabel(r) === "Default" ? "neutral" : "info"} dot>
+                                {crossCheckInputsLabel(r)}
+                              </Badge>
+                              <Button
+                                variant="secondary"
+                                size="sm"
+                                aria-expanded={crossCheckRepoId === r.id}
+                                aria-label={`Code cross-check settings for ${maskRepoPath(r.path_with_namespace, demo)}`}
+                                onClick={(e) => toggleCrossCheck(r, e.currentTarget)}
+                              >
+                                {crossCheckRepoId === r.id ? "Close" : "Manage"}
                               </Button>
                             </div>
                           )}
@@ -1417,6 +1525,126 @@ export function Repos() {
                   <Button variant="ghost" size="sm" onClick={closeTrust}>
                     Close
                   </Button>
+                </div>
+              </div>
+            )}
+
+            {/* The Code cross-check panel (PRD #2170 M3), beside the Trusted-repo
+                panel and, like it, outside the scrolling table. The owner adds
+                checks; the locked base brief and read-only rules stay as they are. */}
+            {crossCheckRepo && (
+              <div
+                ref={crossCheckPanelRef}
+                role="group"
+                aria-label={`Code cross-check for ${maskRepoPath(crossCheckRepo.path_with_namespace, demo)}`}
+                className="space-y-4 rounded-xl border border-edge bg-raised/20 p-4"
+              >
+                <div className="min-w-0 space-y-1">
+                  <h3 className="flex items-center gap-2 text-sm font-semibold text-fg">
+                    Code cross-check
+                    <Badge tone={crossCheckInputsLabel(crossCheckRepo) === "Default" ? "neutral" : "info"} dot>
+                      {crossCheckInputsLabel(crossCheckRepo)}
+                    </Badge>
+                  </h3>
+                  <p id="cross-check-explainer" className="max-w-2xl text-sm text-muted">
+                    Additional checks for the code cross-checker on this repository. Guidance cannot remove the
+                    required checks or change the read-only rules.
+                  </p>
+                </div>
+
+                <div className="space-y-2 rounded-md border border-edge bg-raised p-3">
+                  <label htmlFor="cross-check-guidance" className="block text-sm font-semibold text-fg">
+                    Guidance
+                  </label>
+                  <Textarea
+                    id="cross-check-guidance"
+                    rows={6}
+                    value={guidanceDraft}
+                    readOnly={crossCheckBusy}
+                    aria-invalid={guidanceOverCap || undefined}
+                    aria-describedby="cross-check-explainer cross-check-bytes"
+                    placeholder="For example: flag any new migration that has no down step."
+                    onChange={(e) => {
+                      setGuidanceDraft(e.target.value);
+                      setCrossCheckSaved(false);
+                    }}
+                  />
+                  {/* The byte meter: a hairline that fills toward the server's cap,
+                      warning at 90% and turning danger past it. The number is the
+                      truth; the bar only makes the headroom visible at a glance. */}
+                  <div
+                    aria-hidden="true"
+                    className="h-0.5 w-full overflow-hidden rounded-full bg-edge"
+                  >
+                    <div
+                      data-testid="cross-check-byte-meter"
+                      className={cx(
+                        "h-full rounded-full motion-safe:transition-[width] motion-safe:duration-150",
+                        guidanceOverCap
+                          ? "bg-danger"
+                          : guidanceBytes >= GUIDANCE_MAX_BYTES * 0.9
+                            ? "bg-warn"
+                            : "bg-brand",
+                      )}
+                      style={{ width: `${Math.min(100, (guidanceBytes / GUIDANCE_MAX_BYTES) * 100)}%` }}
+                    />
+                  </div>
+                  <p
+                    id="cross-check-bytes"
+                    className={cx("text-xs tabular-nums", guidanceOverCap ? "text-danger" : "text-faint")}
+                  >
+                    {guidanceOverCap
+                      ? `${guidanceBytes} of ${GUIDANCE_MAX_BYTES} bytes. Remove ${guidanceBytes - GUIDANCE_MAX_BYTES} ${guidanceBytes - GUIDANCE_MAX_BYTES === 1 ? "byte" : "bytes"} to save.`
+                      : `${guidanceBytes} of ${GUIDANCE_MAX_BYTES} bytes`}
+                  </p>
+                </div>
+
+                <div className="flex items-start gap-3 rounded-md border border-edge bg-raised p-3">
+                  <div className="min-w-0 flex-1 space-y-2">
+                    <p id="cross-check-claudemd" className="text-sm font-semibold text-fg">
+                      Give the checker this repository&rsquo;s CLAUDE.md (read from the base commit)
+                    </p>
+                    <p className="text-sm text-muted">
+                      The checker reads the root{" "}
+                      <code className="rounded bg-surface px-1 py-0.5 font-mono text-xs">CLAUDE.md</code> as it was
+                      at the run&rsquo;s merge base with the default branch, so a run cannot write the instructions it is
+                      checked against. This is separate from the lead&rsquo;s
+                      Repo instructions setting.
+                    </p>
+                    <div className="flex flex-wrap gap-1.5 font-mono text-[11px] text-faint">
+                      <span className="rounded border border-edge px-1.5 py-0.5">root CLAUDE.md</span>
+                      <span className="rounded border border-ok/40 px-1.5 py-0.5 text-ok">base commit, not the run&rsquo;s head</span>
+                      <span className="rounded border border-danger/40 px-1.5 py-0.5 text-danger">@-imports stripped</span>
+                      <span className="rounded border border-edge px-1.5 py-0.5">64 KB cap</span>
+                    </div>
+                  </div>
+                  <Toggle
+                    label="Give the checker this repository's CLAUDE.md (read from the base commit)"
+                    checked={checkerClaudemdDraft}
+                    disabled={crossCheckBusy}
+                    onChange={(next) => {
+                      setCheckerClaudemdDraft(next);
+                      setCrossCheckSaved(false);
+                    }}
+                  />
+                </div>
+
+                {crossCheckError && <Alert message={crossCheckError} />}
+
+                <div className="flex flex-wrap items-center gap-2">
+                  <Button
+                    size="sm"
+                    disabled={crossCheckBusy || guidanceOverCap || !crossCheckDirty}
+                    onClick={() => saveCrossCheck(crossCheckRepo)}
+                  >
+                    {crossCheckBusy ? "Saving…" : "Save"}
+                  </Button>
+                  <Button variant="ghost" size="sm" onClick={closeCrossCheck}>
+                    Close
+                  </Button>
+                  <span role="status" className="text-xs text-ok">
+                    {crossCheckSaved ? "Saved. New code cross-checks use these settings." : ""}
+                  </span>
                 </div>
               </div>
             )}
@@ -2053,4 +2281,21 @@ export function Repos() {
       )}
     </div>
   );
+}
+
+// The code cross-check guidance cap, in UTF-8 bytes (PatchRepo, PRD #2170 M3).
+const GUIDANCE_MAX_BYTES = 8192;
+
+function utf8Bytes(text: string): number {
+  return new TextEncoder().encode(text).length;
+}
+
+// The cell/panel badge: which owner inputs a repo's code cross-check carries.
+function crossCheckInputsLabel(repo: Repo): string {
+  const guided = (repo.code_cross_check_guidance ?? "") !== "";
+  const claudemd = repo.cross_check_repo_instructions_enabled ?? false;
+  if (guided && claudemd) return "Guidance + CLAUDE.md";
+  if (guided) return "Guidance";
+  if (claudemd) return "CLAUDE.md";
+  return "Default";
 }

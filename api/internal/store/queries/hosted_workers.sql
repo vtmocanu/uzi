@@ -14,11 +14,22 @@
 -- what this hands it. Object naming derives from the uuid (uzi-hw-<id>), so the
 -- name is not selected here at all, rather than selected and trusted not to be used.
 --
--- Deliberately unbounded: the whole hosted fleet is the desired state, and the
--- controller reconciles it as a set — a paged poll could never express "these are
--- all the workers that should exist", which is what makes orphan detection
--- (Decision 9) possible. The per-user quota (M2) bounds the row count.
+-- Read one overflow sentinel beyond the complete-fleet ceiling. Poll refuses the
+-- entire snapshot when it exceeds 512; a truncated set would permit orphan teardown.
 SELECT w.id,
+       w.user_id, w.capabilities, w.protocol_capabilities, w.version,
+       w.status, w.last_heartbeat_at,
+       w.snapshot_register_nonce, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason,
+       -- Checker eligibility by slot family, matching fn_cross_check_child_eligible:
+       -- ordinary_coverage is the legacy run-slot fallback, NOT ordinary-job support.
+       -- checker_coverage is dedicated checker-slot coverage. Zero disables both;
+       -- NULL with a lane marker and positive slots without one cover neither.
+       ('cross_check_v1' = ANY(w.protocol_capabilities)
+         AND w.max_cross_check_slots IS NULL
+         AND NOT ('cross_check_lane_v1' = ANY(w.protocol_capabilities)))::boolean AS ordinary_coverage,
+       COALESCE('cross_check_v1' = ANY(w.protocol_capabilities)
+         AND w.max_cross_check_slots > 0
+         AND 'cross_check_lane_v1' = ANY(w.protocol_capabilities), false)::boolean AS checker_coverage,
        w.template_declared,
        w.hosted_size,
        w.hosted_generation,
@@ -87,7 +98,8 @@ SELECT w.id,
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
 WHERE w.kind = 'hosted'
-ORDER BY w.created_at ASC;
+ORDER BY w.created_at ASC, w.id ASC
+LIMIT 513;
 
 -- name: CountHostedWorkersForUser :one
 -- The user's PERSISTENT hosted-worker count, for the standing quota gate (PRD #58
@@ -604,7 +616,7 @@ WHERE token_ciphertext IS NOT NULL
 -- leased-idle worker is idle, so it rolls or is released at once, never held for its lease). The
 -- UPDATE takes the row lock, so it serializes against a claim that is rebinding the same worker.
 UPDATE workers
-   SET draining_since = COALESCE(draining_since, now()), maintenance_owns_drain = false, updated_at = now(),
+   SET draining_reason = NULL, draining_since = COALESCE(draining_since, now()), maintenance_owns_drain = false, updated_at = now(),
        lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL
  WHERE id = @id AND kind = 'hosted';
 
@@ -616,9 +628,13 @@ UPDATE workers
 -- so no `draining_since IS NOT NULL` guard — that keeps rows-affected=0 meaning
 -- unambiguously "no such hosted worker" (clean 404), not "already clear". kind='hosted'
 -- mirrors CordonHostedWorker: never touch an external worker.
-UPDATE workers
+UPDATE workers w
    -- Releasing the legacy cordon hands a pending drain to maintenance for cleanup.
-   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END,
+   SET draining_reason = NULL, draining_since = CASE WHEN maintenance_fenced
+         OR maintenance_phase IN ('requested','ready','stopping','recycling')
+         OR stats_disk_pressure_streak >= 2 OR dind_pressure_streak >= 2
+         OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
+       THEN draining_since ELSE NULL END,
        maintenance_owns_drain = maintenance_phase IN ('requested','ready','stopping','recycling'),
        updated_at = now()
- WHERE id = @id AND kind = 'hosted';
+ WHERE w.id = @id AND kind = 'hosted';

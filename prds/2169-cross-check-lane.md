@@ -68,7 +68,7 @@ Hosted acceptance examples (pending maintainer evidence):
 
 ### Isolation
 
-A cross-check child is read-only by construction (PRD #2149 D3): no `Bash`, no write tools, the Codex checker under Landlock rooted at its checkout. (A Claude checker does not exist yet; the Codex-lead direction PRD adds it under the path guard, and its isolation note extends this one.) Checkout confinement and tool restrictions bound repository access; they do not prove network isolation or eliminate same-uid process residuals. The hosted uid split depends on the configured profile. Lead and checker share pod memory/CPU and OOM risk; default-one memory headroom is unmeasured. `docs/worker-setup.md` states this where `WORKER_CROSS_CHECK_SLOTS` is documented.
+A cross-check child is read-only by construction (PRD #2149 D3): no `Bash`, no write tools, the Codex checker under Landlock rooted at its checkout. (The Claude checker for a Codex lead, PRD #2460, runs with only Read, Grep and Glob under its path and pattern guard.) Checkout confinement and tool restrictions bound repository access; they do not prove network isolation or eliminate same-uid process residuals. The hosted uid split depends on the configured profile. Lead and checker share pod memory/CPU and OOM risk; default-one memory headroom is unmeasured. `docs/worker-setup.md` states this where `WORKER_CROSS_CHECK_SLOTS` is documented.
 
 ## Testing decisions
 

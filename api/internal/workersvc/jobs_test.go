@@ -158,11 +158,11 @@ func TestJobRunRefusesPauseExtendAndCredentialPin(t *testing.T) {
 	if !errors.Is(err, ErrPauseNotSupported) || err.Error() != "job runs never park; cancel the job instead" {
 		t.Errorf("pauseRefusalReason(job) = %v", err)
 	}
-	err = extendRefusalReason(job, 7200, 57600)
+	err = extendRefusalReason(job, 7200, 57600, 2*time.Hour, 8*time.Hour)
 	if !errors.Is(err, ErrExtendNotTimed) || !strings.Contains(err.Error(), "job") {
 		t.Errorf("extendRefusalReason(job) = %v, want ErrExtendNotTimed naming the job", err)
 	}
-	if err := extendRefusalReason(store.Run{Status: "failed", Kind: runkind.Job}, 7200, 57600); !errors.Is(err, ErrRunTerminal) {
+	if err := extendRefusalReason(store.Run{Status: "failed", Kind: runkind.Job}, 7200, 57600, 2*time.Hour, 8*time.Hour); !errors.Is(err, ErrRunTerminal) {
 		t.Errorf("terminal job extend = %v, want ErrRunTerminal", err)
 	}
 

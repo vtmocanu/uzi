@@ -265,12 +265,12 @@ describe("issue #1783 M3: a recovery capture whose proof keeps blocking is bound
     assert.notEqual(failed[0]!.fail_origin, "worker_residue_blocked");
   });
 
-  for (const deferral of ["vault_locked", "refresh_unknown"] as const) {
+  for (const deferral of ["vault_locked", "refresh_unknown", "account_unavailable"] as const) {
     it(`${deferral}: blocked proofs past the old cap retain custody until a valid proof parks`, TIMEOUT, async (t) => {
       const noPublication = assertNoPublication(t);
-      client.protocolFeatures = ["recovery_cause_vault_locked"];
+      client.protocolFeatures = ["recovery_cause_vault_locked", "recovery_cause_codex_account_unavailable"];
       const { gitlab, calls: mrCalls } = fakeGitlab();
-      const claim = gitlabClaim(deferral === "vault_locked" ? 1783_06 : 1783_07, { claim_generation: 3 });
+      const claim = gitlabClaim(deferral === "vault_locked" ? 1783_06 : deferral === "refresh_unknown" ? 1783_07 : 1595_06, { claim_generation: 3 });
       const q = blockedQuiescer(claim.run_id);
       const seen = { clone: "", home: "" };
       let custodyCalls: string[] = [];
@@ -306,21 +306,21 @@ describe("issue #1783 M3: a recovery capture whose proof keeps blocking is bound
       assert.ok(!states.some((s) => s.status === "failed" || s.status === "completed"));
       const parks = states.filter((s) => s.status === "recovery_wait");
       assert.equal(parks.length, 1);
-      assert.equal(parks[0]!.recovery_cause, deferral === "vault_locked" ? "vault_locked" : undefined);
+      assert.equal(parks[0]!.recovery_cause, deferral === "vault_locked" ? "vault_locked" : deferral === "account_unavailable" ? "codex_account_unavailable" : undefined);
       assert.deepEqual(custodyCalls, [], "no credentialed custody sink");
       assert.equal(mrCalls.length, 0);
       const feed = api.messages(claim.run_id).filter((m) => m.kind === "status").map((m) => String(m.payload.text));
       const notice = "Recovery checkpoint could not be verified. Keeping the local work and session and retrying before pausing.";
       assert.equal(feed.filter((t) => t === notice).length, 1, "blocked wait is visible and deduplicated");
-      if (deferral === "refresh_unknown") assert.ok(feed.every((t) => !/vault/i.test(t)));
+      if (deferral !== "vault_locked") assert.ok(feed.every((t) => !/vault/i.test(t)));
     });
   }
-  for (const deferral of ["vault_locked", "refresh_unknown"] as const) {
+  for (const deferral of ["vault_locked", "refresh_unknown", "account_unavailable"] as const) {
     for (const exit of ["cancel", "shutdown", "released", "superseded"] as const) {
       it(`${deferral}: ${exit} after seven blocked proofs wins without recovery/completion authority`, TIMEOUT, async (t) => {
         const noPublication = assertNoPublication(t);
         const { gitlab, calls: mrCalls } = fakeGitlab();
-        const claim = gitlabClaim(1783_100 + (deferral === "vault_locked" ? 0 : 10) + ["cancel", "shutdown", "released", "superseded"].indexOf(exit), { claim_generation: 3 });
+        const claim = gitlabClaim(1783_100 + (deferral === "vault_locked" ? 0 : deferral === "refresh_unknown" ? 10 : 20) + ["cancel", "shutdown", "released", "superseded"].indexOf(exit), { claim_generation: 3 });
         const q = blockedQuiescer(claim.run_id);
         const seen = { clone: "", home: "" };
         let ctxRef: RunContext | undefined;

@@ -242,7 +242,7 @@ func TestPermanentlyUnknownAuthorDoesNotWedgeTheMR(t *testing.T) {
 	if len(e.runs.calls) != 1 {
 		t.Fatalf("runs = %d, want the eligible comment to fire although another author is unknown", len(e.runs.calls))
 	}
-	if got := e.st.ledgers[mrwRef]; got.HighWater != 9 || !slices.Equal(got.PendingUnknownIds, []int64{5}) {
+	if got := e.st.ledgers[mrwRef]; got.HighWater != 9 || !slices.Equal(got.PendingUnknownKeys, []string{"review_comment:5"}) {
 		t.Fatalf("ledger = %+v, want high_water 9 with the unknown comment 5 pending", got)
 	}
 	// Nothing re-fires while the author stays unknown, and a later eligible comment still fires.
@@ -263,7 +263,7 @@ func TestPermanentlyUnknownAuthorDoesNotWedgeTheMR(t *testing.T) {
 	if len(e.runs.calls) != 3 {
 		t.Fatalf("runs = %d, want the pending comment to fire exactly once when its author resolves", len(e.runs.calls))
 	}
-	if got := e.st.ledgers[mrwRef].PendingUnknownIds; len(got) != 0 {
+	if got := e.st.ledgers[mrwRef].PendingUnknownKeys; len(got) != 0 {
 		t.Fatalf("pending = %v, want it consumed", got)
 	}
 	if got := e.snapshotBodies(); !slices.Contains(got, "from an author the forge never answers for") {
@@ -614,13 +614,14 @@ func TestEvictionRunsNextToLedgerReconcile(t *testing.T) {
 // the row this tick planned against) is never mistaken for gone.
 func TestStaleFetchLeavesConcurrentlyStoredPendingIDAlone(t *testing.T) {
 	e := newEW(t)
-	e.st.ledgers = map[string]store.MrReworkLedger{
-		mrwRef: {RepoID: mrwRepoRow().ID, Ref: mrwRef, HighWater: 150},
+	e.st.ledgers = map[string]store.GetMRReworkLedgerRow{
+		mrwRef: mrwRow(mrwRef, 0, 150),
 	}
 	e.f.onList = func() {
 		cur := e.st.ledgers[mrwRef]
-		cur.PendingUnknownIds = []int64{170}
+		cur.PendingUnknownKeys = []string{"review_comment:170"}
 		cur.HighWater = 165
+		cur.CommentMarks = []byte(`{"review_comment":165}`)
 		e.st.ledgers[mrwRef] = cur
 	}
 	old := e.comment(120, outsiderAuthor, "old outsider note")
@@ -629,7 +630,7 @@ func TestStaleFetchLeavesConcurrentlyStoredPendingIDAlone(t *testing.T) {
 	if len(e.runs.calls) != 1 {
 		t.Fatalf("runs = %d, want the eligible comment to fire", len(e.runs.calls))
 	}
-	if got := e.st.ledgers[mrwRef].PendingUnknownIds; !slices.Equal(got, []int64{170}) {
+	if got := e.st.ledgers[mrwRef].PendingUnknownKeys; !slices.Equal(got, []string{"review_comment:170"}) {
 		t.Fatalf("pending = %v, want 170 kept: the listing never saw it", got)
 	}
 }

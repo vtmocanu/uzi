@@ -46,7 +46,9 @@ type PollResponse struct {
 
 // DesiredWorker is one hosted worker's desired state.
 type DesiredWorker struct {
-	ID string `json:"id"`
+	RollEvidence   *RollEvidence `json:"roll_evidence,omitempty"`
+	DrainingReason *string       `json:"draining_reason,omitempty"`
+	ID             string        `json:"id"`
 	// Template is the worker type: the per-template agent image to run
 	// (Decision 7). Always set — a hosted row cannot exist without one
 	// (ck_workers_hosted_metadata).
@@ -155,6 +157,7 @@ type DesiredWorker struct {
 // queries/worker_roll_health.sql, where that is enforced by the SQL rather than
 // promised by prose.
 type StatusReport struct {
+	Kind string `json:"kind,omitempty"`
 	// ReportedAt is the controller's clock at send. DISPLAY ONLY — the api stamps its
 	// own observed_at at receipt and computes freshness from that. A field the
 	// untrusted party controls must never drive an expiry the same party benefits from
@@ -172,6 +175,7 @@ type StatusReport struct {
 // value because 0 is a real observation; LastExitCode is a pointer because "exited 0"
 // and "never terminated" are different facts.
 type WorkerStatus struct {
+	Pacing            *Pacing    `json:"pacing,omitempty"`
 	ID                string     `json:"id"`
 	Phase             string     `json:"phase"`
 	PhaseSince        *time.Time `json:"phase_since"`
@@ -182,3 +186,31 @@ type WorkerStatus struct {
 	RestartCount      int32      `json:"restart_count"`
 	LastExitCode      *int32     `json:"last_exit_code"`
 }
+
+// RollEvidence is API-evaluated registration evidence, independent of pod readiness.
+// Registered reports nonce-backed registration; false alone does not exclude legacy registration.
+// NeverRegistered is positive evidence of an offline row with no registration history.
+// An omitted or null NeverRegistered field from older APIs is unknown.
+type RollEvidence struct {
+	NeverRegistered        *bool    `json:"never_registered,omitempty"`
+	Version                int      `json:"version"`
+	OwnerID                string   `json:"owner_id"`
+	Registered             bool     `json:"registered"`
+	SchedulingCapabilities []string `json:"scheduling_capabilities"`
+	ProtocolCapabilities   []string `json:"protocol_capabilities"`
+	// OrdinaryCoverage describes checker fallback into run slots, not ordinary-job support.
+	OrdinaryCoverage  bool       `json:"ordinary_coverage"`
+	CheckerCoverage   bool       `json:"checker_coverage"`
+	RegisteredVersion *string    `json:"registered_version"`
+	RegisterNonce     *string    `json:"register_nonce"`
+	PodUID            *string    `json:"pod_uid"`
+	HeartbeatAt       *time.Time `json:"heartbeat_at"`
+	// LivenessValidUntil is ordinary API connectivity, independent of promotion proof.
+	// Null means there is no fresh API-online heartbeat at evaluation.
+	LivenessValidUntil *time.Time `json:"liveness_valid_until"`
+	EvaluatedAt        time.Time  `json:"evaluated_at"`
+	ValidUntil         time.Time  `json:"valid_until"`
+}
+
+// Pacing is separate from the pod-derived phase.
+type Pacing = workersvc.PacingReport

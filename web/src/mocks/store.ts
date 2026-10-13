@@ -5,6 +5,8 @@
 // over Postgres, so useRunStream's replay/merge logic runs unmodified.
 
 import type { Board, BoardPrefs, IssueProposal, LatestRun, Run, RunMessage, RunStatus, User, WsEvent } from "../lib/api";
+import { seedUnifiedProgress } from "./data/unifiedProgress";
+import { deriveMockProgress } from "./runProgress";
 import {
   mockAdmin,
   mockAwaitingMessages,
@@ -55,12 +57,16 @@ export interface MockState {
 // seedRun copies a fixture into the store with status_since defaulted to the fixture's own
 // value, else its updated_at: the same backfill the issue #1727 migration applied to existing
 // rows, so every stored run carries the field a current server always sends.
+//
+// PRD #2602: progress is derived the way the server's runToDTO derives it (runProgress.ts),
+// unless the fixture pins one explicitly.
 function seedRun(r: Run): Run {
   return {
     ...r,
     auto_approve_blocked_reasons: r.auto_approve_blocked_reasons ?? [],
     issue_input_reason: r.issue_input_reason ?? null,
     status_since: r.status_since ?? r.updated_at,
+    progress: r.progress !== undefined ? r.progress : deriveMockProgress(r),
   };
 }
 
@@ -147,6 +153,7 @@ function seed(): MockState {
   // Job runs: empty logs, so both open without a 404 (their deliverable is the result panel).
   for (const r of mockJobRuns) messages.set(r.id, []);
   for (const [id, log] of Object.entries(mockChatMessages)) messages.set(id, log.map((m) => ({ ...m })));
+  seedUnifiedProgress(runs, messages);
   const proposals = new Map<string, IssueProposal>();
   for (const p of mockProposals) proposals.set(p.id, { ...p });
   const boards = new Map<string, Board>();
@@ -240,6 +247,9 @@ const CARD_MIRRORED_FIELDS = [
   // issue #321: the server-derived planning flag rides the card the same way status does,
   // so a scripted transition out of planning is reflected on the board card too.
   "is_planning",
+  // issue #750/#2760: RunDTO carries is_revising too, so a scripted plan_revising / next
+  // plan transition on the run is reflected on the board card like is_planning.
+  "is_revising",
   "mr_iid",
   "mr_web_url",
   "mr_state",
@@ -264,11 +274,6 @@ const CARD_MIRRORED_FIELDS = [
 const CARD_OWN_FIELDS = [
   "id",
   "updated_at",
-  // issue #750: is_revising is a board/list projection the server computes (it rides the
-  // card DTO and RunListItemDTO, NOT RunDTO — see api.ts), so it is deliberately absent
-  // from the Run patch type and a run patch must never write it. It lives on the OWN side
-  // of the partition, unlike is_planning (which IS on Run and so is mirrored).
-  "is_revising",
   "owner_name",
   "worker_name",
   "is_mine",
@@ -322,7 +327,7 @@ function syncCards(runId: string, patch: Partial<Run>): void {
 // Fields whose change asks the run view to RE-READ the run over REST, exactly as a real
 // run-updated WS frame does (a "state" frame carries no authoritative data — it only
 // triggers refreshRun; runStream.ts). A status change already qualifies; PRD #1064 M3
-// adds the milestone + current_activity fields, because the run view's MilestoneChecklist
+// adds the milestone + current_activity fields, because the run view's MilestoneRows
 // (and its "now" strip) render from run.milestones / milestones_in_progress, which the
 // mid-implement freeze mutates WITHOUT a status change. Without this broadcast that freeze
 // updated the store but never reached the run view, so the strip never appeared live.
@@ -348,6 +353,9 @@ export function patchRun(runId: string, patch: Partial<Run>): Run | undefined {
     updated_at: now,
     status_since: "status_since" in patch ? patch.status_since : statusChanged ? now : run.status_since,
   };
+  // PRD #2602: re-derive progress after every write (status, health, milestones and
+  // planning all feed it), as every server RunDTO response does; an explicit patch wins.
+  if (!("progress" in patch)) next.progress = deriveMockProgress(next);
   state.runs.set(runId, next);
   syncCards(runId, patch);
   // Broadcast a "state" frame when any refresh-worthy field actually changed. The frame

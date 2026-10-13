@@ -127,6 +127,9 @@ function aRun(over: Partial<RunListItem> = {}): RunListItem {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -640,14 +643,14 @@ describe("RunsList — cost_status truthfulness (PRD #1429 M4b D7)", () => {
         aRun({
           id: "sub",
           issue_title: "Subscription run",
-          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 0, cost_status: "subscription" as const },
+          usage: { input_tokens: 1000, cache_read_tokens: 0, cache_creation_tokens: 0, output_tokens: 200, cost_usd: 4.2, cost_status: "subscription" as const },
         }),
       ],
     });
     renderRuns();
     await waitFor(() => expect(screen.getByText("Subscription run")).toBeTruthy());
     // Positive: the honest marker is shown, and tokens still render (not hidden).
-    expect(screen.getByText(/subscription/)).toBeTruthy();
+    expect(screen.getByText("cost n/a")).toBeTruthy();
     expect(screen.getByText(/tok/)).toBeTruthy();
     // Negative, paired with the above: never a dollar figure for this run.
     expect(screen.queryByText(/\$/)).toBeNull();
@@ -1792,5 +1795,149 @@ describe("RunRow — needs-landing status pill (issue #1418)", () => {
     });
     expect(screen.queryByText("needs landing")).toBeNull();
     expect(screen.getByText("stopped")).toBeTruthy();
+  });
+});
+
+// PRD #2602 M1: RunRow carries the server-derived Progress cell beside the milestone badge,
+// and hides it under the waiting-for-vault state exactly as it hides the milestone badge.
+describe("RunRow — Progress cell (PRD #2602)", () => {
+  const renderRow = (over: Partial<RunListItem> = {}, waitingForVault = false) =>
+    render(
+      <MemoryRouter>
+        <ul>
+          <RunRow run={aRun(over)} now={Date.parse("2026-07-05T12:04:00Z")} waitingForVault={waitingForVault} />
+        </ul>
+      </MemoryRouter>,
+    );
+  const prog = (state: NonNullable<RunListItem["progress"]>["state"]) => ({
+    state,
+    pct: null,
+    milestone_done: 0,
+    milestone_total: 0,
+    active_milestone_id: "",
+    phase: "" as const,
+  });
+
+  it("shows the stalled flag with its since time on a running row", () => {
+    const { container } = renderRow({
+      status: "running",
+      health: "stalled",
+      health_since: "2026-07-05T11:41:00Z",
+      progress: prog("stalled"),
+    });
+    const cell = container.querySelector('[data-run-progress="stalled"]')!;
+    expect(cell).toBeTruthy();
+    expect(cell.textContent).toMatch(/^◼ stalledsince /);
+    // One stall, one flag: the health badge yields to the cell (its word is in the tooltip).
+    expect(container.textContent).not.toContain("⚠");
+  });
+
+  it("keeps the health badge when the cell is not showing the stalled flag", () => {
+    const { container } = renderRow({
+      status: "running",
+      health: "slow",
+      health_since: "2026-07-05T11:41:00Z",
+      progress: { ...prog("percent"), pct: 40, milestone_done: 1, milestone_total: 3 },
+    });
+    expect(container.textContent).toContain("⚠ near timeout");
+  });
+
+  it("names the park in screen-reader text only (the status pill shows it)", () => {
+    const { container } = renderRow({ status: "limit_wait", progress: prog("parked") });
+    const cell = container.querySelector('[data-run-progress="parked"]')!;
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe("Progress: limit wait");
+  });
+
+  it("is hidden while the row reads waiting for vault unlock", () => {
+    const { container } = renderRow({ status: "queued", progress: prog("queued") }, true);
+    expect(screen.getByText(/waiting for vault unlock/)).toBeTruthy();
+    expect(container.querySelector("[data-run-progress]")).toBeNull();
+  });
+
+  it("renders no cell for a pre-feature row without progress", () => {
+    const { container } = renderRow({ status: "running" });
+    expect(container.querySelector("[data-run-progress]")).toBeNull();
+  });
+});
+
+// Issue #2661: both the owner list and the admin fleet list read the compact summary
+// projection, and rows still render without the four heavy detail keys.
+describe("RunsList — summary run projection (#2661)", () => {
+  it("owner list requests view=summary and renders a summary row", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRun({
+      id: "r",
+      issue_title: "Summary row",
+      status: "running",
+    });
+    mockApi.listRuns.mockResolvedValue({ runs: [summary as never] });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Summary row")).toBeTruthy());
+    expect(screen.getByText("running")).toBeTruthy();
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
+  });
+
+  it("owner poll tick keeps requesting view=summary", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: false },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    vi.useFakeTimers();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    renderRuns();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.listRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
+  });
+
+  it("admin list requests view=summary on adminListRuns too", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    renderRuns();
+    await waitFor(() => expect(mockApi.adminListRuns).toHaveBeenCalled());
+    expect(mockApi.listRuns).toHaveBeenCalledWith({ view: "summary" });
+    expect(mockApi.adminListRuns).toHaveBeenCalledWith({ view: "summary" });
+  });
+
+  it("admin fleet list renders a summary row and its poll tick keeps view=summary", async () => {
+    vi.mocked(useAuth).mockReturnValue({
+      user: { is_admin: true, email: "me@uzi.test" },
+      vaultUnlocked: true,
+    } as unknown as ReturnType<typeof useAuth>);
+    const { plan_md: _p, repo_agents: _a, issue_description: _d, preserved_patch: _x, ...summary } = aRun({
+      id: "theirs",
+      issue_title: "Their summary row",
+      status: "queued",
+      owner_email: "other@uzi.test",
+    });
+    vi.useFakeTimers();
+    mockApi.listRuns.mockResolvedValue({ runs: [] });
+    mockApi.adminListRuns.mockResolvedValue({ runs: [summary as never] });
+    mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
+    renderRuns();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    expect(screen.getByText("Their summary row")).toBeTruthy();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10000);
+    });
+    expect(mockApi.adminListRuns.mock.calls.length).toBeGreaterThanOrEqual(2); // mount + poll
+    for (const call of mockApi.adminListRuns.mock.calls) expect((call as unknown[])[0]).toEqual({ view: "summary" });
+    for (const call of mockApi.listRuns.mock.calls) expect(call[0]).toEqual({ view: "summary" });
   });
 });

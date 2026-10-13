@@ -31,7 +31,7 @@
 
   // `public/theme-preinit.js` is loaded by `web/index.html` as
   // `<script src="/theme-preinit.js">`. Knip 6.35+ resolves Vite public scripts,
-  // while the currently pinned 6.34 needs it declared explicitly. Keeping it as an
+  // and older releases needed it declared explicitly. Keeping it as an
   // entry is valid for both versions and keeps its imports in scope.
   //
   // `scripts/gen-favicon-png.mjs` is a hand-run generator (its own header says

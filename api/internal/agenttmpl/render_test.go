@@ -197,7 +197,7 @@ func TestLeadParallelDispatchPhrases(t *testing.T) {
 		{"parallel implementers do not commit or run repo-wide gates", "tell it not to commit and not to run repo-wide build or test commands"},
 		{"lead diffs against the last commit and confirms declared scopes", "diff the working tree against the last commit and confirm only the declared scopes changed"},
 		{"read-only validators review an immutable commit range, not a mutating tree", "over the immutable range `<base>..<sha>`"},
-		{"integration gate overlaps the read-only wave rather than serializing ahead of it", "overlapped with the read-only wave you just dispatched, never serialized ahead of it"},
+		{"integration gate overlaps the read-only wave rather than serializing ahead of it", "by default overlapped with the read-only wave you just dispatched rather than serialized ahead of it"},
 		{"integration gate keeps blocking authority over the commit", "The gate keeps full blocking authority over the commit"},
 		{"declared scope map goes to the review wave", "include the declared scope map when you dispatch the review wave"},
 		{"when in doubt, run serially", "run them serially"},

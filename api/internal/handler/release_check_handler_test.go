@@ -3,6 +3,7 @@ package handler
 import (
 	"context"
 	"encoding/json"
+	"fmt"
 	"net/http"
 	"net/http/httptest"
 	"strings"
@@ -134,6 +135,7 @@ func TestPostReleaseCheckTriggersReconciler(t *testing.T) {
 	h.PostReleaseCheck(w, httptest.NewRequest(http.MethodPost, "/api/admin/release-check", nil))
 	dto := decodeReleaseCheck(t, w)
 
+	assertReleaseCheckPartialOmitted(t, w)
 	if rec.calls != 1 {
 		t.Errorf("CheckForUpdate called %d times, want 1", rec.calls)
 	}
@@ -259,6 +261,74 @@ func TestReleaseCheckAdminGate(t *testing.T) {
 			if w.Code != http.StatusOK {
 				t.Fatalf("admin got %d, want 200 (body=%s)", w.Code, w.Body.String())
 			}
+		})
+	}
+}
+
+func TestPostReleaseCheckForwardsPartial(t *testing.T) {
+	for _, partial := range []bool{false, true} {
+		t.Run(fmt.Sprint(partial), func(t *testing.T) {
+			reconciler := &fakeReleaseReconciler{res: releasecheck.Result{
+				Status: "error", Partial: partial, Message: "stable release updated; RC fetch failed: \x00boom\x07",
+			}}
+			h := releaseCheckHandler("0.11.0", reconciler,
+				store.AppSetting{Key: settings.KeyReleaseCheckEnabled, Value: "true"},
+				store.AppSetting{Key: settings.KeyReleaseLatestTag, Value: "v0.12.0"},
+				store.AppSetting{Key: settings.KeyReleaseLatestBody, Value: "### Security\nfix"},
+				store.AppSetting{Key: settings.KeyReleaseCheckedAt, Value: "2026-08-29T11:00:00Z"},
+			)
+			w := httptest.NewRecorder()
+			h.PostReleaseCheck(w, httptest.NewRequest(http.MethodPost, "/api/admin/release-check", nil))
+			dto := decodeReleaseCheck(t, w)
+			if dto.Partial != partial || dto.Status != "error" || dto.Message != "stable release updated; RC fetch failed: boom" {
+				t.Fatalf("POST error result = %+v, want partial=%v and sanitized error", dto, partial)
+			}
+			if dto.LatestTag != "v0.12.0" || dto.Body != "### Security\nfix" || dto.CheckedAt != "2026-08-29T11:00:00Z" || !dto.UpdateAvailable || !dto.Security || reconciler.calls != 1 {
+				t.Fatalf("POST lost persisted facts or derivations: %+v calls=%d", dto, reconciler.calls)
+			}
+			var wire map[string]map[string]json.RawMessage
+			if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
+				t.Fatal(err)
+			}
+			if _, present := wire["release_check"]["partial"]; present != partial {
+				t.Fatalf("partial presence = %v, want %v: %s", present, partial, w.Body.String())
+			}
+			// GET uses the same persisted facts but carries no previous POST outcome.
+			read := httptest.NewRecorder()
+			h.GetReleaseCheck(read, httptest.NewRequest(http.MethodGet, "/api/admin/release-check", nil))
+			if got := decodeReleaseCheck(t, read); got.Partial || got.Status != "ok" || got.LatestTag != "v0.12.0" {
+				t.Fatalf("GET = %+v", got)
+			}
+			assertReleaseCheckPartialOmitted(t, read)
+		})
+	}
+}
+
+func assertReleaseCheckPartialOmitted(t *testing.T, w *httptest.ResponseRecorder) {
+	t.Helper()
+	dto := decodeReleaseCheck(t, w)
+	if dto.Partial {
+		t.Fatal("Partial = true on read-only DTO")
+	}
+	var wire map[string]map[string]json.RawMessage
+	if err := json.Unmarshal(w.Body.Bytes(), &wire); err != nil {
+		t.Fatal(err)
+	}
+	if _, present := wire["release_check"]["partial"]; present {
+		t.Fatalf("partial must be omitted: %s", w.Body.String())
+	}
+}
+
+func TestReleaseCheckReadAndSnoozeOmitPartial(t *testing.T) {
+	for _, enabled := range []string{"true", "false"} {
+		t.Run(enabled, func(t *testing.T) {
+			h := releaseCheckHandler("0.11.0", nil, store.AppSetting{Key: settings.KeyReleaseCheckEnabled, Value: enabled})
+			get := httptest.NewRecorder()
+			h.GetReleaseCheck(get, httptest.NewRequest(http.MethodGet, "/api/admin/release-check", nil))
+			assertReleaseCheckPartialOmitted(t, get)
+			snooze := httptest.NewRecorder()
+			h.PostReleaseCheckSnooze(snooze, httptest.NewRequest(http.MethodPost, "/api/admin/release-check/snooze", nil))
+			assertReleaseCheckPartialOmitted(t, snooze)
 		})
 	}
 }

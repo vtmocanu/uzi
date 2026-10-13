@@ -46,6 +46,22 @@ for pair in "INTERVAL:$INTERVAL" "MAX_HOURS:$MAX_HOURS"; do
 done
 INTERVAL=$((10#$INTERVAL)); MAX_HOURS=$((10#$MAX_HOURS))
 
+if [ -n "${UZI_CTX:-}" ]; then
+  if contexts="$("${UZI_KUBECTL:-kubectl}" config get-contexts -o name)"; then
+    # grep treats embedded newlines as alternative patterns, even with -Fx.
+    case "$UZI_CTX" in
+      *$'\n'*) echo "error: kube context '$UZI_CTX' contains a newline" >&2; exit 2 ;;
+    esac
+    if ! printf '%s\n' "$contexts" | grep -Fx -- "$UZI_CTX" >/dev/null; then
+      echo "error: kube context '$UZI_CTX' not found" >&2
+      exit 2
+    fi
+  else
+    echo "error: could not list kube contexts for context '$UZI_CTX'" >&2
+    exit 2
+  fi
+fi
+
 mkdir -p "$ROOT"
 echo "$$" > "$ROOT/backup-loop.pid"
 START_EPOCH="$(date +%s)"
@@ -78,6 +94,20 @@ write_state(){
 }
 write_state running
 llog "started pid=$$ ctx=${UZI_CTX:-<unset>} ns=[${UZI_WORKER_NS:-uzi-workers uzi-workers-docker}] interval=${INTERVAL}s max=${MAX_HOURS}h ends=$ENDS_AT retention=${UZI_BACKUP_RETENTION_DAYS:-14}d runs=${RUNS[*]}"
+
+# Probe each original target once; a failed probe does not skip sibling targets.
+all_terminal=1
+for RID in "${RUNS[@]}"; do
+  if s="$("$UZI" run get "$RID" --field status 2>/dev/null)"; then
+    case "$s" in
+      completed|failed|cancelled) ;;
+      *) all_terminal=0 ;;
+    esac
+  else
+    all_terminal=0
+  fi
+done
+[ "$all_terminal" -eq 0 ] || llog "WARN all target runs already terminal"
 
 while :; do
   [ -e "$ROOT/STOP" ] && { llog "STOP file present; exiting"; break; }

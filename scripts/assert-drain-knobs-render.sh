@@ -154,6 +154,61 @@ else
   echo "OK (d): --set workers.ephemeralWorkerDataSize=0 reaches the controller as '0'"
 fi
 
+# Issue #1470: pacing knobs and enforced singleton topology.
+got_concurrency=$(render_env "$CHART" "UZI_WORKER_ROLL_CONCURRENCY")
+[ "$got_concurrency" = "1" ] || { echo "FAIL: default roll concurrency is '$got_concurrency', want 1" >&2; fail=1; }
+got_concurrency=$(render_env "$CHART" "UZI_WORKER_ROLL_CONCURRENCY" --set workers.rollConcurrency=3)
+[ "$got_concurrency" = "3" ] || { echo "FAIL: roll concurrency override did not render" >&2; fail=1; }
+expected_stamp="0.86.0-rc.9+g37e46a3"
+got_stamp=$(render_env "$CHART" "UZI_WORKER_ROLL_TARGET_VERSION" --set-string workers.rollTargetVersion="$expected_stamp")
+[ "$got_stamp" = "$expected_stamp" ] || { echo "FAIL: full expected-version stamp was altered" >&2; fail=1; }
+[ -z "$(render_env "$CHART" "UZI_WORKER_ROLL_TARGET_VERSION")" ] || { echo "FAIL: missing exact version mapping was invented" >&2; fail=1; }
+
+for invalid in 0 -1 1.5 garbage; do
+  if helm template uzi "$CHART" --set workers.enabled=true --set api.tls.enabled=true --set-string workers.rollConcurrency="$invalid" > "$WORK/invalid.yaml" 2> "$WORK/invalid.err"; then
+    echo "FAIL: invalid roll concurrency '$invalid' rendered" >&2; fail=1
+  elif ! grep -q "workers.rollConcurrency must be a positive integer" "$WORK/invalid.err"; then
+    echo "BROKEN: invalid concurrency render failed outside the pacing guard" >&2; exit 2
+  fi
+done
+if helm template uzi "$CHART" --set workers.enabled=true --set api.tls.enabled=true --set workers.controller.replicaCount=2 > "$WORK/invalid.yaml" 2> "$WORK/invalid.err"; then
+  echo "FAIL: multiple enabled controllers rendered" >&2; fail=1
+elif ! grep -q "HARD SINGLETON" "$WORK/invalid.err"; then
+  echo "BROKEN: multiple-controller render failed outside singleton guard" >&2; exit 2
+fi
+helm template uzi "$CHART" --set workers.enabled=true --set api.tls.enabled=true --set workers.controller.replicaCount=0 --show-only templates/controller-deployment.yaml > "$WORK/stopped.yaml"
+grep -q "replicas: 0$" "$WORK/stopped.yaml" || { echo "FAIL: zero-replica stop switch was changed" >&2; fail=1; }
+sh "$SCRIPT_DIR/assert-controller-strategy.sh" "$WORK/stopped.yaml"
+helm template uzi "$CHART" --set workers.enabled=true --set api.tls.enabled=true --set workers.controller.enabled=false --set workers.controller.replicaCount=2 > "$WORK/disabled.yaml"
+if grep -q '^  name: uzi-controller$' "$WORK/disabled.yaml" && grep -q '^kind: Deployment$' "$WORK/disabled.yaml"; then
+  # A controller Role/ServiceAccount still exists while workers are enabled;
+  # inspect the Deployment name within its document, rather than those identities.
+  if awk '/^---$/ { deployment=0 } /^kind: Deployment$/ { deployment=1 } deployment && /^  name: uzi-controller$/ { found=1 } END { exit !found }' "$WORK/disabled.yaml"; then
+    echo "FAIL: disabled controller was rendered" >&2; fail=1
+  fi
+fi
+helm template uzi "$CHART" --set workers.enabled=false --set workers.controller.replicaCount=2 > "$WORK/workers-disabled.yaml"
+
+# Current-owner ancestry and the retained-data marker need exactly these verbs.
+helm template uzi "$CHART" -f "$SCRIPT_DIR/../deploy/values/ci-render.yaml" --show-only templates/worker-rbac.yaml > "$WORK/roles.yaml"
+for resource in replicasets persistentvolumeclaims secrets; do
+  case "$resource" in
+    replicasets) expected='verbs: ["list"]' ;;
+    persistentvolumeclaims) expected='verbs: ["create", "list", "patch", "delete"]' ;;
+    secrets) expected='verbs: ["create", "delete"]' ;;
+  esac
+  awk -v resource="$resource" -v expected="$expected" '
+    /resources:/ { selected = index($0, resource) != 0 }
+    selected && /verbs:/ {
+      sub(/^[[:space:]]+/, "")
+      if ($0 != expected) bad=1
+      count++; selected=0
+    }
+    END { exit (bad || count != 3) }
+  ' "$WORK/roles.yaml" || { echo "FAIL: $resource verbs do not match all three worker roles" >&2; fail=1; }
+done
+echo "OK: singleton, positive pacing concurrency, exact version mapping and worker-role verbs checked"
+
 if [ "$fail" -ne 0 ]; then
   echo "FAIL: the M5 drain knobs are NOT correctly wired from values.yaml into the controller Deployment (PRD #422 M5)" >&2
   exit 1

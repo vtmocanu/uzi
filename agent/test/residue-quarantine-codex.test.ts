@@ -104,7 +104,7 @@ describe("launchCodexRoot refuses a provider app-server while latched (issue #22
       ownedDataRoot: "/data/run/root-1",
       provider: { name: "uzi-codex", baseUrl: "http://127.0.0.1:9/v1", envKey: "CODEX_PROVIDER_KEY", credentialValue: "dummy-key" },
       model: "gpt-5-codex",
-      codexBin: "/opt/uzi-codex/0.159.3/bin/codex",
+      codexBin: "/opt/uzi-codex/0.160.0/bin/codex",
       supervisorBin: "/usr/local/bin/uzi-codex-supervisor",
       kind,
       childArgv: kind === "provider" ? ["app-server"] : ["exec", "--", "echo"],

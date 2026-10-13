@@ -173,6 +173,7 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 	rowBindingID, rowBindingLabel := bindingForMode(
 		w.AnthropicBindMode, w.AnthropicSecretID, w.AnthropicSecretLabel.String)
 	return apitypes.WorkerDTO{
+		RollPacing:    freshPacingJSON(w.RollPacing, w.RollPacingObservedAt, now),
 		UpgradeStatus: upgradeStatus,
 		UpgradeDetail: textPtrValue(upgradeDetail != "", upgradeDetail),
 		UpgradeTarget: upgradeTarget,
@@ -342,6 +343,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 // per-user path does when its signal is nil.
 func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	dto := workerDTOFromWorker(row.Worker, int(row.ActiveRuns), row.Busy, "", cpVersion, pinnedWorkerVersion, now, apiStartedAt)
+	dto.RollPacing = freshPacingJSON(row.RollPacing, row.RollPacingObservedAt, now)
 	dto.ActiveCrossChecks = int(row.ActiveCrossChecks)
 	sig := rollSignalFromAdminRow(row)
 	if sig == nil {
@@ -885,4 +887,17 @@ func (h *Handler) custodyDecisionsByWorker(ctx context.Context, ids []uuid.UUID)
 		return nil
 	}
 	return counts
+}
+
+// freshPacingJSON exposes validated diagnostic metadata without refreshing its receipt.
+func freshPacingJSON(data []byte, receipt pgtype.Timestamptz, now time.Time) json.RawMessage {
+	p := workersvc.ParseFreshPacingReport(data, receipt, now)
+	if p == nil {
+		return nil
+	}
+	out, err := json.Marshal(p)
+	if err != nil {
+		return nil
+	}
+	return out
 }

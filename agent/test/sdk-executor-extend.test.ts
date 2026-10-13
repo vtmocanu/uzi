@@ -1,3 +1,4 @@
+import { overflowClock, drain, NATIVE_LIMIT, REPRO_DELAY } from "./overflow-clock.js";
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
@@ -147,6 +148,34 @@ afterEach(() => {
     if (v === undefined) delete process.env[k];
     else process.env[k] = v;
   }
+});
+
+describe("SDK overflow scheduling M1", () => {
+  for (const mode of ["initial", "resumed", "ACK"] as const) it(`SDK oversized ${mode} budget survives native overflow window`, async t => {
+    const clock = overflowClock(t);
+    let turns = 0;
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      turns++;
+      clock.move(1); clock.deliver(); await drain();
+      assert.equal(params.options.abortController!.signal.aborted, false, "oversized wall must not trip after 1ms");
+      if (turns === 1 && mode !== "resumed") yield submitPlan("M1 approved plan");
+      else yield signalDone();
+      yield resultSuccess();
+    })();
+    const { ctx } = makeCtx({
+      kind: "mr_rework", planApproved: true, approvedPlan: "approved",
+      sessionId: mode === "resumed" ? "sess-1" : null,
+      config: { run_timeout_seconds: mode === "ACK" ? 1 : REPRO_DELAY / 1000 },
+      reportIteration: async () => ({ totalWallSeconds: REPRO_DELAY / 1000 }),
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn, timeoutNow: clock.now }).run(ctx).catch((error: Error) => error);
+    assert.ok(!(result instanceof Error), "oversized budget must complete instead of early wall timeout");
+    assert.equal(result.branch, "agent/issue-5");
+    assert.equal(turns, mode === "resumed" ? 1 : 2);
+    clock.assertSafe();
+    assert.ok(clock.requests.some(r => r.delay === NATIVE_LIMIT && r.unrefs === 1));
+  });
 });
 
 describe("SdkExecutor served wall extension (PRD #1189 M1)", () => {

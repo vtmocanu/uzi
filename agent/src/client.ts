@@ -1,3 +1,4 @@
+import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
@@ -34,6 +35,7 @@ import {
   type RawPrDescriptionFields,
   type ClaimRequest,
   type PublishResponse,
+  type HeldPublicationResponse,
   type PublishResult,
   type ChatClaimResponse,
   type ClaimResponse as ProtocolClaimResponse,
@@ -54,6 +56,8 @@ import {
   type RegisterRequest,
   type RegisterResponse,
   type StateAck,
+  type CompletedPublicationReceipt,
+  type CompletedPublicationReason,
   type PlanCrossCheckReconciliation,
   type StateRequest,
   type UserInput,
@@ -90,6 +94,8 @@ import {
   type RecoveryUploadManifest,
   type JobFileUploadMeta,
   type JobFileUploadResponse,
+  type RecoveryArchiveRedundancyRequest,
+  type RecoveryArchiveRedundancyResponse,
   type RecoveryCaptureStatusResponse,
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
@@ -103,6 +109,8 @@ export type PlanCrossCheckGateReason = "revise" | "block" | "malformed" | "model
   | "checker_unavailable" | "confinement_failed" | "timed_out" | "superseded"
   | "codex_lead_unsupported" | "planning_diff_refused" | "interrupted" | "candidate_refused" | "checker_failed"
   | "approved_not_stored" | "revisions_exhausted";
+import { decodeCodeSnapshotCleanup, type CodeSnapshotCleanup, decodeCrossCheckClaim, decodeCodeCrossCheckStatus, decodeCodeFindings, type CodeCrossCheckStatus, type CodeFinding, decodeCodeCrossCheckDispositions, type CodeCrossCheckDispositionBatch, type CodeCrossCheckInstructions } from "./code-cross-check-contract.js";
+
 export type ClaimResponse = ProtocolClaimResponse & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunDetail = ProtocolWorkerRunDetail & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
 export type WorkerRunListItem = ProtocolWorkerRunListItem & { plan_cross_check_gate_reason?: PlanCrossCheckGateReason | null };
@@ -302,6 +310,30 @@ export interface InputReceipt {
 }
 
 /** Error carrying the server's HTTP status + (truncated) body for retry logic. */
+/** Issue #2545 step A: the per-request timeout of the held-publication upload, and of no other route.
+ *  The api's write deadline for the route is 120 s upload + 150 s service + 30 s answer grace = 300 s;
+ *  30 s of margin lets an answer written at the server's deadline still arrive. */
+export const HELD_PUBLICATION_TIMEOUT_MS = 330_000;
+
+/** The held-publication feature string, advertised by the worker and by the api's protocol_features. */
+export const HELD_PUBLICATION_FEATURE = "recovery_held_publication_v1";
+
+/** Issue #2545: a held_publication FINAL was requested but this client's negotiated features do not
+ *  include {@link HELD_PUBLICATION_FEATURE}. Thrown BEFORE anything is sent, so it is non-definitive:
+ *  the journaled FINAL stays and is replayed once the feature is back. */
+export class HeldFeatureUnavailableError extends Error {
+  constructor() {
+    super("held publication feature unavailable; held final release retained");
+    this.name = "HeldFeatureUnavailableError";
+  }
+}
+
+/** The typed outcome of {@link WorkerClient.publishHeld}. `ok: true` only means the api answered 2xx
+ *  with a well-formed body; the caller must still require `body.state === "created"`. */
+export type HeldPublishResult =
+  | { ok: true; body: HeldPublicationResponse }
+  | { ok: false; httpStatus?: number; reason: string };
+
 export class RequestError extends Error {
   constructor(
     readonly method: string,
@@ -316,6 +348,18 @@ export class RequestError extends Error {
   }
 }
 
+/** All attempts of this state report received the complete pre-mutation decode refusal. */
+export class StateReportUnappliedError extends RequestError {
+  constructor(readonly runId: string, refusal: RequestError) {
+    super(refusal.method, refusal.path, refusal.status, refusal.body, refusal.retryAfterHeaderMs);
+    this.name = "StateReportUnappliedError";
+  }
+}
+
+// Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
+class StateDecodeRefusalError extends RequestError {}
+interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
+
 /** Exact current-worker ownership loss; generic route/auth/transport failures are unknown. */
 export function isRunOwnershipLost(err: unknown, runId: string): boolean {
   if (!(err instanceof RequestError) || err.method !== "GET" || err.status !== 404 ||
@@ -328,13 +372,9 @@ export function isRunOwnershipLost(err: unknown, runId: string): boolean {
   } catch { return false; }
 }
 
-/** Issue #1766: the typed Codex credential deferral a locked owner vault produces. A Codex
- *  refresh/release that passed authorization but hit a locked vault answers HTTP 409 with
- *  `{"reason":"vault_locked"}` in the body. Returns "vault_locked" ONLY for that exact shape
- *  (a {@link RequestError}, status 409, a JSON body whose `reason` is "vault_locked"), and
- *  undefined for anything else: another 409 reason, another status, a non-JSON body or a
- *  non-RequestError. It never reads the error's message text. */
-export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
+/** Typed credential deferrals require a RequestError, HTTP 409 and a JSON object with an
+ *  exact supported reason. Message text never determines credential state. */
+export function codexDeferralReason(err: unknown): "vault_locked" | "account_unavailable" | undefined {
   if (!(err instanceof RequestError) || err.status !== 409) return undefined;
   let parsed: unknown;
   try {
@@ -343,7 +383,8 @@ export function codexDeferralReason(err: unknown): "vault_locked" | undefined {
     return undefined;
   }
   if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) return undefined;
-  return (parsed as { reason?: unknown }).reason === "vault_locked" ? "vault_locked" : undefined;
+  const reason = (parsed as { reason?: unknown }).reason;
+  return reason === "vault_locked" ? "vault_locked" : reason === "codex_account_unavailable" ? "account_unavailable" : undefined;
 }
 
 /** Refresh retry decisions use only fixed classifications, never response text in diagnostics. */
@@ -785,6 +826,8 @@ const PERMIT_RETRY_BASE_MS = 1_000;
 const PERMIT_RETRY_MAX_DELAY_MS = 30_000;
 
 export interface ClientOptions {
+  /** Per-instance transport; omitted instances read the current global fetch. */
+  fetch?: typeof fetch;
   sleep?: (ms: number) => Promise<void>;
   terminalRetrySchedule?: number[];
   /** Total wall time (requests AND backoff) a completion-permit request may spend retrying
@@ -1028,6 +1071,17 @@ function memoryPolicy(value: unknown): MemoryPolicy {
   if (p.version !== 1 || !memoryNatural(p.max_interventions) || p.max_interventions < 1 || p.max_interventions > 9999) throw memoryError();
   return { version: 1, max_interventions: p.max_interventions };
 }
+function validateClaimMemory(value: unknown): void {
+  if (!isRecord(value) || !["memory_episode", "memory_intervention_count", "memory_policy"].some((field) => field in value)) return;
+  if (!memoryNatural(value.memory_episode) || !memoryNatural(value.memory_intervention_count)
+    || value.memory_intervention_count > 9999) throw memoryError();
+  if (value.memory_policy !== null) {
+    const policy = memoryPolicy(value.memory_policy);
+    if (value.memory_intervention_count > policy.max_interventions) throw memoryError();
+    value.memory_policy = policy;
+  }
+}
+
 function memoryOutcome(value: unknown): value is MemoryOutcome {
   return value === "no_signal" || value === "unknown" || value === "confirmed_drained";
 }
@@ -1052,9 +1106,31 @@ function decodeMemoryReservation(value: unknown, request: MemoryReservationReque
     authorizing: obj.authorizing, ...(obj.outcome === undefined ? {} : { outcome: obj.outcome }) };
 }
 
+const COMPLETION_HOLDS_MAX_BYTES = 1024 * 1024;
+const COMPLETION_HOLDS_MAX_ITEMS = 1024;
+const COMPLETION_BINDINGS_MAX = 4096;
+const COMPLETION_OBSERVATIONS_MAX = 2048;
+
+type CompletionTicket = { incarnation: number; runId?: string; exclusions: Set<string> };
+type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
+
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
+  // Provenance survives uncertain registration; only a successful changed identity resets it.
+  private completionWorkerId: string | undefined;
+  private completionInventoryUnreadable = false;
+  // Monotonic negative evidence: collisions conservatively refuse only new identities.
+  private readonly ineligibleCompletionClaims = new Uint8Array(64 * 1024);
+  private completionIncarnation = 0;
+  private completionRetirementIncarnation: Readonly<object> = {};
+  // Live and temporarily retired identities each reserve both provenance slots.
+  private readonly completionReservations = new Map<string, CompletionReservation>();
+  private readonly completionTickets = new Set<CompletionTicket>();
+  private readonly receiptIncarnations = new WeakMap<CompletedPublicationReceipt, number>();
+  // Authenticated observations only; empty later inventories do not erase an observed identity.
+  private readonly completionClaims = new Map<string, { repoId?: string; forgeType?: string; branch?: string; eligible: boolean; guarded: boolean } | null>();
+  private readonly completionHolds = new Map<string, string | null>();
   private readonly inventoryGuardedClaims = new Set<string>();
   private readonly settledInventoryGuardedClaims = new Set<string>();
 
@@ -1214,6 +1290,7 @@ export class WorkerClient {
     private readonly log: Logger,
     opts: ClientOptions = {},
   ) {
+    this.transport = opts.fetch;
     this.sleep = opts.sleep ?? sleepReal;
     this.terminalRetrySchedule = opts.terminalRetrySchedule ?? DEFAULT_TERMINAL_RETRY_SCHEDULE;
     this.permitRetryBudgetMs = opts.permitRetryBudgetMs ?? DEFAULT_PERMIT_RETRY_BUDGET_MS;
@@ -1300,6 +1377,19 @@ export class WorkerClient {
         ? Math.floor(res.worker_outbox_max_pending)
         : undefined;
     this.registeredWorkerId = terminalUUID(res.worker_id) ? res.worker_id.toLowerCase() : undefined;
+    if (this.registeredWorkerId) {
+      if (this.registeredWorkerId !== this.completionWorkerId) {
+        this.completionClaims.clear();
+        this.completionHolds.clear();
+        this.completionInventoryUnreadable = false;
+        this.ineligibleCompletionClaims.fill(0);
+        this.completionReservations.clear();
+        this.completionTickets.clear();
+        this.completionIncarnation++;
+        this.completionRetirementIncarnation = {};
+      }
+      this.completionWorkerId = this.registeredWorkerId;
+    }
     return res;
   }
 
@@ -1316,6 +1406,13 @@ export class WorkerClient {
     this.serverFeatures.clear();
     this.invalidateMemoryIncarnation();
     this.latestDindMaintenanceValue = undefined;
+  }
+
+  /** Drop ONE negotiated feature (PRD #1733), where {@link clearFeatures} drops the whole set:
+   *  after an api proves it cannot decode a single optional wire field, only that field's gate
+   *  closes and every other negotiated extension stays on. */
+  dropFeature(f: string): void {
+    this.serverFeatures.delete(f);
   }
 
   async heartbeat(
@@ -1459,57 +1556,103 @@ export class WorkerClient {
   }
 
   private async claimRunLane(path: string, activeSnapshot: ActiveSnapshot | undefined, signal: AbortSignal | undefined, timeoutMs: number, dedicated = false): Promise<ClaimResponse | null> {
-    // The same deadline reaches fetch AND its body. Await the real request rather than a race:
-    // admission must remain held until a late transport has definitively stopped.
-    const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
-    deadline.throwIfAborted();
-    const body: ClaimRequest = {};
-    if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
-      body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
-    }
-    const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
-    deadline.throwIfAborted();
-    if (res.status === 204) return null;
-    if (res.status >= 400) throw await this.toError("POST", path, res);
-    const marker = res.headers.get("X-Uzi-Claim-Kind");
-    if (marker !== null && marker !== "cross_check") {
-      await res.body?.cancel();
-      throw new Error("unknown dedicated claim marker");
-    }
-    // Dedicated requests are bounded even without a marker; unmarked ordinary
-    // claims keep their existing decoder.
-    const claim = (dedicated || marker === "cross_check"
-      ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
-      : await res.json()) as ClaimResponse;
-    if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
-      throw new Error("cross-check claim marker and kind disagree");
-    }
-    deadline.throwIfAborted();
-    if (isRecord(claim) && claim.inventory_guarded !== undefined &&
-        (typeof claim.inventory_guarded !== "boolean" ||
-         (claim.inventory_guarded === true &&
-          (!Number.isSafeInteger(claim.claim_generation) || (claim.claim_generation ?? 0) <= 0 ||
-           !this.hasFeature("recovery_inventory_v1"))))) {
-      throw new Error("malformed or contradictory inventory guard claim");
-    }
-    if (this.inventoryGuardedClaims.has(`${claim?.run_id}:${claim?.claim_generation}`) && claim.inventory_guarded !== true) {
-      throw new Error("guarded generation cannot downgrade its claim assertion");
-    }
-    if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
-    // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
-    // same check as the bind / lookup / ack responses). The warning carries the run id only,
-    // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
-    // 200 body returning as it did before this check existed, rather than throwing here.
-    if (isRecord(claim) && claim.pr_description !== undefined) {
-      const pr = decodePrState(claim.pr_description);
-      if (pr === undefined) {
-        delete claim.pr_description;
-        this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
-      } else {
-        claim.pr_description = pr;
+    const incarnation = this.completionIncarnation;
+    const ticket = this.beginCompletionObservation();
+    try {
+      // The same deadline reaches fetch AND its body. Await the real request rather than a race:
+      // admission must remain held until a late transport has definitively stopped.
+      const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
+      deadline.throwIfAborted();
+      const body: ClaimRequest = {};
+      if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
+        body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
       }
-    }
-    return claim;
+      const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);
+      deadline.throwIfAborted();
+      if (res.status === 204) return null;
+      if (res.status >= 400) throw await this.toError("POST", path, res);
+      const marker = res.headers.get("X-Uzi-Claim-Kind");
+      if (marker !== null && marker !== "cross_check") {
+        await res.body?.cancel();
+        throw new Error("unknown dedicated claim marker");
+      }
+      // Dedicated requests are bounded even without a marker; unmarked ordinary
+      // claims keep their existing decoder.
+      const claim = (dedicated || marker === "cross_check"
+        ? JSON.parse(await readBoundedText(res, 2 * 1024 * 1024, true))
+        : await res.json()) as ClaimResponse;
+      if ((marker === "cross_check") !== (isRecord(claim) && claim.kind === "cross_check")) {
+        throw new Error("cross-check claim marker and kind disagree");
+      }
+      deadline.throwIfAborted();
+      validateClaimMemory(claim);
+      if (isRecord(claim) && claim.inventory_guarded !== undefined &&
+          (typeof claim.inventory_guarded !== "boolean" ||
+           (claim.inventory_guarded === true &&
+            (!Number.isSafeInteger(claim.claim_generation) || (claim.claim_generation ?? 0) <= 0 ||
+             !this.hasFeature("recovery_inventory_v1"))))) {
+        throw new Error("malformed or contradictory inventory guard claim");
+      }
+      if (this.inventoryGuardedClaims.has(`${claim?.run_id}:${claim?.claim_generation}`) && claim.inventory_guarded !== true) {
+        throw new Error("guarded generation cannot downgrade its claim assertion");
+      }
+      if (claim?.inventory_guarded === true) this.inventoryGuardedClaims.add(`${claim.run_id}:${claim.claim_generation}`);
+      // Legacy lane envelopes may omit the candidate; CrossCheckRunner refuses those
+      // before opening a reader. A present candidate always uses stage-specific validation.
+      if (claim?.kind === "cross_check" && claim.cross_check !== undefined) {
+        claim.cross_check = decodeCrossCheckClaim(claim.cross_check);
+      }
+      // PRD #1798 D9: the pr_description is validated or dropped, never cast (decodePrState, the
+      // same check as the bind / lookup / ack responses). The warning carries the run id only,
+      // never the value (untrusted text). The isRecord guard keeps a `null` (or other non-object)
+      // 200 body returning as it did before this check existed, rather than throwing here.
+      if (isRecord(claim) && claim.pr_description !== undefined) {
+        const pr = decodePrState(claim.pr_description);
+        if (pr === undefined) {
+          delete claim.pr_description;
+          this.log.warn("claim pr_description is malformed; ignoring it", { run_id: claim.run_id });
+        } else {
+          claim.pr_description = pr;
+        }
+      }
+      if (incarnation === this.completionIncarnation && isRecord(claim) && terminalUUID(claim.run_id) && terminalGeneration(claim.claim_generation) && claim.claim_generation > 0) {
+        const kind = claim.kind ?? "issue";
+        const branch = kind === "issue" && Number.isSafeInteger(claim.issue_iid) && (claim.issue_iid ?? 0) > 0
+          ? `agent/issue-${claim.issue_iid}`
+          : kind === "self_improve" ? `uzi/self-improve/${claim.run_id.toLowerCase()}`
+          : kind === "mr_rework" ? claim.branch : undefined;
+        const key = `${claim.run_id}:${claim.claim_generation}`;
+        // Retain only bounded primitives. Missing legacy fields keep their fallback; malformed
+        // provenance retains a refusal marker so this generation cannot become an unknown claim.
+        const repo = isRecord(claim.repo) ? claim.repo : undefined;
+        const repoId = repo?.id;
+        const forgeType = repo?.forge_type === undefined ? "gitlab" : repo.forge_type;
+        const valid = (claim.repo === undefined || repo !== undefined) &&
+          (repoId === undefined || (terminalUUID(repoId) && repoId === repoId.toLowerCase())) &&
+          completionForgeType(forgeType) &&
+          (branch === undefined || (completionSafeIdentifier(branch) && Buffer.byteLength(branch, "utf8") <= 2048));
+        const eligible = ["issue", "mr_rework", "self_improve"].includes(kind);
+        const prior = this.completionClaims.get(key);
+        if (ticket.exclusions.has(key)) {
+          // This request preceded retirement of this exact identity.
+        } else if (!eligible) {
+          if (this.completionReservations.has(key)) this.completionClaims.set(key, null);
+          else {
+            for (const bit of this.ineligibleCompletionClaimBits(key)) {
+              this.ineligibleCompletionClaims[bit >>> 3] = (this.ineligibleCompletionClaims[bit >>> 3] ?? 0) | (1 << (bit & 7));
+            }
+          }
+        } else if (this.allowCompletionBinding(key)) {
+          const next = {
+            repoId: repoId as string | undefined, forgeType: forgeType as string, branch: branch as string | undefined,
+            eligible: true, guarded: claim.inventory_guarded === true,
+          };
+          this.completionClaims.set(key, !valid || prior === null ||
+            (prior !== undefined && JSON.stringify(prior) !== JSON.stringify(next)) ? null : next);
+        }
+      }
+      return claim;
+    } finally { this.endCompletionObservation(ticket); }
   }
 
   /** Claim the oldest queued CHAT run for this worker's user (the disjoint chat
@@ -1520,7 +1663,9 @@ export class WorkerClient {
     const res = await this.fetchRaw("POST", path, {});
     if (res.status === 204) return null;
     if (res.status >= 400) throw await this.toError("POST", path, res);
-    return (await res.json()) as ChatClaimResponse;
+    const claim = (await res.json()) as ChatClaimResponse;
+    validateClaimMemory(claim);
+    return claim;
   }
 
   /**
@@ -1625,32 +1770,37 @@ export class WorkerClient {
     });
   }
 
-  /**
-   * Report a run state and return what the server made of it. Every report —
-   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
-   * limit_wait) alike — is retried with bounded backoff on transient failures: the
-   * server transition is idempotent, so a retried non-terminal report is safe
-   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
-   * server. An "already terminal" server response (409, or a 4xx body mentioning
-   * terminal) does not throw, so a lost ack / duplicate replay is safe. A
-   * 4xx is otherwise fatal.
-   *
-   * A durability-boundary caller supplies its permit signal. It cancels the
-   * in-flight request and any retry backoff, so the boundary awaits real request
-   * settlement without multiplying its own deadline by this retry schedule.
-   *
-   * The RESULT used to be discarded. It is now returned, because `limit_wait`
-   * (PRD #35) is the first report whose consequence is that the caller SKIPS
-   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
-   * Read the warning on StateAck before branching on it: the answer is
-   * `status === "limit_wait"`, never `applied`.
-   *
-   * 200 and 409 are both read for their body rather than routed through
-   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
-   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
-   * so parsing a 409's status back out of the error text would work in tests and
-   * fail on real runs.
-   */
+  async codeCrossCheckStatus(runId: string, generation: number, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    return decodeCodeCrossCheckStatus(await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks/code/latest?claim_generation=${generation}`,
+      undefined, CROSS_CHECK_RESPONSE_MAX_BYTES, signal));
+  }
+
+  async submitCodeCrossCheck(runId: string, generation: number,
+    snapshot: { head_commit: string; base_commit: string; repo_instructions_commit?: string } | { reason_class: "snapshot_failed" | "worker_unsupported" },
+    signal?: AbortSignal,
+    /** PRD #2170: the consent this submit was built under and, when on, the CLAUDE.md read at
+     *  repo_instructions_commit (base_commit for legacy adapters). Only a snapshot submit carries them; the server refuses them on a pre-snapshot failure. */
+    instructions?: CodeCrossCheckInstructions): Promise<CodeCrossCheckStatus> {
+    return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
+      { stage: "code", claim_generation: generation, ...snapshot, ...instructions },
+      this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+  }
+
+  async reportCodeCrossCheckDispositions(lead: string, generation: number,
+    batch: CodeCrossCheckDispositionBatch, signal?: AbortSignal): Promise<CodeCrossCheckStatus> {
+    if (!Number.isSafeInteger(generation) || generation <= 0) throw new Error("invalid code cross-check generation");
+    decodeCodeCrossCheckDispositions(batch);
+    return decodeCodeCrossCheckStatus(await this.postJSON(`${WORKER_API_PREFIX}/runs/${lead}/cross-checks/code/dispositions`,
+      { claim_generation: generation, dispositions: batch }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES));
+  }
+
+  async reportCodeCrossCheckVerdict(runId: string, generation: number,
+    result: { outcome: "completed" | "failed"; reason_class?: string; findings: CodeFinding[] }, signal?: AbortSignal): Promise<void> {
+    decodeCodeFindings(result.findings);
+    await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-check-verdict`,
+      { claim_generation: generation, ...result }, this.httpTimeoutMs, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+  }
+
   async submitPlanCrossCheck(runId: string, claimGeneration: number, candidate: PlanCrossCheckCandidate, signal?: AbortSignal, round = 1): Promise<PlanCrossCheckResponse> {
     if (!crossCheckRound(round)) throw new Error("invalid cross-check round");
     return decodePlanCrossCheckResponse(await this.postJSON(`${WORKER_API_PREFIX}/runs/${runId}/cross-checks`,
@@ -1687,8 +1837,40 @@ export class WorkerClient {
     return this.reportStateOnce(runId, `${WORKER_API_PREFIX}/runs/${runId}/state`, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
   }
 
+  /**
+   * Report a run state and return what the server made of it. Every report —
+   * terminal (completed/failed) and non-terminal (running/awaiting_approval/
+   * limit_wait) alike — is retried with bounded backoff on transient failures: the
+   * server transition is idempotent, so a retried non-terminal report is safe
+   * (PRD: "/state is retried with backoff"), and a terminal report *must* reach the
+   * server. An "already terminal" server response (409, or a 4xx body mentioning
+   * terminal) does not throw, so a lost ack / duplicate replay is safe. A
+   * 4xx is otherwise fatal.
+   *
+   * A durability-boundary caller supplies its permit signal. It cancels the
+   * in-flight request and any retry backoff, so the boundary awaits real request
+   * settlement without multiplying its own deadline by this retry schedule.
+   *
+   * The RESULT used to be discarded. It is now returned, because `limit_wait`
+   * (PRD #35) is the first report whose consequence is that the caller SKIPS
+   * filesystem cleanup — so "did this actually park?" stopped being rhetorical.
+   * Read the warning on StateAck before branching on it: the answer is
+   * `status === "limit_wait"`, never `applied`.
+   *
+   * 200 and 409 are both read for their body rather than routed through
+   * postJSON/RequestError. That is deliberate: RequestError truncates bodies at
+   * 4096 chars (toError), and a RunDTO carrying plan_md exceeds that comfortably,
+   * so parsing a 409's status back out of the error text would work in tests and
+   * fail on real runs.
+   */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    if (body.require_running === true) {
+      if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
+          (body.claim_generation ?? 0) <= 0)
+        throw new Error("guarded question state requires awaiting_input and positive claim_generation");
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
+    }
     // PRD #1247 fix round (E): /state carries claim_generation on EVERY mutating report (M5b's
     // reportState closure stamps it), but /state DisallowUnknownFields-decodes, so a rolled-back api
     // that predates the field 400s the report and — force-roll off — a busy newer worker wedges every
@@ -1699,27 +1881,131 @@ export class WorkerClient {
     // claim (generation ?? 0) OMIT the key rather than send 0. The transient-retry loop, AbortSignal,
     // 200/409 single-body ACK parse, already-terminal handling and logging are preserved per variant
     // in reportStateOnce, so the fallback only toggles whether claim_generation is on the wire.
+    const outbound = { ...body };
+    if (body.provider_progress_turns !== undefined) {
+      const count = body.provider_progress_turns;
+      if (!Number.isInteger(count) || count < 0 || count > 2147483647 ||
+          !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+          body.status !== "recovery_wait" ||
+          (body.recovery_cause !== undefined && body.recovery_cause !== "empty_turn" && body.recovery_cause !== "data_volume_full")) {
+        throw new Error("invalid provider_progress_turns recovery park");
+      }
+    }
+    if (!this.hasFeature("provider_progress_on_recovery_park_v1")) delete outbound.provider_progress_turns;
+    if (!this.hasFeature("recovery_completed_publication_v1")) delete outbound.completion_final_head;
     const included = this.includeClaimGeneration(body.claim_generation);
+    if (!included) delete outbound.provider_progress_turns;
     // PRD #1795 M3: the api refuses an id-bearing awaiting_approval report without
     // claim_generation (400 claim_generation_required), and the strict-decode fallback exists for
     // an api that rolled back past the fields. So whenever claim_generation is NOT on the wire, the
     // gate presentation fields are not either: the report degrades to an id-less one, which an
     // allocating api still answers with its revision and an older api accepts unchanged.
-    return this.withGenerationFallback(included, (includeField) =>
+    const evidence: StateAttemptEvidence = { ambiguous: false, refusals: 0 };
+    let ack: StateAck;
+    const sendWith = (b: PlanCrossCheckStateRequest) => (includeField: boolean) =>
       this.reportStateOnce(
         runId,
         path,
-        includeField ? body : { ...body, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined },
+        includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
         signal,
-      ),
-    );
+        undefined,
+        evidence,
+      );
+    try {
+      if (outbound.provider_progress_turns !== undefined && included) {
+        // Both attempts retain the fence. A stripped retry refusal propagates without
+        // invoking the older generation fallback or sending a third variant.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const stripped = { ...outbound };
+          delete stripped.provider_progress_turns;
+          this.dropFeature("provider_progress_on_recovery_park_v1");
+          ack = await sendWith(stripped)(true);
+        }
+      } else if (outbound.recovery_cause === "provider_outage" && included) {
+        // PRD #1733: a typed provider park. An api that predates `productive_turns` answers the
+        // strict-decode 400 `invalid request body`; a current api refuses a bad typed report with
+        // `state must be one of ...`, which is NOT that body and propagates unchanged. The generation
+        // is not stripped first (the generic fallback would send an untyped body without the fence):
+        // re-send once untyped with claim_generation kept, then close only this feature's gate.
+        try {
+          ack = await sendWith(outbound)(true);
+        } catch (err) {
+          if (!isStrictDecodeError(err)) throw err;
+          const untyped = { ...outbound };
+          delete untyped.recovery_cause;
+          delete untyped.productive_turns;
+          ack = await this.withGenerationFallback(included, sendWith(untyped));
+          this.dropFeature("recovery_cause_provider_outage");
+          this.log.warn("provider-outage park rejected by an api that predates it; re-sent untyped and stopped typing it", {});
+        }
+      } else {
+        ack = await this.withGenerationFallback(included, sendWith(outbound));
+      }
+    } catch (err) {
+      if (!evidence.ambiguous && evidence.refusals > 0 && err instanceof StateDecodeRefusalError)
+        throw new StateReportUnappliedError(runId, err);
+      throw err;
+    }
+    if (body.completion_final_head !== undefined && !this.hasFeature("recovery_completed_publication_v1")) ack.completedPublicationReason = "unsupported_feature";
+    return ack;
+  }
+
+  /** Validate proof only at the authenticated state-report seam. This does not settle local custody. */
+  private validateCompletedPublicationReceipt(runId: string, body: StateRequest, fields: Awaited<ReturnType<typeof readRunAck>>): CompletedPublicationReceipt | undefined {
+    const value = fields.completedPublicationCandidate;
+    if (this.completionInventoryUnreadable || !this.registeredWorkerId || !this.hasFeature("recovery_completed_publication_v1") ||
+        body.status !== "completed" || fields.status !== "completed" ||
+        fields.completedPublicationReason || fields.staleClaim || fields.credentialSwitch ||
+        fields.runId !== runId || fields.workerId !== this.registeredWorkerId ||
+        !isRecord(value)) return undefined;
+    for (const key of ["hold_id", "run_id", "owner_id", "worker_id", "repo_id", "connection_id"]) {
+      if (!terminalUUID(value[key]) || value[key] !== (value[key] as string).toLowerCase()) return undefined;
+    }
+    if (value.run_id !== runId || value.worker_id !== this.registeredWorkerId ||
+        !terminalGeneration(value.generation) || value.generation <= 0 || value.generation !== body.claim_generation ||
+        !completionSHA(value.final_head) || value.final_head !== body.completion_final_head ||
+        !completionSHA(value.observed_branch_head) ||
+        !completionPositiveInteger(value.project_id) || !completionPositiveInteger(value.mr_iid) ||
+        !completionForgeType(value.forge_type) ||
+        !completionSafeIdentifier(value.branch) || !completionSafeIdentifier(value.base_url) ||
+        (body.branch !== undefined && value.branch !== body.branch) ||
+        (body.mr_iid !== undefined && value.mr_iid !== body.mr_iid)) return undefined;
+    try {
+      const url = new URL(value.base_url as string);
+      if (url.protocol !== "https:" || url.username || url.password || url.search || url.hash) return undefined;
+    } catch { return undefined; }
+    const key = `${runId}:${body.claim_generation}`;
+    const claim = this.completionClaims.get(key);
+    const hold = this.completionHolds.get(key);
+    if (claim === null || (claim && (!claim.eligible || !claim.guarded ||
+          (claim.repoId !== undefined && claim.repoId !== value.repo_id) ||
+          (claim.forgeType !== undefined && claim.forgeType !== value.forge_type) ||
+          (claim.branch !== undefined && claim.branch !== value.branch))) ||
+        (hold !== undefined && hold !== value.hold_id)) return undefined;
+    if (!this.allowCompletionBinding(key)) return undefined;
+    // Copy exactly the contract fields: unknown response fields carry no authority.
+    const receipt: CompletedPublicationReceipt = {
+      hold_id: value.hold_id as string, run_id: value.run_id as string,
+      owner_id: value.owner_id as string, worker_id: value.worker_id as string,
+      generation: value.generation, final_head: value.final_head,
+      repo_id: value.repo_id as string, connection_id: value.connection_id as string,
+      project_id: value.project_id as number, forge_type: value.forge_type as CompletedPublicationReceipt["forge_type"],
+      base_url: value.base_url as string, branch: value.branch as string, mr_iid: value.mr_iid as number,
+      observed_branch_head: value.observed_branch_head,
+    };
+    this.receiptIncarnations.set(receipt, this.completionIncarnation);
+    return receipt;
   }
 
   /** One /state POST WITH the given body, including the transient-retry loop, AbortSignal
    *  handling, 200/409 single-body ACK parse, already-terminal handling and logging. Split out of
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
-  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number): Promise<StateAck> {
+  private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
+    const incarnation = this.completionIncarnation;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {
@@ -1737,6 +2023,15 @@ export class WorkerClient {
             applied: res.status === 200,
             status: fields.status,
           };
+          if (body.completion_final_head !== undefined) {
+            if (!this.hasFeature("recovery_completed_publication_v1")) {
+              ack.completedPublicationReason = "unsupported_feature";
+            } else {
+              const receipt = incarnation === this.completionIncarnation ? this.validateCompletedPublicationReceipt(runId, body, fields) : undefined;
+              if (receipt && res.status === 200) ack.completedPublicationReceipt = receipt;
+              else if (fields.completedPublicationReason) ack.completedPublicationReason = fields.completedPublicationReason;
+            }
+          }
           // PRD #1497 M2: carry the run's hold_reason off the SAME body so the reportState closure
           // can recognise a SERVER-side wall park (paused + budget_exhausted) on a fenced stale ACK.
           if (fields.holdReason !== undefined)
@@ -1802,11 +2097,28 @@ export class WorkerClient {
           }
           return ack;
         }
+        if (res.status === 400 && evidence) {
+          let text = "";
+          let exact = false;
+          try {
+            // Reject overflow and incomplete reads; a truncated diagnostic is never evidence.
+            text = await readBoundedText(res, ERROR_BODY_MAX_BYTES, true);
+            const decoded: unknown = JSON.parse(text);
+            exact = isRecord(decoded) && Object.keys(decoded).length === 1 &&
+              decoded.error === "invalid request body";
+          } catch { /* unknown or incomplete response */ }
+          const ErrorType = exact ? StateDecodeRefusalError : RequestError;
+          throw new ErrorType("POST", path, res.status, text.slice(0, 4096).trim());
+        }
         if (res.status >= 400) throw await this.toError("POST", path, res);
         // A 2xx we do not model (e.g. 204 from an older server): the report landed,
         // but no status came back. Undefined reads as "not parked", which is safe.
         return { applied: true, status: undefined };
       } catch (err) {
+        if (evidence) {
+          if (err instanceof StateDecodeRefusalError) evidence.refusals++;
+          else evidence.ambiguous = true;
+        }
         if (signal?.aborted) throw err;
         if (this.isAlreadyTerminal(err)) {
           // A 4xx whose TEXT says terminal. The status is not recoverable here, and
@@ -1873,6 +2185,64 @@ export class WorkerClient {
     return { ok: true, body: JSON.parse(text) as PublishResponse };
   }
 
+  /**
+   * Issue #2545 step A: upload one raw, non-thin pack of a failed run's held work; the api creates
+   * `refs/uzi-held/<run-id>/<generation>` at `tip` with the stored credential (the worker never
+   * sends one). Modeled on {@link publishCheckpoint}: the pack is the `application/octet-stream`
+   * body, the tip, generation and coverage digest ride the `X-Uzi-Held-*` headers.
+   *
+   * Never throws for an HTTP outcome: any non-2xx is `{ ok: false, httpStatus, reason }`, where
+   * `reason` is the api's bounded refusal token (a 409/422/413/503) or a local token such as
+   * `http_429`. A transport error or the {@link HELD_PUBLICATION_TIMEOUT_MS} timeout throws, and the
+   * caller treats a throw exactly like a refusal: nothing is on the forge until the answer says
+   * `created`. Without {@link HELD_PUBLICATION_FEATURE} nothing is sent (`unsupported_feature`).
+   */
+  async publishHeld(
+    runId: string,
+    generation: number,
+    tip: string,
+    coverage: string,
+    pack: Readable | Buffer,
+    signal?: AbortSignal,
+  ): Promise<HeldPublishResult> {
+    if (!this.hasFeature(HELD_PUBLICATION_FEATURE)) return { ok: false, reason: "unsupported_feature" };
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/held-publication`;
+    const timeout = AbortSignal.timeout(HELD_PUBLICATION_TIMEOUT_MS);
+    const init: RequestInit = {
+      method: "POST",
+      headers: {
+        Authorization: `Bearer ${this.token}`,
+        "X-Client-Version": this.version,
+        "Content-Type": "application/octet-stream",
+        "X-Uzi-Held-Tip": tip,
+        "X-Uzi-Held-Generation": String(generation),
+        "X-Uzi-Held-Coverage": coverage,
+      },
+      body: pack as RequestInit["body"],
+      // undici requires `duplex: "half"` for a streamed (Readable) request body.
+      duplex: "half",
+      signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
+    };
+    const res = await fetch(this.baseUrl + path, init);
+    const text = await res.text().catch(() => "");
+    if (res.status < 200 || res.status >= 300) {
+      let reason = `http_${res.status}`;
+      try {
+        const parsed = JSON.parse(text) as { reason?: unknown };
+        if (typeof parsed.reason === "string" && /^[a-z0-9_]{1,64}$/.test(parsed.reason)) reason = parsed.reason;
+      } catch { /* a non-JSON refusal keeps the status-derived token */ }
+      return { ok: false, httpStatus: res.status, reason };
+    }
+    let body: Partial<HeldPublicationResponse> | undefined;
+    try { body = JSON.parse(text) as Partial<HeldPublicationResponse>; } catch { body = undefined; }
+    if (!body || typeof body !== "object" || typeof body.publication_id !== "string" ||
+        typeof body.ref !== "string" || typeof body.tip !== "string" || typeof body.state !== "string" ||
+        (body.reason !== undefined && typeof body.reason !== "string")) {
+      return { ok: false, httpStatus: res.status, reason: "malformed_response" };
+    }
+    return { ok: true, body: body as HeldPublicationResponse };
+  }
+
   // ── Durable run recovery archive RPC (PRD #1296 M3, D3/D5) ─────────────────────
   // The Bearer-authenticated worker↔API archive endpoints. Shapes are the M1-frozen
   // protocol types (agent/src/protocol.ts, mirrored from apitypes/recovery.go). The bundle
@@ -1913,14 +2283,44 @@ export class WorkerClient {
     ) as RecoveryReconcileResponse;
   }
 
+  /** Issue #2625: claim a completed run's archive is already covered by its published branch. The
+   *  api decides; a malformed reply (unknown outcome, wrong capture id) is reported as retained with
+   *  reason "invalid_response" so a caller can never act on an unverified expiry. Throws RequestError
+   *  on 4xx/5xx and on abort/timeout. */
+  async proveRecoveryArchiveRedundancy(
+    runId: string,
+    captureId: string,
+    req: RecoveryArchiveRedundancyRequest,
+    signal?: AbortSignal,
+  ): Promise<RecoveryArchiveRedundancyResponse> {
+    const raw = await this.postJSON(
+      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}/redundancy`,
+      req,
+      this.httpTimeoutMs,
+      signal,
+      16 * 1024,
+    );
+    const r = (raw ?? {}) as { capture_id?: unknown; outcome?: unknown; reason?: unknown };
+    const reason = typeof r.reason === "string" && r.reason.length <= 64 ? r.reason : undefined;
+    if (r.capture_id !== captureId || (r.outcome !== "expired" && r.outcome !== "retained")) {
+      return { capture_id: captureId, outcome: "retained", reason: "invalid_response" };
+    }
+    return { capture_id: captureId, outcome: r.outcome, ...(reason === undefined ? {} : { reason }) };
+  }
+
   /** By-id status poll of a capture (handles lost ACKs; on restart tells whether the byte
    * manifest is already bound). JSON GET. Throws RequestError on 4xx/5xx. */
   async getRecoveryCaptureStatus(
     runId: string,
     captureId: string,
+    options?: { signal?: AbortSignal; deadline: number },
   ): Promise<RecoveryCaptureStatusResponse> {
+    if (options && Date.now() >= options.deadline) throw new Error("report HTTP deadline");
     return (await this.getJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/${encodeURIComponent(captureId)}`,
+      options ? Math.max(1, options.deadline - Date.now()) : undefined,
+      options ? 16 * 1024 : undefined,
+      options ? options.signal ?? AbortSignal.timeout(Math.max(1, options.deadline - Date.now())) : undefined,
     )) as RecoveryCaptureStatusResponse;
   }
 
@@ -1984,21 +2384,152 @@ export class WorkerClient {
         throw new Error("final inventory release requires an exact positive safe generation");
       }
       if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; final release retained");
+      // Issue #2545: a held_publication FINAL names a ref on the forge; without the negotiated
+      // feature nothing is sent, and the typed error keeps the journaled FINAL (non-definitive).
+      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE)) {
+        throw new HeldFeatureUnavailableError();
+      }
       body.final_disposition = finalDisposition;
     }
     if (releaseEvidence !== undefined) body.release_evidence = releaseEvidence;
     return (await this.postJSON(
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,
       body,
+      this.httpTimeoutMs,
+      undefined,
+      RECOVERY_RELEASE_RESPONSE_MAX_BYTES,
     )) as RecoveryReleaseResponse;
+  }
+
+  /** New attempts need headroom; original terminal recognition is independent of admission. */
+  canStartPublicationCompletion(runId: string, generation: number): boolean {
+    const key = `${runId}:${generation}`;
+    const claim = this.completionClaims.get(key);
+    const hold = this.completionHolds.get(key);
+    if (this.completionInventoryUnreadable ||
+        claim === null || (claim && (!claim.eligible || !claim.guarded)) || hold === null) return false;
+    // Reserve both provenance slots synchronously, before the runner can await journal installation.
+    return this.allowCompletionBinding(key);
+  }
+
+  /** Called only with persisted receipt proof after actual terminal resolution/removal. */
+  releasePublicationCompletion(receipt: CompletedPublicationReceipt, incarnation?: Readonly<object>): void {
+    if (incarnation !== undefined && incarnation !== this.completionRetirementIncarnation) return;
+    if (this.completionInventoryUnreadable || this.receiptIncarnations.get(receipt) !== this.completionIncarnation) return;
+    const key = `${receipt.run_id}:${receipt.generation}`;
+    const claim = this.completionClaims.get(key);
+    const hold = this.completionHolds.get(key);
+    if (claim === null || hold === null || (hold !== undefined && hold !== receipt.hold_id) ||
+        (claim && (!claim.eligible || !claim.guarded ||
+          (claim.repoId !== undefined && claim.repoId !== receipt.repo_id) ||
+          (claim.forgeType !== undefined && claim.forgeType !== receipt.forge_type) ||
+          (claim.branch !== undefined && claim.branch !== receipt.branch)))) return;
+    this.detachPublicationCompletion(receipt.run_id, key);
+  }
+
+  /** Capture before asynchronous retirement authority checks; same-worker refresh preserves it. */
+  capturePublicationCompletionRetirement(): Readonly<object> {
+    return this.completionRetirementIncarnation;
+  }
+
+  /** Runner notification after authorized deletion and positive absence of both original reports. */
+  releaseRetiredPublicationCompletion(runId: string, generation: number, incarnation: Readonly<object>): void {
+    if (incarnation !== this.completionRetirementIncarnation || this.completionInventoryUnreadable) return;
+    const key = `${runId}:${generation}`;
+    const claim = this.completionClaims.get(key);
+    if (claim === null || this.completionHolds.get(key) === null ||
+        (claim && !claim.eligible)) return;
+    this.detachPublicationCompletion(runId, key);
+  }
+
+  private detachPublicationCompletion(runId: string, key: string): void {
+    this.completionClaims.delete(key);
+    this.completionHolds.delete(key);
+    const reservation = this.completionReservations.get(key);
+    if (!reservation) return;
+    reservation.live = false;
+    // At most 2048 tickets per 2048 identities. A sibling failure never blocks detach.
+    for (const ticket of this.completionTickets) {
+      if (ticket.runId !== undefined && ticket.runId !== runId) continue;
+      ticket.exclusions.add(key);
+      reservation.tickets.add(ticket);
+    }
+    if (reservation.tickets.size === 0) this.completionReservations.delete(key);
+  }
+
+  private ineligibleCompletionClaimBits(key: string): number[] {
+    const digest = createHash("sha256").update(key).digest();
+    const bitCount = this.ineligibleCompletionClaims.length * 8;
+    return [0, 4, 8].map(offset => digest.readUInt32BE(offset) % bitCount);
+  }
+
+  private allowCompletionBinding(key: string): boolean {
+    const prior = this.completionReservations.get(key);
+    if (prior) { prior.live = true; return true; }
+    if (this.ineligibleCompletionClaimBits(key).every(bit =>
+      ((this.ineligibleCompletionClaims[bit >>> 3] ?? 0) & (1 << (bit & 7))) !== 0)) return false;
+    if (this.completionReservations.size * 2 >= COMPLETION_BINDINGS_MAX) return false;
+    this.completionReservations.set(key, { live: true, tickets: new Set() });
+    return true;
+  }
+
+  private beginCompletionObservation(runId?: string): CompletionTicket {
+    if (this.completionTickets.size >= COMPLETION_OBSERVATIONS_MAX)
+      throw new Error("completion observation bookkeeping limit exceeded");
+    const ticket: CompletionTicket = { incarnation: this.completionIncarnation, runId, exclusions: new Set() };
+    this.completionTickets.add(ticket);
+    return ticket;
+  }
+
+  private endCompletionObservation(ticket: CompletionTicket): void {
+    // Registration clears the set; an old incarnation's finally must not detach new work.
+    if (ticket.incarnation !== this.completionIncarnation || !this.completionTickets.delete(ticket)) return;
+    for (const key of ticket.exclusions) {
+      const reservation = this.completionReservations.get(key);
+      if (!reservation) continue;
+      reservation.tickets.delete(ticket);
+      if (!reservation.live && reservation.tickets.size === 0) this.completionReservations.delete(key);
+    }
   }
 
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
    *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
-    return (await this.getJSON(
-      `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`,
-    )) as RecoveryHoldsResponse;
+    const incarnation = this.completionIncarnation;
+    const ticket = this.beginCompletionObservation(runId);
+    try {
+      const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`;
+      const res = await this.fetchRaw("GET", path, undefined);
+      if (res.status >= 400) throw await this.toError("GET", path, res);
+      let response: RecoveryHoldsResponse;
+      try {
+        const text = await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true);
+        response = (text ? JSON.parse(text) : undefined) as RecoveryHoldsResponse;
+      } catch (err) {
+        if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
+        throw err;
+      }
+      if (Array.isArray(response?.holds) && response.holds.length > COMPLETION_HOLDS_MAX_ITEMS) {
+        if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
+        throw new Error("recovery hold inventory exceeds item limit");
+      }
+      if (incarnation !== this.completionIncarnation) return response;
+      if (response?.run_id !== runId || !Array.isArray(response.holds)) this.completionInventoryUnreadable = true;
+      if (this.registeredWorkerId && response?.run_id === runId && Array.isArray(response.holds)) {
+        const seen = new Set<number>();
+        // One bounded pass, no retries; malformed siblings latch hard refusal without blocking siblings.
+        for (const hold of response.holds) {
+          if (!isRecord(hold) || !terminalGeneration(hold.generation) || hold.generation <= 0) { this.completionInventoryUnreadable = true; continue; }
+          const key = `${runId}:${hold.generation}`;
+          if (ticket.exclusions.has(key) || !this.allowCompletionBinding(key)) continue;
+          const prior = this.completionHolds.get(key);
+          const id = terminalUUID(hold.hold_id) && hold.inventory_guarded === true ? hold.hold_id : null;
+          this.completionHolds.set(key, seen.has(hold.generation) || (prior !== undefined && prior !== id) ? null : id);
+          seen.add(hold.generation);
+        }
+      }
+      return response;
+    } finally { this.endCompletionObservation(ticket); }
   }
 
   /** settleRecoveryHold asks the api to settle ONE older-generation custody hold on a completed
@@ -2056,13 +2587,14 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean }> {
+  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
     const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
     // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.
     // Issue #1673: `receipts` is the server's per-reply declaration of receipt mode.
-    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true };
+    // PRD #2603: `now_summary` is the run's effective Now-summary setting; absent ⇒ off.
+    return { inputs: res.inputs ?? [], credentialSwitch: res.credential_switch, receipts: res.receipts === true, nowSummary: res.now_summary === true };
   }
 
   async ackInputs(runId: string, ids: number[], claimGeneration: number): Promise<InputReceipt> {
@@ -2138,13 +2670,28 @@ export class WorkerClient {
     return out;
   }
 
+  async getCodeSnapshotCleanup(leadId: string, signal?: AbortSignal): Promise<CodeSnapshotCleanup> {
+    return decodeCodeSnapshotCleanup(await this.getJSON(
+      `${WORKER_API_PREFIX}/runs/${leadId}/ownership?purpose=code_snapshot`, 3000, 16 * 1024, signal));
+  }
+
   /** issue #559: lightweight read-only ownership/terminality probe for the interactive
    *  park-SKIP path. Returns the run's current status. Throws a RequestError on 4xx/5xx —
    *  the caller distinguishes a DEFINITIVE 404 (run not owned / reclaimed) from a transient
    *  error via `err.status`. Reuses GetRunOwnedByWorker server-side; no new query. */
-  async getRunOwnership(runId: string): Promise<RunOwnershipResponse> {
+  async getRunOwnership(runId: string, options: { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, signal?: AbortSignal): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse>;
+  async getRunOwnership(runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }): Promise<RunOwnershipResponse> {
+    const budget = options && !(options instanceof AbortSignal) ? options : undefined;
+    const signal = options instanceof AbortSignal ? options : budget
+      ? budget.signal ?? AbortSignal.timeout(Math.max(1, budget.deadline - Date.now())) : undefined;
+    signal?.throwIfAborted();
+    if (budget && Date.now() >= budget.deadline) throw new Error("report HTTP deadline");
     // Bound actual streamed bytes before ownership can authorize recovery retirement.
-    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`, undefined, 16 * 1024)) as RunOwnershipResponse;
+    return (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/ownership`,
+      budget ? Math.max(1, budget.deadline - Date.now()) : undefined, 16 * 1024,
+      signal)) as RunOwnershipResponse;
   }
 
   /** PRD #1391 Run B M3 (D3): read a page of a run's MISSING message-seq ranges in `[1..through]`
@@ -2652,6 +3199,31 @@ export class WorkerClient {
     });
   }
 
+  /** Request an ordinary pause. A running ACK records intent; only a paused status confirms a park.
+   * One HTTP attempt, bounded by httpTimeoutMs, with no generation or owner fallback. */
+  async requestWorkerPause(runId: string, claimGeneration: number, signal?: AbortSignal): Promise<StateAck> {
+    if (!Number.isSafeInteger(claimGeneration) || claimGeneration <= 0)
+      throw new Error("worker pause requires positive claim_generation");
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/pause`;
+    try {
+      const res = await this.fetchRaw("POST", path, { claim_generation: claimGeneration }, this.httpTimeoutMs, signal);
+      if (res.status !== 200 && res.status !== 409) throw await this.toError("POST", path, res);
+      const fields = await readRunAck(res, CROSS_CHECK_RESPONSE_MAX_BYTES);
+      if (fields.status === undefined || fields.applied === undefined)
+        throw new RequestError("POST", path, res.status, "invalid worker pause acknowledgement");
+      const ack: StateAck = { status: fields.status, applied: fields.applied };
+      if (fields.holdReason !== undefined) ack.holdReason = fields.holdReason;
+      if (fields.reason !== undefined) ack.reason = fields.reason;
+      if (fields.staleClaim !== undefined) ack.staleClaim = fields.staleClaim;
+      if (fields.credentialSwitch !== undefined) ack.credentialSwitch = fields.credentialSwitch;
+      if (fields.credentialSwitchReleased !== undefined) ack.credentialSwitchReleased = fields.credentialSwitchReleased;
+      return ack;
+    } catch (err) {
+      if (err instanceof RequestError) throw err;
+      throw new RequestError("POST", path, 0, "worker pause transport failed");
+    }
+  }
+
   // ── Inline run summaries (PRD #362 M3c) ────────────────────────────────────
   // Two thin POSTs mirroring reportFinding/saveMemory: the api derives (user, repo)
   // from the CLAIMED run and re-validates + sanitises everything (it, not the worker,
@@ -3148,11 +3720,19 @@ export class WorkerClient {
   }
 
   private async getJSON(path: string, timeoutMs?: number, maxResponseBytes?: number, signal?: AbortSignal): Promise<unknown> {
+    if (signal) signal = AbortSignal.any([signal, AbortSignal.timeout(timeoutMs ?? this.httpTimeoutMs)]);
+    signal?.throwIfAborted();
     const res = await this.fetchRaw("GET", path, undefined, timeoutMs, signal);
-    if (res.status >= 400) throw await this.toError("GET", path, res);
-    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
+    if (res.status >= 400) {
+      if (!signal) throw await this.toError("GET", path, res);
+      const text = await readBoundedText(res, maxResponseBytes ?? ERROR_BODY_MAX_BYTES, true, signal);
+      throw new RequestError("GET", path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
+    }
+    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true, signal);
     return text ? JSON.parse(text) : undefined;
   }
+
+  private readonly transport: typeof fetch | undefined;
 
   private async fetchRaw(
     method: "GET" | "POST",
@@ -3180,7 +3760,7 @@ export class WorkerClient {
         : AbortSignal.timeout(timeoutMs),
     };
     if (body !== undefined) init.body = JSON.stringify(body);
-    return fetch(this.baseUrl + path, init);
+    return (this.transport ?? fetch)(this.baseUrl + path, init);
   }
 
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {
@@ -3208,6 +3788,7 @@ function retryAfterMsOf(h: string | null): number | undefined {
  * reserving another 64 KiB for keys/metadata stays below 6 MiB. Count actual streamed bytes,
  * never Content-Length; the cross-check methods and strict gate ACK opt in. */
 const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
+const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
 
@@ -3252,14 +3833,19 @@ const ERROR_BODY_MAX_BYTES = 4096;
  *  whole, so a small body yields exactly what Response#text() would. A read failure rejects.
  *  With rejectOverflow, read through EOF (including at the exact cap) and reject any chunk
  *  exceeding the remaining byte budget before retaining or decoding it. */
-async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false): Promise<string> {
+async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<string> {
   if (!res.body) return "";
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
+  const abort = () => { void reader.cancel(signal?.reason).catch(() => undefined); };
+  signal?.addEventListener("abort", abort, { once: true });
   try {
+    signal?.throwIfAborted();
     while (total < maxBytes || rejectOverflow) {
+      signal?.throwIfAborted();
       const { done, value } = await reader.read();
+      signal?.throwIfAborted();
       if (done) break;
       if (rejectOverflow && value.byteLength > maxBytes - total) {
         throw new ResponseBodyOverflowError(maxBytes);
@@ -3268,6 +3854,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
       total += parts[parts.length - 1]!.length;
     }
   } finally {
+    signal?.removeEventListener("abort", abort);
     // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
     await reader.cancel().catch(() => undefined);
   }
@@ -3294,6 +3881,11 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * applied it.
  */
 export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
+  applied?: boolean;
+  completedPublicationCandidate?: unknown;
+  completedPublicationReason?: CompletedPublicationReason;
+  runId?: unknown;
+  workerId?: unknown;
   status?: string;
   holdReason?: string | null;
   budgetMaxIterations?: number;
@@ -3319,9 +3911,14 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     const text = boundedText ?? await res.text();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
+      applied?: unknown;
       // PRD #1392 M2 (D10): `reason` is TOP-LEVEL on the {run, reason?} ack body, NOT under run.
       reason?: unknown;
+      completed_publication_receipt?: unknown;
+      completed_publication_reason?: unknown;
       run?: {
+        id?: unknown;
+        worker_id?: unknown;
         status?: unknown;
         // PRD #1497 M2: the run's hold_reason on the RunDTO, read beside `status` to recognise a
         // SERVER-side wall park (paused + budget_exhausted) from a fenced stale-claim ACK.
@@ -3348,6 +3945,11 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     };
     const run = parsed?.run;
     const out: {
+      applied?: boolean;
+      completedPublicationCandidate?: unknown;
+      completedPublicationReason?: CompletedPublicationReason;
+      runId?: unknown;
+      workerId?: unknown;
       status?: string;
       holdReason?: string | null;
       budgetMaxIterations?: number;
@@ -3368,6 +3970,12 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       gateRevision?: number;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
+    if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
+    if (parsed?.completed_publication_receipt !== undefined && parsed.completed_publication_reason === undefined) out.completedPublicationCandidate = parsed.completed_publication_receipt;
+    const completionReason = decodeCompletedPublicationReason(parsed?.completed_publication_reason);
+    if (completionReason) out.completedPublicationReason = completionReason;
+    if (run?.id !== undefined) out.runId = run.id;
+    if (run?.worker_id !== undefined) out.workerId = run.worker_id;
     if (typeof run?.status === "string") out.status = run.status;
     // PRD #1497 M2: the RunDTO's hold_reason rides the SAME body as `status`. A string only — a
     // non-string (older server that omits it, a null hold, an unparseable value) leaves it absent,
@@ -3517,6 +4125,28 @@ function abortableSleep(
       },
     );
   });
+}
+
+function completionSHA(value: unknown): value is string {
+  return typeof value === "string" && /^[0-9a-f]{40}$/.test(value);
+}
+function completionPositiveInteger(value: unknown): value is number {
+  return typeof value === "number" && Number.isSafeInteger(value) && value > 0;
+}
+function completionForgeType(value: unknown): value is CompletedPublicationReceipt["forge_type"] {
+  return value === "gitlab" || value === "forgejo" || value === "github";
+}
+function completionSafeIdentifier(value: unknown): value is string {
+  return typeof value === "string" && value.length > 0 && value.length <= 2048 &&
+    value.trim() === value && !/[\p{Cc}\p{Cf} ]/u.test(value);
+}
+function decodeCompletedPublicationReason(value: unknown): CompletedPublicationReason | undefined {
+  switch (value) {
+    case "completion_identity_missing": case "not_completed": case "identity_changed":
+    case "mr_missing": case "branch_missing": case "branch_mismatch": case "head_mismatch":
+    case "not_ancestor": case "ancestry_unknown": case "forge_timeout": return value;
+    default: return undefined;
+  }
 }
 
 const TERMINAL_REJECTION_RESPONSE_MAX_BYTES = 128 * 1024;

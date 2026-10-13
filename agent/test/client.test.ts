@@ -29,6 +29,186 @@ afterEach(async () => {
   await api.close();
 });
 
+describe("park_run_v1 M2 client", () => {
+  it("advertises the optional protocol and preserves optional claim support independently of phase", async () => {
+    const client = newClient();
+    await client.register("park-worker", undefined, 1, undefined, ["park_run_v1"]);
+    const registration = api.registers[0];
+    assert.ok(registration);
+    assert.deepStrictEqual(registration.protocol_capabilities, ["park_run_v1"]);
+    for (const phase of ["plan", "implement"] as const) {
+      for (const supported of [undefined, false, true]) {
+        api.enqueueClaim(makeClaim({ resume_phase: phase, ...(supported === undefined ? {} : { park_run_supported: supported }) }));
+        const claim = await client.claimRun();
+        assert.equal(claim?.park_run_supported === true, supported === true);
+        if (supported === undefined) assert.equal(claim?.park_run_supported, undefined);
+      }
+    }
+  });
+
+  for (const [code, status, applied] of [[200, "running", true], [409, "awaiting_input", false], [409, "paused", false]] as const) {
+    it(`returns authoritative pause acknowledgement on ${code}/${status}`, async (t) => {
+      const requests: { url: string; init?: RequestInit }[] = [];
+      t.mock.method(globalThis, "fetch", async (url: string, init?: RequestInit) => {
+        requests.push({ url, init });
+        return Response.json({ run: { status, hold_reason: "owner_pause" }, applied,
+          ...(code === 409 ? { disposition: "stale_claim", reason: "stale_claim" } : {}) }, { status: code });
+      });
+      const ack = await newClient().requestWorkerPause("run/1", 7);
+      assert.equal(ack.status, status);
+      assert.equal(ack.applied, applied);
+      assert.equal(ack.holdReason, "owner_pause");
+      assert.equal(ack.staleClaim, code === 409 ? true : undefined);
+      assert.equal(ack.reason, code === 409 ? "stale_claim" : undefined);
+      assert.equal(requests.length, 1);
+      const request = requests[0];
+      assert.ok(request);
+      assert.equal(request.url, baseUrl + "/api/worker/runs/run%2F1/pause");
+      assert.equal(request.init?.method, "POST");
+      assert.deepStrictEqual(JSON.parse(String(request.init?.body)), { claim_generation: 7 });
+      assert.ok(request.init?.signal);
+    });
+  }
+
+  it("uses the response applied field rather than inferring acceptance from HTTP status", async (t) => {
+    t.mock.method(globalThis, "fetch", async () => Response.json({ run: { status: "running" }, applied: false }));
+    assert.equal((await newClient().requestWorkerPause("run-1", 7)).applied, false);
+  });
+
+  for (const route of ["pause", "guarded question"] as const) {
+    it(`bounds actual streamed ${route} ACK bytes despite a misleading Content-Length`, async (t) => {
+      let sends = 0;
+      let bytes = 0;
+      let cancelled = false;
+      const cap = 6 * 1024 * 1024;
+      const chunkSize = 64 * 1024;
+      t.mock.method(globalThis, "fetch", async () => {
+        sends++;
+        const prefix = new TextEncoder().encode(JSON.stringify({
+          run: { status: route === "pause" ? "running" : "awaiting_input" }, applied: true,
+        }));
+        const stream = new ReadableStream<Uint8Array>({
+          pull(controller) {
+            if (bytes === 0) { bytes += prefix.length; controller.enqueue(prefix); return; }
+            if (bytes > 8 * 1024 * 1024) { controller.close(); return; }
+            bytes += chunkSize;
+            controller.enqueue(new Uint8Array(chunkSize).fill(32));
+          },
+          cancel() { cancelled = true; },
+        }, { highWaterMark: 0 });
+        return new Response(stream, { headers: { "Content-Length": "1" } });
+      });
+      const client = newClient();
+      await assert.rejects(route === "pause"
+        ? client.requestWorkerPause("run-1", 7)
+        : client.reportState("run-1", {
+          status: "awaiting_input", claim_generation: 7, require_running: true, open_question_id: "q-1",
+        }));
+      assert.equal(sends, 1, "overflow must not replay the mutation");
+      assert.equal(cancelled, true);
+      assert.ok(bytes <= cap + chunkSize, `consumed ${bytes} bytes`);
+    });
+  }
+
+  it("rejects invalid generations before any pause or guarded state request", async (t) => {
+    let sends = 0;
+    t.mock.method(globalThis, "fetch", async () => { sends++; return Response.json({}); });
+    const client = newClient();
+    for (const generation of [0, -1, 1.5, NaN, Infinity, Number.MAX_SAFE_INTEGER + 1]) {
+      await assert.rejects(client.requestWorkerPause("run-1", generation));
+      await assert.rejects(client.reportState("run-1", {
+        status: "awaiting_input", claim_generation: generation, require_running: true,
+      }));
+    }
+    await assert.rejects(client.reportState("run-1", { status: "awaiting_input", require_running: true }));
+    await assert.rejects(client.reportState("run-1", { status: "running", claim_generation: 7, require_running: true }));
+    assert.equal(sends, 0);
+  });
+
+  for (const code of [400, 404, 501]) {
+    it(`throws RequestError without a generationless retry on pause HTTP ${code}`, async (t) => {
+      let sends = 0;
+      t.mock.method(globalThis, "fetch", async () => {
+        sends++;
+        return Response.json({ error: 'json: unknown field "claim_generation"' }, { status: code });
+      });
+      await assert.rejects(newClient().requestWorkerPause("run-1", 7),
+        (err: unknown) => err instanceof RequestError && err.status === code);
+      assert.equal(sends, 1);
+    });
+  }
+
+  it("throws RequestError on pause transport failure without retrying", async (t) => {
+    let sends = 0;
+    t.mock.method(globalThis, "fetch", async () => { sends++; throw new TypeError("fetch failed"); });
+    await assert.rejects(newClient().requestWorkerPause("run-1", 7), RequestError);
+    assert.equal(sends, 1);
+  });
+
+  it("bounds a stalled pause transport by the existing HTTP timeout", async (t) => {
+    let sends = 0;
+    t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+      sends++;
+      const signal = init?.signal;
+      assert.ok(signal);
+      await new Promise<void>((_resolve, reject) => {
+        signal.addEventListener("abort", () => reject(signal.reason), { once: true });
+      });
+      return Response.json({});
+    });
+    const client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), { httpTimeoutMs: 10 });
+    // Keep a referenced timer while the production deadline (unref'd by Node) is tested.
+    const keeper = setTimeout(() => {}, 1000);
+    try {
+      await assert.rejects(client.requestWorkerPause("run-1", 7), RequestError);
+      assert.equal(sends, 1);
+    } finally {
+      clearTimeout(keeper);
+    }
+  });
+
+  for (const body of ["invalid json", JSON.stringify({ run: { status: "running" } }), JSON.stringify({ applied: true })]) {
+    it(`rejects unreadable or incomplete pause acknowledgement: ${body}`, async (t) => {
+      t.mock.method(globalThis, "fetch", async () => new Response(body));
+      await assert.rejects(newClient().requestWorkerPause("run-1", 7), RequestError);
+    });
+  }
+
+  it("passes cancellation through the bounded pause transport", async (t) => {
+    const abort = new AbortController();
+    t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+      assert.ok(init?.signal);
+      abort.abort();
+      assert.equal(init.signal.aborted, true);
+      init.signal.throwIfAborted();
+      return Response.json({});
+    });
+    await assert.rejects(newClient().requestWorkerPause("run-1", 7, abort.signal), RequestError);
+  });
+
+  it("never strips the guard or generation after an old server strict-decode 400", async (t) => {
+    const bodies: unknown[] = [];
+    t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+      bodies.push(JSON.parse(String(init?.body)));
+      return Response.json({ error: 'json: unknown field "claim_generation"' }, { status: 400 });
+    });
+    const body = { status: "awaiting_input" as const, claim_generation: 7, require_running: true, open_question_id: "q-1" };
+    await assert.rejects(newClient().reportState("run-1", body), RequestError);
+    assert.deepStrictEqual(bodies, [body]);
+  });
+
+  it("returns the authoritative acknowledgement for a guarded question write", async (t) => {
+    t.mock.method(globalThis, "fetch", async (_url: string, init?: RequestInit) => {
+      assert.deepStrictEqual(JSON.parse(String(init?.body)),
+        { status: "awaiting_input", claim_generation: 7, require_running: true });
+      return Response.json({ run: { status: "paused" } }, { status: 409 });
+    });
+    const ack = await newClient().reportState("run-1", { status: "awaiting_input", claim_generation: 7, require_running: true });
+    assert.equal(ack.status, "paused");
+    assert.equal(ack.applied, false);
+  });
+});
+
 describe("register / heartbeat / claim", () => {
   it("registers with name + version and Bearer auth", async () => {
     const res = await newClient().register("vlad-laptop");
@@ -1061,6 +1241,23 @@ describe("completion permit + hold client calls (PRD #1226 M4)", () => {
     } finally {
       await srv.close();
     }
+  });
+});
+
+describe("W1 account boundary deferral", () => {
+  it("recognises only the typed RequestError 409 JSON object", () => {
+    const body = JSON.stringify({ error: "private body", reason: "codex_account_unavailable" });
+    assert.equal(codexDeferralReason(new RequestError("POST", "/x", 409, body)), "account_unavailable");
+    for (const error of [
+      new Error(body),
+      new RequestError("POST", "/x", 400, body),
+      new RequestError("POST", "/x", 500, body),
+      new RequestError("POST", "/x", 409, "codex_account_unavailable"),
+      new RequestError("POST", "/x", 409, JSON.stringify(["codex_account_unavailable"])),
+      new RequestError("POST", "/x", 409, "null"),
+      new RequestError("POST", "/x", 409, JSON.stringify({ reason: "account_unavailable" })),
+      new RequestError("POST", "/x", 409, JSON.stringify({ error: "codex_account_unavailable" })),
+    ]) assert.equal(codexDeferralReason(error), undefined);
   });
 });
 

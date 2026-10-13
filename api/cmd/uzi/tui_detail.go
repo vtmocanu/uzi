@@ -1,6 +1,7 @@
 package main
 
 import (
+	"fmt"
 	"sort"
 	"strings"
 	"time"
@@ -8,6 +9,7 @@ import (
 	tea "charm.land/bubbletea/v2"
 	lipgloss "charm.land/lipgloss/v2"
 	"github.com/charmbracelet/colorprofile"
+	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -46,7 +48,8 @@ const (
 // detailState is one run's live view: the lane rail plus the selected lane's
 // transcript, fed by the REST replay for history and StreamRun for live frames.
 type detailState struct {
-	runID string
+	answer answerState
+	runID  string
 	// gen is this detail session's generation (stamped from tuiModel.detailGen on each drill-in
 	// from the board; the `--run` start session keeps 0). Every run/page command captures it
 	// and every reply is checked against it, because exitToBoard cannot cancel a command in
@@ -82,6 +85,8 @@ type detailState struct {
 	railFold   railFoldMode
 	runLoaded  bool // the first GetRun has landed: header/milestones/accounts can render
 	tailLoaded bool // the newest transcript page has landed
+
+	questionCollapsed bool // session preference; only z toggles, reopening restores expanded
 	// lowSeq / highSeq bound the seq-carrying frames held (0 = none). lowSeq is the backfill
 	// cursor: the background walk requests the newest page strictly below it and the reply
 	// lowers it, until the start of history is reached. highSeq is the total, since seq is
@@ -410,13 +415,14 @@ func (d *detailState) rebuild() {
 	if d.laneIdx >= 0 && d.laneIdx < len(d.lanes) {
 		selKey = d.lanes[d.laneIdx].Key
 	}
-	d.lanes = buildLanes(d.frames)
+	visible := presentationFrames(d.frames)
+	d.lanes = buildLanes(visible)
 	// Prepend the aggregated "all agents" lane once a run has ≥2 real lanes, so index 0 is the
 	// firehose and the individual lanes follow for isolating one. On the FIRST build there is no
 	// prior selection (selKey ""), so the restore below is skipped and the default index 0 lands on
 	// the firehose — the intended opening view for a multi-lane run.
 	if len(d.lanes) >= 2 {
-		d.lanes = append([]agentLane{allLane(d.frames)}, d.lanes...)
+		d.lanes = append([]agentLane{allLane(visible)}, d.lanes...)
 	}
 	if selKey != "" {
 		for i, l := range d.lanes {
@@ -488,6 +494,9 @@ func (m tuiModel) exitToBoard() (tea.Model, tea.Cmd) {
 }
 
 func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
+	if nm, cmd, handled := m.answerKey(k); handled {
+		return nm, cmd
+	}
 	// The overlay and the steer bar get first refusal, in that order: while either is
 	// in an input/confirm mode it must swallow keys that would otherwise be pane
 	// navigation, or typing "l" into a follow-up would move pane focus underneath it.
@@ -546,6 +555,11 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 			cmds = append(cmds, m.backfillCmd(m.detail.runID, m.detail.lowSeq))
 		}
 		return m, tea.Batch(cmds...)
+	case keyCollapseQuestion:
+		if _, open := m.openQuestionFrame(); open {
+			m.detail.questionCollapsed = !m.detail.questionCollapsed
+		}
+		return m, nil
 	case keyCollapseCrew:
 		// Fold / unfold the crew list so the milestone block below it is always reachable
 		// (the rail is height-clamped and does not scroll). `c` is a sticky override (PRD #1257
@@ -607,13 +621,14 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		if maxTop < 0 {
 			maxTop = 0
 		}
-		// F-M5a: reclamp the stored top against the CURRENT extent BEFORE applying the
-		// delta. A resize (WindowSizeMsg) since it was set can leave scroll above the new
-		// maxTop; applying the delta to that stale value would push it past the bottom clamp
-		// below and wrongly re-arm follow on the next key instead of scrolling to older
-		// output.
-		if m.detail.scroll > maxTop {
-			m.detail.scroll = maxTop
+		// renderTranscript preserves a paused top beyond maxTop with padding.
+		// Navigate from that anchor, bounded by the last content row.
+		bottom := maxTop
+		if !m.detail.follow && m.detail.scroll > maxTop {
+			bottom = min(m.detail.scroll, max(0, total-1))
+		}
+		if m.detail.scroll > bottom {
+			m.detail.scroll = bottom
 		}
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
@@ -633,9 +648,9 @@ func (m tuiModel) detailKey(k string) (tea.Model, tea.Cmd) {
 		if m.detail.scroll < 0 {
 			m.detail.scroll = 0
 		}
-		if m.detail.scroll >= maxTop {
-			m.detail.scroll = maxTop
-			if isLiveRunStatus(m.detail.run.Status) {
+		if m.detail.scroll >= bottom {
+			m.detail.scroll = bottom
+			if bottom == maxTop && isLiveRunStatus(m.detail.run.Status) {
 				m.detail.follow = true
 			}
 		}
@@ -690,9 +705,9 @@ func (m tuiModel) detailHeaderLines() []string {
 	// elapsed time — a live run's runtime or a terminal run's total wall time.
 	statusTag := ""
 	if d.run.ID != "" {
-		// RunDTO carries no is_revising (issue #750): the detail header keeps its own
-		// derivePlanRevision panel, so revising is not surfaced through this token here.
-		tok := m.pal.runStateToken(d.run, false)
+		// RunDTO.IsRevising (issue #2760): a run mid-revise replan keeps status
+		// awaiting_approval, so the token must read revising, not the plan-gate amber.
+		tok := m.pal.runStateToken(d.run, d.run.IsRevising)
 		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
 		if dur := runDuration(d.run, time.Now()); dur != "" {
 			statusTag += m.pal.faint.Render(" · " + dur)
@@ -700,15 +715,15 @@ func (m tuiModel) detailHeaderLines() []string {
 	}
 	if d.run.Usage != nil {
 		// Same cost_status branch as boardCostSeg/renderSpend (PRD #1429 M5, D7): this
-		// compact inline tag uses the SAME short labels as the board cell ("sub"/"n/a"),
-		// not renderSpend's spacious "Subscription"/"Unavailable" — the crumb line is a
+		// compact inline tag uses the SAME short "n/a" label as the board cell for nonmetered usage,
+		// not renderSpend's "n/a"/"Unavailable" — the crumb line is a
 		// dense row of tags (status · elapsed · cost · transport), not a dedicated headline.
 		var cost string
 		switch classifyCostStatus(d.run.Usage.CostStatus) {
 		case costStatusMetered:
 			cost = fmtCostCents(d.run.Usage.CostUSD)
 		case costStatusSubscription:
-			cost = "sub"
+			cost = "n/a"
 		default:
 			cost = "n/a"
 		}
@@ -763,7 +778,47 @@ func (m tuiModel) detailHeaderLines() []string {
 	return []string{clampVisual(left, m.width)}
 }
 
+// providerDetailLines uses the CLI's policy clauses without clipping away action
+// hints. Sanitize before wrapping: each returned element is one physical row.
+// Work is bounded by the fixed policy copy plus the renderer's 240-rune ID cap.
+func (m tuiModel) providerDetailLines() []string {
+	r := m.detail.run
+	var clauses []string
+	ink := m.pal.wait
+	if isProviderUnavailableHold(r) {
+		ink = m.pal.amber
+		// The full command ID is terminal-safe and shell-quoted by providerHoldAction.
+		// Cap its display before building copy so malformed IDs cannot expand the frame.
+		r.ID = m.renderer.Plain(r.ID, 240)
+		clauses = strings.Split(providerHoldAction(r), "; ")
+		// Compact only the fixed owner-wait clause; preserve any differing policy text.
+		if clauses[0] == "waiting for the owner" {
+			clauses[0] = "waiting for owner"
+		}
+		clauses[0] = "provider unavailable: " + clauses[0]
+	} else if line := providerParkLine(r); line != "" {
+		clauses = strings.Split(line, "; ")
+	}
+	var rows []string
+	for _, clause := range clauses {
+		// Compact this exact fixed clause so it occupies one row at width 40.
+		// Leave any differing policy text intact.
+		if clause == "clone and session files kept on the worker" {
+			clause = "clone and session files stay on worker"
+		}
+		plain := m.renderer.Plain(clause, len([]rune(clause)))
+		wrapped := ansi.Hardwrap(ansi.Wrap(plain, max(1, m.width), " "), max(1, m.width), true)
+		for _, row := range strings.Split(wrapped, "\n") {
+			rows = append(rows, lipgloss.NewStyle().Foreground(ink).Render(row))
+		}
+	}
+	return rows
+}
+
 func (m tuiModel) renderDetail() string {
+	if m.detail.answer.open {
+		return m.renderAnswerDetail()
+	}
 	d := &m.detail
 	var sb strings.Builder
 
@@ -818,12 +873,16 @@ func (m tuiModel) renderDetail() string {
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 240)), m.width) + "\n")
 	}
 
+	for _, line := range m.providerDetailLines() {
+		sb.WriteString(line + "\n")
+	}
+
 	// The near-timeout countdown (PRD #1170), the run detail's OTHER conditional second
 	// row. Drawn only while the run is flagged `slow` and carries a deadline_at, in the
 	// stall colour that matches the ▲ token above. fitNearTimeoutLine sheds clauses to
 	// m.width so it stays one physical row (the #379 invariant); it returns "" when the run
 	// carries no near-timeout deadline, so the row is silent for every other run.
-	if line := fitNearTimeoutLine(d.run, time.Now(), m.width); line != "" {
+	if line := fitNearTimeoutLine(d.run, time.Now(), m.width); line != "" && !isProviderUnavailableHold(d.run) && providerParkLine(d.run) == "" {
 		sb.WriteString(m.pal.state(crewStalled).Render(m.renderer.Plain(line, 120)) + "\n")
 	}
 
@@ -843,10 +902,10 @@ func (m tuiModel) renderDetail() string {
 		// PRD #1732 D14: a credential_disabled hold is a server park, not an owner pause, so it
 		// must not read "paused by you". Same slot and colour; clampVisual keeps it one row.
 		sb.WriteString(clampVisual(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, 120)), m.width) + "\n")
-	} else if d.run.Status == statusPaused {
+	} else if d.run.Status == statusPaused && !isProviderUnavailableHold(d.run) {
 		line := pausedLine(d.run, time.Now(), m.width)
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
-	} else if d.run.PauseRequestedAt != nil {
+	} else if d.run.PauseRequestedAt != nil && !isProviderUnavailableHold(d.run) {
 		line := pauseRequestedLine(d.run, m.width)
 		sb.WriteString(m.pal.state(crewWaiting).Render(m.renderer.Plain(line, m.width)) + "\n")
 	}
@@ -875,6 +934,9 @@ func (m tuiModel) renderDetail() string {
 		return sb.String() + m.renderReviewOverlay()
 	}
 
+	for _, line := range m.questionCardLines() {
+		sb.WriteString(line + "\n")
+	}
 	rail := m.renderLaneRail()
 	body := m.renderTranscript()
 	sb.WriteString(m.joinColumns(rail, body, laneRailWidth))
@@ -883,6 +945,9 @@ func (m tuiModel) renderDetail() string {
 	// edge, and detailFooter drops them so they are not duplicated.
 	if b := m.detailBanner(); b != "" {
 		sb.WriteString(b + "\n")
+	}
+	for _, line := range m.answerNoticeLines() {
+		sb.WriteString(line + "\n")
 	}
 	// Steer status (queue indicator, notice, typing input, confirm box, or the read-only
 	// reason) renders above the footer when present. When the bar is mid-input it owns the
@@ -963,8 +1028,9 @@ func (m tuiModel) detailFooter() string {
 	}
 	if owner {
 		// v review is meaningless at a plan gate (no verdict yet); everywhere else the owner
-		// gets it. y/n are inline in the band, so they are never here.
-		if !atPlanGate(m.detail.run) {
+		// gets it. y/n are inline in the band, so they are never here. A revising run
+		// (issue #2760) has no verdict yet either, so the hint stays hidden.
+		if !atPlanGate(m.detail.run) && !m.detail.run.IsRevising {
 			parts = append(parts, m.keyHint("v", "review"))
 		}
 		parts = append(parts, m.keyHint("f", "follow-up"), m.keyHint("x", "cancel"))
@@ -988,9 +1054,11 @@ func (m tuiModel) paneTitle(title string, focused bool) string {
 }
 
 // detailBanner is the S3 attention-band treatment: awaiting_approval gets the PLAN GATE band with
-// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated);
+// the OWNER's approve/reject keys inline (dropped from the footer so they are not duplicated),
+// except while the run is revising (issue #2760): the agent is re-planning, it is not the
+// owner's turn, so no band is shown;
 // awaiting_input gets a DISTINCT needs-input band that never offers y/n — those keys do nothing
-// at a clarification park, which is answered off-TUI (run answer / web / Slack); awaiting_followup
+// at a clarification park, where the owner answers with i; awaiting_followup
 // (PRD #517) gets its OWN band, distinct from needs-input: an interactive task parked for the
 // user's next follow-up, which is NOT a y/n prompt — the owner sends a follow-up (the `f` key) or
 // stops the run. All bands show for owner and non-owner alike; the inline y/n keys are
@@ -1000,8 +1068,19 @@ func (m tuiModel) detailBanner() string {
 	owner := m.detail.steer.access == steerAllowed
 	switch m.detail.run.Status {
 	case "awaiting_approval":
+		if m.detail.run.IsRevising {
+			return ""
+		}
 		return m.attentionBanner("⚑ PLAN GATE", "the crew is waiting on your approval", owner)
 	case "awaiting_input":
+		if m.detail.steer.access == steerAllowed {
+			if frame, open := m.openQuestionFrame(); open {
+				if p, ok := parseAnswerableQuestion(frame.Payload); ok {
+					return m.attentionBanner("✎ NEEDS INPUT", fmt.Sprintf("the agent asked %d questions; answer with i", len(p.Questions)), false)
+				}
+				return m.attentionBanner("✎ NEEDS INPUT", "cannot answer this payload here; use the web or Slack", false)
+			}
+		}
 		return m.attentionBanner("✎ NEEDS INPUT", "the agent asked a question; answer it from another terminal, the web, or Slack", false)
 	case "awaiting_followup":
 		// The "with f" hint is owner-only: the `f` steer key is gated to the run owner

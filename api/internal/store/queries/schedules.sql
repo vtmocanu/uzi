@@ -260,6 +260,12 @@ SET last_fired_at = @last_fired_at,
     next_fire_at  = sqlc.narg('next_fire_at'),
     status        = @status,
     last_fire     = @last_fire,
+    -- recent_fires (issue #2519): prepend this fire when it did something (matched > 0), keep the
+    -- newest 10; a blocked/examined-0 tick or a NULL summary leaves the list as it was.
+    recent_fires  = CASE
+      WHEN @last_fire::jsonb @@ '$.matched > 0'
+      THEN jsonb_path_query_array(jsonb_build_array(@last_fire::jsonb) || recent_fires, '$[0 to 9]')
+      ELSE recent_fires END,
     updated_at    = now()
 WHERE id = @id
 RETURNING *;
@@ -387,9 +393,9 @@ WHERE schedule_id = @schedule_id
 -- override onto the fired run through this seam.
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description, schedule_id, auto_approve, wait_on_limit, mr_rework_enabled, model, override_subagent_model, required_capabilities, trigger_source, harness, credential_override_mode, credential_override_secret_id, plan_cross_check_required
-) VALUES (
+, code_cross_check_required) VALUES (
     @user_id, @repo_id::uuid, 'prompt', @issue_title, @issue_description, @schedule_id::uuid, @auto_approve, @wait_on_limit, sqlc.narg('mr_rework_enabled'), sqlc.narg('model'), @override_subagent_model,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'schedule', @harness, sqlc.narg('credential_override_mode'), sqlc.narg('credential_override_secret_id'),
     (@auto_approve AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))
-)
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
 RETURNING *;

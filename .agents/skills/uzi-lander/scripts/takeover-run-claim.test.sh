@@ -4,6 +4,7 @@
 # over that run, by run id or by PR number, must stop at NEXT=claimed_by_other. A run key held
 # by this session or by a dead owner is superseded: claiming the PR releases it.
 set -eu
+export NET_RETRY_BASE_SLEEP=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/takeover.sh"

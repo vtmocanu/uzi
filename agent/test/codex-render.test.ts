@@ -268,7 +268,7 @@ describe("renderCodexRun — model + effort contract", () => {
   });
 
   it("keeps an in-contract model and reports nothing", () => {
-    for (const model of ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol"]) {
+    for (const model of ["gpt-6-astra", "gpt-5.6-sol", "gpt-6-sol", "gpt-6.1-sol", "gpt-6-luna"]) {
       const run = renderCodexRun(runRequest({ model }));
       assert.equal(run.lead.model, model);
       assert.equal(run.diagnostics.length, 0);
@@ -764,4 +764,34 @@ describe("renderCodexRun — diagnostic name sanitization", () => {
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "r", "Grep"), true);
     assert.equal(hasDiagnostic(run.diagnostics, "unknown_tool", "r", "Frobnicate-XYZ"), true);
   });
+});
+
+describe("M3 park_run advertisement", () => {
+  for (const phase of ["plan", "implement"] as const) {
+    for (const supported of [undefined, false, true]) {
+      for (const eligible of [false, true]) {
+        it(`phase=${phase} support=${supported} eligible=${eligible}`, () => {
+          const run = renderCodexRun(runRequest({ phase, parkRunSupported: supported, nonInteractiveIssue: eligible,
+            agents: { child: agent({ tools: allow(["mcp__uzi__park_run"]) }) } }));
+          assert.equal(run.leadGrants.allowedTools.has("park_run"), phase === "implement" && supported === true && eligible);
+          assert.equal(grantFor(run, "child").allowedTools.has("park_run"), false);
+        });
+      }
+    }
+  }
+});
+
+it("U3 D9 root registration is opt-in in every phase and forbidden to explicitly granted children", () => {
+  const name = "mcp__uzi__report_cross_check_dispositions";
+  for (const phase of ["plan", "implement"] as const) {
+    const off = renderCodexRun(runRequest({ phase }));
+    assert.equal(off.leadGrants.allowedTools.has(name), false);
+    const on = renderCodexRun(runRequest({ phase, codeCrossCheck: {
+      generation: 7, codeCrossCheckRepairActive: () => true, codeCrossCheckRepair: async () => undefined,
+      reportCrossCheckDispositions: async () => ({ stage: "code", result: "no_row", repo_instructions_enabled: false }),
+    }, agents: { inherited: agent(), explicit: agent({ tools: allow([name, "report_cross_check_dispositions"]) }) } }));
+    assert.equal(on.leadGrants.allowedTools.has(name), true);
+    assert.equal(toolsOf(on, "inherited").has(name), false);
+    assert.equal(toolsOf(on, "explicit").has(name), false);
+  }
 });

@@ -6,6 +6,8 @@ import (
 	"fmt"
 	"log/slog"
 	"math"
+	"slices"
+	"strings"
 	"time"
 
 	"github.com/google/uuid"
@@ -47,6 +49,7 @@ var checkMeta = map[string]struct {
 	"queue.undispatched": {"owner", groupQueue, "Undispatched task runs", ""},
 	"controller.report":  {"instance", groupControl, "Controller reporting", "hosted-workers"},
 	"db":                 {"instance", groupControl, "Database", ""},
+	"db.size":            {"instance", groupControl, "Database size", "admin-health"},
 	"loops":              {"instance", groupControl, "Background loops", ""},
 	"forge.sync":         {"owner", groupIntegrations, "Forge issue sync", ""},
 	"forge.ciwatch":      {"owner", groupIntegrations, "CI watch capacity", ""},
@@ -54,7 +57,9 @@ var checkMeta = map[string]struct {
 	"schedules.paused":   {"owner", groupHousekeeping, "Paused schedules", ""},
 	"board.drift":        {"owner", groupHousekeeping, "Board drift", ""},
 	"custody.holds":      {"owner", groupHousekeeping, "Recovery custody holds", ""},
+	"recovery.storage":   {"owner", groupHousekeeping, "Recovery storage", ""},
 	"release.check":      {"owner", groupHousekeeping, "Upstream release", ""},
+	"pricing.codex":      {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
 }
 
 // base returns a check DTO pre-filled with the id's fixed metadata and a non-nil (empty)
@@ -201,6 +206,87 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		}
 	}
 
+	// Pacing has its own API receipt. A readiness report cannot renew a hold.
+	var pacing *workersvc.PacingReport
+	var pacingID uuid.UUID
+	retained := map[string]struct{}{}
+	for _, w := range hosted {
+		p := workersvc.ParseFreshPacingReport(w.RollPacing, w.RollPacingObservedAt, now)
+		if p == nil {
+			continue
+		}
+		rank := func(state string) int {
+			switch state {
+			case "held":
+				return 3
+			case "override":
+				return 2
+			default:
+				return 1
+			}
+		}
+		if pacing == nil || rank(p.State) > rank(pacing.State) ||
+			(rank(p.State) == rank(pacing.State) && w.Worker.ID.String() < pacingID.String()) {
+			pacing, pacingID = p, w.Worker.ID
+		}
+	}
+	if pacing != nil && (pacing.State == "held" || pacing.State == "override") {
+		for _, w := range hosted {
+			p := workersvc.ParseFreshPacingReport(w.RollPacing, w.RollPacingObservedAt, now)
+			if p == nil || p.TargetImage != pacing.TargetImage || p.TargetVersion != pacing.TargetVersion ||
+				(p.RetainedImage == nil && p.RetainedVersion == nil) {
+				continue
+			}
+			image, version := "", ""
+			if p.RetainedImage != nil {
+				image = *p.RetainedImage
+			}
+			if p.RetainedVersion != nil {
+				version = *p.RetainedVersion
+			}
+			retained[safe(image+" / "+version)] = struct{}{}
+		}
+		c.Severity = sevWarn
+		cause := "waiting for replacement evidence"
+		if pacing.BlockingReason != nil && *pacing.BlockingReason != "" {
+			cause = safe(*pacing.BlockingReason)
+		} else {
+			for _, w := range hosted {
+				if w.Worker.ID == pacingID && w.RollBlockingReason.Valid {
+					cause = safe(w.RollBlockingReason.String)
+				}
+			}
+		}
+		c.Summary = fmt.Sprintf("Worker roll held at %s: %s.", safe(pacing.TargetImage), cause)
+		if pacing.State == "override" {
+			c.Summary = fmt.Sprintf("Worker roll override to %s: pacing protection bypassed; retained capacity is at risk.", safe(pacing.TargetImage))
+		}
+		// Pacing adds containment details; it cannot lower the existing
+		// all-workers-stuck danger signal or suppress its instance alerts.
+		if failed == len(hosted) {
+			c.Severity = sevDanger
+			c.Summary = fmt.Sprintf("Worker roll %s at %s: %s. All %d hosted workers are stuck.", pacing.State, safe(pacing.TargetImage), cause, failed)
+			if haveStuckSince {
+				c.Since = sincePtr(stuckSince)
+			}
+		}
+		keys := make([]string, 0, len(retained))
+		for key := range retained {
+			keys = append(keys, key)
+		}
+		slices.Sort(keys)
+		coverage := keys[:min(len(keys), 8)]
+		if len(coverage) == 0 {
+			coverage = append(coverage, "none confirmed")
+		}
+		c.Evidence = []apitypes.HealthEvidenceDTO{
+			{Label: "Target image", Value: safe(pacing.TargetImage)},
+			{Label: "Blocking reason", Value: cause},
+			{Label: "Retained image / version coverage", Value: safe(strings.Join(coverage, "; "))},
+		}
+		return c
+	}
+
 	if !anyFreshSignal {
 		// M2 conjunct: only degrade to `unknown` when the controller is ALSO not reporting
 		// cleanly. If controller.report is ok, the controller is alive and simply carries no
@@ -217,6 +303,9 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	if failed == 0 {
 		c.Severity = sevOK
 		c.Summary = fmt.Sprintf("All %d hosted workers are rolling cleanly.", len(hosted))
+		if pacing != nil {
+			c.Summary = fmt.Sprintf("Worker roll %s to %s; waiting for replacement evidence.", pacing.State, safe(pacing.TargetImage))
+		}
 		return c
 	}
 
@@ -616,8 +705,18 @@ func (s *Service) checkQueueUndispatched(ctx context.Context, now time.Time) api
 // checkDB warns on a slow ping or a saturated pool and is danger on a failed ping or a
 // migration-version mismatch. It reads the injected probe (the live pool in production, a
 // fake in unit tests). A nil probe (no pool wired) is `unknown`.
-func (s *Service) checkDB(ctx context.Context) apitypes.HealthCheckDTO {
+func (s *Service) checkDB(ctx context.Context, now time.Time) apitypes.HealthCheckDTO {
 	c := s.base("db")
+	// Evaluated before the nil-probe return so a recorded 53100 is never hidden behind
+	// "probe not configured". It is a fixed server-authored string; no DB error text.
+	if active, last, start := s.cfg.DiskFull.Snapshot(now); active {
+		c.Severity = sevDanger
+		c.Summary = emergencyDiskFullLine
+		c.Evidence = []apitypes.HealthEvidenceDTO{{Label: "Last seen", Value: last.UTC().Format(time.RFC3339)}}
+		c.Since = sincePtr(start)
+		c.Action = strPtr("The database volume is full. Free space or grow the volume; see the admin health docs for the recommended infrastructure free-space alert.")
+		return c
+	}
 	if s.probeDB == nil {
 		c.Severity = sevUnknown
 		c.Summary = "The database probe is not configured."

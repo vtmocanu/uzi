@@ -63,9 +63,9 @@ func TestAdminUsageWindowCommands(t *testing.T) {
 		flags []string
 		want  string
 	}{
-		{"default", nil, "factory (lifetime): input=999 cache_read=888 cache_creation=777 output=666 cost=$196.00 (subscription/unreported costs excluded: subscription_runs=4 unreported_runs=5) (runs=99) finished=100 failed=10 (5 recoverable) fail_rate=10.0% since_last_failure=6h"},
+		{"default", nil, "factory (lifetime): input=999 cache_read=888 cache_creation=777 output=666 cost=$196.00 (API-equivalent estimate incomplete; legacy runs have tokens without an estimate; unreported partial costs included: subscription_runs=4 unreported_runs=5) (runs=99) finished=100 failed=10 (5 recoverable) fail_rate=10.0% since_last_failure=6h"},
 		{"explicit lifetime", []string{"--window", "lifetime"}, "factory (lifetime): input=999"},
-		{"seven days", []string{"--window", "last_7_days"}, "factory (last_7_days): input=33 cache_read=36 cache_creation=39 output=50 cost=$6.00 (subscription/unreported costs excluded: subscription_runs=2 unreported_runs=3) (runs=6) finished=12 failed=3 (1 recoverable) fail_rate=25.0% since_last_failure=6h"},
+		{"seven days", []string{"--window", "last_7_days"}, "factory (last_7_days): input=33 cache_read=36 cache_creation=39 output=50 cost=$6.00 (API-equivalent estimate incomplete; legacy runs have tokens without an estimate; unreported partial costs included: subscription_runs=2 unreported_runs=3) (runs=6) finished=12 failed=3 (1 recoverable) fail_rate=25.0% since_last_failure=6h"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			c := &usageWindowClient{FakeClient: uzicli.FakeClient{AdminUsageV: usageWindowFixture()}}
@@ -138,9 +138,9 @@ func TestAdminUsageWindowRowsAndCopy(t *testing.T) {
 	}
 	out := buf.String()
 	for _, want := range []string{
-		"b@example.com 3 1 (1 recoverable) 25.0% 6h 11 12 13 20 $2.00 (subscription/unreported costs excluded: subscription_runs=2 unreported_runs=3)",
-		"lifetime@example.com 0 0 - no failures 0 0 0 0 $0.00",
-		"outcomes@example.com 0 1 50.0% - 0 0 0 0 $0.00",
+		"b@example.com 3 1 (1 recoverable) 25.0% 6h 11 12 13 20 $2.00 (API-equivalent estimate incomplete; legacy runs have tokens without an estimate; unreported partial costs included: subscription_runs=2 unreported_runs=3)",
+		"lifetime@example.com 0 0 - no failures 0 0 0 0 $0.00 (API-equivalent)",
+		"outcomes@example.com 0 1 50.0% - 0 0 0 0 $0.00 (API-equivalent)",
 	} {
 		email := strings.Fields(want)[0]
 		got := strings.Join(strings.Fields(lineWith(t, out, email)), " ")
@@ -158,7 +158,7 @@ func TestAdminUsageWindowRowsAndCopy(t *testing.T) {
 	}
 	lifetime := renderUsageToString(t, u)
 	assertUsageWindowOrder(t, lifetime, []string{"lifetime@example.com", "b@example.com", "c@example.com", "a@example.com", "outcomes@example.com"})
-	if got := strings.Join(strings.Fields(lineWith(t, lifetime, "b@example.com")), " "); got != "b@example.com 40 10 20.0% 6h 0 0 0 0 $90.00 (subscription/unreported costs excluded: subscription_runs=7 unreported_runs=8)" {
+	if got := strings.Join(strings.Fields(lineWith(t, lifetime, "b@example.com")), " "); got != "b@example.com 40 10 20.0% 6h 0 0 0 0 $90.00 (API-equivalent estimate incomplete; legacy runs have tokens without an estimate; unreported partial costs included: subscription_runs=7 unreported_runs=8)" {
 		t.Errorf("lifetime row=%q", got)
 	}
 }
@@ -202,12 +202,12 @@ func TestAdminUsageWindowZero(t *testing.T) {
 			t.Fatal(err)
 		}
 		out := buf.String()
-		want := "factory (last_7_days): input=0 cache_read=0 cache_creation=0 output=0 cost=$0.00 (runs=0) finished=0 failed=0 fail_rate=- since_last_failure=-"
+		want := "factory (last_7_days): input=0 cache_read=0 cache_creation=0 output=0 cost=$0.00 (API-equivalent) (runs=0) finished=0 failed=0 fail_rate=- since_last_failure=-"
 		if strings.Split(out, "\n")[0] != want || strings.Contains(out, "excluded") {
 			t.Fatalf("zero output=%s", out)
 		}
 		if len(users) > 0 {
-			if got := strings.Join(strings.Fields(lineWith(t, out, "zero@example.com")), " "); got != "zero@example.com 0 0 - - 0 0 0 0 $0.00" {
+			if got := strings.Join(strings.Fields(lineWith(t, out, "zero@example.com")), " "); got != "zero@example.com 0 0 - - 0 0 0 0 $0.00 (API-equivalent)" {
 				t.Errorf("zero row=%q", got)
 			}
 		}

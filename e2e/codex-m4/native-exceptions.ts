@@ -1,7 +1,7 @@
 import type { ResponsesBody } from "./fake-provider.js";
 
 /** #1566: catalog send_user_message_async is DirectModelOnly; no nested async call is assumed.
- * The schema observed from pinned 0.159.3 requires questions[].title, with optional string options. */
+ * The schema observed from pinned 0.160.0 requires questions[].title, with optional string options. */
 export const ASYNC_QUESTIONS = [{ title: "Which validation should run?", options: ["Focused checks", "Defer"] }];
 export const ASYNC_ARGS = { questions: ASYNC_QUESTIONS };
 export const EXCEPTIONS_TITLE = "codex P #1566: pinned async questions and UTC reads complete without worker authority";

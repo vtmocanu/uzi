@@ -113,8 +113,8 @@ D8); it survives below only as the rollback/other-cluster note). Only the tag pu
 anything. Step 1 (the chart-version
 bump) can land **two ways** — a **direct-to-`main` commit** or an **MR**. **Direct-to-`main`
 is the default and preferred at this early dev stage**; the MR way is there for when you want
-the change reviewed. Step 2 (the tag) is identical either way. Both repos (`vtmocanu/uzi` and
-`argo-apps`) permit direct pushes to `main`.
+the change reviewed. Step 2 (the tag) is identical either way. The repository admin role can bypass the
+main ruleset for the release metadata push.
 
 **Auto-tracking does not mean instant.** ArgoCD only notices the new chart on its next
 reconcile poll (default ~3 min) — and a **normal** refresh reuses the cached resolved
@@ -136,28 +136,27 @@ is an independent roll against flaky tests. The trade is that the release commit
 independent pre-land review; that is low risk because it only bumps `Chart.yaml` + CHANGELOG on
 code every feature PR already gated.
 
-**🔴 Unlike the old GitLab tag pipeline, `release.yml` does NOT re-run the full gate.** It runs
-only `assert-version` + `assert-changelog`, then publishes — the heavy test/lint/build gates are
-ASSUMED green on the tagged commit. So **confirm `main`'s `ci.yml` run is green on the exact
-commit you are about to tag BEFORE tagging** (`gh run watch` it if the release commit was just
-pushed); there is no post-tag gate to catch a red `main`. There is no separate "main pipeline"
-to cancel and no warm/cold image cache to reason about — GitHub Actions builds each release fresh.
+**Release publication proves CI coverage without repeating the full gate.**
+`assert-ci-coverage` requires successful main-push CI and smoke on the tagged SHA or its
+ancestors across at most two strict metadata-only hops. It rejects known failures on the
+tagged SHA. Tagged-tree metadata checks validate the chart and bundled changelog; the
+real tagged KinD smoke must succeed before chart publication. Agent runtime bases and
+registry layers are reused when their inputs match; release image identity checks still run.
 
-1. **Bump the chart version and write the CHANGELOG on the release commit.**
-   Edit `chart/Chart.yaml` `version` **and** `appVersion` to the new `X.Y.Z` (they must be
-   equal), and fold `CHANGELOG.md`'s `[Unreleased]` into a new `[X.Y.Z]` section with its
-   date — in the **same** commit. Then land it one of two ways:
-
-   - **Direct to `main` (default).** `git checkout main && git pull --rebase`, commit the
-     bump, `git push origin main`, then **wait for `main`'s `ci.yml` run to go GREEN on that
-     commit before tagging** (step 2). Unlike the old GitLab tag pipeline, `release.yml` does
-     NOT re-run the test/lint/build gate (see the note above), so the tag has no safety net and
-     tagging a red `main` publishes a broken release. `ci.yml`'s `concurrency` cancels any
-     superseded `main` run automatically, so there is nothing to cancel by hand.
-   - **Via an MR (when you want it reviewed).** Open an MR, let CI go green, merge to `main`.
+1. **Wait for the exact main tip, then cut and review the release metadata.**
+   Work in the existing main worktree. Fetch `origin/main` and fast-forward with
+   `git merge --ff-only origin/main`; wait for that exact tip's CI and KinD smoke to succeed
+   before running `.agents/skills/uzi-release/scripts/release-cut.sh X.Y.Z`.
+   Pushing a release commit while parent CI is running cancels the parent's run and
+   destroys its inheritance evidence. The cutter refuses a non-green exact tip.
+   Follow the [release skill](../.agents/skills/uzi-release/SKILL.md) for candidate and
+   promotion options, review `git show HEAD`, then push main. Full main CI still runs
+   on the release commit, but the tag can follow immediately using the enforced parent
+   coverage. A manually prepared metadata bump can also land through an MR; publication
+   requires the same exact-SHA or strict-parent coverage proof.
 
    **Re-check the CHANGELOG just before tagging, whichever way you landed it.**
-   `release.yml`'s `assert-changelog` job fails the publish if any merge since the previous tag
+   `release.yml`'s `assert-changelog` job fails the publish if any merge since the previous stable tag
    changed shipping code without being cited in the new version's section. Run it yourself
    first — `bash scripts/assert-changelog-covers-release.sh main` — because the failure mode
    it guards is invisible in the release commit's own diff (MR or direct): **anything that
@@ -167,16 +166,15 @@ to cancel and no warm/cold image cache to reason about — GitHub Actions builds
    with genuinely nothing to announce is exempted with a `Changelog: none` line in its
    commit message.
 
-2. **Tag that commit (now on `main`) and push the tag.**
+2. **Tag the reviewed release commit and push the tag.**
 
    ```sh
-   git checkout main && git pull
-   git tag -a v0.1.0 -m "uzi 0.1.0"   # == Chart.yaml version/appVersion
-   git push origin v0.1.0
+   git tag -a v0.1.0-rc.1 -m "uzi 0.1.0-rc.1" HEAD  # use the tag printed by release-cut
+   git push origin v0.1.0-rc.1
    ```
 
    The push triggers `release.yml`: it asserts the version equality (`assert-version`) and
-   CHANGELOG coverage (`assert-changelog`), then builds + pushes each image
+   CHANGELOG coverage (`assert-changelog`), CI coverage and tagged metadata, then builds + pushes each image
    (`ghcr.io/vtmocanu/uzi/{api,web,controller,agent-base,agent-jvm}:<tag>` + `:<short-sha>`) and
    the OCI chart (`oci://ghcr.io/vtmocanu/uzi/uzi:<tag>`, published LAST). Homebrew is a separate
    `v*`-triggered run (`brew.yml`).
@@ -219,11 +217,26 @@ image rebuild; old versions stay in GHCR). Because `0.*` would otherwise re-adva
 bad version, resuming auto-tracking means cutting a **fix release** (`0.Y.Z+1`) first, then
 setting `targetRevision` back to `0.*`.
 
-**Hotfix** is a separate, documented **manual** procedure — not a `release-cut` verb: worktree
-at the promoted stable `vB`, cherry-pick the already-merged fix commit(s), a `## [B.1]`
-CHANGELOG section citing them, `deploy/chart/Chart.yaml` bumped to `B.1`, tag `vB.1`, and push.
-See [ADR-1265](../adr/1265-rc-release-train.md) (D4) and `.agents/skills/uzi-release/SKILL.md`
-for the exact steps.
+**Hotfix** remains a manual procedure. Start a worktree at the previous stable patch
+(for example `v0.85.2` for `v0.85.3`), cherry-pick the already-merged fixes, add a cited
+CHANGELOG section and bump both chart version fields. Run
+`scripts/worker-tag-autobump.sh 0.85.3` before committing the metadata so an agent runtime
+fix also advances the worker pin. Run the affected component gates
+and `task check:release-metadata` locally. Since this off-main tree has no main-push CI,
+use an annotated stable patch tag with an explicit exception:
+
+```sh
+git tag -a v0.85.3 -m "v0.85.3" -m "CI-Coverage: hotfix-uncovered" HEAD
+```
+
+The gate reports **UNVERIFIED hotfix: no full CI evidence**. This preserves the existing
+hotfix path; it does not claim those local checks are CI proof. The tag must target an
+off-main descendant of the immediately previous stable patch on its first-parent chain.
+A lightweight tag or missing marker cannot use this exception. In general, a failed
+main-push run on the tagged SHA or any visited coverage-chain commit vetoes publication;
+tagged metadata, version/changelog, worker-image checks and real tagged
+KinD smoke before chart publication remain required. Push under the usual tag authority.
+See [ADR-1265](../adr/1265-rc-release-train.md) (D4) for the separate coverage window.
 
 ## Platform-admin prerequisites (one-time)
 
@@ -466,10 +479,30 @@ which takes uzi down. It fails closed, but the blast radius is the whole product
 | `workers.enabled` | `false` | The envelope + (with the controller) the whole feature. |
 | `workers.controller.enabled` | `true` | `false` = M3's envelope-only shape: namespace/RBAC/quotas/policies with nothing running. Also turns the api's hosting switch off — the two are one flag (`uzi.apiHostingEnabled`), because hosting with no controller means users provision workers nothing ever materializes. Only `kind-smoke.yaml` sets it. |
 | `workers.image.repository` | `ghcr.io/vtmocanu/uzi` | The **prefix**; the controller appends `/agent-<template>:<tag>`. Must match the prefix `release.yml` publishes the agent images under (`ghcr.io/vtmocanu/uzi/agent-base`, `.../agent-jvm`). |
-| `workers.image.tag` | `"0.48.0"` (a **concrete** pin) | **Decoupled from `Chart.AppVersion`** (PRD #422; reverses the old `""` → appVersion default). An app-only release (api/web/db/controller bump) leaves this tag alone, so it rolls **zero** worker pods. Bump it to a new concrete version to deliberately advance the worker fleet — the controller then cordons and drains each busy worker (see `workers.drainDeadline`/`workers.forceRoll` below) instead of hard-killing it. **Must be a concrete version string**: the chart wraps it in `required`, so a blank tag fails the render rather than silently reverting to appVersion — an out-of-tree per-cluster values file that relied on the old empty-tag default must now set one explicitly. See [adr/0422-decouple-worker-version.md](../adr/0422-decouple-worker-version.md). |
-| `workers.drainDeadline` | `"24h"` | How long the controller waits for a cordoned busy worker to finish its run before rolling it anyway (its run then falls back to the existing requeue path). A Go duration string (`"1h"`, `"30m"`). |
-| `workers.forceRoll` | `false` | Emergency override: rolls every drifted worker immediately, regardless of busy-ness (e.g. a CVE that cannot wait on a drain). Leave `false` in normal operation. |
+| `workers.image.tag` | `"0.86.0-rc.9"` (a **concrete** pin) | **Decoupled from `Chart.AppVersion`** (PRD #422; reverses the old `""` → appVersion default). An app-only release leaves this tag alone and rolls zero worker pods when worker rendering is also unchanged. Controller template changes can still cause a paced same-image roll. Bump it to a new concrete version to deliberately advance the worker fleet, with the matching exact `workers.rollTargetVersion` below. The singleton controller admits a canary per owner/lane/capability pool and cordons busy workers when their turn is admitted; retained workers keep claiming. **Must be a concrete version string**: the chart wraps it in `required`, so a blank tag fails the render rather than silently reverting to appVersion — an out-of-tree per-cluster values file that relied on the old empty-tag default must now set one explicitly. See [adr/0422-decouple-worker-version.md](../adr/0422-decouple-worker-version.md). |
+| `workers.controller.replicaCount` | `1` | Enabled controller rendering accepts `0` or `1`, with Recreate strategy. `0` stops reconciliation. Extra controllers outside the chart are unsupported; there is no multi-controller coordination. |
+| `workers.rollConcurrency` | `1` | Positive integer: concurrent admitted replacements per coverage pool after canary promotion. Busy draining reservations and unconfirmed writes consume slots. |
+| `workers.rollTargetVersion` | `""` | Exact verified baked version of the pinned worker image, including `+g<commit>`. Set it even for published bare SemVer tags: ADR-1720's full stamp cannot be derived from those tags. Missing mapping holds paced rolls before cordoning; never infer it from the replacement or strip metadata. |
+| `workers.drainDeadline` | `"24h"` | Go duration (`"1h"`, `"30m"`) bounding a busy worker's **admitted image turn**, not the fleet wait. Expiry requires a bounded fresh re-cordon/poll confirming the current expired drain timestamp. It cannot bypass admission, capacity or a stuck-pool hold. Independent maintenance deadlines retain their own meaning; interrupted runs use the existing requeue path. |
+| `workers.forceRoll` | `false` | Explicit emergency bypass of pacing, holds, promotion evidence and busy waits for drifted workers. Can remove remaining capacity. Custody and independent maintenance fences still apply; no automatic rollback. Restore `false` after the emergency. |
 | `workers.storageClass` | `""` (cluster default) | `standard` on dev-cluster. |
+
+### Deploying paced hosted rolls (#1470)
+
+Deploy the new API first, then the new singleton controller and matching chart
+RBAC, keeping `workers.image.tag` steady. Verify poll evidence and report support
+before advancing the worker pin and its verified `workers.rollTargetVersion`.
+Adding `UZI_POD_UID` and the existing registration-name transport changes the
+worker template, so the controller upgrade itself causes a paced template roll
+at the same image pin. Worker images and user-chosen names do not change.
+
+A new controller against an old API holds when promotion evidence is missing;
+it does not silently fall back to unpaced replacement. An old controller against
+a new API still rolls without pacing. Downgrading during an active paced roll is
+unsafe. Use [Hosted roll verification](../docs/hosted-worker-roll-verification.md)
+for prerequisites, recovery and the maintainer's **open**, unexecuted hosted
+checks. The existing [KinD smoke values](values/kind-smoke.yaml) disable the
+controller and prove the envelope, not paced availability.
 
 ### Not proven until the first real rollout
 
@@ -615,8 +648,8 @@ full reasoning.
 - Loopback-bind — dockerd listens on `tcp://127.0.0.1:2375` only (the
   `docker:dind` image's automatic `0.0.0.0:2375` listener is suppressed), so the
   unauthenticated root daemon is never reachable off-pod.
-- Claim-time repo allowlist — the **Admin Settings** `docker_repo_allowlist`
-  setting: a docker-capable worker only claims runs whose repo is on it. This is
+- Claim-time repo allowlist — the `docker_repo_allowlist`
+  setting (**Admin → Instance → Docker worker repo allowlist**): a docker-capable worker only claims repo-bearing runs whose repo is on it (repo-less judge runs stay claimable, see `api/internal/store/queries/runtime.sql`). This is
   the acceptance's likelihood control and **must be populated before any real
   work runs on a non-rootless cluster**, not an optional follow-up.
 - Soft anti-affinity — keeps the api pod (holding `UZI_SECRET_KEY`) and CNPG off

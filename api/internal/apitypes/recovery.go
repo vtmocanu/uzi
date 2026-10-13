@@ -301,24 +301,31 @@ type RecoveryHoldsResponse struct {
 // superseding | superseded | settling). All three are absent when the run has no live
 // retention record.
 type RecoveryCustodyHoldDTO struct {
-	InventoryGuarded        bool                      `json:"inventory_guarded"`
-	FinalReceipt            *RecoveryFinalDisposition `json:"final_receipt,omitempty"`
-	TerminalRecordRejection string                    `json:"terminal_record_rejection,omitempty"`
-	ID                      string                    `json:"id"`
-	RunID                   string                    `json:"run_id"`
-	Generation              int64                     `json:"generation"`
-	State                   string                    `json:"state"`
-	Attention               string                    `json:"attention"`
-	WorkerID                string                    `json:"worker_id"`
-	WorkerName              string                    `json:"worker_name,omitempty"`
-	HasAvailableCapture     bool                      `json:"has_available_capture"`
-	CaptureState            string                    `json:"capture_state,omitempty"`
-	CreatedAt               time.Time                 `json:"created_at"`
-	UpdatedAt               time.Time                 `json:"updated_at"`
-	ReleasedAt              *time.Time                `json:"released_at,omitempty"`
-	CheckpointRef           string                    `json:"checkpoint_ref,omitempty"`
-	CheckpointTip           string                    `json:"checkpoint_tip,omitempty"`
-	CheckpointState         string                    `json:"checkpoint_state,omitempty"`
+	CompletedPublicationReceipt *CompletedPublicationReceipt `json:"completed_publication_receipt,omitempty"`
+	CompletedPublicationReason  string                       `json:"completed_publication_reason,omitempty"`
+	InventoryGuarded            bool                         `json:"inventory_guarded"`
+	FinalReceipt                *RecoveryFinalDisposition    `json:"final_receipt,omitempty"`
+	TerminalRecordRejection     string                       `json:"terminal_record_rejection,omitempty"`
+	ID                          string                       `json:"id"`
+	RunID                       string                       `json:"run_id"`
+	Generation                  int64                        `json:"generation"`
+	State                       string                       `json:"state"`
+	Attention                   string                       `json:"attention"`
+	WorkerID                    string                       `json:"worker_id"`
+	WorkerName                  string                       `json:"worker_name,omitempty"`
+	HasAvailableCapture         bool                         `json:"has_available_capture"`
+	CaptureState                string                       `json:"capture_state,omitempty"`
+	CreatedAt                   time.Time                    `json:"created_at"`
+	UpdatedAt                   time.Time                    `json:"updated_at"`
+	ReleasedAt                  *time.Time                   `json:"released_at,omitempty"`
+	CheckpointRef               string                       `json:"checkpoint_ref,omitempty"`
+	CheckpointTip               string                       `json:"checkpoint_tip,omitempty"`
+	CheckpointState             string                       `json:"checkpoint_state,omitempty"`
+
+	// FinalPublicationID and HeldRef (issue #2545) are set only for a hold released against a
+	// held publication: the publication row and the forge ref its work lives on.
+	FinalPublicationID string `json:"final_publication_id,omitempty"`
+	HeldRef            string `json:"held_ref,omitempty"`
 }
 
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the
@@ -366,9 +373,14 @@ type RecoveryReconcileResponse struct {
 
 // RecoveryFinalDisposition binds a final archive or empty settled inventory to an exact hold.
 // It is also the owner's read-only receipt after worker deletion.
+//
+// Kind "held_publication" (issue #2545) binds a failed run's held work published to the forge
+// ref refs/uzi-held/<run-id>/<generation>: PublicationID names the run_held_publications row,
+// SourceSha is the ref's tip and CoverageDigest the digest step A published; CaptureID is empty.
 type RecoveryFinalDisposition struct {
 	Kind           string `json:"kind"`
 	CaptureID      string `json:"capture_id,omitempty"`
+	PublicationID  string `json:"publication_id,omitempty"`
 	SourceSha      string `json:"source_sha,omitempty"`
 	CoverageDigest string `json:"coverage_digest"`
 }

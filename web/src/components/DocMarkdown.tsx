@@ -3,6 +3,7 @@ import { type Components } from "react-markdown";
 import { Link } from "react-router-dom";
 import { rewriteHref, resolveImageSrc } from "../lib/docs";
 import { MarkdownCore } from "./MarkdownCore";
+import { rehypeHeadingIds } from "../lib/rehypeHeadingIds";
 
 // Trusted-docs policy for the shared MarkdownCore. Content is repo-authored and
 // reviewed; the pipeline (react-markdown, no rehype-raw) plus these overrides
@@ -53,5 +54,13 @@ function buildComponents(isAdmin: boolean): Components {
 
 export function DocMarkdown({ content, isAdmin }: { content: string; isAdmin: boolean }) {
   const components = useMemo(() => buildComponents(isAdmin), [isAdmin]);
-  return <MarkdownCore content={content} className="docs-prose" components={components} />;
+  const rehypePlugins = useMemo(() => [rehypeHeadingIds], []);
+  return (
+    <MarkdownCore
+      content={content}
+      className="docs-prose"
+      components={components}
+      rehypePlugins={rehypePlugins}
+    />
+  );
 }

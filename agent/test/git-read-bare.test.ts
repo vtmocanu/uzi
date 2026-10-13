@@ -2,7 +2,7 @@
 // (pr-description-context.ts). Real git over a real bare repository.
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
-import { execFileSync } from "node:child_process";
+import { execFileSync, spawn } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
@@ -11,6 +11,8 @@ import { setTimeout as delay } from "node:timers/promises";
 
 import { GitCache, type BoundaryProcessSpawner } from "../src/git.js";
 import { resolvePrdInputFromBare } from "../src/prd-link.js";
+import { readRepoInstructionsAtCommit } from "../src/repo-instructions-at-commit.js";
+import { fileURLToPath } from "node:url";
 import type { BoundaryProcessRequest } from "../src/harness.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
@@ -48,6 +50,68 @@ function withBare(files: Record<string, string>, fn: (gc: GitCache, bare: string
 }
 
 describe("GitCache.readBare (PRD #1798 M5)", () => {
+  it("consumes a dash-leading relative cwd as the required -C value in real Git", async () => {
+    const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+    fs.mkdirSync(scratch, { recursive: true });
+    const root = fs.mkdtempSync(path.join(scratch, "readbare-cwd-"));
+    const originalCwd = process.cwd();
+    try {
+      const bare = path.join(root, "-bare.git");
+      git(root, "init", "--bare", "--", bare);
+      const gc = new GitCache(root, nullLogger(), undefined, testGitCacheOptions());
+      process.chdir(root);
+      assert.deepEqual(await gc.readBare("-bare.git", ["rev-parse", "--is-bare-repository"], {
+        maxBytes: 32, timeoutMs: 30_000,
+      }), { text: "true\n", truncated: false });
+      const seen: BoundaryProcessRequest[] = [];
+      const spawner: BoundaryProcessSpawner = async (request) => {
+        seen.push(request);
+        const child = spawn(request.argv[0]!, request.argv.slice(1), {
+          cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"],
+        });
+        const completed = new Promise<{ code: number }>((resolve, reject) => {
+          child.once("error", reject);
+          child.once("close", (code) => resolve({ code: code ?? -1 }));
+        });
+        return { stdin: child.stdin, stdout: child.stdout, stderr: child.stderr, completed,
+          cancel: async () => { child.kill("SIGKILL"); await completed; } };
+      };
+      // Production factory paths are absolute in normal worker configuration. Exercise that
+      // supervised path with the same hostile basename and actual process cwd plus -C.
+      await gc.withBoundaryProcessSpawner(spawner, new AbortController().signal, async () => {
+        assert.deepEqual(await gc.readBare(bare, ["rev-parse", "--is-bare-repository"], {
+          maxBytes: 32, timeoutMs: 30_000,
+        }), { text: "true\n", truncated: false });
+      });
+      assert.equal(seen.length, 1);
+      assert.equal(seen[0]!.cwd, bare);
+      assert.deepEqual(seen[0]!.argv.slice(1, 3), ["-C", bare]);
+    } finally {
+      process.chdir(originalCwd);
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+
+  it("bounded reads keep hostile paths literal and instruction symlink targets out of argv options", async () => {
+    await withBare({ "--output=escape": "literal\n", ":(glob)*": "glob literal\n" }, async (gc, bare) => {
+      const work = path.join(path.dirname(bare), "work");
+      fs.symlinkSync("--output=escape", path.join(work, "CLAUDE.md"));
+      git(work, "add", "--", "CLAUDE.md");
+      git(work, "commit", "-qm", "hostile instruction target");
+      const head = git(work, "rev-parse", "HEAD").trim();
+      git(path.dirname(bare), "--git-dir", bare, "fetch", "-q", work, "main:main");
+      assert.deepEqual(await readRepoInstructionsAtCommit(gc, bare, head, { timeoutMs: 30_000 }), { text: "literal\n" });
+      for (const name of ["--output=escape", ":(glob)*"]) {
+        const read = await gc.readBare(bare, ["--literal-pathspecs", "ls-tree", "--name-only", head, "--", name], {
+          maxBytes: 1024, timeoutMs: 30_000,
+        });
+        assert.equal(read.text, name + "\n");
+      }
+      assert.deepEqual(await resolvePrdInputFromBare(gc, bare, "-output=escape", "PRD: prds/1798-x.md", 1798,
+        { timeoutMs: 30_000 }), { prdPath: null, prdText: null });
+    });
+  });
+
   it("returns a small output whole, untruncated", async () => {
     await withBare({ "a.txt": "hello\n" }, async (gc, bare) => {
       assert.deepEqual(await gc.readBare(bare, ["show", "HEAD:a.txt"], { maxBytes: 1024, timeoutMs: 30_000 }), {
@@ -94,6 +158,26 @@ describe("GitCache.readBare (PRD #1798 M5)", () => {
       const ac = new AbortController();
       ac.abort();
       await assert.rejects(gc.readBare(bare, ["show", "HEAD:a.txt"], { maxBytes: 1024, signal: ac.signal }), /aborted/);
+    });
+  });
+
+  it("reports the read deadline when the native producer timeout closes before the reader timer", async (t) => {
+    await withBare({ "a.txt": "a" }, async (gc, bare) => {
+      t.mock.timers.enable({ apis: ["setTimeout"] });
+      const setTimer = globalThis.setTimeout;
+      let deadlineTimers = 0;
+      t.mock.method(globalThis, "setTimeout", (callback: (...args: unknown[]) => void, ms?: number, ...args: unknown[]) => {
+        // Keep the reader deadline pending while the actual producer timeout kills its child.
+        const delayMs = ms === 100 && ++deadlineTimers === 2 ? 101 : ms;
+        return setTimer(callback, delayMs, ...args);
+      });
+      const read = gc.readBare(bare, ["-c", "alias.wait=!sleep 3", "wait"], { maxBytes: 1024, timeoutMs: 100 });
+      const rejected = assert.rejects(read, /exceeded 100ms/);
+      await Promise.resolve(); // readBare installs its timer after awaiting spawnGit.
+      assert.equal(deadlineTimers, 2, "both 100ms deadlines were armed");
+      t.mock.timers.tick(100);
+      // No further clock advance: only the producer's timeout can cause this rejection.
+      await rejected;
     });
   });
 

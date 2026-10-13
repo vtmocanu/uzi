@@ -1,12 +1,14 @@
 package handler
 
 import (
+	"encoding/json"
 	"net/http"
 	"net/http/httptest"
 	"strings"
 	"testing"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -110,5 +112,37 @@ func TestCreateRunInputDockerWorkerApprovesNoClear(t *testing.T) {
 	}
 	if st.createdApproval == nil {
 		t.Fatal("a satisfying owning worker must approve")
+	}
+}
+
+// Issue #2680: an unbound approve whose milestone list keeps moving ends in a 409 with the
+// distinct approval_milestones_moved reason (not gate_revision_mismatch, which names a revision
+// the client sent). The store refuses every write attempt with the 0-row result.
+func TestCreateRunInputApprovalMilestonesMoved409(t *testing.T) {
+	owner := store.User{ID: uuid.New()}
+	runID, wkrID := uuid.New(), uuid.New()
+	st := gatedCapStore(owner, runID, store.Worker{ID: wkrID}, nil)
+	st.run.CompletionContractVersion = pgtype.Int4{Int32: 1, Valid: true}
+	st.approvalErr = pgx.ErrNoRows
+	h := newRunsHandler(t, st)
+
+	rec := httptest.NewRecorder()
+	h.CreateRunInput(rec, inputReq(owner, runID, approveOwn))
+
+	if rec.Code != http.StatusConflict {
+		t.Fatalf("status = %d, want 409: %s", rec.Code, rec.Body.String())
+	}
+	var got struct {
+		Error  string `json:"error"`
+		Reason string `json:"reason"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+		t.Fatalf("decode body: %v (%s)", err, rec.Body.String())
+	}
+	if got.Reason != "approval_milestones_moved" {
+		t.Fatalf("reason = %q, want approval_milestones_moved (body: %s)", got.Reason, rec.Body.String())
+	}
+	if strings.TrimSpace(got.Error) == "" {
+		t.Error("error message is empty; want re-read guidance beside the reason")
 	}
 }

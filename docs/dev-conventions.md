@@ -19,7 +19,7 @@ enumerates them.
 Install the runner first:
 
 ```sh
-go install github.com/go-task/task/v3/cmd/task@v3.51.1
+go install github.com/go-task/task/v3/cmd/task@v3.54.0
 ```
 
 Pinned to the same version CI installs, verified through Go's checksum database,
@@ -365,11 +365,26 @@ jobs. All four of those jobs are in `*publish_needs`, so **the release-blocking
 property is inherited**: a CVE published on a Tuesday can redden a `v*` tag publish
 with nobody's diff in it. That is accepted rather than overlooked.
 
-**npm audit gates at `--audit-level=high`, not at zero**, because two moderate
-`react-router` advisories survive every available option — no patched 6.x exists,
-`--force` will not touch them, `overrides` has nothing to point at — so clearing
-them is a React Router 6 → 7 major through shipped SPA routing code. Filed as its
-own issue rather than left as an unexplained threshold.
+**npm audit gates at `--audit-level=high`, not at zero.** The threshold was set
+because two moderate `react-router` advisories had no fix on React Router 6: no
+patched 6.x existed, `--force` would not touch them, and `overrides` had nothing to
+point at, so clearing them meant a React Router 6 → 7 major. `web/package.json` has
+since moved to `react-router-dom` `^7.0.0`, which removed that reason. The threshold
+itself is unchanged and is still `--audit-level=high`.
+
+#### Temporary Mermaid KaTeX override (#2456)
+
+[Issue #2456](https://github.com/vtmocanu/uzi/issues/2456) pins Mermaid's KaTeX
+dependency to `0.18.2` via the scoped `mermaid` override in `web/package.json`
+to address [GHSA-238p-pmpm-9mq7](https://github.com/advisories/GHSA-238p-pmpm-9mq7).
+Mermaid is a dev-only parser for the PR diagram browser tests; Mermaid 11.17.2
+still requires KaTeX `^0.16.47`, so the override upgrades this transitive dependency
+without changing direct dependency declarations or other KaTeX consumers.
+
+Remove the override once a Mermaid release allows KaTeX `>= 0.18.2`. Before
+removal, verify the release's dependency range, regenerate and inspect the
+lockfile to confirm a patched KaTeX resolves without the override, and run the
+PR diagram browser tests and `task vulncheck:web`.
 
 ### 🔴 The rule this milestone earned: a gate script names the environment variables that can shrink its view, and refuses them
 
@@ -608,6 +623,27 @@ dev-server start), or use the Dockerfile above for a full static build.
 (`src/mocks/mockApi/shared.ts`'s `mockScenario()`). It's a single string, so
 scenarios are mutually exclusive by construction. Known values:
 
+- `run-progress` — the PRD #2789 M1 progress card, seeded by
+  `web/src/mocks/data/unifiedProgress.ts`. Open
+  `/runs/run-progress-running?mock=run-progress`,
+  `/runs/run-progress-approval?mock=run-progress`,
+  `/runs/run-progress-failed?mock=run-progress`,
+  `/runs/run-progress-completed?mock=run-progress` or
+  `/runs/run-progress-assigned?mock=run-progress`.
+  The running fixture has a live documenter owner plus a second spec-keeper
+  lane, a `now_note`, iteration 4 and an estimated usage tail. The assigned
+  fixture declares an architect owner with no attributed live lane while
+  documenter and spec-keeper are live, exercising the quiet
+  `Assigned owner:` strip. Approval has candidate rows but no frozen list;
+  failed and completed retain frozen rows with null progress and no live
+  lanes or Now note. These routes cover the unified card and
+  header settings/controls. Open Run settings to inspect the token epochs
+  and toggles; the assigned fixture includes one recorded pin and its time.
+  Approval, holds and outcomes precede progress. The footer uses recorded
+  usage with separate estimated tails; summaries remember saved choices and
+  otherwise collapse after approval. Now fixtures illustrate intended work
+  from titles and role labels. Prompt tests check instructions and fences;
+  live model wording remains a maintainer spot-check.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).
 - `truncated-backlog` — `/judge?mock=truncated-backlog` puts the
@@ -690,3 +726,20 @@ reachable in the demo, not merely covered by a unit test** —
 is realistic" in general is still a convention to uphold by hand, not a
 gate to rely on: the PRD #311 M3 guard covers one specific invariant on
 five named fixtures, nothing broader.
+
+## Coordinated Codex runtime upgrades
+
+The runtime is an image-baked native package, separate from worker-model preferences.
+A lock-only bump is insufficient: the installed versioned directory must agree
+with `CODEX_BIN`, the fail-closed runtime probe's version and architecture digests,
+and active M4 version assertions/evidence. Keep the lock's version, manifest,
+source commit and both architecture tag/hash pairs coordinated; preserve the
+installer's existing verification and the worker's isolation checks.
+
+Before accepting an upgrade, verify the official packages and the actual installed
+executable/receipt/probe on the supported architecture, then require the full real
+worker-UID lane and other required CI checks. Docker-free coordinate tests detect
+stale consumers but do not prove native execution or probe capability. Distinguish
+infrastructure failures from runtime RED, and record evidence on exact source
+heads. The [0.160.0 ADR amendment](../adr/1106-codex-harness.md#amendment-coordinated-runtime-01600-2026-10-10)
+records the compatibility audit and the observed upgrade comparison.

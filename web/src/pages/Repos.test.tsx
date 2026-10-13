@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { Repos } from "./Repos";
 import { api, ApiError, type ForgeConnection, type Repo } from "../lib/api";
@@ -18,6 +18,7 @@ vi.mock("../lib/api", async (importOriginal) => {
       setRepoSkillsEnabled: vi.fn(),
       setRepoClaudemdEnabled: vi.fn(),
       setRepoTrustFlags: vi.fn(),
+      setRepoCodeCrossCheckInputs: vi.fn(),
       getRepoToolProfile: vi.fn(),
       listToolAllowlist: vi.fn(),
       setRepoToolProfile: vi.fn(),
@@ -177,6 +178,169 @@ describe("Repos — Trusted repo panel", () => {
   it("renders the panel OUTSIDE the horizontal-scroll container (never clipped)", async () => {
     const panel = await openTrustPanel("vtmocanu/uzi");
     expect(panel.closest(".overflow-x-auto")).toBeNull();
+  });
+});
+
+// Open the Code cross-check panel for a repo row and return its group element.
+async function openCrossCheckPanel(name: string): Promise<HTMLElement> {
+  renderPage();
+  await screen.findByText(name);
+  fireEvent.click(within(rowFor(name)).getByRole("button", { name: /Code cross-check settings for/ }));
+  return screen.getByRole("group", { name: new RegExp(`Code cross-check for ${name}`) });
+}
+
+const CLAUDEMD_SWITCH = "Give the checker this repository's CLAUDE.md (read from the base commit)";
+
+describe("Repos — Code cross-check panel (PRD #2170 M3)", () => {
+  it("shows a Default badge + Manage on an enabled repo and nothing on a disabled one", async () => {
+    renderPage();
+    await screen.findByText("vtmocanu/uzi");
+    const row = within(rowFor("vtmocanu/uzi"));
+    expect(row.getByText("Default")).toBeTruthy();
+    expect(row.getByRole("button", { name: /Code cross-check settings for vtmocanu\/uzi/ })).toBeTruthy();
+    expect(within(rowFor("example/website")).queryByRole("button", { name: /Code cross-check settings/ })).toBeNull();
+  });
+
+  it("opens outside the scrolling table with the explainer and focuses the guidance field", async () => {
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    expect(panel.closest(".overflow-x-auto")).toBeNull();
+    expect(
+      within(panel).getByText(
+        "Additional checks for the code cross-checker on this repository. Guidance cannot remove the required checks or change the read-only rules.",
+      ),
+    ).toBeTruthy();
+    const field = within(panel).getByLabelText("Guidance");
+    await waitFor(() => expect(document.activeElement).toBe(field));
+    expect(within(panel).getByRole("switch", { name: CLAUDEMD_SWITCH }).getAttribute("aria-checked")).toBe("false");
+    expect(within(panel).getByText("0 of 8192 bytes")).toBeTruthy();
+  });
+
+  it("counts UTF-8 bytes, not characters, as the owner types", async () => {
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    // "é" is 2 bytes and "日本" is 6: 1 + 2 + 6 = 9 bytes for 4 characters.
+    fireEvent.change(within(panel).getByLabelText("Guidance"), { target: { value: "aé日本" } });
+    expect(within(panel).getByText("9 of 8192 bytes")).toBeTruthy();
+  });
+
+  it("disables Save over the 8192-byte cap and says how much to remove", async () => {
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    const save = () => within(panel).getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    // Exactly at the cap is allowed.
+    fireEvent.change(within(panel).getByLabelText("Guidance"), { target: { value: "é".repeat(4096) } });
+    expect(within(panel).getByText("8192 of 8192 bytes")).toBeTruthy();
+    expect(save().disabled).toBe(false);
+    // One byte over is not.
+    fireEvent.change(within(panel).getByLabelText("Guidance"), { target: { value: "é".repeat(4096) + "a" } });
+    expect(within(panel).getByText("8193 of 8192 bytes. Remove 1 byte to save.")).toBeTruthy();
+    expect(save().disabled).toBe(true);
+    expect(within(panel).getByLabelText("Guidance").getAttribute("aria-invalid")).toBe("true");
+    fireEvent.click(save());
+    expect(mockApi.setRepoCodeCrossCheckInputs).not.toHaveBeenCalled();
+  });
+
+  it("Save sends one PATCH with both inputs and updates the row from the response", async () => {
+    mockApi.setRepoCodeCrossCheckInputs.mockResolvedValue({
+      repo: { ...REPOS[0], code_cross_check_guidance: "Check migrations.", cross_check_repo_instructions_enabled: false },
+    });
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    const save = () => within(panel).getByRole("button", { name: "Save" }) as HTMLButtonElement;
+    // Nothing to save until the draft differs from the saved inputs.
+    expect(save().disabled).toBe(true);
+    fireEvent.change(within(panel).getByLabelText("Guidance"), { target: { value: "Check migrations." } });
+    fireEvent.click(save());
+    await waitFor(() => expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledTimes(1));
+    expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledWith("repo-uzi", {
+      code_cross_check_guidance: "Check migrations.",
+      cross_check_repo_instructions_enabled: false,
+    });
+    expect(await within(panel).findByText(/^Saved\./)).toBeTruthy();
+    expect(within(rowFor("vtmocanu/uzi")).getByText("Guidance")).toBeTruthy();
+    expect(save().disabled).toBe(true);
+  });
+
+  it("clearing the guidance sends null", async () => {
+    mockApi.listProjects.mockResolvedValue({
+      repos: [{ ...REPOS[0], code_cross_check_guidance: "Old guidance." }, REPOS[1], REPOS[2]],
+    });
+    mockApi.setRepoCodeCrossCheckInputs.mockResolvedValue({
+      repo: { ...REPOS[0], code_cross_check_guidance: null, cross_check_repo_instructions_enabled: false },
+    });
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    const field = within(panel).getByLabelText("Guidance") as HTMLTextAreaElement;
+    expect(field.value).toBe("Old guidance.");
+    fireEvent.change(field, { target: { value: "" } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledWith("repo-uzi", {
+        code_cross_check_guidance: null,
+        cross_check_repo_instructions_enabled: false,
+      }),
+    );
+    await waitFor(() => expect(within(rowFor("vtmocanu/uzi")).getByText("Default")).toBeTruthy());
+  });
+
+  it("the CLAUDE.md toggle is part of the draft and saves with it", async () => {
+    mockApi.setRepoCodeCrossCheckInputs.mockResolvedValue({
+      repo: { ...REPOS[0], code_cross_check_guidance: null, cross_check_repo_instructions_enabled: true },
+    });
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    const toggle = within(panel).getByRole("switch", { name: CLAUDEMD_SWITCH });
+    fireEvent.click(toggle);
+    // Toggling alone does not write; Save does.
+    expect(mockApi.setRepoCodeCrossCheckInputs).not.toHaveBeenCalled();
+    expect(toggle.getAttribute("aria-checked")).toBe("true");
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
+    await waitFor(() =>
+      expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledWith("repo-uzi", {
+        code_cross_check_guidance: null,
+        cross_check_repo_instructions_enabled: true,
+      }),
+    );
+    await waitFor(() => expect(within(rowFor("vtmocanu/uzi")).getByText("CLAUDE.md")).toBeTruthy());
+  });
+
+  it("shows a refusal inside the panel and keeps the draft", async () => {
+    mockApi.setRepoCodeCrossCheckInputs.mockRejectedValue(new ApiError(403, "only the repo owner or an admin can change this"));
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    fireEvent.change(within(panel).getByLabelText("Guidance"), { target: { value: "Check migrations." } });
+    fireEvent.click(within(panel).getByRole("button", { name: "Save" }));
+    expect(await within(panel).findByRole("alert")).toBeTruthy();
+    expect((within(panel).getByLabelText("Guidance") as HTMLTextAreaElement).value).toBe("Check migrations.");
+  });
+
+  // Save of repo A is still in flight when repo B's panel opens: the late response must not
+  // reach B's draft (success) or B's alert (failure), whatever A's outcome.
+  for (const outcome of ["resolves", "rejects"] as const) {
+    it(`a deferred save for repo A that ${outcome} after repo B opened leaves B's draft and alert alone`, async () => {
+      let settleA: () => void = () => {};
+      const pending = new Promise<{ repo: Repo }>((resolve, reject) => {
+        settleA = () => (outcome === "resolves"
+          ? resolve({ repo: { ...REPOS[0], code_cross_check_guidance: "A saved guidance", cross_check_repo_instructions_enabled: true } })
+          : reject(new ApiError(403, "A refused")));
+      });
+      mockApi.setRepoCodeCrossCheckInputs.mockReturnValue(pending);
+      const panelA = await openCrossCheckPanel("vtmocanu/uzi");
+      fireEvent.change(within(panelA).getByLabelText("Guidance"), { target: { value: "A draft" } });
+      fireEvent.click(within(panelA).getByRole("button", { name: "Save" }));
+      await waitFor(() => expect(mockApi.setRepoCodeCrossCheckInputs).toHaveBeenCalledTimes(1));
+      fireEvent.click(within(rowFor("vtmocanu/atlas")).getByRole("button", { name: /Code cross-check settings for/ }));
+      const panelB = screen.getByRole("group", { name: /Code cross-check for vtmocanu\/atlas/ });
+      const guidanceB = () => within(panelB).getByLabelText("Guidance") as HTMLTextAreaElement;
+      fireEvent.change(guidanceB(), { target: { value: "B draft" } });
+      await act(async () => { settleA(); await pending.catch(() => undefined); });
+      expect(guidanceB().value).toBe("B draft");
+      expect(within(panelB).queryByRole("alert")).toBeNull();
+      expect(within(panelB).queryByText(/^Saved\./)).toBeNull();
+    });
+  }
+
+  it("Close returns focus to the cell trigger", async () => {
+    const panel = await openCrossCheckPanel("vtmocanu/uzi");
+    fireEvent.click(within(panel).getByRole("button", { name: "Close" }));
+    expect(screen.queryByRole("group", { name: /Code cross-check for/ })).toBeNull();
+    expect(document.activeElement).toBe(
+      within(rowFor("vtmocanu/uzi")).getByRole("button", { name: /Code cross-check settings for/ }),
+    );
   });
 });
 

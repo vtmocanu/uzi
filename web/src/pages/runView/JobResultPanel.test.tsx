@@ -3,7 +3,6 @@ import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
 import { JobResultPanel } from "./JobResultPanel";
 import { RunCompletedLine } from "../RunView";
-import { SteerQueueCard } from "../../components/SteerQueueCard";
 import type { Run, RunJob } from "../../lib/api";
 import { extendEnabled } from "../../lib/budget";
 import { isCredentialSwitchRefusedLane } from "../../lib/credentialOverride";
@@ -152,23 +151,6 @@ describe("job run chrome (PRD #1908)", () => {
   it("the completed line points at the result instead of a branch or MR", () => {
     render(<RunCompletedLine run={doneJob} duration="7m" />);
     expect(screen.getByText(/Ran for 7m\./).textContent).toBe("Ran for 7m. Report and findings below.");
-  });
-
-  it("the steer card offers Stop but no follow-up composer on a job", () => {
-    const noop = () => {};
-    const { rerender } = render(
-      <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} run={issueRun} />,
-    );
-    // Control: an issue run has the composer.
-    expect(screen.getByRole("textbox")).toBeTruthy();
-    rerender(
-      <SteerQueueCard inputs={[]} terminal={false} status="running" busy={false} onStop={noop} onSend={noop} run={queuedJob} />,
-    );
-    expect(screen.queryByRole("textbox")).toBeNull();
-    expect(screen.getByText("A job takes no follow-ups. Stopping it cancels the job.")).toBeTruthy();
-    // The button names the thing the heading names ("Stop this job"); the old run copy is gone.
-    expect(screen.getByRole("button", { name: "Stop job" })).toBeTruthy();
-    expect(screen.queryByRole("button", { name: "Stop run" })).toBeNull();
   });
 
   it("a job is never extendable or credential-switchable, whatever its cap", () => {

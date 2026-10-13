@@ -7,9 +7,20 @@ import (
 	"net/http"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/anthropic"
 )
+
+func TestSecretProbeDefaultDeadline(t *testing.T) {
+	before := time.Now()
+	ctx, cancel := (&Handler{}).armSecretTestProbe(context.Background())
+	defer cancel()
+	deadline, ok := ctx.Deadline()
+	if !ok || deadline.Before(before.Add(12*time.Second)) || deadline.After(time.Now().Add(12*time.Second)) {
+		t.Fatalf("default probe deadline %v (present=%v), want 12s", deadline, ok)
+	}
+}
 
 type secretRoundTrip func(*http.Request) (*http.Response, error)
 

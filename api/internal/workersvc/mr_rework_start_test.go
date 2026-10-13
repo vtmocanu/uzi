@@ -42,7 +42,7 @@ func TestStartMRReworkForRunHappyPathStampsManual(t *testing.T) {
 		// GetRunByID (runByIDPlain), distinct from the door check's GetRunByIDForUser (runByID).
 		runByIDPlain:      reworkableSourceRun(runID, user, repo),
 		hasAnthropicToken: true,
-		mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", AttemptCount: 5, HighWater: 100},
+		mrReworkLedger:    testLedgerRow(100, nil),
 		repoRow:           aValidRepoRow(),
 		mrReworkRunResult: store.Run{ID: newRun, Kind: runkind.MRRework, TriggerSource: "manual"},
 	}
@@ -82,6 +82,9 @@ func TestStartMRReworkForRunHappyPathStampsManual(t *testing.T) {
 	if fs.mrReworkAndAdvanceParams.HighWater != 120 || fs.mrReworkAndAdvanceParams.PipelineRef.String != "agent/issue-7" {
 		t.Fatalf("combined call = %+v, want high_water 120 on agent/issue-7", fs.mrReworkAndAdvanceParams)
 	}
+	if got := string(fs.mrReworkAndAdvanceParams.Marks); got != `{"`+testNS+`":120}` {
+		t.Fatalf("combined call marks = %s, want the per-namespace mark of the snapshot", got)
+	}
 	if fs.mrReworkAndAdvanceParams.RepoID != repo {
 		t.Fatalf("combined call repo = %s, want %s", fs.mrReworkAndAdvanceParams.RepoID, repo)
 	}
@@ -99,7 +102,7 @@ func TestStartMRReworkForRunGuidanceOnlyStillAdvances(t *testing.T) {
 		runByIDPlain:      reworkableSourceRun(runID, user, repo),
 		hasAnthropicToken: true,
 		// high_water already above the snapshot's max actionable id (120): nothing new.
-		mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", AttemptCount: 5, HighWater: 500},
+		mrReworkLedger:    store.GetMRReworkLedgerRow{Ref: "agent/issue-7", AttemptCount: 5, CommentMarks: marksJSON("500")},
 		repoRow:           aValidRepoRow(),
 		mrReworkRunResult: store.Run{ID: uuid.New(), Kind: runkind.MRRework, TriggerSource: "manual"},
 	}
@@ -127,8 +130,8 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 		name    string
 		mutate  func(*fakeStore)
 		wantErr error
-		// assessedHighWater is the ledger mark the assessment began with; the plan uses it, not a re-read.
-		assessedHighWater int64
+		// assessedMark is the ledger mark (in testNS) the assessment began with; the plan uses it, not a re-read.
+		assessedMark int64
 	}{
 		{
 			name:    "run not found",
@@ -173,10 +176,10 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 		{
 			name: "nothing new and no guidance",
 			mutate: func(f *fakeStore) {
-				f.mrReworkLedger = store.MrReworkLedger{Ref: "agent/issue-7", HighWater: 500}
+				f.mrReworkLedger = store.GetMRReworkLedgerRow{Ref: "agent/issue-7", CommentMarks: marksJSON("500")}
 			},
-			assessedHighWater: 500,
-			wantErr:           ErrReworkNothingNew,
+			assessedMark: 500,
+			wantErr:      ErrReworkNothingNew,
 		},
 	}
 
@@ -185,7 +188,7 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 			fs := &fakeStore{
 				runByID:           reworkableSourceRun(runID, user, repo),
 				hasAnthropicToken: true,
-				mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", HighWater: 100},
+				mrReworkLedger:    store.GetMRReworkLedgerRow{Ref: "agent/issue-7", CommentMarks: marksJSON("100")},
 				repoRow:           aValidRepoRow(),
 				mrReworkRunResult: store.Run{ID: uuid.New(), Kind: runkind.MRRework},
 			}
@@ -195,7 +198,7 @@ func TestStartMRReworkForRun409Classes(t *testing.T) {
 			// A bare trigger (no guidance) so the nothing-new class fires; the other classes
 			// bail before the guidance check anyway.
 			res := reviewResultOf(sampleReviewSnapshot())
-			res.highWater = tc.assessedHighWater
+			res.ledger = ReviewLedgerState{Marks: map[string]int64{testNS: tc.assessedMark}}
 			_, err := svc.StartMRReworkForRun(context.Background(), user, runID, "", res)
 			if err != tc.wantErr {
 				t.Fatalf("err = %v, want %v", err, tc.wantErr)
@@ -225,7 +228,7 @@ func TestStartMRReworkForRunMapsCreateErrors(t *testing.T) {
 				runByID:           reworkableSourceRun(runID, user, repo),
 				runByIDPlain:      reworkableSourceRun(runID, user, repo),
 				hasAnthropicToken: true,
-				mrReworkLedger:    store.MrReworkLedger{Ref: "agent/issue-7", HighWater: 100},
+				mrReworkLedger:    store.GetMRReworkLedgerRow{Ref: "agent/issue-7", CommentMarks: marksJSON("100")},
 				repoRow:           aValidRepoRow(),
 				mrReworkRunErr:    tc.err,
 			}

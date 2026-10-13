@@ -3,12 +3,51 @@ package settings
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"strings"
 	"testing"
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+func TestReleaseCheckedAt(t *testing.T) {
+	ctx := context.Background()
+	readErr := errors.New("settings unavailable")
+	for _, tc := range []struct {
+		name, value string
+		err         error
+	}{
+		{"missing", "", nil},
+		{"timestamp", "2026-10-09T08:00:00Z", nil},
+		{"malformed remains raw", "not-a-timestamp", nil},
+		{"read error", "", readErr},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			fs := &fakeStore{err: tc.err}
+			if tc.value != "" {
+				fs.rows = []store.AppSetting{row(KeyReleaseCheckedAt, tc.value)}
+			}
+			c := New(fs, time.Hour)
+			got, err := c.ReleaseCheckedAt(ctx)
+			if got != tc.value || !errors.Is(err, tc.err) {
+				t.Fatalf("ReleaseCheckedAt = %q, %v; want %q, %v", got, err, tc.value, tc.err)
+			}
+			if tc.err == nil {
+				fs.rows = []store.AppSetting{row(KeyReleaseCheckedAt, "2026-10-09T12:00:00Z")}
+				cached, _ := c.ReleaseCheckedAt(ctx)
+				if cached != tc.value {
+					t.Fatalf("warm checked-at changed to %q", cached)
+				}
+				c.Invalidate()
+				refreshed, err := c.ReleaseCheckedAt(ctx)
+				if refreshed != "2026-10-09T12:00:00Z" || err != nil {
+					t.Fatalf("invalidated checked-at=%q, %v", refreshed, err)
+				}
+			}
+		})
+	}
+}
 
 // TestReleaseCheckValidateBools pins the strict bool gate on the two release-check
 // toggles (PRD #836 M1): exactly "true"/"false". Without the arm the default branch

@@ -15,6 +15,7 @@
 import { createSdkMcpServer, tool } from "@anthropic-ai/claude-agent-sdk";
 import type { McpSdkServerConfigWithInstance } from "@anthropic-ai/claude-agent-sdk";
 import { z } from "zod";
+import { reportCodeDispositions, type CodeCrossCheckToolAccess } from "./code-cross-check-tools.js";
 
 import type {
   AskUserQuestion,
@@ -34,6 +35,7 @@ const SIGNAL_DONE_TOOL = "signal_done";
 export const ASK_USER_TOOL = "ask_user";
 const REPORT_PROGRESS_TOOL = "report_progress";
 const CHECKPOINT_TOOL = "checkpoint";
+const PARK_RUN_TOOL = "park_run";
 
 /** issue #279: transport-hygiene cap on the `summary` captured from signal_done and
  *  forwarded as `report_md` on a report-only completion. HYGIENE ONLY — the api is the
@@ -46,9 +48,36 @@ const SIGNAL_DONE_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${SIGNAL_DONE_TOOL}`;
 const ASK_USER_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${ASK_USER_TOOL}`;
 const REPORT_PROGRESS_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${REPORT_PROGRESS_TOOL}`;
 const CHECKPOINT_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${CHECKPOINT_TOOL}`;
+const PARK_RUN_QUALIFIED = `mcp__${SIGNAL_SERVER_NAME}__${PARK_RUN_TOOL}`;
+
+/** Validate the optional wire declaration before accepting any completion payload.
+ * Diagnostics are fixed text; rejected input is never reflected to the model. */
+function validateNonClosing(input: unknown): {
+  nonClosing?: { reason: string };
+  diagnostic?: string;
+} {
+  const record = asRecord(input);
+  if (!record || !Object.prototype.hasOwnProperty.call(record, "non_closing")) return {};
+  const value = record["non_closing"];
+  const diagnostic = "Invalid non_closing: expected an object with a reason of 1–500 Unicode code points after trimming. Completion was not accepted.";
+  if (!value || typeof value !== "object" || Array.isArray(value)) return { diagnostic };
+  const reason = (value as Record<string, unknown>)["reason"];
+  if (typeof reason !== "string") return { diagnostic };
+  const trimmed = reason.trim();
+  // Stop at the first excess code point; never truncate an accepted declaration.
+  let count = 0;
+  for (const _point of trimmed) {
+    if (++count > 500) return { diagnostic };
+  }
+  if (count === 0) return { diagnostic };
+  return { nonClosing: { reason: trimmed } };
+}
 
 /** What the worker extracts from one SDK message's tool_use blocks. */
 export interface ScannedSignals {
+  nonClosing?: { reason: string };
+  /** Neutral diagnostic for a rejected done call; other blocks remain independent. */
+  signalDiagnostic?: string;
   draftPlans?: string[];
   /** plan_md from a submit_plan call, if the message carried one. */
   plan?: string;
@@ -134,6 +163,7 @@ export interface ScannedSignals {
    *  back, so a subagent frame — prompt-injected or buggy — must NEVER be able to force
    *  one. Absent unless the tool fired on the lead's own frame. */
   checkpoint?: boolean;
+  parkRun?: boolean;
 }
 
 /** PRD #1798 D4: one verification check the lead says it actually ran, with its outcome. */
@@ -183,6 +213,8 @@ const PR_SUMMARY_MAX_LIST_ENTRIES = 50;
 
 /** Options for the signal server's tool schemas. */
 export interface SignalServerOptions {
+  /** SDK only: supplied during the current repair; the handler revalidates every call. */
+  codeCrossCheck?: CodeCrossCheckToolAccess;
   /** PRD #72 M4: expose `prd_done_path` on signal_done. Issue runs only — a
    *  `ci_fix` run has no issue and a `self_improve` run's issue is a reused
    *  backlog container whose description must never be rewritten (Decision 13).
@@ -205,6 +237,7 @@ export interface SignalServerOptions {
    *  the same discriminator as `progress` — a non-issue run has no milestone boundary to
    *  checkpoint at, so the tool is invisible to the model there rather than present. */
   checkpoint?: boolean;
+  parkRun?: boolean;
   /** issue #279: expose `report_only` on signal_done. Issue runs only — gated on the same
    *  isIssueRun discriminator as prdDonePath/milestones. A `ci_fix` run already has its own
    *  `not_code` no-MR terminal path and a `self_improve`/`prompt` run is never report-only,
@@ -219,11 +252,11 @@ export interface SignalServerOptions {
  *  capture is the worker observing the tool_use in scanSignals; these handler returns
  *  are only guidance. `type: "text"` is a literal so the shape stays assignable to the
  *  SDK tool() callback's result type when the handler is wrapped separately. */
-type SignalAck = { content: Array<{ type: "text"; text: string }> };
+type SignalAck = { content: Array<{ type: "text"; text: string }>; isError?: boolean };
 
 /** The raw signalling tool handlers (mirrors makeMemoryToolHandlers /
- *  makeFindingsToolHandlers). Each handler takes no arguments and returns a fixed ack —
- *  the workflow is driven by scanSignals observing the tool_use, not by these returns.
+ *  makeFindingsToolHandlers). signalDone validates its input; the other handlers return fixed
+ *  acknowledgments. The workflow is driven by scanSignals observing the tool_use.
  *  ALL five are always built; buildSignalMcpServer decides which to REGISTER based on
  *  the conditional gating in opts, so the ack text/timing stays identical whether or not
  *  a tool is exposed.
@@ -235,7 +268,7 @@ type SignalAck = { content: Array<{ type: "text"; text: string }> };
 function makeSignalToolHandlers(): {
   submitPlan(): Promise<SignalAck>;
   askUser(): Promise<SignalAck>;
-  signalDone(): Promise<SignalAck>;
+  signalDone(input: unknown): Promise<SignalAck>;
   reportProgress(): Promise<SignalAck>;
   checkpoint(): Promise<SignalAck>;
 } {
@@ -260,12 +293,16 @@ function makeSignalToolHandlers(): {
         ],
       };
     },
-    async signalDone() {
+    async signalDone(input) {
+      const validated = validateNonClosing(input);
+      if (validated.diagnostic) {
+        return { isError: true, content: [{ type: "text", text: validated.diagnostic }] };
+      }
       return {
         content: [
           {
             type: "text",
-            text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. End your turn.",
+            text: "Completion recorded. The worker will finalize the run — pushing the branch and opening the merge request, unless you set report_only, in which case it records your summary and transcript and opens no merge request. On issue runs only, non_closing declares that this delivery leaves the issue open; omit it on other run kinds. End your turn.",
           },
         ],
       };
@@ -306,6 +343,13 @@ export function buildSignalMcpServer(
   // prds/*.md (a PRD link is optional under the uzi model, PRD #764) in a repo that
   // nonetheless has a prds/ directory invites the model to pick one and declare it.
   const doneShape: Record<string, z.ZodTypeAny> = {
+    non_closing: z.object({ reason: z.string() })
+      .superRefine((value, ctx) => {
+        const validated = validateNonClosing({ non_closing: value });
+        if (validated.diagnostic) ctx.addIssue({ code: z.ZodIssueCode.custom, message: validated.diagnostic });
+      })
+      .optional()
+      .describe("Issue runs only: declare that this delivery leaves the issue open. Reason must contain 1–500 Unicode code points after trimming. Omit on other run kinds."),
     summary: z
       .string()
       .optional()
@@ -462,6 +506,18 @@ export function buildSignalMcpServer(
     name: SIGNAL_SERVER_NAME,
     version: "1.0.0",
     tools: [
+      ...(opts.codeCrossCheck ? [tool("report_cross_check_dispositions",
+        "During the single code repair pass, report addressed or declined findings with reasons.",
+        { dispositions: z.array(z.object({ finding_id: z.string(), disposition: z.enum(["addressed", "declined"]),
+          reason: z.string() }).strict()).max(20) },
+        async (args) => {
+          try {
+            await reportCodeDispositions(opts.codeCrossCheck!, args);
+            return { content: [{ type: "text" as const, text: "Code cross-check dispositions recorded." }] };
+          } catch {
+            return { isError: true, content: [{ type: "text" as const, text: "Code repair is not active or dispositions are invalid." }] };
+          }
+        })] : []),
       tool(
         SAVE_DRAFT_PLAN_TOOL,
         "Lead only: request capture of a draft Markdown plan and keep working. This is not submission or approval.",
@@ -525,7 +581,7 @@ export function buildSignalMcpServer(
         SIGNAL_DONE_TOOL,
         "Signal that the implementation is complete and has passed review. Call this once — and only once — the work is committed locally and the reviewer is satisfied. The worker then finalizes the run — pushing the branch and opening the merge request, UNLESS you set report_only, in which case it records your summary and transcript and opens no merge request; you never push.",
         doneShape,
-        () => h.signalDone(),
+        (input) => h.signalDone(input),
       ),
       // PRD #122 M2. Issue runs only (opts.progress, gated on kind==="issue"). Unlike
       // submit_plan/signal_done, this does NOT end the turn — it is a pure progress
@@ -570,6 +626,9 @@ export function buildSignalMcpServer(
       // acknowledges; the authoritative capture is the worker observing the tool_use in
       // scanSignals. Decision 6: this is a DURABILITY boundary, NOT a quality gate — the
       // description must not imply it verifies or tests anything.
+      ...(opts.parkRun ? [tool(PARK_RUN_TOOL,
+        "Request an owner pause when approved implementation cannot proceed until a dependency is ready. Stop and end your turn. The worker negotiates and publishes the pause.",
+        {}, async () => ({ content: [{ type: "text" as const, text: "Pause requested. Stop and end your turn." }] }))] : []),
       ...(opts.checkpoint
         ? [
             tool(
@@ -607,7 +666,8 @@ export function isSignalToolName(name: unknown): boolean {
     name === REPORT_PROGRESS_QUALIFIED ||
     // PRD #122 M6: checkpoint carries no payload and drives the fetch-back out of band,
     // so its raw tool_use is filtered from the persisted stream like the other signals.
-    name === CHECKPOINT_QUALIFIED
+    name === CHECKPOINT_QUALIFIED ||
+    name === PARK_RUN_QUALIFIED
   );
 }
 
@@ -978,6 +1038,12 @@ export function scanSignals(message: unknown): ScannedSignals {
         delete out.rejectedMilestones;
       }
     } else if (name === SIGNAL_DONE_QUALIFIED) {
+      const validated = validateNonClosing(block["input"]);
+      if (validated.diagnostic) {
+        out.signalDiagnostic = validated.diagnostic;
+        continue;
+      }
+      if (validated.nonClosing !== undefined) out.nonClosing = validated.nonClosing;
       out.done = true;
       // PRD #72 M4. THE ONLY extraction point for prd_done_path, deliberately.
       // It sits inside this branch so it inherits the main-thread guard above
@@ -1096,6 +1162,9 @@ export function scanSignals(message: unknown): ScannedSignals {
       // and fetches the branch back). The tool takes no arguments, so there is nothing to
       // parse: seeing the tool_use on a main-thread frame IS the signal.
       out.checkpoint = true;
+    } else if (name === PARK_RUN_QUALIFIED) {
+      const input = asRecord(block["input"]);
+      if (input && !Array.isArray(block["input"]) && Object.keys(input).length === 0) out.parkRun = true;
     }
   }
   return out;

@@ -91,8 +91,16 @@ import (
 // added here — that is this guard's standing weakness, and it is why the render tests
 // remain the primary defence rather than this.
 var d7UntrustedFields = []string{
+	// Session answer drafts and delivery outcomes (tui_answer.go).
+	"answerText",
+	"answerNotice",
+	"Answers", // composed answerBody review strings
 	// internal (tui_lanes.go)
 	"Label",
+	// Structured transcript question prose (tui_question.go); all use sanitized Markdown.
+	"Question",
+	"Header",
+	"Description",
 	"Role",
 	"Agent",
 	// wire (apitypes)
@@ -151,6 +159,7 @@ var d7UntrustedFields = []string{
 	// GET /api/version, drawn in the board footer skew banner (boardFooterLine) only inside
 	// cellText(...) before SkewWarning embeds it.
 	"serverVersion",
+	"installedVersion",
 	// The startup update prompt's server-authored release facts (PRD #1251 M1), copied off
 	// buildInfoMsg.latest into the model's updatePrompt sub-struct and drawn in the modal
 	// (renderUpdatePrompt / updateChoiceLabel) only through cellText / renderer.Plain. Like
@@ -223,6 +232,15 @@ var d7UntrustedFields = []string{
 	"outboxBlockedText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
 	"runWorkerName",
+	// Issue #2705: the run's health_reason on the crew rail's waiting line (railWaitingLine),
+	// drawn through renderer.Plain; the hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.
+	"runHealthReason",
+	// PRD #2602 run progress strings (tui_detail_progress.go renderProgress): the active milestone id,
+	// the phase and the blocked-by run id derive from untrusted repo/agent/question text and are
+	// drawn only through renderer.Plain. The hostile-value case is in TestTUIViewsStripControlBytesFromUntrustedText.
+	"ActiveMilestoneID", "Phase", "MaybeBlockedByRunID",
+	// PRD #2603: the model-written Now summary on the PROGRESS block, drawn through renderer.Plain.
+	"NowNote",
 }
 
 // d7Writers are the calls that put a string on the screen. lipgloss's Render is one:
@@ -235,12 +253,13 @@ var d7Writers = map[string]bool{
 }
 
 var d7Sanitizers = map[string]bool{
-	"sanitizeTTY": true,
-	"cellText":    true,
-	"compactText": true,
-	"capCell":     true,
-	"Markdown":    true,
-	"Plain":       true,
+	"questionProse": true,
+	"sanitizeTTY":   true,
+	"cellText":      true,
+	"compactText":   true,
+	"capCell":       true,
+	"Markdown":      true,
+	"Plain":         true,
 }
 
 func TestD7UntrustedFieldsNeverReachAWriterUnsanitized(t *testing.T) {

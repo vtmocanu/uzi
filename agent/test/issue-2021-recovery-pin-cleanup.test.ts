@@ -219,23 +219,36 @@ for (const mode of ["boot", "live"] as const) describe(`${mode} durable pin clea
     });
   }
 
-  for (const condition of ["missing metadata", "old finalization metadata", "missing resolver", "missing delete", "missing bare", "resolver throws", "delete throws", "ref locked"] as const) {
-    it(`uploads and retains on ${condition}`, async () => {
+  // Archive-proven records are cleaned even without journaled cleanup metadata (issue #2263).
+  for (const condition of ["missing metadata", "old finalization metadata"] as const) {
+    it(`uploads and deletes the pin on ${condition}`, async () => {
       let record = await journal();
-      if (condition === "missing metadata" || condition === "old finalization metadata") {
-        const { recoveryPinBareDir: _cleanup, ...old } = record;
-        record = condition === "old finalization metadata" ? { ...old, bareDir: NAME, defaultBranch: "main", finalizationPin: true } : old;
-        await raw(record);
-      }
+      const { recoveryPinBareDir: _cleanup, ...old } = record;
+      record = condition === "old finalization metadata" ? { ...old, bareDir: NAME, defaultBranch: "main", finalizationPin: true } : old;
+      await raw(record);
+      archive.uploadError = undefined;
+      const restarted = coord();
+      await retry(restarted, mode);
+      assert.equal((await only()).state, "uploaded");
+      assert.equal(present(), false, "the pin is discovered under the repos root and deleted");
+      assert.equal(present(9), true);
+      await assert.rejects(fs.stat(record.bundlePath!), { code: "ENOENT" });
+      assert.equal(warnings.filter(w => w.message === "recovery: uploaded record pin retained").length, 0);
+      await retry(restarted, mode);
+      assert.equal(archive.uploads, 2);
+    });
+  }
+
+  for (const condition of ["missing capability", "capability throws", "ref locked"] as const) {
+    it(`uploads and retains on ${condition}`, async () => {
+      const record = await journal();
       const producer: RecoveryBundleProducer = {
         produceRecoveryBundle: cache.produceRecoveryBundle.bind(cache), fetchDefaultTip: cache.fetchDefaultTip.bind(cache),
-        resolveRecoveryBareDir: cache.resolveRecoveryBareDir.bind(cache), deleteRecoveryPin: cache.deleteRecoveryPin.bind(cache),
+        resolveRecoveryBareDir: cache.resolveRecoveryBareDir.bind(cache),
+        cleanupArchivedRecoveryPin: cache.cleanupArchivedRecoveryPin.bind(cache),
       };
-      if (condition === "missing resolver") delete producer.resolveRecoveryBareDir;
-      if (condition === "missing delete") delete producer.deleteRecoveryPin;
-      if (condition === "missing bare") producer.resolveRecoveryBareDir = async () => undefined;
-      if (condition === "resolver throws") producer.resolveRecoveryBareDir = async () => { throw new Error("x".repeat(1024)); };
-      if (condition === "delete throws") producer.deleteRecoveryPin = async () => { throw new Error("x".repeat(1024)); };
+      if (condition === "missing capability") delete producer.cleanupArchivedRecoveryPin;
+      if (condition === "capability throws") producer.cleanupArchivedRecoveryPin = async () => { throw new Error("x".repeat(1024)); };
       if (condition === "ref locked") await fs.writeFile(path.join(bare, `${ref(4)}.lock`), "locked");
       archive.uploadError = undefined;
       const restarted = coord(producer);
@@ -245,9 +258,9 @@ for (const mode of ["boot", "live"] as const) describe(`${mode} durable pin clea
       assert.equal(uploaded.recoveryPinBareDir, record.recoveryPinBareDir);
       assert.equal(present(), true);
       await assert.rejects(fs.stat(record.bundlePath!), { code: "ENOENT" });
-      const cleanupWarnings = warnings.filter(w => w.message === "recovery: uploaded bundle pin cleanup failed");
-      assert.equal(cleanupWarnings.length, condition.endsWith("throws") ? 1 : 0);
-      if (cleanupWarnings.length) assert.ok(JSON.stringify(cleanupWarnings[0]!.fields).length < 600);
+      const retained = warnings.filter(w => w.message === "recovery: uploaded record pin retained");
+      assert.equal(retained.length, condition === "missing capability" ? 0 : 1, "unsupported is silent");
+      if (retained.length) assert.ok(JSON.stringify(retained[0]!.fields).length < 600);
       await retry(restarted, mode);
       assert.equal(archive.uploads, 2);
     });

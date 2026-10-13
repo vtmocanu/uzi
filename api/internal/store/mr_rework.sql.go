@@ -12,16 +12,62 @@ import (
 	"github.com/jackc/pgx/v5/pgtype"
 )
 
+const bootstrapMRReworkLedgerMarks = `-- name: BootstrapMRReworkLedgerMarks :execrows
+UPDATE mr_rework_ledger
+SET comment_marks = mr_rework_merge_marks('{}'::jsonb, $1::jsonb),
+    pending_unknown_keys = mr_rework_merge_pending_keys($2::text[], '{}'::text[], '{}'::text[], '{}'::text[], '{}'::text[], NULL),
+    updated_at = now()
+WHERE repo_id = $3::uuid
+  AND ref = $4
+  AND comment_marks IS NULL
+  AND high_water = $5::bigint
+  AND pending_unknown_ids = COALESCE($6::bigint[], '{}'::bigint[])
+`
+
+type BootstrapMRReworkLedgerMarksParams struct {
+	Marks           []byte    `json:"marks"`
+	PendingKeys     []string  `json:"pending_keys"`
+	RepoID          uuid.UUID `json:"repo_id"`
+	Ref             string    `json:"ref"`
+	LegacyHighWater int64     `json:"legacy_high_water"`
+	LegacyPending   []int64   `json:"legacy_pending"`
+}
+
+// One-shot migration of a LEGACY ledger row (comment_marks NULL) to the namespaced state
+// (ADR-1199). Guarded by compare-and-set on the legacy scalars the caller READ
+// (@legacy_high_water, @legacy_pending): if a concurrent writer moved either, or another
+// replica already bootstrapped (comment_marks no longer NULL), zero rows match and the caller
+// re-reads. Marks are normalized through mr_rework_merge_marks (a non-object, SQL or JSON null
+// alike, stores {}; a non-integer value fails loudly on the cast, and the table CHECK would
+// refuse it anyway). The keys go through mr_rework_merge_pending_keys as the EXISTING set with
+// nothing added: deduped, first position kept, order preserved, the 10000 cap applied, NULL
+// elements dropped. After it applies the row is non-legacy for good, even if an older binary later
+// advances the legacy columns.
+func (q *Queries) BootstrapMRReworkLedgerMarks(ctx context.Context, arg BootstrapMRReworkLedgerMarksParams) (int64, error) {
+	result, err := q.db.Exec(ctx, bootstrapMRReworkLedgerMarks,
+		arg.Marks,
+		arg.PendingKeys,
+		arg.RepoID,
+		arg.Ref,
+		arg.LegacyHighWater,
+		arg.LegacyPending,
+	)
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
+}
+
 const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-)
+, code_cross_check_required)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $10, $11,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = $1)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -29,7 +75,7 @@ WHERE NOT EXISTS (
       AND pipeline_ref = $5
       AND status NOT IN ('completed', 'failed', 'cancelled')
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, memory_episode, memory_intervention_count, memory_policy
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, memory_episode, memory_intervention_count, memory_policy
 `
 
 type CreateAutoMRReworkRunParams struct {
@@ -268,6 +314,10 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 		&i.WorkerRecoveryEvidence,
 		&i.CrossCheckLane,
 		&i.CrossCheckLaneGeneration,
+		&i.CompletionFinalHead,
+		&i.CodeCrossCheckRequired,
+		&i.ProviderParkCount,
+		&i.ProviderParkStreakStartedAt,
 		&i.MemoryEpisode,
 		&i.MemoryInterventionCount,
 		&i.MemoryPolicy,
@@ -277,9 +327,10 @@ func (q *Queries) CreateAutoMRReworkRun(ctx context.Context, arg CreateAutoMRRew
 
 const createManualMRReworkRunAndAdvance = `-- name: CreateManualMRReworkRunAndAdvance :one
 WITH led AS (
-    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, comment_marks, pending_unknown_keys)
     SELECT $2::uuid, $5, $11,
-           mr_rework_merge_pending('{}'::bigint[], $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], 0)
+           mr_rework_merge_marks('{}'::jsonb, $12::jsonb),
+           mr_rework_merge_pending_keys('{}'::text[], $13::text[], $14::text[], $15::text[], $16::text[], '{}'::jsonb)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = $2::uuid
@@ -290,20 +341,25 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
-        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $12::bigint[], $13::bigint[], $14::bigint[], $15::bigint[], mr_rework_ledger.high_water),
+        comment_marks = CASE WHEN mr_rework_ledger.comment_marks IS NULL
+                             THEN mr_rework_ledger.comment_marks
+                             ELSE mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks) END,
+        pending_unknown_keys = CASE WHEN mr_rework_ledger.comment_marks IS NULL
+                                    THEN mr_rework_ledger.pending_unknown_keys
+                                    ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $13::text[], $14::text[], $15::text[], $16::text[], mr_rework_ledger.comment_marks) END,
         updated_at    = now()
 )
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-)
+, code_cross_check_required)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
     -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
     -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual', $10,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = $1)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -311,7 +367,7 @@ WHERE NOT EXISTS (
       AND pipeline_ref = $5
       AND status NOT IN ('completed', 'failed', 'cancelled')
 )
-RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, memory_episode, memory_intervention_count, memory_policy
+RETURNING id, user_id, repo_id, issue_iid, issue_title, issue_description, status, requeue_count, worker_id, session_id, last_seq, branch, mr_iid, failure_reason, plan_md, iteration_count, claimed_at, started_at, finished_at, created_at, updated_at, origin_column, board_column, move_pending_since, mr_state, auto_approve, autopilot_commented_at, kind, pipeline_id, pipeline_ref, failure_snapshot, fix_verdict, stop_kind, agent_source, agent_exclusions, repo_agents, title, resume_of_run_id, last_activity_at, health, health_reason, health_since, health_notified_at, target_run_id, mr_web_url, prd_done_path, prd_patch_settled_at, anthropic_secret_id, anthropic_secret_label, anthropic_select_reason, anthropic_headroom_pct, wait_on_limit, limit_resets_at, retry_not_before, limit_wait_count, rate_limit_type, open_question_id, revise_count, plan_source, planned_base_commit, require_base_match, milestones_candidate, milestones_frozen, milestones_completed, milestones_in_progress, budget_max_iterations, budget_wall_seconds, schedule_id, limit_dead_secret_id, report_only, report_md, ci_config_paths, model, override_subagent_model, fail_origin, priority, summary_intent, summary_plan, summary_deltas, issue_comments, base_branch, open_mr, dispatched_at, review_target_run_id, review_requested, then_fix_requested, then_fix_of_run_id, preserved_patch, required_capabilities, stop_reason, required_tools, size_class, interactive, open_followup_id, plan_changed_files, scope_ceiling, status_since, review_comments, budget_paused_seconds, mr_rework_enabled, trigger_source, checkpoint_tip, usage_refolded, codex_secret_id, codex_auth_mode, codex_secret_label, codex_account_key, codex_material_revision, codex_account_revision, codex_claim_epoch, codex_cap_hash, pause_requested_at, pause_mode, pause_after_count, checkpoint_tip_at, recovery_wait_count, recovery_retry_not_before, completion_contract_version, contract_revision, completion_contract, completion_attempts, latest_completion_attempt, milestones_agents, hold_reason, hold_captured_head, completion_budget_exhausted_at, completion_question_at, budget_extension_seconds, claim_generation, harness, recovery_wait_cause, forge_park_count, credential_override_mode, credential_override_secret_id, claim_released_at, credential_switch_requested_at, credential_switch_generation, stale_requeue_generation, budget_finalize_seconds, released_worker_id, released_worker_nonce, gate_revision, gate_presentation_id, gate_presented_payload, gate_payload_digest, gate_refusal_count, gate_refusal_generation, disk_park_count, checkpoint_contains_latest, egress_profile_id, egress_snapshot, job_type, finalize_resume_generation, job_protocol, first_started_at, plan_cross_check_required, plan_cross_check_gate_reason, issue_raw_digest, issue_saved_body, issue_input_reason, auto_approve_blocked_reasons, plan_cross_check_diff_refusal, worker_recovery_episode, requeue_episode_baseline, worker_recovery_evidence, cross_check_lane, cross_check_lane_generation, completion_final_head, code_cross_check_required, provider_park_count, provider_park_streak_started_at, memory_episode, memory_intervention_count, memory_policy
 `
 
 type CreateManualMRReworkRunAndAdvanceParams struct {
@@ -326,10 +382,11 @@ type CreateManualMRReworkRunAndAdvanceParams struct {
 	WaitOnLimit         bool        `json:"wait_on_limit"`
 	Harness             string      `json:"harness"`
 	HighWater           int64       `json:"high_water"`
-	PendingAdd          []int64     `json:"pending_add"`
-	PendingRemove       []int64     `json:"pending_remove"`
-	PendingSuperseded   []int64     `json:"pending_superseded"`
-	PendingSupersededBy []int64     `json:"pending_superseded_by"`
+	Marks               []byte      `json:"marks"`
+	PendingAdd          []string    `json:"pending_add"`
+	PendingRemove       []string    `json:"pending_remove"`
+	PendingSuperseded   []string    `json:"pending_superseded"`
+	PendingSupersededBy []string    `json:"pending_superseded_by"`
 }
 
 // ATOMIC on-demand (manual) mr_rework create + ledger advance (PRD #1202, review-finding
@@ -363,6 +420,7 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		arg.WaitOnLimit,
 		arg.Harness,
 		arg.HighWater,
+		arg.Marks,
 		arg.PendingAdd,
 		arg.PendingRemove,
 		arg.PendingSuperseded,
@@ -537,6 +595,10 @@ func (q *Queries) CreateManualMRReworkRunAndAdvance(ctx context.Context, arg Cre
 		&i.WorkerRecoveryEvidence,
 		&i.CrossCheckLane,
 		&i.CrossCheckLaneGeneration,
+		&i.CompletionFinalHead,
+		&i.CodeCrossCheckRequired,
+		&i.ProviderParkCount,
+		&i.ProviderParkStreakStartedAt,
 		&i.MemoryEpisode,
 		&i.MemoryInterventionCount,
 		&i.MemoryPolicy,
@@ -576,7 +638,8 @@ func (q *Queries) DeleteMRReworkLedgerNotIn(ctx context.Context, repoID uuid.UUI
 }
 
 const getMRReworkLedger = `-- name: GetMRReworkLedger :one
-SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids
+SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids,
+       comment_marks, pending_unknown_keys, (comment_marks IS NULL)::boolean AS legacy
 FROM mr_rework_ledger
 WHERE repo_id = $1::uuid AND ref = $2
 `
@@ -586,13 +649,29 @@ type GetMRReworkLedgerParams struct {
 	Ref    string    `json:"ref"`
 }
 
+type GetMRReworkLedgerRow struct {
+	RepoID             uuid.UUID          `json:"repo_id"`
+	Ref                string             `json:"ref"`
+	AttemptCount       int32              `json:"attempt_count"`
+	HighWater          int64              `json:"high_water"`
+	HaltNotified       bool               `json:"halt_notified"`
+	UpdatedAt          pgtype.Timestamptz `json:"updated_at"`
+	PendingUnknownIds  []int64            `json:"pending_unknown_ids"`
+	CommentMarks       []byte             `json:"comment_marks"`
+	PendingUnknownKeys []string           `json:"pending_unknown_keys"`
+	Legacy             bool               `json:"legacy"`
+}
+
 // The ledger row for a (repo, ref). No row means the MR has NEVER been reworked (a
 // fresh candidate): the generated :one returns a zero-value struct alongside
 // pgx.ErrNoRows, which the detector reads as attempt_count=0, high_water=0,
-// halt_notified=false.
-func (q *Queries) GetMRReworkLedger(ctx context.Context, arg GetMRReworkLedgerParams) (MrReworkLedger, error) {
+// halt_notified=false. comment_marks / pending_unknown_keys are the per-namespace state
+// (ADR-1199); `legacy` is true while comment_marks is NULL, i.e. a row written before the
+// namespaced state existed, which the service bootstraps once (BootstrapMRReworkLedgerMarks).
+// pending_unknown_ids is the frozen legacy copy, read only to bootstrap.
+func (q *Queries) GetMRReworkLedger(ctx context.Context, arg GetMRReworkLedgerParams) (GetMRReworkLedgerRow, error) {
 	row := q.db.QueryRow(ctx, getMRReworkLedger, arg.RepoID, arg.Ref)
-	var i MrReworkLedger
+	var i GetMRReworkLedgerRow
 	err := row.Scan(
 		&i.RepoID,
 		&i.Ref,
@@ -601,6 +680,9 @@ func (q *Queries) GetMRReworkLedger(ctx context.Context, arg GetMRReworkLedgerPa
 		&i.HaltNotified,
 		&i.UpdatedAt,
 		&i.PendingUnknownIds,
+		&i.CommentMarks,
+		&i.PendingUnknownKeys,
+		&i.Legacy,
 	)
 	return i, err
 }
@@ -729,38 +811,37 @@ func (q *Queries) ListMRReworkCandidates(ctx context.Context, repoID uuid.UUID) 
 	return items, nil
 }
 
-const removeMRReworkPendingIDs = `-- name: RemoveMRReworkPendingIDs :exec
+const removeMRReworkPendingKeys = `-- name: RemoveMRReworkPendingKeys :exec
 UPDATE mr_rework_ledger
-SET pending_unknown_ids = ARRAY(
-    SELECT x FROM (
-        SELECT unnest(mr_rework_ledger.pending_unknown_ids) AS x
-        EXCEPT
-        SELECT r AS x FROM unnest(COALESCE($1::bigint[], '{}'::bigint[])) AS r
-    ) t
-    ORDER BY x
+SET pending_unknown_keys = ARRAY(
+    SELECT u.k
+    FROM unnest(mr_rework_ledger.pending_unknown_keys) WITH ORDINALITY AS u(k, ord)
+    WHERE u.k NOT IN (SELECT r FROM unnest(COALESCE($1::text[], '{}'::text[])) AS r WHERE r IS NOT NULL)
+    ORDER BY u.ord
 )
-WHERE repo_id = $2::uuid AND ref = $3
+WHERE repo_id = $2::uuid AND ref = $3 AND comment_marks IS NOT NULL
 `
 
-type RemoveMRReworkPendingIDsParams struct {
-	Ids    []int64   `json:"ids"`
+type RemoveMRReworkPendingKeysParams struct {
+	Keys   []string  `json:"keys"`
 	RepoID uuid.UUID `json:"repo_id"`
 	Ref    string    `json:"ref"`
 }
 
-// Drop ids from a ledger row's pending_unknown_ids WITHOUT spending a cycle (issue #2347): the
-// pending ids the snapshot caps evicted (an eligible pending comment that no longer fits the
+// Drop keys from a ledger row's pending_unknown_keys WITHOUT spending a cycle (issue #2347): the
+// pending keys the snapshot caps evicted (an eligible pending comment that no longer fits the
 // capped snapshot falls back to human review, so it must stop re-triggering the assessment).
-// Array subtraction only: attempt_count, high_water, halt_notified and updated_at are left
-// alone, and no row is created when the ref has none.
-func (q *Queries) RemoveMRReworkPendingIDs(ctx context.Context, arg RemoveMRReworkPendingIDsParams) error {
-	_, err := q.db.Exec(ctx, removeMRReworkPendingIDs, arg.Ids, arg.RepoID, arg.Ref)
+// Array subtraction only, PRESERVING the stored admission order: attempt_count, high_water,
+// halt_notified, comment_marks and updated_at are left alone, no row is created when the ref has
+// none, and a legacy row (comment_marks NULL) is not touched.
+func (q *Queries) RemoveMRReworkPendingKeys(ctx context.Context, arg RemoveMRReworkPendingKeysParams) error {
+	_, err := q.db.Exec(ctx, removeMRReworkPendingKeys, arg.Keys, arg.RepoID, arg.Ref)
 	return err
 }
 
 const setMRReworkHaltNotified = `-- name: SetMRReworkHaltNotified :exec
-INSERT INTO mr_rework_ledger (repo_id, ref, halt_notified)
-VALUES ($1::uuid, $2, true)
+INSERT INTO mr_rework_ledger (repo_id, ref, halt_notified, comment_marks)
+VALUES ($1::uuid, $2, true, '{}'::jsonb)
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET halt_notified = true,
     updated_at    = now()
@@ -775,58 +856,73 @@ type SetMRReworkHaltNotifiedParams struct {
 // comment, set halt_notified so it is never posted again for this ref. Written as an
 // upsert (not a plain UPDATE) so it latches correctly even for a cap of 0, where no
 // proceed ever created the row. high_water is left untouched (a halt consumes no
-// comment).
+// comment). A row created here is NON-legacy (comment_marks '{}'): it never carried legacy
+// scalar state to bootstrap. The update arm leaves comment_marks as it is.
 func (q *Queries) SetMRReworkHaltNotified(ctx context.Context, arg SetMRReworkHaltNotifiedParams) error {
 	_, err := q.db.Exec(ctx, setMRReworkHaltNotified, arg.RepoID, arg.Ref)
 	return err
 }
 
-const upsertMRReworkLedger = `-- name: UpsertMRReworkLedger :exec
-INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
+const upsertMRReworkLedger = `-- name: UpsertMRReworkLedger :execrows
+INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, comment_marks, pending_unknown_keys)
 VALUES ($1::uuid, $2, 1, $3,
-        mr_rework_merge_pending('{}'::bigint[], $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], 0))
+        mr_rework_merge_marks('{}'::jsonb, $4::jsonb),
+        mr_rework_merge_pending_keys('{}'::text[], $5::text[], $6::text[], $7::text[], $8::text[], '{}'::jsonb))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
-    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, $4::bigint[], $5::bigint[], $6::bigint[], $7::bigint[], mr_rework_ledger.high_water),
+    comment_marks = mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks),
+    pending_unknown_keys = mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, $5::text[], $6::text[], $7::text[], $8::text[], mr_rework_ledger.comment_marks),
     updated_at    = now()
+WHERE mr_rework_ledger.comment_marks IS NOT NULL
 `
 
 type UpsertMRReworkLedgerParams struct {
 	RepoID              uuid.UUID `json:"repo_id"`
 	Ref                 string    `json:"ref"`
 	HighWater           int64     `json:"high_water"`
-	PendingAdd          []int64   `json:"pending_add"`
-	PendingRemove       []int64   `json:"pending_remove"`
-	PendingSuperseded   []int64   `json:"pending_superseded"`
-	PendingSupersededBy []int64   `json:"pending_superseded_by"`
+	Marks               []byte    `json:"marks"`
+	PendingAdd          []string  `json:"pending_add"`
+	PendingRemove       []string  `json:"pending_remove"`
+	PendingSuperseded   []string  `json:"pending_superseded"`
+	PendingSupersededBy []string  `json:"pending_superseded_by"`
 }
 
 // The PROCEED path: record that a rework cycle was spent and advance the consumed
-// high-water. attempt_count counts AUTO cycles only; the first proceed INSERTs
+// marks. attempt_count counts AUTO cycles only; the first proceed INSERTs
 // count = 1, every subsequent proceed increments. high_water is ADVANCE-ONLY
-// (GREATEST over the existing value and the new max kept comment id), so it never
-// moves backward even if a later tick sees a smaller max. halt_notified is RESET to
+// (GREATEST over the existing value and the new max kept comment id), kept for readability
+// and binary rollback; the authoritative marks are comment_marks. halt_notified is RESET to
 // false on every proceed (INSERT defaults it false): the latch is one comment per
 // halt episode, so once a proceed advances the counter a later cap halt can comment
 // again.
-// pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
-// (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
-// the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone). An author's
-// older id is replaced by its newer representative only through the parallel
+// comment_marks (ADR-1199): @marks is a namespace -> id object merged per key with GREATEST
+// (mr_rework_merge_marks), never backward.
+// Returns the rows written: an INSERT of a new row is 1; an UPDATE of a non-legacy row is 1; a
+// LEGACY row (comment_marks NULL) matches the ON CONFLICT WHERE below, writes NOTHING and
+// returns 0. 0 rows therefore means the row is legacy (or was bootstrapped-away concurrently):
+// the caller must refuse (ErrReworkLedgerChanged) and roll back, then re-read and bootstrap.
+// pending_unknown_keys: the source-qualified keys ('<namespace>:<id>') of permission-unknown
+// comments the marks moved past (@pending_add, kept only when above the PER-NAMESPACE mark the
+// row had BEFORE this update) merged with the existing set, minus @pending_remove. An author's
+// older key is replaced by its newer representative only through the parallel
 // @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
-// replacement is retained in the same statement (a stale writer's rejected add leaves the older
-// id in place); the merge keeps the oldest 10000 slots (mr_rework_merge_pending).
-func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) error {
-	_, err := q.db.Exec(ctx, upsertMRReworkLedger,
+// replacement is retained in the same statement; the merge keeps the oldest-admitted 10000
+// (mr_rework_merge_pending_keys). pending_unknown_ids is no longer written.
+func (q *Queries) UpsertMRReworkLedger(ctx context.Context, arg UpsertMRReworkLedgerParams) (int64, error) {
+	result, err := q.db.Exec(ctx, upsertMRReworkLedger,
 		arg.RepoID,
 		arg.Ref,
 		arg.HighWater,
+		arg.Marks,
 		arg.PendingAdd,
 		arg.PendingRemove,
 		arg.PendingSuperseded,
 		arg.PendingSupersededBy,
 	)
-	return err
+	if err != nil {
+		return 0, err
+	}
+	return result.RowsAffected(), nil
 }

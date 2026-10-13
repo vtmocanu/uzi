@@ -8,6 +8,7 @@ import (
 	"encoding/binary"
 	"errors"
 	"fmt"
+	"strings"
 	"testing"
 )
 
@@ -157,6 +158,10 @@ func TestScanMalformed(t *testing.T) {
 	if err := Scan(context.Background(), []byte("NOPExxxxxxxxxxxxxxxx"), testLimits); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("bad signature: err = %v, want ErrInvalid", err)
 	}
+	var inv *InvalidError
+	if err := Scan(context.Background(), []byte("NOPExxxxxxxxxxxxxxxx"), testLimits); !errors.As(err, &inv) || inv.Check != "pack header" {
+		t.Fatalf("bad signature: err = %v, want *InvalidError naming the pack header", err)
+	}
 	var buf bytes.Buffer
 	buf.WriteString("PACK")
 	_ = binary.Write(&buf, binary.BigEndian, uint32(2))
@@ -165,6 +170,8 @@ func TestScanMalformed(t *testing.T) {
 	buf.Write(sum[:])
 	if err := Scan(context.Background(), buf.Bytes(), testLimits); !errors.Is(err, ErrInvalid) {
 		t.Fatalf("truncated body: err = %v, want ErrInvalid", err)
+	} else if !errors.As(err, &inv) || inv.Check != "object body" || !strings.Contains(err.Error(), "object body") {
+		t.Fatalf("truncated body: err = %v, want *InvalidError naming the object body", err)
 	}
 }
 

@@ -12,7 +12,7 @@
 # Usage:
 #   claims.sh claim <key> [--repo O/R] [--pr N] [--size FILES] [--lines N] [--priority N]
 #                         [--depends-on '#a,#b'] [--note TEXT] [--as NAME --uuid UUID --kind K] [--force]
-#   claims.sh release <key> [--purge]      # --purge also drops the trail (after a merge)
+#   claims.sh release <key> [--purge]      # --purge also drops the trail (after a merge); an absent key prints "(absent)"
 #   claims.sh release <key> --if-mine      # under the key's lock: drop it only if THIS session owns it
 #   claims.sh touch <key> [--state TEXT]   # heartbeat + last state (trail.sh calls this)
 #   claims.sh show <key>
@@ -158,9 +158,9 @@ case "$verb" in
       rm -f "$f"; echo "RELEASED=$key"; exit 0
     fi
     purge=0; [ "${1:-}" = "--purge" ] && purge=1
-    rm -f "$CL/$key.json"
     suffix=""
-    if [ "$purge" -eq 1 ]; then rm -f "$SD/trail/$key.trail"; suffix=" (trail purged)"; fi
+    if [ -f "$CL/$key.json" ]; then rm -f "$CL/$key.json"; else suffix=" (absent)"; fi
+    if [ "$purge" -eq 1 ]; then rm -f "$SD/trail/$key.trail"; suffix="$suffix (trail purged)"; fi
     echo "RELEASED=$key$suffix"; exit 0;;
 
   touch)

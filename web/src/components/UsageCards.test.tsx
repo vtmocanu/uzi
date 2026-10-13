@@ -5,7 +5,6 @@ import { MemoryRouter } from "react-router-dom";
 import { useState } from "react";
 import { UsageCard, type UsageWindow } from "./UsageCards";
 import type { AdminUsage, RunOutcomes, SelfUsage } from "../lib/api";
-import * as costStatus from "../lib/costStatus";
 import { setDemoMode } from "../lib/demoMode";
 
 const bundle = (input: number, cache: number, output: number, cost: number) => ({
@@ -73,6 +72,43 @@ const columns = (view: ReturnType<typeof mount>) => ({
 afterEach(() => { cleanup(); vi.restoreAllMocks(); vi.useRealTimers(); setDemoMode(false); });
 
 describe("UsageCard (#40, #1293, #1429 D7)", () => {
+  it("retains recorded mixed-run partial dollars while disclosing incomplete cost", () => {
+    const { self } = fixture();
+    self.last_7_days = bundle(1000, 0, 200, 0.61);
+    self.last7_subscription_run_count = 0;
+    self.last7_unreported_run_count = 1;
+    const view = mount({ self });
+    expect(view.getByText("$0.61")).toBeTruthy();
+    expect(view.getByText("+ 1 unreported run").getAttribute("title")).toBe("Unreported runs: cost incomplete; recorded partial costs included");
+    expect(view.getByRole("heading", { name: "Cost (API-equivalent)" })).toBeTruthy();
+  });
+  it("ranks subscription users by total tokens before metered cost in both windows", () => {
+    const f = fixture();
+    f.admin.users[0].usage = f.admin.users[0].last_7_days = bundle(900, 0, 100, 0);
+    f.admin.users[1].usage = f.admin.users[1].last_7_days = bundle(0, 0, 100, 50);
+    f.admin.factory.lifetime = f.admin.factory.last_7_days = bundle(900, 0, 200, 50);
+    const view = mount(f);
+    for (const period of ["Last 7 days", "All time"]) {
+      fireEvent.click(view.getByRole("button", { name: period }));
+      const rows = columns(view).users.getAllByRole("row").slice(1, -1);
+      expect(rows.map((row) => row.querySelector("td")?.textContent)).toEqual([
+        "owner.person@example.com", "other.person@example.com",
+      ]);
+      expect(within(rows[0]).getByRole("img").getAttribute("aria-label")).toBe("91 percent of factory tokens");
+    }
+  });
+  it("breaks equal token totals by cost, output and user ID", () => {
+    const f = fixture();
+    f.admin.users = ["d", "c", "b", "a"].map((id, i) => ({
+      ...f.admin.users[0], user_id: id, email: `${id}@example.com`,
+      last_7_days: bundle([80, 90, 80, 80][i], 0, [20, 10, 20, 20][i], [0, 2, 2, 2][i]),
+    }));
+    f.admin.factory.last_7_days = bundle(330, 0, 70, 6);
+    const rows = columns(mount(f)).users.getAllByRole("row").slice(1, -1);
+    expect(rows.map((row) => row.querySelector("td")?.textContent)).toEqual([
+      "a@example.com", "b@example.com", "c@example.com", "d@example.com",
+    ]);
+  });
   it("switches both scopes with one accessible toggle and the embedded table follows the window", () => {
     const view = mount(fixture());
     const { you, factory, users } = columns(view);
@@ -113,29 +149,25 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(view.getByRole("heading", { name: "You", level: 3 })).toBeTruthy();
     expect(view.getByRole("heading", { name: "Factory · all users", level: 3 })).toBeTruthy();
     expect(view.getByRole("heading", { name: "Per user · last 7 days", level: 3 })).toBeTruthy();
-    for (const name of ["Metered cost", "Failed runs rate", "Tokens"]) {
+    for (const name of ["Cost (API-equivalent)", "Failed runs rate", "Tokens"]) {
       expect(view.getAllByRole("heading", { name, level: 4 })).toHaveLength(2);
     }
   });
 
-  it("builds the compact cost note from counts independently of the full disclosure wording", () => {
-    vi.spyOn(costStatus, "aggregateDisclosure").mockReturnValue({
-      incomplete: true, text: "Metered cost omits this window's subscription runs",
-    });
-    const view = mount({ self: fixture().self });
-    expect(view.getByText("excl. 1 subscription run").getAttribute("title")).toBe("Metered cost omits this window's subscription runs");
-  });
-
   it.each([
-    [0, 1, "excl. 1 unreported run", "Cost excludes 1 unreported run"],
-    [2, 0, "excl. 2 subscription runs", "Cost excludes 2 Codex subscription runs"],
-    [1, 2, "excl. 1 subscription run and 2 unreported runs", "Cost excludes 1 Codex subscription run and 2 unreported runs"],
-  ] as const)("formats compact exclusions and full title for %i subscription and %i unreported runs", (subscription, unreported, short, full) => {
-    const { self } = fixture();
-    self.last7_subscription_run_count = subscription;
-    self.last7_unreported_run_count = unreported;
-    const view = mount({ self });
-    expect(view.getByText(short).getAttribute("title")).toBe(full);
+    [0, 1, "+ 1 unreported run", "Unreported runs: cost incomplete; recorded partial costs included"],
+    [2, 0, "+ 2 runs without a cost estimate", "Runs without a cost estimate: tokens only"],
+    [1, 2, "+ 1 run without a cost estimate and 2 unreported runs", "Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included"],
+  ] as const)("formats compact disclosures and explanatory title for %i subscription and %i unreported runs", (subscription, unreported, short, full) => {
+    const f = fixture();
+    for (const usage of [f.self, f.admin.factory, ...f.admin.users]) {
+      usage.last7_subscription_run_count = subscription;
+      usage.last7_unreported_run_count = unreported;
+    }
+    const view = mount(f);
+    const notes = view.getAllByText(short);
+    expect(notes).toHaveLength(5); // personal card, factory card, two users, factory total
+    for (const note of notes) expect(note.getAttribute("title")).toBe(full);
   });
 
   it("renders a non-admin single column without factory or per-user data", () => {
@@ -204,14 +236,14 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
   });
   it("pairs each selected cost with its own exclusions and full title (#1429 D7)", () => {
     const view = mount({ self: fixture().self });
-    expect(view.getByText("excl. 1 subscription run").getAttribute("title")).toBe("Cost excludes 1 Codex subscription run");
+    expect(view.getByText("+ 1 run without a cost estimate").getAttribute("title")).toBe("Runs without a cost estimate: tokens only");
     fireEvent.click(view.getByRole("button", { name: "All time" }));
-    expect(view.getByText("excl. 8 subscription runs and 2 unreported runs").getAttribute("title")).toBe("Cost excludes 8 Codex subscription runs and 2 unreported runs");
-    expect(view.queryByText("excl. 1 subscription run")).toBeNull();
+    expect(view.getByText("+ 8 runs without a cost estimate and 2 unreported runs").getAttribute("title")).toBe("Runs without a cost estimate: tokens only; Unreported runs: cost incomplete; recorded partial costs included");
+    expect(view.queryByText("+ 1 run without a cost estimate")).toBeNull();
   });
   it("shows real zero metered cost without exclusions when the window is fully metered", () => {
     const { self } = fixture(); self.last_7_days.cost_usd = 0; self.last7_subscription_run_count = 0;
-    const view = mount({ self }); expect(view.getByText("$0.00")).toBeTruthy(); expect(view.queryByTitle(/^Cost excludes/)).toBeNull();
+    const view = mount({ self }); expect(view.getByText("$0.00")).toBeTruthy(); expect(view.queryByText(/^\+ \d+ (runs? without a cost estimate|unreported runs?)/)).toBeNull();
   });
   it("keeps lifetime recency and intact run links in both windows", () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-07T12:00:00Z"));
@@ -249,7 +281,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual(["50 percent of factory tokens", "50 percent of factory tokens"]);
     const row = users.getByText("owner.person@example.com").closest("tr")!;
     expect(row.querySelectorAll("td")[3].getAttribute("title")).toBe("10 of 100 finished runs");
-    expect(row.textContent).toContain("Cost excludes 4 Codex subscription runs and 1 unreported run");
+    expect(row.textContent).toContain("+ 4 runs without a cost estimate and 1 unreported run");
   });
   it("rounds per-user token shares to exactly 100% with largest remainders", () => {
     const f = fixture();
@@ -266,7 +298,7 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     expect((users.getAllByRole("img")[0].firstElementChild as HTMLElement).style.width).toBe("91%");
   });
 
-  it("selects metrics before sorting by cost, output and user ID in both directions", () => {
+  it("selects metrics before sorting by tokens, cost, output and user ID in both directions", () => {
     vi.useFakeTimers(); vi.setSystemTime(new Date("2026-10-07T12:00:00Z"));
     const f = fixture();
     f.admin.users = ["b", "a", "c", "d", "e"].map((id, i) => ({
@@ -291,15 +323,15 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     const rowCells = () => users.getAllByRole("row").slice(1).map((row) =>
       Array.from(row.querySelectorAll("td")).map((cell) => cell.textContent));
     const recent = rowCells();
-    expect(recent.map((r) => r[0])).toEqual(["a@example.com", "c@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
-    expect(recent[1]).toEqual(["c@example.com", "2", "0", "—", "6h", "20", "20", "$1.00Cost excludes 1 Codex subscription run", "67%"]);
-    expect(recent[0][7]).toBe("$2.00Cost excludes 1 unreported run");
+    expect(recent.map((r) => r[0])).toEqual(["c@example.com", "a@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
+    expect(recent[0]).toEqual(["c@example.com", "2", "0", "—", "6h", "20", "20", "$1.00+ 1 run without a cost estimate", "67%"]);
+    expect(recent[1][7]).toBe("$2.00+ 1 unreported run");
     expect(recent[2].slice(1, 8)).toEqual(["0", "0", "—", "6h", "0", "0", "$0.00"]);
     expect(recent[4].slice(1, 4)).toEqual(["0", "1", "50.0%"]);
     expect(recent[5].slice(1, 4)).toEqual(["3", "1", "50.0%"]);
-    expect(recent[5].slice(5, 8)).toEqual(["30", "30", "$3.00Cost excludes 1 Codex subscription run and 1 unreported run"]);
+    expect(recent[5].slice(5, 8)).toEqual(["30", "30", "$3.00+ 1 run without a cost estimate and 1 unreported run"]);
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
-      "33 percent of factory tokens", "67 percent of factory tokens", "0 percent of factory tokens",
+      "67 percent of factory tokens", "33 percent of factory tokens", "0 percent of factory tokens",
       "0 percent of factory tokens", "0 percent of factory tokens",
     ]);
     expect(users.getAllByRole("row")[5].querySelectorAll("td")[3].title).toBe("1 of 2 finished runs");
@@ -308,9 +340,9 @@ describe("UsageCard (#40, #1293, #1429 D7)", () => {
     const lifetime = rowCells();
     expect(lifetime.map((r) => r[0])).toEqual(["c@example.com", "a@example.com", "b@example.com", "d@example.com", "e@example.com", "uzi total"]);
     expect(lifetime[1].slice(1, 4)).toEqual(["4", "10", "10.0%"]);
-    expect(lifetime[2][7]).toBe("$2.00Cost excludes 2 Codex subscription runs");
+    expect(lifetime[2][7]).toBe("$2.00+ 2 runs without a cost estimate");
     expect(lifetime[5].slice(1, 4)).toEqual(["12", "20", "10.0%"]);
-    expect(lifetime[5].slice(5, 8)).toEqual(["70", "70", "$6.00Cost excludes 2 Codex subscription runs and 1 unreported run"]);
+    expect(lifetime[5].slice(5, 8)).toEqual(["70", "70", "$6.00+ 2 runs without a cost estimate and 1 unreported run"]);
     expect(lifetime[5][4]).toBe(totalRecency);
     expect(users.getAllByRole("img").map((bar) => bar.getAttribute("aria-label"))).toEqual([
       "43 percent of factory tokens", "29 percent of factory tokens", "28 percent of factory tokens",

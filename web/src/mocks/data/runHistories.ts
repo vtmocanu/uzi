@@ -120,6 +120,9 @@ function histRun(i: number, minsBack: number): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: minsAgo(minsBack + ranMins),
     started_at: minsAgo(minsBack + ranMins),
@@ -211,6 +214,9 @@ export const mockOtherUserRuns: Run[] = [
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: minsAgo(18),
     started_at: minsAgo(18),
@@ -275,6 +281,9 @@ export const mockOtherUserRuns: Run[] = [
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -350,9 +359,9 @@ function demoRunUsage(r: Run): RunUsage | null {
     cache_read_tokens: round(1_170_000),
     cache_creation_tokens: 0,
     output_tokens: round(48_200),
-    cost_usd: Math.round(187 * scale) / 100,
-    // PRD #1429 M1 (D7): these mock runs are Claude/metered, so a real dollar total shows.
-    cost_status: "metered",
+    // One legacy row has no estimate; the mixed run retains its recorded partial.
+    cost_usd: r.id === "run-closed" ? 0 : r.id === "run-failed" ? 0.61 : Math.round(187 * scale) / 100,
+    cost_status: r.id === "run-closed" ? "subscription" : r.id === "run-failed" ? "unreported" : "metered",
   };
 }
 

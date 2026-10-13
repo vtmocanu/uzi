@@ -410,27 +410,55 @@ func TestHTTPFinalizationEvidence(t *testing.T) {
 }
 
 func TestHTTPFinalizationActualBoundaries(t *testing.T) {
-	report := rawFixtureWire(t, "unpack ok", "ok refs/uzi-checkpoints/main")
-	flush := len(report)
-	var contradictory bytes.Buffer
-	if err := pktline.NewEncoder(&contradictory).EncodeString("ng refs/uzi-checkpoints/main non-fast-forward\n"); err != nil {
-		t.Fatal(err)
+	okReport := rawFixtureWire(t, "unpack ok", "ok refs/uzi-checkpoints/main")
+	ngReport := rawFixtureWire(t, "unpack ok", "ng refs/uzi-checkpoints/main non-fast-forward")
+	encode := func(line string) []byte {
+		var b bytes.Buffer
+		if err := pktline.NewEncoder(&b).EncodeString(line); err != nil {
+			t.Fatal(err)
+		}
+		return b.Bytes()
 	}
-	for _, tc := range []struct {
-		name string
-		tail []byte
-		kind string
-	}{
-		{"valid report", nil, ""},
-		{"trailing flush", []byte("0000"), "malformed"},
-		{"partial header 1", []byte("0"), "incomplete"},
-		{"partial header 2", []byte("00"), "incomplete"},
-		{"partial header 3", []byte("000"), "incomplete"},
-		{"contradictory status after flush", contradictory.Bytes(), "malformed"},
-		{"invalid packet tail", []byte("0005x"), "malformed"},
-	} {
+	contradictory := encode("ng refs/uzi-checkpoints/main non-fast-forward\n")
+	data := encode("ok refs/uzi-checkpoints/main\n")
+	type row struct {
+		name     string
+		report   []byte
+		tail     []byte
+		kind     string
+		rejected bool
+	}
+	rows := []row{
+		{"valid report", okReport, nil, "", false},
+		{"trailing flush", okReport, []byte("0000"), "", false},
+		{"several trailing flushes", okReport, []byte("000000000000"), "", false},
+		{"ng valid report", ngReport, nil, "", true},
+		{"ng trailing flush", ngReport, []byte("0000"), "", true},
+		{"ng several trailing flushes", ngReport, []byte("000000000000"), "", true},
+		{"partial header 1", okReport, []byte("0"), "incomplete", false},
+		{"partial header 2", okReport, []byte("00"), "incomplete", false},
+		{"partial header 3", okReport, []byte("000"), "incomplete", false},
+		{"contradictory status after flush", okReport, contradictory, "malformed", false},
+		{"invalid packet tail", okReport, []byte("0005x"), "malformed", false},
+	}
+	for _, n := range []int{1, 3} {
+		flushes := strings.Repeat("0000", n)
+		with := func(tail ...[]byte) []byte { return append([]byte(flushes), bytes.Join(tail, nil)...) }
+		rows = append(rows,
+			row{fmt.Sprintf("data after %d flushes", n), okReport, with(data), "malformed", false},
+			row{fmt.Sprintf("contradictory after %d flushes", n), okReport, with(contradictory), "malformed", false},
+			row{fmt.Sprintf("partial header 1 after %d flushes", n), okReport, with([]byte("0")), "incomplete", false},
+			row{fmt.Sprintf("partial header 2 after %d flushes", n), okReport, with([]byte("00")), "incomplete", false},
+			row{fmt.Sprintf("partial header 3 after %d flushes", n), okReport, with([]byte("000")), "incomplete", false},
+			row{fmt.Sprintf("partial payload after %d flushes", n), okReport, with([]byte("000dunp")), "incomplete", false},
+			row{fmt.Sprintf("0001 after %d flushes", n), okReport, with([]byte("0001")), "malformed", false},
+			row{fmt.Sprintf("0002 after %d flushes", n), okReport, with([]byte("0002")), "malformed", false},
+		)
+	}
+	for _, tc := range rows {
 		t.Run(tc.name, func(t *testing.T) {
-			wire := append(append([]byte(nil), report...), tc.tail...)
+			flush := len(tc.report)
+			wire := append(append([]byte(nil), tc.report...), tc.tail...)
 			for _, schedule := range []struct {
 				name  string
 				chunk int
@@ -446,8 +474,13 @@ func TestHTTPFinalizationActualBoundaries(t *testing.T) {
 					body := &boundaryBody{data: append([]byte(nil), wire...), chunk: schedule.chunk, terminal: io.EOF}
 					result, _, err := realFinalizationSession(t, body, 200)
 					t.Logf("actual read boundaries=%v report flush=%d result=%+v error=%v", body.boundaries, flush, result, err)
-					if !result.invoked || result.success != (tc.kind == "") || result.rejected || (err == nil) != (tc.kind == "") {
+					if !result.invoked || result.success != (tc.kind == "" && !tc.rejected) || result.rejected != tc.rejected || (err == nil) != (tc.kind == "" && !tc.rejected) {
 						t.Fatalf("unexpected disposition: result=%+v error=%v", result, err)
+					}
+					if tc.rejected {
+						if result.reason != "non-fast-forward" || err == nil || !strings.Contains(err.Error(), "receive-pack failed") || strings.Contains(err.Error(), "case=") {
+							t.Fatalf("unexpected rejection: result=%+v error=%v", result, err)
+						}
 					}
 					if tc.kind != "" && !strings.Contains(err.Error(), "case="+tc.kind) {
 						t.Fatalf("missing diagnostic %s: %v", tc.kind, err)

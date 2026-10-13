@@ -1,7 +1,7 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { MilestoneChecklist } from "./RunView";
+import { MilestoneRows } from "../components/RunMilestoneRows";
 import type { Run, RunActivity } from "../lib/api";
 
 // PRD #1224 M4 — BASELINE CHARACTERIZATION (web).
@@ -16,14 +16,14 @@ import type { Run, RunActivity } from "../lib/api";
 // render. Today's behavior it locks in: with two milestones in progress at once, the
 // acting agent attaches to only the FIRST in-progress milestone (m2) via a single active
 // MilestoneNowStrip; the second in-progress milestone (m3) keeps its bare ◐ mark and
-// gets NO strip / NO agent line; and the header shows the `◐ <firstInProgress>` marker.
+// gets NO strip / NO agent line. M1 keeps those facts on the rows themselves.
 //
 // D8 back-compat baseline: M5 MUST keep this green for the unattributed case.
 
 const AT = "2026-09-03T12:00:00Z";
 const NOW = Date.parse(AT) + 40_000; // 40s after the activity instant → "40s"
 
-// MilestoneChecklist ages the now line via useNow; pin it so "40s" is deterministic.
+// MilestoneRows ages the now line via useNow; pin it so "40s" is deterministic.
 vi.mock("../lib/useNow", () => ({ useNow: () => NOW }));
 
 function anActivity(over: Partial<RunActivity> = {}): RunActivity {
@@ -100,6 +100,9 @@ function run(over: Partial<Run>): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -132,7 +135,7 @@ afterEach(cleanup);
 
 describe("PRD #1224 M4 baseline: unattributed multi-in-progress milestone render (web)", () => {
   it("attaches the single now-strip to the FIRST in-progress milestone (m2) only", () => {
-    render(<MilestoneChecklist run={canonicalRun()} activity={anActivity()} />);
+    render(<MilestoneRows run={canonicalRun()} activity={anActivity()} />);
 
     // Exactly ONE MilestoneNowStrip renders (the active variant). Each active strip prints
     // the role once and a single "40s ago" age token, so both counts are the strip count.
@@ -149,7 +152,7 @@ describe("PRD #1224 M4 baseline: unattributed multi-in-progress milestone render
   });
 
   it("gives the SECOND in-progress milestone (m3) a bare ◐ mark and NO strip / NO agent line", () => {
-    render(<MilestoneChecklist run={canonicalRun()} activity={anActivity()} />);
+    render(<MilestoneRows run={canonicalRun()} activity={anActivity()} />);
 
     const gammaRow = screen.getByText("Gamma").closest("li");
     expect(gammaRow).not.toBeNull();
@@ -164,10 +167,11 @@ describe("PRD #1224 M4 baseline: unattributed multi-in-progress milestone render
     expect(screen.getAllByLabelText("in progress")).toHaveLength(2);
   });
 
-  it("shows the `◐ <firstInProgress>` header marker for m2 (unchanged, non-goal for M5)", () => {
-    render(<MilestoneChecklist run={canonicalRun()} activity={anActivity()} />);
-    expect(screen.getByText(/◐\s*m2/)).toBeTruthy();
-    // Only the first in-progress id is named in the header, never m3.
-    expect(screen.queryByText(/◐\s*m3/)).toBeNull();
+  it("marks m2 in progress and attaches fallback activity only to the first row", () => {
+    render(<MilestoneRows run={canonicalRun()} activity={anActivity()} />);
+    expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByLabelText("in progress")).toBeTruthy();
+    // Both row states survive; only m2 carries fallback activity.
+    expect(within(screen.getByText("m3").closest("li") as HTMLElement).queryByText("coder")).toBeNull();
+    expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByText("coder")).toBeTruthy();
   });
 });

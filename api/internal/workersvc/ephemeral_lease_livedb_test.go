@@ -3,6 +3,7 @@ package workersvc
 import (
 	"context"
 	"fmt"
+	"strings"
 	"sync"
 	"sync/atomic"
 	"testing"
@@ -621,16 +622,12 @@ func TestSetStateEnterLeaseLiveDB(t *testing.T) {
 
 // seedLeasedWorker creates an ephemeral worker that served a completed issue run on `iid` (branch
 // NULL: identity agent/issue-<iid>) and entered its lease through the real EnterEphemeralLease.
-// leaseAge backdates lease_since.
-func (e leaseEnv) seedLeasedWorker(t *testing.T, leaseAge time.Duration) (workerID, served uuid.UUID, iid int64) {
+func (e leaseEnv) seedLeasedWorker(t *testing.T) (workerID, served uuid.UUID, iid int64) {
 	t.Helper()
 	workerID, served, iid = e.seedBound(t, "completed", 1, false)
 	n, err := e.q.EnterEphemeralLease(e.ctx, store.EnterEphemeralLeaseParams{WorkerID: workerID, RunID: served})
 	if err != nil || n != 1 {
 		t.Fatalf("EnterEphemeralLease = (%d, %v), want (1, nil)", n, err)
-	}
-	if leaseAge > 0 {
-		e.exec(`UPDATE workers SET lease_since = now() - $2::interval WHERE id = $1`, workerID, fmt.Sprintf("%d microseconds", leaseAge.Microseconds()))
 	}
 	return workerID, served, iid
 }
@@ -702,7 +699,7 @@ func (p *leaseProbe) hook(admitted, rebound bool) {
 func TestClaimThroughLeaseRebindsLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(2*time.Hour, e.pool)
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 	r := awaitClaim(t, e.claimAsync(svc, w, 1))
@@ -760,7 +757,7 @@ func TestClaimIssueRerunCreatedThroughServiceLiveDB(t *testing.T) {
 func TestClaimLeaseOffNeverClaimsForeignLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	svc := e.service(0, e.pool)
-	w, _, iid := e.seedLeasedWorker(t, 0)
+	w, _, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	r := awaitClaim(t, e.claimAsync(svc, w, 1))
 	if r.err != nil || r.payload != nil {
@@ -782,7 +779,7 @@ func TestClaimTwoFollowUpsForOneLeasedWorkerLiveDB(t *testing.T) {
 	svc := e.service(2*time.Hour, gate)
 	probe := &leaseProbe{}
 	svc.leaseClaimProbe = probe.hook
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	r1 := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	// uq_runs_one_active_per_issue allows one active issue run per issue, so the second lease-eligible
 	// follow-up is an mr_rework on the same branch (its identity is its pipeline_ref).
@@ -833,7 +830,7 @@ func TestClaimVsCordonLiveDB(t *testing.T) {
 		svc := e.service(2*time.Hour, e.pool)
 		probe := &leaseProbe{}
 		svc.leaseClaimProbe = probe.hook
-		w, _, iid := e.seedLeasedWorker(t, 0)
+		w, _, iid := e.seedLeasedWorker(t)
 		follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 		cordon := e.sideTx(t, `UPDATE workers SET draining_since = COALESCE(draining_since, now()),
@@ -858,7 +855,7 @@ func TestClaimVsCordonLiveDB(t *testing.T) {
 		e := newLeaseEnv(t)
 		gate := newGate(t, e.pool)
 		svc := e.service(2*time.Hour, gate)
-		w, _, iid := e.seedLeasedWorker(t, 0)
+		w, _, iid := e.seedLeasedWorker(t)
 		follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 
 		gate.arm()
@@ -896,7 +893,7 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 	e := newLeaseEnv(t)
 	gate := newGate(t, e.pool)
 	svc := e.service(2*time.Hour, gate)
-	w, served, iid := e.seedLeasedWorker(t, 0)
+	w, served, iid := e.seedLeasedWorker(t)
 	follow := e.seedFollowUp(t, iid, agentIssueBranch(iid))
 	del := func() int64 {
 		n, err := e.q.DeleteEphemeralWorkerForRun(e.ctx, store.DeleteEphemeralWorkerForRunParams{
@@ -931,31 +928,189 @@ func TestClaimVsDeleteEphemeralWorkerForRunLiveDB(t *testing.T) {
 
 // ---- fresh admission clock ----------------------------------------------------------------------
 
-// leaseClockCase seeds a worker whose lease expires `window` after the test begins and returns the
-// follow-up. The lease is `lease` long and was entered `lease - window` ago.
-func (e leaseEnv) leaseClockCase(t *testing.T, lease, window time.Duration) (w, served uuid.UUID, follow uuid.UUID) {
+// The fresh-clock tests below need the lease to expire WHILE the claim is blocked on a lock, and the
+// claim's earlier clock reads to be provably before that expiry. Sleeping for a fixed span after
+// "a lock waiter exists" proves neither: the claim's transaction can begin late, and a pre-expired
+// fixture would let a stale-clock bug pass. So the lease is armed from ONE database clock read, with
+// expiry a known positive window after it, and the test waits on the database's own clock until that
+// expiry has passed before releasing the lock. When the claim blocks on the WORKER lock, the arming
+// runs inside the holder's transaction after the claim is observed blocked; when it blocks on a RUN
+// lock (the claim then holds the worker row), the arming runs before the holder and the claim start,
+// and the blocked statement's query_start is asserted to be before the expiry.
+
+// workerLockWindow is how long after arming the lease expires when the claim is blocked on the WORKER
+// lock. The claim's transaction began before the arming (the arming runs inside the lock holder's
+// transaction, after the claim is seen blocked), so its transaction-start now() is before any
+// expiry for every positive window; the value only has to be positive and is kept small to stay fast.
+const workerLockWindow = 250 * time.Millisecond
+
+// runLockWindow is how long after arming the lease expires when the claim is blocked on a RUN lock.
+// An early admission clock (the bug this case catches) would be read right after the worker lock, so
+// the window must cover the span from arming to the claim reaching LockWorkerRecoveryParents; that
+// is asserted (the blocked statement's query_start must be before the expiry) rather than assumed.
+const runLockWindow = time.Second
+
+// leaseClockCase seeds a worker with a FRESH lease (never pre-expired: a lease that already expired
+// would be refused by every clock, so it could not tell a stale clock from a fresh one) and a queued
+// same-branch follow-up. The test then arms the expiry with armLeaseExpiry.
+func (e leaseEnv) leaseClockCase(t *testing.T) (w, served uuid.UUID, follow uuid.UUID) {
 	t.Helper()
-	w, served, iid := e.seedLeasedWorker(t, lease-window)
+	w, served, iid := e.seedLeasedWorker(t)
 	return w, served, e.seedFollowUp(t, iid, agentIssueBranch(iid))
 }
 
-// TestClaimStaleTxStartClockLiveDB (g): the lease has `window` left when the claim transaction
-// begins (that fixes its transaction-start now()), and expires while the claim waits for the worker
-// row. Admission uses a clock read after the wait, so the follow-up is not claimed and the lease is
+// rowQuerier is the QueryRow seam shared by a pool (autocommit) and a transaction.
+type rowQuerier interface {
+	QueryRow(ctx context.Context, sql string, args ...any) pgx.Row
+}
+
+// armLeaseExpiry rewrites the worker's lease_since from a single database clock read c so the lease
+// expires exactly `window` after c (lease_since = c - (lease - window)), and returns c and the
+// resulting expiry. window must be positive, so the lease is never pre-expired when armed.
+func (e leaseEnv) armLeaseExpiry(t *testing.T, q rowQuerier, w uuid.UUID, lease, window time.Duration) (armedAt, expiry time.Time) {
+	t.Helper()
+	if window <= 0 || window >= lease {
+		t.Fatalf("lease expiry window %v must be in (0, %v)", window, lease)
+	}
+	err := q.QueryRow(e.ctx, `WITH c AS (SELECT clock_timestamp() AS t)
+	        UPDATE workers SET lease_since = c.t - $2::interval FROM c WHERE workers.id = $1
+	        RETURNING c.t, workers.lease_since + $3::interval`,
+		w, LeaseInterval(lease-window), LeaseInterval(lease)).Scan(&armedAt, &expiry)
+	if err != nil {
+		t.Fatalf("arm lease expiry (exactly one worker row expected): %v", err)
+	}
+	return armedAt, expiry
+}
+
+// lockHolder is sideTx that also reports its backend pid, so a waiter can be identified by the lock
+// it waits behind (pg_blocking_pids).
+func (e leaseEnv) lockHolder(t *testing.T, lockSQL string, args ...any) (pgx.Tx, int32) {
+	t.Helper()
+	tx := e.sideTx(t, lockSQL, args...)
+	var pid int32
+	if err := tx.QueryRow(e.ctx, `SELECT pg_backend_pid()`).Scan(&pid); err != nil {
+		t.Fatalf("read holder backend pid: %v", err)
+	}
+	return tx, pid
+}
+
+// waitBlockedBy waits until exactly one backend is blocked by holderPid and its current statement is
+// the sqlc query `stmt` (sqlc keeps "-- name: <stmt> :kind" at the start of the query text). It
+// returns that backend's transaction start and the start of the blocked statement. More than one
+// blocked backend, or a different blocked statement that never gives way, is fatal.
+func (e leaseEnv) waitBlockedBy(t *testing.T, holderPid int32, stmt string) (xactStart, queryStart time.Time) {
+	t.Helper()
+	marker := "name: " + stmt
+	deadline := time.Now().Add(20 * time.Second)
+	last := "no backend blocked by the holder"
+	for {
+		rows, err := e.pool.Query(e.ctx, `SELECT pid, xact_start, query_start, query FROM pg_stat_activity
+		        WHERE $1 = ANY(pg_blocking_pids(pid))`, holderPid)
+		if err != nil {
+			t.Fatalf("read blocked backends: %v", err)
+		}
+		type blocked struct {
+			pid         int32
+			xact, query *time.Time
+			text        string
+		}
+		var got []blocked
+		for rows.Next() {
+			var b blocked
+			if err := rows.Scan(&b.pid, &b.xact, &b.query, &b.text); err != nil {
+				rows.Close()
+				t.Fatalf("scan blocked backend: %v", err)
+			}
+			got = append(got, b)
+		}
+		rows.Close()
+		if err := rows.Err(); err != nil {
+			t.Fatalf("read blocked backends: %v", err)
+		}
+		if len(got) > 1 {
+			t.Fatalf("%d backends blocked by holder pid %d, want exactly 1", len(got), holderPid)
+		}
+		if len(got) == 1 {
+			b := got[0]
+			if strings.Contains(b.text, marker) && b.xact != nil && b.query != nil {
+				return *b.xact, *b.query
+			}
+			last = fmt.Sprintf("blocked backend %d runs %q", b.pid, b.text)
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("no backend blocked by holder pid %d on %q: %s", holderPid, stmt, last)
+		}
+		time.Sleep(20 * time.Millisecond)
+	}
+}
+
+// awaitDBClockPast waits until the database's clock_timestamp() is at or past expiry, comparing on the
+// server, and returns the first server clock reading that satisfied it. That reading is what a
+// claim running afterwards can only exceed.
+func (e leaseEnv) awaitDBClockPast(t *testing.T, expiry time.Time) time.Time {
+	t.Helper()
+	deadline := time.Now().Add(20 * time.Second)
+	for {
+		var now time.Time
+		var past bool
+		if err := e.pool.QueryRow(e.ctx, `SELECT t, t >= $1 FROM (SELECT clock_timestamp() AS t) c`, expiry).Scan(&now, &past); err != nil {
+			t.Fatalf("read database clock: %v", err)
+		}
+		if past {
+			return now
+		}
+		if time.Now().After(deadline) {
+			t.Fatalf("database clock %v never reached lease expiry %v", now, expiry)
+		}
+		wait := expiry.Sub(now) + 10*time.Millisecond
+		if wait < 5*time.Millisecond {
+			wait = 5 * time.Millisecond
+		}
+		time.Sleep(wait)
+	}
+}
+
+// assertBefore fails the test when an earlier clock reading is not strictly before the lease expiry:
+// then the fixture could not tell a stale clock from a fresh one.
+func assertBefore(t *testing.T, what string, initial, expiry time.Time) {
+	t.Helper()
+	if !initial.Before(expiry) {
+		t.Fatalf("fixture cannot discriminate: %s %v is not before lease expiry %v (window too short)", what, initial, expiry)
+	}
+}
+
+// logClockOrdering records the ordering the test established, for diagnosing a window failure.
+func logClockOrdering(t *testing.T, what string, initial, expiry, fresh time.Time) {
+	t.Helper()
+	const f = time.RFC3339Nano
+	t.Logf("clock ordering: %s %s < expiry %s <= fresh %s", what, initial.Format(f), expiry.Format(f), fresh.Format(f))
+}
+
+// TestClaimStaleTxStartClockLiveDB (g): the claim transaction begins while the lease is live and
+// blocks on the worker row; the lease then expires, and only afterwards does the claim proceed.
+// Admission uses a clock read after the wait, so the follow-up is not claimed and the lease is
 // never applied. Reading the transaction-start now() instead admits the follow-up through the
 // expired lease (the probe reports it), and only the rebind's own clock then refuses.
+//
+// The barrier: the claim is seen blocked on GetWorkerForUpdate behind the holder (so its transaction
+// has started), the lease is armed inside the holder's transaction to expire workerLockWindow later,
+// the claim's pg_stat_activity xact_start is asserted before that expiry, and the holder commits only
+// once the database clock has passed the expiry.
 func TestClaimStaleTxStartClockLiveDB(t *testing.T) {
-	const lease, window = 5 * time.Second, 2500 * time.Millisecond
+	const lease = 5 * time.Second
 	e := newLeaseEnv(t)
 	svc := e.service(lease, e.pool)
 	probe := &leaseProbe{}
 	svc.leaseClaimProbe = probe.hook
-	w, served, follow := e.leaseClockCase(t, lease, window)
+	w, served, follow := e.leaseClockCase(t)
 
-	holder := e.sideTx(t, `SELECT id FROM workers WHERE id = $1 FOR UPDATE`, w)
+	holder, pid := e.lockHolder(t, `SELECT id FROM workers WHERE id = $1 FOR UPDATE`, w)
 	res := e.claimAsync(svc, w, 1)
-	e.waitLockWaiters(t, 1)
-	time.Sleep(window + 400*time.Millisecond) // the lease expires while the claim waits
+	xactStart, _ := e.waitBlockedBy(t, pid, "GetWorkerForUpdate")
+	_, expiry := e.armLeaseExpiry(t, holder, w, lease, workerLockWindow)
+	assertBefore(t, "claim xact_start (its transaction-start now())", xactStart, expiry)
+	fresh := e.awaitDBClockPast(t, expiry) // the lease expires while the claim waits
+	logClockOrdering(t, "claim xact_start", xactStart, expiry, fresh)
 	if err := holder.Commit(e.ctx); err != nil {
 		t.Fatalf("commit holder: %v", err)
 	}
@@ -975,28 +1130,40 @@ func TestClaimStaleTxStartClockLiveDB(t *testing.T) {
 }
 
 // TestClaimRunLockWaitCrossesExpiryLiveDB (g2): the claim takes the worker lock while the lease is
-// live, then waits on a run lock a side transaction holds (LockOwnedRunsByIDs on a run its snapshot
-// lists) across the lease's expiry. (1) Admission reads its clock AFTER that wait, so it does not
-// admit; reading it right after the worker lock admits through a lease that has since expired.
-// (2) With admission forced by pinning @lease_at to a pre-expiry instant (the test hook), the
-// rebind's own clock refuses: the claim rolls back to its savepoint, the run stays queued with no
-// hold, and the worker reports idle. A rebind that reused the admission instant would apply.
+// live, then waits on a run lock a side transaction holds (LockWorkerRecoveryParents on a run its
+// snapshot lists) across the lease's expiry. (1) Admission reads its clock AFTER that wait, so it
+// does not admit; reading it right after the worker lock admits through a lease that has since
+// expired. (2) With admission forced by pinning @lease_at to the arming instant (before the expiry,
+// the test hook), the rebind's own clock refuses: the claim rolls back to its savepoint, the run
+// stays queued with no hold, and the worker reports idle. A rebind that reused the admission
+// instant would apply.
+//
+// The barrier: the lease is armed (expiry runLockWindow after one database clock read) right before
+// the run lock is taken; the claim is seen blocked on LockWorkerRecoveryParents behind it, and that
+// statement's query_start (after the worker lock and any clock read taken right after it) is asserted
+// before the expiry; the run-lock holder commits only once the database clock has passed the expiry.
 func TestClaimRunLockWaitCrossesExpiryLiveDB(t *testing.T) {
-	const lease, window = 5 * time.Second, 2500 * time.Millisecond
+	const lease = 5 * time.Second
 	run := func(t *testing.T, pin bool) {
 		e := newLeaseEnv(t)
 		svc := e.service(lease, e.pool)
 		probe := &leaseProbe{}
 		svc.leaseClaimProbe = probe.hook
-		if pin {
-			svc.leaseAtOverride = pgtype.Timestamptz{Time: time.Now(), Valid: true} // pre-expiry
-		}
-		w, served, follow := e.leaseClockCase(t, lease, window)
+		w, served, follow := e.leaseClockCase(t)
 
-		runLock := e.sideTx(t, `SELECT id FROM runs WHERE id = $1 FOR UPDATE`, served)
-		res := e.claimAsync(svc, w, 1, served) // the snapshot lists the worker's served run
-		e.waitLockWaiters(t, 1)                // the claim holds the worker lock, waits on the run lock
-		time.Sleep(window + 400*time.Millisecond)
+		armedAt, expiry := e.armLeaseExpiry(t, e.pool, w, lease, runLockWindow)
+		if pin {
+			svc.leaseAtOverride = pgtype.Timestamptz{Time: armedAt, Valid: true} // pre-expiry
+		}
+		runLock, pid := e.lockHolder(t, `SELECT id FROM runs WHERE id = $1 FOR UPDATE`, served)
+		res := e.claimAsync(svc, w, 1, served)                                // the snapshot lists the worker's served run
+		_, queryStart := e.waitBlockedBy(t, pid, "LockWorkerRecoveryParents") // worker lock held, run lock awaited
+		assertBefore(t, "blocked run-lock statement query_start (after any clock read taken right after the worker lock)", queryStart, expiry)
+		if pin {
+			assertBefore(t, "pinned @lease_at", armedAt, expiry)
+		}
+		fresh := e.awaitDBClockPast(t, expiry)
+		logClockOrdering(t, "run-lock query_start", queryStart, expiry, fresh)
 		if err := runLock.Commit(e.ctx); err != nil {
 			t.Fatalf("commit run-lock tx: %v", err)
 		}

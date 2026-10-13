@@ -1,6 +1,6 @@
 import type { ReactNode } from "react";
 import type { AgentUsage, RunUsage } from "../lib/runUsage";
-import { cacheDisplayPct } from "../lib/runUsage";
+import { cacheDisplayPct, usagePanelVisible, sideUsage, hasSpend } from "../lib/runUsage";
 import type { CostStatus, Harness, UsageTail } from "../lib/api";
 import { coverageReasonText, tailCostText, tailVisible } from "../lib/usageTail";
 import { stripUnsafeChars } from "../lib/safeText";
@@ -14,17 +14,21 @@ import { cx } from "./ui";
 // client-side from the message stream (lib/runUsage.ts), so they fold in live as
 // new result frames arrive (Decision 9) with no accumulator.
 //
-// TWO states, gated by two independent flags off deriveRunUsage:
+// Three states, gated off deriveRunUsage:
 //   • CONFIRMED (`hasConfirmed`, once a result frame carried per-model usage): the
-//     billed surface — the 4-stat strip, per-phase table, per-agent table, cost.
+//     billed totals — the 4-stat strip, per-phase table and cost — plus estimated
+//     deduplicated per-agent input attribution.
 //   • LIVE-ONLY (`hasLiveTokens && !hasConfirmed`, from the first assistant-usage
 //     frame until the first result frame lands): a provisional IN-FLIGHT view of
 //     input tokens only. Deliberately NO output and NO cost — per-call output is a
 //     message_start snapshot capturing ~1-4% of the truth, so a live out/cost figure
 //     would be wrong by ~25-100x (see runUsage.ts). Once `hasConfirmed` flips true the
 //     confirmed surfaces take over and this disappears — we never show the deduped
-//     live table beside the raw confirmed per-agent one.
-// A pre-feature run has neither flag, so this renders nothing rather than a fabricated 0.
+//     live table beside the confirmed attribution table.
+//   • SIDE-ONLY (`hasSideUsage && !hasConfirmed`, issue #2686): a summary pass or Now note
+//     recorded spend before any result frame. Only those rows and their Run total render,
+//     beside the live view when that is also present.
+// A pre-feature run has none of these, so this renders nothing rather than a fabricated 0.
 
 const K_CLASS = "text-[10.5px] font-semibold uppercase tracking-[0.07em] text-faint";
 
@@ -148,14 +152,15 @@ export function RunUsagePanel({
   costStatus: CostStatus | "";
   harness?: Harness | null;
 }) {
-  if (!usage.hasLiveTokens && !usage.hasConfirmed) return null;
-  const { hasConfirmed, hasLiveTokens, total, model, phases, agents, agentTotal, agentModels } = usage;
+  if (!usagePanelVisible(usage)) return null;
+  const { hasConfirmed, hasLiveTokens, total, noteTotal, summaryTotal, model, phases, agents, agentTotal, agentModels } = usage;
   const { liveByModel, liveByAgent, liveTotal } = usage;
   const cost = costDisplay(costStatus, total.costUsd);
   // Never Math.round(cacheHitRatio * 100) here: 99.6% rounds to a "100% from cache"
   // label beside a zero-width warn segment while fresh tokens exist. See cacheDisplayPct.
   const cachePct = cacheDisplayPct(total);
   const tokensIn = total.fresh + total.cached;
+  const { rows: sideRows, status: sideStatus } = sideUsage(usage);
 
   return (
     <div>
@@ -187,10 +192,10 @@ export function RunUsagePanel({
         </Stat>
         <Stat label="Tokens out" value={formatTokens(total.out)}>
           <div className="text-[11px] text-muted">
-            {total.phaseCount} phase{total.phaseCount === 1 ? "" : "s"} · {total.turns} turns
+            {total.phaseCount} phase{total.phaseCount === 1 ? "" : "s"} · {total.turns ?? "—"} turns
           </div>
         </Stat>
-        <Stat label="Duration" value={formatDuration(total.durationMs)}>
+        <Stat label="Duration" value={total.durationMs === null ? "—" : formatDuration(total.durationMs)}>
           {model && <div className="truncate text-[11px] text-muted">{model}</div>}
         </Stat>
         <Stat label="Cost" value={costHeadline(cost)} cost={cost.kind === "metered"}>
@@ -249,16 +254,36 @@ export function RunUsagePanel({
               {phases.map((p) => (
                 <tr key={p.seq}>
                   <Td left>{p.label}</Td>
-                  <Td>{p.turns}</Td>
+                  <Td>{p.turns ?? "—"}</Td>
                   <Td>{formatTokens(p.fresh)}</Td>
                   <Td>{formatTokens(p.cached)}</Td>
                   <Td>{formatTokens(p.out)}</Td>
                   <Td>{costCellText(costDisplay(costStatus, p.costUsd))}</Td>
                 </tr>
               ))}
+              {hasSpend(noteTotal) && (
+                <tr>
+                  <Td left>Now summaries</Td>
+                  <Td>—</Td>
+                  <Td>{formatTokens(noteTotal.fresh)}</Td>
+                  <Td>{formatTokens(noteTotal.cached)}</Td>
+                  <Td>{formatTokens(noteTotal.out)}</Td>
+                  <Td>{costCellText(costDisplay(noteTotal.costStatus, noteTotal.costUsd))}</Td>
+                </tr>
+              )}
+              {hasSpend(summaryTotal) && (
+                <tr>
+                  <Td left>Intent, plan &amp; PR summaries</Td>
+                  <Td>—</Td>
+                  <Td>{formatTokens(summaryTotal.fresh)}</Td>
+                  <Td>{formatTokens(summaryTotal.cached)}</Td>
+                  <Td>{formatTokens(summaryTotal.out)}</Td>
+                  <Td>{costCellText(costDisplay(summaryTotal.costStatus, summaryTotal.costUsd))}</Td>
+                </tr>
+              )}
               <tr>
                 <Td left total>Run total</Td>
-                <Td total>{total.turns}</Td>
+                <Td total>{total.turns ?? "—"}</Td>
                 <Td total>{formatTokens(total.fresh)}</Td>
                 <Td total>{formatTokens(total.cached)}</Td>
                 <Td total>{formatTokens(total.out)}</Td>
@@ -287,7 +312,6 @@ export function RunUsagePanel({
                   <Th left>Model</Th>
                   <Th>In (fresh)</Th>
                   <Th>In (cached)</Th>
-                  <Th>Out</Th>
                 </tr>
               </thead>
               <tbody>
@@ -299,7 +323,6 @@ export function RunUsagePanel({
                     <Td left mono>{agentModelCell(a)}</Td>
                     <Td>{formatTokens(a.fresh)}</Td>
                     <Td>{formatTokens(a.cached)}</Td>
-                    <Td>{formatTokens(a.out)}</Td>
                   </tr>
                 ))}
                 <tr>
@@ -307,18 +330,62 @@ export function RunUsagePanel({
                   <Td left total mono>{totalModelCell(agentModels)}</Td>
                   <Td total>{formatTokens(agentTotal.fresh)}</Td>
                   <Td total>{formatTokens(agentTotal.cached)}</Td>
-                  <Td total>{formatTokens(agentTotal.out)}</Td>
                 </tr>
               </tbody>
             </table>
           </div>
           <p className="mt-1.5 text-[11px] text-faint">
-            Attributed from each agent's assistant messages; may not sum to the run total (tokens only — per-agent
-            cost is not available).
+            Estimated attribution from deduplicated assistant usage; identical usage records on the same lane may collapse, and attribution may be incomplete. Output is not attributed.
           </p>
         </details>
       )}
         </>
+      )}
+
+      {/* SIDE-ONLY spend: no result frame landed (e.g. a lead that failed early) but a summary
+          pass or Now note carried usage, so `total` is purely side spend. No stat strip, no
+          per-phase or per-agent tables — nothing there would be real. The Run total's cost
+          status comes from the side totals' own statuses, NOT the run-level `costStatus`
+          prop: that prop can read "metered" while this spend was unpriced, which would
+          render a fabricated $0. One present side → its status; both with the same status →
+          that; otherwise unavailable. */}
+      {!hasConfirmed && sideRows.length > 0 && (
+        <div className={cx(hasLiveTokens && "mb-3")}>
+          <div className="overflow-x-auto" role="region" aria-label="Summary usage, scrollable">
+            <table aria-label="Summary usage" className="w-full min-w-[560px] border-collapse text-xs">
+              <thead>
+                <tr>
+                  <Th left>Phase</Th>
+                  <Th>Turns</Th>
+                  <Th>In (fresh)</Th>
+                  <Th>In (cached)</Th>
+                  <Th>Out</Th>
+                  <Th>Cost</Th>
+                </tr>
+              </thead>
+              <tbody>
+                {sideRows.map((r) => (
+                  <tr key={r.label}>
+                    <Td left>{r.label}</Td>
+                    <Td>—</Td>
+                    <Td>{formatTokens(r.t.fresh)}</Td>
+                    <Td>{formatTokens(r.t.cached)}</Td>
+                    <Td>{formatTokens(r.t.out)}</Td>
+                    <Td>{costCellText(costDisplay(r.t.costStatus, r.t.costUsd))}</Td>
+                  </tr>
+                ))}
+                <tr>
+                  <Td left total>Run total</Td>
+                  <Td total>—</Td>
+                  <Td total>{formatTokens(total.fresh)}</Td>
+                  <Td total>{formatTokens(total.cached)}</Td>
+                  <Td total>{formatTokens(total.out)}</Td>
+                  <Td total>{costCellText(costDisplay(sideStatus, total.costUsd))}</Td>
+                </tr>
+              </tbody>
+            </table>
+          </div>
+        </div>
       )}
 
       {/* The LIVE / in-flight surface. Rendered ONLY before any result frame confirms a
@@ -410,12 +477,12 @@ export function RunUsageTailBlock({ tail }: { tail: UsageTail | null | undefined
   const version = stripUnsafeChars(tail.price_table_version);
   return (
     <section
-      aria-label="Estimated usage, not metered"
+      aria-label="Estimated usage, not in the total"
       className="rounded-lg border border-dashed border-edge bg-raised/40 px-3.5 py-3"
     >
-      <div className={K_CLASS}>Estimated, not metered</div>
+      <div className={K_CLASS}>Estimated, not in the total</div>
       <p className="mt-1 text-[11px] text-faint">
-        Usage after the last reported total of an interrupted session. It is not included in the metered total.
+        Usage after the last reported total of an interrupted session. It is not included in the recorded total.
       </p>
       <div className="mt-2 flex flex-wrap items-baseline gap-x-6 gap-y-1 font-mono text-[13px] tabular-nums">
         <span>

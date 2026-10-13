@@ -14,6 +14,7 @@ import (
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
+	"github.com/vtmocanu/uzi/api/internal/runprogress"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -93,11 +94,11 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		// issue #857: what/how/who started the run. A NOT NULL server enum (DEFAULT
 		// 'manual'), so it is always set and printed unconditionally like KIND above.
 		{"TRIGGER", r.TriggerSource},
-		// RunDTO carries no is_revising (issue #750): the detail page keeps its own
-		// derivePlanRevision panel, so revising is never surfaced through this helper here.
+		// RunDTO.IsRevising (issue #2760) is the server-derived "mid-revise replan" flag,
+		// so a re-planning run reads "revising" here instead of waiting on the owner.
 		// displayRunStatus (issue #1418) additionally reads "needs landing" for a failed run
 		// whose landing_state is needs_landing; every other status is unchanged.
-		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, false, r.LandingState)},
+		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},
@@ -110,6 +111,7 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		rows = append(rows, []string{"AUTO_APPROVE_BLOCKED", strings.Join(r.AutoApproveBlockedReasons, ", ")})
 	}
 	rows = append(rows, planCrossCheckRows(r)...)
+	rows = append(rows, codeCrossCheckRows(r)...)
 	rows = append(rows, workerExhaustionRows(r)...)
 	// DEADLINE (PRD #1170): the run's wall-clock stop time and countdown, emitted only when
 	// the server set a deadline (a running issue run) — right after HEALTH, and emit-only-
@@ -128,6 +130,9 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 	// emit-only-when-held. No retry countdown: the hold ends when the account recovers.
 	if line := codexAccountActionLine(r); line != "" {
 		rows = append(rows, []string{"CODEX_ACCOUNT", line})
+	}
+	if line := providerParkLine(r); line != "" {
+		rows = append(rows, []string{"PROVIDER", line})
 	}
 	// VAULT (issue #1766): a vault_locked park, emit-only-when-parked, with its next retry.
 	if line := vaultParkLine(r); line != "" {
@@ -222,9 +227,12 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		rows = append(rows, []string{"PRD_PATCH_SETTLED_AT", r.PrdPatchSettledAt.UTC().Format(time.RFC3339)})
 	}
 	// Milestone progress + effective budget (PRD #122 M5), the CLI twin of the web's
-	// MilestoneChecklist / MilestoneBadge. Both blocks are conditional so a run with no
+	// RunProgressCard / MilestoneRows. Both blocks are conditional so a run with no
 	// frozen milestone list and a global-default budget is byte-for-byte unchanged — the
 	// same back-compat contract the DTO's nil slices and null budgets carry.
+	if row := progressRow(r); row != nil {
+		rows = append(rows, row)
+	}
 	rows = append(rows, milestoneRows(r)...)
 	// The NOW row(s). PRD #1353 M5 makes LIVE LANES the authoritative live display: when the run has
 	// at least one in-progress milestone with ≥1 lane in MilestonesLive, milestoneLaneRows emits the
@@ -480,13 +488,18 @@ func completionRows(r apitypes.RunDTO) [][]string {
 // The milestone clause is dropped when the run carries no frozen milestones (a prompt-kind park),
 // and the extend clause rides ONLY the wall park (a completion hold resumes through its own
 // decision, not by extending the clock). hold_reason is unconstrained text on the wire, so an
-// UNRECOGNISED value (a newer server than this binary) is passed through sanitizeTTY as a neutral
+// UNRECOGNISED value (a newer server than this binary) is passed through cellText as a neutral
 // label rather than dropped — the same terminal-safety obligation the HOLD_CONTEXT row above
 // carries — so a future hold still surfaces honestly instead of vanishing.
 //
 // It takes now so the parked-since clock unit-tests deterministically, matching pausedSummary.
 func holdRow(r apitypes.RunDTO, now time.Time) []string {
 	if r.HoldReason == nil || *r.HoldReason == "" {
+		return nil
+	}
+	// Resume retains this marker through queued/claimed until the running report.
+	// Only the paused state is still an owner hold.
+	if *r.HoldReason == holdProviderUnavailable && !isProviderUnavailableHold(r) {
 		return nil
 	}
 	clauses := []string{holdReasonLabel(*r.HoldReason), holdParkedClause(r, now)}
@@ -498,14 +511,14 @@ func holdRow(r apitypes.RunDTO, now time.Time) []string {
 		clauses = append(clauses, "extend: uzi run extend "+r.ID+" --by 2h")
 	case holdCredentialDisabled:
 		clauses = append(clauses, credentialDisabledAction(r))
+	case holdProviderUnavailable:
+		clauses = append(clauses, providerHoldAction(r))
 	}
 	return []string{"HOLD", strings.Join(clauses, " · ")}
 }
 
-// holdReasonLabel maps a run.HoldReason to its human label for the HOLD row. The two known
-// values get the same words every #1497 surface uses; an unrecognised value (a newer server)
-// is passed through sanitizeTTY so a future hold reads as its raw-but-terminal-safe reason
-// rather than being dropped or trusted.
+// holdReasonLabel maps known holds to human labels. cellText folds controls and newlines
+// in unknown reasons so a newer server still gets one terminal-safe notice.
 func holdReasonLabel(reason string) string {
 	switch reason {
 	case holdBudgetExhausted:
@@ -514,8 +527,10 @@ func holdReasonLabel(reason string) string {
 		return "completion blocked"
 	case holdCredentialDisabled:
 		return "credential disabled"
+	case holdProviderUnavailable:
+		return "provider unavailable"
 	default:
-		return sanitizeTTY(reason)
+		return cellText(reason)
 	}
 }
 
@@ -569,6 +584,8 @@ func pausedHoldNotice(r apitypes.RunDTO) string {
 		return "parked at its time limit; extend: uzi run extend " + id + " --by 2h"
 	case holdCredentialDisabled:
 		return "held, a credential it needs is disabled; " + credentialDisabledAction(r)
+	case holdProviderUnavailable:
+		return "held, provider unavailable; " + providerHoldAction(r)
 	default:
 		return "paused (" + holdReasonLabel(reason) + ")"
 	}
@@ -794,9 +811,9 @@ func pauseRequestedLine(r apitypes.RunDTO, width int) string {
 // milestoneRows renders a milestone-structured run's progress block for `uzi run get`
 // (PRD #122 M5): a `{done}/{total} reported complete` summary followed by one indented
 // row per milestone in FROZEN order, marked done / in progress / left. It is the CLI twin
-// of the web's MilestoneChecklist, so both surfaces show the same state off the same fields.
+// of the web's RunProgressCard / MilestoneRows; both read the same row-state fields.
 // PRD #390 M4: a run that NEVER reported progress (MilestonesCompleted == nil) renders a
-// NEUTRAL `–/{total}` numerator instead of `0/{total}`, matching the web badge's `M–/N`
+// NEUTRAL `–/{total}` numerator instead of `0/{total}`; the web card reads `– of M reported`
 // (see the summary branch below for the null-vs-`[]` contract).
 //
 // Empty for a run with no frozen milestone list, so a pre-#122 (or non-milestone) run is
@@ -808,7 +825,7 @@ func pauseRequestedLine(r apitypes.RunDTO, width int) string {
 // milestones_completed is a monotone union that can still name a milestone dropped after
 // it was ticked, and counting those would let the summary read 8/7. Iterating the frozen
 // list (rather than reducing over the completed set) also makes the count immune to a
-// duplicate id, matching the web's milestoneBadge exactly.
+// duplicate id, matching milestoneBadge's count for the web card's `k of M reported complete`.
 //
 // Titles are UNTRUSTED repo/agent-authored text (apitypes.Milestone), so each goes through
 // cellText — the same newline-fold, tab-fold and 200-char cap the ANTHROPIC_TOKEN row
@@ -854,6 +871,104 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 	rows = append(rows, []string{"MILESTONES", summary})
 	rows = append(rows, perMilestone...)
 	return rows
+}
+
+// progressRow renders the PROGRESS row of `uzi run get` (PRD #2602), the CLI twin of the web
+// progress cell and the TUI board PROG column. It reads the server-derived RunDTO.Progress and
+// returns nil when it is absent (a terminal run, or an older server), so those runs render
+// byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
+// in the frozen order, else `N of M done`; the pct is clamped to 0..100), `stalled · since 16:41`
+// (health_since, UTC like the other since clauses), `waits on you · plan gate|question|follow-up`
+// by status, `parked · limit wait|pool wait|recovery wait|paused`, `queued` and `planning`. A
+// non-empty MaybeBlockedByRunID appends ` · may be blocked by <id8>` to any of them, and alone
+// (`may be blocked by <id8>`) for a none, unknown or pct-less percent state, like the TUI block.
+// Only the closed state enum, the integer counts, server timestamps and the cleaned, shortened
+// blocked-by id are drawn; the active milestone id is used for its position and never printed.
+func progressRow(r apitypes.RunDTO) []string {
+	p := r.Progress
+	if p == nil {
+		return nil
+	}
+	row := func(v string) []string {
+		// The hint comes from untrusted question text server-side, so the id is cleaned
+		// and shortened before it is printed.
+		if p.MaybeBlockedByRunID != nil && *p.MaybeBlockedByRunID != "" {
+			hint := "may be blocked by " + shortRunID(cellText(*p.MaybeBlockedByRunID))
+			if v == "" {
+				v = hint
+			} else {
+				v += " · " + hint
+			}
+		}
+		if v == "" {
+			return nil
+		}
+		return []string{"PROGRESS", v}
+	}
+	switch p.State {
+	case runprogress.StatePercent:
+		if p.Pct == nil {
+			return row("")
+		}
+		out := fmt.Sprintf("≈%d%%", min(max(*p.Pct, 0), 100))
+		pos := fmt.Sprintf("%s · %d of %d done", out, p.MilestoneDone, p.MilestoneTotal)
+		if p.ActiveMilestoneID != "" {
+			for i, m := range r.Milestones {
+				if m.ID == p.ActiveMilestoneID {
+					pos = fmt.Sprintf("%s · milestone %d of %d", out, i+1, p.MilestoneTotal)
+					break
+				}
+			}
+		}
+		// PRD #2603: the model-written Now summary is untrusted text, so it goes through cellText.
+		if p.NowNote != nil {
+			if text := cellText(p.NowNote.Text); strings.TrimSpace(text) != "" {
+				pos += " · now: " + text + " (model summary"
+				if !p.NowNote.At.IsZero() {
+					pos += ", " + relAge(p.NowNote.At) + " ago"
+				}
+				pos += ")"
+			}
+		}
+		return row(pos)
+	case runprogress.StateStalled:
+		if r.HealthSince != nil {
+			return row("stalled · since " + r.HealthSince.UTC().Format("15:04"))
+		}
+		return row("stalled")
+	case runprogress.StateWaiting:
+		switch r.Status {
+		case "awaiting_approval":
+			return row("waits on you · plan gate")
+		case "awaiting_input":
+			return row("waits on you · question")
+		case "awaiting_followup":
+			return row("waits on you · follow-up")
+		}
+		return row("waits on you")
+	case runprogress.StateParked:
+		return row("parked · " + progressParkWord(r.Status))
+	case runprogress.StateQueued:
+		return row("queued")
+	case runprogress.StatePlanning:
+		return row("planning")
+	}
+	// none and any state this build does not know draw only the blocked-by hint, when set.
+	return row("")
+}
+
+// progressParkWord is the CLI's full park wording; the 8-col board abbreviations
+// (progParkWord) stay board-local. The HOLD row already names a pause's reason.
+func progressParkWord(status string) string {
+	switch status {
+	case "limit_wait":
+		return "limit wait"
+	case "pool_wait":
+		return "pool wait"
+	case "recovery_wait":
+		return "recovery wait"
+	}
+	return "paused"
 }
 
 // nowRow renders the NOW line of `uzi run get` (PRD #1064 M5, D7): the run's
@@ -1623,7 +1738,8 @@ func credentialEpochCell(e apitypes.CredentialEpochDTO) string {
 	return cell + " · " + e.AppliedAt.UTC().Format(time.RFC3339)
 }
 
-// renderMessage prints one run message. In --json mode it emits one compact JSON
+// renderMessage prints one run message, hiding accounting evidence in human mode.
+// In --json mode it emits one compact JSON
 // object per line (NDJSON), so `--follow` streams cleanly and an agent parses it
 // line by line — and since it marshals the DTO whole, `agent_instance` and
 // `agent_label` have been in the JSON output since they were added to MessageDTO
@@ -1636,6 +1752,9 @@ func renderMessage(p *uzicli.Printer, m apitypes.MessageDTO) error {
 			return err
 		}
 		p.Println(string(b))
+		return nil
+	}
+	if isAccountingMessage(m.Kind, m.Payload) {
 		return nil
 	}
 	// %-*s pads to a fixed RUNE width (Go's fmt measures width in runes, not bytes),
@@ -2162,6 +2281,58 @@ func runStatusCell(r apitypes.RunListItemDTO) string {
 		s += " (credential disabled)"
 	}
 	return s
+}
+
+// providerParkLine is CLI retry wording; shared TUI glyphs remain unchanged.
+func providerParkLine(r apitypes.RunDTO) string {
+	if r.Status != statusRecoveryWait || strOr(r.RecoveryWaitCause, "") != providerOutageCause {
+		return ""
+	}
+	start, retry := "unknown", "unknown"
+	if r.ProviderParkStreakStartedAt != nil {
+		start = r.ProviderParkStreakStartedAt.Format(time.RFC3339)
+	}
+	if r.RecoveryRetryNotBefore != nil {
+		retry = r.RecoveryRetryNotBefore.Format(time.RFC3339)
+	}
+	return "provider outage; counted parks: " + itoa(r.ProviderParkCount) + "; streak started: " + start + "; next retry: " + retry
+}
+
+func isProviderUnavailableHold(r apitypes.RunDTO) bool {
+	return r.Status == statusPaused && strOr(r.HoldReason, "") == holdProviderUnavailable
+}
+
+// providerCommandID keeps command hints single-line and shell-inert even for malformed IDs.
+// Valid opaque IDs retain their familiar unquoted spelling; other values are quoted.
+func providerCommandID(id string) string {
+	id = cellText(id)
+	if id != "" && !strings.HasPrefix(id, "-") && strings.IndexFunc(id, func(c rune) bool {
+		return (c < 'a' || c > 'z') && (c < 'A' || c > 'Z') &&
+			(c < '0' || c > '9') && c != '-' && c != '_'
+	}) == -1 {
+		return id
+	}
+	return "'" + strings.ReplaceAll(id, "'", "'\\''") + "'"
+}
+
+func providerHoldAction(r apitypes.RunDTO) string {
+	id := providerCommandID(r.ID)
+	retention := "claim and worker affinity retained"
+	if r.Kind == "issue" {
+		retention = "issue lock, claim and worker affinity retained"
+	}
+	action := "waiting for the owner; no automatic retry deadline; " + retention + "; clone and session files kept on the worker; recovery depends on the worker or a verified recovery copy; owner Resume: uzi run resume " + id + "; Cancel: uzi run cancel " + id
+	done, total, _ := milestoneProgress(r)
+	if r.CanStopAtProviderHold {
+		return action + "; Stop: uzi run scope " + id + " --through " + itoa(done) + "; then, only if scope succeeds, Resume: uzi run resume " + id
+	}
+	reason := "server does not permit Stop (including interactive or otherwise refused runs)"
+	if r.Kind != "issue" || total == 0 {
+		reason = "requires a milestone issue run"
+	} else if done == 0 {
+		reason = "no completed milestone"
+	}
+	return action + "; Stop unavailable: " + reason
 }
 
 // forgeParkLine is the shared "waiting for the forge, retry at HH:MM (N of MAX)" wording

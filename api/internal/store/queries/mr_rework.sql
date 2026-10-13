@@ -82,62 +82,96 @@ WHERE per_branch.branch <> rp.default_branch
 -- The ledger row for a (repo, ref). No row means the MR has NEVER been reworked (a
 -- fresh candidate): the generated :one returns a zero-value struct alongside
 -- pgx.ErrNoRows, which the detector reads as attempt_count=0, high_water=0,
--- halt_notified=false.
-SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids
+-- halt_notified=false. comment_marks / pending_unknown_keys are the per-namespace state
+-- (ADR-1199); `legacy` is true while comment_marks is NULL, i.e. a row written before the
+-- namespaced state existed, which the service bootstraps once (BootstrapMRReworkLedgerMarks).
+-- pending_unknown_ids is the frozen legacy copy, read only to bootstrap.
+SELECT repo_id, ref, attempt_count, high_water, halt_notified, updated_at, pending_unknown_ids,
+       comment_marks, pending_unknown_keys, (comment_marks IS NULL)::boolean AS legacy
 FROM mr_rework_ledger
 WHERE repo_id = @repo_id::uuid AND ref = @ref;
 
--- name: UpsertMRReworkLedger :exec
+-- name: UpsertMRReworkLedger :execrows
 -- The PROCEED path: record that a rework cycle was spent and advance the consumed
--- high-water. attempt_count counts AUTO cycles only; the first proceed INSERTs
+-- marks. attempt_count counts AUTO cycles only; the first proceed INSERTs
 -- count = 1, every subsequent proceed increments. high_water is ADVANCE-ONLY
--- (GREATEST over the existing value and the new max kept comment id), so it never
--- moves backward even if a later tick sees a smaller max. halt_notified is RESET to
+-- (GREATEST over the existing value and the new max kept comment id), kept for readability
+-- and binary rollback; the authoritative marks are comment_marks. halt_notified is RESET to
 -- false on every proceed (INSERT defaults it false): the latch is one comment per
 -- halt episode, so once a proceed advances the counter a later cap halt can comment
 -- again.
--- pending_unknown_ids (issue #2347): the permission-unknown comment ids the mark moved past
--- (@pending_add, kept only when above the mark the row had BEFORE this update) merged with
--- the existing set, minus @pending_remove (ids consumed, now not-eligible, or gone). An author's
--- older id is replaced by its newer representative only through the parallel
+-- comment_marks (ADR-1199): @marks is a namespace -> id object merged per key with GREATEST
+-- (mr_rework_merge_marks), never backward.
+-- Returns the rows written: an INSERT of a new row is 1; an UPDATE of a non-legacy row is 1; a
+-- LEGACY row (comment_marks NULL) matches the ON CONFLICT WHERE below, writes NOTHING and
+-- returns 0. 0 rows therefore means the row is legacy (or was bootstrapped-away concurrently):
+-- the caller must refuse (ErrReworkLedgerChanged) and roll back, then re-read and bootstrap.
+-- pending_unknown_keys: the source-qualified keys ('<namespace>:<id>') of permission-unknown
+-- comments the marks moved past (@pending_add, kept only when above the PER-NAMESPACE mark the
+-- row had BEFORE this update) merged with the existing set, minus @pending_remove. An author's
+-- older key is replaced by its newer representative only through the parallel
 -- @pending_superseded / @pending_superseded_by pairs, which the merge applies only when the
--- replacement is retained in the same statement (a stale writer's rejected add leaves the older
--- id in place); the merge keeps the oldest 10000 slots (mr_rework_merge_pending).
-INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, pending_unknown_ids)
+-- replacement is retained in the same statement; the merge keeps the oldest-admitted 10000
+-- (mr_rework_merge_pending_keys). pending_unknown_ids is no longer written.
+INSERT INTO mr_rework_ledger (repo_id, ref, attempt_count, high_water, comment_marks, pending_unknown_keys)
 VALUES (@repo_id::uuid, @ref, 1, @high_water,
-        mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], 0))
+        mr_rework_merge_marks('{}'::jsonb, @marks::jsonb),
+        mr_rework_merge_pending_keys('{}'::text[], @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], '{}'::jsonb))
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET attempt_count = mr_rework_ledger.attempt_count + 1,
     high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
     halt_notified = false,
-    pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], mr_rework_ledger.high_water),
-    updated_at    = now();
+    comment_marks = mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks),
+    pending_unknown_keys = mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], mr_rework_ledger.comment_marks),
+    updated_at    = now()
+WHERE mr_rework_ledger.comment_marks IS NOT NULL;
 
--- name: RemoveMRReworkPendingIDs :exec
--- Drop ids from a ledger row's pending_unknown_ids WITHOUT spending a cycle (issue #2347): the
--- pending ids the snapshot caps evicted (an eligible pending comment that no longer fits the
+-- name: RemoveMRReworkPendingKeys :exec
+-- Drop keys from a ledger row's pending_unknown_keys WITHOUT spending a cycle (issue #2347): the
+-- pending keys the snapshot caps evicted (an eligible pending comment that no longer fits the
 -- capped snapshot falls back to human review, so it must stop re-triggering the assessment).
--- Array subtraction only: attempt_count, high_water, halt_notified and updated_at are left
--- alone, and no row is created when the ref has none.
+-- Array subtraction only, PRESERVING the stored admission order: attempt_count, high_water,
+-- halt_notified, comment_marks and updated_at are left alone, no row is created when the ref has
+-- none, and a legacy row (comment_marks NULL) is not touched.
 UPDATE mr_rework_ledger
-SET pending_unknown_ids = ARRAY(
-    SELECT x FROM (
-        SELECT unnest(mr_rework_ledger.pending_unknown_ids) AS x
-        EXCEPT
-        SELECT r AS x FROM unnest(COALESCE(@ids::bigint[], '{}'::bigint[])) AS r
-    ) t
-    ORDER BY x
+SET pending_unknown_keys = ARRAY(
+    SELECT u.k
+    FROM unnest(mr_rework_ledger.pending_unknown_keys) WITH ORDINALITY AS u(k, ord)
+    WHERE u.k NOT IN (SELECT r FROM unnest(COALESCE(@keys::text[], '{}'::text[])) AS r WHERE r IS NOT NULL)
+    ORDER BY u.ord
 )
-WHERE repo_id = @repo_id::uuid AND ref = @ref;
+WHERE repo_id = @repo_id::uuid AND ref = @ref AND comment_marks IS NOT NULL;
+
+-- name: BootstrapMRReworkLedgerMarks :execrows
+-- One-shot migration of a LEGACY ledger row (comment_marks NULL) to the namespaced state
+-- (ADR-1199). Guarded by compare-and-set on the legacy scalars the caller READ
+-- (@legacy_high_water, @legacy_pending): if a concurrent writer moved either, or another
+-- replica already bootstrapped (comment_marks no longer NULL), zero rows match and the caller
+-- re-reads. Marks are normalized through mr_rework_merge_marks (a non-object, SQL or JSON null
+-- alike, stores {}; a non-integer value fails loudly on the cast, and the table CHECK would
+-- refuse it anyway). The keys go through mr_rework_merge_pending_keys as the EXISTING set with
+-- nothing added: deduped, first position kept, order preserved, the 10000 cap applied, NULL
+-- elements dropped. After it applies the row is non-legacy for good, even if an older binary later
+-- advances the legacy columns.
+UPDATE mr_rework_ledger
+SET comment_marks = mr_rework_merge_marks('{}'::jsonb, @marks::jsonb),
+    pending_unknown_keys = mr_rework_merge_pending_keys(@pending_keys::text[], '{}'::text[], '{}'::text[], '{}'::text[], '{}'::text[], NULL),
+    updated_at = now()
+WHERE repo_id = @repo_id::uuid
+  AND ref = @ref
+  AND comment_marks IS NULL
+  AND high_water = @legacy_high_water::bigint
+  AND pending_unknown_ids = COALESCE(@legacy_pending::bigint[], '{}'::bigint[]);
 
 -- name: SetMRReworkHaltNotified :exec
 -- The HALT comment-once latch: once the per-MR cap halt has posted its explanatory
 -- comment, set halt_notified so it is never posted again for this ref. Written as an
 -- upsert (not a plain UPDATE) so it latches correctly even for a cap of 0, where no
 -- proceed ever created the row. high_water is left untouched (a halt consumes no
--- comment).
-INSERT INTO mr_rework_ledger (repo_id, ref, halt_notified)
-VALUES (@repo_id::uuid, @ref, true)
+-- comment). A row created here is NON-legacy (comment_marks '{}'): it never carried legacy
+-- scalar state to bootstrap. The update arm leaves comment_marks as it is.
+INSERT INTO mr_rework_ledger (repo_id, ref, halt_notified, comment_marks)
+VALUES (@repo_id::uuid, @ref, true, '{}'::jsonb)
 ON CONFLICT (repo_id, ref) DO UPDATE
 SET halt_notified = true,
     updated_at    = now();
@@ -207,12 +241,12 @@ WHERE ledger.repo_id = @repo_id::uuid
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-)
+, code_cross_check_required)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, @harness,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid
@@ -242,9 +276,10 @@ RETURNING *;
 -- (ErrActiveMRReworkExists/ErrBranchInUse); success -> run + ledger commit together. `ref` on
 -- the ledger is the pipeline_ref (the branch), exactly as the two-step path passed it.
 WITH led AS (
-    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, pending_unknown_ids)
+    INSERT INTO mr_rework_ledger (repo_id, ref, high_water, comment_marks, pending_unknown_keys)
     SELECT @repo_id::uuid, @pipeline_ref, @high_water,
-           mr_rework_merge_pending('{}'::bigint[], @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], 0)
+           mr_rework_merge_marks('{}'::jsonb, @marks::jsonb),
+           mr_rework_merge_pending_keys('{}'::text[], @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], '{}'::jsonb)
     WHERE NOT EXISTS (
         SELECT 1 FROM runs
         WHERE repo_id = @repo_id::uuid
@@ -255,20 +290,25 @@ WITH led AS (
     ON CONFLICT (repo_id, ref) DO UPDATE
     SET high_water    = GREATEST(mr_rework_ledger.high_water, EXCLUDED.high_water),
         halt_notified = false,
-        pending_unknown_ids = mr_rework_merge_pending(mr_rework_ledger.pending_unknown_ids, @pending_add::bigint[], @pending_remove::bigint[], @pending_superseded::bigint[], @pending_superseded_by::bigint[], mr_rework_ledger.high_water),
+        comment_marks = CASE WHEN mr_rework_ledger.comment_marks IS NULL
+                             THEN mr_rework_ledger.comment_marks
+                             ELSE mr_rework_merge_marks(mr_rework_ledger.comment_marks, EXCLUDED.comment_marks) END,
+        pending_unknown_keys = CASE WHEN mr_rework_ledger.comment_marks IS NULL
+                                    THEN mr_rework_ledger.pending_unknown_keys
+                                    ELSE mr_rework_merge_pending_keys(mr_rework_ledger.pending_unknown_keys, @pending_add::text[], @pending_remove::text[], @pending_superseded::text[], @pending_superseded_by::text[], mr_rework_ledger.comment_marks) END,
         updated_at    = now()
 )
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-)
+, code_cross_check_required)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
     -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual', @harness,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

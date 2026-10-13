@@ -20,6 +20,10 @@ import (
 // testServiceToken is a fake fetcher service token, assembled at runtime.
 var testServiceToken = strings.Repeat("s", 8) + "-service-token"
 
+// testControlTimeout leaves wide headroom over a cold TLS handshake in a loaded
+// race suite, yet still fails a real hang well inside the package timeout.
+const testControlTimeout = 30 * time.Second
+
 // fakeAPI is a TLS api answering the fetcher control routes.
 func fakeAPI(t *testing.T, h http.HandlerFunc) (*httptest.Server, *x509.CertPool) {
 	t.Helper()
@@ -48,7 +52,12 @@ func strictDecode[T any](t *testing.T, r *http.Request) T {
 func TestHTTPControlBegin(t *testing.T) {
 	var status atomic.Int32
 	var body atomic.Value
+	var calls atomic.Int32
 	srv, pool := fakeAPI(t, func(w http.ResponseWriter, r *http.Request) {
+		if calls.Add(1) == 1 {
+			// A slow first answer, as a cold handshake under a loaded race suite produces.
+			time.Sleep(1500 * time.Millisecond)
+		}
 		if r.Method != http.MethodPost || r.URL.Path != BeginPath {
 			t.Errorf("%s %s", r.Method, r.URL.Path)
 		}
@@ -62,7 +71,7 @@ func TestHTTPControlBegin(t *testing.T) {
 		w.WriteHeader(int(status.Load()))
 		_, _ = io.WriteString(w, body.Load().(string))
 	})
-	c, err := NewHTTPControl(srv.URL, testServiceToken, pool, time.Second)
+	c, err := NewHTTPControl(srv.URL, testServiceToken, pool, testControlTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -116,7 +125,7 @@ func TestHTTPControlComplete(t *testing.T) {
 		got.Store(strictDecode[apitypes.FetcherCompleteRequest](t, r))
 		w.WriteHeader(int(status.Load()))
 	})
-	c, err := NewHTTPControl(srv.URL+"/", testServiceToken, pool, time.Second)
+	c, err := NewHTTPControl(srv.URL+"/", testServiceToken, pool, testControlTimeout)
 	if err != nil {
 		t.Fatal(err)
 	}

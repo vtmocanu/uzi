@@ -25,6 +25,32 @@ const log: Logger = {
 function client() { return new WorkerClient("http://example.invalid", "fixture", "test", log); }
 function json(value: unknown) { return new Response(JSON.stringify(value), { status: 200 }); }
 
+test("claims preserve optional memory episode, count and frozen policy across both lanes", async (t) => {
+  let payload: unknown = { run_id: run };
+  t.mock.method(globalThis, "fetch", async () => json(payload));
+  const api = client();
+  for (const claim of [() => api.claimRun(), () => api.claimChat()]) {
+    assert.deepEqual(await claim(), { run_id: run }, "legacy payload stays absent");
+    payload = { run_id: run, memory_episode: 4, memory_intervention_count: 2,
+      memory_policy: { version: 1, max_interventions: 3 } };
+    assert.deepEqual(await claim(), payload);
+    payload = { run_id: run, memory_episode: 0, memory_intervention_count: 0, memory_policy: null };
+    assert.deepEqual(await claim(), payload, "no frozen policy stays null");
+    for (const patch of [
+      { memory_episode: -1 }, { memory_episode: Number.MAX_SAFE_INTEGER + 1 },
+      { memory_intervention_count: -1 }, { memory_intervention_count: 1.5 },
+      { memory_episode: undefined }, { memory_policy: undefined },
+      { memory_policy: { version: 2, max_interventions: 3 } },
+      { memory_policy: { version: 1, max_interventions: 10000 } },
+      { memory_intervention_count: 4, memory_policy: { version: 1, max_interventions: 3 } },
+    ]) {
+      payload = { run_id: run, memory_episode: 0, memory_intervention_count: 0, memory_policy: null, ...patch };
+      await assert.rejects(claim(), /memory intervention/);
+    }
+    payload = { run_id: run };
+  }
+});
+
 test("missing feature fails closed with zero HTTP; unavailable API never supplies a permit", async (t) => {
   let calls = 0;
   t.mock.method(globalThis, "fetch", async () => { calls++; throw new Error("raw transport detail"); });

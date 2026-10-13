@@ -2,6 +2,7 @@ package workersvc
 
 import (
 	"context"
+	"errors"
 	"fmt"
 	"log/slog"
 	"time"
@@ -237,6 +238,24 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	if q, ok := s.q.(*store.Queries); ok {
 		if _, err := q.SupersedeExitedPlanCrossChecks(ctx); err != nil {
 			return res, fmt.Errorf("supersede exited plan cross-checks: %w", err)
+		}
+		// At most 100 due records per tick. Each settlement locks its lead first;
+		// a database failure stops this tick rather than hiding unbanked evidence.
+		if s.txBeginner != nil {
+			checks, err := q.ListCodeCrossChecksToSettle(ctx)
+			if err != nil {
+				return res, fmt.Errorf("list code cross-check settlements: %w", err)
+			}
+			for _, check := range checks {
+				lead, err := q.GetRunByID(ctx, check.ID)
+				if err != nil {
+					return res, err
+				}
+				_, err = s.CodeCrossCheckStatus(ctx, store.Worker{ID: uuid.UUID(check.WorkerID.Bytes), UserID: lead.UserID}, check.ID, check.ClaimGeneration)
+				if err != nil && !errors.Is(err, ErrCrossCheckRefused) {
+					return res, fmt.Errorf("settle code cross-check: %w", err)
+				}
+			}
 		}
 	}
 

@@ -143,7 +143,7 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
     await check("mr_review_trusted_bots", { mr_review_trusted_bots: "" }, "");
     const bots = "https://github.com#136622811,https://gitlab.example.com:8443#42";
     await check("mr_review_trusted_bots", { mr_review_trusted_bots: bots }, bots);
-    // PRD #1189: the extension allowance — 0 (off) and an in-range value.
+    // PRD #1189: the extension cap — 0 (off) and an in-range value.
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "0" }, "0");
     await check("run_extension_cap_seconds", { run_extension_cap_seconds: "3600" }, "3600");
   });
@@ -186,7 +186,7 @@ describe("mockApi — F3 updateSettings accepts the nine missing AppSettings key
         status: 400,
       });
     }
-    // PRD #1189: 3599 is below the extension-allowance floor (3600), a distinct bound from the
+    // PRD #1189: 3599 is below the extension-cap floor (3600), a distinct bound from the
     // health-seconds floor (60).
     await expect(api.updateSettings({ run_extension_cap_seconds: "3599" })).rejects.toMatchObject({
       status: 400,

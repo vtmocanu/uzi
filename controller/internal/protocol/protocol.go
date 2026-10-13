@@ -39,8 +39,10 @@ type PollResponse struct {
 
 // DesiredWorker is one hosted worker's desired state.
 type DesiredWorker struct {
-	ID       string `json:"id"`
-	Template string `json:"template"`
+	RollEvidence   *RollEvidence `json:"roll_evidence,omitempty"`
+	DrainingReason *string       `json:"draining_reason,omitempty"`
+	ID             string        `json:"id"`
+	Template       string        `json:"template"`
 	// Size is the preset NAME (S/M/L). Resolving it to cpu/memory/PVC quantities is
 	// this side's job: the api is not allowed to know what a pod spec looks like.
 	Size string `json:"size"`
@@ -133,6 +135,7 @@ type DesiredWorker struct {
 // records. A delta cannot express "this worker no longer has a signal", and the api
 // needs exactly that to let a stale report decay back to version comparison.
 type StatusReport struct {
+	Kind string `json:"kind,omitempty"`
 	// ReportedAt is this controller's clock at send. DISPLAY-ONLY: the api stamps its
 	// own observed_at at receipt and computes freshness from that. Freshness driven by
 	// a timestamp the reporting party controls is freshness the reporting party can
@@ -173,7 +176,8 @@ const (
 // distinguish "no reason" from an empty one. A pointer/value collapse here is
 // exactly what the golden's settled worker exists to catch.
 type WorkerStatus struct {
-	ID string `json:"id"`
+	Pacing *Pacing `json:"pacing,omitempty"`
+	ID     string  `json:"id"`
 	// Phase is the closed enum rolling|stuck|settled. The api validates rather than
 	// sanitizes it, and DROPS an entry carrying anything else rather than rejecting
 	// the whole report — one garbage row must not blind the fleet.
@@ -204,4 +208,41 @@ type DindMaintenance struct {
 	Fenced        bool   `json:"fenced"`
 	ReadyACK      bool   `json:"ready_ack"`
 	Reason        string `json:"reason,omitempty"`
+}
+
+// RollEvidence is API-evaluated registration evidence, independent of pod readiness.
+// Registered reports nonce-backed registration; false alone does not exclude legacy registration.
+// NeverRegistered is positive evidence of an offline row with no registration history.
+// An omitted or null NeverRegistered field from older APIs is unknown.
+type RollEvidence struct {
+	NeverRegistered        *bool      `json:"never_registered,omitempty"`
+	Version                int        `json:"version"`
+	OwnerID                string     `json:"owner_id"`
+	Registered             bool       `json:"registered"`
+	SchedulingCapabilities []string   `json:"scheduling_capabilities"`
+	ProtocolCapabilities   []string   `json:"protocol_capabilities"`
+	OrdinaryCoverage       bool       `json:"ordinary_coverage"`
+	CheckerCoverage        bool       `json:"checker_coverage"`
+	RegisteredVersion      *string    `json:"registered_version"`
+	RegisterNonce          *string    `json:"register_nonce"`
+	PodUID                 *string    `json:"pod_uid"`
+	HeartbeatAt            *time.Time `json:"heartbeat_at"`
+	// LivenessValidUntil is ordinary API connectivity, independent of promotion proof.
+	// Null means there is no fresh API-online heartbeat at evaluation.
+	LivenessValidUntil *time.Time `json:"liveness_valid_until"`
+	EvaluatedAt        time.Time  `json:"evaluated_at"`
+	ValidUntil         time.Time  `json:"valid_until"`
+}
+
+// Pacing is a receipt-timed API diagnostic separate from the pod-derived phase.
+// The controller derives admission from Kubernetes and registration evidence.
+type Pacing struct {
+	State            string  `json:"state"`
+	TargetImage      string  `json:"target_image"`
+	TargetVersion    string  `json:"target_version"`
+	CanaryID         *string `json:"canary_id,omitempty"`
+	BlockingWorkerID *string `json:"blocking_worker_id,omitempty"`
+	BlockingReason   *string `json:"blocking_reason,omitempty"`
+	RetainedImage    *string `json:"retained_image,omitempty"`
+	RetainedVersion  *string `json:"retained_version,omitempty"`
 }

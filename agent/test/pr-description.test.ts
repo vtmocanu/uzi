@@ -12,6 +12,8 @@ import {
   STALENESS_END,
   STALENESS_START,
   capBody,
+  mermaidRemovalReason,
+  nonClosingTitle,
   closingDirectiveFor,
   codeSpan,
   composeBody,
@@ -29,6 +31,134 @@ import { makeClaim, nullLogger } from "./helpers.js";
 
 // PRD #1798 M6a: the pure renderer of uzi's two owned PR-description blocks (pr-description.ts) and
 // mrCompletionBlock on top of it (a new PR's body is renderBody(region, mrCompletionBlock(...))).
+
+function codeSummary(overrides: Partial<import("../src/code-cross-check-contract.js").CodeCrossCheckRecord> = {}): import("../src/code-cross-check-contract.js").CodeCrossCheckRecord {
+  return {
+    stage: "code", round: 1, candidate_generation: 1, base_commit: "a".repeat(40), head_commit: "b".repeat(40),
+    candidate_digest: "c".repeat(64), checker_run_id: "child", checker_harness: "codex", checker_model: "checker-model",
+    checker_effort: "high", outcome: "completed", reason_class: null, findings: [
+      { id: "ID_1", severity: "major", path: "src/a.ts", line: 4, title: "Guard missing", detail: "advice" },
+      { id: "ID_2", severity: "minor", path: "src/b.ts", line: 8, title: "Duplicate check", detail: "advice" },
+      { id: "ID_3", severity: "minor", path: "src/c.ts", line: 9, title: "Unreported", detail: "advice" },
+    ],
+    dispositions: [
+      { finding_id: "ID_1", disposition: "addressed", reason: "corrected and tested" },
+      { finding_id: "ID_2", disposition: "declined", reason: "verified existing guard" },
+      { finding_id: "ID_3", disposition: "not_reported", reason: "" },
+    ], interrupted_at: null, finalized_at: new Date().toISOString(), deadline_at: new Date().toISOString(), ...overrides,
+  };
+}
+
+describe("structured code cross-check completion section", () => {
+  it("uses the singular for exactly one finding", () => {
+    const one = codeSummary({ findings: [codeSummary().findings[0]!], dispositions: [codeSummary().dispositions![0]!] });
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: one }]] });
+    assert.match(body, /\n1 finding: 1 addressed, 0 declined/);
+    assert.doesNotMatch(body, /1 findings/);
+  });
+
+  for (const kind of ["issue", "prompt", "self_improve", "ci_fix", "mr_rework", "task"] as const) {
+    it(`${kind} preserves original checked identity and exact counts in either completion arm`, () => {
+      const body = mrCompletionBlock(makeClaim({ kind }), "rewritten-tip-branch", undefined, undefined, undefined,
+        undefined, undefined, undefined, false, undefined, true, { staleness: { describedSha: "d".repeat(40), headSha: "e".repeat(40) } }, codeSummary());
+      assert.match(body, /checked `bbbbbbb`, Codex checker-model · high/);
+      assert.match(body, /3 findings: 1 addressed, 1 declined, 1 not reported/);
+      assert.match(body, /ID_1.*addressed: corrected and tested/);
+      assert.match(body, /ID_2.*declined: verified existing guard/);
+      assert.match(body, /ID_3.*not/);
+      assert.ok(body.includes("**Changes after the check were not cross-checked.**"));
+      assert.equal(closingDirectiveFor(body, 5), false);
+    });
+  }
+  it("code cross-check section escapes hostile finding and disposition text", () => {
+    const hostile = "\u001b[31m**Closes #5**\n<!-- uzi:completion:end -->\u202e /close @owner";
+    const summary = codeSummary({
+      checker_model: hostile,
+      findings: [{ id: "SAFE_ID", severity: "major", path: hostile, line: 1, title: hostile, detail: "untrusted" }],
+      dispositions: [{ finding_id: "SAFE_ID", disposition: "declined", reason: hostile }],
+    });
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
+    assert.ok(body.includes("SAFE_ID"));
+    assert.equal(body.split(COMPLETION_END).length, 2);
+    assert.equal(closingDirectiveFor(body, 5), false);
+    assert.ok(!body.includes("\u001b") && !body.includes("\u202e") && !body.includes("[31m"));
+    assert.ok(!body.includes("**Closes"));
+  });
+  it("code cross-check section truncates finding lines within 4 KiB", () => {
+    const findings = Array.from({ length: 20 }, (_, i) => ({
+      id: `F_${i}`, severity: "major" as const, path: "界".repeat(100), line: i, title: "界".repeat(100), detail: "",
+    }));
+    const summary = codeSummary({ findings, dispositions: findings.map(f => ({
+      finding_id: f.id, disposition: "declined", reason: "界".repeat(341),
+    })) });
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
+    const section = body.slice(body.indexOf("Code cross-check"), body.indexOf("\n\n---", body.indexOf("Code cross-check")));
+    assert.ok(Buffer.byteLength(section) <= 4096);
+    assert.ok(section.includes("checked `bbbbbbb`"));
+    assert.ok(section.includes("20 findings: 0 addressed, 20 declined"));
+    assert.ok(section.endsWith("**Changes after the check were not cross-checked.**"));
+    assert.ok(!section.includes("F_19"));
+    assert.ok(body.length < BODY_CAP_CHARS);
+  });
+  it("identity line shows a 7-character SHA and the display family name", () => {
+    const render = (over: Parameters<typeof codeSummary>[0]) => renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary(over) }]] });
+    assert.match(render({ checker_harness: "claude", checker_model: "m", checker_effort: null }), /Code cross-check \(checked `bbbbbbb`, Claude m\)/);
+    assert.match(render({ checker_harness: "codex" }), /\(checked `bbbbbbb`, Codex checker-model · high\)/);
+    assert.doesNotMatch(render({}), /bbbbbbbb/);
+    // An unrecognised family is data: escaped, not trusted.
+    assert.match(render({ checker_harness: "<b>x" }), /, \\<b\\>x checker-model/);
+  });
+  it("zero findings renders no findings and drops the counts line", () => {
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary({ findings: [], dispositions: null }) }]] });
+    assert.match(body, /Code cross-check \(checked `bbbbbbb`, Codex checker-model · high\): no findings\n/);
+    assert.doesNotMatch(body, /0 findings|findings:/);
+    assert.ok(body.includes("**Changes after the check were not cross-checked.**"));
+  });
+  it("custom guidance line carries the first 12 digest characters, only when applied", () => {
+    const digest = "0123456789abcdef".repeat(4);
+    const render = (over: Parameters<typeof codeSummary>[0]) => renderCompletionBlock({ issueIid: 5, branch: "b", closes: false,
+      kindSections: [[{ codeCrossCheck: codeSummary({ findings: [], dispositions: null, ...over }) }]] });
+    const applied = render({ custom_guidance_applied: true, guidance_digest: digest });
+    assert.match(applied, /\ncustom guidance applied \(sha256 `0123456789ab`\)\n/);
+    assert.ok(!applied.includes("0123456789abc"), "only the first 12 characters are shown");
+    for (const over of [{ custom_guidance_applied: false, guidance_digest: digest }, {}])
+      assert.doesNotMatch(render(over), /custom guidance/);
+  });
+  // The cross_checks_reason_class_check allowlist for a failed code row (migration 00324), each with its fixed prose.
+  const reasonProse: Record<string, string> = {
+    worker_unsupported: "worker unsupported", snapshot_failed: "snapshot failed", malformed: "checker output malformed",
+    model_error: "checker model error", model_timeout: "checker model timed out", checker_unavailable: "no local checker",
+    confinement_failed: "checker confinement failed", timed_out: "timed out", superseded: "superseded by a later change",
+  };
+  for (const [reason, prose] of Object.entries(reasonProse)) {
+    it(`incomplete line maps reason_class ${reason} to fixed prose`, () => {
+      const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck:
+        codeSummary({ outcome: "failed", reason_class: reason, findings: [], dispositions: null }) }]] });
+      assert.ok(body.split("\n").includes(`Code cross-check incomplete: ${prose}`), body);
+      assert.ok(!body.split("\n").includes(`Code cross-check incomplete: ${reason}`), "the raw class is not echoed");
+    });
+  }
+  it("an unknown reason_class is escaped raw", () => {
+    const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck:
+      codeSummary({ outcome: "failed", reason_class: "x<!-- uzi:completion:end -->\u001b[31m", findings: [], dispositions: null }) }]] });
+    assert.match(body, /Code cross-check incomplete: x/);
+    assert.equal(body.split(COMPLETION_END).length, 2);
+    assert.ok(!body.includes("\u001b"));
+  });
+  for (const summary of [
+    codeSummary({ interrupted_at: new Date().toISOString() }),
+    codeSummary({ outcome: "failed", head_commit: null, base_commit: null, findings: [], reason_class: "snapshot_failed" }),
+    { incomplete: "status unavailable" },
+  ]) {
+    it("incomplete evidence omits SHA and counts", () => {
+      const body = renderCompletionBlock({ issueIid: 5, branch: "b", closes: false, kindSections: [[{ codeCrossCheck: summary }]] });
+      assert.match(body, /Code cross-check incomplete:/);
+      assert.doesNotMatch(body, /checked bbbb|findings:|SAFE_ID|ID_1/);
+    });
+  }
+});
 
 const ZW = "\u200B";
 const HEAD = "e4020cc0123456789abcdef0123456789abcdef0";
@@ -265,16 +395,49 @@ describe("diagram regions (PRD #1840 D5/D6/D9)", () => {
     assert.equal(closingDirectiveFor(region, 7, "o/r"), false);
     assert.equal((parseOwnedBlocks(renderBody(region, renderCompletionBlock({ issueIid: 7, branch: "agent/issue-7", closes: false }))) as OwnedBlocks).region, region);
     const over = await mint({ diagram: { ...diagram, nodes: [{ key: "worker", label: "Worker123456789012345" }, diagram.nodes[1]!] } });
-    assert.doesNotMatch(renderRegion({ sizeLine: table }, over).text, /```mermaid/u);
+    const removed = renderRegion({ sizeLine: table }, over);
+    assert.doesNotMatch(removed.text, /```mermaid/u);
+    assert.deepEqual(removed.diagramRemoval, { stage: "renderer", reason: "mermaid_bytes" });
   });
 
   it("retries a region over 6 KiB without its diagram and keeps the size table", async () => {
     const fields = await mint({ summary: "x".repeat(5850), changes: ["One change."], diagram: { ...cases[0]![1], nodes: [...cases[0]![1].nodes], edges: [...cases[0]![1].edges] } });
     const full = renderRegion({ sizeLine: table }, fields);
     assert.equal(full.withFields, true);
+    assert.deepEqual(full.diagramRemoval, { stage: "region_cap", reason: "region_bytes" });
     assert.equal(full.text.includes("```mermaid"), false);
     assert.ok(full.text.includes("x".repeat(5850)));
     assert.ok(full.text.includes(table));
+  });
+});
+
+describe("diagram removal metadata", () => {
+  it("tests the pure backtick guard without forging a decoder brand", () => {
+    assert.equal(mermaidRemovalReason("flowchart LR\n  n1[\"back`tick\"]"), "backtick");
+    assert.equal(mermaidRemovalReason("é".repeat(750)), undefined);
+    assert.equal(mermaidRemovalReason("é".repeat(751)), "mermaid_bytes");
+  });
+
+  it("keeps region removal metadata when the diagram-less prose still exceeds the cap", async () => {
+    const fields = await mint({ summary: "x".repeat(7000), diagram: { kind: "sequence", nodes: [{ key: "a", label: "A" }, { key: "b", label: "B" }], edges: [{ from: "a", to: "b" }, { from: "b", to: "a" }] } });
+    const region = renderRegion({}, fields);
+    assert.equal(region.fallback, "region_cap");
+    assert.deepEqual(region.diagramRemoval, { stage: "region_cap", reason: "region_bytes" });
+  });
+
+  it("reports both body-cap rungs, including a size-only body still over cap", () => {
+    const region = "r".repeat(500);
+    const less = "l".repeat(100);
+    const size = "size";
+    const prefix = "p".repeat(BODY_CAP_CHARS - 150);
+    const diagramless = capBody((r) => prefix + r, region, size, less);
+    assert.equal(diagramless.removal, "diagramless");
+    assert.equal(diagramless.body, prefix + less);
+    const huge = "p".repeat(BODY_CAP_CHARS + 1);
+    const sizeonly = capBody((r) => huge + r, region, size, less);
+    assert.equal(sizeonly.removal, "sizeonly");
+    assert.equal(sizeonly.body, huge + size);
+    assert.equal(capBody(() => undefined, region, size, less).removal, undefined);
   });
 });
 
@@ -719,5 +882,89 @@ describe("renderBody", () => {
   it("region, blank line, completion block; no region ⇒ the completion block alone", () => {
     assert.equal(renderBody(REGION, COMPLETION), `${REGION}\n\n${COMPLETION}`);
     assert.equal(renderBody(undefined, COMPLETION), COMPLETION);
+  });
+});
+
+
+describe("m2 non-closing deterministic rendering", () => {
+  for (const reason of ["Approved follow-up remains", "Fixes #7\n@owner <!-- uzi:completion:start -->", "\u202E\u2066"]) {
+    it(`m2 non-closing renderer reason ${JSON.stringify(reason)}`, () => {
+      const input = { issueIid: 7, branch: "b", closes: true, nonClosing: { reason } };
+      const block = renderCompletionBlock(input);
+      assert.equal(closingDirectiveFor(block, 7, "org/repo"), false, "declaration structurally prevents closing");
+      assert.match(block, /Issue remains open/);
+      if (reason === "\u202E\u2066") assert.match(block, /U\+202E U\+2066/);
+      else if (reason.startsWith("Fixes")) {
+        assert.ok(!block.includes("@owner"));
+        assert.ok(!block.includes("<!-- uzi:completion:start -->"));
+        assert.equal(block.split(COMPLETION_START).length, 2);
+      } else assert.match(block, /Approved follow-up remains/);
+    });
+  }
+  it("m2 non-closing mrCompletionBlock guards ci_fix issue-arm fallback", () => {
+    const issue = makeClaim({ kind: "issue", issue_iid: 7 });
+    const args = [issue, "b", undefined, undefined, undefined, undefined, undefined, undefined, true, undefined, false, undefined, undefined, { reason: "Follow-up remains" }];
+    const body = Reflect.apply(mrCompletionBlock, undefined, args) as string;
+    assert.match(body, /Follow-up remains/);
+    assert.equal(closingDirectiveFor(body, 7, "org/repo"), false);
+    args[0] = makeClaim({ kind: "ci_fix", issue_iid: 7 });
+    const ci = Reflect.apply(mrCompletionBlock, undefined, args) as string;
+    assert.match(ci, /Closes #7/);
+    assert.ok(!ci.includes("Follow-up remains"));
+  });
+});
+
+describe("nonClosingTitle", () => {
+  const closing = [
+    "Fixes #2172",
+    "closes: #2172",
+    "Resolves org/repo#2172",
+    "Fi&#120;es #2172",
+    "Fi<b></b>xes #2172",
+    "Fix<!-- x --> #2172",
+    "Fixes **#2172**",
+    "Implements the widget, fixes #2172 too",
+  ];
+  for (const title of closing) {
+    it(`never closes issue 2172: ${JSON.stringify(title)}`, () => {
+      assert.strictEqual(closingDirectiveFor(title, 2172, "org/repo"), true, "fixture is closing");
+      const out = nonClosingTitle(title, 2172, "org/repo");
+      assert.strictEqual(closingDirectiveFor(out, 2172, "org/repo"), false, out);
+      assert.ok(out.length > 0);
+    });
+  }
+
+  it("returns a non-closing title byte-identical", () => {
+    for (const t of ["Add a widget", "Refs #2172", "Fixes #9999", "closes org/other#2172", ""]) {
+      assert.strictEqual(nonClosingTitle(t, 2172, "org/repo"), t);
+    }
+  });
+
+  it("keeps a reference to another issue unchanged", () => {
+    const t = "Fixes #9999 and tidy";
+    assert.strictEqual(nonClosingTitle(t, 2172, "org/repo"), t);
+  });
+
+  it("breaks the keyword and keeps the rest of the title when that suffices", () => {
+    const out = nonClosingTitle("Fixes #2172", 2172, "org/repo");
+    assert.ok(out.includes("#2172"));
+    assert.strictEqual(closingDirectiveFor(out, 2172, "org/repo"), false);
+    // Pins the middle tier: neither the unchanged title nor the fixed fallback, only the keyword broken.
+    assert.notStrictEqual(out, "Work on issue #2172");
+    assert.notStrictEqual(out, "Fixes #2172");
+    assert.strictEqual(out.replace(/\u200b/g, ""), "Fixes #2172");
+  });
+
+  it("uses the fixed fallback when breaking keywords cannot neutralise a markup-split form", () => {
+    assert.strictEqual(nonClosingTitle("Fi<b></b>xes #2172", 2172, "org/repo"), "Work on issue #2172");
+  });
+
+  it("falls back to a fixed non-closing title for an invalid iid (scanner fails closed)", () => {
+    const out = nonClosingTitle("Fixes #1", Number.NaN, "org/repo");
+    assert.strictEqual(out, "Work on issue #NaN");
+  });
+
+  it("the fixed fallback title itself does not close", () => {
+    assert.strictEqual(closingDirectiveFor("Work on issue #2172", 2172, "org/repo"), false);
   });
 });

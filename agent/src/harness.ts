@@ -11,6 +11,7 @@
 // zero-unused-export gate stays green).
 
 import type { Readable, Writable } from "node:stream";
+import type { CodeCrossCheckToolAccess } from "./code-cross-check-tools.js";
 import type { EmittedMessage } from "./executor.js";
 import type { PrSummaryClaim } from "./signals.js";
 import type { PluginLoadError } from "./plugin-errors.js";
@@ -40,7 +41,6 @@ export interface HarnessTokens {
 
 export type HarnessCost =
   | { kind: "metered"; usd: number; source: "provider" | "price_table" }
-  | { kind: "subscription" }
   | { kind: "unreported" };
 
 export interface HarnessModelUsage {
@@ -79,9 +79,9 @@ export interface HarnessMetrics {
   cost: HarnessCost;
   // Optional normalized measurements do not replace D0's exact wire values.
   wire?: {
-    num_turns: unknown;
-    duration_ms: unknown;
-    total_cost_usd: unknown;
+    num_turns?: unknown;
+    duration_ms?: unknown;
+    total_cost_usd?: unknown;
   };
 }
 
@@ -148,7 +148,8 @@ export type HarnessSignalName =
   | "signal_done"
   | "ask_user"
   | "report_progress"
-  | "checkpoint";
+  | "checkpoint"
+  | "park_run";
 
 export type HarnessItem =
   | { kind: "text"; text: string }
@@ -247,6 +248,18 @@ export type HarnessEvent = HarnessEventMeta &
         assistantAuthored?: true;
       }
     | {
+        kind: "usage_record";
+        attribution: HarnessAttribution;
+        responseId: string;
+        model: string;
+        usage: Readonly<{
+          input_tokens: number;
+          cache_read_input_tokens: number;
+          cache_creation_input_tokens: number;
+          output_tokens: number;
+        }>;
+      }
+    | {
         kind: "turn_finished";
         terminal: HarnessTerminal;
         // issue #2014: the usage leg and its highest ordinal when this result was decoded,
@@ -308,6 +321,11 @@ export interface HarnessAgent {
 }
 
 export interface RunTurnRequest {
+  /** Worker-derived park admission; never supplied by the model. */
+  parkRunSupported?: boolean;
+  nonInteractiveIssue?: boolean;
+  /** Opted-in root registration persists; the broker checks live repair authority per call. */
+  codeCrossCheck?: CodeCrossCheckToolAccess;
   prompt: string;
   systemPrompt: string;
   resumeSessionId?: string;
@@ -524,6 +542,7 @@ export interface TurnSignals {
   rejectedMilestones?: Milestone[];
   progress?: MilestoneProgress;
   checkpoint?: boolean;
+  parkRun?: boolean;
   summary?: string;
   reportOnly?: boolean;
   proposal?: Proposal;
@@ -531,6 +550,8 @@ export interface TurnSignals {
   prSummary?: PrSummaryClaim;
   /** Issue #2083: see ScannedSignals.decisionsMemo (last-wins; never logged). */
   decisionsMemo?: string;
+  /** Latest accepted declaration that an issue delivery leaves the issue open. */
+  nonClosing?: { reason: string };
 }
 
 export interface ReducedTurnResult extends TurnSignals {
@@ -588,13 +609,42 @@ export interface RunTurnReducer {
   finish(end: TurnStreamEnd): ReducedTurnCompletion;
 }
 
+/** One model's usage as it goes on the wire in a progress_note payload's `model_usage`
+ *  (PRD #2603). The camelCase token keys are the result frame's own `modelUsage` spelling; the
+ *  5m/1h split and the tier/speed/geo markers are what lets the api price a snapshot that has
+ *  no provider costUSD. `costUSD` is set ONLY from a terminal provider report, never invented. */
+export interface AdviceModelUsage {
+  inputTokens: number;
+  outputTokens: number;
+  cacheReadInputTokens: number;
+  cacheCreationInputTokens: number;
+  cacheCreation5mInputTokens?: number;
+  cacheCreation1hInputTokens?: number;
+  costUSD?: number;
+  costStatus?: string;
+  service_tier?: string;
+  speed?: string;
+  inference_geo?: string;
+}
+
+/** The latest per-model usage evidence of one advice pass, keyed by the real model id. */
+export type AdviceUsageSnapshot = Readonly<Record<string, AdviceModelUsage>>;
+
 export interface AdviceRequest {
-  label: "judge" | "review" | "summary";
+  label: "judge" | "review" | "summary" | "now";
   systemPrompt: string;
   prompt: string;
   model?: string;
   /** Reasoning effort; applied to the SDK query only when set. */
   effort?: HarnessEffort;
+  /** Output-token cap; applied only when set (PRD #2603: the Now summary passes 256). */
+  maxOutputTokens?: number;
+  /** "disabled" turns extended thinking off; applied only when set. */
+  thinking?: "disabled";
+  /** Called with the latest non-empty usage snapshot every time provider usage arrives, so the
+   *  evidence survives an abort that never reaches a terminal frame. Optional; a harness that
+   *  cannot observe usage never calls it. */
+  usageObserver?(snapshot: AdviceUsageSnapshot): void;
   output: { kind: "text" } | { kind: "json"; schema: JsonObject };
   signal: AbortSignal;
   timeoutMs: number;

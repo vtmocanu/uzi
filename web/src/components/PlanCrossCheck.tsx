@@ -122,7 +122,7 @@ export function PlanCrossCheck({ run }: { run: Run }) {
       <Findings value={s.findings} />
       <p>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)}) · Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</p>
       {usage && <p>Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</p>}
-      <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : cost === "Unavailable" ? " · cost unavailable" : ""}</p>
+      <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · no cost estimate recorded" : cost === "Unavailable" ? " · cost unavailable" : " · API-equivalent"}</p>
       {childId(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}
     </>}
   </section>;

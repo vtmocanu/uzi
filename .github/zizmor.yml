@@ -11,4 +11,5 @@ rules:
     ignore:
       - ci.yml
       - main-guard.yml
+      - pricing-freshness.yml
       - release.yml

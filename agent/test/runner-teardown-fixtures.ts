@@ -5,6 +5,8 @@ import { runnerCommand, commandRootCommand, RUNNER_UID } from "../src/runner-uid
 import type { CommandWrapper } from "../src/rmtree.js";
 import { residualTestFixture } from "./residual-fixtures.js";
 import { RACED_DIRS, RACED_FILES } from "./swap-racer.js";
+import { AdviceTeardownDiagnostic } from "./advice-teardown-diagnostic.js";
+import type { CodexTransport } from "../src/codex/transport.js";
 
 /** Fixture commands carry only inert environment values, never the worker environment. */
 export function uidScript(wrap: CommandWrapper, script: string, ...args: string[]): void {
@@ -13,8 +15,10 @@ export function uidScript(wrap: CommandWrapper, script: string, ...args: string[
   assert.equal(result.status, 0, result.stderr?.toString() || result.error?.message);
 }
 
-export async function runnerTeardownFixture(body: (root: string, victim: string) => Promise<void>): Promise<void> {
+export async function runnerTeardownFixture(body: (root: string, victim: string, diagnostic: AdviceTeardownDiagnostic) => Promise<void>,
+  diagnoseAdvice = false, output?: (line: string) => void): Promise<void> {
   const saved = process.env.UZI_UID_SPLIT;
+  const diagnostic = new AdviceTeardownDiagnostic(output);
   process.env.UZI_UID_SPLIT = "1";
   try {
     await residualTestFixture(async (root, victim) => {
@@ -22,7 +26,10 @@ export async function runnerTeardownFixture(body: (root: string, victim: string)
       await fs.chmod(root, 0o3775);
       await fs.chown(victim, -1, RUNNER_UID);
       await fs.chmod(victim, 0o2770);
-      try { await body(root, victim); }
+      try {
+        if (diagnoseAdvice) await diagnostic.run(() => body(root, victim, diagnostic));
+        else await body(root, victim, diagnostic);
+      }
       finally {
         process.env.UZI_UID_SPLIT = "1";
         // Only after every racer/provider has settled: restore each fixture owner's dirs,
@@ -35,6 +42,11 @@ export async function runnerTeardownFixture(body: (root: string, victim: string)
         }
       }
     });
+  } catch (error) {
+    // Fixture cleanup can fail too; diagnostic advice fixtures keep the first
+    // assertion as the test result after attempting the existing cleanup.
+    if (diagnoseAdvice) diagnostic.rethrow(error);
+    throw error;
   } finally {
     if (saved === undefined) delete process.env.UZI_UID_SPLIT; else process.env.UZI_UID_SPLIT = saved;
   }
@@ -56,4 +68,20 @@ export async function assertGone(target: string): Promise<void> {
 
 export function writePrivateRunnerFile(target: string): void {
   uidScript(runnerCommand, "const fs=require('node:fs');fs.mkdirSync(process.argv[1]+'/private',{mode:0o700});fs.writeFileSync(process.argv[1]+'/private/keep','keep');fs.chmodSync(process.argv[1]+'/private',0o555)", target);
+}
+
+/** The advice leaves mutate the owned root only after the app-server answered `initialize`.
+ * On the real worker-UID lane this prevented the reproduced teardown failures (issue #2397);
+ * that a mutation during provider startup is the exact cause remains inferred. */
+export async function awaitAdviceProviderReady(transport: CodexTransport, diagnostic: AdviceTeardownDiagnostic): Promise<void> {
+  try {
+    await transport.request("initialize", {
+      clientInfo: { name: "uzi", title: "uzi", version: "0.1.0-m4" },
+      capabilities: { experimentalApi: true, requestAttestation: false },
+    });
+  } catch {
+    diagnostic.mark("provider_not_ready");
+    assert.fail("advice provider was not ready before the root mutation");
+  }
+  diagnostic.mark("provider_ready");
 }

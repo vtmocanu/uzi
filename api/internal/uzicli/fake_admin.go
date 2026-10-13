@@ -25,6 +25,15 @@ func (f *FakeClient) AdminListRuns(context.Context) ([]apitypes.RunListItemDTO, 
 	return f.AdminRuns, nil
 }
 
+// AdminListRunSummaries mirrors AdminListRuns over f.AdminRuns, projected (issue #2661).
+func (f *FakeClient) AdminListRunSummaries(context.Context) ([]apitypes.RunSummaryItemDTO, error) {
+	f.AdminListRunSummariesCalls++
+	if f.Err != nil {
+		return nil, f.Err
+	}
+	return summariesOf(f.AdminRuns), nil
+}
+
 func (f *FakeClient) AdminHealth(context.Context) (apitypes.HealthDocDTO, error) {
 	if f.Err != nil {
 		return apitypes.HealthDocDTO{}, f.Err

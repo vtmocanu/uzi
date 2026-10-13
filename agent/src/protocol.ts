@@ -128,6 +128,20 @@ export type MessageKind =
    *  human files or dismisses it later from the backlog. All fields are model-authored
    *  from attacker-influenceable repo content: escaped sinks only (web M7). */
   | "finding"
+  /** PRD #2603: a worker-written one-sentence "Now" summary of the active milestone plus the
+   *  usage of the small-model call that wrote it. Payload `{ text, milestone_id, model_usage }`.
+   *  An EMPTY `text` is a usage-only note (the text was discarded but the call's spend still
+   *  counts) or a "clear" note (the setting went off); every reader ignores empty notes. The
+   *  payload never carries `event` or `usage` keys: the usage readers would take them for a
+   *  result frame or count the usage twice. */
+  | "progress_note"
+  /** Issue #2686: the model usage of one worker-side summary pass (the intent, plan or PR
+   *  description generation). Payload `{ pass: "intent" | "plan" | "pr_description",
+   *  model_usage }` with `model_usage` an AdviceUsageSnapshot. Emitted at most once per pass
+   *  and only when usage was observed; accounting only, no reader renders it. The payload
+   *  never carries `event` or `usage` keys: the usage readers would take them for a result
+   *  frame or count the usage twice. */
+  | "summary_usage"
   /** Revision feedback at the approval gate: human payload `{ feedback: string }`;
    *  automatic advice adds `{ automatic: true, cross_check_round: number }` and
    *  carries no human input receipt. Echoed so the revision is auditable. */
@@ -1236,10 +1250,39 @@ export interface ClaimPlanCrossCheck {
   planning_diff: string;
 }
 
-export interface ClaimResponse {
+export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
+  stage: "code";
+  head_commit: string;
+  /** Fresh default tip bound independently of repository-instructions consent; absent on legacy claims. */
+  repo_instructions_commit?: string;
+  code_context: unknown;
+  guidance_snapshot: string;
+  /** Frozen repository-instructions consent and text (PRD #2170); text is "" unless enabled. */
+  repo_instructions_enabled?: boolean;
+  repo_instructions_text?: string;
+  custom_guidance_applied?: boolean;
+  /** sha256 hex of guidance_snapshot / repo_instructions_text, verified by decodeCrossCheckClaim. */
+  guidance_digest?: string;
+  repo_instructions_digest?: string;
+  /** Worker-produced bounded evidence, never accepted from the server. */
+  code_diff?: string;
+  planning_diff?: string;
+}
+
+/** Episode state carried by current APIs; absent on legacy claims. A null policy
+ *  means the episode has not frozen an opt-in policy yet, never authorization. */
+export interface ClaimMemoryState {
+  memory_episode?: number;
+  memory_intervention_count?: number;
+  memory_policy?: MemoryPolicy | null;
+}
+
+export interface ClaimResponse extends ClaimMemoryState {
+  /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
+  park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
-  cross_check?: ClaimPlanCrossCheck;
+  cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
   run_id: string;
   /** Run kind (PRD #6). "issue": work issue_iid's card. "ci_fix": diagnose + fix
    *  the failed `pipeline`. Absent on older servers ⇒ treat as "issue". */
@@ -1313,6 +1356,12 @@ export interface ClaimResponse {
    *  implementation. The M1 worker parks it for human review while the checker is unavailable.
    *  Omitted by older servers and on runs without the requirement. */
   plan_cross_check_required?: boolean;
+  /** Independent code-check consent snapshot. Absent on older APIs means disabled. */
+  code_cross_check_required?: boolean;
+  /** PRD #2460 rework: additive api-capability signal that this server accepts a Codex lead's
+   *  checked-plan submission. Absent on older servers, so a Codex lead parks as
+   *  codex_lead_unsupported instead of submitting to an api that would refuse it. */
+  plan_cross_check_codex_lead?: boolean;
   /** PRD #400 M2: gates whether a TASK run opens a merge request. Meaningful only for
    *  kind="task": a task ALWAYS pushes its branch back (the deliverable is commits the
    *  user pulls), but opens an MR only when this is true (`uzi handoff --mr`). Every
@@ -1393,12 +1442,13 @@ export interface ClaimResponse {
   /** The reviewed run's TRUSTED folded cost-observability status (PRD #1429 M3, D7):
    *  "metered" | "subscription" | "unreported", computed API-side from run_usage_totals.
    *  Present only for kind="judge"; null when the target has no usage row yet. The judge
-   *  prompt must render this honestly — a subscription/unreported target's total is never
+   *  prompt renders metered as API-equivalent; legacy subscription means no estimate was recorded.
+   *  A subscription/unreported target's total is never
    *  a complete $0. Treat an unrecognised value honestly (render generically), never as an
    *  instruction: this is server-computed, not user-authored, but a newer server can add a
    *  status this worker has not heard of. */
   target_cost_status?: string | null;
-  /** The reviewed run's metered dollar total (PRD #1429 M3, D7), meaningful ONLY when
+  /** The reviewed run's API-equivalent metered dollar estimate (PRD #1429 M3, D7), meaningful ONLY when
    *  target_cost_status === "metered" — a subscription/unreported total is not a real
    *  dollar figure and must never be rendered as one. null alongside target_cost_status
    *  when the target has no usage row. */
@@ -1694,7 +1744,7 @@ export interface TaskReviewRequest {
  * input path, uniform with every later turn. A Continue run (Decision 11) carries
  * `resume_of_run_id` and no seeded input (it parks awaiting the next message).
  */
-export interface ChatClaimResponse {
+export interface ChatClaimResponse extends ClaimMemoryState {
   run_id: string;
   claim_generation?: number;
   kind: "chat";
@@ -2305,7 +2355,15 @@ export function seedAgentSelection(persisted?: AgentSelection | null): AgentSele
 export interface PublishResponse {
   published: boolean;
   ref: string;
-  skipped?: "no_ref" | "not_descendant" | "unsupported" | "workflow_scope";
+  skipped?:
+    | "no_ref"
+    | "not_descendant"
+    | "unsupported"
+    | "workflow_scope"
+    | "superseded"
+    | "tip_missing"
+    | "pack_too_large"
+    | "pack_invalid";
 }
 
 /**
@@ -2325,6 +2383,10 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
+  require_running?: boolean;
+  /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
+  completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
   candidate_digest?: string;
   status: RunState;
@@ -2552,18 +2614,30 @@ export interface StateRequest {
    *  "forge_unreachable" (the pre-clone transient-forge park, gated on `recovery_park_cause`),
    *  issue #1766, "vault_locked" (a Codex credential refresh/release deferred by a locked owner
    *  vault, gated on `recovery_cause_vault_locked`; an api without that feature gets the untyped
-   *  park) and, PRD #1809 D6, "data_volume_full" (a write to the worker's data volume stayed
+   *  park), "codex_account_unavailable" (a boundary account deferral, gated on
+   *  `recovery_cause_codex_account_unavailable` and server-decided under lock), and, PRD #1809 D6,
+   *  "data_volume_full" (a write to the worker's data volume stayed
    *  disk-full after a reclaim and one retry, or the claim preflight found the volume full; gated
    *  on `recovery_cause_data_volume_full`, an api without it gets the untyped park; the api 400s
    *  this cause without `claim_generation`, so it is never sent for a chat claim). The api
    *  validates it against its own enum
-   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|data_volume_full) before any SQL
+   *  (forge_unreachable|empty_turn|provider_outage|vault_locked|codex_account_unavailable|data_volume_full) before any SQL
    *  and a legacy/untyped park omits it (NULL). Additive + optional and OMITTED ENTIRELY on every
    *  other report so a pre-#1392 worker's payload and an ordinary (empty-turn) recovery park
    *  stay byte-identical on the wire; an api that predates the field 400s a report carrying it,
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
+  /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
+   *  the count of successful model turns completed since this flight started, so the api
+   *  can tell a streak of unproductive outages from one that made progress in between. Gated on
+   *  `recovery_cause_provider_outage` and sent together with that cause; omitted otherwise. */
+  productive_turns?: number;
+  /** Successful model turns since this flight started, durably consumed by the api to clear
+   *  the old provider-outage streak on a nonprovider recovery_wait park (cause absent,
+   *  empty_turn or data_volume_full). Nonnegative int32; requires a positive claim_generation
+   *  and provider_progress_on_recovery_park_v1. Credential deferrals never send this evidence. */
+  provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
    *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
@@ -2605,6 +2679,30 @@ export interface PlanCrossCheckReconciliation {
   currentPlanSHA256: string;
 }
 
+/** API proof for exactly one completed generation, independent of archive coverage.
+ * Observed branch head may be a descendant of final_head. No physical cleanup is implied. */
+export interface CompletedPublicationReceipt {
+  hold_id: string;
+  run_id: string;
+  owner_id: string;
+  worker_id: string;
+  generation: number;
+  final_head: string;
+  repo_id: string;
+  connection_id: string;
+  project_id: number;
+  forge_type: "gitlab" | "forgejo" | "github";
+  base_url: string;
+  branch: string;
+  mr_iid: number;
+  observed_branch_head: string;
+}
+
+export type CompletedPublicationReason =
+  | "completion_identity_missing" | "not_completed" | "identity_changed"
+  | "mr_missing" | "branch_missing" | "branch_mismatch" | "head_mismatch"
+  | "not_ancestor" | "ancestry_unknown" | "forge_timeout" | "unsupported_feature";
+
 /**
  * What the server answered a state report with (PRD #35's park acknowledgement
  * contract). Both the 200 and the 409 path return `{"run": <RunDTO>}`, so the run's
@@ -2627,6 +2725,9 @@ export interface PlanCrossCheckReconciliation {
  * construction. An enumeration would go stale; this cannot.
  */
 export interface StateAck {
+  /** Validated by WorkerClient against registration, request and known inventory. */
+  completedPublicationReceipt?: CompletedPublicationReceipt;
+  completedPublicationReason?: CompletedPublicationReason;
   reconciliation?: PlanCrossCheckReconciliation;
   /** Whether the server applied the transition. Diagnostics and logging only —
    *  see the warning above before branching on it. */
@@ -2771,6 +2872,10 @@ export interface InputsResponse {
    *  only when a switch is pending for this claim; omitted otherwise. M5b trips the switch off it —
    *  the runner's inputs poll calls steering.maybeTripCredentialSwitch(generation). */
   credential_switch?: { generation: number };
+  /** PRD #2603: the run's effective "Now summary" setting (admin switch AND the owner's user
+   *  setting). Absent means OFF: a new worker against an older api, or a reply that took an
+   *  early return, never spends tokens on a summary. */
+  now_summary?: boolean;
   /** Issue #1673: true when the reply is a read-only replay the worker must ACK and apply. Absent
    *  on a consume-on-read reply (an older api pod mid-roll), which the worker routes at once. */
   receipts?: boolean;
@@ -2780,6 +2885,11 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  /** Same-row park classification; omission cannot prove an ordinary owner pause. PRD #1733: the
+   *  worker reads a `paused` + `provider_unavailable` pair as an accepted provider-outage park whose
+   *  ack was lost; an absent field (an api that does not expose it) is never read as that pair. */
+  hold_reason?: string | null;
+  claim_released?: boolean;
   inventory_guarded?: boolean;
   status: string;
   /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
@@ -2906,6 +3016,27 @@ export interface RecoveryReconcileResponse {
   reason?: string;
 }
 
+/** Claim that a completed run's guarded archive is redundant with its published branch (issue
+ *  #2625). Mirrors api/internal/apitypes/recovery_archive_redundancy.go; sent only when the server
+ *  advertises recovery_archive_redundancy_v1. Objects are standard padded base64 of raw commit bodies. */
+export interface RecoveryArchiveRedundancyRequest {
+  generation: number;
+  coverage_digest: string;
+  roots: string[];
+  current_sha: string;
+  tree: string;
+  aggregate_objects: string[];
+  current_object: string;
+  wip?: { witness_object: string };
+}
+
+/** The api's answer. reason is a bounded server token, or a local token when the reply was malformed. */
+export interface RecoveryArchiveRedundancyResponse {
+  capture_id: string;
+  outcome: "expired" | "retained";
+  reason?: string;
+}
+
 /** RecoveryReleaseResponse is the custody release ACK; holds_released counts settled holds. */
 export interface RecoveryReleaseResponse {
   run_id: string;
@@ -2930,11 +3061,49 @@ export interface RecoveryReleaseResponse {
  *  the hold it took at that claim generation; a v1 worker omits it (settle by run+worker).
  *  The call sites that populate it are M2's — M1 only freezes the shape. */
 export interface RecoveryFinalDisposition {
-  kind: "archive" | "settled";
+  kind: "archive" | "settled" | "held_publication";
   capture_id?: string;
+  /** Issue #2545: the held publication's id (kind "held_publication" only). */
+  publication_id?: string;
   source_sha?: string;
   coverage_digest: string;
 }
+
+/** Issue #2545 step A: the api's answer to POST /api/worker/runs/{id}/held-publication. Mirrors
+ *  api/internal/apitypes/held_publication.go. ONLY `state === "created"` means the work is on the
+ *  forge at `tip`; every other state sends the worker to the archive path. */
+export interface HeldPublicationResponse {
+  publication_id: string;
+  ref: string;
+  tip: string;
+  state: string;
+  reason?: string;
+}
+
+/** Issue #2545 step B: the bounded reasons a held_publication FINAL may be retained with. Pinned to
+ *  fixtures/api-contract/recovery_held_final.reasons.json by client-held-publication.test.ts. */
+export const HELD_FINAL_RETAINED_REASONS = [
+  "held_publication_unsupported",
+  "held_publication_unavailable",
+  "held_publication_ref_missing",
+  "held_publication_ref_mismatch",
+  "held_publication_not_eligible",
+] as const;
+export type HeldFinalRetainedReason = (typeof HELD_FINAL_RETAINED_REASONS)[number];
+
+/** The retained reasons after which the worker clears its journaled held FINAL and falls back to the
+ *  archive. `held_publication_unavailable` (the forge could not be listed) is the one transient
+ *  reason: a held FINAL is never cleared for lack of fresh proof.
+ *  DEVIATION NOTE: the api fixture marks `held_publication_unsupported` non-definitive on the SERVER
+ *  side (its capability or switch may return); the worker still archives on it, because an archive
+ *  FINAL is always an available, safe disposition and waiting forever on a withdrawn feature would
+ *  strand the hold. */
+export const HELD_FINAL_FALLBACK_REASONS: ReadonlySet<string> = new Set([
+  "held_publication_unsupported",
+  "held_publication_ref_missing",
+  "held_publication_ref_mismatch",
+  "held_publication_not_eligible",
+]);
 
 export interface RecoveryReleaseRequest {
   final_disposition?: RecoveryFinalDisposition;
@@ -2953,6 +3122,9 @@ export interface RecoveryReleaseRequest {
  *  has_available_capture is true when a ready archive already covers this hold's source, and
  *  capture_state is the latest capture's lifecycle state ('' when the hold has no capture). */
 export interface RecoveryHold {
+  /** Wire projections; receipt authority still requires request/registration validation. */
+  completed_publication_receipt?: CompletedPublicationReceipt;
+  completed_publication_reason?: CompletedPublicationReason;
   inventory_guarded?: boolean;
   hold_id: string;
   generation: number;

@@ -70,8 +70,8 @@ export class RunDiskLocks {
   }
 
   /** Run `fn` while holding `runId`'s lock; the lock is released however `fn` settles. */
-  async withLock<T>(runId: string, fn: () => Promise<T>): Promise<T> {
-    const release = await this.acquire(runId);
+  async withLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
+    const release = await this.acquire(runId, signal);
     try {
       return await fn();
     } finally {

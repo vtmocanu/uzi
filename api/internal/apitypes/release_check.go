@@ -47,6 +47,9 @@ type ReleaseCheckStatusDTO struct {
 	// admin-only.
 	BannerSnoozed bool `json:"banner_snoozed"`
 
+	// Partial is true only when Check now persisted stable facts but the RC fetch failed.
+	Partial bool `json:"partial,omitempty"`
+
 	// Status is "disabled" (master toggle off), "never" (enabled but no check has run),
 	// "ok" (facts present), or "error" (the last "Check now" failed). Message carries a
 	// token-scrubbed reason on an error status, empty otherwise.

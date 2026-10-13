@@ -79,6 +79,15 @@ export interface FrameEffects {
   refreshRun: boolean;
 }
 
+// Message kinds whose arrival changes a server-derived Run field, so the page re-reads the run.
+const REFRESH_KINDS = new Set<string>(["progress_note", "plan", "plan_revising"]);
+
+// hasRefreshKind: true when any message in a replayed/caught-up batch is one whose live
+// arrival would have re-read the run, so replay paths trigger the same re-read.
+export function hasRefreshKind(msgs: readonly RunMessage[]): boolean {
+  return msgs.some((m) => REFRESH_KINDS.has(m.kind));
+}
+
 // applyFrame folds one live WS frame into the stream and reports the side-effects
 // it triggers. A "message" frame is ingested (a seq gap asks for a replay to fill
 // it). A "state" frame carries NO authoritative data — it asks for a run re-read
@@ -103,7 +112,13 @@ export function applyFrame(
       created_at: frame.created_at ?? new Date().toISOString(),
     };
     const r = ingest(state, msg);
-    return { state: r.state, effects: { replay: r.gap, refreshRun: false } };
+    // A progress_note (PRD #2603) updates Run.progress.now_note, which only a run re-read
+    // carries, so an open page refreshes on it. `plan` and `plan_revising` (issue #2760)
+    // flip the server-derived Run.is_revising and progress.state, so they refresh too;
+    // every other message does not. An EMPTY-text
+    // note is the worker's "clear" note and must refresh too, so the line disappears (AC2):
+    // do not skip the refresh for empty text.
+    return { state: r.state, effects: { replay: r.gap, refreshRun: REFRESH_KINDS.has(msg.kind) } };
   }
   if (frame.type === "state") {
     return { state, effects: { replay: true, refreshRun: true } };

@@ -115,7 +115,7 @@ func TestPlanCrossCheckExcludedSnapshotWritersLiveDB(t *testing.T) {
 				run, err = f.q.CreateJudgeRun(ctx, store.CreateJudgeRunParams{UserID: f.userID, TargetRunID: pgU(f.runID), IssueTitle: "judge", IssueDescription: "candidate", TriggerSource: "manual", Harness: "claude"})
 			case "cross_check":
 				mustExec(ctx, t, f.pool, "UPDATE runs SET auto_approve=true WHERE id=$1", f.runID)
-				run, err = f.q.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{ChildID: uuid.New(), BudgetWallSeconds: 300, LeadRunID: f.runID, UserID: f.userID, WorkerID: pgU(f.workerID), ClaimGeneration: 1})
+				run, err = f.q.CreatePlanCrossCheckChild(ctx, store.CreatePlanCrossCheckChildParams{ChildID: uuid.New(), ChildHarness: "codex", BudgetWallSeconds: 300, LeadRunID: f.runID, UserID: f.userID, WorkerID: pgU(f.workerID), ClaimGeneration: 1})
 			}
 			if err != nil {
 				t.Fatal(err)

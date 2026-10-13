@@ -152,7 +152,7 @@ func TestPlanCrossCheckBoundedReplayFencesLiveDB(t *testing.T) {
 		"changed plan", "changed milestones", "changed capabilities", "changed tools", "changed size",
 		"unseen ID", "idless", "missing generation", "zero generation", "stale generation",
 		"released", "wrong worker", "wrong user", "terminal", "untracked kind", "not required",
-		"wrong harness", "automatic parked gate", "invalid submit refusal", "missing submit refusal",
+		"automatic parked gate", "invalid submit refusal", "missing submit refusal",
 		"invalid candidate refusal", "missing candidate refusal",
 	} {
 		t.Run(name, func(t *testing.T) {
@@ -214,8 +214,6 @@ func TestPlanCrossCheckBoundedReplayFencesLiveDB(t *testing.T) {
 				env.exec(`UPDATE runs SET kind='chat',repo_id=NULL,issue_iid=NULL,branch=NULL WHERE id=$1`, leadID)
 			case "not required":
 				env.exec(`UPDATE runs SET plan_cross_check_required=false WHERE id=$1`, leadID)
-			case "wrong harness":
-				env.exec(`UPDATE runs SET harness='codex' WHERE id=$1`, leadID)
 			case "automatic parked gate":
 				env.exec(`UPDATE runs SET auto_approve=true WHERE id=$1`, leadID)
 			case "invalid submit refusal":

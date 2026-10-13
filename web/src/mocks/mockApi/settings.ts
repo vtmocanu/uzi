@@ -10,6 +10,7 @@ import {
   type UserSettingsPatch,
 } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
+import { trimAllowlistToken, uuidIdentity } from "../../lib/dockerAllowlist";
 import {
   isAppearanceMode,
   isDarkTheme,
@@ -96,6 +97,8 @@ const SEED_USER_SETTINGS: UserSettings = {
   // PRD #700 M6: MR review watcher per-user opt-in. null = the default-ON state;
   // an explicit false opts the account out.
   mr_rework_enabled: null,
+  // PRD #2603: the per-user Now-line switch; null reads as ON.
+  now_summary_enabled: null,
   // PRD #1429 M1 (D3): per-user default harness; null = no preference (falls through D11).
   default_harness: null,
 };
@@ -109,7 +112,7 @@ if (mockScenario() === "cross-check-mixed") {
 if (mockScenario() === "cross-check-dormant-claude") {
   SEED_USER_SETTINGS.cross_check_pins = [
     { stage: "plan", harness: "claude", model: "sonnet", effort: "max",
-      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: false },
+      worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "pin", effort_source: "pin", active: true },
   ];
 }
 const SEED_APP_SETTINGS: AppSettings = {
@@ -136,6 +139,8 @@ const SEED_APP_SETTINGS: AppSettings = {
   judge_daily_budget: "0",
   // PRD #914: instance-wide CI-autofix kill-switch, default ON.
   ci_autofix_enabled: "true",
+  // PRD #2603: instance kill-switch for the model-written Now line, default ON.
+  now_summary_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
@@ -155,7 +160,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   health_queued_seconds: "600",
   health_approval_seconds: "3600",
   health_nudge_cooldown_seconds: "1800",
-  // PRD #1189: per-run wall-clock extension allowance, default 16h (matching the server's
+  // PRD #1189: per-request wall-clock extension cap, default 16h (matching the server's
   // DefaultRunExtensionCapSeconds). 0 would turn extending off instance-wide.
   run_extension_cap_seconds: "57600",
   docker_repo_allowlist: "",
@@ -225,12 +230,12 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
   const u = us as Record<string, unknown>;
   const a = as as Record<string, unknown>;
   const validPins = u.cross_check_pins === undefined ||
-    (Array.isArray(u.cross_check_pins) && u.cross_check_pins.length <= 2 &&
-      new Set(u.cross_check_pins.map((p: unknown) => p && typeof p === "object" ? (p as Record<string, unknown>).harness : null)).size === u.cross_check_pins.length &&
+    (Array.isArray(u.cross_check_pins) && u.cross_check_pins.length <= 4 &&
+      new Set(u.cross_check_pins.map((p: unknown) => p && typeof p === "object" ? `${(p as Record<string, unknown>).stage}/${(p as Record<string, unknown>).harness}` : null)).size === u.cross_check_pins.length &&
       u.cross_check_pins.every((p: unknown) => {
         if (!p || typeof p !== "object") return false;
         const pin = p as Record<string, unknown>;
-        if (pin.stage !== "plan" || (pin.harness !== "claude" && pin.harness !== "codex")) return false;
+        if ((pin.stage !== "plan" && pin.stage !== "code") || (pin.harness !== "claude" && pin.harness !== "codex")) return false;
         return (pin.model === null || (typeof pin.model === "string" && !checkerModelWarning(pin.model, pin.harness))) &&
           (pin.effort === null || (typeof pin.effort === "string" && ["low", "medium", "high", "xhigh", "max"].includes(pin.effort)));
       }));
@@ -248,6 +253,7 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#69 blob stays valid; absent reads as inherit.
     (u.judge_model === undefined || u.judge_model === null || typeof u.judge_model === "string") &&
     // Optional so a pre-#362 blob stays valid; absent reads as inherit.
+    (u.now_summary_enabled === undefined || u.now_summary_enabled === null || typeof u.now_summary_enabled === "boolean") &&
     (u.summary_model === undefined || u.summary_model === null || typeof u.summary_model === "string") &&
     (u.theme === null || typeof u.theme === "string") &&
     // PRD #1167 "Lights on" m2: the four raw appearance overrides, each null-or-string
@@ -296,6 +302,9 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     // Optional so a pre-#362 blob stays valid; a missing summary_model is filled
     // from the seed default ("haiku") on load.
     (a.summary_model === undefined || typeof a.summary_model === "string") &&
+    // PRD #2603: a blob that predates now_summary_enabled (undefined) is filled from the
+    // seed ("true") on load; a malformed non-string is refused.
+    (a.now_summary_enabled === undefined || typeof a.now_summary_enabled === "string") &&
     typeof a.health_enabled === "string" &&
     typeof a.health_stall_seconds === "string" &&
     // issue #2046: accept a legacy blob that predates health_tool_call_seconds (undefined);
@@ -485,16 +494,16 @@ function mySettingsResponse(): { settings: UserSettings } {
   const lane = effectiveLegacyLane(userSettings.default_harness);
   const projected =
     lane === "codex" ? userSettings.default_codex_model : userSettings.default_claude_model;
-  const cross_check_pins: CrossCheckPinDTO[] = (["claude", "codex"] as const).map(harness => {
-    const pin = userSettings.cross_check_pins?.find(p => p.stage === "plan" && p.harness === harness);
+  const cross_check_pins: CrossCheckPinDTO[] = (["plan", "code"] as const).flatMap(stage => (["claude", "codex"] as const).map(harness => {
+    const pin = userSettings.cross_check_pins?.find(p => p.stage === stage && p.harness === harness);
     const model = pin?.model ?? null, effort = pin?.effort ?? null;
     const workerModel = harness === "claude" ? userSettings.default_claude_model ?? mockDefaultClaudeModel()
       : userSettings.default_codex_model ?? "gpt-6.1-sol";
     const workerEffort = harness === "claude" ? userSettings.default_effort : userSettings.default_codex_effort;
-    return { stage: "plan", harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
+    return { stage, harness, model, effort, worker_default_model: workerModel, resolved_model: model ?? workerModel,
       resolved_effort: effort ?? workerEffort ?? "medium", model_source: model === null ? "worker default" : "pin",
-      effort_source: effort === null ? "worker default" : "pin", active: harness === "codex" };
-  });
+      effort_source: effort === null ? "worker default" : "pin", active: true };
+  }));
   return { settings: { ...userSettings, cross_check_pins, default_model: projected ?? null } };
 }
 
@@ -809,6 +818,7 @@ export const settingsApi = {
         key === "judge_enabled" ||
         key === "judge_enforce_all" ||
         key === "ephemeral_workers_enabled" ||
+        key === "now_summary_enabled" ||
         key === "release_check_enabled" ||
         key === "release_check_banner_enabled" ||
         key === "health_enabled" ||
@@ -942,7 +952,7 @@ export const settingsApi = {
         (nonSecret as Record<string, string>)[key] = String(n);
         continue;
       }
-      // Per-run extension allowance (PRD #1189), mirroring the server's
+      // Per-request extension cap (PRD #1189, #2735), mirroring the server's
       // validateExtensionCapSeconds: a whole number that is 0 (disable) or in the inclusive
       // range [3600, 604800] (1h to 7d). Note the bounds differ from the health-seconds fields.
       if (key === "run_extension_cap_seconds") {
@@ -969,11 +979,9 @@ export const settingsApi = {
       if (key === "docker_repo_allowlist") {
         const ok = value
           .split(",")
-          .map((t) => t.trim())
+          .map(trimAllowlistToken)
           .filter((t) => t !== "")
-          .every((t) =>
-            /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i.test(t),
-          );
+          .every((t) => uuidIdentity(t) !== null);
         if (!ok) {
           throw new ApiError(
             400,
@@ -1017,6 +1025,14 @@ export const settingsApi = {
   },
 
   // ── Plan cross-check consent (PRD #2149 M1) ─────────────────────────────────
+  setCodeCrossCheckEnabled: async (code: boolean) => {
+    const u = requireSession();
+    if (code && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {
+      throw new ApiError(400, "both Claude and Codex credentials must be usable");
+    }
+    u.code_cross_check_enabled = code;
+    return delay({ user: { ...u } }, 200);
+  },
   setPlanCrossCheckEnabled: async (plan: boolean) => {
     const u = requireSession();
     if (plan && (!hasAnthropicToken(secrets) || !isCodexUsable(secrets))) {
@@ -1141,22 +1157,24 @@ export const settingsApi = {
     let next = { ...userSettings };
     if ("cross_check_pins" in patch) {
       const list: unknown = patch.cross_check_pins;
-      if (!Array.isArray(list) || list.length > 2) throw new ApiError(400, "cross_check_pins: expected at most two cells");
+      if (!Array.isArray(list) || list.length > 4) throw new ApiError(400, "cross_check_pins: expected at most four cells");
       const pins = (userSettings.cross_check_pins ?? []).map(p => ({ ...p }));
       const seen = new Set<string>();
       for (const raw of list) {
         if (!raw || typeof raw !== "object" || Array.isArray(raw)) throw new ApiError(400, "cross_check_pins: invalid cell");
         const cell = raw as Record<string, unknown>;
-        const name = `cross_check_pins[plan/${cell.harness}]`;
-        if (cell.stage !== "plan" || (cell.harness !== "claude" && cell.harness !== "codex"))
+        const name = `cross_check_pins[${cell.stage}/${cell.harness}]`;
+        if ((cell.stage !== "plan" && cell.stage !== "code") || (cell.harness !== "claude" && cell.harness !== "codex"))
           throw new ApiError(400, `${name}: invalid stage/harness`);
         if (Object.keys(cell).some(k => !["stage", "harness", "model", "effort"].includes(k)))
           throw new ApiError(400, `${name}: unknown field`);
         const harness: Harness = cell.harness;
-        if (seen.has(harness)) throw new ApiError(400, `${name}: duplicate cell`);
-        seen.add(harness);
-        const previous = pins.find(p => p.harness === harness);
-        const pin: CrossCheckPinDTO = previous ?? { stage: "plan", harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: harness === "codex" };
+        const stage = cell.stage;
+        const key = `${stage}/${harness}`;
+        if (seen.has(key)) throw new ApiError(400, `${name}: duplicate cell`);
+        seen.add(key);
+        const previous = pins.find(p => p.stage === stage && p.harness === harness);
+        const pin: CrossCheckPinDTO = previous ?? { stage, harness, model: null, effort: null, worker_default_model: null, resolved_model: null, resolved_effort: "medium", model_source: "worker default", effort_source: "worker default", active: true };
         for (const field of ["model", "effort"] as const) {
           if (!(field in cell)) continue;
           const value = cell[field];
@@ -1322,6 +1340,10 @@ export const settingsApi = {
       // present-null clears back to the default-ON state (stored as null). Mirrors
       // the server treating an absent/null value as ON.
       next = { ...next, mr_rework_enabled: patch.mr_rework_enabled ?? null };
+    }
+    if (patch.now_summary_enabled !== undefined) {
+      // Tri-state like mr_rework_enabled (PRD #2603): null clears back to the default ON.
+      next = { ...next, now_summary_enabled: patch.now_summary_enabled ?? null };
     }
     if (patch.default_harness !== undefined) {
       // Tri-state (PRD #1429 M1/D3, review fix M4a): present-null clears to "no

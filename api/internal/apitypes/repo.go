@@ -4,14 +4,16 @@ import "time"
 
 // RepoDTO is the browser/CLI view of a connected repo.
 type RepoDTO struct {
-	ID                string  `json:"id"`
-	ConnectionID      string  `json:"connection_id"`
-	ForgeProjectID    int64   `json:"forge_project_id"`
-	PathWithNamespace string  `json:"path_with_namespace"`
-	WebURL            string  `json:"web_url"`
-	DefaultBranch     *string `json:"default_branch"`
-	Enabled           bool    `json:"enabled"`
-	RepoSkillsEnabled bool    `json:"repo_skills_enabled"`
+	CodeCrossCheckGuidance            *string `json:"code_cross_check_guidance"`
+	CrossCheckRepoInstructionsEnabled bool    `json:"cross_check_repo_instructions_enabled"`
+	ID                                string  `json:"id"`
+	ConnectionID                      string  `json:"connection_id"`
+	ForgeProjectID                    int64   `json:"forge_project_id"`
+	PathWithNamespace                 string  `json:"path_with_namespace"`
+	WebURL                            string  `json:"web_url"`
+	DefaultBranch                     *string `json:"default_branch"`
+	Enabled                           bool    `json:"enabled"`
+	RepoSkillsEnabled                 bool    `json:"repo_skills_enabled"`
 	// RepoClaudemdEnabled is the trusted-repo instructions opt-in (PRD #246): when
 	// true, the lead reads the clone's root CLAUDE.md as a nonce-fenced,
 	// UNTRUSTED/ADVISORY block. Independent of RepoSkillsEnabled (both sit under the

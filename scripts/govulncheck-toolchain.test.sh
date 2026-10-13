@@ -20,6 +20,18 @@ TOOL=example.com/tools/govulncheck@v0.0.1
 API_VERSION=go1.91.2
 CONTROLLER_VERSION=go1.92.3
 mkdir -p "$TMP/bin"
+REAL_MKTEMP="$(command -v mktemp)"
+# Model BSD's bare -d behavior even on GNU hosts; explicit templates still use
+# the real mktemp. Keep the escaped scratch inside the case so cleanup is bounded.
+cat > "$TMP/bin/mktemp" <<'STUB'
+#!/bin/sh
+set -eu
+if [ "$#" -eq 1 ] && [ "$1" = -d ]; then
+  exec "$REAL_MKTEMP" -d "$CASE_DIR/escaped.XXXXXX"
+fi
+exec "$REAL_MKTEMP" "$@"
+STUB
+chmod +x "$TMP/bin/mktemp"
 
 cat > "$TMP/bin/go" <<'STUB'
 #!/bin/sh
@@ -119,7 +131,7 @@ expect() {
     buildvcs) goflags='-buildvcs=false' ;;
   esac
   (cd "$ROOT" && env -i PATH="$TMP/bin:$PATH" TMPDIR="$dir/tmp" \
-    MODULE_ROOT="$ROOT" API_VERSION="$API_VERSION" \
+    REAL_MKTEMP="$REAL_MKTEMP" MODULE_ROOT="$ROOT" API_VERSION="$API_VERSION" \
     CONTROLLER_VERSION="$CONTROLLER_VERSION" CASE_DIR="$dir" \
     ANALYZER="$TMP/analyzer" FAKE_MODE="$mode" ANALYSIS_EXIT="$analysis_exit" \
     GOTOOLCHAIN=auto GOFLAGS="$goflags" GOENV="$goenv" GOPACKAGESDRIVER="$driver" \

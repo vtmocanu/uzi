@@ -39,14 +39,18 @@ export class CodexTurnFailedError extends Error {
 /**
  * Issue #2099: whether a classified terminal failure is a TRANSIENT provider fault worth a
  * bounded same-thread retry: category `transport` with either no HTTP status or one the
- * caller's predicate deems retryable. Pure; reads only the closed classification, never any
- * message text.
+ * caller's predicate deems retryable, or the exact `rateLimitExceeded` token. The other
+ * `rate_limit` tokens keep their existing handling. Pure; reads only the closed
+ * classification, never any message text.
  */
 export function isCodexTransientClassification(
   c: CodexErrorClassification | undefined,
   isRetryableStatus: (status: number) => boolean,
 ): boolean {
-  return c !== undefined && c.category === "transport" && (c.httpStatus === undefined || isRetryableStatus(c.httpStatus));
+  return c !== undefined && (
+    c.classification === "rateLimitExceeded" ||
+    (c.category === "transport" && (c.httpStatus === undefined || isRetryableStatus(c.httpStatus)))
+  );
 }
 
 /** The CLOSED set of provider statuses we are willing to echo as a display `subtype`.
@@ -117,7 +121,7 @@ interface CodexErrorInfoEntry {
   http?: boolean;
 }
 
-/** The CLOSED map of the pinned Codex 0.159.3 app-server `codexErrorInfo` enum (15 scalar + 5 tagged)
+/** The CLOSED map of the pinned Codex 0.160.0 app-server `codexErrorInfo` enum (15 scalar + 5 tagged)
  *  from the exact lower-camel wire tag to its {@link CodexErrorInfoEntry}. A tag ABSENT from
  *  this map, or present with a shape that does not match the wire form, collapses to the
  *  fixed `"unknown"` classification — an arbitrary/attacker-shaped provider tag is NEVER

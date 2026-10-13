@@ -202,6 +202,63 @@ func TestHeartbeatIgnoresInvalidSnapshotLiveDB(t *testing.T) {
 	assertHeartbeatFresh(t, env, wk)
 }
 
+// TestHeartbeatRetiredCancelledReportOmissionLiveDB pins the API half of report-only
+// retirement: an accepted later snapshot drops the pending lease without changing the run.
+func TestHeartbeatRetiredCancelledReportOmissionLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	svc := snapshotSvc(env, testParams())
+	wk := seedSnapshotWorker(t, env, userID, "retirement-nonce")
+	run := seedOutageRun(t, env, userID, repoID, wk, "cancelled", "issue", 2, 0)
+
+	heartbeat := func(snap *ActiveSnapshot) {
+		t.Helper()
+		wkr, err := env.q.GetWorkerByID(env.ctx, wk)
+		if err != nil {
+			t.Fatalf("GetWorkerByID: %v", err)
+		}
+		if _, err := svc.Heartbeat(env.ctx, wkr, nil, nil, snap); err != nil {
+			t.Fatalf("Heartbeat: %v", err)
+		}
+	}
+	pending := &ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: "retirement-nonce",
+		Active: []ActiveRunEntry{entry(run, 2, "running", true)}}
+	heartbeat(pending)
+	row, ok := readActiveRun(t, env, wk, run)
+	if !ok || row.gen != 2 || !row.terminalPending || !row.untilFuture || row.epoch != 1 {
+		t.Fatalf("pending row = %+v present=%v, want generation 2 pending lease at epoch 1", row, ok)
+	}
+	if got := workerEpoch(t, env, wk); got != 1 {
+		t.Fatalf("worker epoch = %d, want 1", got)
+	}
+
+	// Invalid snapshots return no error; the epoch proves omission was actually accepted.
+	heartbeat(&ActiveSnapshot{SnapshotEpoch: 2, RegisterNonce: "wrong-nonce", Active: []ActiveRunEntry{}})
+	if got := workerEpoch(t, env, wk); got != 1 {
+		t.Fatalf("wrong nonce advanced worker epoch to %d, want 1", got)
+	}
+	if _, ok := readActiveRun(t, env, wk, run); !ok {
+		t.Fatal("wrong-nonce omission removed pending row")
+	}
+	heartbeat(&ActiveSnapshot{SnapshotEpoch: 2, RegisterNonce: "retirement-nonce", Active: []ActiveRunEntry{}})
+	if got := workerEpoch(t, env, wk); got != 2 {
+		t.Fatalf("worker epoch = %d, want 2", got)
+	}
+	if _, ok := readActiveRun(t, env, wk, run); ok {
+		t.Fatal("accepted epoch 2 omission retained worker_active_runs row")
+	}
+	heartbeat(pending)
+	if got := workerEpoch(t, env, wk); got != 2 {
+		t.Fatalf("out-of-order heartbeat changed epoch to %d, want 2", got)
+	}
+	if _, ok := readActiveRun(t, env, wk, run); ok {
+		t.Fatal("out-of-order snapshot revived retired report lease")
+	}
+	if got := statusOf(t, env, run); got != "cancelled" {
+		t.Fatalf("run status = %q, want cancelled", got)
+	}
+}
+
 // assertHeartbeatFresh confirms the worker's last_heartbeat_at is within the last few seconds.
 func assertHeartbeatFresh(t *testing.T, env codexTestEnv, workerID uuid.UUID) {
 	t.Helper()

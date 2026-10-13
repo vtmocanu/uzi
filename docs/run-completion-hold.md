@@ -191,6 +191,30 @@ something goes wrong or a human has touched the request in between:
   same failure falls through to the same blind whole-body rewrite the
   unreadable case uses, and is accepted on the same terms. This scan and
   rewrite apply to legacy runs too, not only interlocked ones.
+- **On a delivery the lead declared non-closing** (via `non_closing` on
+  `signal_done`), uzi also keeps the title and commit messages from closing
+  the issue, since both reach the default branch in the squash commit.
+  Before pushing, it checks the messages of every commit the push would
+  publish (relative to the default branch, merge commits included, and again
+  on the exact commit about to be pushed) with the same matcher as the
+  body. On a hit it stops publication (no further push, no request opened or
+  updated, no history rewrite) and fails the run naming the offending
+  commit SHA(s); if the messages can't be read (including commits whose header declares a
+  non-UTF-8 encoding) it refuses the same way, but names no SHA. The
+  committed work is preserved for recovery, and fixing the commits needs a
+  history rewrite left to the owner. A new
+  request's title is the issue title with any closing keyword for the issue
+  neutralised (a zero-width space after the keyword's first letter, or the
+  fixed `Work on issue #N` if that isn't enough). After the request is
+  created or adopted, uzi reads its actual title and retitles it if it
+  closes the issue. If the title can't be read, can't be updated, or still
+  closes after re-reading, the run fails closed; the request stays open and
+  must not be merged as-is. Owner-partial and scope-capped deliveries get the
+  same title neutralisation and fail-closed title confirmation, because they
+  never close their issue either. Only declared runs get the commit-message
+  refusal, so on those partial runs a closing keyword in a commit message can
+  still close the issue via a merge commit or squash body. Full deliveries keep
+  today's title.
 
 ## Not the same as an owner pause
 

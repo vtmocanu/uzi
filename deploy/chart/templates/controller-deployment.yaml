@@ -1,4 +1,10 @@
 {{- if and .Values.workers.enabled .Values.workers.controller.enabled }}
+{{- if not (regexMatch "^[01]$" (toString .Values.workers.controller.replicaCount)) }}
+{{- fail "workers.controller.replicaCount must be 0 or 1: hosted worker admission requires a HARD SINGLETON" }}
+{{- end }}
+{{- if not (regexMatch "^[1-9][0-9]*$" (toString .Values.workers.rollConcurrency)) }}
+{{- fail "workers.rollConcurrency must be a positive integer" }}
+{{- end }}
 {{- /*
   The hosted-worker controller (PRD #58 M6).
 
@@ -189,6 +195,13 @@ spec:
             {{- end }}
             - name: UZI_WORKER_FORCE_ROLL
               value: {{ .Values.workers.forceRoll | default false | quote }}
+            # Admission is canary-first; the deadline only applies on an admitted turn.
+            - name: UZI_WORKER_ROLL_CONCURRENCY
+              value: {{ .Values.workers.rollConcurrency | quote }}
+            {{- with .Values.workers.rollTargetVersion }}
+            - name: UZI_WORKER_ROLL_TARGET_VERSION
+              value: {{ . | quote }}
+            {{- end }}
             # PRD #837 M4 disk-pressure recycle knobs. When a hosted worker reports disk
             # pressure (a volume at used/total >= the api's UZI_DISK_PRESSURE_THRESHOLD
             # across >=2 fresh heartbeats), the controller drains-then-recycles its PVCs.

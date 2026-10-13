@@ -96,8 +96,8 @@ const statusRecoveryWait = "recovery_wait"
 // `run wait` keep waiting on it rather than exiting.
 const statusPaused = "paused"
 
-// holdBudgetExhausted and holdCompletionBlocked are the two run.HoldReason values a
-// `paused` run can carry (PRD #1497 M1 / PRD #1226). A wall park — a run that reached its
+// holdBudgetExhausted and holdCompletionBlocked name the wall and completion holds
+// surfaced below (PRD #1497 M1 / PRD #1226). A wall park — a run that reached its
 // wall-clock time limit — carries budget_exhausted; a structural completion hold carries
 // completion_blocked. Both are surfaced by the `uzi run get` HOLD row and the `run wait`
 // informative line; named here so those two surfaces compare against one literal, the same
@@ -110,9 +110,11 @@ const statusPaused = "paused"
 // enabled again (or, where the CLI and web offer a per-run override, once the owner points
 // the run at another token); uzi never substitutes a credential on its own (D2).
 const (
-	holdBudgetExhausted    = "budget_exhausted"
-	holdCompletionBlocked  = "completion_blocked"
-	holdCredentialDisabled = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
+	holdProviderUnavailable = "provider_unavailable"
+	providerOutageCause     = "provider_outage"
+	holdBudgetExhausted     = "budget_exhausted"
+	holdCompletionBlocked   = "completion_blocked"
+	holdCredentialDisabled  = "credential_disabled" //nolint:gosec // G101: a run hold-reason VOCABULARY value (the server enum), not a credential.
 )
 
 // logsPollInterval is how often `uzi run logs --follow` re-polls
@@ -282,7 +284,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 	}
 
 	cmd.AddCommand(
-		newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunWaitCmd(env, gf),
+		newRunListCmd(env, gf), newRunGetCmd(env, gf), newRunLogsCmd(env, gf), newRunPlanCmd(env, gf), newRunWaitCmd(env, gf),
 		newRunReviewCmd(env, gf), newRunCreateCmd(env, gf), newRunApproveCmd(env, gf), newRunRejectCmd(env, gf),
 		newRunReviseCmd(env, gf), newRunCancelCmd(env, gf), newRunStopCmd(env, gf), newRunScopeCmd(env, gf),
 		newRunExtendCmd(env, gf),
@@ -290,6 +292,7 @@ func newRunCmd(env Env, gf *globalFlags) *cobra.Command {
 		newRunResumeNowCmd(env, gf), newRunMrReworkCmd(env, gf), newRunPauseCmd(env, gf), newRunResumeCmd(env, gf), newRunReworkCmd(env, gf),
 		newRunSetTokenCmd(env, gf),
 		newRunDecideCmd(env, gf), newRunExportCmd(env, gf), newRunRecoveryCmd(env, gf), newRunDiscardCmd(env, gf),
+		newRunHeldCmd(env, gf),
 		newRunFetchesCmd(env, gf),
 	)
 	return cmd
@@ -510,15 +513,8 @@ type answerBody struct {
 
 // questionPayload is the part of a `question` run-message the CLI reads.
 type questionPayload struct {
-	QuestionID string `json:"question_id"`
-	Questions  []struct {
-		Question string `json:"question"`
-		Header   string `json:"header"`
-		Options  []struct {
-			Label       string `json:"label"`
-			Description string `json:"description"`
-		} `json:"options"`
-	} `json:"questions"`
+	QuestionID string           `json:"question_id"`
+	Questions  []answerQuestion `json:"questions"`
 }
 
 // openQuestion reads the run's newest `question` message and returns its payload.
@@ -600,7 +596,8 @@ func nonEmpty(in []string) []string {
 // map[string]json.RawMessage makes its key set the source of truth (self-maintaining as
 // the DTO grows), gives `null → empty line` for free, and makes the non-scalar case a
 // one-byte test — a RawMessage whose first non-space byte is `[` or `{` (the four array
-// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress)
+// fields: milestones, milestones_candidate, milestones_completed, milestones_in_progress, plus
+// the progress object while a run is non-terminal; null on a terminal run prints an empty line)
 // has no meaningful one-line raw form and is a usage error. An unknown field is likewise
 // a usage error (exit 2), never a silent blank.
 //

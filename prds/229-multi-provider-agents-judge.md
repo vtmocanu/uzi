@@ -46,7 +46,7 @@ Per the repo's inspiration-first rule, the two prior-art projects and comparable
 - **dot-agent-deck** (`inspiration/dot-agent-deck`): Rust TUI running CLIs in PTY panes; per-role `command` string; installs hooks into each CLI, no auth management.
 - **The premise is confirmed**: Codex/ChatGPT-subscription auth **requires the `codex` binary** — `@openai/codex-sdk` is itself a JSONL-over-stdio shim that spawns it; OpenAI ships no HTTP/SDK path for subscription tokens. The only counter-example is opencode's *unofficial* community plugin reverse-implementing OpenAI's OAuth against an undocumented endpoint — noted and rejected as a dependency. So uzi's Claude=SDK / Codex=subprocess asymmetry is not a quirk of uzi; it is inherent and matches every project that supports both.
 
-Sources: [@openai/codex-sdk](https://www.npmjs.com/package/@openai/codex-sdk), [Codex SDK README](https://github.com/openai/codex/blob/main/sdk/typescript/README.md), [Codex auth docs](https://developers.openai.com/codex/auth), [opencode-openai-codex-auth (rejected)](https://numman-ali.github.io/opencode-openai-codex-auth/).
+Sources: [@openai/codex-sdk](https://www.npmjs.com/package/@openai/codex-sdk), [Codex SDK README](https://github.com/openai/codex/blob/main/sdk/typescript/README.md), [Codex auth docs](https://learn.chatgpt.com/docs/auth), [opencode-openai-codex-auth (rejected)](https://numman-ali.github.io/opencode-openai-codex-auth/).
 
 ## Decision log
 

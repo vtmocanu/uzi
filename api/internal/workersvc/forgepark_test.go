@@ -3,6 +3,8 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/store"
 	"strings"
 	"testing"
 )
@@ -75,27 +77,31 @@ func TestForgeUnreachableSkipsJudgeRegardlessOfIteration(t *testing.T) {
 	}
 }
 
-// TestSetStateServerOnlyRecoveryCauseRejected (PRD #1590 C2): codex_account_unavailable is a
-// SERVER-written cause (the exact-claim park). A worker reporting it through SetState is refused
-// as ErrInvalidState before any state SQL, exactly like an unknown cause, so a worker can never
-// park a run on the account hold the promoters treat specially.
-func TestSetStateServerOnlyRecoveryCauseRejected(t *testing.T) {
+// The account cause is never written on the worker's word. Capability admission
+// happens before SQL; a capable reporter still needs the locked transaction.
+type accountGateStore struct {
+	*fakeStore
+	reads int
+}
+
+func (q *accountGateStore) GetRunOwnedByWorker(ctx context.Context, arg store.GetRunOwnedByWorkerParams) (store.Run, error) {
+	q.reads++
+	return q.fakeStore.GetRunOwnedByWorker(ctx, arg)
+}
+
+func TestSetStateCodexAccountCapabilityGate(t *testing.T) {
 	run := runningRun(false)
 	fs, svc, wkr := limitParkFixture(t, run)
-
-	_, applied, err := svc.SetState(context.Background(), wkr, run.ID, StateRequest{
-		State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseCodexAccountUnavailable), ClaimGeneration: i64Ptr(1),
-	})
-	// The server-only refusal, not the generic unknown-cause one: without the
-	// serverRecoveryWaitCauses check the cause is still refused, but only as "unknown".
-	if !errors.Is(err, ErrInvalidState) || !strings.Contains(err.Error(), "server-only") {
-		t.Fatalf("SetState err = %v, want ErrInvalidState naming the cause server-only", err)
+	gate := &accountGateStore{fakeStore: fs}
+	svc.q = gate
+	req := StateRequest{State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseCodexAccountUnavailable), ClaimGeneration: i64Ptr(1)}
+	_, applied, err := svc.SetState(context.Background(), wkr, run.ID, req)
+	if !errors.Is(err, ErrInvalidState) || applied || gate.reads != 0 || fs.setRecoveryWait != nil || fs.setFailed != nil {
+		t.Fatalf("incapable request: applied=%v err=%v writes=%v/%v", applied, err, fs.setRecoveryWait, fs.setFailed)
 	}
-	if applied || fs.setRecoveryWait != nil || fs.setFailed != nil {
-		t.Fatalf("a refused server-only cause mutated the run: applied=%v recovery_wait=%v failed=%v",
-			applied, fs.setRecoveryWait, fs.setFailed)
-	}
-	if recoveryWaitCauses[recoveryCauseCodexAccountUnavailable] {
-		t.Fatal("codex_account_unavailable is in the worker-reportable set")
+	wkr.ProtocolCapabilities = append(wkr.ProtocolCapabilities, capability.CodexAccountParkV1)
+	_, applied, err = svc.SetState(context.Background(), wkr, run.ID, req)
+	if err == nil || errors.Is(err, ErrInvalidState) || !strings.Contains(err.Error(), "no tx beginner") || applied || gate.reads == 0 {
+		t.Fatalf("capable request did not reach transaction: applied=%v err=%v", applied, err)
 	}
 }

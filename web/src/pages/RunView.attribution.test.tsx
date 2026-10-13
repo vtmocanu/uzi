@@ -1,19 +1,19 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
 import { cleanup, render, screen, within } from "@testing-library/react";
-import { MilestoneChecklist } from "./RunView";
+import { MilestoneRows } from "../components/RunMilestoneRows";
 import type { MilestoneAgent, MilestoneLane, Run, RunActivity } from "../lib/api";
 
-// PRD #1224 M5 (web render): per-milestone agent attribution in MilestoneChecklist. These
+// PRD #1224 M5 (web render): per-milestone agent attribution in MilestoneRows. These
 // tests pin the D8 "effective attribution" trigger, the D3 live-enrichment join (unique
 // match only), the D8 fallback back-compat, and the untrusted agent_label fold. They render
-// MilestoneChecklist directly (RunView needs routing + a live stream to mount) and pin useNow
+// MilestoneRows directly (RunView needs routing + a live stream to mount) and pin useNow
 // so the client-side age token is deterministic, mirroring RunView.nowline.test.tsx.
 
 const AT = "2026-09-03T12:00:00Z";
 const NOW = Date.parse(AT) + 40_000; // 40s after the activity instant → "40s"
 
-// MilestoneChecklist ages the now line via useNow; pin it so "40s" is deterministic.
+// MilestoneRows ages the now line via useNow; pin it so "40s" is deterministic.
 vi.mock("../lib/useNow", () => ({ useNow: () => NOW }));
 
 function anActivity(over: Partial<RunActivity> = {}): RunActivity {
@@ -88,6 +88,9 @@ function run(over: Partial<Run>): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -130,7 +133,7 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
   // the sibling shows its DECLARED role + label only).
   it("shows each declared role+label, and live tool/age only on the unique activity match", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -169,7 +172,7 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
   // which is the dishonesty this pin catches.
   it("pulses the dot only on the live strip, not the idle declared owner", () => {
     const { container } = render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -199,7 +202,7 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
   // strip shows declared role + label only.
   it("suppresses live tool/age on BOTH strips when the matching role is repeated", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -236,7 +239,7 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
     for (const { name, agents } of cases) {
       it(name, () => {
         render(
-          <MilestoneChecklist
+          <MilestoneRows
             run={run({
               milestones,
               milestones_completed: [],
@@ -264,7 +267,7 @@ describe("PRD #1224 M5: per-milestone agent attribution (web)", () => {
   // stripUnsafeChars before render.
   it("strips control/bidi characters from a hostile declared agent_label", () => {
     const { container } = render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: [],
@@ -289,7 +292,7 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
   // a QUIET "assigned to" line (its role + label, no age token) because it is not itself a lane.
   it("renders a live line per lane plus a quiet declared owner", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -332,7 +335,7 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
   // must now appear ONCE, as its live lane line; the quiet owner strip is suppressed.
   it("shows the owner once (its live lane) when the owner is also a lane", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -379,7 +382,7 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
   // distinct tools \u2192 BOTH render (keyed by instance), never collapsed to one line.
   it("renders both lanes when a role repeats across distinct instances", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -413,7 +416,7 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
   // lane strip DOES (live !== null \u2192 green + pulsing). The dots render owner-first, then each lane.
   it("pulses the dot on each lane but not on the quiet declared owner", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: ["m1"],
@@ -457,7 +460,7 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
     for (const { name, live } of cases) {
       it(name, () => {
         render(
-          <MilestoneChecklist
+          <MilestoneRows
             run={run({
               milestones,
               milestones_completed: ["m1"],
@@ -487,7 +490,7 @@ describe("PRD #1353 M4: per-milestone LIVE LANES (web)", () => {
   // zero-width space U+200B, written as escapes) are scrubbed through stripUnsafeChars at render.
   it("strips control/bidi characters from hostile lane fields", () => {
     const { container } = render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({
           milestones,
           milestones_completed: [],

@@ -219,7 +219,7 @@ waivable.** A blocking push/merge finding is **waivable** whenever uzi could
 actually read who can reach `main` — a readable ruleset that admits the write
 role, or a default branch with no protection at all. There, if the risk is
 knowingly accepted, the repo owner clicks **Request admin approval** on their
-Repos page (with a required reason of their own), an instance admin approves it
+Boards page (with a required reason of their own), an instance admin approves it
 from **Admin → Blocked repos**, and the owner then retries Enable so the live
 guard runs again. This is the common first-onboarding case on a repo whose
 default branch simply isn't protected — including a **GitHub Free private

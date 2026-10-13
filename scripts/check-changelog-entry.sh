@@ -26,8 +26,9 @@
 #     no shipping change is uncommitted. The oracle reads the SQUASH subject, so a docs-only
 #     branch squashed under a non-docs PR title still fails there: a stricter later check,
 #     never a bypass.
-#   - Every shipping path is a dependency manifest (basename go.mod, go.sum, Dockerfile or
-#     devbox.lock) AND every shipping commit is `chore(deps):`/`fix(deps):`/`build(deps):`
+#   - Every shipping path is a dependency manifest (basename go.mod, go.sum, Dockerfile,
+#     devbox.lock, package.json or package-lock.json; not the Codex runtime lock) AND every
+#     shipping commit is `chore(deps):`/`fix(deps):`/`build(deps):`
 #     typed, so a behavior edit to a Dockerfile under a fix title is not spared.
 #     deploy/chart/** is never exempt. Both predicates live in scripts/lib/dependency-bump.sh,
 #     which release-cut.sh also sources to cite exactly these merges in one bullet at cut

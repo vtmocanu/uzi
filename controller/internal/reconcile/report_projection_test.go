@@ -76,7 +76,8 @@ func TestTickProjectsRollHealthOntoStatusWire(t *testing.T) {
 		t.Fatalf("Tick: %v", err)
 	}
 	assertStatusWire(t, reports, `{
-		"reported_at": "2026-10-05T10:11:12.789Z",
+		"kind": "fleet",
+        "reported_at": "2026-10-05T10:11:12.789Z",
 		"poll_interval_seconds": 37,
 		"worker_image_tag": "controller-target",
 		"workers": [
@@ -144,7 +145,8 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
 		t.Fatalf("stuck Tick: %v", err)
 	}
 	assertStatusWire(t, reports, `{
-		"reported_at": "2026-10-05T12:00:00Z",
+		"kind": "fleet",
+        "reported_at": "2026-10-05T12:00:00Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
 		"workers": [{
@@ -174,7 +176,8 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
 		t.Fatalf("settled Tick: %v", err)
 	}
 	assertStatusWire(t, reports, `{
-		"reported_at": "2026-10-05T12:00:23Z",
+		"kind": "fleet",
+        "reported_at": "2026-10-05T12:00:23Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
 		"workers": [{
@@ -196,7 +199,8 @@ func TestTickReplacesRollHealthStatusAcrossTicks(t *testing.T) {
 		t.Fatalf("empty fleet Tick: %v", err)
 	}
 	assertStatusWire(t, reports, `{
-		"reported_at": "2026-10-05T12:00:46Z",
+		"kind": "fleet",
+        "reported_at": "2026-10-05T12:00:46Z",
 		"poll_interval_seconds": 23,
 		"worker_image_tag": "transition-target",
 		"workers": []

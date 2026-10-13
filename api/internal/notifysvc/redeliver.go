@@ -17,6 +17,7 @@ const redeliverBatch = 50
 // separate from Store so the Notify fakes need not implement it. *store.Queries
 // satisfies it.
 type RedeliveryStore interface {
+	PruneNotificationsForUser(ctx context.Context, arg store.PruneNotificationsForUserParams) (int64, error)
 	ClaimPendingSlackNotifications(ctx context.Context, arg store.ClaimPendingSlackNotificationsParams) ([]store.ClaimPendingSlackNotificationsRow, error)
 }
 
@@ -29,23 +30,45 @@ type Redeliverer struct {
 	q      RedeliveryStore
 	slack  Slacker
 	logger *slog.Logger
+	cap    int32
+}
+
+// RedelivererOption configures a Redeliverer at construction.
+type RedelivererOption func(*Redeliverer)
+
+// WithRedeliveryUserCap sets the per-user retention cap after exhaustion.
+// Non-positive values fall back to DefaultUserCap, as in New.
+func WithRedeliveryUserCap(cap int) RedelivererOption {
+	c := int32(cap) //nolint:gosec // G115: small per-user retention cap, matching New
+	if c <= 0 {
+		c = DefaultUserCap
+	}
+	return func(r *Redeliverer) { r.cap = c }
 }
 
 // NewRedeliverer builds a Redeliverer. A nil slack makes Pass a no-op; a nil logger
 // falls back to slog.Default.
-func NewRedeliverer(q RedeliveryStore, slack Slacker, logger *slog.Logger) *Redeliverer {
+func NewRedeliverer(q RedeliveryStore, slack Slacker, logger *slog.Logger, opts ...RedelivererOption) *Redeliverer {
 	if logger == nil {
 		logger = slog.Default()
 	}
-	return &Redeliverer{q: q, slack: slack, logger: logger}
+	r := &Redeliverer{q: q, slack: slack, logger: logger, cap: DefaultUserCap}
+	for _, o := range opts {
+		o(r)
+	}
+	return r
 }
 
 // Pass claims one batch of pending durable rows and re-enqueues each on the Slacker with
 // its row id as DeliveryID. It returns how many were handed to the Slacker: an enqueue
 // the notifier drops on a full queue still counts, and that row stays pending for a later
-// claim. A row whose stored render cannot be decoded is logged and skipped; it keeps being
-// claimed until it exhausts MaxSlackAttempts and then stops. With no Slacker it claims
-// nothing.
+// claim while below MaxSlackAttempts. A row whose stored render cannot be decoded is
+// logged and skipped; it keeps being claimed until it exhausts MaxSlackAttempts.
+// The final claim attempts best-effort per-user pruning before decoding or publishing,
+// including for a corrupt render (issue #2076). Successful pruning removes eligible
+// older rows without a later Notify; pending durable rows and timestamp ties remain.
+// A prune failure is logged without undoing exhaustion or blocking a valid final DM.
+// This pass does not sweep historical settled rows. With no Slacker it claims nothing.
 func (r *Redeliverer) Pass(ctx context.Context) (int64, error) {
 	if r.slack == nil {
 		return 0, nil
@@ -62,6 +85,11 @@ func (r *Redeliverer) Pass(ctx context.Context) (int64, error) {
 	for _, row := range rows {
 		last := row.SlackAttempts >= MaxSlackAttempts
 		if last {
+			if _, err := r.q.PruneNotificationsForUser(ctx, store.PruneNotificationsForUserParams{
+				UserID: row.UserID, Keep: r.cap, MaxAttempts: MaxSlackAttempts,
+			}); err != nil {
+				r.logger.Warn("notify: prune after slack exhaustion failed", "user", row.UserID.String(), "error", err)
+			}
 			r.logger.Warn("notify: slack redelivery giving up after this attempt",
 				"notification", row.ID.String(), "user", row.UserID.String(), "attempts", row.SlackAttempts)
 		}

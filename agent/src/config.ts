@@ -7,6 +7,7 @@ import type { CodexRuntimeProbeResult } from "./codex/codex-runtime-probe.js";
 import type { CodexHarnessAvailability } from "./codex/codex-capability.js";
 import { TRANSIENT_TRIP_MS } from "./batcher.js";
 import { errMessage } from "./util.js";
+import { parseRecoveryDecodedLimitBytes } from "./recovery-closure.js";
 
 // Worker configuration, parsed from env (PRD #4 §Configuration).
 //
@@ -29,6 +30,7 @@ export type ExecutorKind = "sdk" | "stub";
 export type CommandSandboxMode = "off" | "required" | "best-effort";
 
 export interface Config {
+  recoveryDecodedLimitBytes: number;
   apiUrl: string;
   workerToken: string;
   dataDir: string;
@@ -561,8 +563,10 @@ export function loadConfig(env: NodeJS.ProcessEnv = process.env): Config {
   const apiUrl = required(env, "UZI_API_URL").replace(/\/+$/, "");
   const rawLevel = env.UZI_LOG_LEVEL?.trim().toLowerCase() ?? "info";
   const dataDir = env.UZI_DATA_DIR?.trim() || "/data";
+  const recoveryDecodedLimitBytes = parseRecoveryDecodedLimitBytes(env.UZI_RECOVERY_DECODED_LIMIT_BYTES);
   return {
     apiUrl,
+    recoveryDecodedLimitBytes,
     workerToken: resolveWorkerToken(env),
     dataDir,
     workerName: env.UZI_WORKER_NAME?.trim() || os.hostname(),

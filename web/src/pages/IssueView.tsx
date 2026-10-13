@@ -1,6 +1,6 @@
 import { useEffect, useRef, useState } from "react";
 import { Link, useNavigate, useParams } from "react-router-dom";
-import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunListItem, type SecretMeta } from "../lib/api";
+import { api, isHttpsUrl, preferForgeUrl, type IssueDetail, type RunSummaryItem, type SecretMeta } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
 import { useAsyncData } from "../lib/useAsyncData";
 import { hasAnthropicToken, hasAnyCodexCredential, isCodexUsable } from "../lib/hasToken";
@@ -44,7 +44,7 @@ function columnLabel(issue: IssueDetail): string {
 // runDuration renders a terminal run's wall-clock span, or null while it is still
 // running (no finished_at yet — the live elapsed lives on the run view). Thin
 // wrapper over formatDuration kept co-located with the history row it feeds.
-function runDuration(run: RunListItem): string | null {
+function runDuration(run: RunSummaryItem): string | null {
   const start = firstStartIso(run);
   if (!start || !run.finished_at) return null;
   return formatDuration(new Date(run.finished_at).getTime() - new Date(start).getTime());
@@ -122,7 +122,7 @@ export function IssueView() {
     async ({ isCurrent }) => {
       const [{ issue }, { runs }, { workers }, { secrets }, { settings }] = await Promise.all([
         api.getIssue(repoId, iidNum),
-        api.listRuns({ repoId, issueIid: iidNum }),
+        api.listRuns({ repoId, issueIid: iidNum, view: "summary" }),
         api.listWorkers(),
         api.listSecrets(),
         // PRD #1429 M4a review Fix 1: the viewer's own default_harness, so the
@@ -519,7 +519,7 @@ function repoPathFromWebUrl(webUrl: string): string {
   }
 }
 
-function RunHistoryRow({ run, projectWebUrl }: { run: RunListItem; projectWebUrl: string }) {
+function RunHistoryRow({ run, projectWebUrl }: { run: RunSummaryItem; projectWebUrl: string }) {
   const stopped = isStoppedRun(run.status, run.stop_kind);
   const duration = runDuration(run);
   // PRD §3 asks for an MR/PR *link* in the history. Prefer the forge-supplied URL

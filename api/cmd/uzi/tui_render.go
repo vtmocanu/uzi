@@ -403,12 +403,20 @@ const (
 	credDisabledWord  = "cred disabled"
 )
 
-// runStateToken is stateToken over a whole run: the Codex relogin_required hold (which the
-// status/cause pair cannot express, it hangs on CodexAccountAction) and the credential_disabled
-// hold (it hangs on HoldReason) read as amber attention tokens, and every other run takes
-// stateToken unchanged. isRevising is passed
-// separately because only the list DTO carries it (the detail header passes false).
+const (
+	providerHoldWord  = "provider hold"
+	providerRetryWord = "provider wait"
+)
+
+// runStateToken gives typed provider, Codex relogin and credential holds their
+// own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if isProviderUnavailableHold(r) {
+		return runToken{glyph: "⊘", word: providerHoldWord, color: p.amber}
+	}
+	if providerParkLine(r) != "" {
+		return runToken{glyph: "~", word: providerRetryWord, color: p.wait}
+	}
 	if codexReloginHold(r) {
 		return runToken{glyph: codexReloginGlyph, word: codexReloginWord, color: p.amber}
 	}

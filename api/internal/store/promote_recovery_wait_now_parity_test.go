@@ -4,6 +4,8 @@ import (
 	"os"
 	"path/filepath"
 	"reflect"
+	"slices"
+	"sort"
 	"testing"
 )
 
@@ -18,8 +20,13 @@ import (
 // the ordinary `go test ./...` gate catches that drift, exactly as the limit-wait guard does
 // for its pair.
 //
+// The ONE deliberate exception (PRD #1733) is the owner-driven provider-park streak reset: the
+// early promote clears provider_park_count and provider_park_streak_started_at (the owner chose to
+// try again), while the sweep pass and the vault-unlock promoter PRESERVE them. The exception is
+// named below as ownerStreakReset, so no other column can ride along unnoticed.
+//
 // It ALSO pins two intents by name:
-//   - the mutated set is exactly the 10 columns listed below (naming every one, so a
+//   - the mutated set is exactly the 10 columns listed below (plus ownerStreakReset on the early promote) (naming every one, so a
 //     reviewer sees the whole set and a drift in ANY query reddens here);
 //   - the load-bearing PRESERVED columns (worker_id, session_id, last_seq, and the recovery
 //     backoff/history pair recovery_wait_count + recovery_retry_not_before) appear in NONE of the
@@ -60,14 +67,26 @@ func TestPromoteRecoveryWaitNowMirrorsSweepPass(t *testing.T) {
 		t.Fatalf("PromoteVaultLockedRecoveryWaitRuns mutates %v, want exactly %v", unlock, want)
 	}
 
-	if !reflect.DeepEqual(now, want) {
-		t.Fatalf("PromoteRecoveryWaitRunNow mutates %v, want exactly %v", now, want)
+	// The early promote carries the common set plus the owner-driven streak reset, in the helper's
+	// sorted order.
+	ownerStreakReset := []string{"provider_park_count", "provider_park_streak_started_at"}
+	wantNow := append(append([]string{}, want...), ownerStreakReset...)
+	sort.Strings(wantNow)
+	if !reflect.DeepEqual(now, wantNow) {
+		t.Fatalf("PromoteRecoveryWaitRunNow mutates %v, want exactly %v", now, wantNow)
 	}
 	if !reflect.DeepEqual(sweep, want) {
 		t.Fatalf("PromoteRecoveryWaitRuns mutates %v, want exactly %v — the early promote pins itself to this set, so the sweep pass drifting reddens here too", sweep, want)
 	}
-	if !reflect.DeepEqual(sweep, now) {
-		t.Fatalf("column-parity broken: PromoteRecoveryWaitRuns mutates %v but PromoteRecoveryWaitRunNow mutates %v — the recovery resume paths must stay identical", sweep, now)
+	// Everything but the owner-driven streak reset must stay identical across the two paths.
+	nowCommon := make([]string, 0, len(now))
+	for _, c := range now {
+		if !slices.Contains(ownerStreakReset, c) {
+			nowCommon = append(nowCommon, c)
+		}
+	}
+	if !reflect.DeepEqual(sweep, nowCommon) {
+		t.Fatalf("column-parity broken: PromoteRecoveryWaitRuns mutates %v but PromoteRecoveryWaitRunNow mutates %v (minus the owner streak reset) — the recovery resume paths must stay identical", sweep, nowCommon)
 	}
 
 	// The load-bearing PRESERVED columns must appear in NONE of the SET clauses. If any of these
@@ -85,6 +104,15 @@ func TestPromoteRecoveryWaitNowMirrorsSweepPass(t *testing.T) {
 	for _, c := range preserved {
 		if mutated[c] {
 			t.Errorf("PromoteRecoveryWaitRunNow mutates %q, but it MUST be preserved (early promote must leave worker/session affinity and the recovery cadence intact)", c)
+		}
+	}
+	// The automatic promotions preserve the provider-park streak: only the owner's early promote
+	// clears it.
+	for name, cols := range map[string][]string{"PromoteRecoveryWaitRuns": sweep, "PromoteVaultLockedRecoveryWaitRuns": unlock} {
+		for _, c := range ownerStreakReset {
+			if slices.Contains(cols, c) {
+				t.Errorf("%s mutates %q, but the automatic promotions MUST preserve the provider-park streak", name, c)
+			}
 		}
 	}
 }

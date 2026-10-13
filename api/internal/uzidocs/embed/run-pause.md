@@ -8,8 +8,8 @@ audience: user
 
 A run's owner can park it on demand — not because anything went wrong, just
 because it's an inconvenient time to keep spending — and pick it back up
-later exactly where it left off. Nothing runs and nothing is spent while it
-waits.
+later from its preserved session or published checkpoint. No model turns run
+while it is paused.
 
 ## Requesting a pause
 
@@ -21,11 +21,10 @@ From the run view's **‖ Pause ▾** menu (beside **Stop run**), or
   pushes a checkpoint, then parks. The run stays `running` until then: the
   page shows an info chip, **Pause requested · after M4** (or **· after the
   current step**), with **Cancel pause** and **Pause now** beside it.
-- **Pause now** (`--now`). Drops the turn in flight and parks on the last
-  checkpoint right away. This is the one that costs something: **work since
-  that checkpoint, plus the turn in flight, is discarded** — the menu names
-  the checkpoint's age (*"Work since the last checkpoint (9m ago) is
-  discarded"*) so you know what you're giving up before you choose it.
+- **Pause now** (`--now`). Interrupts the turn in flight and attempts to
+  checkpoint the current work before parking. Preservation can fail or the
+  published checkpoint can be older than the latest local work; check the
+  activity feed rather than assuming that every edit reached the forge.
 
 A pending request is a flag on the still-running run, not a state of its
 own — withdraw it any time before the boundary with **Cancel pause** (CLI:
@@ -39,6 +38,48 @@ task parks after every turn, and judge/MR-rework/CI-fix runs are short and
 finish on their own — pausing any of those, or a run already sitting at a
 gate or an involuntary park, is refused (409) with the reason. Owner-only.
 
+## Waiting on a dependency during implementation
+
+On an approved, non-interactive **issue** run, answer the lead's current
+implementation clarification with `/park` to request a pause directly:
+
+```sh
+uzi run answer <id> --message /park
+```
+
+This command is recognized after the owner answer has been validated and
+consumed for that question. Answers are trimmed and empty entries ignored;
+there must be at least one non-empty entry, and each must equal `/park`
+exactly. A batch mixing `/park` with other text is ordinary guidance.
+
+With API and worker support, ordinary prose goes back to the lead:
+continue if it gives actionable work; if implementation must wait on a
+dependency and no actionable work remains, call `park_run` and end the turn.
+That tool is lead-only, during approved issue implementation, including
+clarification follow-ups. Planning,
+subagents, interactive runs and other run kinds cannot use it.
+
+Both the API and worker must support this path. With older components, use
+the existing `uzi run pause <id> --now` when the run is running. A successful
+park uses the ordinary `paused` state, stops the wall clock, frees the run
+slot, and waits for owner resume from the session or published checkpoint.
+There is no dependency polling or automatic resume when a dependency lands,
+and no extra custody or retention guarantee beyond an ordinary pause.
+Local-only edits and session state still depend on the retained worker;
+checkpoint and recovery data follow the existing
+[retention rules](./run-recovery.md), rather than a separate dependency archive.
+
+If checkpoint publication fails, the ordinary `pause_failed` safeguard
+clears the request without declaring a successful pause. This dependency
+path then asks one worker-authored question about what to do next. It does
+not restart a paid/provider turn or retry parking until an explicit owner
+answer: `/park` authorizes one more attempt; prose returns to the lead;
+cancel ends the run. The fallback is ordinary `awaiting_input`: question
+wait time is banked out of the wall budget, but the worker slot stays held.
+It shares the run's absolute `QUESTION_TIMEOUT_SECONDS` deadline (when enabled);
+another question or retry does not reset it on that worker. An unattended
+run that needs this owner decision stops with a trusted refusal instead.
+
 ## What's durable, and where
 
 Parking works like the checkpoint the run already keeps pushing during
@@ -48,13 +89,13 @@ not just on one worker's disk. The run's session and its HOME (skills, git
 credentials, in-progress state) stay on the worker that was running it,
 freeing its slot for other work in the meantime.
 
-**If the checkpoint can't be published, the run does not park.** It stays
-`running`, the pending request is cleared, and the run's activity feed
-carries the reason (*"Could not pause: the checkpoint could not be
-published. The run is still running and has restarted the interrupted
-step."*). There's no Slack DM for this — uzi's Slack notifier only reacts to
-status changes, and a failed pause never changes the run's status — so the
-activity feed is where you'll see it.
+**If the checkpoint can't be published, the run does not park.** The
+pending request is cleared without changing the status to `paused`, and the
+run's activity feed carries the reason (*"Could not pause: the checkpoint
+could not be published. The run is still running and has restarted the
+interrupted step."*). An ordinary owner pause restarts work; the dependency
+path above waits for an answer instead. The `pause_failed` report itself sends no Slack
+DM because it is not a status transition; its reason is in the activity feed.
 
 ## Resuming
 
@@ -73,11 +114,31 @@ already resumes a run held for a pooled token).
 
 ## The clock stops
 
-Nothing runs and nothing is spent while a run is paused. The time it spends
+No model turns run while a run is paused. The time it spends
 parked is banked separately and doesn't count against its budget, so the
 remaining budget on resume is exactly what it was at the moment you paused
 it — unlike a usage-limit wait, whose resume gives the run a fresh full
 clock.
+
+## Held after provider outages
+
+A run can also pause without an owner request after a provider-outage
+streak reaches its elapsed bound (default 24h): `paused` with
+`hold_reason: provider_unavailable`. This policy stops automatic retry
+without failing the run. **Resume** queues a fresh attempt and clears the
+streak; **Cancel** ends it. Eligible **Stop** sets the scope ceiling first,
+then requires **Resume** after success, rather than an atomic Stop endpoint.
+It requires a non-interactive milestone issue run with at least one
+completed milestone; the surfaces explain unavailable actions.
+
+This hold retains the claim, worker affinity and the issue lock for issue
+runs, and satisfies and clears pending pause requests. The worker keeps
+clone and HOME; a verified capture may still be unpublished. The owner-pause
+publication rule above does not guarantee publication for this involuntary
+hold. Losing the worker's storage can lose unpublished work; another worker
+needs published work or an available verified recovery copy. See
+[Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for progress resets, detection timing and compatibility.
 
 ## Not the same as a completion hold
 

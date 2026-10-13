@@ -9,8 +9,10 @@ audience: user
 Settings → Workers shows what release each worker runs and whether it is keeping up; the
 Workers nav item carries a red count of workers needing attention. A version is baked into
 the image at build time and reported **at registration only** — `0.11.7+g1a2b3c4` is the
-0.11.7 release built from commit `1a2b3c4`, and the `+g…` is excluded from comparison. That
-register-only detail matters before you read any badge: a worker that went offline part-way
+0.11.7 release built from commit `1a2b3c4`, and the `+g…` is excluded from badge comparison.
+Paced hosted-roll promotion uses the **exact** baked version, including `+g…`;
+a matching badge does not prove a replacement is safe to promote.
+The register-only detail matters before you read any badge: a worker that went offline part-way
 through an upgrade still reports the version it ran *before*, so a failed upgrade is detected
 by watching the pod rather than by asking the worker.
 
@@ -24,8 +26,11 @@ by watching the pod rather than by asking the worker.
 | **upgrade failed** | The new container is not ready *and* stuck: a blocking reason, three restarts, or ten minutes — or no pod could be created at all | yes |
 | *(no badge)* | Nothing usable to compare | none |
 
-**outdated** — hosted workers are rolled for you when a release changes the image tag, so this
-usually means a roll has not happened yet or did not finish. If the worker is still busy when
+**outdated** — hosted workers are rolled for you when the independent `workers.image.tag` pin
+advances: a release whose agent runtime changed bumps the chart default, an app-only release
+does not, and an operator may override the pin per cluster
+([ADR-422](../adr/0422-decouple-worker-version.md)). This usually means a roll has not happened
+yet or did not finish. If the worker is still busy when
 its roll starts, the cluster may **cordon/drain** it first — it keeps finishing its current
 runs but stops claiming new ones until the roll completes; see
 [Draining and cordoned](hosted-workers.md#draining-and-cordoned). **External workers are never
@@ -42,6 +47,32 @@ badge expired after a fixed window and the row fell back to version comparison, 
 worker that never registered meant no badge at all: the alert went quiet while the worker was
 still broken. As long as the cluster keeps reporting the worker as stuck, the badge now stays.
 It clears when the pod recovers, not on a timer.
+
+## Paced hosted replacements
+
+Persistent hosted workers use one canary per owner, placement lane and effective
+registered capability pool before admitting more replacements. The default is
+one concurrent replacement per pool after promotion. Workers waiting behind a
+canary keep claiming on the old image; a healthy busy worker can still be useful
+capacity. A stuck participant holds the rest of its pool even after a drain
+deadline. A single-worker pool can lose service while its worker is replaced.
+Ephemeral workers are outside this pacing policy.
+
+A Ready pod alone does not promote a canary. The controller must connect the
+current Deployment, ReplicaSet and running pod UID to the target image, exact
+registered version, changed registration nonce and a subsequent fresh heartbeat
+for that nonce. Missing proof holds the roll; re-registering an old process at
+the same version is not replacement proof. The user-chosen worker name stays
+unchanged.
+
+Operators set `workers.rollTargetVersion` from the pinned image's verified baked
+stamp, including build metadata, even when the image tag is a bare release
+number. Do not copy the API version or infer the target from the new worker.
+Registration's existing 64-byte version limit still applies: a version changed
+by sanitization or truncation cannot supply promotion proof. Recovery needs an
+explicit operator decision; there is no automatic rollback or unpaced fallback.
+See the [verification runbook](./hosted-worker-roll-verification.md) for upgrade
+order, force-roll risks and the checks still assigned to the maintainer.
 
 ## When an upgrade fails
 
@@ -101,7 +132,8 @@ an admin sees the same roll health **across every owner** from Admin → Health
 **A settled worker behind its target reads *outdated*.** The version is baked into every agent
 image at build time and reported at registration, and each release builds a fresh image, so a
 hosted worker's reported version is what it actually runs. Just after a roll, a worker whose
-new pod is Ready but has not re-registered yet briefly reads *upgrading*; after that, a worker
+new pod is Ready but has not re-registered yet can read *upgrading*. Ready and
+badge state are display observations, not paced promotion proof; a worker
 still reporting an older release (for example one cordoned while it finishes work on its previous
 pod) reads *outdated* until it rolls. Agent images published before release 0.84.0 could be re-tagged
 aliases that report an older version than their tag; a worker pinned to one reads *outdated*

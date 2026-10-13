@@ -6,14 +6,14 @@ import { Badge, Button, Card, cx, type BadgeTone } from "./ui";
 import { FollowUpComposer } from "./FollowUpComposer";
 
 // SteerQueueCard is the run's steering surface (PRD #95): the follow-up queue with
-// per-entry delivery status, plus — while the run is live — the composer + Stop control.
+// per-entry delivery status, plus — while the run is live — the composer.
 //
 // Critically, this card is rendered UNCONDITIONALLY by RunView — including for a terminal
 // run — and its `inputs` are lifted into useRunStream (Decision 7/B1). That is what lets
 // the queue survive the run completing and still show "Not delivered — run finished" or "Not confirmed — run finished"; it
 // could never do that from inside the !terminal-gated composer, which unmounts on
-// completion. The composer + Stop, by contrast, are only meaningful for a live run, so
-// they are gated on !terminal.
+// completion. The composer is only meaningful for a live run, so it is gated on
+// !terminal.
 //
 // Delivery state (Decision 7, issue #1800) is derived CLIENT-SIDE from the input's receipt
 // timestamps and run.status: consumed_at is the worker having received it (Received),
@@ -199,7 +199,7 @@ function PauseMenu({
     : "Drops the turn in flight. Work since the last checkpoint is discarded.";
 
   return (
-    <div className="relative">
+    <div>
       <Button
         variant="secondary"
         disabled={busy}
@@ -212,7 +212,7 @@ function PauseMenu({
       {open && (
         <div
           role="menu"
-          className="absolute left-0 z-10 mt-1 w-72 rounded-md border border-edge bg-raised p-1 shadow-lg"
+          className="absolute right-0 z-10 mt-1 w-72 rounded-md border border-edge bg-raised p-1 shadow-lg"
         >
           {showMilestoneItem && (
             <button
@@ -264,10 +264,8 @@ export function SteerQueueCard({
   status,
   canSteer = true,
   busy,
-  onStop,
   onSend,
   run,
-  onPause,
 }: {
   inputs: SteerInput[];
   terminal: boolean;
@@ -276,19 +274,14 @@ export function SteerQueueCard({
   status?: string;
   // canSteer is false for a NON-OWNER viewer (a non-owner admin can open the owner-or-
   // admin run view, but the owner-only /inputs 404s — useRunStream reports that here).
-  // Decision 8/N2: hide the composer + Stop so there is no Send affordance that 404s.
+  // Decision 8/N2: hide the composer so there is no Send affordance that 404s.
   // Defaults true (owner) so a legit owner is never hidden. A non-owner's queue is also
   // empty (the 404 leaves it []), so the whole card collapses to nothing below.
   canSteer?: boolean;
   busy: boolean;
-  onStop: () => void;
   onSend: (text: string) => void;
-  // PRD #1190: the full run + the pause callback, needed only for the "‖ Pause ▾" menu
-  // beside Stop run. OPTIONAL so every existing caller/test that renders the card without a
-  // pause affordance is unchanged — the menu renders only when BOTH are supplied AND the
-  // run is a running, pausable one with no pause already pending.
+  // The run kind controls whether a follow-up composer is meaningful.
   run?: Run;
-  onPause?: (mode: "milestone" | "now") => void;
 }) {
   // Render nothing when there is no queue to show AND no composer to offer: a finished
   // run with an empty queue (matching the pre-v2 "no composer once terminal" behavior),
@@ -298,13 +291,13 @@ export function SteerQueueCard({
   if (inputs.length === 0 && (terminal || !canSteer)) return null;
 
   // PRD #1908: a job runs one session over its fixed inputs and never reads a follow-up, so
-  // it offers Stop only; a composer there would queue text nothing consumes.
+  // its controls are in the header; a composer would queue text nothing consumes.
   const takesFollowUps = run?.kind !== "job";
 
   return (
     <Card className="space-y-3 p-4">
       <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">
-        {takesFollowUps ? "Steer this run" : "Stop this job"}
+        {takesFollowUps ? "Steer this run" : "Job controls"}
       </h2>
 
       {inputs.length > 0 && (
@@ -343,7 +336,7 @@ export function SteerQueueCard({
         </ul>
       )}
 
-      {/* Composer + Stop are live-run-only, owner-only steering; the queue above persists
+      {/* The composer is live-run-only, owner-only steering; the queue above persists
           past terminal and is shown read-only to a non-owner only if it is non-empty
           (which it never is — a non-owner's /inputs 404s, leaving the queue empty). */}
       {!terminal && canSteer && (
@@ -379,19 +372,23 @@ export function SteerQueueCard({
           ) : (
             <p className="text-sm text-muted">A job takes no follow-ups. Stopping it cancels the job.</p>
           )}
-          {/* PRD #1190: Pause ▾ sits beside Stop run, offered only for a RUNNING, pausable
-              run with no pause already pending (a pending request has its own chip + actions
-              in the header). Unpausable kinds and any parked status show no menu. */}
-          <div className="flex flex-wrap items-center gap-2">
-            {run && onPause && status === "running" && !run.pause_requested_at && isPausableRun(run) && (
-              <PauseMenu run={run} busy={busy} onPause={onPause} />
-            )}
-            <Button variant="danger" disabled={busy} onClick={onStop}>
-              {takesFollowUps ? "Stop run" : "Stop job"}
-            </Button>
-          </div>
+          <p className="text-xs text-faint">{takesFollowUps ? "Pause or stop this run from the header." : "Stop this job from the header."}</p>
         </>
       )}
     </Card>
   );
+}
+
+export function RunControls({ run, busy, terminal, canSteer, onPause, onStop }: {
+  run: Run; busy: boolean; terminal: boolean; canSteer: boolean;
+  onPause: (mode: "milestone" | "now") => void; onStop: () => void;
+}) {
+  if (terminal || !canSteer) return null;
+  return <div className="flex flex-wrap items-center gap-2">
+    {run.status === "running" && !run.pause_requested_at && isPausableRun(run) && <PauseMenu run={run} busy={busy} onPause={onPause} />}
+    <Button variant="danger" size="sm" disabled={busy} onClick={onStop}
+      aria-label={run.kind === "job" ? "Stop this job" : "Stop run"}>
+      {run.kind === "job" ? "Stop this job" : "Stop run"}
+    </Button>
+  </div>;
 }

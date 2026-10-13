@@ -867,6 +867,19 @@ function breakClosingKeywords(s: string, mode: "all" | "directives"): string {
   return out;
 }
 
+/**
+ * A PR title that publishes no closing keyword for `issueIid`, for a run whose lead declared the
+ * delivery non-closing. A title that already scans clean is returned byte-identical. Otherwise the
+ * closing keywords are broken (zero-width space), and when even that still scans as closing the
+ * fixed `Work on issue #N` stands in; the result never closes the issue.
+ */
+export function nonClosingTitle(title: string, issueIid: number, repoPath?: string): string {
+  if (!closingDirectiveFor(title, issueIid, repoPath)) return title;
+  const broken = breakClosingKeywords(title, "directives");
+  if (!closingDirectiveFor(broken, issueIid, repoPath)) return broken;
+  return `Work on issue #${issueIid}`;
+}
+
 /** The api's breakMentions: U+200B after every `@` not preceded by an ASCII letter or digit, unless
  *  it ends the text or a space follows it. */
 function breakMentions(s: string): string {
@@ -996,6 +1009,7 @@ export interface RenderedRegion {
   withFields: boolean;
   /** Set when withFields is false. */
   fallback?: RegionFallback;
+  diagramRemoval?: { stage: "renderer" | "region_cap"; reason: "mermaid_bytes" | "backtick" | "region_bytes" };
 }
 
 const RUNG2_NOTE = "_Summary written by the agent, not checked against the diff._";
@@ -1062,9 +1076,9 @@ function verificationLines(fields: SanitizedPrDescriptionFields, input: RegionIn
   return out;
 }
 
-function diagramBlock(fields: SanitizedPrDescriptionFields): string[] {
+function diagramBlock(fields: SanitizedPrDescriptionFields): { lines: string[]; reason?: "mermaid_bytes" | "backtick" } {
   const diagram = fields.diagram;
-  if (!diagram) return [];
+  if (!diagram) return { lines: [] };
   const ids = new Map(diagram.nodes.map((node, i) => [node.key, `n${i + 1}`]));
   const connected = new Set(diagram.edges.flatMap((edge) => [edge.from, edge.to]));
   const source = diagram.kind === "flow"
@@ -1076,16 +1090,25 @@ function diagramBlock(fields: SanitizedPrDescriptionFields): string[] {
     : ["sequenceDiagram", ...diagram.nodes.map((node) => `  participant ${ids.get(node.key)} as ${sequenceLabel(node.label)}`),
       ...diagram.edges.map((edge) => `  ${ids.get(edge.from)}->>${ids.get(edge.to)}: ${sequenceLabel(edge.label || diagram.nodes.find((node) => node.key === edge.to)!.label)}`)];
   const mermaid = source.join("\n");
-  if (Buffer.byteLength(mermaid, "utf8") > 1500 || mermaid.includes("`")) return [];
-  return [...(diagram.title ? [`_${escapeInline(diagram.title)}_`, ""] : []), "```mermaid", ...source, "```"];
+  const reason = mermaidRemovalReason(mermaid);
+  if (reason) return { lines: [], reason };
+  return { lines: [...(diagram.title ? [`_${escapeInline(diagram.title)}_`, ""] : []), "```mermaid", ...source, "```"] };
+}
+
+/** Pure guard, also covers backticks that the decoder already rejects. */
+export function mermaidRemovalReason(source: string): "mermaid_bytes" | "backtick" | undefined {
+  if (Buffer.byteLength(source, "utf8") > 1500) return "mermaid_bytes";
+  if (source.includes("`")) return "backtick";
+  return undefined;
 }
 
 function sequenceLabel(label: string): string {
   return label.replace(/\bend\b/giu, "(end)");
 }
 
-function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, withoutDiagram = false): string {
+function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, withoutDiagram = false): { text: string; diagramRemoval?: RenderedRegion["diagramRemoval"] } {
   const blocks: string[][] = [];
+  let diagramRemoval: RenderedRegion["diagramRemoval"];
   const summary = fields.summary.trim();
   if (summary) blocks.push([summary]);
   // D8 rung 2: the note qualifies the summary, so it follows it, never under "### Verification"
@@ -1096,7 +1119,8 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, 
   if (fields.changes.length) blocks.push(["### What changed", ...fields.changes.map((c) => `- ${c}`)]);
   if (!withoutDiagram) {
     const diagram = diagramBlock(fields);
-    if (diagram.length) blocks.push(diagram);
+    if (diagram.lines.length) blocks.push(diagram.lines);
+    if (diagram.reason) diagramRemoval = { stage: "renderer", reason: diagram.reason };
   }
   const verification = verificationLines(fields, input);
   if (verification.length) blocks.push(["### Verification", ...verification]);
@@ -1107,7 +1131,7 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, 
   if (notes.length) blocks.push(["### Scope and review notes", ...notes]);
   const prov = provenanceOf(input);
   if (prov) blocks.push([prov]);
-  return wrapRegion(blocks.map((b) => b.join("\n")).join("\n\n").split("\n"));
+  return { text: wrapRegion(blocks.map((b) => b.join("\n")).join("\n\n").split("\n")), diagramRemoval };
 }
 
 /**
@@ -1115,7 +1139,8 @@ function fieldsRegion(fields: SanitizedPrDescriptionFields, input: RegionInput, 
  * instance from a WorkerClient decoder; it is checked with `SanitizedPrDescriptionFields.is()` at
  * runtime, and anything else (a plain object, `Object.assign({}, s, raw)`, `structuredClone(s)`, a
  * Proxy, an `any`) renders the size-and-provenance-only region instead (fail closed). A rendered
- * region over REGION_CAP_BYTES (6 KiB) also falls back to it. The fields are published as the api
+ * region over REGION_CAP_BYTES (6 KiB) first removes the diagram, then falls back to it if prose
+ * still exceeds the cap. Removal metadata survives both selections. The fields are published as the api
  * returned them: no re-escaping.
  */
 export function renderRegion(input: RegionInput, fields?: SanitizedPrDescriptionFields, withoutDiagram = false): RenderedRegion {
@@ -1126,14 +1151,15 @@ export function renderRegion(input: RegionInput, fields?: SanitizedPrDescription
   if (input.source === "deterministic_only") {
     return { text: deterministicRegion(input), withFields: false, fallback: "deterministic_only" };
   }
-  let text = fieldsRegion(fields, input, withoutDiagram);
+  let { text, diagramRemoval } = fieldsRegion(fields, input, withoutDiagram);
   if (!withoutDiagram && fields.diagram && Buffer.byteLength(text, "utf8") > REGION_CAP_BYTES) {
-    text = fieldsRegion(fields, input, true);
+    if (!diagramRemoval) diagramRemoval = { stage: "region_cap", reason: "region_bytes" };
+    text = fieldsRegion(fields, input, true).text;
   }
   if (Buffer.byteLength(text, "utf8") > REGION_CAP_BYTES) {
-    return { text: deterministicRegion(input), withFields: false, fallback: "region_cap" };
+    return { text: deterministicRegion(input), withFields: false, fallback: "region_cap", ...(diagramRemoval ? { diagramRemoval } : {}) };
   }
-  return { text, withFields: true };
+  return { text, withFields: true, ...(diagramRemoval ? { diagramRemoval } : {}) };
 }
 
 /** sha256 (hex) of the exact region text, markers included, with CRLF normalised to LF (a forge
@@ -1170,6 +1196,7 @@ const BRIDGE_SENTENCE =
  */
 export type KindSectionLine =
   | { fixed: string }
+  | { codeCrossCheck: import("./code-cross-check-gate.js").CodeCrossCheckSummary }
   | { path: string }
   | { check: { name: string; status: CheckStatus; detail: string } };
 
@@ -1194,6 +1221,7 @@ function renderFixedLine(s: string): string {
 }
 
 function renderKindSectionLine(line: KindSectionLine): string {
+  if ("codeCrossCheck" in line) return renderCodeCrossCheck(line.codeCrossCheck);
   if ("path" in line) return `> - ${codeSpan(line.path)}`;
   if ("check" in line) {
     const c = line.check;
@@ -1201,6 +1229,65 @@ function renderKindSectionLine(line: KindSectionLine): string {
     return `- ${checkEmoji(status)} ${escapeInline(c.name)} — ${status} (${escapeInline(c.detail)})`;
   }
   return renderFixedLine(line.fixed);
+}
+
+/** Fixed wording for every `reason_class` a failed code cross-check row can carry (the
+ *  cross_checks_reason_class_check allowlist for stage 'code'); anything else is escaped raw. */
+const CODE_CROSS_CHECK_REASON_PROSE: ReadonlyMap<string, string> = new Map([
+  ["worker_unsupported", "worker unsupported"],
+  ["snapshot_failed", "snapshot failed"],
+  ["malformed", "checker output malformed"],
+  ["model_error", "checker model error"],
+  ["model_timeout", "checker model timed out"],
+  ["checker_unavailable", "no local checker"],
+  ["confinement_failed", "checker confinement failed"],
+  ["timed_out", "timed out"],
+  ["superseded", "superseded by a later change"],
+]);
+
+/** Code data occupies escaped value slots only; the 4 KiB budget drops finding lines first. */
+function renderCodeCrossCheck(summary: import("./code-cross-check-gate.js").CodeCrossCheckSummary): string {
+  const value = (s: string | null | undefined, cap = 256): string => {
+    // Strip complete ANSI sequences before dropping the remaining invisible controls.
+    // eslint-disable-next-line no-control-regex -- Literal ESC/BEL matching removes hostile ANSI sequences.
+    const clean = (s ?? "").replace(/\u001b\[[0-?]*[ -/]*[@-~]/gu, "").replace(/\u001b\][^\u0007]*(?:\u0007|\u001b\\)/gu, "");
+    let bounded = "";
+    for (const rune of clean) {
+      if (Buffer.byteLength(bounded + rune) > cap) break;
+      bounded += rune;
+    }
+    return escapeInline(bounded);
+  };
+  if ("incomplete" in summary) return `Code cross-check incomplete: ${value(summary.incomplete)}`;
+  if (summary.interrupted_at !== null || summary.reason_class === "interrupted") return "Code cross-check incomplete: interrupted";
+  if (summary.outcome !== "completed") {
+    const reason = summary.reason_class;
+    return `Code cross-check incomplete: ${reason === null ? "not finished" : CODE_CROSS_CHECK_REASON_PROSE.get(reason) ?? value(reason)}`;
+  }
+  if (!summary.head_commit || !summary.base_commit) return "Code cross-check incomplete: snapshot failed";
+  const dispositions = new Map((summary.dispositions ?? []).map(d => [d.finding_id, d]));
+  let addressed = 0, declined = 0, missing = 0;
+  const findings = summary.findings.map(f => {
+    const d = dispositions.get(f.id);
+    const disposition = d?.disposition ?? "not_reported";
+    if (disposition === "addressed") addressed++;
+    else if (disposition === "declined") declined++;
+    else missing++;
+    return `- ${codeSpan(f.id)} · ${value(f.severity)} · ${value(f.path)}:${f.line} · ${value(f.title)} — ${disposition === "not_reported" ? "not reported" : value(disposition)}${d?.reason ? `: ${value(d.reason, 1024)}` : ""}`;
+  });
+  const family = summary.checker_harness === "codex" ? "Codex" : summary.checker_harness === "claude" ? "Claude" : value(summary.checker_harness);
+  const identity = `Code cross-check (checked ${codeSpan(summary.head_commit.slice(0, 7))}, ${family} ${value(summary.checker_model)}${summary.checker_effort ? ` · ${value(summary.checker_effort)}` : ""})`;
+  const counts = summary.findings.length === 0
+    ? `${identity}: no findings`
+    : `${identity}\n${summary.findings.length} ${summary.findings.length === 1 ? "finding" : "findings"}: ${addressed} addressed, ${declined} declined${missing ? `, ${missing} not reported` : ""}`;
+  // The digest is the frozen guidance's sha256; only its first 12 hex characters are shown.
+  const guidance = summary.custom_guidance_applied
+    ? [`custom guidance applied${summary.guidance_digest ? ` (sha256 ${codeSpan(summary.guidance_digest.slice(0, 12))})` : ""}`]
+    : [];
+  const footer = "**Changes after the check were not cross-checked.**";
+  const render = () => [counts, ...guidance, ...findings, footer].join("\n");
+  while (findings.length && Buffer.byteLength(render()) > 4096) findings.pop();
+  return render();
 }
 
 /** A kind section as markdown, leading and trailing blank lines dropped; "" when it has no text. */
@@ -1224,10 +1311,12 @@ export interface CompletionBlockInput {
   /** Sections a kind carries after its line (the self_improve evidence, the prompt run's
    *  guard-critical paths), as structured KindSection data that this renderer escapes. */
   kindSections?: readonly (KindSection | undefined)[];
-  /** Render `Closes #N`. An owner partial or a scope-capped run never closes, whatever this says. */
+  /** Render `Closes #N`. Owner partials, scope caps and non-closing declarations suppress it. */
   closes: boolean;
   completionScope?: ClaimConfig["completion_scope"];
   scopeCapped?: { completedCount: number; total?: number };
+  /** Issue-only declaration; the caller redacts the reason before rendering. */
+  nonClosing?: { reason: string };
   /** The run used the repository's own agents (PRD #37 D3b). */
   repoAgents?: boolean;
   gatesUnverified?: readonly string[];
@@ -1277,9 +1366,9 @@ function issueArm(input: CompletionBlockInput): string[] {
   const deferred = input.completionScope?.deferred ?? [];
   const accepted = input.completionScope?.accepted ?? [];
   const isOwnerPartial = deferred.length > 0;
-  // Only the normal arm (last below) can render `Closes #N`: an owner partial (PRD #1227) and an
-  // operator scope cap (PRD #634) never close, whatever `closes` says, structurally here and not only
-  // in the create-then-verify flow.
+  // Only the normal arm (last below) can render `Closes #N`, and a non-closing declaration
+  // suppresses it there too. Owner partials (PRD #1227) and operator scope caps (PRD #634)
+  // never close, whatever `closes` says.
   const lines = isOwnerPartial
     ? [
         `Implements part of #${iid} (partial delivery — owner scope decision; this MR does NOT close the issue).`,
@@ -1301,8 +1390,13 @@ function issueArm(input: CompletionBlockInput): string[] {
       : [
           // #1801: NOT `Implements issue #N.` (a GitLab closing keyword).
           `Related to #${iid}.`,
-          ...(input.closes ? ["", `Closes #${iid}`] : []),
+          ...(input.closes && !input.nonClosing ? ["", `Closes #${iid}`] : []),
         ];
+  if (input.nonClosing) {
+    const reason = escapeInline(input.nonClosing.reason) || Array.from(input.nonClosing.reason, (c) =>
+      `U+${c.codePointAt(0)!.toString(16).toUpperCase().padStart(4, "0")}`).join(" ");
+    lines.push("", `> **Issue remains open.** ${reason}`);
+  }
   if (accepted.length > 0) {
     lines.push(
       "",
@@ -1344,9 +1438,10 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
     paras.push(issueArm(input).join("\n"));
   }
   if (input.repoAgents) paras.push(REPO_AGENTS_LINE);
-  if (input.kindLine !== undefined) {
+  {
     for (const section of input.kindSections ?? []) {
-      const t = section ? renderKindSection(section) : "";
+      const visible = input.kindLine === undefined ? section?.filter(line => "codeCrossCheck" in line) : section;
+      const t = visible ? renderKindSection(visible) : "";
       if (t) paras.push(t);
     }
   }
@@ -1357,6 +1452,46 @@ export function renderCompletionBlock(input: CompletionBlockInput): string {
   }
   paras.push(`---\n${completionFooter(input.branch)}`);
   return [COMPLETION_START, paras.join("\n\n"), COMPLETION_END].join("\n");
+}
+
+const CODE_CROSS_CHECK_PARAGRAPH_RE = /^Code cross-check (?:\(checked |incomplete: )/u;
+
+/**
+ * Refresh-mode swap of ONLY the code cross-check paragraph (renderCodeCrossCheck's output, which
+ * never contains a blank line) inside an existing completion block. The fresh block's paragraph
+ * replaces the old one in place; with no old one it is inserted before the bridge sentence, the
+ * staleness pair or the footer, whichever comes first; with no fresh one the old paragraph is
+ * dropped unless it names `headSha` as the commit it checked (an earlier run's evidence for another
+ * head, or an incomplete note, must not outlive its run). Every other
+ * paragraph, the closing-reference text included, is returned byte-for-byte.
+ */
+export function swapCodeCrossCheckSection(oldCompletion: string, freshCompletion: string, headSha: string): string {
+  // Paragraphs are separated by a blank line in any of CommonMark's line endings; the separators
+  // are kept (odd indexes) so every untouched byte, its own line endings included, is preserved.
+  // A CR directly before an LF is half of one CRLF, never a line ending of its own.
+  const BLANK = /((?:\r\n|\r(?!\n)|\n)(?:\r\n|\r|\n))/u;
+  const parts = oldCompletion.split(BLANK);
+  const eol = /\r\n|\r|\n/u.exec(oldCompletion)?.[0] ?? "\n";
+  const fresh = freshCompletion.split(BLANK).find((p, k) => k % 2 === 0 && CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  const at = parts.findIndex((p, k) => k % 2 === 0 && CODE_CROSS_CHECK_PARAGRAPH_RE.test(p));
+  if (fresh === undefined) {
+    if (at < 0) return oldCompletion;
+    const checked = /^Code cross-check \(checked `([0-9a-f]{7})`/u.exec(parts[at]!)?.[1];
+    if (checked !== undefined && headSha.startsWith(checked)) return oldCompletion;
+    // The footer always follows the section, so drop the paragraph with the separator after it.
+    parts.splice(at, 2);
+    return parts.join("");
+  }
+  // The fresh block is LF-rendered: write its paragraph in the old body's line ending.
+  const written = fresh.replace(/\r\n|\r|\n/gu, eol);
+  if (at >= 0) {
+    parts[at] = written;
+    return parts.join("");
+  }
+  const anchor = parts.findIndex((p, k) => k % 2 === 0 && (p === BRIDGE_SENTENCE || p.includes(STALENESS_START) || /^---(?:\r\n|\r|\n)/u.test(p)));
+  if (anchor < 0) return oldCompletion;
+  parts.splice(anchor, 0, written, parts[1] ?? eol + eol);
+  return parts.join("");
 }
 
 // ── Parsing and composing a body (D10, D15) ─────────────────────────────────────────────────
@@ -1720,21 +1855,21 @@ export function renderBody(region: string | undefined, completion: string): stri
 
 /**
  * D15: the body `compose(region)` builds, unless it exceeds BODY_CAP_CHARS, in which case the
- * region is replaced by `sizeOnlyRegion` (the size line and provenance, no model text). Preserved
+ * region first tries `diagramLessRegion`, then `sizeOnlyRegion` (size and provenance). Preserved
  * text and the completion block are never truncated, so a body can stay over the cap when they
- * alone exceed it. `capped` reports that the region was dropped.
+ * alone exceed it. `capped` reports size-only selection; removal metadata names the chosen rung.
  */
 export function capBody(
   compose: (region: string) => string | undefined,
   region: string,
   sizeOnlyRegion: string,
   diagramLessRegion?: string,
-): { body: string | undefined; capped: boolean; diagramless?: boolean } {
+): { body: string | undefined; capped: boolean; diagramless?: boolean; removal?: "diagramless" | "sizeonly" } {
   const body = compose(region);
   if (body === undefined || body.length <= BODY_CAP_CHARS || region === sizeOnlyRegion) return { body, capped: false };
   if (diagramLessRegion && diagramLessRegion !== region) {
     const less = compose(diagramLessRegion);
-    if (less !== undefined && less.length <= BODY_CAP_CHARS) return { body: less, capped: false, diagramless: true };
+    if (less !== undefined && less.length <= BODY_CAP_CHARS) return { body: less, capped: false, diagramless: true, removal: "diagramless" };
   }
-  return { body: compose(sizeOnlyRegion), capped: true };
+  return { body: compose(sizeOnlyRegion), capped: true, removal: "sizeonly" };
 }

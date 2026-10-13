@@ -134,12 +134,14 @@ func newRunPauseCmd(env Env, gf *globalFlags) *cobra.Command {
 // It rides the SAME POST /inputs path the sibling steering verbs use (c.SubmitRunInput),
 // posting kind=extend with a body of whole seconds parsed from --by, but prints its own
 // data-carrying line (like newRunPauseCmd) because a successful extend comes back with the
-// new deadline + running total on the response. The cap ("of 16h allowed") is NOT on the
-// response, so it is read best-effort off a `run get` fetch; if that read fails the line
-// stays truthful by dropping the "of <cap> allowed" tail rather than inventing a number.
+// new deadline + running total on the response. The per-extension maximum ("up to 16h per
+// extension") is NOT on the response, so it is read best-effort off a `run get` fetch; if that
+// read fails the line stays truthful by dropping the "(up to <cap> per extension)" tail rather
+// than inventing a number.
 //
 // The kind allowlist and the extend guards are the server's: a disabled cap
-// (ErrExtendDisabled), an over-cap request (ErrExtensionCapExceeded) and an untimed kind
+// (ErrExtendDisabled), an over-maximum request (ErrExtensionCapExceeded), a request past the total-run-time limit
+// (ErrExtensionLimitReached) and an untimed kind
 // (ErrExtendNotTimed) all come back as 409 (exit 5), and a body under the minimum as 400
 // (exit 2), each with the server's message printed verbatim — the same `return err` flow
 // scope/pause use.
@@ -149,16 +151,17 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Extend a run's wall-clock budget by a duration (owner-only): --by 2h",
 		Long: "Grant a non-terminal, time-limited run MORE wall-clock time so the sweep does not " +
 			"kill it at its current deadline (PRD #1189). Owner-only; the added time stacks on the " +
-			"frozen budget rather than replacing it, and the run's per-run extension allowance is an " +
-			"admin setting.\n\n" +
+			"frozen budget rather than replacing it. The admin sets the maximum for ONE extension " +
+			"(run_extension_cap_seconds); extend again to add more. Total run time has a technical " +
+			"limit of about 24.8 days (24d 20h 31m 23s).\n\n" +
 			"--by takes a duration: Go's `2h`, `90m`, `1h30m`, plus a `d` (day = 24h) unit — `1d` is " +
 			"24h. It must be at least 60 seconds (the server's minimum); `0`, a value under a minute, " +
 			"a negative value or an unparseable one is a usage error (exit 2).\n\n" +
 			"Valid on any non-terminal run of a kind the sweep can time out (an issue, task, prompt, " +
 			"self-improve, mr-rework or ci-fix run), including a queued or parked one. A chat, judge " +
-			"or interactive-task run never times out, so extending one is a 409 (exit 5); an over-cap " +
-			"request, or extending while the admin has turned extensions off, is also a 409, with the " +
-			"server's message printed verbatim.",
+			"or interactive-task run never times out, so extending one is a 409 (exit 5); a request " +
+			"over the per-extension maximum or past the total-time limit, or extending while the admin " +
+			"has turned extensions off, is also a 409, with the server's message printed verbatim.",
 		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
@@ -188,9 +191,9 @@ func newRunExtendCmd(env Env, gf *globalFlags) *cobra.Command {
 			if gf.quiet {
 				return nil
 			}
-			// The response carries the new total + deadline; the per-run cap is a stable admin
-			// setting the response does not repeat, so read it best-effort off the run. A failed
-			// read leaves capSeconds 0 and extendSuccessLine drops the "of <cap> allowed" tail.
+			// The response carries the new total + deadline; the per-extension maximum is a stable
+			// admin setting the response does not repeat, so read it best-effort off the run. A failed
+			// read leaves capSeconds 0 and extendSuccessLine drops the "(up to <cap> per extension)" tail.
 			capSeconds := 0
 			if run, gerr := c.GetRun(cmd.Context(), runID); gerr == nil {
 				capSeconds = run.BudgetExtensionCapSeconds
@@ -254,14 +257,14 @@ func parseDurationWithDays(s string) (time.Duration, error) {
 
 // extendSuccessLine is the human confirmation for a successful `run extend` (PRD #1189 M3):
 //
-//	Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this run: 2h of 16h allowed.
+//	Extended <id> by 2h. 3h05m left, times out 17:20. Extensions on this run: 2h total (up to 16h per extension).
 //
 // "by" is the REQUESTED duration; the "left"/"times out" clause is derived from the response's
-// deadline_at (local zone, via the CLI's existing formatters); and the allowance is the new
-// running total (response) against the per-run cap (fetched run DTO). Clauses the response does
+// deadline_at (local zone, via the CLI's existing formatters); and the allowance clause is the new
+// running total (response) with the per-extension maximum (fetched run DTO). Clauses the response does
 // not carry are dropped rather than fabricated: a run extended while queued/parked carries no
 // deadline_at yet (the sweep only computes one for a running run), so the deadline clause is
-// omitted; and a failed cap read drops just the "of <cap> allowed" tail.
+// omitted; and a failed cap read drops just the "(up to <cap> per extension)" tail.
 //
 // PRD #1497 M3: an Extend on a `budget_exhausted` WALL PARK is not a plain time grant — the
 // server adds the time AND resumes the parked run in one action, and says so with resumed:true.
@@ -295,9 +298,9 @@ func extendSuccessLine(runID string, requestedSeconds int, res apitypes.RunInput
 	if res.ExtensionSeconds != nil {
 		total := shortDuration(time.Duration(*res.ExtensionSeconds) * time.Second)
 		if capSeconds > 0 {
-			fmt.Fprintf(&b, " Extensions on this run: %s of %s allowed.", total, shortDuration(time.Duration(capSeconds)*time.Second))
+			fmt.Fprintf(&b, " Extensions on this run: %s total (up to %s per extension).", total, shortDuration(time.Duration(capSeconds)*time.Second))
 		} else {
-			fmt.Fprintf(&b, " Extensions on this run: %s.", total)
+			fmt.Fprintf(&b, " Extensions on this run: %s total.", total)
 		}
 	}
 	return b.String()

@@ -20,7 +20,7 @@ import (
 
 // drainCmd executes a returned tea.Cmd and every inner cmd of a tea.BatchMsg it yields,
 // returning the produced messages. Executing fetchRunsCmd / refreshRunMetaCmd this way is what
-// makes the FakeClient count its ListRuns / GetRun invocations. A reply's re-armed tick is a
+// makes the FakeClient count its ListRunSummaries / GetRun invocations. A reply's re-armed tick is a
 // tea.Tick, so a caller that drains a boardRunsMsg batch must shrink boardPollInterval first
 // (below) to keep boardTickInterval from blocking on the real 2s cadence.
 func drainCmd(cmd tea.Cmd) []tea.Msg {
@@ -71,7 +71,7 @@ func tick(t *testing.T, m tuiModel) (tuiModel, tea.Cmd) {
 }
 
 // Two consecutive periodic board ticks with NO intervening reply must issue EXACTLY ONE real
-// ListRuns: the first tick fetches and latches the guard (waitID != 0), the second is skipped
+// ListRunSummaries: the first tick fetches and latches the guard (waitID != 0), the second is skipped
 // while the poll is in flight. A matching boardRunsMsg then clears the guard so the next tick
 // fetches again (count → 2).
 func TestTUIBoardTickInFlightGuard(t *testing.T) {
@@ -91,17 +91,17 @@ func TestTUIBoardTickInFlightGuard(t *testing.T) {
 	if m.board.waitID == 0 {
 		t.Fatal("first boardTickMsg did not set waitID; the in-flight guard can never engage")
 	}
-	drainCmd(cmd) // runs the fetch closure → ListRunsCalls == 1
-	if fake.ListRunsCalls != 1 {
-		t.Fatalf("first tick issued %d ListRuns, want exactly 1", fake.ListRunsCalls)
+	drainCmd(cmd) // runs the fetch closure → ListRunSummariesCalls == 1
+	if fake.ListRunSummariesCalls != 1 {
+		t.Fatalf("first tick issued %d ListRunSummaries, want exactly 1", fake.ListRunSummariesCalls)
 	}
 	waitID := m.board.waitID
 
 	// Second tick with the guard still latched (no reply yet): must NOT issue a fetch.
 	m, cmd = tick(t, m)
 	drainCmd(cmd)
-	if fake.ListRunsCalls != 1 {
-		t.Fatalf("a second tick while a poll was in flight issued another ListRuns (total %d); the guard did not hold", fake.ListRunsCalls)
+	if fake.ListRunSummariesCalls != 1 {
+		t.Fatalf("a second tick while a poll was in flight issued another ListRunSummaries (total %d); the guard did not hold", fake.ListRunSummariesCalls)
 	}
 
 	// The matching board reply clears the guard, so the next tick fetches again.
@@ -112,8 +112,8 @@ func TestTUIBoardTickInFlightGuard(t *testing.T) {
 	}
 	m, cmd = tick(t, m)
 	drainCmd(cmd)
-	if fake.ListRunsCalls != 2 {
-		t.Fatalf("after a reply cleared the guard, the next tick brought the total to %d ListRuns, want 2", fake.ListRunsCalls)
+	if fake.ListRunSummariesCalls != 2 {
+		t.Fatalf("after a reply cleared the guard, the next tick brought the total to %d ListRunSummaries, want 2", fake.ListRunSummariesCalls)
 	}
 }
 
@@ -152,8 +152,8 @@ func TestTUIBoardTickGuardClearsOnAdminMismatchReply(t *testing.T) {
 	// Proof it is unwedged: the next tick fetches again.
 	m, cmd = tick(t, m)
 	drainCmd(cmd)
-	if fake.ListRunsCalls != 2 {
-		t.Fatalf("after the ignored reply cleared the guard, total ListRuns is %d, want 2", fake.ListRunsCalls)
+	if fake.ListRunSummariesCalls != 2 {
+		t.Fatalf("after the ignored reply cleared the guard, total ListRunSummaries is %d, want 2", fake.ListRunSummariesCalls)
 	}
 }
 
@@ -232,13 +232,13 @@ func TestTUIBoardTickReArmsWhileQuittingModalOpen(t *testing.T) {
 
 	// A board tick fires while the modal is open: it must NOT poll (no work while the user decides)
 	// but MUST re-arm the tick chain so polling survives the modal.
-	callsBefore := fake.ListRunsCalls
+	callsBefore := fake.ListRunSummariesCalls
 	m, cmd := tick(t, m)
 	if !hasMsg[boardTickMsg](drainCmd(cmd)) {
 		t.Fatal("a board tick during the quitting modal did not re-arm the tick chain; cancelling the modal would leave polling dead")
 	}
-	if fake.ListRunsCalls != callsBefore {
-		t.Fatalf("a board tick during the quitting modal issued a poll (calls %d → %d); no work should happen while the modal is open", callsBefore, fake.ListRunsCalls)
+	if fake.ListRunSummariesCalls != callsBefore {
+		t.Fatalf("a board tick during the quitting modal issued a poll (calls %d → %d); no work should happen while the modal is open", callsBefore, fake.ListRunSummariesCalls)
 	}
 
 	// Cancel the modal with a non-confirming key: the model keeps running.
@@ -251,8 +251,8 @@ func TestTUIBoardTickReArmsWhileQuittingModalOpen(t *testing.T) {
 	// Proof polling is alive: the re-armed tick (current gen) fetches again from idle.
 	m, cmd = tick(t, m)
 	drainCmd(cmd)
-	if fake.ListRunsCalls != callsBefore+1 {
-		t.Fatalf("after cancelling the modal the board did not resume polling (ListRuns %d, want %d)", fake.ListRunsCalls, callsBefore+1)
+	if fake.ListRunSummariesCalls != callsBefore+1 {
+		t.Fatalf("after cancelling the modal the board did not resume polling (ListRunSummaries %d, want %d)", fake.ListRunSummariesCalls, callsBefore+1)
 	}
 }
 
@@ -268,9 +268,9 @@ func TestTUIManualRefreshNotBlockedByInFlight(t *testing.T) {
 
 	next, cmd := m.handleKey(keyRefresh)
 	m = next.(tuiModel)
-	drainCmd(cmd) // executes the fetch closure → ListRunsCalls increments
-	if fake.ListRunsCalls != 1 {
-		t.Fatalf("manual r refresh issued %d ListRuns while a poll was in flight, want 1 (never blocked)", fake.ListRunsCalls)
+	drainCmd(cmd) // executes the fetch closure → ListRunSummariesCalls increments
+	if fake.ListRunSummariesCalls != 1 {
+		t.Fatalf("manual r refresh issued %d ListRunSummaries while a poll was in flight, want 1 (never blocked)", fake.ListRunSummariesCalls)
 	}
 	if m.board.waitID == 0 {
 		t.Error("manual r refresh cleared the in-flight marker; it should mint a fresh waitID so the next tick does not stack a second poll")

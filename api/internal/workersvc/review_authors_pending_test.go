@@ -23,17 +23,17 @@ func applyDelta(pending []int64, plan workersvc.ReviewPlan) []int64 {
 	for _, id := range pending {
 		base[id] = true
 	}
-	for _, id := range plan.PendingAdd {
-		base[id] = true
+	for _, k := range plan.PendingAdd {
+		base[k.ID] = true
 	}
-	for _, id := range plan.PendingRemove {
-		delete(base, id)
+	for _, k := range plan.PendingRemove {
+		delete(base, k.ID)
 	}
 	dropped := map[int64]bool{}
 	replacement := map[int64]bool{}
 	slot := map[int64]int64{}
 	for i, o := range plan.PendingSuperseded {
-		n := plan.PendingSupersededBy[i]
+		o, n := o.ID, plan.PendingSupersededBy[i].ID
 		if o == n || !base[o] || !base[n] {
 			continue
 		}
@@ -93,13 +93,13 @@ func TestPlanOutsiderFloodKeepsEligibleAuthorsComment(t *testing.T) {
 	p := h.params(comments...)
 	p.Trusted = trusted
 	res := h.snapshot(t, p)
-	plan := res.Plan(0, nil)
+	plan := res.Plan(raState(0))
 	if !plan.HasNew || plan.MaxActionableID != 900 {
 		t.Fatalf("plan = %+v, want the trusted bot to fire at mark 900", plan)
 	}
-	if len(plan.PendingAdd) != 251 || !slices.Contains(plan.PendingAdd, 100) {
+	if len(plan.PendingAdd) != 251 || !slices.Contains(plan.PendingAdd, raKey(100)) {
 		t.Fatalf("pending add has %d ids (contains 100: %t), want one per unverified author (251) including X's 100",
-			len(plan.PendingAdd), slices.Contains(plan.PendingAdd, 100))
+			len(plan.PendingAdd), slices.Contains(plan.PendingAdd, raKey(100)))
 	}
 	pending := applyDelta(nil, plan)
 	if len(pending) != 251 || !slices.Contains(pending, 100) {
@@ -111,26 +111,26 @@ func TestPlanOutsiderFloodKeepsEligibleAuthorsComment(t *testing.T) {
 	h.lookup.answers[flakyID] = forge.AuthorEligible
 	p2 := h.params(comments...)
 	p2.Trusted = trusted
-	p2.HighWater, p2.Pending = 900, pending
+	p2.Ledger = raState(900, pending...)
 	res2 := h.snapshot(t, p2)
-	plan2 := res2.Plan(900, pending)
+	plan2 := res2.Plan(raState(900, pending...))
 	if !plan2.HasNew {
 		t.Fatalf("plan = %+v, want X's pending comment to trigger", plan2)
 	}
 	if !slices.Contains(bodies(res2), "real finding") {
 		t.Fatalf("snapshot bodies lack X's comment: %v", bodies(res2))
 	}
-	if !slices.Contains(plan2.PendingRemove, 100) {
+	if !slices.Contains(plan2.PendingRemove, raKey(100)) {
 		t.Fatalf("pending remove = %v, want X's 100 consumed", plan2.PendingRemove)
 	}
 	pending = applyDelta(pending, plan2)
-	plan3 := res2.Plan(900, pending)
+	plan3 := res2.Plan(raState(900, pending...))
 	if plan3.HasNew {
 		t.Fatalf("plan = %+v, want no second trigger once X's id is consumed", plan3)
 	}
 }
 
-func TestPlanKeepsOneNewestPendingIDPerAuthor(t *testing.T) {
+func TestPlanKeepsOneLastListedPendingKeyPerAuthor(t *testing.T) {
 	h := newHarness()
 	// X (unknown) has 100 pending, then 150 and 170 arrive; a member comment at 180 moves the mark.
 	res := h.snapshot(t, h.params(
@@ -139,14 +139,14 @@ func TestPlanKeepsOneNewestPendingIDPerAuthor(t *testing.T) {
 		inline(170, flakyID, "xavier", "c", raT0.Add(2*time.Second)),
 		inline(180, memberID, "carol", "d", raT0.Add(3*time.Second)),
 	))
-	plan := res.Plan(120, []int64{100})
-	if !slices.Equal(plan.PendingAdd, []int64{170}) {
-		t.Fatalf("pending add = %v, want only the newest id of the author", plan.PendingAdd)
+	plan := res.Plan(raState(120, 100))
+	if !slices.Equal(plan.PendingAdd, raKeys(170)) {
+		t.Fatalf("pending add = %v, want only the last listed key of the author", plan.PendingAdd)
 	}
 	if len(plan.PendingRemove) != 0 {
 		t.Fatalf("pending remove = %v, want supersession kept out of the unconditional removals", plan.PendingRemove)
 	}
-	if !slices.Equal(plan.PendingSuperseded, []int64{100}) || !slices.Equal(plan.PendingSupersededBy, []int64{170}) {
+	if !slices.Equal(plan.PendingSuperseded, raKeys(100)) || !slices.Equal(plan.PendingSupersededBy, raKeys(170)) {
 		t.Fatalf("superseded = %v by %v, want 100 replaced by 170", plan.PendingSuperseded, plan.PendingSupersededBy)
 	}
 	if got := applyDelta([]int64{100}, plan); !slices.Equal(got, []int64{170}) {
@@ -166,8 +166,8 @@ func TestPlanRepresentativeComesFromTheAcceptedSet(t *testing.T) {
 		inline(110, memberID, "carol", "d", raT0.Add(3*time.Second)),
 		inline(125, flakyID+2, "zed", "e", raT0.Add(4*time.Second)),
 	))
-	plan := res.Plan(120, []int64{100})
-	if !slices.Equal(plan.PendingAdd, []int64{100}) {
+	plan := res.Plan(raState(120, 100))
+	if !slices.Equal(plan.PendingAdd, raKeys(100)) {
 		t.Fatalf("pending add = %v, want just the already pending 100", plan.PendingAdd)
 	}
 	if len(plan.PendingRemove) != 0 {
@@ -203,8 +203,8 @@ func TestPlanAtCapKeepsOlderIDWhenSupersedeCouldLoseTheAuthor(t *testing.T) {
 	p := h.params(comments...)
 	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
 	res := h.snapshot(t, p)
-	plan := res.Plan(99, pending)
-	if slices.Contains(plan.PendingRemove, 100) || slices.Contains(plan.PendingSuperseded, 100) {
+	plan := res.Plan(raState(99, pending...))
+	if slices.Contains(plan.PendingRemove, raKey(100)) || slices.Contains(plan.PendingSuperseded, raKey(100)) {
 		t.Fatalf("X's 100 is removed or superseded although the merged set cannot be guaranteed to fit")
 	}
 	if got := applyDelta(pending, plan); !slices.Contains(got, 100) || len(got) != workersvc.ReviewPendingCap {
@@ -226,7 +226,7 @@ func TestPlanCapWarningIgnoresAlreadyPendingIDs(t *testing.T) {
 		pending = append(pending, c.ID)
 	}
 	res := h.snapshot(t, h.params(comments...))
-	plan := res.Plan(0, pending)
+	plan := res.Plan(raState(0, pending...))
 	if len(plan.PendingAdd) != workersvc.ReviewPendingCap {
 		t.Fatalf("pending add = %d ids, want every pending id represented", len(plan.PendingAdd))
 	}
@@ -254,8 +254,8 @@ func TestPlanSupersedesWhenPostMergeSetFitsTheCap(t *testing.T) {
 	p := h.params(comments...)
 	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
 	res := h.snapshot(t, p)
-	plan := res.Plan(99, pending)
-	if !slices.Contains(plan.PendingSuperseded, 100) {
+	plan := res.Plan(raState(99, pending...))
+	if !slices.Contains(plan.PendingSuperseded, raKey(100)) {
 		t.Fatalf("superseded = %v, want A's older 100 superseded", plan.PendingSuperseded)
 	}
 	got := applyDelta(pending, plan)
@@ -286,11 +286,50 @@ func TestPlanCapWarningFiresWhenNewIDsExceedTheCap(t *testing.T) {
 	p := h.params(comments...)
 	p.Trusted = []settings.TrustedBot{{BaseURL: "https://github.com", ForgeUserID: coderabbit}}
 	res := h.snapshot(t, p)
-	plan := res.Plan(99, pending)
-	if !slices.Contains(plan.PendingAdd, 15000) {
+	plan := res.Plan(raState(99, pending...))
+	if !slices.Contains(plan.PendingAdd, raKey(15000)) {
 		t.Fatalf("pending add lacks the new author's 15000: setup is not exercising a new add")
 	}
 	if !bytes.Contains(buf.Bytes(), []byte("would exceed its cap")) {
 		t.Fatalf("no cap warning although a new id overflows the set; log: %q", buf.String())
+	}
+}
+
+// The representative is the author's LAST unknown actionable key in listing order, not the key
+// with the largest id: ids of different namespaces are not comparable (issue_comment ids run
+// far above review_comment ids).
+func TestPlanRepresentativeIsLastListedAcrossNamespaces(t *testing.T) {
+	h := newHarness()
+	ic := func(id, author int64, name, body string, at time.Time) forge.MRComment {
+		c := inline(id, author, name, body, at)
+		c.IDNamespace = forge.CommentNSIssueComment
+		return c
+	}
+	rc := func(id, author int64, name, body string, at time.Time) forge.MRComment {
+		c := inline(id, author, name, body, at)
+		c.IDNamespace = forge.CommentNSReviewComment
+		return c
+	}
+	const issueID, reviewID = int64(5_580_000_000), int64(3_960_000_001)
+	res := h.snapshot(t, h.params(
+		ic(issueID-1000, flakyID, "xavier", "older, already pending", raT0.Add(-time.Second)),
+		ic(issueID, flakyID, "xavier", "first", raT0),
+		rc(reviewID, flakyID, "xavier", "later", raT0.Add(time.Second)),
+		// Member comments move both namespaces' marks above X's ids.
+		ic(issueID+100, memberID, "carol", "m1", raT0.Add(2*time.Second)),
+		rc(reviewID+100, memberID, "carol", "m2", raT0.Add(3*time.Second)),
+	))
+	old := workersvc.CommentKey{Namespace: forge.CommentNSIssueComment, ID: issueID - 1000}
+	state := workersvc.ReviewLedgerState{
+		Marks:   map[string]int64{forge.CommentNSIssueComment: issueID - 500, forge.CommentNSReviewComment: reviewID - 500},
+		Pending: []workersvc.CommentKey{old},
+	}
+	plan := res.Plan(state)
+	want := workersvc.CommentKey{Namespace: forge.CommentNSReviewComment, ID: reviewID}
+	if !slices.Equal(plan.PendingAdd, []workersvc.CommentKey{want}) {
+		t.Fatalf("pending add = %v, want only the last listed key %v", plan.PendingAdd, want)
+	}
+	if !slices.Equal(plan.PendingSuperseded, []workersvc.CommentKey{old}) || !slices.Equal(plan.PendingSupersededBy, []workersvc.CommentKey{want}) {
+		t.Fatalf("superseded = %v by %v, want %v replaced by %v", plan.PendingSuperseded, plan.PendingSupersededBy, old, want)
 	}
 }

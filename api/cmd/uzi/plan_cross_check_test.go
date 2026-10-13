@@ -92,7 +92,7 @@ func TestRunGetPlanCrossCheckSummary(t *testing.T) {
 				case "metered":
 					wantCost = "$1.25"
 				case "subscription":
-					wantCost = "subscription"
+					wantCost = "no estimate"
 				}
 			}
 			if !strings.Contains(out, wantCost) || strings.Contains(out, "$0.00") {

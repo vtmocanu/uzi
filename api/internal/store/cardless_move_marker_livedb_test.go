@@ -42,7 +42,9 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("open pool: %v", err)
 	}
-	defer pool.Close()
+	// t.Cleanup, not defer: the filler cleanup below needs the pool, and cleanups run after
+	// deferred calls, last registered first.
+	t.Cleanup(pool.Close)
 	q := store.New(pool)
 
 	exec := func(sql string, args ...any) {
@@ -85,10 +87,12 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 			t.Fatalf("CancelRunServerSide(%s) = %d, %v; want 1 row", id, n, err)
 		}
 	}
+	// Order matters: both card-less writes sit between the two positive controls, so a
+	// regressed stamp on either would fall inside the give-up window bounded below.
 	complete(issueDone)
 	complete(judgeRun)
-	cancel(issueCancelled)
 	cancel(promptRun)
+	cancel(issueCancelled)
 
 	// The marker itself, read straight off the rows.
 	for _, tc := range []struct {
@@ -110,6 +114,26 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 		}
 	}
 
+	// Crowding (issue #1966): ListGaveUpColumnMoves is ORDER BY move_pending_since LIMIT 100
+	// with no user or repo scope, and the serial live-DB suite leaves other tests' stamped rows
+	// behind. 100 card-bearing filler runs stamped earlier than the fixtures reproduce that, so a
+	// window not bounded by the fixtures' own stamps loses the positive control past the LIMIT.
+	fillerUser, fillerConn, fillerRepo := uuid.New(), uuid.New(), uuid.New()
+	t.Cleanup(func() {
+		// users cascades to forge_connections, repos and runs.
+		if _, err := pool.Exec(context.Background(), `DELETE FROM users WHERE id = $1`, fillerUser); err != nil {
+			t.Errorf("cleanup filler user: %v", err)
+		}
+	})
+	exec(`INSERT INTO users (id, email, password_hash) VALUES ($1, $2, 'x')`, fillerUser, fmt.Sprintf("cml-fill-%s@e2e", fillerUser))
+	exec(`INSERT INTO forge_connections (id, user_id, forge_type, base_url, bot_username, bot_forge_user_id, token_ciphertext)
+	      VALUES ($1, $2, 'github', 'https://forge.e2e', 'bot', 1, $3)`, fillerConn, fillerUser, []byte{0x1})
+	exec(`INSERT INTO repos (id, connection_id, forge_project_id, path_with_namespace, web_url, default_branch, enabled)
+	      VALUES ($1, $2, 1, 'g/cml-fill', 'https://forge.e2e/g/cml-fill', 'main', true)`, fillerRepo, fillerConn)
+	exec(`INSERT INTO runs (id, user_id, repo_id, kind, issue_iid, issue_title, issue_description, status, move_pending_since)
+	      SELECT gen_random_uuid(), $1, $2, 'issue', g, 't', 'd', 'failed', now() - interval '30 minutes'
+	      FROM generate_series(1, 100) AS g`, fillerUser, fillerRepo)
+
 	// Reconcile window: grace already passed, give-up not yet reached. The shared DB may
 	// hold other packages' rows, so assert membership by id with a large page.
 	now := time.Now()
@@ -122,9 +146,22 @@ func TestCardlessRunMoveMarkerLiveDB(t *testing.T) {
 		t.Fatalf("ListPendingColumnMoves: %v", err)
 	}
 	// Give-up window: the markers crossed the give-up boundary during the last interval.
+	// The query keeps only the oldest 100 rows in the window, unscoped, so bound the window
+	// by the positive controls' own stamps (> prior, <= giveup). The serial suite stamped
+	// every leftover row before these fixtures, so they fall outside it, and the positive
+	// control proves the window still returns rows, and both card-less writes were stamped
+	// between the controls, keeping their absence checks meaningful.
+	var stamps []time.Time
+	for _, id := range []uuid.UUID{issueDone, issueCancelled} {
+		var ts time.Time
+		if err := pool.QueryRow(ctx, `SELECT move_pending_since FROM runs WHERE id = $1`, id).Scan(&ts); err != nil {
+			t.Fatalf("read move_pending_since of %s: %v", id, err)
+		}
+		stamps = append(stamps, ts)
+	}
 	gaveUpRows, err := q.ListGaveUpColumnMoves(ctx, store.ListGaveUpColumnMovesParams{
-		GiveupCutoff: pgtype.Timestamptz{Time: now.Add(time.Minute), Valid: true},
-		PriorCutoff:  pgtype.Timestamptz{Time: now.Add(-time.Hour), Valid: true},
+		GiveupCutoff: pgtype.Timestamptz{Time: slices.MaxFunc(stamps, time.Time.Compare), Valid: true},
+		PriorCutoff:  pgtype.Timestamptz{Time: slices.MinFunc(stamps, time.Time.Compare).Add(-time.Microsecond), Valid: true},
 	})
 	if err != nil {
 		t.Fatalf("ListGaveUpColumnMoves: %v", err)

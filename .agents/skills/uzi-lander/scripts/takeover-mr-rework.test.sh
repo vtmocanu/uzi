@@ -4,6 +4,7 @@
 # had rework off while it was on, and an unwanted rework started on a bot comment. The script
 # must stay read-only: the stub fails on any uzi call that is not a read.
 set -eu
+export NET_RETRY_BASE_SLEEP=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/takeover.sh"

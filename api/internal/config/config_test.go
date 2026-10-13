@@ -132,6 +132,7 @@ func TestLoadAgentRuntimeDefaults(t *testing.T) {
 		{"WorkerPollInterval", cfg.WorkerPollInterval, 3 * time.Second},
 		{"WorkerAffinityGrace", cfg.WorkerAffinityGrace, 2 * time.Minute},
 		{"WorkerAffinityCeiling", cfg.WorkerAffinityCeiling, 2 * time.Hour},
+		{"WorkerStaleRequeueGrace", cfg.WorkerStaleRequeueGrace, 10 * time.Minute},
 	}
 	for _, c := range checks {
 		if c.got != c.want {
@@ -252,6 +253,41 @@ func TestLoadRunDiskParkMax(t *testing.T) {
 		}
 		if cfg.RunDiskParkMax != tc.want {
 			t.Errorf("RunDiskParkMax for UZI_RUN_DISK_PARK_MAX=%q = %d, want %d", tc.env, cfg.RunDiskParkMax, tc.want)
+		}
+	}
+}
+
+// TestLoadRunProviderParkMaxDuration pins the PRD #1733 provider park bound: unset is 24h, a
+// positive override is honoured, 0 is the legal "no hold" off switch (so it must NOT parse like
+// parseDuration, which would turn it into the default), and a negative or malformed value falls
+// back to 24h.
+func TestLoadRunProviderParkMaxDuration(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	for _, tc := range []struct {
+		env  string
+		want time.Duration
+	}{
+		{"", 24 * time.Hour},
+		{"36h", 36 * time.Hour},
+		{"0", 0},
+		{"0s", 0},
+		{"-1h", 24 * time.Hour},
+		{"nonsense", 24 * time.Hour},
+	} {
+		t.Setenv("RUN_PROVIDER_PARK_MAX_DURATION", tc.env)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with RUN_PROVIDER_PARK_MAX_DURATION=%q: %v", tc.env, err)
+		}
+		if cfg.RunProviderParkMaxDuration != tc.want {
+			t.Errorf("RunProviderParkMaxDuration for RUN_PROVIDER_PARK_MAX_DURATION=%q = %v, want %v", tc.env, cfg.RunProviderParkMaxDuration, tc.want)
 		}
 	}
 }
@@ -1072,6 +1108,45 @@ func TestLoadSalvageForges(t *testing.T) {
 	}
 }
 
+// TestLoadHeldPublication pins UZI_HELD_PUBLICATION (issue #2545): default ON, "off"/"false"
+// disable it, and an unrecognised value refuses to start rather than keeping the default.
+func TestLoadHeldPublication(t *testing.T) {
+	t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+	t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+	varied := make([]byte, secretbox.KeySize)
+	for i := range varied {
+		varied[i] = byte(i + 1)
+	}
+	t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+
+	cfg, err := Load()
+	if err != nil {
+		t.Fatalf("Load(): %v", err)
+	}
+	if !cfg.HeldPublication {
+		t.Fatal("HeldPublication default = false, want on")
+	}
+	for raw, want := range map[string]bool{
+		"": true, "on": true, "ON": true, " true ": true, "1": true, "yes": true,
+		"off": false, "OFF": false, "false": false, " False ": false, "0": false, "no": false,
+	} {
+		t.Setenv("UZI_HELD_PUBLICATION", raw)
+		cfg, err := Load()
+		if err != nil {
+			t.Fatalf("Load() with UZI_HELD_PUBLICATION=%q: %v", raw, err)
+		}
+		if cfg.HeldPublication != want {
+			t.Errorf("UZI_HELD_PUBLICATION=%q -> %v, want %v", raw, cfg.HeldPublication, want)
+		}
+	}
+	for _, raw := range []string{"disabled", "of", "2", "enable", "tru"} {
+		t.Setenv("UZI_HELD_PUBLICATION", raw)
+		if _, err := Load(); err == nil || !strings.Contains(err.Error(), "UZI_HELD_PUBLICATION") {
+			t.Errorf("UZI_HELD_PUBLICATION=%q: Load() err = %v, want a UZI_HELD_PUBLICATION error", raw, err)
+		}
+	}
+}
+
 // TestNormalizeTrustedBotBaseURLMatchesConfig pins settings.NormalizeTrustedBotBaseURL (a copy,
 // because this package imports settings) to NormalizeForgeBaseURL: the trusted review-bot
 // allowlist is matched against the connection's normalized base URL, so the two must agree.
@@ -1177,6 +1252,43 @@ func TestImplicitRunCeilingPreservesLongTimeout(t *testing.T) {
 			}
 			if _, err := Load(); err != nil {
 				t.Fatalf("unset ceiling: %v", err)
+			}
+		})
+	}
+}
+
+// TestLoadWorkerStaleRequeueGrace pins WORKER_STALE_REQUEUE_GRACE (#2705): 10m default, "0" is
+// the legitimate DISABLE value, and a malformed or negative value falls back to the default.
+func TestLoadWorkerStaleRequeueGrace(t *testing.T) {
+	for _, tc := range []struct {
+		name string
+		set  bool
+		val  string
+		want time.Duration
+	}{
+		{"default when unset", false, "", 10 * time.Minute},
+		{"zero disables the pin", true, "0", 0},
+		{"explicit value", true, "3m", 3 * time.Minute},
+		{"invalid falls back to default", true, "soon", 10 * time.Minute},
+		{"negative falls back to default", true, "-5m", 10 * time.Minute},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			t.Setenv("DATABASE_URL", "postgres://uzi:pw@db:5432/uzi?sslmode=disable")
+			t.Setenv("JWT_SECRET", "unit-test-jwt-signing-key-not-a-real-secret")
+			varied := make([]byte, secretbox.KeySize)
+			for i := range varied {
+				varied[i] = byte(i + 1)
+			}
+			t.Setenv("UZI_SECRET_KEY", base64.StdEncoding.EncodeToString(varied))
+			if tc.set {
+				t.Setenv("WORKER_STALE_REQUEUE_GRACE", tc.val)
+			}
+			cfg, err := Load()
+			if err != nil {
+				t.Fatalf("Load: %v", err)
+			}
+			if cfg.WorkerStaleRequeueGrace != tc.want {
+				t.Fatalf("WorkerStaleRequeueGrace = %v, want %v", cfg.WorkerStaleRequeueGrace, tc.want)
 			}
 		})
 	}

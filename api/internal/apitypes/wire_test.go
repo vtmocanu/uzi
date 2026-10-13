@@ -46,7 +46,7 @@ func assertTags(t *testing.T, name string, v any, want ...string) {
 func TestUserDTOTags(t *testing.T) {
 	assertTags(t, "UserDTO", UserDTO{},
 		"id", "email", "display_name", "is_admin", "is_active",
-		"autopilot_enabled", "plan_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
+		"autopilot_enabled", "plan_cross_check_enabled", "code_cross_check_enabled", "judge_enabled", "ci_autofix_enabled",
 		// issue #916: the per-user AI-attribution opt-out. Default true (current
 		// behavior); when false the worker suppresses the Co-Authored-By trailer.
 		"attribution_enabled",
@@ -88,9 +88,11 @@ var runDTOKeys = []string{
 	// issue #321: server-computed planning-phase display flag, always on the wire (bool,
 	// false for every non-planning and pre-feature run). Derived, not stored.
 	"is_planning",
+	// issues #750/#2760: server-derived plan-revise flag, always on the wire (bool).
+	"is_revising",
 	// PRD #122 M1: the FROZEN milestone list, always on the wire (nil ⇒ null ⇒ a run
 	// with no milestones, which is every pre-feature run).
-	"auto_approve", "plan_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
+	"auto_approve", "plan_cross_check_required", "code_cross_check_required", "plan_cross_check_gate_reason", "plan_cross_check_diff_refusal",
 	// issue #857: the run's trigger provenance (what/how/who started it), NOT NULL
 	// (DEFAULT 'manual') so always on the wire.
 	"trigger_source",
@@ -143,6 +145,9 @@ var runDTOKeys = []string{
 	// allowance unused). Both always on the wire; worker_name is null unless the run-detail read
 	// enriched it.
 	"worker_name", "can_stop_at_wall",
+	// PRD #1733: the server-derived Stop gate for a provider_unavailable hold (a paused milestone
+	// issue run with a completed milestone). Always on the wire.
+	"can_stop_at_provider_hold",
 	// PRD #1227 M1: the owner-decision contract projection. completion_revision is the run's current
 	// contract_revision (null when unfrozen); completion_deferred / completion_accepted are the
 	// owner-deferred milestones and owner-accepted criteria decoded from the frozen contract, STABLE
@@ -236,6 +241,8 @@ var runDTOKeys = []string{
 	"recovery_wait_cause", "recovery_retry_not_before", "forge_park_count", "forge_park_max",
 	// PRD #1809 M5: the disk-only lifetime counter of counted data_volume_full parks.
 	"disk_park_count",
+	// PRD #1733: the open provider-park streak (count, and when it began; null when none is open).
+	"provider_park_count", "provider_park_streak_started_at",
 	// PRD #1590 D6: the derived owner action for a codex_account_unavailable hold (null otherwise).
 	"codex_account_action",
 	// Issue #1730: the run's bound alias id and its independent snapshotted label.
@@ -278,6 +285,8 @@ var runDTOKeys = []string{
 	// overlaid on the single-run detail read only.
 	"outcome_pending",
 	"auto_approve_blocked_reasons", "issue_input_reason",
+	// PRD #2602: server-derived progress estimate (object, null for a terminal run).
+	"progress",
 }
 
 func TestRunDTOTags(t *testing.T) {
@@ -356,9 +365,8 @@ func TestRunListItemDTOTags(t *testing.T) {
 	// PRD #1497 M1: worker_name is now on RunDTO too, so it is in runDTOKeys — RunListItemDTO's own
 	// worker_name field shadows the embedded one (json collapses the duplicate tag to one key), so it
 	// is NOT appended here any more.
-	// is_revising (issue #750) is on RunListItemDTO only, deliberately NOT on RunDTO —
-	// so it is listed here, not in runDTOKeys.
-	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count", "is_revising")
+	// is_revising moved onto RunDTO (issue #2760), so it is in runDTOKeys.
+	want := append(append([]string{}, runDTOKeys...), "repo_path", "judge_verdict", "judge_todo_count")
 	assertTags(t, "RunListItemDTO(no owner)", RunListItemDTO{}, want...)
 	// owner_email present when set.
 	email := "u@example.test"
@@ -829,6 +837,7 @@ func TestRepoDTOTags(t *testing.T) {
 	assertTags(t, "RepoDTO", RepoDTO{},
 		"id", "connection_id", "forge_project_id", "path_with_namespace", "web_url",
 		"default_branch", "enabled", "repo_skills_enabled", "repo_claudemd_enabled", "repo_devbox_opt_in",
+		"code_cross_check_guidance", "cross_check_repo_instructions_enabled",
 		// PRD #686 D1: the per-repo self-improve dogfooding capability (folds the
 		// improve_uzi backlog + selects the uzi worker directive). Default false.
 		"repo_fold_improve_uzi_backlog",
@@ -1153,7 +1162,9 @@ func TestUserSettingsDTOTags(t *testing.T) {
 		// of sidebar_token_ids).
 		"sidebar_codex_account_ids",
 		// PRD #1551 M1 (D2): the retained per-harness worker-model lanes (each null ⇒ inherit).
-		"default_claude_model", "default_codex_model")
+		"default_claude_model", "default_codex_model",
+		// PRD #2603: the per-user model-written "Now" summary switch (null ⇒ default ON).
+		"now_summary_enabled")
 }
 
 func TestCrossCheckPinDTOTags(t *testing.T) {

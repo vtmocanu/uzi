@@ -5,6 +5,7 @@
 # exit 11 and RESULT=changelog_misplaced, naming the bullets and leaving them where they are;
 # a clean rebase that keeps them under [Unreleased] must still pass.
 set -eu
+export NET_RETRY_BASE_SLEEP=0
 
 HERE="$(cd "$(dirname "$0")" && pwd)"
 SCRIPT="$HERE/land-prep.sh"

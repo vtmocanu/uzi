@@ -21,10 +21,10 @@ runs:
         # future arm64 runner this fails LOUDLY at `task --version`, which is the
         # honest failure mode; adding arm64 needs a SECOND checksum literal.
         # renovate-tarball: depName=go-task/task
-        TASK_VERSION="v3.53.1"
+        TASK_VERSION="v3.54.0"
         # Renovate keeps TASK_SHA256 in lockstep with TASK_VERSION (it resolves the
         # new tag's task_linux_amd64.tar.gz sha256 from the release's checksums).
-        TASK_SHA256="a54a408f6861ff921f6e87774180db31bacd8c1e7c944ca696db9fea49a82fc7"
+        TASK_SHA256="680859dbb4d881a9c72d4d9a8f510825450849af8567deacd7302c01124416fb"
         # Retry transient network failures (e.g. `curl: (35) Connection reset by
         # peer` mid-download). --retry-all-errors (curl >= 7.71, ubuntu-latest has
         # >= 7.81) covers connection resets that plain --retry does not; the sha256

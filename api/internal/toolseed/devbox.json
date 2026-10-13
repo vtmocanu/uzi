@@ -21,7 +21,7 @@
   //
   // CORRECTION (2026-07-25, PRD #123): the line above read "an exact resolved store path".
   // It does not. Every entry in devbox.lock resolves to a FLAKE REF —
-  // `github:NixOS/nixpkgs/20535e48…#<attr>` — not a `/nix/store/…` path; there is no
+  // `github:NixOS/nixpkgs/<rev>#<attr>` — not a `/nix/store/…` path; there is no
   // store_path key in the file at all. The distinction is load-bearing, not pedantic: a
   // store path would need no evaluation and therefore no github, whereas a flake ref means
   // nix must still evaluate nixpkgs, which is why PRD #123 treats "just commit a lockfile"
@@ -131,9 +131,9 @@
   // plain `devbox add file perl coreutils` resolves through devbox-search, which pins each
   // package to ITS OWN nixpkgs revision (measured: file/perl → 7525d999…, coreutils →
   // 6d120041…) and writes a fat `systems:` block — dragging two EXTRA nixpkgs revisions
-  // into an image whose whole point is one pinned rev. Bare attrs resolve against the
-  // manifest's own nixpkgs input and lock as `source: "nixpkg"` at 20535e48…, matching
-  // every entry above. Add packages by editing this file + `devbox install`, not `devbox add`.
+  // into an image whose whole point is one pinned rev. Bare attrs lock as
+  // `source: "nixpkg"` from the manifest's shared nixpkgs input (see `devbox.lock`).
+  // Add packages by editing this file + `devbox install`, not `devbox add`.
   //
   // `kubernetes-helm` + `kubeconform` (2026-07-27, owner decision) give an agent editing
   // deploy/chart/ a LOCAL gate. uzi ships a 2809-line chart whose only gate today is CI's
@@ -188,7 +188,8 @@
   //     the `file` regression.
   // Both written BARE (never `go-task@latest` / `jq.bin@latest`) for the pinning reason the
   // openssl/file note above records — a versioned/`devbox add` form pins each to its own
-  // nixpkgs rev; bare attrs lock as `source: "nixpkg"` at 20535e48…, matching every entry.
+  // nixpkgs rev; bare attrs lock as `source: "nixpkg"` from the manifest's shared nixpkgs
+  // input (see `devbox.lock`).
   //
   // `shellcheck.bin` (2026-08-07) closes the open `install_worker_tool` judge rec for
   // `shellcheck` (run 84b6a933, review 4d950db6). Same "every worker should have it" class as
@@ -219,8 +220,9 @@
   // this attr and the `lint:shell` pin must move together.
   //
   // Written BARE of any version/`@latest` suffix (the `.bin` is an OUTPUT selector, not a version)
-  // for the pinning reason recorded above; locks as `source: "nixpkg"` at 20535e48…. Verified at
-  // the pinned rev (2026-08-07): `shellcheck.bin` lands bin/shellcheck in the profile via live
+  // for the pinning reason recorded above; locks as `source: "nixpkg"` from the manifest's
+  // shared nixpkgs input (see `devbox.lock`). Verified at the pinned rev (2026-08-07):
+  // `shellcheck.bin` lands bin/shellcheck in the profile via live
   // `devbox install`, `shellcheck --version` → 0.11.0; its bin-output narinfo
   // (ixvpvkr2s92pbi6si1ki8yk3fs1gvlf2) is HTTP 200 on cache.nixos.org for x86_64-linux (1.5 MiB
   // download / 7.5 MiB unpacked), so CI's amd64-only kaniko build SUBSTITUTES it rather than
@@ -253,7 +255,7 @@
   // Written BARE of any version/`@latest` suffix and added by hand-editing this file +
   // `devbox install` (never `devbox add`, which pins each package to its own nixpkgs rev and
   // writes a fat `systems:` block) for the pinning reason recorded above; both lock as
-  // `source: "nixpkg"` at 20535e48…, matching every entry.
+  // `source: "nixpkg"` from the manifest's shared nixpkgs input (see `devbox.lock`).
   //
   // `gnumake` (2026-08-11, owner decision) bakes GNU make into every worker. Same "every
   // worker should have it, in ANY repo" class as gcc/go-task above — make is gcc's build
@@ -278,7 +280,8 @@
   // non-negotiable condition for baking a tool in. Written BARE of any version/`@latest`
   // suffix and added by hand-editing this file + the sibling devbox.lock entry (never
   // `devbox add`, which pins to its own nixpkgs rev and writes a fat `systems:` block) for
-  // the pinning reason recorded above; locks as `source: "nixpkg"` at 20535e48….
+  // the pinning reason recorded above; locks as `source: "nixpkg"` from the manifest's
+  // shared nixpkgs input (see `devbox.lock`).
   //
   // NOT added, deliberately:
   //   * `kubectl` — weighed alongside helm and DROPPED (2026-07-27). A worker cannot reach
@@ -331,8 +334,8 @@
   // Both closures are small, so per Decision 6a this rides an existing marker-changing reseed
   // rather than spending a standalone roll. Written BARE of any version/`@latest` suffix and added
   // by hand-editing this file + the sibling devbox.lock entry (never `devbox add`, which pins each
-  // to its own nixpkgs rev and writes a fat `systems:` block); both lock as `source: "nixpkg"` at
-  // 20535e48…, matching every entry above.
+  // to its own nixpkgs rev and writes a fat `systems:` block); both lock as `source: "nixpkg"`
+  // from the manifest's shared nixpkgs input (see `devbox.lock`).
   //
   // `yamllint` (2026-08-16) closes the open `install_worker_tool` judge rec for `yamllint`
   // (target `yamllint`, issue #330). Same "every worker should have it, in ANY repo" class as
@@ -356,7 +359,8 @@
   // → 1.37.1), never `command -v` inside `devbox run` — the check that would have caught the
   // `file` regression. Written BARE of any version/`@latest` suffix and added by hand-editing this
   // file + the sibling devbox.lock entry (never `devbox add`, which pins its own rev and writes a
-  // fat `systems:` block); locks as `source: "nixpkg"` at 20535e48….
+  // fat `systems:` block); locks as `source: "nixpkg"` from the manifest's shared nixpkgs
+  // input (see `devbox.lock`).
   //
   // `semgrep` (2026-08-30, PRD #862 M0) bakes the SAST engine the security gate needs so a
   // uzi worker can run and validate `task gate`'s semgrep step (invariant rules). Same "every

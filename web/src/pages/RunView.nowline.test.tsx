@@ -1,10 +1,10 @@
 // @vitest-environment jsdom
 import { afterEach, describe, it, expect, vi } from "vitest";
-import { cleanup, render, screen } from "@testing-library/react";
-import { MilestoneChecklist } from "./RunView";
+import { cleanup, render, screen, within } from "@testing-library/react";
+import { MilestoneRows } from "../components/RunMilestoneRows";
 import type { Run, RunActivity } from "../lib/api";
 
-// PRD #1064 M3: the run-view "now" line hosted by MilestoneChecklist — the three variants
+// PRD #1064 M3: the run-view "now" line hosted by MilestoneRows — the three variants
 // (active under the in-progress row, unattached under the header, waiting), the D4 first-
 // in-progress selection, the untrusted-field folding, the reduced-motion dot, and the D5
 // milestone-only / byte-compat contract. `activity` is derived in RunView from the live
@@ -13,7 +13,7 @@ import type { Run, RunActivity } from "../lib/api";
 const AT = "2026-09-03T12:00:00Z";
 const NOW = Date.parse(AT) + 40_000; // 40s after the activity instant → "40s"
 
-// MilestoneChecklist ages the now line via useNow; pin it so "40s" is deterministic.
+// MilestoneRows ages the now line via useNow; pin it so "40s" is deterministic.
 vi.mock("../lib/useNow", () => ({ useNow: () => NOW }));
 
 function anActivity(over: Partial<RunActivity> = {}): RunActivity {
@@ -88,6 +88,9 @@ function run(over: Partial<Run>): Run {
     codex_secret_label: null,
     recovery_retry_not_before: null,
     forge_park_count: 0,
+    provider_park_count: 0,
+    provider_park_streak_started_at: null,
+    can_stop_at_provider_hold: false,
     forge_park_max: 0,
     claimed_at: null,
     started_at: null,
@@ -106,15 +109,15 @@ const milestones = [
 
 afterEach(cleanup);
 
-describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
-  it("renders the active strip under the in-progress row and names the id in the header", () => {
+describe("MilestoneRows now line (PRD #1064 M3)", () => {
+  it("renders the active strip under the marked in-progress row", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones, milestones_completed: ["m1"], milestones_in_progress: ["m2"] })}
         activity={anActivity()}
       />,
     );
-    expect(screen.getByText(/◐\s*m2/)).toBeTruthy();
+    expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByLabelText("in progress")).toBeTruthy();
     expect(screen.getByText("coder")).toBeTruthy();
     expect(screen.getByText("Decouple both detectors from the branch convention")).toBeTruthy();
     expect(screen.getByText("Edit api/internal/poller/ci_autofix.go")).toBeTruthy();
@@ -123,33 +126,33 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
 
   it("renders an UNATTACHED strip under the header when nothing is declared in progress", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones, milestones_completed: ["m1"], milestones_in_progress: [] })}
         activity={anActivity()}
       />,
     );
-    // No in-progress id → no ◐ marker in the header, but the now line still shows.
-    expect(screen.queryByText(/◐/)).toBeNull();
+    // No in-progress id means no active row mark, but the unattached strip still shows.
+    expect(screen.queryByLabelText("in progress")).toBeNull();
     expect(screen.getByText("coder")).toBeTruthy();
     expect(screen.getByText("40s ago")).toBeTruthy();
   });
 
   it("renders NO strip when there is no activity (a milestone run with nothing acting)", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones, milestones_completed: ["m1"], milestones_in_progress: ["m2"] })}
         activity={null}
       />,
     );
-    // The checklist itself still renders (the ◐ header marker is present), but no now line.
-    expect(screen.getByText(/◐\s*m2/)).toBeTruthy();
+    // The rows still render with the in-progress mark, but no activity strip.
+    expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByLabelText("in progress")).toBeTruthy();
     expect(screen.queryByText("coder")).toBeNull();
     expect(screen.queryByText("40s ago")).toBeNull();
   });
 
   it("shows the WAITING variant on a rate/pool-limited run", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ status: "limit_wait", milestones, milestones_completed: ["m1"], milestones_in_progress: ["m2"] })}
         activity={anActivity()}
       />,
@@ -162,7 +165,7 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
   // must show the WAITING variant rather than pretending the lane is at work.
   it("shows the WAITING variant on a recovery_wait run", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ status: "recovery_wait", milestones, milestones_completed: ["m1"], milestones_in_progress: ["m2"] })}
         activity={anActivity()}
       />,
@@ -174,14 +177,15 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
 
   it("D4: with several ids in progress, only the FIRST by frozen order is named and carries the strip", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones, milestones_completed: [], milestones_in_progress: ["m3", "m2"] })}
         activity={anActivity()}
       />,
     );
     // Frozen order is m1,m2,m3 → m2 is first-in-progress, not m3 (input order).
-    expect(screen.getByText(/◐\s*m2/)).toBeTruthy();
-    expect(screen.queryByText(/◐\s*m3/)).toBeNull();
+    expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByLabelText("in progress")).toBeTruthy();
+    expect(within(screen.getByText("m3").closest("li") as HTMLElement).queryByText("coder")).toBeNull();
+    expect(within(screen.getByText("m2").closest("li") as HTMLElement).getByText("coder")).toBeTruthy();
     // Exactly one now strip, even though two ids are in progress.
     expect(screen.getAllByText("40s ago")).toHaveLength(1);
     // The second in-progress id still renders as an in-progress mark (◐).
@@ -190,7 +194,7 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
 
   it("folds all four untrusted fields through stripUnsafeChars", () => {
     render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones, milestones_completed: [], milestones_in_progress: ["m2"] })}
         // RIGHT-TO-LEFT OVERRIDE (U+202E) and zero-width space (U+200B) as escapes.
         activity={anActivity({
@@ -208,7 +212,7 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
 
   it("the now-line dot uses animate-pulse (index.css neutralizes it under prefers-reduced-motion)", () => {
     const { container } = render(
-      <MilestoneChecklist
+      <MilestoneRows
         run={run({ milestones, milestones_completed: ["m1"], milestones_in_progress: ["m2"] })}
         activity={anActivity()}
       />,
@@ -220,7 +224,7 @@ describe("MilestoneChecklist now line (PRD #1064 M3)", () => {
   // milestone list renders NOTHING even when activity is present — byte-identical to a
   // pre-#1064 non-milestone run.
   it("D5: renders nothing for a non-milestone run even when activity is present", () => {
-    const { container } = render(<MilestoneChecklist run={run({ milestones: null })} activity={anActivity()} />);
+    const { container } = render(<MilestoneRows run={run({ milestones: null })} activity={anActivity()} />);
     expect(container.textContent).toBe("");
   });
 });

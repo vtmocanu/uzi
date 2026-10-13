@@ -75,7 +75,7 @@ func TestPlanCrossCheckChildAdmissionLiveDB(t *testing.T) {
 				case "ResumePausedRun":
 					_, err = f.q.ResumePausedRun(ctx, store.ResumePausedRunParams{ID: fx.checkerID, UserID: f.userID, GlobalTimeoutSeconds: 3600})
 				case "ExtendAndResumeWallPark":
-					_, err = f.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{ID: fx.checkerID, UserID: f.userID, Secs: 60, Cap: 3600, GlobalTimeoutSeconds: 3600})
+					_, err = f.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{ID: fx.checkerID, UserID: f.userID, Secs: 60, Cap: 3600, BaseWallUpperSeconds: extendTestBaseWallUpper, FinalizeAllowanceSeconds: extendTestFinalizeAllowance, MaxWallSeconds: extendTestMaxWall, GlobalTimeoutSeconds: 3600})
 				case "PromotePoolWaitRun":
 					_, err = f.q.PromotePoolWaitRun(ctx, store.PromotePoolWaitRunParams{ID: fx.checkerID, UserID: f.userID})
 				case "PromoteLimitWaitRunNow":

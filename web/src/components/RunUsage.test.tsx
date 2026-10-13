@@ -52,6 +52,11 @@ function twoPhase(): RunMessage[] {
 }
 
 describe("RunUsagePanel", () => {
+  it("Codex recorded cost states the uzi price-table basis", () => {
+    const view = render(<RunUsagePanel costStatus="metered" harness="codex" usage={deriveRunUsage(twoPhase())} />);
+    expect(view.getByText("API-equivalent · uzi price table")).toBeTruthy();
+    expect(view.getAllByText("$1.26").length).toBeGreaterThan(0);
+  });
   it("renders the strip totals, per-phase deltas, and per-agent attribution", () => {
     const { getByText, getAllByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
 
@@ -75,7 +80,95 @@ describe("RunUsagePanel", () => {
     expect(getByText("lead")).toBeTruthy();
     expect(getByText("coder")).toBeTruthy();
     expect(getByText("Attributed total")).toBeTruthy();
-    expect(getByText(/may not sum to the run total/)).toBeTruthy();
+    expect(getByText(/Estimated attribution from deduplicated assistant usage/)).toBeTruthy();
+  });
+
+  it("shows Now summaries as its own row so Run total equals the sum of the rows", () => {
+    seq = 0;
+    const msgs: RunMessage[] = [
+      m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+      result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+      m("progress_note", "lead", {
+        text: "Writing tests",
+        model_usage: { "claude-haiku-4-5": { inputTokens: 400, outputTokens: 50, cacheReadInputTokens: 100, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered" } },
+      }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+    );
+    const total = rows.find((r) => r[0] === "Run total");
+    const notes = rows.find((r) => r[0] === "Now summaries");
+    expect(notes).toEqual(["Now summaries", "—", "400", "100", "50", "$0.01"]);
+    // Phase 1000/2000/300 plus the note row 400/100/50.
+    expect(total?.slice(2, 5)).toEqual(["1.4k", "2.1k", "350"]);
+  });
+
+  it("shows the Now summaries row for a cost-only note so Run total's cost adds up", () => {
+    seq = 0;
+    const msgs: RunMessage[] = [
+      m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+      result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+      m("progress_note", "lead", {
+        text: "Writing tests",
+        model_usage: { "claude-haiku-4-5": { inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.02, costStatus: "metered" } },
+      }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+    );
+    expect(rows.find((r) => r[0] === "Now summaries")).toEqual(["Now summaries", "—", "0", "0", "0", "$0.02"]);
+  });
+
+  it("shows an unpriced note's cost as unavailable, never a metered $0, and a priced one as dollars", () => {
+    const render1 = (entry: Record<string, unknown>) => {
+      seq = 0;
+      const msgs: RunMessage[] = [
+        m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+        result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+        m("progress_note", "lead", { text: "Writing tests", model_usage: { "claude-haiku-4-5": entry } }),
+      ];
+      const { getByRole, unmount } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+      const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+        Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+      );
+      unmount();
+      return rows.find((r) => r[0] === "Now summaries");
+    };
+    const base = { inputTokens: 400, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 };
+    expect(render1({ ...base, costUSD: 0.02, costStatus: "metered" })?.[5]).toBe("$0.02");
+    const unpriced = render1({ ...base, costStatus: "unreported" });
+    expect(unpriced?.[5]).toBe("n/a");
+    expect(unpriced?.[5]).not.toMatch(/\$0/);
+  });
+
+  it("shows Intent, plan & PR summaries as its own row so Run total equals the sum of the rows", () => {
+    seq = 0;
+    const msgs: RunMessage[] = [
+      m("status", "lead", { event: "init", model: "claude-sonnet-5" }),
+      result({ input: 1_000, cacheRead: 2_000, output: 300, cost: 0.5 }, { turns: 3, durationMs: 10_000 }),
+      m("summary_usage", "lead", {
+        pass: "plan",
+        model_usage: { "claude-haiku-4-5": { inputTokens: 400, outputTokens: 50, cacheReadInputTokens: 100, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered" } },
+      }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = Array.from(getByRole("table", { name: "Per-phase usage" }).querySelectorAll("tbody tr")).map((tr) =>
+      Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""),
+    );
+    expect(rows.find((r) => r[0] === "Intent, plan & PR summaries")).toEqual(["Intent, plan & PR summaries", "—", "400", "100", "50", "$0.01"]);
+    expect(rows.find((r) => r[0] === "Run total")?.slice(2, 5)).toEqual(["1.4k", "2.1k", "350"]);
+  });
+
+  it("omits the Intent, plan & PR summaries row when no pass carried usage", () => {
+    const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
+    expect(queryByText("Intent, plan & PR summaries")).toBeNull();
+  });
+
+  it("omits the Now summaries row when no note carried usage", () => {
+    const { queryByText } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(twoPhase())} />);
+    expect(queryByText("Now summaries")).toBeNull();
   });
 
   it("renders nothing for a run with no usage (pre-feature)", () => {
@@ -164,7 +257,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
     );
     // The PRD and the approved mock both place Model right after Agent; without
     // this, moving the column anywhere in the row leaves every other test green.
-    expect(headerTexts(agentTable(container))).toEqual(["Agent", "Model", "In (fresh)", "In (cached)", "Out"]);
+    expect(headerTexts(agentTable(container))).toEqual(["Agent", "Model", "In (fresh)", "In (cached)"]);
   });
 
   it("renders each agent's model and 'N models' on the total row for a mixed run", () => {
@@ -195,8 +288,8 @@ describe("RunUsagePanel model column (PRD #93)", () => {
         // first-seen implementation — it must render the most frequent one.
         usage={deriveRunUsage([
           assistantFrame("coder", 100, "claude-opus-4-8"),
-          assistantFrame("coder", 100, "claude-sonnet-5"),
-          assistantFrame("coder", 100, "claude-sonnet-5"),
+          assistantFrame("coder", 101, "claude-sonnet-5"),
+          assistantFrame("coder", 102, "claude-sonnet-5"),
           resultFrame(),
         ])}
       />,
@@ -272,7 +365,7 @@ describe("RunUsagePanel model column (PRD #93)", () => {
 // that (a real reading, e.g. a cache-only call), and "—" is retired from cost display
 // entirely — it used to mean both "no data" and "we chose not to say", indistinguishably.
 describe("RunUsagePanel cost status (PRD #1429 D7)", () => {
-  it("metered: shows the real dollar figure — even a genuine $0.00 — and names the credential", () => {
+  it("metered: shows the real dollar figure — even a genuine $0.00 — and states the API-equivalent basis", () => {
     seq = 0;
     // Note it is `costUSD: 0` on the model entry that matters, not the frame's
     // `total_cost_usd` (issue #195).
@@ -281,23 +374,26 @@ describe("RunUsagePanel cost status (PRD #1429 D7)", () => {
       <RunUsagePanel costStatus="metered" harness="claude" usage={deriveRunUsage(messages)} />,
     );
     // Positive: the real metered figure renders as an actual dollar amount, and the
-    // sub-label names the credential it was spent against.
+    // sub-label names the estimate basis.
     expect(container.textContent).toContain("$0.00");
-    expect(container.textContent).toContain("your Anthropic token");
+    expect(container.textContent).toContain("API-equivalent · Claude SDK");
     // Negative, paired with the above: never the retired ambiguous dash, and never a
     // non-metered label leaking onto a metered run.
     expect(container.textContent).not.toContain("—");
-    expect(container.textContent).not.toContain("Subscription");
+    expect(container.textContent).not.toContain("No estimate");
     expect(container.textContent).not.toContain("Unavailable");
   });
 
   it("subscription: never a dollar figure even with real tokens spent — labelled, not hidden", () => {
     seq = 0;
     const messages = [result({ input: 1000, cacheRead: 0, output: 200, cost: 0 }, { turns: 3, durationMs: 5000 })];
-    const { container } = render(<RunUsagePanel costStatus="subscription" usage={deriveRunUsage(messages)} />);
-    // Positive: the run is explicitly labelled as subscription usage...
-    expect(container.textContent).toContain("Subscription");
-    expect(container.textContent).toContain("subscription usage");
+    const usage = deriveRunUsage(messages);
+    usage.total.costUsd = 4.2;
+    const { container, getAllByText } = render(<RunUsagePanel costStatus="subscription" usage={usage} />);
+    expect(getAllByText("n/a").length).toBeGreaterThan(0);
+    // Positive: the legacy row explicitly has no recorded estimate...
+    expect(container.textContent).toContain("No estimate");
+    expect(container.textContent).toContain("no cost estimate recorded");
     // ...and its real tokens are still shown, not hidden alongside the missing dollar.
     expect(container.textContent).toContain("Tokens in");
     // Negative, paired with the above: no dollar figure anywhere in the panel, and
@@ -603,9 +699,9 @@ describe("RunUsageTailBlock", () => {
         <RunUsageTailBlock tail={tail()} />
       </div>,
     );
-    const block = container.querySelector('section[aria-label="Estimated usage, not metered"]')!;
+    const block = container.querySelector('section[aria-label="Estimated usage, not in the total"]')!;
     expect(block).toBeTruthy();
-    expect(getByText("Estimated, not metered")).toBeTruthy();
+    expect(getByText("Estimated, not in the total")).toBeTruthy();
     expect(block.textContent).toContain("~$1.23 estimated");
     expect(block.textContent).toContain("anthropic-standard-2026-10-03");
     // The metered group does not contain the tail block.
@@ -640,7 +736,7 @@ describe("RunUsageTailBlock", () => {
     expect(hidden.container.textContent).toBe("");
     cleanup();
     const shown = render(<RunUsageTailBlock tail={tail({ ...zero, cost_usd: null, cost_status: "unpriced" })} />);
-    expect(shown.container.textContent).toContain("Estimated, not metered");
+    expect(shown.container.textContent).toContain("Estimated, not in the total");
   });
 
   it("explains each coverage reason in words and shows an unknown reason safely", () => {
@@ -677,5 +773,87 @@ describe("RunUsageTailBlock", () => {
     expect(container.textContent).not.toContain("‮");
     expect(container.textContent).not.toContain("\u001b");
     expect(container.textContent).toContain("evilmodel");
+  });
+});
+
+describe("m2 honest usage presentation", () => {
+  it("renders unknown Duration, sublabel and both Turns cells as dashes", () => {
+    const frame = result({ input: 10, cacheRead: 2, output: 3, cost: 0 }, { turns: 0, durationMs: 0 });
+    delete (frame.payload as Record<string, unknown>)["num_turns"];
+    delete (frame.payload as Record<string, unknown>)["duration_ms"];
+    const r = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage([frame])} />);
+    expect(r.getByText("Duration").parentElement?.textContent).toBe("Duration—");
+    expect(r.getByText("1 phase · — turns")).toBeTruthy();
+    const table = r.getByRole("table", { name: "Per-phase usage" }) as HTMLTableElement;
+    expect(columnTexts(table, 1)).toEqual(["—", "—"]);
+  });
+  it("preserves measured zero and removes only per-agent output with exact footer", () => {
+    const frame = result({ input: 10, cacheRead: 2, output: 3, cost: 0 }, { turns: 0, durationMs: 0 });
+    const r = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage([assistantFrame("lead", 1), frame])} />);
+    expect(r.getByText("1 phase · 0 turns")).toBeTruthy();
+    expect(r.getByText("Duration").parentElement?.textContent).toBe("Duration0.0s");
+    const agent = agentTable(r.container);
+    expect(headerTexts(agent)).toEqual(["Agent", "Model", "In (fresh)", "In (cached)"]);
+    expect([...agent.tBodies[0].rows].map(row => row.cells.length)).toEqual([4, 4]);
+    expect(r.getByRole("table", { name: "Per-phase usage" }).textContent).toContain("Out");
+    expect(r.getByText("Estimated attribution from deduplicated assistant usage; identical usage records on the same lane may collapse, and attribution may be incomplete. Output is not attributed.")).toBeTruthy();
+  });
+});
+
+describe("RunUsagePanel side-only spend (no result frame)", () => {
+  const entry = (over: Record<string, unknown> = {}) => ({
+    "claude-haiku-4-5": { inputTokens: 400, outputTokens: 40, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.01, costStatus: "metered", ...over },
+  });
+  const rowsOf = (table: HTMLElement) =>
+    Array.from(table.querySelectorAll("tbody tr")).map((tr) => Array.from(tr.querySelectorAll("td")).map((td) => td.textContent ?? ""));
+
+  it("shows the summaries row and Run total when a summary pass is the only spend", () => {
+    seq = 0;
+    const msgs = [m("summary_usage", "lead", { pass: "plan", model_usage: entry() })];
+    const { getByRole, queryByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = rowsOf(getByRole("table", { name: "Summary usage" }));
+    expect(rows).toEqual([
+      ["Intent, plan & PR summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+    expect(queryByRole("group", { name: "Run usage totals" })).toBeNull();
+    expect(queryByRole("table", { name: "Per-phase usage" })).toBeNull();
+    expect(queryByRole("table", { name: "Per-agent usage" })).toBeNull();
+  });
+
+  it("shows the Now summaries row and Run total when a Now note is the only spend", () => {
+    seq = 0;
+    const msgs = [m("progress_note", "lead", { text: "Reading the code", model_usage: entry() })];
+    const { getByRole, queryByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    expect(rowsOf(getByRole("table", { name: "Summary usage" }))).toEqual([
+      ["Now summaries", "—", "400", "0", "40", "$0.01"],
+      ["Run total", "—", "400", "0", "40", "$0.01"],
+    ]);
+    expect(queryByRole("table", { name: "Per-phase usage" })).toBeNull();
+  });
+
+  it("never shows a dollar figure for unpriced side spend, even when the run-level status is metered", () => {
+    seq = 0;
+    const msgs = [m("summary_usage", "lead", { pass: "plan", model_usage: entry({ costUSD: 0, costStatus: "unreported" }) })];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = rowsOf(getByRole("table", { name: "Summary usage" }));
+    expect(rows[0]?.[5]).toBe("n/a");
+    expect(rows[1]?.[5]).toBe("n/a");
+    expect(rows.flat().join(" ")).not.toMatch(/\$0/);
+  });
+
+  it("shows the Run total cost as unavailable when a metered note sits beside an unpriced summary", () => {
+    seq = 0;
+    const msgs = [
+      m("progress_note", "lead", { text: "Reading the code", model_usage: entry() }),
+      m("summary_usage", "lead", { pass: "plan", model_usage: entry({ costUSD: 0, costStatus: "unreported" }) }),
+    ];
+    const { getByRole } = render(<RunUsagePanel costStatus="metered" usage={deriveRunUsage(msgs)} />);
+    const rows = rowsOf(getByRole("table", { name: "Summary usage" }));
+    expect(rows.map((r) => [r[0], r[5]])).toEqual([
+      ["Now summaries", "$0.01"],
+      ["Intent, plan & PR summaries", "n/a"],
+      ["Run total", "n/a"],
+    ]);
   });
 });

@@ -20,21 +20,33 @@ export function SummarySettingsCard({
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
 
-  const dirty = model !== settings.summary_model;
+  // PRD #2603: instance kill-switch for the model-written "Now" line. Absent (an older
+  // server) reads as on, the server default.
+  const savedNow = settings.now_summary_enabled !== "false";
+  const [nowEnabled, setNowEnabled] = useState(savedNow);
+
+  const modelDirty = model !== settings.summary_model;
+  const nowDirty = nowEnabled !== savedNow;
+  const dirty = modelDirty || nowDirty;
 
   const save = async (e: FormEvent) => {
     e.preventDefault();
     setError("");
     setNotice("");
-    if (model.trim() === "") {
+    if (modelDirty && model.trim() === "") {
       setError("The summary model must not be empty.");
       return;
     }
     setBusy(true);
     try {
-      const resp = await api.updateSettings({ summary_model: model });
+      // Only the changed keys, so saving one control never rewrites the other.
+      const resp = await api.updateSettings({
+        ...(modelDirty ? { summary_model: model } : {}),
+        ...(nowDirty ? { now_summary_enabled: String(nowEnabled) } : {}),
+      });
       onSaved(resp);
       setModel(resp.settings.summary_model);
+      setNowEnabled(resp.settings.now_summary_enabled !== "false");
       setNotice("Run summary settings saved.");
     } catch (err) {
       setError(errorMessage(err, "Failed to save run summary settings"));
@@ -76,6 +88,23 @@ export function SummarySettingsCard({
             summaries are light and produced per run. Pin{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">sonnet</code> or{" "}
             <code className="rounded bg-raised px-1 py-0.5 text-fg">opus</code> for richer summaries.
+          </p>
+        </div>
+
+        <div className="space-y-1.5">
+          <label className="flex cursor-pointer select-none items-center gap-2 text-sm">
+            <input
+              type="checkbox"
+              checked={nowEnabled}
+              onChange={(e) => setNowEnabled(e.target.checked)}
+              className="h-4 w-4 rounded border-edge accent-brand"
+            />
+            Model-written Now line
+          </label>
+          <p className="text-xs text-faint">
+            Instance kill-switch. While a run works, a small model writes a one-sentence summary of its
+            current step on the progress card, on the run owner&rsquo;s own credential. Off stops it for
+            every user, whatever their own setting. On by default.
           </p>
         </div>
 

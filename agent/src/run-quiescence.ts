@@ -199,7 +199,56 @@ export interface ProcTable {
 const PROC_ROOT = path.join("/", "proc");
 
 /** A procfs-shaped table rooted at `root`: `<root>/<pid>/{status,environ,cwd,stat}`. */
-export function procfsTableAt(root: string): ProcTable {
+export function procfsTableAt(root: string, budget?: { signal?: AbortSignal; deadline: number }): ProcTable {
+  if (budget) {
+    let total = 0;
+    const check = () => {
+      budget.signal?.throwIfAborted();
+      if (Date.now() >= budget.deadline) throw new Error("process proof deadline");
+    };
+    const read = (pid: number, name: string, cap: number, encoding: BufferEncoding) => {
+      check();
+      const fd = fs.openSync(path.join(root, String(pid), name), fs.constants.O_RDONLY |
+        fs.constants.O_NOFOLLOW | fs.constants.O_NONBLOCK);
+      try {
+        const buf = Buffer.alloc(cap + 1);
+        let length = 0;
+        // Complete EOF, including at the cap; at most cap+1 nonempty reads.
+        while (length < buf.length) {
+          check();
+          const count = fs.readSync(fd, buf, length, buf.length - length, null);
+          if (!count) break;
+          length += count;
+          total += count;
+          if (total > 32 * 1024 * 1024) throw new Error("process byte budget");
+        }
+        if (length > cap) throw new Error("process file budget");
+        return buf.toString(encoding, 0, length);
+      } finally { fs.closeSync(fd); }
+    };
+    return {
+      listPids: () => {
+        check();
+        const pids: number[] = [];
+        const directory = fs.opendirSync(root);
+        try {
+          for (;;) {
+            check();
+            const entry = directory.readSync();
+            if (!entry) break;
+            if (!/^[0-9]+$/.test(entry.name)) continue;
+            if (pids.length >= 4096) throw new Error("process PID budget");
+            pids.push(Number(entry.name));
+          }
+        } finally { directory.closeSync(); }
+        return pids;
+      },
+      readStatus: pid => read(pid, "status", 64 * 1024, "utf8"),
+      readStat: pid => read(pid, "stat", 64 * 1024, "utf8"),
+      readEnviron: pid => read(pid, "environ", 256 * 1024, "latin1"),
+      readCwd: pid => { check(); return fs.readlinkSync(path.join(root, String(pid), "cwd")); },
+    };
+  }
   return {
     listPids: () =>
       fs
@@ -434,6 +483,7 @@ export type QuiesceMode = "own" | "seed" | "capture";
 
 /** What the scan is looking for. JSON-serializable: it crosses into the runner-uid helper. */
 export interface ScanRequest {
+  reportDeadline?: number;
   mode: QuiesceMode;
   /** Only processes of this real uid are considered. */
   targetUid: number;
@@ -704,6 +754,7 @@ export interface ReapDeps {
   /** The runner-uid helper excludes EVERY descendant: it starts no agent, so anything below it
    *  (e.g. its own TypeScript loader's service process, which inherits its env) is its own. */
   excludeAllDescendants?: boolean;
+  reportBudget?: { signal: AbortSignal; deadline: number };
 }
 
 const defaultSleep = (ms: number) => new Promise<void>((r) => setTimeout(r, ms));
@@ -724,18 +775,54 @@ function defaultKill(pid: number): void {
 export async function reapProcesses(req: ScanRequest, deps: ReapDeps = {}): Promise<ProcessQuiescence> {
   // A test view stands in for the real table only when the caller injected none.
   const view = deps.table === undefined && testView !== undefined ? viewReapDeps(testView) : undefined;
-  const table = deps.table ?? view?.table ?? procfsTable;
+  const reportBudget: { signal?: AbortSignal; deadline: number } | undefined = deps.reportBudget ??
+    (req.reportDeadline === undefined ? undefined : { deadline: req.reportDeadline });
+  const baseTable = deps.table ?? (reportBudget && testView && "procRoot" in testView
+    ? procfsTableAt(testView.procRoot, reportBudget) : view?.table) ??
+    (reportBudget ? procfsTableAt(PROC_ROOT, reportBudget) : procfsTable);
+  let tableFailure: unknown;
+  let bytes = 0;
+  const bounded = <T>(read: () => T, cap?: number): T => {
+    try {
+      reportBudget?.signal?.throwIfAborted();
+      if (reportBudget && Date.now() >= reportBudget.deadline) throw new Error("process proof deadline");
+      const result = read();
+      if (reportBudget && typeof result === "string" && cap !== undefined) {
+        const length = Buffer.byteLength(result);
+        bytes += length;
+        if (length > cap || bytes > 32 * 1024 * 1024) throw new Error("process input budget");
+      }
+      return result;
+    } catch (error) {
+      // Vanishing processes retain the existing attribution semantics. Budget and
+      // incomplete-table failures cannot be hidden by scanOnce's per-PID tryRead.
+      if (!["ENOENT", "ESRCH"].includes((error as NodeJS.ErrnoException).code ?? "")) tableFailure = error;
+      throw error;
+    }
+  };
+  const table: ProcTable = reportBudget ? {
+    listPids: () => bounded(() => {
+      const pids = baseTable.listPids();
+      if (pids.length > 4096) throw new Error("process PID budget");
+      return pids;
+    }),
+    readStatus: pid => bounded(() => baseTable.readStatus(pid), 64 * 1024),
+    readStat: pid => bounded(() => baseTable.readStat(pid), 64 * 1024),
+    readEnviron: pid => bounded(() => baseTable.readEnviron(pid), 256 * 1024),
+    readCwd: pid => bounded(() => baseTable.readCwd(pid), 64 * 1024),
+  } : baseTable;
   const kill = deps.kill ?? view?.kill ?? defaultKill;
   const sleep = deps.sleep ?? defaultSleep;
   const now = deps.now ?? Date.now;
-  const deadline = now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS);
+  // Report observations never kill a writer after byte inspection.
+  const deadline = reportBudget ? now() : now() + (deps.deadlineMs ?? view?.deadlineMs ?? REAP_DEADLINE_MS);
   const selfPid = deps.selfPid ?? process.pid;
   const killed: number[] = [];
   let last: ScanResult;
   for (;;) {
     last = scanOnce(req, table, selfPid, deps.excludeAllDescendants ?? false);
-    if (last.tableError) {
-      return { state: "unverified", processes: [], killed, detail: last.tableError };
+    if (last.tableError || tableFailure || (reportBudget && Date.now() >= reportBudget.deadline)) {
+      return { state: "unverified", processes: [], killed, detail: last.tableError ?? String(tableFailure ?? "process proof deadline") };
     }
     // An unreadable pid is rescanned too: a process caught mid-execve (or mid-exit) can read
     // back EACCES for an instant. Only one that stays unattributable to the deadline counts.
@@ -870,8 +957,8 @@ const defaultHelperSpawn: HelperSpawn = (command, args, opts) =>
  *  before every helper start and removed after it. Injectable for tests; either method may be
  *  synchronous or return a promise. */
 export interface HelperTmp {
-  make(): string | Promise<string>;
-  remove(dir: string): void | Promise<void>;
+  make(budget?: { signal: AbortSignal; deadline: number }): string | Promise<string>;
+  remove(dir: string, budget?: { signal: AbortSignal; deadline: number }): void | Promise<void>;
 }
 
 /** How a helper-TMPDIR command (mktemp / rm) is wrapped to run as the runner: `runnerCommand`
@@ -892,7 +979,12 @@ function runFixedAsRunner(
   command: string,
   args: string[],
   timeoutMs: number,
+  budget?: { signal: AbortSignal; deadline: number },
 ): Promise<{ status: number | null; stdout: string }> {
+  if (budget) {
+    budget.signal.throwIfAborted();
+    if (Date.now() >= budget.deadline) return Promise.reject(new Error("report helper setup deadline"));
+  }
   const w = wrap(command, args);
   return new Promise((resolve, reject) => {
     let settled = false;
@@ -901,19 +993,36 @@ function runFixedAsRunner(
       detached: true,
       stdio: ["ignore", "pipe", "ignore"],
     });
+    let cancellation: Error | undefined;
+    const cancel = () => {
+      if (settled) return;
+      cancellation = new Error("report helper setup cancelled");
+      killRunnerGroup(child.pid);
+    };
+    budget?.signal.addEventListener("abort", cancel, { once: true });
+    if (budget?.signal.aborted) cancel();
     const timer = setTimeout(() => {
       if (settled) return;
-      settled = true;
       killRunnerGroup(child.pid);
-      reject(new Error(`${command} as the runner timed out after ${timeoutMs} ms`));
-    }, timeoutMs);
+      if (budget) cancellation = new Error("report helper setup deadline");
+      else {
+        settled = true;
+        reject(new Error(`${command} as the runner timed out after ${timeoutMs} ms`));
+      }
+    }, budget ? Math.max(1, Math.min(timeoutMs, budget.deadline - Date.now())) : timeoutMs);
     let out = "";
     child.stdout?.setEncoding("utf8");
     child.stdout?.on("data", (c: string) => {
+      if (budget && Buffer.byteLength(out) + Buffer.byteLength(c) > 64 * 1024) {
+        cancellation = new Error("report helper setup output overflow");
+        killRunnerGroup(child.pid);
+        return;
+      }
       if (out.length < 64 * 1024) out += c;
     });
     child.on("error", (err) => {
       if (settled) return;
+      if (budget) { cancellation = err; return; }
       settled = true;
       clearTimeout(timer);
       reject(err);
@@ -922,7 +1031,9 @@ function runFixedAsRunner(
       if (settled) return;
       settled = true;
       clearTimeout(timer);
-      resolve({ status, stdout: out });
+      budget?.signal.removeEventListener("abort", cancel);
+      if (cancellation) reject(cancellation);
+      else resolve({ status, stdout: out });
     });
   });
 }
@@ -936,7 +1047,7 @@ function runFixedAsRunner(
 export function runnerHelperTmp(
   base: string,
   wrap: RunnerWrap = runnerCommand,
-  timeouts: { makeMs?: number; removeMs?: number } = {},
+  timeouts: { makeMs?: number; removeMs?: number; budget?: { signal: AbortSignal; deadline: number } } = {},
 ): { make(): Promise<string>; remove(dir: string): Promise<void> } {
   return {
     make: async () => {
@@ -945,6 +1056,7 @@ export function runnerHelperTmp(
         "mktemp",
         ["-d", path.join(base, "uzi-quiesce-XXXXXXXXXX")],
         timeouts.makeMs ?? HELPER_TMP_MAKE_TIMEOUT_MS,
+        timeouts.budget,
       );
       const dir = r.stdout.trim();
       if (r.status !== 0 || !path.isAbsolute(dir) || !isWithinPath(dir, base) || path.resolve(dir) === path.resolve(base)) {
@@ -953,21 +1065,21 @@ export function runnerHelperTmp(
       return dir;
     },
     remove: async (dir) => {
-      await runFixedAsRunner(wrap, "rm", ["-rf", "--", dir], timeouts.removeMs ?? HELPER_TMP_REMOVE_TIMEOUT_MS);
+      await runFixedAsRunner(wrap, "rm", ["-rf", "--", dir], timeouts.removeMs ?? HELPER_TMP_REMOVE_TIMEOUT_MS, timeouts.budget);
     },
   };
 }
 
 const defaultHelperTmp: HelperTmp = {
-  make: () => {
+  make: budget => {
     const base = runnerTmpdir() ?? os.tmpdir();
     // Single-uid the helper runs as this process's uid, so a plain mkdtemp (mode 0700) is its own.
     if (!uidSplitActive()) return fs.promises.mkdtemp(path.join(base, "uzi-quiesce-"));
-    return runnerHelperTmp(base).make();
+    return runnerHelperTmp(base, runnerCommand, { budget }).make();
   },
-  remove: (dir) => {
+  remove: (dir, budget) => {
     if (!uidSplitActive()) return fs.promises.rm(dir, { recursive: true, force: true });
-    return runnerHelperTmp(runnerTmpdir() ?? os.tmpdir()).remove(dir);
+    return runnerHelperTmp(runnerTmpdir() ?? os.tmpdir(), runnerCommand, { budget }).remove(dir);
   },
 };
 
@@ -1034,7 +1146,7 @@ function parseHelperVerdict(stdout: string): ProcessQuiescence {
  */
 async function reapProcessesViaHelper(
   req: ScanRequest,
-  opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp } = {},
+  opts: { spawnHelper?: HelperSpawn; timeoutMs?: number; helperTmp?: HelperTmp; reportBudget?: { signal: AbortSignal; deadline: number } } = {},
 ): Promise<ProcessQuiescence> {
   const unverified = (detail: string): ProcessQuiescence => ({ state: "unverified", processes: [], killed: [], detail });
   let argv: string[];
@@ -1046,10 +1158,17 @@ async function reapProcessesViaHelper(
   const helperTmp = opts.helperTmp ?? defaultHelperTmp;
   let tmpDir: string;
   try {
-    tmpDir = await helperTmp.make();
+    opts.reportBudget?.signal.throwIfAborted();
+    if (opts.reportBudget && Date.now() >= opts.reportBudget.deadline) throw new Error("report helper setup deadline");
+    tmpDir = await helperTmp.make(opts.reportBudget);
   } catch (err) {
     return unverified(`quiescence helper TMPDIR unavailable: ${(err as Error).message}`);
   }
+  // Owned temporary cleanup needs a fresh maintenance budget: an aborted proof signal
+  // cannot finish rm. This budget grants no report authority, and runFixedAsRunner
+  // still awaits CLOSE if its cleanup deadline fires after the command starts.
+  const cleanupBudget = () => ({ signal: new AbortController().signal,
+    deadline: Date.now() + HELPER_TMP_REMOVE_TIMEOUT_MS });
   const removeTmp = (): void => {
     // Best effort, not awaited (the verdict does not wait on cleanup): a leftover private dir is
     // harmless, and a synchronous throw or a rejection is swallowed alike.
@@ -1059,6 +1178,10 @@ async function reapProcessesViaHelper(
       // swallowed, see above
     }
   };
+  if (opts.reportBudget && (opts.reportBudget.signal.aborted || Date.now() >= opts.reportBudget.deadline)) {
+    await Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).catch(() => undefined);
+    return unverified("report helper setup expired");
+  }
   const wrapped = runnerCommand(process.execPath, argv);
   const helperEnv: NodeJS.ProcessEnv = { PATH: runnerPath() ?? HELPER_PATH, TMPDIR: tmpDir, TSX_DISABLE_CACHE: "1" };
   return new Promise<ProcessQuiescence>((resolve) => {
@@ -1068,10 +1191,22 @@ async function reapProcessesViaHelper(
       if (settled) return;
       settled = true;
       if (timer) clearTimeout(timer);
-      removeTmp();
-      resolve(r);
+      opts.reportBudget?.signal.removeEventListener("abort", cancelReport);
+      if (opts.reportBudget) {
+        // Settlement includes the already-started cleanup; expiry never releases
+        // source or journal boundaries while a helper command is still running.
+        Promise.resolve().then(() => helperTmp.remove(tmpDir, cleanupBudget())).then(
+          () => resolve(opts.reportBudget!.signal.aborted || Date.now() >= opts.reportBudget!.deadline
+            ? unverified("report helper cleanup expired") : r),
+          () => resolve(unverified("report helper cleanup failed")));
+      } else { removeTmp(); resolve(r); }
     };
+    let reportFailure: ProcessQuiescence | undefined;
     let child: import("node:child_process").ChildProcess;
+    const cancelReport = () => {
+      reportFailure = unverified("report helper cancelled");
+      killRunnerGroup(child.pid);
+    };
     try {
       child = (opts.spawnHelper ?? defaultHelperSpawn)(wrapped.command, wrapped.args, {
         cwd: "/",
@@ -1081,10 +1216,14 @@ async function reapProcessesViaHelper(
       done(unverified(`quiescence helper spawn failed: ${(err as Error).message}`));
       return;
     }
+    opts.reportBudget?.signal.addEventListener("abort", cancelReport, { once: true });
+    if (opts.reportBudget?.signal.aborted) cancelReport();
     timer = setTimeout(() => {
       killRunnerGroup(child.pid);
-      done(unverified("quiescence helper timed out"));
-    }, opts.timeoutMs ?? HELPER_TIMEOUT_MS);
+      if (opts.reportBudget) reportFailure = unverified("quiescence helper timed out");
+      else done(unverified("quiescence helper timed out"));
+    }, opts.reportBudget ? Math.max(1, Math.min(opts.timeoutMs ?? HELPER_TIMEOUT_MS,
+      opts.reportBudget.deadline - Date.now())) : opts.timeoutMs ?? HELPER_TIMEOUT_MS);
     const out: Buffer[] = [];
     let outBytes = 0;
     child.stdout?.on("data", (c: Buffer) => {
@@ -1092,7 +1231,8 @@ async function reapProcessesViaHelper(
       outBytes += c.length;
       if (outBytes > HELPER_STDOUT_MAX) {
         killRunnerGroup(child.pid);
-        done(unverified("quiescence helper output exceeded 1 MiB"));
+        if (opts.reportBudget) reportFailure = unverified("quiescence helper output exceeded 1 MiB");
+        else done(unverified("quiescence helper output exceeded 1 MiB"));
         return;
       }
       out.push(c);
@@ -1102,8 +1242,13 @@ async function reapProcessesViaHelper(
     // below reports that exit, so the write error itself is only swallowed here.
     child.stdin?.on("error", () => undefined);
     child.stdin?.end(JSON.stringify(testView === undefined ? req : { ...req, view: testView }));
-    child.on("error", (err) => done(unverified(`quiescence helper spawn failed: ${err.message}`)));
+    child.on("error", (err) => {
+      const failure = unverified(`quiescence helper spawn failed: ${err.message}`);
+      if (opts.reportBudget) reportFailure = failure;
+      else done(failure);
+    });
     child.on("close", (code, signal) => {
+      if (reportFailure) { done(reportFailure); return; }
       if (code !== 0) {
         done(unverified(`quiescence helper exited ${code ?? signal ?? "abnormally"}`));
         return;
@@ -1135,6 +1280,7 @@ export async function reapRunProcesses(req: ScanRequest, opts: ReapRunOptions = 
       spawnHelper: opts.spawnHelper,
       timeoutMs: opts.helperTimeoutMs,
       helperTmp: opts.helperTmp,
+      reportBudget: opts.reportBudget,
     });
   }
   try {
@@ -1339,6 +1485,7 @@ export async function teardownDocker(opts: DockerTeardownOptions): Promise<Docke
 
 /** One quiescence request for a run's clone. */
 export interface QuiesceRunRequest {
+  reportBudget?: { signal: AbortSignal; deadline: number };
   mode: QuiesceMode;
   /** This attempt, when there is one (its marker is "own"). */
   attempt: RunAttempt | undefined;
@@ -1403,7 +1550,9 @@ export async function quiesceRunAttempt(req: QuiesceRunRequest, deps: QuiesceRun
       ],
       workerNonce: workerSpawnNonce(),
     };
-    processResult = await reapRunProcesses(scan, deps.reap);
+    processResult = await reapRunProcesses(req.reportBudget ? { ...scan, reportDeadline: req.reportBudget.deadline } : scan,
+      req.reportBudget ? { ...deps.reap, reportBudget: req.reportBudget,
+        deadlineMs: Math.max(0, req.reportBudget.deadline - Date.now()) } : deps.reap);
   }
   const docker = await teardownDocker({ ...deps.docker, dockerHost: req.dockerHost, targetPaths: req.targetPaths }).catch(
     (err: unknown): DockerTeardown => ({ state: "docker_error", removed: [], detail: (err as Error).message }),
@@ -1437,6 +1586,7 @@ function isScanRequest(v: unknown): v is ScanRequest {
         Number.isSafeInteger((r as { startTime?: unknown }).startTime),
     ) &&
     typeof o.workerNonce === "string" &&
+    (o.reportDeadline === undefined || (Number.isSafeInteger(o.reportDeadline) && (o.reportDeadline as number) > 0)) &&
     (o.view === undefined || isQuiescenceView(o.view))
   );
 }

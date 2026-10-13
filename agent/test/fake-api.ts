@@ -88,6 +88,9 @@ export class FakeApi {
   /** Issue #1604: a credential_switch signal for another claim generation that rides every GET
    *  WITHOUT fencing it (the rows still drain): a superseded claim's switch. */
   private readonly foreignSwitchSignal = new Map<string, number>();
+  /** PRD #2603: the per-run `now_summary` value GET /inputs carries. A run with no entry omits the
+   *  field, which the worker reads as OFF (an older api, or an early-return reply). */
+  readonly nowSummary = new Map<string, boolean>();
   /** Issue #1604: stamp created_at on input rows as the real server does. Off by default so the
    *  wire-shape tests that deep-compare rows keep their exact fixtures; the #1604 interruption
    *  suite turns it on (resume_plan_at is compared against it). */
@@ -220,10 +223,26 @@ export class FakeApi {
   // with no override answers 200 {status:"running"} — the "still ours, keep going"
   // default the skip path proceeds on. An override expresses a terminal status, a
   // 404 not-owned, or a transient 5xx.
+  /** Opt-in M2 fixtures; legacy tests retain their original wire shape. */
+  parkRunGeneration: number | undefined;
+  readonly workerPauseRequests: Array<{ runId: string; generation: unknown }> = [];
+  parkRunOwnership: { status: string; claim_generation: number; hold_reason: string | null; claim_released: boolean } | undefined;
+  guardedQuestionStatus: string | undefined;
+  workerPauseRefused = false;
+  workerPauseReason: string | undefined;
+  guardedQuestionReason: string | undefined;
   private readonly ownershipByRun = new Map<
     string,
-    { httpStatus: number; status?: string; generation?: number; inventoryGuarded?: boolean }
+    { httpStatus: number; status?: string; generation?: number; inventoryGuarded?: boolean; holdReason?: string }
   >();
+  // PRD #1733: runs whose typed provider-outage park (`recovery_cause: "provider_outage"`) is
+  // acked with a different run status and/or hold_reason, e.g. paused + provider_unavailable.
+  private readonly typedParkAck = new Map<string, { status: string; holdReason?: string }>();
+  // PRD #1733: runs whose typed provider-outage reports are refused with a 400 carrying this error
+  // text (an old api's strict-decode "invalid request body", or a new api's validation refusal).
+  private readonly typedParkRefusal = new Map<string, { error: string; remaining: number }>();
+  /** PRD #1733: every typed provider-outage report refused by {@link refuseTypedParkWith}. */
+  readonly refusedTypedParks: StateRequest[] = [];
   // issue #1319: the owner-scoped orphan-classification read. Keyed by OWNER run id (the
   // fake trusts the test for the claimant/authz; the runner's predicate logic is what's under
   // test). No override for an owner => 404 (fail closed), matching the server's not-found.
@@ -810,8 +829,28 @@ export class FakeApi {
    *  terminal status (completed/failed/cancelled) to drive the skip-path terminal throw.
    *  PRD #1391 Run B M4: an optional `generation` rides the 200 as `claim_generation`, so a test
    *  can model the queued-duplicate router seeing a DIFFERENT generation own the run. */
-  setOwnershipStatus(runId: string, status: string, generation?: number, inventoryGuarded?: boolean): void {
-    this.ownershipByRun.set(runId, { httpStatus: 200, status, generation, ...(inventoryGuarded !== undefined ? { inventoryGuarded } : {}) });
+  setOwnershipStatus(runId: string, status: string, generation?: number, inventoryGuarded?: boolean, holdReason?: string): void {
+    this.ownershipByRun.set(runId, {
+      httpStatus: 200,
+      status,
+      generation,
+      ...(inventoryGuarded !== undefined ? { inventoryGuarded } : {}),
+      ...(holdReason !== undefined ? { holdReason } : {}),
+    });
+  }
+
+  /** PRD #1733: ack this run's typed provider-outage park with `status` (and `hold_reason`), e.g.
+   *  the api's `paused` + `provider_unavailable` hold. Other reports are acked as usual. */
+  ackTypedParkAs(runId: string, status: string, holdReason?: string): void {
+    this.typedParkAck.set(runId, { status, ...(holdReason !== undefined ? { holdReason } : {}) });
+  }
+
+  /** PRD #1733: refuse every typed provider-outage report for this run with a 400 whose body is
+   *  `{error}`: "invalid request body" models an api that strict-decodes `productive_turns`, "state
+   *  must be one of ..." a current api's validation refusal. The untyped park is accepted. Refuses
+   *  the first `times` typed reports, then accepts. */
+  refuseTypedParkWith(runId: string, error: string, times = Number.POSITIVE_INFINITY): void {
+    this.typedParkRefusal.set(runId, { error, remaining: times });
   }
 
   /** issue #559 M3: answer the ownership probe with 404 — the DEFINITIVE not-owned
@@ -1300,6 +1339,7 @@ export class FakeApi {
           inputs: pending,
           receipts: true,
           ...(signal !== undefined ? { credential_switch: { generation: signal } } : {}),
+          ...(this.nowSummary.has(runId) ? { now_summary: this.nowSummary.get(runId) } : {}),
         });
       }
     }
@@ -1326,6 +1366,17 @@ export class FakeApi {
       });
     }
 
+    const pauseRunMatch = /^\/api\/worker\/runs\/([^/]+)\/pause$/.exec(p);
+    if (req.method === "POST" && pauseRunMatch && this.parkRunGeneration !== undefined) {
+      const runId = pauseRunMatch[1]!;
+      this.workerPauseRequests.push({ runId, generation: json.claim_generation });
+      return send(res, json.claim_generation === this.parkRunGeneration && !this.workerPauseRefused ? 200 : 409, {
+        applied: json.claim_generation === this.parkRunGeneration && !this.workerPauseRefused,
+        ...(this.workerPauseReason ? { reason: this.workerPauseReason } : {}),
+        run: { status: "running", hold_reason: null },
+        ...(json.claim_generation !== this.parkRunGeneration ? { disposition: "stale_claim" } : {}),
+      });
+    }
     // issue #559 M3: the read-only ownership probe. Not part of the runMatch
     // alternation above (it is a GET-only read of a distinct segment), so it is
     // routed here. No override ⇒ 200 {status:"running"} (still ours, keep going).
@@ -1333,6 +1384,7 @@ export class FakeApi {
     if (req.method === "GET" && ownMatch) {
       const runId = ownMatch[1] as string;
       this.ownershipRequests.push(runId);
+      if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
       if (!o) return send(res, 200, { status: "running" });
       if (o.httpStatus !== 200)
@@ -1342,6 +1394,7 @@ export class FakeApi {
       const body: Record<string, unknown> = { status: o.status ?? "running" };
       if (o.generation !== undefined) body.claim_generation = o.generation;
       if (o.inventoryGuarded !== undefined) body.inventory_guarded = o.inventoryGuarded;
+      if (o.holdReason !== undefined) body.hold_reason = o.holdReason;
       return send(res, 200, body);
     }
 
@@ -1538,6 +1591,21 @@ export class FakeApi {
       return;
     }
     const body = json as unknown as StateRequest;
+    const typedRefusal = this.typedParkRefusal.get(runId);
+    if (typedRefusal !== undefined && typedRefusal.remaining > 0 && body.recovery_cause === "provider_outage") {
+      typedRefusal.remaining--;
+      this.refusedTypedParks.push(body);
+      return send(res, 400, { error: typedRefusal.error });
+    }
+    if (body.require_running === true && this.parkRunGeneration !== undefined &&
+        (json.claim_generation !== this.parkRunGeneration || this.guardedQuestionStatus !== undefined)) {
+      return send(res, 409, {
+        applied: false,
+        run: { status: this.guardedQuestionStatus ?? "running", hold_reason: null },
+        ...(this.guardedQuestionReason ? { reason: this.guardedQuestionReason } : {}),
+        ...(json.claim_generation !== this.parkRunGeneration ? { disposition: "stale_claim" } : {}),
+      });
+    }
     const drop = this.droppedStates.get(runId);
     if (drop?.matches(body)) {
       if (drop.beforeDrop !== undefined) await drop.beforeDrop;
@@ -1686,7 +1754,15 @@ export class FakeApi {
         // StateAck.status undefined — the client cannot branch on it and falls through to ownership.
         ...(this.omitStateAckStatusRuns.has(runId)
           ? {}
-          : { status: this.stateStatusOverride.get(runId) ?? body.status }),
+          : {
+              status:
+                (body.recovery_cause === "provider_outage" ? this.typedParkAck.get(runId)?.status : undefined) ??
+                this.stateStatusOverride.get(runId) ??
+                body.status,
+            }),
+        ...(body.recovery_cause === "provider_outage" && this.typedParkAck.get(runId)?.holdReason !== undefined
+          ? { hold_reason: this.typedParkAck.get(runId)!.holdReason }
+          : {}),
         // PRD #1190 M2: the server-decided pause boundary rides the RunDTO the ACK wraps. Only
         // present when a test armed it; otherwise absent (the worker reads it as "no pause").
         ...(this.pauseRequestedRuns.has(runId) ? { pause_requested: true } : {}),

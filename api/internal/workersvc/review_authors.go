@@ -1,9 +1,11 @@
 package workersvc
 
 import (
+	"cmp"
 	"context"
 	"errors"
 	"log/slog"
+	"maps"
 	"slices"
 	"sort"
 	"time"
@@ -25,14 +27,15 @@ import (
 // poller's automatic watcher and the on-demand rework endpoint, so they cannot drift.
 //
 // The work is bounded and fair. One tick makes at most issueinput.MaxDistinctAuthors lookups
-// inside issueinput.AssessmentTimeout, each under a per-lookup timeout, and the authors whose
+// inside issueinput.AssessmentTimeout (30s). Author-specific calls use a 5s per-lookup timeout;
+// shared repository evidence uses the remaining assessment deadline. The authors whose
 // answer is still needed wait in a per-(repo, ref) FIFO queue (mr_review_author_queue) so a
 // flood of unanswerable authors cannot starve the one that matters: whoever was attempted goes
 // to the back, whoever was not reached keeps its place at the front.
 
 const (
-	// DefaultReviewLookupTimeout bounds one author lookup, so a single hanging forge call
-	// costs one slot of the tick instead of the whole assessment deadline.
+	// DefaultReviewLookupTimeout bounds author-specific calls to 5s. Shared repository
+	// evidence uses the remaining 30s assessment deadline.
 	DefaultReviewLookupTimeout = 5 * time.Second
 	// reviewVerdictTTL is how long a not-eligible answer is trusted before it is asked again.
 	reviewVerdictTTL = 6 * time.Hour
@@ -142,19 +145,22 @@ func (a *ReviewAssessor) QueueBound(ctx context.Context, repoID uuid.UUID, ref s
 
 // ReviewAssessParams is one assessment's input.
 type ReviewAssessParams struct {
-	RepoID         uuid.UUID
-	Ref            string
-	ProjectID      int64
-	BaseURL        string // the connection's base URL, for the trusted-bot instance match
-	BotForgeUserID int64
-	Lookup         issueinput.AuthorLookup
-	Trusted        []settings.TrustedBot
+	// AssessmentTimeout bounds both phases together; zero uses the 30-second
+	// background default. ReviewAssessor.Timeout independently bounds each lookup.
+	AssessmentTimeout time.Duration
+	RepoID            uuid.UUID
+	Ref               string
+	ProjectID         int64
+	BaseURL           string // the connection's base URL, for the trusted-bot instance match
+	BotForgeUserID    int64
+	Lookup            issueinput.AuthorLookup
+	Trusted           []settings.TrustedBot
 	// Comments is the MR's complete comment list, oldest first (the driver guarantee).
 	Comments []forge.MRComment
-	// HighWater and Pending come from the ledger row: a comment is NEW when its id is above
-	// HighWater or is in Pending.
-	HighWater int64
-	Pending   []int64
+	// Ledger is the ledger row's namespaced state (LedgerStateFromRow, after any
+	// BootstrapReviewLedger): a comment is NEW when its id is above its own namespace's mark
+	// or its key is pending (ADR-1199).
+	Ledger ReviewLedgerState
 	// QueueBound is the max queue_seq the caller read (QueueBound) BEFORE it fetched Comments.
 	// The end-of-tick prune only deletes rows at or below it: every such row was admitted before
 	// the comments were fetched, so its candidacy is decided by this very list. A row admitted
@@ -171,8 +177,9 @@ const (
 	classNotEligible
 )
 
-// timeoutLookup bounds each lookup with its own deadline. The child context keeps the
-// values of the assessment context (forge.BeginAuthorAssessment's evidence cache).
+// timeoutLookup bounds author-specific calls with their own deadline (5s by default).
+// The child preserves forge.BeginAuthorAssessment's evidence cache, whose shared reads
+// use the remaining assessment deadline (30s by default).
 type timeoutLookup struct {
 	inner issueinput.AuthorLookup
 	d     time.Duration
@@ -191,7 +198,7 @@ type ReviewAssessment struct {
 	p        ReviewAssessParams
 	asmt     *issueinput.Assessment
 	kept     []forge.MRComment // every non-self comment, in forge order (oldest first)
-	pending  map[int64]bool
+	pending  map[CommentKey]bool
 	trusted  map[int64]bool        // author ids matched by the allowlist
 	class    map[int64]reviewClass // author id -> decided class
 	tried    map[int64]bool        // author ids a lookup was attempted for
@@ -231,14 +238,17 @@ func (r *ReviewAssessment) actionable(c forge.MRComment) bool {
 }
 
 func (r *ReviewAssessment) isNew(c forge.MRComment) bool {
-	return c.ID > r.p.HighWater || r.pending[c.ID]
+	return r.p.Ledger.isNewKey(KeyOf(c), r.pending)
 }
 
 func commentLess(a, b forge.MRComment) bool {
 	if !a.CreatedAt.Equal(b.CreatedAt) {
 		return a.CreatedAt.Before(b.CreatedAt)
 	}
-	return a.ID < b.ID
+	if a.ID != b.ID {
+		return a.ID < b.ID
+	}
+	return a.IDNamespace < b.IDNamespace
 }
 
 // Begin runs the candidate phase: it decides every author it can without a lookup (allowlist,
@@ -265,15 +275,15 @@ func (a *ReviewAssessor) Begin(ctx context.Context, p ReviewAssessParams) (*Revi
 	r := &ReviewAssessment{
 		assessor: a,
 		p:        p,
-		asmt:     issueinput.NewAssessment(ctx, timeoutLookup{p.Lookup, a.timeout()}, p.ProjectID),
+		asmt:     issueinput.NewAssessmentWithTimeout(ctx, timeoutLookup{p.Lookup, a.timeout()}, p.ProjectID, p.AssessmentTimeout),
 		kept:     kept,
-		pending:  map[int64]bool{},
+		pending:  map[CommentKey]bool{},
 		trusted:  map[int64]bool{},
 		class:    map[int64]reviewClass{},
 		tried:    map[int64]bool{},
 	}
-	for _, id := range p.Pending {
-		r.pending[id] = true
+	for _, k := range p.Ledger.Pending {
+		r.pending[k] = true
 	}
 	if err := r.begin(ctx); err != nil {
 		r.Close()
@@ -496,16 +506,15 @@ type ReviewSnapshotResult struct {
 	Attempted        int
 	ContextAttempted int
 
-	eligibleActionable []int64         // ids of actionable comments kept in the (capped) snapshot
-	unknownActionable  []int64         // ids of actionable comments whose author is unknown
-	unknownAuthor      map[int64]int64 // comment id -> author id, for unknownActionable
-	class              map[int64]reviewClass
-	inSnapshot         map[int64]bool
-	// highWater and pending are the ledger values the assessment was begun with
-	// (ReviewAssessParams.HighWater/Pending), which callers read BEFORE listing the comments.
-	// PlanAssessed plans against exactly these, never a later re-read.
-	highWater int64
-	pending   []int64
+	eligibleActionable []CommentKey         // keys of actionable comments kept in the (capped) snapshot
+	unknownActionable  []CommentKey         // keys of actionable comments whose author is unknown, in listing order
+	unknownAuthor      map[CommentKey]int64 // comment key -> author id, for unknownActionable
+	class              map[CommentKey]reviewClass
+	inSnapshot         map[CommentKey]bool
+	// ledger is the state the assessment was begun with (ReviewAssessParams.Ledger), which
+	// callers read BEFORE listing the comments. PlanAssessed plans against exactly this, never
+	// a later re-read.
+	ledger ReviewLedgerState
 }
 
 // Snapshot finishes the assessment: it looks up the context-only authors (everyone not yet
@@ -533,29 +542,31 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 	res := &ReviewSnapshotResult{
 		Attempted:        r.Attempted,
 		ContextAttempted: r.ContextAttempted,
-		class:            make(map[int64]reviewClass, len(r.kept)),
-		inSnapshot:       map[int64]bool{},
-		unknownAuthor:    map[int64]int64{},
-		highWater:        r.p.HighWater,
-		pending:          slices.Clone(r.p.Pending),
+		class:            make(map[CommentKey]reviewClass, len(r.kept)),
+		inSnapshot:       map[CommentKey]bool{},
+		unknownAuthor:    map[CommentKey]int64{},
+		ledger:           ReviewLedgerState{Marks: maps.Clone(r.p.Ledger.Marks), Pending: slices.Clone(r.p.Ledger.Pending)},
 	}
 	snap := &ReviewCommentsSnapshot{Version: ReviewSnapshotVersion, Comments: []ReviewCommentSnapshot{}}
 	var eligible []ReviewCommentSnapshot
+	var eligibleKeys []CommentKey // in lockstep with eligible: the wire snapshot carries bare ids
 	var eligibleActionable []bool
 	for _, c := range r.kept {
 		cl := r.classOf(c)
-		res.class[c.ID] = cl
+		key := KeyOf(c)
+		res.class[key] = cl
 		switch cl {
 		case classEligible:
 			eligible = append(eligible, toReviewSnapshot(c))
+			eligibleKeys = append(eligibleKeys, key)
 			eligibleActionable = append(eligibleActionable, r.actionable(c))
 		case classNotEligible:
 			snap.WithheldNotEligible++
 		default:
 			snap.WithheldUnknown++
 			if r.actionable(c) {
-				res.unknownActionable = append(res.unknownActionable, c.ID)
-				res.unknownAuthor[c.ID] = c.AuthorForgeUserID
+				res.unknownActionable = append(res.unknownActionable, key)
+				res.unknownAuthor[key] = c.AuthorForgeUserID
 			}
 		}
 	}
@@ -563,160 +574,169 @@ func (r *ReviewAssessment) Snapshot(ctx context.Context) *ReviewSnapshotResult {
 	if snap.Comments == nil {
 		snap.Comments = []ReviewCommentSnapshot{} // never "comments":null on the wire
 	}
-	// The caps keep the newest tail, so the kept comments line up with the end of eligible.
+	// The caps keep the newest tail, so the kept comments line up with the end of eligible
+	// (and of eligibleKeys, which carries the namespace the wire comment lacks).
 	offset := len(eligible) - len(snap.Comments)
-	for i, c := range snap.Comments {
-		res.inSnapshot[c.ID] = true
+	for i := range snap.Comments {
+		key := eligibleKeys[offset+i]
+		res.inSnapshot[key] = true
 		if eligibleActionable[offset+i] {
-			res.eligibleActionable = append(res.eligibleActionable, c.ID)
+			res.eligibleActionable = append(res.eligibleActionable, key)
 		}
 	}
 	res.Snapshot = snap
 	return res
 }
 
-// ReviewPendingCap is the size the ledger's pending_unknown_ids is bounded to (the CHECK and
-// the LIMIT of mr_rework_merge_pending). On overflow the database keeps the OLDEST ids.
+// ReviewPendingCap is the size the ledger's pending_unknown_keys is bounded to (the CHECK and
+// the LIMIT of mr_rework_merge_pending_keys). On overflow the database keeps the OLDEST keys.
 const ReviewPendingCap = 10000
 
 // ReviewPlan is what a snapshot means for one ledger row.
 type ReviewPlan struct {
-	// HasNew: an eligible actionable comment in the snapshot is above the high-water mark or
+	// HasNew: an eligible actionable comment in the snapshot is above its namespace's mark or
 	// pending, i.e. there is something to rework.
 	HasNew bool
-	// MaxActionableID is the high-water mark to advance to: the largest eligible actionable
-	// id in the (capped) snapshot, 0 when there is none.
+	// MaxActionable is, per namespace, the largest eligible actionable id in the (capped)
+	// snapshot: the marks to advance to. Never nil; a namespace with none is absent.
+	MaxActionable map[string]int64
+	// MaxActionableID is the largest eligible actionable id over all namespaces, 0 when there
+	// is none. It feeds only the legacy high_water column, which stays readable (and sane for a
+	// binary rollback); it is never compared against another namespace's ids.
 	MaxActionableID int64
 	// UnknownNew counts actionable comments from permission-unknown authors that are new.
 	UnknownNew int
-	// PendingAdd and PendingRemove are the ledger's pending_unknown_ids delta.
-	PendingAdd    []int64
-	PendingRemove []int64
+	// PendingAdd and PendingRemove are the ledger's pending_unknown_keys delta.
+	PendingAdd    []CommentKey
+	PendingRemove []CommentKey
 	// PendingSuperseded and PendingSupersededBy are parallel slices (never nil): an author's
-	// older pending id and that author's newer representative. The ledger merge drops the older
-	// id only when the representative is retained in the same atomic statement (a retained
-	// representative takes the older id's place in the cap order within that merge). A stale
-	// writer whose add the high-water filter rejects, or whose representative another writer
-	// removed, therefore leaves the older id in place instead of losing the author.
-	PendingSuperseded   []int64
-	PendingSupersededBy []int64
+	// older pending key and that author's newer representative. The ledger merge drops the
+	// older key only when the representative is retained in the same atomic statement (a
+	// retained representative takes the older key's place in the cap order within that merge).
+	// A stale writer whose add the per-namespace mark filter rejects, or whose representative
+	// another writer removed, therefore leaves the older key in place instead of losing the
+	// author.
+	PendingSuperseded   []CommentKey
+	PendingSupersededBy []CommentKey
 	// PendingEvicted is the part of PendingRemove that is safe to drop even when no run is
-	// created: pending ids whose author is eligible but whose comment the snapshot caps evicted.
-	// They fall back to human review; left pending they would keep HasTrigger true (it ignores
-	// the caps) while HasNew stays false, repeating the full assessment every tick.
-	PendingEvicted []int64
+	// created: pending keys whose author is eligible but whose comment the snapshot caps
+	// evicted. They fall back to human review; left pending they would keep HasTrigger true (it
+	// ignores the caps) while HasNew stays false, repeating the full assessment every tick.
+	PendingEvicted []CommentKey
 }
 
-// PlanAssessed plans against the ledger values the assessment began with, which the caller
-// read before listing the comments. A pending id in that set therefore existed before the
+// PlanAssessed plans against the ledger state the assessment began with, which the caller
+// read before listing the comments. A pending key in that set therefore existed before the
 // listing, so one absent from the listing is gone whatever the forge's id order. The DELTAS
-// (pending add/remove/supersession and MaxActionableID) must come from that pre-listing row:
-// a later re-read cannot tell a pending id the listing lost from one added after it. Whether
-// there is still something new is a separate question, HasNewAgainst, which the create paths
-// re-validate against the current row under the branch lock.
+// (pending add/remove/supersession and the marks to advance) must come from that pre-listing
+// row: a later re-read cannot tell a pending key the listing lost from one added after it.
+// Whether there is still something new is a separate question, HasNewAgainst, which the
+// create paths re-validate against the current row under the branch lock.
 func (res *ReviewSnapshotResult) PlanAssessed() ReviewPlan {
-	return res.Plan(res.highWater, res.pending)
+	return res.Plan(res.ledger)
 }
 
-// HasNewAgainst reports whether an eligible actionable comment in the snapshot is above
-// highWater or in pending: the freshness test the create paths re-run against the CURRENT
-// ledger row under the branch lock. It carries no deltas.
-func (res *ReviewSnapshotResult) HasNewAgainst(highWater int64, pending []int64) bool {
-	for _, id := range res.eligibleActionable {
-		if id > highWater || slices.Contains(pending, id) {
+// HasNewAgainst reports whether an eligible actionable comment in the snapshot is above its
+// namespace's mark or pending in state: the freshness test the create paths re-run against the
+// CURRENT ledger row under the branch lock. It carries no deltas.
+func (res *ReviewSnapshotResult) HasNewAgainst(state ReviewLedgerState) bool {
+	pending := state.pendingSet()
+	for _, k := range res.eligibleActionable {
+		if state.isNewKey(k, pending) {
 			return true
 		}
 	}
 	return false
 }
 
-// Plan computes the plan against a ledger row's high-water mark and pending set. The row must
-// have been read before the comments were listed (see PlanAssessed).
-func (res *ReviewSnapshotResult) Plan(highWater int64, pending []int64) ReviewPlan {
-	pendingSet := make(map[int64]bool, len(pending))
-	for _, id := range pending {
-		pendingSet[id] = true
+// Plan computes the plan against a ledger state. The state must have been read before the
+// comments were listed (see PlanAssessed).
+func (res *ReviewSnapshotResult) Plan(state ReviewLedgerState) ReviewPlan {
+	pendingSet := state.pendingSet()
+	plan := ReviewPlan{MaxActionable: map[string]int64{}}
+	for _, k := range res.eligibleActionable {
+		plan.MaxActionable[k.Namespace] = max(plan.MaxActionable[k.Namespace], k.ID)
+		plan.MaxActionableID = max(plan.MaxActionableID, k.ID)
 	}
-	var plan ReviewPlan
-	for _, id := range res.eligibleActionable {
-		if id > plan.MaxActionableID {
-			plan.MaxActionableID = id
-		}
-	}
-	plan.HasNew = res.HasNewAgainst(highWater, pending)
-	newMark := max(highWater, plan.MaxActionableID)
-	// One representative pending id per unverified author: that author's NEWEST unknown
-	// actionable id among those the ledger merge will accept (above the old mark and at or below
-	// the new one, or already pending). Newest because capReviewComments keeps the newest tail:
-	// when the author later resolves eligible the firing run's snapshot is rebuilt from the full
-	// comment list, so one id per author is enough to trigger, and the newest is the one the
-	// caps are most likely to keep. A flood of outsider comments therefore costs one slot per
-	// outsider, not one per comment, and cannot push an eligible author's id out of the set.
-	rep := map[int64]int64{} // author id -> newest allowed unknown actionable id
-	for _, id := range res.unknownActionable {
-		allowed := pendingSet[id] || (id > highWater && id <= newMark)
-		if id > highWater || pendingSet[id] {
+	plan.HasNew = res.HasNewAgainst(state)
+	newMark := func(ns string) int64 { return max(state.Marks[ns], plan.MaxActionable[ns]) }
+	// One representative pending key per unverified author: that author's LAST unknown
+	// actionable comment in listing order (the driver's oldest-first order) among those the
+	// ledger merge will accept (above the old mark of its namespace and at or below the new
+	// one, or already pending). The last one because capReviewComments keeps the newest tail:
+	// when the author later resolves eligible the firing run's snapshot is rebuilt from the
+	// full comment list, so one key per author is enough to trigger, and the latest is the one
+	// the caps are most likely to keep. Ids of different namespaces are not comparable, so
+	// listing position, not id, decides. A flood of outsider comments therefore costs one slot
+	// per outsider, not one per comment, and cannot push an eligible author's key out of the set.
+	rep := map[int64]CommentKey{} // author id -> last allowed unknown actionable key
+	for _, k := range res.unknownActionable {
+		allowed := pendingSet[k] || (k.ID > state.Marks[k.Namespace] && k.ID <= newMark(k.Namespace))
+		if state.isNewKey(k, pendingSet) {
 			plan.UnknownNew++
 		}
 		if !allowed {
 			continue
 		}
-		if a := res.unknownAuthor[id]; id > rep[a] {
-			rep[a] = id
+		rep[res.unknownAuthor[k]] = k
+	}
+	plan.PendingAdd = make([]CommentKey, 0, len(rep))
+	isRep := make(map[CommentKey]bool, len(rep))
+	for _, k := range rep {
+		plan.PendingAdd = append(plan.PendingAdd, k)
+		isRep[k] = true
+	}
+	slices.SortFunc(plan.PendingAdd, func(a, b CommentKey) int {
+		if a.ID != b.ID {
+			return cmp.Compare(a.ID, b.ID)
 		}
-	}
-	plan.PendingAdd = make([]int64, 0, len(rep))
-	for _, id := range rep {
-		plan.PendingAdd = append(plan.PendingAdd, id)
-	}
-	slices.Sort(plan.PendingAdd)
-	isRep := make(map[int64]bool, len(rep))
-	for _, id := range plan.PendingAdd {
-		isRep[id] = true
-	}
+		return cmp.Compare(a.Namespace, b.Namespace)
+	})
 	newAdds := 0
-	for _, id := range plan.PendingAdd {
-		if !pendingSet[id] {
+	for _, k := range plan.PendingAdd {
+		if !pendingSet[k] {
 			newAdds++
 		}
 	}
-	plan.PendingRemove = []int64{}
-	plan.PendingEvicted = []int64{}
-	plan.PendingSuperseded = []int64{}
-	plan.PendingSupersededBy = []int64{}
-	var superseded []int64 // older pending ids of authors whose newer representative is in PendingAdd
-	for _, id := range pending {
-		cl, present := res.class[id]
+	plan.PendingRemove = []CommentKey{}
+	plan.PendingEvicted = []CommentKey{}
+	plan.PendingSuperseded = []CommentKey{}
+	plan.PendingSupersededBy = []CommentKey{}
+	var superseded []CommentKey // older pending keys of authors whose newer representative is in PendingAdd
+	for _, k := range state.Pending {
+		cl, present := res.class[k]
 		switch {
 		case !present, cl == classNotEligible:
-			plan.PendingRemove = append(plan.PendingRemove, id) // gone, or its author is now known to be out
-		case cl == classEligible && res.inSnapshot[id]:
-			plan.PendingRemove = append(plan.PendingRemove, id) // consumed by this snapshot
+			plan.PendingRemove = append(plan.PendingRemove, k) // gone, or its author is now known to be out
+		case cl == classEligible && res.inSnapshot[k]:
+			plan.PendingRemove = append(plan.PendingRemove, k) // consumed by this snapshot
 		case cl == classEligible:
-			plan.PendingRemove = append(plan.PendingRemove, id) // evicted by the caps: human review
-			plan.PendingEvicted = append(plan.PendingEvicted, id)
+			plan.PendingRemove = append(plan.PendingRemove, k) // evicted by the caps: human review
+			plan.PendingEvicted = append(plan.PendingEvicted, k)
 		case cl == classUnknown:
-			if a, ok := res.unknownAuthor[id]; ok && rep[a] != 0 && !isRep[id] {
-				superseded = append(superseded, id)
+			if a, ok := res.unknownAuthor[k]; ok {
+				if _, has := rep[a]; has && !isRep[k] {
+					superseded = append(superseded, k)
+				}
 			}
 		}
 	}
-	// One id per author across ticks: an older pending id of an author whose newer representative
-	// is being added (or already pending) is superseded, but only when the merged set is
-	// guaranteed to fit. The supersession is NOT a removal: the ledger merge
-	// (mr_rework_merge_pending) applies each (older, representative) pair only when the
+	// One key per author across ticks: an older pending key of an author whose newer
+	// representative is being added (or already pending) is superseded, but only when the
+	// merged set is guaranteed to fit. The supersession is NOT a removal: the ledger merge
+	// (mr_rework_merge_pending_keys) applies each (older, representative) pair only when the
 	// representative is retained in the same statement, so a stale writer's rejected add cannot
-	// cost the author its only id. The fit check counts the superseded ids as dropped; near the cap,
-	// when the set would overflow, the pairs are withheld and both ids may briefly stay (the next
-	// tick, after the removals, emits them once they fit).
-	incoming := len(pending) + newAdds - len(plan.PendingRemove)
+	// cost the author its only key. The fit check counts the superseded keys as dropped; near
+	// the cap, when the set would overflow, the pairs are withheld and both keys may briefly
+	// stay (the next tick, after the removals, emits them once they fit).
+	incoming := len(state.Pending) + newAdds - len(plan.PendingRemove)
 	if incoming-len(superseded) <= ReviewPendingCap {
-		for _, id := range superseded {
-			plan.PendingSuperseded = append(plan.PendingSuperseded, id)
-			plan.PendingSupersededBy = append(plan.PendingSupersededBy, rep[res.unknownAuthor[id]])
+		for _, k := range superseded {
+			plan.PendingSuperseded = append(plan.PendingSuperseded, k)
+			plan.PendingSupersededBy = append(plan.PendingSupersededBy, rep[res.unknownAuthor[k]])
 		}
 	} else {
-		slog.Warn("workersvc: review pending set would exceed its cap; the ledger keeps the oldest ids",
+		slog.Warn("workersvc: review pending set would exceed its cap; the ledger keeps the oldest keys",
 			"incoming", incoming, "cap", ReviewPendingCap)
 	}
 	return plan

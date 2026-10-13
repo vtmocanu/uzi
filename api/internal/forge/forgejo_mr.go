@@ -71,6 +71,9 @@ func forgejoMRState(pr *gitea.PullRequest) string {
 // this feature uses (resolve is a documented no-op — see ResolveMergeRequestThread).
 // Gitea's comment/review endpoints return no forge system notes, so no D2 filter is
 // needed; the driver sorts the merged list by CreatedAt for oldest-first (D8).
+// Each surface gets its own id namespace (CommentNSIssueComment, CommentNSReview,
+// CommentNSReviewComment). Separate namespaces are safe even where the server
+// shares a table: a split never merges sequences, so no id can be misordered.
 func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID int64) ([]MRComment, error) {
 	c, err := f.newClient(ctx)
 	if err != nil {
@@ -95,7 +98,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 			if cm == nil {
 				continue
 			}
-			mc := MRComment{ID: cm.ID, Body: cm.Body, CreatedAt: cm.Created, ReviewState: ReviewCommentSummary}
+			mc := MRComment{ID: cm.ID, IDNamespace: CommentNSIssueComment, Body: cm.Body, CreatedAt: cm.Created, ReviewState: ReviewCommentSummary}
 			if cm.Poster != nil {
 				mc.AuthorForgeUserID = cm.Poster.ID
 				mc.AuthorUsername = cm.Poster.UserName
@@ -128,7 +131,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 				continue
 			}
 			if r.Body != "" {
-				mc := MRComment{ID: r.ID, Body: r.Body, CreatedAt: r.Submitted, HeadSHA: r.CommitID, ReviewState: ReviewCommentSummary}
+				mc := MRComment{ID: r.ID, IDNamespace: CommentNSReview, Body: r.Body, CreatedAt: r.Submitted, HeadSHA: r.CommitID, ReviewState: ReviewCommentSummary}
 				if r.Reviewer != nil {
 					mc.AuthorForgeUserID = r.Reviewer.ID
 					mc.AuthorUsername = r.Reviewer.UserName
@@ -145,6 +148,7 @@ func (f *forgejo) ListMergeRequestComments(ctx context.Context, projectID, mrIID
 				}
 				mc := MRComment{
 					ID:          rc.ID,
+					IDNamespace: CommentNSReviewComment,
 					Body:        rc.Body,
 					CreatedAt:   rc.Created,
 					HeadSHA:     rc.CommitID,

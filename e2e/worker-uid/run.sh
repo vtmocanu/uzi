@@ -32,6 +32,7 @@ timeout --kill-after=30s "${WORKER_UID_TIMEOUT:-600}" docker run --rm --network 
   --test-name-pattern "$PATTERN" \
   /app/test/codex-launcher.test.ts /app/test/codex-executor.test.ts \
   /app/test/codex-shared-dir.test.ts /app/test/entrypoint-migration.test.ts \
+  /app/test/git-planning-diff.test.ts \
   > "$REPORT_DIR/results.xml"
 rc=$?
 set -e

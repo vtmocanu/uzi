@@ -471,6 +471,35 @@ describe("runReadOnlyModelPass — Codex advice routing (PRD #1429 M3)", () => {
     assert.equal(ran?.request.prompt, "hello");
   });
 
+  it("passes the refresh deny and the request's model, effort and timeout through to the factory and harness (PRD #2603)", async () => {
+    let built: { refresh?: string } | undefined;
+    let req: { model?: string; effort?: string; timeoutMs?: number } | undefined;
+    const buildHarness = (async (params: { refresh?: string }) => {
+      built = params;
+      return {
+        kind: "codex" as const,
+        run: async (request: { model?: string; effort?: string; timeoutMs?: number }) => {
+          req = request;
+          return { text: "x", end: { kind: "terminal", terminal: { outcome: "success" } } };
+        },
+      };
+    }) as never;
+    await runReadOnlyModelPass(
+      baseOpts({ token: undefined, model: "gpt-6-luna", effort: "low", timeoutMs: 30_000, codex: { runId: "r", binding: codexBinding as never, buildHarness, refresh: "deny" } }),
+    );
+    assert.equal(built?.refresh, "deny");
+    assert.deepEqual(req && { model: req.model, effort: req.effort, timeoutMs: req.timeoutMs }, { model: "gpt-6-luna", effort: "low", timeoutMs: 30_000 });
+    // Existing callers pass no refresh option: the key is absent.
+    let plain: object | undefined;
+    await runReadOnlyModelPass(
+      baseOpts({ token: undefined, codex: { runId: "r", binding: codexBinding as never, buildHarness: (async (p: object) => {
+        plain = p;
+        return { kind: "codex" as const, run: async () => ({ text: "x", end: { kind: "terminal", terminal: { outcome: "success" } } }) };
+      }) as never } }),
+    );
+    assert.equal(plain && "refresh" in plain, false);
+  });
+
   it("creates no ephemeral HOME dir for the Codex path", async () => {
     const before = new Set(await fs.readdir(os.tmpdir()));
     const buildHarness = (async () => ({

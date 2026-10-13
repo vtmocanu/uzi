@@ -61,6 +61,21 @@ export function RunDefaults() {
   const [crossCheckError, setCrossCheckError] = useState("");
   const [crossCheckWarning, setCrossCheckWarning] = useState("");
 
+  const toggleCodeCrossCheck = async (code: boolean) => {
+    setCrossCheckError("");
+    setCrossCheckWarning("");
+    setCrossCheckBusy(true);
+    try {
+      const response = await api.setCodeCrossCheckEnabled(code);
+      await refresh();
+      setCrossCheckWarning(response.warning ?? "");
+    } catch (err) {
+      setCrossCheckError(errorMessage(err, "Failed to update code cross-check"));
+    } finally {
+      setCrossCheckBusy(false);
+    }
+  };
+
   const togglePlanCrossCheck = async (plan: boolean) => {
     setCrossCheckError("");
     setCrossCheckWarning("");
@@ -219,6 +234,26 @@ export function RunDefaults() {
     }
   };
 
+  // PRD #2603: the per-user switch for the model-written Now line. A UserSettings field like
+  // mr_rework_enabled: null/absent reads as ON, only an explicit false opts out.
+  const [nowSummaryEnabled, setNowSummaryEnabled] = useState<boolean | null>(null);
+  const [nowSummaryBusy, setNowSummaryBusy] = useState(false);
+  const [nowSummaryError, setNowSummaryError] = useState("");
+
+  const toggleNowSummary = async (next: boolean) => {
+    setNowSummaryError("");
+    setNowSummaryBusy(true);
+    try {
+      const { settings } = await api.putMySettings({ now_summary_enabled: next });
+      setCommittedSettings(current => current && ({ ...current, now_summary_enabled: settings.now_summary_enabled }));
+      setNowSummaryEnabled(settings.now_summary_enabled ?? null);
+    } catch (err) {
+      setNowSummaryError(errorMessage(err, "Failed to update the Now line setting"));
+    } finally {
+      setNowSummaryBusy(false);
+    }
+  };
+
   // PRD #1551 M3: the grouped Harness-and-worker-models card. The default harness and
   // the two retained per-harness model lanes are ONE user decision saved in one PUT
   // (D1). Each of the three carries its own saved snapshot so their dirty state is
@@ -304,6 +339,7 @@ export function RunDefaults() {
       setDefaultEffort(eff);
       setSavedEffort(eff);
       setMrReworkEnabled(settings.mr_rework_enabled ?? null);
+      setNowSummaryEnabled(settings.now_summary_enabled ?? null);
       // PRD #1429 M4a, D3: harness-aware credential facts, computed on ALL secrets
       // (not the anthropic_token-only slice below, which the judge picker uses).
       setClaudeUsable(hasAnthropicToken(rows));
@@ -584,6 +620,15 @@ export function RunDefaults() {
           />
           <span className="text-fg">Plan cross-check · Required before implementation</span>
         </label>
+        <label className="flex items-center gap-3 text-sm">
+          <input type="checkbox" className="h-4 w-4 accent-brand"
+            aria-describedby="code-cross-check-help"
+            checked={user?.code_cross_check_enabled ?? false}
+            disabled={crossCheckBusy}
+            onChange={(e) => toggleCodeCrossCheck(e.target.checked)} />
+          <span className="text-fg">Code cross-check · Advisory before publication</span>
+        </label>
+        <p id="code-cross-check-help" className="text-sm text-muted">Adds the other model family's findings to the merge request; never blocks it</p>
         {committedSettings && <CrossCheckDefaults settings={committedSettings} />}
       </Card>
 
@@ -815,6 +860,25 @@ export function RunDefaults() {
           >
             Save summary model
           </Button>
+        </div>
+
+        <div className="space-y-2">
+          {nowSummaryError && <Alert message={nowSummaryError} />}
+          <label className="flex items-center gap-3 text-sm">
+            <input
+              type="checkbox"
+              className="h-4 w-4 accent-brand"
+              checked={nowSummaryEnabled !== false}
+              disabled={nowSummaryBusy || !committedSettings}
+              aria-describedby="now-summary-help"
+              onChange={(e) => toggleNowSummary(e.target.checked)}
+            />
+            <span className="text-fg">Model-written Now line</span>
+          </label>
+          <p id="now-summary-help" className="text-xs text-faint">
+            A small model summarises the current step of a running run, on your own credential. On by
+            default; your admin can also turn it off for the whole instance.
+          </p>
         </div>
       </Card>
 

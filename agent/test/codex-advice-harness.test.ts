@@ -13,6 +13,10 @@ import type { CodexProviderConfig } from "../src/codex/codex-harness.js";
 import type { AdviceRequest, AdviceResultPolicy } from "../src/harness.js";
 import type { CodexNotification, CodexTransport } from "../src/codex/transport.js";
 import type { Logger } from "../src/log.js";
+import { runReadOnlyModelPass } from "../src/model-pass.js";
+import { CodexAdviceCredentialBridge, CODEX_PRODUCTION_PROVIDER, makeCodexAdviceHarness } from "../src/codex/codex-executor.js";
+import { selectCodexBinding } from "../src/codex/select.js";
+import type { AdviceUsageSnapshot } from "../src/harness.js";
 import {
   createCodexAppServerAuth,
   type CodexAppServerAuthSession,
@@ -266,6 +270,8 @@ function makeHarness(
     dispose?: () => Promise<void>;
     disposeThrows?: boolean;
     log?: Logger;
+    authMode?: "subscription" | "api_key";
+    now?: () => Date;
   } = {},
 ): Bits {
   const transport = opts.transport ?? new FakeTransport();
@@ -288,6 +294,8 @@ function makeHarness(
     provider: opts.provider ?? provider,
     appServerAuth: opts.appServerAuth,
     credentialValue: opts.credentialValue,
+    ...(opts.authMode ? { authMode: opts.authMode } : {}),
+    ...(opts.now ? { now: opts.now } : {}),
     log: opts.log ?? noopLog,
   });
   return { harness, transport, launchSpecs, disposeCalls: () => disposeCalls };
@@ -1272,5 +1280,203 @@ describe("CodexAdviceHarness: launch is deadline-bound and disposed exactly once
     // Wait past the launch delay for the late disposer (work.then → disposeOnce) to run.
     await new Promise((r) => setTimeout(r, launchDelayMs + 80));
     assert.equal(disposeCalls, 1, "the late-resolving launch root is disposed EXACTLY once");
+  });
+});
+
+// --- PRD #2603 M2: gpt-6-luna and per-call usage ---------------------------------------
+
+function bdown(inputTokens: number, outputTokens: number, cachedInputTokens = 0) {
+  return { inputTokens, cachedInputTokens, cacheWriteInputTokens: 0, outputTokens, reasoningOutputTokens: 0, totalTokens: inputTokens + outputTokens };
+}
+
+function tokenUsage(total: ReturnType<typeof bdown>, last: ReturnType<typeof bdown>, threadId = "th-1", turnId = "tn-1"): CodexNotification {
+  return {
+    kind: "token_usage_updated",
+    method: "thread/tokenUsage/updated",
+    threadId,
+    turnId,
+    usage: { total, last, pricingEvidenceComplete: true },
+    params: { threadId, turnId },
+  };
+}
+
+const FIXED_NOW = () => new Date("2026-10-10T00:00:00Z");
+const LUNA = "gpt-6-luna";
+
+describe("CodexAdviceHarness: gpt-6-luna is in the contract (no fallback)", () => {
+  it("sends gpt-6-luna to the launcher, thread/start and turn/start unchanged", async () => {
+    const bits = makeHarness();
+    bits.transport.push(threadStarted()).push(agentMessage("ok")).push(turnCompleted("completed")).end();
+    await bits.harness.run(makeAdviceRequest({ model: LUNA, effort: "low" }), noThrowPolicy);
+    assert.equal(bits.launchSpecs[0]!.model, LUNA);
+    const thread = bits.transport.requests.find((r) => r.method === "thread/start")!.params as { model?: string };
+    const turn = bits.transport.requests.find((r) => r.method === "turn/start")!.params as { model?: string; effort?: string };
+    assert.equal(thread.model, LUNA);
+    assert.equal(turn.model, LUNA);
+    assert.equal(turn.effort, "low");
+  });
+});
+
+describe("CodexAdviceHarness: usage observer", () => {
+  it("reports the reconciled per-model tokens and table cost after every accepted note, ignoring duplicate, stale and foreign notes", async () => {
+    const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
+    const seen: AdviceUsageSnapshot[] = [];
+    bits.transport
+      .push(threadStarted())
+      .push(tokenUsage(bdown(100, 10), bdown(100, 10)))
+      .push(tokenUsage(bdown(100, 10), bdown(100, 10))) // duplicate
+      .push(tokenUsage(bdown(250, 30, 50), bdown(150, 20, 50)))
+      .push(tokenUsage(bdown(100, 10), bdown(100, 10))) // stale (lower cumulative)
+      .push(tokenUsage(bdown(9_000, 900), bdown(9_000, 900), "th-foreign"))
+      .push(agentMessage("Running the gate"))
+      .push(turnCompleted("completed"))
+      .end();
+    const result = await bits.harness.run(makeAdviceRequest({ model: LUNA, usageObserver: (u) => seen.push(u) }), noThrowPolicy);
+    assert.equal(result.text, "Running the gate");
+    const last = seen.at(-1)![LUNA]!;
+    // total 250 input of which 50 cached: 200 uncached; output 30.
+    assert.equal(last.inputTokens, 200);
+    assert.equal(last.cacheReadInputTokens, 50);
+    assert.equal(last.cacheCreationInputTokens, 0);
+    assert.equal(last.outputTokens, 30);
+    assert.equal(last.costStatus, "metered");
+    // luna low tier per response: (100 * 0.10 + 10 * 0.50) + (100 * 0.10 + 50 * 0.01 + 20 * 0.50) = 15 + 20.5 µ$.
+    assert.ok(Math.abs(last.costUSD! - 0.0000355) < 1e-12, `cost ${last.costUSD}`);
+    assert.equal(seen[0]![LUNA]!.outputTokens, 10);
+    assert.ok(seen.every((s) => Object.keys(s).join() === LUNA), "only the call's own model, never the foreign thread's");
+  });
+
+  it("without an auth mode the tokens are reported with an unreported cost", async () => {
+    const bits = makeHarness();
+    const seen: AdviceUsageSnapshot[] = [];
+    bits.transport.push(threadStarted()).push(tokenUsage(bdown(10, 2), bdown(10, 2))).push(agentMessage("x")).push(turnCompleted("completed")).end();
+    await bits.harness.run(makeAdviceRequest({ model: LUNA, usageObserver: (u) => seen.push(u) }), noThrowPolicy);
+    assert.deepEqual(seen.at(-1)![LUNA], { inputTokens: 10, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costStatus: "unreported" });
+  });
+
+  it("a fresh accountant per call: a second call never inherits the first call's usage", async () => {
+    const run = async (): Promise<AdviceUsageSnapshot> => {
+      const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
+      let snap: AdviceUsageSnapshot = {};
+      bits.transport.push(threadStarted()).push(tokenUsage(bdown(40, 4), bdown(40, 4))).push(agentMessage("x")).push(turnCompleted("completed")).end();
+      await bits.harness.run(makeAdviceRequest({ model: LUNA, usageObserver: (u) => (snap = u) }), noThrowPolicy);
+      return snap;
+    };
+    assert.deepEqual(await run(), await run());
+  });
+});
+
+describe("runReadOnlyModelPass on the Codex harness: usage delivered once", () => {
+  const baseOpts = (bits: Bits, over: Partial<Parameters<typeof runReadOnlyModelPass>[0]> = {}): Parameters<typeof runReadOnlyModelPass>[0] => ({
+    model: LUNA,
+    systemPrompt: "s",
+    prompt: "p",
+    homeRoot: "/tmp",
+    homePrefix: "uzi-now-",
+    label: "now",
+    timeoutMs: 5000,
+    graceMs: 20,
+    queryFn: (() => {
+      throw new Error("no Claude SDK on the Codex path");
+    }) as never,
+    denyReason: "x",
+    log: noopLog,
+    codex: { runId: "run-1", binding: {} as never, buildHarness: async () => bits.harness },
+    ...over,
+  });
+
+  it("settles with the reconciled usage exactly once (duplicate and stale notes uncounted)", async () => {
+    const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
+    bits.transport
+      .push(threadStarted())
+      .push(tokenUsage(bdown(100, 10), bdown(100, 10)))
+      .push(tokenUsage(bdown(100, 10), bdown(100, 10)))
+      .push(tokenUsage(bdown(50, 5), bdown(50, 5)))
+      .push(agentMessage("Running the gate"))
+      .push(turnCompleted("completed"))
+      .end();
+    const got: AdviceUsageSnapshot[] = [];
+    const text = await runReadOnlyModelPass(baseOpts(bits, { onUsage: (u) => got.push(u) }));
+    assert.equal(text, "Running the gate");
+    assert.equal(got.length, 1);
+    assert.equal(got[0]![LUNA]!.inputTokens, 100);
+    assert.equal(got[0]![LUNA]!.outputTokens, 10);
+    assert.ok(Math.abs(got[0]![LUNA]!.costUSD! - 0.000015) < 1e-12);
+  });
+
+  it("abort after a token notification posts the reconciled tokens and cost once, without a terminal frame", async () => {
+    const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
+    const ctrl = new AbortController();
+    const got: AdviceUsageSnapshot[] = [];
+    bits.transport.push(threadStarted()).push(tokenUsage(bdown(100, 10), bdown(100, 10)));
+    const p = runReadOnlyModelPass(baseOpts(bits, { signal: ctrl.signal, onUsage: (u) => got.push(u) }));
+    // Let the harness consume the note, then abort while the stream is waiting for more.
+    for (let i = 0; i < 50; i++) await new Promise<void>((r) => setImmediate(r));
+    ctrl.abort();
+    await assert.rejects(p, /aborted/);
+    assert.equal(got.length, 1);
+    assert.equal(got[0]![LUNA]!.inputTokens, 100);
+    assert.equal(got[0]![LUNA]!.costStatus, "metered");
+    assert.ok(Math.abs(got[0]![LUNA]!.costUSD! - 0.000015) < 1e-12);
+  });
+
+  it("abort with no token notification reports no tokens and no cost", async () => {
+    const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
+    const ctrl = new AbortController();
+    const got: AdviceUsageSnapshot[] = [];
+    bits.transport.push(threadStarted());
+    const p = runReadOnlyModelPass(baseOpts(bits, { signal: ctrl.signal, onUsage: (u) => got.push(u) }));
+    for (let i = 0; i < 50; i++) await new Promise<void>((r) => setImmediate(r));
+    ctrl.abort();
+    await assert.rejects(p, /aborted/);
+    assert.deepEqual(got, []);
+  });
+});
+
+describe("makeCodexAdviceHarness: refresh deny (PRD #2603, the Now summary shares the run's credential)", () => {
+  const SUB = { auth_mode: "subscription", access_token: "claim-tok", capability: "run-cap", generation: 3, chatgpt_account_id: "verified-account", chatgpt_plan_type: null };
+
+  async function runWithRefreshRequest(refresh: "deny" | undefined): Promise<{ refreshCalls: number; replied: "error" | "result" | "none" }> {
+    const selection = selectCodexBinding({ codex: SUB });
+    if (selection.kind !== "codex") throw new Error("expected a codex binding");
+    let refreshCalls = 0;
+    const client = {
+      releaseCodex: async () => ({ auth_mode: "subscription", access_token: "released-tok", generation: 3, chatgpt_account_id: "verified-account" }),
+      refreshCodex: async () => {
+        refreshCalls++;
+        return { access_token: "refreshed-tok", generation: 4, chatgpt_account_id: "verified-account", outcome: "advanced" };
+      },
+    };
+    const transport = new FakeTransport(authResponder);
+    const bridge = new CodexAdviceCredentialBridge("run-1", client as never, selection.binding);
+    const harness = await makeCodexAdviceHarness(
+      bridge,
+      CODEX_PRODUCTION_PROVIDER,
+      async () => ({ transport, cwd: "/isolated/work", dispose: async () => {} }),
+      noopLog,
+      undefined,
+      refresh,
+    );
+    transport
+      .push(threadStarted())
+      .push({ kind: "activity", method: "account/chatgptAuthTokens/refresh", requestId: 44, params: { reason: "unauthorized", previousAccountId: null } })
+      .push(agentMessage("ok"))
+      .push(turnCompleted("completed"))
+      .end();
+    try {
+      await harness.run(makeAdviceRequest({ model: LUNA }), noThrowPolicy);
+    } catch {
+      /* a poisoned auth owner may also fail the call; the reply below is what is asserted */
+    }
+    const reply = transport.responses.find((r) => r.requestId === 44)?.response as { error?: unknown; result?: unknown } | undefined;
+    return { refreshCalls, replied: reply === undefined ? "none" : reply.error !== undefined ? "error" : "result" };
+  }
+
+  it("never calls refreshCodex when denied: codex gets an error reply instead of the run's generation advancing", async () => {
+    assert.deepEqual(await runWithRefreshRequest("deny"), { refreshCalls: 0, replied: "error" });
+  });
+
+  it("control: without the deny the same request refreshes through the client", async () => {
+    assert.deepEqual(await runWithRefreshRequest(undefined), { refreshCalls: 1, replied: "result" });
   });
 });

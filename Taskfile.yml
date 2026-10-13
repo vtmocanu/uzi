@@ -286,6 +286,9 @@ tasks:
       - task: lint:shell
       - task: lint:yaml
       - task: check:skill-triage-render
+      # A web test importing an uncopied fixture passes gate:web but breaks the web image build (#2602).
+      - task: test:web-docker-fixtures
+      - task: check:web-docker-fixtures
       - task: lint:formula
       # Workflow linting (actionlint + zizmor). Grouped with the other lint:* checks;
       # like them it fail-open SKIPs when its tools are absent on a laptop and is
@@ -310,6 +313,12 @@ tasks:
       # a fake `go` + throwaway repos, no real sqlc and no network, proving 2/1/0 fire so
       # a gutted check cannot read green. The REAL drift check runs in gate:api, not here.
       - task: test:sqlc-drift-gate
+      # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
+      # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
+      - task: test:docker-pull-fallback
+      # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
+      # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
+      - task: test:web-nginx-cleanup
       # Hermetic fetch-retry contract for scan:secrets (scripts/scan-secrets.sh): a
       # fake `go install` failing then succeeding, no real gitleaks and no network,
       # proving a transient proxy failure is retried while a broken scan is not.
@@ -318,6 +327,7 @@ tasks:
       # golangci aliases and the outer Go-toolchain group. No registry lookup.
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
+      - task: test:forge-fake
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -353,12 +363,14 @@ tasks:
       # Hermetic regressions for the landing scripts: no network, forge or live PR.
       # They pin review routing, fail-closed quota timing and stale-base push behavior.
       - task: test:uzi-lander
+      - task: test:ci-safe-paths
       # hermetic (~1s, fake go + gofmt on PATH): fmt-check:api and fmt-check:controller run
       # the module toolchain's gofmt, not a stale PATH gofmt, and still fail closed.
       - task: test:fmt-check-toolchain
       # Offline fake-go contract: govulncheck install and child package loading use
       # the module-selected toolchain, preserving host/target settings and failures.
       - task: test:govulncheck-toolchain
+      - task: test:devbox-update
       - task: test:brew-tap-guard
       # cheapest-first: this whole-file duplicate check is sub-second, so it runs
       # before `scan:secrets`, which is deliberately last because it dominates.
@@ -388,11 +400,17 @@ tasks:
       # Sub-second, offline, index-only -- runs before `scan:secrets` too. A tree fact,
       # so it belongs in gate:repo.
       - task: check:mktemp-portability
+      - task: check:postgres-pin-parity
       # Over-cap SKILL.md guard: a repo skill whose SKILL.md exceeds the 65536-byte
       # runtime cap is dropped silently at run time (agent/src/repo-skills.ts:151), so it
       # looks committed but never loads. Sub-second, offline, tree-fact -- runs before
       # `scan:secrets` too. Belongs in gate:repo, not a component gate.
       - task: check:skill-size
+      # Per-file byte budgets on loaded agent guidance (AGENTS.md, .claude/rules/*.md), so
+      # growth toward the 64 KiB runtime cap is a reviewed edit. Offline tree fact; about 2-3 s
+      # locally (macOS, 2026-10-13), nearly all in the hermetic fixture test (the real-tree
+      # check is ~0.1 s), so it is not in the sub-second band.
+      - task: check:guidance-size
       # /api/v1 backward-compatibility gate (PRD #1908 Decision 11): oasdiff diffs the spec on
       # origin/main against the tree's and fails on any breaking change. It sits here, not in
       # gate:api, because CI's lint-repo job already runs `task gate:repo` (so no
@@ -414,6 +432,9 @@ tasks:
       - task: test:semgrep-parity
       - task: check:semgrep-parity
       - task: test:semgrep-gate
+      # Hermetic fixture tests only; aging real prices is advisory and never gates.
+      - task: test:pricing-freshness
+      - task: test:pricing-freshness-issue
       # Provider-token source-hygiene guard (PRD #1120 M3): an ADDITIONAL, independent
       # check (never a replacement for scan:secrets) that flags a NEWLY-ADDED complete
       # provider-token literal in tracked source EVEN when an inline //gitleaks:allow is
@@ -849,10 +870,6 @@ tasks:
       # (groupName "shellcheck" in renovate.json) folds them into ONE bump PR. A
       # single shared variable would have to be spliced into a `cmds:` line, which
       # this file's header bans.
-      #
-      # NOTE: temporarily downgraded to 0.10.0 to force a live Renovate bump-back
-      # PR (0.11.0 is latest; with no version delta Renovate opens nothing). This
-      # proves the wiring end to end; Renovate then bumps it back to 0.11.0.
       # renovate: datasource=github-releases depName=koalaman/shellcheck
       - ./scripts/lint-shell.sh warning 0.11.0
 
@@ -873,6 +890,11 @@ tasks:
       # directory (so a stray file up the tree could govern the gate), and `-c` on a
       # missing file exits 1 -- indistinguishable from "there are findings".
       - ./scripts/lint-yaml.sh .yamllint
+
+  test:ci-safe-paths:
+    desc: workflow safe-path skips, fallback conditions, cancellation and agent result gates
+    cmds:
+      - ruby scripts/ci-safe-paths.test.rb
 
   lint:actions:
     desc: actionlint + zizmor over .github/workflows (embedded shell + Actions hazards)
@@ -990,6 +1012,16 @@ tasks:
     cmds:
       - ./scripts/scan-secrets.test.sh
 
+  test:docker-pull-fallback:
+    desc: hermetic mirror-first, Docker Hub fallback contract for CI image pulls (fake docker, no network)
+    cmds:
+      - ./scripts/docker-pull-fallback.test.sh
+
+  test:web-nginx-cleanup:
+    desc: hermetic cleanup-ownership contract for assert-web-nginx.sh (fake docker/helm/yq, no network)
+    cmds:
+      - ./scripts/assert-web-nginx.test.sh
+
   test:sqlc-drift-gate:
     desc: hermetic exit-code contract for the sqlc-drift gate (fake go, no real sqlc, no network)
     cmds:
@@ -1004,6 +1036,11 @@ tasks:
     desc: hermetic Codex pin extraction, grouping and partial-update rejection
     cmds:
       - node ./scripts/renovate-codex-runtime.test.mjs
+
+  test:forge-fake:
+    desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
+    cmds:
+      - node --test e2e/forge-fake/issue-comments.test.mjs
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
@@ -1089,19 +1126,25 @@ tasks:
     cmds:
       - ./scripts/fmt-check-toolchain.test.sh
 
+  test:devbox-update:
+    desc: hermetic devbox workflow token isolation, validated lock transfer and proposal behavior
+    cmds:
+      - ./scripts/devbox-update.test.sh
+
   test:govulncheck-toolchain:
     desc: hermetic govulncheck module toolchain, host-native install, analysis environment and exit contract (fake go)
     cmds:
       - ./scripts/govulncheck-toolchain.test.sh
 
   test:uzi-lander:
-    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, and orphan run-PR claims
+    desc: hermetic tests of uzi-lander review routing, quota timing, CI discovery, required-check completeness, stale-base push guards, base-move tolerance, CHANGELOG union and release fold, the post-rebase CHANGELOG placement guard, orphan run-PR claims, and Go test failure attribution
     cmds:
       - ./.agents/skills/uzi-lander/scripts/lib/review-threads.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/sanitize.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/freshness.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/greptile-verdict.test.sh
       - ./.agents/skills/uzi-lander/scripts/lib/required-checks.test.sh
+      - ./.agents/skills/uzi-lander/scripts/lib/net-retry.test.sh
       - ./.agents/skills/uzi-lander/scripts/cr-rate-limit.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep.test.sh
       - ./.agents/skills/uzi-lander/scripts/land-prep-guards.test.sh
@@ -1117,7 +1160,9 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
       - ./.agents/skills/uzi-lander/scripts/orphans.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-run-ci.test.sh
+      - ./.agents/skills/uzi-lander/scripts/attribute-failures.test.sh
       - ./.agents/skills/uzi-lander/scripts/test-linux.test.sh
+      - python3 -B ./.agents/skills/uzi-lander/scripts/ci-timing-report.test.py
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)
@@ -1131,6 +1176,7 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+      - python3 -I -B scripts/release-ci-coverage.test.py
 
   test:agent-runtime-key:
     desc: offline fixture test of scripts/agent-runtime-key.sh (builds temp git repos; issue 1720)
@@ -1226,6 +1272,19 @@ tasks:
       # gate recipe) stays true. `task e2e:registry-doc` is the writer. See the header.
       - ./scripts/check-e2e-registry-doc.sh
 
+  test:web-docker-fixtures:
+    desc: hermetic exit-code contract for check:web-docker-fixtures (throwaway git repos, no network), tally-guarded
+    cmds:
+      - ./scripts/check-web-docker-fixtures.test.sh
+
+  check:web-docker-fixtures:
+    desc: every fixtures/ path a web source statically imports is copied into web/Dockerfile and web/Dockerfile.mock
+    cmds:
+      # The web image builds copy only an explicit fixtures/ list, then type-check the
+      # tests in `npm run build`; an uncopied static import passes gate:web and breaks
+      # build-web and the KinD smoke only (#2602). Exit 2 = instrument broken.
+      - ./scripts/check-web-docker-fixtures.sh
+
   check:no-binary-text:
     desc: no NEW text-extension source file is git-binary or carries control bytes, with a canary proving the detector fired
     cmds:
@@ -1238,6 +1297,13 @@ tasks:
       # (instrument broken). The explicit canary arg makes this echo show what is scanned.
       # See the script header.
       - ./scripts/check-binary-text.sh scripts/binary-text-canary.go
+
+  check:postgres-pin-parity:
+    desc: docker-compose.yml and ci.yml's mirrored postgres service pin the same tag and digest, with hermetic 0/1/2 fixtures
+    cmds:
+      # ci.yml pulls postgres through mirror.gcr.io (#2621), so Renovate sees two packages;
+      # renovate.json groups them (#2622) and this fails the gate if they still drift.
+      - ./scripts/check-postgres-pin-parity.test.sh
 
   check:mktemp-portability:
     desc: no tracked *.sh carries a `mktemp -t <name>` template with too few X's (dies on GNU coreutils), with a canary proving the detector fired
@@ -1305,6 +1371,19 @@ tasks:
       # canary arg makes this echo show what is scanned. See the script header.
       - ./scripts/check-skill-size.sh scripts/skill-size-canary.txt .agents/skills
 
+  check:guidance-size:
+    desc: AGENTS.md and .claude/rules/*.md stay within per-file byte budgets (AGENTS.md at or under the 64 KiB runtime cap), with a canary proving the detector fired
+    cmds:
+      # AGENTS.md is dropped silently at run time when strictly larger than
+      # REPO_INSTRUCTIONS_MAX_BYTES (64 KiB, agent/src/repo-instructions.ts); the rules files
+      # are not loaded by worker runs, only by interactive Claude Code sessions. scripts/guidance-size-budgets.tsv holds one budget per
+      # file, so growth is a reviewed edit. CLAUDE.md is a symlink to AGENTS.md and is counted
+      # once, via AGENTS.md. Excluded: .claude/agents/*.md (upstream-synced roster),
+      # .claude/agent-team.md (generated manifest), skills (check:skill-size),
+      # ARCHITECTURE.md and docs/. The hermetic test runs first, then the real tree.
+      - ./scripts/check-guidance-size.test.sh
+      - ./scripts/check-guidance-size.sh scripts/guidance-size-canary.txt scripts/guidance-size-budgets.tsv
+
   check:token-literals:
     desc: no NEW complete provider-token-shaped literal in tracked source (even with an inline //gitleaks:allow), with canaries proving the detector fired
     cmds:
@@ -1329,12 +1408,23 @@ tasks:
       - ./scripts/assert-worker-tag-decoupled.sh
 
   render:openshift-check:
-    desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) render as documented
+    desc: assert the OpenShift/OKD chart knobs (HTTPRoute, nullable ids, DNS ports, OVN egress, SCC) and the DB capacity render as documented
     cmds:
       # Offline (the CNPG subchart is stripped), needs helm + yq. Not in gate:repo (the
       # lint job lacks helm); CI runs it in the helm-chart job. See the script header and
-      # docs/openshift.md.
+      # docs/openshift.md. Also runs the DB capacity render check (the api's
+      # DB_STORAGE_CAPACITY_BYTES derived from the database storage size), so CI's
+      # helm-chart job enforces it without a workflow edit.
       - ./scripts/assert-openshift-render.sh
+      - ./scripts/assert-db-capacity-render.sh
+
+  render:db-capacity-check:
+    desc: assert the chart renders the api's DB_STORAGE_CAPACITY_BYTES from the database storage size
+    cmds:
+      # Standalone, NOT wired into gate:repo/gate: the lint job lacks helm. Offline
+      # (CNPG subchart stripped), non-vacuous, needs helm + yq. Also run by
+      # render:openshift-check.
+      - ./scripts/assert-db-capacity-render.sh
 
   render:drain-knobs-check:
     desc: assert the controller Deployment renders the drain-deadline + force-roll knobs (PRD 422 M5)
@@ -2301,6 +2391,27 @@ tasks:
     cmds:
       - npm run check-docs
 
+  check:release-metadata:
+    desc: validate the tagged chart and bundled changelog before publication
+    cmds:
+      - task: check-changelog:web
+      - task: test:release-changelog-parity
+      - ./scripts/check-release-chart.sh
+      - task: render:worker-tag-check
+      - task: render:openshift-check
+      - task: render:drain-knobs-check
+      - task: render:ephemeral-docker-check
+      - task: render:ephemeral-lease-check
+      # Reuse the tracked-tree scanner and its canaries instead of adding a weaker
+      # diff-only scanner. The parent supplies code coverage, not new-text scanning.
+      - task: scan:secrets
+
+  test:release-changelog-parity:
+    desc: compare the bundled changelog with release note extraction
+    dir: web
+    cmds:
+      - npx --no-install vitest run src/lib/changelog.parity.test.ts
+
   check-changelog:web:
     desc: assert the newest released CHANGELOG section matches Chart.yaml version
     dir: web
@@ -2392,7 +2503,7 @@ tasks:
 
   # ----------------------------------------------------------- agent (npm) ----
   test:codex-refresh-lostreply-e2e:
-    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker)
+    desc: Linux-only combined Codex lost refresh reply proof (real HTTP, Postgres and worker), plus the checkpoint chain bridge
     preconditions:
       - sh: '[ "$(uname -s)" = Linux ]'
         msg: 'test:codex-refresh-lostreply-e2e is Linux-only; requires the Linux-only session-copy fixture'
@@ -2406,9 +2517,51 @@ tasks:
           (cd agent && npm ci --ignore-scripts)
           task deps-check:agent
         fi
+      # Issue #2733: the agent<->broker checkpoint chain bridge rides this target on purpose.
+      # `test-codex-refresh-lostreply-e2e` is the only CI job that has Go, Node AND the agent's
+      # installed dependencies, and `.github/workflows` is deliberately untouched (the worker PAT
+      # cannot push it), so calling it here is the wiring. It runs right after the deps check and
+      # before the Postgres-backed step: the bridge needs no database, so a Docker or Postgres
+      # flake cannot skip it.
+      - task: test:checkpoint-chain-bridge
       - |
         mkdir -p .uzi/scratch
         UZI_CODEX_REFRESH_LOSTREPLY_E2E=1 TMPDIR="{{.ROOT_DIR}}/.uzi/scratch" ./e2e/run-store-it.sh
+
+  test:checkpoint-chain-bridge:
+    desc: real agent RunRunner checkpoint chain through the real pushbroker.Publish (needs Node and agent deps)
+    preconditions:
+      - sh: command -v node && node -e 'if (Number(process.versions.node.split(".")[0]) < 24) process.exit(1)'
+        msg: 'test:checkpoint-chain-bridge requires Node 24 or newer (the agent fixture runs under tsx)'
+      - sh: command -v go
+        msg: 'test:checkpoint-chain-bridge requires Go (the bridge is a Go test)'
+    cmds:
+      - |
+        if ! task deps-check:agent; then
+          (cd agent && npm ci --ignore-scripts)
+          task deps-check:agent
+        fi
+      - |
+        # The log lives under .uzi/scratch (inside the worktree, gitignored), not /tmp.
+        # -buildvcs=false: a linked worktree cannot stamp VCS info. -race: the test's loopback
+        # server records publishes from handler goroutines, and the sibling e2e leg runs -race too. -count=1: no
+        # silent-green from Go's test cache. -v: the RUN/PASS/SKIP lines below are read from it.
+        mkdir -p .uzi/scratch
+        LOG="$(mktemp "{{.ROOT_DIR}}/.uzi/scratch/checkpoint-chain-bridge-log.XXXXXX")"
+        rc=0
+        (cd api && UZI_CHECKPOINT_CHAIN_BRIDGE=1 go test -buildvcs=false -count=1 -race -v \
+          -run '^TestAgentCheckpointChainBridge$' ./internal/pushbroker/) > "$LOG" 2>&1 || rc=$?
+        cat "$LOG"
+        [ "$rc" -eq 0 ] || { echo "checkpoint chain bridge failed (exit $rc): $LOG" >&2; exit 1; }
+        # A named RUN and PASS are mandatory and any SKIP fails: the test skips silently when its
+        # gate variable is unset, which would read as green (same discipline as e2e/run-store-it.sh).
+        if ! grep -q '^=== RUN   TestAgentCheckpointChainBridge$' "$LOG" ||
+          ! grep -q '^--- PASS: TestAgentCheckpointChainBridge ' "$LOG" ||
+          grep -q -- '--- SKIP:' "$LOG"; then
+          echo "checkpoint chain bridge did not run and pass without skips: $LOG" >&2
+          exit 1
+        fi
+        rm -f "$LOG"
 
   deps-check:agent:
     desc: agent - is node_modules stale? (declared ranges AND resolved lockfile, offline)
@@ -2751,6 +2904,18 @@ tasks:
     # tree's agent/src against it, and CQ_BUILD_ARGS="--network host" where the build needs it.
     cmds:
       - ./e2e/clone-quiescence/run.sh
+
+  test:web-nginx:
+    desc: Opt-in assert the three web nginx configs gzip and cache static assets and keep security headers (#2662)
+    # Runs the digest-pinned nginx image from web/Dockerfile once per config (web/nginx.conf,
+    # web/nginx.mock.conf and the chart's rendered web-configmap.yaml) beside a stub api, and
+    # checks gzip, Cache-Control and security headers on real responses. Requires a working
+    # docker daemon plus helm, yq and curl. NOT wired into gate, gate:repo or gate:web
+    # (gate:repo does not require Docker or Helm); CI runs it in the path-filtered
+    # test-web-nginx job (#2663). Exit 2 means the instrument is broken, 1 means a property failed, and
+    # task reports either failure as 201.
+    cmds:
+      - ./scripts/assert-web-nginx.sh
 
   test:provision-path-split:
     desc: Opt-in build and run the worker-image provision PATH and Codex command fixture (#1685)
@@ -3100,6 +3265,23 @@ tasks:
       - rm -f api/internal/uzidocs/embed/*.md
       - cp docs/*.md api/internal/uzidocs/embed/
 
+  test:pricing-freshness:
+    desc: hermetic pricing freshness CLI schema and calendar tests
+    cmds:
+      - bash scripts/pricing-freshness.test.sh
+
+  test:pricing-freshness-issue:
+    desc: hermetic test of the weekly pricing freshness tracking-issue sync (stub gh)
+    cmds:
+      - bash scripts/pricing-freshness-issue.test.sh
+
+  # Explicit writer only; the codexprice mirror test detects drift in gates.
+  codex-pricing:sync:
+    desc: mirror canonical agent Codex pricing bytes into the API embed package
+    cmds:
+      - mkdir -p api/internal/codexprice
+      - cp agent/src/codex/codex-pricing.json api/internal/codexprice/codex-pricing.json
+
   # e2e:registry-doc regenerates the phase-registry table in e2e/README.md from the
   # e2e/phases/NN-*.sh headers and splices it between the registry:begin/end markers.
   # NOT a gate target and NOT under gate: it WRITES the tree; check:e2e-registry-doc
@@ -3138,6 +3320,16 @@ tasks:
     dir: api
     cmds:
       - go run ./cmd/roleparity
+
+  # Offline advisory: findings exit 0; invalid inputs/instrument failures exit 2.
+  # Deliberately absent from gates: only test:pricing-freshness is a gate member.
+  nudge:pricing:
+    desc: 'pricing freshness NUDGE - recorded verification and promotional review dates (never gates)'
+    # Pass findings through unchanged, including machine-readable --json output.
+    silent: true
+    interactive: true
+    cmds:
+      - bash scripts/pricing-freshness.sh {{.CLI_ARGS}}
 
   # Same contract as nudge:roles: never in a gate, exits 0 on any drift. It
   # compares each builtin byte for byte with the upstream product-agents/ file at

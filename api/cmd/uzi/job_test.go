@@ -1,12 +1,14 @@
 package main
 
 import (
+	"errors"
 	"os"
 	"path/filepath"
 	"strings"
 	"syscall"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/clitoken"
@@ -323,5 +325,67 @@ func TestJobRefusesAdminToken(t *testing.T) {
 	_, _, code, built = runWithToken(t, fakeEnv(nil), "uzc_"+strings.Repeat("d", 43), "job", "list")
 	if code != uzicli.ExitOK || !built {
 		t.Errorf("a uzc_ token must proceed: exit = %d built = %v", code, built)
+	}
+}
+
+func TestJobCreateLongPromptAndInputFileFailures(t *testing.T) {
+	for _, flagKind := range []string{"prompt-file", "input"} {
+		for _, kind := range []string{"missing", "directory"} {
+			t.Run(flagKind+"/"+kind, func(t *testing.T) {
+				dir := t.TempDir()
+				// Fixed short components exceed the render cap without exceeding NAME_MAX.
+				for range 8 {
+					dir = filepath.Join(dir, "nested-long-path-component")
+				}
+				if err := os.MkdirAll(dir, 0o700); err != nil {
+					t.Fatal(err)
+				}
+				path := filepath.Join(dir, "input.txt")
+				what := "prompt file"
+				args := []string{"job", "create", "--type", "research"}
+				if flagKind == "input" {
+					what = "input file for in"
+				}
+				var wantReason string
+				switch kind {
+				case "missing":
+					_, err := os.Stat(path)
+					var pe *os.PathError
+					if !errors.As(err, &pe) {
+						t.Fatalf("missing child stat = %v, want PathError", err)
+					}
+					wantReason = "cannot read " + what + ": " + pe.Err.Error()
+				case "directory":
+					path = dir
+					wantReason = what + " is not a regular file"
+				}
+				if utf8.RuneCountInString(path) <= 200 {
+					t.Fatalf("fixture path is too short: %q", path)
+				}
+				if flagKind == "input" {
+					args = append(args, "--prompt", "p", "--input", "in=@"+path)
+				} else {
+					args = append(args, "--prompt-file", path)
+				}
+				fc := &uzicli.FakeClient{JobCreated: sampleJob()}
+				out, errOut, code := runCLI(t, fakeEnv(fc), args...)
+				if code != uzicli.ExitUsage || out != "" {
+					t.Errorf("exit = %d, stdout = %q; want exit %d and no stdout", code, out, uzicli.ExitUsage)
+				}
+				if !strings.HasPrefix(errOut, "uzi: "+wantReason+": \"") {
+					t.Errorf("reason must precede path: stderr = %q, want reason %q", errOut, wantReason)
+				}
+				if !strings.HasSuffix(errOut, "…\n") || strings.Count(errOut, "\n") != 1 {
+					t.Errorf("stderr must be one truncated line: %q", errOut)
+				}
+				if n := utf8.RuneCountInString(errOut); n > len("uzi: ")+200+1+1 {
+					t.Errorf("stderr has %d runes, exceeds prefix + 200 + ellipsis + newline", n)
+				}
+				assertNoTerminalControl(t, "long job file failure", errOut)
+				if len(fc.JobCreateReqs) != 0 {
+					t.Errorf("a job was created after a failed local read: %v", fc.JobCreateReqs)
+				}
+			})
+		}
 	}
 }

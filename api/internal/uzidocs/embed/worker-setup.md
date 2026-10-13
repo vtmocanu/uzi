@@ -466,6 +466,13 @@ The one exception is on the Claude run lane: `Read` may open a file directly
 inside that run's own SDK tool-result spill directory (the "Output too large ...
 Full output saved to" file); Write, Edit, Glob, Grep and the other lanes keep the
 worktree-only rule (see [ADR 2332](../adr/2332-sdk-spill-read-allowance.md)).
+The read-only Plan cross-check Claude checker (for a Codex lead) is stricter:
+`Read`, `Grep` and `Glob` only, with one path guard that confines them to its
+own checkout, apart from its own SDK spill files under its home. It also denies
+absolute, home-relative and `..` Glob/Grep patterns as defense in depth; the
+runner uid it runs as is the boundary, not that pattern check. See
+[Cross-check](./cross-check.md#claude-checker-isolation).
+
 This is a tool policy, not a promise that every shell command is filesystem
 confined: Claude's Bash guardrail screens commands but does not jail paths;
 Codex also screens the shell working directory, and uses Landlock only when
@@ -628,9 +635,14 @@ below.
 controller-managed k8s worker (see [Hosted workers](./hosted-workers.md)) the cap
 comes from the chart value `workers.maxConcurrentRuns` (default 1), which the
 controller renders into the pod's `WORKER_MAX_CONCURRENT_RUNS` env for you. Raising
-it is an operator action: update the controller/chart configuration and size
-the preset to hold that many concurrent runs. Desired spec changes use the
-existing worker roll process. It's the same knob described above, and raising
+it is an operator action: apply updated chart values with the new cap. The
+controller Deployment gets the updated `UZI_WORKER_MAX_CONCURRENT_RUNS` env and
+restarts; the restarted controller renders a changed worker pod-template hash.
+Reconciliation then rolls each worker under the existing drain rules: busy workers
+are cordoned and allowed to finish, bounded by the drain deadline and the operator
+force-roll override (see [ADR-422](../adr/0422-decouple-worker-version.md)). No new
+published controller or chart release is required. Size the preset to hold that
+many concurrent runs. It's the same knob described above, and raising
 it opts into the same intra-user residuals just covered. An ephemeral (run-bound)
 hosted worker is recorded with a run cap of 1, whatever it advertises, since
 its run lane serves its bound run (or an eligible lease follow-up). Its separate
@@ -647,14 +659,22 @@ worker values fall back to 1. Zero disables lane advertisement and polling;
 it does not turn checks into ordinary run-slot work. The worker registers
 its slot count even when zero.
 
-A Claude lead can hold its run slot while its read-only Codex checker uses
-a cross-check slot on the same worker. The worker must support the required
-Codex harness/model. The reverse direction and Code cross-check are not
-shipped. See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
+A lead can hold its run slot while its read-only opposite-family checker
+uses a cross-check slot on the same worker: a Codex checker for a Claude lead
+(the worker must support the required Codex harness/model), or a Claude
+checker for a Codex lead (the worker must advertise
+`cross_check_codex_lead_v1`). See [Cross-check](./cross-check.md#2-wait-for-the-checked-plan) for
 own-worker preference, the 2-minute default fallback grace and mixed-image
 rollout behavior. Cordoning permits the worker's own pinned child to finish;
 quarantine and maintenance fencing still block claims. Shutdown and draining
 include the cross-check pool.
+
+[Code cross-check](./cross-check.md#code-cross-check) uses the same lane, but
+its checker is pinned to the lead's own worker, with no fallback to another
+worker. A worker advertises `cross_check_code_v1` only with a cross-check lane
+above zero and the Codex harness; a lead on a worker without it records
+"Code cross-check incomplete: worker unsupported". Deploy the api and its
+migrations before such workers.
 
 **Settings → Workers** shows separate capacity, for example `1/1 runs` and
 `1/1 cross-checks`. A live checker remains visible even if re-registration

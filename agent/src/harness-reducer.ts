@@ -96,6 +96,18 @@ export class RunTurnReducerImpl implements RunTurnReducer {
           ),
         );
         break;
+      case "usage_record":
+        reduction.messages.push({
+          kind: "status",
+          ...event.attribution,
+          payload: {
+            event: "codex_response_usage",
+            usage_response_id: event.responseId,
+            usage: event.usage,
+            model: event.model,
+          },
+        });
+        break;
       case "frame":
         this.acceptFrame(event, reduction);
         break;
@@ -195,7 +207,9 @@ export class RunTurnReducerImpl implements RunTurnReducer {
       reduction.progress = s.progress;
     }
     if (s.done) this.result.done = true;
+    if (s.nonClosing !== undefined) this.result.nonClosing = s.nonClosing;
     if (s.checkpoint) this.result.checkpoint = true;
+    if (s.parkRun) this.result.parkRun = true;
     if (s.prdDonePath !== undefined) this.result.prdDonePath = s.prdDonePath;
     if (s.milestonesCompleted !== undefined) {
       this.result.milestonesCompleted = s.milestonesCompleted;

@@ -764,13 +764,13 @@ func (m tuiModel) ciEmptyState() string {
 // ciFooter is the one-line key legend for the ci screen (D13). enter/→ opens the CI-run drill-in
 // (jobs + steps, PRD #1255 M6). R is dropped when only one repo is enabled.
 func (m tuiModel) ciFooter() string {
-	parts := []string{m.keyHint("↑↓", "move"), m.keyHint("enter", "jobs"), m.keyHint("/", "filter")}
+	parts := []footerHint{m.footerHint("↑↓", "move"), m.footerHint("enter", "jobs"), m.footerHint("/", "filter")}
 	if len(m.repos) > 1 {
-		parts = append(parts, m.keyHint("R", "repo"))
+		parts = append(parts, m.footerHint("R", "repo"))
 	}
-	parts = append(parts, m.keyHint("tab", "views"), m.keyHint("r", "refresh"),
-		m.keyHint("?", "keys"), m.keyHint("q", "quit"))
-	return m.withSplitNote(" " + strings.Join(parts, m.pal.faint.Render(" · ")))
+	parts = append(parts, m.footerHint("tab", "views"), m.footerHint("r", "refresh"),
+		m.footerHint("?", "keys"), m.footerHint("q", "quit"))
+	return m.withSplitNote(m.fitFooterHints(parts, m.width))
 }
 
 // ciLink wraps an already-styled `<Name> #<Number>` segment in an OSC-8 hyperlink to the run's

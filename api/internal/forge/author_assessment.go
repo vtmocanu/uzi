@@ -29,6 +29,7 @@ type evidenceResult struct {
 	err   error
 }
 type authorEvidence struct {
+	ctx     context.Context
 	mu      sync.Mutex
 	entries map[evidenceKey]evidenceResult
 }
@@ -37,22 +38,22 @@ type authorEvidence struct {
 // caller supplies its deadline and must never reuse this context across operations.
 // It does not impose a decoded-memory bound or change SDK retries.
 func BeginAuthorAssessment(ctx context.Context) context.Context {
-	return context.WithValue(ctx, assessmentKey{}, &authorEvidence{entries: make(map[evidenceKey]evidenceResult)})
+	return context.WithValue(ctx, assessmentKey{}, &authorEvidence{ctx: ctx, entries: make(map[evidenceKey]evidenceResult)})
 }
 
 // assessmentEvidence serializes repository evidence reads within an operation.
 // Each read runs once; a failed read does not discard completed independent reads.
-func assessmentEvidence[T any](ctx context.Context, key evidenceKey, fetch func() (T, error)) (T, error) {
+func assessmentEvidence[T any](ctx context.Context, key evidenceKey, fetch func(context.Context) (T, error)) (T, error) {
 	state, _ := ctx.Value(assessmentKey{}).(*authorEvidence)
 	if state == nil {
-		return fetch()
+		return fetch(ctx)
 	}
 	state.mu.Lock()
 	defer state.mu.Unlock()
 	if v, ok := state.entries[key]; ok {
 		return v.value.(T), v.err
 	}
-	v, err := fetch()
+	v, err := fetch(state.ctx)
 	state.entries[key] = evidenceResult{v, err}
 	return v, err
 }

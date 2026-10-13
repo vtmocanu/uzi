@@ -131,6 +131,7 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
 });
 
 function renderPage() {
@@ -180,6 +181,79 @@ describe("AdminSettings — Updates card (PRD #836 M5)", () => {
     fireEvent.click(btn);
     await waitFor(() => expect(mockApi.checkReleaseNow).toHaveBeenCalledTimes(1));
     expect(await screen.findByText("Freshly re-checked release")).toBeTruthy();
+  });
+
+  it("keeps the fresh stable version panel after Check now returns a partial error", async () => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-01T12:00:00Z"));
+    mockApi.checkReleaseNow.mockResolvedValue({
+      release_check: releaseCheck({
+        status: "error",
+        partial: true,
+        message: "RC fetch failed: upstream unavailable",
+        latest_tag: "v0.6.0",
+        latest_name: "Fresh stable security release",
+        checked_at: "2026-09-01T11:58:00Z",
+        security: true,
+      }),
+    });
+    renderPage();
+    const btn = await screen.findByRole("button", { name: /check now/i });
+    expect(screen.getByText("v0.5.0")).toBeTruthy();
+    expect(screen.getByText("Hosted worker drain controls")).toBeTruthy();
+
+    fireEvent.click(btn);
+    expect(await screen.findByText(
+      "Stable release updated, but RC check failed — RC fetch failed: upstream unavailable",
+    )).toBeTruthy();
+    expect(mockApi.checkReleaseNow).toHaveBeenCalledTimes(1);
+    expect(screen.getByText("v0.4.2")).toBeTruthy();
+    expect(screen.getByText("v0.6.0")).toBeTruthy();
+    expect(screen.getByText("Fresh stable security release")).toBeTruthy();
+    expect(screen.queryByText("v0.5.0")).toBeNull();
+    expect(screen.queryByText("Hosted worker drain controls")).toBeNull();
+    expect(screen.getByText("Security release")).toBeTruthy();
+    expect(screen.getByText(
+      "v0.6.0 is flagged as a security release — update at the next opportunity.",
+    )).toBeTruthy();
+    expect(screen.getByText("Checked 2m ago.")).toBeTruthy();
+  });
+
+  it.each([
+    { label: "omitted", over: {} },
+    { label: "false", over: { partial: false } },
+  ])("hides cached stable facts after Check now returns a full error with partial $label", async ({ over }) => {
+    vi.spyOn(Date, "now").mockReturnValue(Date.parse("2026-09-01T12:00:00Z"));
+    mockApi.checkReleaseNow.mockResolvedValue({
+      release_check: releaseCheck({
+        ...over,
+        status: "error",
+        message: "stable fetch failed: rate limited",
+        security: true,
+      }),
+    });
+    renderPage();
+    const btn = await screen.findByRole("button", { name: /check now/i });
+    expect(screen.getByText("v0.4.2")).toBeTruthy();
+    expect(screen.getByText("v0.5.0")).toBeTruthy();
+    expect(screen.getByText("Hosted worker drain controls")).toBeTruthy();
+    expect(screen.getByText("Checked 2d ago.")).toBeTruthy();
+
+    fireEvent.click(btn);
+    expect(await screen.findByText(
+      "Release check unavailable — stable fetch failed: rate limited",
+    )).toBeTruthy();
+    expect(mockApi.checkReleaseNow).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText("v0.4.2")).toBeNull();
+    expect(screen.queryByText("v0.5.0")).toBeNull();
+    expect(screen.queryByText("Hosted worker drain controls")).toBeNull();
+    expect(screen.queryByText("Update available")).toBeNull();
+    expect(screen.queryByText("Security release")).toBeNull();
+    expect(screen.queryByRole("link", { name: /full notes on github/i })).toBeNull();
+    expect(screen.queryByText(/Worker drain deadline controls/)).toBeNull();
+    expect(screen.getByText(
+      "v0.5.0 is flagged as a security release — update at the next opportunity.",
+    )).toBeTruthy();
+    expect(screen.getByText("Checked 2d ago.")).toBeTruthy();
   });
 
   it("persists the master toggle through updateSettings with the string key", async () => {

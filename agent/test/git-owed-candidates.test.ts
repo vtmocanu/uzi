@@ -529,7 +529,21 @@ describe("issue1924 M2 owed candidates", () => {
   }
 
   for (const mode of ["absent", "duplicate", "malformed", "unreadable", "ambiguous_legacy", "case_collision", "failed_enumeration"] as const) {
-    it(`existing head with ${mode} ownership refuses fetch without changing the old anchor`, async () => {
+    it(`existing head with ${mode} ownership refuses fetch without changing the old anchor`, async t => {
+      // Probe this fixture's filesystem, rather than assuming a host platform.
+      if (mode === "case_collision") {
+        const probe = path.join(fx.dataDir, "case-probe-lower");
+        fs.writeFileSync(probe, "", { flag: "wx" });
+        let caseSensitive: boolean;
+        try {
+          try { fs.statSync(path.join(fx.dataDir, "CASE-PROBE-LOWER")); caseSensitive = false; }
+          catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+            caseSensitive = true;
+          }
+        } finally { fs.unlinkSync(probe); }
+        if (!caseSensitive) { t.skip("fixture root folds case, so distinct colliding refs cannot exist"); return; }
+      }
       gitIn(bare, ["update-ref", `refs/uzi-runner/${BRANCH}`, base]);
       let restore = () => {};
       const key = `uzi-trackowner.${BRANCH}.owner`;
@@ -633,7 +647,9 @@ describe("issue1924 M2 owed candidates", () => {
   });
 
   for (const foreign of [false, true]) {
-    it(`stamp failure with ${foreign ? "foreign" : "same-run"} old stamp pins H2; pending blocks H3 and reseed`, async () => {
+    it(`stamp failure with ${foreign ? "foreign" : "same-run"} old stamp pins H2; pending blocks H3 and reseed`, {
+      skip: process.platform !== "linux" && "reseed requires Linux descriptor-pinned clone removal",
+    }, async () => {
       const h = root("H", [base]);
       if (foreign) opts.context = { ...opts.context, runId: "foreign-run" };
       updated(await fetch());
@@ -735,7 +751,9 @@ describe("issue1924 M2 owed candidates", () => {
   });
 
   for (const phase of ["committed", "same_stamp_failure", "foreign_stamp_failure"] as const) {
-    it(`loss of both sidecars after ${phase} never restores historical ownership`, async () => {
+    it(`loss of both sidecars after ${phase} never restores historical ownership`, {
+      skip: process.platform !== "linux" && "reseed requires Linux descriptor-pinned clone removal",
+    }, async () => {
       if (phase === "foreign_stamp_failure") opts.context = { ...opts.context, runId: "foreign-run" };
       const h = root("first"); updated(await fetch());
       opts.context = { ...positiveContext(), runId: RUN, generation: 2 };

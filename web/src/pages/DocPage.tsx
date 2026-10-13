@@ -1,4 +1,5 @@
-import { Link, useParams } from "react-router-dom";
+import { useEffect } from "react";
+import { Link, useLocation, useParams } from "react-router-dom";
 import { getDoc, isRoutableDoc } from "../lib/docs";
 import { DocMarkdown } from "../components/DocMarkdown";
 import { useAuth } from "../auth/AuthContext";
@@ -10,8 +11,20 @@ import { useAuth } from "../auth/AuthContext";
 // shell rather than the App-level redirect to `/`.
 export function DocPage() {
   const { slug = "" } = useParams();
+  const location = useLocation();
   const doc = getDoc(slug);
   const isAdmin = useAuth().user?.is_admin ?? false;
+
+  useEffect(() => {
+    if (!location.hash) return;
+    let id: string;
+    try {
+      id = decodeURIComponent(location.hash.slice(1));
+    } catch {
+      return;
+    }
+    document.getElementById(id)?.scrollIntoView({ block: "start" });
+  }, [slug, location.hash]);
 
   if (!doc || !isRoutableDoc(slug, isAdmin)) {
     return (

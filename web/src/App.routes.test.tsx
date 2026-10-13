@@ -56,6 +56,8 @@ class RouteErrorBoundary extends Component<
   }
 }
 
+// 30000 like the route-smoke tests below: the cold mock-mode graph import can exceed
+// Vitest's 10s default hook timeout under a full coverage run (#2424).
 beforeAll(async () => {
   vi.stubEnv("VITE_UZI_MOCK", "1");
   vi.resetModules();
@@ -70,7 +72,7 @@ beforeAll(async () => {
   // here anyway so it comes from the mock-mode graph, consistent with the file's
   // "never capture the build flag early" discipline.
   ({ getDoc } = await import("./lib/docs"));
-});
+}, 30000);
 
 afterAll(() => {
   vi.unstubAllEnvs();

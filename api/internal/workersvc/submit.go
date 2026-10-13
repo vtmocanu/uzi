@@ -9,6 +9,7 @@ import (
 	"math"
 	"strconv"
 	"strings"
+	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -148,7 +149,7 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			row store.RunUserInput
 		)
 		if sel != nil {
-			res, row, err = s.submitApproval(ctx, run, *sel, opts.ExpectedGateRevision)
+			res, row, err = s.submitApproval(ctx, userID, run, *sel, opts.ExpectedGateRevision, opts.OverrideCapabilities)
 		} else {
 			res, row, err = s.enqueueGateApproval(ctx, run, body, opts.ExpectedGateRevision)
 		}
@@ -206,12 +207,14 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 	// below (the generic `extend` already admits a paused row; the milestone `stop` branch is
 	// unconditional on status, so it would otherwise mis-handle a parked run). `extend` adds time and
 	// resumes in one action (ExtendAndResumeWallPark); `stop` caps the scope, grants the finalize
-	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged.
+	// allowance, and resumes (StopWallPark); `cancel` falls through to CancelRunServerSide unchanged,
+	// because hasLivePoller reads every paused run as having no poller even while its kept worker
+	// heartbeats for other runs (issue #1969).
 	// PRD #1908 D-E: a job is never extended, on ANY extend path. Refuse it here, above the
 	// budget_exhausted wall-park branch (which routes to ExtendAndResumeWallPark with no kind
 	// filter) and the generic CTE (whose kind list admits a job).
 	if kind == "extend" && run.Kind == runkind.Job {
-		return SubmitInputResult{}, extendRefusalReason(run, 0, 0)
+		return SubmitInputResult{}, s.extendRefusal(run, 0, 0)
 	}
 	if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "budget_exhausted" {
 		switch kind {
@@ -227,10 +230,14 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 			if capSeconds == 0 {
 				return SubmitInputResult{}, ErrExtendDisabled
 			}
-			// secs > capSeconds can never apply and would overflow the CTE's int4 addition — reported
-			// as a cap violation here, keeping secs in [60, capSeconds] for the int32 casts below.
+			// The cap is per request. secs > capSeconds can never apply; reporting it here keeps
+			// secs in [60, capSeconds] for the int32 casts below.
 			if secs > capSeconds {
-				return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+				return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
+			}
+			// secs beyond the room left under MaxRunWallSeconds can never apply either.
+			if secs > s.extensionRoom(run) {
+				return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
 			}
 			return s.extendAndResumeWallPark(ctx, userID, run, secs, capSeconds)
 		case "stop":
@@ -306,9 +313,10 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 
 	// An `extend` (PRD #1189 M1) is an owner-only request to add wall-clock time ON TOP of the
 	// frozen budget. It ADDS @secs to runs.budget_extension_seconds (never mutating the immutable
-	// budget_wall_seconds) and writes a kind='extend' audit row in ONE statement, capped by the
-	// admin setting run_extension_cap_seconds (0 = extending disabled). Like `scope` the control
-	// is server-only — served to the worker as the column on the ACK/claim, excluded from
+	// budget_wall_seconds) and writes a kind='extend' audit row in ONE statement. The admin setting
+	// run_extension_cap_seconds is the PER-REQUEST maximum (0 = extending disabled); admission
+	// also requires room under MaxRunWallSeconds. Later served totals are not capped by it.
+	// Like `scope` the control is server-only — served to the worker as the column on the ACK/claim, excluded from
 	// ConsumeRunInputs — so it never routes through the worker's steering queue. A 0-row result
 	// is disambiguated into the 409 classes from the already-loaded run (extendRefusalReason).
 	// The projected total and deadline are computed BEFORE the CTE from the fetched row, so the
@@ -325,12 +333,16 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		if capSeconds == 0 {
 			return SubmitInputResult{}, ErrExtendDisabled
 		}
-		// secs is user input. A request larger than the whole cap can never be applied and,
-		// left unbounded, would overflow the CTE's int4 budget_extension_seconds + @secs
-		// addition — so it is reported as a cap violation here. After this, secs ∈ [60,
+		// secs is user input. The cap is per request: a request larger than it can never be
+		// applied, so it is reported as a cap violation here. After this, secs ∈ [60,
 		// capSeconds], keeping every int32 cast in submitExtend and the DB arithmetic in range.
 		if secs > capSeconds {
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
+		}
+		// A request beyond the room left under MaxRunWallSeconds can never apply either (the
+		// CTE enforces the same bound atomically; this names it without a write).
+		if secs > s.extensionRoom(run) {
+			return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
 		}
 		// The write is a helper taking secs/capSeconds as plain ints: crossing the function
 		// boundary is what keeps gosec G109 (strconv.Atoi result → int32) from firing at the
@@ -359,6 +371,11 @@ func (s *Service) submitInput(ctx context.Context, userID, runID uuid.UUID, kind
 		// CreateStopVerdictInput (no stop_kind='stopped') — the scope-capped disposition is
 		// stamped at finalize by the worker in m3, not here.
 		if milestoneIssueRun {
+			// PRD #1733: Stop on a provider hold is this same scope write followed by the owner's
+			// resume, so with nothing complete it would finalize nothing; refuse it up front.
+			if run.Status == "paused" && run.HoldReason.Valid && run.HoldReason.String == "provider_unavailable" && len(completed) < 1 {
+				return SubmitInputResult{}, ErrProviderHoldStopUnavailable
+			}
 			reason, _ := stripNUL(body)
 			reason = strings.TrimSpace(reason)
 			auditBody := fmt.Sprintf("stop → finalize %d completed milestone(s), start no further", len(completed))
@@ -717,6 +734,10 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 	return SubmitInputResult{ServerSide: true}, nil
 }
 
+// approveMilestoneAttempts bounds submitApproval's write attempts when an unbound approve keeps
+// losing the race with a republished milestone list (issue #2680).
+const approveMilestoneAttempts = 3
+
 // submitApproval enqueues an approve_plan carrying an agent selection (PRD #37):
 // validate against the run's real roster, then write the run's agent_source /
 // agent_exclusions and the worker-bound input body in one statement, so the row can
@@ -726,18 +747,7 @@ func (s *Service) cancelPendingOutcomeRun(ctx context.Context, userID uuid.UUID,
 // client's text: the worker parses it back with parseAgentSelection, and a raw
 // pass-through would hand an unvalidated string to the process that builds the
 // agent map.
-func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSelection, expected *int64) (SubmitInputResult, store.RunUserInput, error) {
-	roster, err := s.rosterFor(ctx, run, sel.Source, nil)
-	if err != nil {
-		return SubmitInputResult{}, store.RunUserInput{}, err
-	}
-	if err := validateSelection(sel, roster); err != nil {
-		return SubmitInputResult{}, store.RunUserInput{}, err
-	}
-	// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
-	// every approve_plan — both the selection-bearing path that reaches here and the
-	// nil-selection plain-enqueue path — so a plan can never be approved onto a worker that
-	// cannot run it, whichever path the client used.
+func (s *Service) submitApproval(ctx context.Context, userID uuid.UUID, run store.Run, sel AgentSelection, expected *int64, overrideCaps bool) (SubmitInputResult, store.RunUserInput, error) {
 	exclusions, err := encodeJSONArray(sel.Exclusions)
 	if err != nil {
 		return SubmitInputResult{}, store.RunUserInput{}, fmt.Errorf("encode agent exclusions: %w", err)
@@ -746,92 +756,156 @@ func (s *Service) submitApproval(ctx context.Context, run store.Run, sel AgentSe
 	if err != nil {
 		return SubmitInputResult{}, store.RunUserInput{}, fmt.Errorf("encode agent selection: %w", err)
 	}
-	// Issue #260 instrumentation: capture the live milestone freeze state on both sides of
-	// the approve-time freeze so a future human-gated dev-cluster run reveals what
-	// CreateApprovePlanInput saw. Best-effort: a snapshot read error is logged at Warn and
-	// NEVER aborts the approve.
-	before, beforeErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
-	if beforeErr != nil {
-		slog.Warn("workersvc: approve-freeze pre-read failed", "run_id", run.ID, "error", beforeErr)
-	}
-	// PRD #1226 M1 (D1): build the structural completion contract to freeze at the SAME
-	// approve freeze, ONLY for an interlocked run (completion_contract_version stamped at
-	// CreateRun). Build it from the SAME milestone source the query freezes —
-	// COALESCE(milestones_frozen, milestones_candidate) — preferring the fresh `before`
-	// snapshot read just above (so it matches what the freeze reads a line later), falling
-	// back to the run snapshot if that read failed. The query still guards the assignment
-	// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
-	// non-interlocked run passes NULL and stays legacy. A build error is best-effort:
-	// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
-	var completionContract []byte
-	if run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0 {
-		frozenSrc := run.MilestonesFrozen
-		candidateSrc := run.MilestonesCandidate
-		if beforeErr == nil {
-			frozenSrc = before.MilestonesFrozen
-			candidateSrc = before.MilestonesCandidate
+	// Issue #2680: the contract below is built in Go from a snapshot read of the milestone
+	// source, but CreateApprovePlanInput freezes the source as it is at WRITE time. The query
+	// therefore refuses (pgx.ErrNoRows, nothing written) when the source it would freeze is not
+	// the ContractSource this attempt built from, and an UNBOUND approve re-reads and tries again
+	// against the refreshed run, at most approveMilestoneAttempts times. A bound approve is not
+	// retried: its refusal is answered as a gate-revision mismatch (verdictNotWritten) and the
+	// client refetches.
+	for attempt := 1; ; attempt++ {
+		roster, err := s.rosterFor(ctx, run, sel.Source, nil)
+		if err != nil {
+			return SubmitInputResult{}, store.RunUserInput{}, err
 		}
-		src := frozenSrc
-		if len(src) == 0 {
-			src = candidateSrc
+		if err := validateSelection(sel, roster); err != nil {
+			return SubmitInputResult{}, store.RunUserInput{}, err
 		}
-		contract, cerr := buildCompletionContract(src)
-		if cerr != nil {
-			slog.Warn("workersvc: build completion contract at approve failed", "run_id", run.ID, "error", cerr)
+		// The capability approval gate (capabilityGate) is enforced UPSTREAM in SubmitInput for
+		// every approve_plan — both the selection-bearing path that reaches here and the
+		// nil-selection plain-enqueue path — so a plan can never be approved onto a worker that
+		// cannot run it, whichever path the client used. A retry re-runs it below (#2680).
+		// Issue #260 instrumentation: capture the live milestone freeze state on both sides of
+		// the approve-time freeze so a future human-gated dev-cluster run reveals what
+		// CreateApprovePlanInput saw. Best-effort: a snapshot read error is logged at Warn and
+		// NEVER aborts the approve.
+		before, beforeErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
+		if beforeErr != nil {
+			slog.Warn("workersvc: approve-freeze pre-read failed", "run_id", run.ID, "error", beforeErr)
+		}
+		// PRD #1226 M1 (D1): build the structural completion contract to freeze at the SAME
+		// approve freeze, ONLY for an interlocked run (completion_contract_version stamped at
+		// CreateRun). Build it from the SAME milestone source the query freezes —
+		// COALESCE(milestones_frozen, milestones_candidate) — preferring the fresh `before`
+		// snapshot read just above (so it matches what the freeze reads a line later), falling
+		// back to the run snapshot if that read failed. The query still guards the assignment
+		// (freezes once, only when contract IS NULL), so a re-approve never re-freezes. A
+		// non-interlocked run passes NULL and stays legacy. A build error is best-effort:
+		// log and pass NULL rather than fail the human approve (mirrors the #260 instrumentation).
+		//
+		// Issue #2680: a refusable attempt (the same interlocked, not-yet-frozen condition) also
+		// passes the exact source bytes the contract was built from as ContractSource, NIL
+		// included (nil = "I saw no source", so a candidate published meanwhile is refused and
+		// retried rather than frozen beside an empty-criteria contract), and keeps passing it when
+		// the build fails so that best-effort NULL-contract path never loops.
+		var (
+			completionContract []byte
+			contractSource     []byte
+		)
+		refusable := run.CompletionContractVersion.Valid && len(run.CompletionContract) == 0
+		if refusable {
+			frozenSrc := run.MilestonesFrozen
+			candidateSrc := run.MilestonesCandidate
+			if beforeErr == nil {
+				frozenSrc = before.MilestonesFrozen
+				candidateSrc = before.MilestonesCandidate
+			}
+			src := frozenSrc
+			if len(src) == 0 {
+				src = candidateSrc
+			}
+			if len(src) > 0 {
+				contractSource = src
+			}
+			contract, cerr := buildCompletionContract(src)
+			if cerr != nil {
+				slog.Warn("workersvc: build completion contract at approve failed", "run_id", run.ID, "error", cerr)
+			} else {
+				completionContract = contract
+			}
+		}
+		// PRD #1795 M2: the row is stamped with the gate binding of the row the UPDATE locked, and
+		// an expected revision joins the UPDATE predicate: a mismatch returns pgx.ErrNoRows having
+		// written no selection, no milestone/contract/budget freeze and no input.
+		row, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
+			RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
+			CompletionContract:   completionContract,
+			ContractSource:       contractSource,
+			ExpectedGateRevision: pgconv.Int8Ptr(expected),
+			// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
+			// this run's effective budget from its frozen milestone count, atomically with the
+			// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
+			// same config and never changes a budget frozen once.
+			RunMaxIterations:         int32(s.p.RunMaxIterations), //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
+			RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
+			MilestoneBudgetCap:       milestoneBudgetCap,
+			SizeBudgetFactorL:        sizeBudgetFactorL,
+			BudgetWallCeilingSeconds: budgetDurationSeconds(s.p.RunWallCeiling),
+		})
+		if err != nil {
+			if !errors.Is(err, pgx.ErrNoRows) || expected != nil || !refusable {
+				return SubmitInputResult{}, store.RunUserInput{}, err
+			}
+			// An unbound refusal on a refusable attempt is the #2680 source predicate (the
+			// unbound path has no other refusal besides a vanished run, which the re-read below
+			// tells apart). The re-read runs on every refusal, the last included, so a run that
+			// vanished or finished is classified as such rather than as source contention.
+			refreshed, gerr := s.GetRun(ctx, userID, run.ID)
+			if gerr != nil {
+				return SubmitInputResult{}, store.RunUserInput{}, gerr // ErrRunNotFound stays a 404
+			}
+			if terminalStatuses[refreshed.Status] {
+				return SubmitInputResult{}, store.RunUserInput{}, ErrRunTerminal
+			}
+			// Out of attempts: the milestone list keeps moving.
+			if attempt >= approveMilestoneAttempts {
+				return SubmitInputResult{}, store.RunUserInput{}, ErrApprovalMilestonesMoved
+			}
+			if refreshed.Status != "awaiting_approval" {
+				// The run left the gate mid-approve: the caller must re-read and decide again.
+				return SubmitInputResult{}, store.RunUserInput{}, ErrApprovalMilestonesMoved
+			}
+			// The republished plan may carry new required_capabilities; the upstream gate ran
+			// against the old row, so re-run it (the owner override bypasses it, as upstream).
+			if !overrideCaps {
+				if cerr := s.capabilityGate(ctx, refreshed); cerr != nil {
+					return SubmitInputResult{}, store.RunUserInput{}, cerr
+				}
+			}
+			run = refreshed
+			continue
+		}
+		after, afterErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
+		if afterErr != nil {
+			slog.Warn("workersvc: approve-freeze post-read failed", "run_id", run.ID, "error", afterErr)
+		}
+		// Issue #260: emit ONE structured log capturing what the approve-time freeze saw at the
+		// live instant. Approves are human-gated and rare, so this logs unconditionally. The
+		// pathological signature is the #260 bug SHAPE specifically — a candidate WAS present at
+		// the pre-read yet frozen came out NULL after the freeze — raised to Warn with a stable
+		// signature field for alerting. A 0-milestone LEGACY run correctly freezes NULL from a NULL
+		// candidate (see CreateApprovePlanInput's own comment), so it must NOT trip the signature,
+		// or every no-milestone approve would drown the real signal; hence the before-candidate
+		// guard, not a bare after-frozen-empty test. (Issue #1626: a 0-milestone INTERLOCKED run's
+		// candidate is the explicit `[]` (planMilestonesParam), which freezes `[]`: non-empty bytes
+		// on both sides, so it does not trip the signature either.)
+		logArgs := []any{
+			"run_id", run.ID,
+			"before_frozen", string(before.MilestonesFrozen),
+			"before_candidate", string(before.MilestonesCandidate),
+			"before_updated_at", before.UpdatedAt.Time,
+			"after_frozen", string(after.MilestonesFrozen),
+			"after_updated_at", after.UpdatedAt.Time,
+		}
+		if afterErr == nil && beforeErr == nil && len(before.MilestonesCandidate) > 0 && len(after.MilestonesFrozen) == 0 {
+			slog.Warn("workersvc: approve-time milestone freeze", append(logArgs, "signature", "approve_froze_null")...)
 		} else {
-			completionContract = contract
+			slog.Info("workersvc: approve-time milestone freeze", logArgs...)
 		}
+		// Populated AFTER validateSelection accepted the selection: only a valid, accepted
+		// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
+		return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, row, nil
 	}
-	// PRD #1795 M2: the row is stamped with the gate binding of the row the UPDATE locked, and
-	// an expected revision joins the UPDATE predicate: a mismatch returns pgx.ErrNoRows having
-	// written no selection, no milestone/contract/budget freeze and no input.
-	row, err := s.q.CreateApprovePlanInput(ctx, store.CreateApprovePlanInputParams{
-		RunID: run.ID, Body: pgconv.TextOrNull(string(body)), AgentSource: pgconv.TextOrNull(sel.Source), AgentExclusions: exclusions,
-		CompletionContract:   completionContract,
-		ExpectedGateRevision: pgconv.Int8Ptr(expected),
-		// PRD #122 M2 (Decision 5/5b): the budget-scaling config the freeze reads to derive
-		// this run's effective budget from its frozen milestone count, atomically with the
-		// candidate→frozen copy. IDEMPOTENT via COALESCE — a re-gate resume re-supplies the
-		// same config and never changes a budget frozen once.
-		RunMaxIterations:         int32(s.p.RunMaxIterations), //nolint:gosec // G115: RunMaxIterations is a small bounded config int (env RUN_MAX_ITERATIONS), never near int32 range
-		RunTimeoutSeconds:        int32(s.p.RunTimeout.Seconds()),
-		MilestoneBudgetCap:       milestoneBudgetCap,
-		SizeBudgetFactorL:        sizeBudgetFactorL,
-		BudgetWallCeilingSeconds: budgetDurationSeconds(s.p.RunWallCeiling),
-	})
-	if err != nil {
-		return SubmitInputResult{}, store.RunUserInput{}, err
-	}
-	after, afterErr := s.q.GetRunMilestoneFreezeSnapshot(ctx, run.ID)
-	if afterErr != nil {
-		slog.Warn("workersvc: approve-freeze post-read failed", "run_id", run.ID, "error", afterErr)
-	}
-	// Issue #260: emit ONE structured log capturing what the approve-time freeze saw at the
-	// live instant. Approves are human-gated and rare, so this logs unconditionally. The
-	// pathological signature is the #260 bug SHAPE specifically — a candidate WAS present at
-	// the pre-read yet frozen came out NULL after the freeze — raised to Warn with a stable
-	// signature field for alerting. A 0-milestone LEGACY run correctly freezes NULL from a NULL
-	// candidate (see CreateApprovePlanInput's own comment), so it must NOT trip the signature,
-	// or every no-milestone approve would drown the real signal; hence the before-candidate
-	// guard, not a bare after-frozen-empty test. (Issue #1626: a 0-milestone INTERLOCKED run's
-	// candidate is the explicit `[]` (planMilestonesParam), which freezes `[]`: non-empty bytes
-	// on both sides, so it does not trip the signature either.)
-	logArgs := []any{
-		"run_id", run.ID,
-		"before_frozen", string(before.MilestonesFrozen),
-		"before_candidate", string(before.MilestonesCandidate),
-		"before_updated_at", before.UpdatedAt.Time,
-		"after_frozen", string(after.MilestonesFrozen),
-		"after_updated_at", after.UpdatedAt.Time,
-	}
-	if afterErr == nil && beforeErr == nil && len(before.MilestonesCandidate) > 0 && len(after.MilestonesFrozen) == 0 {
-		slog.Warn("workersvc: approve-time milestone freeze", append(logArgs, "signature", "approve_froze_null")...)
-	} else {
-		slog.Info("workersvc: approve-time milestone freeze", logArgs...)
-	}
-	// Populated AFTER validateSelection accepted the selection: only a valid, accepted
-	// guard-role exclusion warrants the owner heads-up (PRD #319 M3).
-	return SubmitInputResult{ServerSide: false, ExcludedGuardRoles: excludedGuardRoles(sel)}, row, nil
 }
 
 // capabilityGate is the AUTHORITATIVE, server-side PRD #84 M4 4c approval gate. A run at
@@ -1057,7 +1131,8 @@ func (s *Service) submitScopeCeiling(ctx context.Context, run store.Run, ceiling
 // to int32) from firing, exactly as submitScopeCeiling does for its ceiling. The projected
 // total and deadline are computed from the already-fetched run BEFORE the CTE so the write
 // stays one statement and needs no read-back. A 0-row CTE (terminal / untimed kind / over the
-// cap) yields pgx.ErrNoRows, mapped to the specific 409 by extendRefusalReason over that row.
+// per-request cap / over the total-time limit) yields pgx.ErrNoRows, mapped to the specific 409
+// by extendRefusalReason over that row.
 func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
 	secs32, cap32 := int32(0), int32(0)
 	if secs >= 0 && secs <= math.MaxInt32 {
@@ -1071,16 +1146,19 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 	// CURRENT budget_extension_seconds atomically, so a total derived from run.BudgetExtensionSeconds
 	// can be stale under concurrent extends; the committed total (newTotal) is the only source of
 	// truth, and the running total is reconstructable from the run row plus these delta rows.
-	auditBody := fmt.Sprintf("extend +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
+	auditBody := fmt.Sprintf("extend +%s (max %s per extension)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
 	newTotal, err := s.q.CreateExtendInput(ctx, store.CreateExtendInputParams{
-		ID:   run.ID,
-		Secs: secs32,
-		Cap:  cap32,
-		Body: pgconv.TextOrNull(auditBody),
+		ID:                       run.ID,
+		Secs:                     secs32,
+		Cap:                      cap32,
+		BaseWallUpperSeconds:     s.baseWallUpperSeconds(),
+		FinalizeAllowanceSeconds: WallParkFinalizeSeconds,
+		MaxWallSeconds:           MaxRunWallSeconds,
+		Body:                     pgconv.TextOrNull(auditBody),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.extendRefusal(run, secs, capSeconds)
 		}
 		return SubmitInputResult{}, err
 	}
@@ -1093,11 +1171,13 @@ func (s *Service) submitExtend(ctx context.Context, run store.Run, secs, capSeco
 
 // extendAndResumeWallPark applies the owner's Extend on a budget_exhausted wall park (PRD #1497 M1,
 // D7): add @secs of wall-clock time AND resume, in ONE statement (ExtendAndResumeWallPark). It banks
-// the overrun so the extension buys exactly @secs of active run-time, clears the hold, drops the
-// released worker (D19), and writes the extend + resume audit rows. Refusals mirror submitExtend's
-// (a 0-row CTE — over the cap — is mapped by extendRefusalReason). The projected deadline is
-// computed from the committed new total; Resumed is true so the CLI says the run resumed. Callers
-// have already validated secs ∈ [60, capSeconds].
+// the overrun so the extension buys @secs of active run-time (exactly @secs when the park landed at
+// or past the deadline), clears the hold, drops the released worker (D19), and writes the extend +
+// resume audit rows. A refused statement returns no row (pgx.ErrNoRows); wallParkExtendRefusal then
+// re-reads the run to name why, and nothing is published or notified. The projected deadline is
+// computed from the POST-update budget row the statement returns (it has banked the overrun and the
+// parked interval into budget_paused_seconds); Resumed is true so the CLI says the run resumed.
+// Callers have already validated secs in [60, capSeconds].
 func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) (SubmitInputResult, error) {
 	secs32, cap32 := int32(0), int32(0)
 	if secs >= 0 && secs <= math.MaxInt32 {
@@ -1106,20 +1186,21 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 	if capSeconds >= 0 && capSeconds <= math.MaxInt32 {
 		cap32 = int32(capSeconds)
 	}
-	auditBody := fmt.Sprintf("extend and resume +%s (cap %s)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
-	newTotal, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
-		ID:                   run.ID,
-		UserID:               userID,
-		Secs:                 secs32,
-		Cap:                  cap32,
-		GlobalTimeoutSeconds: int32(s.p.RunTimeout.Seconds()),
-		Body:                 pgconv.TextOrNull(auditBody),
+	auditBody := fmt.Sprintf("extend and resume +%s (max %s per extension)", extendDurationLabel(secs), extendDurationLabel(capSeconds))
+	row, err := s.q.ExtendAndResumeWallPark(ctx, store.ExtendAndResumeWallParkParams{
+		ID:                       run.ID,
+		UserID:                   userID,
+		Secs:                     secs32,
+		Cap:                      cap32,
+		BaseWallUpperSeconds:     s.baseWallUpperSeconds(),
+		FinalizeAllowanceSeconds: WallParkFinalizeSeconds,
+		MaxWallSeconds:           MaxRunWallSeconds,
+		GlobalTimeoutSeconds:     int32(s.p.RunTimeout.Seconds()),
+		Body:                     pgconv.TextOrNull(auditBody),
 	})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
-			// The only refusal reachable here (the caller pre-validated the cap and the status is a
-			// budget_exhausted paused hold) is a raced cap violation; extendRefusalReason words it.
-			return SubmitInputResult{}, extendRefusalReason(run, secs, capSeconds)
+			return SubmitInputResult{}, s.wallParkExtendRefusal(ctx, userID, run, secs, capSeconds)
 		}
 		return SubmitInputResult{}, err
 	}
@@ -1129,10 +1210,35 @@ func (s *Service) extendAndResumeWallPark(ctx context.Context, userID uuid.UUID,
 		s.bcast.PublishState(run.ID, "queued")
 	}
 	s.notify(run.ID, "queued")
-	// Deadline reflects the new total extension; the finalize term is unchanged by an extend.
-	deadline := RunDeadline(run.StartedAt, run.BudgetWallSeconds, run.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, newTotal, run.BudgetFinalizeSeconds)
-	nt := int(newTotal)
+	// Deadline comes from the post-update row: the statement banked the overrun and the parked
+	// interval into budget_paused_seconds, which the pre-update run snapshot does not carry.
+	deadline := RunDeadline(row.StartedAt, row.BudgetWallSeconds, row.BudgetPausedSeconds, run.Kind, run.Interactive, "running", s.p.RunTimeout, row.BudgetExtensionSeconds, row.BudgetFinalizeSeconds)
+	nt := int(row.BudgetExtensionSeconds)
 	return SubmitInputResult{ServerSide: false, ExtensionSeconds: &nt, DeadlineAt: deadline, Resumed: true}, nil
+}
+
+// wallParkExtendRefusal names why ExtendAndResumeWallPark matched no row. The statement's guards
+// (status/hold, per-request cap, total-time limit, cross_check plan-check eligibility) all collapse
+// into "0 rows", and the run snapshot the caller holds can be stale, so it re-reads the run and
+// classifies from the fresh row: terminal, no longer a budget_exhausted park, over the total-time
+// room (or the per-request cap), a cross_check that can no longer resume, else a concurrent change. A re-read failure is returned as is.
+func (s *Service) wallParkExtendRefusal(ctx context.Context, userID uuid.UUID, run store.Run, secs, capSeconds int) error {
+	cur, err := s.GetRun(ctx, userID, run.ID)
+	if err != nil {
+		return err
+	}
+	switch {
+	case terminalStatuses[cur.Status]:
+		return ErrRunTerminal
+	case cur.Status != "paused" || !cur.HoldReason.Valid || cur.HoldReason.String != "budget_exhausted":
+		return ErrWallParkChanged
+	case secs > capSeconds || secs > s.extensionRoom(cur):
+		return s.extendRefusal(cur, secs, capSeconds)
+	case cur.Kind == runkind.CrossCheck:
+		return ErrWallParkCrossCheckIneligible
+	default:
+		return ErrWallParkChanged
+	}
 }
 
 // stopWallPark applies the owner's Stop on a budget_exhausted wall park of a milestone issue run
@@ -1210,15 +1316,55 @@ func (s *Service) runExtensionCap(ctx context.Context) (int, error) {
 	return s.healthSettings.RunExtensionCapSeconds(ctx)
 }
 
-// extendRefusalReason turns a 0-row CreateExtendInput into the specific 409 the owner sees
-// (PRD #1189 M1), decided from the already-loaded run row — the causes the CTE's predicate
+// baseWallUpperSeconds is the service-side wall reserve for extension admission:
+// max(current RunTimeout, current RunWallCeiling, MaxRunWallCeiling), in seconds. The extend
+// predicates take GREATEST of it and the persisted budget_wall_seconds. It does not cap the
+// served total after a later configuration increase.
+func (s *Service) baseWallUpperSeconds() int32 {
+	return budgetDurationSeconds(max(s.p.RunTimeout, s.p.RunWallCeiling, MaxRunWallCeiling))
+}
+
+// extensionRoom is ExtensionRoomSeconds for a loaded run row under this service's config.
+func (s *Service) extensionRoom(run store.Run) int {
+	return ExtensionRoomSeconds(run.BudgetWallSeconds, run.BudgetExtensionSeconds, run.BudgetFinalizeSeconds, s.p.RunTimeout, s.p.RunWallCeiling)
+}
+
+// extendRefusal is extendRefusalReason under this service's config.
+func (s *Service) extendRefusal(run store.Run, secs, capSeconds int) error {
+	return extendRefusalReason(run, secs, capSeconds, s.p.RunTimeout, s.p.RunWallCeiling)
+}
+
+// ExtensionRoomSeconds is how many more seconds extension admission permits under the retained
+// MaxRunWallSeconds limit. It mirrors the SQL predicate in CreateExtendInput /
+// ExtendAndResumeWallPark and is the same arithmetic:
+//
+//	room = MaxRunWallSeconds - wallUpper - finalizeUpper - extension, clamped at 0
+//
+// wallUpper is the admission reserve: max(persisted budget_wall_seconds when set, current
+// runTimeout, current wallCeiling, MaxRunWallCeiling). The 72h reserve covers later plan scaling
+// of a NULL wall or a RUN_WALL_CEILING increase within its validated range. A later RUN_TIMEOUT
+// increase above 72h can still raise the served total for a NULL-wall run; that larger total is
+// honored without clamping by shared chunked monotonic relative timers (#2761), not capped here.
+// finalizeUpper is max(finalize, WallParkFinalizeSeconds): the one-time Stop allowance is reserved
+// before it is granted. Existing extensions consume admission room. Pure; the SQL is authoritative.
+func ExtensionRoomSeconds(wall pgtype.Int4, ext, finalize int32, runTimeout, wallCeiling time.Duration) int {
+	wallUpper := int(budgetDurationSeconds(max(runTimeout, wallCeiling, MaxRunWallCeiling)))
+	if wall.Valid {
+		wallUpper = max(wallUpper, int(wall.Int32))
+	}
+	finalizeUpper := max(int(finalize), WallParkFinalizeSeconds)
+	return max(0, MaxRunWallSeconds-wallUpper-finalizeUpper-int(ext))
+}
+
+// extendRefusalReason turns a 0-row CreateExtendInput (or, via wallParkExtendRefusal, a 0-row
+// ExtendAndResumeWallPark) into the specific 409 the owner sees (PRD #1189 M1), decided from a
+// loaded run row (the caller's snapshot, or a fresh re-read) - the causes the CTE's predicate
 // collapses into "0 rows". Terminal first (the run is dead, the clock is already stopped),
-// then a kind that never times out (chat/judge, or an interactive task — the runWallClock
-// exclusion set), then the residual cause: budget_extension_seconds + secs would exceed the
-// per-run cap, so the message names the remaining allowance. Same accepted TOCTOU as
-// pauseRefusalReason: a run that changed between GetRun and the CTE is reported as the guard
-// the stale row suggests, which is harmless (the run is dead or untimed either way).
-func extendRefusalReason(run store.Run, secs, capSeconds int) error {
+// then a kind that never times out (chat/judge, or an interactive task - the runWallClock
+// exclusion set), then the per-request cap (secs > capSeconds), then the residual cause: the
+// extension-admission room under MaxRunWallSeconds. Same accepted TOCTOU as pauseRefusalReason:
+// a run that changed between GetRun and the CTE is reported as the guard the stale row suggests.
+func extendRefusalReason(run store.Run, secs, capSeconds int, runTimeout, wallCeiling time.Duration) error {
 	if terminalStatuses[run.Status] {
 		return ErrRunTerminal
 	}
@@ -1230,12 +1376,13 @@ func extendRefusalReason(run store.Run, secs, capSeconds int) error {
 	if run.Kind == runkind.Job {
 		return fmt.Errorf("%w (a job run's wall-clock limit is fixed at creation)", ErrExtendNotTimed)
 	}
-	remaining := capSeconds - int(run.BudgetExtensionSeconds)
-	if remaining < 0 {
-		remaining = 0
+	if secs > capSeconds {
+		return fmt.Errorf("%w: +%s is more than the %s maximum per extension", ErrExtensionCapExceeded,
+			extendDurationLabel(secs), extendDurationLabel(capSeconds))
 	}
-	return fmt.Errorf("%w: %s exceeds the remaining extension cap (%s left of %s)", ErrExtensionCapExceeded,
-		extendDurationLabel(secs), extendDurationLabel(remaining), extendDurationLabel(capSeconds))
+	room := ExtensionRoomSeconds(run.BudgetWallSeconds, run.BudgetExtensionSeconds, run.BudgetFinalizeSeconds, runTimeout, wallCeiling)
+	return fmt.Errorf("%w: +%s would take this run past the %s limit on total run time (%s left)", ErrExtensionLimitReached,
+		extendDurationLabel(secs), wallLimitLabel(MaxRunWallSeconds), wallLimitLabel(room))
 }
 
 // extendDurationLabel renders a whole-second extension duration tersely for an audit body or
@@ -1255,6 +1402,26 @@ func extendDurationLabel(secs int) string {
 	default:
 		return fmt.Sprintf("%dm", m)
 	}
+}
+
+// wallLimitLabel renders a total-time duration with every non-zero unit, seconds included
+// ("24d 20h 31m 23s"), for the MaxRunWallSeconds limit and the room left under it, which are
+// not whole minutes.
+func wallLimitLabel(secs int) string {
+	if secs <= 0 {
+		return "0s"
+	}
+	var parts []string
+	for _, u := range []struct {
+		n    int
+		unit string
+	}{{86400, "d"}, {3600, "h"}, {60, "m"}, {1, "s"}} {
+		if q := secs / u.n; q > 0 {
+			parts = append(parts, fmt.Sprintf("%d%s", q, u.unit))
+			secs -= q * u.n
+		}
+	}
+	return strings.Join(parts, " ")
 }
 
 func stopKindFor(kind string) string {

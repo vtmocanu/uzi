@@ -9,7 +9,7 @@ import { patchRun, state } from "./store";
 // extend, which still advances updated_at. A demo that let status_since follow updated_at
 // would teach exactly the drift the field exists to remove.
 
-const RUN_ID = "run-live"; // a pausable `issue` kind with an 8h budget and a 16h allowance.
+const RUN_ID = "run-live"; // a pausable `issue` kind with an 8h budget and a 16h per-extension cap.
 const T0 = Date.parse("2026-03-01T10:00:00Z");
 
 /** Runs every timer the engine scheduled, including ones scheduled BY a timer. */

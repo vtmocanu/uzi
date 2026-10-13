@@ -206,7 +206,7 @@ export function SwitchTokenAction({
   };
 
   return (
-    <span className="inline-flex flex-col gap-1.5">
+    <span className="inline-flex min-w-0 max-w-full flex-col gap-1.5">
       <Button
         variant="secondary"
         size="sm"
@@ -217,7 +217,7 @@ export function SwitchTokenAction({
         {triggerLabel}
       </Button>
       {open && (
-        <div className="w-72 space-y-2 rounded-lg border border-edge bg-surface p-3">
+        <div className="w-72 max-w-full space-y-2 rounded-lg border border-edge bg-surface p-3">
           <TokenPicker
             label="Switch this run's Anthropic token"
             className="h-8 w-full text-xs"
@@ -231,7 +231,7 @@ export function SwitchTokenAction({
               Switching now interrupts the run — it loses at most the in-flight step, then continues on the new token.
             </p>
           )}
-          <div className="flex gap-2">
+          <div className="flex flex-wrap gap-2">
             <Button size="sm" disabled={busy || pinnedUnresolved} onClick={() => void submit()}>
               Switch to this token
             </Button>

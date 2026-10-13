@@ -53,7 +53,7 @@ func TestPlanNamesAPendingIDTheCapsEvicted(t *testing.T) {
 		comments = append(comments, inline(id, memberID, "carol", big, raT0.Add(time.Duration(id)*time.Second)))
 	}
 	p := h.params(comments...)
-	p.HighWater, p.Pending = 200, []int64{50}
+	p.Ledger = raState(200, 50)
 	as, err := h.assessor().Begin(context.Background(), p)
 	if err != nil || as == nil {
 		t.Fatalf("Begin: %v, %v", as, err)
@@ -66,14 +66,14 @@ func TestPlanNamesAPendingIDTheCapsEvicted(t *testing.T) {
 	if !res.Snapshot.Truncated {
 		t.Fatal("precondition: the byte cap must have clipped the snapshot")
 	}
-	plan := res.Plan(200, []int64{50})
+	plan := res.Plan(raState(200, 50))
 	if plan.HasNew {
 		t.Fatalf("plan = %+v, want nothing new in the capped snapshot", plan)
 	}
-	if !slices.Equal(plan.PendingEvicted, []int64{50}) {
+	if !slices.Equal(plan.PendingEvicted, raKeys(50)) {
 		t.Fatalf("PendingEvicted = %v, want [50]", plan.PendingEvicted)
 	}
-	if !slices.Contains(plan.PendingRemove, 50) {
+	if !slices.Contains(plan.PendingRemove, raKey(50)) {
 		t.Fatalf("PendingRemove = %v, want it to include the evicted 50", plan.PendingRemove)
 	}
 }
@@ -101,7 +101,7 @@ func TestPruneBoundTakenBeforeFetchProtectsAConcurrentAdmission(t *testing.T) {
 	// A's comments predate B's admission: flaky's comment is consumed (at or below the mark) and
 	// the member's comment is not in A's list, so A's keep set is empty.
 	p := h.params(inline(5, flakyID, "flaky", "a", raT0))
-	p.HighWater, p.QueueBound = 1000, bound
+	p.Ledger, p.QueueBound = raState(1000), bound
 	as, err := a.Begin(ctx, p)
 	if err != nil || as == nil {
 		t.Fatalf("Begin: %v, %v", as, err)

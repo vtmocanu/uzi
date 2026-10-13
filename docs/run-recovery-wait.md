@@ -13,15 +13,17 @@ Uzi retries in place and, if the trouble persists, parks the run in
 
 - A **positively empty SDK turn** — a turn that finishes with a reported
   turn count of zero and no model activity, plan, question, or completion.
-- A **transient provider error** — the Anthropic API returning 408, 429, or
-  any 5xx (500/502/503/504/529), or a status-less transport error.
+- A **transient Claude provider error** — a failed turn carrying a 408, 429,
+  or 5xx status, including when its reason is not `api_error`; a failed
+  `api_error` with no status also qualifies.
 - A **transient Codex provider error** — on the Codex harness, a turn that
   ends failed because the provider was overloaded (`serverOverloaded`), had an
   internal server error (`internalServerError`), or had no flex capacity
   (`flexUnavailable`), or because Codex's HTTP transport failed (a connection
   or stream failure, or too many failed attempts) with a 408, 429, or 5xx
-  status or no status. Codex's own rate-limit and usage-limit errors are not
-  included; they keep their existing handling.
+  status or no status. The exact Codex token `rateLimitExceeded` also qualifies.
+  `usageLimitExceeded` keeps its [usage-limit handling](./run-limit-wait.md),
+  and `sessionBudgetExceeded` keeps its existing handling.
 
 Uzi retries the interruption a few times in place. A Codex provider error is
 retried on the same thread up to 2 times per turn, after a short wait
@@ -66,11 +68,15 @@ an unverified capture attempt.
 ## What happens automatically
 
 For these empty-turn and provider recoveries, after verified capture, the server parks the run on a capped exponential
-backoff and returns it to `queued` when that delay passes. There is no
-lifetime cap on recovery parks and no manual resume step.
+backoff and returns it to `queued` when that delay passes. Empty-turn and
+resumed-gate recovery have no lifetime cap or manual resume step. Typed provider
+parks use the elapsed streak bound below.
 
-A same-worker resume can recover from the verified local checkpoint and
-retained SDK session. Publishing a checkpoint to the forge is best-effort:
+An ordinary unwired resume can recover from the verified local checkpoint
+with same-path session continuity, provided its key has never entered
+retained-source recovery. Docker-wired resumes and retained-source recovery
+use a fresh attempt path and model session. Publishing a checkpoint to the
+forge is best-effort:
 a different worker can recover only what was successfully published.
 Losing the original worker's storage before publication can therefore
 still lose newer work. Recovery does not promise protection against loss
@@ -78,8 +84,10 @@ of every copy.
 
 If capture fails during shutdown, the worker retains the source clone and
 session. A worker-owned ownership record prevents a later claim from
-deleting that clone before recovering it. This protection requires the
-worker's persistent storage to survive.
+deleting that clone before recovering it. A later acquired claim discovers
+retained source before forge refresh or disk preflight and uses the bounded
+recovery below. This protection requires the worker's persistent storage
+to survive.
 
 A run whose approved plan and work are available continues implementation
 without requesting the same approval again. If a human-approved run loses
@@ -89,10 +97,147 @@ This fix does not reconstruct plan text missing from older runs. A legacy
 auto-approved run whose stored plan is empty can still need a new planning
 turn; an approval flag alone is not an implementation-ready plan.
 
+## Provider outage streaks
+
+With a compatible worker and API, a provider-origin park stores
+`recovery_wait_cause: provider_outage`. The run surfaces show the provider
+park count, streak start and next retry. `provider_park_count` counts the
+current streak, separately from the backoff counter; it is not a lifetime
+attempt budget. `provider_park_streak_started_at` starts at the first park.
+
+The default bound is **24 hours** (`RUN_PROVIDER_PARK_MAX_DURATION`;
+`0` disables the hold while typing and counting remain enabled). At the
+next qualifying provider park at or past that bound, the run becomes
+`paused` with `hold_reason: provider_unavailable`, waiting for its owner
+instead of retrying automatically. This policy does not fail the run.
+Detection can lag by backoff, jitter, queue/claim delay and the next attempt;
+there is no maximum overshoot promise or deadline-triggered sweep to a hold.
+
+A provider park reporting positive `productive_turns` starts a new streak
+at that park with count 1. These are completed, error-free model turns in
+the current flight, including planning, implementation and review; claiming
+the run or becoming `running` does not count as progress. Progress is not
+limited to provider parks: a flight that completed turns and then parks for
+another reason, an ordinary (untyped or `empty_turn`) or a disk
+(`data_volume_full`) recovery park, reports them as `provider_progress_turns`,
+and the API clears an open streak in the same statement that applies that
+park. Missing or zero evidence leaves the streak untouched, and the report
+must carry a positive `claim_generation`; the generation, status and release
+fences reject stale or replayed evidence, so it cannot reset a streak twice.
+Owner Resume,
+early credential-driven promotion and credential switching clear the streak.
+Automatic and vault-unlock promotion preserve it.
+
+For a **provider unavailable** hold:
+
+1. **Resume** (`uzi run resume <id>`) queues a fresh attempt and clears the
+   streak, or **Cancel** (`uzi run cancel <id>`) ends the run.
+2. To finalize completed work, eligible **Stop** first sets the scope ceiling,
+   then **Resume** separately. From the CLI, run `uzi run stop <id>` and,
+   after it succeeds, `uzi run resume <id>`. This is not an atomic endpoint.
+   Stop requires a non-interactive milestone issue run with at least one
+   completed milestone; other runs show why it is unavailable. Finalization
+   still requires the existing completion permit and budget checks. Another
+   provider outage during finalization can open a fresh streak.
+
+The hold retains the claim, worker affinity and the issue lock on issue
+runs. The worker keeps its clone and HOME; verified local captures can
+contain unpublished work. These are not a guarantee of recovery after
+losing that worker's storage: another worker can recover published work or
+an available verified recovery copy, not an unverified capture or every
+latest edit. Pending pause requests are satisfied and cleared by this hold.
+
+Typed reporting requires the negotiated `recovery_cause_provider_outage`
+feature. Old workers, or new workers against an API without it, send untyped
+parks with the old behavior. If a worker cached the feature before an API
+rollback, a positively identified older strict decoder's unknown-field
+refusal triggers one untyped resend and disables the cached feature;
+ordinary validation errors do not. Recognizing `paused` alone does not
+make rollback safe: older APIs lack the provider hold's late-failure guards.
+
+`provider_progress_turns` is gated separately by the negotiated
+`provider_progress_on_recovery_park_v1` feature. A worker sends it only after
+seeing that feature, only with a positive claim generation, and only on an
+ordinary or disk recovery park. If the API refuses it as an unknown field
+(a positively identified strict-decoder refusal after a rollback), the worker
+drops the cached feature and re-sends the same park once without the field,
+keeping the fence; a refusal of that retry propagates, and there is no third
+variant. An old worker or an old API therefore sends no progress evidence and
+the streak is preserved, the conservative direction: the bound may fire
+earlier than it would have, never later.
+
+## Bounded retained-source recovery
+
+Recovery of an already retained source runs inside the acquired claim,
+with a durable budget bound to that source: **3 total reserved iterations**,
+counting blocked and nonblocked failures together, and a **five-minute
+deadline from the first reservation**. Reservation happens before work and
+survives crash, reclaim and successor handoff. Retry delays use the existing
+exponential backoff capped at 16 times its base. Capture, publication,
+adoption or reclaim does not reset the budget; a trusted, successfully
+settled real model turn does.
+
+A permanent blocker or exhausted budget ends the run **failed**, keeping
+local work and custody. It does not park for automatic reclaim or offer
+Resume. Actual quiescence failure uses `worker_residue_blocked`; a missing
+source, invalid recovery clock, preservation or adoption failure, missing
+needed prerequisites, or an oversized fallback is not a quiescence failure.
+Transient capture, forge or disk failures consume the same reserved budget.
+These bounds do not change the healthy provider/empty-turn park budgets or
+the owner-only worker-recovery-exhaustion hold below.
+
+An actual verified thin bundle under the size cap can support local
+adoption and model execution when its needed prerequisites are locally
+available and verified, even if remote publication is unknown. A nonempty
+prerequisite list alone is not a blocker; missing or unverifiable needed
+prerequisites, or a fallback still over the cap, are blockers. This local
+proof does not prove independent recovery, remote durability or custody
+release. Predecessor sources, pins, journals and descriptors stay retained
+until the existing verified final disposition or explicit discard.
+
+Local verification checks the full reachable object history, including
+prerequisite history and object hashes, under the worker's configured delivered
+decoded-history cap (default **8 GiB**, or 8589934592 bytes) and the existing
+deadline. Missing or corrupt objects are refused. History above that cap keeps
+work and custody and fails with a recorded blocker in `uzi run recovery`
+and the worker log, even when the thin archive is below 64 MiB. Overflow,
+timeout, corruption and interruption never authorize custody release or
+source cleanup.
+
+The configured budget counts delivered object contents cumulatively within a
+recovery operation, including repeated verification reads; nested operations
+share the same delivered-byte counter. Object contents stream through a pipe
+chunk and bounded header, without content buffers proportional to the cap.
+Metadata listings retain the existing 64 MiB output cap (`GIT_MAX_BUFFER`);
+object arrays remain bounded by that listing. The delivered-byte cap is **not a
+RAM limit** and does **not** bound Git-internal delta decompression memory. The
+deadline limits duration, and the shared worker cgroup does not isolate this
+verifier from sibling runs. The resulting residual resource-exhaustion risk
+remains deferred scope, as authorized by the human review on 2026-10-09 (#2512).
+
+See [Recovery decoded-history limit](./configuration.md#recovery-decoded-history-limit)
+for worker startup configuration. Recorded cap errors show exact bytes and GiB
+when the cap is at least 1 GiB. Raising the cap and restarting does not unblock
+an already blocked journal: it reports previous decoded verification exhaustion,
+the current cap, and that the prior cap was not recorded. Cancellation, existing
+deadlines, encoded archive caps and storage quotas remain unchanged; there is
+no deduplication or history exclusion.
+
+Retained recovery uses a genuinely fenced fresh successor path and model
+session on external restarts too, including on unwired workers. Losing the
+retained storage can still lose work. A source-only failed run requires
+operator recovery from that storage; export remains limited to a
+manifest-bound available archive, with no new download API or failed-run
+Resume. Downgrading workers during pending recovery is unsupported: older
+workers may drop its durable recovery fields. See
+[Recovering unpublished work](./run-recovery.md#retained-source-failure-and-local-proof).
+
 ## If it never recovers
 
-The empty-turn and provider recovery park has no timeout or lifetime-attempt failure. You
-can **cancel** the run at any time. Normal watchdogs still apply while it
+Empty-turn and resumed-gate recovery have no lifetime park cap. Typed provider
+recovery stops automatic retries at the elapsed streak bound and asks its
+owner to Resume, use eligible Stop then Resume, or Cancel. You can **cancel**
+the run at any time. Normal watchdogs still apply while it
 is running, including while it retries capture; recovery does not override
 a genuine timeout or cancellation.
 
@@ -101,8 +246,10 @@ a genuine timeout or cancellation.
 A `recovery_wait` park can also come from a different cause: the forge
 (GitHub, GitLab, Forgejo) was unreachable when the worker tried to clone or
 fetch your repo — a DNS blip, a dropped connection, or a transient 5xx.
-Unlike the empty-turn case above, nothing has been cloned yet, so there is
-no checkpoint to capture; the run just parks and retries.
+On this healthy path, retained-source discovery found no local source,
+so there is no checkpoint to capture; the run just parks and retries.
+If retained source exists, recovery uses the acquired-claim bound above
+instead of this no-local-source forge park.
 
 The run's badge and feed say **waiting for the forge, retry at HH:MM (N of
 MAX)**, naming the next retry time and how many of this run's lifetime
@@ -120,13 +267,23 @@ the run at any point during these retries ends it `cancelled`, as usual.
 
 ## Codex account unavailable
 
-A `recovery_wait` park can also come from the Codex subscription account
-itself: it is quarantined (a safety state, not a defect) or it needs a fresh
-login, so uzi holds a Codex subscription run here instead of failing it.
-Only the run kinds that hold custody of your source — issue, ci_fix,
-self_improve, prompt, task and mr_rework — are held this way; a Codex chat
-run still fails immediately (you're present to react to it), and so does a
-judge run (it's advisory).
+A Codex subscription run can enter `recovery_wait` before it starts, or
+while running at a milestone checkpoint, done checkpoint, finalize or
+recovery-capture boundary. The API must confirm that its account is
+quarantined at the run's frozen identity and credential revision, or that
+a re-login on the same credential is being verified. That account state
+holds the run instead of failing it. This applies to issue, ci_fix,
+self_improve, prompt, task and mr_rework runs without an egress profile;
+chat, judge, job, cross_check and egress-profile runs keep their handling.
+
+For a running run, uzi settles execution without requesting another Codex
+credential, commits unfinished work, fetches it back into the worker's
+tracking ref and verifies it **before** reporting the park. Publishing the
+recovery checkpoint is best-effort: the feed says whether it was published
+or saved on this worker. The source custody hold and session stay available
+for recovery; this does not promise an available server archive or permanent
+local clone. If capture or the park report cannot be verified, the worker
+retains the local work and session and retries rather than claiming a park.
 
 The run card, `uzi run get`, `uzi run list`/`uzi admin runs`, and the TUI
 board each name one of four states (a state this client does not recognise
@@ -143,8 +300,9 @@ reads **Codex account unavailable**):
   confirming the new login belongs to the same account before releasing
   anything.
 - **Codex account available again** — the account cleared; the run is going
-  back into the queue and will pick up where it left off. When the hold
-  began at claim time, it prefers the worker that held its source.
+  back into the queue and will pick up where it left off. It prefers the
+  worker that holds its source, including when the hold began at a running
+  checkpoint; normal worker-affinity limits still apply.
 
 A successful same-credential re-login re-admits the run: the activity feed
 records the re-admission, naming the credential and what changed.
@@ -156,6 +314,13 @@ no countdown. It lasts until the account recovers, you log in again, or you
 cancel. Cancel works exactly as it does for any `recovery_wait` run.
 
 ### When it fails instead
+
+This checkpoint protection needs an upgraded API and worker. An account
+refusal during a turn's app-server refresh, or during startup credential
+release, does not gain this account-park handling; their vault-lock handling
+stays unchanged. Transient or ambiguous refreshes and non-credential
+boundary faults keep their existing handling. A generic credential error
+is not evidence of an account hold.
 
 Logging in with a different ChatGPT account does not resume the run: it
 fails with `credential_unavailable` and a reason naming the change. The
@@ -332,7 +497,8 @@ empty-turn park (`RUN_RECOVERY_PARK_BASE` up to `RUN_RECOVERY_MAX_PARK`);
 there is no separate timer for this cause.
 
 **Custody differs by when the park happens.** Every data-volume-full park
-that lands **before your repo has been cloned** first releases this run's
+that lands **before your repo has been cloned**, with no retained source
+found by discovery, first releases this run's
 recovery-custody hold — the same release-then-park sequence a
 [forge-unreachable park](#forge-unreachable-at-clone) uses, and for the
 same reason: nothing has been cloned yet, so there is nothing for this

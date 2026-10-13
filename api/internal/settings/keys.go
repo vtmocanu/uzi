@@ -118,9 +118,10 @@ const (
 	KeyHealthQueuedSeconds        = "health_queued_seconds"
 	KeyHealthApprovalSeconds      = "health_approval_seconds"
 	KeyHealthNudgeCooldownSeconds = "health_nudge_cooldown_seconds"
-	// KeyRunExtensionCapSeconds (PRD #1189) is the TOTAL extra wall-clock time, in seconds,
-	// an owner may grant a single run through Extend (budget_extension_seconds). It is a
-	// per-run total, not per-extension, so repeating Extend cannot exceed it. 0 disables
+	// KeyRunExtensionCapSeconds (PRD #1189, #2735) is the PER-REQUEST maximum of extra wall-clock
+	// time, in seconds, an owner may grant a run in one Extend. It does not cap the run's
+	// cumulative budget_extension_seconds: repeating Extend adds more, bounded only by the
+	// technical total-run-time limit (workersvc.MaxRunWallSeconds). 0 disables
 	// extending entirely; a non-zero value is [3600, 604800] (1h to 7d) — validated by
 	// validateExtensionCapSeconds, whose bounds differ from validateHealthSeconds.
 	KeyRunExtensionCapSeconds = "run_extension_cap_seconds"
@@ -270,6 +271,11 @@ const (
 	// defaults; no seeded row (an absent row synthesizes to the default). The per-user
 	// opt-in lives on users.mr_rework_enabled, not here.
 	KeyMrReworkEnabled = "mr_rework_enabled"
+	// KeyNowSummaryEnabled (PRD #2603) is the admin kill-switch for the model-written "Now"
+	// line on the run progress card (text "true"/"false"). Ships ON like KeyMrReworkEnabled;
+	// the per-user opt-out lives on users.now_summary_enabled (NULL reads as ON). The
+	// effective value for a run is this switch AND the run owner's setting.
+	KeyNowSummaryEnabled = "now_summary_enabled"
 	// KeyDecisionsMemoEnabled (issue #2083) is the admin kill-switch for the run decisions memo
 	// (text "true"/"false"). Off by default: the worker-protocol routes fail closed and the read
 	// half answers enabled=false until an admin turns it on.
@@ -368,8 +374,8 @@ const (
 	DefaultHealthQueuedSeconds        = "600"  // 10m stuck queued
 	DefaultHealthApprovalSeconds      = "3600" // 1h idle awaiting approval
 	DefaultHealthNudgeCooldownSeconds = "1800" // 30m between Slack nudges per run
-	// PRD #1189: 16h of total extension per run by default (two full 8h ceilings) —
-	// generous for a human decision and still finite. 0 turns extending off.
+	// PRD #1189, #2735: at most 16h per extension request by default (two full 8h ceilings) —
+	// generous for a human decision; the run may be extended again. 0 turns extending off.
 	DefaultRunExtensionCapSeconds = "57600"
 	// PRD #58 Decision 8: two hosted workers per user by default. Hosting is itself
 	// off unless WORKER_HOSTING_ENABLED is set (the compose default), so this value
@@ -427,6 +433,8 @@ const (
 	// ci-autofix's maxAttempts). Both are the admin-side gates; the per-user opt-in
 	// (also default-on) lives on users.mr_rework_enabled.
 	DefaultMrReworkEnabled = "true"
+	// DefaultNowSummaryEnabled: the Now summary ships on (PRD #2603 D2).
+	DefaultNowSummaryEnabled = "true"
 	// DefaultDecisionsMemoEnabled: the memo ships dark (issue #2083).
 	DefaultDecisionsMemoEnabled = "false"
 	DefaultMrReworkCap          = "5"
@@ -569,6 +577,7 @@ var Defaults = map[string]string{
 	// judge keys: an absent row synthesizes to these defaults, so All/AdminView
 	// surface them to the settings page on every instance and no migration seeds them.
 	KeyMrReworkEnabled:      DefaultMrReworkEnabled,
+	KeyNowSummaryEnabled:    DefaultNowSummaryEnabled,
 	KeyDecisionsMemoEnabled: DefaultDecisionsMemoEnabled,
 	KeyMrReworkCap:          DefaultMrReworkCap,
 	KeyMrReviewTrustedBots:  "",

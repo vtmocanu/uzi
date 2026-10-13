@@ -1,7 +1,8 @@
-// Pinned Codex 0.159.3 app-server dynamic-tool registration for the worker-owned
+// Pinned Codex 0.160.0 app-server dynamic-tool registration for the worker-owned
 // callback boundary. The app-server receives only the immutable grant's model-visible
 // subset. Native environments are disabled separately on every fresh thread.
 
+import { CODE_DISPOSITIONS_TOOL } from "../code-cross-check-tools.js";
 import { GET_ISSUE_HELP } from "../forge-tool-help.js";
 import { CODEX_DELEGATE_TOOLS, codexDynamicToolWireName, type RunGrants } from "./broker.js";
 
@@ -29,6 +30,14 @@ function objectSchema(
 
 function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
   switch (name) {
+    case CODE_DISPOSITIONS_TOOL:
+      return {
+        description: "During the single code repair pass, report addressed or declined findings with reasons.",
+        inputSchema: objectSchema({ dispositions: { type: "array", maxItems: 20,
+          items: objectSchema({ finding_id: { type: "string", pattern: "^[A-Za-z0-9_-]{1,64}$" },
+            disposition: { type: "string", enum: ["addressed", "declined"] }, reason: STRING },
+            ["finding_id", "disposition", "reason"], false) } }, ["dispositions"], false),
+      };
     case "Bash":
       return {
         description: "Run one worker-screened shell command inside the current worktree.",
@@ -110,6 +119,10 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
         inputSchema: objectSchema({
           summary: STRING,
           report_only: { type: "boolean" },
+          non_closing: {
+            ...objectSchema({ reason: STRING }, ["reason"], false),
+            description: "Issue runs only: declare that this delivery leaves the issue open. Reason must contain 1–500 Unicode code points after trimming. Omit on other run kinds.",
+          },
           milestones_completed: { type: "array", items: STRING },
           prd_done_path: STRING,
           proposal: objectSchema({ title: STRING, body: STRING }, ["title", "body"], false),
@@ -165,6 +178,8 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
           },
         }, [], false),
       };
+    case "park_run":
+      return { description: "Request an owner pause when approved implementation must wait on a dependency. Stop and end your turn.", inputSchema: { type: "object", properties: {}, additionalProperties: false } };
     case "checkpoint":
       return {
         description: "Request a cooperative worker checkpoint at a safe milestone boundary.",

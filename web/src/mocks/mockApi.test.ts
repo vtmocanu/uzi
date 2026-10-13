@@ -1006,3 +1006,33 @@ describe("mockApi token delete cascades like ON DELETE SET NULL (PRD #104 D5)", 
     expect(me.user.judge_anthropic_secret_label).toBeNull();
   });
 });
+
+// Issue #2661: the mock mirrors ?view=summary so demo and test parity holds.
+describe("mockApi run-list summary projection (#2661)", () => {
+  const heavy = ["plan_md", "repo_agents", "issue_description", "preserved_patch"];
+  // The demo seed never sets preserved_patch (it is only present on a failed run with a
+  // preserved diff), so the "carried by default" half checks the three seeded keys.
+  const seeded = ["plan_md", "repo_agents", "issue_description"];
+
+  it("listRuns omits the four heavy keys for the summary view and carries them by default", async () => {
+    installStorage();
+    const api = await reload();
+    const full = (await api.listRuns()).runs;
+    const summary = (await api.listRuns({ view: "summary" })).runs;
+    expect(summary.length).toBe(full.length);
+    expect(full.length).toBeGreaterThan(0);
+    for (const k of seeded) expect(k in full[0]).toBe(true);
+    for (const k of heavy) for (const row of summary) expect(k in row).toBe(false);
+  });
+
+  it("adminListRuns omits the four heavy keys for the summary view and carries them by default", async () => {
+    installStorage();
+    const api = await reload();
+    const full = (await api.adminListRuns()).runs;
+    const summary = (await api.adminListRuns({ view: "summary" })).runs;
+    expect(summary.length).toBe(full.length);
+    expect(full.length).toBeGreaterThan(0);
+    for (const k of seeded) expect(k in full[0]).toBe(true);
+    for (const k of heavy) for (const row of summary) expect(k in row).toBe(false);
+  });
+});

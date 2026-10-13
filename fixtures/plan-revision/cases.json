@@ -1,0 +1,521 @@
+[
+  {
+    "name": "one-line edit",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "alpha\nold\nomega\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "alpha\nnew\nomega\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "alpha\nnew\nomega\n",
+      "base_version": 1,
+      "base_plan_md": "alpha\nold\nomega\n",
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "pending feedback",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      }
+    ],
+    "target_version": 1,
+    "target_seq": 1,
+    "expected": {
+      "version": 1,
+      "plan_md": "first\n",
+      "base_version": null,
+      "base_plan_md": null,
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "re-presentation",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 2,
+    "expected": {
+      "version": 2,
+      "plan_md": "first\n",
+      "base_version": null,
+      "base_plan_md": null,
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "two rounds",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      },
+      {
+        "seq": 4,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 5,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "third\n"
+        }
+      }
+    ],
+    "target_version": 3,
+    "target_seq": 5,
+    "expected": {
+      "version": 3,
+      "plan_md": "third\n",
+      "base_version": 2,
+      "base_plan_md": "second\n",
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "earlier version with later feedback",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 4,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "third\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 2,
+    "expected": {
+      "version": 2,
+      "plan_md": "second\n",
+      "base_version": null,
+      "base_plan_md": null,
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "identical revise",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "same\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "same\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "same\n",
+      "base_version": 1,
+      "base_plan_md": "same\n",
+      "identical_after_feedback": true
+    }
+  },
+  {
+    "name": "feedback is not reused",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      },
+      {
+        "seq": 4,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "third\n"
+        }
+      }
+    ],
+    "target_version": 3,
+    "target_seq": 4,
+    "expected": {
+      "version": 3,
+      "plan_md": "third\n",
+      "base_version": null,
+      "base_plan_md": null,
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "no predecessor",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      }
+    ],
+    "target_version": 1,
+    "target_seq": 2,
+    "expected": {
+      "version": 1,
+      "plan_md": "first\n",
+      "base_version": null,
+      "base_plan_md": null,
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "automatic feedback",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise",
+          "automatic": true
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "second\n",
+      "base_version": 1,
+      "base_plan_md": "first\n",
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "unsorted feed",
+    "messages": [
+      {
+        "seq": 5,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 5,
+    "expected": {
+      "version": 2,
+      "plan_md": "second\n",
+      "base_version": 1,
+      "base_plan_md": "first\n",
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "trailing CR/LF equality",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "same\r\n\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "same\n\r"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "same\n\r",
+      "base_version": 1,
+      "base_plan_md": "same\r\n\n",
+      "identical_after_feedback": true
+    }
+  },
+  {
+    "name": "meaningful trailing spaces",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "same \n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "same\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "same\n",
+      "base_version": 1,
+      "base_plan_md": "same \n",
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "pending feedback preserves existing base",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      },
+      {
+        "seq": 4,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "second\n",
+      "base_version": 1,
+      "base_plan_md": "first\n",
+      "identical_after_feedback": false
+    }
+  },
+  {
+    "name": "earlier revision keeps its own base",
+    "messages": [
+      {
+        "seq": 1,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "first\n"
+        }
+      },
+      {
+        "seq": 2,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 3,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "second\n"
+        }
+      },
+      {
+        "seq": 4,
+        "kind": "plan_feedback",
+        "payload": {
+          "feedback": "Please revise"
+        }
+      },
+      {
+        "seq": 5,
+        "kind": "plan",
+        "payload": {
+          "plan_md": "third\n"
+        }
+      }
+    ],
+    "target_version": 2,
+    "target_seq": 3,
+    "expected": {
+      "version": 2,
+      "plan_md": "second\n",
+      "base_version": 1,
+      "base_plan_md": "first\n",
+      "identical_after_feedback": false
+    }
+  }
+]

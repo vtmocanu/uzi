@@ -399,6 +399,7 @@ type Config struct {
 	// and RunMaxIterations are enforced worker-side and shipped in the claim
 	// payload; the rest drive the server sweeper and claim affinity.
 	PlanCrossCheckMaxRevisions int32
+	CodeCrossCheckTimeout      time.Duration // independent code checker wall-clock budget
 	PlanCrossCheckTimeout      time.Duration // bounded checker wall-clock budget
 	RunTimeout                 time.Duration // base wall clock before a running run parks at budget_exhausted
 	RunWallCeiling             time.Duration // server-enforced ceiling on scaled and handoff wall budgets
@@ -422,8 +423,12 @@ type Config struct {
 	RunMaxRequeues              int           // automatic worker-death requeues allowed per owner recovery episode (zero disables automatic requeues)
 	WorkerHeartbeatInterval     time.Duration // how often a worker heartbeats
 	WorkerHeartbeatStale        time.Duration // no heartbeat past this ⇒ worker offline + eligible runs re-queued within episode allowance, else held or failed by recorded state
-	DiskPressureThreshold       float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
-	SweepInterval               time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
+	// DBStorageCapacityBytes is DB_STORAGE_CAPACITY_BYTES: the database-size budget (bytes) the
+	// admin-health db.size check measures pg_database_size against. 0 means unset or invalid,
+	// and the check reports `na`.
+	DBStorageCapacityBytes int64
+	DiskPressureThreshold  float64       // PRD #837 M4: used/total fraction in (0,1] at/above which a worker's self-reported volume counts as under disk pressure (display/lifecycle-only)
+	SweepInterval          time.Duration // run-liveness sweep cadence; 0 ⇒ sweeper's built-in 15s default
 	// SweeperBootGrace (PRD #1390 M1, D1): the three stale-worker passes
 	// (MarkStaleWorkersOffline, FailRunsOfStaleWorkersOverCap, RequeueRunsOfStaleWorkers)
 	// are skipped until this has elapsed since the LISTENER became ready — not since the
@@ -462,9 +467,12 @@ type Config struct {
 	ActiveSnapshotDisabled bool
 	WorkerPollInterval     time.Duration // worker claim-poll cadence
 	WorkerAffinityGrace    time.Duration // a re-queued run waits this long for its prior worker (chat lane; ClaimChatRun)
-	WorkerAffinityCeiling  time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
-	WorkerSpreadGrace      time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
-	WorkerBackgroundGrace  time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
+	// WorkerStaleRequeueGrace (#2705): how long a run the stale-worker sweeper requeued stays
+	// pinned to its (heartbeat-stale) previous worker so a returning worker can resume it. 0 disables.
+	WorkerStaleRequeueGrace time.Duration
+	WorkerAffinityCeiling   time.Duration // PRD #628 D3a: run-lane affinity ceiling — a promoted run stays pinned to a LIVE, non-draining prior worker (liveness leg) but never longer than this, bounding the live-but-wedged case
+	WorkerSpreadGrace       time.Duration // PRD #216: a queued run older than this is exempt from the fleet-aware spread
+	WorkerBackgroundGrace   time.Duration // PRD #320: a demoted (judge/self_improve) run older than this fails open to normal priority so background work never starves
 
 	// Anthropic usage-limit park (PRD #35). Both are server-side bounds on a
 	// WORKER-REPORTED event, which is why they are here and not in the claim payload:
@@ -525,6 +533,12 @@ type Config struct {
 	// fail_origin='data_volume_full'. A PREVENTIVE park (the worker stopped the run before the
 	// volume filled) is neither counted nor capped. 0 = unlimited; the default (3) lives in Load.
 	RunDiskParkMax int
+	// Provider-transient park bound (PRD #1733, RUN_PROVIDER_PARK_MAX_DURATION). An unbroken
+	// streak of typed provider_outage recovery parks is bounded in ELAPSED time: the first
+	// provider park at or past this age since the streak began becomes a paused owner hold
+	// (hold_reason 'provider_unavailable') instead of another recovery_wait. It never fails a
+	// run. 0 disables the hold (typing and counting stay on); the default (24h) lives in Load.
+	RunProviderParkMaxDuration time.Duration
 
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
@@ -766,7 +780,7 @@ type Config struct {
 	RecoveryReadyPayloadPerOwner   int64         // UZI_RECOVERY_READY_PAYLOAD_PER_OWNER_BYTES — ready payload quota per owner. Default 1 GiB.
 	RecoveryInstanceBytes          int64         // UZI_RECOVERY_INSTANCE_BYTES — instance-wide byte quota (scoped to the affected owner on breach, never a global stop). Default 4 GiB.
 	RecoveryMaxCapturesPerClaim    int           // UZI_RECOVERY_MAX_CAPTURES_PER_CLAIM — captures admitted under one hold. Default 16.
-	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded) captures per owner. Default 256.
+	RecoveryMaxCapturesPerOwner    int           // UZI_RECOVERY_MAX_CAPTURES_PER_OWNER — retained (non-discarded, non-expired) captures per owner. Default 256.
 	RecoveryReadyRetention         time.Duration // UZI_RECOVERY_READY_RETENTION — ready-artifact TTL, begins at durable capture. Default 168h (7d).
 	RecoveryUploadRetryWindow      time.Duration // UZI_RECOVERY_UPLOAD_RETRY_WINDOW — governs the periodic stalled→needs_action sweep (workersvc ExpireStalledUploads), NOT an in-request loop: a capture stuck in a non-terminal upload state longer than this is surfaced as needs_action with the source retained. Default 24h; the sweep disables on a non-positive value.
 	RecoveryMaxConcurrentUploads   int           // UZI_RECOVERY_MAX_CONCURRENT_UPLOADS — concurrent uploads per API process. Default 2.
@@ -797,6 +811,13 @@ type Config struct {
 	// on a forge that left the list is settled 'disabled' (after a CAS delete of any
 	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
+
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is the held-work publication switch.
+	// Unset or empty means on. Accepted values, case-insensitive and trimmed: true, on, 1, yes, t,
+	// y (on) and false, off, 0, no, f, n (off); any other value fails startup. It is copied to
+	// workersvc.Params.HeldPublication (step A admission); the handler reads it from Config for the
+	// advertised protocol feature and step B.
+	HeldPublication bool
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1083,6 +1104,17 @@ func Load() (Config, error) {
 	if cfg.PlanCrossCheckTimeout <= 0 || cfg.PlanCrossCheckTimeout > 2*time.Hour || cfg.PlanCrossCheckTimeout >= cfg.RunTimeout {
 		return Config{}, fmt.Errorf("PLAN_CROSS_CHECK_TIMEOUT must be positive, at most 2h, and below RUN_TIMEOUT")
 	}
+	cfg.CodeCrossCheckTimeout = 30 * time.Minute
+	if raw, present := os.LookupEnv("CODE_CROSS_CHECK_TIMEOUT"); present {
+		value, err := time.ParseDuration(raw)
+		if err != nil {
+			return Config{}, fmt.Errorf("CODE_CROSS_CHECK_TIMEOUT: %w", err)
+		}
+		cfg.CodeCrossCheckTimeout = value
+	}
+	if cfg.CodeCrossCheckTimeout <= 0 || cfg.CodeCrossCheckTimeout > 2*time.Hour {
+		return Config{}, fmt.Errorf("CODE_CROSS_CHECK_TIMEOUT must be positive and at most 2h")
+	}
 	cfg.RunIdleTimeout = parseDuration("RUN_IDLE_TIMEOUT", 10*time.Minute)
 	// PRD #517 M5: the interactive-task park's worker-side idle backstop, delivered on
 	// the claim (like RunIdleTimeout). Shorter than chat's 60m because a parked task pins
@@ -1123,6 +1155,18 @@ func Load() (Config, error) {
 				"value", raw)
 		}
 	}
+	// DB_STORAGE_CAPACITY_BYTES: a positive base-10 int64 byte count of at most 1 EiB (the same
+	// bound deploy/chart/templates/_helpers.tpl enforces). Unset is silently 0; a set but
+	// unparseable, nonpositive or oversized value is 0 with one boot warning. Non-fatal: it
+	// only feeds the db.size health check.
+	if raw := strings.TrimSpace(os.Getenv("DB_STORAGE_CAPACITY_BYTES")); raw != "" {
+		if v, perr := strconv.ParseInt(raw, 10, 64); perr == nil && v > 0 && v <= maxDBStorageCapacityBytes {
+			cfg.DBStorageCapacityBytes = v
+		} else {
+			slog.Warn("DB_STORAGE_CAPACITY_BYTES is not a positive integer of at most 1 EiB (1152921504606846976 bytes); ignoring it, so the db.size health check is `na`",
+				"value", raw)
+		}
+	}
 	// 0 (or unset) delegates to the sweeper's own built-in 15s default, so current
 	// behaviour is preserved unless SWEEP_INTERVAL is explicitly set.
 	cfg.SweepInterval = parseNonNegDuration("SWEEP_INTERVAL", 0)
@@ -1155,6 +1199,11 @@ func Load() (Config, error) {
 	cfg.MRReviewQuietPeriod = parseNonNegDuration("MR_REVIEW_QUIET_PERIOD", 3*time.Minute)
 	cfg.WorkerPollInterval = parseDuration("WORKER_POLL_INTERVAL", 3*time.Second)
 	cfg.WorkerAffinityGrace = parseDuration("WORKER_AFFINITY_GRACE", 2*time.Minute)
+	// #2705: a stale-requeued run stays pinned to its previous worker this long while that
+	// worker's row exists; 0 disables the pin. The pin runs from status_since (the requeue, or
+	// a later Codex account promotion, which opens a new queued episode). WORKER_AFFINITY_CEILING
+	// bounds each queued episode, not the total.
+	cfg.WorkerStaleRequeueGrace = parseNonNegDuration("WORKER_STALE_REQUEUE_GRACE", 10*time.Minute)
 	// PRD #628 D3a: the run-lane affinity ceiling. ClaimRun now pins a promoted run
 	// to its prior worker while its row exists and it is heartbeating or draining
 	// (PRD #1030, verified against ClaimRun on 2026-09-08; the earlier comment
@@ -1208,6 +1257,11 @@ func Load() (Config, error) {
 	// UZI_RUN_DISK_PARK_MAX=0 is legal and means "unlimited" (never fail on the count), and an
 	// invalid or negative value falls back to the default of 3 counted disk parks.
 	cfg.RunDiskParkMax = parseNonNegInt("UZI_RUN_DISK_PARK_MAX", 3)
+
+	// Provider-transient park bound (PRD #1733). parseNonNegDuration, NOT parseDuration:
+	// RUN_PROVIDER_PARK_MAX_DURATION=0 is legal and disables the hold (parseDuration would turn
+	// it into the default), while a negative or malformed value falls back to 24h.
+	cfg.RunProviderParkMaxDuration = parseNonNegDuration("RUN_PROVIDER_PARK_MAX_DURATION", 24*time.Hour)
 
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)
@@ -1387,6 +1441,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SalvageForges = salvageForges
+
+	heldPublication, err := parseOnOff("UZI_HELD_PUBLICATION", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.HeldPublication = heldPublication
 
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
@@ -2238,6 +2298,22 @@ func parseBool(key string, def bool) (bool, error) {
 	return v, nil
 }
 
+// parseOnOff parses a switch that operators write either as a boolean or as on/off. Empty or
+// unset returns def; true/on/1/yes and false/off/0/no are accepted case-insensitively. Anything
+// else is an error, so a typo fails boot instead of silently keeping the default.
+func parseOnOff(key string, def bool) (bool, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch raw {
+	case "":
+		return def, nil
+	case "true", "on", "1", "yes", "t", "y":
+		return true, nil
+	case "false", "off", "0", "no", "f", "n":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be on/off or true/false, got %q", key, os.Getenv(key))
+}
+
 // parsePositiveInt parses a strictly-positive integer env var. Empty/unset returns
 // def. Unlike parseInt (which silently falls back to def on any bad value), a
 // set-but-malformed or non-positive value is an error, so a control-flavoured knob
@@ -2309,3 +2385,7 @@ func samePort(a, b string) bool {
 	}
 	return hostA == hostB
 }
+
+// maxDBStorageCapacityBytes is 1 EiB, the ceiling deploy/chart/templates/_helpers.tpl applies
+// to the rendered DB_STORAGE_CAPACITY_BYTES.
+const maxDBStorageCapacityBytes = int64(1) << 60

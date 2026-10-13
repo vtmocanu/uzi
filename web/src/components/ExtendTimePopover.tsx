@@ -1,6 +1,6 @@
 // PRD #1189: the Extend chooser — the owner's control for granting a run more wall-clock
 // time. Extend NEVER adds time on the first click (Decision 5): it always opens this chooser
-// with +2h preselected, showing what is used, how much allowance is left, and the deadline the
+// with +2h preselected, showing what is used, the per-extension maximum, and the deadline the
 // pick would produce, so a state-changing action never hides its magnitude behind one tap.
 //
 // It is one component reused in three places — the header (while the near-timeout flag is up),
@@ -151,22 +151,20 @@ export function ExtendTimePopover({
   const customTrimmed = custom.trim();
   const effective = customTrimmed !== "" ? parseDurationToSeconds(custom) : picked;
 
-  const allowanceLeft = view?.allowanceLeftSec ?? 0;
-  const overAllowance = effective != null && effective > allowanceLeft;
-  const canConfirm = !busy && !capDisabled && effective != null && !overAllowance && allowanceLeft > 0;
+  const perExtensionMax = view?.perExtensionMaxSec ?? 0;
+  const overMax = effective != null && effective > perExtensionMax;
+  const canConfirm = !busy && !capDisabled && effective != null && !overMax && perExtensionMax > 0;
 
   // The disabled reason, named so the owner knows why: an invalid custom value, or a pick above
-  // what the allowance still permits (naming the remaining allowance AND the cap).
+  // the per-extension maximum.
   let reason: string | null = null;
   if (!capDisabled && view) {
-    if (allowanceLeft <= 0) {
-      reason = `This run has used its full ${formatBudgetDuration(view.capSec)} extension allowance.`;
-    } else if (customTrimmed !== "" && effective == null) {
+    if (customTrimmed !== "" && effective == null) {
       reason = "Enter a duration like 2h, 90m or 1h30m.";
-    } else if (overAllowance && effective != null) {
+    } else if (overMax && effective != null) {
       reason = `+${formatBudgetDuration(effective)} is more than the ${formatBudgetDuration(
-        allowanceLeft,
-      )} left of this run's ${formatBudgetDuration(view.capSec)} extension allowance.`;
+        perExtensionMax,
+      )} maximum per extension.`;
     }
   }
 
@@ -208,8 +206,8 @@ export function ExtendTimePopover({
           <p className="text-sm font-semibold text-fg">Extend time</p>
           {capDisabled || !view ? (
             <p className="mt-2 text-xs text-muted">
-              Extensions are turned off for this instance. Ask an admin to raise the extension
-              allowance to grant a run more time.
+              Extensions are turned off for this instance. Ask an admin to set a maximum per
+              extension to let owners grant a run more time.
             </p>
           ) : (
             <>
@@ -217,7 +215,7 @@ export function ExtendTimePopover({
               <div className="mt-2 flex flex-wrap gap-1.5">
                 {QUICK_PICKS.map((sec) => {
                   const active = customTrimmed === "" && picked === sec;
-                  const tooBig = sec > allowanceLeft;
+                  const tooBig = sec > perExtensionMax;
                   return (
                     <button
                       key={sec}
@@ -251,8 +249,8 @@ export function ExtendTimePopover({
                 />
               </label>
 
-              {/* The facts the pick is chosen against (mock frame B): what is used, what
-                  allowance is left, and the deadline the pick would produce. */}
+              {/* The facts the pick is chosen against (mock frame B): what is used, the most
+                  one extension may add, and the deadline the pick would produce. */}
               <dl className="mt-3 space-y-1 text-xs text-muted">
                 <div className="flex justify-between gap-2">
                   <dt>Used</dt>
@@ -261,12 +259,16 @@ export function ExtendTimePopover({
                   </dd>
                 </div>
                 <div className="flex justify-between gap-2">
-                  <dt>Allowance left</dt>
-                  <dd className="tabular-nums text-fg">
-                    {formatBudgetDuration(view.allowanceLeftSec)} of {formatBudgetDuration(view.capSec)}
-                  </dd>
+                  <dt>Up to {formatBudgetDuration(view.perExtensionMaxSec)} per extension</dt>
+                  <dd className="text-faint">extend again any time</dd>
                 </div>
-                {effective != null && !overAllowance && (
+                {view.extSec > 0 && (
+                  <div className="flex justify-between gap-2">
+                    <dt>Extended so far</dt>
+                    <dd className="tabular-nums text-fg">{formatBudgetDuration(view.extSec)}</dd>
+                  </div>
+                )}
+                {effective != null && !overMax && (
                   <div className="flex justify-between gap-2">
                     <dt>After +{formatBudgetDuration(effective)}</dt>
                     <dd className="tabular-nums text-fg">

@@ -3,7 +3,7 @@
 // This is the reusable library the production worker adapter (and the m3a lifecycle
 // test) calls to launch ONE supervisor root: a static Go supervisor
 // (`/usr/local/bin/uzi-codex-supervisor`, built by a sibling unit) which forks the
-// pinned Codex app-server (`/opt/uzi-codex/0.159.3/bin/codex app-server`). It
+// pinned Codex app-server (`/opt/uzi-codex/0.160.0/bin/codex app-server`). It
 // composes the worker→runner/runner-cmd uid boundaries in `runner-uid.ts`.
 //
 // SUPPORTED PROFILE (fail-closed): this primitive is supported ONLY under the A1
@@ -75,7 +75,7 @@ const CODEX_LAUNCH_PATH = "/usr/local/sbin:/usr/local/bin:/usr/sbin:/usr/bin:/sb
 /** The pinned, image-baked Codex app-server binary. Exported so the production adapter
  *  composition (codex-executor.ts) can build a provider {@link CodexLaunchSpec} without
  *  re-typing the literal; the launcher still re-validates a provider spec names exactly it. */
-export const CODEX_BIN = "/opt/uzi-codex/0.159.3/bin/codex";
+export const CODEX_BIN = "/opt/uzi-codex/0.160.0/bin/codex";
 /** The pinned, image-baked supervisor trust anchor. Exported for the same reason. */
 export const SUPERVISOR_BIN = "/usr/local/bin/uzi-codex-supervisor";
 /** The fixed provider child argv (`codex app-server`). Exported so the production
@@ -226,6 +226,8 @@ export interface LauncherDeps {
   readonly assertNoUnexpectedSystemConfig?: (etcCodexDir?: string) => void;
   readonly etcCodexDir?: string;
   readonly deadlines?: Partial<LauncherDeadlines>;
+  /** Trusted tests only; arms the started await without altering its supplied budget or clock. */
+  readonly armStartedDeadlineForTest?: (fire: () => void, ms: number) => () => void;
   /** Boundary checkpoint only: identity and absolute budget survive every wrapper. */
   readonly startupCleanup?: StartupCleanupAuthorization;
   /** M3b-only authenticated custom-provider redirect. The alternate builder accepts
@@ -860,7 +862,29 @@ export class SupervisedChildExitTimeoutError extends Error {
   }
 }
 
-function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error): Promise<T> {
+function withDeadline<T>(p: Promise<T>, ms: number, label: string, timeoutError?: () => Error,
+  armForTest?: LauncherDeps["armStartedDeadlineForTest"]): Promise<T> {
+  if (armForTest) {
+    return new Promise<T>((resolve, reject) => {
+      let done = false;
+      let cancel = () => {};
+      const settle = (action: () => void): void => {
+        if (done) return;
+        done = true;
+        cancel();
+        action();
+      };
+      cancel = armForTest(() => settle(() => reject(timeoutError?.() ??
+        new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`))), ms);
+      // A trusted arm may fire synchronously before returning its cancellation handle.
+      if (done) cancel();
+      p.then(
+        value => settle(() => resolve(value)),
+        (error: unknown) => settle(() => reject(error instanceof Error ? error : new Error(String(error)))),
+      );
+    });
+  }
+  // Keep the production timer path unchanged, including unref and native cancellation.
   return new Promise<T>((resolve, reject) => {
     const timer = setTimeout(() => reject(timeoutError?.() ?? new TrustedExecutionRefusal(`${label} deadline exceeded (${ms}ms)`)), ms);
     if (typeof timer.unref === "function") timer.unref();
@@ -997,7 +1021,8 @@ export async function launchCodexRoot(spec: CodexLaunchSpec, deps: LauncherDeps 
   }
 
   // 7. Parse evidence (bounded), await `started`, expose snapshot/dispose + transport.
-  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind);
+  const handle = await createHandle(child, uid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, spec.kind,
+    undefined, deps.armStartedDeadlineForTest);
   return withOwnedTreeCleanup(
     handle,
     { uid, kind: spec.kind, root: spec.ownedDataRoot },
@@ -1092,7 +1117,8 @@ async function launchEffectRoot(spec: CodexEffectLaunchSpec, deps: LauncherDeps)
     launchClassifications.set(error, error.classification);
     throw error;
   }
-  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup);
+  return createHandle(child, expectedUid, { ...DEFAULT_DEADLINES, ...deps.deadlines }, "command", deps.startupCleanup,
+    deps.armStartedDeadlineForTest);
 }
 
 async function createHandle(
@@ -1101,6 +1127,7 @@ async function createHandle(
   deadlines: LauncherDeadlines,
   kind: CodexRootKind,
   startupCleanup?: StartupCleanupAuthorization,
+  armStartedDeadlineForTest?: LauncherDeps["armStartedDeadlineForTest"],
 ): Promise<CodexRootHandle> {
   const control = asWritable(child.stdio[3], "control");
   const evidence = asReadable(child.stdio[4], "evidence");
@@ -1194,13 +1221,19 @@ async function createHandle(
       }
       return;
     }
-    fail(new TrustedExecutionRefusal(why === "oversized line" ? `oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)` : `evidence ${why}`));
-  });
-  evidence.on("end", () => {
+    fail(new TrustedExecutionRefusal(why === "oversized line" ? `oversized evidence line (> ${MAX_EVIDENCE_LINE_BYTES} bytes)`
+      : why === "stream error" ? `evidence stream error: ${prefix}` : `evidence ${why}`));
+    stopLines();
+    if (why === "oversized line") evidence.destroy();
+  }, true);
+  const onEvidenceClosed = (): void => {
     resolveEvidenceEnd();
     if (failure || cleanDisposed || exited || abandoningStartup) return;
     if (pending.size > 0 || !disposeInFlight) fail(new TrustedExecutionRefusal("evidence stream closed before confirmed disposal"));
-  });
+  };
+  evidence.on("end", onEvidenceClosed);
+  // Close settles channel joining; readableEnded still gates actual EOF proof.
+  evidence.on("close", onEvidenceClosed);
   control.on("error", (err: Error) => fail(new TrustedExecutionRefusal(`control stream error: ${err.message}`, { cause: err })));
 
   function dispatch(value: unknown): void {
@@ -1467,6 +1500,8 @@ async function createHandle(
     }
   }
 
+  // All consumers and lifecycle handlers must be ready before prebuffered evidence flows.
+
   // Await `started` (bounded). A pre-started failure/exit rejects the launch; we end
   // the control channel so the supervisor runs its own bounded abnormal cleanup — we
   // NEVER process-group kill.
@@ -1477,7 +1512,7 @@ async function createHandle(
         const error = new CodexLaunchError("started_deadline", "unconfirmed", undefined);
         launchClassifications.set(error, "started_deadline");
         return error;
-      });
+      }, armStartedDeadlineForTest);
   } catch (error) {
     let verified = false;
     let cleanupFailure: unknown;
@@ -1651,16 +1686,25 @@ function spawnStandaloneMode(
 function readBoundedRecords(
   stream: Readable, limit: number, onLine: (line: string) => void,
   onBreach: (why: string, prefix: string) => void,
+  acceptCR = false,
 ): () => void {
   let pending = Buffer.alloc(0);
   let dropping = false;
   let stopped = false;
+  let skipLF = false;
+  const stop = (): void => { stopped = true; pending = Buffer.alloc(0); stream.off("data", data); };
   const data = (chunk: Buffer | string): void => {
     if (stopped) return;
     const bytes = typeof chunk === "string" ? Buffer.from(chunk) : chunk;
     let offset = 0;
     while (offset < bytes.length && !stopped) {
-      const nl = bytes.indexOf(0x0a, offset);
+      if (skipLF) {
+        skipLF = false;
+        if (bytes[offset] === 0x0a) { offset++; continue; }
+      }
+      const lf = bytes.indexOf(0x0a, offset);
+      const cr = acceptCR ? bytes.indexOf(0x0d, offset) : -1;
+      const nl = lf < 0 ? cr : cr < 0 ? lf : Math.min(lf, cr);
       const end = nl < 0 ? bytes.length : nl;
       if (!dropping) {
         const size = end - offset;
@@ -1677,13 +1721,18 @@ function readBoundedRecords(
       }
       if (nl < 0) break;
       dropping = false;
+      skipLF = acceptCR && bytes[nl] === 0x0d;
       offset = nl + 1;
     }
   };
   stream.on("data", data);
-  stream.on("end", () => { if (!stopped && (pending.length > 0 || dropping)) onBreach("truncated line", ""); });
-  stream.on("error", () => { if (!stopped) onBreach("stream error", ""); });
-  return () => { stopped = true; pending = Buffer.alloc(0); stream.off("data", data); };
+  stream.on("end", () => {
+    if (!stopped && (pending.length > 0 || dropping)) onBreach("truncated line", "");
+    stop();
+  });
+  stream.on("close", stop);
+  stream.on("error", (error: Error) => { if (!stopped) onBreach("stream error", error.message); stop(); });
+  return stop;
 }
 
 /** Split a mode's stdout into bounded lines. Any breach (an over-long line, more lines

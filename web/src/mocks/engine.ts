@@ -7,9 +7,19 @@
 import type { IssueProposal, RunInputKind } from "../lib/api";
 // isTerminalRun comes from the leaf module (not the ../lib/api barrel) to stay clear of the
 // mock↔barrel runtime cycle the api-acyclic test guards.
+import { formatBudgetDuration } from "../lib/budget";
 import { isTerminalRun } from "../lib/runStatus";
 import { HEARTBEAT_MILESTONES, SAMPLE_PLAN } from "./data";
 import { appendMessage, getRun, listMessages, nextProposalId, patchRun, putProposal } from "./store";
+
+// Mock stand-ins for the server-side technical wall limit an extend must fit under.
+const MOCK_MAX_TOTAL_WALL_SECONDS = 2147483;
+const MOCK_RUN_TIMEOUT_SECONDS = 6 * 3600;
+// The server reserves the maximum validated RUN_WALL_CEILING (72h) for every run, not the current
+// setting, so a later ceiling raise cannot push an already-admitted total past the extension-admission
+// limit (#2735).
+const MOCK_MAX_RUN_WALL_CEILING_SECONDS = 72 * 3600;
+const MOCK_MIN_FINALIZE_SECONDS = 1800;
 
 // ── Result frames (extracted, single source) ─────────────────────────────────
 // PRD #311: the plan-turn and implement-turn `result` frames are the cost/usage
@@ -206,7 +216,7 @@ function planningScript(runId: string): Timed[] {
     {
       delay: 1600,
       step: () => {
-        appendMessage(runId, "plan", "lead", { text: SAMPLE_PLAN() });
+        appendMessage(runId, "plan", "lead", { plan_md: SAMPLE_PLAN() });
         // PRD #40: the plan TURN ends with its own result frame (cumulative usage so
         // far), so the per-phase table shows a "Plan" phase distinct from implement.
         // PRD #311: the frame is PLAN_RESULT_FRAME (module-level, guarded).
@@ -447,11 +457,13 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
       delay: 1500,
       step: () => {
         const plan = `${SAMPLE_PLAN()}\n\n> Revised after rejection: ${reason || "(no reason given)"}`;
-        appendMessage(runId, "plan", "lead", { text: plan });
-        appendMessage(runId, "status", null, { text: "revised plan submitted — awaiting approval" });
+        // Patch the run BEFORE appending: appendMessage broadcasts synchronously and the
+        // plan frame makes the page re-read the run, which must already be un-revising
+        // with the bumped gate_revision (issue #2760).
         // PRD #122: the re-gate still shows the milestones as PRE-APPROVAL candidates.
         patchRun(runId, {
           status: "awaiting_approval",
+          is_revising: false,
           plan_md: plan,
           gate_revision: (getRun(runId)?.gate_revision ?? 0) + 1,
           milestones_candidate: HEARTBEAT_MILESTONES,
@@ -459,6 +471,8 @@ function revisedPlanScript(runId: string, reason: string): Timed[] {
           milestones_completed: null,
           milestones_in_progress: null,
         });
+        appendMessage(runId, "plan", "lead", { plan_md: plan });
+        appendMessage(runId, "status", null, { text: "revised plan submitted — awaiting approval" });
       },
     },
   ];
@@ -616,6 +630,7 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     case "reject_plan":
       if (run.status !== "awaiting_approval") return null;
       patchRun(runId, { status: "running" });
+      appendMessage(runId, "plan_feedback", null, { feedback: body });
       appendMessage(runId, "status", null, { text: "plan rejected — sending feedback to the agent" });
       schedule(runId, revisedPlanScript(runId, body));
       return null;
@@ -628,6 +643,10 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     case "revise_plan": {
       if (run.status !== "awaiting_approval") return null;
       const round = countPlanFeedback(runId) + 1;
+      // Mirrors the server's runToDTO: the latest plan-family message is plan_revising, so
+      // is_revising is true and progress derives to "planning" until the next plan lands.
+      // Patched BEFORE the broadcasting appends so the plan_revising frame's run re-read sees it.
+      patchRun(runId, { is_revising: true });
       appendMessage(runId, "plan_feedback", null, { feedback: body });
       appendMessage(runId, "plan_revising", "lead", { round });
       schedule(runId, revisedPlanScript(runId, body));
@@ -687,6 +706,15 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
     // status (D3): the run stays running and only the three pause columns are set. The park
     // to `paused` then lands on a timer (the mock's stand-in for the worker's next report /
     // turn abort): quickly for "now", after a beat for "milestone" (the boundary rule).
+    case "scope": {
+      if (isTerminalRun(run.status) || run.kind !== "issue" || !run.milestones?.length)
+        return { status: 409, message: "scope requires an active milestone issue run" };
+      if (!/^\d+$/.test(body)) return { status: 400, message: "invalid scope ceiling" };
+      const done = new Set(run.milestones_completed ?? []);
+      const completed = run.milestones.filter((m) => done.has(m.id)).length;
+      patchRun(runId, { scope_ceiling: Math.max(completed, Math.min(run.milestones.length, Number(body))) });
+      return null;
+    }
     case "pause": {
       if (run.status !== "running")
         return { status: 409, message: `run is ${run.status}; the clock is already stopped` };
@@ -743,11 +771,24 @@ export function handleInput(runId: string, kind: RunInputKind, body: string): In
       if (cap <= 0) {
         return { status: 409, message: "extensions are turned off for this instance" };
       }
-      if (currentExt + secs > cap) {
-        const leftSec = Math.max(0, cap - currentExt);
+      // The cap is a per-request maximum (#2735): earlier extensions do not shrink it.
+      if (secs > cap) {
         return {
           status: 409,
-          message: `${secs}s exceeds the remaining extension cap (${leftSec}s left of ${cap}s)`,
+          message: `${formatBudgetDuration(secs)} is more than the ${formatBudgetDuration(cap)} maximum per extension`,
+        };
+      }
+      // Mirror the server's technical room (a ~24.8 day total wall): it reserves the larger of the
+      // run's frozen wall, RUN_TIMEOUT (mock 6h) and the 72h maximum wall ceiling.
+      const room =
+        MOCK_MAX_TOTAL_WALL_SECONDS -
+        Math.max(run.budget_wall_seconds ?? 0, MOCK_RUN_TIMEOUT_SECONDS, MOCK_MAX_RUN_WALL_CEILING_SECONDS) -
+        Math.max(run.budget_finalize_seconds ?? 0, MOCK_MIN_FINALIZE_SECONDS) -
+        currentExt;
+      if (secs > room) {
+        return {
+          status: 409,
+          message: `${formatBudgetDuration(secs)} is more than the ${formatBudgetDuration(Math.max(0, room))} of technical room left on this run`,
         };
       }
       const newExt = currentExt + secs;

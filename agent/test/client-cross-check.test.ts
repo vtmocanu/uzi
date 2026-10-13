@@ -36,7 +36,10 @@ for (const sources of [
 ] as const) {
  it("HTTP claim preserves independent provenance and legacy absence: " + JSON.stringify(sources), async () => {
   const body = { kind: "cross_check", config: { default_model: "gpt-6-astra", default_effort: "xhigh" },
-   cross_check: { stage: "plan", ...sources } };
+   cross_check: { stage: "plan", lead_run_id: "lead", round: 1,
+    candidate_digest: "b".repeat(64), deadline_at: "2030-01-01T00:00:00Z",
+    plan_md: "legacy plan", milestones: [], required_capabilities: [], required_tools: [],
+    size_class: "s", base_commit: "a".repeat(40), planning_diff: "", ...sources } };
   const server = http.createServer((_req, res) => {
    res.setHeader("X-Uzi-Claim-Kind", "cross_check"); res.setHeader("Content-Type", "application/json");
    res.end(JSON.stringify(body));

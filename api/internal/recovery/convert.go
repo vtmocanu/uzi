@@ -1,11 +1,13 @@
 package recovery
 
 import (
+	"encoding/json"
 	"time"
 
 	"github.com/google/uuid"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
 
@@ -113,7 +115,14 @@ func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCu
 		HasAvailableCapture:     row.HasAvailableCapture,
 		CaptureState:            row.CaptureState,
 	}
-	if row.FinalDisposition.Valid {
+	out.CompletedPublicationReason = row.CompletedPublicationReason.String
+	if len(row.CompletedPublicationReceipt) > 0 {
+		var receipt apitypes.CompletedPublicationReceipt
+		if json.Unmarshal(row.CompletedPublicationReceipt, &receipt) == nil {
+			out.CompletedPublicationReceipt = &receipt
+		}
+	}
+	if row.FinalDisposition.Valid && row.FinalDisposition.String != "completed_publication" {
 		out.FinalReceipt = &apitypes.RecoveryFinalDisposition{
 			Kind:           row.FinalDisposition.String,
 			SourceSha:      row.FinalSourceSha.String,
@@ -121,6 +130,12 @@ func custodyHoldToDTO(row store.ListCustodyHoldsForOwnerRow) apitypes.RecoveryCu
 		}
 		if row.FinalCaptureID.Valid {
 			out.FinalReceipt.CaptureID = uuid.UUID(row.FinalCaptureID.Bytes).String()
+		}
+		if row.FinalPublicationID.Valid {
+			pub := uuid.UUID(row.FinalPublicationID.Bytes).String()
+			out.FinalReceipt.PublicationID = pub
+			out.FinalPublicationID = pub
+			out.HeldRef = pushbroker.HeldRef(row.RunID, row.Generation)
 		}
 	}
 	if row.CreatedAt.Valid {

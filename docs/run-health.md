@@ -20,7 +20,7 @@ left to the deadline (e.g. `1h 5m left`).
 | ⚠ looping | The agent has repeated the exact same tool call 4+ times recently — or its updates can't be saved, so it keeps resending them. | Open the run view and check what it's stuck repeating (or whether it's stuck retrying a save); it may need a nudge or a cancel. |
 | ⚠ stalled | No new activity for a while, and nothing is currently running (a long build or test suite in progress does **not** count as stalled) — or one tool call has been running far longer than a normal build or test suite would (see [Long tool calls](#long-tool-calls)). | Open the run view — it's either quietly working on something the flag doesn't see, or genuinely wedged. |
 | ⚠ near timeout | Has used most (default 85%) of its wall-clock budget while running, gate time excluded; it will park and wait for you at the timeout, not fail — see [Running out of time](#running-out-of-time). | Let it finish if it is on its last milestone, `uzi run scope --through N` / `run stop` to finalize what is committed, or [give it more time](#giving-a-run-more-time) instead. Raising `RUN_TIMEOUT` only helps a run whose budget isn't already frozen — a milestone-scaled run freezes its `budget_wall_seconds` at plan approval, so a later `RUN_TIMEOUT` bump won't extend it. |
-| ⚠ waiting for worker | Queued longer than expected with no worker claiming it. | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
+| ⚠ waiting for worker | Queued longer than expected with no worker claiming it — or, for a repo the Docker worker allowlist blocks, as soon as the next health sweep detects it (see below). | The reason names why, if you own the run: no worker online, your vault is locked, or just a wait — start a worker or unlock your vault as needed. A judge or self-improve run instead reads **deprioritized** (yielding to interactive work on purpose, not stuck) or, once it's waited past the grace window, **priority restored** — see [Queue priority](#queue-priority). |
 | ⚠ needs approval | Sitting at `awaiting_approval` longer than expected (never shown for autopilot runs, which approve themselves). | Approve, reject, or request changes to the plan — see [Plan approval gate](./run-activity.md#plan-approval-gate). |
 
 When suitable persistent workers are finishing runs before an upgrade, the reason is
@@ -31,12 +31,30 @@ run vetoes it, because that worker can resume its own work. Incompatible own wor
 not veto it. Account, vault, custody and isolated-profile guards keep precedence.
 
 One **waiting for worker** reason worth calling out is the Docker-worker
-allowlist. When every online worker is a Docker worker and the run's repo
-isn't on the Docker-worker allowlist, no worker is eligible to claim it, so
-the run stays `queued` and the owner's reason names it specifically — _"this
-repo isn't on the Docker worker allowlist, so no Docker worker can run it"_ —
-distinct from "no worker online" or "all workers busy". The fix is to add the
-repo to the allowlist, not to start another worker.
+repo allowlist. When the owner has workers online but every one of them is a
+Docker worker and the run's repo isn't on the Docker worker repo allowlist,
+no worker is eligible to claim it, so the run stays `queued` and the reason
+names it specifically, distinct from "no worker online" or "all workers busy".
+Like the stale-requeue pin reason, and unlike the other waiting reasons, it is flagged as soon as the next health
+sweep detects the block, without waiting for **Stuck queued after**
+(`health_queued_seconds`); a higher-precedence block (locked vault, custody
+limit, and so on) still hides it, and setting `health_queued_seconds` to `0`
+still turns it off with every other queued flag. The wording depends on
+whether the run's owner is an admin, because only an admin can change the
+allowlist (**Admin → Instance → Docker worker repo allowlist**, at
+`/admin/settings`). An admin viewing someone else's run sees the owner's
+variant.
+
+- Owner is an admin: _"this repo isn't on the Docker worker repo allowlist, so
+  your Docker workers can't run it; add it under Admin → Instance → Docker
+  worker repo allowlist"_
+- Owner is not an admin: _"this repo isn't on the Docker worker repo
+  allowlist, so your Docker workers can't run it; ask an admin to add it under
+  Admin → Instance → Docker worker repo allowlist"_
+
+The fix is to add the repo to the allowlist, not to start another worker. The
+owner's Slack nudge for this flag arrives sooner too, still subject to the
+[Slack nudge cooldown](./admin-settings.md).
 
 One **stalled** reason worth calling out is an undelivered outcome. When a
 worker has a running or awaiting-approval run's outcome journaled but not yet
@@ -87,6 +105,25 @@ never stops the run.
 Only the run's owner (and admins) see the reason text behind a flag; everyone
 else viewing a shared board sees just the ⚠ badge.
 
+## Provider recovery and owner attention
+
+A typed `recovery_wait` / `provider_outage` park shows its provider park
+count, streak start and next retry. After the configured elapsed streak
+bound (default 24h), the next qualifying provider park becomes `paused` /
+`provider_unavailable`, an owner-attention hold rather than a running
+stalled/looping warning. There is no maximum detection overshoot promise.
+Positive completed model turns on the park report start a new streak.
+
+The owner can **Resume** a fresh attempt or **Cancel**. Eligible **Stop**
+sets the scope ceiling, then requires **Resume** after success; it is not
+an atomic endpoint. Stop requires a non-interactive milestone issue run
+with at least one completed milestone. Claim, worker affinity and the
+issue lock for issue runs remain held. Clone/HOME and verified captures
+depend on surviving storage or an available verified recovery copy, not
+a guarantee that every latest edit is recoverable elsewhere.
+See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for resets, the `0` off switch and mixed-fleet limits.
+
 ## Giving a run more time
 
 A run that can time out shows its wall-clock budget in the header, right
@@ -94,7 +131,7 @@ next to the elapsed time — `3h 48m / 8h`, or `3h 48m / 8h+2h` once it's been
 extended. When it crosses **near timeout**, the run's owner gets an
 **Extend time…** button in the header and a panel explaining what will
 happen: a chooser offering +1h / +2h / +4h / +8h or a custom duration (`2h`,
-`90m`, `1h30m`), with the used time, the remaining allowance and the
+`90m`, `1h30m`), with the used time, the maximum per extension and the
 resulting deadline shown before you confirm. The extension adds to the
 run's existing budget — it never replaces it, and the underlying frozen
 budget described in [Milestone-scaled
@@ -106,11 +143,36 @@ formats and what a refusal looks like).
 Only the run's owner can extend it; everyone else sees inert text in the
 same spot. Extending a run clears its near-timeout flag on the next health
 sweep, though a long-enough run can cross 85% of the new, larger budget
-later and get flagged again — that's expected, not a bug. Total extra time
-per run is bounded by an admin-set allowance (default 16h); once a run has
-used up its allowance, or an admin has turned extending off entirely, the
-button and the CLI command both stop working — see [Admin
+later and get flagged again — that's expected, not a bug. An admin-set
+maximum per extension (default 16h) limits how much time one request can
+add; it is not a lifetime total, so the owner may extend the same run again
+and again. Each extension is an explicit, owner-authorized, audited action:
+repeated grants permit longer resource use, and nothing extends a run
+automatically. When an admin has turned extending off entirely, the button
+and the CLI command both stop working — see [Admin
 settings](admin-settings.md#run-health) for that setting.
+
+### How much time a run can have in total
+
+Extension admission retains a 2147483-second limit (24d 20h 31m 23s).
+The room left for extensions is that limit, minus the larger of the run's
+frozen wall budget (`budget_wall_seconds`), current `RUN_TIMEOUT`, current
+`RUN_WALL_CEILING` and 72h (the largest `RUN_WALL_CEILING` the configuration
+accepts), minus the 30-minute finalize allowance that Stop grants (or the
+larger finalize allowance already granted), minus what is already extended.
+A request past that room is refused with a 409 naming the limit and the
+room left. The 72h reserve covers later plan scaling or a ceiling increase,
+including a run with no frozen wall yet. With a frozen wall and current
+configuration no larger than 72h, and the standard finalize reserve, a run
+starts with 1886483 s (about 21d 20h) of extension room.
+
+This is an admission limit, not an absolute cap on the wall total served to
+the worker. A later `RUN_TIMEOUT` increase above 72h can raise the served
+total for a run with no frozen wall; that larger total is honored without
+clamping. The worker schedules long relative deadlines in chunks within the
+native timer range, so exceeding that range no longer fires the timer at
+once. Chat, judge and interactive-task runs never time out, so extending
+one is refused, and a job is never extended.
 
 ## Running out of time
 

@@ -12,9 +12,11 @@ import (
 	"unicode"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5/pgconn"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/dbdiskfull"
 	"github.com/vtmocanu/uzi/api/internal/settings"
 	"github.com/vtmocanu/uzi/api/internal/slacksvc"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -30,6 +32,9 @@ import (
 // ---- fakes -----------------------------------------------------------------
 
 type fakeStore struct {
+	storageRows            []store.RecoveryStorageHealthRow
+	storageErr             error
+	storageRead            func(context.Context, store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error)
 	custodyAggregateErr    error
 	custodyAggregate       store.GetCustodyAggregateForOwnerRow
 	custodyListParams      []store.ListOwnersOverCustodyLimitParams
@@ -61,6 +66,16 @@ type fakeStore struct {
 	ciwatchErr             error
 	runDisk                []store.WorkerRunDisk
 	runDiskErr             error
+}
+
+func (f *fakeStore) RecoveryStorageHealth(ctx context.Context, p store.RecoveryStorageHealthParams) ([]store.RecoveryStorageHealthRow, error) {
+	if f.storageRead != nil {
+		return f.storageRead(ctx, p)
+	}
+	if f.storageRows == nil && f.storageErr == nil {
+		return []store.RecoveryStorageHealthRow{{}}, nil
+	}
+	return f.storageRows, f.storageErr
 }
 
 func (f *fakeStore) ListEnabledRepoIDs(context.Context) ([]uuid.UUID, error) {
@@ -501,7 +516,7 @@ func TestDB(t *testing.T) {
 				st := *tc.probe
 				svc.probeDB = func(context.Context) dbStat { return st }
 			}
-			c := svc.checkDB(context.Background())
+			c := svc.checkDB(context.Background(), svc.now())
 			if c.Severity != tc.wantSev {
 				t.Fatalf("severity = %q, want %q (summary %q)", c.Severity, tc.wantSev, c.Summary)
 			}
@@ -510,6 +525,98 @@ func TestDB(t *testing.T) {
 			}
 		})
 	}
+}
+
+// Evaluate reads the clock once and judges db disk-full at that instant. A clock that
+// jumps past the window on later calls must not clear a sighting made at that instant.
+func TestEvaluateJudgesDiskFullAtItsSingleNow(t *testing.T) {
+	t0 := fixedNow
+	sig := dbdiskfull.New(func() time.Time { return t0 })
+	sig.Observe(fmt.Errorf("write: %w", &pgconn.PgError{Code: "53100"}))
+	calls := 0
+	svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, DiskFull: sig, Now: func() time.Time {
+		calls++
+		if calls == 1 {
+			return t0
+		}
+		return t0.Add(dbdiskfull.Window + time.Second)
+	}})
+	svc.probeDB = func(context.Context) dbStat { return dbStat{schemaAtHead: true, maxConns: 20} }
+	doc, err := svc.Evaluate(context.Background())
+	if err != nil || calls != 1 {
+		t.Fatalf("Evaluate err=%v clock calls=%d, want exactly 1", err, calls)
+	}
+	for _, check := range doc.Checks {
+		if check.ID == "db" {
+			if check.Severity != sevDanger {
+				t.Fatalf("db check severity=%q, want danger", check.Severity)
+			}
+			return
+		}
+	}
+	t.Fatal("no db check in the document")
+}
+
+func TestDBDiskFull(t *testing.T) {
+	pg := func(code string) error { return fmt.Errorf("write: %w", &pgconn.PgError{Code: code}) }
+	clock := fixedNow
+	mk := func() (*Service, *dbdiskfull.Signal) {
+		sig := dbdiskfull.New(func() time.Time { return clock })
+		svc := New(Config{Store: &fakeStore{}, Settings: &fakeSettings{}, DiskFull: sig, Now: func() time.Time { return clock }})
+		svc.probeDB = func(context.Context) dbStat { return dbStat{schemaAtHead: true, maxConns: 20} }
+		return svc, sig
+	}
+	t.Run("store write error and commit-shaped error go danger then recover", func(t *testing.T) {
+		for _, err := range []error{pg("53100"), fmt.Errorf("commit: %w", fmt.Errorf("tx: %w", &pgconn.PgError{Code: "53100"}))} {
+			clock = fixedNow
+			svc, sig := mk()
+			sig.Observe(err)
+			c := svc.checkDB(context.Background(), svc.now())
+			if c.Severity != sevDanger || c.Summary != "Database writes are failing: disk full (53100)." {
+				t.Fatalf("got %q / %q", c.Severity, c.Summary)
+			}
+			if len(c.Evidence) != 1 || c.Evidence[0].Label != "Last seen" || c.Evidence[0].Value != fixedNow.UTC().Format(time.RFC3339) {
+				t.Fatalf("evidence = %+v", c.Evidence)
+			}
+			clock = fixedNow.Add(dbdiskfull.Window + time.Second)
+			if c := svc.checkDB(context.Background(), svc.now()); c.Severity != sevOK {
+				t.Fatalf("after window: %q / %q", c.Severity, c.Summary)
+			}
+		}
+	})
+	t.Run("since is the incident start, evidence is the last sighting", func(t *testing.T) {
+		clock = fixedNow
+		svc, sig := mk()
+		sig.Observe(pg("53100"))
+		clock = fixedNow.Add(time.Minute)
+		sig.Observe(pg("53100"))
+		c := svc.checkDB(context.Background(), svc.now())
+		if c.Since == nil || *c.Since != fixedNow.UTC().Format(time.RFC3339) {
+			t.Fatalf("Since = %v, want %v", c.Since, fixedNow.UTC().Format(time.RFC3339))
+		}
+		if c.Evidence[0].Value != fixedNow.Add(time.Minute).UTC().Format(time.RFC3339) {
+			t.Fatalf("evidence = %+v", c.Evidence)
+		}
+	})
+	t.Run("nil probe does not hide it", func(t *testing.T) {
+		clock = fixedNow
+		svc, sig := mk()
+		svc.probeDB = nil
+		sig.Observe(pg("53100"))
+		if c := svc.checkDB(context.Background(), svc.now()); c.Severity != sevDanger {
+			t.Fatalf("got %q", c.Severity)
+		}
+	})
+	t.Run("other errors stay ok", func(t *testing.T) {
+		for _, err := range []error{pg("53200"), pg("53300"), errors.New("unrelated")} {
+			clock = fixedNow
+			svc, sig := mk()
+			sig.Observe(err)
+			if c := svc.checkDB(context.Background(), svc.now()); c.Severity != sevOK {
+				t.Fatalf("%v: got %q / %q", err, c.Severity, c.Summary)
+			}
+		}
+	})
 }
 
 // ---- slack.socket ----------------------------------------------------------
@@ -880,11 +987,12 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// present. M2-B added controller.report + loops (control) and forge.ciwatch
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
-	// fleet.quarantine (workers), making 17.
+	// fleet.quarantine (workers); pricing.codex follows release.check, db.size follows db and
+	// recovery.storage follows custody.holds, making 20.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "queue.waiting", "queue.undispatched",
-		"controller.report", "db", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
-		"schedules.paused", "board.drift", "custody.holds", "release.check",
+		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
+		"schedules.paused", "board.drift", "custody.holds", "recovery.storage", "release.check", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {
 		t.Fatalf("doc has %d checks, want %d", len(doc.Checks), len(wantIDs))
@@ -1148,6 +1256,16 @@ func TestFleetCapacityRollConfirmation(t *testing.T) {
 	}{
 		{name: "ordinary roll informational", want: sevOK},
 		{name: "older unrelated health uses drain overlap", want: sevOK},
+		{name: "fresh active cohort drain", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DiagnosticSuitable, e.DiagnosticRolling, e.DiagnosticDrainingOnly = 2, 2, 2
+		}, want: sevOK},
+		{name: "fresh drain plus unreported offline peer", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DrainingEligible = 1
+			e.DiagnosticSuitable, e.DiagnosticRolling, e.DiagnosticDrainingOnly = 2, 1, 1
+		}, want: sevDanger, since: row.HealthSince.Time},
+		{name: "fresh held cohort", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
+			e.DiagnosticSuitable, e.DiagnosticRolling, e.DiagnosticDrainingOnly = 2, 2, 0
+		}, want: sevDanger, since: row.HealthSince.Time},
 		{name: "24h equality", change: func(_ *store.ListOwnersWaitingNoCapacityRow, e *store.CountOnlineWorkersClaimableForRunRow) {
 			e.LatestSuitableDrainingSince.Time = fixedNow.Add(-24 * time.Hour)
 		}, want: sevDanger, since: fixedNow.Add(-24 * time.Hour)},
@@ -1497,4 +1615,8 @@ func TestCustodyHoldsAggregateError(t *testing.T) {
 	if got.Severity != sevUnknown || len(got.Evidence) != 0 {
 		t.Fatalf("failed aggregate check=%+v", got)
 	}
+}
+
+func (f *fakeStore) ListRecentUnpricedCodexModels(context.Context, store.ListRecentUnpricedCodexModelsParams) ([]store.ListRecentUnpricedCodexModelsRow, error) {
+	return nil, nil
 }

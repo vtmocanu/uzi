@@ -502,7 +502,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assert.ok(cause.startsWith("a".repeat(200)));
   });
 
-  it("checkpoint publish keeps the feed line byte-identical and logs the structured refusal", async () => {
+  it("checkpoint publish names the bounded pair and logs the structured refusal", async () => {
     const { gitlab } = fakeGitlab();
     const branch = "feature/refusal-checkpoint";
     const P = publishBranch(branch);
@@ -542,7 +542,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
       git.checkpointPack = original;
     }
     assert.deepEqual(outcome, { published: false, reason: "scratch_publication_refused" });
-    assert.deepEqual(feed, ["checkpoint publish failed: scratch_publication_refused"]);
+    assert.deepEqual(feed, ["checkpoint publish failed: scratch_publication_refused (floor_unverified at floor_refresh)"]);
     const line = lines.find((l) => l.msg === "scratch publication refused");
     assert.ok(line);
     assert.equal(line.fields?.site, "checkpoint_publish");
@@ -596,6 +596,7 @@ describe("RunRunner — scratch publication refusal diagnostics (issue #2054)", 
     assert.equal(line.fields?.site, "checkpoint_publish");
     assert.equal(line.fields?.kind, "exec_failed");
     assert.equal(line.fields?.step, "object_walk");
+    assert.deepEqual(feed, ["checkpoint publish failed: scratch_publication_refused (exec_failed at object_walk)"]);
     assert.equal(line.fields?.detail, undefined);
     assert.equal(line.fields?.cause, undefined);
   });
@@ -996,7 +997,7 @@ describe("RunRunner.bridgeBareTrackingRefIfDivergent (PRD #1416 M3 — the share
     assert.equal(flight.checkpointFloor, P);
     assert.equal(flight.lastCheckpointRefTip, "CONFIRMED");
     assert.equal(flight.lastAttemptedCheckpointRefTip, "ATTEMPTED");
-    assert.deepEqual(lines, ["checkpoint publish failed: scratch_publication_refused"]);
+    assert.deepEqual(lines, ["checkpoint publish failed: scratch_publication_refused (scratch_present at scratch_walk)"]);
   });
 
   it("returns 'unknown' (never bridges) when ancestry cannot be determined", async () => {
