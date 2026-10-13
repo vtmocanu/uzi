@@ -2184,8 +2184,8 @@ export class CodexHarness implements RunHarness {
     // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
     // the run's auth mode against the D5 price table (C4b). The reducer emits
     // `terminal.usage.wire.modelUsage`, so the reconciled deltas + cost ride out there. When no
-    // usage was reconciled, aggregateByModel() is undefined and the terminal usage is left
-    // byte-identical to before C4a. `now` is the real clock at the terminal point; the price
+    // usage was reconciled and no model is incomplete, aggregateByModel() is undefined and the
+    // terminal usage is left byte-identical to before C4a. `now` is the real clock at the terminal point; the price
     // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
     const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
     const modelUsage = this.accountant.aggregateByModel(pricing);
