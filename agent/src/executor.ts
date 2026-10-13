@@ -1799,7 +1799,11 @@ export class StubExecutor implements Executor {
       }
       // Stub-only E2E barrier: helper startup may outlast the stream. The harness
       // releases this exact run only after stopping the API, never by elapsed time.
-      if (ctx.issueDescription.includes("UZI_STUB_OUTBOX_CUT_BARRIER")) {
+      const cutBarrier = ctx.issueDescription.includes("UZI_STUB_OUTBOX_CUT_BARRIER");
+      const firstClaimBarrier = ctx.issueDescription.includes("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER");
+      if (firstClaimBarrier && (!Number.isSafeInteger(ctx.claimGeneration) || ctx.claimGeneration! < 1))
+        throw new Error("invalid stub outbox barrier claim generation");
+      if (cutBarrier || (firstClaimBarrier && ctx.claimGeneration === 1)) {
         if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(ctx.runId))
           throw new Error("invalid stub outbox barrier run id");
         const name = `cdr-outbox-cut-${ctx.runId}`;

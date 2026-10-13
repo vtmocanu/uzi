@@ -137,15 +137,16 @@ assert_contiguous() {
   done
   fail "outbox phase: run $run stream is not a gapless 1..N sequence after drain: $(printf '%s' "$msgs" | jq -c '[.messages[].seq] | sort')"
 }
-# make_outbox_run [cut_barrier] — create + approve a UZI_STUB_OUTBOX stub run and wait until its stream
+# make_outbox_run [cut_barrier|first_cut_barrier]: create + approve a stub run and wait until its stream
 # is flowing; leave the id in OUTBOX_RUN (a GLOBAL, so a `fail`/`pass` in here runs in the
 # current shell and a captured command-substitution can't swallow its exit — the 50/51
 # idiom). The caller has already recreated the agent with the case's outbox knobs.
 # cut_barrier holds stub completion until the harness releases the run after API stop.
+# first_cut_barrier holds only claim 1, letting case 7's resumed execution complete.
 make_outbox_run() {
   local iid n deadline barrier="${1:-}"
   iid="$(apipost "/api/repos/$REPO_ID/issues" \
-    "$(jq -nc --arg barrier "$barrier" '{title:"E2E outbox UZI_STUB_OUTBOX",description:("implements prds/1391-worker-outbox-durable-reports.md UZI_STUB_OUTBOX" + (if $barrier == "cut_barrier" then " UZI_STUB_OUTBOX_CUT_BARRIER" else "" end))}')" \
+    "$(jq -nc --arg barrier "$barrier" '{title:"E2E outbox UZI_STUB_OUTBOX",description:("implements prds/1391-worker-outbox-durable-reports.md UZI_STUB_OUTBOX" + (if $barrier == "cut_barrier" then " UZI_STUB_OUTBOX_CUT_BARRIER" elif $barrier == "first_cut_barrier" then " UZI_STUB_OUTBOX_FIRST_CUT_BARRIER" else "" end))}')" \
     | jq -r '.card.iid')"
   { [ -n "$iid" ] && [ "$iid" != null ]; } || fail "outbox phase: could not create the stub issue"
   # Cases create one fresh run at a time. Re-check before each initial claim;
@@ -279,13 +280,15 @@ configure_outbox_api_alias() {
   image="$("${COMPOSE[@]}" images -q agent)" || fail "outbox phase: could not read built worker image for API placeholder"
   [ -n "$image" ] || fail "outbox phase: built worker image missing for API placeholder"
   OUTBOX_DNS_OVERRIDE="$RUNROOT/phase52-api-alias.json"
-  # Reuse the loaded image, bypass worker startup, and pass no credentials or mounts.
+  # Reuse the loaded image, bypass worker startup, and pass no credentials or stored
+  # data. Empty tmpfs mounts suppress anonymous image-volume copies of /data and /nix.
   # A profile confines this extra service to explicit phase calls. Its unique name
   # is outside uzi- so it cannot be confused with the developer's real stack.
   jq -n --arg image "$image" --arg name "cdr-outbox-api-$PROJECT" '{services:{
     "outbox-api-placeholder":{image:$image,pull_policy:"never",container_name:$name,
       profiles:["outbox-api-cut"],entrypoint:["/usr/local/bin/node","-e","process.on(\"SIGTERM\", () => process.exit(0)); setInterval(() => {}, 2147483647)"],command:[],
       user:"65534:65534",read_only:true,cap_drop:["ALL"],security_opt:["no-new-privileges:true"],
+      tmpfs:["/data:size=1m","/nix:size=1m"],
       cpus:0.1,mem_limit:"64m",stop_grace_period:"2s",networks:{default:{aliases:["api"]}}}}}' > "$OUTBOX_DNS_OVERRIDE" \
     || fail "outbox phase: could not write API alias placeholder overlay"
   COMPOSE+=(-f "$OUTBOX_DNS_OVERRIDE" --profile outbox-api-cut)
@@ -296,8 +299,8 @@ start_outbox_api_alias() {
     || fail "outbox phase: API alias placeholder startup failed"
 }
 remove_outbox_api_alias() {
-  # The reused worker image declares /data and /nix as VOLUME. This service
-  # mounts neither named volume, so remove its image-created anonymous copies.
+  # Remove any anonymous image volumes along with this placeholder container.
+  # Persistent worker data is never attached to this service.
   "${COMPOSE[@]}" rm -s -f -v outbox-api-placeholder >/dev/null \
     || fail "outbox phase: API alias placeholder removal failed"
 }
@@ -620,7 +623,7 @@ RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
 pass "case 5: the carve-out run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
 
 # =============================================================================
-# Cases 3-6 hold stub completion until the cut. Cases 7-8 require a durable
+# Cases 3-8 hold stub completion until the cut. Cases 7-8 require a durable
 # finalize hand-off AFTER the cut, then interrupt it before terminal completion.
 # CASE 6 — an INTERLOCKED run finishing during the outage WAITS for the api to issue its completion
 # permit, then completes. Regression: its one-shot permit request used to throw `fetch failed` into
@@ -654,7 +657,7 @@ pass "case 6: the interlocked run waited out the outage for its permit -> comple
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart
 # that lands while the api is DOWN, and the one-shot finalize-resume allowance keeps that run from
 # being failed as worker_lost by the orphan pass, exactly once. The cut is DETERMINISTIC: the api is
-# stopped while the stub stream is still running (executor not returned), so no terminal can land, and
+# stopped while the stub executor is held at its cut barrier, so no terminal can land, and
 # the agent is restarted only once the finalize record is PROVEN durable, by BOTH the agent's own
 # `finalize record durable` line (logged after the directory fsync) AND the file being on disk.
 say "ISSUE #1742: finalize-resume allowance across an agent restart during an api outage (A completes, B is one-shot)"
@@ -683,17 +686,18 @@ f42_durable_logged() {
     END { exit(hit ? 0 : 1) }' "$f"
 }
 # f42_cut RUN GEN — the deterministic cut for run RUN at claim generation GEN: stop the API (the run's
-# stream is still running, so no terminal can land), assert there is NO durable finalize line yet, then
+# executor is still held, so no terminal can land), assert there is NO durable finalize line yet, then
 # wait (bounded) for BOTH proofs of the durable point. Returns 0 once both hold, 1 on timeout, 2 when the
 # hand-off beat the outage (inconclusive). Like the other wait_* it never calls `fail` itself: it runs
 # with the API stopped, and a `fail` there would wedge every later phase. The caller restores the api
-# first and judges after.
+# first and judges after. Setup failures use the phase's EXIT restore path.
 f42_cut() {
   local run="$1" gen="$2" start deadline
   api_cut
   if f42_durable_logged "$run" "$gen"; then
     return 2
   fi
+  release_outbox_cut_barrier "$run"
   start=$SECONDS; deadline=$((SECONDS + 90))
   while [ "$SECONDS" -lt "$deadline" ]; do
     if f42_durable_logged "$run" "$gen" \
@@ -806,10 +810,11 @@ F42_MAX="$(f42_max_requeues)" || fail "issue 1742: cannot resolve RUN_MAX_REQUEU
 # CASE 7 (A, completion control): the durable finalize record lets the run resume at G+1 even with the
 # requeue budget spent. G+1 captures the predecessor and completes in the same claim.
 say "CASE 7: finalize restart on spent budget -> G+1 capture and completion (never worker_lost)"
-make_outbox_run
+make_outbox_run first_cut_barrier
 RUN_F1="$OUTBOX_RUN"
 GEN_F1="$(rb_run_field "$RUN_F1" claim_generation)"
-say "cutting the api while run $RUN_F1's stub stream is still running (generation $GEN_F1)"
+[ "$GEN_F1" = 1 ] || fail "case 7: first-claim barrier requires fresh generation 1 (got $GEN_F1)"
+say "cutting the api while run $RUN_F1's stub is held before finalize (generation $GEN_F1)"
 rc=0; f42_cut "$RUN_F1" "$GEN_F1" || rc=$?
 if [ "$rc" = 0 ]; then
   f42_restart_cycle "$RUN_F1" "$GEN_F1" "$F42_MAX" 1
@@ -844,7 +849,7 @@ assert_finalize_allowance_spent() {
   [ "$(rb_run_field "$run" requeue_count)" = "$((max + 1))" ] || fail "case 8: spent requeue count changed"
 }
 say "CASE 8: allowance is one-shot: G+1 captured, resumed finalize interrupted -> owner recovery hold, mark stays G"
-make_outbox_run
+make_outbox_run cut_barrier
 RUN_F2="$OUTBOX_RUN"
 GEN_F2="$(rb_run_field "$RUN_F2" claim_generation)"
 say "first cut: run $RUN_F2 at generation $GEN_F2"
