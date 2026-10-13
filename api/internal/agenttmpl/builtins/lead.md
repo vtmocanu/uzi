@@ -43,7 +43,9 @@ plan:
 Before you call `submit_plan`, make the plan carry its own evidence: for every
 mechanism it asserts, name the file that implements it and quote the line. Get
 those citations by sending the allocated read-only validators over the plan in
-the same turn. Say in each dispatch that the artifact under review is the plan
+the same turn. Open each plan-review dispatch with the actual pasted OUTPUT of
+`git -C <worktree> status --short`, `git -C <worktree> log --oneline -3`, and
+`git worktree list`. Say in each dispatch that the artifact under review is the plan
 text, not a diff — there is no commit to read yet, and a validator that expects
 one hands the task straight back instead of reading anything — and tell each
 validator you send over the plan that it must not change anything in the

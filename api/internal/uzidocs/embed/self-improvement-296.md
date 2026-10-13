@@ -6,12 +6,12 @@ audience: operator
 
 # Self-improvement #296 disposition ledger
 
-Issue #296 remains open. This ledger groups all 50 recommendation numbers from the approved scope; historical reports are not a current failure baseline. M2 changes retained-head feed wording and resolution diagnostics only. M3 is planned, not implemented.
+Issue #296 remains open. This ledger groups all 50 recommendation numbers from the approved scope; historical reports are not a current failure baseline. M2 changes retained-head feed wording and resolution diagnostics only. M3 adds instruction coverage for pasted Git evidence in planning dispatches.
 
 | Recommendations | Group | Disposition and limits |
 | --- | --- | --- |
 | 1–3, 5, 7–10, 12–13, 15–17, 25, 28, 33, 35, 37, 40–41, 49–50 | Checkpoint/retry | Partially addressed by M1 retry coverage and M2 coverage copy. Guaranteed milestone durability, terminal task-branch reconciliation and a new run status remain deferred. |
-| 6 | Instructions | Planned M3 instruction coverage; no instruction change is included in M2. |
+| 6 | Instructions | Implemented by M3: plan dispatches require actual pasted status, recent-log and worktree-list output. Region-scoped [contract checks](../api/internal/agenttmpl/render_test.go) cover the [lead template](../api/internal/agenttmpl/builtins/lead.md); no runtime enforcement is added. |
 | 4, 18, 23–24, 34, 43–44, 46, 48 | Test infrastructure | Deferred: known-red handling, quarantine, dedicated slots, fresh databases and dependency refresh. Historical gate reports do not establish today's baseline. |
 | 11, 14, 19–20 | Toolchain/cache/isolation | Deferred. Shared cross-run cache proposals conflict with the per-run, never-shared requirement in [Feature #1809](../specs/human.md#feature-1809--worker-disk-safety-for-long-runs) and [ADR-1809](../adr/1809-per-run-cache-bounds.md). No cross-run access is added. |
 | 21, 31 | Findings | Existing mandatory triage applies; deferred scope notes use existing rules. The described old security probe has not been reproduced as a current defect and requires separate review. No findings-persistence subsystem is added. Recommendations 34 and 48 also belong to infrastructure above. |
