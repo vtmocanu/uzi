@@ -107,9 +107,17 @@ func TestCICompressedPerResponseLimitTrips(t *testing.T) {
 	body := bytes.Repeat(empty, ciRepairCompressedJSONBytes/len(empty)+2)
 	_, err := ciTransportRT(t, WithCIRepairReadLimits(context.Background()), ciFixedResponse(body, "gzip"))
 	requireCIBudget(t, err)
-	// identity bodies are counted too: pad is whitespace, within decompressed bounds
+	if !strings.Contains(err.Error(), "compressed JSON bytes") {
+		t.Fatalf("gzip reason = %v", err)
+	}
+	// Identity bodies are counted too. The compressed and decompressed
+	// per-response limits are equal, so both trip on the same byte; the
+	// compressed counter reads first and its error takes precedence.
 	_, err = ciTransportRT(t, WithCIRepairReadLimits(context.Background()), ciFixedResponse(bytes.Repeat([]byte(" "), ciRepairCompressedJSONBytes+1), ""))
 	requireCIBudget(t, err)
+	if !strings.Contains(err.Error(), "compressed JSON bytes") {
+		t.Fatalf("identity reason = %v", err)
+	}
 }
 
 func TestCICompressedBytesCountedForIdentityAndGzip(t *testing.T) {
@@ -166,4 +174,30 @@ func TestCIDecompressedLimitsStillTrip(t *testing.T) {
 	ciBudget(ctx).remaining = 10
 	_, err = ciTransportRT(t, ctx, ciFixedResponse(gzipBytes(t, strings.Repeat(" ", 11)), "gzip"))
 	requireCIBudget(t, err)
+}
+
+// Each response stays under the per-response compressed limit and inflates to
+// nothing, so only the shared compressed per-fire pool can trip.
+func TestCICompressedPerFireLimitTripsWithGzipUnderDecompressedBudgets(t *testing.T) {
+	ctx := WithCIRepairReadLimits(context.Background())
+	empty := emptyGzipMember(t)
+	body := bytes.Repeat(empty, (ciRepairCompressedJSONBytes*7/8)/len(empty))
+	if len(body) >= ciRepairCompressedJSONBytes || len(body)*(ciRepairCompressedFireBytes/len(body)+1) <= ciRepairCompressedFireBytes {
+		t.Fatalf("fixture sizes do not straddle the per-fire bound: %d", len(body))
+	}
+	var err error
+	for i := 0; i <= ciRepairCompressedFireBytes/len(body) && err == nil; i++ {
+		var resp *http.Response
+		resp, err = ciTransportRT(t, ctx, ciFixedResponse(body, "gzip"))
+		if err == nil {
+			_ = resp.Body.Close()
+		}
+	}
+	requireCIBudget(t, err)
+	if !strings.Contains(err.Error(), "compressed JSON bytes") {
+		t.Fatalf("reason = %v", err)
+	}
+	if got := ciBudget(ctx).remaining; got != ciRepairFireBytes {
+		t.Fatalf("decompressed fire budget was consumed: %d", got)
+	}
 }

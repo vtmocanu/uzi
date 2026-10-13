@@ -16,7 +16,9 @@ const (
 	ciRepairFireBytes = 16 << 20
 
 	// Raw network bytes, charged below the gzip reader, in addition to the
-	// decompressed budgets above.
+	// decompressed budgets above. The bound holds because budgeted requests use
+	// HTTP/1.1 only (forgeHTTP1Transport): over HTTP/2, padding and empty DATA
+	// frames never reach the response body and would bypass the counter.
 	ciRepairCompressedJSONBytes = 4 << 20
 	ciRepairCompressedFireBytes = 16 << 20
 )
@@ -214,13 +216,26 @@ func (r *ciCompressedReader) Read(p []byte) (int, error) {
 	if ce := b.compressedErr.Load(); ce != nil {
 		return 0, ce
 	}
-	allowance := max(min(r.remaining, b.compressedRemaining.Load()), 0)
+	// Reserve the allowance from the shared pool before reading so concurrent
+	// readers on one fire cannot jointly overshoot it, then refund what the read
+	// did not use.
+	var allowance, reserved int64
+	for {
+		cur := b.compressedRemaining.Load()
+		allowance = max(min(r.remaining, cur), 0)
+		reserved = min(allowance, int64(len(p)))
+		if b.compressedRemaining.CompareAndSwap(cur, cur-reserved) {
+			break
+		}
+	}
 	if int64(len(p)) > allowance+1 {
 		p = p[:allowance+1]
 	}
 	n, err := r.reader.Read(p)
 	r.remaining -= int64(n)
-	b.compressedRemaining.Add(-int64(n))
+	if used := min(int64(n), reserved); used < reserved {
+		b.compressedRemaining.Add(reserved - used)
+	}
 	if int64(n) > allowance {
 		b.compressedErr.CompareAndSwap(nil, &CIReadBudgetError{reason: "compressed JSON bytes"})
 		return 0, b.compressedErr.Load()
