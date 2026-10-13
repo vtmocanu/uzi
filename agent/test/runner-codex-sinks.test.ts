@@ -121,7 +121,8 @@ function acknowledgedCompletionInventory(runId: string, generation: number) {
       assert.deepEqual([...roots].sort(), [...sourceHeads].sort());
       const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha })).digest("hex");
       aggregateSha = fingerprint.slice(0, 40);
-      return { sha: aggregateSha, fingerprint };
+      return { sha: aggregateSha, fingerprint,
+        coverageRef: `refs/uzi-recovery/m2-${generation}`, originalShas: [...roots], currentSha };
     },
     resolveRecoveryBareDir: async bare => bare === path.basename(context.barePath) ? context.barePath : undefined,
     ancestry: async (_bare, source, target) => sourceHeads.includes(source) && target === aggregateSha ? "ancestor" : "unknown",
@@ -135,7 +136,7 @@ function acknowledgedCompletionInventory(runId: string, generation: number) {
       const bytes = Buffer.concat([Buffer.from(`# v2 git bundle\n${opts.sourceSha} refs/heads/recovered-source\n\n`),
         pack, createHash("sha1").update(pack).digest()]);
       fs.writeFileSync(opts.outPath, bytes);
-      return { bundlePath: opts.outPath, byteSize: bytes.length,
+      return { bundlePath: opts.outPath, sourceSha: opts.sourceSha, byteSize: bytes.length,
         checksum: createHash("sha256").update(bytes).digest("hex"),
         chunkCount: 1, prerequisiteShas: [], selfContained: true, alreadyPublished: false };
     },
