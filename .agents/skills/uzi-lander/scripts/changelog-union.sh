@@ -100,7 +100,8 @@ SENTINEL='<!-- changelog-union:join -->'
 # (1 ancestor, 2 ours = the base, 3 theirs = the branch), never from marker fragments, and
 # PROVES the fold first: every block the ancestor held under [Unreleased] is, verbatim, in a
 # released section of ours that holds it more often than the ancestor did, and not in ours'
-# [Unreleased], and theirs still holds it unedited.
+# [Unreleased], and theirs still holds it unedited. "Verbatim" ignores one rewrite: the release
+# cut's linkification of a bare `#N` into `[#N](URL/pull|issues/N)` (norm below).
 # The branch additions (theirs' [Unreleased] blocks the ancestor lacked) are then inserted
 # into ours' [Unreleased] under their `### Heading` (created, when absent, in the order
 # Added, Changed, Deprecated, Removed, Fixed, Security; any other heading goes last).
@@ -128,7 +129,7 @@ fold_resolve() {
     function blank(s) { return s ~ /^[ \t]*$/ }
     function flush(f) {
       if (cur == "") return
-      nb[f]++; BT[f, nb[f]] = cur; BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
+      nb[f]++; BT[f, nb[f]] = cur; BN[f, nb[f]] = norm(cur); BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
       cur = ""
     }
     function parse(f,   i, s, isu, h, sec) {
@@ -151,6 +152,20 @@ fold_resolve() {
       }
       flush(f)
     }
+    # The release cut linkifies bare `(#N)` citations (scripts/changelog-links.sh) while it folds,
+    # so a genuinely folded bullet differs from its ancestor copy by `#N` -> `[#N](URL/pull|issues/N)`.
+    # The proof compares this normalised text; a link whose target number differs from its text is
+    # a real edit and stays as written. Inserted text is always the branch'"'"'s own BT.
+    function norm(s,   o, m, pre, a, b) {
+      o = ""
+      while (match(s, /\[#[0-9]+\]\(https?:\/\/[^) \t\n]*\/(pull|issues)\/[0-9]+\)/)) {
+        m = substr(s, RSTART, RLENGTH); pre = substr(s, 1, RSTART - 1); s = substr(s, RSTART + RLENGTH)
+        a = m; sub(/^\[#/, "", a); sub(/\].*/, "", a)
+        b = m; sub(/\)$/, "", b); sub(/.*\//, "", b)
+        o = o pre (a == b ? "#" a : m)
+      }
+      return o s
+    }
     function rank(h) {
       sub(/^### /, "", h)
       if (h == "Added") return 1
@@ -169,25 +184,25 @@ fold_resolve() {
       # A block is identified by its subsection AND its text, with multiplicity: K-joined key.
       for (k = 1; k <= nb[1]; k++) if (BU[1, k]) {
         if (BH[1, k] == "") die("a heading-less bullet under [Unreleased] of the ancestor")
-        key = BH[1, k] K BT[1, k]; if (!(key in acnt)) { na++; AK[na] = key }
+        key = BH[1, k] K BN[1, k]; if (!(key in acnt)) { na++; AK[na] = key }
         acnt[key]++
       }
       if (na == 0) die("the ancestor [Unreleased] holds no bullet block, so there is no fold to prove")
       # A fold target is a release section, keyed by its [version] (never the date), that holds
       # a block MORE often in the base than in the ancestor: a new version, or an RC-first
       # stable-keyed section an rc.N cut folded into again.
-      for (k = 1; k <= nb[1]; k++) if (!BU[1, k] && BS[1, k] != "") arel[BS[1, k] K BH[1, k] K BT[1, k]]++
+      for (k = 1; k <= nb[1]; k++) if (!BU[1, k] && BS[1, k] != "") arel[BS[1, k] K BH[1, k] K BN[1, k]]++
       for (k = 1; k <= nb[2]; k++) {
-        if (BU[2, k]) ou[BT[2, k]] = 1
+        if (BU[2, k]) ou[BN[2, k]] = 1
         else {
-          orl[BT[2, k]] = 1
-          if (BS[2, k] != "") brel[BS[2, k] K BH[2, k] K BT[2, k]]++
+          orl[BN[2, k]] = 1
+          if (BS[2, k] != "") brel[BS[2, k] K BH[2, k] K BN[2, k]]++
         }
       }
       for (key in brel) if (brel[key] > arel[key]) nrc[substr(key, index(key, K) + 1)] += brel[key] - arel[key]
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
         if (BH[3, k] == "") die("a heading-less bullet under [Unreleased] of the branch")
-        tcnt[BH[3, k] K BT[3, k]]++
+        tcnt[BH[3, k] K BN[3, k]]++
       }
       for (k = 1; k <= na; k++) {
         key = AK[k]; t = substr(key, index(key, K) + 1)
@@ -201,11 +216,11 @@ fold_resolve() {
       if (oa != ot) die("the branch changed the file outside [Unreleased]")
       nadd = 0
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
-        t = BT[3, k]; key = BH[3, k] K t
+        t = BT[3, k]; tn = BN[3, k]; key = BH[3, k] K tn
         if (++used[key] <= acnt[key]) continue   # an ancestor occurrence, not an addition
-        if ((t in ou) || (t in orl)) die("a branch-added bullet already exists in the base: " title(t))
-        if (t in seenadd) die("a branch-added bullet is repeated: " title(t))
-        seenadd[t] = 1; nadd++; AD[nadd] = t; AH[nadd] = BH[3, k]
+        if ((tn in ou) || (tn in orl)) die("a branch-added bullet already exists in the base: " title(t))
+        if (tn in seenadd) die("a branch-added bullet is repeated: " title(t))
+        seenadd[tn] = 1; nadd++; AD[nadd] = t; AH[nadd] = BH[3, k]
       }
       # subsections of the base [Unreleased]: heading line SL, last non-blank line SE
       us = ustart[2]; ue = uend[2]; ns = 0; lastnb = us

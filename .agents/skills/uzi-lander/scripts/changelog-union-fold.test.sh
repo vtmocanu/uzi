@@ -226,6 +226,48 @@ printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added desc\n\n-
 mkconflict nogain; expect_refuse nogain
 grep -Fq 'fold unproven' <<<"$OUT" || fail "nogain: wrong refusal reason: $OUT"
 
+# 16. The release cut (scripts/changelog-links.sh) linkifies bare `(#N)` citations while it folds,
+#     so the base's released copy of an ancestor bullet differs from the ancestor's only by
+#     `(#N)` -> `([#N](.../pull/N))`. Derived from the rc.12 fold of the "Provider outages"
+#     bullet (the old proof demanded a verbatim copy and refused "fold unproven" on a genuine fold).
+U_='https://github.com/o/r'
+LANC_="${HEAD_}## [Unreleased]
+
+### Changed
+
+- **Outages are bounded ([#1733](${U_}/issues/1733)).**
+  Retried under a streak, including the exact token (#2361). Resume clears it.
+
+## [0.2.0] - 2026-02-01
+
+### Changed
+
+- **earlier**
+  earlier desc
+"
+printf '%s' "$LANC_" > "$WORK/link.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Outages are bounded ([#1733](%s/issues/1733)).**\n  Retried under a streak, including the exact token ([#2361](%s/pull/2361)). Resume clears it.\n' "$HEAD_" "$U_" "$U_" > "$WORK/link.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Outages are bounded ([#1733](%s/issues/1733)).**\n  Retried under a streak, including the exact token (#2361). Resume clears it.\n\n- **branch new (#9)**\n  branch desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n' "$HEAD_" "$U_" > "$WORK/link.branch.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **branch new (#9)**\n  branch desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Outages are bounded ([#1733](%s/issues/1733)).**\n  Retried under a streak, including the exact token ([#2361](%s/pull/2361)). Resume clears it.\n' "$HEAD_" "$U_" "$U_" > "$WORK/link.want.md"
+mkconflict link
+expect_ok link
+
+# 17. Linkification is the ONLY tolerated difference: a reworded released copy, a link whose
+#     target number differs from its text, and a released copy of a bullet that the ancestor
+#     held twice (one copy dropped) all still refuse.
+cp "$WORK/link.base.md" "$WORK/linkedit.base.md"; cp "$WORK/link.branch.md" "$WORK/linkedit.branch.md"
+sed 's/Resume clears it/Resume clears the streak/' "$WORK/link.main.md" > "$WORK/linkedit.main.md"
+mkconflict linkedit; expect_refuse linkedit
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linkedit: wrong refusal reason: $OUT"
+cp "$WORK/link.base.md" "$WORK/linkwrong.base.md"; cp "$WORK/link.branch.md" "$WORK/linkwrong.branch.md"
+sed 's#/pull/2361#/pull/9999#' "$WORK/link.main.md" > "$WORK/linkwrong.main.md"
+mkconflict linkwrong; expect_refuse linkwrong
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linkwrong: wrong refusal reason: $OUT"
+awk '/^- \*\*Outages/ { n++ } { print } /^  Retried under/ && n == 1 { print ""; print "- **Outages are bounded ([#1733]('"$U_"'/issues/1733)).**"; print "  Retried under a streak, including the exact token (#2361). Resume clears it." }' "$WORK/link.base.md" > "$WORK/linkdup.base.md"
+cp "$WORK/link.main.md" "$WORK/linkdup.main.md"; cp "$WORK/linkdup.base.md" "$WORK/linkdup.branch.md"
+mkconflict linkdup; expect_refuse linkdup
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linkdup: wrong refusal reason: $OUT"
+
 # 15. Refusal: markers in a plain file with no index stages stay the old refusal.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **a**\n||||||| b\n- **old**\n=======\n- **b**\n>>>>>>> x\n' > "$WORK/plain.md"
 cp "$WORK/plain.md" "$WORK/plain.before"
@@ -233,4 +275,4 @@ RC=0; OUT=$(bash "$SCRIPT" "$WORK/plain.md" 2>&1) || RC=$?
 [ "$RC" -eq 1 ] || fail "plain: expected exit 1, got $RC: $OUT"
 cmp -s "$WORK/plain.md" "$WORK/plain.before" || fail "plain: a refusal must leave the file untouched"
 
-echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals"
+echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals, and a fold that only linkified a bare (#N) citation (tolerated; a reworded, mis-targeted or de-duplicated copy still refuses)"
