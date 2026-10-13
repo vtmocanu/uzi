@@ -799,6 +799,68 @@ describe("captured memory epoch seam", () => {
     assert.equal(rig.providerLaunches(), 2);
   });
 
+  it("delegated child shell uses accessor capture A instead of static capture B", async () => {
+    const captureA = capture();
+    const captureB = capture(new WorkerMemoryCommands(), 1);
+    const childThread = "th-memory-child";
+    const childTurn = "tn-memory-child";
+    const responder: Responder = (c) => {
+      if (c.method === "thread/start") {
+        return { thread: { id: c.threadStartCount === 1 ? "th-1" : childThread } };
+      }
+      if (c.method === "turn/start") {
+        if (c.turnStartCount === 1) return { turn: { id: "tn-1" } };
+        c.transport
+          .push(toolCall(11, "uzi_bash", { command: "echo memory-child" }, childThread, childTurn, "memory-child-shell"))
+          .push(turnCompleted("completed", childThread, childTurn));
+        return { turn: { id: childTurn } };
+      }
+      return {};
+    };
+    const rig = makeRig({ responder });
+    const childSpawns: SpawnCommandOptions[] = [];
+    const executor = new CodexExecutor(noopLog, "/data/agent-home/run-1",
+      { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider, capturedMemory: captureB },
+      { ...rig.deps, spawnCommand: answerEnvProbe(async (argv, opts) => {
+        assert.ok(argv.includes("echo memory-child"), "the delegated child shell reaches the actual spawn callback");
+        childSpawns.push(opts);
+        return { code: 0, stdout: "memory-child\n", stderr: "" };
+      }, rig.probeCalls) });
+    const agents: AgentTemplate[] = [
+      { name: "lead", description: "the lead", prompt_body: "lead body", tools: null, skills: [] },
+      { name: "coder", description: "a coder", prompt_body: "coder body", tools: null, skills: [] },
+    ];
+    let reads = 0;
+    const { ctx, emitted } = makeCtx({
+      runId, agents, capturedMemory: () => { reads++; return captureA; },
+    });
+    rig.transport.push(threadStarted())
+      .push(toolCall(1, "spawn_agent", { role: "coder", prompt: "run the child shell" }, "th-1", "tn-1", "memory-dispatch"));
+    const runP = executor.run(ctx);
+    await waitFor(() => rig.transport.responses.some(r => r.requestId === 1), "memory child spawn_agent reply");
+    rig.transport.push(signalDone()).push(turnCompleted()).end();
+    await withTimeout(runP, 3000, "captured memory delegated child run");
+
+    assert.equal(reads, 1, "delegation reads the runner capture accessor exactly once for the epoch");
+    const childRequest = rig.transport.requests.filter(r => r.method === "turn/start")[1];
+    assert.ok(childRequest, "the named memory child starts a real demuxed turn");
+    assert.equal(rec(childRequest.params).threadId, childThread, "the shell belongs to the named memory child thread");
+    const childUse = emitted.find(m => m.kind === "tool_use" && m.agent === "coder" && m.payload.name === "Bash");
+    assert.ok(childUse, "the delegated coder emits the child shell callback");
+    const dispatch = emitted.find(m => m.kind === "tool_use" && m.payload.name === "Agent");
+    assert.ok(dispatch, "the root emits the memory child dispatch");
+    assert.equal(childUse.agentInstance, dispatch.payload.id, "the child shell identity belongs to the root dispatch");
+    assert.equal(childSpawns.length, 1, "exactly one delegated child shell reaches spawn");
+    assert.equal(isBrokerModelCommand(childSpawns[0]!.modelCommand, captureA), true,
+      "delegated child shell metadata binds accessor capture A");
+    assert.equal(isBrokerModelCommand(childSpawns[0]!.modelCommand, captureB), false,
+      "delegated child shell metadata rejects wrong static capture B");
+    assert.equal(rec(rec(rig.transport.responses.find(r => r.requestId === 11)?.response).result).success, true,
+      "the demuxed child shell callback succeeds");
+    assert.equal(rec(rec(rig.transport.responses.find(r => r.requestId === 1)?.response).result).success, true,
+      "the root spawn_agent callback succeeds after its child settles");
+  });
+
   for (const missing of [true, false]) {
     it(`${missing ? "absent runner capture overrides static authority" : "mismatched run identity"} refuses before epoch launch`, async () => {
       const rig = makeRig();
