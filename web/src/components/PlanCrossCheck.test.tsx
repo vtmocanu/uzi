@@ -1,6 +1,6 @@
 // @vitest-environment jsdom
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, within } from "@testing-library/react";
+import { cleanup, fireEvent as domFireEvent, render, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import type { PlanCrossCheckSummary, Run } from "../lib/apiTypes";
 import { mockRuns } from "../mocks/data/runs";
@@ -11,6 +11,10 @@ import { PlanPanel } from "../pages/runView/PlanPanel";
 vi.mock("../lib/api", async (original) => {
   const actual = await original<typeof import("../lib/api")>();
   return { ...actual, api: { ...actual.api, listSecrets: vi.fn().mockResolvedValue({ secrets: [] }) } };
+});
+// Testing Library's event map does not include the native details toggle event.
+const fireEvent = Object.assign(domFireEvent, {
+  toggle: (node: Element) => domFireEvent(node, new Event("toggle")),
 });
 afterEach(cleanup);
 const child = "11111111-1111-4111-8111-111111111111";
@@ -36,6 +40,38 @@ const cases: [unknown, unknown, string][] = [
   ["failed", "__proto__", "Outcome unavailable"], ["failed", "toString", "Outcome unavailable"],
   ["revise", "approve", "Outcome unavailable"], ["block", null, "Outcome unavailable"],
 ];
+describe("plan cross-check headers", () => {
+  it.each(["standalone", "inset"] as const)("renders a named %s shell and heading", (presentation) => {
+    const r = render(<MemoryRouter><PlanCrossCheck presentation={presentation}
+      run={run({ plan_cross_check_summary: summary({ checker_run_id: child }) })} /></MemoryRouter>);
+    const region = r.getByRole("region", { name: "Plan cross-check" });
+    const heading = within(region).getByRole("heading", { name: "Plan cross-check", level: presentation === "inset" ? 3 : 2 });
+    const shell = presentation === "inset" ? region : region.firstElementChild!;
+    for (const token of [presentation === "inset" ? "rounded-lg" : "rounded-xl", "border", "border-edge", "bg-surface", presentation === "inset" ? "p-4" : "p-5"]) {
+      expect(shell.classList.contains(token)).toBe(true);
+    }
+    expect(region.classList.contains("rounded-md")).toBe(false);
+    expect(region.classList.contains("p-3")).toBe(false);
+    if (presentation === "standalone") {
+      expect(region.classList.contains("border")).toBe(false);
+      expect(region.classList.contains("p-5")).toBe(false);
+    }
+    const link = within(region).getByRole("link", { name: "Open checker run" });
+    expect(link.closest("header")).toBe(heading.closest("header"));
+    expect(link.classList.contains("focus-visible:ring-brand/60")).toBe(true);
+  });
+  it("places the event link in its header without repeating event text", () => {
+    const r = render(<MemoryRouter><PlanCrossCheckEvent payload={{ verdict: "approve", reason_class: "approve", checker_run_id: child }} /></MemoryRouter>);
+    const region = r.getByRole("region", { name: "Plan cross-check event" });
+    const heading = within(region).getByRole("heading", { level: 2, name: "Plan cross-check of checked candidate: Passed" });
+    expect(within(region).getAllByText("Plan cross-check of checked candidate: Passed")).toHaveLength(1);
+    const link = within(region).getByRole("link", { name: "Open checker run" });
+    expect(link.closest("header")).toBe(heading.closest("header"));
+    expect(link.getAttribute("href")).toBe(`/runs/${child}`);
+    expect(region.firstElementChild?.classList.contains("rounded-xl")).toBe(true);
+  });
+});
+
 describe("M1 plan cross-check outcomes at real sinks", () => {
   it.each(cases)("%s / %s", (verdict, reason_class, label) => {
     const s = summary({ verdict: verdict as string, reason_class: reason_class as string | null });
@@ -109,7 +145,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
     expect(region.querySelector("script, img, [onerror]")).toBeNull();
     expect(within(region).getByText("bad").getAttribute("href")).toBeNull();
     expect(within(region).getByText("good").getAttribute("title")).toBe("review denied");
-    expect(within(region).queryByText("Checker run")).toBeNull();
+    expect(within(region).queryByText("Open checker run")).toBeNull();
     expect(region.textContent!.length).toBeLessThan(17500);
     expect(within(region).getByText("Findings truncated for display.")).toBeTruthy();
   });
@@ -127,7 +163,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
   });
   it("links only validated checker IDs and accepts null findings", () => {
     const r = render(<MemoryRouter><PlanCrossCheck run={run({ plan_cross_check_summary: summary({ checker_run_id: child }) })} /></MemoryRouter>);
-    expect(r.getByRole("link", { name: "Checker run" }).getAttribute("href")).toBe(`/runs/${child}`);
+    expect(r.getByRole("link", { name: "Open checker run" }).getAttribute("href")).toBe(`/runs/${child}`);
     expect(r.getByText(/Checker cost: Unavailable/)).toBeTruthy();
   });
 });
@@ -220,8 +256,134 @@ describe("recorded checker sources", () => {
       checker_model_source: modelSource as PlanCrossCheckSummary["checker_model_source"],
       checker_effort_source: effortSource as PlanCrossCheckSummary["checker_effort_source"],
     }) })} />);
-    expect(r.getByText(`Model: historical-model (${modelLabel}) · Effort: high (${effortLabel})`)).toBeTruthy();
+    const model = r.getByText(`Model: historical-model (${modelLabel})`);
+    const effort = r.getByText(`Effort: high (${effortLabel})`);
+    expect(model.closest("p")).toBe(effort.closest("p"));
     expect(r.container.textContent).not.toContain("provider-attribute");
     expect(r.getByText("These findings concern an earlier plan; they do not certify the current plan.")).toBeTruthy();
   });
+});
+
+describe("plan evidence rows and recording states", () => {
+  it.each([3, 5])("renders %s ordered rows with inert paths and native disclosure", count => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+      summary: "Overview", items: Array.from({ length: count }, (_, i) => ({
+        file: "pkg/__init__.py", severity: i === 0 ? "toString" : i === 1 ? "error" : "warning",
+        summary: "**Title " + i + "**", rationale: "Inline `code` [safe](https://example.com) [bad](javascript:alert(1))",
+      })),
+    } }) })} />);
+    const rows = [...r.container.querySelectorAll("li")];
+    expect(rows.map(row => row.querySelector("strong")?.textContent)).toEqual(Array.from({ length: count }, (_, i) => "Title " + i));
+    const chip = rows[0].querySelector("code")!;
+    expect(chip.textContent).toBe("pkg/__init__.py");
+    expect(chip.querySelector("strong, em")).toBeNull();
+    expect(rows[0].textContent).toContain("Severity unavailable");
+    expect(rows[1].querySelector(".text-danger")).toBeTruthy();
+    expect(rows[2].querySelector(".text-warn")).toBeTruthy();
+    expect(rows[0].querySelector(".judge-prose.text-muted code")?.textContent).toBe("code");
+    expect(rows[0].querySelector('a[href="https://example.com"]')).toBeTruthy();
+    expect(r.container.querySelector('a[href^="javascript:"]')).toBeNull();
+    const details = r.container.querySelector("details");
+    expect(rows.slice(0, 3).every(row => !row.closest("details"))).toBe(true);
+    if (count === 3) { expect(details).toBeNull(); return; }
+    expect(rows.slice(3).every(row => row.closest("details") === details)).toBe(true);
+    const toggle = r.getByText("Show 2 more findings");
+    expect(toggle.tagName).toBe("SUMMARY");
+    expect(toggle.className).toContain("focus-visible:ring-2");
+    (details as HTMLDetailsElement).open = true;
+    fireEvent.toggle(details!);
+    expect(r.getByText("Hide 2 more findings")).toBeTruthy();
+    (details as HTMLDetailsElement).open = false;
+    fireEvent.toggle(details!);
+    expect(r.getByText("Show 2 more findings")).toBeTruthy();
+  });
+  it("consumes summary then file/severity/summary/rationale without a new path cap", () => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+      summary: "S".repeat(1000), items: [
+        { file: "P".repeat(1000), severity: "info", summary: "T".repeat(10000), rationale: "R".repeat(5000) },
+        ...Array.from({ length: 20 }, () => ({ file: "omitted", severity: "info", summary: "omitted", rationale: "omitted" })),
+      ],
+    } }) })} />);
+    const rows = r.container.querySelectorAll("li");
+    expect(rows).toHaveLength(20);
+    expect(rows[0].querySelector("code")?.textContent).toBe("P".repeat(1000));
+    expect(rows[0].querySelector(".judge-prose.text-muted")?.textContent).toBe("R".repeat(4380));
+    expect(rows[1].textContent).not.toContain("omitted");
+    const notice = r.getByText("Findings truncated for display.");
+    const details = r.container.querySelector("details")!;
+    expect(details.open).toBe(false);
+    expect(notice.closest("details")).toBeNull();
+    details.open = true;
+    fireEvent.toggle(details);
+    expect(r.getByText("Hide 17 more findings")).toBeTruthy();
+    expect(notice.closest("details")).toBeNull();
+  });
+  it.each(["queued", "running", "completed", "failed", "cancelled"] as const)("labels missing required plan evidence for %s", status => {
+    const terminal = ["completed", "failed", "cancelled"].includes(status);
+    const r = render(<PlanCrossCheck run={run({ status, plan_cross_check_required: true, plan_cross_check_summary: undefined, plan_cross_check_gate_reason: undefined })} />);
+    expect(r.getByText(terminal ? "Not recorded" : "Pending")).toBeTruthy();
+    expect(r.getByText(terminal ? "This run ended without a plan cross-check result." : "Runs when the plan is ready, before it can proceed.")).toBeTruthy();
+    if (!terminal) {
+      expect(r.queryByText("Not recorded")).toBeNull();
+      expect(r.queryByText(/This run ended/)).toBeNull();
+      expect(r.queryByRole("link", { name: "Open checker run" })).toBeNull();
+      expect(r.queryByText(/Model:|Checker cost:|Checked candidate:/)).toBeNull();
+    }
+  });
+  it.each([null, ""])("shows valid pending reason %s with no-result copy", reason_class => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ verdict: "pending", reason_class }) })} />);
+    expect(r.getByText("Pending").closest("header")).toBeTruthy();
+    expect(r.getByText("No result recorded yet.")).toBeTruthy();
+  });
+  it("prioritizes historical state while retaining strict outcome evidence", () => {
+    const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ historical: true, verdict: "approve", reason_class: "block" }) })} />);
+    expect(r.getByText("Superseded").closest("header")).toBeTruthy();
+    expect(r.getByText("Earlier-plan evidence")).toBeTruthy();
+    expect(r.getByText("Earlier-plan evidence: Outcome unavailable")).toBeTruthy();
+    expect(r.getByText("These findings concern an earlier plan; they do not certify the current plan.")).toBeTruthy();
+  });
+});
+
+it("renders summary inline code, literal hostile path and info/info/warning in source order", () => {
+  const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+    summary: "Overview uses `plan_summary`.", items: ["info", "info", "warning"].map((severity, i) => ({
+      file: "<img src=x>__hostile__*path*", severity, summary: "Row " + i, rationale: "Reason " + i,
+    })),
+  } }) })} />);
+  const inline = r.getByText("plan_summary");
+  expect(inline.tagName).toBe("CODE");
+  expect(inline.closest(".judge-prose")).toBeTruthy();
+  const rows = [...r.container.querySelectorAll("li")];
+  expect(rows.map(row => row.querySelector(".judge-prose")?.textContent)).toEqual(["Row 0", "Row 1", "Row 2"]);
+  expect(rows.map(row => row.querySelector(".shrink-0")?.textContent)).toEqual(["info", "info", "warning"]);
+  expect(rows[2].querySelector(".text-warn")).toBeTruthy();
+  for (const row of rows) {
+    const chip = row.querySelector("code")!;
+    expect(chip.textContent).toBe("<img src=x>__hostile__*path*");
+    expect(chip.querySelector("img, em, strong")).toBeNull();
+  }
+  expect(r.container.querySelector("img, .animate-pulse, .overflow-auto, .overflow-y-auto, .overflow-scroll, .overflow-y-scroll")).toBeNull();
+  expect(r.queryByText(/Checking/)).toBeNull();
+});
+
+it.each(["summary", "file", "title", "detail", "items"])("discloses isolated plan %s truncation outside either disclosure state", field => {
+  const items = Array.from({ length: field === "items" ? 21 : 5 }, (_, i) => ({
+    file: "path_" + i, severity: "info", summary: "Title " + i, rationale: "Detail " + i,
+  }));
+  if (field === "file") items[0].file = "P".repeat(16385);
+  if (field === "title") items[0].summary = "T".repeat(16385);
+  if (field === "detail") items[0].rationale = "D".repeat(16385);
+  const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
+    summary: field === "summary" ? "S".repeat(16385) : "Overview", items,
+  } }) })} />);
+  const notice = r.getByText("Findings truncated for display.");
+  const details = r.container.querySelector("details")!;
+  expect(details.open).toBe(false);
+  expect(notice.closest("details")).toBeNull();
+  expect(r.container.querySelectorAll("li")).toHaveLength(field === "items" ? 20 : 5);
+  if (field === "items") expect(r.queryByText("Title 20")).toBeNull();
+  details.open = true;
+  fireEvent.toggle(details);
+  expect(r.getByText(field === "items" ? "Hide 17 more findings" : "Hide 2 more findings")).toBeTruthy();
+  expect(notice.closest("details")).toBeNull();
 });

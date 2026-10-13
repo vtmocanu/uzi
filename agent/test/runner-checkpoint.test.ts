@@ -818,7 +818,7 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     // httpStatus } contract — an UNCONFIRMED publish); every later publish succeeds. A
     // failed publish must NOT advance
     // lastPublishedTip, so the SAME tip stays publish-eligible next interval.
-    const restorePublish = spyPublish(events, { nullFirst: 1 });
+    const restorePublish = spyPublish(events, { nullFirst: 3 });
     const publishesAtEachStage: number[] = [];
     const exec: Executor = {
       run: async (ctx) => {
@@ -852,7 +852,7 @@ describe("RunRunner — time-based checkpoint (PRD #267)", () => {
     // tip, and the successful retry then stopped it re-publishing.
     assert.deepStrictEqual(
       publishesAtEachStage,
-      [1, 2, 2],
+      [3, 4, 4],
       "a failed publish leaves the tip publish-eligible; the retry lands then stops re-publishing",
     );
   });
@@ -1018,7 +1018,7 @@ describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue
     } finally {
       restore();
     }
-    assert.equal(count(), 2, "the HTTP 500 left the tip publish-eligible, so the second checkpoint retried");
+    assert.equal(count(), 6, "the HTTP 500 left the tip publish-eligible, so the second checkpoint retried");
     const failures = statusTexts(claim.run_id).filter((t) =>
       t.includes("checkpoint publish failed: HTTP 500"),
     );
@@ -1262,7 +1262,8 @@ describe("issue #1086: two-tip checkpoint reconciliation (F2)", () => {
     const orig = git.checkpointPack.bind(git);
     (git as unknown as { checkpointPack: unknown }).checkpointPack = async () => {
       if (opts.throws) throw new Error("boom checkpointPack");
-      return { tipOid: opts.tipOid ?? "PACKTIP", pack: { readableEnded: true }, exited: Promise.resolve(0) };
+      const replay = async () => ({ pack: { readableEnded: true }, exited: Promise.resolve(0), cancel: () => {} });
+      return { tipOid: opts.tipOid ?? "PACKTIP", ...await replay(), replay };
     };
     return () => {
       (git as unknown as { checkpointPack: unknown }).checkpointPack = orig;

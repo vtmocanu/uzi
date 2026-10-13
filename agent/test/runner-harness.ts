@@ -330,6 +330,9 @@ export function runnerWith(
     // Spread LAST so a test can override checkpointIntervalMs / now (PRD #267) and any
     // other RunnerOptions field. Optional: existing call sites pass nothing.
     ...extra,
+    // Checkpoint publish retries (HTTP 5xx) wait no real backoff; a test that passes its own
+    // checkpointTestHooks keeps this default unless it sets retryBackoffMs itself.
+    checkpointTestHooks: { retryBackoffMs: [0, 0], ...extra?.checkpointTestHooks },
   });
 }
 

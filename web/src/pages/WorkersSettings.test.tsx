@@ -1847,6 +1847,17 @@ describe("WorkersSettings pending outcomes (#1994)", () => {
 });
 
 describe("WorkersSettings dedicated cross-check capacity", () => {
+  it("retains idle dedicated cross-check capacity", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({
+      name: "idle-lane-worker", busy: false, active_runs: 0, max_concurrent_runs: 1,
+      active_cross_checks: 0, max_cross_check_slots: 1,
+    })] });
+    renderPage();
+    await screen.findByText("idle-lane-worker");
+    expect(screen.getByText("0/1 runs")).toBeTruthy();
+    expect(screen.getByText("0/1 cross-checks").title).toBe("Running 0 of 1 cross-check slots");
+  });
+
   it("shows separate cap-one badges and drains cross-check-only work", async () => {
     mockApi.listWorkers.mockResolvedValue({ workers: [aWorker({
       name: "lane-worker", busy: true, active_runs: 1, max_concurrent_runs: 1,
@@ -1855,7 +1866,7 @@ describe("WorkersSettings dedicated cross-check capacity", () => {
     })] });
     renderPage();
     await screen.findByText("lane-worker");
-    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-check"));
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -1868,7 +1879,7 @@ describe("WorkersSettings dedicated cross-check capacity", () => {
     renderPage();
     await screen.findByText("lane-worker");
     expect(screen.getByText("0/1 runs")).toBeTruthy();
-    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("1/1 cross-check")).toBeTruthy();
     expect(screen.getByText("draining")).toBeTruthy();
   });
 });

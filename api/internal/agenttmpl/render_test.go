@@ -514,6 +514,7 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 		{"the citation property is due before submit_plan", "Before you call `submit_plan`"},
 		{"every asserted mechanism is cited by file and line", "name the file that implements it and quote the line"},
 		{"the wave reviews the plan text, not a diff", "the artifact under review is the plan text, not a diff"},
+		{"each plan-review dispatch carries actual output", "Open each plan-review dispatch with the actual pasted OUTPUT of"},
 		{"the no-write rule is RELAYED to each dispatched validator", "tell each validator you send over the plan that it must not change anything"},
 		{"the no-write rule exists to protect the approval gate", "a change nobody saw when approving it"},
 		{"re-planning re-cites only what changed", "re-cite only the mechanisms that changed"},
@@ -546,6 +547,18 @@ func TestLeadPlanCritiquePhrases(t *testing.T) {
 	for _, c := range planCases {
 		if !strings.Contains(plan, c.phrase) {
 			t.Errorf("PLAN region lost behavior %q: missing phrase %q", c.behavior, c.phrase)
+		}
+	}
+	// These commands also occur after implementation, so check only the plan
+	// region independently of the case-table global duplication audit. This
+	// covers the rendered instructions, not runtime enforcement.
+	for _, command := range []string{
+		"git -C <worktree> status --short",
+		"git -C <worktree> log --oneline -3",
+		"git worktree list",
+	} {
+		if n := strings.Count(plan, "`"+command+"`"); n != 1 {
+			t.Errorf("PLAN region must carry command %q exactly once, got %d", command, n)
 		}
 	}
 	for _, c := range bulletCases {

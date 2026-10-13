@@ -46,7 +46,7 @@ WORK=$(mktemp -d)
 NAME="lander-linux-test-$$"
 cleanup() { docker rm -f "$NAME" >/dev/null 2>&1 || true; rm -rf "$WORK"; }
 trap cleanup EXIT INT TERM
-COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" -cf "$WORK/tree.tar" .agents Taskfile.yml   # no macOS xattr headers
+COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" -cf "$WORK/tree.tar" .agents Taskfile.yml scripts/release-ci-coverage.py   # no macOS xattr headers; merge.sh locates the coverage script in the tree
 
 # The test list travels as positional arguments; the script inside reads them with "$@".
 # The container ends with a LANDER_TESTS_RC=<n> line; without it the harness broke (docker
@@ -56,7 +56,7 @@ COPYFILE_DISABLE=1 tar --no-xattrs -C "$ROOT" -cf "$WORK/tree.tar" .agents Taskf
 docker run --rm --name "$NAME" -v "$WORK":/in:ro "$IMAGE" bash -c '
   set -u
   export DEBIAN_FRONTEND=noninteractive
-  { apt-get update -qq && apt-get install -y -qq jq git curl ca-certificates; } >/dev/null 2>&1 \
+  { apt-get update -qq && apt-get install -y -qq jq git curl ca-certificates python3; } >/dev/null 2>&1 \
     || { echo "BROKEN: package install failed in the container" >&2; exit 2; }
   mkdir -p /r && tar -C /r -xf /in/tree.tar && cd /r
   git init -q && git add -A && git -c user.name=t -c user.email=t@example.com commit -qm tree

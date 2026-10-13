@@ -108,8 +108,8 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   it shares your model's blind spots, so name it in the trail. Every review brief asks
   for applicable cleanup lenses (reuse, simplification, efficiency, fix altitude),
   reported apart from mandatory findings.
-- **A buddy never reviews a diff it wrote.** When the buddy implemented the change, the
-  independent review is a bot or a fresh local reviewer; the buddy only verifies findings.
+- Follow the `session-peers` skill's Buddy rules for role split, joint planning and non-author review.
+  When the buddy implemented the change, use a bot or fresh local reviewer; the buddy only verifies findings.
 - **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
   a major, low or neutral Merge Confidence, red CI a fix on our side might clear, a rule
   that does not clearly apply. Brief facts (diff, CI evidence, release notes, the
@@ -407,7 +407,7 @@ changes it); trust it over a handover's claim.
    It refuses on a moved head, an active rework, red, pending or no passing required checks, a
    git conflict, or (exit 5) any unresolved thread, open code-scanning alert or
    unacknowledged comment, or (exit 10) a `chore(release):` commit's CI still running on
-   `main` (merging would cancel it; wait), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
+   `main` (merging would cancel it; wait, unless its tag is already on origin and `release-ci-coverage.py` reports it covered without that run: the refusal then names the rule), takes the repo-wide merge lock (exit 7 = another lander is merging; wait
    for its `main` run to appear), confirms `MERGED`, prints `MERGE_SHA`, writes the trail
    line and releases the claim. A classifier block prints the exact command for the
    user's `!` line; after they run it, reconcile the evidence the out-of-band merge skipped

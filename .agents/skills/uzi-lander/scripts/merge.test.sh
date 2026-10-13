@@ -100,6 +100,8 @@ if [ "\${1:-}" = api ]; then
       exit 0 ;;
     *'/issues/42/comments'*) if [ -n "\${COMMENTS_FILE:-}" ]; then cat "\$COMMENTS_FILE"; else echo '[]'; fi; exit 0 ;;
     *'/pulls/42/reviews'*) echo '[]'; exit 0 ;;
+    *'/git/ref/tags/'*) [ -n "\${TAG_REF_JSON:-}" ] || { echo 'HTTP 404' >&2; exit 1; }; printf '%s\n' "\$TAG_REF_JSON"; exit 0 ;;
+    *'/git/tags/'*) [ -n "\${TAG_OBJ_JSON:-}" ] || { echo 'HTTP 404' >&2; exit 1; }; printf '%s\n' "\$TAG_OBJ_JSON"; exit 0 ;;
   esac
   case "\$*" in *'/rules/branches/main'*)
     [ "\${RULES_FAIL:-0}" = 1 ] && exit 1
@@ -141,7 +143,19 @@ echo "unexpected gh call: \$*" >&2
 exit 1
 STUB
 [ ! -s "$OUTER_GH_LOG" ] || fail "outer gh ran while creating the gh stub: $(cat "$OUTER_GH_LOG")"
-chmod +x "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat"
+# python3 stand-in for scripts/release-ci-coverage.py only (COV_RC = its verdict); every other
+# python3 call (lib/state.sh's peer registry) goes to the real interpreter.
+REAL_PY=$(command -v python3) || { echo "BROKEN: no python3 on PATH" >&2; exit 2; }
+export REAL_PY
+cat > "$WORK/bin/python3" <<'STUB'
+#!/usr/bin/env bash
+case "$*" in
+  *release-ci-coverage.py*) echo "$*" >> "$COV_LOG"; echo "coverage stub rc=${COV_RC:-1}"; exit "${COV_RC:-1}" ;;
+esac
+exec "$REAL_PY" "$@"
+STUB
+export COV_LOG="$WORK/cov.log"
+chmod +x "$WORK/bin/gh" "$WORK/bin/sleep" "$WORK/bin/stat" "$WORK/bin/python3"
 export PATH="$WORK/bin:$PATH"
 export UZI_LANDER_STATE_DIR="$WORK/state"
 
@@ -432,6 +446,52 @@ MAIN_RUNS_JSON="[$(run completed 'chore(release): v0.85.1' 101),$(run in_progres
 export MAIN_RUNS_JSON
 merge_run ordinary
 grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "ordinary in-flight main CI blocked the merge: $(cat "$WORK/m.ordinary")"
+# 8b. A release run whose publication does not need it (rc.12's metadata-only release commit
+#     blocked every merge for ~15 min). It is allowed ONLY when the release tag is already on
+#     origin at that exact commit AND release-ci-coverage.py (read-only, --wait 0, no --tag so
+#     the unverified-hotfix exception never counts) reports the tag's coverage satisfied without
+#     this run. Everything else keeps exit 10.
+REL=$(git -C "$HERE" rev-parse HEAD)
+rel_run() { jq -nc --arg t "$1" --arg sha "$REL" '{status:"in_progress",display_title:$t,head_sha:$sha,name:"CI",id:901}'; }
+MAIN_RUNS_JSON="[$(rel_run 'chore(release): v0.86.0-rc.12')]"; export MAIN_RUNS_JSON
+TAGOK=$(jq -nc --arg s "$REL" '{object:{type:"commit",sha:$s}}')
+rel_case() { # label want-rc : runs merge.sh against the current TAG_*/COV_RC env
+  : > "$COV_LOG"; merge_run "$1"
+  # want 0 = proceeds to the merge command (this stub never reaches MERGED, so rc is 9 there)
+  if [ "$2" -eq 0 ]; then [ "$rc" -ne 10 ] || fail "release case $1: refused with 10: $(cat "$WORK/m.$1")"
+  else [ "$rc" -eq "$2" ] || fail "release case $1: rc=$rc, want $2: $(cat "$WORK/m.$1")"; fi
+}
+export TAG_REF_JSON="$TAGOK" COV_RC=0
+rel_case relok 0
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "tag on origin + coverage satisfied did not merge: $(cat "$WORK/m.relok")"
+grep -q 'release run .* allowed' "$WORK/m.relok" || fail "allow rule not printed: $(cat "$WORK/m.relok")"
+grep -q -- "release-ci-coverage.py coverage $REL .*--wait 0" "$COV_LOG" || fail "coverage not invoked read-only: $(cat "$COV_LOG")"
+if grep -q -- '--tag' "$COV_LOG"; then fail "coverage must not be invoked with --tag (the hotfix exception is not evidence)"; fi
+# annotated tag: the ref names a tag object that peels to the release commit
+TAG_OBJ_JSON=$(jq -nc --arg s "$REL" '{object:{type:"commit",sha:$s}}')
+export TAG_REF_JSON='{"object":{"type":"tag","sha":"aaaa1111"}}' TAG_OBJ_JSON
+rel_case relann 0
+grep -q -- '--match-head-commit' "$WORK/merge.log" 2>/dev/null || fail "annotated tag peeling to the release commit did not merge: $(cat "$WORK/m.relann")"
+unset TAG_OBJ_JSON TAG_REF_JSON
+# refusals, each exit 10 with the rule named and nothing merged
+rel_case reltagless 10
+grep -q 'release run .* refused' "$WORK/m.reltagless" || fail "refusal rule not printed: $(cat "$WORK/m.reltagless")"
+[ ! -e "$WORK/merge.log" ] || fail "merged although the release tag is not on origin (cut awaiting its CI)"
+TAG_REF_JSON=$(jq -nc '{object:{type:"commit",sha:"0123456789abcdef0123456789abcdef01234567"}}'); export TAG_REF_JSON
+rel_case relother 10
+[ ! -e "$WORK/merge.log" ] || fail "merged although the tag points at another commit"
+export TAG_REF_JSON="$TAGOK" COV_RC=1
+rel_case relnocov 10
+[ ! -e "$WORK/merge.log" ] || fail "merged although release-ci-coverage did not report coverage"
+export COV_RC=0
+MAIN_RUNS_JSON="[$(rel_run 'chore(release): bump things')]"; export MAIN_RUNS_JSON
+rel_case reltitle 10
+[ ! -e "$WORK/merge.log" ] || fail "merged on a release title carrying no tag"
+# one allowed run does not excuse a second one that is not
+MAIN_RUNS_JSON="[$(rel_run 'chore(release): v0.86.0-rc.12'),$(jq -nc '{status:"queued",display_title:"chore(release): v0.86.0-rc.13",head_sha:"5f9145cbaaaa0000",name:"CI",id:902}')]"; export MAIN_RUNS_JSON
+rel_case relmixed 10
+[ ! -e "$WORK/merge.log" ] || fail "merged over a second, uncovered release run"
+unset TAG_REF_JSON COV_RC
 unset MAIN_RUNS_JSON
 export RUNS_FAIL=1
 merge_run runsfail
@@ -545,4 +605,4 @@ bash "$HERE/claims.sh" release '#42' --purge > /dev/null
 MERGE_STATE=OPEN; export MERGE_STATE
 unset RUNS_FAIL CHECKS_JSON CHECKS_RC
 
-echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses; --expect-closes refuses a closing-reference mismatch"
+echo "PASS merge: --confirm-only reconciles an out-of-band merge; empty/unreadable/partial/skipping-only/unregistered required checks refuse; a conflicting PR names the conflict; every unresolved thread (bots included), alerts and unacknowledged comments refuse; an in-flight release run on main refuses unless its tag is on origin and coverage holds without it; --expect-closes refuses a closing-reference mismatch"

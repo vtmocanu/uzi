@@ -24,6 +24,15 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Runs list and Dashboard: the stalled and waits-on-you flags show their elapsed time inline ([#2836](https://github.com/vtmocanu/uzi/issues/2836)).**
+  The progress flags read `◼ stalled · 14m` and `● waits on you · plan gate · 6m`, so the flag lines up with its neighbouring pills; the clock time moves to the tooltip.
+
+- **Worker cross-check badges reflect active load ([#2857](https://github.com/vtmocanu/uzi/issues/2857)).**
+  A single active cross-check uses the singular label; Dashboard and Runs hide idle cross-check badges while Workers settings retains idle capacity, with run and busy badges unchanged.
+
+- **Run-page cross-check cards match the Run summary treatment ([#2856](https://github.com/vtmocanu/uzi/issues/2856)).**
+  Plan and Code cross-checks use consistent headers, styled checker links, compact prose and literal finding chips. The first three findings stay visible, with the rest in a keyboard-accessible disclosure; checker metadata shares a footer, and pending or missing results have clearer states. Plan approval shows checker evidence below its header, and Run review uses the same sentence-case heading style.
+
 - **Report-only issue runs now finish under the completion interlock ([#2821](https://github.com/vtmocanu/uzi/issues/2821)).**
   A report-only issue run with every frozen milestone declared complete can store its findings and finish without publishing a branch or opening a merge request. Completion still checks the current worker and claim generation; identical retries preserve the stored report. Mixed report-only publication requests are refused, except for an interlocked issue's scope-capped zero-work delivery through its existing valid permit. Legacy headless report-only completions keep their existing behavior.
 
@@ -43,6 +52,9 @@ through `[0.52.0]`.)
 
 - **Retained run sources on a worker can be inspected and explicitly reclaimed without stopping the worker ([#1786](https://github.com/vtmocanu/uzi/issues/1786)).**
   A worker now serves a local, operator-only `inspect` / `discard` command over a 0600 Unix socket under its data directory (no network listener), run through `docker exec` / `kubectl exec` as described in "Recovering unpublished work". Inspect reports a retained clone's generation, attempt, descriptor digest, size and the one supported disposition: the owner's existing hold discard when the server lists an open hold of this worker on the run, resolving a surviving local recovery, settlement or terminal record, a local discard, or refused (naming the consumers). Discard closes new claims briefly, requires the worker idle, reserves the run for the whole disposal, reads server holds before taking the repository lock, and deletes only the exact confirmed source. Anything not proven gone is kept with its records, metadata is retired only after every path is verified gone, and an unreadable server holds read refuses before anything is deleted.
+
+- **Checkpoint publishes can recover from an HTTP 5xx within the same logical operation ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
+  An explicit numeric HTTP 500–599 response now permits up to three HTTP requests total, with 250ms and 1000ms backoffs. Any supplied caller deadline or abort signal is shared across attempts; each HTTP request retains its own client timeout. Some callers supply no outer signal, so the first request's timeout does not bound the total operation; the outer checkpoint gate (default 20m) still limits logical operations. Each replay uses a fresh producer for the fixed original source, candidate and floor, rechecks ownership, scratch/floor safety and remediation, and explicitly cancels and settles the abandoned producer first. A confirming ACK requires producer exit zero. HTTP 4xx, nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried. Intermediate 5xx responses stay in numeric operator retry logs; continuing 5xx failures reach the deduped feed after the third request, while a successful retry emits one positive recovery line even without an earlier feed failure. This does not guarantee durability for divergent heads or resolve the production HTTP 500 cause.
 
 ## [0.86.0] - 2026-10-06
 

@@ -6,21 +6,22 @@
 //
 // States (PRD rules 1-8; the board shows `70%` without the ≈ the run page carries):
 //   percent  → `70%` over a thin brand-tone bar (a progressbar, aria value 0-100)
-//   waiting  → `● waits on you`, warn, with a `plan gate|question|follow-up since HH:MM`
-//              sub-line (the reason from the status, the time from status_since)
-//   stalled  → `◼ stalled`, danger, with `since HH:MM` from health_since; its tooltip and
-//              accessible name carry the health word (stalled vs looping), because the row
-//              drops its RunHealthBadge while this flag shows (see progressShowsStall)
+//   waiting  → `● waits on you · plan gate|question|follow-up · 6m`, warn, one line: the
+//              reason from the status, the elapsed time from status_since (the clock time
+//              rides in the tooltip and the screen-reader text)
+//   stalled  → `◼ stalled · 14m`, danger, one line: the elapsed time from health_since;
+//              its tooltip and accessible name carry the health word (stalled vs looping),
+//              because the row drops its RunHealthBadge while this flag shows (see
+//              progressShowsStall)
 //   parked / queued / planning → screen-reader-only `Progress: <word>`: the status pill
 //              beside the cell already names the state, so a visible flag would repeat it
 //              (the TUI and CLI, which have no such pill, keep the visible flag)
 //   none     → faint `—`, titled, with a screen-reader `Progress: no estimate`
 // An absent/null progress (a pre-feature server, or a terminal run) or an unknown state
 // (a newer server's enum member) renders nothing, so the row reads exactly as before.
-import type { ReactNode } from "react";
 import type { Run, RunProgress } from "../lib/apiTypes";
 import { formatLocalTime } from "../lib/budget";
-import { parkLabel } from "../lib/runBadge";
+import { formatElapsed, parkLabel } from "../lib/runBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Badge } from "./ui";
 
@@ -63,25 +64,21 @@ export function stallTitle(run: Partial<Pick<Run, "health" | "health_reason">>):
   return reason === "" ? base : `${base} ${reason}`;
 }
 
-// Stacked flag + faint sub-line (`<reason> since HH:MM`, or whichever half is known); the
-// sub-line drops when neither is.
-function Flagged({
-  state,
-  reason,
-  since,
-  children,
-}: {
-  state: string;
-  reason?: string;
-  since: string | null;
-  children: ReactNode;
-}) {
-  const sub = [reason, since && `since ${since}`].filter(Boolean).join(" ");
+// Since renders the elapsed time inline (` · 14m`, hidden from assistive tech) plus a
+// screen-reader sentence carrying the same duration and the clock time. Nothing when the
+// instant is missing or unparseable.
+function Since({ iso, clock }: { iso: string | null | undefined; clock: number }) {
+  const at = formatLocalTime(iso);
+  const ms = iso ? Date.parse(iso) : NaN;
+  if (at === null || !Number.isFinite(ms)) return null;
+  const dur = formatElapsed(clock - ms);
   return (
-    <span data-run-progress={state} className="inline-flex flex-col items-start gap-0.5">
-      {children}
-      {sub && <span className="font-mono text-[10px] leading-none tabular-nums text-faint">{sub}</span>}
-    </span>
+    <>
+      <span aria-hidden="true"> · {dur}</span>
+      <span className="sr-only">
+        , for {dur}, since {at}
+      </span>
+    </>
   );
 }
 
@@ -94,9 +91,10 @@ function Quiet({ state, word }: { state: string; word: string }) {
   );
 }
 
-export function RunProgressCell({ run }: { run: ProgressRun }) {
+export function RunProgressCell({ run, now }: { run: ProgressRun; now?: number }) {
   const p = run.progress;
   if (!p) return null;
+  const clock = now ?? Date.now();
   switch (p.state) {
     case "percent": {
       if (typeof p.pct !== "number" || !Number.isFinite(p.pct)) return null;
@@ -126,26 +124,37 @@ export function RunProgressCell({ run }: { run: ProgressRun }) {
         </span>
       );
     }
-    case "waiting":
+    case "waiting": {
+      const reason = waitReason(run.status);
+      const at = formatLocalTime(run.status_since);
+      const title =
+        reason && at
+          ? `Waiting on you at the ${reason} since ${at}.`
+          : "This run is waiting on you: a plan approval, a question or a follow-up.";
       return (
-        <Flagged state="waiting" reason={waitReason(run.status)} since={formatLocalTime(run.status_since)}>
-          <Badge tone="warning" dot title="This run is waiting on you: a plan approval, a question or a follow-up.">
-            waits on you
+        <span data-run-progress="waiting" className="inline-flex">
+          <Badge tone="warning" dot title={title}>
+            <span>
+              waits on you{reason && ` · ${reason}`}
+              <Since iso={run.status_since} clock={clock} />
+            </span>
           </Badge>
-        </Flagged>
+        </span>
       );
+    }
     case "stalled": {
       const looping = run.health === "looping";
+      const at = formatLocalTime(run.health_since);
       return (
-        <Flagged state="stalled" since={formatLocalTime(run.health_since)}>
-          <Badge
-            tone="danger"
-            title={stallTitle(run)}
-          >
-            <span aria-hidden="true">◼</span> stalled
-            {looping && <span className="sr-only"> (looping)</span>}
+        <span data-run-progress="stalled" className="inline-flex">
+          <Badge tone="danger" title={at ? `Since ${at}. ${stallTitle(run)}` : stallTitle(run)}>
+            <span>
+              <span aria-hidden="true">◼</span> stalled
+              {looping && <span className="sr-only"> (looping)</span>}
+              <Since iso={run.health_since} clock={clock} />
+            </span>
           </Badge>
-        </Flagged>
+        </span>
       );
     }
     case "parked":

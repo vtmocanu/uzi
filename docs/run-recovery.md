@@ -45,6 +45,21 @@ acknowledgement does not prove that origin rejected the update.
 
 ## What you'll see
 
+The worker feed may say that **retained heads are retained locally with no
+confirmed checkpoint coverage**. This reports current local retention, not
+an immediate recovery failure. Inspect status with `uzi run recovery` or
+`uzi run export`; export still requires an available archive and can refuse.
+An **Earlier recovery archive covers retained heads** message reports that
+separate archive evidence while local custody remains retained.
+
+A **Confirmed checkpoint covers previously retained heads** message resolves
+only the listed, previously announced heads after positive checkpoint
+coverage removes their owed pins. Divergent remaining heads stay retained.
+These best-effort feed rows can be absent when delivery is refused or the
+feed is closed; they are not cleanup authority, a custody-release receipt,
+an MR/push confirmation or a promise of archive availability. They do not
+change the **Recovery archives** section or its **Needs action** state.
+
 The run page shows a **Recovery archives** section on any run that failed to
 finalize, and on any run that already has a retained capture even before it
 reaches a final status. Each retained capture is in one of these six states:
@@ -317,8 +332,8 @@ claim's only copy.
 Inventory-capable workers pin each divergent unpublished head locally at
 `refs/uzi-owed/<run-id>/<sha>` before replacing its tracking head. These
 pins retain the original SHAs without descendant compaction. Feed notices
-separate **worker-local, not checkpoint durable** heads from confirmed
-remote copies: a local pin does not survive loss of that worker's disk.
+report **local retention with no confirmed checkpoint coverage** separately
+from remote confirmation: a local pin does not survive loss of that worker's disk.
 Only containment in a broker-confirmed or claim-confirmed remote head can
 clear a candidate through publication reconciliation; a local tracking ref
 or checkpoint bridge is not that evidence.

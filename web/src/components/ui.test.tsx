@@ -5,7 +5,7 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { Card, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
+import { Card, CardHeader, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
 import { effectiveRunStatus, runBadge } from "../lib/runBadge";
 import type { LatestRun, RunStatus } from "../lib/api";
 
@@ -36,6 +36,20 @@ function latestRun(status: string): LatestRun {
 }
 
 afterEach(cleanup);
+
+describe("CardHeader", () => {
+  it.each([2, 3] as const)("renders heading level %s and its slots", (level) => {
+    render(<CardHeader title="Review" level={level} badge={<span>Passed</span>}
+      subtitle="Checked candidate" actions={<button>Open evidence</button>} />);
+    const heading = screen.getByRole("heading", { name: "Review", level });
+    const header = heading.closest("header")!;
+    expect(heading.className).toBe("text-sm font-semibold text-fg");
+    expect(header.classList.contains("flex-wrap")).toBe(true);
+    expect(header.textContent).toContain("Passed");
+    expect(screen.getByText("Checked candidate").closest("header")).toBe(header);
+    expect(screen.getByRole("button").parentElement?.classList.contains("ml-auto")).toBe(true);
+  });
+});
 
 describe("StatusPill", () => {
   // PRD #88: RUN_STATUS_TONES falls to `{ tone: "neutral" }` for an unknown status, so a

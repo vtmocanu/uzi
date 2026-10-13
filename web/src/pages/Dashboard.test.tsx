@@ -724,6 +724,21 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
   const withStats = (over: Partial<Worker>): Worker =>
     aWorker({ stats_source: "cgroup", stats_mem_bytes: 1_000_000, ...over });
 
+  it("hides idle cross-checks while retaining active checks", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [
+      withStats({ id: "lane-idle", name: "idle-lane-worker", active_runs: 0, max_concurrent_runs: 1, active_cross_checks: 0, max_cross_check_slots: 1 }),
+      withStats({ id: "lane-active", name: "active-lane-worker", active_runs: 1, max_concurrent_runs: 1, active_cross_checks: 1, max_cross_check_slots: 1 }),
+    ] });
+    renderDashboard();
+    const idleRow = (await screen.findByText("idle-lane-worker")).closest("li");
+    const activeRow = (await screen.findByText("active-lane-worker")).closest("li");
+    expect(idleRow).not.toBeNull();
+    expect(activeRow).not.toBeNull();
+    expect(within(activeRow!).getByTitle("Running 1 of 1 cross-check slots")).toBeTruthy();
+    expect(within(idleRow!).getByText("0/1 runs")).toBeTruthy();
+    expect(within(idleRow!).queryByText("0/1 cross-checks")).toBeNull();
+  });
+
   it("shows separate cap-one badges and drains dedicated cross-checks", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [withStats({
@@ -735,7 +750,7 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     renderDashboard();
     await flush();
     expect(screen.getByText("Worker load")).toBeTruthy();
-    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-check"));
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -748,7 +763,7 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     });
     renderDashboard();
     await flush();
-    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("1/1 cross-check")).toBeTruthy();
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -936,6 +951,44 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     expect(cell.textContent).toContain("(looping)");
     const health = within(row).getByText(/^⚠ looping/);
     expect(health.parentElement?.className).toBe("contents sm:hidden");
+  });
+  it("the stalled cell ages on the page clock (useNow), not on a private Date.now()", async () => {
+    vi.useFakeTimers();
+    const T0 = Date.parse("2026-07-05T12:00:00Z");
+    vi.setSystemTime(T0);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "s",
+          issue_title: "Stalled run",
+          status: "running",
+          health: "stalled",
+          health_since: new Date(T0 - 5 * 60_000).toISOString(),
+          progress: { state: "stalled", pct: null, milestone_done: 1, milestone_total: 3, active_milestone_id: "b", phase: "" },
+        }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const visible = () =>
+      screen.getByText("Stalled run").closest("li")!.querySelector('[data-run-progress="stalled"] [aria-hidden="true"]:not(:first-child)')!
+        .textContent;
+    expect(visible()).toBe(" · 5m");
+    // The wall clock jumps 10m, but the 30s useNow tick has not fired. The 10s poll re-renders
+    // the page, and the cell must still read the page clock.
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    expect(visible()).toBe(" · 5m");
+    // Once the 30s tick fires the page clock catches up.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(visible()).toBe(" · 15m");
   });
 });
 

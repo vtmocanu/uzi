@@ -2046,7 +2046,11 @@ export class WorkerClient {
         : AbortSignal.timeout(this.httpTimeoutMs),
     };
     const res = await fetch(this.baseUrl + path, init);
-    if (res.status < 200 || res.status >= 300) return { ok: false, httpStatus: res.status };
+    if (res.status < 200 || res.status >= 300) {
+      // Discard remote content without exposing it or changing the HTTP outcome.
+      await res.body?.cancel().catch(() => undefined);
+      return { ok: false, httpStatus: res.status };
+    }
     const text = await res.text();
     // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
     // outcome carrying the 2xx code rather than fabricating a body.

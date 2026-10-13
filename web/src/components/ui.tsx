@@ -58,6 +58,34 @@ export function Card({
   );
 }
 
+export function CardHeader({
+  title,
+  level = 2,
+  badge,
+  subtitle,
+  actions,
+}: {
+  title: ReactNode;
+  level?: 2 | 3;
+  badge?: ReactNode;
+  subtitle?: ReactNode;
+  actions?: ReactNode;
+}) {
+  const Heading = level === 3 ? "h3" : "h2";
+  return (
+    <header className="flex items-center justify-between gap-2 flex-wrap">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <Heading className="text-sm font-semibold text-fg">{title}</Heading>
+          {badge}
+        </div>
+        {subtitle && <div className="mt-1 text-xs text-muted">{subtitle}</div>}
+      </div>
+      {actions && <div className="ml-auto flex flex-wrap items-center justify-end gap-2">{actions}</div>}
+    </header>
+  );
+}
+
 // SectionTitle is the small-caps card heading used across settings/detail pages.
 export function SectionTitle({
   children,

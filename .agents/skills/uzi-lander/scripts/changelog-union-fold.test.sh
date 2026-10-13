@@ -226,6 +226,88 @@ printf '%s## [Unreleased]\n\n### Added\n\n- **old added**\n  old added desc\n\n-
 mkconflict nogain; expect_refuse nogain
 grep -Fq 'fold unproven' <<<"$OUT" || fail "nogain: wrong refusal reason: $OUT"
 
+# 16. The release cut (scripts/changelog-links.sh) linkifies bare `(#N)` citations while it folds,
+#     so the base's released copy of an ancestor bullet differs from the ancestor's only by
+#     `(#N)` -> `([#N](.../pull/N))`. Derived from the rc.12 fold of the "Provider outages"
+#     bullet (the old proof demanded a verbatim copy and refused "fold unproven" on a genuine fold).
+U_='https://github.com/o/r'
+LANC_="${HEAD_}## [Unreleased]
+
+### Changed
+
+- **Outages are bounded ([#1733](${U_}/issues/1733)).**
+  Retried under a streak, including the exact token (#2361). Resume clears it.
+
+## [0.2.0] - 2026-02-01
+
+### Changed
+
+- **earlier**
+  earlier desc
+"
+printf '%s' "$LANC_" > "$WORK/link.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Outages are bounded ([#1733](%s/issues/1733)).**\n  Retried under a streak, including the exact token ([#2361](%s/pull/2361)). Resume clears it.\n' "$HEAD_" "$U_" "$U_" > "$WORK/link.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Outages are bounded ([#1733](%s/issues/1733)).**\n  Retried under a streak, including the exact token (#2361). Resume clears it.\n\n- **branch new (#9)**\n  branch desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n' "$HEAD_" "$U_" > "$WORK/link.branch.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **branch new (#9)**\n  branch desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Outages are bounded ([#1733](%s/issues/1733)).**\n  Retried under a streak, including the exact token ([#2361](%s/pull/2361)). Resume clears it.\n' "$HEAD_" "$U_" "$U_" > "$WORK/link.want.md"
+mkconflict link
+expect_ok link
+
+# 16b. Per-bullet protection: a historical released bullet that already carries a linked
+#      `[#2361](...)` on every side must not stop an unrelated [Unreleased] bullet's bare `(#2361)`
+#      from folding as its linkified form.
+printf '%s' "${LANC_/earlier desc/earlier cites [#2361](${U_}/pull/2361).}" > "$WORK/hist.base.md"
+sed "s#^  earlier desc#  earlier cites [\#2361](${U_}/pull/2361).#" "$WORK/link.main.md" > "$WORK/hist.main.md"
+sed "s#^  earlier desc#  earlier cites [\#2361](${U_}/pull/2361).#" "$WORK/link.branch.md" > "$WORK/hist.branch.md"
+sed "s#^  earlier desc#  earlier cites [\#2361](${U_}/pull/2361).#" "$WORK/link.want.md" > "$WORK/hist.want.md"
+grep -Fq "earlier cites" "$WORK/hist.main.md" || fail "hist fixture not built"
+mkconflict hist
+expect_ok hist
+
+# 16c. An already-linked historical copy is not a newly gained release copy when main
+#      merely deletes the bare-citation Unreleased bullet. Refuse and leave the conflict intact.
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Same (#2361)**\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linknogain.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linknogain.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Same (#2361)**\n\n- **New**\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linknogain.branch.md"
+mkconflict linknogain; expect_refuse linknogain
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linknogain: wrong refusal reason: $OUT"
+
+# 16d. The same historical copy plus one genuinely gained released copy does prove a fold.
+cp "$WORK/linknogain.base.md" "$WORK/linkgain.base.md"
+cp "$WORK/linknogain.branch.md" "$WORK/linkgain.branch.md"
+{ cat "$WORK/linknogain.main.md"; printf '\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n'; } > "$WORK/linkgain.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **New**\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linkgain.want.md"
+mkconflict linkgain; expect_ok linkgain
+
+# 17. Linkification is the ONLY tolerated difference: a reworded released copy, a link whose
+#     target number differs from its text, and a released copy of a bullet that the ancestor
+#     held twice (one copy dropped) all still refuse.
+cp "$WORK/link.base.md" "$WORK/linkedit.base.md"; cp "$WORK/link.branch.md" "$WORK/linkedit.branch.md"
+sed 's/Resume clears it/Resume clears the streak/' "$WORK/link.main.md" > "$WORK/linkedit.main.md"
+mkconflict linkedit; expect_refuse linkedit
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linkedit: wrong refusal reason: $OUT"
+cp "$WORK/link.base.md" "$WORK/linkwrong.base.md"; cp "$WORK/link.branch.md" "$WORK/linkwrong.branch.md"
+sed 's#/pull/2361#/pull/9999#' "$WORK/link.main.md" > "$WORK/linkwrong.main.md"
+mkconflict linkwrong; expect_refuse linkwrong
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linkwrong: wrong refusal reason: $OUT"
+awk '/^- \*\*Outages/ { n++ } { print } /^  Retried under/ && n == 1 { print ""; print "- **Outages are bounded ([#1733]('"$U_"'/issues/1733)).**"; print "  Retried under a streak, including the exact token (#2361). Resume clears it." }' "$WORK/link.base.md" > "$WORK/linkdup.base.md"
+cp "$WORK/link.main.md" "$WORK/linkdup.main.md"; cp "$WORK/linkdup.base.md" "$WORK/linkdup.branch.md"
+mkconflict linkdup; expect_refuse linkdup
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linkdup: wrong refusal reason: $OUT"
+
+# 18. A citation ALREADY linked in the ancestor is compared as written: the branch re-pointing it
+#     (another repository, same number) is an edit, refused rather than dropped in favour of the
+#     base's old link; the same bullet untouched by the branch folds fine.
+LINK_='([#2361](https://github.com/o/r/pull/2361))'
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Linked already**\n  Cites %s here.\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n' "$HEAD_" "$LINK_" > "$WORK/relink.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Linked already**\n  Cites %s here.\n' "$HEAD_" "$LINK_" > "$WORK/relink.main.md"
+sed 's#github.com/o/r/pull/2361#github.com/other/repo/pull/2361#' "$WORK/relink.base.md" > "$WORK/relink.branch.md"
+mkconflict relink; expect_refuse relink
+grep -Fq 'moved or deleted' <<<"$OUT" || fail "relink: wrong refusal reason: $OUT"
+cp "$WORK/relink.base.md" "$WORK/relinkok.base.md"; cp "$WORK/relink.main.md" "$WORK/relinkok.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Linked already**\n  Cites %s here.\n\n- **new**\n  new desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n' "$HEAD_" "$LINK_" > "$WORK/relinkok.branch.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **new**\n  new desc\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **earlier**\n  earlier desc\n\n- **Linked already**\n  Cites %s here.\n' "$HEAD_" "$LINK_" > "$WORK/relinkok.want.md"
+mkconflict relinkok; expect_ok relinkok
+
 # 15. Refusal: markers in a plain file with no index stages stay the old refusal.
 printf '## [Unreleased]\n\n### Fixed\n\n<<<<<<< HEAD\n- **a**\n||||||| b\n- **old**\n=======\n- **b**\n>>>>>>> x\n' > "$WORK/plain.md"
 cp "$WORK/plain.md" "$WORK/plain.before"
@@ -233,4 +315,4 @@ RC=0; OUT=$(bash "$SCRIPT" "$WORK/plain.md" 2>&1) || RC=$?
 [ "$RC" -eq 1 ] || fail "plain: expected exit 1, got $RC: $OUT"
 cmp -s "$WORK/plain.md" "$WORK/plain.before" || fail "plain: a refusal must leave the file untouched"
 
-echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals"
+echo "PASS changelog-union-fold: release fold happy path, newer base bullets, created headings in order, appended heading, an RC-first fold into an existing release section, and the edited, deleted, unproven, no-gain, unfolded, duplicate, released-change, prose and no-stage refusals, and a fold that only linkified a bare (#N) citation (tolerated; a reworded, mis-targeted or de-duplicated copy still refuses)"

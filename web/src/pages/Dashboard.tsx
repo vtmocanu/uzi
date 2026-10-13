@@ -351,7 +351,7 @@ export function Dashboard() {
                       {w.status}
                     </Badge>
                     <WorkerCordonBadge worker={w} />
-                    <WorkerRunBadge worker={w} />
+                    <WorkerRunBadge worker={w} hideIdleCrossChecks />
                     <span className="truncate text-sm font-medium text-fg">{w.name}</span>
                   </div>
                   <WorkerStatLine worker={w} />
@@ -539,7 +539,7 @@ export function Dashboard() {
                         truncating title (the M badge still carries the count there); the
                         Runs list rows wrap and keep it at every width. */}
                     <span className="hidden sm:contents">
-                      <RunProgressCell run={r} />
+                      <RunProgressCell run={r} now={now} />
                     </span>
                     {/* A stalled cell already says so (with the health word in its
                         tooltip), so the health badge yields to it from sm up and stays

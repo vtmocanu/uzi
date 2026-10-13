@@ -18,7 +18,8 @@
 # it). Every blank line between a section's entries is kept byte-identical. Only a join the
 # union itself makes gets a chosen gap: the first side's last line against the second side's
 # first gets the larger of the two sides' own blank runs there, or, when neither has one,
-# [Unreleased]'s convention; a folded repeat's bullets against its first occurrence's always
+# [Unreleased]'s convention (when [Unreleased] holds no pair of entries to vote, e.g. right
+# after a release fold, the convention of the file's released sections); a folded repeat's bullets against its first occurrence's always
 # get the convention (the
 # majority of item pairs each side already had; on a tie the nearest pair before the join,
 # else blank when any pair is blank-separated, else none). A file with no conflict markers
@@ -77,14 +78,19 @@ SEP_AWK='
   function sepcount(s, k) {
     if (s ~ /^[ \t]*$/) { gap[k] = 1; return }
     if (s ~ /^#/) { pl[k] = 0; gap[k] = 0; last[k] = ""; return }
-    if (s ~ /^[-*] / && pl[k]) { if (gap[k]) nblank++; else ntight++; last[k] = (gap[k] ? 1 : 0) }
+    if (s ~ /^[-*] / && pl[k]) {
+      if (k == "g") { if (gap[k]) gblank++; else gtight++ }   # fallback: the released sections
+      else { if (gap[k]) nblank++; else ntight++ }
+      last[k] = (gap[k] ? 1 : 0)
+    }
     pl[k] = (s ~ /^[-*] / || s ~ /^  /); gap[k] = 0
   }
   # joinstyle(near): 1 = one blank line at a join, 0 = none.
   function joinstyle(near) {
     if (nblank != ntight) return (nblank > ntight)
     if (near != "") return near + 0
-    return (nblank > 0)
+    if (nblank > 0) return 1
+    return (gblank > gtight)   # no pair in [Unreleased] at all: the released sections decide
   }
 '
 
@@ -100,7 +106,8 @@ SENTINEL='<!-- changelog-union:join -->'
 # (1 ancestor, 2 ours = the base, 3 theirs = the branch), never from marker fragments, and
 # PROVES the fold first: every block the ancestor held under [Unreleased] is, verbatim, in a
 # released section of ours that holds it more often than the ancestor did, and not in ours'
-# [Unreleased], and theirs still holds it unedited.
+# [Unreleased], and theirs still holds it unedited. "Verbatim" ignores one rewrite: the release
+# cut's linkification of a bare `#N` into `[#N](URL/pull|issues/N)` (norm below).
 # The branch additions (theirs' [Unreleased] blocks the ancestor lacked) are then inserted
 # into ours' [Unreleased] under their `### Heading` (created, when absent, in the order
 # Added, Changed, Deprecated, Removed, Fixed, Security; any other heading goes last).
@@ -128,7 +135,7 @@ fold_resolve() {
     function blank(s) { return s ~ /^[ \t]*$/ }
     function flush(f) {
       if (cur == "") return
-      nb[f]++; BT[f, nb[f]] = cur; BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
+      nb[f]++; BT[f, nb[f]] = cur; BN[f, nb[f]] = cur; BU[f, nb[f]] = curu; BH[f, nb[f]] = curh; BS[f, nb[f]] = cursec
       cur = ""
     }
     function parse(f,   i, s, isu, h, sec) {
@@ -151,6 +158,28 @@ fold_resolve() {
       }
       flush(f)
     }
+    # The release cut linkifies bare `(#N)` citations (scripts/changelog-links.sh) while it folds,
+    # so a folded bullet in the BASE differs from its ancestor copy by `#N` -> `[#N](URL/pull|issues/N)`.
+    # Fold gain/absence comparisons undo that only for links whose target number equals
+    # their text and that the ancestor Unreleased bullet does not contain (PROT, per bullet).
+    # Already-linked citations and branch edits stay compared as written.
+    function norm(s,   o, m, pre, a, b) {
+      o = ""
+      while (match(s, /\[#[0-9]+\]\(https?:\/\/[^) \t\n]*\/(pull|issues)\/[0-9]+\)/)) {
+        m = substr(s, RSTART, RLENGTH); pre = substr(s, 1, RSTART - 1); s = substr(s, RSTART + RLENGTH)
+        a = m; sub(/^\[#/, "", a); sub(/\].*/, "", a)
+        b = m; sub(/\)$/, "", b); sub(/.*\//, "", b)
+        o = o pre ((a == b && !(m in PROT)) ? "#" a : m)
+      }
+      return o s
+    }
+    # matchlink(b, a): is block text b the ancestor block text a, up to the release-cut
+    # linkification of a bare `#N` in a? Links a itself carries are protected (PROT) for this call.
+    function matchlink(b, a,   t) {
+      split("", PROT); t = a
+      while (match(t, /\[#[0-9]+\]\(https?:\/\/[^) \t\n]*\/(pull|issues)\/[0-9]+\)/)) { PROT[substr(t, RSTART, RLENGTH)] = 1; t = substr(t, RSTART + RLENGTH) }
+      return norm(b) == a
+    }
     function rank(h) {
       sub(/^### /, "", h)
       if (h == "Added") return 1
@@ -169,25 +198,31 @@ fold_resolve() {
       # A block is identified by its subsection AND its text, with multiplicity: K-joined key.
       for (k = 1; k <= nb[1]; k++) if (BU[1, k]) {
         if (BH[1, k] == "") die("a heading-less bullet under [Unreleased] of the ancestor")
-        key = BH[1, k] K BT[1, k]; if (!(key in acnt)) { na++; AK[na] = key }
+        key = BH[1, k] K BN[1, k]; if (!(key in acnt)) { na++; AK[na] = key; AKH[na] = BH[1, k]; AKT[na] = BT[1, k] }
         acnt[key]++
       }
       if (na == 0) die("the ancestor [Unreleased] holds no bullet block, so there is no fold to prove")
+      # Compare historical release counts on both sides with the same per-bullet
+      # linkification rule; an unchanged linked copy cannot count as a release gain.
+      # Ancestor Unreleased and branch blocks stay exact for branch-edit checks.
+      for (f = 1; f <= 2; f++) for (k = 1; k <= nb[f]; k++) if (f == 2 || !BU[f, k])
+        for (i = 1; i <= na; i++)
+          if (AKH[i] == BH[f, k] && matchlink(BT[f, k], AKT[i])) { BN[f, k] = AKT[i]; break }
       # A fold target is a release section, keyed by its [version] (never the date), that holds
       # a block MORE often in the base than in the ancestor: a new version, or an RC-first
       # stable-keyed section an rc.N cut folded into again.
-      for (k = 1; k <= nb[1]; k++) if (!BU[1, k] && BS[1, k] != "") arel[BS[1, k] K BH[1, k] K BT[1, k]]++
+      for (k = 1; k <= nb[1]; k++) if (!BU[1, k] && BS[1, k] != "") arel[BS[1, k] K BH[1, k] K BN[1, k]]++
       for (k = 1; k <= nb[2]; k++) {
-        if (BU[2, k]) ou[BT[2, k]] = 1
+        if (BU[2, k]) ou[BN[2, k]] = 1
         else {
-          orl[BT[2, k]] = 1
-          if (BS[2, k] != "") brel[BS[2, k] K BH[2, k] K BT[2, k]]++
+          orl[BN[2, k]] = 1
+          if (BS[2, k] != "") brel[BS[2, k] K BH[2, k] K BN[2, k]]++
         }
       }
       for (key in brel) if (brel[key] > arel[key]) nrc[substr(key, index(key, K) + 1)] += brel[key] - arel[key]
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
         if (BH[3, k] == "") die("a heading-less bullet under [Unreleased] of the branch")
-        tcnt[BH[3, k] K BT[3, k]]++
+        tcnt[BH[3, k] K BN[3, k]]++
       }
       for (k = 1; k <= na; k++) {
         key = AK[k]; t = substr(key, index(key, K) + 1)
@@ -201,11 +236,11 @@ fold_resolve() {
       if (oa != ot) die("the branch changed the file outside [Unreleased]")
       nadd = 0
       for (k = 1; k <= nb[3]; k++) if (BU[3, k]) {
-        t = BT[3, k]; key = BH[3, k] K t
+        t = BT[3, k]; split("", PROT); tn = norm(t); key = BH[3, k] K t
         if (++used[key] <= acnt[key]) continue   # an ancestor occurrence, not an addition
-        if ((t in ou) || (t in orl)) die("a branch-added bullet already exists in the base: " title(t))
-        if (t in seenadd) die("a branch-added bullet is repeated: " title(t))
-        seenadd[t] = 1; nadd++; AD[nadd] = t; AH[nadd] = BH[3, k]
+        if ((t in ou) || (t in orl) || (tn in ou) || (tn in orl)) die("a branch-added bullet already exists in the base: " title(t))
+        if (tn in seenadd) die("a branch-added bullet is repeated: " title(t))
+        seenadd[tn] = 1; nadd++; AD[nadd] = t; AH[nadd] = BH[3, k]
       }
       # subsections of the base [Unreleased]: heading line SL, last non-blank line SE
       us = ustart[2]; ue = uend[2]; ns = 0; lastnb = us
@@ -292,6 +327,7 @@ awk "$SEP_AWK"'
     for (i = u + 1; i <= n; i++) if (L[i] ~ /^## /) { e = i; break }
     ns = 0; np = 0; dup = 0
     for (i = u + 1; i < e; i++) sepcount(L[i], "f")
+    for (i = 1; i <= n; i++) { if (L[i] ~ /^## /) isrel = (L[i] ~ /^## \[[0-9]+\.[0-9]+\.[0-9]+/); if ((i < u || i >= e) && isrel) sepcount(L[i], "g") }
     for (i = u + 1; i < e; i++) {
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
@@ -339,7 +375,7 @@ else
 # nearest earlier pair.
 if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
   BEGIN { st = 0 }  # 0 outside, 1 first side, 2 diff3 base, 3 second side
-  st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/) }
+  st == 0 && /^## / { unrel = ($0 ~ /^## \[Unreleased\]/); isrel = ($0 ~ /^## \[[0-9]+\.[0-9]+\.[0-9]+/) }
   /^<<<<<<<( |$)/ { if (st != 0) { bad = "nested <<<<<<< at line " NR; exit 1 } st = 1; next }
   /^[|][|][|][|][|][|][|]( |$)/  { if (st != 1) { bad = "stray ||||||| at line " NR; exit 1 } st = 2; hasbase = 1; next }
   /^=======$/     {
@@ -374,6 +410,7 @@ if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL"
   st == 2 { C[++nc] = $0; next }
   st == 1 { A[++na] = $0 }
   st == 3 { B[++nb] = $0 }
+  isrel && st != 3 { sepcount($0, "g") }
   unrel && st != 3 { sepcount($0, "o") }
   unrel && st != 1 { sepcount($0, "t") }
   { print; print > before }
@@ -381,6 +418,7 @@ if ! awk -v before="$tmpd/before" -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL"
     if (bad != "") { print "changelog-union: refusing: " bad > "/dev/stderr"; exit 1 }
     if (st != 0) { print "changelog-union: unterminated conflict block" > "/dev/stderr"; exit 1 }
     print "votes", nblank + 0, ntight + 0 > sepfile
+    print "fallback", gblank + 0, gtight + 0 > sepfile
     for (j = 1; j <= nj; j++) print "join", j, near[j] > sepfile
   }
 ' "$FILE" > "$tmpd/union"; then
@@ -426,6 +464,7 @@ awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
     while ((getline ln < sepfile) > 0) {
       split(ln, f, " ")
       if (f[1] == "votes") { nblank = f[2] + 0; ntight = f[3] + 0 }
+      else if (f[1] == "fallback") { gblank = f[2] + 0; gtight = f[3] + 0 }
       else if (f[1] == "join") near[f[2]] = f[3]
     }
   }

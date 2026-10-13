@@ -342,7 +342,7 @@ if [ -f "$LEASE_FILE" ]; then
     echo "RESULT=base_moved"; exit 8
   fi
 else
-  [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
+  [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase (a worktree ahead of the remote, e.g. after a manual commit, is accepted and records the lease)" >&2; exit 8; }
   # A NEW landing: the worktree must already contain the remote head, or be fast-forwarded
   # to it NOW (a failed fast-forward records no lease); anything else is a divergence no
   # lease can vouch for.

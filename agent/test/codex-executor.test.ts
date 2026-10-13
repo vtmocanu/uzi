@@ -1751,6 +1751,7 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
         };
         await new RunRunner(client, git, () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
           pollMs: 5,
+          checkpointTestHooks: { retryBackoffMs: [0, 0] },
           ...(scenario === "docker" ? { dockerHost: "unix:///2360-fixture-only.sock" } : {}),
           quiesceRun: async () => ({
             process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
@@ -1774,9 +1775,10 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
             assert.equal(report.fail_origin, "rate_limited");
             assert.equal(published.length, 0);
           } else {
-            assert.equal(published.length, 1, `existing park sink published WIP: ${diagnostics.lines.join("\n")}`);
+            assert.equal(published.length, scenario === "publish-failed" ? 3 : 1, `existing park sink published WIP: ${diagnostics.lines.join("\n")}`);
             assert.equal(report.checkpoint_contains_latest, scenario === "publish-failed" ? undefined : true);
-            assert.deepEqual(publishedTrees, ["recover this work\n"]);
+            assert.deepEqual(publishedTrees, Array(scenario === "publish-failed" ? 3 : 1).fill("recover this work\n"));
+            assert.deepEqual(published, Array(published.length).fill(published[0]), "park retries preserve the WIP tip");
             if (scenario === "window" || scenario === "docker") {
               const resumed = makeRig({ responder: c => {
                 if (c.method === "thread/resume") return { thread: { id: "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee" } };
