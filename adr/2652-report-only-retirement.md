@@ -143,8 +143,10 @@ so this cleanup does not request expiry of an archive the report may still need.
 A disabled outbox at initialization conservatively protects every acknowledged generation,
 even if no report was loaded. A failed initialization cannot establish physical absence;
 narrowing this to an empty in-memory pending set would lose that guarantee. Such records
-retain journals and run-scoped pins indefinitely and consume rotating live-pass slots
-(the default per-pass cap is four), but their local bundles are freed. There is no
+retain journals and run-scoped pins indefinitely, but their local bundles are freed.
+ACK cleanup protected by a pending report is excluded before the live-pass cap
+(four by default), leaving slots for uploads and FINAL. Once the exact report retires,
+its ACK cleanup becomes eligible again. There is no
 per-recovery TTL or quota; data-volume statfs accounting, disk pressure and owed-head
 admission remain in force. A repaired store or successful exact report retirement permits
 the existing cleanup retry. One debug diagnostic per retained ACK exposes the deferral.
