@@ -1295,6 +1295,21 @@ grep -q 'incomplete coverage: 1 of 2 attributed sources captured' "$D_T2B/latest
   || fail "t2 journal: missing 'incomplete coverage: 1 of 2'; log: $(log_of "$D_T2B")"
 [ -f "$D_T2B/latest-attempt/issue-4242.tgz" ] || fail "t2 journal: primary artifact not kept"
 [ ! -e "$D_T2B/latest" ] || fail "t2 journal: latest advanced"
+# Variant: the ledger-named dir cannot be listed (mode 000). chmod cannot lock out root,
+# so this one needs an unprivileged user.
+if [ "$(id -u)" -ne 0 ]; then
+  t2_layout
+  ledger "$A1" run-4242 "$BADA1" live
+  chmod 000 "$BADA1"
+  D_T2L="$WORK/out.t2.locked"
+  rc="$(backup_rc "$D_T2L" run-4242)"
+  chmod 755 "$BADA1"
+  [ "$rc" -eq 1 ] || fail "t2 locked: exit $rc, want 1; log: $(log_of "$D_T2L")"
+  grep -q 'incomplete coverage: 1 of 2 attributed sources captured' "$D_T2L/latest-attempt/backup.log" \
+    || fail "t2 locked: missing 'incomplete coverage: 1 of 2'; log: $(log_of "$D_T2L")"
+  [ -f "$D_T2L/latest-attempt/issue-4242.tgz" ] || fail "t2 locked: primary artifact not kept"
+  [ ! -e "$D_T2L/latest" ] || fail "t2 locked: latest advanced"
+fi
 # Variant: nothing names the dir, so it is not a gap.
 t2_layout
 D_T2C="$WORK/out.t2.unattributed"

@@ -504,9 +504,8 @@ and falling back to the durable bare tracking ref when no clone survives:
   a nonempty or unlistable one that the journal, ledger (`live`/`reclaimed`) or marker names is an
   attributed source that is listed but unreadable, so it is incomplete coverage (FAIL, `latest`
   not advanced). A directory no journal, ledger or marker names is not an attributed source, but on
-  a run that captures nothing an unreadable `.git` in any same-stem directory, or a nonempty or
-  unlistable one without `.git`, even an unattributed one, still makes the search inconclusive
-  (FAIL, retry): a known limitation. Cost: every
+  a run that captures nothing an unreadable `.git` in any same-stem directory, even an
+  unattributed one, still makes the search inconclusive (FAIL, retry): a known limitation. Cost: every
   cycle execs into every Running pod in `UZI_WORKER_NS` for each bound run (a handful of probes
   per pod), and one pod that cannot be exec'd into fails every bound run's cycle until it is fixed (the FAIL line names it and verified artifacts are kept). Do not drop its namespace from `UZI_WORKER_NS` unless you have verified that namespace holds no source a tracked run needs: excluding it hides those sources from the search, so their work is no longer backed up and the backup could read green without it (it lists namespaces, so
   excluding a pod means excluding its namespace).

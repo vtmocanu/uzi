@@ -84,9 +84,8 @@
 # <m> counts the sources found (the clones or tracking ref the run tried to capture) plus
 # the attributed ones listed but unreadable (deduped by pod and path). The artifacts that were captured are kept. A dir the journal, ledger
 # and marker do not name is not an attributed source: it is never a gap by itself, though
-# on a run that captured nothing, a dir with an unreadable .git, or one with no .git
-# that is not positively empty (it holds something, or cannot be listed), still makes the
-# search inconclusive. Each inconclusive reason names the pod or namespace that failed.
+# on a run that captured nothing, a dir with an unreadable .git still makes the search
+# inconclusive (an unnamed dir with no .git, empty or not, does not). Each inconclusive reason names the pod or namespace that failed.
 # Exit: 0 when every active target produced a verified recovery artifact for every
 # attributed source (no coverage gap, see above; terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
@@ -675,8 +674,8 @@ select_clone(){
     # live or reclaimed attempt of THIS run, may hold its work: that is an unfinished search (and an attributed source
     # that is not captured: a coverage gap, counted in the total), not absence. An
     # unnamed unreadable dir (e.g. an empty root-owned attempt) is not attributed to
-    # this run, so it is no gap; the listing's rc 3 already keeps a no-capture run
-    # from SNAP.
+    # this run, so it is no gap; only an unreadable .git (the listing's rc 3) keeps a
+    # no-capture run from SNAP.
     if [ -z "$br" ]; then
       if { printf '%s\n' "$journal_ok" | grep -qxF -- "$aid$tab$path"; } \
          || { [ -n "$aid" ] && printf '%s\n' "$ledger_live" | grep -qxF -- "$aid$tab$path"; }; then
