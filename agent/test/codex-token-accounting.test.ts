@@ -59,10 +59,10 @@ function assertEntry(
   assert.ok(actual !== undefined && !("costUSD" in actual), "no costUSD in a C4a entry");
 }
 
-// #2878 M1: guard counter loss reproducibly; no historical incident raw frame is available.
+// #2878 M2: guard counter loss reproducibly; no historical incident raw frame is available.
 // Pinned 0.160.1 resume evidence lives in e2e/codex-m4/token-resume.test.ts and
 // large-resume.test.ts: replay precedes turn/started. Neither proves compaction caused the incident.
-describe("#2878 M1 accountant", () => {
+describe("#2878 M2 accountant", () => {
   const pricing = { authMode: "api_key" as const, now: new Date("2026-10-13") };
   const note = (inputTokens: number, outputTokens: number) =>
     usage({ inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
@@ -73,7 +73,7 @@ describe("#2878 M1 accountant", () => {
   });
 
   for (const sameModel of [false, true]) {
-    it(`RED retained child recorded before root incomplete: ${sameModel ? "same model" : "distinct model"}`, () => {
+    it(`regression retained child recorded before root incomplete: ${sameModel ? "same model" : "distinct model"}`, () => {
       const acct = new CodexUsageAccountant();
       acct.registerThread(ROOT, MODEL_ROOT, true);
       const childModel = sameModel ? MODEL_ROOT : "gpt-6.1-sol";
@@ -88,12 +88,12 @@ describe("#2878 M1 accountant", () => {
       assert.deepEqual(acct.aggregateByModel(pricing), expected,
         "incomplete root retains child counters and only taints its own model");
       assert.equal(acct.takeIncompleteNotice(), true);
-      acct.markIncomplete();
+      acct.markIncomplete(ROOT, "invalid_raw_usage");
       assert.equal(acct.takeIncompleteNotice(), false, "notice remains claim-wide once-only");
     });
   }
 
-  it("RED advancing snapshot with decreasing output rejects whole snapshot", () => {
+  it("regression advancing snapshot with decreasing output rejects whole snapshot", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
     acct.record(ROOT, note(1000, 200), true);
@@ -110,7 +110,7 @@ describe("#2878 M1 accountant", () => {
     assert.deepEqual(acct.aggregateByModel(pricing), { [MODEL_ROOT]: entry(130, 30) });
   });
 
-  it("RED missing live baseline quarantines attempted work despite later replay", () => {
+  it("regression missing live baseline quarantines attempted work despite later replay", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
     acct.record(ROOT, note(600, 180));
@@ -120,10 +120,10 @@ describe("#2878 M1 accountant", () => {
     assert.deepEqual(acct.aggregateByModel(pricing), { [MODEL_ROOT]: entry(0, 0) });
   });
 
-  it("RED historical malformation can recover proved baseline but never reported cost", () => {
+  it("regression historical malformation can recover proved baseline but never reported cost", () => {
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
-    acct.markIncomplete(); // invalid historical note rejected by harness, before attempted work
+    acct.markIncomplete(ROOT, "invalid_raw_usage"); // invalid historical note rejected by harness, before attempted work
     acct.record(ROOT, note(1000, 200), true);
     assert.equal(acct.hasBaseline(ROOT), true);
     acct.record(ROOT, usage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
@@ -132,7 +132,7 @@ describe("#2878 M1 accountant", () => {
   });
 
   for (const total of [[1110, 210], [10, 2]]) {
-    it(`GREEN nonadvancing composition ${total.join("/")} leaves counters and price unchanged`, () => {
+    it(`compatibility nonadvancing composition ${total.join("/")} leaves counters and price unchanged`, () => {
       const acct = new CodexUsageAccountant();
       acct.registerThread(ROOT, MODEL_ROOT, true);
       acct.record(ROOT, note(1000, 200), true);
@@ -149,17 +149,21 @@ describe("#2878 M1 accountant", () => {
 
 describe("CodexUsageAccountant: proved replay and incomplete claims", () => {
   it("never guesses total-last without replay, and later replay cannot clear incomplete", () => {
+    const lowerBound = { [MODEL_ROOT]: {
+      inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+      reasoningOutputTokens: 0, costStatus: "unreported",
+    } };
     const acct = new CodexUsageAccountant();
     acct.registerThread(ROOT, MODEL_ROOT, true);
     acct.record(ROOT, usage({ inputTokens: 600, totalTokens: 600 }, { inputTokens: 300, totalTokens: 300 }));
     assert.equal(acct.usageIncomplete, true);
-    assert.equal(acct.aggregateByModel({ authMode: "subscription", now: new Date("2026-10-05") }), undefined);
+    assert.deepEqual(acct.aggregateByModel({ authMode: "subscription", now: new Date("2026-10-05") }), lowerBound);
     assert.equal(acct.takeIncompleteNotice(), true);
     acct.registerThread(ROOT, MODEL_ROOT, false);
     acct.registerThread("later-child", MODEL_CHILD, false);
     acct.record(ROOT, usage({ inputTokens: 300, totalTokens: 300 }, { inputTokens: 200, totalTokens: 200 }), true);
     assert.equal(acct.usageIncomplete, true);
-    assert.equal(acct.aggregateByModel(), undefined);
+    assert.deepEqual(acct.aggregateByModel(), lowerBound);
     assert.equal(acct.takeIncompleteNotice(), false);
   });
 

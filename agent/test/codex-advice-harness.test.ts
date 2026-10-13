@@ -1317,9 +1317,9 @@ describe("CodexAdviceHarness: gpt-6-luna is in the contract (no fallback)", () =
   });
 });
 
-describe("#2878 M1 advice direct writer", () => {
+describe("#2878 M2 advice direct writer", () => {
   for (const shape of ["equal", "reset", "advancing regression"] as const) {
-    it(`${shape === "advancing regression" ? "RED" : "GREEN"} advice ${shape} retains proved counters`, async () => {
+    it(`${shape === "advancing regression" ? "regression" : "compatibility"} advice ${shape} retains proved counters`, async () => {
       const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
       const seen: AdviceUsageSnapshot[] = [];
       const total = shape === "equal" ? bdown(1110, 210)

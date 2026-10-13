@@ -64,7 +64,7 @@ function assertTokens(
   assert.equal(entry.reasoningOutputTokens, want.reasoning);
 }
 
-describe("#2878 M1 priced cumulative monotonicity", () => {
+describe("#2878 M2 priced cumulative monotonicity", () => {
   const baseline = { inputTokens: 1000, cachedInputTokens: 100, cacheWriteInputTokens: 50,
     outputTokens: 200, totalTokens: 1200 };
   const accepted = { inputTokens: 1100, cachedInputTokens: 110, cacheWriteInputTokens: 55,
@@ -78,7 +78,7 @@ describe("#2878 M1 priced cumulative monotonicity", () => {
     ["output", { ...accepted, inputTokens: 1120, outputTokens: 210, totalTokens: 1330 }],
   ];
   for (const [bucket, total] of regressions) {
-    it(`RED advancing decrease in cumulative priced ${bucket} retains proved delta without cost`, () => {
+    it(`regression advancing decrease in cumulative priced ${bucket} retains proved delta without cost`, () => {
       const acct = new CodexUsageAccountant();
       acct.registerThread(ROOT, ASTRA, true);
       acct.record(ROOT, usage(baseline, baseline), true);

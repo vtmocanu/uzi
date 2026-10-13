@@ -3585,10 +3585,10 @@ export class CodexExecutor implements Executor {
         // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
         // a fresh lineage even when thread/resume emits no thread/started notification.
         accountant,
-        onTokenUsageIncomplete: () => {
+        onTokenUsageIncomplete: (text) => {
           ctx.emit({ kind: "status", agent: "worker", payload: {
             event: "codex_token_usage_incomplete",
-            text: "Token usage for this resumed claim is unavailable; recorded run totals are incomplete. Execution continues.",
+            text,
           } });
         },
         emitClaimInit: epochIndex === 0,

@@ -5035,10 +5035,10 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
   });
 });
 
-// #2878 M1: a shared API fixture is asserted against ctx.emit from the real executor,
+// #2878 M2: a shared API fixture is asserted against ctx.emit from the real executor,
 // never manufactured from accountant output. Strip only elapsed duration from the actual
 // result payload; JSON serialization omits undefined wire fields exactly as persistence does.
-describe("#2878 M1 worker emitted fixture", () => {
+describe("#2878 M2 worker emitted fixture", () => {
   const fixture = JSON.parse(readFileSync(
     new URL("../../fixtures/run-usage/codex-incomplete-claim.json", import.meta.url), "utf8",
   )) as Record<string, unknown>;
@@ -5049,7 +5049,7 @@ describe("#2878 M1 worker emitted fixture", () => {
     return JSON.parse(JSON.stringify(stable)) as unknown;
   };
 
-  it("GREEN earlier metered worker payload matches shared fixture", async () => {
+  it("compatibility earlier metered worker payload matches shared fixture", async () => {
     const rig = makeRig();
     rig.transport.push(threadStarted())
       .push(tokenUsageUpdated("th-1", "tn-1", { inputTokens: 100, outputTokens: 20, totalTokens: 120 }))
@@ -5060,7 +5060,7 @@ describe("#2878 M1 worker emitted fixture", () => {
   });
 
   for (const childModel of ["gpt-6.1-sol", "gpt-6-astra"]) {
-    it(`RED retained child recorded before incomplete root worker payload: ${childModel}`, async () => {
+    it(`regression retained child recorded before incomplete root worker payload: ${childModel}`, async () => {
       const responder: Responder = c => {
         if (c.method === "thread/start") return { thread: { id: "th-child" } };
         if (c.method === "thread/resume") return { thread: { id: "th-1" } };
@@ -5095,7 +5095,7 @@ describe("#2878 M1 worker emitted fixture", () => {
     });
   }
 
-  it("RED zero incomplete worker payload downgrades an earlier same-key meter", async () => {
+  it("regression zero incomplete worker payload downgrades an earlier same-key meter", async () => {
     const rig = makeMultiEpochRig([resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
       t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
         params: { threadId: th, turn: { id: tn } } })
@@ -5109,8 +5109,8 @@ describe("#2878 M1 worker emitted fixture", () => {
   });
 });
 
-describe("#2878 M1 cause-specific worker notice", () => {
-  it("RED missing replay notice names the unavailable baseline for attempted resumed work once across epochs", async () => {
+describe("#2878 M2 cause-specific worker notice", () => {
+  it("regression missing replay notice names the unavailable baseline for attempted resumed work once across epochs", async () => {
     const rig = makeMultiEpochRig([
       resumedEpochResponder("th-1", "tn-1", (t, th, tn) => {
         t.push({ kind: "turn_started", method: "turn/started", threadId: th, turnId: tn,
@@ -5148,7 +5148,7 @@ describe("#2878 M1 cause-specific worker notice", () => {
       "a resumed claim alone must not stand in for the actual accounting cause");
   });
 
-  it("RED invalid live raw usage notice names validation failure and the retained baseline after same-claim recreation once across epochs", async () => {
+  it("regression invalid live raw usage notice names validation failure and the retained baseline after same-claim recreation once across epochs", async () => {
     const rawMarker = "private-invalid-usage-bucket";
     const invalidUsage = (th: string, tn: string): CodexNotification => {
       const note = tokenUsageUpdated(th, tn, { inputTokens: 9000, totalTokens: 9000 });
@@ -5238,10 +5238,13 @@ describe("CodexExecutor: incomplete resumed claim notice", () => {
       assert.deepEqual(emitted.filter(m => m.payload.event === "codex_token_usage_incomplete"), [{
         kind: "status", agent: "worker", payload: {
           event: "codex_token_usage_incomplete",
-          text: "Token usage for this resumed claim is unavailable; recorded run totals are incomplete. Execution continues.",
+          text: "Codex token accounting is incomplete: missing proved replay at the live boundary. The baseline is unavailable; only proven usage is recorded. Cost is unreported for the affected model. Execution continues.",
         },
       }]);
-      assert.equal(lastResultModelUsage(emitted), undefined);
+      assert.deepEqual(lastResultModelUsage(emitted), { "gpt-6-astra": {
+        inputTokens: 0, outputTokens: 0, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+        reasoningOutputTokens: 0, costStatus: "unreported",
+      } });
     });
   }
 });

@@ -762,7 +762,7 @@ for (const mode of ["success", "model-error", "unclean"] as const) {
 }
 
 for (const shape of ["equal", "reset", "advancing regression"] as const) {
- it(`#2878 M1 ${shape === "advancing regression" ? "RED" : "GREEN"} cross-check real transport ${shape}`, async () => {
+ it(`#2878 M2 ${shape === "advancing regression" ? "regression" : "compatibility"} cross-check real transport ${shape}`, async () => {
   const c = claim();
   c.config = { default_model: "gpt-6.1-sol", default_effort: "high" };
   const r = rig({ claim: c, notes: emit => {

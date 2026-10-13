@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Codex retains proven usage when cost accounting becomes incomplete ([#2878](https://github.com/vtmocanu/uzi/issues/2878)).**
+  Proven token counters survive invalid usage and advancing cumulative regressions; affected model costs remain unreported, and a once-per-claim notice names the actual accounting cause and whether a proved baseline is available.
+
 - **Runs list and Dashboard: the stalled and waits-on-you flags show their elapsed time inline ([#2836](https://github.com/vtmocanu/uzi/issues/2836)).**
   The progress flags read `◼ stalled · 14m` and `● waits on you · plan gate · 6m`, so the flag lines up with its neighbouring pills; the clock time moves to the tooltip.
 
