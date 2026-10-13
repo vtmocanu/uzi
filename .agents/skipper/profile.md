@@ -5,6 +5,12 @@
   `uzi-lander`; plan gate means approval or steering is required; RC cut means
   creating a release candidate through `uzi-release`.
 - Delivery/landing skill: `uzi-lander`. Dispatch and plan steering: `uzi-watcher`.
+- Local resources: relay this rule to each lead at enrollment. Run at most one
+  heavy local test job per lead at a time, including delegated buddy jobs:
+  `task gate:*`, `go test -race`, full `node --test`/Vitest suites or local
+  e2e/Docker tests. Prefer CI for full gates (`uzi-lander` `LOCAL_GATES=none`);
+  run only targeted tests locally. Never unset, raise or override the machine's
+  inherited local test-concurrency caps.
 - Resources: this repo's main branch for merges; the GitHub account's shared CI
   capacity for CI admission. Derive identities from the remote and operational
   reports; keep live owners and resource identifiers in private state.
