@@ -880,10 +880,9 @@ describe("Dashboard usage recency refresh (#2399)", () => {
   });
 });
 
-// PRD #2602 M1: the recent-runs row carries the server-derived Progress cell beside the
-// milestone badge; a row without `progress` (pre-feature server) renders no cell.
-describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
-  it("shows `70%` with a progressbar for a percent run and nothing for a run without progress", async () => {
+// The recent-runs row keeps milestone counts beside the running status estimate.
+describe("Dashboard recent-run status progress", () => {
+  it("shows server progress inside the running status pill and keeps an ordinary pill without an estimate", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({
@@ -914,9 +913,12 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     const row = screen.getByText("Percent run").closest("li")!;
     const bar = within(row).getByRole("progressbar");
     expect(bar.getAttribute("aria-valuenow")).toBe("70");
-    expect(bar.textContent).toBe("70%");
-    // The cell sits in the raised badge cluster right after the M2/3 badge.
-    expect(bar.closest("[data-run-progress]")?.parentElement?.previousElementSibling?.textContent).toBe("M2/3");
+    expect(bar.getAttribute("aria-valuetext")).toBe("Running, about 70%; 2 of 3 milestones done");
+    // Milestone counts stay visible beside the status estimate at every width.
+    expect(within(row).getByText("M2/3")).toBeTruthy();
+    expect(bar.textContent).toBe("running · 70%");
+    expect(bar.closest(".hidden")).toBeNull();
+    expect(row.querySelector('[data-run-progress="percent"]')).toBeNull();
     const old = screen.getByText("Pre-feature run").closest("li")!;
     expect(old.querySelector("[data-run-progress]")).toBeNull();
   });

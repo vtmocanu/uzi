@@ -493,8 +493,8 @@ export function RunRow({
                   {msBadge.label}
                 </Badge>
               )}
-              {/* PRD #2602: the server-derived progress cell, beside the milestone badge
-                  it estimates from; hidden with it under waitingForVault. */}
+              {/* PRD #2602: the waiting/stalled progress flags; percentages appear in the
+                  status pill. Hidden with milestones under waitingForVault. */}
               <RunProgressCell run={run} now={now} />
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run, and when
@@ -506,7 +506,7 @@ export function RunRow({
               {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              <StatusPill status={pillStatus} />
+              <StatusPill status={pillStatus} progress={run.progress} />
               {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
                   raised above the card's stretched-link overlay (relative z-10, issue #485
                   NB1) so the click hits the button rather than the run-details Link; it

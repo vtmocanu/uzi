@@ -58,23 +58,11 @@ describe.each([
 });
 
 describe("RunProgressCell (PRD #2602)", () => {
-  it("percent: NN% without ≈ and a 0-100 progressbar with a descriptive name", () => {
+  it("percent yields to the adjacent running status pill", () => {
     const { container } = renderCell({
       progress: progress({ state: "percent", pct: 70, milestone_done: 2, milestone_total: 3 }),
     });
-    const bar = screen.getByRole("progressbar");
-    expect(bar.getAttribute("aria-valuenow")).toBe("70");
-    expect(bar.getAttribute("aria-valuemin")).toBe("0");
-    expect(bar.getAttribute("aria-valuemax")).toBe("100");
-    expect(bar.getAttribute("aria-label")).toBe("Run progress: about 70%, 2 of 3 milestones done");
-    expect(container.textContent).toBe("70%");
-    expect(container.textContent).not.toContain("≈");
-    // The fill is the brand tone at the percentage width, not a utilisation colour.
-    const fill = bar.querySelector(".bg-brand") as HTMLElement;
-    expect(fill.style.width).toBe("70%");
-    // Mock sizing: a 13px semibold figure over a w-16 bar.
-    expect(bar.className).toContain("w-16");
-    expect(bar.firstElementChild?.className).toContain("text-[13px]");
+    expect(container.innerHTML).toBe("");
   });
 
   it("percent with a missing pct renders nothing rather than a fabricated 0%", () => {
@@ -258,13 +246,12 @@ describe("RunProgressCell (PRD #2602)", () => {
     expect(cell.textContent).toBe(`Progress: ${state}`);
   });
 
-  it("none: a visible faint em dash, titled, with a screen-reader name", () => {
+  it("none: screen-reader-only no estimate without a visible placeholder", () => {
     const { container } = renderCell({ progress: progress({ state: "none" }) });
     const cell = cellOf(container) as HTMLElement;
-    expect(cell.className).toContain("text-faint");
-    expect(cell.getAttribute("title")).toBe("No milestone plan to measure progress against");
-    expect(cell.querySelector('[aria-hidden="true"]')?.textContent).toBe("—");
-    expect(cell.querySelector(".sr-only")?.textContent).toBe("Progress: no estimate");
+    expect(cell.className).toBe("sr-only");
+    expect(cell.textContent).toBe("Progress: no estimate");
+    expect(cell.querySelector('[aria-hidden="true"]')).toBeNull();
   });
 
   it.each([

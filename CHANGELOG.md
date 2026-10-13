@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Changed
+
+- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
+  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
