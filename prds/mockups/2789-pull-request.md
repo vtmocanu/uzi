@@ -14,7 +14,7 @@ The Now prompt also describes intended work from titles and role labels while pr
 
 ## Scope and review boundaries
 
-Design/decisions: [PRD](prds/done/2789-run-page-unified-progress.md), [interactive mock](prds/mockups/2789-run-page-unified-progress-mock.html). The approved implementation plan governs scope, the revised PRD governs behavior, and the mock governs unspecified presentation.
+Design/decisions: [PRD](../done/2789-run-page-unified-progress.md), [interactive mock](2789-run-page-unified-progress-mock.html). The approved implementation plan governs scope, the revised PRD governs behavior, and the mock governs unspecified presentation.
 
 Target-default cumulative review base: 2bf9a00e6eac5e3989097bdb7167cd3143a092df. Published presentation prototype floor: 3bef77073807e55d01e097f7f60a43d583d6ee21, followed by lead/integration edits. The default branch was merged, preserving published history. The published prototype was treated as unreviewed starting code, not completed milestones. Source reviews cover the whole branch from the target merge base, including kept prototype code, within each owner's scope.
 
@@ -26,7 +26,7 @@ This change introduces no API/DTO/schema/migration, server progress rule, pricin
 
 ## Mock deviations
 
-The [M3 permanent report](prds/mockups/2789-m3-validation.md) records necessary differences:
+The [M3 permanent report](2789-m3-validation.md) records necessary differences:
 
 - Existing full approval/hero content, controls and semantic app styling remain rather than the mock's shortened panels. Sample identity/model/token/time/ages/usage differ; scenario messages supply usage, and the approval fixture has no usage footer to invent.
 - Terminal progress is null: frozen reported rows remain without fabricated terminal progress state or active segment. The plan segment retains its plan colour and completed rows retain strike-through.
@@ -35,7 +35,7 @@ The [M3 permanent report](prds/mockups/2789-m3-validation.md) records necessary 
 
 Dropped prototype behaviors: duplicate milestone/Active role surfaces, active-ordinal count wording, implied phase sequence, redundant header count/iteration/stage when shown by the card, whole-card disappearance despite frozen rows, generic side-only “in flight” cost copy and ambiguous unpriced-tail wording. Saved-choice/excerpt migrations and real header-only control tests replace prototype shortcuts while retaining the old pinned facts described below.
 
-Permanent four-state sheets compare running, awaiting approval, failed and completed with the mock: [light](prds/mockups/2789-run-page-parity-light.png), [dark](prds/mockups/2789-run-page-parity-dark.png). Eight real Chromium pages had zero page errors; terminal fixtures had no Now/live lanes. Corrected full-approval captures supersede the earlier crop. Narrow-view behavior is proved separately by shipping M2 browser tests, not inferred from desktop sheets: [M2 light](prds/mockups/2789-m2-header-parity-light.png), [M2 dark](prds/mockups/2789-m2-header-parity-dark.png). Earlier card comparisons: [M1 light](prds/mockups/2789-m1-progress-parity-light.png), [M1 dark](prds/mockups/2789-m1-progress-parity-dark.png).
+Permanent four-state sheets compare running, awaiting approval, failed and completed with the mock: [light](2789-run-page-parity-light.png), [dark](2789-run-page-parity-dark.png). Eight real Chromium pages had zero page errors; terminal fixtures had no Now/live lanes. Corrected full-approval captures supersede the earlier crop. Narrow-view behavior is proved separately by shipping M2 browser tests, not inferred from desktop sheets: [M2 light](2789-m2-header-parity-light.png), [M2 dark](2789-m2-header-parity-dark.png). Earlier card comparisons: [M1 light](2789-m1-progress-parity-light.png), [M1 dark](2789-m1-progress-parity-dark.png).
 
 ## Recorded verification
 
@@ -59,7 +59,7 @@ These are recorded lead executions at their tested revisions; later documentatio
 
 Repo gates explicitly skipped workflow lint because actionlint was unavailable; triage rendering was Bash-only because zsh was unavailable. No workflow file changed. Four M1 CLI/TUI comment files had empty gofmt -l output, exit 0.
 
-[Permanent M1 report](prds/mockups/2789-m1-validation.md), [M2 report](prds/mockups/2789-m2-validation.md), [M3 report](prds/mockups/2789-m3-validation.md) preserve source mutations and actual failures. Source verdicts are cumulative within owned scope and original SHAs, not live API/model-output proof. M3 source reviewer/tester/auditor ran 115/680/197 focused tests respectively with other checks itemized in the report. M3 evidence reviewers found no mandatory evidence/security issue. Tester suggestions at df1b5d28 were named passing output, coverage thresholds and a pre-commit gate: the instrumentation gap is closed at ceff by matching all 29 named failure occurrences to explicit passes among 72 tests (zero skipped). The two coverage/pre-commit infrastructure suggestions remain deferred. Earlier M1/M2 formatter/coverage suggestions likewise remain deferred under the approved existing-gates/no-workflow-change scope; no new threshold or workflow is claimed.
+[Permanent M1 report](2789-m1-validation.md), [M2 report](2789-m2-validation.md), [M3 report](2789-m3-validation.md) preserve source mutations and actual failures. Source verdicts are cumulative within owned scope and original SHAs, not live API/model-output proof. M3 source reviewer/tester/auditor ran 115/680/197 focused tests respectively with other checks itemized in the report. M3 evidence reviewers found no mandatory evidence/security issue. Tester suggestions at df1b5d28 were named passing output, coverage thresholds and a pre-commit gate: the instrumentation gap is closed at ceff by matching all 29 named failure occurrences to explicit passes among 72 tests (zero skipped). The two coverage/pre-commit infrastructure suggestions remain deferred. Earlier M1/M2 formatter/coverage suggestions likewise remain deferred under the approved existing-gates/no-workflow-change scope; no new threshold or workflow is claimed.
 
 M3 has **zero old→new migrations and 54 new cases** in two added suites; pre-existing tests are unchanged against its unit base. The 72-case proof selection includes existing prefs tests and is not 72 new cases. M4 has zero migrations and nine new tests; every original test is unchanged.
 
@@ -1178,7 +1178,7 @@ Observed branch: `M2 header and settings > names the real 'queued' job Stop exac
 
 M1 tooltip locator setup migrates M–/4 → – of 4 reported and M0/4 → 0 of 4 reported complete. The title predicates are unchanged and separately fail under tooltip-neutral / tooltip-zero (typecheck 0, focused failure 1, unmodified 0). These are setup/getter migrations additional to the 35 assertion groups above.
 
-MilestoneChecklist imports/row-only renders in attribution, baseline and nowline suites now use production RunMilestoneRows; count/combined-surface renders use actual RunProgressCard. No fake checklist header is added. Unchanged effective-attribution/unique-role live-tool/age predicates, repeated-role suppression, owner/live dedup, quiet assigned-owner strips and sanitization remain; owner-dedup, repeated-role and sanitizer-inert-reversal prove retained predicates. Existing D17 server/badge parity/count source remains.
+MilestoneChecklist imports/row-only renders in attribution, baseline and nowline suites now use production MilestoneRows; count/combined-surface renders use actual RunProgressCard. No fake checklist header is added. Unchanged effective-attribution/unique-role live-tool/age predicates, repeated-role suppression, owner/live dedup, quiet assigned-owner strips and sanitization remain; owner-dedup, repeated-role and sanitizer-inert-reversal prove retained predicates. Existing D17 server/badge parity/count source remains.
 
 M1 summary fixtures expand the real body before intent/approved-plan/null or malformed deltas/hostile Markdown assertions. Collapsed full-body negatives have preceding/following positives and a gate-state remount that would otherwise default expanded. DeliveredCard host cases add initial Expand, preserving publication/failure/body visibility predicates. Saved true/false, per-run isolation, fresh/expiry-boundary/GC and safe corrupt-storage facts remain; only absence becomes undefined so caller state supplies the default.
 
@@ -1187,8 +1187,12 @@ M1's historical SteeringSurface helper used real controls beside the real queue.
 Real issue-page Stop/textbox positives make terminal/non-owner/job negatives falsifiable. M2-A04 is the scoped composer-body negative (controls-relocated), not unrelated page ownership. M2-A01/A03 share a line but use different runtime owner/status branches above. M2-J3–J7 prove the original queued branch; running counterparts strengthen coverage. No obsolete-copy absence query substitutes for these facts. The migration preserves every pinned behavioral fact.
 
 
+## Final documentation validation
+
+The repository gate passed at 5d20c1c1 with positive canaries and zero gating findings. That green did not cover a separate docs-check failure: this PR body initially had 13 invalid relative paths (tester check exit 201). Equivalent base-925 docs validation passed, then the repaired links and completed PRD move passed the direct docs check (75 docs, 48 existing advisory warnings). The lifecycle and repair range receive immutable review before submission. No source/test change or new prompt behavior is introduced by that repair.
+
 ## M4 evidence and accepted limits
 
-[Permanent M4 proof](prds/mockups/2789-m4-validation.md) records each of 23 exact export-only breaks with successful typecheck, named behavioral failure, and unmodified pass. The full agent gate retained 14 existing conditional profile/platform/live-session skips; no Now test was skipped. UID/root/packaged profile, absent ssh-agent and live Anthropic prerequisites were not added or requested. Reviewer found stale current demo wording; both source and embedded copy were corrected. Admin settings does not quote old tool wording and stays unchanged.
+[Permanent M4 proof](2789-m4-validation.md) records each of 23 exact export-only breaks with successful typecheck, named behavioral failure, and unmodified pass. The full agent gate retained 14 existing conditional profile/platform/live-session skips; no Now test was skipped. UID/root/packaged profile, absent ssh-agent and live Anthropic prerequisites were not added or requested. Reviewer found stale current demo wording; both source and embedded copy were corrected. Admin settings does not quote old tool wording and stays unchanged.
 
 The approved M4 boundary is prompt-only: no response-bound expansion. Claude's inherited accumulation limitation is recorded for off-task triage (84ab3fc3); Codex retains its 8 MiB cap but does not forward requested output tokens. Prompt construction is verified, not live-model compliance or arbitrary conflicting-instruction detection. Optional formatter/coverage/pre-commit infrastructure suggestions remain deferred under the approved existing-gates/no-workflow-change scope.

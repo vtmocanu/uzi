@@ -1,6 +1,6 @@
 # PRD #2789: Run page, one progress card for milestones, live work and Now
 
-**Status**: Implemented — M1–M4 checked; final evidence/repository gate review pending
+**Status**: Done — M1–M4 implemented and validated
 **Priority**: Medium
 **GitHub issue**: #2789
 **Design mock**: `prds/mockups/2789-run-page-unified-progress-mock.html` (open it in a browser; a Before/After toggle and a run-state switch sit at the top)
@@ -111,7 +111,7 @@ Blocked by: none
 - [x] Docs: `docs/run-activity.md` "Milestones and the now line" and the run-page bullet of "Progress estimate" (about lines 401-440 and 504-515); `task docs:sync`, mirror committed. `CHANGELOG.md` `[Unreleased]` line.
 - [x] Acceptance: examples 1 and 4; mock parity for the progress card.
 
-Evidence: [M1 validation, assertion migrations and deliberate breaks](mockups/2789-m1-validation.md), with light/dark browser comparisons. Source reviewed at `bffcbb77`; web gate passed at `b05cc1b7` (identical source), repository gate and production build passed at `60e5ccc1`. M2–M4 remained pending at that M1 checkpoint.
+Evidence: [M1 validation, assertion migrations and deliberate breaks](../mockups/2789-m1-validation.md), with light/dark browser comparisons. Source reviewed at `bffcbb77`; web gate passed at `b05cc1b7` (identical source), repository gate and production build passed at `60e5ccc1`. M2–M4 remained pending at that M1 checkpoint.
 
 ### M2: Header shows identity and state; settings and controls move up
 Blocked by: M1 (the iteration count moves into the card first)
@@ -124,7 +124,7 @@ Blocked by: M1 (the iteration count moves into the card first)
 - [x] `CHANGELOG.md` line.
 - [x] Acceptance: example 1's header clauses; mock parity for the header.
 
-Evidence: [M2 validation, old → new assertion inventory and deliberate breaks](mockups/2789-m2-validation.md), with light/dark header and mobile disclosure comparisons. Cumulative source review is clean through `e5d39e35`; full web/repository gates and production build passed at that revision. At that M2 snapshot, M3–M4 remained pending.
+Evidence: [M2 validation, old → new assertion inventory and deliberate breaks](../mockups/2789-m2-validation.md), with light/dark header and mobile disclosure comparisons. Cumulative source review is clean through `e5d39e35`; full web/repository gates and production build passed at that revision. At that M2 snapshot, M3–M4 remained pending.
 
 ### M3: What needs you comes first, cost in the card, summary collapses after the gate
 Blocked by: M1 (the cost footer lives in the card)
@@ -135,7 +135,7 @@ Blocked by: M1 (the cost footer lives in the card)
 - [x] `CHANGELOG.md` line.
 - [x] Acceptance: examples 2 and 3; mock parity for the attention slot and footer.
 
-Evidence: [M3 validation and isolated deliberate breaks](mockups/2789-m3-validation.md), with [light](mockups/2789-run-page-parity-light.png) and [dark](mockups/2789-run-page-parity-dark.png) four-state Chromium comparisons. Source review is clean at `f2083e52`; full web gate, production build and uncached docs mirror passed. Thirteen valid deliberate breaks typechecked and failed intended assertions, followed by 72 unmodified passing cases. Final repository gate passed at `df1b5d28`; reviewer, tester and auditor verified the committed proof and screenshots with no mandatory findings. A fresh JSON-report run matched all 29 recorded failing test names to passing results among 72 tests. M4 evidence follows below.
+Evidence: [M3 validation and isolated deliberate breaks](../mockups/2789-m3-validation.md), with [light](../mockups/2789-run-page-parity-light.png) and [dark](../mockups/2789-run-page-parity-dark.png) four-state Chromium comparisons. Source review is clean at `f2083e52`; full web gate, production build and uncached docs mirror passed. Thirteen valid deliberate breaks typechecked and failed intended assertions, followed by 72 unmodified passing cases. Final repository gate passed at `df1b5d28`; reviewer, tester and auditor verified the committed proof and screenshots with no mandatory findings. A fresh JSON-report run matched all 29 recorded failing test names to passing results among 72 tests. M4 evidence follows below.
 
 ### M4: The Now note describes the work, not the tool
 Blocked by: none
@@ -145,7 +145,7 @@ Blocked by: none
 - [x] Docs: `docs/run-activity.md` "What the model sees" (about line 575), and `docs/admin-settings.md` if it quotes the old behaviour; `task docs:sync` when a `docs/*.md` changes. `CHANGELOG.md` line.
 - [x] Acceptance: example 5.
 
-Evidence: [M4 source validation and archived deliberate breaks](mockups/2789-m4-validation.md). Source `9255f834` passed the full agent gate: 12,986 unit passes, 14 conditional skips, zero failures, plus 183 Codex conformance passes and the required clause matrix. All 79 Now cases executed. Twenty-three valid archived breaks typechecked and failed named intended assertions, followed by a fresh unmodified 79-case pass. Source reviewer/tester/auditor examined the unit and cumulative agent/docs scope; the stale demo-doc wording is corrected with its mirror. Final evidence/repository review remains pending at this snapshot; live model wording is a maintainer spot-check, not a merge criterion.
+Evidence: [M4 source validation and archived deliberate breaks](../mockups/2789-m4-validation.md). Source `9255f834` passed the full agent gate: 12,986 unit passes, 14 conditional skips, zero failures, plus 183 Codex conformance passes and the required clause matrix. All 79 Now cases executed. Twenty-three valid archived breaks typechecked and failed named intended assertions, followed by a fresh unmodified 79-case pass. Source reviewer/tester/auditor examined the unit and cumulative agent/docs scope; the stale demo-doc wording is corrected with its mirror. The repository gate passed at `5d20c1c1`; cumulative reviewer/tester/auditor proof checks passed. The separately detected PR-body link errors are fixed in the lifecycle integration and rechecked directly. Live model wording is a maintainer spot-check, not a merge criterion.
 
 ## Decision Log
 
