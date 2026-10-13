@@ -661,7 +661,9 @@ describe("RunRunner #1786 M2 — terminal-disk deferral exits keep an unpreserve
       restore();
     }
     assertRecoverable(f.clone(), worked(), "row 3");
-    assert.deepEqual(sites, ["recovery_probe_gone"]);
+    // issue #1786: a 404 is an explicit keep; no coverage check runs at all (a covered verdict could
+    // not release it either way, see the covered-clone suite at the end of this file).
+    assert.deepEqual(sites, []);
     assert.deepEqual(stopMarkers(f.claim.run_id), [], "missing authority keeps the plain journal");
     assert.equal(api.states.filter((s) => s.body.status === "failed" || s.body.status === "recovery_wait").length, 0);
   });
@@ -1149,4 +1151,65 @@ describe("RunRunner #1786 M2 rework — the cancel ACK keeps owner-authorized di
       assert.deepEqual(stopMarkers(r.claim.run_id), []);
     });
   }
+});
+
+// issue #1786: an ownership 404 in the handler's loop is a quiet stop with unknown authority. It is
+// neither a park nor a terminal status, so a covered verdict must never release the clone. The
+// coverage proof only runs on Linux (and the hardened clean check refuses a case-folding clone), so
+// the suite is skipped elsewhere, like the terminal-disk suite above.
+describe("RunRunner #1786 — an ownership 404 in the handler's loop keeps a covered clone", { skip: LINUX_CAPTURE }, () => {
+  it("credential-deferred: a 404 after a verified, still-covered capture keeps the clone; no stopped record, no further report", async () => {
+    const iid = 17950;
+    const r = credRig(iid);
+    const parked = spyHandlerResults(r.runner);
+    const report = client.reportState.bind(client);
+    let parkSent = false;
+    let parkReportsSent = 0;
+    // A statusless park ACK sends the loop back to the ownership read, which now answers 404.
+    client.reportState = async (runId, body, signal) => {
+      if (body.status === "recovery_wait") { parkSent = true; parkReportsSent++; return { applied: true } as never; }
+      return report(runId, body, signal);
+    };
+    const own = client.getRunOwnership.bind(client);
+    client.getRunOwnership = async (runId: string) => {
+      if (parkSent) throw new RequestError("GET", "/ownership", 404, "not found");
+      return own(runId);
+    };
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+      client.getRunOwnership = own;
+    }
+    assert.deepEqual(parked, [false], "the handler stopped without parking");
+    assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "credential-deferred 404");
+    assert.deepEqual(coveredReasons(r.lines), [], "no cleanup-time check released the clone");
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
+    assert.equal(parkReportsSent, 1, "one park report, none after the 404");
+    assert.ok(!statuses(r.claim.run_id).includes("failed"));
+  });
+
+  it("terminal-disk: a 404 after a verified, still-covered capture keeps the clone; no stopped record, no failure report", async () => {
+    const f = fixture();
+    const sites = spyExitSites(f.runner);
+    let captured = false;
+    const hook = afterVerifiedCapture(() => { captured = true; });
+    const own = client.getRunOwnership.bind(client);
+    client.getRunOwnership = async (runId: string) => {
+      if (captured) throw new RequestError("GET", "/ownership", 404, "not found");
+      return own(runId);
+    };
+    try {
+      await f.runner.execute(f.claim);
+    } finally {
+      client.getRunOwnership = own;
+      hook.restore();
+    }
+    assert.equal(hook.fired(), 1, "the capture verified before the 404");
+    assert.ok(fs.existsSync(f.clone()), "the covered clone survives the 404");
+    assert.equal(fs.readFileSync(path.join(f.clone(), "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+    assert.deepEqual(sites, [], "no coverage-based release was attempted");
+    assert.deepEqual(stopMarkers(f.claim.run_id), []);
+    assert.equal(api.states.filter((s) => s.body.status === "failed" || s.body.status === "recovery_wait").length, 0);
+  });
 });
