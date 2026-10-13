@@ -697,7 +697,7 @@ function makeExecutor(
   log: Logger = noopLog,
   dockerWiring?: DockerWiring,
   providerConfig: CodexProviderConfig = provider,
-  summaryOptions: Pick<import("../src/codex/codex-executor.js").CodexExecutorOptions, "summaryRunner" | "summarySettleMs" | "codexAdviceHarnessFactory"> = {},
+  summaryOptions: Pick<import("../src/codex/codex-executor.js").CodexExecutorOptions, "summaryRunner" | "summarySettleMs" | "codexAdviceHarnessFactory" | "summaryClaimCodex"> = {},
 ): CodexExecutor {
   const seam = rig.deps.spawnCommand;
   return new CodexExecutor(
@@ -16926,6 +16926,70 @@ describe("2833 Codex inline summaries", () => {
     });
     return { rig, intents, plans };
   }
+  it("2833 forwards original subscription claim identity to intent and plan summaries", async () => {
+    const rawCodex = { ...SUBSCRIPTION, claim_metadata: "original subscription claim" };
+    const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: "Raw claim plan" }, th, tn, "plan"))
+        .push(turnCompleted("completed", th, tn)));
+    const rig = makeMultiEpochRig([planResponder, done]);
+    const inputs: IntentSummaryInput[] = [];
+    const summaryRunner = {
+      generateIntentSummary: async (input: IntentSummaryInput) => { inputs.push(input); return "Intent."; },
+      generatePlanSummary: async (input: PlanSummaryInput) => {
+        inputs.push(input);
+        return { summary: "Plan.", deltas: [] };
+      },
+    };
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => {} });
+    const { ctx } = makeCtx({
+      planApproved: false, approvedPlan: undefined,
+      gatePlan: async (md, _milestones, awaiting) => { await awaiting?.(md); return approve; },
+    });
+    await makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+      summaryRunner, summaryClaimCodex: rawCodex,
+    }).run(ctx);
+    assert.equal(inputs.length, 2);
+    for (const input of inputs) assert.equal(input.claim?.secrets.codex, rawCodex);
+    assert.equal((inputs[1] as PlanSummaryInput).planMd, "Raw claim plan");
+  });
+
+  for (const rawCodex of [null, { ...SUBSCRIPTION, chatgpt_plan_type: "unsupported" }]) {
+    it(`2833 present malformed raw claim ${JSON.stringify(rawCodex)} fails closed with valid executor binding`, async () => {
+      const { rig, intents, plans } = summaryRig();
+      let adviceCalls = 0;
+      let fallbackCalls = 0;
+      const runner = new SummaryRunner(noopLog, {
+        homeRoot: path.resolve("../.uzi/scratch"), modelTimeoutMs: 1000,
+        queryFn: (() => { fallbackCalls++; throw new Error("unexpected Claude fallback"); }) as
+          import("../src/sdk-executor.js").SdkQueryFn,
+        codexAdviceHarnessFactory: (async () => { adviceCalls++; throw new Error("unexpected advice"); }) as
+          import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory,
+      });
+      const results: unknown[] = [];
+      const summaryRunner = {
+        generateIntentSummary: async (input: IntentSummaryInput) => {
+          const intent = await runner.generateIntentSummary(input);
+          results.push(intent);
+          results.push(await runner.generatePlanSummary({ ...input, planMd: "Plan." }));
+          return intent;
+        },
+        generatePlanSummary: runner.generatePlanSummary.bind(runner),
+      };
+      const { ctx } = makeCtx({ reportIteration: async () => {
+        await waitForSummary(() => results.length === 2, "fail-closed summary passes");
+      } });
+      const result = await makeExecutor(rig, bindingOf(SUBSCRIPTION), noopLog, undefined, provider, {
+        summaryRunner, summaryClaimCodex: rawCodex,
+      }).run(ctx);
+      assert.equal(result.branch, ctx.branch);
+      assert.deepEqual(results, [null, null]);
+      assert.equal(adviceCalls, 0);
+      assert.equal(fallbackCalls, 0);
+      assert.deepEqual(intents, []);
+      assert.deepEqual(plans, []);
+    });
+  }
+
   for (const raw of [SUBSCRIPTION, API_KEY]) {
     it(`2833 ${raw.auth_mode} real SummaryRunner reaches advice factory with fixed pins`, async () => {
       const { rig, intents } = summaryRig();

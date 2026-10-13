@@ -256,6 +256,7 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
       runHome,
       {
         binding: selection.binding,
+        summaryClaimCodex: codex,
         codexAdviceHarnessFactory: deps.codexAdviceHarnessFactory,
         client,
         provider: CODEX_PRODUCTION_PROVIDER,

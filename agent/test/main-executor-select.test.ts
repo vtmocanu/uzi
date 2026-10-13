@@ -60,13 +60,15 @@ it("2833 forwards shared advice factory to Codex summary runner while stub stays
   const factory = (async () => { throw new Error("should not construct during selection"); }) as
     import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
   const deps = baseDeps({ codexAdviceHarnessFactory: factory });
-  const result = buildRunExecutor("run-summary", VALID_SUBSCRIPTION_CODEX, deps);
+  const rawCodex = { ...VALID_SUBSCRIPTION_CODEX, claim_metadata: "original subscription claim" };
+  const result = buildRunExecutor("run-summary", rawCodex, deps);
   assert.ok(result.executor instanceof CodexExecutor);
   const executor = result.executor as unknown as {
-    opts: { codexAdviceHarnessFactory?: unknown };
+    opts: { codexAdviceHarnessFactory?: unknown; summaryClaimCodex?: unknown };
     summaryRunner: { homeRoot: string; codexAdviceHarnessFactory?: unknown };
   };
   assert.equal(executor.opts.codexAdviceHarnessFactory, factory);
+  assert.equal(executor.opts.summaryClaimCodex, rawCodex);
   assert.equal(executor.summaryRunner.homeRoot, SDK_HOME_ROOT);
   assert.equal(executor.summaryRunner.codexAdviceHarnessFactory, factory);
   const stub = buildRunExecutor("run-summary", VALID_SUBSCRIPTION_CODEX, { ...deps, executorKind: "stub" });

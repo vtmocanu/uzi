@@ -1758,6 +1758,8 @@ export interface CodexExecutorOptions {
   /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
   readonly summarySettleMs?: number;
   readonly codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
+  /** Original summary claim block, validated by SummaryRunner; undefined uses the standalone binding. */
+  readonly summaryClaimCodex?: unknown;
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
@@ -2370,7 +2372,9 @@ export class CodexExecutor implements Executor {
     const prdInputP = summariesOn
       ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
     const summaryInputs = async () => ({
-      claim: { run_id: ctx.runId, secrets: { codex: summaryBinding } },
+      claim: { run_id: ctx.runId, secrets: {
+        codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
+      } },
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
       issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
     });
