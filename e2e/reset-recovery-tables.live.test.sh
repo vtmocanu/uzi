@@ -17,26 +17,58 @@ TMP="$(mktemp -d "$ROOT/.uzi/scratch/reset-live.XXXXXX")"
 NAME="rrt-live-$$-$RANDOM"
 VOLUME="$NAME-data"
 OLD_VOLUME="$NAME-old-data"
+CONTAINER_CREATED=0
+VOLUME_CREATED=0
+OLD_VOLUME_CREATED=0
 cleanup() {
   local rc=$?
   # Only exact session-owned objects. A failed cleanup is reported, never broadened.
-  docker rm -f "$NAME" > "$TMP/cleanup.log" 2>&1 || echo "cleanup failed: $NAME (see $TMP/cleanup.log)" >&2
-  docker volume rm "$VOLUME" "$OLD_VOLUME" >> "$TMP/cleanup.log" 2>&1 || echo "volume cleanup failed (see $TMP/cleanup.log)" >&2
+  if [ "$CONTAINER_CREATED" -eq 1 ]; then
+    docker rm -f "$NAME" > "$TMP/cleanup.log" 2>&1 || echo "cleanup failed: $NAME (see $TMP/cleanup.log)" >&2
+  fi
+  if [ "$VOLUME_CREATED" -eq 1 ]; then
+    docker volume rm "$VOLUME" >> "$TMP/cleanup.log" 2>&1 || echo "volume cleanup failed: $VOLUME (see $TMP/cleanup.log)" >&2
+  fi
+  if [ "$OLD_VOLUME_CREATED" -eq 1 ]; then
+    docker volume rm "$OLD_VOLUME" >> "$TMP/cleanup.log" 2>&1 || echo "volume cleanup failed: $OLD_VOLUME (see $TMP/cleanup.log)" >&2
+  fi
   exit "$rc"
 }
 trap cleanup EXIT
+if docker container inspect "$NAME" >/dev/null 2>&1; then
+  echo "REFUSING: container already exists: $NAME" >&2
+  exit 1
+fi
+for volume in "$VOLUME" "$OLD_VOLUME"; do
+  if docker volume inspect "$volume" >/dev/null 2>&1; then
+    echo "REFUSING: volume already exists: $volume" >&2
+    exit 1
+  fi
+done
 docker image inspect "$IMAGE" >/dev/null 2>&1 || docker pull "$IMAGE"
 docker volume create "$VOLUME" >/dev/null
+VOLUME_CREATED=1
 docker volume create "$OLD_VOLUME" >/dev/null
+OLD_VOLUME_CREATED=1
+remove_owned_container() {
+  [ "$CONTAINER_CREATED" -eq 1 ] || return 0
+  docker rm -f "$NAME" >/dev/null
+  CONTAINER_CREATED=0
+}
 start() {
   local volume="$1" marker="$2"
   local mounts=()
   if [ "$marker" = yes ]; then
     mounts=(--mount "type=bind,source=$ROOT/e2e/test-database-marker.sql,target=/docker-entrypoint-initdb.d/10-uzi-test-database-marker.sql,readonly")
   fi
+  if docker container inspect "$NAME" >/dev/null 2>&1; then
+    echo "REFUSING: container already exists: $NAME" >&2
+    return 1
+  fi
   docker run -d --name "$NAME" -e POSTGRES_PASSWORD=owned-test-password \
     -p 127.0.0.1::5432 --mount "type=volume,source=$volume,target=/var/lib/postgresql/data" \
     "${mounts[@]}" "$IMAGE" > "$TMP/container-id"
+  CONTAINER_CREATED=1
   # Bounded 90 probes; stop on failure rather than run tests against an unready DB.
   local ready=no
   for ((i=0; i<90; i++)); do
@@ -135,7 +167,7 @@ echo 'PASS: compose marker mount, pgdata retained, no db published port'
 start "$VOLUME" yes
 [ "$(sql <<< 'SELECT marker FROM uzi_test_harness.database_marker;')" = recovery-reset-v1 ]
 echo 'PASS: fresh initdb mount automatically creates marker'
-docker rm -f "$NAME" >/dev/null
+remove_owned_container
 start "$VOLUME" yes
 [ "$(sql <<< 'SELECT marker FROM uzi_test_harness.database_marker;')" = recovery-reset-v1 ]
 echo 'PASS: initialized marker persists across restart'
@@ -294,10 +326,10 @@ invoke
 [ "$rc" -eq 0 ] && grep -Fq 'deleted chunks=0 captures=0 holds=0 episode_notices=0' "$TMP/reset.out"
 echo 'PASS: marked missing recovery schema no-op'
 # Reusing an initialized unmarked volume must NOT execute the added initdb mount.
-docker rm -f "$NAME" >/dev/null
+remove_owned_container
 start "$OLD_VOLUME" no
 [ "$(sql <<< "SELECT to_regclass('uzi_test_harness.database_marker') IS NULL;")" = t ]
-docker rm -f "$NAME" >/dev/null
+remove_owned_container
 start "$OLD_VOLUME" yes
 [ "$(sql <<< "SELECT to_regclass('uzi_test_harness.database_marker') IS NULL;")" = t ]
 seed
