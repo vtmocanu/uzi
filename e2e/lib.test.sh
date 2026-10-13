@@ -521,6 +521,20 @@ jq -c '.holds[0].completed_publication_receipt.observed_branch_head="invalid"' "
 mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
 custody_case "publication receipt refuses an invalid observed head" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
 
+handoff_receipt_boundary() {
+  # shellcheck disable=SC2034  # consumed by the evaluated real phase statements
+  local RUN_T=T RUN_M=M settled=""
+  wait_completed_custody_receipt() { settled="$settled $1"; }
+  assert_settled() { case " $settled " in *" $1 "*) ;; *) fail "handoff $1 leaves a pending receipt for custody seeding";; esac; }
+  eval "$(awk '
+    /^wait_completed_custody_receipt / { print }
+    /^RM_JSON=.*handoff rm/ { print "assert_settled T" }
+    /^pass "task\/handoff coverage complete/ { print "assert_settled M" }
+  ' "$ROOT/e2e/phases/70-handoff.sh")"
+  echo 'handoff receipts settle before branch deletion and next phase'
+}
+custody_case "handoff cannot hand a changing receipt baseline to custody seeding" pass 'handoff receipts settle' handoff_receipt_boundary
+
 diagnostic_trap() {
   local phase="$1" status="$2"
   RUNROOT="$SEQ_DIR"
@@ -760,6 +774,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 136 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 137 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 136 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 137 ] && [ "$cases" -eq "$passed" ]
