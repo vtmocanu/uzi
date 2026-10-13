@@ -131,6 +131,11 @@ func (f *fakeStore) ListLargestRunDiskForWorkers(context.Context, store.ListLarg
 }
 
 type fakeSettings struct {
+	sourceEnabled  bool
+	sourceURL      string
+	sourceRef      string
+	sourceStatus   settings.AgentSourceStatus
+	sourceErrors   [4]error
 	healthEnabled  bool
 	releaseEnabled bool
 	release        settings.ReleaseStatus
@@ -147,6 +152,19 @@ func (f *fakeSettings) ReleaseCheckEnabled(context.Context) (bool, error) {
 }
 func (f *fakeSettings) ReleaseStatus(context.Context) (settings.ReleaseStatus, error) {
 	return f.release, f.relStatusErr
+}
+
+func (f *fakeSettings) AgentSourceEnabled(context.Context) (bool, error) {
+	return f.sourceEnabled, f.sourceErrors[0]
+}
+func (f *fakeSettings) AgentSourceRepoURL(context.Context) (string, error) {
+	return f.sourceURL, f.sourceErrors[1]
+}
+func (f *fakeSettings) AgentSourceRef(context.Context) (string, error) {
+	return f.sourceRef, f.sourceErrors[2]
+}
+func (f *fakeSettings) AgentSourceStatus(context.Context) (settings.AgentSourceStatus, error) {
+	return f.sourceStatus, f.sourceErrors[3]
 }
 
 // fixedNow is the clock every test anchors to.
@@ -988,11 +1006,11 @@ func TestEvaluateRollupAndRegistry(t *testing.T) {
 	// (integrations), so it is 14, not 11; PRD #1809 M6 added fleet.rundisk
 	// (workers), issue #2203 adds forge.sync (integrations), and issue #2213 adds
 	// fleet.quarantine (workers); pricing.codex follows release.check, db.size follows db and
-	// recovery.storage follows custody.holds, making 20.
+	// recovery.storage follows custody.holds, making 21 with agentsource.update after release.check.
 	wantIDs := []string{
 		"fleet.roll", "fleet.capacity", "fleet.disk", "fleet.rundisk", "fleet.quarantine", "queue.waiting", "queue.undispatched",
 		"controller.report", "db", "db.size", "loops", "forge.ciwatch", "forge.sync", "slack.socket",
-		"schedules.paused", "board.drift", "custody.holds", "recovery.storage", "release.check", "pricing.codex",
+		"schedules.paused", "board.drift", "custody.holds", "recovery.storage", "release.check", "agentsource.update", "pricing.codex",
 	}
 	if len(doc.Checks) != len(wantIDs) {
 		t.Fatalf("doc has %d checks, want %d", len(doc.Checks), len(wantIDs))

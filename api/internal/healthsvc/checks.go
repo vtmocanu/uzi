@@ -59,6 +59,7 @@ var checkMeta = map[string]struct {
 	"custody.holds":      {"owner", groupHousekeeping, "Recovery custody holds", ""},
 	"recovery.storage":   {"owner", groupHousekeeping, "Recovery storage", ""},
 	"release.check":      {"owner", groupHousekeeping, "Upstream release", ""},
+	"agentsource.update": {"instance", groupHousekeeping, "Agent source update", "agent-source"},
 	"pricing.codex":      {"instance", groupHousekeeping, "Codex price coverage", "admin-health"},
 }
 

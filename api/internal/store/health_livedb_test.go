@@ -328,6 +328,13 @@ func (r rollRepoAllowlist) DockerRepoAllowlist(context.Context) ([]uuid.UUID, er
 
 type rollHealthSettings struct{}
 
+func (rollHealthSettings) AgentSourceEnabled(context.Context) (bool, error)   { return false, nil }
+func (rollHealthSettings) AgentSourceRepoURL(context.Context) (string, error) { return "", nil }
+func (rollHealthSettings) AgentSourceRef(context.Context) (string, error)     { return "", nil }
+func (rollHealthSettings) AgentSourceStatus(context.Context) (settings.AgentSourceStatus, error) {
+	return settings.AgentSourceStatus{}, nil
+}
+
 func (rollHealthSettings) HealthEnabled(context.Context) (bool, error)       { return true, nil }
 func (rollHealthSettings) ReleaseCheckEnabled(context.Context) (bool, error) { return false, nil }
 func (rollHealthSettings) ReleaseStatus(context.Context) (settings.ReleaseStatus, error) {

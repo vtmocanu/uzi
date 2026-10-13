@@ -117,7 +117,7 @@ func resolveRefTip(refs RemoteRefs, ref string) string {
 func DeriveUpdate(pinnedRef, lastAppliedSHA, latestRef, remoteTipSHA string) (available bool, latest string) {
 	r := strings.TrimSpace(pinnedRef)
 
-	if isSHAPin(r) {
+	if IsSHAPin(r) {
 		return false, ""
 	}
 
@@ -136,8 +136,8 @@ func DeriveUpdate(pinnedRef, lastAppliedSHA, latestRef, remoteTipSHA string) (av
 	return false, ""
 }
 
-// isSHAPin reports whether ref is exactly a 40-hex git object id (an immutable pin).
-func isSHAPin(ref string) bool {
+// IsSHAPin reports whether ref is exactly a 40-hex git object id (an immutable pin).
+func IsSHAPin(ref string) bool {
 	if len(ref) != shaHexLen {
 		return false
 	}
