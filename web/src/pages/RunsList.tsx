@@ -495,7 +495,7 @@ export function RunRow({
               )}
               {/* PRD #2602: the server-derived progress cell, beside the milestone badge
                   it estimates from; hidden with it under waitingForVault. */}
-              <RunProgressCell run={run} />
+              <RunProgressCell run={run} now={now} />
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run, and when
                   the progress cell's stalled flag already shows the stall. */}

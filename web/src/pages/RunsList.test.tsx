@@ -1818,7 +1818,7 @@ describe("RunRow — Progress cell (PRD #2602)", () => {
     phase: "" as const,
   });
 
-  it("shows the stalled flag with its since time on a running row", () => {
+  it("shows the stalled flag with its elapsed time on a running row", () => {
     const { container } = renderRow({
       status: "running",
       health: "stalled",
@@ -1827,7 +1827,7 @@ describe("RunRow — Progress cell (PRD #2602)", () => {
     });
     const cell = container.querySelector('[data-run-progress="stalled"]')!;
     expect(cell).toBeTruthy();
-    expect(cell.textContent).toMatch(/^◼ stalledsince /);
+    expect(cell.textContent).toMatch(/^◼ stalled · 23m, for 23m, since /);
     // One stall, one flag: the health badge yields to the cell (its word is in the tooltip).
     expect(container.textContent).not.toContain("⚠");
   });

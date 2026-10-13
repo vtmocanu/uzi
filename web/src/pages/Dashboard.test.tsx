@@ -937,6 +937,44 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     const health = within(row).getByText(/^⚠ looping/);
     expect(health.parentElement?.className).toBe("contents sm:hidden");
   });
+  it("the stalled cell ages on the page clock (useNow), not on a private Date.now()", async () => {
+    vi.useFakeTimers();
+    const T0 = Date.parse("2026-07-05T12:00:00Z");
+    vi.setSystemTime(T0);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "s",
+          issue_title: "Stalled run",
+          status: "running",
+          health: "stalled",
+          health_since: new Date(T0 - 5 * 60_000).toISOString(),
+          progress: { state: "stalled", pct: null, milestone_done: 1, milestone_total: 3, active_milestone_id: "b", phase: "" },
+        }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const visible = () =>
+      screen.getByText("Stalled run").closest("li")!.querySelector('[data-run-progress="stalled"] [aria-hidden="true"]:not(:first-child)')!
+        .textContent;
+    expect(visible()).toBe(" · 5m");
+    // The wall clock jumps 10m, but the 30s useNow tick has not fired. The 10s poll re-renders
+    // the page, and the cell must still read the page clock.
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    expect(visible()).toBe(" · 5m");
+    // Once the 30s tick fires the page clock catches up.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(visible()).toBe(" · 15m");
+  });
 });
 
 // Issue #2661: the dashboard polls the compact summary projection; tiles and the recent
