@@ -32,8 +32,13 @@
   owner; never count them as duplicate dispatches or require their own landing
   claim. Surface a stuck child as a finding on its parent.
 - Checks (read-only; report changes to the owner, or the user when unowned):
-  - Read `uzi run list --json` and the repo's landing board with
-    `.agents/skills/uzi-lander/scripts/claims.sh list --json`. Every active delivery run
+  - With existing authorized admin access, use `uzi admin runs --json` for
+    all-user nonterminal runs (maximum 500); otherwise `uzi run list --json`
+    covers only the authenticated user's newest 200 runs. Both omit report-only
+    children. Treat owner-only coverage as partial and a cap-sized result as
+    potentially truncated; never claim every active run was checked. Use known
+    parent/child IDs and owner reports for child findings.
+    Read `.agents/skills/uzi-lander/scripts/claims.sh list --json`. Every visible active delivery run
     needs a live landing owner: `run-<id>` before its PR, `#<PR>` after takeover.
     Check claim liveness; unreadable or unverified claims remain unknown.
   - Compare active runs by repository and issue against board claims and the
@@ -42,8 +47,10 @@
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
-  - Read open PRs with `gh pr list --state open --json number,url,headRefOid`;
-    flag a PR without a live `#<PR>` landing claim.
+  - Read all open PR pages with
+    `gh api --paginate 'repos/{owner}/{repo}/pulls?state=open&per_page=100' --jq '.[] | {number, url: .html_url, headRefOid: .head.sha}'`;
+    flag a PR without a live
+    `#<PR>` landing claim; a failed page makes coverage unknown.
   - Check the current main tip's CI using the landing/release skills' operational
     checks; report red CI to its owner. Keep pending or missing evidence distinct
     from failure; inspect no workflow code during patrol.
