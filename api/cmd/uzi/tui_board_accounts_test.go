@@ -123,17 +123,40 @@ func TestBoardAccountConservativeThresholds(t *testing.T) {
 	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
 	m.tokenCount, m.codexCredentialCount = 1, 1
 	for _, tc := range []struct {
-		width      int
-		cost, mile bool
+		width            int
+		cost, mile, prog bool
+		worker           int
 	}{
-		{83, false, false}, {94, false, false}, {95, true, false}, {100, true, false}, {110, true, false}, {111, true, true}, {119, true, true}, {120, true, true},
+		{83, false, false, false, 0}, {94, false, false, false, 0},
+		{95, true, false, false, 0}, {100, true, false, false, 0},
+		{110, true, false, false, 0}, {111, true, true, true, 0},
+		{119, true, true, true, 0}, {120, true, true, true, 18},
 	} {
 		m.width = tc.width
 		if m.boardShowCost() != tc.cost || m.boardShowMile() != tc.mile {
 			t.Fatalf("width %d: cost/mile = %t/%t", tc.width, m.boardShowCost(), m.boardShowMile())
 		}
-		if m.boardShowProg() && m.boardProgRoom() < boardProgTitleFloor {
-			t.Fatalf("width %d lost title floor", tc.width)
+		if got := m.boardShowProg(); got != tc.prog {
+			t.Errorf("width %d: percentage visible = %t, want %t", tc.width, got, tc.prog)
+		}
+		if got := m.boardWorkerWidth(); got != tc.worker {
+			t.Errorf("width %d: worker columns = %d, want %d", tc.width, got, tc.worker)
+		}
+	}
+	// On the personal board milestones are the stricter limit. The admin's
+	// owner column makes the title-room floor bind: 128 leaves 24 columns,
+	// while 129 leaves the required 25, with milestones already visible.
+	m.board.admin = true
+	for _, tc := range []struct {
+		width int
+		prog  bool
+	}{{128, false}, {129, true}} {
+		m.width = tc.width
+		if !m.boardShowMile() {
+			t.Fatalf("admin width %d must show milestones", tc.width)
+		}
+		if got := m.boardShowProg(); got != tc.prog {
+			t.Errorf("admin width %d: percentage visible = %t, want %t", tc.width, got, tc.prog)
 		}
 	}
 }

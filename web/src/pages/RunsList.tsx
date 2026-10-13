@@ -54,7 +54,7 @@ import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
-import { anthropicTokenCount, codexCredentialCount } from "../lib/hasToken";
+import { anthropicTokenCount, codexCredentialCount, showsRunAccounts } from "../lib/hasToken";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
@@ -649,7 +649,7 @@ export function RunsList() {
                       run={r}
                       now={now}
                       waitingForVault={!vaultUnlocked && r.status === "queued"}
-                      showCredential={credentialCounts.claude + credentialCounts.codex > 1}
+                      showCredential={showsRunAccounts(credentialCounts)}
                       credentialCount={credentialCounts[r.harness]}
                       // The personal Active list is all the viewer's own runs, so the
                       // Expedite/undo action is offered here (PRD #320 M6); reload
@@ -947,7 +947,7 @@ export function RunsHistory() {
                 {g.runs.map((r) => (
                   <RunRow
                     key={r.id} run={r} now={now}
-                    showCredential={credentialCounts.claude + credentialCounts.codex > 1}
+                    showCredential={showsRunAccounts(credentialCounts)}
                     credentialCount={credentialCounts[r.harness]}
                   />
                 ))}

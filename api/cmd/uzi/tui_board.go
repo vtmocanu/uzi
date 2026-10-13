@@ -897,7 +897,7 @@ const (
 	boardMileCap         = 9  // above this many milestones the micro-bar falls back to N/M text
 	boardOwnerWidth      = 20 // admin owner-email cell
 	boardCredWidth       = 10 // maximum credential label width; no tone dot
-	boardCostWidth       = 6  // COST cell width (right-aligned; fits "$9999", "<$1", "—")
+	boardCostWidth       = 6  // COST cell width (right-aligned; fits "$9999", "<$1", "n/a"; blank when usage is absent)
 	boardTitleMax        = 60 // TITLE cap: long titles trim to a tidy column instead of running a wide terminal
 	// boardMileMinWidth is the narrowest own board that shows the milestone micro-bar. Below it
 	// the column is dropped (milestone progress is still on the run-detail view) so the fixed

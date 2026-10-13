@@ -248,12 +248,13 @@ A run whose token you later delete still names it, with **(deleted)** — the
 name is a snapshot taken when the run was claimed, so history stays readable.
 
 Once you hold **more than one credential across Claude and Codex**, the **Runs**
-list shows a compact account badge beside each run's status. Both harnesses show
-their recorded account label, with a small dot when the state is worth a look
-(info or amber), and the mode and reason on hover. The list refreshes credential
-counts with its normal visible-tab poll, so adding or removing a credential
-updates the badges without reloading. A failed refresh keeps the last-good counts.
-With just one credential in total, personal lists hide the badge.
+list shows a compact badge for each run's account label (see `default` below).
+Claude badges also show a small dot when the selection state is worth a look
+(info or amber), with the mode and reason on hover; Codex badges are neutral.
+The list refreshes credential counts with its normal visible-tab poll, so adding
+or removing a credential updates the badges without reloading. A failed refresh
+keeps the last-good counts. With just one credential in total, personal lists
+hide the badge.
 
 The personal web list and TUI board display `claude` or `codex` in place of the
 exact label `default` when you hold exactly one credential for that run's harness
