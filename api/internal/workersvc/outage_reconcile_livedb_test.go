@@ -370,13 +370,13 @@ func TestMissingCompletionHoldDeferralLifecycleLiveDB(t *testing.T) {
 	}
 	heartbeat := func(t *testing.T, epoch int64, active []ActiveRunEntry) {
 		t.Helper()
-		updated, err := svc.Heartbeat(env.ctx, hbWorker(t, env, wk), nil, nil,
+		_, err := svc.Heartbeat(env.ctx, hbWorker(t, env, wk), nil, nil,
 			&ActiveSnapshot{SnapshotEpoch: epoch, RegisterNonce: "nonce-A", Active: active})
 		if err != nil {
 			t.Fatalf("Heartbeat epoch %d: %v", epoch, err)
 		}
-		if updated.SnapshotEpoch != epoch || hbWorker(t, env, wk).SnapshotEpoch != epoch {
-			t.Fatalf("snapshot epoch %d was not persisted", epoch)
+		if got := hbWorker(t, env, wk).SnapshotEpoch; got != epoch {
+			t.Fatalf("persisted snapshot epoch: got %d, want %d", got, epoch)
 		}
 	}
 	assertHeld := func(t *testing.T) {
