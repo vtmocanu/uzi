@@ -5,7 +5,8 @@ import { existsSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
 
-import { Outbox, canonicalizeTerminalBody } from "../src/outbox.js";
+import { Outbox, canonicalizeTerminalBody, type ReportRetirementContext } from "../src/outbox.js";
+import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import {
   journalAndResolveTerminal,
   installTerminalWriteAhead,
@@ -175,6 +176,43 @@ it("unit 1: no selected winner with unavailable key retains unjournaled fallback
 
 const GEN = 7;
 const FENCE = 42;
+
+for (const [reply, ack] of [
+  ["200", { applied: true, status: "completed" }],
+  ["terminal 409", { applied: false, status: "cancelled" }],
+] as const) {
+  it(`${reply} still attempts retirement when the advisory settled marker rejects`, async t => {
+    const { outbox, root } = await mkOutbox();
+    await outbox.journalTerminal("r1", GEN, "running", FENCE, { status: "completed" });
+    const bytes = await fs.readFile(path.join(root, "r1", `terminal-${GEN}.json`));
+    const mark = t.mock.method(outbox, "markTerminalServerSettled", async () => {
+      throw new Error("advisory marker failure");
+    });
+    // Model a custody guard refusing unlink, so the real journal remains and its
+    // conservative advertising can be checked after the retirement attempt.
+    const retire = t.mock.method(outbox, "retireTerminal", async (run: string, gen: number, context?: ReportRetirementContext) => {
+      assert.equal(run, "r1");
+      assert.equal(gen, GEN);
+      assert.ok(context?.expectedIdentity, "retirement keeps the authenticated send identity");
+      return false;
+    });
+    const { logger, lines } = recordingLogger();
+    const deps = { ...depsFor(outbox, new FakeClient()), log: logger };
+    const { send } = scriptedSend([ack]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send });
+    assert.equal(mark.mock.calls.length, 1);
+    assert.equal(retire.mock.calls.length, 1, "advisory failure must not skip retirement");
+    assert.equal(outbox.hasPendingTerminal("r1", GEN), true);
+    assert.equal(outbox.listPendingTerminals()[0]?.server_settled, undefined);
+    assert.deepEqual(await fs.readFile(path.join(root, "r1", `terminal-${GEN}.json`)), bytes);
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
+    assert.equal(registry.claimsPausedByPendingOverflow(), true, "failed mark remains conservative");
+    assert.ok(lines.some(line => {
+      const item = line as Record<string, unknown>;
+      return item.level === "debug" && item.run_id === "r1" && item.claim_generation === GEN;
+    }));
+  });
+}
 
 describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3b)", () => {
   it("journals BEFORE the first POST; the fence is the durable emitted tail; sent only with terminal_fence", async () => {
