@@ -31,8 +31,8 @@
 //	<body>
 //
 // For a prompt target the body is the run prompt; for a sweep target the body is
-// the per-issue guidance. auto_approve and wait_on_limit are NOT per-file: every
-// default job is created with both true (see AutoApprove / WaitOnLimit).
+// the per-issue guidance. ci_watch bodies are repair prompts. auto_approve is
+// optional (defaults to true); wait_on_limit remains true for every default job.
 //
 // A sweep's selector kind (PRD #767 M4) decides how its candidate issues are
 // chosen: "label" (the default) matches issues carrying ALL of `labels`, while
@@ -50,10 +50,9 @@ import (
 	"strings"
 )
 
-// AutoApprove and WaitOnLimit are the fixed run flags every default scheduled
-// job is seeded with. They are constants rather than per-file frontmatter keys
-// because a default job must run unattended (auto-approve its own plan) and ride
-// out an Anthropic usage limit (wait rather than fail) on every repo alike.
+// AutoApprove is a temporary migration seam for existing production readers.
+// U3 switches those readers to DefaultJob.AutoApprove before M1 ships.
+// WaitOnLimit remains true so default jobs wait through usage limits.
 const (
 	AutoApprove = true
 	WaitOnLimit = true
@@ -88,12 +87,13 @@ type DefaultJob struct {
 	Slug        string
 	Name        string
 	Description string
-	Target      string // "prompt" | "sweep" | "self_improve"
+	Target      string // "prompt" | "sweep" | "self_improve" | "ci_watch"
+	AutoApprove bool   // Absent frontmatter defaults to true; explicit false is preserved.
 	Cron        string
 	Timezone    string
 	Model       string // "" => inherit the owner default
 
-	// Prompt is the run prompt for a "prompt" target (the file body). Empty for
+	// Prompt is the run prompt for a "prompt" or "ci_watch" target (the file body). Empty for
 	// a "sweep" target.
 	Prompt string
 
@@ -244,7 +244,7 @@ func parse(raw []byte) (DefaultJob, error) {
 	}
 	body := strings.TrimSpace(afterClose[len("\n"):])
 
-	j := DefaultJob{Timezone: DefaultTimezone}
+	j := DefaultJob{Timezone: DefaultTimezone, AutoApprove: true}
 	selectorSet := false
 	capacityLimitSet, capacityRoomSet, removalSet := false, false, false
 	for _, line := range strings.Split(frontmatter, "\n") {
@@ -268,6 +268,11 @@ func parse(raw []byte) (DefaultJob, error) {
 			if val != "" {
 				j.Timezone = val
 			}
+		case "auto_approve":
+			if val != "true" && val != "false" {
+				return DefaultJob{}, fmt.Errorf("invalid auto_approve %q: want boolean", val)
+			}
+			j.AutoApprove = val == "true"
 		case "model":
 			j.Model = val
 		case "output":
@@ -344,7 +349,10 @@ func parse(raw []byte) (DefaultJob, error) {
 	}
 
 	switch j.Target {
-	case "prompt":
+	case "prompt", "ci_watch":
+		if j.Target == "ci_watch" && j.Output != "" {
+			return DefaultJob{}, fmt.Errorf("ci_watch must not set output")
+		}
 		if body == "" {
 			return DefaultJob{}, fmt.Errorf("catalog %q (prompt) has an empty body", j.Slug)
 		}

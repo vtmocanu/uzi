@@ -13,10 +13,10 @@ import (
 // catalogSlugs is the exact set of default scheduled jobs the product ships
 // (PRD #589 M1, extended by PRD #590 M1 with self-improve, PRD #767 M4 with
 // assigned-sweep, and issue #928 with refactor-scout). Keep it sorted — Catalog()
-// returns its slice sorted by slug and TestCatalogSetIsExactlyTen compares
+// returns its slice sorted by slug and TestCatalogSet compares
 // index-for-index.
 var catalogSlugs = []string{
-	"assigned-sweep", "bug-hunt", "bug-triage", "docs-hygiene", "feature-bingo", "ondeck-sweep", "planned-sweep", "refactor-scout", "self-improve", "test-improvement",
+	"assigned-sweep", "bug-hunt", "bug-triage", "ci-repair", "docs-hygiene", "feature-bingo", "ondeck-sweep", "planned-sweep", "refactor-scout", "self-improve", "test-improvement",
 }
 
 func TestProposalJobsInheritOwnerModel(t *testing.T) {
@@ -33,7 +33,7 @@ func TestProposalJobsInheritOwnerModel(t *testing.T) {
 	}
 }
 
-func TestCatalogSetIsExactlyTen(t *testing.T) {
+func TestCatalogSet(t *testing.T) {
 	got := schedtmpl.Catalog()
 	if len(got) != len(catalogSlugs) {
 		t.Fatalf("got %d catalog entries, want %d", len(got), len(catalogSlugs))
@@ -84,7 +84,7 @@ func TestCatalogParseAndValid(t *testing.T) {
 		}
 
 		switch j.Target {
-		case "prompt":
+		case "prompt", "ci_watch":
 			if strings.TrimSpace(j.Prompt) == "" {
 				t.Errorf("catalog %q (prompt) has an empty prompt", j.Slug)
 			}

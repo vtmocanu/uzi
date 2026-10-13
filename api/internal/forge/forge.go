@@ -624,22 +624,24 @@ type Check struct {
 // route layer (no forge's runs list includes jobs), so a driver leaves them zero.
 // Name, Title, Actor, Branch are UNTRUSTED forge text.
 type WorkflowRun struct {
-	ID         int64
-	Name       string
-	Number     int64
-	Event      string
-	Branch     string
-	SHA        string
-	Status     string
-	Conclusion string
-	Title      string
-	Actor      string
-	WebURL     string
-	CreatedAt  time.Time
-	UpdatedAt  time.Time
-	StartedAt  time.Time
-	JobsDone   int
-	JobsTotal  int
+	// WorkflowKey is the provider identity: GitHub workflow ID, Forgejo path, GitLab name/ref.
+	WorkflowKey string
+	ID          int64
+	Name        string
+	Number      int64
+	Event       string
+	Branch      string
+	SHA         string
+	Status      string
+	Conclusion  string
+	Title       string
+	Actor       string
+	WebURL      string
+	CreatedAt   time.Time
+	UpdatedAt   time.Time
+	StartedAt   time.Time
+	JobsDone    int
+	JobsTotal   int
 }
 
 // ListMergeRequestsOptions filters ListMergeRequestRefs. State's zero value means

@@ -1,6 +1,9 @@
 package forge
 
-import "fmt"
+import (
+	"context"
+	"fmt"
+)
 
 // maxForgeItems and maxForgePages backstop every driver pagination loop against a
 // buggy or compromised, PAT-authenticated forge that returns a perpetually non-zero
@@ -35,6 +38,19 @@ func forgePaginationCapErr(kind string, limit int) error {
 // inline loops produced. fetch must return the RAW error (unwrapped) so paginate does
 // not double-wrap.
 func paginate[T any](wrap func(error) error, fetch func(page int) (items []T, next int, err error)) ([]T, error) {
+	return paginateLimits(wrap, fetch, maxForgeItems, maxForgePages, nil)
+}
+
+// paginateLimits bounds attempts and accumulated mapped items; a failed page
+// discards the entire snapshot. Strict CI reads also reject nonadvancing pointers
+// and empty continuing pages, so one bad snapshot never becomes complete evidence.
+func paginateLimits[T any](wrap func(error) error, fetch func(int) ([]T, int, error), itemLimit, pageLimit int, budget *ciRepairBudget) ([]T, error) {
+	capErr := func(kind string, limit int) error {
+		if budget != nil {
+			return budget.fail("job pagination " + kind)
+		}
+		return forgePaginationCapErr(kind, limit)
+	}
 	var out []T
 	apiPage := 1
 	for iter := 1; ; iter++ {
@@ -42,17 +58,46 @@ func paginate[T any](wrap func(error) error, fetch func(page int) (items []T, ne
 		if err != nil {
 			return nil, wrap(err)
 		}
-		out = append(out, items...)
-		if len(out) > maxForgeItems {
-			return nil, wrap(forgePaginationCapErr("item", maxForgeItems))
+		if len(items) > itemLimit-len(out) {
+			return nil, wrap(capErr("item", itemLimit))
 		}
+		out = append(out, items...)
 		if next == 0 {
 			break
 		}
-		if iter >= maxForgePages {
-			return nil, wrap(forgePaginationCapErr("page", maxForgePages))
+		if budget != nil && (next <= apiPage || len(items) == 0) {
+			return nil, wrap(capErr("progress", pageLimit))
+		}
+		if iter >= pageLimit {
+			return nil, wrap(capErr("page", pageLimit))
+		}
+		if budget != nil && len(out) == itemLimit {
+			return nil, wrap(capErr("item", itemLimit))
 		}
 		apiPage = next
 	}
 	return out, nil
+}
+
+// paginateCIJobs retains ordinary pagination defaults outside the CI-watch lane.
+func paginateCIJobs(ctx context.Context, pageSize int, wrap func(error) error, fetch func(int) ([]Job, int, error)) ([]Job, error) {
+	b := ciBudget(ctx)
+	if b == nil {
+		return paginate(wrap, fetch)
+	}
+	return paginateLimits(wrap, func(page int) ([]Job, int, error) {
+		items, next, err := fetch(page)
+		if err = ciReadError(ctx, err); err != nil {
+			return nil, 0, err
+		}
+		if len(items) > pageSize {
+			return nil, 0, b.fail("oversized job page")
+		}
+		for _, job := range items {
+			if job.ID <= 0 {
+				return nil, 0, b.fail("invalid job identity")
+			}
+		}
+		return items, next, nil
+	}, 1000, 10, b)
 }

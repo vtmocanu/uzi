@@ -472,9 +472,10 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 	if err != nil {
 		return nil, err
 	}
+	ctx = markCIJSON(ctx)
 	opt := &gh.ListWorkflowJobsOptions{ListOptions: gh.ListOptions{PerPage: githubPerPage}}
 	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
-	return paginate(wrap, func(page int) ([]Job, int, error) {
+	return paginateCIJobs(ctx, githubPerPage, wrap, func(page int) ([]Job, int, error) {
 		opt.Page = page
 		jobs, resp, err := g.client.Actions.ListWorkflowJobs(ctx, slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
@@ -484,6 +485,9 @@ func (g *github) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 		if jobs != nil {
 			for _, j := range jobs.Jobs {
 				if j == nil {
+					if b := ciBudget(ctx); b != nil {
+						return nil, 0, b.fail("invalid job identity")
+					}
 					continue
 				}
 				items = append(items, toGitHubJob(j))
