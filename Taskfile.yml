@@ -1193,7 +1193,7 @@ tasks:
       - python3 -I -B scripts/release-ci-coverage.test.py
 
   test:worker-roll-target-package:
-    desc: offline packaged-chart stamp/override regressions; needs Helm, ci.yml helm-chart job (not task gate; #2906)
+    desc: "offline packaged-chart stamp/override regressions; needs Helm, ci.yml helm-chart job (not task gate; #2906)"
     cmds:
       - ./scripts/chart-inject-roll-target.test.sh
 
