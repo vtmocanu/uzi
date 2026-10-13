@@ -106,12 +106,30 @@ func memoryBindingMatches(row store.MemoryIntervention, b MemoryBinding, user uu
 }
 
 func memoryCurrent(w store.Worker, r store.Run, b MemoryBinding) bool {
+	return memoryIdentityCurrent(w, r, b) && (r.Status == "claimed" || r.Status == "running")
+}
+
+func memoryIdentityCurrent(w store.Worker, r store.Run, b MemoryBinding) bool {
 	return w.ID == b.WorkerID && w.UserID == r.UserID &&
 		w.SnapshotRegisterNonce.Valid && w.SnapshotRegisterNonce.String == b.RegisterNonce &&
 		r.WorkerID == pgconv.UUID(w.ID) && !r.ClaimReleasedAt.Valid &&
 		r.ClaimGeneration == b.ClaimGeneration && r.MemoryEpisode == b.MemoryEpisode &&
-		(r.Status == "claimed" || r.Status == "running") &&
 		!r.PauseRequestedAt.Valid && !r.CredentialSwitchRequestedAt.Valid
+}
+
+// memoryEligible proves an unresolved revision belongs to the locked current claim.
+// It is server proof, not model phase authority; the worker must guard revision signals.
+func memoryEligible(ctx context.Context, q *store.Queries, w store.Worker, r store.Run, b MemoryBinding) (bool, error) {
+	if !memoryIdentityCurrent(w, r, b) {
+		return false, nil
+	}
+	if memoryCurrent(w, r, b) {
+		return true, nil
+	}
+	if r.Status != "awaiting_approval" {
+		return false, nil
+	}
+	return q.MemoryRevisionEligible(ctx, r.ID)
 }
 
 // memoryLock always takes the worker lock before applicable parent and run locks.
@@ -181,7 +199,11 @@ func (s *Service) ReserveMemoryIntervention(ctx context.Context, w store.Worker,
 	if err != nil {
 		return MemoryReservation{}, err
 	}
-	current := memoryCurrent(locked, run, b) && parent
+	current, err := memoryEligible(ctx, q, locked, run, b)
+	if err != nil {
+		return MemoryReservation{}, err
+	}
+	current = current && parent
 	prior, err := q.GetMemoryIntervention(ctx, b.InterventionID)
 	if err == nil {
 		if !memoryBindingMatches(prior, b, locked.UserID) {
@@ -323,7 +345,11 @@ func (s *Service) parkWorkerMemoryPressure(ctx context.Context, w store.Worker, 
 	if err != nil {
 		return run, false, err
 	}
-	if !memoryCurrent(locked, run, b) || !parent {
+	current, err := memoryEligible(ctx, q, locked, run, b)
+	if err != nil {
+		return run, false, err
+	}
+	if !current || !parent {
 		return run, false, ErrStaleClaim
 	}
 	run, err = q.ParkWorkerMemoryPressure(ctx, store.ParkWorkerMemoryPressureParams{

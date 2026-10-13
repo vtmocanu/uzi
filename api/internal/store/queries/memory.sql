@@ -69,17 +69,55 @@ SELECT (EXISTS (
  AND ((cc.stage = 'plan' AND cc.round = (SELECT max(latest.round) FROM cross_checks latest WHERE latest.lead_run_id = cc.lead_run_id AND latest.stage = cc.stage) AND (cc.round = 1 OR (cc.automatic_rounds_enabled AND cc.round <= cc.automatic_revision_limit + 1)) AND cc.verdict = 'pending') OR (cc.stage = 'code' AND cc.outcome = 'pending' AND cc.interrupted_at IS NULL)) AND cc.deadline_at>now()
 ))::boolean;
 
+-- name: MemoryRevisionEligible :one
+-- Called after GetMemoryRunForUpdate locks the current run and applicable parents.
+-- Current-claim unresolved receipt proof; this does not attest the model's phase.
+SELECT (EXISTS (
+    SELECT 1 FROM runs WHERE runs.id = @id AND runs.status = 'awaiting_approval'
+      AND EXISTS (
+        SELECT 1 FROM run_user_inputs i
+        WHERE i.run_id = runs.id AND i.kind = 'revise_plan'
+          AND i.consumed_at IS NOT NULL
+          AND i.consumed_claim_generation = runs.claim_generation
+          AND i.consumed_worker_id = runs.worker_id
+          AND i.applied_at IS NULL AND i.disposition IS NULL
+          AND ((i.gate_binding = 'bound' AND i.gate_revision > 0
+                AND i.gate_revision = runs.gate_revision)
+            OR (i.gate_binding = 'unbound' AND i.gate_revision IS NULL)
+            OR (i.gate_binding IS NULL AND i.gate_revision IS NULL))
+    )
+))::boolean;
+
 -- name: ParkWorkerMemoryPressure :one
 -- The caller holds the worker, parent and run locks. Custody and drain evidence survive.
-UPDATE runs SET status='recovery_wait', status_since=now(),
+UPDATE runs SET
+    -- Match SetRunRunning's approval-wait credit before replacing status_since.
+    -- Owner resume banks only the subsequent memory hold; exact replay cannot bank twice.
+    budget_paused_seconds = budget_paused_seconds
+        + CASE WHEN status = 'awaiting_approval'
+               THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - status_since))::int)
+               ELSE 0 END,
+    status='recovery_wait', status_since=now(),
     recovery_wait_cause='worker_memory_pressure', recovery_retry_not_before=NULL,
     claim_released_at=now(), released_worker_id=worker_id,
     released_worker_nonce= @register_nonce,
     codex_cap_hash=NULL, codex_claim_epoch=codex_claim_epoch+1,
     health='ok', health_reason=NULL, health_since=NULL, updated_at=now()
-WHERE id= @id AND worker_id= @worker_id AND claim_generation= @claim_generation
-    AND memory_episode= @memory_episode AND claim_released_at IS NULL
-    AND status IN ('claimed','running')
+WHERE runs.id= @id AND runs.worker_id= @worker_id AND runs.claim_generation= @claim_generation
+    AND runs.memory_episode= @memory_episode AND runs.claim_released_at IS NULL
+    AND runs.pause_requested_at IS NULL AND runs.credential_switch_requested_at IS NULL
+    AND (runs.status IN ('claimed','running') OR (runs.status = 'awaiting_approval' AND EXISTS (
+        SELECT 1 FROM run_user_inputs i
+        WHERE i.run_id = runs.id AND i.kind = 'revise_plan'
+          AND i.consumed_at IS NOT NULL
+          AND i.consumed_claim_generation = runs.claim_generation
+          AND i.consumed_worker_id = runs.worker_id
+          AND i.applied_at IS NULL AND i.disposition IS NULL
+          AND ((i.gate_binding = 'bound' AND i.gate_revision > 0
+                AND i.gate_revision = runs.gate_revision)
+            OR (i.gate_binding = 'unbound' AND i.gate_revision IS NULL)
+            OR (i.gate_binding IS NULL AND i.gate_revision IS NULL))
+    )))
 RETURNING *;
 
 -- name: ResumeMemoryEpisode :one
