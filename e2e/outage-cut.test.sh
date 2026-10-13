@@ -26,7 +26,9 @@ fixture() {
       rm) [ "$API_AVAILABLE" = 1 ] || fail 'alias removal creates a DNS gap';
         [ "$REFUSE_REMOVE" = 0 ] || return 1; ALIAS_AVAILABLE=0 ;;
       logs) echo fixture-evidence ;;
-      exec) [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop'; BARRIER_RELEASED=1 ;;
+      exec) [ "$API_AVAILABLE" = 0 ] || fail 'barrier released before API stop';
+        [ "${3:-}:${4:-}" = -u:10001:10001 ] || fail 'barrier writer must match worker uid for sticky tmp cleanup'
+        BARRIER_RELEASED=1 ;;
     esac
   }
   fail() { echo "$*" >&2; exit 1; }

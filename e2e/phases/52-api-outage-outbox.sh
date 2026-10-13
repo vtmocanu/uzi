@@ -318,7 +318,8 @@ api_cut() {
 release_outbox_cut_barrier() {
   local run="$1"
   [[ "$run" =~ ^[0-9a-f]{8}-([0-9a-f]{4}-){3}[0-9a-f]{12}$ ]] || fail "outbox phase: invalid cut barrier run id"
-  "${COMPOSE[@]}" exec -T agent node -e \
+  # Match the worker, not the root image default, so sticky /tmp permits unlink.
+  "${COMPOSE[@]}" exec -T -u 10001:10001 agent node -e \
     'require("node:fs").writeFileSync("/tmp/cdr-outbox-cut-" + process.argv[1], "cut\n", {flag:"wx"})' "$run" \
     || fail "outbox phase: could not release cut barrier for run $run"
 }
