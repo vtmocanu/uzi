@@ -151,6 +151,13 @@ per-recovery TTL or quota; data-volume statfs accounting, disk pressure and owed
 admission remain in force. A repaired store or successful exact report retirement permits
 the existing cleanup retry. One debug diagnostic per retained ACK exposes the deferral.
 
+Finalize retirement checks the exact covering ACK before attempting an archive-only
+proof under the same authority deadline. It then uses the existing ownership,
+incarnation and live-execution fences and conditional outbox unlink. A slow alternative
+proof must not consume the whole deadline before an already-authoritative ACK can be
+used. Absent, legacy and unknown inventory do not qualify for this priority; their
+existing proof paths are unchanged.
+
 A healthy covering thin capture may retire a report while custody remains open.
 Once live execution has ended, the next accepted heartbeat omits the retired
 report's terminal-pending active-run row. This changes the worker's pending-report
