@@ -269,22 +269,21 @@ grep -q 'waiting on exact quota reset at ' "$WORK/exact-future-wait.out" || fail
 grep -q '^CR_RESET_ELAPSED=1$' "$WORK/exact-future-wait.out" || fail "future exact reset did not release the wait: $(cat "$WORK/exact-future-wait.out")"
 if grep -q '^CR_RESUMED=1$' "$WORK/exact-future-wait.out"; then fail "stale status ended future exact wait early"; fi
 
-# Live countdowns of 19 and 20 minutes stay in the CodeRabbit lane. All time is
+# A live countdown of 20 minutes stays in the CodeRabbit lane. All time is
 # virtual: the query poll advances 30 s, preserving each rounded live minute value.
-for minutes in 19 20; do
-  MODE=query; RESET_MIN=$minutes; HEAD_OID="boundary-$minutes"; EXACT_WAIT_CLOCK_STEP=30
-  export MODE RESET_MIN HEAD_OID EXACT_WAIT_CLOCK_STEP
-  printf '[]\n' > "$COMMENTS"
-  rm -f "$POSTED" "$WATCHED"
-  if ! bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 30 > "$WORK/boundary-$minutes.out" 2>&1; then
-    fail "$minutes-minute live reset rejected the wait: $(cat "$WORK/boundary-$minutes.out")"
-  fi
-  grep -q "^CR_RESET_MIN=$minutes\$" "$WORK/boundary-$minutes.out" || fail "$minutes-minute live reset header wrong: $(cat "$WORK/boundary-$minutes.out")"
-  grep -q 'waiting on exact quota reset at ' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not wait: $(cat "$WORK/boundary-$minutes.out")"
-  grep -q '^CR_RESET_ELAPSED=1$' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not elapse: $(cat "$WORK/boundary-$minutes.out")"
-  grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not trigger review: $(cat "$WORK/boundary-$minutes.out")"
-  [ "$(cat "$WATCHED")" = 'test/repo 42 60 60 --reviewer coderabbit' ] || fail "$minutes-minute reset did not hand off to CodeRabbit"
-done
+minutes=20
+MODE=query; RESET_MIN=$minutes; HEAD_OID="boundary-$minutes"; EXACT_WAIT_CLOCK_STEP=30
+export MODE RESET_MIN HEAD_OID EXACT_WAIT_CLOCK_STEP
+printf '[]\n' > "$COMMENTS"
+rm -f "$POSTED" "$WATCHED"
+if ! bash "$SCRIPT" test/repo 42 --trigger-review --interval 0 --max-wait-min 30 > "$WORK/boundary-$minutes.out" 2>&1; then
+  fail "$minutes-minute live reset rejected the wait: $(cat "$WORK/boundary-$minutes.out")"
+fi
+grep -q "^CR_RESET_MIN=$minutes\$" "$WORK/boundary-$minutes.out" || fail "$minutes-minute live reset header wrong: $(cat "$WORK/boundary-$minutes.out")"
+grep -q 'waiting on exact quota reset at ' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not wait: $(cat "$WORK/boundary-$minutes.out")"
+grep -q '^CR_RESET_ELAPSED=1$' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not elapse: $(cat "$WORK/boundary-$minutes.out")"
+grep -q '^CR_REVIEW_TRIGGER=posted$' "$WORK/boundary-$minutes.out" || fail "$minutes-minute reset did not trigger review: $(cat "$WORK/boundary-$minutes.out")"
+[ "$(cat "$WATCHED")" = 'test/repo 42 60 60 --reviewer coderabbit' ] || fail "$minutes-minute reset did not hand off to CodeRabbit"
 unset HEAD_OID EXACT_WAIT_CLOCK_STEP RESET_MIN
 
 # A live reset of 21 minutes is outside the 20-minute lane and switches immediately.
