@@ -44,10 +44,14 @@
   // test, that suite does NOT skip without it: it proves the fetch tool's certificate
   // check, so a missing openssl fails it loudly. `task` is the system gate runner used by the confinement delegation.
   // go runs the existing real sanitizer helper for the opt-in offline evaluator.
-  "ignoreBinaries": ["mkfifo", "openssl", "task", "go"],
+  // `setpriv` (util-linux) is run ONLY by test/retained-source-channel.test.ts to connect to the
+  // retained-source socket as the runner uids (a root-only case that skips otherwise).
+  "ignoreBinaries": ["mkfifo", "openssl", "task", "go", "setpriv"],
 
-  // The confinement probe and standalone editor evaluator are opt-in entries.
-  "entry": ["test/cross-check-confinement-packaged.probe.ts", "src/pr-description-eval-cli.ts"],
+  // The confinement probe and standalone editor evaluator are opt-in entries. The operator
+  // retained-source client is executed by path inside the image (`node /app/src/ops/retained-source.mjs`,
+  // issue #1786), never imported, so it is an entry.
+  "entry": ["test/cross-check-confinement-packaged.probe.ts", "src/pr-description-eval-cli.ts", "src/ops/retained-source.mjs"],
 
   // An exported type/interface referenced only within its OWN declaring file is
   // legitimate in-file contract surface, not dead-export debt: the src/protocol.ts

@@ -10,6 +10,7 @@ import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { randomBytes, createHmac } from "node:crypto";
 import { PendingRecoveryCaptureError } from "../src/git.js";
+import { quiesceRunAttempt } from "../src/run-quiescence.js";
 import { CredentialSwitchSignal, PauseNowSignal } from "../src/steering.js";
 import { MessageBatcher } from "../src/batcher.js";
 import { canonicalJson, type RecoveryRecord } from "../src/recovery.js";
@@ -257,7 +258,13 @@ for (const outcome of ["missing journal", "thrown discovery", "corrupt journal",
     client.releaseRecoveryCustody = async () => { releases++; throw new Error("must not release"); };
     (r as any).recovery.forgetGeneration = async () => { forgets++; };
     git.deleteRecoveryPin = async () => { deletes++; };
-    (r as any).quiesceRun = async () => { reaps++; throw new Error("must not reap"); };
+    (r as any).quiesceRun = async (_flight: unknown, _executor: unknown, opts: { site: string }) => {
+      // issue #1786: a claim fence stops the flight through the stopped_source process proof, the
+      // one quiesce a retained flight takes; every other reap here is still a failure.
+      reaps++;
+      if (outcome === "fence" && opts.site === "stopped_source") throw new Error("the proof is blocked in this fixture");
+      throw new Error("must not reap");
+    };
     git.createOrAttachRunnerClone = async () => { throw new PendingRecoveryCaptureError(clone.path, clone.branch); };
     git.discoverRetainedRecovery = async (...args) => {
       if (++discoveries === 1) return undefined;
@@ -277,7 +284,7 @@ for (const outcome of ["missing journal", "thrown discovery", "corrupt journal",
     };
     await r.execute(claim);
     assert.equal(discoveries, 2);
-    assert.deepEqual({ models, reaps, releases, forgets, deletes }, { models: 0, reaps: 0, releases: 0, forgets: 0, deletes: 0 });
+    assert.deepEqual({ models, reaps, releases, forgets, deletes }, { models: 0, reaps: outcome === "fence" ? 1 : 0, releases: 0, forgets: 0, deletes: 0 });
     const terminals = api.states.filter(s => s.body.status === "failed");
     if (["aborted", "shutdown", "fence"].includes(outcome)) assert.equal(terminals.length, 0);
     else {
@@ -301,7 +308,13 @@ for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
     let models = 0, reaps = 0, releases = 0, forgets = 0, deletes = 0, reads = 0;
     const before = readJournal(bare, clone.branch);
     const r = runnerWith(factory(async () => { models++; throw new Error("must not model"); }), fakeGitlab().gitlab);
-    (r as any).quiesceRun = async () => { reaps++; throw new Error("must not reap"); };
+    (r as any).quiesceRun = async (_flight: unknown, _executor: unknown, opts: { site: string }) => {
+      // issue #1786: a claim fence stops the flight through the stopped_source process proof, the
+      // one quiesce a retained flight takes; every other reap here is still a failure.
+      reaps++;
+      if (outcome === "fence" && opts.site === "stopped_source") throw new Error("the proof is blocked in this fixture");
+      throw new Error("must not reap");
+    };
     client.releaseRecoveryCustody = async () => { releases++; throw new Error("must not release"); };
     (r as any).recovery.forgetGeneration = async () => { forgets++; };
     git.deleteRecoveryPin = async () => { deletes++; };
@@ -318,7 +331,7 @@ for (const outcome of ["owner cancel", "shutdown", "fence"] as const) {
     };
     await r.execute(claim);
     assert.equal(reads, 1);
-    assert.deepEqual({ models, reaps, releases, forgets, deletes }, { models: 0, reaps: 0, releases: 0, forgets: 0, deletes: 0 });
+    assert.deepEqual({ models, reaps, releases, forgets, deletes }, { models: 0, reaps: outcome === "fence" ? 1 : 0, releases: 0, forgets: 0, deletes: 0 });
     const terminals = api.states.filter(s => s.body.status === "failed");
     assert.equal(terminals.length, outcome === "owner cancel" ? 1 : 0);
     if (outcome === "owner cancel") {
@@ -423,6 +436,8 @@ type RetainedSwitchOptions = {
   unsafe?: "bundle" | "source" | "late bundle" | "late source";
   interruption?: "execution" | "lifecycle";
   cancelOnly?: boolean;
+  /** Collects every quiescence request the runner makes (the real proof still runs). */
+  quiesceRequests?: import("../src/run-quiescence.js").QuiesceRunRequest[];
 };
 
 for (const ack of ["lost", "statusless", "stale", "idempotent"] as const) {
@@ -442,6 +457,13 @@ for (const mismatch of ["pending", "ownership"] as const) {
     await retainedSwitchRegression("capture", true, { mismatch });
   });
 }
+it("a retained-recovery flight fenced after adoption still runs the stopped-source process proof and keeps predecessor and successor", async () => {
+  const requests: import("../src/run-quiescence.js").QuiesceRunRequest[] = [];
+  await retainedSwitchRegression("adoption", true, { terminal: "fence", quiesceRequests: requests });
+  const proof = requests.filter(r => r.site === "stopped_source");
+  assert.equal(proof.length, 1, `the stopped_source proof ran once: ${requests.map(r => r.site).join(",")}`);
+  assert.equal(proof[0]!.processes, true);
+});
 it("retained recovery credential switch verifies existing guarded bundle", async () => {
   await retainedSwitchRegression("capture", true, { guarded: true });
 });
@@ -522,7 +544,13 @@ async function retainedSwitchRegression(seam: "capture" | "ownership" | "adoptio
   let flight: any;
   const log = recordingLogger();
   const r = runnerWith(factory(async () => { models++; throw new Error("must not resume model"); }),
-    fakeGitlab().gitlab, "fixture-journal-key", log.logger, { recoveryRetryMs: 1 });
+    fakeGitlab().gitlab, "fixture-journal-key", log.logger, {
+      recoveryRetryMs: 1,
+      ...(options.quiesceRequests ? { quiesceRun: (req: import("../src/run-quiescence.js").QuiesceRunRequest) => {
+        options.quiesceRequests!.push(req);
+        return quiesceRunAttempt(req);
+      } } : {}),
+    });
   const phaseClone = (r as any).phaseClone.bind(r);
   (r as any).phaseClone = async (...args: any[]) => {
     flight = args[1];

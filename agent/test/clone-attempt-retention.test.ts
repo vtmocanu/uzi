@@ -993,7 +993,7 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
   it("the script reads uzi-recovery.<branch>.clone and uzi-attempts.<branch>.entry by these names", () => {
     assert.ok(script.includes('config --get "uzi-recovery.$branch.clone"'));
     assert.ok(script.includes('config --get-all "uzi-attempts.$branch.entry"'));
-    for (const field of [".runId", ".clonePath", ".attemptId"]) assert.ok(script.includes(field), field);
+    for (const field of [".runId", ".clonePath", ".attemptId", ".state"]) assert.ok(script.includes(field), field);
   });
 
   it("the worker writes exactly those keys and JSON field names, and the script's own jq filter reads them", async () => {
@@ -1010,6 +1010,7 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
     // Run the script's own ledger filter (last value per attemptId wins) over what we wrote.
     const m = /"\$JQ" -rRn --arg rid "\$rid" '([\s\S]*?)' 2>\/dev\/null\)"/.exec(script);
     assert.ok(m, "the script's ledger jq filter");
+    assert.ok(m[1]!.includes(".state"), "the ledger filter carries the winning state");
     await git.releaseAttemptInPlace(s.bare, seeded.path, s.branch, "run-3101", "abandoned");
     // The same jq the script runs: its `JQ="${UZI_JQ:-jq}"` default, read from the script itself.
     const jqBin = process.env.UZI_JQ ?? /^JQ="\$\{UZI_JQ:-([^}]+)\}"$/m.exec(script)?.[1];
@@ -1020,7 +1021,8 @@ describe("issue #1783 M2 P-ledger-contract: the keys and JSON shapes backup-runs
     });
     if (jq.error) return; // no jq on this host: the string contract above still binds
     assert.equal(jq.status, 0, jq.stderr);
-    assert.equal(jq.stdout.trim(), `${attemptId}\t${seeded.path}`);
+    // The filter also carries the winning state: only `live`/`reclaimed` attempts are extra sources.
+    assert.equal(jq.stdout.trim(), `${attemptId}\t${seeded.path}\tabandoned`);
     const states = cfgAll(s.bare, `uzi-attempts.${s.branch}.entry`).map((v) => (JSON.parse(v) as { state: string }).state);
     assert.deepEqual(states, ["live", "abandoned"], "appended, the last value wins");
     assert.deepEqual(cfgAll(s.bare, `uzi-recovery.${s.branch}.clone`), [], "the journal is cleared (an empty value)");

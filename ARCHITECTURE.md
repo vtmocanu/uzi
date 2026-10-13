@@ -484,7 +484,8 @@ browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (co
 
 ### Server/worker trust boundary
 
-The worker never receives inbound connections; every call is worker → `api`
+The worker never receives inbound network connections (its only inbound endpoint is a
+worker-local `0600` Unix socket for operator exec, not network-reachable); every call is worker → `api`
 (`POST/GET /api/worker/*`), authenticated by a Bearer join token whose sha256
 the server looks up (`mw.RequireWorker`) — never a session cookie, so there is
 no CSRF step on this path. The token is shown once, at issuance (Settings →

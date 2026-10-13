@@ -3783,8 +3783,11 @@ type StateRequest struct {
 	Branch                    *string `json:"branch"`
 	MrIID                     *int64  `json:"mr_iid"`
 	// Head is the EXACT source-branch tip H a `completed` report is being made against
-	// (PRD #1226 M2, D5). It is REQUIRED for an INTERLOCKED run's completion: SetState routes
-	// such a completion through completeRunWithPermitLease, which consumes the permit issued for
+	// (PRD #1226 M2, D5). It is required for permit-backed INTERLOCKED completion.
+	// A headless, uncapped report-only issue completion instead validates full frozen
+	// structural delivery and a positive live claim generation under the run lock.
+	// SetState routes interlocked completion through completeRunWithPermitLease, which
+	// consumes the permit for publication completion issued for
 	// (run, contract_revision, Head) and writes `completed` in one transaction. A completed
 	// report whose Head does not match an unconsumed permit leaves the run non-terminal
 	// (applied=false). Absent on a LEGACY run's completion (that path is byte-for-byte
@@ -4154,6 +4157,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	if req.RecoveryCause != nil && !recoveryWaitCauses[*req.RecoveryCause] {
 		return store.Run{}, false, fmt.Errorf("%w: unknown recovery_cause %q", ErrInvalidState, *req.RecoveryCause)
 	}
+	if err := validateReportOnlyShape(req); err != nil {
+		return store.Run{}, false, err
+	}
 	if err := validateCompletedPublicationReport(wkr, req); err != nil {
 		return store.Run{}, false, err
 	}
@@ -4166,6 +4172,9 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 	owned, err := s.runOwnedByWorker(ctx, runID, wkr)
 	if err != nil {
 		return store.Run{}, false, err
+	}
+	if err := validateCappedReportOnly(owned, req); err != nil {
+		return owned, false, err
 	}
 	sessionID := stripNULParam(req.SessionID)
 	// PRD #1190 M1: pause_failed is a worker REPORT, not a status transition — the worker could
@@ -4779,8 +4788,11 @@ func (s *Service) setState(ctx context.Context, wkr store.Worker, runID uuid.UUI
 			StopKind:            scopeStopKind,
 			ID:                  runID, WorkerID: pgconv.UUID(wkr.ID),
 		}
-		// PRD #1226 M2 (D4): an INTERLOCKED run's terminal completion is PERMIT-GATED and runs
-		// through a service transaction (completeRunWithPermitLease) that consumes the permit issued
+		// PRD #1226 M2 (D4): INTERLOCKED completion runs through completeRunWithPermitLease.
+		// Headless, uncapped report-only issue completion may bypass a permit only after
+		// locked validation of full frozen structural delivery, a positive live claim
+		// generation, and absence of stored publication fields. Other completions are
+		// permit-gated: the transaction consumes the permit issued
 		// for the exact (run, contract_revision, head) and writes `completed` atomically, with a
 		// seam for later generation activation. A gated completion with no matching unconsumed
 		// permit updates nothing and stays non-terminal (rows==0 -> applied=false -> 409). A

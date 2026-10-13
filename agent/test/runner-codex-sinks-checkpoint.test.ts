@@ -657,6 +657,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     let committedTip = "";
     let softSkipped = false;
     const claim = gitlabClaim(1923, {
+      claim_generation: 1,
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
     const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {

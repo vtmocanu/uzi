@@ -221,7 +221,8 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     client.protocolFeatures = [VAULT_FEATURE];
     let locked = true;
     const rig1 = codexRig({ vaultLocked: () => locked });
-    const claim = gitlabClaim(1773);
+    // issue #1786: the park ACK releases the clone only when its coverage is revalidated, which needs a claim generation.
+    const claim = gitlabClaim(1773, { claim_generation: 1 });
     const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "RESUME.txt", "work saved across the vault lock\n");
       return { branch: ctx.branch };
@@ -956,12 +957,12 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     assert.ok(sessionKept(lines), "the session is kept");
   });
 
-  it("a 404 in the loop after a verified capture releases the clone and session", async () => {
+  it("a 404 in the loop after a verified capture keeps the clone (issue #1786: a 404 is unknown authority) and releases the session", async () => {
     const { gitlab } = fakeGitlab();
     client.protocolFeatures = [VAULT_FEATURE];
     const rig = codexRig({ vaultLocked: () => true });
     const w = workThenDefer(rig);
-    const claim = gitlabClaim(1796);
+    const claim = gitlabClaim(1796, { claim_generation: 5 });
     const report = client.reportState.bind(client);
     client.reportState = async (runId, body, signal) => {
       if (body.status === "recovery_wait") {
@@ -974,8 +975,8 @@ describe("RunRunner #1766 — the park loop's exits after running is confirmed",
     await runnerWith(() => ({ executor: w.exec }), gitlab, undefined, logger, { recoveryRetryMs: 5 }).execute(claim);
     assert.equal(parkReports(claim.run_id).length, 0);
     assertCaptured(1796);
-    assert.equal(fs.existsSync(worktreeDirFor(1796)), false, "the verified capture lets the clone go");
-    assert.equal(sessionKept(lines), false, "and the session");
+    assert.equal(fs.existsSync(worktreeDirFor(1796)), true, "a covered verdict never releases the clone after a 404");
+    assert.equal(sessionKept(lines), false, "the verified capture still lets the session go");
   });
 
   it("a cancel whose capture is not verified (fetch-back fails) keeps the clone and session after a terminal ack", async () => {

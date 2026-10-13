@@ -3,6 +3,7 @@ package workersvc
 import (
 	"bytes"
 	"context"
+	"errors"
 	"fmt"
 	"testing"
 
@@ -184,5 +185,51 @@ func TestScopeCapTerminalDeclarationCannotAuthorizeLiveDB(t *testing.T) {
 	_, applied, err := svc.SetState(e.ctx, w, runID, StateRequest{State: "completed", Branch: strPtr("agent/issue-1"), Head: strPtr("h"), MilestonesCompleted: &declared})
 	if err != nil || applied {
 		t.Fatalf("terminal declaration applied=%v err=%v", applied, err)
+	}
+}
+
+func TestReportOnlyScopeCapPermitRefusalsLiveDB(t *testing.T) {
+	for _, name := range []string{"missing permit", "wrong head", "wrong branch", "invalid head", "invalid branch"} {
+		t.Run(name, func(t *testing.T) {
+			e := setupInterlockLiveDB(t)
+			svc := e.permitService(t)
+			wid := e.seedWorker(t, nil)
+			w := store.Worker{ID: wid}
+			id := e.seedFrozenRun(t, wid, []string{"m1"}, nil, false)
+			e.exec(t, "UPDATE runs SET claim_generation=1 WHERE id=$1", id)
+			if _, err := svc.SubmitInput(e.ctx, e.userID, id, "scope", "0", nil); err != nil {
+				t.Fatal(err)
+			}
+			req := reportOnlyRequest()
+			yes := true
+			req.ScopeCapped = &yes
+			req.Head = strPtr("h")
+			req.Branch = strPtr("b")
+			if name != "missing permit" {
+				p, err := svc.RequestCompletionPermit(e.ctx, w, id, cappedPermitRequest(t, true))
+				if err != nil || !p.Granted {
+					t.Fatalf("permit=%+v err=%v", p, err)
+				}
+				switch name {
+				case "wrong head":
+					req.Head = strPtr("other")
+				case "wrong branch":
+					req.Branch = strPtr("other")
+				case "invalid head":
+					req.Head = strPtr(" ")
+				case "invalid branch":
+					req.Branch = strPtr(" ")
+				}
+			}
+			before := reportOnlySnapshot(t, e, id)
+			_, ok, err := svc.SetState(e.ctx, w, id, req)
+			if ok || (err != nil && !errors.Is(err, ErrInvalidState)) || !bytes.Equal(before, reportOnlySnapshot(t, e, id)) {
+				t.Fatalf("capped refusal applied=%v err=%v", ok, err)
+			}
+			var consumed int
+			if err := e.pool.QueryRow(e.ctx, "SELECT count(*) FROM run_completion_permits WHERE run_id=$1 AND consumed_at IS NOT NULL", id).Scan(&consumed); err != nil || consumed != 0 {
+				t.Fatalf("consumed=%d err=%v", consumed, err)
+			}
+		})
 	}
 }

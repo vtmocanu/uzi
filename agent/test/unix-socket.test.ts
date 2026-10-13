@@ -5,7 +5,7 @@ import http from "node:http";
 import os from "node:os";
 import path from "node:path";
 import { spawn, type ChildProcess } from "node:child_process";
-import { listenUnix, shortUnixSocket } from "./unix-socket.js";
+import { directoryFdSocketPath, listenUnix, shortUnixSocket } from "./unix-socket.js";
 
 // Issue #2044: the TMPDIR a Codex run gets, rebuilt from its parts.
 const CODEX_TMPDIR_BYTES = "/tmp/uzi-codex-command-".length + 36 + "/uzi-tmpdir-guard.XXXXXX".length;
@@ -32,66 +32,137 @@ after(() => {
 });
 
 if (process.platform === "linux") {
-  it("successive directory-FD socket lifetimes isolate HTTP endpoints when the FD is reused", async () => {
+  const requestBody = (options: http.RequestOptions): Promise<string> => new Promise((resolve, reject) => {
+    const req = http.get(options, res => {
+      let body = "";
+      res.on("data", chunk => body += chunk);
+      res.on("error", reject);
+      res.on("end", () => resolve(body));
+    });
+    req.on("error", reject);
+    req.setTimeout(3000, () => req.destroy(new Error("HTTP timeout")));
+  });
+
+  const closeServer = async (server: http.Server): Promise<void> => {
+    server.closeAllConnections();
+    await new Promise<void>(resolve => server.close(() => resolve()));
+  };
+
+  it("modeled repeated directory-FD identity isolates successive HTTP endpoints", async () => {
     const root = fs.mkdtempSync(path.join(os.tmpdir(), "socket-reuse-"));
-    const cwd = process.cwd();
-    const base = path.join(root, "p".repeat(Math.max(1, 104 - Buffer.byteLength(root))));
-    fs.mkdirSync(base);
-    const makeFixture = (): ReturnType<typeof shortUnixSocket> => {
-      try {
-        process.chdir(root);
-        return shortUnixSocket(base);
-      } finally {
-        process.chdir(cwd);
-      }
-    };
-    let fixture: ReturnType<typeof shortUnixSocket> | undefined;
-    const reserved: number[] = [];
+    const agent = new http.Agent({ keepAlive: true });
+    const servers: http.Server[] = [];
+    let directoryFd: number | undefined;
     try {
-      fixture = makeFixture();
-      const firstSocket = fixture.socket;
-      const firstFd = fixture.directoryFd;
-      assert.ok(firstFd !== undefined);
-      // Reserve lower slots released by HTTP so the next factory reuses this directory FD.
-      for (const body of ["first daemon", "second daemon"]) {
-        const socket = fixture.socket;
-        const server = http.createServer((_req, res) => res.end(body));
+      directoryFd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW);
+      // Retain one owned FD through both lifetimes: model numeric reuse without OS recycling.
+      const firstSocket = directoryFdSocketPath(directoryFd);
+      const firstOptions = { agent, socketPath: firstSocket, host: "localhost", port: 80, path: "/ping" };
+      assert.ok(path.isAbsolute(firstSocket));
+      assert.ok(Buffer.byteLength(firstSocket) <= 103);
+      const firstServer = http.createServer((_req, res) => res.end("first daemon"));
+      servers.push(firstServer);
+      await listenUnix(firstServer, firstSocket);
+      assert.equal(await requestBody(firstOptions), "first daemon");
+      await closeServer(firstServer);
+
+      const secondSocket = directoryFdSocketPath(directoryFd);
+      const secondOptions = { ...firstOptions, socketPath: secondSocket };
+      assert.ok(path.isAbsolute(secondSocket));
+      assert.ok(Buffer.byteLength(secondSocket) <= 103);
+      assert.notEqual(secondSocket, firstSocket, "repeated numeric identity has distinct paths");
+      assert.notEqual(agent.getName(secondOptions), agent.getName(firstOptions), "successive lifetimes have distinct HTTP pool keys");
+      const secondServer = http.createServer((_req, res) => res.end("second daemon"));
+      servers.push(secondServer);
+      await listenUnix(secondServer, secondSocket);
+      assert.equal(await requestBody(secondOptions), "second daemon");
+    } finally {
+      agent.destroy();
+      try {
+        for (const server of servers) await closeServer(server);
+      } finally {
         try {
-          await listenUnix(server, fixture.socket);
-          const response = await new Promise<string>((resolve, reject) => {
-            const req = http.get({ socketPath: socket, path: "/ping" }, res => {
-              let received = "";
-              res.on("data", chunk => received += chunk);
-              res.on("end", () => resolve(received));
-            });
-            req.on("error", reject);
-            req.setTimeout(3000, () => req.destroy(new Error("HTTP timeout")));
-          });
-          assert.equal(response, body);
+          if (directoryFd !== undefined) fs.closeSync(directoryFd);
         } finally {
-          server.closeAllConnections();
-          await new Promise<void>(resolve => server.close(() => resolve()));
-          if (body === "first daemon") {
-            // At most firstFd + 1 opens fill lower slots; an open failure aborts this test.
-            for (let attempt = 0; attempt <= firstFd; attempt++) {
-              const fd = fs.openSync(root, fs.constants.O_RDONLY | fs.constants.O_DIRECTORY);
-              reserved.push(fd);
-              if (fd > firstFd) break;
-            }
-          }
-          fixture.dispose();
-        }
-        if (body === "first daemon") {
-          fixture = makeFixture();
-          assert.equal(fixture.directoryFd, firstFd, "the parent directory FD is recycled");
-          assert.ok(path.isAbsolute(fixture.socket));
-          assert.notEqual(fixture.socket, firstSocket, "factory lifetimes have distinct HTTP pool keys");
+          fs.rmSync(root, { recursive: true, force: true });
         }
       }
+    }
+  });
+
+  it("successive long-base factories vary socket basenames independently of directory FDs", async t => {
+    const long = fs.mkdtempSync(path.join(base, "q".repeat(120)));
+    const realOpenSync = fs.openSync;
+    const flags = fs.constants.O_RDONLY | fs.constants.O_DIRECTORY | fs.constants.O_NOFOLLOW;
+    const intermediateFds: number[] = [];
+    const agent = new http.Agent({ keepAlive: true });
+    const servers: http.Server[] = [];
+    let fixture: ReturnType<typeof shortUnixSocket> | undefined;
+    let firstFd: number | undefined;
+    let returnedFd: number | undefined;
+    let fixtureOpens = 0;
+    try {
+      t.mock.method(fs, "openSync", (target: fs.PathLike, requestedFlags: string | number, mode?: fs.Mode) => {
+        if (typeof target !== "string" || path.dirname(target) !== long ||
+            !path.basename(target).startsWith("us-") || requestedFlags !== flags) {
+          return realOpenSync(target, requestedFlags, mode);
+        }
+        fixtureOpens++;
+        if (fixtureOpens === 1) {
+          firstFd = realOpenSync(target, requestedFlags, mode);
+          return firstFd;
+        }
+        assert.equal(fixtureOpens, 2);
+        assert.ok(firstFd !== undefined);
+        // Open only the requested owned directory. Hold lower slots until the check completes.
+        // At most firstFd + 2 real opens; any open failure aborts and finally closes intermediates.
+        for (let attempt = 0; attempt < firstFd + 2; attempt++) {
+          const fd = realOpenSync(target, requestedFlags, mode);
+          if (fd > firstFd) {
+            returnedFd = fd;
+            return fd; // The fixture owns this descriptor; the harness owns only intermediates.
+          }
+          intermediateFds.push(fd);
+        }
+        throw new Error("could not perturb the owned directory FD within the open bound");
+      });
+
+      fixture = shortUnixSocket(long);
+      assert.equal(fixture.directoryFd, firstFd);
+      const firstBasename = path.basename(fixture.socket);
+      const firstServer = http.createServer((_req, res) => res.end("first factory daemon"));
+      servers.push(firstServer);
+      await listenUnix(firstServer, fixture.socket);
+      assert.equal(await requestBody({ agent, socketPath: fixture.socket, path: "/ping" }), "first factory daemon");
+      await closeServer(firstServer);
+      fixture.dispose();
+      fixture = undefined;
+
+      fixture = shortUnixSocket(long);
+      assert.equal(fixtureOpens, 2, "the directory-open perturbation executed");
+      assert.ok(firstFd !== undefined && returnedFd !== undefined && returnedFd > firstFd);
+      assert.equal(fixture.directoryFd, returnedFd);
+      assert.notEqual(path.basename(fixture.socket), firstBasename, "factory lifetimes vary basenames independently of FD numbers");
+      const secondServer = http.createServer((_req, res) => res.end("second factory daemon"));
+      servers.push(secondServer);
+      await listenUnix(secondServer, fixture.socket);
+      assert.equal(await requestBody({ agent, socketPath: fixture.socket, path: "/ping" }), "second factory daemon");
     } finally {
-      fixture?.dispose();
-      for (const fd of reserved) fs.closeSync(fd);
-      fs.rmSync(root, { recursive: true, force: true });
+      t.mock.restoreAll();
+      agent.destroy();
+      try {
+        for (const server of servers) await closeServer(server);
+      } finally {
+        try {
+          fixture?.dispose();
+        } finally {
+          try {
+            for (const fd of intermediateFds) fs.closeSync(fd);
+          } finally {
+            fs.rmSync(long, { recursive: true, force: true });
+          }
+        }
+      }
     }
   });
 

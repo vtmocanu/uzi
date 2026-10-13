@@ -110,10 +110,14 @@ export function attemptClonePath(canonicalPath: string, attemptId: string): stri
   return `${canonicalPath}${ATTEMPT_SEPARATOR}${attemptId}`;
 }
 
-/** The generation of an attempt id as a number (`gx`, an unknown generation, is -1). */
-function attemptGeneration(attemptId: string): number {
-  const g = /-(g[0-9]+|gx)-/.exec(attemptId)?.[1] ?? "gx";
-  return g === "gx" ? -1 : Number(g.slice(1));
+/** The claim generation an attempt id was minted under, or undefined for `gx` (the claim carried
+ *  none) and for a string that is not an attempt id. */
+export function attemptGeneration(attemptId: string): number | undefined {
+  if (!ATTEMPT_ID_RE.test(attemptId)) return undefined;
+  const g = /-(g[0-9]+|gx)-/.exec(attemptId)?.[1];
+  if (g === undefined || g === "gx") return undefined;
+  const n = Number(g.slice(1));
+  return Number.isSafeInteger(n) ? n : undefined;
 }
 
 /**
@@ -125,8 +129,9 @@ export function compareAttemptIds(a: string, b: string): number {
   const ta = a.slice(0, a.indexOf("-"));
   const tb = b.slice(0, b.indexOf("-"));
   if (ta !== tb) return ta < tb ? -1 : 1;
-  const ga = attemptGeneration(a);
-  const gb = attemptGeneration(b);
+  // `gx` (no generation) sorts lowest.
+  const ga = attemptGeneration(a) ?? -1;
+  const gb = attemptGeneration(b) ?? -1;
   if (ga !== gb) return ga - gb;
   return a < b ? -1 : a > b ? 1 : 0;
 }

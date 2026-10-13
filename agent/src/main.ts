@@ -27,6 +27,7 @@ import { JobRunner } from "./job-runner.js";
 import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
@@ -563,8 +564,12 @@ async function main(): Promise<void> {
     thresholdOf: () => client.diskPressureThreshold,
     reclaim: () => reclaimNow?.() ?? Promise.resolve(),
   });
+  // issue #1786: the runner's stopped-source retention exits notify the operator channel (built below
+  // from the runner), which logs the bounded retained count and bytes. Late-bound for that reason.
+  let notifyRetained: (() => void) | undefined;
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     pollMs: config.pollIntervalMs,
+    onSourceRetained: () => notifyRetained?.(),
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
     // issue #1597 M2: the mid-turn checkpoint tick cadence (CHECKPOINT_TICK_INTERVAL; 0 disables).
@@ -823,6 +828,13 @@ async function main(): Promise<void> {
           log,
         })
       : undefined;
+  // issue #1786: the operator retained-source channel (a local 0600 Unix socket, started and closed
+  // by Worker.run). Its idle probe reads the worker's own active sets, hence the late-bound `worker`.
+  const retainedSource = new RetainedSourceServer({
+    dataDir: config.dataDir, git, client, gate: dindGate, runner, log,
+    isIdle: () => worker?.isIdle() ?? false,
+  });
+  notifyRetained = () => { void retainedSource.reportRetained(); };
   worker = new Worker(
     config,
     client,
@@ -845,6 +857,10 @@ async function main(): Promise<void> {
     dindMaintenance,
     terminalRejections,
     crossCheckRunner,
+    // issue #1786: the claim gate is shared with the operator retained-source channel on every
+    // worker, DinD or not.
+    dindGate,
+    retainedSource,
   );
 
   // Signal handlers FIRST, before anything that can take real time. Until these

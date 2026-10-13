@@ -57,7 +57,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     it(`${failure} failure retains active work until capture verifies`, async () => {
       const { gitlab } = fakeGitlab();
       const iid = failure === "wip" ? 1301 : failure === "fetch" ? 1302 : 1303;
-      const claim = gitlabClaim(iid);
+      const claim = gitlabClaim(iid, { claim_generation: 1 });
       const fixture = factoryFor(claim, failure === "fetch");
       const secondFailure = deferred();
       let attempts = 0;
@@ -261,7 +261,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
 
   it("same-run claims wait for delayed ACK and cleanup, then refresh their message cursors", async () => {
     const { gitlab } = fakeGitlab();
-    const claim = gitlabClaim(1308);
+    const claim = gitlabClaim(1308, { claim_generation: 1 });
     const ackReached = deferred();
     const releaseAck = deferred();
     const cleanupReached = deferred();

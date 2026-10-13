@@ -179,7 +179,7 @@ const TERMINAL_REASONS: ReadonlySet<string> = new Set([
 const SETTLEMENT_KEY_LABEL = "uzi-recovery-settlement-v1";
 const SETTLEMENT_VERSION = 1 as const;
 const SAFE_ID = /^[A-Za-z0-9_-]{1,128}$/;
-const RUN_TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+export const RUN_TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
 
 /** Whether `id` is a single safe path component the journal accepts. The runner checks both ids
  *  BEFORE pinning `refs/uzi-settle/...`, so a refused record never leaves an orphan pin (and two
