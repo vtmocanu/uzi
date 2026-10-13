@@ -172,7 +172,7 @@ vars:
   # scripts/oasdiff.sh as an ARGUMENT, like the golangci-lint pin above, so `task`'s echo shows the
   # resolved version. The wrapper carries the per-arch sha256 pins and refuses any other version.
   # renovate: datasource=github-releases depName=oasdiff-taskfile packageName=oasdiff/oasdiff
-  OASDIFF_VERSION: v1.32.1
+  OASDIFF_VERSION: v1.33.0
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
