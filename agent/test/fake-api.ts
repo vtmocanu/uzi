@@ -227,6 +227,10 @@ export class FakeApi {
   parkRunGeneration: number | undefined;
   readonly workerPauseRequests: Array<{ runId: string; generation: unknown }> = [];
   parkRunOwnership: { status: string; claim_generation: number; hold_reason: string | null; claim_released: boolean } | undefined;
+  /** Per-run wire fixtures; absent entries preserve the legacy incomplete ownership DTO. */
+  readonly completionHoldWire = new Map<string, (res: http.ServerResponse) => void>();
+  readonly ownershipWire = new Map<string, (res: http.ServerResponse) => void>();
+  readonly committedHoldOwnership = new Map<string, unknown>();
   guardedQuestionStatus: string | undefined;
   workerPauseRefused = false;
   workerPauseReason: string | undefined;
@@ -1384,6 +1388,10 @@ export class FakeApi {
     if (req.method === "GET" && ownMatch) {
       const runId = ownMatch[1] as string;
       this.ownershipRequests.push(runId);
+      const wire = this.ownershipWire.get(runId);
+      if (wire) return wire(res);
+      if (this.committedHoldOwnership.has(runId))
+        return send(res, 200, this.committedHoldOwnership.get(runId));
       if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
       if (!o) return send(res, 200, { status: "running" });
@@ -1461,6 +1469,8 @@ export class FakeApi {
     if (req.method === "POST" && holdMatch) {
       const runId = holdMatch[1] as string;
       this.completionHoldRequests.push({ runId, body: json });
+      const wire = this.completionHoldWire.get(runId);
+      if (wire) return wire(res);
       return send(res, this.completionHoldHttpStatus, {
         run: { id: runId, status: this.completionHoldStatus },
       });
