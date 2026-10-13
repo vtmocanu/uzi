@@ -33,6 +33,9 @@ through `[0.52.0]`.)
 - **Run-page cross-check cards match the Run summary treatment ([#2856](https://github.com/vtmocanu/uzi/issues/2856)).**
   Plan and Code cross-checks use consistent headers, styled checker links, compact prose and literal finding chips. The first three findings stay visible, with the rest in a keyboard-accessible disclosure; checker metadata shares a footer, and pending or missing results have clearer states. Plan approval shows checker evidence below its header, and Run review uses the same sentence-case heading style.
 
+- **Human-stopped runs read as stopped rather than failed in the CLI and TUI ([#2850](https://github.com/vtmocanu/uzi/issues/2850)).**
+  Cancellations and rejected plans get neutral stopped labels before needs-landing presentation; TUI boards use compact `stopped` and detail headers name the reason. Slack preserves `Cancelled` and adds `Stopped (plan rejected)`. Raw JSON, scalar status fields, filtering and lifecycle transitions remain unchanged; `admin runs` shares the renderer but still lists active runs only.
+
 - **Report-only issue runs now finish under the completion interlock ([#2821](https://github.com/vtmocanu/uzi/issues/2821)).**
   A report-only issue run with every frozen milestone declared complete can store its findings and finish without publishing a branch or opening a merge request. Completion still checks the current worker and claim generation; identical retries preserve the stored report. Mixed report-only publication requests are refused, except for an interlocked issue's scope-capped zero-work delivery through its existing valid permit. Legacy headless report-only completions keep their existing behavior.
 
