@@ -16684,7 +16684,7 @@ describe("M1 expired wall physical Codex runner", () => {
 });
 
 describe("M4 dependency wait physical Codex runner", () => {
-  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async (t) => {
     let calls = 0;
     const custody = await exerciseDependencyWaitRunner((ctx, home) => {
       let advertisedTools: unknown;
@@ -16722,10 +16722,10 @@ describe("M4 dependency wait physical Codex runner", () => {
       return new CodexExecutor(noopLog, home,
         { binding: bindingOf(SUBSCRIPTION), client: rig.client as never, provider },
         { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!, rig.probeCalls) });
-    });
+    }, t.signal);
     assert.equal(calls, 3);
     for (const mode of ["now", "after_milestone"] as const) {
-      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, t.signal, mode);
       assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
     }
   });

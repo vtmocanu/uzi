@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -6833,8 +6834,50 @@ describe("M1 expired wall physical Claude runner", () => {
   }
 });
 
+describe("M4 dependency wait cancellation", () => {
+  for (const alreadyAborted of [false, true]) {
+    it(`rejects caller cancellation and completes cleanup alreadyAborted=${alreadyAborted}`, async (t) => {
+      const controller = new AbortController();
+      const reason = new Error("caller cancelled dependency wait");
+      const directories = t.mock.method(fs, "mkdtempSync");
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      let executorExited = false;
+      if (alreadyAborted) controller.abort(reason);
+      const outcome = exerciseDependencyWaitRunner(() => ({
+        run: async () => {
+          enter();
+          await barrier;
+          executorExited = true;
+          throw new Error("fixture executor released");
+        },
+      }), controller.signal).then(
+        () => ({ error: undefined }),
+        error => ({ error }),
+      );
+      let listeners = 0;
+      if (!alreadyAborted) {
+        await entered;
+        listeners = getEventListeners(controller.signal, "abort").length;
+        controller.abort(reason);
+        release();
+      }
+      const result = await outcome;
+      assert.equal(result.error, reason, "the caller's exact abort reason is propagated");
+      assert.equal(executorExited, !alreadyAborted, "cleanup joins the released executor");
+      if (!alreadyAborted) assert.equal(listeners, 1, "readiness observes caller cancellation");
+      assert.equal(getEventListeners(controller.signal, "abort").length, 0);
+      assert.ok(directories.mock.calls.length >= 3);
+      for (const call of directories.mock.calls.slice(0, 3))
+        assert.equal(fs.existsSync(call.result!), false, "helper finally removes its fixture directories");
+    });
+  }
+});
+
 describe("M4 dependency wait physical Claude runner", () => {
-  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async (t) => {
     let calls = 0;
     const custody = await exerciseDependencyWaitRunner((ctx, home) => {
       const script = scriptedDependencyWait("reworded", ({ continuation, advertisedTools }) => {
@@ -6867,10 +6910,10 @@ describe("M4 dependency wait physical Claude runner", () => {
         yield resultSuccess();
       })();
       return new SdkExecutor(nullLogger(), home, { queryFn, installDeps: async () => ({ results: [], truncated: false }) });
-    });
+    }, t.signal);
     assert.equal(calls, 3);
     for (const mode of ["now", "after_milestone"] as const) {
-      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, t.signal, mode);
       assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
     }
   });

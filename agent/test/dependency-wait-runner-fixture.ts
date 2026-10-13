@@ -117,6 +117,7 @@ function gitRead(tree: string, ...args: string[]): string {
  */
 export async function exerciseDependencyWaitRunner(
   build: (ctx: RunContext, home: string) => Executor,
+  signal: AbortSignal,
   ownerMode?: "now" | "after_milestone",
 ) {
   const token = "fixture-worker-token";
@@ -127,6 +128,7 @@ export async function exerciseDependencyWaitRunner(
   let worker: ReturnType<typeof startSweepWorker> | undefined;
   try {
     const client = new WorkerClient(await api.listen(), token, "test", nullLogger(), { sleep: async () => {} });
+    signal.throwIfAborted();
     const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     const active = new ActiveRunRegistry();
     const { gitlab, calls: forgeWrites } = fakeGitlab();
@@ -166,7 +168,12 @@ export async function exerciseDependencyWaitRunner(
     let releases = 0;
     let idleClaims = 0;
     let resolveFirstReady!: () => void;
-    const firstReady = new Promise<void>(resolve => { resolveFirstReady = resolve; });
+    let rejectFirstReady!: (reason: unknown) => void;
+    const firstReady = new Promise<void>((resolve, reject) => {
+      resolveFirstReady = resolve;
+      rejectFirstReady = reject;
+    });
+    const abortReady = () => rejectFirstReady(signal.reason);
     const observeReady = () => {
       if (executions === 1 && releases === 1 && idleClaims > 0) resolveFirstReady();
     };
@@ -221,8 +228,14 @@ export async function exerciseDependencyWaitRunner(
       return next;
     };
     // RunRunner + real HTTP remain intact; only the worker's claim source is scripted.
-    worker = startSweepWorker({ outbox: sweep.outbox, client, runner: { execute: claim => runner.execute(claim), isExecuting: runId => runner.isExecuting(runId), resumePendingRecoveries: () => runner.resumePendingRecoveries() }, activeRuns: active, terminalRejections: coordinator });
-    await firstReady;
+    signal.throwIfAborted();
+    signal.addEventListener("abort", abortReady, { once: true });
+    try {
+      worker = startSweepWorker({ outbox: sweep.outbox, client, runner: { execute: claim => runner.execute(claim), isExecuting: runId => runner.isExecuting(runId), resumePendingRecoveries: () => runner.resumePendingRecoveries() }, activeRuns: active, terminalRejections: coordinator });
+      await firstReady;
+    } finally {
+      signal.removeEventListener("abort", abortReady);
+    }
     const firstStates = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
     const paused = firstStates.find(s => s.status === "paused");
     assert.ok(paused, JSON.stringify(firstStates));
