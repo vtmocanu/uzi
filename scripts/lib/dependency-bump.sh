@@ -4,7 +4,10 @@
 #
 #   is_dependency_manifest <path>  -> 0 if a SHIPPING path may change in a dependency bump
 #                                     without its own CHANGELOG line (basename go.mod, go.sum,
-#                                     Dockerfile or devbox.lock; never deploy/chart/**).
+#                                     Dockerfile, devbox.lock, package.json or
+#                                     package-lock.json; never deploy/chart/**). The
+#                                     Codex runtime lock is deliberately not here: a new
+#                                     Codex runtime is user-visible and gets a real entry.
 #   is_dependency_subject <subject> -> 0 if a commit subject is dependency-typed
 #                                     (`chore(deps):` / `fix(deps):` / `build(deps):`, `!` ok).
 #
@@ -16,7 +19,7 @@
 is_dependency_manifest() {
   case "$1" in deploy/chart/*) return 1 ;; esac
   case "${1##*/}" in
-    go.mod|go.sum|Dockerfile|devbox.lock) return 0 ;;
+    go.mod|go.sum|Dockerfile|devbox.lock|package.json|package-lock.json) return 0 ;;
     *) return 1 ;;
   esac
 }

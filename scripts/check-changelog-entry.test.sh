@@ -8,7 +8,7 @@ set -euo pipefail
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMP="$(mktemp -d)"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=34
+FLOOR=40
 cases=0
 passed=0
 
@@ -29,6 +29,11 @@ fresh() {
   echo 'package api' > "$d/seed/api/x.go"
   echo 'module x' > "$d/seed/api/go.mod"
   echo 'a: 1' > "$d/seed/deploy/chart/values.yaml"
+  mkdir -p "$d/seed/agent/src" "$d/seed/agent/codex"
+  echo '{"name":"agent"}' > "$d/seed/agent/package.json"
+  echo '{"lockfileVersion":3}' > "$d/seed/agent/package-lock.json"
+  echo 'export {};' > "$d/seed/agent/src/x.ts"
+  echo 'CODEX_VERSION=0.1.0' > "$d/seed/agent/codex/codex-package.lock"
   git -C "$d/seed" init -q -b main
   git -C "$d/seed" add -A
   git -C "$d/seed" commit -qm init
@@ -151,6 +156,24 @@ expect 1 "an uncommitted manifest edit is not covered by the deps subject"
 
 fresh manifest-plus-code; echo 'require y v1' >> "$W/api/go.mod"; echo '// y' >> "$W/api/x.go"; commit "chore(deps): bump y"
 expect 1 "manifest plus source is not exempt"
+
+fresh npm-lock; echo '{"lockfileVersion":3,"x":1}' > "$W/agent/package-lock.json"; commit "chore(deps): lock file maintenance"
+expect 0 "agent npm lockfile only, dependency-typed"
+
+fresh npm-manifest; echo '{"name":"agent","dependencies":{"y":"1"}}' > "$W/agent/package.json"; echo '{"lockfileVersion":3,"y":1}' > "$W/agent/package-lock.json"; commit "fix(deps): update dependency y to v1"
+expect 0 "agent npm manifest and lockfile, dependency-typed"
+
+fresh npm-fix-subject; echo '{"name":"agent","scripts":{"x":"y"}}' > "$W/agent/package.json"; commit "fix(agent): add a script"
+expect 1 "an agent package.json edit under a non-deps subject is not exempt"
+
+fresh npm-plus-source; echo '{"lockfileVersion":3,"y":1}' > "$W/agent/package-lock.json"; echo '// y' >> "$W/agent/src/x.ts"; commit "chore(deps): bump y"
+expect 1 "npm lockfile plus agent source is not exempt"
+
+fresh chart-npm; mkdir -p "$W/deploy/chart/files"; echo '{}' > "$W/deploy/chart/files/package.json"; commit "chore(deps): chart package"
+expect 1 "a package.json under deploy/chart is not exempt"
+
+fresh codex-lock; echo 'CODEX_VERSION=0.1.1' > "$W/agent/codex/codex-package.lock"; commit "chore(deps): update codex runtime"
+expect 1 "the Codex runtime lock is never a dependency-exempt manifest"
 
 fresh chart; echo 'a: 2' > "$W/deploy/chart/values.yaml"; commit "chore(deps): chart"
 expect 1 "deploy/chart change is never exempt"

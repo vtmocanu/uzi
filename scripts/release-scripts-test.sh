@@ -1941,7 +1941,22 @@ git -C "$SDH" add -A; gcommit "$SDH" "fix(deps): bump x and adapt (#350)"
 feature_201_changelog "$SDH"
 run_rc "$SDH" 0.2.0
 assert_eq "a dependency merge that also changes source is not auto-cited (cut fails)" "1" "$RC_RC"
-rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI"
+# An agent npm bump (manifest + lockfile, Renovate-typed) is cited in bulk too; the Codex
+# runtime lock is not a dependency manifest, so an uncited Codex bump still fails the cut.
+SDJ="$(mktemp -d)"; seed_repo "$SDJ"; add_feature "$SDJ" 201
+mkdir -p "$SDJ/agent"; echo '{"dependencies":{"y":"1"}}' > "$SDJ/agent/package.json"; echo '{"y":1}' > "$SDJ/agent/package-lock.json"
+git -C "$SDJ" add -A; gcommit "$SDJ" "fix(deps): update dependency y to v1 (#360)"
+feature_201_changelog "$SDJ"
+run_rc "$SDJ" 0.2.0
+assert_eq "agent npm dependency merge exits 0" "0" "$RC_RC"
+assert_contains "agent npm dependency merge is auto-cited" "#360" "$(dep_bullet "$SDJ")"
+SDK="$(mktemp -d)"; seed_repo "$SDK"; add_feature "$SDK" 201
+add_dep "$SDK" agent/codex/codex-package.lock "chore(deps): update codex runtime (#370)"
+feature_201_changelog "$SDK"
+run_rc "$SDK" 0.2.0
+assert_eq "a Codex runtime lock bump is not auto-cited (cut fails)" "1" "$RC_RC"
+assert_contains "oracle names the Codex runtime merge" "(#370)" "$RC_OUT"
+rm -rf "$SDA" "$SDB" "$SDC" "$SDD" "$SDE" "$SDF" "$SDG" "$SDH" "$SDI" "$SDJ" "$SDK"
 
 rm -rf "$S1" "$S3" "$S4" "$S6" "$S7" "$S8" "$S8P" "$S8O" "$S8R" "$S8N" "$S8A" "$S8B" "$S8C" "$S9" "$SA" "$SB" "$SC" "$SD" "$SE" \
        "$S8.origin.git" "$S8P.origin.git" "$S8O.origin.git" "$S8R.origin.git" "$S8A.origin.git" "$S8B.origin.git" "$S9.origin.git" "$SD.origin.git" "$SE.origin.git" \
