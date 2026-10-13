@@ -52,9 +52,16 @@ run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 custody_open() { db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id = '$1' AND state = 'open'"; }
 # war_lists WORKER RUN — "1" if the worker_active_runs snapshot table lists RUN for WORKER.
 war_lists() { db_psql "SELECT count(*) FROM worker_active_runs WHERE worker_id = '$1' AND run_id = '$2'"; }
-# cancel_run RUN — best-effort server-side cancel (frees the worker slot; the HOLD sentinel is
+# cancel_run RUN — best-effort cancel input (the HOLD sentinel is
 # abort-aware, so a cancel unwinds it promptly). Never reddens a passed case.
-cancel_run() { apipost "/api/runs/$1/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true; }
+cancel_run() {
+  local response failed=0
+  response="$(apipost "/api/runs/$1/inputs" '{"kind":"cancel","body":""}' 2>/dev/null)" || failed=1
+  mkdir -p "$RUNROOT/artifacts/fixture-settlement"
+  printf '%s' "$response" | jq -cRs --arg run "$1" --argjson failed "$failed" \
+    '(try fromjson catch {}) as $reply | {run_id:$run,request_failed:($failed == 1),server_side:$reply.server_side,status:$reply.status}' \
+    >> "$RUNROOT/artifacts/fixture-settlement/cancel.jsonl" || true
+}
 
 # make_hold_run — create + approve a UZI_STUB_HOLD stub run and leave it genuinely `running`
 # (the stub holds one tool call open, so `stalled` is suppressed). Leaves the id in HOLD_RUN
@@ -210,7 +217,12 @@ sleep 20
 "${COMPOSE[@]}" up -d --wait api >/dev/null
 wait_http
 login
-# Give the worker a heartbeat cycle to reconnect, then assert nothing was requeued INSIDE the
+# Unchanged statuses are immediately readable throughout boot grace. Require an
+# actual post-restore heartbeat before cancelling, otherwise the stale-poller
+# fallback can cancel server-side without delivering an input to these live flights.
+API_A_RESTORED_AT="$(db_psql 'SELECT clock_timestamp()')"
+wait_worker_heartbeat_after "$WORKER1" "$API_A_RESTORED_AT" 30
+# Assert nothing was requeued INSIDE the
 # grace: both read their original status, neither was charged, and the gate run's park time did
 # NOT move (the durable proof that the boot sweep's stale passes were skipped).
 wait_status "$EA" running 30

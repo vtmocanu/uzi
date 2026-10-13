@@ -683,7 +683,21 @@ dump_fixture_settlement() {
     || echo 'fixture settlement: worker diagnostic unavailable' >&2
   # Keep the full already-redacted worker log as evidence of actual redrive cadence.
   "${COMPOSE[@]}" logs --no-color agent > "$dir/agent-redrive.log" 2>/dev/null || true
+  db_psql "SELECT json_build_object('worker_id',w.id,'last_heartbeat_at',w.last_heartbeat_at,'max_concurrent_runs',w.max_concurrent_runs,'pending_overflow_until',w.pending_overflow_until,'active',COALESCE((SELECT json_agg(json_build_object('run_id',a.run_id,'generation',a.claim_generation,'phase',a.phase,'terminal_pending',a.terminal_pending,'reported_at',a.reported_at)) FROM worker_active_runs a WHERE a.worker_id=w.id),'[]'::json)) FROM workers w" \
+    > "$dir/workers.jsonl" || echo 'fixture settlement: worker snapshot unavailable' >&2
   cat "$dir/recovery.jsonl"
+}
+wait_worker_heartbeat_after() {
+  local worker="$1" restored_at="$2" timeout="${3:-30}" ready deadline=$((SECONDS + ${3:-30}))
+  while :; do
+    ready="$(db_psql "SELECT COALESCE(last_heartbeat_at > '$restored_at'::timestamptz AND last_heartbeat_at > clock_timestamp() - interval '15 seconds',false) FROM workers WHERE id='$worker'")" || ready=""
+    [ "$ready" = t ] && return 0
+    if [ "$SECONDS" -ge "$deadline" ]; then
+      dump_fixture_settlement || true
+      fail "worker $worker has no fresh heartbeat after API restore ($restored_at) within ${timeout}s"
+    fi
+    sleep 0.5
+  done
 }
 wait_runs_terminal_off_worker() {
   local timeout="$1" run status active start=$SECONDS deadline pending settled; shift
