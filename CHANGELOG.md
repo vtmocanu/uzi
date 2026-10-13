@@ -46,6 +46,9 @@ through `[0.52.0]`.)
 - **Codex judges record their own API-equivalent spend ([#2915](https://github.com/vtmocanu/uzi/issues/2915)).**
   Judge passes report observed per-model usage before the verdict and completion, including a failed pass that already observed usage. Accounting frames follow existing claim-time notes so they remain in the trace. Accounting transport failures log a warning while the verdict still lands; stale claims are abandoned. Both credential modes preserve metered or unavailable cost status; past judge runs are not backfilled.
 
+- **Task reviews record model spend on both harnesses ([#2916](https://github.com/vtmocanu/uzi/issues/2916)).**
+  Handoff reviews report their own observed usage before publishing findings, including failed passes with cost evidence. Accounting frames follow existing claim-time notes so they remain in the trace. Accounting transport failures log a warning while findings still land; stale claims are abandoned. Codex preserves unavailable cost markers; Claude passes without provider cost log unavailable usage instead of fabricating metered zero. Past reviews are not backfilled.
+
 - **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
   A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
 

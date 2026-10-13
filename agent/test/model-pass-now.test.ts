@@ -260,6 +260,7 @@ describe("caller option policy", () => {
     const forwardsUsage = new Set([
       "summary-runner.ts", // #2686: summary passes report their spend.
       "judge-runner.ts", // #2915: Codex judges report their spend.
+      "review-runner.ts", // #2916: task reviews report their spend.
     ]);
     for (const f of ["judge-runner.ts", "review-runner.ts", "summary-runner.ts", "pr-description-eval-cli.ts"]) {
       const src = readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
