@@ -1475,7 +1475,7 @@ describe("#2493 initial credential release", () => {
   });
   }
 
-  it("real runner reclaims release-unavailable park, adopts stored rollout and completes the same thread", async () => {
+  it("real runner reclaims release-unavailable park, captures work and completes in a fresh thread", async () => {
     const api = new FakeApi("resume-release-worker");
     const url = await api.listen();
     const fx = makeFixture();
@@ -1487,21 +1487,18 @@ describe("#2493 initial credential release", () => {
     const thread = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
     const rolloutName = `rollout-${thread}.jsonl`;
     let rollout = "";
-    const first = makeMultiEpochRig([epochResponder(thread, "tn-first", (t, th, tn) => {
-      t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
-    })]);
-    const second = makeMultiEpochRig([resumedEpochResponder(thread, "tn-resume", (t, th, tn) => {
-      t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
-    })]);
+    const freshThread = "bbbbbbbb-cccc-dddd-eeee-ffffffffffff";
+    const secondRigs: MultiRig[] = [];
+    let predecessorPath = "";
+    let successorPath = "";
     const claim = makeClaim({
       claim_generation: 1,
       repo: { id: "r1", url: "https://gitlab.example.test/org/repo", clone_url: fx.originPath },
       plan_approved: true, plan_source: "agent", plan_md: "approved plan",
       secrets: { forge_pat: "fixture-forge-pat-000000", codex: SUBSCRIPTION as never },
     });
-    // The app-server fixture writes a valid rollout for the thread it actually reports.
-    // Real CodexSessionStore persist/adopt carries it between the two executor claims.
-    for (const [index, rig] of [first, second].entries()) {
+    // The first claim stores a valid rollout; the retained-source successor starts a new thread.
+    const configureRig = (rig: MultiRig, index: number): MultiRig => {
       const launch = rig.deps.launchProviderRoot!;
       const effect = rig.deps.launchEffectRoot!;
       rig.deps = { ...rig.deps, sessionStore: {
@@ -1524,7 +1521,7 @@ describe("#2493 initial credential release", () => {
             await fs.writeFile(path.join(sessions, rolloutName), rollout);
           } else {
             assert.equal(await fs.readFile(path.join(sessions, rolloutName), "utf8"), rollout,
-              "fresh provider epoch receives the exact prior rollout, not dummy session bytes");
+              "the stored predecessor rollout remains available without resuming its thread");
           }
           return launch(spec, mode);
         },
@@ -1544,7 +1541,8 @@ describe("#2493 initial credential release", () => {
             waitChild: async () => exited, dispose: async ms => { await exited; return handle.dispose(ms); } };
         },
       };
-    }
+      return rig;
+    };
     const priorHome = path.join(fx.dataDir, "prior-session-home");
     await fs.mkdir(path.join(priorHome, "sessions"), { recursive: true });
     await fs.writeFile(path.join(priorHome, "sessions", rolloutName),
@@ -1558,45 +1556,66 @@ describe("#2493 initial credential release", () => {
     const executorFor = (rig: MultiRig) => new CodexExecutor(diagnostics.log, homeDir,
       { binding: bindingOf(SUBSCRIPTION), client, provider },
       { ...rig.deps, spawnCommand: answerEnvProbe(rig.deps.spawnCommand!) });
-    const firstExecutor = executorFor(first);
-    const firstRun = firstExecutor.run.bind(firstExecutor);
-    firstExecutor.run = async ctx => {
-      commitInTree(ctx.worktreePath, "RESUME.txt", "identifiable committed release recovery\n");
-      const checkpoint = ctx.checkpoint!;
-      ctx.checkpoint = async opts => {
-        await checkpoint(opts);
-        api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503 })));
+    const firstFactory = () => {
+      const first = configureRig(makeMultiEpochRig([epochResponder(thread, "tn-first", (t, th, tn) => {
+        t.push(toolCall(1, "checkpoint", {}, th, tn, "checkpoint")).push(turnCompleted("completed", th, tn));
+      })]), 0);
+      const executor = executorFor(first);
+      const run = executor.run.bind(executor);
+      executor.run = async ctx => {
+        predecessorPath = ctx.worktreePath;
+        commitInTree(ctx.worktreePath, "RESUME.txt", "identifiable committed release recovery\n");
+        const checkpoint = ctx.checkpoint!;
+        ctx.checkpoint = async opts => {
+          await checkpoint(opts);
+          api.codexReleaseSequences.set(claim.run_id, Array.from({ length: 6 }, () => ({ status: 503 })));
+        };
+        return run(ctx);
       };
-      return firstRun(ctx);
+      return { executor, homeDir };
     };
     try {
-      await new RunRunner(client, git, () => ({ executor: firstExecutor, homeDir }), diagnostics.log, 20,
+      api.setOwnershipStatus(claim.run_id, "running", 1);
+      await new RunRunner(client, git, firstFactory, diagnostics.log, 20,
         undefined, { pollMs: 5, recoveryRetryMs: 5, quiesceRun }).execute({ ...claim, session_id: thread });
       assert.equal(api.states.at(-1)?.body.status, "recovery_wait", diagnostics.lines.join("\n"));
       assert.equal(api.states.at(-1)?.body.session_id, thread);
       assert.equal(await CodexSessionStore.inspectSession(path.join(homeDir, "codex-session-store"), thread), "present");
       const releasesBefore = api.codexRequests.filter(r => r.operation === "release").length;
-      const resumedExecutor = executorFor(second);
-      const resumeRun = resumedExecutor.run.bind(resumedExecutor);
-      resumedExecutor.run = async ctx => {
-        assert.equal(ctx.sessionId, thread, "runner resolves the parked session on reclaim");
-        assert.equal(await fs.readFile(path.join(ctx.worktreePath, "RESUME.txt"), "utf8"),
-          "identifiable committed release recovery\n");
-        const tree = spawnSync("/usr/bin/git", ["-C", ctx.worktreePath, "show", "HEAD:RESUME.txt"], { encoding: "utf8" });
-        assert.equal(tree.status, 0, tree.stderr);
-        assert.equal(tree.stdout, "identifiable committed release recovery\n");
-        return resumeRun(ctx);
+      const secondFactory = () => {
+        const second = configureRig(makeMultiEpochRig([epochResponder(freshThread, "tn-fresh", (t, th, tn) => {
+          t.push(signalDone(th, tn)).push(turnCompleted("completed", th, tn));
+        })]), 1);
+        secondRigs.push(second);
+        const resumedExecutor = executorFor(second);
+        const resumeRun = resumedExecutor.run.bind(resumedExecutor);
+        resumedExecutor.run = async ctx => {
+          successorPath = ctx.worktreePath;
+          assert.equal(ctx.sessionId, undefined, "the retained-source successor starts a fresh session");
+          assert.notEqual(successorPath, predecessorPath);
+          assert.match(successorPath, /\.attempt-.*-g2-/);
+          assert.equal(await fs.readFile(path.join(ctx.worktreePath, "RESUME.txt"), "utf8"),
+            "identifiable committed release recovery\n");
+          const tree = spawnSync("/usr/bin/git", ["-C", ctx.worktreePath, "show", "HEAD:RESUME.txt"], { encoding: "utf8" });
+          assert.equal(tree.status, 0, tree.stderr);
+          assert.equal(tree.stdout, "identifiable committed release recovery\n");
+          return resumeRun(ctx);
+        };
+        return { executor: resumedExecutor, homeDir };
       };
       api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation! + 1);
-      await new RunRunner(client, git, () => ({ executor: resumedExecutor, homeDir }), diagnostics.log, 20,
+      await new RunRunner(client, git, secondFactory, diagnostics.log, 20,
         undefined, { pollMs: 5, recoveryRetryMs: 5, quiesceRun, gitlab: fakeGitlab().gitlab })
         .execute({ ...claim, claim_generation: claim.claim_generation! + 1, session_id: thread, last_seq: 1000 });
       assert.equal(api.states.at(-1)?.body.status, "completed", diagnostics.lines.join("\n"));
       assert.ok(api.codexRequests.filter(r => r.operation === "release").length > releasesBefore, "reclaim freshly authorizes");
+      const second = secondRigs.at(-1)!;
       const requests = second.epochs[0]!.transport.requests;
-      assert.equal(rec(requests.find(r => r.method === "thread/resume")!.params).threadId, thread);
-      assert.equal(requests.some(r => r.method === "thread/start"), false);
+      assert.equal(requests.some(r => r.method === "thread/resume"), false);
+      assert.equal(requests.filter(r => r.method === "thread/start").length, 1);
       assert.equal(second.epochs[0]!.transport.turnStartCount, 1);
+      assert.equal(await fs.readFile(path.join(predecessorPath, "RESUME.txt"), "utf8"),
+        "identifiable committed release recovery\n", "completion keeps the predecessor source");
       assert.ok(!api.states.some(s => s.body.status === "failed"));
     } finally { await api.close(); fx.cleanup(); }
   });
