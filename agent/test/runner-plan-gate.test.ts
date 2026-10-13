@@ -351,11 +351,11 @@ describe("2833 M3 runner Codex summary persistence", () => {
   }
 });
 
-it("M1 destructive checkpoint waits for summary settlement before reaping", { timeout: 8000 }, async () => {
+it("M1 destructive checkpoint waits for summary settlement before reaping", async () => {
   const { gitlab } = fakeGitlab();
   const claim = gitlabClaim(28385, { auto_approve: true });
   const settling = deferred(), drained = deferred();
-  let active = false, settled = false, reaps = 0;
+  let active = false, settled = false, prematureReap = false, reaps = 0;
   const executor: Executor = {
     async closeAndSettlePlanSummary() {
       if (!active) return;
@@ -365,6 +365,7 @@ it("M1 destructive checkpoint waits for summary settlement before reaping", { ti
     },
     killAgentTree() {
       if (!active) return;
+      if (!settled) prematureReap = true;
       assert.equal(settled, true, "summary drain precedes the destructive action");
       reaps++;
     },
@@ -377,17 +378,20 @@ it("M1 destructive checkpoint waits for summary settlement before reaping", { ti
     },
   };
   const execution = runner(executor, gitlab).execute(claim);
-  let timer: NodeJS.Timeout | undefined;
   try {
-    await Promise.race([settling.promise, new Promise<never>((_, reject) => {
-      timer = setTimeout(() => reject(new Error("checkpoint did not reach settlement")), 3000);
-    })]);
+    const reachedSettlement = await Promise.race([
+      settling.promise.then(() => true),
+      execution.then(() => false),
+    ]);
+    assert.equal(reachedSettlement, true, "checkpoint must reach settlement before execution ends");
+    await flushMicrotasks();
+    assert.equal(prematureReap, false, "a blocked drain cannot permit a reap attempt");
     assert.equal(reaps, 0, "a blocked drain cannot permit a reap");
   } finally {
-    clearTimeout(timer);
     drained.resolve();
     await execution;
   }
+  assert.equal(prematureReap, false, "summary drain precedes every destructive action");
   assert.ok(reaps > 0, "the checkpoint reaps after summary settlement");
 });
 
