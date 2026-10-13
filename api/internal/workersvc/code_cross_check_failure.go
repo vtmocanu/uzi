@@ -61,6 +61,7 @@ func (s *Service) RecordCodeCrossCheckFailure(ctx context.Context, worker store.
 			return result, freezeErr
 		}
 		params.GuidanceText = frozen.GuidanceText.String
+		params.RepoInstructionsCommit = frozen.RepoInstructionsCommit
 		params.RepoInstructionsEnabled = frozen.RepoInstructionsEnabled
 		params.RepoInstructionsText = frozen.RepoInstructionsText.String
 		params.BaseCommit = pgtype.Text{String: base, Valid: true}

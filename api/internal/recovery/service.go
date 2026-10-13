@@ -659,6 +659,9 @@ func (s *Service) ListHoldsForWorkerRun(ctx context.Context, wkr store.Worker, r
 // release.
 func (s *Service) Release(ctx context.Context, wkr store.Worker, runID uuid.UUID, req apitypes.RecoveryReleaseRequest) (apitypes.RecoveryReleaseResponse, error) {
 	if req.FinalDisposition != nil {
+		if req.FinalDisposition.Kind == FinalKindHeldPublication {
+			return s.releaseHeldPublication(ctx, wkr, runID, req)
+		}
 		return s.releaseFinalInventory(ctx, wkr, runID, req)
 	}
 	// PRD #1392 M1 (D3): the worker's release-evidence declaration is UNTRUSTED and allowlisted

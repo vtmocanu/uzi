@@ -1217,6 +1217,8 @@ export interface ClaimPlanCrossCheck {
 export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" | "planning_diff"> {
   stage: "code";
   head_commit: string;
+  /** Fresh default tip bound independently of repository-instructions consent; absent on legacy claims. */
+  repo_instructions_commit?: string;
   code_context: unknown;
   guidance_snapshot: string;
   /** Frozen repository-instructions consent and text (PRD #2170); text is "" unless enabled. */
@@ -1232,6 +1234,8 @@ export interface ClaimCodeCrossCheck extends Omit<ClaimPlanCrossCheck, "stage" |
 }
 
 export interface ClaimResponse {
+  /** True iff the worker advertised park_run_v1; absent means false, independent of phase. */
+  park_run_supported?: boolean;
   /** Protection requires this exact-generation assertion AND recovery_inventory_v1. */
   inventory_guarded?: boolean;
   cross_check?: ClaimPlanCrossCheck | ClaimCodeCrossCheck;
@@ -2335,6 +2339,8 @@ export type PublishResult =
   | { ok: false; httpStatus: number };
 
 export interface StateRequest {
+  /** Guard an awaiting_input write against a concurrent pause; requires a positive generation. */
+  require_running?: boolean;
   /** Immutable delivered final SHA; sent only with recovery_completed_publication_v1. */
   completion_final_head?: string;
   /** Required for an opted-in autopilot plan write; server-computed at submission. */
@@ -2578,6 +2584,16 @@ export interface StateRequest {
    *  which the worker's capability-aware fallback avoids by only sending it when the api
    *  advertised `recovery_park_cause` at register (D7). */
   recovery_cause?: string;
+  /** PRD #1733: with `recovery_cause: "provider_outage"` only (the api 400s it on any other report),
+   *  the count of successful model turns completed since this flight started, so the api
+   *  can tell a streak of unproductive outages from one that made progress in between. Gated on
+   *  `recovery_cause_provider_outage` and sent together with that cause; omitted otherwise. */
+  productive_turns?: number;
+  /** Successful model turns since this flight started, durably consumed by the api to clear
+   *  the old provider-outage streak on a nonprovider recovery_wait park (cause absent,
+   *  empty_turn or data_volume_full). Nonnegative int32; requires a positive claim_generation
+   *  and provider_progress_on_recovery_park_v1. Credential deferrals never send this evidence. */
+  provider_progress_turns?: number;
   /** PRD #1809 D6: qualifies a `recovery_cause: "data_volume_full"` park. `true` parks WITHOUT
    *  counting toward the api's lifetime cap (UZI_RUN_DISK_PARK_MAX), for M4's soft cache-cap park;
    *  absent or false is a counted park, and past the cap the api fails the run itself (fail_origin
@@ -2825,6 +2841,11 @@ export interface InputsResponse {
  *  status of a run this worker owns. A 404 (not owned / reclaimed) is signalled by a
  *  thrown RequestError, not by this shape. */
 export interface RunOwnershipResponse {
+  /** Same-row park classification; omission cannot prove an ordinary owner pause. PRD #1733: the
+   *  worker reads a `paused` + `provider_unavailable` pair as an accepted provider-outage park whose
+   *  ack was lost; an absent field (an api that does not expose it) is never read as that pair. */
+  hold_reason?: string | null;
+  claim_released?: boolean;
   inventory_guarded?: boolean;
   status: string;
   /** PRD #1391 Run B M4: the run's current `claim_generation` (additive on the probe). The run-lane
@@ -2996,11 +3017,49 @@ export interface RecoveryReleaseResponse {
  *  the hold it took at that claim generation; a v1 worker omits it (settle by run+worker).
  *  The call sites that populate it are M2's — M1 only freezes the shape. */
 export interface RecoveryFinalDisposition {
-  kind: "archive" | "settled";
+  kind: "archive" | "settled" | "held_publication";
   capture_id?: string;
+  /** Issue #2545: the held publication's id (kind "held_publication" only). */
+  publication_id?: string;
   source_sha?: string;
   coverage_digest: string;
 }
+
+/** Issue #2545 step A: the api's answer to POST /api/worker/runs/{id}/held-publication. Mirrors
+ *  api/internal/apitypes/held_publication.go. ONLY `state === "created"` means the work is on the
+ *  forge at `tip`; every other state sends the worker to the archive path. */
+export interface HeldPublicationResponse {
+  publication_id: string;
+  ref: string;
+  tip: string;
+  state: string;
+  reason?: string;
+}
+
+/** Issue #2545 step B: the bounded reasons a held_publication FINAL may be retained with. Pinned to
+ *  fixtures/api-contract/recovery_held_final.reasons.json by client-held-publication.test.ts. */
+export const HELD_FINAL_RETAINED_REASONS = [
+  "held_publication_unsupported",
+  "held_publication_unavailable",
+  "held_publication_ref_missing",
+  "held_publication_ref_mismatch",
+  "held_publication_not_eligible",
+] as const;
+export type HeldFinalRetainedReason = (typeof HELD_FINAL_RETAINED_REASONS)[number];
+
+/** The retained reasons after which the worker clears its journaled held FINAL and falls back to the
+ *  archive. `held_publication_unavailable` (the forge could not be listed) is the one transient
+ *  reason: a held FINAL is never cleared for lack of fresh proof.
+ *  DEVIATION NOTE: the api fixture marks `held_publication_unsupported` non-definitive on the SERVER
+ *  side (its capability or switch may return); the worker still archives on it, because an archive
+ *  FINAL is always an available, safe disposition and waiting forever on a withdrawn feature would
+ *  strand the hold. */
+export const HELD_FINAL_FALLBACK_REASONS: ReadonlySet<string> = new Set([
+  "held_publication_unsupported",
+  "held_publication_ref_missing",
+  "held_publication_ref_mismatch",
+  "held_publication_not_eligible",
+]);
 
 export interface RecoveryReleaseRequest {
   final_disposition?: RecoveryFinalDisposition;

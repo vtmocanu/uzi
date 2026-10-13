@@ -1,5 +1,18 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { isParkAnswer } from "../src/park-run.js";
+
+describe("M3 exact park answers", () => {
+  it("requires a nonempty exact validated answer and leaves prose/actionable answers alone", () => {
+    assert.equal(isParkAnswer({ kind: "cancel" }), false);
+    for (const answers of [[], [""], [" ", "\t"], ["/park", "continue"], ["/park later"], ["Still waiting; stay parked"], ["Implement M2 now"]]) {
+      assert.equal(isParkAnswer({ kind: "answer", answers }), false);
+    }
+    for (const answers of [["/park"], [" /park "], ["", " ", " /park ", "/park"]]) {
+      assert.equal(isParkAnswer({ kind: "answer", answers }), true);
+    }
+  });
+});
 import { buildSignalMcpServer, isSignalToolName, REPORT_MD_MAX_LEN, scanSignals } from "../src/signals.js";
 
 // The plan/done signals are observed from the SDK message stream, so a scripted
@@ -1136,5 +1149,15 @@ describe("buildSignalMcpServer", () => {
     const s = buildSignalMcpServer() as unknown as { type: string; name: string };
     assert.strictEqual(s.type, "sdk");
     assert.strictEqual(s.name, "uzi");
+  });
+});
+
+describe("M3 park_run scanning", () => {
+  it("takes only noarg main-thread park signals", () => {
+    assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", {})), { parkRun: true });
+    assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", [])), {});
+    assert.deepEqual(scanSignals(subagentToolUse("mcp__uzi__park_run", {})), {});
+    assert.deepEqual(scanSignals(toolUse("mcp__uzi__park_run", { reason: "wait" })), {});
+    assert.equal(isSignalToolName("mcp__uzi__park_run"), true);
   });
 });

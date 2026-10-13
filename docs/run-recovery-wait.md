@@ -13,15 +13,17 @@ Uzi retries in place and, if the trouble persists, parks the run in
 
 - A **positively empty SDK turn** — a turn that finishes with a reported
   turn count of zero and no model activity, plan, question, or completion.
-- A **transient provider error** — the Anthropic API returning 408, 429, or
-  any 5xx (500/502/503/504/529), or a status-less transport error.
+- A **transient Claude provider error** — a failed turn carrying a 408, 429,
+  or 5xx status, including when its reason is not `api_error`; a failed
+  `api_error` with no status also qualifies.
 - A **transient Codex provider error** — on the Codex harness, a turn that
   ends failed because the provider was overloaded (`serverOverloaded`), had an
   internal server error (`internalServerError`), or had no flex capacity
   (`flexUnavailable`), or because Codex's HTTP transport failed (a connection
   or stream failure, or too many failed attempts) with a 408, 429, or 5xx
-  status or no status. Codex's own rate-limit and usage-limit errors are not
-  included; they keep their existing handling.
+  status or no status. The exact Codex token `rateLimitExceeded` also qualifies.
+  `usageLimitExceeded` keeps its [usage-limit handling](./run-limit-wait.md),
+  and `sessionBudgetExceeded` keeps its existing handling.
 
 Uzi retries the interruption a few times in place. A Codex provider error is
 retried on the same thread up to 2 times per turn, after a short wait
@@ -66,8 +68,9 @@ an unverified capture attempt.
 ## What happens automatically
 
 For these empty-turn and provider recoveries, after verified capture, the server parks the run on a capped exponential
-backoff and returns it to `queued` when that delay passes. There is no
-lifetime cap on recovery parks and no manual resume step.
+backoff and returns it to `queued` when that delay passes. Empty-turn and
+resumed-gate recovery have no lifetime cap or manual resume step. Typed provider
+parks use the elapsed streak bound below.
 
 An ordinary unwired resume can recover from the verified local checkpoint
 with same-path session continuity, provided its key has never entered
@@ -93,6 +96,75 @@ its work entirely, the existing plan-review safeguard still applies.
 This fix does not reconstruct plan text missing from older runs. A legacy
 auto-approved run whose stored plan is empty can still need a new planning
 turn; an approval flag alone is not an implementation-ready plan.
+
+## Provider outage streaks
+
+With a compatible worker and API, a provider-origin park stores
+`recovery_wait_cause: provider_outage`. The run surfaces show the provider
+park count, streak start and next retry. `provider_park_count` counts the
+current streak, separately from the backoff counter; it is not a lifetime
+attempt budget. `provider_park_streak_started_at` starts at the first park.
+
+The default bound is **24 hours** (`RUN_PROVIDER_PARK_MAX_DURATION`;
+`0` disables the hold while typing and counting remain enabled). At the
+next qualifying provider park at or past that bound, the run becomes
+`paused` with `hold_reason: provider_unavailable`, waiting for its owner
+instead of retrying automatically. This policy does not fail the run.
+Detection can lag by backoff, jitter, queue/claim delay and the next attempt;
+there is no maximum overshoot promise or deadline-triggered sweep to a hold.
+
+A provider park reporting positive `productive_turns` starts a new streak
+at that park with count 1. These are completed, error-free model turns in
+the current flight, including planning, implementation and review; claiming
+the run or becoming `running` does not count as progress. Progress is not
+limited to provider parks: a flight that completed turns and then parks for
+another reason, an ordinary (untyped or `empty_turn`) or a disk
+(`data_volume_full`) recovery park, reports them as `provider_progress_turns`,
+and the API clears an open streak in the same statement that applies that
+park. Missing or zero evidence leaves the streak untouched, and the report
+must carry a positive `claim_generation`; the generation, status and release
+fences reject stale or replayed evidence, so it cannot reset a streak twice.
+Owner Resume,
+early credential-driven promotion and credential switching clear the streak.
+Automatic and vault-unlock promotion preserve it.
+
+For a **provider unavailable** hold:
+
+1. **Resume** (`uzi run resume <id>`) queues a fresh attempt and clears the
+   streak, or **Cancel** (`uzi run cancel <id>`) ends the run.
+2. To finalize completed work, eligible **Stop** first sets the scope ceiling,
+   then **Resume** separately. From the CLI, run `uzi run stop <id>` and,
+   after it succeeds, `uzi run resume <id>`. This is not an atomic endpoint.
+   Stop requires a non-interactive milestone issue run with at least one
+   completed milestone; other runs show why it is unavailable. Finalization
+   still requires the existing completion permit and budget checks. Another
+   provider outage during finalization can open a fresh streak.
+
+The hold retains the claim, worker affinity and the issue lock on issue
+runs. The worker keeps its clone and HOME; verified local captures can
+contain unpublished work. These are not a guarantee of recovery after
+losing that worker's storage: another worker can recover published work or
+an available verified recovery copy, not an unverified capture or every
+latest edit. Pending pause requests are satisfied and cleared by this hold.
+
+Typed reporting requires the negotiated `recovery_cause_provider_outage`
+feature. Old workers, or new workers against an API without it, send untyped
+parks with the old behavior. If a worker cached the feature before an API
+rollback, a positively identified older strict decoder's unknown-field
+refusal triggers one untyped resend and disables the cached feature;
+ordinary validation errors do not. Recognizing `paused` alone does not
+make rollback safe: older APIs lack the provider hold's late-failure guards.
+
+`provider_progress_turns` is gated separately by the negotiated
+`provider_progress_on_recovery_park_v1` feature. A worker sends it only after
+seeing that feature, only with a positive claim generation, and only on an
+ordinary or disk recovery park. If the API refuses it as an unknown field
+(a positively identified strict-decoder refusal after a rollback), the worker
+drops the cached feature and re-sends the same park once without the field,
+keeping the fence; a refusal of that retry propagates, and there is no third
+variant. An old worker or an old API therefore sends no progress evidence and
+the streak is preserved, the conservative direction: the bound may fire
+earlier than it would have, never later.
 
 ## Bounded retained-source recovery
 
@@ -162,8 +234,10 @@ workers may drop its durable recovery fields. See
 
 ## If it never recovers
 
-The empty-turn and provider recovery park has no timeout or lifetime-attempt failure. You
-can **cancel** the run at any time. Normal watchdogs still apply while it
+Empty-turn and resumed-gate recovery have no lifetime park cap. Typed provider
+recovery stops automatic retries at the elapsed streak bound and asks its
+owner to Resume, use eligible Stop then Resume, or Cancel. You can **cancel**
+the run at any time. Normal watchdogs still apply while it
 is running, including while it retries capture; recovery does not override
 a genuine timeout or cancellation.
 

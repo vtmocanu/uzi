@@ -77,15 +77,16 @@ type ObservedWorker struct {
 	HasNixPVC      bool
 	HasDinDDataPVC bool
 	// Incarnation and pod-list evidence are used only by fenced DinD maintenance.
-	DeploymentUID         string
-	DeploymentTerminating bool
-	DinDPVCUID            string
-	DinDPVCLive           bool
-	DinDPVCPhase          string
-	DinDPVCCreatedAt      *time.Time
-	PodsKnown             bool
-	WorkerPodCount        int
-	ReadyPodUID           string
+	DeploymentResourceVersion string
+	DeploymentUID             string
+	DeploymentTerminating     bool
+	DinDPVCUID                string
+	DinDPVCLive               bool
+	DinDPVCPhase              string
+	DinDPVCCreatedAt          *time.Time
+	PodsKnown                 bool
+	WorkerPodCount            int
+	ReadyPodUID               string
 	// NixPVCSize is the observed /nix PVC's requested storage (spec.resources.requests[storage]),
 	// recorded ONLY from a LIVE (deletionTimestamp == nil) nix PVC. nil means "no live nix PVC
 	// observed" — the PVC is absent OR Terminating. M3's size-drift arm compares it against the
@@ -282,6 +283,8 @@ func (l *Loop) Run(ctx context.Context) {
 // against a view we just admitted we could not read is how a healthy worker gets
 // clobbered. Retrying next tick costs one interval.
 func (l *Loop) Tick(ctx context.Context) error {
+	start := l.now()
+	ctx = WithPollStart(ctx, start)
 	resp, err := l.poller.Poll(ctx)
 	if err != nil {
 		return err
@@ -290,9 +293,7 @@ func (l *Loop) Tick(ctx context.Context) error {
 	if err != nil {
 		return err
 	}
-	if err := l.materializer.Reconcile(ctx, resp.Workers, observed); err != nil {
-		return err
-	}
+	reconcileErr := l.materializer.Reconcile(ctx, resp.Workers, observed)
 
 	// Roll health goes LAST, and its error is logged-and-swallowed rather than
 	// returned (PRD #113 M3). Both properties are deliberate.
@@ -306,8 +307,8 @@ func (l *Loop) Tick(ctx context.Context) error {
 	// reconciling workers because a status POST failed would be strictly worse than
 	// the one we have today, which does not report at all — an observability feature
 	// must never be able to take down the thing it observes.
-	l.report(ctx, observed)
-	return nil
+	l.report(ctx, observed, resp.Workers)
+	return reconcileErr
 }
 
 // report sends per-worker roll health, if a reporter is wired.
@@ -315,19 +316,27 @@ func (l *Loop) Tick(ctx context.Context) error {
 // A nil reporter is a supported configuration, not a degraded one: it is what every
 // existing test constructs, and it keeps this milestone's addition strictly additive
 // to a loop whose failure modes are already understood.
-func (l *Loop) report(ctx context.Context, observed []ObservedWorker) {
+func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []protocol.DesiredWorker) {
 	if l.reporter == nil {
 		return
 	}
+	var outcomes map[string]*protocol.Pacing
+	if source, ok := l.materializer.(interface {
+		PacingOutcomes() map[string]*protocol.Pacing
+	}); ok {
+		outcomes = source.PacingOutcomes()
+	}
 	workers := make([]protocol.WorkerStatus, 0, len(observed))
+	reported := make(map[string]bool, len(observed))
 	for _, o := range observed {
-		// A worker with no pod information contributes no row. Reporting a blank phase
-		// would be an assertion about a worker we did not observe a pod for, and the
-		// api treats an absent row as "no signal" — which is the truth here.
+		// Without pod health, only a desired worker's pacing outcome supplies a
+		// rolling-gap fallback below. Otherwise an absent row means no signal.
 		if o.Roll.Phase == "" {
 			continue
 		}
+		reported[o.ID] = true
 		workers = append(workers, protocol.WorkerStatus{
+			Pacing:            outcomes[o.ID],
 			ID:                o.ID,
 			Phase:             o.Roll.Phase,
 			PhaseSince:        timePtr(o.Roll.PhaseSince),
@@ -339,7 +348,20 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker) {
 			LastExitCode:      o.Roll.LastExitCode,
 		})
 	}
+	// Iterate the finite desired snapshot, not the outcome map: stale outcomes
+	// cannot add workers outside the poll, and each worker contributes at most one row.
+	for _, w := range desired {
+		pacing := outcomes[w.ID]
+		if reported[w.ID] || pacing == nil {
+			continue
+		}
+		reported[w.ID] = true
+		workers = append(workers, protocol.WorkerStatus{
+			ID: w.ID, Phase: protocol.PhaseRolling, TargetImage: pacing.TargetImage, Pacing: pacing,
+		})
+	}
 	report := protocol.StatusReport{
+		Kind:                "fleet",
 		ReportedAt:          l.now(),
 		PollIntervalSeconds: int(l.interval.Seconds()),
 		WorkerImageTag:      l.workerImageTag,

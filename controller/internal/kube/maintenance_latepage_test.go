@@ -23,13 +23,13 @@ func TestDinDLaterPodPagesKeepStopGateClosed(t *testing.T) {
 		client.PrependReactor("list", "pods", func(a k8stesting.Action) (bool, runtime.Object, error) {
 			options := a.(interface{ GetListOptions() metav1.ListOptions }).GetListOptions()
 			pages++
-			if pages == 1 {
+			if pages == 1 || pages == 3 {
 				if options.Continue != "" || options.Limit != 256 {
 					t.Fatalf("first page options %+v", options)
 				}
 				return true, &corev1.PodList{ListMeta: metav1.ListMeta{Continue: "next"}, Items: make([]corev1.Pod, 256)}, nil
 			}
-			if pages != 2 || options.Continue != "next" {
+			if (pages != 2 && pages != 4) || options.Continue != "next" {
 				t.Fatalf("page/options %d %+v", pages, options)
 			}
 			if failed {
@@ -39,7 +39,7 @@ func TestDinDLaterPodPagesKeepStopGateClosed(t *testing.T) {
 			return true, &corev1.PodList{Items: []corev1.Pod{pod}}, nil
 		})
 		err := m.Reconcile(context.Background(), []protocol.DesiredWorker{w}, nil)
-		if (err != nil) != failed || pages != 2 {
+		if (err != nil) != failed || pages != 4 {
 			t.Fatalf("failed=%v pages=%d err=%v", failed, pages, err)
 		}
 		if f.op.Phase != "stopping" || len(f.calls) != 0 {

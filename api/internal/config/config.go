@@ -533,6 +533,12 @@ type Config struct {
 	// fail_origin='data_volume_full'. A PREVENTIVE park (the worker stopped the run before the
 	// volume filled) is neither counted nor capped. 0 = unlimited; the default (3) lives in Load.
 	RunDiskParkMax int
+	// Provider-transient park bound (PRD #1733, RUN_PROVIDER_PARK_MAX_DURATION). An unbroken
+	// streak of typed provider_outage recovery parks is bounded in ELAPSED time: the first
+	// provider park at or past this age since the streak began becomes a paused owner hold
+	// (hold_reason 'provider_unavailable') instead of another recovery_wait. It never fails a
+	// run. 0 disables the hold (typing and counting stay on); the default (24h) lives in Load.
+	RunProviderParkMaxDuration time.Duration
 
 	// CI status integration (PRD #6). The pipeline sync rides the existing poller
 	// tick (no new interval). CIWatchRunWindow bounds how long a finished run's
@@ -805,6 +811,13 @@ type Config struct {
 	// on a forge that left the list is settled 'disabled' (after a CAS delete of any
 	// unrecorded copy), so a rollback can still make forge calls for existing rows.
 	SalvageForges []string
+
+	// HeldPublication (issue #2545, UZI_HELD_PUBLICATION) is the held-work publication switch.
+	// Unset or empty means on. Accepted values, case-insensitive and trimmed: true, on, 1, yes, t,
+	// y (on) and false, off, 0, no, f, n (off); any other value fails startup. It is copied to
+	// workersvc.Params.HeldPublication (step A admission); the handler reads it from Config for the
+	// advertised protocol feature and step B.
+	HeldPublication bool
 }
 
 // placeholderSecrets are values that must never be accepted as a real signing
@@ -1245,6 +1258,11 @@ func Load() (Config, error) {
 	// invalid or negative value falls back to the default of 3 counted disk parks.
 	cfg.RunDiskParkMax = parseNonNegInt("UZI_RUN_DISK_PARK_MAX", 3)
 
+	// Provider-transient park bound (PRD #1733). parseNonNegDuration, NOT parseDuration:
+	// RUN_PROVIDER_PARK_MAX_DURATION=0 is legal and disables the hold (parseDuration would turn
+	// it into the default), while a negative or malformed value falls back to 24h.
+	cfg.RunProviderParkMaxDuration = parseNonNegDuration("RUN_PROVIDER_PARK_MAX_DURATION", 24*time.Hour)
+
 	cfg.SkillMaxBytes = parseInt("SKILL_MAX_BYTES", 65536)
 	cfg.SkillsMaxPerRun = parseInt("SKILLS_MAX_PER_RUN", 32)
 
@@ -1423,6 +1441,12 @@ func Load() (Config, error) {
 		return Config{}, err
 	}
 	cfg.SalvageForges = salvageForges
+
+	heldPublication, err := parseOnOff("UZI_HELD_PUBLICATION", true)
+	if err != nil {
+		return Config{}, err
+	}
+	cfg.HeldPublication = heldPublication
 
 	// Must run after Addr and TLSAddr are set (it rejects the two colliding).
 	if err := loadTLS(&cfg); err != nil {
@@ -2272,6 +2296,22 @@ func parseBool(key string, def bool) (bool, error) {
 		return false, fmt.Errorf("%s must be a boolean (true/false), got %q", key, raw)
 	}
 	return v, nil
+}
+
+// parseOnOff parses a switch that operators write either as a boolean or as on/off. Empty or
+// unset returns def; true/on/1/yes and false/off/0/no are accepted case-insensitively. Anything
+// else is an error, so a typo fails boot instead of silently keeping the default.
+func parseOnOff(key string, def bool) (bool, error) {
+	raw := strings.ToLower(strings.TrimSpace(os.Getenv(key)))
+	switch raw {
+	case "":
+		return def, nil
+	case "true", "on", "1", "yes", "t", "y":
+		return true, nil
+	case "false", "off", "0", "no", "f", "n":
+		return false, nil
+	}
+	return false, fmt.Errorf("%s must be on/off or true/false, got %q", key, os.Getenv(key))
 }
 
 // parsePositiveInt parses a strictly-positive integer env var. Empty/unset returns

@@ -59,11 +59,14 @@ func (s *Service) Reconcile(ctx context.Context, wkr store.Worker, runID, captur
 	// An accepted identity is authoritative even after expiry, and may differ
 	// from this request. Echo it unchanged; only the caller can exact-match it.
 	if hold.State == "released" {
-		if hold.FinalDisposition.String == "archive" || hold.FinalDisposition.String == "settled" {
+		if hold.FinalDisposition.String == "archive" || hold.FinalDisposition.String == "settled" || hold.FinalDisposition.String == FinalKindHeldPublication {
 			res.Outcome = "accepted"
 			res.FinalReceipt = &apitypes.RecoveryFinalDisposition{Kind: hold.FinalDisposition.String, SourceSha: hold.FinalSourceSha.String, CoverageDigest: hold.FinalCoverageDigest.String}
 			if hold.FinalCaptureID.Valid {
 				res.FinalReceipt.CaptureID = uuid.UUID(hold.FinalCaptureID.Bytes).String()
+			}
+			if hold.FinalPublicationID.Valid {
+				res.FinalReceipt.PublicationID = uuid.UUID(hold.FinalPublicationID.Bytes).String()
 			}
 			if hold.FinalDisposition.String == "settled" {
 				res.ReleaseEvidence = hold.ReleaseEvidence.String

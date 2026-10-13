@@ -227,7 +227,9 @@ backfilled. Failed/cancelled/parked runs and other kinds keep their prior rules.
 Quarantine can permit the existing custody release exception but blocks
 physical destruction. Bad-MAC terminal cleanup remains its separate policy.
 No intent, endpoint, discovery, driver or E2E mechanism is added; #2544,
-#2545 and #2506 remain outside this change.
+#2545 and #2506 remain outside this change. (2026-10-12: #2545 is now
+implemented by [ADR-2545](2545-failed-run-held-publication.md); see the
+amendment below. #2544 and #2506 remain excluded.)
 
 ## Amendment 2026-10-11 — published-redundancy early expiry (#2625)
 
@@ -309,3 +311,27 @@ size is promised.
 Explicit discard semantics are unchanged, as is failed, cancelled and parked
 run handling. Only the completed, identity-stamped, released-hold case above
 can expire early.
+
+## Amendment 2026-10-12 — held-publication FINAL as covering acknowledgment (#2545)
+
+**Status**: Implemented in worker and API. See
+[ADR-2545](2545-failed-run-held-publication.md) for the publication design.
+
+A failed run's journaled `held_publication` FINAL, once ACKed, is a covering
+final acknowledgment for the local retirement rules above. Its retained copy is
+the forge ref `refs/uzi-held/<run-id>/<generation>`, which the API listed at the
+declared tip before release. It therefore does not need the self-contained,
+prerequisite-free bundle that an archive FINAL needs. Every other covering check
+still applies: the inventory is inactive, every unresolved root and retained
+source head is an ancestor of the FINAL's source SHA, clone heads are verified,
+and quarantine blocks physical destruction. The API releases only when the
+request exactly matches the created publication row (publication id, source SHA,
+coverage digest), and on replay the hold's stored receipt. The worker sends the
+request verbatim from its journal and checks the ACK's run, generation and
+release flags before the
+record is marked acknowledged and the generation is retired. A retained or
+cleared held FINAL grants no destruction authority, and the worker keeps the
+clone, pins and open hold. A transient retention keeps the journaled request
+for replay. A definitive one clears it, and the worker captures an archive on
+the same record, which then follows the archive rules above. #2544 and #2506
+remain excluded.

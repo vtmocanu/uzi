@@ -447,7 +447,13 @@ export function renderCodexRun(request: RunTurnRequest): RenderedCodexRun {
   const leadGrants: RunGrants = {
     role: LEAD_ROLE,
     phase: request.phase,
-    allowedTools: sortedSet([...fullVocabulary(true), ...(request.codeCrossCheck ? [CODE_DISPOSITIONS_TOOL] : [])]),
+    allowedTools: sortedSet([
+      ...fullVocabulary(true).filter((tool) => tool !== "park_run"
+        || (request.phase === "implement" && request.parkRunSupported === true && request.nonInteractiveIssue === true)),
+      ...(request.codeCrossCheck ? [CODE_DISPOSITIONS_TOOL] : []),
+    ]),
+    parkRunSupported: request.parkRunSupported,
+    nonInteractiveIssue: request.nonInteractiveIssue,
     allowedSkills: buildAllowedSkills(request.leadSkills, LEAD_ROLE, diagnostics),
     isRoot: true,
   };

@@ -592,20 +592,45 @@ describe("RunRunner — over-cap forge answers are permanent and treated as unre
 
 // PRD #1798 M6 (amended D10, M1): a legacy non-closing run whose publisher NEVER read the PR must not
 // complete on the strength of having observed nothing. It falls back to the blind whole-body
-// non-closing rewrite; only when that is refused too does the run fail closed.
+// non-closing rewrite; only when that is refused too does the run fail closed. Since #2815 a
+// scope-capped or owner-partial run also reads its PR title back, so a PR that is never readable at
+// all fails closed on the title confirm even when the blind description rewrite lands.
 describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD #1798 M6, amended D10)", () => {
   const closingCompletion = (iid: number) =>
     [COMPLETION_START, `Related to #${iid}.`, "", `Closes #${iid}`, "", "---", "Opened by uzi.", COMPLETION_END].join("\n");
 
-  it("every GET is refused (403): the blind non-closing rewrite lands and the scope-capped run completes non-closing", async () => {
+  it("description reads refused (403) before the blind rewrite: the rewrite lands and the scope-capped run completes non-closing", async () => {
     const existing = `${SIZE_REGION}\n\n${closingCompletion(1930)}`;
-    const { gitlab, pr, calls } = fakeGitlab({ headStatus: 403, existing });
+    // Issue #2815: the title confirm also reads the PR now, so only the reads BEFORE the blind
+    // description write are refused; the title read after it succeeds.
+    let written = false;
+    const { gitlab, pr, calls } = fakeGitlab({
+      existing,
+      onWrite: () => { written = true; },
+      intercept: req => req.method === "GET" && !written ? { status: 403, text: async () => "{}" } : undefined,
+    });
     const claim = gitlabClaim(1930);
 
     await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
 
     assert.ok(statuses(claim.run_id).includes("completed"), "the blind rewrite removed the directive");
     assert.equal(closingDirectiveFor(pr.description, 1930, "org/repo"), false);
+    assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "one blind write");
+  });
+
+  it("every GET is refused (403): the blind rewrite lands but the unreadable title fails the scope-capped run closed (#2815)", async () => {
+    const existing = `${SIZE_REGION}\n\n${closingCompletion(1933)}`;
+    const { gitlab, pr, calls } = fakeGitlab({ headStatus: 403, existing });
+    const claim = gitlabClaim(1933);
+
+    await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
+
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    const failed = api.states.find((st) => st.runId === claim.run_id && st.body.status === "failed")?.body;
+    assert.equal(failed?.failure_reason,
+      "completion interlock: a closing directive could not be removed from a non-closing merge request's title; the merge request remains open and must not be merged as-is");
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(closingDirectiveFor(pr.description, 1933, "org/repo"), false, "the blind description rewrite still landed");
     assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "one blind write");
   });
 
@@ -630,7 +655,9 @@ describe("RunRunner — a legacy non-closing run whose PR is never readable (PRD
 
     await runner(new ScopeCappedStub(nullLogger()), gitlab).execute(claim);
 
-    assert.equal(reads.length, 1, "the over-cap read is permanent: not retried");
+    // One refused over-cap description read (permanent: not retried) plus, since #2815, the title
+    // confirm read of the already rewritten (small) body.
+    assert.equal(reads.length, 2, "one over-cap read (permanent: not retried) plus the title confirm read");
     assert.equal(calls.filter((c) => c.method === "PUT").length, 1, "the blind rewrite");
     assert.ok(statuses(claim.run_id).includes("completed"));
     assert.equal(closingDirectiveFor(pr.description, 1932, "org/repo"), false);
@@ -791,4 +818,198 @@ describe("m2 non-closing delivery", () => {
     assert.match(pr.description, /Approved follow-up remains/);
     assert.equal(closingDirectiveFor(pr.description, 2172, "org/repo"), false);
   });
+
+  // Issue #2779: the PR TITLE of a declared non-closing issue run must not close the issue either.
+  const CLOSING_TITLE = "Fixes #2172";
+  function failureReason(runId: string): string | undefined {
+    return api.states.find(st => st.runId === runId && st.body.status === "failed")?.body.failure_reason;
+  }
+  const TITLE_REASON =
+    "completion interlock: a closing directive could not be removed from a non-closing merge request's title; the merge request remains open and must not be merged as-is";
+
+  it("m2 non-closing raw Claude frames through SdkExecutor retitle a closing issue title", async () => {
+    const { gitlab, pr } = fakeGitlab();
+    const claim = gitlabClaim(2172, { issue_title: CLOSING_TITLE });
+    api.setInputs(claim.run_id, [input("approve_plan")]);
+    let turn = 0;
+    const queryFn: SdkQueryFn = params => (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      if (turn++ === 0) {
+        yield assistant([{ type: "tool_use", id: "plan", name: "mcp__uzi__submit_plan", input: { plan_md: "Approved follow-up remains open" } }]);
+      } else {
+        const cwd = params.options.cwd!;
+        fs.writeFileSync(path.join(cwd, "m2.txt"), "delivered work\n");
+        execFileSync("git", ["-C", cwd, "add", "m2.txt"]);
+        execFileSync("git", ["-C", cwd, "-c", "user.name=Test", "-c", "user.email=test@example.test", "-c", "commit.gpgsign=false", "commit", "-m", "m2 work"]);
+        yield assistant([{ type: "tool_use", id: "done", name: "mcp__uzi__signal_done", input: { non_closing: { reason: "Approved follow-up remains" } } }]);
+      }
+      yield resultOk();
+    })();
+    await runnerWith(() => ({ executor: new SdkExecutor(nullLogger(), homeDir, { queryFn }), homeDir }), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(closingDirectiveFor(pr.title, 2172, "org/repo"), false, "the created PR title does not close the issue");
+    assert.ok(pr.title.includes("#2172"));
+  });
+
+  for (const interlocked of [false, true]) {
+    it(`m2 non-closing ${interlocked ? "interlocked" : "legacy"} declared run creates its PR with a non-closing title`, async () => {
+      const { gitlab, pr, calls } = fakeGitlab();
+      const claim = interlocked ? interlockedClaim(2172) : gitlabClaim(2172);
+      claim.issue_title = CLOSING_TITLE;
+      api.setCompletionPermitResponse(true);
+      await runner(declaring("Approved follow-up remains"), gitlab).execute(claim);
+      assert.ok(statuses(claim.run_id).includes("completed"));
+      assert.equal(closingDirectiveFor(pr.title, 2172, "org/repo"), false);
+      const create = calls.find(c => c.method === "POST");
+      assert.ok(create, "the create POST was recorded");
+      const createdTitle = String(JSON.parse(create.body ?? "{}").title);
+      assert.equal(closingDirectiveFor(createdTitle, 2172, "org/repo"), false, `create-time title is non-closing: ${createdTitle}`);
+      assert.ok(createdTitle.includes("#2172"));
+      assert.ok(!calls.some(c => c.method !== "POST" && "title" in JSON.parse(c.body ?? "{}") && !("description" in JSON.parse(c.body ?? "{}"))),
+        "no title-only write was needed");
+    });
+  }
+
+  it("m2 non-closing retitles an adopted PR whose title closes the issue", async () => {
+    const { gitlab, pr, calls } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), existingTitle: CLOSING_TITLE });
+    const claim = gitlabClaim(2172);
+    await runner(declaring("Approved follow-up remains"), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(closingDirectiveFor(pr.title, 2172, "org/repo"), false);
+    assert.ok(calls.some(c => (c.method === "PUT" || c.method === "PATCH") && JSON.parse(c.body ?? "{}").title !== undefined), "a title write was recorded");
+    assert.match(pr.description, /Maintainer notes\./, "the description survives a title write");
+  });
+
+  it("m2 non-closing leaves a clean adopted title untouched (no title write)", async () => {
+    const clean = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), existingTitle: "Tidy title" });
+    await runner(declaring("Approved follow-up remains"), clean.gitlab).execute(gitlabClaim(2172));
+    assert.equal(clean.pr.title, "Tidy title");
+    assert.ok(!clean.calls.some(c => JSON.parse(c.body ?? "{}").title !== undefined && c.method !== "POST"));
+  });
+
+  it("m2 non-closing fails closed, without a hold, when the PR title cannot be read", async () => {
+    const { gitlab } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), omitTitle: true });
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(failureReason(claim.run_id), TITLE_REASON);
+  });
+
+  it("m2 non-closing fails closed, without a hold, when the closing title cannot be rewritten", async () => {
+    const { gitlab, pr } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), existingTitle: CLOSING_TITLE, titleWriteStatus: 403 });
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(failureReason(claim.run_id), TITLE_REASON);
+    assert.equal(pr.title, CLOSING_TITLE, "the forge refused the write");
+  });
+
+  it("m2 non-closing falls back to a fixed title when the forge refuses the rewritten one (422)", async () => {
+    const { gitlab, pr } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), existingTitle: CLOSING_TITLE, titleWriteStatuses: [422] });
+    const claim = gitlabClaim(2172);
+    await runner(declaring("Approved follow-up remains"), gitlab).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.equal(pr.title, "Work on issue #2172");
+  });
+
+  it("m2 non-closing fails closed, without a hold, when the title write succeeds but the re-read still closes", async () => {
+    const { gitlab, pr } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), existingTitle: CLOSING_TITLE, titleWriteIgnored: true });
+    const claim = interlockedClaim(2172);
+    api.setCompletionPermitResponse(true);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(failureReason(claim.run_id), TITLE_REASON);
+    assert.equal(pr.title, CLOSING_TITLE);
+  });
+
+  it("m2 non-closing legacy run: an unreadable title fails closed with no hold", async () => {
+    const { gitlab } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), omitTitle: true });
+    const claim = gitlabClaim(2172);
+    await runnerWith(() => ({ executor: declaring("Follow-up remains") }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+    assert.ok(statuses(claim.run_id).includes("failed"));
+    assert.ok(!statuses(claim.run_id).includes("completed"));
+    assert.equal(api.completionHoldRequests.length, 0);
+    assert.equal(failureReason(claim.run_id), TITLE_REASON);
+  });
+  // Issue #2815: owner-partial and #634 scope-capped deliveries never close their issue, so their PR
+  // title gets the same neutralisation and fail-closed confirmation as a declared non-closing run.
+  const DEFERRED = [{ milestone_id: "m2", title: "Later", reason: "owner deferred" }];
+  const partialModes: { name: string; claim: () => ReturnType<typeof gitlabClaim>; exec: () => StubExecutor }[] = [
+    { name: "owner-partial interlocked", claim: () => interlockedClaim(2172, { deferred: DEFERRED }), exec: () => declaring() },
+    { name: "owner-partial legacy", claim: () => gitlabClaim(2172, { config: { completion_scope: { deferred: DEFERRED } } }), exec: () => declaring() },
+    { name: "scope-capped interlocked", claim: () => interlockedClaim(2172), exec: () => declaring(undefined, { completedCount: 1, total: 2 }) },
+    { name: "scope-capped legacy", claim: () => gitlabClaim(2172), exec: () => declaring(undefined, { completedCount: 1, total: 2 }) },
+  ];
+
+  for (const mode of partialModes) {
+    describe(`#2815 ${mode.name}`, () => {
+      it("creates its PR with a non-closing [partial] title", async () => {
+        const { gitlab, pr, calls } = fakeGitlab();
+        const claim = mode.claim();
+        claim.issue_title = CLOSING_TITLE;
+        api.setCompletionPermitResponse(true);
+        await runner(mode.exec(), gitlab).execute(claim);
+        assert.ok(statuses(claim.run_id).includes("completed"));
+        const create = calls.find(c => c.method === "POST");
+        assert.ok(create, "the create POST was recorded");
+        const createdTitle = String(JSON.parse(create.body ?? "{}").title);
+        assert.equal(closingDirectiveFor(createdTitle, 2172, "org/repo"), false, `create-time title: ${createdTitle}`);
+        assert.ok(createdTitle.startsWith("[partial] ") && createdTitle.includes("#2172"), createdTitle);
+        assert.equal(closingDirectiveFor(pr.title, 2172, "org/repo"), false);
+        assert.ok(pr.title.startsWith("[partial] ") && pr.title.includes("#2172"), pr.title);
+      });
+
+      it("retitles an adopted PR whose title closes the issue", async () => {
+        const { gitlab, pr, calls } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), existingTitle: CLOSING_TITLE });
+        const claim = mode.claim();
+        api.setCompletionPermitResponse(true);
+        await runner(mode.exec(), gitlab).execute(claim);
+        assert.ok(statuses(claim.run_id).includes("completed"));
+        assert.equal(closingDirectiveFor(pr.title, 2172, "org/repo"), false);
+        assert.ok(calls.some(c => (c.method === "PUT" || c.method === "PATCH") && JSON.parse(c.body ?? "{}").title !== undefined), "a title write was recorded");
+      });
+
+      for (const [label, opts] of [["unreadable", { omitTitle: true }], ["write ignored", { existingTitle: CLOSING_TITLE, titleWriteIgnored: true }]] as const) {
+        it(`fails closed, without a hold, when the title is ${label}`, async () => {
+          const { gitlab } = fakeGitlab({ existing: adoptedBody(2172, "Maintainer notes."), ...opts });
+          const claim = mode.claim();
+          api.setCompletionPermitResponse(true);
+          await runnerWith(() => ({ executor: mode.exec() }), gitlab, undefined, undefined, { recoveryRetryMs: 1 }).execute(claim);
+          assert.ok(statuses(claim.run_id).includes("failed"));
+          assert.ok(!statuses(claim.run_id).includes("completed"));
+          assert.equal(api.completionHoldRequests.length, 0);
+          assert.equal(failureReason(claim.run_id), TITLE_REASON);
+        });
+      }
+    });
+  }
+
+  const fullModes: { name: string; claim: () => ReturnType<typeof gitlabClaim> }[] = [
+    { name: "full delivery legacy", claim: () => gitlabClaim(2172) },
+    { name: "full delivery interlocked", claim: () => interlockedClaim(2172) },
+    { name: "accept-only (nothing deferred)", claim: () => gitlabClaim(2172, { config: { completion_scope: { deferred: [], accepted: [{ id: "c1", milestone_id: "m1", text: "crit", reason: "owner accepted" }] } } }) },
+  ];
+  for (const mode of fullModes) {
+    it(`#2815 ${mode.name} keeps the plain closing-style title and writes no title`, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const claim = mode.claim();
+      claim.issue_title = CLOSING_TITLE;
+      api.setCompletionPermitResponse(true);
+      await runner(declaring(), gitlab).execute(claim);
+      assert.ok(statuses(claim.run_id).includes("completed"));
+      const create = calls.find(c => c.method === "POST");
+      assert.ok(create, "the create POST was recorded");
+      assert.equal(JSON.parse(create.body ?? "{}").title, CLOSING_TITLE);
+      assert.ok(!calls.some(c => c.method !== "POST" && c.method !== "GET" && "title" in JSON.parse(c.body ?? "{}") && !("description" in JSON.parse(c.body ?? "{}"))),
+        "no title-only write");
+    });
+  }
 });

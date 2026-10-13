@@ -52,6 +52,7 @@ export class CodeCrossCheckGate {
   private same(row: CodeCrossCheckRecord, authorized: CodeCrossCheckRecord): boolean {
     return row.candidate_digest === authorized.candidate_digest
       && row.head_commit === authorized.head_commit && row.base_commit === authorized.base_commit
+      && (row.repo_instructions_commit ?? null) === (authorized.repo_instructions_commit ?? null)
       && row.checker_run_id === authorized.checker_run_id
       && JSON.stringify(row.findings) === JSON.stringify(authorized.findings);
   }
@@ -138,8 +139,8 @@ export class CodeCrossCheckGate {
 export async function checkCode(options: {
   client: Pick<WorkerClient, "codeCrossCheckStatus" | "submitCodeCrossCheck">;
   runId: string; generation: number; signal: AbortSignal;
-  snapshot(): Promise<{ head_commit: string; base_commit: string } | { reason_class: "snapshot_failed" | "worker_unsupported" } | undefined>;
-  /** The root CLAUDE.md at `baseCommit` (readRepoInstructionsAtCommit), "" when absent or unreadable.
+  snapshot(): Promise<{ head_commit: string; base_commit: string; repo_instructions_commit?: string } | { reason_class: "snapshot_failed" | "worker_unsupported" } | undefined>;
+  /** The root CLAUDE.md at the instruction pin (baseCommit for legacy adapters), "" when absent or unreadable.
    *  Called only while the server reports repository instructions enabled. */
   readInstructions?(baseCommit: string, signal: AbortSignal): Promise<string>;
   pollMs?: number; requestMs?: number;
@@ -161,7 +162,7 @@ export async function checkCode(options: {
         if (!("base_commit" in snapshot)) return undefined;
         if (!enabled) return { repo_instructions_enabled: false };
         let text = "";
-        try { text = (await options.readInstructions?.(snapshot.base_commit, signal)) ?? ""; } catch { signal.throwIfAborted(); }
+        try { text = (await options.readInstructions?.(snapshot.repo_instructions_commit ?? snapshot.base_commit, signal)) ?? ""; } catch { signal.throwIfAborted(); }
         return { repo_instructions_enabled: true, repo_instructions_text: text };
       };
       const first = await instructionsFor(current.repo_instructions_enabled);
@@ -182,7 +183,7 @@ export async function checkCode(options: {
     }
     if ("result" in current) return undefined;
     if (current.candidate_generation !== generation || current.interrupted_at !== null) return maskSupersededAdvice(current);
-    const identity = JSON.stringify([current.head_commit, current.base_commit, current.candidate_digest, current.deadline_at]);
+    const identity = JSON.stringify([current.head_commit, current.base_commit, current.repo_instructions_commit ?? null, current.candidate_digest, current.deadline_at]);
     // Server deadline includes queue time; two hours also bounds a malformed far-future deadline.
     const deadline = Math.min(Date.parse(current.deadline_at), Date.now() + 2 * 60 * 60_000);
     while (current.outcome === "pending") {
@@ -195,7 +196,7 @@ export async function checkCode(options: {
         atDeadline ? options.requestMs ?? 3000 : deadline - Date.now());
       if ("result" in next) return undefined;
       if (next.candidate_generation !== generation || next.interrupted_at !== null) return maskSupersededAdvice(next);
-      if (identity !== JSON.stringify([next.head_commit, next.base_commit, next.candidate_digest, next.deadline_at])) return undefined;
+      if (identity !== JSON.stringify([next.head_commit, next.base_commit, next.repo_instructions_commit ?? null, next.candidate_digest, next.deadline_at])) return undefined;
       current = next;
       if (atDeadline) return current;
     }

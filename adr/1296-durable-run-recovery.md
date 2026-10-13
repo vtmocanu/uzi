@@ -523,6 +523,22 @@ this new field, while the new worker reads old field-absent journals. Rollback r
 inspection and adoption by returning to a compatible worker; refusal erases neither bytes nor pins.
 No server rollout is required.
 
+### Issue #2263: uploaded-record pin cleanup
+
+Supersedes, for non-guarded records, the #2021 sentence "A crash between the uploaded write and cleanup may leave the pin indefinitely: no retry or cleanup scheduler is added." The coordinator now deletes a surviving transient pin (`generation ?? 0`) of an `uploaded` record, closing two leaks: bundles installed before #2021 / PR #2249 (no `recoveryPinBareDir`; when the record also has no `bareDir`, bounded discovery of up to 256 bares, ambiguity refused; a record with `bareDir` uses it directly; a record carrying both `recoveryPinBareDir` and `bareDir` passes both, and a disagreement retains the pin as `invalid_identity`) and a crash after the authenticated `uploaded` write.
+
+**Archive proof.** Deletion requires an authenticated, non-guarded `uploaded` record with server capture id, checksum and size, `selfContained === true` and explicit empty `prerequisiteShas`; `archiveProvesPin` additionally requires no coverage digest, final request or completion receipt. A thin archive keeps its pin. Consequence: a park made with forge credentials usually bundles forge prerequisites, so its pin is now kept, where the runner deleted it unconditionally after upload. This was required at plan approval (issue #2263 plan review).
+
+**Eligibility** is decided under the journal lock, held across a bounded, fail-closed journal read and the delete (lock order journal, attribution, bare): no inventory-guarded record in the run, every same pin-generation record uploaded, residue quarantine clear, run not executing; execution and quarantine are rechecked synchronously before the Git commit. `GitCache.cleanupArchivedRecoveryPin` makes one bounded attempt (30 s; the coordinator caps each record at 10 s, `PIN_CLEANUP_RECORD_MS`, within the 60 s boot budget): bare identity (no `.git`/`commondir`/`gitdir` redirects, unsafe config keys, symlinked reflog paths and a symlinked or hard-linked `logs/HEAD`), a bounded `cat-file -t` that must print `commit`, then `update-ref --stdin` prepare/commit compare-and-delete. Every failure retains the pin with a reason; an uncommitted transaction is aborted gracefully so no ref lock is stranded (teardown may add up to the 5 s abort grace beyond the cap).
+
+**Paths.** Upload path: retains `executing` while the run is still executing (normal for the runner's own settle); the live pass deletes later. Boot sweep: after uploads, archive-proven records only, least recently attempted first, capped per pass, 60 s budget. Live pass: leftover upload slots only, per-record exponential backoff on refusal (the live re-drive base and cap), a 6-hour in-process settle interval after deleted or already-absent, and it runs while credentials are blocked (local work, no credential needed; it does not move the upload schedule).
+
+**No completion marker is persisted.** A pin recreated by `anchorRecoveryHead` is caught at the next boot or settle interval; a marker would hide it.
+
+**Runner and plain delete.** The runner's unconditional post-upload delete is removed. Its already-published path deletes with an expected-SHA compare-and-delete and honours the residue quarantine. Settlement cleanup and the owner-cancel custody release (inventory-guarded completion cleanup does not use it) keep their call sites, but the plain three-argument `deleteRecoveryPin` they call now refuses symlinked ref and reflog paths, repository redirects (including a `reftable` entry), a symlinked `packed-refs` and a symlinked or hard-linked `logs/HEAD`, so their behaviour changed: they retain the pin on unsafe metadata.
+
+**Accepted residuals.** A symlink planted between the last check and Git's own unlink is not detectable in userspace. A v1 run (no claim generation) whose journal is removed at completed-run release before the live pass runs keeps its pin. The already-published delete gets one attempt.
+
 ## Amendment 2026-10-09 — #2507: synchronous completed-publication release
 
 **Status**: Implemented in API and worker; this amendment records the maintainer
@@ -606,4 +622,38 @@ Existing archive source-boundary diagnostics, including failed/cancelled
 foreground `execution_tail_present`, remain applicable to capture fallback.
 This amendment adds no intent, endpoint, crash discovery, forge driver or E2E
 mechanism and does not implement #2544 quota, #2545 failed publication or
-#2506 failed thin release.
+#2506 failed thin release. (Superseded for #2545 only by the 2026-10-12
+amendment below: failed publication is now implemented by
+[ADR-2545](2545-failed-run-held-publication.md). #2544 and #2506 remain
+excluded.)
+
+## Amendment 2026-10-12 — #2545: a failed run's held work is published before custody release
+
+**Status**: Implemented in API and worker. See
+[ADR-2545](2545-failed-run-held-publication.md) for the full design.
+
+This adds a fifth final disposition to the inventory-guarded hold:
+`final_disposition = release_evidence = 'held_publication'`, bound by NULL-safe
+CHECKs to a non-null `final_publication_id`. It applies only to a `failed` run
+whose `fail_origin` is not `push_secret_blocked` or `worker_residue_blocked`,
+for the exact claim generation, with a `created` publication row whose tip and
+coverage digest match the FINAL. `recovery_inventory_hold_guard` enforces this.
+The API first creates `refs/uzi-held/<run-id>/<generation>` with the owner's
+stored connection credential from a worker-uploaded, scanned pack (step A). The
+worker then sends a journaled FINAL `{kind:"held_publication"}` on the existing
+release route (step B). Step B answers an exact replay before any mutable
+check and lists the ref outside every lock. It releases under worker, run, hold
+and publication locks.
+
+Cancelled and parked runs, completed runs (still #2507's receipt policy) and
+every unproved failed case keep the archive path, which is unchanged. Every
+step-A outcome, and every definitive step-B refusal, short of an ACKed or
+still-journaled held FINAL falls back to capturing an archive on the same frozen
+record; a transient step-B answer keeps the journaled FINAL and the open hold,
+with no archive, and retries. A local failure to journal the held FINAL after a
+created step A (an unreadable or lost journal write) likewise keeps custody
+without an archive until the worker's live re-drive or boot sweep, which replays
+a FINAL that did land or otherwise captures the archive on the same record.
+Retention for the held ref runs from
+acknowledgement for `UZI_RECOVERY_READY_RETENTION`. #2544 quota and #2506 failed
+thin release remain excluded.

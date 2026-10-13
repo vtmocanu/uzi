@@ -14,7 +14,7 @@ import (
 
 const cordonHostedWorker = `-- name: CordonHostedWorker :execrows
 UPDATE workers
-   SET draining_since = COALESCE(draining_since, now()), maintenance_owns_drain = false, updated_at = now(),
+   SET draining_reason = NULL, draining_since = COALESCE(draining_since, now()), maintenance_owns_drain = false, updated_at = now(),
        lease_since = NULL, lease_repo_id = NULL, lease_branch = NULL
  WHERE id = $1 AND kind = 'hosted'
 `
@@ -108,7 +108,7 @@ func (q *Queries) CountHostedWorkersForUser(ctx context.Context, userID uuid.UUI
 const createEphemeralHostedWorker = `-- name: CreateEphemeralHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, ephemeral, ephemeral_run_id, anthropic_bind_mode, isolated_lane)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, true, $7::uuid, $8, $9::boolean)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason
 `
 
 type CreateEphemeralHostedWorkerParams struct {
@@ -226,6 +226,9 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 		&i.MaintenanceAckAt,
 		&i.MaintenanceActivityFloor,
 		&i.MaxCrossCheckSlots,
+		&i.RegisteredPodUid,
+		&i.RollHeartbeatAt,
+		&i.DrainingReason,
 	)
 	return i, err
 }
@@ -233,7 +236,7 @@ func (q *Queries) CreateEphemeralHostedWorker(ctx context.Context, arg CreateEph
 const createHostedWorker = `-- name: CreateHostedWorker :one
 INSERT INTO workers (user_id, name, token_hash, template_declared, kind, hosted_size, docker_enabled, anthropic_bind_mode)
 VALUES ($1, $2, $3, $4, 'hosted', $5, $6, $7)
-RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason
 `
 
 type CreateHostedWorkerParams struct {
@@ -349,6 +352,9 @@ func (q *Queries) CreateHostedWorker(ctx context.Context, arg CreateHostedWorker
 		&i.MaintenanceAckAt,
 		&i.MaintenanceActivityFloor,
 		&i.MaxCrossCheckSlots,
+		&i.RegisteredPodUid,
+		&i.RollHeartbeatAt,
+		&i.DrainingReason,
 	)
 	return i, err
 }
@@ -613,6 +619,19 @@ func (q *Queries) LeaseClockNow(ctx context.Context) (pgtype.Timestamptz, error)
 const listHostedWorkersForController = `-- name: ListHostedWorkersForController :many
 
 SELECT w.id,
+       w.user_id, w.capabilities, w.protocol_capabilities, w.version,
+       w.status, w.last_heartbeat_at,
+       w.snapshot_register_nonce, w.registered_pod_uid, w.roll_heartbeat_at, w.draining_reason,
+       -- Checker eligibility by slot family, matching fn_cross_check_child_eligible:
+       -- ordinary_coverage is the legacy run-slot fallback, NOT ordinary-job support.
+       -- checker_coverage is dedicated checker-slot coverage. Zero disables both;
+       -- NULL with a lane marker and positive slots without one cover neither.
+       ('cross_check_v1' = ANY(w.protocol_capabilities)
+         AND w.max_cross_check_slots IS NULL
+         AND NOT ('cross_check_lane_v1' = ANY(w.protocol_capabilities)))::boolean AS ordinary_coverage,
+       COALESCE('cross_check_v1' = ANY(w.protocol_capabilities)
+         AND w.max_cross_check_slots > 0
+         AND 'cross_check_lane_v1' = ANY(w.protocol_capabilities), false)::boolean AS checker_coverage,
        w.template_declared,
        w.hosted_size,
        w.hosted_generation,
@@ -681,7 +700,8 @@ SELECT w.id,
 FROM workers w
 LEFT JOIN hosted_worker_tokens t ON t.worker_id = w.id
 WHERE w.kind = 'hosted'
-ORDER BY w.created_at ASC
+ORDER BY w.created_at ASC, w.id ASC
+LIMIT 513
 `
 
 type ListHostedWorkersForControllerParams struct {
@@ -691,6 +711,18 @@ type ListHostedWorkersForControllerParams struct {
 
 type ListHostedWorkersForControllerRow struct {
 	ID                       uuid.UUID          `json:"id"`
+	UserID                   uuid.UUID          `json:"user_id"`
+	Capabilities             []string           `json:"capabilities"`
+	ProtocolCapabilities     []string           `json:"protocol_capabilities"`
+	Version                  pgtype.Text        `json:"version"`
+	Status                   string             `json:"status"`
+	LastHeartbeatAt          pgtype.Timestamptz `json:"last_heartbeat_at"`
+	SnapshotRegisterNonce    pgtype.Text        `json:"snapshot_register_nonce"`
+	RegisteredPodUid         pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt          pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	DrainingReason           pgtype.Text        `json:"draining_reason"`
+	OrdinaryCoverage         bool               `json:"ordinary_coverage"`
+	CheckerCoverage          bool               `json:"checker_coverage"`
 	TemplateDeclared         pgtype.Text        `json:"template_declared"`
 	HostedSize               pgtype.Text        `json:"hosted_size"`
 	HostedGeneration         int64              `json:"hosted_generation"`
@@ -727,10 +759,8 @@ type ListHostedWorkersForControllerRow struct {
 // what this hands it. Object naming derives from the uuid (uzi-hw-<id>), so the
 // name is not selected here at all, rather than selected and trusted not to be used.
 //
-// Deliberately unbounded: the whole hosted fleet is the desired state, and the
-// controller reconciles it as a set — a paged poll could never express "these are
-// all the workers that should exist", which is what makes orphan detection
-// (Decision 9) possible. The per-user quota (M2) bounds the row count.
+// Read one overflow sentinel beyond the complete-fleet ceiling. Poll refuses the
+// entire snapshot when it exceeds 512; a truncated set would permit orphan teardown.
 func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHostedWorkersForControllerParams) ([]ListHostedWorkersForControllerRow, error) {
 	rows, err := q.db.Query(ctx, listHostedWorkersForController, arg.DiskPressureMinStreak, arg.HeartbeatCutoff)
 	if err != nil {
@@ -742,6 +772,18 @@ func (q *Queries) ListHostedWorkersForController(ctx context.Context, arg ListHo
 		var i ListHostedWorkersForControllerRow
 		if err := rows.Scan(
 			&i.ID,
+			&i.UserID,
+			&i.Capabilities,
+			&i.ProtocolCapabilities,
+			&i.Version,
+			&i.Status,
+			&i.LastHeartbeatAt,
+			&i.SnapshotRegisterNonce,
+			&i.RegisteredPodUid,
+			&i.RollHeartbeatAt,
+			&i.DrainingReason,
+			&i.OrdinaryCoverage,
+			&i.CheckerCoverage,
 			&i.TemplateDeclared,
 			&i.HostedSize,
 			&i.HostedGeneration,
@@ -1035,12 +1077,16 @@ func (q *Queries) RebindLeasedEphemeralWorker(ctx context.Context, arg RebindLea
 }
 
 const uncordonHostedWorker = `-- name: UncordonHostedWorker :execrows
-UPDATE workers
+UPDATE workers w
    -- Releasing the legacy cordon hands a pending drain to maintenance for cleanup.
-   SET draining_since = CASE WHEN maintenance_phase IN ('requested','ready','stopping','recycling') THEN draining_since ELSE NULL END,
+   SET draining_reason = NULL, draining_since = CASE WHEN maintenance_fenced
+         OR maintenance_phase IN ('requested','ready','stopping','recycling')
+         OR stats_disk_pressure_streak >= 2 OR dind_pressure_streak >= 2
+         OR EXISTS (SELECT 1 FROM recovery_custody_holds h WHERE h.live_worker_id = w.id AND h.state = 'open')
+       THEN draining_since ELSE NULL END,
        maintenance_owns_drain = maintenance_phase IN ('requested','ready','stopping','recycling'),
        updated_at = now()
- WHERE id = $1 AND kind = 'hosted'
+ WHERE w.id = $1 AND kind = 'hosted'
 `
 
 // Controller uncordon-write (issue #458): clear draining_since so a worker that was

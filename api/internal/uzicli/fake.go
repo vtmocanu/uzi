@@ -671,6 +671,15 @@ type FakeClient struct {
 	DiscardHoldCalls    []DiscardHoldCall
 	DiscardHoldErr      error
 
+	// Owner held-publication list + early expiry (issue #2545). HeldPublicationsResult backs
+	// HeldPublications and HeldExpireResult backs ExpireHeldPublications; HeldErr wins over the
+	// blanket Err. HeldExpireCalls records each run id expired IN ORDER, so a CLI test proves NO
+	// expiry was attempted on a declined prompt or a non-TTY refusal (the list stays empty).
+	HeldPublicationsResult apitypes.HeldPublicationsDTO
+	HeldExpireResult       apitypes.HeldPublicationsExpireDTO
+	HeldErr                error
+	HeldExpireCalls        []string
+
 	// Err, when non-nil, is returned by every method (before any lookup).
 	Err error
 }

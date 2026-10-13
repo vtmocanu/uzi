@@ -5,7 +5,7 @@ import path from "node:path";
 import { execFileSync, spawn } from "node:child_process";
 import { createCodexExecutionSafety } from "../src/codex/safety.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
-import type { WorkerClient } from "../src/client.js";
+import { RequestError, type WorkerClient } from "../src/client.js";
 import type { Executor, RunContext } from "../src/executor.js";
 import { checkCode } from "../src/code-cross-check-gate.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
@@ -123,9 +123,131 @@ it("code gate submits the base commit's CLAUDE.md, not the head's edit, when the
   assert.deepEqual(instructions, { repo_instructions_enabled: true, repo_instructions_text: "base rules\n" });
 });
 
+// M2 keeps the old base fixture above; these cases fork before default instructions advance.
+for (const interlocked of [false, true]) {
+  for (const created of [false, true]) {
+    it(`instruction tip ${created ? "creates" : "changes"} CLAUDE after old fork (${interlocked ? "interlocked" : "legacy"})`, async (t) => {
+      const g = (dir: string, ...args: string[]) => execFileSync("git", ["-C", dir, ...args], { encoding: "utf8" }).trim();
+      const advance = (text: string) => {
+        fs.writeFileSync(path.join(fx.originPath, "CLAUDE.md"), text);
+        fs.writeFileSync(path.join(fx.originPath, "default-only.txt"), text);
+        g(fx.originPath, "add", "CLAUDE.md", "default-only.txt");
+        g(fx.originPath, "-c", "user.name=test", "-c", "user.email=test@example.test", "commit", "-qm", "advance default instructions");
+        return g(fx.originPath, "rev-parse", "HEAD");
+      };
+      if (!created) advance("old default rules\n");
+      g(fx.originPath, "branch", "-m", "release/é");
+      let persisted: import("../src/code-cross-check-contract.js").CodeCrossCheckStatus =
+        { stage: "code", result: "no_row", repo_instructions_enabled: true };
+      t.mock.method(client, "codeCrossCheckStatus", async () => persisted);
+      let base = "", head = "", tip = "";
+      const pins = t.mock.method(git, "pinCodeSnapshot", git.pinCodeSnapshot.bind(git));
+      const instructionReads: string[] = [];
+      const readOriginal = git.readBare.bind(git);
+      t.mock.method(git, "readBare", async (...args: Parameters<typeof git.readBare>) => {
+        if (args[1].includes("ls-tree") && args[1].includes("CLAUDE.md")) instructionReads.push(args[1][5]!);
+        return readOriginal(...args);
+      });
+      let reaps = 0, atGate = false;
+      const fetchOriginal = git.fetchDefaultTip.bind(git);
+      const fetch = t.mock.method(git, "fetchDefaultTip", async (...args: Parameters<typeof git.fetchDefaultTip>) => {
+        assert.equal(atGate, true);
+        assert.ok(reaps > 0);
+        assert.equal(args[1], "release/é");
+        assert.equal(args[2], "fixture-pat");
+        assert.equal(args[3], fx.originPath);
+        return fetchOriginal(...args);
+      });
+      let submits = 0;
+      const submit = t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _gen: number,
+        snapshot: Parameters<WorkerClient["submitCodeCrossCheck"]>[2], _signal?: AbortSignal, instructions?: unknown) => {
+        submits++;
+        assert.deepEqual(snapshot, { head_commit: head, base_commit: base, repo_instructions_commit: tip });
+        assert.deepEqual(instructions, { repo_instructions_enabled: true, repo_instructions_text: "fresh tip rules\n" });
+        const bare = git.barePathFor(fx.originPath);
+        assert.equal(g(bare, "merge-base", head, tip), base);
+        const diff = g(bare, "diff", "--name-only", `${base}...${head}`);
+        assert.ok(diff.includes("implementation.txt"));
+        assert.ok(!diff.includes("default-only.txt"));
+        if (interlocked && created && submits === 1) {
+          advance("forge rules after pin\n");
+          throw new RequestError("POST", "/cross-checks", 409, "consent changed");
+        }
+        persisted = { ...record(head, base), repo_instructions_commit: tip };
+        return persisted;
+      });
+      const exec: Executor = {
+        killAgentTree: () => { reaps++; },
+        run: async ctx => {
+          base = g(ctx.worktreePath, "rev-parse", "HEAD");
+          fs.writeFileSync(path.join(ctx.worktreePath, "CLAUDE.md"), "runhead rules\n");
+          g(ctx.worktreePath, "add", "CLAUDE.md");
+          head = commit(ctx);
+          if (interlocked) await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+          tip = advance("fresh tip rules\r\n");
+          reaps = 0;
+          atGate = true;
+          await ctx.codeCrossCheckGate!({ interlocked });
+          await ctx.codeCrossCheckGate!({ interlocked });
+          atGate = false;
+          assert.equal(fetch.mock.callCount(), 1, "reuse never snapshots/refetches");
+          assert.equal(submit.mock.callCount(), interlocked && created ? 2 : 1);
+          assert.deepEqual(instructionReads, interlocked && created ? [tip, tip] : [tip]);
+          return { branch: ctx.branch };
+        },
+      };
+      const claim = gitlabClaim(2788, { code_cross_check_required: true, claim_generation: 1,
+        repo: { ...gitlabClaim(2788).repo, default_branch: "release/é" },
+        secrets: { forge_pat: "fixture-pat" } });
+      await runner(exec, fakeGitlab().gitlab, undefined, { checkpointIntervalMs: 0 }).execute(claim);
+      assert.equal(submit.mock.callCount(), interlocked && created ? 2 : 1);
+      assert.equal(api.states.find(s => s.runId === claim.run_id && s.body.status === "completed")?.body.status, "completed", JSON.stringify(api.states));
+      assert.equal(pins.mock.calls.find(call => call.arguments[4] === true)?.arguments[3], base, "durable pin retains captured diff default");
+    });
+  }
+}
+
+for (const interlocked of [false, true]) {
+  for (const failure of ["fetch", "quiescence"] as const) {
+    it(`fresh ${interlocked ? "interlocked" : "legacy"} ${failure} failure creates no durable snapshot`, async (t) => {
+      t.mock.method(client, "codeCrossCheckStatus", async () =>
+        ({ stage: "code", result: "no_row", repo_instructions_enabled: false }));
+      let submitted: unknown, atGate = false;
+      const fetch = t.mock.method(git, "fetchDefaultTip", async () => { throw new Error("tip fetch unavailable"); });
+      const pin = t.mock.method(git, "pinCodeSnapshot", git.pinCodeSnapshot.bind(git));
+      t.mock.method(client, "submitCodeCrossCheck", async (_id: string, _gen: number, snapshot: unknown) => {
+        submitted = snapshot;
+        return { ...record(), head_commit: null, base_commit: null, outcome: "failed", reason_class: "snapshot_failed" };
+      });
+      const exec: Executor = {
+        killAgentTree: () => { if (atGate && failure === "quiescence") throw new Error("reap unavailable"); },
+        run: async ctx => {
+          commit(ctx);
+          if (interlocked) await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+          atGate = true;
+          await ctx.codeCrossCheckGate!({ interlocked });
+          atGate = false;
+          assert.deepEqual(submitted, { reason_class: "snapshot_failed" });
+          assert.equal(fetch.mock.callCount(), failure === "fetch" ? 1 : 0);
+          assert.ok(pin.mock.calls.every(call => call.arguments[4] === false), "no durable pin call");
+          const bare = git.barePathFor(fx.originPath);
+          await assert.rejects(git.codeSnapshotTip(bare, ctx.runId));
+          assert.equal(await git.codeSnapshotCandidate(bare, ctx.runId), undefined, "no durable metadata");
+          return { branch: ctx.branch };
+        },
+      };
+      const claim = gitlabClaim(2789, { code_cross_check_required: true, claim_generation: 1 });
+      await runner(exec, fakeGitlab().gitlab, undefined, { checkpointIntervalMs: 0 }).execute(claim);
+      assert.deepEqual(submitted, { reason_class: "snapshot_failed" });
+      assert.equal(api.states.find(s => s.runId === claim.run_id && s.body.status === "completed")?.body.status, "completed", JSON.stringify(api.states));
+    });
+  }
+}
+
 function codeSafety() {
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   let reaps = 0;
+  const boundaryProcesses: string[][] = [];
   const reservation = registry.reserveLaunch("provider");
   assert.equal(reservation.kind, "reserved");
   if (reservation.kind === "reserved") registry.registerRoot(reservation.reservation, {
@@ -134,6 +256,7 @@ function codeSafety() {
   const safety = createCodexExecutionSafety(registry,
     async () => { throw new Error("unused root spawn"); }, undefined, undefined,
     async request => {
+      boundaryProcesses.push([...request.argv]);
       const [command, ...args] = request.argv;
       assert.ok(command);
       const child = spawn(command, args, { cwd: request.cwd, env: request.env, stdio: ["pipe", "pipe", "pipe"] });
@@ -154,7 +277,7 @@ function codeSafety() {
         waitChild: async () => terminal,
       };
     });
-  return { safety, reaps: () => reaps };
+  return { safety, reaps: () => reaps, boundaryProcesses };
 }
 
 for (const harness of ["claude", "codex"] as const) {
@@ -181,8 +304,14 @@ for (const harness of ["claude", "codex"] as const) {
         run: async ctx => {
           await assert.rejects(ctx.reportCrossCheckDispositions!([]), /not active/);
           original = commit(ctx);
+          const instructionFetch = t.mock.method(git, "fetchDefaultTip", git.fetchDefaultTip.bind(git));
           if (interlocked) await ctx.checkpoint!({ reap: true, sink: "done_checkpoint" });
+          const boundaryStart = safetyRig?.boundaryProcesses.length ?? 0;
           assert.equal((await ctx.codeCrossCheckGate!({ interlocked })).action, "repair");
+          assert.equal(instructionFetch.mock.callCount(), 1, "consent off still acquires the pin");
+          if (safetyRig) assert.ok(safetyRig.boundaryProcesses.slice(boundaryStart).some(
+            args => args.includes("+refs/heads/main:refs/remotes/origin/main")),
+          "instruction fetch runs through Codex boundary spawner");
           assert.equal((await ctx.codeCrossCheckRepair!())?.head_commit, original);
           execFileSync("git", ["-C", ctx.worktreePath, "-c", "user.name=test", "-c", "user.email=test@example.test", "commit", "--allow-empty", "-qm", "repair"]);
           repaired = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"], { encoding: "utf8" }).trim();
@@ -270,7 +399,7 @@ for (const movement of ["bridge", "concurrent clone tip"] as const) {
     assert.equal(publishesAtGate[1], publishesAtGate[0], "the interlocked gate step publishes nothing");
     assert.equal(status.mock.callCount(), movement === "bridge" ? 2 : 3, "publication refresh occurs only when this run publishes an MR");
     assert.equal(submit.mock.callCount(), 1);
-    assert.deepEqual(snapshots, [{ head_commit: originalH, base_commit: base }]);
+    assert.deepEqual(snapshots, [{ head_commit: originalH, base_commit: base, repo_instructions_commit: base }]);
     assert.match(originalH, /^[0-9a-f]{40}$/);
     assert.match(movedTip, /^[0-9a-f]{40}$/);
     assert.notEqual(movedTip, originalH, "the post-import movement actually happened");
@@ -305,6 +434,7 @@ for (const failure of ["refused import", "failed import", "unavailable reap", "u
     });
     let pinsBeforeFailure = 0, pinsAfterGate = 0;
     const pin = t.mock.method(git, "pinCodeSnapshot", git.pinCodeSnapshot.bind(git));
+    const fetch = t.mock.method(git, "fetchDefaultTip", async () => { throw new Error("unexpected instruction fetch"); });
     let checkpointError: unknown, gateResult: unknown;
     const exec: Executor = {
       killAgentTree: () => {
@@ -336,13 +466,14 @@ for (const failure of ["refused import", "failed import", "unavailable reap", "u
     assert.ok(imported > 0, "first checkpoint successfully imported real Git work");
     assert.equal(pinsBeforeFailure, 1, "first checkpoint captured a snapshot to invalidate");
     assert.equal(pinsAfterGate, pinsBeforeFailure, "failed checkpoint cannot repin a cached tip");
+    assert.equal(fetch.mock.callCount(), 0, "failed quiescence/capture never fetches instructions");
     assert.deepEqual(snapshots, [{ reason_class: "snapshot_failed" }], "failure submission contains neither SHA");
     assert.deepEqual(gateResult, { action: "proceed" });
     if (failure === "unavailable reap") {
-      assert.equal(reapFailures, 1);
+      assert.equal(reapFailures, 2, "checkpoint and fresh code gate each reprove quiescence");
       assert.ok(checkpointError instanceof Error);
     } else if (failure === "unverified quiescence") {
-      assert.equal(blockedProofs, 1);
+      assert.equal(blockedProofs, 2, "checkpoint and fresh code gate each reprove quiescence");
       assert.equal(failedPhaseImports, 0, "unverified quiescence prevented import");
     } else {
       assert.equal(refused, 1, "second checkpoint attempted import despite the unchanged tip");
@@ -456,6 +587,7 @@ it("Codex lead with unverified reap records snapshot_failed without a checked SH
     return { ...record(), head_commit: null, base_commit: null, outcome: "failed", reason_class: "snapshot_failed" };
   });
   const pin = t.mock.method(git, "pinCodeSnapshot", async () => { throw new Error("unexpected snapshot"); });
+  const fetch = t.mock.method(git, "fetchDefaultTip", async () => { throw new Error("unexpected authenticated fetch"); });
   let failingReap = false, reapFailures = 0;
   const exec: Executor = { killAgentTree: () => {
     if (failingReap) { reapFailures++; throw new Error("fixture reap unavailable"); }
@@ -471,5 +603,6 @@ it("Codex lead with unverified reap records snapshot_failed without a checked SH
     secrets: { forge_pat: "fixture-pat", codex: { auth_mode: "api_key", capability: "fixture-cap", access_token: "fixture-access" } } }));
   assert.deepEqual(submitted, { reason_class: "snapshot_failed" });
   assert.equal(reapFailures, 1, "snapshot boundary actually exercised the failing reap");
+  assert.equal(fetch.mock.callCount(), 0);
   assert.equal(pin.mock.callCount(), 0);
 });

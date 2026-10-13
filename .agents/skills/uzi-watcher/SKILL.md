@@ -304,6 +304,13 @@ no kube access:
   --json` (each hold's `captures[].id`) or from `run export`'s own stderr listing when it
   refuses to guess.
 - `uzi run get RUN --json | jq -r .preserved_patch`: the diff a typed push failure preserves.
+- `git fetch origin refs/uzi-held/<run-id>/<generation>`: for a **failed** run on a server with
+  `UZI_HELD_PUBLICATION` on (the default), the api publishes the run's held work (commits since
+  its last checkpoint plus WIP) to this ref and releases the custody hold. Check it FIRST for a
+  failed run; `uzi run held RUN` lists the ref and its retention, and `uzi run held expire RUN`
+  ends the retention early. It does not exist for a run that failed `push_secret_blocked` or
+  `worker_residue_blocked`, nor for cancelled or parked runs, which keep the archive and salvage
+  sources below.
 - `uzi run get RUN --json | jq -r .salvage_state`: a **failed** run on a forge listed in
   `UZI_SALVAGE_FORGES` may have `salvage_state` at `promoted` — a bounded, run-scoped copy of
   the run's *last published checkpoint* (may be behind its final local work), fetchable with

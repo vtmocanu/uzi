@@ -194,6 +194,8 @@ uzi run decide <run-id> --continue [--guidance <text>]
 uzi run export <run-id> --output <path> [--capture <id>]
 uzi run recovery [<run-id>] [--json]
 uzi run discard <run-id> --hold <hold-id> [--yes]
+uzi run held <run-id> [--json]
+uzi run held expire <run-id> [--yes]
 uzi run fetches <run-id> [--json]
 uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--remove-label-on-dispatch[=false]] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
@@ -820,6 +822,16 @@ uzi version
   (without a TTY and without `--yes` it refuses and changes nothing). A cancelled prompt mutates
   nothing. An available archive is never deleted here (export it first). A foreign/absent/already
   settled hold is a 404 (exit 4).
+- `uzi run held <run-id> [--json]` — list a failed run's held-work publications: the forge refs
+  (`refs/uzi-held/<run-id>/<generation>`) its committed work was published to before custody was
+  released, with each ref's state, the tip it holds and when it is deleted. Fetch one before then
+  with `git fetch origin <ref>`. `uzi run recovery <run-id>` shows the same ref as a released
+  hold's held receipt. Owner-only (a foreign run is a 404, exit 4).
+- `uzi run held expire <run-id> [--yes]` — make the run's acknowledged held refs due for deletion
+  now; the server's cleanup deletes them shortly after (this command deletes nothing itself).
+  **Destructive:** fetch the work first. It prompts for confirmation interactively; `--yes` is
+  **required** for a non-interactive run (without a TTY and without `--yes` it refuses and
+  changes nothing).
 - `uzi run fetches <run-id> [--json]` — the source log of a run bound to a site list
   (official-sources research): every web fetch it attempted, allowed or refused, with the
   reason, HTTP status, bytes, content type, the URL asked for and the final URL. Owner-only

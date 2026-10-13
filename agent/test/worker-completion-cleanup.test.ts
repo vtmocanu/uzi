@@ -2,6 +2,7 @@ import { it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import path from "node:path";
+import os from "node:os";
 import { fileURLToPath } from "node:url";
 import { execFileSync, spawn } from "node:child_process";
 import { once } from "node:events";
@@ -24,9 +25,9 @@ const wire = JSON.parse(await fs.readFile(new URL("../../fixtures/completed-publ
 const literal: CompletedPublicationReceipt = wire.ack.completed_publication_receipt;
 
 // All Git children are local, bounded to 10 seconds, and use no forge credentials.
-async function fixture(shared = false, attempted = false, receipted = true, foreignSibling = false) {
-  await fs.mkdir(scratch, { recursive: true });
-  const root = await fs.mkdtemp(path.join(scratch, "receipt-cleanup-"));
+async function fixture(shared = false, attempted = false, receipted = true, foreignSibling = false, fixtureParent = scratch) {
+  await fs.mkdir(fixtureParent, { recursive: true });
+  const root = await fs.mkdtemp(path.join(fixtureParent, "receipt-cleanup-"));
   const cmd = (cwd: string, args: string[]) => execFileSync("git", ["-C", cwd, ...args], {
     encoding: "utf8", stdio: ["ignore", "pipe", "pipe"], timeout: 10000,
     env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
@@ -724,73 +725,90 @@ it("worker quarantine retains receipt authority and dirty clone", async () => {
   } finally { await f.close(); }
 });
 
-for (const count of [1, 2]) {
-  it(`persisted completion receipt retires report while retaining ${count} physical predecessors`, async t => {
-    const f = await fixture(false, true, false);
+for (const layout of ["scratch", "attempt-parent"] as const) for (const count of [1, 2]) {
+  it(`persisted completion receipt retires report while retaining ${count} physical predecessors${layout === "attempt-parent" ? " under an attempt-shaped parent" : ""}`, async t => {
+    const enclosing = layout === "attempt-parent"
+      ? await fs.mkdtemp(path.join(os.tmpdir(), "receipt-cleanup-layout-")) : undefined;
+    const fixtureParent = enclosing
+      ? path.join(enclosing, "x.attempt-20261011T201335Z-g1-0123456789abcdef") : scratch;
     try {
-      const attemptId = f.completingRecord.completionSource!.attemptId!;
-      const predecessors: { runId: string; clonePath: string; attemptId?: string; restoreTip: string }[] = [];
-      const canonical = f.clone.slice(0, f.clone.indexOf(".attempt-"));
-      for (let i = 0; i < count; i++) {
-        const priorAttempt = i ? `20261008T000000Z-g${f.generation}-${"0".repeat(15)}${i}` : undefined;
-        const clonePath = priorAttempt ? canonical + ".attempt-" + priorAttempt : canonical;
-        await fs.cp(f.clone, clonePath, { recursive: true });
-        await fs.writeFile(path.join(clonePath, "predecessor.txt"), `predecessor ${i} dirty bytes`);
-        predecessors.push({ runId: f.runId, clonePath, ...(priorAttempt ? { attemptId: priorAttempt } : {}), restoreTip: f.head });
-        if (priorAttempt) f.cmd(f.bare, ["config", "--add", `uzi-attempts.${f.branch}.entry`,
-          JSON.stringify({ attemptId: priorAttempt, runId: f.runId, clonePath, state: "abandoned" })]);
+      const f = await fixture(false, true, false, false, fixtureParent);
+      try {
+        const attemptId = f.completingRecord.completionSource!.attemptId!;
+        const predecessors: { runId: string; clonePath: string; attemptId?: string; restoreTip: string }[] = [];
+        const canonical = f.git.runnerClonePath(f.bare, "issue-7");
+        for (let i = 0; i < count; i++) {
+          const priorAttempt = i ? `20261008T000000Z-g${f.generation}-${"0".repeat(15)}${i}` : undefined;
+          const clonePath = priorAttempt ? canonical + ".attempt-" + priorAttempt : canonical;
+          const relative = path.relative(path.resolve(f.root), path.resolve(clonePath));
+          assert.ok(relative !== "" && !path.isAbsolute(relative) && relative !== ".." &&
+            !relative.startsWith(".." + path.sep), "predecessor clone must be strictly within the fixture root");
+          await fs.cp(f.clone, clonePath, { recursive: true });
+          await fs.writeFile(path.join(clonePath, "predecessor.txt"), `predecessor ${i} dirty bytes`);
+          predecessors.push({ runId: f.runId, clonePath, ...(priorAttempt ? { attemptId: priorAttempt } : {}), restoreTip: f.head });
+          if (priorAttempt) f.cmd(f.bare, ["config", "--add", `uzi-attempts.${f.branch}.entry`,
+            JSON.stringify({ attemptId: priorAttempt, runId: f.runId, clonePath, state: "abandoned" })]);
+        }
+        const journalKey = `uzi-recovery.${f.branch}.clone`;
+        const pending = JSON.parse(f.cmd(f.bare, ["config", "--get", journalKey]));
+        f.cmd(f.bare, ["config", journalKey, JSON.stringify({ ...pending, retainedSources: predecessors })]);
+        const pin = `refs/uzi-recovery-episode/${f.runId}/${f.head}`;
+        f.cmd(f.bare, ["update-ref", pin, f.head]);
+        const outbox = new Outbox({ root: path.join(f.root, "outbox"), log: nullLogger(),
+          runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
+        await outbox.init();
+        assert.equal((await outbox.journalFinalize(f.runId, f.generation)).written, true);
+        const current = f.make({ outbox });
+        await current.runner.observeSettlementTerminalAck(f.runId, f.generation,
+          { ...wire.request, completion_final_head: f.head },
+          { applied: true, completedPublicationReceipt: { ...literal, final_head: f.head, observed_branch_head: f.head } });
+        assert.equal(await current.recovery.hasPersistedCompletionReceipt(f.runId, f.generation), true);
+        assert.equal(await current.recovery.inventoryCleanupState(f.runId, f.generation), "pending",
+          "receipt-only authority never satisfies archive FINAL");
+        const config = await fs.readFile(path.join(f.bare, "config"));
+        const receiptBytes = await fs.readFile(f.journal);
+        const descriptors = await Promise.all(predecessors.map(src => fs.stat(src.clonePath)));
+        let moves = 0;
+        const rename = fs.rename.bind(fs);
+        t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
+          if (String(args[0]) === f.clone) moves++;
+          return rename(...args);
+        });
+        assert.equal((await outbox.journalTerminal(f.runId, f.generation, "completed", 0,
+          { ...wire.request, completion_final_head: f.head })).journaled, true);
+        const protectedDeps = current.runner.protectRecoveryTerminalDeps({ outbox } as
+          Parameters<RunRunner["protectRecoveryTerminalDeps"]>[0]);
+        assert.equal(await protectedDeps.outbox.retireTerminal(f.runId, f.generation), true,
+          "persisted receipt permits protected retirement of its exact completed report");
+        await current.recovery.resumePending();
+        assert.equal(moves, 0);
+        assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
+        assert.deepEqual(await fs.readFile(f.journal), receiptBytes);
+        assert.equal(f.cmd(f.clone, ["rev-parse", "HEAD"]), f.head);
+        assert.equal(await fs.readFile(path.join(f.clone, "untracked.txt"), "utf8"), "untracked remainder\n");
+        for (const [i, src] of predecessors.entries()) {
+          assert.equal(await fs.readFile(path.join(src.clonePath, "predecessor.txt"), "utf8"), `predecessor ${i} dirty bytes`);
+          assert.equal((await fs.stat(src.clonePath)).ino, descriptors[i]!.ino);
+        }
+        assert.equal(f.cmd(f.bare, ["rev-parse", pin]), f.head);
+        assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation), false);
+        await (current.runner as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
+          .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation }, "completion-predecessor-regression");
+        assert.deepEqual(await outbox.listPendingFinalizes(), []);
+        assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
+        assert.deepEqual(await fs.readFile(f.journal), receiptBytes);
+        assert.ok(attemptId);
+        assert.equal(f.rpc(), 0);
+      } finally {
+        try {
+          if (enclosing) assert.deepEqual(await fs.readdir(enclosing), [path.basename(fixtureParent)],
+            "regression layout must contain only its intentional attempt-shaped parent");
+        } finally { await f.close(); }
       }
-      const journalKey = `uzi-recovery.${f.branch}.clone`;
-      const pending = JSON.parse(f.cmd(f.bare, ["config", "--get", journalKey]));
-      f.cmd(f.bare, ["config", journalKey, JSON.stringify({ ...pending, retainedSources: predecessors })]);
-      const pin = `refs/uzi-recovery-episode/${f.runId}/${f.head}`;
-      f.cmd(f.bare, ["update-ref", pin, f.head]);
-      const outbox = new Outbox({ root: path.join(f.root, "outbox"), log: nullLogger(),
-        runMaxBytes: 64 << 20, maxBytes: 128 << 20, retentionMs: 86400000 });
-      await outbox.init();
-      assert.equal((await outbox.journalFinalize(f.runId, f.generation)).written, true);
-      const current = f.make({ outbox });
-      await current.runner.observeSettlementTerminalAck(f.runId, f.generation,
-        { ...wire.request, completion_final_head: f.head },
-        { applied: true, completedPublicationReceipt: { ...literal, final_head: f.head, observed_branch_head: f.head } });
-      assert.equal(await current.recovery.hasPersistedCompletionReceipt(f.runId, f.generation), true);
-      assert.equal(await current.recovery.inventoryCleanupState(f.runId, f.generation), "pending",
-        "receipt-only authority never satisfies archive FINAL");
-      const config = await fs.readFile(path.join(f.bare, "config"));
-      const receiptBytes = await fs.readFile(f.journal);
-      const descriptors = await Promise.all(predecessors.map(src => fs.stat(src.clonePath)));
-      let moves = 0;
-      const rename = fs.rename.bind(fs);
-      t.mock.method(fs, "rename", async (...args: Parameters<typeof fs.rename>) => {
-        if (String(args[0]) === f.clone) moves++;
-        return rename(...args);
-      });
-      assert.equal((await outbox.journalTerminal(f.runId, f.generation, "completed", 0,
-        { ...wire.request, completion_final_head: f.head })).journaled, true);
-      const protectedDeps = current.runner.protectRecoveryTerminalDeps({ outbox } as
-        Parameters<RunRunner["protectRecoveryTerminalDeps"]>[0]);
-      assert.equal(await protectedDeps.outbox.retireTerminal(f.runId, f.generation), true,
-        "persisted receipt permits protected retirement of its exact completed report");
-      await current.recovery.resumePending();
-      assert.equal(moves, 0);
-      assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
-      assert.deepEqual(await fs.readFile(f.journal), receiptBytes);
-      assert.equal(f.cmd(f.clone, ["rev-parse", "HEAD"]), f.head);
-      assert.equal(await fs.readFile(path.join(f.clone, "untracked.txt"), "utf8"), "untracked remainder\n");
-      for (const [i, src] of predecessors.entries()) {
-        assert.equal(await fs.readFile(path.join(src.clonePath, "predecessor.txt"), "utf8"), `predecessor ${i} dirty bytes`);
-        assert.equal((await fs.stat(src.clonePath)).ino, descriptors[i]!.ino);
-      }
-      assert.equal(f.cmd(f.bare, ["rev-parse", pin]), f.head);
-      assert.equal(await current.runner.recoveryInventoryPending(f.runId, f.generation), false);
-      await (current.runner as unknown as { retireFinalizeRecord(flight: unknown, site: string): Promise<void> })
-        .retireFinalizeRecord({ runId: f.runId, claimGeneration: f.generation }, "completion-predecessor-regression");
-      assert.deepEqual(await outbox.listPendingFinalizes(), []);
-      assert.deepEqual(await fs.readFile(path.join(f.bare, "config")), config);
-      assert.deepEqual(await fs.readFile(f.journal), receiptBytes);
-      assert.ok(attemptId);
-      assert.equal(f.rpc(), 0);
-    } finally { t.mock.restoreAll(); await f.close(); }
+    } finally {
+      try { t.mock.restoreAll(); }
+      finally { if (enclosing) await fs.rm(enclosing, { recursive: true, force: true }); }
+    }
   });
 }
 

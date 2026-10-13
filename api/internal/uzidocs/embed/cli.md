@@ -111,6 +111,8 @@ uzi run export <id> --output <path> [--capture <id>]
 uzi run fetches <id> [--json]
 uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
+uzi run held <id> [--json]
+uzi run held expire <id> [--yes]
 uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
@@ -353,8 +355,9 @@ A few worth knowing:
   pushed checkpoint until you resume it — see [Pausing and resuming a
   run](./run-pause.md) for the full picture. The default finishes the
   milestone (or turn) already in flight, pushes a checkpoint, then parks;
-  `--now` drops the turn in flight and parks on the last checkpoint instead,
-  discarding whatever changed since; `--cancel` withdraws a pending request
+  `--now` interrupts the turn and attempts to checkpoint current work before
+  parking; preservation can fail or publish an older checkpoint (see the
+  activity feed). `--cancel` withdraws a pending request
   and leaves the run running. `--now` and `--cancel` are mutually exclusive.
   None of the three is synchronous — the park lands on the worker's next
   report, so watch `uzi run get <id>`. Owner-only, and valid only on a
@@ -362,7 +365,8 @@ A few worth knowing:
   run already parks between turns, an interactive task parks after every
   turn, judge/mr-rework/ci-fix runs finish on their own, and a run already
   at a gate or an involuntary park is refused too — all as a 409 (exit 5)
-  naming the reason.
+  naming the reason. This existing command is also the compatibility path
+  when dependency parking requires an API or worker upgrade.
 - **`run resume <id>`** resumes a run the owner paused: it moves the run
   from `paused` back to `queued`, keeps the worker pin, and preserves the
   remaining budget (the clock stopped while paused, so resuming does not
@@ -405,6 +409,20 @@ A few worth knowing:
   past is rejected rather than applied to the current one, and calling it
   against a run that isn't currently parked fails outright instead of
   queuing.
+  During approved, non-interactive issue implementation, use
+  `uzi run answer <id> --message /park` to request a dependency pause.
+  After validation and consumption, trimmed non-empty answers must each be
+  exactly `/park`; a mixed batch is ordinary guidance to the lead.
+  With API and worker support, prose lets the lead continue actionable work
+  or call its lead-only `park_run` tool when no actionable work remains.
+  Planning, subagents, interactive runs and other run kinds are excluded.
+  Success is an ordinary owner-resumed pause: wall stopped, run slot freed.
+  A failed publication instead asks a worker question in `awaiting_input`
+  (wall wait banked, slot held), with no provider turn or park retry until
+  an explicit answer and no reset of the shared absolute `QUESTION_TIMEOUT_SECONDS`.
+  An unattended run needing that decision stops with a trusted refusal.
+  See [Dependency waits](./run-pause.md#waiting-on-a-dependency-during-implementation)
+  for compatibility, checkpoint and retention limits.
   **The CLI's derivation is narrower than the web's**: it always answers the
   *newest* question message in the feed, where the web additionally checks
   whether a newer `answer` has already closed it. That gap is real for one
@@ -1189,6 +1207,80 @@ uzi run discard <run-id> --hold <hold-id> --yes
   might still need it.
 - **Terminal and owner-scoped.** A discarded hold cannot be revived, and you can discard
   only your own runs' holds.
+
+### Fetching and expiring a failed run's held ref: `uzi run held`
+
+When a run ends `failed`, uzi first tries to publish its held work to your forge as
+`refs/uzi-held/<run-id>/<generation>` and release the worker's custody against that ref;
+the recovery archive above is the fallback. See
+[Publishing a failed run's held work](./run-recovery.md#publishing-a-failed-runs-held-work)
+for what is eligible, what is published, and when it falls back. Both commands are
+owner-only (a run that is not yours reads as not found) and work with a `uzc_` token.
+
+```
+uzi run held <run-id> [--json]
+```
+
+- **One row per publication, newest generation first.** Columns are `GEN`, `STATE`, `REF`,
+  `TIP` (short) and `EXPIRES` (UTC, RFC 3339; `-` when none is set). The states are
+  `prepared`, `invoked`, `created`, `create_unknown`, `refused`, `acknowledged`,
+  `delete_unknown`, `deleted` and `abandoned`. Below the table, a publication's `LastError`
+  prints as `gen <n>: <text>` and its refusal as `gen <n>: reason <code>`. When a ref may
+  still be on the forge (`acknowledged`, `created` or `delete_unknown`), it also prints
+  ``fetch a held ref with `git fetch origin <ref>`; end the retention early with `uzi run held expire <run-id>` ``.
+- **No publication.** Prints `run <run-id> has no held publications` (nothing under
+  `--quiet`). That is also the answer for a run that was cancelled, parked, or failed on
+  an excluded origin, or whose work fell back to the archive before anything was sent to the forge. A refused
+  create, an unconfirmed create (`create_unknown`) or a created row later deleted still lists a row.
+- **`--json`** prints the array of publication objects (`id`, `run_id`, `generation`, `ref`,
+  `tip`, `state`, `created_at`, and when set `ref_created_at`, `acknowledged_at`,
+  `expires_at`, `owner_expired_at`, `deleted_at`, `last_error`, `refusal_reason`). An empty
+  result is `[]`, never `null`.
+- **Fetch it before it expires.** A ref is kept for `UZI_RECOVERY_READY_RETENTION` after its
+  release is acknowledged. Name a local branch so the commit stays reachable once the ref
+  is deleted:
+
+```
+git fetch origin refs/uzi-held/<run-id>/<generation>:refs/heads/recovered/<run-id>
+```
+
+`uzi run recovery <run-id>` also prints `hold <hold-id> held: <ref> @ <12-char tip>` for a
+hold that was released against a held publication (`held_ref` on the hold with `--json`).
+The run page shows the same refs in its **Held work** panel.
+
+```
+uzi run held expire <run-id> [--yes]
+```
+
+- **Ends the retention early.** It makes every **acknowledged** publication of the run due
+  for deletion now; the server's cleanup deletes each ref shortly after. The command deletes
+  nothing itself, and a publication that is not acknowledged is never touched.
+- **Destructive, so it confirms.** Once the ref is deleted, the work survives only in a
+  clone you fetched it into. Without `--yes` it prompts `[y/N]` on stderr (a bare Enter
+  aborts, printing `aborted` unless `--quiet`); with stdin not a terminal and no `--yes` it
+  refuses with exit 2 and changes nothing.
+- **Result.** `N held publication(s) of run <run-id> are due for deletion; the server deletes
+  each ref shortly`, or `run <run-id> has no acknowledged held publication to expire` when
+  there was nothing to do. `--json` prints the endpoint's object (`expired`, and the
+  affected `publications`).
+
+Held-ref cleanup does not depend on `UZI_HELD_PUBLICATION`: with the feature switched off,
+refs already published are still deleted at their expiry, and `uzi run held expire` still
+works.
+
+While a held ref may still exist, removing its repo or its forge connection is refused with a
+409. The error text (`connection` in place of `repo` for a connection removal) reads:
+
+```
+this repo has N held-work publication(s) of failed runs still on the forge (<ref> (<state>); ...);
+acknowledged refs clear at their retention expiry (or sooner with `uzi run held expire <run-id>`);
+refs in any other state (being created, reconciled or deleted) settle against the forge first; a
+ref that is then acknowledged follows the retention rule. Remove the repo after the block lifts
+```
+
+The body also carries `held_refs` (**at most 5** refs, each named with its state in the error
+text; any further ones are only counted, as `and N more`) and `held_count` (the true total).
+Retry the removal once the refs are deleted or settled.
 
 ### A failed run's salvage copy: `refs/uzi-salvage/<run-id>`
 
@@ -2616,7 +2708,9 @@ A run's `status` (on `run get` and `run list`) is one of exactly **thirteen** va
   token](anthropic-token.md#letting-uzi-pick-the-token-auto-selection);
 - `recovery_wait` — parked to recover from a resumed turn that came back empty
   (no model activity) or hit a transient provider error; the sweep auto-resumes
-  it on a capped backoff until it recovers or you cancel it — see [Recovering
+  it on a capped backoff. Empty-turn and resumed-gate recovery have no lifetime cap;
+  typed `provider_outage` parks use the elapsed streak bound and can become
+  `paused` / `provider_unavailable` — see [Recovering
   from a transient interruption](run-recovery-wait.md). An exhausted worker-death episode also parks here with cause
   `worker_requeue_exhausted`, requiring explicit owner Resume or Cancel
   without an automatic timer. A Codex credential
@@ -2673,6 +2767,41 @@ A `running` run whose agent is still drafting its plan, pre-approval, reads
 TUI board and detail header's status chip, and on `admin runs` — so you can
 tell "still proposing work" apart from "actively implementing" at a glance.
 It's still the same `running` value underneath, not an additional status.
+
+### Provider outage recovery and owner hold
+
+`recovery_wait` with cause `provider_outage` is a typed provider retry.
+`run get` shows the count, streak start and next retry; `--json` carries
+`provider_park_count` and `provider_park_streak_started_at`. The counter
+belongs to the current streak, separately from the recovery backoff count.
+The default elapsed bound is 24h from the first park; operators can change
+`RUN_PROVIDER_PARK_MAX_DURATION` or use `0` to disable the hold while
+typing/counting remain enabled. Positive completed `productive_turns` on
+a provider park starts a new streak; the same evidence on an ordinary or
+disk recovery park (`provider_progress_turns`) clears an open streak. Owner Resume, early credential-driven
+promotion and credential switching clear it; automatic and vault-unlock
+promotion preserve it. Detection is at the next qualifying park, with no
+maximum overshoot promised.
+
+At the bound, `paused` with `hold_reason: provider_unavailable` means the
+run waits for its owner, without automatic retry or policy-driven failure.
+`run get` and the TUI show Resume, Cancel and server-gated Stop hints.
+Use `uzi run resume <id>` for a fresh attempt or `uzi run cancel <id>`.
+For eligible Stop, run `uzi run stop <id>` to set the scope ceiling, then,
+after success, `uzi run resume <id>`. There is no atomic Stop endpoint for
+this hold. It requires a non-interactive milestone issue run and at least
+one completed milestone; unavailable actions explain why. Existing
+completion-permit and budget checks apply, and a provider outage during
+finalization can open a new streak.
+
+The hold retains the claim, worker affinity and the issue lock for issue
+runs. Clone and HOME stay on the worker. Recovery depends on surviving
+worker storage or an available verified recovery copy; it does not promise
+that unpublished latest edits are available on another worker.
+`run wait` prints the provider retry/hold notice and continues waiting
+through `paused` unless `--until paused` is selected.
+See [Provider outage streaks](./run-recovery-wait.md#provider-outage-streaks)
+for both harnesses, verified-capture limits and mixed-fleet compatibility.
 
 ### Worker recovery exhaustion
 

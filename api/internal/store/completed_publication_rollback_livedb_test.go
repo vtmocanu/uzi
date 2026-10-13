@@ -102,7 +102,8 @@ func TestCompletedPublicationRollbackRoundTripLiveDB(t *testing.T) {
 	for name, hold := range holds {
 		var snapshot string
 		if err := pool.QueryRow(ctx, `SELECT ((to_jsonb(h) - ARRAY[
-			'completion_identity','completed_publication_receipt','completed_publication_reason']) ||
+			'completion_identity','completed_publication_receipt','completed_publication_reason',
+			'final_publication_id']) ||
 			jsonb_build_object('final_disposition',NULLIF(final_disposition,'completed_publication'),
 				'release_evidence',NULLIF(release_evidence,'completed_publication')))::text
 			FROM recovery_custody_holds h WHERE id=$1`, hold).Scan(&snapshot); err != nil {
@@ -175,7 +176,8 @@ func TestCompletedPublicationRollbackRoundTripLiveDB(t *testing.T) {
 	for name, hold := range holds {
 		var snapshot string
 		if err := pool.QueryRow(ctx, `SELECT (to_jsonb(h) - ARRAY[
-			'completion_identity','completed_publication_receipt','completed_publication_reason'])::text
+			'completion_identity','completed_publication_receipt','completed_publication_reason',
+			'final_publication_id'])::text
 			FROM recovery_custody_holds h WHERE id=$1`, hold).Scan(&snapshot); err != nil || snapshot != expected[name] {
 			t.Fatalf("re-up changed retained %s data: %s err=%v", name, snapshot, err)
 		}

@@ -7,7 +7,7 @@
 // truth for the schedules' timestamp formatting). Issue #2519 adds RecentFiresPanel, the
 // expanded "Recent fires" list.
 
-import { useState } from "react";
+import { useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { Badge, type BadgeTone, cx } from "./ui";
 import { ChevronDownIcon } from "./icons";
@@ -15,6 +15,8 @@ import { ForgeIssueAnchor } from "./ForgeIssueAnchor";
 import { scheduleSkipReasonLabel } from "../lib/scheduleSkipReasons";
 import type { LastFireStarted, LastFire, LastFireSkip, Schedule, ScheduleSkipReason } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
+import { api, type Run } from "../lib/api";
+import { parkLabel } from "../lib/runBadge";
 
 // Outcomes use the fire-time snapshot, including after the selector has been edited.
 export function labelRemovalOutcome(run: LastFireStarted): string | null {
@@ -123,6 +125,30 @@ export function LastRunOutcome({
       </button>
     </div>
   );
+}
+
+const CURRENT_STARTED_RUN_LIMIT = 4;
+
+// Only the first CURRENT_STARTED_RUN_LIMIT entries mount a read per expanded fire:
+// at most four parallel attempts, no retries or polling; failures do not block siblings.
+// Cleanup retires responses on collapse/unmount; it does not cancel pending requests.
+function CurrentStartedRun({ runId }: { runId: string }) {
+  const [state, setState] = useState<{ id: string; run?: Run; unavailable?: boolean } | null>(null);
+  useEffect(() => {
+    let active = true;
+    api.getRun(runId).then(({ run }) => {
+      if (active && run.id === runId) setState({ id: runId, run });
+    }).catch(() => {
+      if (active) setState({ id: runId, unavailable: true });
+    });
+    return () => { active = false; };
+  }, [runId]);
+  const current = state?.id === runId ? state : null;
+  return <span className="text-[11.5px] text-muted">
+    {current?.run ? `Current: ${parkLabel(current.run)}` : current?.unavailable ? "Current state unavailable" : "Loading current state…"}
+    {current?.run?.status === "paused" && current.run.hold_reason === "provider_unavailable" &&
+      <Link className="ml-2 underline" to={`/runs/${runId}`}>View owner actions</Link>}
+  </span>;
 }
 
 // ineligibleMatched is the count of selector-matching issues the fire could not run
@@ -278,7 +304,8 @@ export function LastFireDetail({ s, fire, heading = "Last fire" }: { s: Schedule
         </div>
       ) : (fire.started.length > 0 || fire.skips.length > 0) && (
         <div className="flex flex-col gap-2">
-          {fire.started.map((r) => (
+          {fire.started.length > CURRENT_STARTED_RUN_LIMIT && <p className="text-[12px] text-muted">Current state is checked for only the first four started entries in each expanded fire.</p>}
+          {fire.started.map((r, index) => (
             <div
               key={r.run_id}
               className="flex items-start gap-3 rounded-lg border border-edge bg-raised/50 px-3 py-2"
@@ -288,6 +315,8 @@ export function LastFireDetail({ s, fire, heading = "Last fire" }: { s: Schedule
                 {r.title && <div className="text-[12.5px] text-muted">{r.title}</div>}
                 {labelRemovalOutcome(r) && <div className={cx("text-[11.5px]", r.label_remove_failed ? "text-warn" : "text-muted")}>{labelRemovalOutcome(r)}</div>}
               </div>
+              {index < CURRENT_STARTED_RUN_LIMIT ? <CurrentStartedRun runId={r.run_id} /> :
+                <span className="text-[11.5px] text-muted">Open run for current state</span>}
               <Link
                 to={`/runs/${r.run_id}`}
                 className="inline-flex shrink-0 items-center gap-1 rounded-md border border-ok/35 bg-ok/[0.08] px-2 py-0.5 font-mono text-[11.5px] text-ok hover:bg-ok/15"

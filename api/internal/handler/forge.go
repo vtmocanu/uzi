@@ -526,12 +526,30 @@ func (h *Handler) DeleteConnection(w http.ResponseWriter, r *http.Request) {
 		h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, salvage)
 		return
 	}
+	// Issue #2545: a failed run's held-work publication keeps live_run_id (ON DELETE RESTRICT)
+	// while its refs/uzi-held ref may exist on the forge, and deleting the connection would also
+	// destroy the credential the retention delete needs. Refuse with a 409 naming the held refs.
+	held, err := h.q.CountLiveHeldPublicationsForConnection(r.Context(), store.CountLiveHeldPublicationsForConnectionParams{ConnectionID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count held refs for connection delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if held > 0 {
+		h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, held)
+		return
+	}
 	rows, err := h.q.DeleteForgeConnectionForUser(r.Context(), store.DeleteForgeConnectionForUserParams{ID: id, UserID: user.ID})
 	if err != nil {
 		// A sweep recorded a salvage row between the count above and this delete: the
 		// RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
 		if isSalvageRestrict(err) {
 			h.writeConnectionSalvageConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		// Same race for a held publication recorded between its count and this delete.
+		if isHeldRestrict(err) {
+			h.writeConnectionHeldConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
 		slog.Error("delete connection", "error", err)
@@ -991,6 +1009,17 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		h.writeRepoSalvageConflict(r.Context(), w, id, user.ID, salvage)
 		return
 	}
+	// Issue #2545: the same guard for a live held-work publication ref of one of the repo's runs.
+	held, err := h.q.CountLiveHeldPublicationsForRepo(r.Context(), store.CountLiveHeldPublicationsForRepoParams{RepoID: id, UserID: user.ID})
+	if err != nil {
+		slog.Error("count held refs for repo delete", "error", err)
+		httpx.Error(w, http.StatusInternalServerError, "internal error")
+		return
+	}
+	if held > 0 {
+		h.writeRepoHeldConflict(r.Context(), w, id, user.ID, held)
+		return
+	}
 	// The :execrows return may be 0 if a concurrent enable slipped in between the
 	// fetch above and this delete — that is the D6 `enabled = false` guard working, so
 	// treat 0 rows as an already-gone no-op and still return 204, never 500.
@@ -999,6 +1028,10 @@ func (h *Handler) DeleteRepo(w http.ResponseWriter, r *http.Request) {
 		// the RESTRICT FK refused the cascade. Same 409 as the guard, never a 500.
 		if isSalvageRestrict(err) {
 			h.writeRepoSalvageConflict(r.Context(), w, id, user.ID, -1)
+			return
+		}
+		if isHeldRestrict(err) {
+			h.writeRepoHeldConflict(r.Context(), w, id, user.ID, -1)
 			return
 		}
 		slog.Error("delete repo", "error", err)
@@ -1115,6 +1148,98 @@ func writeSalvageConflict(w http.ResponseWriter, what string, count int64, rows 
 		"salvage_refs":         refs,
 		"salvage_pending_runs": pending,
 		"salvage_count":        count,
+	})
+}
+
+// heldRefListCap bounds how many live held publications a removal 409 names; the total is
+// always reported in held_count.
+const heldRefListCap = 5
+
+// heldRestrictConstraint is run_held_publications' live pointer FK (migration 00333). The
+// handlers match it by name so only a held restriction maps to the held 409.
+const heldRestrictConstraint = "run_held_publications_live_run_id_fkey"
+
+// isHeldRestrict reports whether err is the foreign-key violation (23503) raised when a delete
+// cascades onto a run that a live held publication still points at.
+func isHeldRestrict(err error) bool {
+	var pgErr *pgconn.PgError
+	return errors.As(err, &pgErr) && pgErr.Code == "23503" && pgErr.ConstraintName == heldRestrictConstraint
+}
+
+// heldConflictRow is one live held publication a removal 409 names.
+type heldConflictRow struct {
+	RunID uuid.UUID
+	State string
+	Ref   string
+}
+
+// writeRepoHeldConflict writes the repo-removal held-publication 409 (owner-scoped). count < 0
+// means the guard raced: the count is re-read so the response still reports a total.
+func (h *Handler) writeRepoHeldConflict(ctx context.Context, w http.ResponseWriter, repoID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveHeldPublicationsForRepo(ctx, store.CountLiveHeldPublicationsForRepoParams{RepoID: repoID, UserID: userID})
+		if err != nil {
+			slog.Error("count held refs for repo delete", "error", err)
+		}
+		count = n
+	}
+	rows, err := h.q.ListLiveHeldPublicationRefsForRepo(ctx, store.ListLiveHeldPublicationRefsForRepoParams{RepoID: repoID, UserID: userID, Lim: heldRefListCap})
+	if err != nil {
+		slog.Error("list held refs for repo delete", "error", err)
+	}
+	named := make([]heldConflictRow, 0, len(rows))
+	for _, row := range rows {
+		named = append(named, heldConflictRow{RunID: row.RunID, State: row.State, Ref: row.Ref})
+	}
+	writeHeldConflict(w, "repo", count, named)
+}
+
+// writeConnectionHeldConflict is writeRepoHeldConflict for a forge connection removal.
+func (h *Handler) writeConnectionHeldConflict(ctx context.Context, w http.ResponseWriter, connID, userID uuid.UUID, count int64) {
+	if count < 0 {
+		n, err := h.q.CountLiveHeldPublicationsForConnection(ctx, store.CountLiveHeldPublicationsForConnectionParams{ConnectionID: connID, UserID: userID})
+		if err != nil {
+			slog.Error("count held refs for connection delete", "error", err)
+		}
+		count = n
+	}
+	rows, err := h.q.ListLiveHeldPublicationRefsForConnection(ctx, store.ListLiveHeldPublicationRefsForConnectionParams{ConnectionID: connID, UserID: userID, Lim: heldRefListCap})
+	if err != nil {
+		slog.Error("list held refs for connection delete", "error", err)
+	}
+	named := make([]heldConflictRow, 0, len(rows))
+	for _, row := range rows {
+		named = append(named, heldConflictRow{RunID: row.RunID, State: row.State, Ref: row.Ref})
+	}
+	writeHeldConflict(w, "connection", count, named)
+}
+
+// writeHeldConflict writes the removal 409 for live held publications. what is "repo" or
+// "connection", count the total number of live rows, rows the (at most heldRefListCap) rows
+// named. held_refs lists every named refs/uzi-held ref; held_count is the total. A lookup that
+// failed or raced still refuses: the count is floored at the number of rows named, and at 1.
+func writeHeldConflict(w http.ResponseWriter, what string, count int64, rows []heldConflictRow) {
+	refs := make([]string, 0, len(rows))
+	parts := make([]string, 0, len(rows)+1)
+	for _, row := range rows {
+		refs = append(refs, row.Ref)
+		parts = append(parts, row.Ref+" ("+row.State+")")
+	}
+	count = max(count, int64(len(rows)), 1)
+	named := ""
+	if len(parts) > 0 {
+		if int64(len(rows)) < count {
+			parts = append(parts, fmt.Sprintf("and %d more", count-int64(len(rows))))
+		}
+		named = " (" + strings.Join(parts, "; ") + ")"
+	}
+	httpx.JSON(w, http.StatusConflict, map[string]any{
+		"error": fmt.Sprintf("this %s has %d held-work publication(s) of failed runs still on the forge%s; "+
+			"acknowledged refs clear at their retention expiry (or sooner with `uzi run held expire <run-id>`); refs in any other state "+
+			"(being created, reconciled or deleted) settle against the forge first; a ref that is then acknowledged follows the retention rule. "+
+			"Remove the %s after the block lifts", what, count, named, what),
+		"held_refs":  refs,
+		"held_count": count,
 	})
 }
 

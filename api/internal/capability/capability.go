@@ -65,6 +65,13 @@ const RecoveryInventoryV1 = "recovery_inventory_v1"
 // RecoveryCompletedPublicationV1 negotiates API proof of the completing generation’s final head.
 const RecoveryCompletedPublicationV1 = "recovery_completed_publication_v1"
 
+// RecoveryHeldPublicationV1 negotiates the publication of a failed run's held work to a
+// refs/uzi-held ref before custody is released (issue #2545). It is a worker/server protocol
+// fact, not a scheduler capability, so it lives in the protocol vocabulary only. The server
+// advertises the matching protocol feature while UZI_HELD_PUBLICATION is on, and step A and
+// step B require the worker to report this token.
+const RecoveryHeldPublicationV1 = "recovery_held_publication_v1"
+
 // CodexHarnessV1 is the PROTOCOL capability a worker self-reports (PRD #1332 M5A, D3) after a
 // successful startup probe of the pinned, out-of-PATH Codex runtime receipt — it declares the
 // worker can execute a Codex-harness run. Like CompletionInterlockV1 / RecoveryArchiveV1 it is a
@@ -127,6 +134,9 @@ const CredentialSwitchV1 = "credential_switch_v1" //nolint:gosec // G101: a capa
 // advertises it (RequestWallParks joins on it); an incapable worker's out-of-time run is parked
 // server-side at once (ParkRunsAtWall), never failed, so a mixed fleet is handled by construction.
 const WallParkV1 = "wall_park_v1"
+
+// ParkRunV1 negotiates worker-requested ordinary pause and guarded question writes.
+const ParkRunV1 = "park_run_v1"
 
 // InputReceiptsV1 advertises explicit ACK and applied receipts for steering inputs.
 const InputReceiptsV1 = "input_receipts_v1"
@@ -238,6 +248,7 @@ var protocolVocabulary = map[string]struct{}{
 	RecoveryArchiveV2:              {},
 	RecoveryInventoryV1:            {},
 	RecoveryCompletedPublicationV1: {},
+	RecoveryHeldPublicationV1:      {},
 	CodexHarnessV1:                 {},
 	CodexRuntimeV2:                 {},
 	CodexRefreshRecoveryV1:         {},
@@ -246,6 +257,7 @@ var protocolVocabulary = map[string]struct{}{
 	CodexCompletionInterlockV1:     {},
 	CredentialSwitchV1:             {},
 	WallParkV1:                     {},
+	ParkRunV1:                      {},
 	InputReceiptsV1:                {},
 	InputInclusionV1:               {},
 	GateRevisionV1:                 {},
@@ -264,7 +276,7 @@ var protocolVocabulary = map[string]struct{}{
 
 // protocolOrder fixes FilterProtocol's stable output order (protocolVocabulary is a map,
 // so its own iteration order is not stable). Keep in lockstep with protocolVocabulary.
-var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckCodeV1}
+var protocolOrder = []string{DindMaintenanceV1, CompletionInterlockV1, RecoveryArchiveV1, RecoveryArchiveV2, RecoveryInventoryV1, RecoveryCompletedPublicationV1, RecoveryHeldPublicationV1, CodexHarnessV1, CodexRuntimeV2, CodexRefreshRecoveryV1, CodexAccountParkV1, CodexCustomModelV1, CodexCompletionInterlockV1, CredentialSwitchV1, WallParkV1, ParkRunV1, InputReceiptsV1, InputInclusionV1, GateRevisionV1, AdviceClaimFenceV1, JobRunnerV1, JobFilesV1, IsolatedFetchV1, IsolatedJobV1, CrossCheckV1, CrossCheckLaneV1, CrossCheckRoundsV1, CrossCheckPinsV1, CrossCheckCodexLeadV1, CrossCheckCodeV1}
 
 // FilterProtocol returns the members of in that are in the PROTOCOL vocabulary, DROPPING
 // unknowns silently (never an error), deduped, in stable order. It mirrors Filter but

@@ -139,9 +139,23 @@ func (m *Materializer) reconcileDinD(ctx context.Context, w protocol.DesiredWork
 			if o.DeploymentUID != op.DeploymentUID || o.DeploymentTerminating {
 				return true, nil
 			}
+			if e := rollFrom(ctx, w.ID); e != nil && !m.drain.ForceRoll {
+				if err := m.reserveMaintenanceRoll(e); err != nil {
+					return true, err
+				}
+				// reservation advanced Deployment RV after the observation above.
+				o.DeploymentResourceVersion = e.dep.ResourceVersion
+				if err := m.retainRollReservation(ctx, e); err != nil {
+					return true, err
+				}
+			}
 			uid := types.UID(op.DeploymentUID)
+			rv := o.DeploymentResourceVersion
+			if rv == "" {
+				return true, fmt.Errorf("DinD stopping needs deployment resourceVersion")
+			}
 			foreground := metav1.DeletePropagationForeground
-			err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(w.ID), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid}, PropagationPolicy: &foreground})
+			err := m.client.AppsV1().Deployments(ns).Delete(ctx, deploymentName(w.ID), metav1.DeleteOptions{Preconditions: &metav1.Preconditions{UID: &uid, ResourceVersion: &rv}, PropagationPolicy: &foreground})
 			if err != nil && !apierrors.IsNotFound(err) {
 				return true, err
 			}
@@ -205,6 +219,9 @@ func (m *Materializer) legacyRecycleDue(w protocol.DesiredWorker, o reconcile.Ob
 }
 
 func (m *Materializer) reconcileReplacement(ctx context.Context, w protocol.DesiredWorker, o reconcile.ObservedWorker) error {
+	if e := rollFrom(ctx, w.ID); e != nil && !e.admitted && !m.drain.ForceRoll {
+		return nil // Cleanup may progress; a replacement still needs its image turn.
+	}
 	// Disable only the legacy triggers in this local copy during fenced rebuilding.
 	w.DindMaintenance = nil
 	w.DiskPressure = false
