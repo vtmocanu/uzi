@@ -185,14 +185,26 @@ func TestUsageFoldCodexIncompleteClaimLiveDB(t *testing.T) {
 				if len(got.rows) != len(wantModels) {
 					t.Fatalf("%s row/model count = %d, want %d: %+v", label, len(got.rows), len(wantModels), got.rows)
 				}
+				byModel := make(map[string]persistedRow, len(got.rows))
+				for _, row := range got.rows {
+					if _, exists := byModel[row.model]; exists {
+						t.Fatalf("%s duplicate model %q: %+v", label, row.model, got.rows)
+					}
+					byModel[row.model] = row
+				}
 				// Every row must have the exact same session and lineage key.
 				// With no persisted init frames, epoch and lineage index are zero.
-				for j, row := range got.rows {
-					if row.modelState != wantModels[j] || row.session != sessionID ||
+				for _, want := range wantModels {
+					row, ok := byModel[want.model]
+					if !ok {
+						t.Fatalf("%s missing model %q: %+v", label, want.model, got.rows)
+					}
+					delete(byModel, want.model)
+					if row.modelState != want || row.session != sessionID ||
 						row.harness != "codex" || row.basis != "per_leg" ||
 						row.epoch != 0 || row.lineage != 0 || !row.legacyGeneration {
-						t.Fatalf("%s row %d = %+v, want model %+v session %q codex/per_leg epoch=0 lineage=0 legacy generation",
-							label, j, row, wantModels[j], sessionID)
+						t.Fatalf("%s model %q = %+v, want model %+v session %q codex/per_leg epoch=0 lineage=0 legacy generation",
+							label, want.model, row, want, sessionID)
 					}
 				}
 				if got.total != wantTotal {
