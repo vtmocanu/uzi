@@ -451,7 +451,15 @@ completed_receipt_fixture() {
     jq -nc --arg run "$UUID" --arg step "$step" '{run_id:$run,status:"completed",generation:1,holds:[
       {id:"own-hold",generation:1,inventory_guarded:true,state:"released",after_outcome:true,
         final_disposition:"archive",release_evidence:"archive",archive_matches:true}]}
-      | if $step=="open" then .holds[0] += {state:"open",final_disposition:null,release_evidence:null}
+      | if $step=="completed-publication" then
+          . += {owner_id:"owner",worker_id:"worker",repo_id:"repo",mr_iid:7,branch:"agent/issue-1",final_head:("a"*40)} |
+          {hold_id:"own-hold",run_id:$run,owner_id:"owner",worker_id:"worker",generation:1,repo_id:"repo",
+            connection_id:"connection",project_id:1,forge_type:"gitlab",base_url:"https://example.test",
+            branch:"agent/issue-1",mr_iid:7,final_head:("a"*40)} as $identity |
+          .holds[0] += {final_disposition:"completed_publication",release_evidence:"completed_publication",
+            final_capture_id:null,final_source_sha:null,final_coverage_digest:null,final_publication_id:null,
+            completion_identity:$identity,completed_publication_receipt:($identity+{observed_branch_head:("b"*40)})}
+        elif $step=="open" then .holds[0] += {state:"open",final_disposition:null,release_evidence:null}
         elif $step=="missing" then .holds=[]
         elif $step=="duplicate" then .holds += .holds
         elif $step=="wrong-generation" then .holds[0].generation=2
@@ -500,6 +508,18 @@ completed_receipt_fixture legacy-before-completion
 custody_case "legacy archive receipt may precede completion" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
 completed_receipt_fixture failed
 custody_case "failed run cannot satisfy completed custody boundary" fail 'missing exact run/generation/hold' wait_completed_custody_receipt "$UUID" 2
+completed_receipt_fixture completed-publication
+custody_case "completed publication accepts its exact immutable receipt" pass 'completed custody receipt' wait_completed_custody_receipt "$UUID" 2
+for field in hold_id run_id owner_id worker_id generation repo_id connection_id project_id forge_type base_url branch mr_iid final_head; do
+  completed_receipt_fixture completed-publication
+  jq -c --arg field "$field" '.holds[0].completed_publication_receipt[$field]="other"' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
+  mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+  custody_case "publication receipt refuses mismatched $field" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
+done
+completed_receipt_fixture completed-publication
+jq -c '.holds[0].completed_publication_receipt.observed_branch_head="invalid"' "$SEQ_DIR/seq" > "$SEQ_DIR/changed"
+mv "$SEQ_DIR/changed" "$SEQ_DIR/seq"
+custody_case "publication receipt refuses an invalid observed head" fail 'lacks final custody proof' wait_completed_custody_receipt "$UUID" 2
 
 diagnostic_trap() {
   local phase="$1" status="$2"
@@ -740,6 +760,6 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
 done
 
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 121 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has all 136 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 121 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 136 ] && [ "$cases" -eq "$passed" ]
