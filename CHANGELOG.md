@@ -32,6 +32,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**
+  The existing sync interval checks advertised refs, then independently stages the configured ref; either operation can fail without preventing the other, and neither bumps the pin nor applies templates. The new instance housekeeping check `agentsource.update` reads persisted discovery facts only, warning for a newer tag or moved branch, reporting `ok` when no update is derived, `na` when disabled, unconfigured or SHA-pinned, and `unknown` before a recorded check or on a settings read failure. It never yields Danger; warnings and unknowns feed Admin/Health attention counts and a separate Instance advisory mark, with a direct link to agent-source settings. Bumping a tag pin clears the tag signal; applying a snapshot matching the recorded tip clears the branch signal. Failed discovery retains last-good facts, so Health does not diagnose discovery freshness or sync failures; template changes still require review and approval.
+
 - **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
   A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
 

@@ -2395,7 +2395,7 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 rationale, and the deferred items (version skew, per-connection sync freshness).
 
 The health registry supplies each check's `scope` (#2293): `db`,
-`db.size`, `controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
+`db.size`, `controller.report`, `loops`, `fleet.roll`, `agentsource.update` and `pricing.codex` are `instance`;
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit

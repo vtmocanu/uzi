@@ -967,8 +967,8 @@ A few worth knowing:
   last sync/apply time and commit, the staged snapshot's counts, whether a
   snapshot is pending review, and the derived update signal —
   `update_available`, plus `latest_ref` and `update_checked_at` once a
-  check has run. Those three are computed server-side from the last **Check
-  for updates** result and the live config; the CLI itself does no egress
+  check has run. Those three are computed server-side from the last automatic
+  or manual discovery result and the live config; the CLI itself does no egress
   to produce them. Read-only, same as every other `admin` verb here —
   setting up the source, and triggering **Sync now**, **Check for
   updates**, **Bump pin**, and **Approve & apply** stay web-only.

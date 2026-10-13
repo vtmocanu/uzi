@@ -55,8 +55,9 @@ It surfaces five ways:
 - **One notice per admin per Danger episode**, as a Slack DM for a linked
   admin, selects checks with server-supplied `scope: instance` and severity
   `danger`. The current instance checks are `db`, `db.size`, `controller.report`,
-  `loops`, `fleet.roll` and `pricing.codex`; the rest are `owner`. `fleet.roll` remains
-  instance infrastructure even when the hosted workers belong to a single owner.
+  `loops`, `fleet.roll`, `agentsource.update` and `pricing.codex`; the rest are
+  `owner`. `fleet.roll` remains instance infrastructure even when the hosted
+  workers belong to a single owner.
 
   Episodes follow `blocking`: the opening evaluation sends nothing, and the
   next still-blocking evaluation claims one notice per admin. Another instance
@@ -405,12 +406,35 @@ These are bounded observations, not a globally ordered snapshot:
 | `custody.holds` | An owner at the [recovery custody admission limit](run-recovery.md) | any owner at the limit | — | `na` when custody admission is disabled |
 | `recovery.storage` | Current persisted quota-refused recovery captures; [diagnosis](./recovery-storage-diagnosis.md) | any matching capture | — | `unknown` when the read fails or exceeds four seconds |
 | `release.check` | Whether this instance is far behind the latest release, per the same derivation [Update checks](updates.md) uses | far behind | — | `na` when the upstream release check is disabled |
+| `agentsource.update` | Persisted [agent-source discovery](agent-source.md#update-checks-and-the-update-badge), compared with the current pin and last-applied SHA | newer semver tag or tracked branch moved | — | `na` when disabled, unconfigured or SHA-pinned; `unknown` before a recorded check or on a settings read failure |
 | `pricing.codex` | Recent Codex usage on models without a currently valid price in this release's table | any such model | — | `unknown` when the usage query fails or exceeds its five-second deadline |
 
 `unknown` and `na` are first-class outcomes, not edge cases to squint past: a
 check reading `unknown` means its observation is missing, stale, unreadable,
 or turned off, and a check reading `na` means it genuinely does not apply here (no
 hosted workers, no Slack). Neither is ever folded into, or displayed as, `ok`.
+
+### Agent source updates
+
+`agentsource.update` is an instance-scoped housekeeping advisory
+([#2902](https://github.com/vtmocanu/uzi/issues/2902)). Health reads persisted
+discovery facts only: it performs no remote request, sync, pin change or apply,
+and staging results do not affect its verdict. A newer semver tag or a tracked
+branch tip different from the last-applied SHA yields `warn`; otherwise a
+recorded check yields `ok`. Disabled or unconfigured sources and immutable
+40-hex SHA pins yield `na`; no recorded check or a settings read failure yields
+`unknown`. Failed discovery preserves last-good facts, so this check does not
+report discovery freshness or sync failures.
+
+The check never yields `danger`, so it cannot open a blocking episode, raise
+the Danger banner or trigger an admin Danger notice. Its `warn` or `unknown`
+still contributes to Health and Admin attention counts, and the **Instance**
+tab carries a separate advisory mark linking readers toward agent-source
+settings. The attention item links directly to `/admin/settings#agent-source`.
+A tag warning clears by bumping the pin; a branch warning clears by applying
+a snapshot matching the recorded branch tip. See
+[Agent source](./agent-source.md#update-checks-and-the-update-badge) for the
+review workflow and badge behavior.
 
 ### Recovery storage
 
