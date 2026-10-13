@@ -963,9 +963,9 @@ func (e *Scheduler) createIssueRun(ctx context.Context, sched store.RunSchedule,
 		var reason SkipReason
 		switch {
 		case errors.Is(err, workersvc.ErrHarnessLabelInvalid):
-			reason = SkipReason("harness_label_invalid")
+			reason = SkipHarnessLabelInvalid
 		case errors.Is(err, workersvc.ErrHarnessLabelConflict):
-			reason = SkipReason("harness_label_conflict")
+			reason = SkipHarnessLabelConflict
 		default:
 			return FireOutcome{}, err
 		}

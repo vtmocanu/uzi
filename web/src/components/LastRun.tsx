@@ -49,12 +49,14 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // stored Anthropic credential override, which Codex cannot use. Actionable — the owner clears
   // the override or the Codex default — so it reads amber like the other owner-fixable skips.
   codex_override_conflict: "warning",
+  harness_label_conflict: "warning",
+  harness_label_invalid: "warning",
   // PRD #1093: the owner's user-level "pause all schedules" switch was on when this fire
   // came due. Benign and self-resolving — the cadence advanced as normal and re-fires on
   // resume, nothing replays (the explanatory detail-row copy is added in M4).
   schedules_paused: "neutral",
-  // PRD #1429 (D5): the owner has no usable credential for either harness at fire time, so
-  // D11 cannot resolve one. Actionable — the owner adds/repairs a credential — so it reads amber.
+  // No usable credential at fire time (neither harness under D11, or a label-selected harness), so
+  // Actionable — the owner adds/repairs a credential — so it reads amber.
   no_usable_credential: "warning",
   // PRD #1732 (D2): the schedule's pinned credential is disabled, or its pinned harness has no
   // enabled credential. Actionable — the owner enables it in Settings — so it reads amber.

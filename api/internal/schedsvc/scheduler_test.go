@@ -1494,9 +1494,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible;
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
-	// credential_disabled).
-	if len(AllSkipReasons) != 12 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 12", len(AllSkipReasons))
+	// credential_disabled; issue #2853 added harness_label_conflict and harness_label_invalid).
+	if len(AllSkipReasons) != 14 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 14", len(AllSkipReasons))
 	}
 }
 

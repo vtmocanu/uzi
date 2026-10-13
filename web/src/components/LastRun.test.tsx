@@ -226,6 +226,14 @@ function renderDetail(f: LastFire) {
   );
 }
 
+it.each([
+  ["harness_label_conflict", "issue harness label conflicts with schedule pin"],
+  ["harness_label_invalid", "invalid issue harness labels"],
+] as const)("shows %s harness label refusals as owner-actionable badges", (reason, label) => {
+  renderDetail(fire([{ issue_iid: 7, title: "Harness choice", reason, web_url: null }]));
+  expect(screen.getByText(label).className).toMatch(/warn/);
+});
+
 describe("LastFireDetail — schedules_paused fire (PRD #1093)", () => {
   it("renders the explanatory row instead of a candidate list for a pause-all fire", () => {
     renderDetail(fire([{ issue_iid: null, title: "", reason: "schedules_paused", web_url: null }]));
