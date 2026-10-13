@@ -639,8 +639,11 @@ scenarios are mutually exclusive by construction. Known values:
   lanes or Now note. These routes cover the unified card and
   header settings/controls. Open Run settings to inspect the token epochs
   and toggles; the assigned fixture includes one recorded pin and its time.
-  Attention order, cost-footer and summary-collapse changes (M3), and
-  Now summarizer wording changes (M4), remain pending.
+  Approval, holds and outcomes precede progress. The footer uses recorded
+  usage with separate estimated tails; summaries remember saved choices and
+  otherwise collapse after approval. Now fixtures illustrate intended work
+  from titles and role labels. Prompt tests check instructions and fences;
+  live model wording remains a maintainer spot-check.
 - `oidc`, `oidc-degraded`, `sso-only` — the PRD #45 OIDC UX, otherwise
   unreachable in the demo (OIDC off, password on, by default).
 - `truncated-backlog` — `/judge?mock=truncated-backlog` puts the
