@@ -12,6 +12,7 @@ import { MemoryRouter } from "react-router-dom";
 import { api } from "./api";
 import { useAuth } from "../auth/AuthContext";
 import { HealthStatusProvider } from "./useAdminHealth";
+import { AdminShell } from "../components/AdminShell";
 import { HealthDangerBanner } from "../components/HealthDangerBanner";
 import { healthySilentDoc, ownerOnlyDoc, incidentDoc } from "../mocks/data/health";
 
@@ -19,7 +20,7 @@ import { healthySilentDoc, ownerOnlyDoc, incidentDoc } from "../mocks/data/healt
 // provider's isAdmin read is driven per test.
 vi.mock("./api", async (importOriginal) => {
   const actual = await importOriginal<typeof import("./api")>();
-  return { ...actual, api: { getAdminHealth: vi.fn(), snoozeAdminHealth: vi.fn() } };
+  return { ...actual, api: { getAdminHealth: vi.fn(), snoozeAdminHealth: vi.fn(), getAgentSource: vi.fn() } };
 });
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
 
@@ -28,6 +29,7 @@ const mockApi = vi.mocked(api);
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.useRealTimers();
 });
 
 // Mount the provider with a real consumer under it (the banner), so the test exercises the
@@ -37,12 +39,32 @@ function renderProvider() {
     <MemoryRouter>
       <HealthStatusProvider>
         <HealthDangerBanner />
+        <AdminShell description={null}>body</AdminShell>
       </HealthStatusProvider>
     </MemoryRouter>,
   );
 }
 
 describe("HealthStatusProvider — the isAdmin fetch gate", () => {
+  it("retains the last-good source pip on a failed shared 10000ms poll without source fetches", async () => {
+    vi.useFakeTimers();
+    vi.mocked(useAuth).mockReturnValue({ user: { is_admin: true } } as never);
+    const doc = healthySilentDoc();
+    doc.checks.find((c) => c.id === "agentsource.update")!.severity = "warn";
+    doc.counts = { ok: 20, warn: 1, danger: 0, unknown: 0, na: 0 };
+    mockApi.getAdminHealth.mockResolvedValueOnce(doc).mockRejectedValueOnce(new Error("offline"));
+    renderProvider();
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(9999); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
+    await act(async () => { await vi.advanceTimersByTimeAsync(1); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+  });
+
   it("makes NO request to /api/admin/health for a non-admin session", async () => {
     vi.mocked(useAuth).mockReturnValue({ user: { is_admin: false } } as never);
     mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
@@ -52,6 +74,9 @@ describe("HealthStatusProvider — the isAdmin fetch gate", () => {
     await Promise.resolve();
     await Promise.resolve();
     expect(mockApi.getAdminHealth).not.toHaveBeenCalled();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+    expect(screen.getByRole("link", { name: "Instance" })).toBeTruthy();
+    expect(screen.queryByRole("img", { name: /Agent source update/ })).toBeNull();
   });
 
   it("shares scoped owner danger with the banner without an instance alert", async () => {
