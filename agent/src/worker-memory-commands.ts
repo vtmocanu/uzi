@@ -3,7 +3,7 @@ import type { MemoryPolicy, WorkerMemoryPressureResult } from "./protocol.js";
 import { makeTextRedactor } from "./redact.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 
-type Root = Readonly<{ pid: number; startTime: number }>;
+type Root = Readonly<{ pid: number; startTime: string }>;
 type ContextInput = {
   run_id: string;
   worker_id: string;
@@ -23,6 +23,8 @@ type Observation = {
   startedAtMs: number;
   completedAtMs: number;
   rows: readonly (Root & { rssBytes: number })[];
+  supervisor?: Root;
+  primary?: Root;
 };
 type Budget = Readonly<{ remainingMs: number; signal: AbortSignal }>;
 type Entry = Readonly<{
@@ -33,6 +35,7 @@ type Entry = Readonly<{
   attemptId: string;
   commandId: string;
   root: Root;
+  primary?: Root;
   command: string;
   observe: (budget?: Budget) => Promise<Observation>;
   cancel: (authority: Budget & Readonly<{ authorized: () => boolean }>) => Promise<void>;
@@ -46,7 +49,10 @@ function uuid(value: string): boolean {
     && value !== "00000000-0000-0000-0000-000000000000";
 }
 function positive(n: number): boolean { return Number.isSafeInteger(n) && n > 0; }
-function rootValid(root: Root): boolean { return positive(root.pid) && positive(root.startTime); }
+function rootValid(root: Root): boolean {
+  return positive(root.pid) && typeof root.startTime === "string"
+    && /^[1-9][0-9]{0,19}$/.test(root.startTime) && BigInt(root.startTime) <= 18446744073709551615n;
+}
 function key(root: Root): string { return `${root.pid}:${root.startTime}`; }
 function fresh(o: Observation, now: number, age: number): boolean {
   return o.available === true && o.complete === true && Number.isFinite(now) && now >= 0
@@ -85,7 +91,14 @@ export class WorkerMemoryCommands {
     return true;
   }
 
+  private readonly prepared = new WeakSet<Entry>();
+
   prepareOutcome(entry: Entry): Promise<WorkerMemoryPressureResult> {
+    this.prepared.add(entry);
+    return this.watchOutcome(entry);
+  }
+
+  watchOutcome(entry: Entry): Promise<WorkerMemoryPressureResult> {
     const existing = this.outcomes.get(entry);
     if (existing) return existing.promise;
     let resolve!: (result: WorkerMemoryPressureResult) => void;
@@ -94,7 +107,9 @@ export class WorkerMemoryCommands {
     return promise;
   }
 
-  outcome(entry: Entry): Promise<WorkerMemoryPressureResult> | undefined { return this.outcomes.get(entry)?.promise; }
+  outcome(entry: Entry): Promise<WorkerMemoryPressureResult> | undefined {
+    return this.prepared.has(entry) ? this.outcomes.get(entry)?.promise : undefined;
+  }
 
   resolveToolOutcome(entry: Entry, result: WorkerMemoryPressureResult): boolean {
     const slot = this.outcomes.get(entry);
@@ -176,9 +191,9 @@ export class WorkerMemoryCommands {
 
   register(context: Context, input: Omit<Entry, "identity" | "context" | "command" | "root" | "commandId"> & {
     command: string; root: Root;
-  }): Entry {
-    if (!this.admitsCommands(context) || input.source !== "codex-model-command"
-      || !rootValid(input.root) || ![input.toolId, input.attemptId].every((id) => typeof id === "string" && id.length > 0
+  }, commandId?: string): Entry {
+    if (!this.admitsCommands(context) || (commandId !== undefined && !uuid(commandId)) || input.source !== "codex-model-command"
+      || !rootValid(input.root) || (input.primary !== undefined && !rootValid(input.primary)) || ![input.toolId, input.attemptId].every((id) => typeof id === "string" && id.length > 0
         && Buffer.byteLength(id) <= 256 && !/[\p{Cc}\u061c\u200e\u200f\u2028-\u202e\u2066-\u2069]/u.test(id))
       || typeof input.observe !== "function" || typeof input.cancel !== "function"
       || typeof input.drain !== "function") throw new Error("untrusted memory command");
@@ -187,9 +202,10 @@ export class WorkerMemoryCommands {
     const attemptId = redact(input.attemptId);
     if (Buffer.byteLength(toolId) > 256 || Buffer.byteLength(attemptId) > 256) throw new Error("untrusted memory command IDs");
     const entry: Entry = Object.freeze({
-      source: input.source, toolId, attemptId, commandId: randomUUID(),
+      source: input.source, toolId, attemptId, commandId: commandId ?? randomUUID(),
       observe: input.observe, cancel: input.cancel, drain: input.drain,
       identity: randomUUID(), context, root: Object.freeze({ ...input.root }),
+      ...(input.primary ? { primary: Object.freeze({ ...input.primary }) } : {}),
       command: sanitizeForLog(makeTextRedactor([...this.secrets])(input.command), 1021),
     });
     this.entries.set(entry.identity, entry);
@@ -253,13 +269,15 @@ export class WorkerMemoryCommands {
     const enrolledPids = new Map<number, Entry[]>();
     for (const entry of this.entries.values()) {
       if (this.drained.has(entry)) continue;
-      const owners = enrolledPids.get(entry.root.pid) ?? [];
-      owners.push(entry);
-      enrolledPids.set(entry.root.pid, owners);
+      for (const identity of [entry.root, ...(entry.primary ? [entry.primary] : [])]) {
+        const owners = enrolledPids.get(identity.pid) ?? [];
+        owners.push(entry);
+        enrolledPids.set(identity.pid, owners);
+      }
     }
     const invalid = new Set<number>();
     const owners = new Map<string, number[]>();
-    const pidStarts = new Map<number, Set<number>>();
+    const pidStarts = new Map<number, Set<string>>();
     const totals = new Map<number, number>();
     const entryOwners = new Map<Entry, number[]>();
     candidates.forEach(({ entry, observation }, index) => {
@@ -282,7 +300,7 @@ export class WorkerMemoryCommands {
         const indices = owners.get(identity) ?? [];
         indices.push(index);
         owners.set(identity, indices);
-        const starts = pidStarts.get(row.pid) ?? new Set<number>();
+        const starts = pidStarts.get(row.pid) ?? new Set<string>();
         starts.add(row.startTime);
         pidStarts.set(row.pid, starts);
         if (identity === key(entry.root)) hasRoot = true;
@@ -292,7 +310,26 @@ export class WorkerMemoryCommands {
         total += row.rssBytes;
         if (!Number.isSafeInteger(total)) invalid.add(index);
       }
-      if (!hasRoot) invalid.add(index);
+      if (entry.primary) {
+        // Production observations come from the enrolled supervisor handle. The
+        // primary can exit while detached children are adopted by that supervisor.
+        if (!observation.supervisor || !rootValid(observation.supervisor)
+          || key(observation.supervisor) !== key(entry.root)
+          || !observation.primary || !rootValid(observation.primary)
+          || key(observation.primary) !== key(entry.primary)
+          || protectedPids.has(entry.root.pid) || protectedPids.has(entry.primary.pid)
+          || enrolledPids.get(entry.root.pid)?.some((other) => other !== entry)) invalid.add(index);
+        for (const root of [entry.root, entry.primary]) {
+          const identity = key(root);
+          if (seen.has(identity)) continue;
+          const indices = owners.get(identity) ?? [];
+          indices.push(index);
+          owners.set(identity, indices);
+          const starts = pidStarts.get(root.pid) ?? new Set<string>();
+          starts.add(root.startTime);
+          pidStarts.set(root.pid, starts);
+        }
+      } else if (!hasRoot) invalid.add(index);
       totals.set(index, total);
     });
     for (const indices of entryOwners.values()) if (indices.length > 1) for (const index of indices) invalid.add(index);
@@ -305,12 +342,17 @@ export class WorkerMemoryCommands {
       const rssBytesApprox = totals.get(index);
       if (!invalid.has(index) && rssBytesApprox !== undefined) {
         valid.push(Object.freeze({ entry, rssBytesApprox, observation: Object.freeze({
-          ...observation, rows: Object.freeze(observation.rows.map((row) => Object.freeze({ ...row }))),
+          ...observation,
+          ...(observation.supervisor ? { supervisor: Object.freeze({ ...observation.supervisor }) } : {}),
+          ...(observation.primary ? { primary: Object.freeze({ ...observation.primary }) } : {}),
+          rows: Object.freeze(observation.rows.map((row) => Object.freeze({ ...row }))),
         }) }));
       }
     });
     valid.sort((a, b) => b.rssBytesApprox - a.rssBytesApprox
-      || a.entry.root.pid - b.entry.root.pid || a.entry.root.startTime - b.entry.root.startTime
+      || a.entry.root.pid - b.entry.root.pid
+      || (BigInt(a.entry.root.startTime) < BigInt(b.entry.root.startTime) ? -1
+        : BigInt(a.entry.root.startTime) > BigInt(b.entry.root.startTime) ? 1 : 0)
       || a.entry.identity.localeCompare(b.entry.identity));
     return valid[0];
   }

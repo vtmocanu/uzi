@@ -55,6 +55,8 @@ import {
   type FileopClient,
   type RunGrants,
   type ScreenPolicy,
+  type CapturedMemoryContext,
+  type CodexCallbackBrokerOptions,
   type SpawnCommandSeam,
   type ToolHandler,
 } from "./broker.js";
@@ -132,6 +134,8 @@ export interface ChildThreadController {
 export type StartChildTurnSeam = (spec: StartChildTurnSpec) => Promise<ChildThreadController>;
 
 export interface CodexDelegationRunnerOptions {
+  readonly capturedMemory?: CapturedMemoryContext;
+  readonly scrubToolResult?: CodexCallbackBrokerOptions["scrubToolResult"];
   readonly policyParent?: () => ReturnType<typeof admitPolicyTurn> | undefined;
   readonly policySink?: (payload: PolicyRefusalPayload) => void | Promise<void>;
   readonly scrubPolicyRole?: (role: string) => string;
@@ -328,6 +332,8 @@ export class CodexDelegationRunner {
     // effect seams, NO delegation targets (a subagent cannot delegate), and a deny-only
     // delegate seam that a child's isRoot:false grants make unreachable anyway.
     const childBroker = new CodexCallbackBroker({
+      capturedMemory: this.opts.capturedMemory,
+      scrubToolResult: this.opts.scrubToolResult,
       registry: this.registry,
       spawnCommand: this.spawnCommand,
       fileop: this.fileop,
@@ -514,7 +520,7 @@ export class CodexDelegationRunner {
           result = { ok: false, code: "broker_error", message: "the callback failed" };
         }
         if (projectable) {
-          const output = result.ok ? result.output : result.message;
+          const output = result.ok ? result.output : result.memoryPressure ?? result.message;
           this.projectChild(controller, [
             { kind: "tool", phase: "finished", id: callId, name: canonical, output, isError: !result.ok },
           ]);
@@ -530,7 +536,8 @@ export class CodexDelegationRunner {
   /** Map a broker {@link CallbackResult} to the app-server tool reply body (mirrors the
    *  run harness's `replyOf`): `{ success, contentItems:[{type,text}] }`. */
   private replyBody(result: CallbackResult): unknown {
-    const text = result.ok ? this.stringify(result.output) : result.policyRefusal
+    const text = result.ok ? this.stringify(result.output) : result.memoryPressure
+      ? JSON.stringify(result.memoryPressure) : result.policyRefusal
       ? JSON.stringify({ code: result.code, message: result.message, policyRefusal: result.policyRefusal }) : result.message;
     return { success: result.ok, contentItems: [{ type: "inputText", text }] };
   }

@@ -2003,6 +2003,7 @@ export class CodexHarness implements RunHarness {
    *  denial is returned as `success:false` so it lands as a failed tool result. */
   private replyOf(result: CallbackResult): { result: unknown } {
     const text = result.ok ? this.stringifyOutput(result.output)
+      : result.memoryPressure ? JSON.stringify(result.memoryPressure)
       : result.policyRefusal ? JSON.stringify({ code: result.code, message: result.message, policyRefusal: result.policyRefusal }) : result.message;
     return { result: { success: result.ok, contentItems: [{ type: "inputText", text }] } };
   }

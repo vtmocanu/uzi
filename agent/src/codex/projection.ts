@@ -229,7 +229,7 @@ export function projectToolInput(args: unknown, scrub: ProjectionScrub): unknown
  *  BEFORE bounding, and bounded on its JSON-escaped size, so the persisted
  *  `JSON.stringify(content)` is at most MAX_PROJECTED_BYTES + 2 (the quotes). */
 export function projectToolOutput(result: CallbackResult, scrub: ProjectionScrub): string {
-  return projectOutputValue(result.ok ? result.output : result.message, scrub);
+  return projectOutputValue(result.ok ? result.output : result.memoryPressure ?? result.message, scrub);
 }
 
 /** Project a raw tool output VALUE (a string passes through, anything else is JSON-stringified)

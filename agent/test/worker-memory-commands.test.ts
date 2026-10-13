@@ -9,7 +9,7 @@ const contextInput = () => ({
 });
 type Entry = ReturnType<WorkerMemoryCommands["register"]>;
 type Observation = Parameters<WorkerMemoryCommands["select"]>[0][number]["observation"];
-const row = (pid: number, rssBytes = 100, startTime = 10) => ({ pid, startTime, rssBytes });
+const row = (pid: number, rssBytes = 100, startTime = "10") => ({ pid, startTime, rssBytes });
 function observation(rows = [row(10)], time = 100): Observation {
   return { available: true, complete: true, startedAtMs: time, completedAtMs: time, rows };
 }
@@ -18,13 +18,47 @@ function setup() {
   const context = registry.begin(contextInput());
   return { registry, context };
 }
-function enroll(registry: WorkerMemoryCommands, context: ReturnType<WorkerMemoryCommands["begin"]>, pid = 10, startTime = 10): Entry {
+function enroll(registry: WorkerMemoryCommands, context: ReturnType<WorkerMemoryCommands["begin"]>, pid = 10, startTime = "10"): Entry {
   return registry.register(context, {
     source: "codex-model-command", toolId: "tool", attemptId: "attempt",
     root: { pid, startTime }, command: "literal inert fixture", observe: async () => observation(),
     cancel: async () => {}, drain: async () => ({ confirmed: false }),
   });
 }
+
+test("maximum uint64 ticks stay exact across selection, protection and PID reuse", () => {
+  const { registry, context } = setup();
+  const max = "18446744073709551615";
+  const entry = enroll(registry, context, 10, max);
+  const exact = observation([row(10, 100, max)]);
+  const selected = registry.select([{ entry, observation: exact }], 100, 200);
+  assert.ok(selected, "maximum uint64 identity enrolls and selects without Number conversion");
+  assert.equal(registry.checkBeforeCancel(selected, observation([row(10, 100, "18446744073709551614")]), 100, 200), false,
+    "adjacent large ticks cannot inherit cancellation authority");
+  const protectedRoot = registry.protect("provider", { pid: 10, startTime: "18446744073709551614" });
+  assert.equal(registry.select([{ entry, observation: exact }], 100, 200), undefined);
+  registry.unprotect(protectedRoot);
+  for (const ticks of ["01", "0", "-1", "1e3", "18446744073709551616", " 10", "10.0"]) {
+    assert.throws(() => enroll(registry, context, 20, ticks));
+  }
+});
+
+test("attested supervisor keeps exited primary descendants eligible and rejects changed supervisor ticks", () => {
+  const { registry, context } = setup();
+  const entry = registry.register(context, {
+    source: "codex-model-command", toolId: "tool", attemptId: "attempt", command: "fixture",
+    root: { pid: 9, startTime: "18446744073709551615" }, primary: { pid: 10, startTime: "11" },
+    observe: async () => observation(), cancel: async () => {}, drain: async () => ({ confirmed: false }),
+  });
+  const adopted = { ...observation([row(12)]), supervisor: entry.root, primary: entry.primary };
+  assert.equal(registry.select([{ entry, observation: adopted }], 100, 200)?.entry, entry,
+    "exited primary needs exact supervisor and original primary attestation");
+  for (const patch of [{ supervisor: undefined }, { primary: undefined },
+    { supervisor: { ...entry.root, startTime: "18446744073709551614" } },
+    { primary: { pid: 10, startTime: "12" } }]) {
+    assert.equal(registry.select([{ entry, observation: { ...adopted, ...patch } }], 100, 200), undefined);
+  }
+});
 
 test("exact prepared outcome survives unregister and PID reuse without settling replacement", async () => {
   const { registry, context } = setup();
@@ -41,7 +75,7 @@ test("exact prepared outcome survives unregister and PID reuse without settling 
   registry.recordDrain(old, { confirmed: true });
   assert.equal(registry.unregister(old), true);
   const next = registry.begin({ ...contextInput(), lifecycleRevision: 2 });
-  const root = enroll(registry, next, 10, 99);
+  const root = enroll(registry, next, 10, "99");
   let newSettled = false;
   void registry.prepareOutcome(root).then(() => { newSettled = true; });
   for (const patch of [
@@ -91,7 +125,7 @@ test("bounded enumeration fails closed without observing or discarding retained 
   const protectedRegistry = new WorkerMemoryCommands();
   const protectedContext = protectedRegistry.begin(contextInput());
   const candidate = enroll(protectedRegistry, protectedContext, 400);
-  const roots = Array.from({ length: 257 }, (_, i) => protectedRegistry.protect("provider", { pid: i + 1000, startTime: 10 }));
+  const roots = Array.from({ length: 257 }, (_, i) => protectedRegistry.protect("provider", { pid: i + 1000, startTime: "10" }));
   assert.equal(protectedRegistry.eligibleEntries(), undefined);
   assert.equal(protectedRegistry.select([{ entry: candidate, observation: observation([row(400)]) }], 100, 200), undefined);
   assert.equal(protectedRegistry.unprotect(roots[0]!), true);
@@ -150,7 +184,7 @@ test("enrollment is Codex-only, UUID worker-owned, command redacted before bound
   const context = registry.begin(contextInput());
   const input = {
     source: "codex-model-command" as const, toolId: "tool", attemptId: "attempt",
-    root: { pid: 10, startTime: 10 }, command: secret + "\n\u202e" + "x".repeat(2000),
+    root: { pid: 10, startTime: "10" }, command: secret + "\n\u202e" + "x".repeat(2000),
     observe: async () => observation(), cancel: async () => {}, drain: async () => ({ confirmed: false }),
   };
   const entry = registry.register(context, input);
@@ -164,7 +198,7 @@ test("enrollment is Codex-only, UUID worker-owned, command redacted before bound
   for (const source of ["claude", "provider", "boundary", "sink", "marks"]) {
     assert.throws(() => registry.register(context, { ...input, source: source as typeof input.source }));
   }
-  for (const root of [{ pid: 0, startTime: 10 }, { pid: 10, startTime: NaN }]) {
+  for (const root of [{ pid: 0, startTime: "10" }, { pid: 10, startTime: "invalid" }]) {
     assert.throws(() => registry.register(context, { ...input, root }));
   }
   const latch = registry.acquireLatch(context);
@@ -218,7 +252,7 @@ test("unavailable, incomplete, stale, malformed and unattributed candidates are 
     { ...observation(), available: false }, { ...observation(), complete: false },
     observation([row(10)], 0), observation([row(11)]),
     observation([row(10, -1)]), observation([row(10, Number.MAX_SAFE_INTEGER + 1)]),
-    observation([row(10, 1, 0)]), observation([row(0)]),
+    observation([row(10, 1, "0")]), observation([row(0)]),
     observation([row(10, Number.MAX_SAFE_INTEGER), row(11, 1)]),
     observation(Array.from({ length: 257 }, (_, i) => row(i + 1))),
     { ...observation(), completedAtMs: 101 },
@@ -231,13 +265,13 @@ test("protected roots come from worker-owned data; marks grant no authority", ()
   const { registry, context } = setup();
   const entry = enroll(registry, context);
   for (const kind of ["worker", "provider", "boundary", "sink"] as const) {
-    const root = registry.protect(kind, { pid: 11, startTime: 10 });
+    const root = registry.protect(kind, { pid: 11, startTime: "10" });
     assert.equal(registry.unprotect({ ...root }), false);
     assert.equal(registry.select([{ entry, observation: observation([row(10), row(11)]) }], 100, 200), undefined);
     assert.equal(registry.unprotect(root), true);
   }
-  assert.throws(() => registry.protect("provider", { pid: -1, startTime: 10 }));
-  const protectedRoot = registry.protect("provider", { pid: 10, startTime: 99 });
+  assert.throws(() => registry.protect("provider", { pid: -1, startTime: "10" }));
+  const protectedRoot = registry.protect("provider", { pid: 10, startTime: "99" });
   assert.equal(registry.select([{ entry, observation: observation() }], 100, 200), undefined);
   registry.unprotect(protectedRoot);
   const withMarks = { ...observation([row(11)]), mark: "codex-model-command" };
@@ -251,7 +285,7 @@ test("duplicate identity, overlapping trees and PID reuse disqualify affected ca
   const c = enroll(registry, context, 30);
   for (const [rowsA, rowsB] of [
     [[row(10), row(11)], [row(20), row(11)]],
-    [[row(10), row(11)], [row(20), row(11, 100, 99)]],
+    [[row(10), row(11)], [row(20), row(11, 100, "99")]],
     [[row(10), row(20)], [row(20)]],
   ]) {
     assert.ok(rowsA);
@@ -270,14 +304,14 @@ test("root replacement cannot inherit old selection; undrained old root prevents
   const old = enroll(registry, context);
   const selected = registry.select([{ entry: old, observation: observation() }], 100, 200);
   assert.ok(selected);
-  assert.equal(registry.checkBeforeCancel(selected, observation([row(10, 100, 99)]), 100, 200), false);
+  assert.equal(registry.checkBeforeCancel(selected, observation([row(10, 100, "99")]), 100, 200), false);
   const replacement = registry.begin(contextInput());
-  const next = enroll(registry, replacement, 10, 99);
+  const next = enroll(registry, replacement, 10, "99");
   assert.equal(registry.checkBeforeCancel(selected, observation(), 100, 200), false);
-  assert.equal(registry.select([{ entry: next, observation: observation([row(10, 100, 99)]) }], 100, 200), undefined);
+  assert.equal(registry.select([{ entry: next, observation: observation([row(10, 100, "99")]) }], 100, 200), undefined);
   registry.recordDrain(old, { confirmed: true });
   registry.unregister(old);
-  assert.equal(registry.select([{ entry: next, observation: observation([row(10, 100, 99)]) }], 100, 200)?.entry, next);
+  assert.equal(registry.select([{ entry: next, observation: observation([row(10, 100, "99")]) }], 100, 200)?.entry, next);
 });
 
 test("all three adapter callbacks are retained on immutable exact entries without invoking real processes", async () => {
@@ -285,7 +319,7 @@ test("all three adapter callbacks are retained on immutable exact entries withou
   const calls: string[] = [];
   const entry = registry.register(context, {
     source: "codex-model-command", toolId: "tool", attemptId: "attempt",
-    root: { pid: 10, startTime: 10 }, command: "fixture",
+    root: { pid: 10, startTime: "10" }, command: "fixture",
     observe: async () => { calls.push("observe"); return observation(); },
     cancel: async () => { calls.push("cancel"); },
     drain: async () => { calls.push("drain"); return { confirmed: true }; },
@@ -305,7 +339,7 @@ test("tool and attempt IDs reject controls and bidi, and scrub known secrets at 
   const context = registry.begin(contextInput());
   const input = {
     source: "codex-model-command" as const, toolId: "tool", attemptId: "attempt",
-    root: { pid: 10, startTime: 10 }, command: "fixture",
+    root: { pid: 10, startTime: "10" }, command: "fixture",
     observe: async () => observation(), cancel: async () => {}, drain: async () => ({ confirmed: true }),
   };
   for (const id of ["line\nbreak", "tab\tid", "bidi\u202e", "isolate\u2066", "null\u0000", "x".repeat(257)]) {

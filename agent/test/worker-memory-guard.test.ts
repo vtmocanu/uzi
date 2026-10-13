@@ -218,11 +218,11 @@ async function fixture(options: {
   let invalidate = () => {};
   const enroll = (ctx = context, pid = 10, rss = 100) => commands.register(ctx, {
     source: "codex-model-command", toolId: "tool", attemptId: "attempt",
-    root: { pid, startTime: 10 }, command: "inert fixture",
+    root: { pid, startTime: "10" }, command: "inert fixture",
     observe: async (budget) => {
       if (budget) { assert.ok(budget.signal); budgets.push(budget.remainingMs); }
       return options.observe ? options.observe(budget) : { available: true, complete: true, startedAtMs: time, completedAtMs: time,
-        rows: [{ pid, startTime: 10, rssBytes: rss }] };
+        rows: [{ pid, startTime: "10", rssBytes: rss }] };
     },
     cancel: async (authority) => { assert.ok(authority?.authorized()); signals++; await options.cancel?.(authority); },
     drain: async (budget) => {
@@ -424,7 +424,7 @@ test("old observation after replacement cannot select replacement root", async (
   const join = f.commands.prepareOutcome(replacement);
   void join.then(() => { joined = true; });
   held.resolve({ available: true, complete: true, startedAtMs: 0, completedAtMs: 0,
-    rows: [{ pid: 10, startTime: 10, rssBytes: 100 }] });
+    rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] });
   await f.monitor.settle();
   assert.equal(f.requests.length, 0);
   assert.equal(f.signals(), 0);
@@ -532,7 +532,7 @@ test("additional pre-cancel observation must contain exact selected root start t
   let count = 0;
   const f = await fixture({ observe: async () => ({
     available: true, complete: true, startedAtMs: 0, completedAtMs: 0,
-    rows: [{ pid: 10, startTime: ++count === 1 ? 10 : 11, rssBytes: 100 }],
+    rows: [{ pid: 10, startTime: ++count === 1 ? "10" : "11", rssBytes: 100 }],
   }) });
   f.monitor.tick();
   await until(() => f.requests.length === 1);

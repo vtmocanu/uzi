@@ -60,6 +60,7 @@ import { checkedImplementationContext, nextAutomaticRound, validateCheckedPlanBu
 import { recordRoot, type RecordedRoot, type StartTimeReader } from "../worker-spawn-mark.js";
 import path from "node:path";
 import { randomUUID } from "node:crypto";
+import { boundedCommandWait, enrollMemoryCommand } from "./memory-command.js";
 import { scopeCapAtBoundary, scopeCapAtDone, scopeSteerAckPayload } from "../scope-cap.js";
 import fs from "node:fs/promises";
 import { constants as FS } from "node:fs";
@@ -143,6 +144,8 @@ import {
   CommandDeadlineError,
   type FileopClient,
   type ScreenPolicy,
+  type CapturedMemoryContext,
+  isBrokerModelCommand,
   type SpawnCommandResult,
   type SpawnCommandSeam,
   type ToolHandler,
@@ -1751,6 +1754,7 @@ export interface CodexExecutorDeps {
 }
 
 export interface CodexExecutorOptions {
+  readonly capturedMemory?: CapturedMemoryContext;
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
@@ -3419,6 +3423,8 @@ export class CodexExecutor implements Executor {
         commandSandbox,
         this.log,
         commandCache,
+        DEFAULT_WALL_MS,
+        this.opts.capturedMemory,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
       // Issue #1598: least privilege: the fileop helper never runs Go or npm, so it gets no
@@ -3484,7 +3490,13 @@ export class CodexExecutor implements Executor {
         const runPlan = buildCodexRunPlan(
           this.buildRunRequest(ctx, phase, this.phasePrompt(ctx, phase), undefined, new AbortController().signal, selection.current),
         );
+        const scrubToolResult = (result: NonNullable<SpawnCommandResult["memoryPressure"]>) => ({
+          ...result, command: scrubProjected(result.command),
+          tool_id: scrubProjected(result.tool_id), attempt_id: scrubProjected(result.attempt_id),
+        });
         const delegationRunner = new CodexDelegationRunner({
+          capturedMemory: this.opts.capturedMemory,
+          scrubToolResult,
           registry,
           roles: runPlan.roles,
           startChildTurn: (spec: StartChildTurnSpec) =>
@@ -3501,6 +3513,8 @@ export class CodexExecutor implements Executor {
           scrubPolicyRole: scrubProjected,
         });
         return new CodexCallbackBroker({
+          capturedMemory: this.opts.capturedMemory,
+          scrubToolResult,
           registry,
           spawnCommand,
           fileop,
@@ -4848,7 +4862,7 @@ async function launchRegisteredEffectRoot(
   const root = registeredRoot(handle, kind, log);
   const admitted = registry.registerRoot(reservation.reservation, root);
   if (!admitted.ok) {
-    await root.dispose(deadlineMs).catch(() => undefined);
+    await boundedCommandWait(root.dispose(deadlineMs), deadlineMs).catch(() => undefined);
     throw new TrustedExecutionRefusal(`${kind} root failed registry admission`);
   }
   return { handle, root };
@@ -5067,8 +5081,14 @@ export function makeDefaultSpawnCommand(
   log?: Pick<Logger, "warn">,
   cache?: RunCommandCache,
   wallMs: number = DEFAULT_WALL_MS,
+  capturedMemory?: CapturedMemoryContext,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
+      if (capturedMemory && isBrokerModelCommand(opts.modelCommand)
+        && !isBrokerModelCommand(opts.modelCommand, capturedMemory)) throw new Error("memory command context binding mismatch");
+      if (capturedMemory && isBrokerModelCommand(opts.modelCommand, capturedMemory)
+        && (!capturedMemory.commands.isCurrent(capturedMemory.context, capturedMemory.flight, capturedMemory.lifecycleRevision)
+          || !capturedMemory.commands.admitsCommands(capturedMemory.context))) throw new Error("captured memory admission closed");
       const [cmd, ...rest] = argv;
       const withCache = cacheForLaunch(cache, launch);
       const launched = await launchRegisteredEffectRoot(
@@ -5079,6 +5099,13 @@ export function makeDefaultSpawnCommand(
         "command",
         log,
       );
+      let memory: Awaited<ReturnType<typeof enrollMemoryCommand>>;
+      try {
+        memory = await enrollMemoryCommand(capturedMemory, opts.modelCommand, registry, launched.root, launched.handle, reapDeadlineMs, opts.signal);
+      } catch (error) {
+        await boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs);
+        throw error;
+      }
       let stdout = "";
       let stderr = "";
       let capturedBytes = 0;
@@ -5139,16 +5166,32 @@ export function makeDefaultSpawnCommand(
         terminal,
         aborted.then(() => ({ kind: "aborted" as const })),
         capTrip.then(() => ({ kind: "cap" as const })),
+        ...(memory ? [memory.outcome.then((result) => ({ kind: "memory" as const, result }))] : []),
       ]);
       if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
-      const reaped = await registry.reapRoot(launched.root, reapDeadlineMs);
-      if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
-      await outputEnded;
+      let cleanupError: unknown;
+      let reaped = false;
+      try {
+        const result = await (memory?.reap() ?? boundedCommandWait(registry.reapRoot(launched.root, reapDeadlineMs), reapDeadlineMs));
+        reaped = result.ok;
+        if (!result.ok) cleanupError = new Error(COMMAND_ROOT_UNREAPED);
+      } catch (error) { cleanupError = error; }
+      memory?.recordDisposal(reaped);
+      try { await boundedCommandWait(outputEnded, reapDeadlineMs); } catch (error) { cleanupError ??= error; }
+      const prepared = memory?.preparedOutcome();
+      let memoryPressure = first.kind === "memory" ? first.result : undefined;
+      try {
+        if (!memoryPressure && prepared) memoryPressure = await boundedCommandWait(prepared, reapDeadlineMs);
+      } finally {
+        if (reaped) memory?.unregister();
+      }
+      if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
+      if (cleanupError) throw cleanupError;
       if (first.kind === "aborted") throw new Error("command aborted");
       if (first.kind === "deadline") throw new CommandDeadlineError(wallMs);
       if (first.kind === "failed") throw first.error;
       return {
-        code: first.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
+        code: first.kind === "cap" || first.kind === "memory" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
         stdout,
         stderr,
       };
