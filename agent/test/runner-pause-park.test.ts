@@ -120,6 +120,7 @@ function runnerWithGit(
     // committed work back to the tracking ref — handlePausePark then does the publish itself,
     // so these tests exercise its publish path directly.
     checkpointIntervalMs: 0,
+    checkpointTestHooks: { retryBackoffMs: [0, 0] },
   });
 }
 
@@ -639,6 +640,7 @@ describe("RunRunner — M2 explicit park callback", () => {
       const runner = options.deadlineRetry || options.interruptWait
         ? new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
             pollMs: 5, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+            checkpointTestHooks: { retryBackoffMs: [0, 0] },
             now: () => clockStart + (options.interruptWait ? (callbackEntries > 1 ? 200 : 0) : questions * 601),
             setTimer: (cb, ms) => {
               timerDelays.push(ms);

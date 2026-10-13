@@ -2076,12 +2076,17 @@ export interface PendingTerminal {
 /** Issue #2545: the raw pack a held publication may upload, matching the api's cap on the route. */
 const HELD_PACK_MAX_BYTES = 64 * 1024 * 1024;
 
+/** The live pack producer of one checkpoint publish request (the first, or a replay after a 5xx). */
+type CheckpointPackProducer = Pick<NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>, "pack" | "exited" | "cancel">;
+
 /** issue #1597 M2: test-only seams for the mid-turn checkpoint tick and the scanned publish. */
 export interface CheckpointTestHooks {
   /** Issue #2545: test-only override of the held-publication pack cap (production: 64 MiB). */
   heldPackMaxBytes?: number;
   /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
   softDeadlineMs?: number;
+  /** Test-only backoff before the second and third checkpoint publish request; production is 250 ms then 1000 ms. */
+  retryBackoffMs?: readonly [number, number];
   /** Test-only expiry control; omit deadlineAt for signal-driven expiry. Production keeps its real 10s budget. */
   armSoftDeadline?: (fire: () => void, ms: number) => { deadlineAt?: number; cancel: () => void };
   /** Awaited just before a tick's git-busy probe (a test can hold a tick in its pre-scope phase). */
@@ -13668,7 +13673,7 @@ export class RunRunner {
     // whole un-landed overlay chain; this is bounded by the broker's object cap and self-clears on
     // the first landed ACK.
     let packedTip: string | undefined;
-    let producer: NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>> | Awaited<ReturnType<NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>["replay"]>> | undefined;
+    let producer: CheckpointPackProducer | undefined;
     let retried = false;
     let producerExit: number | undefined;
     const observeProducer = () => {
@@ -13725,7 +13730,8 @@ export class RunRunner {
         res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal);
         if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
-        const backoffMs = attempt === 1 ? 250 : 1_000;
+        const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
+        const backoffMs = attempt === 1 ? firstBackoffMs : secondBackoffMs;
         flight.runLog.warn("checkpoint publish retry", { run_id: flight.runId, attempt, backoff_ms: backoffMs, http_status: res.httpStatus });
         await abandon(true);
         await sleep(backoffMs, signal);

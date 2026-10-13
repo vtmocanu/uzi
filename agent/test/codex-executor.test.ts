@@ -1751,6 +1751,7 @@ describe("decoded Codex usage limits reach RunRunner #2360", () => {
         };
         await new RunRunner(client, git, () => ({ executor, homeDir }), diagnostics.log, 20, undefined, {
           pollMs: 5,
+          checkpointTestHooks: { retryBackoffMs: [0, 0] },
           ...(scenario === "docker" ? { dockerHost: "unix:///2360-fixture-only.sock" } : {}),
           quiesceRun: async () => ({
             process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },

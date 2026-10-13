@@ -106,12 +106,14 @@ function runnerWithGit(
   factory: ExecutorFactory,
   gitlab: ReturnType<typeof fakeGitlab>["gitlab"],
   gitCache = git,
+  retryBackoffMs: readonly [number, number] = [0, 0],
 ): RunRunner {
   return new RunRunner(client, gitCache, factory, nullLogger(), 20, undefined, {
     pollMs: 5,
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,
     gitlab,
+    checkpointTestHooks: { retryBackoffMs },
   });
 }
 
@@ -172,7 +174,8 @@ describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => 
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-retry-"));
     const { factory } = parkFactory(homeRoot, "RETRY.txt");
-    const r = runnerWithGit(factory, gitlab);
+    // A long backoff proves the expired permit, not the delay, ends the retry.
+    const r = runnerWithGit(factory, gitlab, git, [60_000, 60_000]);
     const abort = new AbortController();
     const seam = r as unknown as {
       reapForSink: (executor: unknown, options: { boundary: string },

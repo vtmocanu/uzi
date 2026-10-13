@@ -225,6 +225,7 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
     hooks: {
       onTickOutcome: onOutcome,
       tickKillGraceMs: 300,
+      retryBackoffMs: [0, 0],
       ...extraHooks,
       tickSpawn: {
         onSpawn: (pid, argv) => {
@@ -352,6 +353,7 @@ function mkRunner(
     gitlab,
     checkpointIntervalMs: INTERVAL_MS,
     checkpointTickIntervalMs: TICK_MS,
+    checkpointTestHooks: { retryBackoffMs: [0, 0] },
     ...(ctl ? { setTimer: ctl.setTimer, setTickTimer: ctl.setTickTimer, now: ctl.now, checkpointTestHooks: ctl.hooks } : {}),
     ...extra,
   });

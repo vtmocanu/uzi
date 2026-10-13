@@ -13,11 +13,16 @@ const FAIL = { ok: false, httpStatus: 500 };
 async function exercise(opts: {
   responses?: unknown[]; abort?: "backoff" | "ownership" | "guard";
   refusal?: "ownership" | "scratch" | "remediation"; exit?: number; throws?: boolean; packThrows?: boolean;
+  /** Omit for the production 250 ms then 1000 ms backoff; the default skips real waiting. */
+  backoffMs?: readonly [number, number] | "production";
 } = {}) {
   const abort = new AbortController();
   const git = new GitCache("/unused", nullLogger());
   const client = new WorkerClient("http://unused", "test", "test", nullLogger());
-  const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 1);
+  const backoff = opts.backoffMs ?? (opts.abort === "backoff" ? [60_000, 60_000] as const : [0, 0] as const);
+  const hooks = backoff === "production" ? undefined : { retryBackoffMs: backoff };
+  const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch: "branch" }) } }), nullLogger(), 1,
+    undefined, { checkpointTestHooks: hooks });
   const seam = runner as unknown as {
     requireTrackingOwned: () => Promise<string>;
     checkpointRemediationHold: () => Promise<boolean>;
@@ -63,12 +68,16 @@ async function exercise(opts: {
     return (opts.responses?.[requests - 1] ?? FAIL) as Awaited<ReturnType<typeof client.publishCheckpoint>>;
   };
   const feed: unknown[] = [];
+  const retryLogs: Array<{ attempt: unknown; backoff_ms: unknown }> = [];
+  const runLog = { ...nullLogger(), warn: (msg: string, fields?: Record<string, unknown>) => {
+    if (msg === "checkpoint publish retry") retryLogs.push({ attempt: fields?.attempt, backoff_ms: fields?.backoff_ms });
+  } };
   const flight = { runId: "retry", runKind: "issue", lastCheckpointRefTip: "OLD",
     lastAttemptedCheckpointRefTip: undefined as string | undefined,
-    reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(),
+    reportedPublishOutcomes: new Set<string>(), runLog,
     batcher: { emit: (value: unknown) => feed.push(value) } };
   const outcome = await seam.publishCheckpointOutcome(flight, "bare", "branch", undefined, abort.signal);
-  return { outcome, flight, feed, requests, producers, cancels, streams, bytes, events };
+  return { outcome, flight, feed, requests, producers, cancels, streams, bytes, events, retryLogs };
 }
 
 it("500 then ACK uses fresh exact streams, settles the old producer, and recovers an empty ledger", async () => {
@@ -92,6 +101,18 @@ it("persistent 500 is exactly three requests and one exhausted diagnostic", asyn
   assert.equal(r.feed.length, 1);
   assert.equal(r.flight.lastCheckpointRefTip, "OLD");
   assert.equal(r.flight.lastAttemptedCheckpointRefTip, TIP);
+});
+
+it("production backoff is 250 ms then 1000 ms when no test hook is set", async () => {
+  const started = Date.now();
+  const r = await exercise({ backoffMs: "production" });
+  assert.equal(r.requests, 3);
+  assert.deepEqual(r.retryLogs, [{ attempt: 1, backoff_ms: 250 }, { attempt: 2, backoff_ms: 1000 }]);
+  assert.ok(Date.now() - started >= 1200, "the production delays were actually waited");
+});
+it("the test hook replaces the backoff the retry log reports", async () => {
+  const r = await exercise({ backoffMs: [3, 5] });
+  assert.deepEqual(r.retryLogs, [{ attempt: 1, backoff_ms: 3 }, { attempt: 2, backoff_ms: 5 }]);
 });
 
 for (const response of [{ ok: false, httpStatus: 400 }, { ok: false, httpStatus: 200 },

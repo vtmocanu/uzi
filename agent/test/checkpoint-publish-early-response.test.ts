@@ -62,7 +62,8 @@ async function child(mode: Mode): Promise<void> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
   const client = new WorkerClient(`http://127.0.0.1:${port}`, "test-token", "test", nullLogger());
-  const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch }) } }), nullLogger(), 1);
+  const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch }) } }), nullLogger(), 1, undefined,
+    { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
   const privateGit = git as unknown as {
     spawnGit: (cwd: string, args: string[], stdin?: string) => Promise<{ exited: Promise<number> }>;
   };
