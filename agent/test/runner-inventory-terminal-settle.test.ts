@@ -234,28 +234,34 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   const boot = await freshRunner.snapshotBootRecoveries();
   assert.ok(boot.some(record => record.captureId === uploaded.captureId && record.state === "uploaded"));
   await freshRunner.resumePendingRecoveries(undefined, boot);
-  const persisted = await new RecoveryCoordinator({
+  const inspector = new RecoveryCoordinator({
     client, git: freshGit, log: nullLogger(), recoveryRoot: freshGit.recoveryRoot, workerToken: token,
-  }).inspect(claim.run_id);
-  // Successful FINAL removes the generation's ACK after local cleanup.
-  assert.deepEqual(persisted, []);
+  });
+  const persisted = await inspector.inspect(claim.run_id);
+  // FINAL preserves its authenticated authority while the exact terminal is pending.
+  assert.ok(persisted.some(record => record.generation === generation && record.finalAcknowledged));
   assert.equal(server.finals(), 1, "exactly one successful custody release");
   assert.equal(server.isOpen(), false);
   assert.deepEqual((await client.listRecoveryHolds(claim.run_id)).holds, []);
   assert.equal(await freshRunner.recoveryInventoryPending(claim.run_id, generation), false);
-  assert.ok(custodyReads.length > preFinalCustodyReads, "local cleanup requires a fresh custody read");
-  assert.ok(custodyReads.slice(preFinalCustodyReads).every(read =>
-    read.runId === claim.run_id && read.generation === generation &&
-    read.workerId === workerId && !read.open), "released exact-generation custody authorizes retirement");
-  const postReleaseCustodyReads = custodyReads.length;
+  assert.equal(custodyReads.length, preFinalCustodyReads, "the retained covering ACK supplies its existing authority");
   assert.ok(await freshOutbox.readTerminalJournal(claim.run_id, generation), "FINAL alone does not retire the outbox");
   await replay();
-  assert.ok(custodyReads.length > postReleaseCustodyReads, "terminal retirement rechecks released custody");
-  assert.ok(custodyReads.slice(postReleaseCustodyReads).every(read => !read.open));
   assert.equal(await freshOutbox.readTerminalJournal(claim.run_id, generation), undefined);
   assert.deepEqual(freshOutbox.listPendingTerminals(), []);
   assert.equal(freshOutbox.depthFor(claim.run_id)?.pendingTerminal ?? 0, 0);
   assert.equal(freshOutbox.depthFor(claim.run_id)?.pendingMessages ?? 0, 0);
   await freshRunner.resumePendingRecoveries();
+  assert.deepEqual(await inspector.inspect(claim.run_id), [], "the existing post-retirement recovery pass cleans the ACK cohort");
+  assert.equal(fs.existsSync(uploaded.bundlePath), false);
   assert.equal(server.finals(), 1, "a later recovery pass does not release twice");
+
+  // Preserve the old absent-inventory oracle separately, after the ACK has actually gone.
+  assert.equal((await freshOutbox.journalTerminal(claim.run_id, generation, "finalize", 0, body)).journaled, true);
+  const absentReads = custodyReads.length;
+  await replay();
+  assert.ok(custodyReads.length > absentReads, "absent inventory retirement requires fresh exact custody authority");
+  assert.ok(custodyReads.slice(absentReads).every(read => read.runId === claim.run_id &&
+    read.generation === generation && read.workerId === workerId && !read.open));
+  assert.equal(await freshOutbox.readTerminalJournal(claim.run_id, generation), undefined);
 });
