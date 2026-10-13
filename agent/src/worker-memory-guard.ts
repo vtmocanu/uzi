@@ -178,6 +178,7 @@ type Timer = (callback: () => void, ms: number) => () => void;
 type Authority = Readonly<{
   request: Readonly<MemoryReservationRequest>;
   context: Context;
+  phaseRevision: number;
   entry: Entry;
   incarnation: MemoryIncarnation;
   sample: Available;
@@ -214,6 +215,7 @@ export class WorkerMemoryMonitor {
     report: (request: MemoryOutcomeRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
     feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
     preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+    prepareFeedback?: (context: Context, result: WorkerMemoryPressureResult) => void;
     preparePreservation?: (context: Context, result: WorkerMemoryPressureResult) => void;
     preservationBudgetMs?: (context: Context) => number;
     timer?: Timer;
@@ -328,7 +330,7 @@ export class WorkerMemoryMonitor {
   private contextCurrent(a: Authority): boolean {
     const incarnation = this.ports.incarnation();
     return !this.closed
-      && this.ports.commands.isCurrent(a.context)
+      && this.ports.commands.phaseAdmits(a.context, a.phaseRevision)
       && incarnation?.worker_id === a.incarnation.worker_id
       && incarnation?.register_nonce === a.incarnation.register_nonce
       && incarnation?.revision === a.incarnation.revision;
@@ -401,6 +403,9 @@ export class WorkerMemoryMonitor {
       guidance: "Use smaller or serial commands after recovery.",
     });
     const preserveCapturedFlight = preserve && this.ports.commands.isCurrent(a.context);
+    // Retain feed intent for every outcome before tool completion and bounded IO.
+    // Eligibility was captured first: either preparation hook may retire admission.
+    try { this.ports.prepareFeedback?.(a.context, result); } catch {}
     if (preserveCapturedFlight) {
       // The owner sets clone/session retention intent synchronously, before feedback
       // can unblock tool completion. memoryPark only retires local authority; it
@@ -425,18 +430,19 @@ export class WorkerMemoryMonitor {
 
   private async intervene(entries: readonly Entry[], deadline: number): Promise<void> {
     const commands = this.ports.commands;
-    const candidates = await Promise.all(entries.map(async (entry) => {
-      try { return { entry, observation: await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline) }; }
+    const captures = entries.map((entry) => ({ entry, phaseRevision: commands.phaseRevision(entry.context) }));
+    const candidates = await Promise.all(captures.map(async ({ entry, phaseRevision }) => {
+      try { return { entry, phaseRevision, observation: await this.bounded((signal, remainingMs) => entry.observe({ signal, remainingMs }), deadline) }; }
       catch { return undefined; }
     }));
     if (this.closed || !this.applicable) return;
-    const selected = commands.select(candidates.filter((value) => value !== undefined), this.ports.now(), this.config.responseBudgetMs);
+    const selected = commands.select(candidates.filter((value) => value !== undefined).filter(({ entry, phaseRevision }) => commands.phaseAdmits(entry.context, phaseRevision)), this.ports.now(), this.config.responseBudgetMs);
     if (!selected) return;
     const entry = selected.entry;
     const incarnation = this.ports.incarnation();
     if (!this.latest || !incarnation || incarnation.worker_id !== entry.context.worker_id || incarnation.register_nonce !== entry.context.register_nonce) return;
     const a: Authority = Object.freeze({
-      context: entry.context, entry, incarnation: Object.freeze({ ...incarnation }),
+      context: entry.context, phaseRevision: selected.phaseRevision, entry, incarnation: Object.freeze({ ...incarnation }),
       sample: Object.freeze({ ...this.latest, stat: Object.freeze({ ...this.latest.stat }),
         pressure: Object.freeze({ some: Object.freeze({ ...this.latest.pressure.some }), full: Object.freeze({ ...this.latest.pressure.full }) }) }),
       request: Object.freeze({

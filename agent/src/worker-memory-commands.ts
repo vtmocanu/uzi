@@ -41,7 +41,7 @@ type Entry = Readonly<{
   cancel: (authority: Budget & Readonly<{ authorized: () => boolean }>) => Promise<void>;
   drain: (budget?: Budget & Readonly<{ authorized: () => boolean }>) => Promise<{ confirmed: boolean; detail?: string }>;
 }>;
-type Selection = Readonly<{ entry: Entry; rssBytesApprox: number; observation: Observation }>;
+type Selection = Readonly<{ entry: Entry; rssBytesApprox: number; observation: Observation; phaseRevision: number }>;
 type ProtectedRoot = Readonly<{ identity: string; kind: "worker" | "provider" | "boundary" | "sink"; root: Root }>;
 
 function uuid(value: string): boolean {
@@ -69,6 +69,8 @@ function fresh(o: Observation, now: number, age: number): boolean {
 export class WorkerMemoryCommands {
   private readonly contexts = new Map<string, Context>();
   private readonly latches = new Map<Context, Latch>();
+  private readonly phaseHolds = new Map<Context, Latch>();
+  private readonly phaseRevisions = new WeakMap<Context, number>();
   private readonly entries = new Map<string, Entry>();
   private readonly drained = new WeakSet<Entry>();
   private readonly failures = new Map<Entry, string>();
@@ -144,6 +146,7 @@ export class WorkerMemoryCommands {
     if (old) this.retire(old);
     const context = Object.freeze({ ...input, ...(policy ? { memory_policy: Object.freeze({ ...policy }) } : {}), identity: randomUUID() });
     if (policy) this.allowances.set(context, policy.max_interventions - (input.memory_intervention_count ?? 0));
+    this.phaseRevisions.set(context, 0);
     this.contexts.set(context.run_id, context);
     return context;
   }
@@ -157,6 +160,7 @@ export class WorkerMemoryCommands {
     if (!this.isCurrent(context)) return false;
     this.contexts.delete(context.run_id);
     this.latches.delete(context);
+    this.phaseHolds.delete(context);
     return true;
   }
 
@@ -165,6 +169,7 @@ export class WorkerMemoryCommands {
   registrationRotated(): void {
     this.contexts.clear();
     this.latches.clear();
+    this.phaseHolds.clear();
   }
 
   shutdown(): void {
@@ -185,8 +190,31 @@ export class WorkerMemoryCommands {
     return true;
   }
 
+  pressureHeld(context: Context): boolean { return this.latches.has(context); }
+
+  phaseRevision(context: Context): number { return this.phaseRevisions.get(context) ?? 0; }
+
+  holdPhase(context: Context): Latch | undefined {
+    if (!this.isCurrent(context)) return undefined;
+    const token = Object.freeze({ context, identity: randomUUID() });
+    this.phaseRevisions.set(context, this.phaseRevision(context) + 1);
+    this.phaseHolds.set(context, token);
+    return token;
+  }
+
+  releasePhase(token: Latch): boolean {
+    if (!this.isCurrent(token.context) || this.phaseHolds.get(token.context) !== token) return false;
+    this.phaseHolds.delete(token.context);
+    return true;
+  }
+
+  phaseAdmits(context: Context, capturedRevision = this.phaseRevision(context)): boolean {
+    return this.isCurrent(context) && !this.phaseHolds.has(context)
+      && capturedRevision === this.phaseRevision(context);
+  }
+
   admitsCommands(context: Context): boolean {
-    return this.isCurrent(context) && !this.latches.has(context);
+    return this.phaseAdmits(context) && !this.latches.has(context) && this.remaining(context) !== 0;
   }
 
   register(context: Context, input: Omit<Entry, "identity" | "context" | "command" | "root" | "commandId"> & {
@@ -254,7 +282,7 @@ export class WorkerMemoryCommands {
   eligibleEntries(): readonly Entry[] | undefined {
     if (this.entries.size > 256 || this.protectedRoots.size > 256) return undefined;
     const eligible: Entry[] = [];
-    for (const entry of this.entries.values()) if (this.isRegistered(entry)) eligible.push(entry);
+    for (const entry of this.entries.values()) if (this.isRegistered(entry) && this.phaseAdmits(entry.context)) eligible.push(entry);
     return Object.freeze(eligible);
   }
 
@@ -284,7 +312,7 @@ export class WorkerMemoryCommands {
       const enrolled = entryOwners.get(entry) ?? [];
       enrolled.push(index);
       entryOwners.set(entry, enrolled);
-      if (!this.isRegistered(entry) || !fresh(observation, now, maxAgeMs)) invalid.add(index);
+      if (!this.isRegistered(entry) || !this.phaseAdmits(entry.context) || !fresh(observation, now, maxAgeMs)) invalid.add(index);
       if (!Array.isArray(observation.rows) || observation.rows.length > 256) return;
       let total = 0;
       let hasRoot = false;
@@ -342,7 +370,7 @@ export class WorkerMemoryCommands {
     candidates.forEach(({ entry, observation }, index) => {
       const rssBytesApprox = totals.get(index);
       if (!invalid.has(index) && rssBytesApprox !== undefined) {
-        valid.push(Object.freeze({ entry, rssBytesApprox, observation: Object.freeze({
+        valid.push(Object.freeze({ entry, phaseRevision: this.phaseRevision(entry.context), rssBytesApprox, observation: Object.freeze({
           ...observation,
           ...(observation.supervisor ? { supervisor: Object.freeze({ ...observation.supervisor }) } : {}),
           ...(observation.primary ? { primary: Object.freeze({ ...observation.primary }) } : {}),
@@ -363,6 +391,7 @@ export class WorkerMemoryCommands {
    */
   checkBeforeCancel(selection: Selection, observation: Observation, now: number, maxAgeMs: number): boolean {
     return this.isRegistered(selection.entry)
+      && this.phaseAdmits(selection.entry.context, selection.phaseRevision)
       && this.select([{ entry: selection.entry, observation }], now, maxAgeMs) !== undefined;
   }
 }

@@ -2,7 +2,7 @@ import { performance } from "node:perf_hooks";
 import type { WorkerClient } from "./client.js";
 import type { Config } from "./config.js";
 import type { Logger } from "./log.js";
-import type { WorkerMemoryPressureResult } from "./protocol.js";
+import type { MemoryPolicy, WorkerMemoryPressureResult } from "./protocol.js";
 import { WorkerMemoryCommands } from "./worker-memory-commands.js";
 import { WorkerMemoryMonitor } from "./worker-memory-guard.js";
 import { WorkerMemoryReader } from "./worker-memory-reader.js";
@@ -10,6 +10,8 @@ import { WorkerMemoryReader } from "./worker-memory-reader.js";
 type Context = ReturnType<WorkerMemoryCommands["begin"]>;
 type Sinks = Readonly<{
   feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+  /** Retain every outcome before bounded delivery or tool completion can be skipped. */
+  prepareFeedback: (context: Context, result: WorkerMemoryPressureResult) => void;
   preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
   /** Must synchronously retain this flight's clone/session intent and revoke admission. */
   preparePreservation: (context: Context, result: WorkerMemoryPressureResult) => void;
@@ -22,8 +24,16 @@ type Sinks = Readonly<{
  */
 export class WorkerMemoryRuntime {
   readonly commands: WorkerMemoryCommands;
+  readonly configuredMemoryPolicy: Readonly<MemoryPolicy>;
   private readonly sinks = new WeakMap<Context, Sinks>();
   private readonly monitor: WorkerMemoryMonitor;
+  private readonly invalidationListeners = new Set<() => void>();
+
+  subscribeInvalidation(callback: () => void): () => void {
+    this.invalidationListeners.add(callback);
+    return () => { this.invalidationListeners.delete(callback); };
+  }
+
   private readonly receipts = new Set<Readonly<{ context: Context; kind: "feedback" | "preserve"; completion: Promise<void> }>>();
 
   /** Unsettled owner operations, including callbacks that ignored deadline/abort.
@@ -48,6 +58,9 @@ export class WorkerMemoryRuntime {
     log: Pick<Logger, "error">,
     options: { reader?: Pick<WorkerMemoryReader, "sample">; now?: () => number; secrets?: readonly string[] } = {},
   ) {
+    if (!Number.isSafeInteger(settings.maxInterventions) || settings.maxInterventions < 1
+      || settings.maxInterventions > 9999) throw new Error("invalid memory guard settings");
+    this.configuredMemoryPolicy = Object.freeze({ version: 1, max_interventions: settings.maxInterventions });
     const reader = options.reader ?? new WorkerMemoryReader();
     this.commands = new WorkerMemoryCommands(options.secrets);
     const sink = (context: Context): Sinks => {
@@ -63,7 +76,10 @@ export class WorkerMemoryRuntime {
       now: options.now ?? (() => performance.now()),
       commands: this.commands,
       incarnation: () => client.memoryIncarnation,
-      subscribeInvalidation: (callback) => client.subscribeMemoryInvalidation(callback),
+      subscribeInvalidation: (callback) => client.subscribeMemoryInvalidation(() => {
+        callback();
+        for (const listener of this.invalidationListeners) listener();
+      }),
       reserve: (request, signal, ms) => client.reserveMemoryIntervention(request, signal, ms),
       report: (request, signal, ms) => client.reportMemoryInterventionOutcome(request, signal, ms),
       feedback: (result, context, signal, ms) => {
@@ -74,6 +90,7 @@ export class WorkerMemoryRuntime {
         const bound = sink(context);
         return this.ownedSink(context, "preserve", () => bound.preserve(context, signal, ms));
       },
+      prepareFeedback: (context, result) => sink(context).prepareFeedback(context, result),
       preparePreservation: (context, result) => sink(context).preparePreservation(context, result),
       preservationBudgetMs: (context) => sink(context).preservationBudgetMs,
     });
@@ -84,6 +101,7 @@ export class WorkerMemoryRuntime {
    */
   begin(input: Parameters<WorkerMemoryCommands["begin"]>[0], sinks: Sinks): Context {
     if (typeof sinks?.feedback !== "function" || typeof sinks?.preserve !== "function"
+      || typeof sinks?.prepareFeedback !== "function"
       || typeof sinks?.preparePreservation !== "function"
       || !Number.isSafeInteger(sinks?.preservationBudgetMs) || sinks.preservationBudgetMs < 1
       || sinks.preservationBudgetMs > 2147483647) {

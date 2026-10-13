@@ -169,6 +169,7 @@ test("independent run/episode interventions are not lifetime capped; mutated sam
 
 type Monitor = import("../src/worker-memory-guard.js").WorkerMemoryMonitor;
 type MonitorPorts = ConstructorParameters<typeof import("../src/worker-memory-guard.js").WorkerMemoryMonitor>[1];
+type TreeObservation = Awaited<ReturnType<ReturnType<import("../src/worker-memory-commands.js").WorkerMemoryCommands["register"]>["observe"]>>;
 function barrier<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -269,6 +270,73 @@ async function fixture(options: {
     advance: (ms: number) => { time += ms; for (const timer of timers) if (timer.at <= time) { timers.delete(timer); timer.callback(); } },
   };
 }
+
+test("observation captures phase revision before await, including wait then resume", async () => {
+  for (const resume of [false, true]) {
+    const observed = barrier<TreeObservation>();
+    let reads = 0;
+    const f = await fixture({ observe: async () => {
+      reads++;
+      return observed.promise;
+    } });
+    try {
+      f.monitor.tick();
+      await until(() => reads === 1);
+      const token = f.commands.holdPhase(f.context)!;
+      if (resume) f.commands.releasePhase(token);
+      observed.resolve({ available: true, complete: true, startedAtMs: 0, completedAtMs: 0,
+        rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] });
+      await f.monitor.settle();
+      assert.equal(f.requests.length, 0);
+      assert.equal(f.signals(), 0);
+      assert.equal(f.drainSignals(), 0);
+      assert.equal(f.commands.isCurrent(f.context), true);
+    } finally { await f.monitor.stop(); }
+  }
+});
+
+test("charged deferred reservation cannot signal after phase wait or wait then resume", async () => {
+  for (const resume of [false, true]) {
+    const f = await fixture();
+    try {
+      f.monitor.tick();
+      await until(() => f.requests.length === 1);
+      const token = f.commands.holdPhase(f.context)!;
+      if (resume) f.commands.releasePhase(token);
+      f.reservation.resolve(f.ack(undefined, 0));
+      await f.monitor.settle();
+      assert.equal(f.signals(), 0);
+      assert.equal(f.drainSignals(), 0);
+      assert.deepEqual(f.preserved, [f.context]);
+      assert.equal(f.feedback[0]?.outcome, "no_signal");
+      assert.equal(f.reports[0]?.intervention_id, f.requests[0]?.intervention_id);
+      assert.equal(f.reports[0]?.outcome, "no_signal");
+      assert.equal(f.requests.length, 1);
+    } finally { await f.monitor.stop(); }
+  }
+});
+
+test("recheck observation cannot regain signal authority after wait then resume", async () => {
+  const observed = barrier<TreeObservation>();
+  let reads = 0;
+  const tree: TreeObservation = { available: true, complete: true, startedAtMs: 0, completedAtMs: 0,
+    rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+  const f = await fixture({ observe: async () => ++reads === 1 ? tree : observed.promise });
+  try {
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack());
+    await until(() => reads === 2);
+    const phase = f.commands.holdPhase(f.context)!;
+    f.commands.releasePhase(phase);
+    observed.resolve(tree);
+    await f.monitor.settle();
+    assert.equal(f.signals(), 0);
+    assert.equal(f.drainSignals(), 0);
+    assert.equal(f.feedback[0]?.outcome, "no_signal");
+    assert.deepEqual(f.preserved, [f.context]);
+  } finally { await f.monitor.stop(); }
+});
 
 test("preservation intent and retirement precede feedback; timeout forwards abort and independent budgets", async () => {
   const feedback = barrier<void>();
@@ -570,9 +638,11 @@ test("old drain after replacement cannot dispose new root or allowance", async (
   await f.monitor.stop();
 });
 
-test("per-run policy and consumed count are frozen; exhausted run parks without reservation", async () => {
+test("per-run policy is frozen; already enrolled exhausted run parks without reservation", async () => {
   const policy = { version: 1 as const, max_interventions: 1 };
-  const f = await fixture({ policy, count: 1 });
+  const f = await fixture({ policy });
+  f.commands.updateAllowance(f.context, 0);
+  assert.throws(() => f.enroll(f.context, 20));
   policy.max_interventions = 2;
   f.monitor.tick();
   await f.monitor.settle();

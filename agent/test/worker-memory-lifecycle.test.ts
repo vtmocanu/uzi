@@ -193,7 +193,7 @@ for (const lane of ["run", "isolated"] as const) test("fatal sampler failure can
   const memory = active.memory;
   const context = memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 },
-    { feedback: async () => {}, preserve: async () => {}, preparePreservation: () => {}, preservationBudgetMs: 500 });
+    { feedback: async () => {}, preserve: async () => {}, prepareFeedback: () => {}, preparePreservation: () => {}, preservationBudgetMs: 500 });
   const execution = {
     execute: async () => {
       events.push("execute");
@@ -278,7 +278,7 @@ test("shutdown before run prevents registration and sampling; stop revokes conte
   const context = f.memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 },
     { feedback: async () => { throw new Error("unexpected"); }, preserve: async () => { throw new Error("unexpected"); },
-      preparePreservation: () => {}, preservationBudgetMs: 500 });
+      prepareFeedback: () => {}, preparePreservation: () => {}, preservationBudgetMs: 500 });
   const worker = build(config(), f.client, f.memory);
   const stopped = worker.shutdownMemory();
   assert.equal(f.memory.commands.isCurrent(context), false);
@@ -406,12 +406,12 @@ test("runtime enrollment requires the captured owner's synchronous hook and inde
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 };
   type Sinks = Parameters<WorkerMemoryRuntime["begin"]>[1];
   const valid: Sinks = { feedback: async () => {}, preserve: async () => {},
-    preparePreservation: () => {}, preservationBudgetMs: 500 };
+    prepareFeedback: () => {}, preparePreservation: () => {}, preservationBudgetMs: 500 };
   const context = f.memory.begin(input, valid);
   try {
     for (const incomplete of [
       { ...valid, feedback: undefined }, { ...valid, preserve: undefined },
-      { ...valid, preparePreservation: undefined }, { ...valid, preservationBudgetMs: undefined },
+      { ...valid, prepareFeedback: undefined }, { ...valid, preparePreservation: undefined }, { ...valid, preservationBudgetMs: undefined },
       ...[0, -1, 0.5, NaN, Infinity, 2147483648].map((preservationBudgetMs) => ({ ...valid, preservationBudgetMs })),
     ]) {
       assert.throws(() => f.memory.begin({ ...input, flight: {} }, incomplete as unknown as Sinks),
@@ -443,7 +443,7 @@ test("runtime retains an unstopped sink receipt after bounded shutdown", async (
   let signal: AbortSignal | undefined;
   const context = f.memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 }, {
-    preparePreservation: (captured, result) => {
+    prepareFeedback: () => {}, preparePreservation: (captured, result) => {
       assert.equal(captured, context); intent = true; preparedResult = result;
       assert.equal(result.run_id, captured.run_id);
       assert.equal(result.memory_episode, captured.memory_episode);
@@ -490,7 +490,7 @@ test("delayed historical sinks remain bound after retirement and never use a run
   const input = { run_id: runId, worker_id: workerId, register_nonce: "fixture",
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 };
   const context = f.memory.begin(input, {
-    preparePreservation: (captured) => { assert.equal(captured, context); prepared = true; },
+    prepareFeedback: () => {}, preparePreservation: (captured) => { assert.equal(captured, context); prepared = true; },
     preservationBudgetMs: 500,
     feedback: async (_result, captured) => {
       assert.equal(prepared, true);
@@ -517,7 +517,7 @@ test("delayed historical sinks remain bound after retirement and never use a run
     assert.equal(f.memory.commands.isCurrent(context), false);
     const successor = f.memory.begin({ ...input, flight: {}, lifecycleRevision: 2,
       claim_generation: 2, memory_episode: 1 }, {
-      preparePreservation: () => { successorCalls++; }, preservationBudgetMs: 900,
+      prepareFeedback: () => {}, preparePreservation: () => { successorCalls++; }, preservationBudgetMs: 900,
       feedback: async () => { successorCalls++; }, preserve: async () => { successorCalls++; },
     });
     assert.equal(f.memory.commands.admitsCommands(successor), true);

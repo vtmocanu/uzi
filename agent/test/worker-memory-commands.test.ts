@@ -26,6 +26,82 @@ function enroll(registry: WorkerMemoryCommands, context: ReturnType<WorkerMemory
   });
 }
 
+test("phase holds and pressure latches release independently in both orders", () => {
+  for (const phaseFirst of [true, false]) {
+    const { registry, context } = setup();
+    const entry = enroll(registry, context);
+    const selected = registry.select([{ entry, observation: observation() }], 100, 200)!;
+    const pressure = registry.acquireLatch(context)!;
+    const phase = registry.holdPhase(context)!;
+    assert.ok(Object.isFrozen(phase));
+    assert.equal(registry.isCurrent(context), true);
+    assert.equal(registry.admitsCommands(context), false);
+    assert.throws(() => enroll(registry, context, 20));
+    assert.deepEqual(registry.eligibleEntries(), []);
+    assert.equal(registry.select([{ entry, observation: observation() }], 100, 200), undefined);
+    assert.equal(registry.checkBeforeCancel(selected, observation(), 100, 200), false);
+    if (phaseFirst) {
+      assert.equal(registry.releasePhase(phase), true);
+      assert.equal(registry.admitsCommands(context), false);
+      assert.equal(registry.releaseLatch(pressure), true);
+    } else {
+      assert.equal(registry.releaseLatch(pressure), true);
+      assert.equal(registry.admitsCommands(context), false);
+      assert.equal(registry.releasePhase(phase), true);
+    }
+    assert.equal(registry.admitsCommands(context), true);
+    assert.equal(registry.checkBeforeCancel(selected, observation(), 100, 200), false);
+    const fresh = registry.select([{ entry, observation: observation() }], 100, 200)!;
+    assert.equal(fresh.phaseRevision, 1);
+    assert.equal(registry.checkBeforeCancel(fresh, observation(), 100, 200), true);
+  }
+});
+
+test("phase tokens require exact current identity and are revoked by every lifetime seam", () => {
+  for (const invalidate of ["begin", "retire", "rotation", "shutdown"] as const) {
+    const { registry, context } = setup();
+    const old = registry.holdPhase(context)!;
+    const token = registry.holdPhase(context)!;
+    assert.equal(registry.phaseRevision(context), 2);
+    assert.equal(registry.releasePhase(old), false);
+    assert.equal(registry.releasePhase({ ...token }), false);
+    assert.equal(registry.releasePhase({ context, identity: token.identity }), false);
+    assert.equal(registry.holdPhase({ ...context }), undefined);
+    assert.equal(registry.phaseAdmits(context), false);
+    if (invalidate === "begin") registry.begin(contextInput());
+    if (invalidate === "retire") registry.retire(context);
+    if (invalidate === "rotation") registry.registrationRotated();
+    if (invalidate === "shutdown") registry.shutdown();
+    assert.equal(registry.releasePhase(token), false);
+    assert.equal(registry.holdPhase(context), undefined);
+    assert.equal(registry.phaseAdmits(context), false);
+    assert.equal(registry.phaseRevision(context), 2);
+  }
+});
+
+test("phase hold is local and exhausted admission does not revoke an enrolled signal tree", () => {
+  const { registry, context } = setup();
+  const entry = enroll(registry, context);
+  const sibling = registry.begin({ ...contextInput(), run_id: "33333333-3333-4333-8333-333333333333" });
+  const other = enroll(registry, sibling, 20);
+  const token = registry.holdPhase(context)!;
+  assert.equal(registry.admitsCommands(sibling), true);
+  assert.deepEqual(registry.eligibleEntries(), [other]);
+  registry.releasePhase(token);
+  const selected = registry.select([{ entry, observation: observation() }], 100, 200)!;
+  registry.updateAllowance(context, 0);
+  const pressure = registry.acquireLatch(context)!;
+  assert.equal(registry.admitsCommands(context), false);
+  assert.throws(() => enroll(registry, context, 30));
+  assert.equal(registry.checkBeforeCancel(selected, observation(), 100, 200), true);
+  registry.releaseLatch(pressure);
+  assert.equal(registry.admitsCommands(context), false);
+  const exhausted = registry.begin({ ...contextInput(), memory_policy: { version: 1, max_interventions: 1 }, memory_intervention_count: 1 });
+  assert.throws(() => enroll(registry, exhausted));
+  assert.equal(registry.admitsCommands(exhausted), false);
+  assert.equal(registry.admitsCommands(sibling), true);
+});
+
 test("maximum uint64 ticks stay exact across selection, protection and PID reuse", () => {
   const { registry, context } = setup();
   const max = "18446744073709551615";
