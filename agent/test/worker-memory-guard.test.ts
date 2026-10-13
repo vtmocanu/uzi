@@ -168,6 +168,7 @@ test("independent run/episode interventions are not lifetime capped; mutated sam
 });
 
 type Monitor = import("../src/worker-memory-guard.js").WorkerMemoryMonitor;
+type MonitorPorts = ConstructorParameters<typeof import("../src/worker-memory-guard.js").WorkerMemoryMonitor>[1];
 function barrier<T>() {
   let resolve!: (value: T) => void;
   let reject!: (error: Error) => void;
@@ -179,6 +180,10 @@ async function until(predicate: () => boolean) {
   assert.ok(predicate(), "barrier reached within bounded microtask turns");
 }
 async function fixture(options: {
+  preparePreservation?: MonitorPorts["preparePreservation"];
+  preservationBudgetMs?: MonitorPorts["preservationBudgetMs"];
+  feedback?: MonitorPorts["feedback"];
+  preserve?: MonitorPorts["preserve"];
   autoReserve?: boolean;
   holdNextReserve?: boolean;
   fractional?: boolean;
@@ -249,8 +254,10 @@ async function fixture(options: {
       const reserved = requests.find((r) => r.intervention_id === request.intervention_id)!;
       return { ...ack(reserved, Math.min(1, reserved.policy.max_interventions - 1)), authorizing: false, outcome: request.outcome };
     },
-    feedback: async (result) => { feedback.push(result); },
-    preserve: async (ctx) => { preserved.push(ctx); },
+    preparePreservation: options.preparePreservation,
+    preservationBudgetMs: options.preservationBudgetMs,
+    feedback: async (result, ctx, signal, ms) => { feedback.push(result); await options.feedback?.(result, ctx, signal, ms); },
+    preserve: async (ctx, signal, ms) => { preserved.push(ctx); await options.preserve?.(ctx, signal, ms); },
   });
   return { monitor, commands, context, input, entry, enroll, ack, reservation, nextReservation, requests, reports, feedback, preserved,
     budgets, timerArgs, timers, drainSignals: () => drainSignals,
@@ -262,6 +269,86 @@ async function fixture(options: {
     advance: (ms: number) => { time += ms; for (const timer of timers) if (timer.at <= time) { timers.delete(timer); timer.callback(); } },
   };
 }
+
+test("preservation intent and retirement precede feedback; timeout forwards abort and independent budgets", async () => {
+  const feedback = barrier<void>();
+  const preservation = barrier<void>();
+  let intent = false;
+  let preparedResult: import("../src/protocol.js").WorkerMemoryPressureResult | undefined;
+  let feedbackSignal: AbortSignal | undefined;
+  let preservationSignal: AbortSignal | undefined;
+  let feedbackBudget = 0, preservationBudget = 0;
+  const f = await fixture({
+    preparePreservation: (ctx, result) => {
+      assert.equal(ctx, f.context); intent = true; preparedResult = result;
+      assert.equal(Object.isFrozen(result), true);
+      assert.equal(result.run_id, ctx.run_id);
+      assert.equal(result.claim_generation, ctx.claim_generation);
+    },
+    preservationBudgetMs: (ctx) => { assert.equal(ctx, f.context); return 700; },
+    feedback: async (_result, ctx, signal, ms) => {
+      assert.equal(intent, true, "owner retention intent exists before any feedback await");
+      assert.equal(_result, preparedResult, "owner retains the exact intervention before feedback dispatch");
+      assert.equal(ctx, f.context);
+      assert.equal(f.commands.isCurrent(ctx), false, "local admission is already revoked");
+      feedbackSignal = signal; feedbackBudget = ms;
+      await feedback.promise;
+    },
+    preserve: async (ctx, signal, ms) => {
+      assert.equal(ctx, f.context);
+      preservationSignal = signal; preservationBudget = ms;
+      await preservation.promise;
+    },
+  });
+  try {
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack(undefined, 0));
+    await until(() => feedbackSignal !== undefined);
+    assert.equal(feedbackBudget, 100);
+    assert.equal(feedbackSignal!.aborted, false);
+    assert.deepEqual(f.preserved, []);
+    f.advance(100);
+    await until(() => preservationSignal !== undefined);
+    assert.equal(feedbackSignal!.aborted, true);
+    assert.equal(preservationBudget, 700, "preservation gets its owner's full independent budget");
+    f.advance(699);
+    assert.equal(preservationSignal!.aborted, false);
+    f.advance(1);
+    await f.monitor.settle();
+    assert.equal(preservationSignal!.aborted, true);
+  } finally {
+    feedback.resolve(); preservation.resolve();
+    await f.monitor.stop();
+  }
+});
+
+test("stop joins the bounded monitor while feedback ignores abort", async () => {
+  const held = barrier<void>();
+  let entered = false, settled = false;
+  let signal: AbortSignal | undefined;
+  const f = await fixture({
+    feedback: async (_result, _ctx, abort) => {
+      entered = true; signal = abort;
+      await held.promise;
+      settled = true;
+    },
+  });
+  try {
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack(undefined, 0));
+    await until(() => entered);
+    await f.monitor.stop();
+    assert.equal(f.monitor.busy, false);
+    assert.equal(signal!.aborted, true);
+    assert.equal(settled, false, "joining bounded orchestration does not settle the owner callback");
+  } finally {
+    held.resolve();
+    await until(() => settled);
+    await f.monitor.stop();
+  }
+});
 
 for (const transition of ["retirement", "owner Resume/new episode", "replacement claim", "registration rotation", "shutdown", "selected-root replacement"] as const) {
   test("delayed ACK: " + transition, async () => {

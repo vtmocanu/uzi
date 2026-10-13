@@ -212,8 +212,10 @@ export class WorkerMemoryMonitor {
     subscribeInvalidation?: (callback: () => void) => () => void;
     reserve: (request: MemoryReservationRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
     report: (request: MemoryOutcomeRequest, signal: AbortSignal, remainingMs: number) => Promise<MemoryReservation>;
-    feedback: (result: WorkerMemoryPressureResult, context: Context) => Promise<void>;
-    preserve: (context: Context) => Promise<void>;
+    feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+    preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+    preparePreservation?: (context: Context, result: WorkerMemoryPressureResult) => void;
+    preservationBudgetMs?: (context: Context) => number;
     timer?: Timer;
   }) {
     this.config = Object.freeze({ ...config });
@@ -398,11 +400,24 @@ export class WorkerMemoryMonitor {
       cancellation_confirmed: outcome === "confirmed_drained", outcome, retry_blocked: true,
       guidance: "Use smaller or serial commands after recovery.",
     });
+    let retiredForPreservation = false;
+    if (preserve && this.ports.commands.isCurrent(a.context)) {
+      // The owner sets clone/session retention intent synchronously, before feedback
+      // can unblock tool completion. memoryPark only retires local authority; it
+      // proves nothing about API park acceptance or preservation completion.
+      try { this.ports.preparePreservation?.(a.context, result); }
+      catch { /* Failed preparation cannot restore admission or suppress the preservation attempt. */ }
+      finally { retiredForPreservation = this.ports.commands.memoryPark(a.context); }
+    }
     this.ports.commands.resolveToolOutcome(a.entry, result);
     // Ports receive bounded, scrubbed worker-owned metadata, never raw errors/observations.
-    try { await this.bounded(() => this.ports.feedback(result, a.context), this.ports.now() + this.config.responseBudgetMs); } catch {}
-    if (preserve && this.ports.commands.memoryPark(a.context)) {
-      try { await this.bounded(() => this.ports.preserve(a.context), this.ports.now() + this.config.responseBudgetMs); } catch {}
+    // A bounded wait is not proof that a sink which ignores abort has stopped.
+    try { await this.bounded((signal, ms) => this.ports.feedback(result, a.context, signal, ms), this.ports.now() + this.config.responseBudgetMs); } catch {}
+    if (retiredForPreservation) {
+      // The fallback is for pure monitor ports. Runtime enrollment requires an
+      // independent budget supplied by the captured runner owner.
+      const budget = this.ports.preservationBudgetMs?.(a.context) ?? this.config.responseBudgetMs;
+      try { await this.bounded((signal, ms) => this.ports.preserve(a.context, signal, ms), this.ports.now() + budget); } catch {}
     }
   }
 

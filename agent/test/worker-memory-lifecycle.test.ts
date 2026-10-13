@@ -193,7 +193,7 @@ for (const lane of ["run", "isolated"] as const) test("fatal sampler failure can
   const memory = active.memory;
   const context = memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 },
-    { feedback: async () => {}, preserve: async () => {} });
+    { feedback: async () => {}, preserve: async () => {}, preparePreservation: () => {}, preservationBudgetMs: 500 });
   const execution = {
     execute: async () => {
       events.push("execute");
@@ -277,7 +277,8 @@ test("shutdown before run prevents registration and sampling; stop revokes conte
   const f = rig({ register: async () => { registrations++; return {}; } });
   const context = f.memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
     claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 },
-    { feedback: async () => { throw new Error("unexpected"); }, preserve: async () => { throw new Error("unexpected"); } });
+    { feedback: async () => { throw new Error("unexpected"); }, preserve: async () => { throw new Error("unexpected"); },
+      preparePreservation: () => {}, preservationBudgetMs: 500 });
   const worker = build(config(), f.client, f.memory);
   const stopped = worker.shutdownMemory();
   assert.equal(f.memory.commands.isCurrent(context), false);
@@ -396,4 +397,136 @@ test("revocation during register prevents its late response from restoring clien
   gate.resolve();
   await registering;
   assert.equal(client.memoryIncarnation, undefined);
+});
+
+
+test("runtime enrollment requires the captured owner's synchronous hook and independent preservation budget", async () => {
+  const f = rig();
+  const input = { run_id: runId, worker_id: workerId, register_nonce: "fixture",
+    claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 };
+  type Sinks = Parameters<WorkerMemoryRuntime["begin"]>[1];
+  const valid: Sinks = { feedback: async () => {}, preserve: async () => {},
+    preparePreservation: () => {}, preservationBudgetMs: 500 };
+  const context = f.memory.begin(input, valid);
+  try {
+    for (const incomplete of [
+      { ...valid, feedback: undefined }, { ...valid, preserve: undefined },
+      { ...valid, preparePreservation: undefined }, { ...valid, preservationBudgetMs: undefined },
+      ...[0, -1, 0.5, NaN, Infinity, 2147483648].map((preservationBudgetMs) => ({ ...valid, preservationBudgetMs })),
+    ]) {
+      assert.throws(() => f.memory.begin({ ...input, flight: {} }, incomplete as unknown as Sinks),
+        /owner preservation budget/);
+      assert.equal(f.memory.commands.isCurrent(context), true, "invalid enrollment cannot retire its predecessor");
+    }
+  } finally { await f.memory.stop(); }
+});
+
+function enrollMemoryFixture(memory: WorkerMemoryRuntime, context: ReturnType<WorkerMemoryRuntime["begin"]>) {
+  return memory.commands.register(context, {
+    source: "codex-model-command", toolId: "tool", attemptId: "attempt",
+    command: "inert fixture", root: { pid: 10, startTime: "10" },
+    observe: async () => {
+      const time = performance.now();
+      return { available: true, complete: true, startedAtMs: time, completedAtMs: time,
+        rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+    },
+    cancel: async () => { throw new Error("reservation failed; must not cancel"); },
+    drain: async () => { throw new Error("reservation failed; must not drain"); },
+  });
+}
+
+test("runtime retains an unstopped sink receipt after bounded shutdown", async () => {
+  const f = rig();
+  const feedback = deferred();
+  let entered = false, intent = false, settled = false;
+  let preparedResult: import("../src/protocol.js").WorkerMemoryPressureResult | undefined;
+  let signal: AbortSignal | undefined;
+  const context = f.memory.begin({ run_id: runId, worker_id: workerId, register_nonce: "fixture",
+    claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 }, {
+    preparePreservation: (captured, result) => {
+      assert.equal(captured, context); intent = true; preparedResult = result;
+      assert.equal(result.run_id, captured.run_id);
+      assert.equal(result.memory_episode, captured.memory_episode);
+    },
+    preservationBudgetMs: 500,
+    feedback: async (_result, captured, abort, ms) => {
+      assert.equal(intent, true);
+      assert.equal(_result, preparedResult, "runtime forwards exact captured intervention before dispatch");
+      assert.equal(captured, context);
+      assert.equal(f.memory.commands.isCurrent(context), false);
+      assert.ok(ms > 0 && ms <= settings.responseBudgetMs);
+      signal = abort; entered = true;
+      await feedback.promise;
+      settled = true;
+    },
+    preserve: async () => { throw new Error("shutdown must not start preservation"); },
+  });
+  enrollMemoryFixture(f.memory, context);
+  const running = f.memory.run();
+  try {
+    await until(() => entered);
+    const receipt = f.memory.sinkReceipts[0]!;
+    assert.equal(receipt.context, context);
+    assert.equal(receipt.kind, "feedback");
+    await f.memory.stop();
+    await running;
+    assert.equal(signal!.aborted, true);
+    assert.equal(settled, false);
+    assert.deepEqual(f.memory.sinkReceipts, [receipt], "abort did not prove sink settlement");
+    feedback.resolve();
+    await receipt.completion;
+    assert.equal(settled, true);
+    assert.deepEqual(f.memory.sinkReceipts, []);
+  } finally {
+    feedback.resolve();
+    await f.memory.stop(); await running;
+  }
+});
+
+test("delayed historical sinks remain bound after retirement and never use a run-ID successor", async () => {
+  const f = rig();
+  const feedback = deferred();
+  let entered = false, prepared = false, preserved = false, successorCalls = 0;
+  const input = { run_id: runId, worker_id: workerId, register_nonce: "fixture",
+    claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1 };
+  const context = f.memory.begin(input, {
+    preparePreservation: (captured) => { assert.equal(captured, context); prepared = true; },
+    preservationBudgetMs: 500,
+    feedback: async (_result, captured) => {
+      assert.equal(prepared, true);
+      assert.equal(captured, context);
+      entered = true;
+      await feedback.promise;
+      assert.equal(captured.flight, input.flight);
+      assert.equal(captured.lifecycleRevision, 1);
+      assert.equal(captured.register_nonce, "fixture");
+      assert.equal(captured.claim_generation, 1);
+      assert.equal(captured.memory_episode, 0);
+    },
+    preserve: async (captured, signal, ms) => {
+      assert.equal(captured, context);
+      assert.equal(signal.aborted, false);
+      assert.ok(ms > settings.responseBudgetMs && ms <= 500);
+      preserved = true;
+    },
+  });
+  enrollMemoryFixture(f.memory, context);
+  const running = f.memory.run();
+  try {
+    await until(() => entered);
+    assert.equal(f.memory.commands.isCurrent(context), false);
+    const successor = f.memory.begin({ ...input, flight: {}, lifecycleRevision: 2,
+      claim_generation: 2, memory_episode: 1 }, {
+      preparePreservation: () => { successorCalls++; }, preservationBudgetMs: 900,
+      feedback: async () => { successorCalls++; }, preserve: async () => { successorCalls++; },
+    });
+    assert.equal(f.memory.commands.admitsCommands(successor), true);
+    feedback.resolve();
+    await until(() => preserved && f.memory.sinkReceipts.length === 0);
+    assert.equal(successorCalls, 0);
+    assert.equal(f.memory.commands.admitsCommands(successor), true, "historical preservation cannot retire a successor");
+  } finally {
+    feedback.resolve();
+    await f.memory.stop(); await running;
+  }
 });

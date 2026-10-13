@@ -9,8 +9,11 @@ import { WorkerMemoryReader } from "./worker-memory-reader.js";
 
 type Context = ReturnType<WorkerMemoryCommands["begin"]>;
 type Sinks = Readonly<{
-  feedback: (result: WorkerMemoryPressureResult, context: Context) => Promise<void>;
-  preserve: (context: Context) => Promise<void>;
+  feedback: (result: WorkerMemoryPressureResult, context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+  preserve: (context: Context, signal: AbortSignal, remainingMs: number) => Promise<void>;
+  /** Must synchronously retain this flight's clone/session intent and revoke admission. */
+  preparePreservation: (context: Context, result: WorkerMemoryPressureResult) => void;
+  preservationBudgetMs: number;
 }>;
 
 /** One worker-owned reader, registry and sampler. Adapters must bind real sinks
@@ -21,6 +24,23 @@ export class WorkerMemoryRuntime {
   readonly commands: WorkerMemoryCommands;
   private readonly sinks = new WeakMap<Context, Sinks>();
   private readonly monitor: WorkerMemoryMonitor;
+  private readonly receipts = new Set<Readonly<{ context: Context; kind: "feedback" | "preserve"; completion: Promise<void> }>>();
+
+  /** Unsettled owner operations, including callbacks that ignored deadline/abort.
+   * The bound runner must reconcile these before releasing its clone/session.
+   */
+  get sinkReceipts() { return Object.freeze([...this.receipts]); }
+
+  private ownedSink(context: Context, kind: "feedback" | "preserve", work: () => Promise<void>): Promise<void> {
+    let completion: Promise<void>;
+    try { completion = work(); }
+    catch (error) { completion = Promise.reject(error); }
+    const receipt = Object.freeze({ context, kind, completion });
+    this.receipts.add(receipt);
+    // Exactly one completion observer per invocation; no retry or new operation.
+    void completion.then(() => this.receipts.delete(receipt), () => this.receipts.delete(receipt));
+    return completion;
+  }
 
   constructor(
     settings: Extract<NonNullable<Config["memoryGuard"]>, { enabled: true }>,
@@ -46,8 +66,16 @@ export class WorkerMemoryRuntime {
       subscribeInvalidation: (callback) => client.subscribeMemoryInvalidation(callback),
       reserve: (request, signal, ms) => client.reserveMemoryIntervention(request, signal, ms),
       report: (request, signal, ms) => client.reportMemoryInterventionOutcome(request, signal, ms),
-      feedback: (result, context) => sink(context).feedback(result, context),
-      preserve: (context) => sink(context).preserve(context),
+      feedback: (result, context, signal, ms) => {
+        const bound = sink(context);
+        return this.ownedSink(context, "feedback", () => bound.feedback(result, context, signal, ms));
+      },
+      preserve: (context, signal, ms) => {
+        const bound = sink(context);
+        return this.ownedSink(context, "preserve", () => bound.preserve(context, signal, ms));
+      },
+      preparePreservation: (context, result) => sink(context).preparePreservation(context, result),
+      preservationBudgetMs: (context) => sink(context).preservationBudgetMs,
     });
   }
 
@@ -55,8 +83,11 @@ export class WorkerMemoryRuntime {
    * preservation path. Historical feedback remains attached to this exact context.
    */
   begin(input: Parameters<WorkerMemoryCommands["begin"]>[0], sinks: Sinks): Context {
-    if (typeof sinks?.feedback !== "function" || typeof sinks?.preserve !== "function") {
-      throw new Error("memory adapter requires feedback and preservation");
+    if (typeof sinks?.feedback !== "function" || typeof sinks?.preserve !== "function"
+      || typeof sinks?.preparePreservation !== "function"
+      || !Number.isSafeInteger(sinks?.preservationBudgetMs) || sinks.preservationBudgetMs < 1
+      || sinks.preservationBudgetMs > 2147483647) {
+      throw new Error("memory adapter requires feedback, synchronous preservation preparation and owner preservation budget");
     }
     const context = this.commands.begin(input);
     this.sinks.set(context, Object.freeze({ ...sinks }));
@@ -65,7 +96,9 @@ export class WorkerMemoryRuntime {
 
   run(): Promise<void> { return this.monitor.run(); }
   // Worker invokes stop before awaiting any runner cancellation. Monitor.stop
-  // invalidates the registry synchronously, then joins its bounded work.
+  // invalidates the registry synchronously, then joins its bounded work. Unsettled
+  // sink receipts remain owned here after stop; abort is advisory, not settlement.
+  // Runner receipt reconciliation/clone release is a later wiring seam.
   stop(): Promise<void> {
     this.client.revokeMemoryAuthority();
     return this.monitor.stop();
