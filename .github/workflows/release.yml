@@ -299,7 +299,9 @@ jobs:
             UZI_PRDS_OPEN=${{ needs.assert-changelog.outputs.prds_open }}
       # Sign by digest (covers both pushed tags; no tag->digest TOCTOU).
       - name: Sign image (cosign keyless)
-        run: cosign sign --yes ghcr.io/vtmocanu/uzi/api@${{ steps.build.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/api@${DIGEST}"
 
   publish-web:
     runs-on: ubuntu-latest
@@ -352,7 +354,9 @@ jobs:
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/web:${{ needs.prep.outputs.short_sha }}
       - name: Sign image (cosign keyless)
-        run: cosign sign --yes ghcr.io/vtmocanu/uzi/web@${{ steps.build.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/web@${DIGEST}"
 
   publish-controller:
     runs-on: ubuntu-latest
@@ -404,7 +408,9 @@ jobs:
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.version }}
             ghcr.io/vtmocanu/uzi/controller:${{ needs.prep.outputs.short_sha }}
       - name: Sign image (cosign keyless)
-        run: cosign sign --yes ghcr.io/vtmocanu/uzi/controller@${{ steps.build.outputs.digest }}
+        env:
+          DIGEST: ${{ steps.build.outputs.digest }}
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/controller@${DIGEST}"
 
   # Per-template worker images. Destination is <prefix>/agent-<template>, which is what
   # makes the chart's workers.image.repository (ghcr.io/vtmocanu/uzi) + the controller's
@@ -523,7 +529,7 @@ jobs:
         env:
           TEMPLATE: ${{ matrix.template }}
           DIGEST: ${{ steps.base.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/agent-runtime-${TEMPLATE}@${DIGEST}"
       - id: runtime
         name: Pin the runtime base digest this release builds on
         env:
@@ -571,7 +577,7 @@ jobs:
         env:
           TEMPLATE: ${{ matrix.template }}
           DIGEST: ${{ steps.build.outputs.digest }}
-        run: cosign sign --yes "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
+        run: ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/agent-${TEMPLATE}@${DIGEST}"
       # Filesystem half of the identity check (assert-agent-version reads only the image
       # config): export JUST /opt/uzi-src/BUILD_INFO from the digest this job pushed and
       # require it to name this commit. The builder already holds those layers, so this
@@ -781,7 +787,7 @@ jobs:
             sha256:*) : ;;
             *) echo "ERROR: could not parse chart digest from helm push output" >&2; exit 1 ;;
           esac
-          cosign sign --yes "ghcr.io/vtmocanu/uzi/uzi@${digest}"
+          ./scripts/cosign-sign-retry.sh "ghcr.io/vtmocanu/uzi/uzi@${digest}"
 
   # --------------------------------------------------------------- release ----
   # Create the GitHub Release from the tag's CHANGELOG section. The curated prose

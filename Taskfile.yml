@@ -316,6 +316,7 @@ tasks:
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
       # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
       - task: test:docker-pull-fallback
+      - task: test:cosign-sign-retry
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
       - task: test:web-nginx-cleanup
@@ -1012,6 +1013,11 @@ tasks:
     desc: hermetic fetch-retry contract for scan:secrets (fake go, no real gitleaks, no network)
     cmds:
       - ./scripts/scan-secrets.test.sh
+
+  test:cosign-sign-retry:
+    desc: hermetic transient signing retry and fatal refusal checks
+    cmds:
+      - ./scripts/cosign-sign-retry.test.sh
 
   test:docker-pull-fallback:
     desc: hermetic mirror-first, Docker Hub fallback contract for CI image pulls (fake docker, no network)
