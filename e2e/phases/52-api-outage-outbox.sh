@@ -619,7 +619,7 @@ pass "case 6: the interlocked run waited out the outage for its permit -> comple
 # Issue #1742 — the finalize record (write-ahead of every finalize step) survives an agent restart
 # that lands while the api is DOWN, and the one-shot finalize-resume allowance keeps that run from
 # being failed as worker_lost by the orphan pass, exactly once. The cut is DETERMINISTIC: the api is
-# paused while the stub stream is still running (executor not returned), so no terminal can land, and
+# stopped while the stub stream is still running (executor not returned), so no terminal can land, and
 # the agent is restarted only once the finalize record is PROVEN durable, by BOTH the agent's own
 # `finalize record durable` line (logged after the directory fsync) AND the file being on disk.
 say "ISSUE #1742: finalize-resume allowance across an agent restart during an api outage (A completes, B is one-shot)"
