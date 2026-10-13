@@ -9,6 +9,17 @@ fixture() {
   RUNROOT="$SCRATCH" PROJECT=fixture COMPOSE=(fake_compose) OUTBOX_BASE_COMPOSE=(fake_compose) OUTBOX_RESTORE_NEEDED=0 RUN_B1=00000000-0000-0000-0000-000000000001
   API_AVAILABLE=1 API_PAUSED=0 ALIAS_AVAILABLE=0 REFUSE_API=0 REFUSE_ALIAS=0 REFUSE_REMOVE=0
   BARRIER_ARMED=0 BARRIER_RELEASED=0 FIXTURE_FINISHED=0 SLOW_HELPER=0
+  RESTORING=0
+  export UZI_E2E_RECOVERY_FAST_REDRIVE=1
+  storage_diagnostic_snapshot() {
+    case "$1" in
+      outbox-before-restore) RESTORING=1 ;;
+      outbox-after-restore) RESTORING=0 ;;
+      outbox-entry) : ;;
+      *) fail 'unexpected storage diagnostic boundary' ;;
+    esac
+    printf '%s\n' "$1" >> "$SCRATCH/calls"
+  }
   fake_compose() {
     while [ "${1:-}" = -f ] || [ "${1:-}" = --profile ]; do shift 2; done
     printf '%s\n' "$*" >> "$SCRATCH/calls"
@@ -22,6 +33,8 @@ fixture() {
             if [ "$SLOW_HELPER:$BARRIER_ARMED" = 1:0 ]; then FIXTURE_FINISHED=1; fi
             ALIAS_AVAILABLE=1 ;;
           api) [ "$REFUSE_API" = 0 ] || return 1; API_AVAILABLE=1; API_PAUSED=0 ;;
+          agent) [ "$RESTORING" != 1 ] || [ -z "${UZI_E2E_RECOVERY_FAST_REDRIVE:-}" ] \
+            || fail 'fast redrive must be unset before agent restore' ;;
         esac ;;
       rm) [ "$API_AVAILABLE" = 1 ] || fail 'alias removal creates a DNS gap';
         [ "$REFUSE_REMOVE" = 0 ] || return 1; ALIAS_AVAILABLE=0 ;;
@@ -68,6 +81,9 @@ echo 'PASS: real CASE 3 keeps API alias through stop, removes placeholder after 
 restore_outbox_resolution
 [ "${#COMPOSE[@]}:$OUTBOX_RESTORE_NEEDED:$ALIAS_AVAILABLE" = 1:0:0 ]
 [ -s "$SCRATCH/artifacts/52-api-outage-outbox/agent-before-api-restore.log" ]
+[ -z "${UZI_E2E_RECOVERY_FAST_REDRIVE:-}" ]
+grep -F outbox-before-restore "$SCRATCH/calls" >/dev/null
+grep -F outbox-after-restore "$SCRATCH/calls" >/dev/null
 echo 'PASS: restore removes placeholder and preserves worker evidence before recreation'
 : > "$SCRATCH/calls"
 if ( fixture; configure_outbox_api_alias; eval "$(awk '/^trap .*restore_outage_state/ { print }' "$PHASE")"; api_cut; exit 7 ); then

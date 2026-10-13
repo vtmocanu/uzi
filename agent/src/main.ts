@@ -10,7 +10,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
-import { RunRunner, type ExecutorFactory, type RunExecution } from "./runner.js";
+import { RunRunner, type ExecutorFactory, type RunExecution, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
@@ -56,6 +56,20 @@ export function buildWorkerGitCache(
     recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
     terminalRecordProtection,
   });
+}
+
+/** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
+export function buildRecoveryLiveTiming(
+  executor: ExecutorKind,
+  log: Logger,
+  env: NodeJS.ProcessEnv = process.env,
+): RunnerOptions["recoveryLiveTiming"] {
+  if (env.UZI_E2E_RECOVERY_FAST_REDRIVE !== "1") return undefined;
+  if (executor !== "stub") {
+    log.warn("UZI_E2E_RECOVERY_FAST_REDRIVE ignored outside the stub executor");
+    return undefined;
+  }
+  return { liveBackoffBaseMs: 1_000, liveBackoffCapMs: 5_000 };
 }
 
 /**
@@ -572,6 +586,7 @@ async function main(): Promise<void> {
   // from the runner), which logs the bounded retained count and bytes. Late-bound for that reason.
   let notifyRetained: (() => void) | undefined;
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
+    recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
     pollMs: config.pollIntervalMs,
     onSourceRetained: () => notifyRetained?.(),
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,

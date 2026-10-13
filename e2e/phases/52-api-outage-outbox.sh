@@ -333,9 +333,10 @@ api_back() {
 }
 restore_outbox_resolution() {
   [ "$OUTBOX_RESTORE_NEEDED" = 1 ] || return 0
+  storage_diagnostic_snapshot outbox-before-restore
   mkdir -p "$RUNROOT/artifacts/52-api-outage-outbox"
   "${COMPOSE[@]}" logs --no-color agent > "$RUNROOT/artifacts/52-api-outage-outbox/agent-before-api-restore.log" 2>/dev/null || true
-  unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS
+  unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS UZI_E2E_RECOVERY_FAST_REDRIVE
   "${COMPOSE[@]}" up -d --wait --no-deps outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder startup failed' >&2; return 1; }
   "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null || { echo 'outbox cleanup: API recreation failed' >&2; return 1; }
   "${COMPOSE[@]}" rm -s -f outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder removal failed' >&2; return 1; }
@@ -344,6 +345,7 @@ restore_outbox_resolution() {
   login || { echo 'outbox cleanup: API login failed' >&2; return 1; }
   "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || { echo 'outbox cleanup: agent recreation failed' >&2; return 1; }
   wait_worker_online || { echo 'outbox cleanup: agent registration failed' >&2; return 1; }
+  storage_diagnostic_snapshot outbox-after-restore
   OUTBOX_RESTORE_NEEDED=0
 }
 restore_outage_state() {
@@ -377,6 +379,7 @@ outage() {
 # Exported so it out-ranks the env-file's E2E_WORKER_HEARTBEAT_STALE=15s (compose ranks
 # shell env above --env-file), exactly as phase 46 exports UZI_E2E_MAX_CONCURRENT_RUNS.
 export E2E_WORKER_HEARTBEAT_STALE=300s
+storage_diagnostic_snapshot outbox-entry
 configure_outbox_api_alias
 recreate_outbox_api
 pass "api recreated with a 300s heartbeat-stale window so the outage cannot requeue the running run"
@@ -385,6 +388,7 @@ pass "api recreated with a 300s heartbeat-stale window so the outage cannot requ
 # CASE 1 — spill + drain, contiguous, no drops, no `failed` report.
 say "CASE 1: spill + ordered drain (default quotas) — barrier, contiguity, no failed report"
 # Lower ONLY the spill trip window; leave the quotas at their defaults so no drop occurs.
+export UZI_E2E_RECOVERY_FAST_REDRIVE=1
 export WORKER_TRANSIENT_TRIP_MS=3s
 recreate_outbox_agent
 pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s (default quotas)"
@@ -956,7 +960,7 @@ resolve_fixture_source_hold "$RUN_F2" "$GEN_F2"
 resolve_fixture_source_hold "$RUN_F2" "$GEN_F2_OBSERVED"
 
 # =============================================================================
-# RESTORE — return the api stale window and the agent outbox knobs to their defaults so
+# RESTORE — return the api stale window, outbox knobs and recovery retry spacing to defaults so
 # later phases (59-restart-agent, 60-62) are unaffected. Mirrors phase 46's restore.
 say "restore: recreate api + agent back to their defaults"
 restore_outbox_resolution
