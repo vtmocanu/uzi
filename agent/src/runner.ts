@@ -15073,7 +15073,7 @@ export class RunRunner {
           // PRD #1733: the typed provider park landed and only its ack was lost.
           if (providerTypedSent && !credentialDeferred &&
               (status === "recovery_wait" || (status === "paused" && holdReason === PROVIDER_HOLD_REASON))) {
-            await this.dispositionProviderPark(claim, flight, runLog, providerReap, status);
+            if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, status)) keepClone();
             return true;
           }
           if (credentialDeferred && status !== "recovery_wait") {
@@ -15385,7 +15385,9 @@ export class RunRunner {
                     : "paused to recover from a provider outage; the recovery checkpoint is saved on this worker and it resumes automatically",
               },
             });
-            await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status);
+            // issue #1786: a held or unproven-reap park keeps the clone explicitly, so the handler's
+            // cleanup-time coverage check cannot release it.
+            if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status)) keepClone();
             return true;
           }
           if (ack.status === "recovery_wait" && disk) {
@@ -15522,6 +15524,8 @@ export class RunRunner {
    * cache drop is skipped, while the park itself still stands. A held (paused) run keeps its clone
    * for the owner's resume, and settles only a guarded claim: the guarded path is credential-free,
    * the legacy path fetches with the forge PAT and so keeps custody without settling.
+   * Returns true when the clone must be kept (held, or an unproven reap), so the caller can make
+   * that an explicit keep rather than a release-eligible exit (issue #1786).
    */
   private async dispositionProviderPark(
     claim: ClaimResponse,
@@ -15529,19 +15533,21 @@ export class RunRunner {
     runLog: Logger,
     reaped: boolean | undefined,
     status: string,
-  ): Promise<void> {
+  ): Promise<boolean> {
     flight.productiveTurns = 0;
     const held = status === "paused";
     // The same guards as reapRecoveryProviderForSettle: with no clone, no recovery harness or a
     // non-publishing kind there is nothing to settle and nothing a missing proof would endanger.
     const settleApplies = this.recovery.enabled && isCodePublishingKind(resolveRunKind(claim.kind)) && flight.barePath !== undefined;
-    if (held || (settleApplies && reaped !== true)) flight.preserveRecoveryClone = true;
-    if (!settleApplies) return;
+    const keep = held || (settleApplies && reaped !== true);
+    if (keep) flight.preserveRecoveryClone = true;
+    if (!settleApplies) return keep;
     if (reaped !== true) {
       flight.providerParkUnproven = true;
-      return;
+      return keep;
     }
     if (!held || claim.inventory_guarded === true) await this.settleRecoveryGeneration(claim, flight, runLog);
+    return keep;
   }
 
   private async waitRecoveryRetry(
