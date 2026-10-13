@@ -79,7 +79,9 @@ function rig(overrides: object = {}, reader?: Pick<WorkerMemoryReader, "sample">
 }
 
 test("memory samples continue through stalled heartbeat and real boot terminal gate; Claude enrolls nothing", async () => {
-  const dir = await fs.mkdtemp(path.resolve("../.uzi/scratch/memory-outbox-"));
+  const scratch = path.resolve("../.uzi/scratch");
+  await fs.mkdir(scratch, { recursive: true });
+  const dir = await fs.mkdtemp(path.join(scratch, "memory-outbox-"));
   const outbox = new Outbox({ root: dir, log: nullLogger(), runMaxBytes: 1 << 20,
     maxBytes: 2 << 20, retentionMs: 10000 });
   await outbox.init();

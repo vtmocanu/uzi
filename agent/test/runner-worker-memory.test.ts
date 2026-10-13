@@ -479,7 +479,9 @@ function memoryOutbox(root: string, fail = false) {
 }
 
 function memoryOutboxRoot() {
-  return fs.mkdtempSync(path.resolve("../.uzi/scratch/memory-tail-"));
+  const scratch = path.resolve("../.uzi/scratch");
+  fs.mkdirSync(scratch, { recursive: true });
+  return fs.mkdtempSync(path.join(scratch, "memory-tail-"));
 }
 
 test("memory tail persists before spill threshold and reopens with exact seq/generation without ACK", async () => {

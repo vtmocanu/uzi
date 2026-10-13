@@ -47,7 +47,13 @@ Lead dependency checks, lint, dead-code and typecheck passed through pinned cano
 
 Delegated durable-tail focused checks passed 132 tests (`gate-log.bthttX`, EXIT=0), scoped lint (`gate-log.N9Hc8K`) and typecheck (`gate-log.ukjH4K`). Its fix-absent fold failed the persistence assertion (`gate-log.H3S0B2`, EXIT=1). The tests include real outbox reopen/replay, unsettled original transport, an expired prior boundary and failed-store custody. The initial-allowance delegate was cancelled during mutation work; the lead restored the intended check and reran the combined focused checks. No result is inferred from that cancellation.
 
-Committed-range review, additional lifecycle/adapter integration proofs and the full canonical M3 agent gate remain pending for this candidate. Production default remains disabled; M4 and M5 have not started.
+Reviewer/tester/auditor reviewed the candidate at `822e0496d2ffe2e3847f6a223496f59d7d35fbf6`. No production authority/security/data-integrity defect was demonstrated. Reviewer reported a blocking fresh-checkout test defect: the new outbox helper assumed the ignored scratch parent already existed. The same prerequisite affected the preserved lifecycle fixture. Both helpers now create their own parent before allocating outboxes; repair verification and committed-range review are recorded below.
+
+Tester typechecked a fold setting the four custody flags false and observed a named `memory preservation integration must keep original session` failure, without timeout. Reverting only the dispatch error selection stayed green because other guards still protected the result; no independent sensitivity claim is made for that dispatch guard or clone retention. Tester's serial grouped-file run is supplementary evidence, not a canonical gate or permission to change gate concurrency. Lead focused checks used default file concurrency. Auditor independently passed the secret gate (both canaries detected, zero tracked findings), agent dependency audit (zero vulnerabilities) and a scoped Semgrep run (three applicable rules, six targets, zero findings). These available checks do not erase the earlier API scanner limits or establish full milestone acceptance.
+
+Lead also passed all five captured-memory epoch seam cases (`gate-log.lfw2xJ`, EXIT=0) and all 18 existing adapter unit cases (`gate-log.10TNxe`, EXIT=0) at `822e0496`, zero failures/cancellations/skips. Those component cases do not replace the pending actual runner-to-Codex adapter flow.
+
+Additional lifecycle/adapter integration proofs and the full canonical M3 agent gate remain pending. Production default remains disabled; M4 and M5 have not started.
 
 ## Next serial integration
 
