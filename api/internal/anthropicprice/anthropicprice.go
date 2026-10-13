@@ -130,8 +130,9 @@ func Price(u Usage) (Cost, bool) {
 	if u.Speed != "" && u.Speed != standardSpeed {
 		return Cost{}, false
 	}
-	if u.InferenceGeo != "" && u.InferenceGeo != standardInferenceGeo &&
-		!(u.InferenceGeo == unavailableInferenceGeo && r.predatesInferenceGeo) {
+	geoStandard := u.InferenceGeo == "" || u.InferenceGeo == standardInferenceGeo ||
+		(u.InferenceGeo == unavailableInferenceGeo && r.predatesInferenceGeo)
+	if !geoStandard {
 		return Cost{}, false
 	}
 	if u.InputTokens < 0 || u.CacheReadInputTokens < 0 || u.CacheCreationInputTokens < 0 || u.OutputTokens < 0 {
