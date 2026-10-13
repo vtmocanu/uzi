@@ -1,6 +1,6 @@
 # PRD #2789: Run page, one progress card for milestones, live work and Now
 
-**Status**: In progress — M1 and M2 complete; M3–M4 pending
+**Status**: In progress — M1 and M2 complete; M3 awaiting final repository gate and evidence review; M4 pending
 **Priority**: Medium
 **GitHub issue**: #2789
 **Design mock**: `prds/mockups/2789-run-page-unified-progress-mock.html` (open it in a browser; a Before/After toggle and a run-state switch sit at the top)
@@ -124,16 +124,18 @@ Blocked by: M1 (the iteration count moves into the card first)
 - [x] `CHANGELOG.md` line.
 - [x] Acceptance: example 1's header clauses; mock parity for the header.
 
-Evidence: [M2 validation, old → new assertion inventory and deliberate breaks](mockups/2789-m2-validation.md), with light/dark header and mobile disclosure comparisons. Cumulative source review is clean through `e5d39e35`; full web/repository gates and production build passed at that revision. M3–M4 remain pending.
+Evidence: [M2 validation, old → new assertion inventory and deliberate breaks](mockups/2789-m2-validation.md), with light/dark header and mobile disclosure comparisons. Cumulative source review is clean through `e5d39e35`; full web/repository gates and production build passed at that revision. At that M2 snapshot, M3–M4 remained pending.
 
 ### M3: What needs you comes first, cost in the card, summary collapses after the gate
 Blocked by: M1 (the cost footer lives in the card)
 
-- [ ] Attention slot directly under the header with the members and order listed in Modules, moved with their existing content and gates.
-- [ ] Cost footer per Modules.
-- [ ] `summaryCollapse` tri-state read and the state default per Modules.
-- [ ] `CHANGELOG.md` line.
-- [ ] Acceptance: examples 2 and 3; mock parity for the attention slot and footer.
+- [x] Attention slot directly under the header with the members and order listed in Modules, moved with their existing content and gates.
+- [x] Cost footer per Modules.
+- [x] `summaryCollapse` tri-state read and the state default per Modules.
+- [x] `CHANGELOG.md` line.
+- [x] Acceptance: examples 2 and 3; mock parity for the attention slot and footer.
+
+Evidence: [M3 validation and isolated deliberate breaks](mockups/2789-m3-validation.md), with [light](mockups/2789-run-page-parity-light.png) and [dark](mockups/2789-run-page-parity-dark.png) four-state Chromium comparisons. Source review is clean at `f2083e52`; full web gate, production build and uncached docs mirror passed. Thirteen valid deliberate breaks typechecked and failed intended assertions, followed by 72 unmodified passing cases. Final repository gate and evidence review remain pending at this snapshot; M4 is unchecked.
 
 ### M4: The Now note describes the work, not the tool
 Blocked by: none
