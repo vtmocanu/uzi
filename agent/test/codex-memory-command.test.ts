@@ -155,6 +155,38 @@ test("captured-context/admission seam refuses new shells while held and after re
   assert.equal(spawns, 0, "retired captured flight cannot start a command");
 });
 
+test("retired captured flight rejects a shell without invoking its spawn seam", async () => {
+  const c = captured();
+  let spawns = 0;
+  const b = broker(async () => { spawns++; return { code: 0, stdout: "", stderr: "" }; },
+    new ExecutionRegistry(newLocalExecutionEpoch(1)), c);
+  c.commands.retire(c.context);
+  const result = await b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+  assert.equal(result.ok, false, "retired captured flight cannot admit a model shell");
+  assert.equal(spawns, 0, "retired captured flight never reaches spawn");
+});
+
+test("trusted model command is enrolled before the executor waits for ordinary completion", async () => {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  let enrollmentAtWait = -1;
+  const handle: CodexRootHandle = {
+    ...root.handle,
+    waitChild: async () => {
+      enrollmentAtWait = c.commands.eligibleEntries()?.length ?? 0;
+      root.child.resolve({ event: "child_exit", code: 0 });
+      return root.handle.waitChild();
+    },
+  };
+  const b = broker(makeDefaultSpawnCommand(registry, async () => handle,
+    100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+  const result = await b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+  assert.equal(result.ok, true);
+  assert.equal(enrollmentAtWait, 1, "trusted model shell must acquire enrollment before ordinary completion");
+  assert.equal(c.commands.eligibleEntries()?.length, 0, "confirmed cleanup retires enrollment");
+});
+
 test("enrollment seam excludes internal probes, cloned metadata and no captured context", async () => {
   const c = captured();
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
