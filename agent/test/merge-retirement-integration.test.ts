@@ -43,8 +43,9 @@ for (const lane of ["archive", "ordinary"] as const) {
       recoveryInventoryPending: async () => lane === "archive",
       isExecuting: () => false,
       retireRecoveryReport: async (_run: string, _generation: number, context: ReportRetirementContext) => {
-        if (lane !== "archive") return false;
-        return outbox.retireFinalizeIfEligible(run, generation, () => true, context.signal!, context.expectedIdentity!);
+        if (lane !== "archive") return { retired: false };
+        const retired = await outbox.retireFinalizeIfEligible(run, generation, () => true, context.signal!, context.expectedIdentity!);
+        return retired ? { retired: true, authority: "existing_archive" } : { retired: false };
       },
       notifyPublicationCompletionRetired: async () => { notifications++; },
     };
@@ -199,7 +200,7 @@ it("worker notifies exactly once after successful archive finalize unlink, never
   const retire = f.r.retireRecoveryReport.bind(f.r);
   t.mock.method(f.r, "retireRecoveryReport", async (...args: Parameters<typeof retire>) => {
     const result = await retire(...args);
-    results.push(result);
+    results.push(result.retired);
     return result;
   });
   let notifications = 0;

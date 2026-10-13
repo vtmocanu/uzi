@@ -3543,6 +3543,29 @@ export class WorkerClient {
     return true;
   }
 
+  /** One fresh, observational custody proof; eligible is scoped to this callback only. */
+  async withAcknowledgedFinalReportCustody(
+    runId: string, generation: number, budget: { signal: AbortSignal; deadline: number },
+    action: (eligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    const workerId = this.registeredWorkerId;
+    const eligible = () => !!workerId && workerId === this.registeredWorkerId &&
+      this.hasFeature("recovery_inventory_v1") && this.hasFeature("terminal_rejection_report") &&
+      !budget.signal.aborted && Date.now() < budget.deadline;
+    if (!terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0 || !eligible()) return;
+    const ownership = await this.getRunOwnership(runId, budget);
+    if (!eligible() || ownership.status !== "completed" || ownership.claim_generation !== generation ||
+        ownership.inventory_guarded !== true) return;
+    const custody = await this.getTerminalRejectionCustody(runId, generation, workerId!,
+      budget.signal, Math.max(1, budget.deadline - Date.now()));
+    if (!eligible() || !custody || custody.outcome !== "settled" || !custody.complete ||
+        !custody.exact_complete || !custody.sibling_complete || custody.exact_count < 1 ||
+        custody.exact_count !== custody.exact_holds.length || custody.sibling_count !== 0 ||
+        custody.sibling_holds.length !== 0 || !custody.exact_holds.some(h => h.state === "released") ||
+        !custody.exact_holds.every(h => h.state === "released" || h.state === "discarded")) return;
+    await action(eligible);
+  }
+
   async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {
     if (!this.hasFeature("terminal_rejection_report")) return undefined;
     if (!terminalUUID(runId) || !terminalUUID(workerId) || !terminalGeneration(generation)) throw terminalResponseError();
