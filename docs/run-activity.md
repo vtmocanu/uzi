@@ -614,12 +614,18 @@ after one of those is discarded.
 **What the model sees.** The active milestone's title and the newest 20 tool
 calls, each cut down to role, label, tool and detail (the same fields the
 [`now` line](#milestones-and-the-now-line) reads; never a Bash command), with
-claim secrets redacted.
+claim secrets redacted. The prompt describes the intended work from the title,
+role and label, ignores a leading `[mN]` tag, and names a tool only when no work
+description is known. Titles and labels never establish an outcome; the model
+must not infer success or predict next steps. These fields remain inert JSON
+inside matching nonce-based fences. The result stays one plain present-tense
+sentence of at most 120 characters, marked as a model summary with its age.
+Prompt tests check these instructions and fences, not live model wording.
 
 | Harness | Model | Limits |
 |---|---|---|
 | Claude | `haiku`, extended thinking off | 256 output tokens |
-| Codex | `gpt-6-luna` at reasoning effort `low` | The Codex advice path cannot enforce an output-token cap, so the 30-second timeout is the only bound. `low` is the lowest effort uzi's Codex contract allows |
+| Codex | `gpt-6-luna` at reasoning effort `low` | The requested 256-output-token cap is not forwarded by the Codex advice path; its response text has an 8 MiB cap and the call has a 30-second timeout. `low` is the lowest effort uzi's Codex contract allows |
 
 There is no fallback to a more expensive model: if the account refuses the
 model, or the call fails or times out, that summary is skipped and the run is
