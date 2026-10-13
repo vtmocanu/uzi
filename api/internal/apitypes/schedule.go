@@ -150,6 +150,45 @@ func (o OptionalInteger) MarshalJSON() ([]byte, error) {
 // zero value and dropped from the marshaled body.
 func (o OptionalInteger) IsZero() bool { return !o.Present }
 
+// OptionalCIWorkflows preserves PATCH presence: absent keeps selectors, null or
+// [] clears to all workflows. U3 validates at most 20 entries of 1..200 bytes.
+type OptionalCIWorkflows struct {
+	Present bool
+	Value   []string
+}
+
+func (o *OptionalCIWorkflows) UnmarshalJSON(b []byte) error {
+	o.Present = true
+	return json.Unmarshal(b, &o.Value)
+}
+
+func (o OptionalCIWorkflows) MarshalJSON() ([]byte, error) { return json.Marshal(o.Value) }
+func (o OptionalCIWorkflows) IsZero() bool                 { return !o.Present }
+
+// CIEpisodeCursor is an opaque base64 encoding of an exclusive workflow key,
+// ordered by UTF-8 bytes. U3 validates the decoded key is 1..200 bytes.
+type CIEpisodeCursor string
+
+// CIEpisodeDTO exposes durable loop history; run IDs are forge execution IDs.
+type CIEpisodeDTO struct {
+	WorkflowKey       string     `json:"workflow_key"`
+	LastHandledRunID  *int64     `json:"last_handled_run_id"`
+	ObservedCreatedAt *time.Time `json:"observed_created_at"`
+	ObservedUpdatedAt *time.Time `json:"observed_updated_at"`
+	ObservedRunID     *int64     `json:"observed_run_id"`
+	LastSignature     *string    `json:"last_signature"`
+	Attempts          int        `json:"attempts"`
+	HaltedReason      *string    `json:"halted_reason"`
+	UpdatedAt         time.Time  `json:"updated_at"`
+}
+
+// CIEpisodePage contains at most 100 entries (default 100); a nil next cursor
+// means exhausted. The endpoint emits [] for an empty page.
+type CIEpisodePage struct {
+	Episodes   []CIEpisodeDTO   `json:"episodes"`
+	NextCursor *CIEpisodeCursor `json:"next_cursor"`
+}
+
 // ScheduleRequest is the create/patch input for a run schedule (PRD #241 M4).
 //
 // On CREATE, omitted pointer fields take their documented defaults (auto_approve=true
@@ -177,10 +216,11 @@ func (o OptionalInteger) IsZero() bool { return !o.Present }
 // inherit the owner default (NULL in the DB). Validated later via agenttmpl.ValidateModel;
 // it carries the same "present, even to clear" replace-semantics on PATCH (see mergeSchedule).
 type ScheduleRequest struct {
-	RemoveLabelOnDispatch *bool           `json:"remove_label_on_dispatch,omitempty"`
-	CapacityLimit         OptionalInteger `json:"capacity_limit,omitzero"`
-	CapacityRoomNeeded    OptionalInteger `json:"capacity_room_needed,omitzero"`
-	Target                string          `json:"target"`
+	CIWorkflows           OptionalCIWorkflows `json:"ci_workflows,omitzero"`
+	RemoveLabelOnDispatch *bool               `json:"remove_label_on_dispatch,omitempty"`
+	CapacityLimit         OptionalInteger     `json:"capacity_limit,omitzero"`
+	CapacityRoomNeeded    OptionalInteger     `json:"capacity_room_needed,omitzero"`
+	Target                string              `json:"target"`
 	// RepoID repoints a schedule to another repo on PATCH (Feature A, PRD #344). It is
 	// honored ONLY on PATCH: CreateSchedule takes the repo from the URL and ignores a
 	// body repo_id, so a create caller has no reason to send it. Empty = keep the current
@@ -255,24 +295,27 @@ type ScheduleRequest struct {
 // best-effort display value and may be "" when the repo can no longer be resolved
 // (disconnected or no longer owned).
 type ScheduleDTO struct {
-	RemoveLabelOnDispatch bool       `json:"remove_label_on_dispatch"`
-	CapacityLimit         *int       `json:"capacity_limit"`
-	CapacityRoomNeeded    *int       `json:"capacity_room_needed"`
-	ID                    string     `json:"id"`
-	RepoID                string     `json:"repo_id"`
-	RepoPath              string     `json:"repo_path"`
-	Target                string     `json:"target"`
-	IssueIID              *int64     `json:"issue_iid"`
-	Labels                []string   `json:"labels"`
-	Prompt                string     `json:"prompt"`
-	Timing                string     `json:"timing"`
-	CronExpr              string     `json:"cron_expr"`
-	RunAt                 *time.Time `json:"run_at"`
-	Timezone              string     `json:"timezone"`
-	NextFireAt            *time.Time `json:"next_fire_at"`
-	LastFiredAt           *time.Time `json:"last_fired_at"`
-	AutoApprove           bool       `json:"auto_approve"`
-	WaitOnLimit           bool       `json:"wait_on_limit"`
+	// CIWorkflows nil/empty means all; CIEpisodes is populated only on CI detail.
+	CIWorkflows           []string       `json:"ci_workflows,omitempty"`
+	CIEpisodes            *CIEpisodePage `json:"ci_episodes,omitempty"`
+	RemoveLabelOnDispatch bool           `json:"remove_label_on_dispatch"`
+	CapacityLimit         *int           `json:"capacity_limit"`
+	CapacityRoomNeeded    *int           `json:"capacity_room_needed"`
+	ID                    string         `json:"id"`
+	RepoID                string         `json:"repo_id"`
+	RepoPath              string         `json:"repo_path"`
+	Target                string         `json:"target"`
+	IssueIID              *int64         `json:"issue_iid"`
+	Labels                []string       `json:"labels"`
+	Prompt                string         `json:"prompt"`
+	Timing                string         `json:"timing"`
+	CronExpr              string         `json:"cron_expr"`
+	RunAt                 *time.Time     `json:"run_at"`
+	Timezone              string         `json:"timezone"`
+	NextFireAt            *time.Time     `json:"next_fire_at"`
+	LastFiredAt           *time.Time     `json:"last_fired_at"`
+	AutoApprove           bool           `json:"auto_approve"`
+	WaitOnLimit           bool           `json:"wait_on_limit"`
 	// MrReworkEnabled is the per-schedule MR-rework override (PRD #841 M2): nil means
 	// inherit the owner default (NULL in the DB, the schedule default per D5), a value is
 	// an explicit override a scheduled run stamps onto itself. It is *bool (tri-state),

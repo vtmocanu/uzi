@@ -1987,7 +1987,26 @@ export type RunNowResponse = {
   skips: LastFireSkip[];
 };
 
+export interface CIEpisodeDTO {
+  workflow_key: string;
+  last_handled_run_id: number | null;
+  observed_created_at: string | null;
+  observed_updated_at: string | null;
+  observed_run_id: number | null;
+  last_signature: string | null;
+  attempts: number;
+  halted_reason: "no_progress" | "attempt_cap" | null;
+  updated_at: string;
+}
+
+export interface CIEpisodePage {
+  episodes: CIEpisodeDTO[];
+  next_cursor: string | null;
+}
+
 export interface Schedule {
+  ci_workflows?: string[];
+  ci_episodes?: CIEpisodePage;
   remove_label_on_dispatch: boolean;
  capacity_limit: number | null;
  capacity_room_needed: number | null;
@@ -2169,6 +2188,8 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
+  // Omitted preserves PATCH selectors; null or [] clears to all workflows.
+  ci_workflows?: string[] | null;
   remove_label_on_dispatch?: boolean;
  capacity_limit?: number | null;
  capacity_room_needed?: number | null;

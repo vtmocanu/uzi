@@ -1,4 +1,7 @@
 {
+  "ci_workflows": [
+    "x"
+  ],
   "remove_label_on_dispatch": true,
   "capacity_limit": 1,
   "capacity_room_needed": 1,

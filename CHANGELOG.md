@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **Persistence for scheduled default-branch CI repair ([#2865](https://github.com/vtmocanu/uzi/issues/2865)).**
+  CI-watch schedules retain bounded per-workflow episode history for deduplication and repair limits. Ordinary prompt runs keep their existing defaults.
+
 ### Fixed
 
 - **Claude cross-checks no longer fail with `confinement_failed` as soon as they start ([#2869](https://github.com/vtmocanu/uzi/issues/2869)).**
