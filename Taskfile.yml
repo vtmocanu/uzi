@@ -1189,7 +1189,13 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+      - ./scripts/worker-roll-target.test.sh
       - python3 -I -B scripts/release-ci-coverage.test.py
+
+  test:worker-roll-target-package:
+    desc: offline packaged-chart exact worker stamp and override regressions (#2906)
+    cmds:
+      - ./scripts/chart-inject-roll-target.test.sh
 
   test:agent-runtime-key:
     desc: offline fixture test of scripts/agent-runtime-key.sh (builds temp git repos; issue 1720)

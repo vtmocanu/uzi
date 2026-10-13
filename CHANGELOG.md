@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
+  Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; missing or conflicting image identity blocks chart publication.
+
 ### Changed
 
 - **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**

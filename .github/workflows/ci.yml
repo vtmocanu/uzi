@@ -900,8 +900,8 @@ jobs:
         run: task gate:repo
       # Offline fixture test of the release-train scripts (PRD 1265 M1). A `gate`
       # member, not a `gate:repo` member (it builds a multi-commit git repo), so it
-      # is a distinct step here in the repo-wide job. Needs only git + bash, both
-      # present on the runner and set up by the checkout above.
+      # is a distinct step here in the repo-wide job. Registry identity fixtures also
+      # use jq; packaging fixtures run separately in helm-chart, which installs Helm.
       - name: test:release-scripts (release-train fixture)
         run: task test:release-scripts
       - name: Save Go cache (main only)
@@ -935,6 +935,8 @@ jobs:
             --show-only templates/controller-deployment.yaml > /tmp/uzi-controller.yaml
           sh scripts/assert-controller-strategy.sh /tmp/uzi-controller.yaml
       - uses: ./.github/actions/setup-task
+      - name: Verify packaged-chart worker roll target
+        run: task test:worker-roll-target-package
       - name: Render and assert the OpenShift/OKD knobs
         # Offline (strips the CNPG subchart). Needs helm (above) and yq, which the
         # ubuntu-latest runner provides, the same unpinned-reader reasoning as

@@ -547,8 +547,10 @@ workers:
   # Replacements admitted concurrently AFTER canary promotion. Positive integer.
   rollConcurrency: 1
   # Exact baked worker version, including build metadata. Published bare release
-  # tags do not identify the +g<commit> stamp; set this from the pinned image's
-  # verified release identity. Missing mapping holds rolls before cordoning.
+  # tags do not identify the +g<commit> stamp. Release packaging fills this empty
+  # default from signature-verified pinned image configs (#2906); tracked values
+  # stay empty. Per-cluster overrides win: custom pins/source charts need a matching
+  # verified target. Missing mapping holds rolls before cordoning.
   # Example: "0.86.0-rc.9+g37e46a3". Never use the independently advancing API version.
   rollTargetVersion: ""
 

@@ -42,8 +42,10 @@ set; two partial workers cannot provide that set by union.
    **unpaced**; do not change the worker pin in this window.
 2. Deploy the new chart/RBAC and singleton controller at the steady worker pin,
    with `workers.forceRoll: false`, positive `workers.rollConcurrency: 1`, and
-   `workers.rollTargetVersion` set to that image's independently verified exact
-   baked stamp, including `+g<commit>`. A bare published SemVer image tag is not
+   `workers.rollTargetVersion` matching that image's independently verified exact
+   baked stamp, including `+g<commit>`. Published charts inject the verified stamp
+   during release packaging; per-cluster overrides still win. A custom worker pin
+   or an unpackaged source chart needs a matching verified override. A bare published SemVer image tag is not
    enough to derive ADR-1720's stamp. Do not copy the API version, infer the target
    from a replacement or strip build metadata.
 3. Verify controller poll evidence and report support, plus permission for
