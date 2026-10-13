@@ -31,6 +31,8 @@ through `[0.52.0]`.)
 
 - **The bundled Codex runtime moves from 0.160.0 to 0.160.1 ([#2819](https://github.com/vtmocanu/uzi/pull/2819)).**
   The launcher path, fail-closed probe digests, image assertions and e2e version checks move together. The patch release only backports Windows environment preservation for remote MCP servers; the app-server protocol, error enum, config, rollout and sandbox code are unchanged.
+- **Routine dependency bumps: `@anthropic-ai/claude-agent-sdk` 0.3.287 to 0.3.290 ([#2631](https://github.com/vtmocanu/uzi/pull/2631)) and the oasdiff gate tool v1.32.1 to v1.33.0 ([#2634](https://github.com/vtmocanu/uzi/pull/2634), [#2633](https://github.com/vtmocanu/uzi/pull/2633), [#2632](https://github.com/vtmocanu/uzi/pull/2632), [#2534](https://github.com/vtmocanu/uzi/pull/2534)).**
+  The SDK range carries Claude Code parity releases plus fixes, among them deny and ask rules now matching aliased tools written with a wildcard. The four oasdiff pins move together because the wrapper test requires them to agree.
 
 ## [0.86.0] - 2026-10-06
 
