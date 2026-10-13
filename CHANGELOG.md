@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Jobs with a wall budget above Node's timer range no longer abort at once ([#2771](https://github.com/vtmocanu/uzi/issues/2771)).**
   The job runner's input-download and session deadlines now re-arm in chunks below the native timer limit, as #2761 did for the executors, so a long job budget runs to its full length.
 
+### Changed
+
+- **The bundled Codex runtime moves from 0.160.0 to 0.160.1 ([#2819](https://github.com/vtmocanu/uzi/pull/2819)).**
+  The launcher path, fail-closed probe digests, image assertions and e2e version checks move together. The patch release only backports Windows environment preservation for remote MCP servers; the app-server protocol, error enum, config, rollout and sandbox code are unchanged.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
