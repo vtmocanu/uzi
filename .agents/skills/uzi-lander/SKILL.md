@@ -108,8 +108,8 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
   it shares your model's blind spots, so name it in the trail. Every review brief asks
   for applicable cleanup lenses (reuse, simplification, efficiency, fix altitude),
   reported apart from mandatory findings.
-- **A buddy never reviews a diff it wrote.** When the buddy implemented the change, the
-  independent review is a bot or a fresh local reviewer; the buddy only verifies findings.
+- Follow the `session-peers` skill's Buddy rules for role split, joint planning and non-author review.
+  When the buddy implemented the change, use a bot or fresh local reviewer; the buddy only verifies findings.
 - **Decide together when unsure.** Consult the buddy on a call the rules do not settle:
   a major, low or neutral Merge Confidence, red CI a fix on our side might clear, a rule
   that does not clearly apply. Brief facts (diff, CI evidence, release notes, the
