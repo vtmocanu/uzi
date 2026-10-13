@@ -72,6 +72,23 @@ async function setup(count = 0, configured = settings) {
   return { memory, claim, reservations, parkReceipts, pressure: (bytes: number) => { usage = bytes; } };
 }
 
+function releaseGate() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+// Observe custody on the actual flight without importing the runner's private type.
+type MemoryFlightProof = {
+  parked?: boolean;
+  retainedLocalCustody?: boolean;
+  workerMemory?: {
+    operation?: Promise<void>; settled?: boolean; closing?: Promise<void>;
+    feedback: Map<string, { operation?: Promise<boolean> }>;
+  };
+  steering: { terminalLifecycleSignal(): AbortSignal };
+};
+
 function enroll(ctx: RunContext, toolId = "original-tool") {
   const captured = ctx.capturedMemory!()!;
   let cancellations = 0;
@@ -625,6 +642,366 @@ for (const fail of [false, true]) {
     }
   });
 }
+
+test("M3 late native park ACK stays owned after deadline and cannot mutate a reclaimed successor", async () => {
+  const f = await setup(1);
+  const monitoring = f.memory.run();
+  const release = releaseGate();
+  const successorRelease = releaseGate();
+  let original: MemoryFlightProof | undefined;
+  let successor: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
+  let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined;
+  let successorWork: Promise<void> | undefined;
+  const report = client.reportState.bind(client);
+  client.reportState = async (...args) => {
+    const ack = await report(...args);
+    if (args[1].recovery_cause === "worker_memory_pressure") {
+      nativeAck = ack;
+      parkSignal = args[2];
+      // Intentionally ignore abort after a REAL client-validated receipt.
+      await release.promise;
+    }
+    return ack;
+  };
+  fs.writeFileSync(homeDir + "/session-proof", "original session");
+  git.worktreeStatus = async () => ["M fixture"];
+  git.commitWipMarker = async () => false;
+  const executor: Executor = {
+    settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+    run: async ctx => {
+      const command = enroll(ctx);
+      original = command.captured.flight as MemoryFlightProof;
+      f.pressure(950);
+      const result = await command.captured.commands.watchOutcome(command.entry);
+      ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+      throw new Error("quiet retained stop");
+    },
+  };
+  // Rescue ignores abort too; the original work is always released and joined in finally.
+  // Reclaim performs real local capture; allow its positive 5000ms budget before rescue.
+  const rescue = setTimeout(() => release.resolve(), 5000);
+  const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+    { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 });
+  const started = performance.now();
+  const work = runner.execute(f.claim);
+  try {
+    await until(() => nativeAck !== undefined);
+    assert.ok(nativeAck!.memoryParkAccepted, "receipt derives from the native public memory-hold DTO");
+    await work;
+    assert.ok(performance.now() - started < 1500, "runner deadline does not wait for uncooperative park return");
+    const operation = original!.workerMemory!.operation!;
+    assert.ok(operation, "original preservation promise remains on its flight");
+    assert.notEqual(original!.workerMemory!.settled, true, "original work has not settled");
+    assert.equal(parkSignal!.aborted, true);
+    assert.notEqual(original!.parked, true, "native acceptance alone cannot mark an expired flight parked");
+    assert.equal(original!.retainedLocalCustody, true);
+    assert.equal(fs.readFileSync(homeDir + "/session-proof", "utf8"), "original session");
+    assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+    assert.equal(api.states.filter(s => s.body.recovery_cause === "worker_memory_pressure").length, 1);
+    assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
+
+    f.pressure(100);
+    git.worktreeStatus = async () => [];
+    api.memoryRegisterNonce = "successor-memory-registration";
+    await client.register("memory-fixture", "base");
+    const next = { ...f.claim, claim_generation: 8, memory_episode: 4, memory_intervention_count: 1 };
+    api.setOwnershipStatus(next.run_id, "running", 8);
+    const nextExecutor: Executor = { run: async ctx => {
+      successor = ctx.capturedMemory!();
+      await successorRelease.promise;
+      throw new Error("successor proof complete");
+    } };
+    const successorLog: string[] = [];
+    const log = nullLogger();
+    log.child = () => log;
+    log.warn = log.error = (message, fields) => { successorLog.push(message + JSON.stringify(fields)); };
+    successorWork = runnerWith(() => ({ executor: nextExecutor }), fakeGitlab().gitlab, undefined, log,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(next);
+    try {
+      await until(() => successor !== undefined);
+    } catch {
+      assert.fail("successor executor admission: " + JSON.stringify(api.states) + successorLog.join("\\n"));
+    }
+    assert.notEqual(successor!.flight, original);
+    assert.equal(successor!.context.claim_generation, 8);
+    assert.equal(successor!.context.memory_episode, 4);
+    assert.equal(successor!.context.register_nonce, "successor-memory-registration");
+    assert.equal(successor!.context.flight, successor!.flight);
+    assert.equal(successor!.commands.remaining(successor!.context), 1, "reclaim uses persisted count, never resets allowance");
+    assert.equal(successor!.commands.admitsCommands(successor!.context), true);
+    const nextFlight = successor!.flight as MemoryFlightProof;
+    assert.notEqual(original!.workerMemory!.settled, true, "controlled release, not rescue, settles old park");
+    const nextParked = nextFlight.parked;
+    release.resolve();
+    await operation;
+    assert.equal(original!.workerMemory!.operation, operation, "late completion settles the same original promise");
+    assert.equal(original!.workerMemory!.settled, true);
+    assert.notEqual(original!.parked, true);
+    assert.equal(nextFlight.parked, nextParked, "old acceptance cannot mark successor parked");
+    assert.equal(nextFlight.workerMemory!.operation, undefined);
+    assert.equal(successor!.commands.admitsCommands(successor!.context), true);
+    assert.equal(successor!.commands.remaining(successor!.context), 1);
+  } finally {
+    clearTimeout(rescue);
+    release.resolve();
+    successorRelease.resolve();
+    await work;
+    await original?.workerMemory?.operation;
+    await original?.workerMemory?.closing;
+    await successorWork;
+    await f.memory.stop(); await monitoring;
+    await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+  }
+});
+
+for (const interruption of ["registration", "generation", "shutdown", "cancel"] as const) {
+  test(`M3 capture interruption ${interruption} keeps original custody and prevents stale mutations`, async () => {
+    const f = await setup(1);
+    const monitoring = f.memory.run();
+    const captureScope = new AsyncLocalStorage<boolean>();
+    let original: MemoryFlightProof | undefined;
+    let reads = 0, writes = 0, fetches = 0;
+    const executor: Executor = {
+      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      run: async ctx => {
+        const recover = git.withRecoveryOperation.bind(git);
+        git.withRecoveryOperation = (signal, deadline, action) =>
+          recover(signal, deadline, owned => captureScope.run(true, () => action(owned)));
+        const command = enroll(ctx);
+        original = command.captured.flight as MemoryFlightProof;
+        f.pressure(950);
+        const result = await command.captured.commands.watchOutcome(command.entry);
+        ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+        throw new Error("quiet retained stop");
+      },
+    };
+    const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 });
+    fs.writeFileSync(homeDir + "/session-proof", "original session");
+    git.worktreeStatus = async () => {
+      if (!captureScope.getStore()) return [];
+      reads++;
+      if (interruption === "registration") client.revokeMemoryAuthority();
+      if (interruption === "generation") api.setOwnershipStatus(f.claim.run_id, "running", 8);
+      if (interruption === "shutdown") runner.shutdown();
+      if (interruption === "cancel") {
+        api.setInputs(f.claim.run_id, [input("cancel")]);
+        await until(() => original!.steering.terminalLifecycleSignal().aborted);
+      }
+      return ["M fixture"];
+    };
+    const commit = git.commitWipMarker.bind(git);
+    git.commitWipMarker = async (...args) => {
+      if (captureScope.getStore()) { writes++; return false; }
+      return commit(...args);
+    };
+    const fetch = git.fetchAgentBranch.bind(git);
+    git.fetchAgentBranch = async (...args) => {
+      if (captureScope.getStore()) fetches++;
+      return fetch(...args);
+    };
+    try {
+      await runner.execute(f.claim);
+      await original?.workerMemory?.operation;
+      assert.equal(reads, 1, "interruption occurs inside actual owner capture after quiescence");
+      assert.equal(writes, 0, "ownership/lifecycle recheck prevents the next WIP write");
+      assert.equal(fetches, 0, "no stale tracking fetch follows interruption");
+      assert.equal(api.states.some(s => s.body.recovery_cause === "worker_memory_pressure"), false);
+      assert.notEqual(original!.parked, true);
+      assert.equal(original!.retainedLocalCustody, true);
+      assert.equal(fs.readFileSync(homeDir + "/session-proof", "utf8"), "original session");
+      assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+      assert.equal(original!.workerMemory!.feedback.size, 0, "original feedback was actually ACKed");
+      assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
+      assert.equal(f.memory.sinkReceipts.some(receipt => receipt.context.flight === original), false,
+        "original sink receipts are settled, never transferred to a run-ID successor");
+    } finally {
+      await original?.workerMemory?.operation;
+      await original?.workerMemory?.closing;
+      await f.memory.stop(); await monitoring;
+      await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+    }
+  });
+}
+
+test("M3 delayed feedback beyond deadline retains original send and sink receipt without parking", async () => {
+  const f = await setup(1);
+  const monitoring = f.memory.run();
+  const release = releaseGate();
+  let original: MemoryFlightProof | undefined, sending = false, sendSignal: AbortSignal | undefined;
+  const post = client.postMessages.bind(client);
+  client.postMessages = async (...args) => {
+    await post(...args);
+    if (args[1].some(message => message.payload.event === "worker_memory_pressure")) {
+      sending = true;
+      sendSignal = args[3];
+      await release.promise; // Native feed ACK is withheld by an intentionally uncooperative adapter.
+    }
+  };
+  fs.writeFileSync(homeDir + "/session-proof", "original session");
+  const executor: Executor = { run: async ctx => {
+    const command = enroll(ctx);
+    original = command.captured.flight as MemoryFlightProof;
+    f.pressure(950);
+    await command.captured.commands.watchOutcome(command.entry);
+    throw new Error("quiet retained stop");
+  } };
+  const rescue = setTimeout(() => release.resolve(), 2000);
+  const started = performance.now();
+  const work = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+    { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 }).execute(f.claim);
+  try {
+    await until(() => sending);
+    const receipt = f.memory.sinkReceipts.find(r => r.kind === "feedback" && r.context.flight === original);
+    assert.ok(receipt, "original feedback sink owns its completion receipt");
+    const pending = [...original!.workerMemory!.feedback.values()][0]!;
+    const operation = pending.operation!;
+    assert.ok(operation);
+    let settled = false;
+    void operation.then(() => { settled = true; });
+    await work;
+    assert.ok(performance.now() - started < 1500, "uncooperative feedback does not defeat owner deadline");
+    assert.equal(settled, false);
+    assert.equal(sendSignal!.aborted, true);
+    assert.ok(f.memory.sinkReceipts.includes(receipt), "timeout does not discard uncompleted sink receipt");
+    assert.equal(original!.retainedLocalCustody, true);
+    assert.equal(fs.readFileSync(homeDir + "/session-proof", "utf8"), "original session");
+    assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+    assert.equal(api.states.some(s => s.body.recovery_cause === "worker_memory_pressure"), false);
+    release.resolve();
+    await operation;
+    await receipt.completion;
+    assert.equal(pending.operation, operation, "late ACK settles the original send");
+    assert.equal(original!.workerMemory!.feedback.size, 1, "late ACK cannot erase intent after delivery authority expired");
+    assert.equal(f.memory.sinkReceipts.includes(receipt), false, "only settlement retires the receipt");
+    assert.notEqual(original!.parked, true);
+    assert.equal(api.messages(f.claim.run_id).filter(m => m.payload.event === "worker_memory_pressure").length, 1);
+  } finally {
+    clearTimeout(rescue); release.resolve();
+    await work;
+    await original?.workerMemory?.operation;
+    await original?.workerMemory?.closing;
+    await f.memory.stop(); await monitoring;
+    await Promise.allSettled(f.memory.sinkReceipts.map(receipt => receipt.completion));
+  }
+});
+
+test("M3 deferred outcome ACK cannot rearm pressure after its response budget expires", async () => {
+  const f = await setup();
+  const monitoring = f.memory.run();
+  const release = releaseGate();
+  let reportWork: Promise<unknown> | undefined, reportSignal: AbortSignal | undefined;
+  let proof = false, executorError: unknown;
+  const report = client.reportMemoryInterventionOutcome.bind(client);
+  client.reportMemoryInterventionOutcome = (...args) => {
+    reportSignal = args[1];
+    reportWork = (async () => {
+      const ack = await report(...args);
+      await release.promise; // Deliberately ignore abort; this exact promise is joined below.
+      return ack;
+    })();
+    return reportWork as ReturnType<typeof report>;
+  };
+  const rescue = setTimeout(() => release.resolve(), 2000);
+  const executor: Executor = { run: async ctx => {
+    try {
+      const command = enroll(ctx);
+      f.pressure(950);
+      const result = await command.captured.commands.watchOutcome(command.entry);
+      assert.equal(result.outcome, "confirmed_drained");
+      await until(() => reportSignal !== undefined);
+      await until(() => reportSignal!.aborted);
+      assert.equal(command.captured.commands.pressureHeld(command.captured.context), true);
+      release.resolve(); await reportWork;
+      f.pressure(100);
+      await ctx.reportIteration!(1);
+      await new Promise(resolve => setTimeout(resolve, 30)); // Three configured rearm windows, after the late ACK.
+      assert.equal(command.captured.commands.pressureHeld(command.captured.context), true,
+        "expired outcome ACK cannot resolve the held pressure ticket");
+      assert.equal(command.captured.commands.admitsCommands(command.captured.context), false);
+      assert.equal(command.captured.commands.remaining(command.captured.context), 1);
+      assert.equal(f.reservations.length, 1, "deferred outcome never spends another intervention");
+      proof = true;
+    } catch (error) { executorError = error; throw error; }
+    finally { release.resolve(); await reportWork; }
+    throw new Error("deferred outcome proof complete");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    if (executorError) throw executorError;
+    assert.equal(proof, true);
+  } finally {
+    clearTimeout(rescue); release.resolve(); await reportWork;
+    await f.memory.stop(); await monitoring;
+  }
+});
+
+test("M3 reordered Running ACK cannot release the input phase token or clear pressure", async () => {
+  const f = await setup();
+  const monitoring = f.memory.run();
+  const release = releaseGate();
+  let oldAck: StateAck | undefined, executorError: unknown, proof = false;
+  let oldWork: Promise<unknown> | undefined, inputWork: Promise<unknown> | undefined;
+  const rescue = setTimeout(() => {
+    release.resolve();
+    api.setInputs(f.claim.run_id, [input("cancel")]);
+  }, 2000);
+  const executor: Executor = { run: async ctx => {
+    try {
+      const command = enroll(ctx);
+      f.pressure(950);
+      await command.captured.commands.watchOutcome(command.entry);
+      assert.equal(command.captured.commands.pressureHeld(command.captured.context), true);
+      const report = client.reportState.bind(client);
+      let delay = true;
+      client.reportState = async (...args) => {
+        const ack = await report(...args);
+        if (delay && args[1].status === "running") {
+          delay = false; oldAck = ack;
+          await release.promise;
+        }
+        return ack;
+      };
+      oldWork = Promise.resolve(ctx.reportIteration!(1));
+      await until(() => oldAck !== undefined);
+      assert.equal(oldAck!.status, "running");
+      inputWork = ctx.askUser!([{ question: "Proceed?", header: "Choice" }]);
+      await until(() => api.states.at(-1)?.body.status === "awaiting_input");
+      const waiting = ctx.capturedMemory!()!;
+      assert.equal(waiting.context, command.captured.context, "pressure-held lifecycle keeps its original context");
+      assert.equal(waiting.commands.phaseAdmits(waiting.context), false);
+      release.resolve(); await oldWork;
+      assert.equal(waiting.commands.phaseAdmits(waiting.context), false, "reordered Running ACK cannot release current input hold");
+      assert.equal(waiting.commands.pressureHeld(waiting.context), true, "Running ACK cannot clear pressure latch");
+      assert.equal(waiting.commands.admitsCommands(waiting.context), false);
+      const question = api.states.findLast(s => s.body.status === "awaiting_input")!.body.open_question_id;
+      api.setInputs(f.claim.run_id, [input("answer", JSON.stringify({ question_id: question, answers: "proceed" }))]);
+      await inputWork;
+      const resumed = ctx.capturedMemory!()!;
+      assert.equal(resumed.context, waiting.context);
+      assert.equal(resumed.commands.phaseAdmits(resumed.context), true, "matching input resume ACK releases its own phase");
+      assert.equal(resumed.commands.pressureHeld(resumed.context), true);
+      assert.equal(resumed.commands.admitsCommands(resumed.context), false);
+      assert.equal(resumed.commands.remaining(resumed.context), 1);
+      f.pressure(100);
+      await until(() => resumed.commands.admitsCommands(resumed.context));
+      assert.equal(f.reservations.length, 1);
+      proof = true;
+    } catch (error) { executorError = error; throw error; }
+    finally { release.resolve(); await oldWork; await inputWork?.catch(() => {}); }
+    throw new Error("lifecycle proof complete");
+  } };
+  try {
+    await runnerWith(() => ({ executor }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    if (executorError) throw executorError;
+    assert.equal(proof, true);
+  } finally {
+    clearTimeout(rescue); release.resolve();
+    await f.memory.stop(); await monitoring;
+  }
+});
 
 test("runtime freezes and validates configured policy; first null claim seeds it while persisted policy/count win", async () => {
   const configured = { ...settings, maxInterventions: 4 };
