@@ -5139,6 +5139,7 @@ describe("#2878 M1 cause-specific worker notice", () => {
     assert.equal(notices[0]!.kind, "status");
     assert.equal(notices[0]!.agent, "worker");
     const text = String(notices[0]!.payload.text);
+    assert.ok(text.length <= 512, "fixed accounting-cause notice stays within a 512-character diagnostic budget");
     assert.match(text,
       /(?:missing|absent|unavailable|unproved|unestablished|no)\b[^.]*\b(?:replay|baseline)|(?:replay|baseline)\b[^.]*\b(?:missing|absent|unavailable|unproved|unestablished|not established)/i,
       "notice identifies missing replay or an unavailable baseline as the accounting cause");
@@ -5198,11 +5199,15 @@ describe("#2878 M1 cause-specific worker notice", () => {
     assert.ok(emitted.indexOf(responses[0]!) < emitted.indexOf(notices[0]!));
     assert.ok(!JSON.stringify(emitted).includes(rawMarker), "worker feed never includes the raw provider bucket");
     const text = String(notices[0]!.payload.text);
+    assert.ok(text.length <= 512, "fixed accounting-cause notice stays within a 512-character diagnostic budget");
     assert.match(text, /invalid|malformed|validation|validat(?:ion|e|ed|ing)[^.]*fail|fail[^.]*validat/i,
       "notice identifies invalid usage or validation failure as the accounting cause");
     assert.match(text,
       /(?:retained|proved|proven|established|available|known)\b[^.]*\bbaseline|baseline\b[^.]*\b(?:retained|proved|proven|established|available|known)/i,
       "notice states that the proved baseline remains available");
+    assert.doesNotMatch(text,
+      /\b(?:no|without)\s+(?:(?:known|available|proved|proven|established|retained)\s+)?baseline\b|\bbaseline\b[^.;]*\b(?:not|unavailable|unknown|unproved|unestablished)\b/i,
+      "notice must not contradict its retained-baseline assertion");
     assert.doesNotMatch(text, /this resumed claim/i,
       "same-claim recreation must not be mislabeled as an unbaselined resumed claim");
   });
