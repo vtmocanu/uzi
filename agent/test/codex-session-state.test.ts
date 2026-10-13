@@ -403,6 +403,108 @@ describe(
     );
   });
 
+  it("session directory enumeration stops after the first over-cap entry", async (t) => {
+    const sessionsDir = join(codexHome, "sessions");
+    for (let i = 0; i < 80; i += 1) {
+      await writeFileAt(join(sessionsDir, `junk-${i}.txt`), "x");
+    }
+    const tiny: SessionStoreBounds = { ...DEFAULT_SESSION_STORE_BOUNDS, maxFiles: 1, maxScanEntries: 5 };
+    const sourceIdentity = await fsp.stat(sessionsDir);
+    const originalOpen = fsp.open;
+    const originalOpendir = fsp.opendir;
+    const originalReaddir = fsp.readdir;
+    let sourceHandle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+    const directories: Awaited<ReturnType<typeof fsp.opendir>>[] = [];
+    const bufferSizes: (number | undefined)[] = [];
+    const closedBeforeHandle: (string | undefined)[] = [];
+    let eagerAttempts = 0;
+    let yieldedEntries = 0;
+    let persistError: unknown;
+
+    // Match the inode pinned by the production source handle, including fd aliases.
+    const isHeldSource = async (path: Parameters<typeof fsp.opendir>[0]): Promise<boolean> => {
+      if (!sourceHandle || sourceHandle.fd < 0) return false;
+      const [held, listed] = await Promise.all([sourceHandle.stat(), fsp.stat(path)]);
+      return held.dev === listed.dev && held.ino === listed.ino;
+    };
+
+    try {
+      t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+        const handle = await originalOpen(...args);
+        const identity = await handle.stat();
+        if (identity.dev === sourceIdentity.dev && identity.ino === sourceIdentity.ino) {
+          sourceHandle = handle;
+          const originalClose = handle.close.bind(handle);
+          t.mock.method(handle, "close", async () => {
+            // Node's Dir iterator closes internally; a public close() spy misses it.
+            for (const directory of directories) {
+              let code: string | undefined;
+              try {
+                await directory.read();
+              } catch (error) {
+                code = (error as NodeJS.ErrnoException).code;
+              }
+              closedBeforeHandle.push(code);
+            }
+            return originalClose();
+          });
+        }
+        return handle;
+      });
+      t.mock.method(fsp, "readdir", async (
+        path: Parameters<typeof fsp.readdir>[0],
+        ...options: unknown[]
+      ) => {
+        if (await isHeldSource(path)) {
+          eagerAttempts += 1;
+          throw new Error("eager source directory enumeration is forbidden");
+        }
+        return Reflect.apply(originalReaddir, fsp, [path, ...options]);
+      });
+      t.mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+        const targeted = await isHeldSource(args[0]);
+        const directory = await originalOpendir(...args);
+        if (targeted) {
+          directories.push(directory);
+          bufferSizes.push(args[1]?.bufferSize);
+          const originalIterator = directory[Symbol.asyncIterator].bind(directory);
+          t.mock.method(directory, Symbol.asyncIterator, async function* () {
+            // Returning from this wrapper forwards iterator cleanup to the real Dir.
+            for await (const entry of originalIterator()) {
+              yieldedEntries += 1;
+              yield entry;
+            }
+          });
+        }
+        return directory;
+      });
+      try {
+        await CodexSessionStore.persist(codexHome, storeDir, { bounds: tiny });
+      } catch (error) {
+        persistError = error;
+      }
+    } finally {
+      t.mock.restoreAll();
+    }
+
+    // Assert outside the listing-error catch in copyAllowlistedSessions and all mocks.
+    assert.equal(eagerAttempts, 0, "source enumeration must not attempt eager readdir");
+    assert.equal(directories.length, 1, "the held source directory must be streamed");
+    assert.deepEqual(bufferSizes, [1], "streaming must buffer only one entry");
+    assert.equal(yieldedEntries, tiny.maxScanEntries + 1, "stop at the first over-cap junk entry");
+    for (const directory of directories) {
+      await assert.rejects(() => directory.read(), { code: "ERR_DIR_CLOSED" });
+    }
+    assert.deepEqual(closedBeforeHandle, ["ERR_DIR_CLOSED"], "Dir must close before its source handle");
+    assert.ok(sourceHandle, "the source directory handle was observed");
+    assert.equal(sourceHandle.fd, -1, "the held source handle must also close");
+    assert.ok(persistError instanceof CodexSessionStoreBoundError);
+    assert.equal(persistError.bound, "maxScanEntries");
+    assert.equal(persistError.limit, tiny.maxScanEntries);
+    assert.equal(await currentGenId(storeDir), undefined, "an over-cap scan must publish no pointer");
+    assert.equal(existsSync(join(storeDir, "current")), false, "no current pointer was created");
+  });
+
   it("FIX 2: a within-bounds nested tree copies with the correct files/bytes tally", async () => {
     await writeFileAt(join(codexHome, "sessions", "rollout-a.jsonl"), "aaaa"); // 4 bytes
     await writeFileAt(join(codexHome, "sessions", "2026", "rollout-b.jsonl"), "bbbbbb"); // 6 bytes
