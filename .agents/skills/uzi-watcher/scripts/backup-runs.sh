@@ -69,9 +69,12 @@
 #   UZI_KUBECTL / UZI_BIN / UZI_JQ / UZI_STAT  tool overrides (default: from PATH)
 # A failed run with a worker binding is captured like an active one while its clone or
 # owned tracking ref survives; once that source is gone it is status-only (SNAP).
-# Completed and cancelled runs capture an exact protected source when one is present,
-# or the kept canonical clone named by a matching uzi-stopped marker; otherwise they
-# are status-only, unless the source search itself could not complete (FAIL).
+# Completed and cancelled runs capture exactly attributed sources: an exact protected
+# source, the kept canonical clone named by a matching uzi-stopped marker, and attempt
+# clones whose last ledger entry for the run is live or reclaimed (a retired or abandoned
+# attempt is never a source, and the journal is ignored: it names a path, not an exact
+# attempt). With none they are status-only, unless the source search itself could not
+# complete (FAIL).
 # Coverage is fail-closed, for a clone capture and a BARE one alike: when an attributed
 # source is listed but unreadable, a source search is inconclusive (a failed kubectl
 # listing or exec, an unparseable marker, an invalid descriptor), or the primary or an
@@ -81,7 +84,9 @@
 # <m> counts the sources found (the clones or tracking ref the run tried to capture) plus
 # the attributed ones listed but unreadable (deduped by pod and path). The artifacts that were captured are kept. A dir the journal, ledger
 # and marker do not name is not an attributed source: it is never a gap by itself, though
-# on a run that captured nothing it still makes the search inconclusive.
+# on a run that captured nothing, a dir with an unreadable .git, or one with no .git
+# that is not positively empty (it holds something, or cannot be listed), still makes the
+# search inconclusive. Each inconclusive reason names the pod or namespace that failed.
 # Exit: 0 when every active target produced a verified recovery artifact for every
 # attributed source (no coverage gap, see above; terminal
 # targets may be status-only); 1 when any active target did not, or a failed run's
@@ -329,9 +334,11 @@ tar cf - -C "$OUT" . 2>/dev/null | gzip -c
 # It also records a coverage gap: once a source was captured, a search that did not
 # complete may have hidden an attributed one. The one exception is the candidate
 # listing's rc 3 (see select_clone), which touches only PROBE_ERR_FILE.
+# probe_inconclusive [detail]: the detail names what failed (the pod or namespace), and
+# reaches both the coverage-gap reasons and the no-capture FAIL line.
 probe_inconclusive(){
   : > "$PROBE_ERR_FILE"
-  mark_gap "the source search was inconclusive (a kubectl listing or exec failed)"
+  mark_gap "the source search was inconclusive (${1:-a kubectl listing or exec failed})"
 }
 # mark_gap <reason>: record, in a per-run file (the searches run in subshells), that an
 # attributed source could not be listed or read, so the run's coverage is incomplete.
@@ -341,7 +348,7 @@ running_pods(){   # $1=ns ; prints Running pod names; marks the search inconclus
   local out
   if ! out="$("$KUBECTL" --context "$CTX" -n "$1" get pods \
                 --field-selector=status.phase=Running -o name 2>/dev/null)"; then
-    probe_inconclusive
+    probe_inconclusive "listing Running pods in namespace $1 failed"
     return 1
   fi
   [ -z "$out" ] || printf '%s\n' "$out"
@@ -358,7 +365,7 @@ kexec_probe(){
     sh -c '"$@"; printf "\n__uzi_probe_rc=%s\n" "$?"' _ "$@" 2>/dev/null)" || :
   case "$out" in
     *"__uzi_probe_rc="*) ;;
-    *) probe_inconclusive; return 125 ;;
+    *) probe_inconclusive "exec into pod $ns/$pod failed"; return 125 ;;
   esac
   rc="${out##*__uzi_probe_rc=}"
   out="${out%__uzi_probe_rc=*}"
@@ -366,14 +373,15 @@ kexec_probe(){
   return "$rc"
 }
 
-# probe_absent <rc>: succeed for a found result (0); fail for a genuine "not found" (1,
+# probe_absent <rc> <ns>/<pod>: succeed for a found result (0); fail for a genuine "not found" (1,
 # as `git show-ref --verify` and `git config --get` report it); any other code is a
 # probe that ran and errored (e.g. 128 for an unreadable repo), so mark it inconclusive.
 probe_absent(){
   case "$1" in
     0) return 0 ;;
     1) return 1 ;;
-    *) probe_inconclusive; return 1 ;;
+    125) return 1 ;;   # kexec_probe already recorded the failed exec, naming the pod
+    *) probe_inconclusive "a probe on pod $2 errored"; return 1 ;;
   esac
 }
 
@@ -402,9 +410,11 @@ list_pods(){
 # On-pod candidate listing: one "<path><TAB><branch>" line per existing candidate
 # dir ($1=runner base, $2=stem): the canonical dir plus every <stem>.attempt-*
 # sibling (quoted prefix, so the glob can never reach another stem). <branch> is
-# empty when the dir has a .git it cannot read, or cannot be searched (a root-owned attempt
-# dir). Quarantined residue and skills-plugin dirs never qualify (defensive: the
-# stem-anchored glob cannot produce them today). A path carrying a newline or a TAB is
+# empty when the dir has a .git it cannot read, cannot be listed (a root-owned attempt
+# dir), or has no .git yet holds something (not positively empty). Only a dir with no
+# .git (not even a symlink) whose listing succeeds and is empty is skipped. Quarantined
+# residue and skills-plugin dirs never qualify (defensive: the stem-anchored glob cannot
+# produce them today). A path carrying a newline or a TAB is
 # skipped: a newline could forge a second line, a tab could forge the branch field.
 # shellcheck disable=SC2016
 LIST_CANDIDATES='
@@ -416,9 +426,13 @@ for d in "$1/$2" "$1/$2".attempt-*; do
   case "${d##*/}" in .uzi-residue-*|.uzi-skills-*) continue ;; esac
   case "$d" in *"
 "*|*"$tab"*) continue ;; esac
-  # A searchable dir with no .git (e.g. a delayed Docker create recreating an empty
-  # attempt path) holds no clone this capture could read: it is absent, not unknown.
-  if [ ! -e "$d/.git" ] && [ -r "$d" ] && [ -x "$d" ]; then continue; fi
+  # Only positively empty residue (e.g. a delayed Docker create recreating an empty
+  # attempt path) is absent: no .git entry of any kind and `ls -A` succeeds printing
+  # nothing. A dir whose listing fails, or that holds anything else, is printed with
+  # an empty branch, so the caller can attribute it and report it unreadable.
+  if [ ! -e "$d/.git" ] && [ ! -L "$d/.git" ] && out="$(ls -A "$d" 2>/dev/null)" && [ -z "$out" ]; then
+    continue
+  fi
   br=""
   if [ -r "$d/.git" ]; then
     br="$(git -c safe.directory="$d" -C "$d" rev-parse --abbrev-ref HEAD 2>/dev/null)" || br=""
@@ -450,7 +464,9 @@ aid_newer(){
 # "Clone layout"). Line 1 is this pod's primary, which can be an unattributed fallback
 # (the newest ledger attempt in any state); every further line is an ATTRIBUTED source
 # (journal-named, marker canonical, or a ledger attempt in state live/reclaimed), and the
-# primary repeats there when it is attributed itself. The caller uses line 1 only on the
+# primary repeats there when it is attributed itself. For a completed/cancelled run
+# (terminal_capture=2) the journal is ignored and the ledger counts only in state
+# live/reclaimed, so there is no unattributed fallback. The caller uses line 1 only on the
 # pod that supplies the run's primary (add_sources).
 # A candidate is valid only when (a) the journal or the ledger names it for <rid>
 # (runId equal, clonePath equal, attemptId equal when the entry carries one) and
@@ -472,17 +488,17 @@ select_clone(){
     # records a gap only when the journal, ledger or marker names it); the listing's
     # rc alone is not a coverage gap, but it still keeps a no-capture run from SNAP.
     3) : > "$PROBE_ERR_FILE" ;;
-    *) probe_inconclusive; return 1 ;;
+    *) probe_inconclusive "listing candidate clones on pod $ns/$pod failed"; return 1 ;;
   esac
   [ -n "$listing" ] || return 1
   rc=0
   journal="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --get "uzi-recovery.$branch.clone")" || rc=$?
-  probe_absent "$rc" || journal=""
+  probe_absent "$rc" "$ns/$pod" || journal=""
   rc=0
   ledger="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --get-all "uzi-attempts.$branch.entry")" || rc=$?
-  probe_absent "$rc" || ledger=""
+  probe_absent "$rc" "$ns/$pod" || ledger=""
   # Stopped-source markers (uzi-stopped.<runId>.entry, appended with --add). Each value
   # must pass the jq check below: the exact key set plus the field types/shapes it lists,
   # a subset of agent/src/git.ts parseStoppedMarker (it does not validate `at` as a date,
@@ -496,7 +512,7 @@ select_clone(){
   rc=0
   stopped="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --local --no-includes --get-all "uzi-stopped.$rid.entry")" || rc=$?
-  case "$rc" in 0|1) ;; *) probe_inconclusive; return 1 ;; esac
+  case "$rc" in 0|1) ;; *) probe_inconclusive "reading the stopped marker on pod $ns/$pod failed"; return 1 ;; esac
   if [ "$rc" -eq 0 ]; then
     # shellcheck disable=SC2016
     marker_verdict="$(printf '%s\n' "$stopped" | "$JQ" -Rrn --arg rid "$rid" --arg branch "$branch" \
@@ -513,19 +529,19 @@ select_clone(){
           and ($m.reason | str) and ($m.reason | test("^[A-Za-z0-9_.:-]{1,64}$"))
         then (if $m.runId == $rid and $m.branch == $branch and $m.key == $stem and $m.clonePath == $path
               then "match" else "skip" end)
-        else "bad" end' 2>/dev/null)" || { probe_inconclusive; return 1; }
-    if printf '%s\n' "$marker_verdict" | grep -qxF bad; then probe_inconclusive; return 1; fi
+        else "bad" end' 2>/dev/null)" || { probe_inconclusive "unreadable stopped marker on pod $ns/$pod"; return 1; }
+    if printf '%s\n' "$marker_verdict" | grep -qxF bad; then probe_inconclusive "unreadable stopped marker on pod $ns/$pod"; return 1; fi
     if printf '%s\n' "$marker_verdict" | grep -qxF match; then marker_path="$RUNNER_BASE/$stem"; fi
   fi
   rc=0
   protected="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$bare" config --local --no-includes --get-all "uzi-retained.$rid.journal")" || rc=$?
-  case "$rc" in 0|1) ;; *) probe_inconclusive; return 1 ;; esac
+  case "$rc" in 0|1) ;; *) probe_inconclusive "reading the protected descriptor on pod $ns/$pod failed"; return 1 ;; esac
   if [ "$rc" -eq 0 ]; then
     rc=0
     protected_ledger="$(kexec_probe "$ns" "$pod" git --git-dir="$bare" config --local --no-includes \
       --get-regexp '^uzi-attempts\..*\.entry$')" || rc=$?
-    case "$rc" in 0|1) ;; *) probe_inconclusive; return 1 ;; esac
+    case "$rc" in 0|1) ;; *) probe_inconclusive "reading the attempt ledger on pod $ns/$pod failed"; return 1 ;; esac
     # Validate the full exact-run descriptor and all source ledger identities in
     # one pass. Malformed evidence refuses this pod, including a newer active slot.
     # shellcheck disable=SC2016
@@ -593,15 +609,15 @@ select_clone(){
           and (if has("attemptId") then $last[$s.attemptId] | same($s) else true end))
         then . else error("protected source ledger mismatch") end
       | .[] | "\(.attemptId // "")\t\(.clonePath)"' 2>/dev/null)" || {
-        probe_inconclusive; return 1;
+        probe_inconclusive "invalid protected descriptor or ledger evidence on pod $ns/$pod"; return 1;
       }
   fi
   if [ "${terminal_capture:-0}" -eq 2 ]; then
-    # A completed/cancelled run is captured only from protected custody or a valid
-    # stopped marker; the live journal and ledger names are ignored for it, with or
-    # without a protected descriptor (which validated against protected_ledger above).
-    [ -n "$protected_ok" ] || [ -n "$marker_path" ] || return 1
-    journal=""; ledger=""
+    # A completed/cancelled run ignores the live journal: a canonical journal entry
+    # names a path, not an exact attempt identity, so it cannot prove the dir is this
+    # run's. Protected custody, a valid stopped marker, and ledger attempts of this
+    # exact run in state live or reclaimed (ledger_ok, below) stay attributed sources.
+    journal=""
   fi
   # The journal also keeps canonical predecessors, which have no ledger identity.
   # Only worker attribution is accepted; a recorded successor is not execution authority.
@@ -640,6 +656,9 @@ select_clone(){
     | .[] | select(.runId == $rid) | "\(.attemptId)\t\(.clonePath)\t\(.state // "")"' 2>/dev/null)" || ledger_rows=""
   ledger_ok="$(printf '%s\n' "$ledger_rows" | cut -f1,2)"
   ledger_live="$(printf '%s\n' "$ledger_rows" | awk -F'\t' '$3 == "live" || $3 == "reclaimed" { print $1 "\t" $2 }')"
+  # A terminal run has no unattributed fallback: its primary may be only a live or
+  # reclaimed attempt of this exact run, never a retired or abandoned one.
+  if [ "${terminal_capture:-0}" -eq 2 ]; then ledger_ok="$ledger_live"; fi
   while IFS="$tab" read -r path br; do
     [ -n "$path" ] && [ "${path%/*}" = "$RUNNER_BASE" ] || continue
     # Belt-and-braces for the on-pod tab filter: a tab left in the branch field
@@ -703,11 +722,11 @@ pod_has_ref(){
   local rc=0
   kexec_probe "$ns" "$pod" \
     git --git-dir="$REPOS_BASE/$REPO_SLUG.git" show-ref --verify --quiet "$ref" >/dev/null || rc=$?
-  probe_absent "$rc" || return 1
+  probe_absent "$rc" "$ns/$pod" || return 1
   rc=0
   owner="$(kexec_probe "$ns" "$pod" \
     git --git-dir="$REPOS_BASE/$REPO_SLUG.git" config --get "uzi-trackowner.$branch.owner")" || rc=$?
-  probe_absent "$rc" || return 1
+  probe_absent "$rc" "$ns/$pod" || return 1
   [ "$owner" = "$rid" ]
 }
 
@@ -1011,7 +1030,12 @@ for RID in "${RUNS[@]}"; do
       continue
     fi
     if [ -e "$PROBE_ERR_FILE" ]; then
-      log "FAIL $RID ($LBL) status=$st: status saved, but the source search was inconclusive (a kubectl listing or exec failed); retry"
+      # Name why: the deduped gap reasons, else the listing's rc 3 (an unreadable .git),
+      # which sets only PROBE_ERR_FILE. Never an empty parenthetical.
+      why=""
+      if [ -s "$GAP_FILE" ]; then why="$(sort -u "$GAP_FILE" | paste -sd ';' - | sed 's/;/; /g')"; fi
+      [ -n "$why" ] || why="a candidate's .git could not be read"
+      log "FAIL $RID ($LBL) status=$st: status saved, but the source search was inconclusive ($why); retry"
       failures=1
       continue
     fi

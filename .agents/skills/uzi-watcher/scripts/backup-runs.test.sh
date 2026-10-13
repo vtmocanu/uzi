@@ -312,8 +312,9 @@ if [ "$(id -u)" -ne 0 ]; then
     || fail "failed run, unnamed locked dir: expected SNAP; got: $(cat "$D_INC/latest-attempt/backup.log")"
   chmod 755 "$LOCKED"; rm -rf "$LOCKED"
 fi
-# A completed run (no stopped marker, no protected descriptor) stays status-only even
-# when a clone for it still exists.
+# A completed run whose only evidence is the journal (no stopped marker, no protected
+# descriptor, no ledger attempt) stays status-only even when the named clone still exists:
+# a journal entry names a path, not an exact attempt identity.
 git --git-dir="$BARE" config 'uzi-recovery.agent/issue-4242.clone' \
   "{\"runId\":\"completed-1\",\"clonePath\":\"$RUNNER\"}"
 run_backup 1.completed completed-1 >/dev/null
@@ -892,6 +893,8 @@ echo "PASS protected completed singleton: episode-free old dirty bytes survive n
 # --- stopped-source marker (issue 1786): a detached kept canonical clone ---------
 # markStoppedCanonical clears the plain journal and appends uzi-stopped.<runId>.entry;
 # the marker alone then names the kept canonical dir for this run.
+# log_of <dest>: the latest attempt's backup.log.
+log_of() { cat "$1/latest-attempt/backup.log"; }
 DIG="$(printf 'ab%.0s' $(seq 32))"
 # stopped_marker <runId> <branch> <key> <clonePath> [runId-in-value]: append one marker.
 stopped_marker() {
@@ -980,7 +983,8 @@ source_check() {
 source_check marker-d "$RB/issue-4242.attempt-$A2" live-attempt "$CANON" kept-canon
 echo "PASS marker-d: journal-current attempt is primary; the kept canonical is captured as source-2"
 
-# case M-e: a completed run (terminal_capture=2) captures only through a marker; a
+# case M-e: a completed run (terminal_capture=2) captures exactly attributed sources (a
+# marker, a protected descriptor, a live/reclaimed ledger attempt of this run); the
 # journal alone stays status-only.
 reset_layout
 make_clone "$CANON" agent/issue-4242 kept-canon
@@ -996,15 +1000,19 @@ rc="$(backup_rc "$D_ME" completed-1)"
 [ "$rc" -eq 0 ] || fail "marker-e marker: exit $rc, want 0"
 tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
   || fail "marker-e marker: kept canonical dirty bytes not captured; log: $(cat "$D_ME/latest-attempt/backup.log")"
-# A ledger attempt of the terminal run stays ignored even with the marker.
+# A live ledger attempt of the terminal run is an attributed source beside the marker:
+# the marker canonical stays primary and the attempt is source-2.
 make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 newer-attempt
 ledger "$A2" completed-1 "$RB/issue-4242.attempt-$A2" live
 rc="$(backup_rc "$D_ME" completed-1)"
 [ "$rc" -eq 0 ] || fail "marker-e ledger: exit $rc, want 0"
 tar -xOzf "$D_ME/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
   || fail "marker-e ledger: a ledger attempt displaced the marker-named canonical"
-# A journal-current on-branch attempt of the terminal run is ignored too: the marker
-# canonical wins (kills a mutation that drops the terminal-mode journal clearing).
+tar -xOzf "$D_ME/latest/issue-4242.source-2.tgz" ./issue-4242.source-2.uncommitted.patch | grep -qxF '+newer-attempt' \
+  || fail "marker-e ledger: the live ledger attempt was not captured as source-2; log: $(log_of "$D_ME")"
+# A journal-current on-branch attempt of the terminal run is not promoted by the journal:
+# the marker canonical stays primary (kills a mutation that drops the terminal-mode
+# journal clearing); the attempt is still captured, through its live ledger entry.
 reset_layout
 make_clone "$CANON" agent/issue-4242 kept-canon
 make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
@@ -1017,9 +1025,11 @@ rc="$(backup_rc "$D_ME2" completed-1)"
 tar -xOzf "$D_ME2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+kept-canon' \
   || fail "marker-e journal-current: marker canonical not captured; log: $(cat "$D_ME2/latest-attempt/backup.log")"
 tar -xOzf "$D_ME2/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+live-attempt' \
-  && fail "marker-e journal-current: the journal-current attempt was captured for a terminal run"
-# A marker whose canonical dir is gone captures nothing: a ledger attempt of the terminal
-# run is never the fallback (kills a mutation that drops the terminal-mode ledger clearing).
+  && fail "marker-e journal-current: the journal-current attempt became the primary of a terminal run"
+tar -xOzf "$D_ME2/latest/issue-4242.source-2.tgz" ./issue-4242.source-2.uncommitted.patch | grep -qxF '+live-attempt' \
+  || fail "marker-e journal-current: the live ledger attempt was not captured as source-2; log: $(log_of "$D_ME2")"
+# A marker whose canonical dir is gone: the run's live ledger attempt is still an
+# attributed source, so it is captured (primary) instead of falling to SNAP.
 reset_layout
 make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 ledger-attempt
 ledger "$A2" completed-1 "$RB/issue-4242.attempt-$A2" live
@@ -1027,11 +1037,9 @@ stopped_marker completed-1 agent/issue-4242 issue-4242 "$CANON"
 D_ME3="$WORK/out.marker-e3"
 rc="$(backup_rc "$D_ME3" completed-1)"
 [ "$rc" -eq 0 ] || fail "marker-e canonical-gone: exit $rc, want 0"
-grep -q 'SNAP completed-1 .*status=completed' "$D_ME3/latest-attempt/backup.log" \
-  || fail "marker-e canonical-gone: expected SNAP; got: $(cat "$D_ME3/latest-attempt/backup.log")"
-[ ! -e "$D_ME3/latest-attempt/issue-4242.tgz" ] \
-  || fail "marker-e canonical-gone: a ledger attempt was captured for a terminal run"
-echo "PASS marker-e: completed run captures the marker-named canonical; journal alone stays status-only"
+tar -xOzf "$D_ME3/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+ledger-attempt' \
+  || fail "marker-e canonical-gone: the live ledger attempt was not captured; log: $(log_of "$D_ME3")"
+echo "PASS marker-e: completed run captures marker canonical and live ledger attempts; journal alone stays status-only"
 
 # case M-f(a): live successor (journal-current, ledger live) + detached dirty canonical
 # predecessor with a valid marker: both captured (same layout as marker-d, asserted
@@ -1095,6 +1103,8 @@ rc="$(backup_rc "$D_FD" run-4242 "UZI_TEST_PODS=pod/uzi-hw-$WID-test pod/uzi-hw-
 [ "$rc" -eq 1 ] || fail "marker-f-d: exit $rc, want 1"
 grep -q 'incomplete coverage' "$D_FD/latest-attempt/backup.log" \
   || fail "marker-f-d: missing 'incomplete coverage'; got: $(cat "$D_FD/latest-attempt/backup.log")"
+grep -q 'incomplete coverage.*exec into pod ns/uzi-hw-second-test failed' "$D_FD/latest-attempt/backup.log" \
+  || fail "marker-f-d: the FAIL line does not name the failing pod; got: $(cat "$D_FD/latest-attempt/backup.log")"
 [ -f "$D_FD/latest-attempt/issue-4242.tgz" ] || fail "marker-f-d: primary artifact missing"
 echo "PASS marker-f: every attributed source captured; retired not extra; a coverage gap fails closed"
 
@@ -1102,7 +1112,6 @@ echo "PASS marker-f: every attributed source captured; retired not extra; a cove
 BADA1="$RB/issue-4242.attempt-$A1"
 # bad_dir <path>: a dir whose .git exists but cannot be read.
 bad_dir() { mkdir -p "$1"; echo 'gitdir: /nonexistent' > "$1/.git"; }
-log_of() { cat "$1/latest-attempt/backup.log"; }
 
 # B1+B2: no readable clone, the ledger names an unreadable attempt live for the run, and
 # the run owns a tracking ref. The BARE artifact is kept, but it is not full coverage:
@@ -1149,8 +1158,8 @@ grep -q 'incomplete coverage: 0 of 1 attributed sources captured' "$D_R2/latest-
   || fail "cov-r2: missing 'incomplete coverage: 0 of 1'; log: $(log_of "$D_R2")"
 
 # R3: a completed run with a valid protected descriptor captures the descriptor's
-# source only; a live ledger attempt of the run that the descriptor does not name is
-# not a source.
+# source as the primary; a live ledger attempt of the exact run, which the descriptor
+# does not name, is an attributed source too (source-2).
 reset_layout
 rid=completed-1
 predecessor="$RB/issue-4242"
@@ -1166,7 +1175,8 @@ rc="$(backup_rc "$D_R3" "$rid")"
 [ "$rc" -eq 0 ] || fail "cov-r3: exit $rc, want 0; log: $(log_of "$D_R3")"
 tar -xOzf "$D_R3/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+desc-old-dirty' \
   || fail "cov-r3: descriptor source not captured"
-[ ! -e "$D_R3/latest/issue-4242.source-2.tgz" ] || fail "cov-r3: a ledger-only live attempt became source-2 of a terminal run"
+tar -xOzf "$D_R3/latest/issue-4242.source-2.tgz" ./issue-4242.source-2.uncommitted.patch | grep -qxF '+ledger-only-live' \
+  || fail "cov-r3: the ledger-only live attempt was not captured as source-2; log: $(log_of "$D_R3")"
 git --git-dir="$BARE" config --unset-all "uzi-retained.$rid.journal"
 
 # N1: an unreadable dir that nothing names is not an attributed source: with the
@@ -1220,5 +1230,100 @@ tar -xOzf "$D_N2B/latest/issue-4242.source-2.tgz" ./issue-4242.source-2.uncommit
   || fail "cov-n2 live: pod 2's attributed attempt was not captured as source-2; log: $(log_of "$D_N2B")"
 rm -rf "$WORK/altpod"
 echo "PASS coverage review fixes: bare gap, total, primary failure, terminal descriptor, unnamed dir, per-pod extras"
+
+# --- review fixes on PR #2793 ----------------------------------------------------------
+# T1: a completed/cancelled run captures its exactly attributed LEDGER sources even with
+# no marker and no protected descriptor (the journal alone stays status-only).
+for rid in completed-1 cancelled-1; do
+  reset_layout
+  make_clone "$BADA1" agent/issue-4242 dirty-predecessor
+  ledger "$A1" "$rid" "$BADA1" reclaimed
+  D_T1="$WORK/out.t1.$rid"
+  rc="$(backup_rc "$D_T1" "$rid")"
+  [ "$rc" -eq 0 ] || fail "t1 $rid: exit $rc, want 0; log: $(log_of "$D_T1")"
+  tar -xOzf "$D_T1/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+dirty-predecessor' \
+    || fail "t1 $rid: the reclaimed attempt's dirty bytes were not captured; log: $(log_of "$D_T1")"
+done
+# An unreadable reclaimed attempt of the terminal run is an attributed source we could
+# not read: FAIL, retry, latest not advanced, and the FAIL line says why.
+reset_layout
+bad_dir "$BADA1"
+ledger "$A1" completed-1 "$BADA1" reclaimed
+D_T1B="$WORK/out.t1.unreadable"
+rc="$(backup_rc "$D_T1B" completed-1)"
+[ "$rc" -eq 1 ] || fail "t1 unreadable: exit $rc, want 1; log: $(log_of "$D_T1B")"
+grep -q 'FAIL completed-1 .*inconclusive (.*attributed source .* is listed but unreadable.*); retry' "$D_T1B/latest-attempt/backup.log" \
+  || fail "t1 unreadable: FAIL line does not give the unreadable-source reason; log: $(log_of "$D_T1B")"
+[ ! -e "$D_T1B/latest" ] || fail "t1 unreadable: latest advanced"
+# A retired attempt is never a source: status-only, success.
+reset_layout
+make_clone "$BADA1" agent/issue-4242 retired-dirty
+ledger "$A1" completed-1 "$BADA1" retired
+D_T1C="$WORK/out.t1.retired"
+rc="$(backup_rc "$D_T1C" completed-1)"
+[ "$rc" -eq 0 ] || fail "t1 retired: exit $rc, want 0; log: $(log_of "$D_T1C")"
+grep -q 'SNAP completed-1 .*status=completed' "$D_T1C/latest-attempt/backup.log" \
+  || fail "t1 retired: expected SNAP; log: $(log_of "$D_T1C")"
+[ ! -e "$D_T1C/latest-attempt/issue-4242.tgz" ] || fail "t1 retired: a retired attempt was captured"
+echo "PASS t1: terminal runs capture live/reclaimed ledger attempts; retired is status-only; unreadable fails"
+
+# T2: an attributed attempt dir with no .git that holds a file is not "absent": it may
+# be an unreadable source, so coverage is incomplete. Unattributed, it is ignored.
+t2_layout() {
+  reset_layout
+  make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+  journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+  ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+  mkdir -p "$BADA1"; echo stray > "$BADA1/stray-file"
+}
+t2_layout
+ledger "$A1" run-4242 "$BADA1" live
+D_T2="$WORK/out.t2.ledger"
+rc="$(backup_rc "$D_T2" run-4242)"
+[ "$rc" -eq 1 ] || fail "t2 ledger: exit $rc, want 1; log: $(log_of "$D_T2")"
+grep -q 'incomplete coverage: 1 of 2 attributed sources captured' "$D_T2/latest-attempt/backup.log" \
+  || fail "t2 ledger: missing 'incomplete coverage: 1 of 2'; log: $(log_of "$D_T2")"
+[ -f "$D_T2/latest-attempt/issue-4242.tgz" ] || fail "t2 ledger: primary artifact not kept"
+[ ! -e "$D_T2/latest" ] || fail "t2 ledger: latest advanced"
+# Variant: the journal (not the ledger) names the .git-less dir.
+t2_layout
+journal run-4242 "$BADA1" "$A1"
+D_T2B="$WORK/out.t2.journal"
+rc="$(backup_rc "$D_T2B" run-4242)"
+[ "$rc" -eq 1 ] || fail "t2 journal: exit $rc, want 1; log: $(log_of "$D_T2B")"
+grep -q 'incomplete coverage: 1 of 2 attributed sources captured' "$D_T2B/latest-attempt/backup.log" \
+  || fail "t2 journal: missing 'incomplete coverage: 1 of 2'; log: $(log_of "$D_T2B")"
+[ -f "$D_T2B/latest-attempt/issue-4242.tgz" ] || fail "t2 journal: primary artifact not kept"
+[ ! -e "$D_T2B/latest" ] || fail "t2 journal: latest advanced"
+# Variant: nothing names the dir, so it is not a gap.
+t2_layout
+D_T2C="$WORK/out.t2.unattributed"
+rc="$(backup_rc "$D_T2C" run-4242)"
+[ "$rc" -eq 0 ] || fail "t2 unattributed: exit $rc, want 0; log: $(log_of "$D_T2C")"
+[ -f "$D_T2C/latest/issue-4242.tgz" ] || fail "t2 unattributed: no capture"
+echo "PASS t2: an attributed .git-less dir holding files is a gap; unattributed is ignored"
+
+# T3: a no-capture FAIL names what failed instead of a fixed parenthetical.
+reset_layout
+D_T3="$WORK/out.t3.exec"
+rc="$(backup_rc "$D_T3" failed-2 UZI_TEST_EXECFAIL=1)"
+[ "$rc" -eq 1 ] || fail "t3 exec: exit $rc, want 1"
+grep -q 'FAIL failed-2 .*inconclusive (.*exec into pod ns/uzi-hw-w0rker-test failed.*); retry' "$D_T3/latest-attempt/backup.log" \
+  || fail "t3 exec: FAIL line does not name the pod; log: $(log_of "$D_T3")"
+D_T3B="$WORK/out.t3.list"
+rc="$(backup_rc "$D_T3B" failed-2 UZI_TEST_GETFAIL=1)"
+[ "$rc" -eq 1 ] || fail "t3 list: exit $rc, want 1"
+grep -q 'FAIL failed-2 .*inconclusive (.*listing Running pods in namespace ns failed.*); retry' "$D_T3B/latest-attempt/backup.log" \
+  || fail "t3 list: FAIL line does not name the namespace; log: $(log_of "$D_T3B")"
+# Only the candidate listing's rc 3 (an unattributed unreadable .git) set the marker.
+reset_layout
+bad_dir "$BADA1"
+D_T3C="$WORK/out.t3.rc3"
+rc="$(backup_rc "$D_T3C" failed-2)"
+[ "$rc" -eq 1 ] || fail "t3 rc3: exit $rc, want 1"
+grep -qF "FAIL failed-2 (#4242) status=failed: status saved, but the source search was inconclusive (a candidate's .git could not be read); retry" "$D_T3C/latest-attempt/backup.log" \
+  || fail "t3 rc3: FAIL line mismatch; log: $(log_of "$D_T3C")"
+! grep -q 'inconclusive ()' "$D_T3C/latest-attempt/backup.log" || fail "t3 rc3: empty parenthetical"
+echo "PASS t3: the no-capture FAIL line names the failing pod, namespace or unreadable .git"
 
 echo "ALL PASS"
