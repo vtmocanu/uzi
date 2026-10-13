@@ -323,6 +323,27 @@ test("preservation intent and retirement precede feedback; timeout forwards abor
   }
 });
 
+test("preparation revoking captured admission does not suppress preservation", async () => {
+  let prepared = false;
+  const f = await fixture({
+    preparePreservation: (context, result) => {
+      assert.equal(context, f.context);
+      assert.equal(result.run_id, context.run_id);
+      prepared = true;
+      assert.equal(f.commands.retire(context), true, "owner revokes captured admission synchronously");
+    },
+  });
+  try {
+    f.monitor.tick();
+    await until(() => f.requests.length === 1);
+    f.reservation.resolve(f.ack(undefined, 0));
+    await f.monitor.settle();
+    assert.equal(prepared, true);
+    assert.equal(f.commands.isCurrent(f.context), false);
+    assert.deepEqual(f.preserved, [f.context], "preparation retirement must not suppress the captured owner preservation attempt");
+  } finally { await f.monitor.stop(); }
+});
+
 test("stop joins the bounded monitor while feedback ignores abort", async () => {
   const held = barrier<void>();
   let entered = false, settled = false;
