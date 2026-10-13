@@ -31,7 +31,7 @@ export function updateCompletionStreak(
     : 1;
 }
 
-/** Enter a verified completion hold only after an attempt has been recorded. */
+/** Request a completion hold after an attempt; true includes unresolved delivery retained by the runner. */
 export async function routeCompletionHold(
   ctx: RunContext,
   reason: string,

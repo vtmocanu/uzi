@@ -483,14 +483,15 @@ mislead:
 
 | Flag | When |
 |---|---|
-| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds the elapsed time inline, `· 6m`, with the clock time in its tooltip); the TUI board shows only `waits on you` (`on you` on a narrow terminal) |
-| Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI and TUI board say which: `limit wait`, `pool wait`, `recovery wait` or `paused` (the board abbreviates to `⏸ limit`, `⏸ pool`, `⏸ recov`, `⏸ paused`). On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
+| Waits on you | The run is awaiting approval, input or a follow-up. The web row and the CLI name which: `plan gate`, `question` or `follow-up` (the web row adds the elapsed time inline, `· 6m`, with the clock time in its tooltip); the TUI status word names the wait, adding `waits on you` (`on you` on a narrow terminal) only when stalled/looping health hides it |
+| Parked | The run is in a usage-limit, pool or recovery wait, or paused. The CLI names the park reason. The TUI status word names it too, adding a short pause flag only when stalled/looping health hides it. On the web the row's status pill already says it, so the progress cell adds only screen-reader text |
 | Queued | The run has not started yet (on the web, the status pill says it and the cell adds only screen-reader text) |
-| Stalled | The run's health is stalled or looping. The web row (`◼ stalled · 14m`, the elapsed time inline with the clock time in its tooltip, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board shows only `stalled` |
+| Stalled | The run's health is stalled or looping. The web row (`◼ stalled · 14m`, the elapsed time inline with the clock time in its tooltip, replacing the separate health pill on that row) and the CLI (`stalled · since HH:MM`, UTC) show since when; the TUI board status word carries `stalled` or `looping` |
 | Planning | The run is planning and has no frozen milestone list yet, or is re-planning after a revise: it stays awaiting approval while the lead re-plans, but nothing waits on you until the new plan lands. On the web the status pill says `planning` or `revising`, and the cell adds only screen-reader text |
 
-When there is no estimate at all, the web cell shows `—`, the TUI board cell
-is blank and `uzi run get` omits the row.
+An explicit no-estimate state adds only screen-reader text on web rows, with
+no visible placeholder. The TUI omits the percentage but retains any frozen
+milestone marker; `uzi run get` omits the progress row.
 
 **No time remaining or finish time is shown.** The estimate is too
 unreliable to display: in a backtest of completed issue runs, only 59% of
@@ -498,13 +499,17 @@ the estimates fell within 2x of the actual time remaining.
 
 Where it appears:
 
-- **Web** (dashboard and runs list rows): a Progress cell, `70%` with a thin
-  bar, or `● waits on you` / `◼ stalled` as above. On the Dashboard the cell
-  is hidden at phone widths; the runs list keeps it.
-- **TUI board**: a `PROG` column after `MILES`, e.g. `70% ▰▰▰▰▰▰▱▱`. The bar
-  drops before the percent on narrow terminals, leaving the percent or a
-  short flag. Every flag is text, so `NO_COLOR` keeps all of them. The board
-  shows no "since" time.
+- **Web** (dashboard and runs list rows): running and live completion status pills show
+  their label with a percentage, for example `running · 70%`, and a static fill
+  at every width beside the milestone badge.
+  Waiting and stalled flags remain separate. On the Dashboard those flags are
+  hidden at phone widths; the health badge remains visible and the runs list
+  keeps the flags.
+- **TUI board**: one progress cell combines the milestone micro-bar with the
+  server-derived percent in a fixed slot after the marker. On narrow terminals the percent
+  drops first, preserving the milestone marker and room for the title. Repeated
+  status words are omitted; waiting or parked flags remain when stalled or looping
+  health hides that status. Every flag survives `NO_COLOR`; no "since" time is shown.
 - **CLI**: `uzi run get` prints a `PROGRESS` row, e.g. `≈70% · milestone 3
   of 3`, `stalled · since 14:05` or `waits on you · plan gate`; a run
   waiting on a question may add ` · may be blocked by <id>` (see [May be

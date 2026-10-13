@@ -533,9 +533,9 @@ export function Dashboard() {
                         {msBadge.label}
                       </Badge>
                     )}
-                    {/* PRD #2602: the server-derived progress cell (percent or a flag);
+                    {/* PRD #2602: the server-derived waiting/stalled flags;
                         renders nothing for a pre-feature server or a terminal run. This
-                        cluster does not wrap, so below sm the cell yields its ~60px to the
+                        cluster does not wrap, so below sm the flags yield their space to the
                         truncating title (the M badge still carries the count there); the
                         Runs list rows wrap and keep it at every width. */}
                     <span className="hidden sm:contents">
@@ -551,7 +551,7 @@ export function Dashboard() {
                     ) : (
                       <RunHealthBadge run={r} />
                     )}
-                    <StatusPill status={effectiveRunStatus(r)} />
+                    <StatusPill status={effectiveRunStatus(r)} progress={r.progress} />
                   </div>
                 </div>
               </li>

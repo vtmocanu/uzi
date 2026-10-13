@@ -4,6 +4,7 @@
 // (gated by AdminRoute + the admin-only API). Validation mirrors the server
 // (Decision 8) for immediate feedback, but the server stays the source of truth.
 
+import { useLocation } from "react-router-dom";
 import { useCallback, useEffect, useState, type FormEvent } from "react";
 import {
   api,
@@ -114,6 +115,7 @@ function resolveDarkDisplay(s: AppSettings): string {
 
 export function AdminSettings() {
   const { refresh } = useAuth();
+  const { hash } = useLocation();
   const [saved, setSaved] = useState<AppSettings | null>(null);
   // Per-key secret-configured flags and sources (PRD #25), consumed by the Slack
   // card for its "configured ✓" and env-greying behavior.
@@ -187,6 +189,12 @@ export function AdminSettings() {
     [applyResponse],
     { fallback: "Failed to load settings" },
   );
+
+  useEffect(() => {
+    if (!loading && hash === "#agent-source") {
+      document.getElementById("agent-source")?.scrollIntoView?.({ block: "start" });
+    }
+  }, [loading, hash]);
 
   // Poll only the live Slack connection state so the chip reflects connecting →
   // connected without a manual reload. Uses the dedicated status endpoint (not the

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # takeover.sh — one-shot snapshot of a uzi run and/or its PR, so a session taking over
-# mid-flight starts from facts instead of a hand-rolled survey. Read-only.
+# mid-flight starts from facts instead of a hand-rolled survey. Only claims write.
 #
 # Usage: takeover.sh (<run-id> | <PR-number>) [--repo OWNER/REPO] [--no-claim]
 #   A bare number is a PR; anything else is a uzi run id (prefix ok). Each resolves the
@@ -46,9 +46,25 @@
 # warning goes to stderr: uzi's poller may auto-start an mr_rework on new review comments.
 # This script only reads; it never changes the setting.
 # Exit 0 on a snapshot, 3 on usage / could not resolve the target, 4 on NEXT=claimed_by_other.
+# The entire snapshot (including helper/peer calls and retries) has a 120-second deadline,
+# configurable with TAKEOVER_TIMEOUT_SECONDS (positive seconds). A deadline ends with
+# UNKNOWN=1 and NEXT=unknown, exits 124, and stops this snapshot's descendant processes.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Bound the whole snapshot rather than only its direct gh/uzi calls: sourced helpers and
+# claim-time peer lookups can block too. The supervisor preserves normal output/status.
+if [ "${1:-}" = --deadline-child ]; then
+  shift
+else
+  command -v python3 >/dev/null || {
+    echo "UNKNOWN=1"
+    echo "NEXT=unknown (python3 missing)"
+    exit 3
+  }
+  exec python3 "$HERE/takeover-deadline.py" "${TAKEOVER_TIMEOUT_SECONDS:-120}" \
+    bash "$0" --deadline-child "$@"
+fi
 # shellcheck source=lib/greptile-verdict.sh
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/review-threads.sh

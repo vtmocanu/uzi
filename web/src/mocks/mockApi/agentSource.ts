@@ -1,7 +1,7 @@
-import type { AgentSourceApplyResult, AgentSourceView } from "../../lib/api";
+import type { AgentSourceApplyResult, AgentSourceView, HealthCheck } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { mockAgentSource } from "../data";
-import { delay, requireSession } from "./shared";
+import { delay, mockScenario, requireSession } from "./shared";
 
 // Agent-source demo state (PRD #602 M5): a deep clone so mutations (config save,
 // sync, apply) do not leak back into the shared fixture. The config half is edited
@@ -12,8 +12,28 @@ export let agentSource: AgentSourceView = structuredClone(mockAgentSource);
 // server's persist-facts/derive-at-read split: the update-check writes these, and
 // getAgentSource DERIVES update_available/latest_ref from them + the LIVE config at
 // read time — so a pin bump or apply self-clears the badge with no new egress. Null
-// until a check has run, so a fresh install shows no badge.
+// only in the test-only unchecked-source scenario until an explicit check has run;
+// other demos start with current passing facts or the agent-source-update newer tag.
 let agentSourceRemote: { latestRef: string; tipSha: string; checkedAt: string } | null = null;
+
+// Seed before either consumer can read, once per module lifetime. Later reads never
+// overwrite a saved config or persisted update-check facts.
+const scenario = mockScenario() ?? "";
+if (scenario === "agent-source-update") {
+  agentSource.config.enabled = true;
+  agentSource.config.ref = "v1.2.0";
+  agentSourceRemote = {
+    latestRef: "v1.10.0",
+    tipSha: agentSource.staged!.fetched_sha,
+    checkedAt: new Date().toISOString(),
+  };
+} else if (scenario !== "unchecked-source") {
+  agentSourceRemote = {
+    latestRef: agentSource.config.ref,
+    tipSha: agentSource.status.last_applied_sha ?? "",
+    checkedAt: new Date().toISOString(),
+  };
+}
 
 // parseAgentSourceSemver mirrors the server's re-prefix + IsValid guard (Decision 4):
 // a non-`v`-prefixed or malformed ref is not a comparable semver (null), never treated
@@ -84,6 +104,42 @@ function agentSourceView(): AgentSourceView {
   const clone = structuredClone(agentSource);
   clone.status = deriveAgentSourceStatus();
   return clone;
+}
+
+// Health and the card share deriveAgentSourceStatus and the same mutable state.
+export function agentSourceHealthCheck(): HealthCheck {
+  const config = agentSource.config;
+  const status = deriveAgentSourceStatus();
+  let severity = "ok";
+  let summary = "Agent source is up to date.";
+  if (!config.enabled || !config.url.trim()) {
+    severity = "na";
+    summary = "Agent source disabled or unconfigured.";
+  } else if (/^[0-9a-f]{40}$/i.test(config.ref.trim())) {
+    severity = "na";
+    summary = "Agent source is pinned to an immutable SHA.";
+  } else if (!status.update_checked_at?.trim()) {
+    severity = "unknown";
+    summary = "Agent source not checked yet.";
+  } else if (status.update_available) {
+    severity = "warn";
+    summary = status.latest_ref
+      ? `Agent source newer tag ${status.latest_ref} is available.`
+      : "Agent source tracked branch moved.";
+  }
+  return {
+    id: "agentsource.update",
+    scope: "instance",
+    group: "housekeeping",
+    title: "Agent source update",
+    doc: "agent-source",
+    severity,
+    summary,
+    since: null,
+    evidence: [],
+    command: null,
+    action: "Review agent source updates at /admin/settings#agent-source.",
+  };
 }
 
 // mockAllowedAgentSourceHosts mirrors the server's SSRF allowlist: a save of a URL
@@ -212,7 +268,7 @@ export const agentSourceApi = {
     // Persist the remote facts; the derived fields are computed at read time.
     agentSourceRemote = {
       latestRef: "v1.10.0",
-      tipSha: "a1b2c3d4e5f60718293a",
+      tipSha: agentSource.staged?.fetched_sha ?? "9f2c17a4e0b3d6c8a1f5",
       checkedAt: now,
     };
     agentSource.status = {

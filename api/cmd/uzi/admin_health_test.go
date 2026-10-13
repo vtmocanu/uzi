@@ -59,6 +59,60 @@ func rollDangerCheck() apitypes.HealthCheckDTO {
 	}
 }
 
+// The generic health renderer must carry agent-source updates through both output
+// formats; warn remains advisory unless the caller requests strict probing.
+func TestAdminHealthAgentSourceUpdate(t *testing.T) {
+	docLink := "agent-source"
+	action := "Review agent source updates at /admin/settings#agent-source."
+	check := apitypes.HealthCheckDTO{
+		ID: "agentsource.update", Scope: "instance", Group: "housekeeping",
+		Title: "Agent source update", Severity: "warn",
+		Summary: "Agent source newer tag v1.10.0 is available.",
+		Doc:     &docLink, Action: &action,
+	}
+	doc := healthDoc("warn", check, dbOKCheck())
+	for _, jsonMode := range []bool{false, true} {
+		for _, strict := range []bool{false, true} {
+			t.Run(fmt.Sprintf("json=%t/strict=%t", jsonMode, strict), func(t *testing.T) {
+				args := []string{"admin", "health", "--no-color"}
+				wantExit := uzicli.ExitOK
+				if jsonMode {
+					args = append(args, "--json")
+				}
+				if strict {
+					args = append(args, "--strict")
+					wantExit = uzicli.ExitHealthDanger
+				}
+				out, _, code := runCLI(t, fakeEnv(&uzicli.FakeClient{AdminHealthDoc: doc}), args...)
+				if code != wantExit {
+					t.Fatalf("exit = %d, want %d", code, wantExit)
+				}
+				if jsonMode {
+					var got apitypes.HealthDocDTO
+					if err := json.Unmarshal([]byte(out), &got); err != nil {
+						t.Fatalf("invalid health JSON: %v\n%s", err, out)
+					}
+					if !reflect.DeepEqual(got, doc) {
+						t.Errorf("JSON altered agent-source health document: got %+v, want %+v", got, doc)
+					}
+					return
+				}
+				for _, want := range []string{
+					"agentsource.update", "WARN", check.Summary,
+					"status: WARN", "1 warn", "blocking: false (instance-wide)",
+				} {
+					if !strings.Contains(out, want) {
+						t.Errorf("agent-source update report missing %q:\n%s", want, out)
+					}
+				}
+				if strings.Contains(out, "ping 4ms") {
+					t.Errorf("ok check appeared in attention-only report:\n%s", out)
+				}
+			})
+		}
+	}
+}
+
 func queueWarnCheck() apitypes.HealthCheckDTO {
 	since := healthSinceTS
 	return apitypes.HealthCheckDTO{

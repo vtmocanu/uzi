@@ -104,7 +104,7 @@ func TestSteerStateDataVolumeFull(t *testing.T) {
 // the board's status-word cell. Reddening mutation: drop the dataVolumeFullCause arm in
 // stateGlyphWord (it falls back to "recovery wait").
 func TestStateGlyphWordDataVolumeFull(t *testing.T) {
-	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", dataVolumeFullCause)
+	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", "", dataVolumeFullCause)
 	if glyph != "~" || word != "disk wait" {
 		t.Errorf("data_volume_full token = (%q, %q), want (~, disk wait)", glyph, word)
 	}

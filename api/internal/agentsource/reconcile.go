@@ -485,7 +485,7 @@ func (r *Reconciler) recordStatus(ctx context.Context, status, sha, errMsg strin
 }
 
 // Runner is the interval trigger. It sleeps AgentSourceInterval() and, when enabled,
-// runs one Reconcile — recovering from any panic and logging (never crashing the
+// runs discovery then Reconcile, independently recovering and logging (never crashing the
 // process) on error. It is boot-safe: main.go starts it as a non-blocking background
 // goroutine BEFORE the listener starts, and the first tick only fires after one
 // interval, so a first reconcile against an unreachable source never delays boot.
@@ -505,7 +505,7 @@ func NewRunner(rec *Reconciler, set SettingsReader, logger *slog.Logger) *Runner
 
 // Start loops until ctx is cancelled: sleep the configured interval, then reconcile
 // if enabled. Disabled is the default — the loop just idles and does nothing. It
-// never panics the process (each tick's Reconcile is panic-recovered).
+// never panics the process (each operation is panic-recovered).
 func (rn *Runner) Start(ctx context.Context) {
 	for {
 		interval, _ := rn.settings.AgentSourceInterval(ctx)
@@ -523,19 +523,40 @@ func (rn *Runner) Start(ctx context.Context) {
 	}
 }
 
-// tick runs one reconcile with a panic guard so a bug in the parse/diff path can
-// never take down the api process.
+// tick performs at most one discovery and one staging pass, sequentially. Each
+// operation's failure leaves the other eligible to run; no retry is added.
 func (rn *Runner) tick(ctx context.Context) {
 	defer func() {
 		if p := recover(); p != nil {
-			rn.logger.Error("agentsource: reconcile panic recovered", "panic", p)
+			rn.logger.Error("agentsource: tick panic recovered", "panic", p)
 		}
 	}()
-	enabled, _ := rn.settings.AgentSourceEnabled(ctx)
+	enabled, err := rn.settings.AgentSourceEnabled(ctx)
+	if err != nil {
+		rn.logger.Error("agentsource: read enabled", "error", err)
+		return
+	}
 	if !enabled {
 		return
 	}
-	if _, err := rn.rec.Reconcile(ctx); err != nil {
-		rn.logger.Error("agentsource: reconcile", "error", err)
+	rn.runOperation("check for update", func() (string, string, error) {
+		result, err := rn.rec.CheckForUpdate(ctx)
+		return result.Status, result.Message, err
+	})
+	rn.runOperation("reconcile", func() (string, string, error) {
+		result, err := rn.rec.Reconcile(ctx)
+		return result.Status, result.Message, err
+	})
+}
+
+func (rn *Runner) runOperation(name string, operation func() (string, string, error)) {
+	defer func() {
+		if p := recover(); p != nil {
+			rn.logger.Error("agentsource: operation panic recovered", "operation", name, "panic", p)
+		}
+	}()
+	status, message, err := operation()
+	if status == statusError || err != nil {
+		rn.logger.Error("agentsource: operation failed", "operation", name, "status", status, "message", message, "error", err)
 	}
 }

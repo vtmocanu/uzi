@@ -53,9 +53,10 @@ Below, `RUN` is a run id, `PR` a PR number, `S` this skill's `scripts/` director
   toolchain risk, and unexplained lockfile changes need review. State the decision. Reserve
   CodeRabbit/Greptile for large or high-risk work, and get user approval before requesting
   a review bot for Renovate-class work. Read references/renovate.md before landing one.
-- **Prefer CodeRabbit; wait for it only when the live reset is 15 minutes or less.**
-  Its quota refills hourly. Otherwise switch at once: a large or trust-boundary PR goes to
-  Greptile (the buddy reviews too); a small PR to the buddy alone (step 3).
+- **Prefer CodeRabbit; normally wait when the live reset is 20 minutes or less.**
+  Skip that wait only when the PR must merge ASAP or the user asks. For a longer or
+  unknown reset, switch: a large or trust-boundary PR goes to Greptile (the buddy
+  reviews too); a small PR to the buddy alone (step 3).
 - **Claim what you land.** `takeover.sh` records this session as the PR's lander in the
   repo's shared state (`claims.sh`), so other landers, Claude or Codex, see who holds what
   and message you instead of double-driving it. A PR another live session holds stops you
@@ -137,7 +138,7 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 |---|---|
 | Small/mechanical non-Renovate PR | the buddy (the initial local reviewer) |
 | After a small local fix | the buddy's `APPROVE` of the fixed head, plus green CI; a fix too big for that goes to `uzi run rework` (step 4) |
-| CodeRabbit rate-limited | live reset ≤ 15 min: wait for CodeRabbit; otherwise a large or trust-boundary PR switches to Greptile (step 3) and the buddy reviews too, a small PR takes the buddy alone |
+| CodeRabbit rate-limited | live reset ≤ 20 min: normally wait for CodeRabbit; switch earlier only for an ASAP merge or the user's request. Longer/unknown resets use Greptile for large or trust-boundary PRs (plus buddy review), the buddy alone for small PRs (step 3) |
 | Bot skipped or absent | the buddy |
 | Skill or script maintenance (`[skip-cr]`) | the buddy; the lander and the buddy land it, no user review |
 | Rebase, merge of `main`, or renumber only | the buddy's `APPROVE` of the range-diff (for a merge, the conflict resolution) on the new head, plus green CI (`watch-pr.sh --reviewer none`, which still checks current-head CI and live findings); a prior review of the old head carries over only when the range-diff changes no reviewed semantics. This is the one exception to the exact-SHA review rules below |
@@ -149,6 +150,12 @@ the `session-peers` skill (`buddy: @NAME`), or else a **local buddy**, a subagen
 ```
 S/takeover.sh <RUN|PR>          # resolves run <-> PR, prints KEY=VALUE + NEXT=<state>
 ```
+
+The snapshot requires Python 3 and has a 120-second wall deadline (override with positive
+`TAKEOVER_TIMEOUT_SECONDS`). On expiry it stops its own subprocesses, prints `UNKNOWN=1`
+and `NEXT=unknown`, and exits 124. Rerun before acting; claims already recorded may remain.
+Caller interruption and startup refusal also print the unknown trailer. A grandchild that
+creates its own session can escape process-group cleanup; this is an accepted limit.
 
 `MR_REWORK_ENABLED=true|false|unknown` reports the run's setting. On `true`, or `unknown` when
 you will fix locally, run `uzi run mr-rework RUN --enabled=false` first (the script never
@@ -258,8 +265,10 @@ changes it); trust it over a handover's claim.
    CI-sufficient Renovate lane, not a missing review. First run `S/review-quota.sh
    OWNER/REPO`, then batch fixes into one push.
    - **Rate-limited (exit 5).** Read the live reset first: `S/cr-rate-limit.sh OWNER/REPO PR
-     --query` (never the walkthrough's figure). `CR_RESET_MIN` ≤ 15 → wait for CodeRabbit
-     (below). Longer or `unknown` → switch: a large or trust-boundary PR posts
+     --query` (never the walkthrough's figure). `CR_RESET_MIN` ≤ 20 → normally wait
+     for CodeRabbit (below), conserving Greptile quota. Switch earlier only when
+     the PR must merge ASAP or the user asks; choose the same risk-appropriate
+     fallback without starting the wait. Longer or `unknown` → switch: a large or trust-boundary PR posts
      `@greptileai review`, then `--reviewer greptile --reviewer-grace 2`, and the buddy
      reviews the same head; a small PR takes the buddy alone, with `--reviewer none`. To
      wait, run

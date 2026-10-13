@@ -183,7 +183,9 @@ describe("RunProgressCard (PRD #2602 M2)", () => {
     expect(card(container)?.getAttribute("data-run-progress-card")).toBe("stalled");
     const flag = screen.getByText(`stalled · since ${formatLocalTime(HEALTH_SINCE)}`).parentElement as HTMLElement;
     expect(flag.textContent).toBe(`◼stalled · since ${formatLocalTime(HEALTH_SINCE)}`);
-    expect(flag.getAttribute("title")).toContain("no tool call for 25m");
+    expect(flag.getAttribute("title")).toBe(
+      "Stalled: no progress is being made; the percentage returns once activity resumes. Reason: no tool call for 25m",
+    );
     expect(flag.className).toContain("text-danger");
     expect(container.textContent).not.toMatch(/≈\d/);
   });

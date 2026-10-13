@@ -56,7 +56,7 @@
     },
     {
       "customType": "regex",
-      "description": "uzi CI tool pins carrying a `# renovate: datasource=.. depName=..` annotation on the line directly above the version literal, for pins WITHOUT a companion sha256 (currently zizmor in ci.yml). config:recommended already tracks go.mod / package-lock / Dockerfile FROM / GHA uses:; this covers versions pinned inline in shell that no built-in manager sees, VERSION only. Pins that DO have a companion sha256 (go-task, sqlc, actionlint) use the `# renovate-tarball:` marker + the github-release-attachments manager below instead, so their sha bumps in lockstep -- do NOT give a sha-carrying pin the `datasource=` marker or both managers would match it.",
+      "description": "uzi CI tool pins carrying a `# renovate: datasource=.. depName=..` annotation on the line directly above the version literal, for pins WITHOUT a companion sha256 (including Taskfile tool pins). config:recommended already tracks go.mod / package-lock / Dockerfile FROM / GHA uses:; this covers versions pinned inline in shell that no built-in manager sees, VERSION only. Pins that DO have a companion sha256 (go-task, sqlc, actionlint) use the `# renovate-tarball:` marker + the github-release-attachments manager below instead, so their sha bumps in lockstep -- do NOT give a sha-carrying pin the `datasource=` marker or both managers would match it.",
       "managerFilePatterns": [
         "/^\\.github/workflows/[^/]+\\.ya?ml$/",
         "/^\\.github/actions/[^/]+/action\\.ya?ml$/",

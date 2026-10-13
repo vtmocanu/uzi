@@ -1591,7 +1591,7 @@ func TestNotifierLimitWaitResumeKeepsUsageLimitClause(t *testing.T) {
 // and a fallback built from fixed labels + the escaped repo#iid — never a raw field.
 func TestRenderThreadBlocksShapesPerEvent(t *testing.T) {
 	failedCancelled := baseRun("failed")
-	failedCancelled.FailureReason = txt("run cancelled")
+	failedCancelled.StopKind = txt("cancelled")
 
 	failedReason := baseRun("failed")
 	failedReason.FailureReason = txt("the agent crashed")
@@ -1714,7 +1714,7 @@ func TestRenderThreadBlocksNeedsLanding(t *testing.T) {
 
 	// a cancelled failure still routes to the cancelled copy, needs_landing inputs or not.
 	cancelledLandable := baseRun("failed")
-	cancelledLandable.FailureReason = txt("run cancelled")
+	cancelledLandable.StopKind = txt("cancelled")
 	cancelledLandable.FailOrigin = txt("workflow_scope_missing")
 	cancelledLandable.HasPreservedPatch = true
 
@@ -2077,11 +2077,11 @@ func TestForgeMrVocabulary(t *testing.T) {
 // --- PRD #268 M2: the Block Kit root glyphs -------------------------------------
 
 // statusGlyph is the canonical (emoji, label) per status on the root line. This pins
-// the exact pair for every arm, including the `failed`+"run cancelled" sentinel that
+// the exact pair for every arm, including the `failed` cancellation stamp that
 // reads as Cancelled, so a later edit that swaps a glyph or reword is caught.
 func TestStatusGlyph(t *testing.T) {
 	failedCancelled := baseRun("failed")
-	failedCancelled.FailureReason = txt("run cancelled")
+	failedCancelled.StopKind = txt("cancelled")
 
 	for _, tc := range []struct {
 		name         string
@@ -2135,7 +2135,7 @@ func TestStatusGlyphNeedsLanding(t *testing.T) {
 	plainFailed.HasPreservedPatch = true
 
 	cancelledLandable := baseRun("failed")
-	cancelledLandable.FailureReason = txt("run cancelled")
+	cancelledLandable.StopKind = txt("cancelled")
 	cancelledLandable.FailOrigin = txt("workflow_scope_missing")
 	cancelledLandable.HasPreservedPatch = true
 

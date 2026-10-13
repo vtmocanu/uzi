@@ -1,4 +1,5 @@
 import { afterEach, describe, it } from "node:test";
+import { establishTrackingOwnership } from "./publication-fixture.js";
 import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -224,6 +225,7 @@ function control(extraHooks: Partial<NonNullable<RunnerOptions["checkpointTestHo
     hooks: {
       onTickOutcome: onOutcome,
       tickKillGraceMs: 300,
+      retryBackoffMs: [0, 0],
       ...extraHooks,
       tickSpawn: {
         onSpawn: (pid, argv) => {
@@ -283,7 +285,7 @@ async function hangUntilAborted(pack: Readable, signal?: AbortSignal): Promise<n
 }
 
 /** A publisher that behaves like the api broker's strict-descendant rule (pushbroker.Publish): apply
- *  the pack, answer published when the declared tip already IS the ref (AlreadyCurrent), refuse
+ *  the pack, answer published for an already-current tip only with the run's persisted checkpoint, refuse
  *  `not_descendant` (a 2xx skip) when the ref is set and the tip does not descend it, else advance
  *  the ref with a compare-and-swap. `ack` lets a call model a lost ACK: `landed` advances the ref
  *  and answers HTTP 500; `dropped` answers HTTP 500 without landing. Every answer is recorded.
@@ -293,6 +295,7 @@ function brokerPublish(
   originPath: string,
   ref: string,
   ack: (call: number) => "landed" | "dropped" | undefined = () => undefined,
+  persistedTip: () => string | undefined = () => undefined,
 ): { impl: Parameters<typeof stubPublish>[0]; answers: Array<{ call: number; tip: string; answer: unknown }> } {
   const answers: Array<{ call: number; tip: string; answer: unknown }> = [];
   const impl: Parameters<typeof stubPublish>[0] = async (call, tip, pack) => {
@@ -305,7 +308,9 @@ function brokerPublish(
       gitIn(originPath, ["index-pack", "--stdin", "--fix-thin"], bytes);
       const cur = refOr(originPath, ref);
       if (cur === tip) {
-        answer = { ok: true, body: { published: true, ref } };
+        answer = persistedTip() === tip
+          ? { ok: true, body: { published: true, ref } }
+          : { ok: true, body: { published: false, ref, skipped: "not_descendant" } };
       } else if (cur !== null && !isAncestorIn(originPath, cur, tip)) {
         answer = { ok: true, body: { published: false, ref, skipped: "not_descendant" } };
       } else {
@@ -348,6 +353,7 @@ function mkRunner(
     gitlab,
     checkpointIntervalMs: INTERVAL_MS,
     checkpointTickIntervalMs: TICK_MS,
+    checkpointTestHooks: { retryBackoffMs: [0, 0] },
     ...(ctl ? { setTimer: ctl.setTimer, setTickTimer: ctl.setTickTimer, now: ctl.now, checkpointTestHooks: ctl.hooks } : {}),
     ...extra,
   });
@@ -715,7 +721,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     const ctl = control();
     const pub = stubPublish(async (n, _tip, pack) => {
       await drain(pack);
-      return n < 2 ? { ok: false, httpStatus: 503 } : LANDED;
+      return n < 6 ? { ok: false, httpStatus: 503 } : LANDED;
     });
     const claim = gitlabClaim(1597_204);
     const seen: string[] = [];
@@ -740,7 +746,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         "publish_failed:rejected",
         "published",
       ]);
-      assert.equal(pub.count(), 3, "one publish per open interval");
+      assert.equal(pub.count(), 7, "two exhausted logical operations and one successful operation");
       const feed = statusTexts(claim.run_id);
       assert.deepEqual(
         feed.filter((t) => t.startsWith("checkpoint publish")),
@@ -925,12 +931,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
   });
 
   it("(e) real gitleaks: a secret committed then removed within the range is found and not published", async (t) => {
-    let gitleaks = "";
-    try {
-      gitleaks = execFileSync("sh", ["-c", "command -v gitleaks"], { encoding: "utf8" }).trim();
-    } catch {
-      /* not installed */
-    }
+    const gitleaks = realGitleaks();
     if (!gitleaks || !path.isAbsolute(gitleaks)) {
       t.skip("gitleaks is not on PATH in this environment; the shim variants above cover the logic");
       return;
@@ -1040,9 +1041,8 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         // The pause path is INSIDE its publish, holding the gate with a wip marker committed.
         ctl.advance(INTERVAL_MS + 1);
         tickOutcome = await ctl.fire();
-        return { ok: false, httpStatus: 500 }; // the pause fails → the marker is undone
       }
-      return LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED; // exhausted pause fails → marker is undone
     });
     const claim = gitlabClaim(1597_211);
     let parked: boolean | undefined;
@@ -1064,7 +1064,8 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       assert.equal(parked, false);
       assert.equal(headSubject.startsWith("wip(park):"), false, "the marker was undone");
       assert.equal(tickOutcome, "gate_busy");
-      assert.equal(pub.count(), 1, "only the pause's own publish ran — the tick never published the marker");
+      assert.deepEqual(pub.tips, Array(3).fill(pub.tips[0]), "pause retries preserve the WIP tip");
+      assert.equal(pub.count(), 3, "only the pause's three requests ran — the tick never published the marker");
     } finally {
       await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [tmp] });
     }
@@ -1623,23 +1624,28 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
     const calls: Array<{ args: string[]; stdin?: string }> = [];
     const seam = g as unknown as { spawnGit: (
       cwd: string, args: string[], stdin?: string,
-    ) => Promise<{ stdout: Readable }> };
+    ) => Promise<{ stdout: Readable; exited: Promise<number>; cancel: () => void }> };
     const original = seam.spawnGit.bind(g);
     seam.spawnGit = async (cwd, args, stdin) => {
       assert.equal(cwd, bare);
       calls.push({ args, stdin });
       const stdout = new PassThrough();
       stdout.end();
-      return { stdout };
+      return { stdout, exited: Promise.resolve(0), cancel: () => {} };
     };
     let out;
+    const range = { tipSha: tip, excludeSha: base };
     try {
-      out = await g.checkpointPack(bare, branch, undefined, { tipSha: tip, excludeSha: base });
+      out = await g.checkpointPack(bare, branch, undefined, range);
+      range.tipSha = base;
+      range.excludeSha = tip;
+      gitIn(bare, ["update-ref", `refs/uzi-runner/${branch}`, base]);
+      await out!.replay();
     } finally {
       seam.spawnGit = original;
     }
     assert.equal(out?.tipOid, tip);
-    assert.deepEqual(calls, [{ args: ["pack-objects", "--revs", "--stdout"], stdin: `${tip}\n^${base}\n` }],
+    assert.deepEqual(calls, Array.from({ length: 2 }, () => ({ args: ["pack-objects", "--revs", "--stdout"], stdin: `${tip}\n^${base}\n` })),
       "the real commit and floor passed validation before the pinned pack call");
     await assert.rejects(g.checkpointPack(bare, branch, undefined, { tipSha: "main", excludeSha: base }), /40-hex/);
   });
@@ -1702,15 +1708,33 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
 
 const execFileP = promisify(execFile);
 
-/** The absolute gitleaks on PATH, or "" (then the real-binary variants skip explicitly). */
+/** Absolute scanner path; missing locally skips, missing in CI fails the test. */
 function realGitleaks(): string {
+  let bin = "";
   try {
     const p = execFileSync("sh", ["-c", "command -v gitleaks"], { encoding: "utf8" }).trim();
-    return path.isAbsolute(p) ? p : "";
+    if (path.isAbsolute(p)) bin = p;
   } catch {
-    return "";
+    // The CI assertion must stay outside this discovery catch.
   }
+  assert.ok(bin || !process.env.CI, "CI requires the real gitleaks binary on PATH");
+  return bin;
 }
+
+it("missing real gitleaks fails in CI and remains optional locally", () => {
+  const oldPath = process.env.PATH;
+  const oldCI = process.env.CI;
+  try {
+    process.env.PATH = "";
+    process.env.CI = "1";
+    assert.throws(realGitleaks, /CI requires the real gitleaks/);
+    delete process.env.CI;
+    assert.equal(realGitleaks(), "");
+  } finally {
+    if (oldPath === undefined) delete process.env.PATH; else process.env.PATH = oldPath;
+    if (oldCI === undefined) delete process.env.CI; else process.env.CI = oldCI;
+  }
+});
 
 /** Resolve with `p`, or reject after `ms` — a probe that must never block. */
 function within<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
@@ -2595,6 +2619,35 @@ describe("issue #1963 confirmed real checkpoint scan floors", () => {
   });
 });
 
+for (const state of ["persisted", "absent", "attempt-only"] as const) {
+  it("same-tip broker ACK requires own persisted checkpoint: " + state, async () => {
+    const branch = "agent/same-tip-" + state;
+    const tip = commitIn(fx.originPath, "same-tip.txt", state);
+    gitIn(fx.originPath, ["branch", branch, tip]);
+    const g = mkGit(fx.dataDir);
+    const bare = await g.ensureClone(fx.originPath);
+    const context = await establishTrackingOwnership(g, bare, fx.originPath, branch, "same-tip", 1, "issue");
+    const ref = "refs/uzi-checkpoints/" + branch;
+    gitIn(fx.originPath, ["update-ref", ref, tip]);
+    const broker = brokerPublish(fx.originPath, ref, () => undefined,
+      () => state === "persisted" ? tip : undefined);
+    const pub = stubPublish(broker.impl);
+    const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1,
+      owedContext: Promise.resolve(context), lastCheckpointRefTip: state === "persisted" ? tip : "OLD",
+      lastAttemptedCheckpointRefTip: state === "attempt-only" ? tip : undefined,
+      reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
+    try {
+      const outcome = await (mkRunner(g, turn(async () => {}), undefined) as unknown as {
+        publishCheckpointOutcome: (flight: unknown, bare: string, branch: string) => Promise<unknown>;
+      }).publishCheckpointOutcome(flight, bare, branch);
+      assert.deepEqual(outcome, state === "persisted" ? { published: true }
+        : { published: false, reason: "skipped", skipLabel: "not_descendant" });
+      assert.equal(flight.lastCheckpointRefTip, state === "persisted" ? tip : "OLD");
+      assert.equal(pub.count(), 1);
+    } finally { pub.restore(); }
+  });
+}
+
 describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () => {
   const workflow = ".github/workflows/ci.yml";
   const progress = { completed: ["m1"], in_progress: [] };
@@ -2626,7 +2679,8 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
             const realTip = commitIn(ctx.worktreePath, "r.txt", "real\n");
             commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
             await ctx.checkpoint!({ reap: true, progress });
-            assert.equal(pub.count(), 1, "the milestone publish was attempted");
+            const milestoneRequests = firstAck === "clean" ? 1 : 2;
+            assert.equal(pub.count(), milestoneRequests, "lost ACK replay is refused without persisted evidence");
             const overlay = pub.tips[0]!;
             assert.equal(
               parentsIn(g.barePathFor(fx.originPath), overlay).at(-1),
@@ -2642,11 +2696,11 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
             ctl.advance(INTERVAL_MS + 1);
             if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
             else await ctx.checkpoint!({ reap: false, progress });
-            assert.equal(pub.count(), 2);
-            const chain = pub.tips[1]!;
+            assert.equal(pub.count(), milestoneRequests + 1);
+            const chain = pub.tips[milestoneRequests]!;
             assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, newTip], "chain parents are [O, N]");
             assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
-            const second = (broker.answers[1]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+            const second = (broker.answers[milestoneRequests]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
             assert.deepEqual([second?.published, second?.skipped], [true, undefined], "no not_descendant refusal");
           }), ctl, { github }).execute(claim);
           if (turnErrors.length > 0) throw turnErrors[0];
@@ -2669,7 +2723,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
       const claim = githubClaim(iid);
       const { github } = fakeGitHub();
       const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
-      const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+      const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call >= 1 && call <= 3 ? "dropped" : undefined));
       const pub = stubPublish(broker.impl);
       try {
         await mkRunner(g, turn(async (ctx) => {
@@ -2681,7 +2735,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
           const r2 = commitIn(ctx.worktreePath, "r2.txt", "real 2\n");
           commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid} b\n`);
           await ctx.checkpoint!({ reap: true, progress });
-          assert.equal(pub.count(), 2, "the second milestone publish was attempted");
+          assert.equal(pub.count(), 4, "the second milestone exhausted three requests");
           const o2 = pub.tips[1]!;
           assert.equal(parentsIn(g.barePathFor(fx.originPath), o2).at(-1), r2, "milestone 2 built an overlay over R2");
           assert.equal(refOr(fx.originPath, checkpointRef), o1, "O2 was dropped: the ref still sits at O1");
@@ -2689,13 +2743,13 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
           ctl.advance(INTERVAL_MS + 1);
           if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
           else await ctx.checkpoint!({ reap: false, progress });
-          assert.equal(pub.count(), 3);
-          const chain = pub.tips[2]!;
+          assert.equal(pub.count(), 5);
+          const chain = pub.tips[4]!;
           const chainParents = parentsIn(fx.originPath, chain);
           assert.equal(chainParents[0], o2, "chain's first parent is O2");
           assert.equal(chainParents.at(-1), newTip, "chain's last parent is N");
           assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
-          const last = (broker.answers[2]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+          const last = (broker.answers[4]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
           assert.deepEqual([last?.published, last?.skipped], [true, undefined], "no not_descendant refusal");
         }), ctl, { github }).execute(claim);
         if (turnErrors.length > 0) throw turnErrors[0];
@@ -2713,7 +2767,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
     const claim = githubClaim(iid);
     const { github } = fakeGitHub();
     const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
-    const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+    const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call >= 1 && call <= 3 ? "dropped" : undefined));
     const pub = stubPublish(broker.impl);
     try {
       await mkRunner(g, turn(async (ctx) => {
@@ -2734,7 +2788,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
         const n2 = commitIn(ctx.worktreePath, "n2.txt", "raw N2\n");
         ctl.advance(INTERVAL_MS + 1);
         assert.equal(await ctl.fire(), "published", "the next tick must advance, not wedge on not_descendant");
-        const chain = pub.tips[2]!;
+        const chain = pub.tips[4]!;
         assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, n2], "chained over the confirmed overlay");
         assert.equal(refOr(fx.originPath, checkpointRef), chain);
       }), ctl, { github }).execute(claim);
@@ -3401,7 +3455,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
     const claim = gitlabClaim(1785_201);
     const pub = stubPublish(async (n, _tip, pack) => {
       await drain(pack);
-      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let laterTip = "";
     try {
@@ -3413,6 +3467,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
           await waitAbort(ctx.signal!);
           assert.equal(ctx.signal!.aborted, true);
           assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
           laterTip = commitIn(ctx.worktreePath, "after.txt", "after\n");
           ctl.advance(INTERVAL_MS + 1);
           assert.equal(await ctl.fire(), "published");
@@ -3421,7 +3476,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       ).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
       assert.equal(pub.tips.at(-1), laterTip);
-      assert.equal(pub.count(), 2);
+      assert.equal(pub.count(), 4);
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3435,7 +3490,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
     const claim = gitlabClaim(1785_203);
     const pub = stubPublish(async (n, _tip, pack) => {
       await drain(pack);
-      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let sha = "";
     try {
@@ -3447,8 +3502,9 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
               api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
               await waitAbort(ctx.signal!);
               assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
               sha = commitIn(ctx.worktreePath, "codex-after.txt", "after\\n");
-              assert.equal(pub.count(), 1, "the post-pause commit has not been published");
+              assert.equal(pub.count(), 3, "the post-pause commit has not been published");
               ctl.advance(INTERVAL_MS + 1);
               assert.equal(await ctl.fire(), "published");
             });
@@ -3474,7 +3530,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
     const pub = stubPublish(async (n, _tip, pack) => {
       outsidePermit.push(!codex.inPermit());
       await drain(pack);
-      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let sha = "";
     let atReturn = -1;
@@ -3487,6 +3543,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
               api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
               await waitAbort(ctx.signal!);
               assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
               sha = commitIn(ctx.worktreePath, "codex-notick.txt", "after\\n");
               await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
               atReturn = pub.count();
@@ -3497,9 +3554,9 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         },
       }), undefined, { checkpointTickIntervalMs: 0 }).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
-      assert.equal(atReturn, 2);
+      assert.equal(atReturn, 4);
       assert.equal(pub.tips.at(-1), sha);
-      assert.deepEqual(outsidePermit, [true, true]);
+      assert.deepEqual(outsidePermit, [true, true, true, true]);
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3516,13 +3573,13 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       const landedTips: string[] = [];
       let owedSha = "";
       const pub = stubPublish(async (n, tip, pack, signal) => {
-        if (n === 1) {
+        if (n === 3) {
           entered.resolve();
           return hangUntilAborted(pack, signal);
         }
         await drain(pack);
-        if (n > 0) landedTips.push(tip);
-        return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+        if (n > 3) landedTips.push(tip);
+        return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
       });
       let runner: RunRunner | undefined;
       try {
@@ -3534,9 +3591,10 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
                 api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
                 await waitAbort(ctx.signal!);
                 assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+                assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
                 owedSha = commitIn(ctx.worktreePath, "after-sticky.txt", "after\\n");
                 await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
-                assert.equal(pub.count(), 1, "the Codex milestone still owes its publish");
+                assert.equal(pub.count(), 3, "the Codex milestone still owes its publish");
                 ctl.fireNoWait();
                 await bounded(entered.promise, TEARDOWN_MS, "restarted tick publish entry");
                 const outcome = ctl.nextOutcome();
@@ -3549,7 +3607,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
                 if (stop === "cancel") {
                   assert.equal(ctx.cancelRequested?.(), true, "the executor sees the sticky cancel after the spent abort");
                 }
-                assert.equal(pub.count(), 2, "the owed publish was aborted, with no later delivery");
+                assert.equal(pub.count(), 4, "the owed publish was aborted, with no later delivery");
               });
               return { branch: ctx.branch };
             },
@@ -3561,7 +3619,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
           // This stub returns normally; the SDK, not this stub, turns the sticky flag into a cancel.
           assert.equal(finalStatus(claim.run_id), "completed", "the stub's normal return completes the run");
         }
-        assert.equal(pub.count(), 2);
+        assert.equal(pub.count(), 4);
         assert.ok(!landedTips.includes(owedSha), "the aborted deferred milestone never landed");
       } finally {
         await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: pub.restore, paths: [tmp] });
@@ -3577,13 +3635,13 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       const entered = deferred();
       const landedTips: string[] = [];
       const pub = stubPublish(async (n, tip, pack, signal) => {
-        if (n === 1) {
+        if (n === 3) {
           entered.resolve();
           return hangUntilAborted(pack, signal);
         }
         await drain(pack);
-        if (n > 1) landedTips.push(tip);
-        return n > 1 ? LANDED : { ok: false, httpStatus: 500 };
+        if (n > 3) landedTips.push(tip);
+        return n > 3 ? LANDED : { ok: false, httpStatus: 500 };
       });
       let owedSha = "";
       const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
@@ -3596,6 +3654,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
           api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
           await waitAbort(ctx.signal!);
           assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
           owedSha = commitIn(ctx.worktreePath, "after-repeat.txt", "after\n");
           ctl.advance(INTERVAL_MS + 1);
           ctl.fireNoWait();
@@ -3607,7 +3666,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
             api.requestCredentialSwitch(claim.run_id, 1);
           }
           assert.equal(await bounded(outcome, TEARDOWN_MS, "restarted tick interruption"), "aborted");
-          assert.equal(pub.count(), 2);
+          assert.equal(pub.count(), 4);
           if (interrupt === "switch") {
             // An unreadable capture cannot verify a restore point. The fake API confirms the
             // failed-switch report, so this in-place attempt must give up and keep the claim.
@@ -3622,7 +3681,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         }), ctl, { recoveryRetryMs: 1 });
         await runner.execute(claim);
         assert.equal(ctl.outcomes[0], "aborted");
-        assert.equal(pub.tips[1], owedSha, "the restarted tick entered publish for the deferred commit");
+        assert.equal(pub.tips[3], owedSha, "the restarted tick entered publish for the deferred commit");
         assert.ok(!landedTips.includes(owedSha), "the interrupted deferred commit did not land");
         if (interrupt === "switch") {
           assert.equal(switchOutcome, "gave_up", "the executor handled the switch in place");
@@ -3650,9 +3709,9 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         try { return await hangUntilAborted(pack, signal); }
         finally { order.push("tick publish aborted"); }
       }
-      order.push(n === 1 ? "pause publish" : "later tick publish");
+      order.push(n < 4 ? "pause publish" : "later tick publish");
       await drain(pack);
-      return n === 1 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 4 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let sha = "";
     try {
@@ -3665,6 +3724,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         await waitAbort(ctx.signal!);
         pauseRequested = true;
         assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+        assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
         assert.equal(ctl.outcomes[0], "aborted", "the tick settled before the park acquired the sink");
         sha = commitIn(ctx.worktreePath, "after-active.txt", "after\\n");
         ctl.advance(INTERVAL_MS + 1);
@@ -3679,7 +3739,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         },
       }).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
-      assert.deepEqual(order, ["tick publish aborted", "pause quiesce", "pause publish", "later tick publish"]);
+      assert.deepEqual(order, ["tick publish aborted", "pause quiesce", "pause publish", "pause publish", "pause publish", "later tick publish"]);
       assert.equal(pub.tips.at(-1), sha);
     } finally {
       pub.restore();
@@ -3782,9 +3842,8 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
         delays.push(ctl.armedDelay()); // → one quick retry armed
         seen.push(await ctl.fire()); // the quick retry: gate still busy
         delays.push(ctl.armedDelay()); // → back to the normal cadence
-        return { ok: false, httpStatus: 500 }; // the pause fails; the run carries on
       }
-      return LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED; // exhausted pause fails; run carries on
     });
     const claim = gitlabClaim(1597_274);
     let sha = "";
@@ -3798,6 +3857,7 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
                 sha = commitIn(ctx.worktreePath, "R.txt", "r\n");
                 await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // deferred
                 assert.equal(await ctx.parkForPause!({ completedCount: 1 }), false);
+                assert.deepEqual(pub.tips, [sha, sha, sha], "pause retries preserve the deferred tip");
                 seen.push(await ctl.fire()); // gate free again: the owed publish goes out
                 // The published attempt SETTLED the owed publish: new work on a frozen clock now
                 // waits for the time gate instead of bypassing it on every tick.

@@ -233,7 +233,7 @@ func TestRunGetLongToolCallHealth(t *testing.T) {
 	}
 }
 
-// Branch advance diagnostics belong on STOP_REASON beside a neutral cancelled status.
+// Branch advance diagnostics belong on STOP_REASON beside the stopped (cancelled) label.
 func TestRunGetBranchAdvanceStopReason(t *testing.T) {
 	const reason = "superseded by a concurrent branch advance; further publication stopped. cause=remote_branch_advanced; superseding_tip=0123456789abcdef0123456789abcdef01234567"
 	for _, kind := range []string{"mr_rework", "ci_fix"} {
@@ -256,7 +256,7 @@ func TestRunGetBranchAdvanceStopReason(t *testing.T) {
 				}
 			}
 			for key, want := range map[string]string{
-				"STATUS": "cancelled", "STOP_KIND": "branch_moved", "STOP_REASON": reason,
+				"STATUS": "stopped (cancelled)", "STOP_KIND": "branch_moved", "STOP_REASON": reason,
 			} {
 				if rows[key] != want {
 					t.Errorf("%s = %q, want %q:\n%s", key, rows[key], want, out)
@@ -1373,10 +1373,106 @@ func TestAdminAgentSourceGetAndStatus(t *testing.T) {
 	if group.RunE != nil || group.Run != nil {
 		t.Error("`admin agent-source` must be a container group with no RunE")
 	}
+	if len(group.Commands()) != 2 {
+		t.Errorf("`admin agent-source` must retain only the read-only get/status leaves, got %v", group.Commands())
+	}
 	for _, leaf := range []string{"get", "status"} {
 		if findCmd(group, leaf) == nil {
 			t.Errorf("missing `admin agent-source %s` subcommand", leaf)
 		}
+	}
+}
+
+// Status displays the server's stored update projection, including an explicit false,
+// without adding a CLI update-check or apply action.
+func TestAdminAgentSourceStatusUpdateProjection(t *testing.T) {
+	for _, tc := range []struct {
+		name      string
+		available bool
+		latest    string
+	}{
+		{"newer tag", true, "v1.10.0"},
+		{"current tag", false, "v1.10.0"},
+		{"no remote facts", false, ""},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			source := apitypes.AgentSourceDTO{
+				Status: apitypes.AgentSourceStatusDTO{
+					LastSyncStatus: "ok", LastAppliedSHA: "cafef00d",
+					UpdateAvailable: tc.available, LatestRef: tc.latest,
+				},
+				Staged: &apitypes.AgentSourceStagedDTO{
+					FetchedSHA: "deadbeef", Pending: true,
+					Counts: apitypes.AgentSourceCountsDTO{Staged: 3, Changed: 2, Failed: 1},
+				},
+			}
+			fc := &uzicli.FakeClient{AgentSourceV: source}
+			out, _, code := runCLI(t, fakeEnv(fc), "admin", "agent-source", "status", "--no-color")
+			if code != uzicli.ExitOK {
+				t.Fatalf("status exit = %d, want 0", code)
+			}
+			rows := map[string]string{}
+			for _, line := range strings.Split(out, "\n") {
+				fields := strings.Fields(line)
+				if len(fields) == 2 {
+					rows[fields[0]] = fields[1]
+				}
+			}
+			wantAvailable := "false"
+			if tc.available {
+				wantAvailable = "true"
+			}
+			for field, want := range map[string]string{
+				"update_available": wantAvailable, "last_applied_sha": "cafef00d",
+				"pending": "true", "staged": "3", "changed": "2", "failed": "1",
+			} {
+				if rows[field] != want {
+					t.Errorf("%s = %q, want %q:\n%s", field, rows[field], want, out)
+				}
+			}
+			if tc.latest == "" {
+				if _, exists := rows["latest_ref"]; exists {
+					t.Errorf("absent latest tag rendered a latest_ref row:\n%s", out)
+				}
+			} else if rows["latest_ref"] != tc.latest {
+				t.Errorf("latest_ref = %q, want %q", rows["latest_ref"], tc.latest)
+			}
+
+			out, _, code = runCLI(t, fakeEnv(fc), "admin", "agent-source", "status", "--json")
+			if code != uzicli.ExitOK {
+				t.Fatalf("status --json exit = %d, want 0", code)
+			}
+			var got map[string]json.RawMessage
+			if err := json.Unmarshal([]byte(out), &got); err != nil {
+				t.Fatalf("invalid status JSON: %v\n%s", err, out)
+			}
+			if len(got) != 2 || got["status"] == nil || got["staged"] == nil {
+				t.Fatalf("status JSON must retain only status/staged projections: %s", out)
+			}
+			var status map[string]json.RawMessage
+			if err := json.Unmarshal(got["status"], &status); err != nil {
+				t.Fatal(err)
+			}
+			if string(status["update_available"]) != wantAvailable {
+				t.Errorf("JSON update_available = %s, want %s", status["update_available"], wantAvailable)
+			}
+			var latest string
+			if raw, exists := status["latest_ref"]; exists {
+				if err := json.Unmarshal(raw, &latest); err != nil {
+					t.Fatal(err)
+				}
+			}
+			if latest != tc.latest {
+				t.Errorf("JSON latest_ref = %q, want %q", latest, tc.latest)
+			}
+			var staged apitypes.AgentSourceStagedDTO
+			if err := json.Unmarshal(got["staged"], &staged); err != nil {
+				t.Fatal(err)
+			}
+			if staged.FetchedSHA != "deadbeef" || !staged.Pending || staged.Counts != source.Staged.Counts {
+				t.Errorf("JSON staged projection changed: %+v", staged)
+			}
+		})
 	}
 }
 

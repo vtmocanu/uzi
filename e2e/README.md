@@ -119,6 +119,57 @@ a 10-minute timeout except `workersvc`, whose cumulative LiveDB runtime approach
 600 seconds and gets a bounded 15 minutes (900 seconds). This adds timeout headroom,
 not a speedup; a failed invocation stops the sweep immediately.
 
+## Recovery reset marker lifecycle
+
+`reset-recovery-tables.sh` is hygiene for owned throwaway test databases. It
+accepts only `--dsn`, a positional DSN, or `UZI_TEST_DATABASE_URL`; it ignores
+`DATABASE_URL`. Loopback and `sslmode=disable` are preliminary guards, not proof
+that a database is disposable. The database must also have exactly one row in
+`uzi_test_harness.database_marker`, with `marker = 'recovery-reset-v1'`.
+
+`test-database-marker.sql` creates that schema and text-primary-key table during
+Postgres **initialization only**. Store-it and the e2e Compose overlay mount the
+same fixture read-only at
+`/docker-entrypoint-initdb.d/10-uzi-test-database-marker.sql`. Compose resolves its
+source from the repository root, retains the base `pgdata` mount, and publishes
+no database port. Store-it uses its root-derived fixture path.
+
+A retained initialized volume does not run initdb scripts again: adding the
+mount cannot mark an old database. An unmarked retained volume must be recreated
+**only through its owned throwaway harness**, after confirming the exact container
+and volume belong to that harness. Never mark an existing database manually or
+recreate a real stack's volumes. There is no force option, and reset never creates
+or repairs the marker.
+
+Marker validation and the four deletes share one implicit DO transaction. The
+order is public chunks, captures, holds, then episode notices. Unrelated data and
+the marker remain. A marked database without recovery tables is a no-op. Missing,
+malformed or unreadable markers, connection errors, and deletion errors fail
+without a success banner. A held publication's RESTRICT hold FK refuses the reset
+and rolls back earlier deletes; reset does not broaden deletion to publications.
+
+Focused checks (no product builds or migrations):
+
+```sh
+task test:reset-recovery-tables    # hermetic; also reached by gate:repo
+task test:store-it-cleanup        # hermetic; exact initialization mount argv
+task test:reset-recovery-tables:live  # standalone Docker PostgreSQL proof
+RESET_CLIENT_MODE=native task test:reset-recovery-tables:live
+RESET_MUTATIONS=1 task test:reset-recovery-tables:live
+```
+
+The live task requires a responding Docker daemon and may pull `postgres:17`
+(`UZI_STORE_IT_PG_IMAGE` overrides it). Docker-client mode is deterministic and
+uses a loopback DSN; native mode requires host `psql` and fails explicitly if
+absent, with no fallback. It creates unique `rrt-live-*` containers and two owned
+volumes outside the `uzi-` namespace, cleaning only those exact objects. Logs and
+mutation source exports stay under `.uzi/scratch/`. Startup is bounded to 90
+one-second readiness attempts; an infrastructure or assertion failure stops the
+suite and runs cleanup. Mutation mode additionally proves named tests reject a
+bypassed marker guard, wrong or extra marker rows, deletion before validation
+(using a raising DELETE probe), and a split transaction that fails on final notices.
+It applies mutants only to the live task's own throwaway database.
+
 ## Phase registry (what it asserts)
 
 The suite is now a **phase registry**: each assertion group lives in its own file

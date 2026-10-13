@@ -148,6 +148,7 @@ let shutdownSignal: "SIGINT" | "SIGTERM" | undefined;
  *  supplies lightweight stand-ins (a `nullLogger()`, a throwaway `WorkerClient`, a
  *  temp dir, a fabricated `DockerWiring`). */
 export interface BuildRunExecutorDeps {
+  codexAdviceHarnessFactory?: import("./codex/codex-executor.js").CodexAdviceHarnessFactory;
   log: Logger;
   client: WorkerClient;
   sdkHomeRoot: string;
@@ -255,6 +256,8 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
       runHome,
       {
         binding: selection.binding,
+        summaryClaimCodex: codex,
+        codexAdviceHarnessFactory: deps.codexAdviceHarnessFactory,
         client,
         provider: CODEX_PRODUCTION_PROVIDER,
         // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
@@ -507,6 +510,7 @@ async function main(): Promise<void> {
       client,
       sdkHomeRoot,
       executorKind: config.executor,
+      codexAdviceHarnessFactory,
       stubPlanGate: config.stubPlanGate,
       workerTokenFile: config.workerTokenFile,
       dockerWiring: config.dockerWiring,

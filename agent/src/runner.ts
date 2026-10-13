@@ -1813,10 +1813,12 @@ interface RunFlight {
   active: ActiveRun | undefined;
   parked: boolean;
   /** Issue #1784: true only once the server answered `paused` to a completion hold or a wall park on
-   *  THIS flight (enterCompletionHold / enterWallPark). Drives the Codex finalize-boundary bypass in
-   *  executeClaim: a confirmed-`paused` run's credential reconcile is refused by the server. An
-   *  undeliverable wall park leaves it false. */
+   *  THIS flight (enterCompletionHold / enterWallPark). A confirmed-`paused` run's credential
+   *  reconcile is refused by the server. executeClaim also bypasses the finalize boundary for
+   *  unresolved completionHeld results. An undeliverable wall park leaves this false. */
   holdOrWallParkConfirmed: boolean;
+  /** Process-local hold proof; unresolved retains artifacts without claiming a park. */
+  completionHoldOutcome: "none" | "unresolved" | "confirmed" | "refused";
   /** Wall report outcome could not be proven; finalize may run only after an exact-generation probe. */
   uncertainWallPark: boolean;
   /** PRD #1391 Run B M3 (N2/D5): true once ANY terminal outcome for this generation has been
@@ -2076,12 +2078,17 @@ export interface PendingTerminal {
 /** Issue #2545: the raw pack a held publication may upload, matching the api's cap on the route. */
 const HELD_PACK_MAX_BYTES = 64 * 1024 * 1024;
 
+/** The live pack producer of one checkpoint publish request (the first, or a replay after a 5xx). */
+type CheckpointPackProducer = Pick<NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>, "pack" | "exited" | "cancel">;
+
 /** issue #1597 M2: test-only seams for the mid-turn checkpoint tick and the scanned publish. */
 export interface CheckpointTestHooks {
   /** Issue #2545: test-only override of the held-publication pack cap (production: 64 MiB). */
   heldPackMaxBytes?: number;
   /** Test-only checkpoint publication budget; production is fixed at 10 seconds. */
   softDeadlineMs?: number;
+  /** Test-only backoff before the second and third checkpoint publish request; production is 250 ms then 1000 ms. */
+  retryBackoffMs?: readonly [number, number];
   /** Test-only expiry control; omit deadlineAt for signal-driven expiry. Production keeps its real 10s budget. */
   armSoftDeadline?: (fire: () => void, ms: number) => { deadlineAt?: number; cancel: () => void };
   /** Awaited just before a tick's git-busy probe (a test can hold a tick in its pre-scope phase). */
@@ -2163,6 +2170,8 @@ export interface RunnerOptions {
   shutdownPublishTimeoutMs?: number;
   /** Delay between local recovery capture / state-report attempts (capped at 30s). */
   recoveryRetryMs?: number;
+  /** TEST-ONLY budget for the single ambiguous completion-hold ownership read. */
+  completionHoldReconcileTimeoutMs?: number;
   /** PRD #1171 m4: the bounded absolute deadline (ms) for a Codex durability-sink
    *  `withBoundary` (quiesce → reap → action). NEVER unbounded. Default 30s. Only used when the
    *  executor is Codex-selected (`executor.safety`); a Claude/stub run ignores it. The finalize
@@ -2356,6 +2365,7 @@ export class RunRunner {
   private readonly checkpointTestHooks: CheckpointTestHooks | undefined;
   private readonly planCrossCheckTiming: PlanCrossCheckTiming | undefined;
   private readonly recoveryRetryMs: number;
+  private readonly completionHoldReconcileTimeoutMs: number;
   /** PRD #1171 m4: bounded absolute deadline (ms) for a Codex durability-sink withBoundary. */
   private readonly codexBoundaryDeadlineMs: number;
   private readonly codexFinalizeBoundaryDeadlineMs: number;
@@ -2483,6 +2493,9 @@ export class RunRunner {
         log: this.log,
         recoveryRoot: this.git.recoveryRoot,
         terminalRecordProtection: (runId) => this.git.hasPhysicalTerminalProtection(runId),
+        pendingGenerationReport: (runId, generation) => !!this.outbox &&
+          (this.outbox.isDisabled() || this.outbox.hasPendingTerminal(runId, generation) ||
+            !!this.outbox.finalizeRecordIdentity(runId, generation)),
         isExecuting: (runId) => this.isExecuting(runId) && !this.inventoryReservations.has(runId),
         withInventorySourceBoundary: (context, action) => this.withInventorySourceBoundary(context, action),
         withCompletionSourceBoundary: (source, action) => this.withCompletionSourceBoundary(source, action),
@@ -2553,6 +2566,12 @@ export class RunRunner {
     this.teardownTestDeps = opts.teardownTestDeps;
     this.shutdownPublishTimeoutMs = opts.shutdownPublishTimeoutMs ?? 15_000;
     this.recoveryRetryMs = Math.max(1, Math.min(opts.recoveryRetryMs ?? 1_000, 30_000));
+    const holdBudget = opts.completionHoldReconcileTimeoutMs === undefined
+      ? 5_000 : opts.completionHoldReconcileTimeoutMs;
+    if (!Number.isFinite(holdBudget) || holdBudget <= 0) {
+      throw new Error("completionHoldReconcileTimeoutMs must be positive and finite");
+    }
+    this.completionHoldReconcileTimeoutMs = holdBudget;
     // PRD #1171 m4: bounded, never unbounded. Clamp a caller-supplied 0/negative to the default.
     this.codexBoundaryDeadlineMs =
       opts.codexBoundaryDeadlineMs && opts.codexBoundaryDeadlineMs > 0
@@ -3225,6 +3244,11 @@ export class RunRunner {
     }
     const executionRejection: ExecutionRejection = { rejected: false };
     const dispatchFailure = async (failure: unknown, allowDiskDeferral = false): Promise<void> => {
+      if (flight.completionHoldOutcome === "unresolved") {
+        await batcher.close().catch(() => undefined);
+        runLog.warn("completion hold unresolved; retaining artifacts without terminal dispatch");
+        return;
+      }
       // The owed-candidate cap stopped this run by aborting its attempt: report the cap, not the
       // executor's abort error. A cancel, a shutdown or a stale claim keeps its own arm.
       const err = flight.owedLimitStop !== undefined && !flight.steering?.isCancelled() &&
@@ -3285,7 +3309,7 @@ export class RunRunner {
             await this.reapForSink(
               executor,
               { boundary: "park", deadlineMs: this.codexBoundaryDeadlineMs },
-              async () => {
+              async (permit) => {
                 // PRD #759 M1: commit any uncommitted work in the runner-owned clone to a
                 // clearly-marked THROWAWAY commit (subject-prefixed wip(park):) so the
                 // fetch-back carries it to the local tracking ref and the #628 broker publishes
@@ -3321,6 +3345,7 @@ export class RunRunner {
                   barePath,
                   branch,
                   await this.buildCheckpointOverlay(claim, flight, barePath),
+                  permit?.signal,
                 );
               },
               flight,
@@ -3913,9 +3938,9 @@ export class RunRunner {
       // security-boundary reap (its killAgentTree?.() — no-op for Codex); this wrapper adds the
       // Codex-ONLY finalize withBoundary so that, for a Codex run, the WHOLE phasePublish
       // (push/base-align/MR, or the not_code/report-only/undeliverable-park/switch-release early
-      // returns) runs under the held permit (an owner pause, confirmed hold/wall park, or unresolved
-      // wall park without same-generation running proof bypasses it) — its per-sink reconcile and
-      // quiesce/reap close admission and tear down the
+      // returns) runs under the held permit (an owner pause, any completionHeld result,
+      // confirmed wall park, or unresolved wall park without same-generation running proof bypasses it).
+      // Its per-sink reconcile and quiesce/reap close admission and tear down the
       // provider root before any PAT git op. For Claude/stub this is a plain call (the legacy
       // reap already happened at the untouched security boundary). A CodexBoundaryError before
       // a committed publish still propagates to the failed-run report below, unless it carries a
@@ -3925,12 +3950,13 @@ export class RunRunner {
       let postFinalizeTerminal: (() => Promise<void>) | undefined;
       if (
         flight.result?.pausedAt ||
-        ((flight.result?.walled || flight.result?.completionHeld) && flight.holdOrWallParkConfirmed) ||
+        flight.result?.completionHeld ||
+        (flight.result?.walled && flight.holdOrWallParkConfirmed) ||
         (flight.result?.walled && flight.uncertainWallPark)
       ) {
-        // Issues #1764/#1784: an owner-pause, or a completion hold / wall park the server CONFIRMED
-        // (`paused`), PARKED the run, so phasePublish takes its non-terminal early return and
-        // finalizes nothing. Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
+        // Issues #1764/#1784/#2816: owner pauses, completionHeld results (confirmed or
+        // unresolved), and confirmed wall parks take phasePublish's nonterminal early return.
+        // Call it OUTSIDE the Codex finalize boundary: that boundary's per-sink
         // credential reconcile (refreshCodex/releaseCodex) is refused by the server once the run is
         // `paused` (not an actively-claimed status), which would fail a durably parked run. An
         // unresolved wall park bypasses it unless the ownership probe proves this generation is
@@ -4338,7 +4364,9 @@ export class RunRunner {
         // reading disk pressure needs to connect the held dir to the shutdown interrupt
         // (a same-worker resume) rather than to a leak.
         runLog.info(
-          "run interrupted by worker shutdown; preserving its plugin dir and HOME for a same-worker resume",
+          flight.completionHoldOutcome === "unresolved"
+            ? "completion hold unresolved; preserving plugin dir and HOME for owner action"
+            : "run interrupted by worker shutdown; preserving its plugin dir and HOME for a same-worker resume",
           {
             run_home: runHome,
           },
@@ -4378,7 +4406,7 @@ export class RunRunner {
    * Never throws.
    */
   private async retireFinalizeRecord(flight: RunFlight, site: string): Promise<void> {
-    if (!this.outbox) return;
+    if (flight.completionHoldOutcome === "unresolved" || !this.outbox) return;
     const incarnation = this.client.capturePublicationCompletionRetirement?.();
     if (await this.recoveryInventoryPending(flight.runId, flight.claimGeneration)) return;
     try {
@@ -4395,9 +4423,13 @@ export class RunRunner {
     }
   }
 
-  /** PRD #1391 Run B M3b: the terminal-resolve deps for this runner, or undefined when no usable
-   *  outbox is wired (a test without spill, or a store that failed closed) — in which case the
-   *  write-ahead terminal send path falls back to today's un-journaled `reportState`. */
+  /** Read-only exact covering ACK predicate, using ADR-2417's unchanged physical journal rule. */
+  async recoveryFinalAcknowledged(runId: string, generation: number): Promise<boolean> {
+    try { return await this.recovery.inventoryCleanupState(runId, generation) === "acknowledged"; }
+    catch { return false; }
+  }
+
+  /** Unknown or unresolved custody retains the generation's terminal/finalize reports. */
   async recoveryInventoryPending(runId: string, generation: number): Promise<boolean> {
     if (this.unpersistedCompletionReceipts.has(this.completionKey(runId, generation))) return true;
     const key = this.completionKey(runId, generation);
@@ -4597,6 +4629,9 @@ export class RunRunner {
     // behaviour is identical.
     beforeResolve?: () => Promise<void>,
   ): Promise<void> {
+    // An ambiguous hold must not install a competing failure journal. Committed completion
+    // callbacks remain authoritative and are still delivered.
+    if (body.status === "failed" && flight.completionHoldOutcome === "unresolved") return;
     // Issue #1673: a flight an input receipt fenced (released or superseded claim) sends and
     // journals no terminal; the StaleClaimError reaches executeClaim's quiet stop.
     if (flight.steering?.claimFence() !== undefined) throw new StaleClaimError();
@@ -4784,6 +4819,7 @@ export class RunRunner {
    * the terminal is not stranded until boot (N4).
    */
   private async handlePermanentFailure(claim: ClaimResponse, flight: RunFlight, reason: string): Promise<void> {
+    if (flight.completionHoldOutcome === "unresolved") return;
     const outbox = this.outbox;
     if (outbox) outbox.holdTerminalResolve(flight.runId, flight.claimGeneration);
     try {
@@ -4884,6 +4920,7 @@ export class RunRunner {
      *  and every custody settle, so the exact-generation hold stays open for the reconciler. */
     opts: { keepCustody?: boolean } = {},
   ): Promise<void> {
+    if (flight.completionHoldOutcome === "unresolved") return;
     const { batcher, redactText, runLog } = flight;
     if (flight.retainedLocalCustody || flight.completedRetainedSuccessor) opts = { ...opts, keepCustody: true };
     // issue #2213: a run stopped by the worker quarantine (raised at a turn boundary, a provider
@@ -5855,6 +5892,7 @@ export class RunRunner {
       body: Parameters<RunFlight["reportState"]>[0],
     ): Promise<void> => {
       const status = (body as { status?: string }).status;
+      if (flight.completionHoldOutcome === "unresolved") return;
       try {
         if (this.completionReceipts.has(this.completionKey(flight.runId, flight.claimGeneration))) return;
         if (claim.inventory_guarded === true && ["completed", "failed", "cancelled"].includes(status ?? "")) {
@@ -5987,19 +6025,20 @@ export class RunRunner {
     const interlocked = claim.config?.completion_contract_version != null;
     // Park the incomplete/unverifiable interlocked run, else report a typed failure. Shared by the
     // permit-denied and PR-head-mismatch paths (D5's held-or-fail). enterCompletionHold reaps,
-    // captures a VERIFIED same-worker restore point and parks on a `paused` ACK (returns true), or
-    // parks nothing (returns false); on true we skip finalization exactly like the
-    // result.completionHeld branch above, and on false the run follows normal terminal cleanup
-    // (enterCompletionHold cleared its preserve flags) so we report a static, content-free failure.
+    // captures a VERIFIED same-worker restore point. True means confirmed or unresolved:
+    // skip finalization, retaining artifacts and evidence. False means capture failed or proof
+    // refused the hold; normal terminal cleanup may proceed with a content-free failure.
     // `holdReason` is a static hold-reason string, never raw model output.
     const holdOrFailInterlocked = async (holdReason: string): Promise<void> => {
-      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog);
+      const held = await this.enterCompletionHold(flight, claim, holdReason, runLog, { publishCheckpoint: false });
       if (held) {
         // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
-        await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        if (flight.completionHoldOutcome === "confirmed")
+          await this.retireFinalizeRecord(flight, "completion_hold_accepted");
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
-        runLog.info("run entered the completion hold; skipping finalization", {
+        runLog.info("completion hold retained; skipping finalization", {
+          hold_outcome: flight.completionHoldOutcome,
           run_id: runId,
           reason: holdReason,
         });
@@ -6086,15 +6125,14 @@ export class RunRunner {
       // PRD #1226 M3 (D3/D6): the run entered the recoverable COMPLETION HOLD — a repeated
       // no-progress completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed
       // to ctx.enterCompletionHold (M4) instead of failing. Like the pause park, the run is
-      // non-terminal and the hold seam already handled the transition, so there is nothing to
-      // finalize (no push, no MR, no completion report). Reap + close the batcher and return; the
-      // finally preserves its HOME for resume. Issue #1784: a Codex run whose hold the server
-      // confirmed (`paused`) reaches here via the finalize-boundary bypass in executeClaim. In M3
-      // this branch was dead (the seam was unwired, so completionHeld was never set); M4 wired it.
+      // nonterminal whether confirmed or unresolved. Reap + close the batcher and return;
+      // the finally preserves HOME and clone. Every completionHeld result reaches here via
+      // executeClaim's finalize-boundary bypass, including an ambiguous hold delivery.
       if (result.completionHeld) {
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
-        runLog.info("run entered the completion hold; skipping finalization", {
+        runLog.info("completion hold retained; skipping finalization", {
+          hold_outcome: flight.completionHoldOutcome,
           run_id: runId,
           reason: result.completionHeld.reason,
         });
@@ -8764,6 +8802,7 @@ export class RunRunner {
       // so every path that never reaches the park logic cleans up exactly as before.
       parked: false,
       holdOrWallParkConfirmed: false,
+      completionHoldOutcome: "none",
       uncertainWallPark: false,
       // PRD #1391 Run B M3 (N2/D5): no terminal outcome selected yet. Set by journalAndSendTerminal
       // when an outcome is resolved or a competing outcome is deferred for an unavailable selected
@@ -10247,7 +10286,7 @@ export class RunRunner {
                     ? "aborted"
                     : `publish_failed:${outcome.reason}`;
                 // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
-                // cadence to <= 1 publish/interval/run even under a persistent broker failure. An owed
+                // cadence to <= 1 logical operation/interval/run (up to three internal HTTP requests). An owed
                 // (deferred) publish is settled by the attempt too (issue #1597 M2 round 4), so the gate
                 // — not pendingPublish — governs every retry.
                 flight.lastPublish = this.now();
@@ -10634,8 +10673,8 @@ export class RunRunner {
       // PRD #686 M4: dogfood flag (absent ⇒ generic; older server never sets it).
       selfImproveDogfood: claim.self_improve_dogfood,
       config: claim.config,
-      // PRD #1064 M1 (Decision 2): the claim's FROZEN milestone list, the transition-frame
-      // title fallback on a pre-approved resume whose loop-scope frozen list is undefined.
+      // PRD #1064 M1 (Decision 2): the claim's FROZEN milestone list supplies resumed
+      // implementation prompts and the transition-frame title fallback.
       frozenMilestones: claim.milestones,
       // Preflighted above: the claim's id, or undefined when its transcript is not
       // on this worker (issue #105).
@@ -11524,9 +11563,9 @@ export class RunRunner {
       // no-progress completion attempt, a post-attempt budget/stall/wall/idle exhaustion, or the
       // server's budget_exhausted steer, the executor calls this INSTEAD of throwing a terminal
       // failure. enterCompletionHold reaps, captures a VERIFIED same-worker restore point, requests
-      // the hold, and returns true ONLY on a `paused` ACK (parked; the finally preserves the clone
-      // and HOME); false means it did NOT park (it cleared its preserve flags), so the executor falls
-      // back to the legacy throw and the run's normal terminal cleanup runs. Live for every
+      // the hold, and returns true for confirmed or unresolved delivery (the finally preserves
+      // clone and HOME). False means capture failed or explicit refusal/terminal proof permitted
+      // normal cleanup, so the executor falls back to the legacy throw. Live for every
       // interlocked run: completion_interlock_rollout defaults ON (#1626), so an unseeded
       // Claude or Codex issue run carries completion_contract_version and completionInterlock
       // above is true; a legacy or seeded run leaves it false and never reaches this seam.
@@ -12054,7 +12093,7 @@ export class RunRunner {
       const labels = chunk.map(s => s.slice(0, 12));
       flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
         archived ? `Earlier recovery archive covers retained heads ${labels.join(", ")}; local custody retained. Use uzi run recovery or uzi run export.`
-          : `Retained heads ${labels.join(", ")} are worker-local, not checkpoint durable; recovery needs action. Use uzi run recovery or uzi run export.`,
+          : `Retained heads ${labels.join(", ")} are retained locally with no confirmed checkpoint coverage. Inspect status with uzi run recovery or uzi run export.`,
       } });
       for (const s of chunk) seen.add(s);
     }
@@ -12063,10 +12102,31 @@ export class RunRunner {
   private async reconcileConfirmedOwed(flight: RunFlight, barePath: string, confirmedSha: string): Promise<void> {
     try {
       const result = await this.git.reconcileOwedCandidates(barePath, flight.runId, confirmedSha);
-      // Released heads are no longer owed: forget them so the ledger tracks only live pins.
+      // Only reconcileOwedCandidates supplies positive checkpoint coverage proof.
+      // Snapshot previously announced removals before forgetting all released heads.
+      const resolved = [...new Set(result.removedShas)].filter(sha => /^[0-9a-f]{40}$/.test(sha) &&
+        (flight.owedAnnounced.heads.has(sha) || flight.owedAnnounced.archived.has(sha)));
       for (const sha of result.removedShas) {
         flight.owedAnnounced.heads.delete(sha);
         flight.owedAnnounced.archived.delete(sha);
+      }
+      // Diagnostics confer no cleanup authority and delivery adds no retry ledger.
+      // One synchronous attempt per eight-head row, bounded by the finite inventory;
+      // a refused row does not block later rows or remaining-head announcements.
+      for (let i = 0; i < resolved.length; i += 8) {
+        const chunk = resolved.slice(i, i + 8);
+        try {
+          if (flight.owedFeedClosed) throw new Error("feed closed");
+          flight.batcher.emit({ kind: "status", agent: "worker", payload: { text:
+            `Confirmed checkpoint covers previously retained heads ${chunk.map(sha => sha.slice(0, 12)).join(", ")}; these heads are no longer owed locally.`,
+          } });
+        } catch (err) {
+          try {
+            flight.runLog.info("recovery: checkpoint coverage resolution not delivered", {
+              heads: chunk, error: errMessage(err),
+            });
+          } catch { /* Best-effort diagnostics must not interrupt reconciliation. */ }
+        }
       }
       this.announceOwedHeads(flight, result.retainedShas);
     } catch (err) {
@@ -13646,18 +13706,39 @@ export class RunRunner {
     // whole un-landed overlay chain; this is bounded by the broker's object cap and self-clears on
     // the first landed ACK.
     let packedTip: string | undefined;
-    let recoveryPack: Awaited<ReturnType<GitCache["checkpointPack"]>> = null;
+    let producer: CheckpointPackProducer | undefined;
+    let retried = false;
+    let producerExit: number | undefined;
+    const observeProducer = () => {
+      producerExit = undefined;
+      void producer!.exited.then(code => { producerExit = code; });
+    };
+    const abandon = async (checkFailure = false) => {
+      if (!producer) return;
+      // Observe an already-settled local failure before intentionally cancelling an unread tail.
+      await Promise.resolve();
+      const failed = producerExit !== undefined && producerExit !== 0;
+      producer.cancel();
+      if (!producer.pack.readableEnded) producer.pack.destroy();
+      await producer.exited;
+      producer = undefined;
+      if (checkFailure && failed) throw new Error("checkpoint pack producer failed");
+    };
     try {
+      signal?.throwIfAborted();
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      signal?.throwIfAborted();
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
         throw new SecretRemediationPendingError();
       }
       const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
         async (wantedSha) => {
+          signal?.throwIfAborted();
           // The clean scan names the owned source, while ancestry judges the actual overlay/bridge.
           if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
             throw new SecretRemediationPendingError();
           }
+          signal?.throwIfAborted();
         },
         // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed
         // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
@@ -13670,16 +13751,40 @@ export class RunRunner {
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
-      if (flight.retainedEpisode) recoveryPack = packed;
+      producer = packed;
+      observeProducer();
       packedTip = packed.tipOid;
-      onStep?.("checkpoint_upload");
-      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
+      let res;
+      // Only an explicit 5xx is retriable. Three requests share the caller's deadline;
+      // any failed guard, transport exception or abort stops this logical operation.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        signal?.throwIfAborted();
+        onStep?.("checkpoint_upload");
+        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal);
+        if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
+        flight.lastAttemptedCheckpointRefTip = packed.tipOid;
+        const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
+        const backoffMs = attempt === 1 ? firstBackoffMs : secondBackoffMs;
+        flight.runLog.warn("checkpoint publish retry", { run_id: flight.runId, attempt, backoff_ms: backoffMs, http_status: res.httpStatus });
+        await abandon(true);
+        await sleep(backoffMs, signal);
+        signal?.throwIfAborted();
+        await this.requireTrackingOwned(flight, barePath, branch, sourceSha);
+        signal?.throwIfAborted();
+        producer = await packed.replay();
+        observeProducer();
+        retried = true;
+      }
+      if (!res) throw new Error("checkpoint publish produced no response");
       if (res.ok && res.body.published === true) {
         // An early HTTP success does not prove the streamed git pack completed. spawnGit's
         // exit promise never rejects and, inside a boundary, settles only after root reap.
         // Abandon an unread tail so the producer cannot stay blocked on pipe backpressure.
-        if (!packed.pack.readableEnded) packed.pack.destroy();
-        if (await packed.exited !== 0) throw new Error("checkpoint pack producer failed");
+        if (!producer!.pack.readableEnded) {
+          producer!.cancel();
+          producer!.pack.destroy();
+        }
+        if (await producer!.exited !== 0) throw new Error("checkpoint pack producer failed");
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
@@ -13693,7 +13798,7 @@ export class RunRunner {
         this.triggerLiveSettle(flight, packed.tipOid, "checkpoint");
         // issue #1597 M1: a failure/skip line is on the feed, so say it recovered — once — and
         // clear the dedupe set so a recurring failure is surfaced again rather than swallowed.
-        if (flight.reportedPublishOutcomes.size > 0) {
+        if (retried || flight.reportedPublishOutcomes.size > 0) {
           flight.reportedPublishOutcomes.clear();
           flight.runLog.info("checkpoint publishing recovered", { run_id: flight.runId });
           this.emitWorkerDiagnostic(flight, "status", "checkpoint publishing recovered — published to origin");
@@ -13761,10 +13866,7 @@ export class RunRunner {
       });
       return { published: false, reason: "error" };
     } finally {
-      if (recoveryPack) {
-        if (!recoveryPack.pack.readableEnded) recoveryPack.pack.destroy();
-        await recoveryPack.exited;
-      }
+      await abandon();
     }
   }
 
@@ -16033,54 +16135,23 @@ export class RunRunner {
   }
 
   /**
-   * PRD #1226 M4 (D3/D6): enter the recoverable COMPLETION HOLD. Modeled on
-   * handleRecoveryExhausted (the hold-loop template) with the D6 FIXED park order:
-   *   1. reap the agent tree (REAP-BEFORE-GIT, before any credentialed capture git).
-   *   2. set the preserve flags FIRST so no cleanup can strand the clone/session WHILE capture or the
-   *      hold ACK is still uncertain — retain-everything is the default through the bounded capture
-   *      retry and the hold request. It is held SET only on the true (parked) path; every false-
-   *      return path CLEARS both flags before returning (mirroring handleRecoveryExhausted's non-
-   *      parked branches), so a run that could NOT be parked follows NORMAL terminal cleanup instead
-   *      of leaking its clone + HOME into a finally that skips cleanup while the flags are set.
-   *   3-5. captureHoldContext (WIP-commit dirty → fetch-back → verifyRunnerTrackingCovers, REQUIRE
-   *      verified; publish best-effort) with a bounded retry; DURING the retries a never-yet-verified
-   *      capture retains the live clone (no hold requested), and only on GIVING UP does it clear the
-   *      flags and return false so the subsequent terminal outcome cleans up.
-   *   6. client.requestCompletionHold({head}) and REQUIRE the RETURNED status === "paused" (the
-   *      positive-ack contract, the same as the pause park). A non-paused status or a thrown error
-   *      clears the flags and returns false (the run is not parked).
-   *   issue #1783: steps 1 and 3-5 are gated on the clone being provably QUIESCENT (quiesceRun
-   *      before the capture, and captureHoldContext's re-proof after its wip marker). When either
-   *      proof is `survivors`/`unverified` the capture is skipped entirely (nothing fetched back or
-   *      published), the flags stay set, and the hold is still requested with an EMPTY head (the
-   *      wall park's degraded shape): the hold stands with no claimed head, never a failed run.
-   *   7. only after a paused ACK: mark the flight parked (so the finally's park carve-out preserves
-   *      the HOME + plugin dir, the clone staying via preserveRecoveryClone) and return true.
-   *
-   * Returns true = ENTERED the verified hold (parked; phasePublish's completionHeld branch
-   * finalizes nothing and the finally preserves the clone + HOME for a same-worker resume). Returns
-   * false = could NOT capture a verified restore point OR the hold ACK was not `paused`; the flags
-   * are CLEARED, so the run is NOT parked and its normal terminal outcome (the executor's legacy
-   * throw, or phasePublish's typed failure) cleans up the clone + HOME like any other failed run.
-   * `reason` is a content-free failure-reason constant, never raw model output.
+   * Capture verified local work before requesting a completion hold. A literal paused ACK
+   * confirms the park; an explicit non-held ACK refuses it. Ambiguous delivery gets one bounded
+   * ownership read, retaining clone, HOME and finalize/recovery evidence unless proof resolves it.
+   * Automatic recovery is not guaranteed if active snapshots are disabled or unavailable;
+   * artifacts are retained for owner action. No durable state or retry loop is added.
    */
   private async enterCompletionHold(
     flight: RunFlight,
     claim: ClaimResponse,
     reason: string,
     runLog: Logger,
+    options: { publishCheckpoint?: boolean } = {},
   ): Promise<boolean> {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
     flight.executor.killAgentTree?.();
-    // 2. Retain EVERYTHING up front: the runner clone is the only copy of the run's work until the
-    //    tracking ref verifiably covers HEAD, and the session HOME must survive the same-worker
-    //    resume. Set before any destructive possibility so an uncertain capture or a refused hold ACK
-    //    can never strand the work WHILE the hold is being attempted (AC: no hold cleans the only Git
-    //    work copy when capture or acknowledgement is uncertain). Held SET only on the true (parked)
-    //    path below; EVERY false-return path clears both flags first (mirroring
-    //    handleRecoveryExhausted's non-parked branches) so a run that could not be parked follows
-    //    normal terminal cleanup rather than leaking its clone + HOME.
+    // Retain clone and session throughout capture and ambiguous delivery.
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
     // 3-5. Capture a VERIFIED same-worker restore point, retrying bounded (like recovery's retain-
@@ -16110,7 +16181,7 @@ export class RunRunner {
     for (let attempt = 0; !holdQuiescence.blocked && attempt < COMPLETION_HOLD_CAPTURE_ATTEMPTS; attempt++) {
       if (flight.active?.shuttingDown || flight.steering.isCancelled()) break;
       try {
-        const result = await this.captureHoldContext(claim, flight, runLog);
+        const result = await this.captureHoldContext(claim, flight, runLog, options);
         if (result.residueBlocked) {
           captured = residueHold("after_runner_git");
           break;
@@ -16137,38 +16208,66 @@ export class RunRunner {
       );
       return false;
     }
-    // 6. Request the hold and REQUIRE the RETURNED status to be literally "paused" (the positive-
-    //    ack contract, keyed off the returned status exactly like the pause park — never off
-    //    `applied`). requestCompletionHold reads the status off BOTH a 200 and a 409 body without
-    //    throwing; a non-paused status or a real transport error means the run is NOT parked, so we
-    //    clear the flags (below) and it follows normal terminal cleanup.
     const head = captured.head;
-    let status: string;
+    flight.completionHoldOutcome = "unresolved";
+    flight.parked = false;
+    flight.holdOrWallParkConfirmed = false;
+    let status: unknown;
     try {
-      ({ status } = await this.client.requestCompletionHold(flight.runId, {
+      const ack = await this.client.requestCompletionHold(flight.runId, {
         head,
-        // PRD #1247 M5: stamp the claim-lane generation (the SAME value the reportState closure
-        // stamps) so the server refuses to park a released/superseded stale flight's reclaimed run.
         claimGeneration: flight.claimGeneration,
-      }));
+      });
+      status = ack?.status;
     } catch (holdError) {
-      flight.preserveRecoveryClone = false;
-      flight.preserveSession = false;
-      runLog.warn("completion hold: hold request failed; not parking (flags cleared for normal terminal cleanup)", {
+      runLog.warn("completion hold request ambiguous; retaining artifacts for ownership reconciliation", {
         run_id: flight.runId,
         error: errMessage(holdError),
       });
-      return false;
     }
-    if (status !== "paused") {
+    const refuse = (): false => {
+      flight.completionHoldOutcome = "refused";
       flight.preserveRecoveryClone = false;
       flight.preserveSession = false;
-      runLog.warn("completion hold: server did not park the run; not parking (flags cleared for normal terminal cleanup)", {
+      runLog.info("completion hold refused by proof; normal terminal cleanup permitted", {
         run_id: flight.runId,
-        server_status: status || "unknown",
       });
       return false;
+    };
+    if (typeof status === "string" &&
+        ["queued", "claimed", "running", "completed", "failed", "cancelled"].includes(status)) {
+      return refuse();
     }
+    if (status !== "paused") {
+      // One read, bounded by an absolute production deadline. Errors (including 404) are
+      // ambiguous; active snapshots cannot fence a POST that may still arrive later.
+      try {
+        const ownership = await this.client.getRunOwnership(flight.runId, {
+          deadline: Date.now() + this.completionHoldReconcileTimeoutMs,
+        });
+        const exactGeneration = typeof ownership?.claim_generation === "number" &&
+          Number.isSafeInteger(ownership.claim_generation) &&
+          ownership.claim_generation > 0 && ownership.claim_generation === flight.claimGeneration;
+        if (exactGeneration && ownership.claim_released === false) {
+          if (["failed", "completed", "cancelled"].includes(ownership.status) &&
+              ownership.hold_reason === null) return refuse();
+          if (ownership.status === "paused" && ownership.hold_reason === "completion_blocked")
+            status = "paused";
+        }
+      } catch (probeError) {
+        runLog.warn("completion hold ownership unresolved; retaining artifacts", {
+          run_id: flight.runId,
+          error: errMessage(probeError),
+        });
+      }
+      if (status !== "paused") {
+        runLog.warn("completion hold unresolved; ending nonterminal with artifacts retained for owner action", {
+          run_id: flight.runId,
+        });
+        return true;
+      }
+    }
+    flight.completionHoldOutcome = "confirmed";
     // 7. Durably held. Mark the flight parked so the finally's park carve-out preserves the HOME and
     //    plugin dir for the same-worker resume (the clone stays via preserveRecoveryClone, set
     //    above). phasePublish's completionHeld branch reaps again (idempotent) and skips finalize.
@@ -16545,6 +16644,7 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
     runLog: Logger,
+    options: { publishCheckpoint?: boolean } = {},
   ): Promise<{ verified: boolean; published: boolean; mode: "same_worker_only"; head: string | null; residueBlocked?: boolean }> {
     const NONE = {
       verified: false,
@@ -16616,6 +16716,10 @@ export class RunRunner {
     // Codex run the publish runs under the finalize-class boundary facade (withCodexBoundaryOnly),
     // idempotent like the recovery path. A blocked boundary leaves `published` false — the restore
     // point is still VERIFIED locally, which is what gates "captured".
+    // A post-permit hold already owns the finalize boundary: retain the verified local
+    // capture, but skip the optional remote overlay/checkpoint and its nested boundary.
+    if (options.publishCheckpoint === false)
+      return { verified: true, published: false, mode: "same_worker_only", head };
     let published = false;
     try {
       await this.withCodexBoundaryOnly(

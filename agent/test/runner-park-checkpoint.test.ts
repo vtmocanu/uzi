@@ -106,12 +106,14 @@ function runnerWithGit(
   factory: ExecutorFactory,
   gitlab: ReturnType<typeof fakeGitlab>["gitlab"],
   gitCache = git,
+  retryBackoffMs: readonly [number, number] = [0, 0],
 ): RunRunner {
   return new RunRunner(client, gitCache, factory, nullLogger(), 20, undefined, {
     pollMs: 5,
     planApprovalTimeoutMs: 0,
     questionTimeoutMs: 600,
     gitlab,
+    checkpointTestHooks: { retryBackoffMs },
   });
 }
 
@@ -168,6 +170,42 @@ function spyPublishHttpError(httpStatus: number): { restore: () => void } {
 }
 
 describe("RunRunner — checkpoint on the limit-park path (PRD #628 M2)", () => {
+  it("expired park permit interrupts retry backoff without a second upload", async () => {
+    const { gitlab } = fakeGitlab();
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-park-retry-"));
+    const { factory } = parkFactory(homeRoot, "RETRY.txt");
+    // A long backoff proves the expired permit, not the delay, ends the retry.
+    const r = runnerWithGit(factory, gitlab, git, [60_000, 60_000]);
+    const abort = new AbortController();
+    const seam = r as unknown as {
+      reapForSink: (executor: unknown, options: { boundary: string },
+        body: (permit?: { signal: AbortSignal }) => Promise<unknown>, flight: unknown) => Promise<unknown>;
+    };
+    const reap = seam.reapForSink.bind(r);
+    seam.reapForSink = (executor, options, body, flight) => reap(executor, options,
+      options.boundary === "park" ? () => body({ signal: abort.signal }) : body, flight);
+    const publish = client.publishCheckpoint.bind(client);
+    let calls = 0;
+    client.publishCheckpoint = async (_run, _tip, pack, signal) => {
+      calls++;
+      assert.equal(signal, abort.signal, "park forwards the original permit signal");
+      await drain(pack);
+      setTimeout(() => abort.abort(), 10);
+      return { ok: false, httpStatus: 500 };
+    };
+    try {
+      const claim = gitlabClaim(628991, { wait_on_limit: true });
+      await r.execute(claim);
+      assert.equal(calls, 1);
+      assert.equal(abort.signal.aborted, true);
+      assert.ok(parked(claim.run_id), "deadline cannot undo the park");
+    } finally {
+      client.publishCheckpoint = publish;
+      seam.reapForSink = reap;
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+  });
+
   it("publishes a checkpoint carrying the committed work when a park has new commits", async () => {
     const { gitlab } = fakeGitlab();
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-628-pub-"));

@@ -17,6 +17,7 @@ import type { WorkerClient } from "./client.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import type { GitCache } from "./git.js";
 import type { Logger } from "./log.js";
+import type { AdviceUsageSnapshot } from "./harness.js";
 import { fenceNonce } from "./prompt.js";
 import { defaultQueryFn } from "./sdk-messages.js";
 import { runReadOnlyModelPass, safeReportFailed } from "./model-pass.js";
@@ -50,6 +51,13 @@ const REVIEW_MODEL_TIMEOUT_MS = 5 * 60 * 1000;
 const DIFF_CHAR_BUDGET = 600_000;
 
 const VALID_SEVERITIES = new Set<TaskReviewFinding["severity"]>(["info", "warning", "error"]);
+
+/** Claude's result fold requires provider dollars for every model, including a real zero. */
+export function hasProviderCostForEveryModel(snapshot: AdviceUsageSnapshot): boolean {
+  const models = Object.values(snapshot);
+  return models.length > 0 && models.every((u) =>
+    typeof u.costUSD === "number" && Number.isFinite(u.costUSD) && u.costUSD >= 0);
+}
 
 const REVIEW_SYSTEM_PROMPT = `You are a code reviewer for the "uzi" AI factory. You are given the unified git DIFF of a
 task branch against its base branch, and you produce a structured review of the changes in that diff.
@@ -171,6 +179,7 @@ export class ReviewRunner {
     // Compute the review. Any failure BEFORE the post falls back to a `failed` review so
     // the reviewed run still receives a (report-only) result rather than nothing.
     let review: TaskReviewRequest;
+    let modelUsage: AdviceUsageSnapshot | undefined;
     try {
       const runningAck = await this.client.reportState(reviewRunId, {
         status: "running",
@@ -219,15 +228,24 @@ export class ReviewRunner {
         // uses (agent/src/main.ts's makeExecutor). A malformed codex block falls through
         // to the outer catch's failed-review fallback exactly like any other prep failure.
         const selection = selectCodexBinding({ codex: claim.secrets.codex });
+        const onUsage = (snapshot: AdviceUsageSnapshot): void => {
+          // The Claude result fold assumes a provider cost. Token-only interrupted
+          // evidence would otherwise fabricate metered zero; keep that gap explicit.
+          if (selection.kind === "claude" && !hasProviderCostForEveryModel(snapshot)) {
+            this.log.warn("review pass usage unavailable", { run_id: reviewRunId });
+            return;
+          }
+          modelUsage = snapshot;
+        };
         if (selection.kind === "codex") {
-          review = await this.reviewCodex(claim, diff, selection.binding);
+          review = await this.reviewCodex(claim, diff, selection.binding, onUsage);
         } else {
           const token = claim.secrets?.anthropic_oauth_token?.trim();
           if (!token) {
             this.log.warn("review claim carried no Anthropic token; posting failed review", { run_id: reviewRunId });
             review = { status: "failed", summary: "No Anthropic token available for review.", findings: [] };
           } else {
-            review = await this.review(claim, diff, token);
+            review = await this.review(claim, diff, token, onUsage);
           }
         }
       }
@@ -264,6 +282,23 @@ export class ReviewRunner {
           run_id: reviewRunId,
         });
         return;
+      }
+      // Single-pass advisory usage uses the existing judge result-frame fold. The
+      // advice helper flushes once on success or failure; no evidence posts nothing.
+      // Append after any claim-time notes to retain the accounting frame in the trace.
+      if (modelUsage) {
+        try {
+          await this.client.postMessages(reviewRunId, [{ seq: claim.last_seq + 1, kind: "status", agent: "reviewer",
+            payload: { event: "result", modelUsage },
+          }], claim.claim_generation);
+        } catch (err) {
+          if (isStaleClaimRefusal(err)) {
+            this.log.warn("review claim superseded (stale) at usage post; abandoning", { run_id: reviewRunId });
+            return;
+          }
+          // Accounting is best effort; a transport failure must not discard the findings.
+          this.log.warn("review usage post failed", { run_id: reviewRunId, error: errMessage(err) });
+        }
       }
       try {
         await this.client.postTaskReview(targetId, review, claim.claim_generation, reviewRunId);
@@ -315,10 +350,13 @@ export class ReviewRunner {
 
   /** The model call: one text-only turn over the diff, JSON out. Returns a `failed`
    *  review on any model failure so execute() still posts a (report-only) result. */
-  private async review(claim: ClaimResponse, diff: string, token: string): Promise<TaskReviewRequest> {
+  private async review(
+    claim: ClaimResponse, diff: string, token: string,
+    onUsage: (snapshot: AdviceUsageSnapshot) => void,
+  ): Promise<TaskReviewRequest> {
     try {
       const prompt = buildReviewPrompt(diff);
-      const text = await this.runModel(token, prompt);
+      const text = await this.runModel(token, prompt, onUsage);
       return parseTaskReview(text);
     } catch (err) {
       this.log.warn("review model call failed; posting failed review", {
@@ -334,7 +372,10 @@ export class ReviewRunner {
    *  `runReadOnlyModelPass`'s `codex` option instead of an Anthropic token. A missing
    *  factory (a wiring gap) fails closed the same way any other model failure does: a
    *  `failed` review still lands, never a silent Claude substitution. */
-  private async reviewCodex(claim: ClaimResponse, diff: string, binding: CodexBinding): Promise<TaskReviewRequest> {
+  private async reviewCodex(
+    claim: ClaimResponse, diff: string, binding: CodexBinding,
+    onUsage: (snapshot: AdviceUsageSnapshot) => void,
+  ): Promise<TaskReviewRequest> {
     try {
       if (!this.codexAdviceHarnessFactory) {
         throw new Error("review claim carries a Codex binding but no Codex advice-harness factory is wired");
@@ -356,6 +397,7 @@ export class ReviewRunner {
         denyReason: "the reviewer is read-only and runs no tools",
         log: this.log,
         codex: { runId: claim.run_id, binding, buildHarness: this.codexAdviceHarnessFactory },
+        onUsage,
       });
       return parseTaskReview(text);
     } catch (err) {
@@ -367,7 +409,7 @@ export class ReviewRunner {
     }
   }
 
-  private async runModel(token: string, prompt: string): Promise<string> {
+  private async runModel(token: string, prompt: string, onUsage: (snapshot: AdviceUsageSnapshot) => void): Promise<string> {
     return runReadOnlyModelPass({
       token,
       systemPrompt: REVIEW_SYSTEM_PROMPT,
@@ -379,6 +421,7 @@ export class ReviewRunner {
       queryFn: this.queryFn,
       denyReason: "the reviewer is read-only and runs no tools",
       log: this.log,
+      onUsage,
     });
   }
 

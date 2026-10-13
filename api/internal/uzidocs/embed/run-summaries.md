@@ -6,23 +6,25 @@ audience: user
 
 # Run summaries
 
-Every run gets two short plain-English summaries, so you can tell what it's
-doing without opening the issue or reading the raw plan:
+Issue runs can get short plain-English intent and plan summaries, so you can
+tell what they're doing without opening the issue or reading the raw plan:
 
 - **Intent summary** — "what this run will implement", compiled from the
   issue title and body (plus a linked PRD, when there is one) shortly after
   the run starts. It shows as a one-line preview on the runs list and as a
   card on the run page.
 - **Plan summary + deltas** — "what the proposed plan will do", compiled the
-  moment the agent's plan reaches the approval gate. Alongside it, a short
+  moment the agent's plan reaches the human approval gate (`awaiting_approval`),
+  not when autopilot approves it. Alongside it, a short
   tagged list of how the plan diverged from the original ask: **added**,
   **changed**, or **dropped**. The card reads **Proposed plan** while the run
   sits at the gate and relabels to **Approved plan** once you approve — the
   same text, not a regenerated one. A revised plan (after **Request
   changes**) regenerates both.
 
-Both summaries are generated on **your own Anthropic token**, on a cheap
-model by default, so they cost very little next to the run itself.
+Both summaries use **the run owner's own credential for the run's original
+harness**: an Anthropic token for Claude, or the bound OpenAI API key or
+Codex subscription for Codex.
 
 ## Read the deltas as a heads-up, not a substitute
 
@@ -37,10 +39,11 @@ not to replace that read.
 ## It's advisory — it never blocks your run
 
 Summary generation runs alongside the real work, never in place of it. If it
-fails or times out, it's simply skipped: the card falls back to the issue
-title and the run proceeds exactly as if summaries didn't exist. A seeded or
-pre-approved run (one that skips planning) gets an intent summary only —
-there's no plan gate for a plan summary to attach to.
+fails, is refused or times out, it's simply skipped: the card falls back to
+the issue title and the run proceeds exactly as if summaries didn't exist.
+Both planning and seeded or pre-approved issue runs are eligible for an
+intent summary. A seeded or pre-approved run skips the plan gate; an
+autopilot-approved plan also gets no plan summary.
 
 ## The Now summary
 
@@ -72,12 +75,15 @@ across devices.
 
 ## Which model it runs on
 
-The instance default is **haiku** — summaries are lightweight and run once
-or twice per run, so a fast, cheap model is the right default. From
-**Settings → Run defaults → Run summaries**, the **Summary model** picker
-lets you override that for your own runs; leave it on **Inherit** to use the
-instance default. See [Admin settings](./admin-settings.md#run-summaries) for
-the instance-wide setting.
+For **Claude** intent and plan summaries, the instance default is **haiku**.
+From **Settings → Run defaults → Run summaries**, the **Summary model** picker
+lets you override that for your own Claude runs; leave it on **Inherit** to
+use the instance default. See
+[Admin settings](./admin-settings.md#run-summaries) for the instance-wide setting.
+
+**Codex** intent and plan summaries use **gpt-6-luna** with **low** effort.
+They do not follow the Summary model setting and have no fallback model.
+The Now summary keeps its separate scheduler, switches and model selection.
 
 ## From the CLI
 

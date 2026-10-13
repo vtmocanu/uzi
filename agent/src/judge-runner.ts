@@ -218,10 +218,9 @@ export class JudgeRunner {
     // The one exception is a usage-limit death (LimitReachedError), which fails the run
     // with its structured limit facts (PRD #35 Decision 14, issue #1970).
     let review: ReviewRequest;
-    // The terminal result frame's usage, mapped to a run message the API's foldRunUsage
-    // writes into a run_usage row (PRD #69 M6). Set ONLY on a successful model call —
-    // the no-token, trace-fetch-throw, and model-error/limit paths all post NO usage
-    // frame (there is no real spend to record on the deterministic fallback).
+    // Usage mapped to the existing result-frame fold (PRD #69 M6). Claude supplies a
+    // successful terminal result; Codex preserves observed evidence even when the pass
+    // fails. A fallback without usage evidence posts no accounting frame.
     let usageMessage: EmittedMessage | undefined;
     try {
       // Report `running` so the judge run's started_at is stamped (PRD #69 M6). A judge
@@ -260,7 +259,9 @@ export class JudgeRunner {
       // any other trace/prep failure — the judge lane's "never spuriously fail" posture.
       const selection = selectCodexBinding({ codex: claim.secrets.codex });
       if (selection.kind === "codex") {
-        review = await this.judgeCodex(claim, trace, selection.binding);
+        const judged = await this.judgeCodex(claim, trace, selection.binding);
+        review = judged.review;
+        usageMessage = judged.usageMessage;
       } else {
         const token = claim.secrets?.anthropic_oauth_token?.trim();
         if (!token) {
@@ -307,17 +308,26 @@ export class JudgeRunner {
 
     try {
       // Post the judge's own usage frame BEFORE the review + completion so the run_usage
-      // row exists (PRD #69 M6). A single-turn judge has no batcher/gapless-seq machinery
-      // in this lane, so seq:1 is safe.
+      // row exists (PRD #69 M6). Continue after any claim-time notes, such as a model
+      // fallback, so the accounting frame is not deduplicated against an existing seq.
       if (usageMessage) {
         // PRD #1247 M2 fix round: pass the claim's generation so the usage batch rides the m3
         // send-gate (postMessages applies includeClaimGeneration internally, gating on
         // generation > 0 && capability/feature) rather than being refused for a capability worker.
-        await this.client.postMessages(
-          judgeRunId,
-          [{ seq: 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
-          claim.claim_generation,
-        );
+        try {
+          await this.client.postMessages(
+            judgeRunId,
+            [{ seq: claim.last_seq + 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
+            claim.claim_generation,
+          );
+        } catch (err) {
+          if (isStaleClaimRefusal(err)) {
+            this.log.warn("judge claim superseded (stale) at usage post; abandoning", { run_id: judgeRunId });
+            return;
+          }
+          // Accounting is best effort; a transport failure must not discard the verdict.
+          this.log.warn("judge usage post failed", { run_id: judgeRunId, error: errMessage(err) });
+        }
       }
       // PRD #1247 fix round (Greptile P1, pre-post probe): the initial running ack closes only the
       // pre-model window. A judge model call can run minutes while a stale-worker requeue (~45s)
@@ -435,8 +445,8 @@ export class JudgeRunner {
       });
       const fb = fallbackReview(claim.judge_signal);
       fb.model = model;
-      // No usageMessage on the fallback: the model call did not complete, so there is
-      // no terminal result frame — and no spend — to fold.
+      // The Claude fallback does not retain usage evidence when runModel throws;
+      // do not manufacture a zero-cost result frame.
       return { review: fb };
     }
   }
@@ -448,11 +458,15 @@ export class JudgeRunner {
    *  failure). A missing factory (a wiring gap) fails closed the same way: the deterministic
    *  fallback still lands, never a silent Claude substitution.
    *
-   *  No usageMessage: Codex M3 carries no rate-limit/usage-frame mapping equivalent to
-   *  mapSdkMessage's Claude SDK result yet, so this posts no run_usage row for the judge's
-   *  own spend (a Codex judge's cost accounting is a separate, later concern from routing). */
-  private async judgeCodex(claim: ClaimResponse, trace: JudgeTraceResponse, binding: CodexBinding): Promise<ReviewRequest> {
+   *  The advice pass flushes its latest usage evidence once, including on failure. Return
+   *  that result frame for the existing judge usage fold; absent evidence posts nothing. */
+  private async judgeCodex(
+    claim: ClaimResponse,
+    trace: JudgeTraceResponse,
+    binding: CodexBinding,
+  ): Promise<{ review: ReviewRequest; usageMessage?: EmittedMessage }> {
     const model = (claim.judge_model ?? "").trim();
+    let usageMessage: EmittedMessage | undefined;
     try {
       if (!this.codexAdviceHarnessFactory) {
         throw new Error("judge claim carries a Codex binding but no Codex advice-harness factory is wired");
@@ -478,8 +492,11 @@ export class JudgeRunner {
         denyReason: "the judge is read-only and runs no tools",
         log: this.log,
         codex: { runId: claim.run_id, binding, buildHarness: this.codexAdviceHarnessFactory },
+        onUsage: (modelUsage) => {
+          usageMessage = { kind: "status", agent: JUDGE_AGENT, payload: { event: "result", modelUsage } };
+        },
       });
-      return calibrateReview(parseReview(text, model), claim.failure_class ?? null);
+      return { review: calibrateReview(parseReview(text, model), claim.failure_class ?? null), usageMessage };
     } catch (err) {
       this.log.warn("judge model call failed; using deterministic fallback", {
         run_id: claim.run_id,
@@ -487,7 +504,7 @@ export class JudgeRunner {
       });
       const fb = fallbackReview(claim.judge_signal);
       fb.model = model;
-      return fb;
+      return { review: fb, usageMessage };
     }
   }
 

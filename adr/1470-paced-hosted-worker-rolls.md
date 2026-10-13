@@ -116,8 +116,13 @@ same-image template roll introducing pod UID transport.
 
 ### D5 — Target version is independently verified release identity
 
-Configure `workers.rollTargetVersion` from the pinned image's verified baked
-stamp, including `+g<commit>`. ADR-1720's published bare SemVer tag cannot identify
+Published charts carry `workers.rollTargetVersion` from the pinned image's
+release-pipeline-verified baked stamp, including `+g<commit>` (#2906). Packaging
+resolves each template tag once, verifies its exact release-workflow signature
+and reads its config at that same digest; all templates must agree. The tracked
+default stays empty because when the pin is the release being cut, its stamp
+names the commit that contains the chart. A per-cluster override still wins; custom worker pins need their own verified
+matching override. ADR-1720's published bare SemVer tag cannot identify
 that complete stamp. Do not infer the target from the replacement, substitute
 the independently advancing API version, or strip build metadata. A missing
 mapping holds before cordoning. The controller's fully specified SemVer-tag

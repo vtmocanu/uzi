@@ -34,9 +34,9 @@ whole turn, in the worst case. This closes that gap **inside** the turn:
    most once per tick, when the branch tip has moved and the clone is not busy, and, once the
    branch tip differs from the last *confirmed* published tip and `CHECKPOINT_INTERVAL`
    (default `20m`, unchanged from PRD #267) has elapsed since the last publish *attempt* —
-   not the last success, so a persistent broker failure is retried at most once per
-   interval — publishes it to origin through the existing ADR-122 broker — credential-free,
-   worker-side, unchanged wire contract.
+   not the last success, so a persistent broker failure starts a new logical publish at
+   most once per interval — publishes it to origin through the existing ADR-122 broker —
+   credential-free, worker-side, unchanged wire contract.
 2. **A per-flight sink gate** serializes the tick against every other path that moves the
    run's durable state — the checkpoint closure, the pause/wall/completion-hold parks, and
    the credential switch — so a tick can never interleave with one of those and fetch or
@@ -70,6 +70,36 @@ secret scan runs via `agent/src/git.ts`'s `secretScanRange`, with `agent/src/sec
 holding its pure, I/O-free helpers; `CHECKPOINT_TICK_INTERVAL` parsing is in
 `agent/src/config.ts`.
 
+## Bounded HTTP retries (issue #296)
+
+[Issue #296](https://github.com/vtmocanu/uzi/issues/296) adds retries for explicit numeric
+HTTP 500–599 within one logical checkpoint publish: at most three HTTP requests total,
+with 250ms then 1000ms backoffs. Any supplied caller deadline or abort signal is shared
+across attempts; each HTTP request retains its own client timeout. Some callers supply
+no outer signal, so the first request's timeout does not bound the total operation. The
+`CHECKPOINT_INTERVAL` gate (default `20m`) still measures logical operations. HTTP 4xx,
+nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried.
+
+The replay factory captures the original source, candidate and literal floor. It
+opens a fresh stream without resolving branch tips, rebuilding overlays, acquiring
+credentials or widening ranges. Before every producer it repeats scratch/floor and
+candidate remediation guards; the runner rechecks ownership against the original
+source before replay. Abandoned producers are explicitly cancelled, unread streams
+destroyed, and exit/reap awaited before reopening. Ordinary and retained paths settle
+the final producer too. A published ACK requires producer exit zero; an intentionally
+cancelled non-2xx producer may exit nonzero and cannot confirm publication.
+
+Ambiguous attempts retain the attempted tip for later logical-operation overlay
+chaining. Only ACK plus producer success advances the confirmed tip and clears the
+attempted tip. Intermediate HTTP 5xx failures appear in operator retry logs with the
+numeric status, attempt and backoff; a continuing 5xx failure reaches the deduped feed
+only after the third request. A confirmed publish after a retry emits one positive
+“checkpoint publishing recovered — published to origin” feed line even when no earlier
+failure was recorded in the feed's dedupe ledger.
+
+These retries do not guarantee durability for divergent heads or resolve the cause of
+production HTTP 500 responses.
+
 ## Context
 
 ### The gap: a single long turn reaches no checkpoint
@@ -91,7 +121,7 @@ assumed.
 `CHECKPOINT_INTERVAL`). Each tick fetches back at most once, and only when the branch tip
 has moved and the clone is not busy; it publishes to origin once `CHECKPOINT_INTERVAL`
 (still `20m`) has elapsed since the last publish **attempt** — not the last success, so a
-persistent broker failure is retried at most once per interval rather than hammered. A
+persistent broker failure starts a new logical publish at most once per interval. A
 milestone publish deferred out of a Codex permit (`pendingPublish`) is owed and bypasses
 this gate once; after that attempt (published, blocked, or failed) the normal
 `CHECKPOINT_INTERVAL` gate governs retries again. Worst-case data loss from a worker-disk
@@ -105,9 +135,9 @@ publish. A git-busy marker defers the tick for as long as it is present, whateve
 finding or an untrusted scan keeps that tick's work on worker-local storage. Under #1964,
 remembered findings also hold unscanned checkpoint uploads in the current flight; that
 memory is lost on reclaim or a new flight, so this is not durable containment (see the
-explicit residual boundaries below). The tick retries a failed publish at most once per
-`CHECKPOINT_INTERVAL`. In each of those cases the work is at risk from a worker-disk loss,
-and is never reported as durable.
+explicit residual boundaries below). The tick starts a failed publish's next logical
+operation at most once per `CHECKPOINT_INTERVAL`. In each of those cases the work is at
+risk from a worker-disk loss, and is never reported as durable.
 
 **There is no durability claim while every sink is down.** The tick's fetch-back into the
 worker's own bare is local disk, not a different failure domain from the worker itself; the

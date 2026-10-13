@@ -1,6 +1,13 @@
 import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { Worker } from "../src/worker.js";
+import fs from "node:fs";
+import path from "node:path";
+import { Outbox } from "../src/outbox.js";
+import type { Executor, RunContext } from "../src/executor.js";
+import { api, client, fx, gitlabClaim, fakeGitlab, runnerWith, installHarness, deferred, worktreeDirFor } from "./runner-harness.js";
+import { commitInTree } from "./runner-codex-sinks-fixture.js";
+import { nullLogger } from "./helpers.js";
 import type { Config } from "../src/config.js";
 import type { WorkerClient } from "../src/client.js";
 import { RequestError } from "../src/client.js";
@@ -99,6 +106,124 @@ function endlessRunClient(): { client: WorkerClient; claimCalls: () => number } 
   } as unknown as WorkerClient;
   return { client, claimCalls: () => claimCalls };
 }
+
+describe("M2 serial Worker real completion custody", () => {
+  installHarness();
+
+  it("M2 serial frees capacity one after unresolved hold and omits it from real heartbeat leases", async (t) => {
+    const first = gitlabClaim(28161, {
+      claim_generation: 7, config: { completion_contract_version: 1, contract_revision: 1 },
+    });
+    const second = gitlabClaim(28162, { claim_generation: 8 });
+    api.setRegisterProtocolFeatures(["active_run_snapshot", "heartbeat_outbox", "claim_generation_fence"]);
+    api.registerNonce = "33333333-0000-4000-8000-000000000003";
+    api.setCompletionPermitResponse(false);
+    api.completionHoldWire.set(first.run_id, (res) => { res.writeHead(200); res.end(""); });
+    api.ownershipWire.set(first.run_id, (res) => {
+      res.writeHead(200, { "Content-Type": "application/json" });
+      res.end(JSON.stringify({
+        status: "running", claim_generation: 7, hold_reason: null, claim_released: false,
+      }));
+    });
+    const outbox = new Outbox({
+      root: path.join(fx.dataDir, "outbox"), log: nullLogger(),
+      runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024,
+      retentionMs: 7 * 86_400_000,
+    });
+    await outbox.init();
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(),
+      () => client.workerOutboxMaxPending);
+    const remove = t.mock.method(registry, "remove");
+    const secondStarted = deferred();
+    const releaseSecond = deferred();
+    let firstSignal: AbortSignal | undefined;
+    let firstHeld: boolean | undefined;
+    let finalizeBytes!: Buffer;
+    const finalizePath = path.join(fx.dataDir, "outbox", first.run_id, "finalize-7.json");
+    let secondExecuting = false;
+    const factory = (runId: string) => ({
+      executor: {
+        run: async (ctx: RunContext) => {
+          if (runId === first.run_id) {
+            firstSignal = ctx.signal;
+            commitInTree(ctx.worktreePath, "M2-worker.txt", "retained work\n");
+            assert.equal((await outbox.journalFinalize(first.run_id, 7)).written, true);
+            finalizeBytes = fs.readFileSync(finalizePath);
+            firstHeld = await ctx.enterCompletionHold!("M2 worker unresolved completion");
+            return { branch: ctx.branch, completionHeld: { reason: "M2 worker unresolved completion" } };
+          }
+          secondExecuting = true;
+          secondStarted.resolve();
+          await releaseSecond.promise;
+          return { branch: ctx.branch, pausedAt: { completedCount: 0, total: 1 } };
+        },
+      } as Executor,
+    });
+    const { gitlab } = fakeGitlab();
+    const run = runnerWith(factory, gitlab, undefined, undefined, {
+      outbox, activeRuns: registry, completionHoldReconcileTimeoutMs: 5_000,
+    });
+    const controller = new AbortController();
+    const worker = new Worker(fakeConfig({ dataDir: fx.dataDir, heartbeatIntervalMs: 10, chatSessions: 0 }),
+      client, run, { execute: async () => {} } as unknown as ChatRunner,
+      noJudge, noReview, nullLogger(), okPreflight, outbox, undefined, registry,
+      undefined, undefined, undefined, undefined,
+      (dataDir) => new StatsCollector({ dataDir, processRss: () => 64 * 1024 * 1024 }));
+    api.enqueueClaim(first);
+    api.enqueueClaim(second);
+    const done = worker.run(controller.signal);
+    // A test timeout does not unwind the body's finally; this cleanup still stops the worker.
+    t.after(async () => {
+      controller.abort();
+      releaseSecond.resolve();
+      await done.catch(() => {});
+    });
+    try {
+      // Event-driven readiness: a worker that exits first fails at once; --test-timeout bounds a hang.
+      await Promise.race([secondStarted.promise, done.then(() => { throw new Error("worker exited before the second claim"); })]);
+      assert.ok(secondExecuting, "the second real executor begins with capacity one");
+      assert.equal(firstHeld, true, "the first executor retained unresolved completion custody");
+      assert.equal(run.isExecuting(first.run_id), false, "the first execute has settled");
+      assert.deepEqual(fs.readFileSync(finalizePath), finalizeBytes, "existing finalize evidence survives execute settlement");
+      assert.equal(registry.has(first.run_id), false);
+      assert.ok(remove.mock.calls.some((call) => call.arguments[0] === first.run_id), JSON.stringify({ first: first.run_id, removed: remove.mock.calls.map((call) => call.arguments), states: api.states }));
+      assert.equal(registry.has(second.run_id), true);
+      assert.equal(api.completionHoldRequests.length, 1);
+      assert.equal(api.completionHoldRequests[0]!.body.claim_generation, 7);
+      assert.match(String(api.completionHoldRequests[0]!.body.head), /^[a-f0-9]{40}$/);
+      assert.ok(api.ownershipRequests.includes(first.run_id), "the real reconciliation read reached the network");
+      assert.ok(fs.existsSync(worktreeDirFor(28161)));
+      assert.deepEqual(outbox.listPendingTerminals(), []);
+      assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: first.run_id, claim_generation: 7 }],
+        "local finalize evidence is distinct from a terminal journal");
+      await outbox.drainRun(first.run_id, async (messages, generation) => {
+        await client.postMessages(first.run_id, messages, generation);
+      });
+      assert.equal(outbox.depthFor(first.run_id)?.pendingMessages ?? 0, 0);
+      assert.equal(outbox.depthFor(first.run_id)?.pendingTerminal ?? 0, 0);
+      const afterDrain = api.heartbeatBodies.length;
+      for (let i = 0; i < 500 && api.heartbeatBodies.length === afterDrain; i++) await tick(10);
+      const heartbeat = api.heartbeatBodies[afterDrain];
+      assert.ok(heartbeat, "a subsequent production heartbeat reached FakeApi");
+      const snapshot = heartbeat.active_snapshot as {
+        register_nonce: string; active: Array<{ run_id: string; terminal_pending: boolean }>;
+        pending_overflow: boolean;
+      };
+      assert.equal(snapshot.register_nonce, api.registerNonce);
+      assert.ok(snapshot.active.some((entry) => entry.run_id === second.run_id));
+      assert.ok(snapshot.active.every((entry) => entry.run_id !== first.run_id && !entry.terminal_pending));
+      assert.equal(snapshot.pending_overflow, false);
+      assert.ok(!((heartbeat.outbox ?? []) as Array<{ run_id: string }>).some((entry) => entry.run_id === first.run_id));
+      run.shutdown();
+      assert.equal(firstSignal?.aborted, false, "shutdown cannot abort the removed first flight");
+      assert.ok(!api.states.some((s) => s.runId === first.run_id && ["failed", "completed", "cancelled"].includes(s.body.status)));
+    } finally {
+      controller.abort();
+      releaseSecond.resolve();
+      await done;
+    }
+  });
+});
 
 describe("Worker — concurrent run + chat lanes (Decision 4)", () => {
   it("executes a run and a chat session concurrently, sharing logger + client", async () => {

@@ -27,6 +27,8 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "self_improve_mr_cap_reached",
   "open_mr_exists",
   "codex_override_conflict",
+  "harness_label_conflict",
+  "harness_label_invalid",
   "schedules_paused",
   "no_usable_credential",
   "credential_disabled",
@@ -55,6 +57,19 @@ describe("the schedule skip-reason vocabulary is one vocabulary", () => {
     // loudly rather than false-green against an empty TS set.
     expect(fromGo.length).toBeGreaterThan(0);
     expect(fromGo).toEqual([...ALL_SCHEDULE_SKIP_REASONS].sort());
+  });
+});
+
+describe("issue harness skip labels", () => {
+  it.each([
+    ["harness_label_conflict", "issue harness label conflicts with schedule pin"],
+    ["harness_label_invalid", "invalid issue harness labels"],
+  ])("renders %s as human copy", (reason, label) => {
+    expect(scheduleSkipReasonLabel(reason as ScheduleSkipReason)).toBe(label);
+  });
+
+  it("uses credential copy that also covers a label-selected harness", () => {
+    expect(scheduleSkipReasonLabel("no_usable_credential")).toBe("no usable credential");
   });
 });
 

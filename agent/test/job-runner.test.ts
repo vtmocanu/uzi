@@ -1504,7 +1504,7 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(o.skills, []);
       assert.deepStrictEqual(o.settingSources, []);
       assert.strictEqual(o.strictMcpConfig, true);
-      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false }, disableSkillShellExecution: true });
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false }, disableSkillShellExecution: true });
       for (const banned of ["Bash", "WebFetch", "WebSearch", "Agent", "Task", "Skill", "MultiEdit", "NotebookEdit"]) {
         assert.ok((o.disallowedTools ?? []).includes(banned), `${banned} is disallowed`);
         assert.ok(!(o.tools as string[]).includes(banned));
@@ -1518,7 +1518,7 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(o.skills, ["uzi:brand-voice"]);
       assert.deepStrictEqual(o.plugins, [{ type: "local", path: "/data/jobs/run/.uzi-skills-work", skipMcpDiscovery: true }]);
       assert.ok(!(o.disallowedTools ?? []).includes("Skill"));
-      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false }, disableSkillShellExecution: true });
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false }, disableSkillShellExecution: true });
     });
 
     it("keeps the Glob/Grep escape guard and the sources/ write guard on", async () => {

@@ -133,13 +133,15 @@ func scheduleTokenCell(s apitypes.ScheduleDTO) string {
 // reason falls back to the raw wire string in skipReasonLabel, so a new server-side reason
 // degrades gracefully rather than rendering blank.
 var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-reason labels (credential_disabled is a VOCABULARY value), no credential.
-	"config_not_supported":  "configuration not supported",
-	"not_eligible":          "not eligible",
-	"already_running":       "already running",
-	"description_too_large": "description too large",
-	"fetch_failed":          "fetch failed",
-	"schedules_paused":      "all schedules paused",
-	"credential_disabled":   "pinned credential is disabled",
+	"config_not_supported":   "configuration not supported",
+	"not_eligible":           "not eligible",
+	"already_running":        "already running",
+	"description_too_large":  "description too large",
+	"fetch_failed":           "fetch failed",
+	"schedules_paused":       "all schedules paused",
+	"credential_disabled":    "pinned credential is disabled",
+	"harness_label_conflict": "issue harness label conflicts with schedule pin",
+	"harness_label_invalid":  "invalid issue harness labels",
 }
 
 // skipReasonLabel renders a skip reason as its human label, falling back to the raw wire
@@ -155,7 +157,9 @@ func skipReasonLabel(reason string) string {
 // per-candidate breakdown. A reason with no actionable hint is absent (empty), and the
 // caller omits the trailing `# …` for it.
 var skipReasonHints = map[string]string{
-	"not_eligible": "add the configured uzi label or assign the issue to uzi",
+	"not_eligible":           "add the configured uzi label or assign the issue to uzi",
+	"harness_label_conflict": "match the issue harness label to the schedule pin, or change the pin",
+	"harness_label_invalid":  "keep exactly one of harness::codex or harness::claude and remove other harness::* labels",
 	// PRD #1732 D2/D12: the schedule's pin is kept, never substituted; enabling is web-only.
 	"credential_disabled": "enable the credential in Settings, or change the schedule's token",
 }

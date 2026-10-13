@@ -1072,6 +1072,43 @@ describe("buildImplementPrompt", () => {
   });
 });
 
+describe("approved m1 display reconciliation", () => {
+  const milestones = [{ id: "m1", title: "Schema" }, { id: "m2", title: "UI" }, { id: "m3", title: "Docs" }];
+  it("combines ACK and local completion, done wins, and unknown IDs never render", () => {
+    const progress = { completed: ["m2", "unknown-local"], in_progress: ["m1", "m2", "m3"] };
+    const snapshot = structuredClone(progress);
+    const note = milestoneStatusNote(milestones, progress, false, ["m1", "unknown-server"]);
+    assert.match(note, /\[m1\] Schema — done/);
+    assert.match(note, /\[m2\] UI — done/);
+    assert.match(note, /\[m3\] Docs — in progress/);
+    assert.doesNotMatch(note, /unknown-local|unknown-server|declarations may be unknown/);
+    assert.deepEqual(progress, snapshot, "display does not overwrite per-turn progress");
+  });
+  it("absent ACK uses local evidence and warns that prior declarations may be unknown", () => {
+    const note = milestoneStatusNote(milestones, { completed: ["m2"], in_progress: ["m3"] });
+    assert.match(note, /\[m1\] Schema — not started/);
+    assert.match(note, /\[m2\] UI — done/);
+    assert.match(note, /\[m3\] Docs — in progress/);
+    assert.match(note, /Prior completion declarations may be unknown/);
+    assert.doesNotMatch(milestoneStatusNote(milestones, undefined, false, []), /declarations may be unknown/);
+  });
+  it("reports verified committed work before done without demanding redundant checks", () => {
+    const note = milestoneStatusNote(milestones, undefined);
+    assert.match(note, /required work and checks are complete\nand committed/);
+    assert.match(note, /On resume, reconcile previous committed\/reviewed work/);
+    assert.match(note, /Immediately before calling `signal_done`, report finished-but-unreported milestone IDs/);
+    assert.match(note, /actually complete `milestones_completed`/);
+    assert.match(note, /in `signal_done` in the same turn/);
+    assert.match(note, /already verified gate need not be rerun/);
+    assert.match(note, /lost verification evidence or code changes require checks/);
+    assert.match(note, /maintainer-owned, deferred, or genuinely unfinished work undeclared/);
+  });
+  it("absent or empty breakdown adds no guidance even with ACK and local status", () => {
+    for (const list of [undefined, []]) assert.equal(
+      milestoneStatusNote(list, { completed: ["m1"], in_progress: [] }, true, ["m1", "unknown"]), "");
+  });
+});
+
 describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
   const milestones = [
     { id: "m1", title: "wire the schema" },
@@ -1180,9 +1217,9 @@ describe("buildImplementPrompt — milestone note (PRD #122 M6)", () => {
   });
 
   it("is additive-absent: no milestones ⇒ byte-identical to the pre-M6 prompt", () => {
-    // Success-criterion posture (Decision 4/10): a run with no approved breakdown — and
-    // every non-issue run, and the pre-approved resume where frozenMilestones is undefined
-    // — gets the exact prompt it got before M6. Both the absent field and an empty list.
+    // Success-criterion posture (Decision 4/10): a run with no approved breakdown gets
+    // the exact prompt it got before M6, including a resume with no frozen claim list.
+    // Both the absent field and an empty list add nothing.
     const base = { branch: "agent/issue-7", subagentNames: ["coder"], first: true, iteration: 1 };
     const before = buildImplementPrompt({ ...base });
     const emptyList = buildImplementPrompt({ ...base, milestones: [] });

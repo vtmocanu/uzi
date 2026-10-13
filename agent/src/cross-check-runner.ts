@@ -16,6 +16,7 @@ import { selectCodexBinding } from "./codex/select.js";
 import { CrossCheckCheckerUnavailableError } from "./codex/model-rejection.js";
 import { ChatSteering } from "./steering.js";
 import { makeTerminalOutboxDeps, postTerminalState, isStaleClaimRefusal } from "./terminal-resolve.js";
+import { CrossCheckConfinementError } from "./cross-check-confinement.js";
 import { errMessage } from "./util.js";
 import { rmHomeTree } from "./rmtree.js";
 import { uidSplitActive } from "./runner-uid.js";
@@ -175,6 +176,9 @@ export class CrossCheckRunner {
         || !/^[a-f0-9]{40}$/.test(candidate.base_commit)
         || (code && (candidate.round !== 1 || !/^[a-f0-9]{40}$/.test(code.head_commit))))
         throw new Error("invalid checker claim");
+      // issue #2886: resolve (and identity-check) the code child's existing bare before the model
+      // timer starts, so this await cannot race the timeout ahead of the snapshot reader.
+      const codeBare = code ? await this.git.existingBarePathFor(claim.repo.clone_url) : undefined;
       const deadline = Date.parse(candidate.deadline_at);
       const timeout = Math.min(this.opts.modelTimeoutMs ?? 15 * 60_000, deadline - Date.now());
       if (!Number.isFinite(timeout) || timeout <= 0) {
@@ -186,7 +190,7 @@ export class CrossCheckRunner {
       steering = new ChatSteering(this.client, runId, this.opts.pollMs ?? 1000, this.log, cancel,
         { onFollowUp: () => this.log.warn("cross-check ignores follow-up input", { run_id: runId }) }, generation);
       steering.start();
-      const bare = code ? this.git.barePathFor(claim.repo.clone_url)
+      const bare = code ? codeBare!
         : await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
       cancel.signal.throwIfAborted();
       if (code) {
@@ -214,7 +218,7 @@ export class CrossCheckRunner {
       cancel.signal.throwIfAborted();
       reason = "malformed";
       if (code) {
-        if (!nativeCleanupConfirmed) throw new Error("cross-check cleanup unconfirmed");
+        if (!nativeCleanupConfirmed) throw new CrossCheckConfinementError("cleanup_callback_missing");
         const findings = validateCodeFindings(text);
         const probe = await this.client.reportState(runId, { status: "running", claim_generation: claim.claim_generation }, cancel.signal);
         cancel.signal.throwIfAborted();
@@ -252,6 +256,13 @@ export class CrossCheckRunner {
       else if (!cancel.signal.aborted && err instanceof CrossCheckCheckerUnavailableError) reason = "checker_unavailable";
       else if (err instanceof CrossCheckMalformedError || (err instanceof Error && /invalid code cross-check|JSON/.test(err.message))) reason = "malformed";
       else if (/confinement|cleanup unconfirmed/.test(errMessage(err))) reason = "confinement_failed";
+      if (err instanceof CrossCheckConfinementError || reason === "confinement_failed") {
+        // The Claude token has already left the secret registry. Do not log errMessage(err).
+        this.log.warn("cross-check confinement refused", { run_id: runId, stage: code ? "code" : "plan",
+          subreason: err instanceof CrossCheckConfinementError ? err.subreason : "unknown",
+          ...(err instanceof CrossCheckConfinementError && err.priorFailure ? { prior_failure: err.priorFailure } : {}),
+        });
+      }
       try {
         if (!verdictDelivered) {
           if (code) await this.client.reportCodeCrossCheckVerdict(runId, generation, { outcome: "failed", reason_class: reason, findings: [] });

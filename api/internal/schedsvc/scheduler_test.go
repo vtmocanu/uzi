@@ -280,9 +280,8 @@ type autopilotCall struct {
 	// a test can prove the auto-approve scheduled path threads scheduleCredentialOverride(sched)
 	// onto the created run. nil for the poller-shaped CreateAutopilotRun (no per-run override).
 	credOverride *workersvc.CredentialOverride
-	// explicit is the schedule's pinned run_schedules.harness (PRD #1429 M2, D5), captured so a
-	// test can prove the auto-approve scheduled path threads scheduleHarness(sched). nil for the
-	// poller-shaped CreateAutopilotRun (no per-schedule harness pin) and for a NULL-harness schedule.
+	// explicit captures the effective schedule pin or fresh issue-label selection.
+	// It is nil when neither the schedule nor the issue selects a harness.
 	explicit *workersvc.Harness
 }
 
@@ -365,6 +364,10 @@ type fakeRuns struct {
 	credDisabledCalls int
 }
 
+func (f *fakeRuns) CheckStoredCredentialOverrideEnabled(context.Context, uuid.UUID, *workersvc.CredentialOverride) error {
+	return f.credDisabledErr
+}
+
 // ScheduleCredentialDisabled fakes the pre-fire stored-pin check (PRD #1732 D2).
 func (f *fakeRuns) ScheduleCredentialDisabled(_ context.Context, _ uuid.UUID, _ *workersvc.CredentialOverride, _ *workersvc.Harness) error {
 	f.credDisabledCalls++
@@ -418,19 +421,19 @@ func (f *fakeRuns) CreateScheduledRun(_ context.Context, userID, repoID uuid.UUI
 	// false force: the scheduled seam never forces a run creation (issue #856).
 	// credOverride captured (PRD #1247 M6): proves the non-auto path threads the schedule's
 	// stored override onto the run. explicit captured (PRD #1429 M2, D5): proves it threads
-	// scheduleHarness(sched).
+	// the effective pin or fresh issue-label selection.
 	f.runs = append(f.runs, runCall{userID, repoID, issueIID, waitOnLimit, mrReworkEnabled, true, model, overrideSubagentModel, false, credOverride, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
-func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string) (store.Run, error) {
+func (f *fakeRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, issueIID int64, description string, explicit *workersvc.Harness) (store.Run, error) {
 	if f.err != nil {
 		return store.Run{}, f.err
 	}
 	// nil waitOnLimit: the poller seam has no per-run choice (owner default). nil model:
 	// the poller seam has no per-run model (PRD #300). Kept so the interface stays
 	// satisfied even though the scheduler no longer calls it. nil credOverride (PRD #1247).
-	// nil explicit (PRD #1429 M2): the poller seam has no per-schedule harness pin either.
-	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, nil})
+	// explicit is the poller's ephemeral issue-label selection.
+	f.autopilot = append(f.autopilot, autopilotCall{userID, repoID, issueIID, description, nil, nil, nil, false, nil, explicit})
 	return store.Run{ID: uuid.New()}, nil
 }
 func (f *fakeRuns) CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error) {
@@ -490,7 +493,8 @@ type fakeForge struct {
 	// getIID logs every candidate iid GetIssue was called for, in order (issue #416): the
 	// examined-count / forge-call-bound assertions read it. A candidate skipped by the
 	// active-run pre-check never reaches GetIssue, so it is absent here.
-	getIID []int64
+	getIID      []int64
+	labelsByIID map[int64][]string
 
 	// self_improve tracking-issue resolution (PRD #590 M1): ListIssues returns listResult;
 	// CreateIssue is only called when no OPEN listResult issue exists, and it records the
@@ -519,6 +523,9 @@ func (f *fakeForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue
 	f.getIID = append(f.getIID, iid)
 	issue := f.issue
 	issue.IID = iid
+	if labels, ok := f.labelsByIID[iid]; ok {
+		issue.Labels = labels
+	}
 	if issue.AuthorForgeUserID == 0 {
 		issue.AuthorForgeUserID = 2
 	}
@@ -1490,9 +1497,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	// PRD #686 D10 added self_improve_mr_cap_reached; PRD #764 retired not_eligible;
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
-	// credential_disabled).
-	if len(AllSkipReasons) != 12 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 12", len(AllSkipReasons))
+	// credential_disabled; issue #2853 added harness_label_conflict and harness_label_invalid).
+	if len(AllSkipReasons) != 14 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 14", len(AllSkipReasons))
 	}
 }
 

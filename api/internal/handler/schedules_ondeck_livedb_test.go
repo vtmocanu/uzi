@@ -26,8 +26,8 @@ type ondeckForge struct {
 	writes int
 }
 
-func (f *ondeckForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
-	return forge.Issue{Title: "next", Labels: f.labels}, nil
+func (f *ondeckForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
+	return forge.Issue{IID: iid, Title: "next", Labels: f.labels}, nil
 }
 func (f *ondeckForge) UpdateIssueLabels(_ context.Context, _, _ int64, add, remove []string) error {
 	f.writes++

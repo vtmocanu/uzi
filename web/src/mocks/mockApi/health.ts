@@ -2,6 +2,21 @@ import type { HealthDoc } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { confirmedDrainDoc, degradedDoc, healthySilentDoc, incidentDoc, ownerOnlyDoc } from "../data";
 import { delay, mockScenario, requireAdmin } from "./shared";
+import { agentSourceHealthCheck } from "./agentSource";
+
+function withAgentSource(doc: HealthDoc): HealthDoc {
+  const source = agentSourceHealthCheck();
+  const checks = doc.checks.map((c) => c.id === source.id ? source : c);
+  const counts = { ok: 0, warn: 0, danger: 0, unknown: 0, na: 0 };
+  for (const c of checks) counts[c.severity as keyof typeof counts]++;
+  return {
+    ...doc,
+    checks,
+    counts,
+    status: counts.danger > 0 ? "danger" : counts.warn + counts.unknown > 0 ? "warn" : "ok",
+    blocking: checks.some((c) => c.scope === "instance" && c.severity === "danger"),
+  };
+}
 
 // Admin health (PRD #1484). GET /api/admin/health backs the Health tab and (M5) the
 // Overview card + danger banner. Admin-only (RequireAdminRO), so the mock gates on admin
@@ -30,21 +45,22 @@ export const healthApi = {
     requireAdmin();
     switch (mockScenario()) {
       case "health-degraded":
-        return delay(degradedDoc());
+        return delay(withAgentSource(degradedDoc()));
       case "health-owner-only":
-        return delay(ownerOnlyDoc());
+        return delay(withAgentSource(ownerOnlyDoc()));
       case "health-confirmed-drain":
-        return delay(confirmedDrainDoc());
+        return delay(withAgentSource(confirmedDrainDoc()));
       case "health-incident": {
         const d = incidentDoc();
         // Reflect a prior snooze so the banner stays hidden until the snooze expires or a
         // new episode opens — the same round-trip the real endpoint gives the banner.
         if (snoozed?.episode === d.episode_id) d.snoozed_until = snoozed.until;
-        return delay(d);
+        return delay(withAgentSource(d));
       }
+      case "agent-source-update":
       case "health-silent":
       default:
-        return delay(healthySilentDoc());
+        return delay(withAgentSource(healthySilentDoc()));
     }
   },
 

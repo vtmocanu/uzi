@@ -469,13 +469,13 @@ type PendingJudgeDTO struct {
 
 // JudgeRunDTO is the judge run's own timing + token/cost usage for the reviewed run's
 // panel (PRD #69 M6, Decision 10). Judge spend is the owner's own token spend: the judge
-// run posts its terminal result frame like any work run, so foldRunUsage writes a
+// run posts its observed model usage as a result frame, so foldRunUsage writes a
 // run_usage row and it also rolls into the owner's usage totals — the CHOSEN behavior.
 //
 // ClaimedAt/StartedAt/FinishedAt are the judge run's lifecycle stamps; StartedAt is set
 // once the worker reports `running`, so it is null for a pre-feature judge that never
 // did (leaving the panel to show no duration). Usage is nil when the judge posted no
-// result frame (every pre-feature judge) — the panel then renders NO cost/time strip,
+// usage evidence (including older Codex judges that did not report it) — the panel renders NO cost/time strip,
 // never a fabricated 0.
 type JudgeRunDTO struct {
 	JudgeRunID string     `json:"judge_run_id"`

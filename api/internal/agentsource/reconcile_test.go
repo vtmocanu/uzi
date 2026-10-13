@@ -19,6 +19,7 @@ import (
 // --- fakes ---------------------------------------------------------------------
 
 type fakeSettings struct {
+	enabledErr     error
 	enabled        bool
 	url            string
 	ref            string
@@ -30,7 +31,9 @@ type fakeSettings struct {
 	invalidated    int
 }
 
-func (f *fakeSettings) AgentSourceEnabled(context.Context) (bool, error)   { return f.enabled, nil }
+func (f *fakeSettings) AgentSourceEnabled(context.Context) (bool, error) {
+	return f.enabled, f.enabledErr
+}
 func (f *fakeSettings) AgentSourceRepoURL(context.Context) (string, error) { return f.url, nil }
 func (f *fakeSettings) AgentSourceRef(context.Context) (string, error)     { return f.ref, nil }
 func (f *fakeSettings) AgentSourceFolder(context.Context) (string, error)  { return f.folder, nil }
@@ -361,6 +364,7 @@ func TestRunnerTick(t *testing.T) {
 	stOn := newFakeStore()
 	setOn := &fakeSettings{enabled: true, url: "https://ok.test/a.git"}
 	recOn := newRec(stOn, setOn, true)
+	recOn.lsRemote = func(context.Context, CloneOptions) (RemoteRefs, error) { return RemoteRefs{}, nil }
 	recOn.fetch = stubFetch("sha", []SourceFile{roleFile("coder", "b")}, nil)
 	NewRunner(recOn, setOn, nil).tick(context.Background())
 	if len(stOn.upserts) != 1 {
@@ -371,6 +375,7 @@ func TestRunnerTick(t *testing.T) {
 	stPanic := newFakeStore()
 	setPanic := &fakeSettings{enabled: true, url: "https://ok.test/a.git"}
 	recPanic := newRec(stPanic, setPanic, true)
+	recPanic.lsRemote = func(context.Context, CloneOptions) (RemoteRefs, error) { return RemoteRefs{}, nil }
 	recPanic.fetch = func(context.Context, CloneOptions) (string, []SourceFile, error) {
 		panic("boom")
 	}
@@ -544,6 +549,7 @@ func buildFixtureRepo(t *testing.T) string {
 
 func gitRun(t *testing.T, dir, name string, args ...string) {
 	t.Helper()
+	// #nosec G204 -- Callers pass literal git commands and test-owned fixture arguments, never user input.
 	cmd := exec.Command(name, args...)
 	if dir != "" {
 		cmd.Dir = dir
@@ -555,7 +561,7 @@ func gitRun(t *testing.T, dir, name string, args ...string) {
 
 func mustWrite(t *testing.T, path, content string) {
 	t.Helper()
-	if err := os.MkdirAll(filepath.Dir(path), 0o755); err != nil {
+	if err := os.MkdirAll(filepath.Dir(path), 0o700); err != nil {
 		t.Fatalf("mkdir: %v", err)
 	}
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
