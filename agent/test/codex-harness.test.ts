@@ -3009,6 +3009,100 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     });
   }
 
+  it("#2903 M1: real broker queues read pwd checkpoint behind held Bash", async () => {
+    const ac = new AbortController();
+    const request = makeRequest({ signal: ac.signal });
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    let release!: () => void;
+    let markEntered!: () => void;
+    const held = new Promise<void>(resolve => { release = resolve; });
+    const entered = new Promise<void>(resolve => { markEntered = resolve; });
+    const raw = "gate progress fixture\n";
+    const order: string[] = [];
+    let fileops = 0;
+    const broker = new CodexCallbackBroker({
+      registry,
+      spawnCommand: async (argv, opts) => {
+        assert.deepEqual(argv.slice(0, 2), ["/bin/sh", "-c"]);
+        assert.equal(opts.cwd, WORKSPACE);
+        order.push(`spawn:${argv[2]}`);
+        if (argv[2] === "echo held-2903") {
+          markEntered();
+          await held;
+          return { code: 0, stdout: "held effect complete\n", stderr: "" };
+        }
+        assert.equal(argv[2], "pwd");
+        return { code: 0, stdout: WORKSPACE + "\n", stderr: "" };
+      },
+      fileop: { op: async () => {
+        fileops++;
+        order.push("read");
+        return { ok: true, size: Buffer.byteLength(raw), data: Buffer.from(raw).toString("base64") };
+      } },
+      worktreePath: WORKSPACE,
+      grants: renderCodexRun(request).leadGrants,
+      delegate: async () => ({ ok: false, code: "unused", message: "no delegation" }),
+      allowedRoles: new Set<string>(),
+    });
+    const { harness, transport } = makeHarness({ registry, broker });
+    transport.onRespond = id => { order.push(`reply:${id}`); };
+    transport.push(toolCall(29030, "uzi_bash", { command: "echo held-2903" }, "th-1", "tn-1", "held-2903"));
+    const iter = harness.startTurn(request).events[Symbol.asyncIterator]();
+    const events: HarnessEvent[] = [];
+    try {
+      events.push((await iter.next()).value!);
+      events.push(...await pullUntil(iter, "started"));
+      await withTimeout(entered, 1000, "held command entry");
+      transport.push(toolCall(29031, "uzi_read", { path: "progress.txt" }, "th-1", "tn-1", "read-2903"))
+        .push(toolCall(29032, "uzi_bash", { command: "pwd" }, "th-1", "tn-1", "pwd-2903"))
+        .push(toolCall(29033, "checkpoint", {}, "th-1", "tn-1", "checkpoint-2903"))
+        // Consuming this frame proves the reader encountered every queued request.
+        .push(agentMessage("commentary after all #2903 requests"));
+      events.push(...await pullUntil(iter, "commentary"));
+      await tick();
+      assert.deepEqual(order, ["spawn:echo held-2903"]);
+      assert.equal(transport.responses.length, 0);
+      assert.equal(fileops, 0);
+      assert.equal(events.some(e => e.kind === "frame" && e.signals?.checkpoint), false);
+      assert.equal(registry.inFlightCallbackCount(), 1);
+
+      release();
+      transport.push(turnCompleted());
+      events.push(...await withTimeout(collect({ [Symbol.asyncIterator]: () => iter }), 5000, "#2903 FIFO completion"));
+      assert.deepEqual(order, [
+        "spawn:echo held-2903", "reply:29030", "read", "reply:29031",
+        "spawn:pwd", "reply:29032", "reply:29033",
+      ]);
+      assert.deepEqual(transport.responses.map(r => r.requestId), [29030, 29031, 29032, 29033]);
+      const outputs = transport.responses.map(({ response }) => {
+        const result = rec(rec(response).result);
+        assert.equal(result.success, true);
+        const items = result.contentItems as { type: string; text: string }[];
+        assert.equal(items.length, 1);
+        assert.equal(items[0]!.type, "inputText");
+        return rec(JSON.parse(items[0]!.text));
+      });
+      assert.deepEqual(outputs[1], {
+        size: Buffer.byteLength(raw), content: "gate progress fixture\n", offset: 1,
+        linesReturned: 1, partialLastLine: false, truncated: false,
+      });
+      assert.deepEqual(outputs[2], { code: 0, stdout: WORKSPACE + "\n", stderr: "" });
+      assert.deepEqual(outputs[3], { checkpoint: true });
+      const checkpointFrames = events.filter(e => e.kind === "frame" && e.signals?.checkpoint);
+      assert.equal(checkpointFrames.length, 1);
+      assert.equal(events.at(-1)?.kind, "turn_finished");
+      assert.equal(fileops, 1);
+      assert.equal(registry.inFlightCallbackCount(), 0);
+      assert.equal(registry.isPoisoned(), false);
+    } finally {
+      release();
+      ac.abort();
+      await tick();
+      await iter.return?.();
+      await harness.close();
+    }
+  });
+
   it("A blocked, B queued, C commentary: effects stay serial and terminal waits without reading beyond it", async () => {
     const ac = new AbortController();
     let releaseA!: (r: CallbackResult) => void;
