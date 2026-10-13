@@ -585,6 +585,94 @@ for phase in 60-schedules-sweep 72-custody-lifecycle; do
   else echo "FAIL: $phase invoked diagnostic snapshot on success"; fi
 done
 
+# A terminal row alone does not free the worker's snapshot. Drive the real
+# shared boundary with a virtual clock, including the actual phase-42 calls.
+readopt_settlement() {
+  local mode="$1" run X=X ED=ED
+  dump_fixture_settlement() { echo 'settlement diagnostic requested'; }
+  # shellcheck disable=SC2034  # consumed by the evaluated real phase statements
+  local E=E G=G EA=EA GA=GA
+  eval "$(awk '/^wait_runs_terminal_off_worker\(\) \{/,/^\}/' "$LIB")"
+  for run in R E G EA GA X ED; do
+    echo 0 > "$SEQ_DIR/settle-$run"
+    echo pending > "$SEQ_DIR/off-$run"
+  done
+  run_status_quick() {
+    local n status=cancelled
+    n="$(cat "$SEQ_DIR/settle-$1")"; echo $((n + 1)) > "$SEQ_DIR/settle-$1"
+    case "$mode" in
+      delayed|phase) [ "$n" -ge 1 ] || status=running ;;
+      timeout) status=running ;;
+      failed|completed) status="$mode" ;;
+      unknown) return 1 ;;
+    esac
+    echo "$status"
+  }
+  db_psql() {
+    local run n
+    run="$(printf '%s' "$1" | awk -F "'" '{print $2}')"
+    [ "$1" = "SELECT count(*) FROM worker_active_runs WHERE run_id = '$run'" ] \
+      || fail 'unexpected fixture settlement query'
+    n="$(cat "$SEQ_DIR/settle-$run")"
+    if [ "$mode" = snapshot-timeout ] || { [ "$mode" = delayed-removal ] && [ "$n" -lt 3 ]; }; then
+      echo 1
+    else echo off > "$SEQ_DIR/off-$run"; echo 0
+    fi
+  }
+  cancel_run() { :; }
+  if [ "$mode" = phase ]; then
+    # These are real phase statements, not a copy of the fixed sequence.
+    eval "$(awk '/^cancel_run "\$(E|EA|X|ED)"/ || /^wait_runs_terminal_off_worker /' \
+      "$ROOT/e2e/phases/42-api-outage-readoption.sh")"
+    for run in E G EA GA X ED; do
+      [ "$(cat "$SEQ_DIR/settle-$run")" -ge 2 ] && [ "$(cat "$SEQ_DIR/off-$run")" = off ] \
+        || fail "next case would start with run $run still pending cancellation"
+    done
+    echo 'every case cancellation observed before the next boundary'
+  else
+    wait_runs_terminal_off_worker 2 R
+    case "$mode" in
+      delayed) [ "$(cat "$SEQ_DIR/settle-R")" -eq 2 ] || fail 'did not wait for cancellation' ;;
+      delayed-removal) [ "$(cat "$SEQ_DIR/settle-R")" -eq 3 ] || fail 'did not wait for snapshot removal' ;;
+    esac
+  fi
+}
+custody_case "readoption waits for delayed cancellation" pass 'run=R status=cancelled' readopt_settlement delayed
+custody_case "readoption waits after terminal until off worker" pass 'run=R status=cancelled' readopt_settlement delayed-removal
+custody_case "readoption timeout names the non-terminal run" fail 'run=R status=running' readopt_settlement timeout
+custody_case "readoption timeout names a terminal run still on worker" fail 'worker_active_runs=1' readopt_settlement snapshot-timeout
+custody_case "readoption permits failed terminal fixture off worker" pass 'run=R status=failed' readopt_settlement failed
+custody_case "readoption permits completed terminal fixture off worker" pass 'run=R status=completed' readopt_settlement completed
+custody_case "readoption unavailable status cannot read green" fail 'status=unknown' readopt_settlement unknown
+custody_case "phase 42 waits at every case cancellation boundary" pass 'every case cancellation observed' readopt_settlement phase
+
+rollback_settlement() {
+  local ED=ED snapshots=0 terminal_observed=0
+  COMPOSE=(rollback_compose)
+  eval "$(awk '/^wait_runs_terminal_off_worker\(\) \{/,/^\}/' "$LIB")"
+  run_status_quick() { echo cancelled; }
+  db_psql() { [ "$snapshots" = 1 ] && echo 0 || echo 1; }
+  wait_status() { [ "$1:$2" = ED:cancelled ] || fail 'unexpected terminal wait'; terminal_observed=1; }
+  wait_worker_online() { :; }
+  rollback_compose() {
+    case " $* " in
+      *' agent '*)
+        [ "$terminal_observed" = 1 ] || fail 'worker recreated before cancellation was observed'
+        snapshots=1 ;;
+    esac
+  }
+  # The rollback fallback disables snapshots until the worker registers again.
+  # Run the actual restore waits and recreates with that protocol state.
+  eval "$(awk '
+    /^say "restore:/ { inside=1; next }
+    /^pass "api \+ agent recreated/ { inside=0 }
+    inside && (/^"\$\{COMPOSE\[@\]\}" up/ || /^wait_status / || /^wait_runs_terminal_off_worker / || /^wait_worker_online$/) { print }
+  ' "$ROOT/e2e/phases/42-api-outage-readoption.sh")"
+  [ "$terminal_observed:$snapshots" = 1:1 ] || fail 'rollback restoration did not settle in protocol order'
+  echo 'rollback cancelled before restart and off worker after renegotiation'
+}
+custody_case "rollback waits for cancellation before renegotiating snapshots" pass 'rollback cancelled before restart' rollback_settlement
+
 # Accepted cancellation is asynchronous. Execute the real phase's cancellation
 # statements and the real wait_status against delayed terminal responses before
 # permitting the next leg's credential changes or final token teardown.
@@ -808,7 +896,5 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
   else echo "FAIL: $phase still clears custody or lacks headroom wait"; fi
 done
 
+node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 143 cases green; a zero-case or
-# partially-red run must exit nonzero.
-[ "$cases" -ge 143 ] && [ "$cases" -eq "$passed" ]
