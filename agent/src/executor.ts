@@ -198,7 +198,7 @@ export interface RunContext {
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
-   *  model. Only the SDK executor's summary hooks read it; the stub ignores it. */
+   *  model. Claude summary hooks read it; Codex intent/plan summaries use fixed model pins. */
   summaryModel?: string;
   /** PRD #362 M3c (Decision 3): the run's INTENT summary is already set, so the
    *  executor skips intent generation on a resume/re-claim rather than re-spending
@@ -811,10 +811,10 @@ export interface ExecutorResult {
   /** Latest accepted declaration that an issue delivery leaves the issue open. */
   nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
-   *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
-   *  latched from the LAST successful generation of this run. Absent whenever that pass did not
-   *  run or did not succeed, which is normal: a resumed run past its gate and every Codex run
-   *  never produce one. */
+   *  summary pass produced and the api accepted,
+   *  latched only for the current gate generation after API acceptance. A newer gate clears the
+   *  previous latch even if its replacement fails. Absent when the pass did not run or succeed,
+   *  including a resumed run past its gate. */
   summaryPlan?: string;
   /** PRD #1798 M2: the tagged deltas (added / changed / dropped) that accompanied
    *  `summaryPlan`, from the same generation. Present only alongside `summaryPlan`. */

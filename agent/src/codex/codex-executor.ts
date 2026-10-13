@@ -21,7 +21,7 @@
 // `process.env`.
 //
 // SCOPE (R4): this does NOT clone SdkExecutor's Claude-lane extras (empty-turn retry,
-// plan/intent summary hooks, health/interleave sentinels, interactive OWNER park).
+// health/interleave sentinels, interactive OWNER park).
 // Issue #2099 is the one retry that IS in scope: a turn that fails with a transient PROVIDER
 // classification (CodexTurnFailedError: transport or exact rateLimitExceeded token;
 // see isCodexTransientClassification)
@@ -111,6 +111,8 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
+import { SummaryRunner, type PlanSummaryResult } from "../summary-runner.js";
+import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
 import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
@@ -1751,6 +1753,11 @@ export interface CodexExecutorDeps {
 }
 
 export interface CodexExecutorOptions {
+  /** Advisory seams; the default runner uses the shared provisioning HOME and advice factory. */
+  readonly summaryRunner?: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
+  /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
+  readonly summarySettleMs?: number;
+  readonly codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
@@ -1959,6 +1966,9 @@ export class CodexExecutor implements Executor {
    */
   async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    this.summaryLifecycleClosed = true;
+    if (!this.summaryRunActive) this.summaryCapturedBeforeStart = true;
+    await this.settleIntentSummary(deadlineAt);
     if (purpose === "cancel") {
       // Owner cancellation spends one deadline independently of the spent lifecycle signal.
       // Close admission and drain before joining the installer, then observe the drain again:
@@ -2128,6 +2138,35 @@ export class CodexExecutor implements Executor {
     // report. pendingInterruption then drops implementation into driveTurnWithWallPark.
   }
 
+  private summaryLifecycleClosed = false;
+  private summaryRunActive = false;
+  private summaryCapturedBeforeStart = false;
+  private intentFlight?: { ctrl: AbortController; done: Promise<void>; delivered: boolean; abandoned: boolean };
+  private readonly summaryRunner: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
+
+  /** Abort once and join within one bound; abandonment drops all late results and usage. */
+  private async settleIntentSummary(deadlineAt?: number): Promise<void> {
+    const flight = this.intentFlight;
+    if (!flight) return;
+    flight.ctrl.abort();
+    if (flight.abandoned) return;
+    const bound = Math.min(this.opts.summarySettleMs ?? 3_000,
+      deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = await Promise.race([
+        flight.done.then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), bound); }),
+      ]);
+      if (!settled) {
+        flight.abandoned = true;
+        this.log.warn("intent summary did not settle within the bound");
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private readonly log: Logger;
   private readonly homeRoot: string;
   private readonly provisionHomeDir: string;
@@ -2149,6 +2188,9 @@ export class CodexExecutor implements Executor {
     this.provisionHomeDir = opts.provisionHomeDir ?? this.homeRoot;
     this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.opts = opts;
+    this.summaryRunner = opts.summaryRunner ?? new SummaryRunner(log, {
+      homeRoot: this.provisionHomeDir, codexAdviceHarnessFactory: opts.codexAdviceHarnessFactory,
+    });
     this.deps = deps;
     this.sessionStore = deps.sessionStore ?? CodexSessionStore;
   }
@@ -2189,6 +2231,15 @@ export class CodexExecutor implements Executor {
   }
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
+    this.intentFlight = undefined;
+    // A capture before run starts closes admission permanently for that unstarted leg.
+    const summaryState = { closed: this.summaryCapturedBeforeStart };
+    this.summaryCapturedBeforeStart = false;
+    this.summaryLifecycleClosed = false;
+    this.summaryRunActive = true;
+    let planGeneration = 0;
+    let latestPlanSummary: PlanSummaryResult | undefined;
+    let summaryResult: ExecutorResult | undefined;
     this.depsInstall = undefined;
     this.safety = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
@@ -2304,6 +2355,52 @@ export class CodexExecutor implements Executor {
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
     const lifecycleSignal = ctx.terminalLifecycleSignal
       ? AbortSignal.any([lifecycleAbort.signal, ctx.terminalLifecycleSignal]) : lifecycleAbort.signal;
+    const intentAbort = (): void => { this.intentFlight?.ctrl.abort(lifecycleSignal.reason); };
+    lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
+    const summaryAllowed = (): boolean => !summaryState.closed && !this.summaryLifecycleClosed
+      && !lifecycleSignal.aborted && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
+    const summaryBinding = {
+      auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
+      ...(binding.authMode === "subscription" ? {
+        generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
+        chatgpt_plan_type: null,
+      } : {}),
+    };
+    const summariesOn = ctx.kind === undefined || ctx.kind === "issue";
+    const prdInputP = summariesOn
+      ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
+    const summaryInputs = async () => ({
+      claim: { run_id: ctx.runId, secrets: { codex: summaryBinding } },
+      token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
+      issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
+    });
+    const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
+      const generation = ++planGeneration;
+      latestPlanSummary = undefined;
+      return async planMd => {
+        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return;
+        let delivered = false;
+        try {
+          const inputs = await summaryInputs();
+          if (!summaryAllowed() || generation !== planGeneration) return;
+          const result = await this.summaryRunner.generatePlanSummary({
+            ...inputs, planMd, signal: lifecycleSignal,
+            onUsage: usage => {
+              if (delivered || ctx.claimFenced?.() || generation !== planGeneration || summaryState.closed || this.summaryLifecycleClosed) return;
+              delivered = true;
+              ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
+            },
+          });
+          if (!result || !summaryAllowed() || generation !== planGeneration) return;
+          await this.opts.client.postPlanSummary(ctx.runId, {
+            ...result, plan_md: planMd.replaceAll("\u0000", ""),
+          });
+          if (summaryAllowed() && generation === planGeneration) latestPlanSummary = result;
+        } catch (error) {
+          this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
+        }
+      };
+    };
     const installAbort = new AbortController();
     const installState: NonNullable<CodexExecutor["depsInstall"]> = {
       abort: installAbort, cancellation: lifecycleSignal,
@@ -2569,6 +2666,30 @@ export class CodexExecutor implements Executor {
 
       // Plan → approval gate, exactly like SdkExecutor (fail-closed): a pre-approved resume
       // skips the planning turn and the gate.
+      if (summariesOn && !ctx.summaryIntentPresent && summaryAllowed()) {
+        const flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false, abandoned: false };
+        this.intentFlight = flight;
+        if (lifecycleSignal.aborted) intentAbort();
+        flight.done = (async () => {
+          try {
+            const inputs = await summaryInputs();
+            if (!summaryAllowed() || flight.ctrl.signal.aborted) return;
+            const summary = await this.summaryRunner.generateIntentSummary({
+              ...inputs, signal: flight.ctrl.signal,
+              onUsage: usage => {
+                if (flight.delivered || flight.abandoned || ctx.claimFenced?.() || this.intentFlight !== flight) return;
+                flight.delivered = true;
+                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: usage } });
+              },
+            });
+            if (summary && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
+              await this.opts.client.postIntentSummary(ctx.runId, summary);
+            }
+          } catch (error) {
+            this.log.warn("intent summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
+          }
+        })();
+      }
       const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
       // #1586: the exact plan version the in-process gate approved (the LAST planMd handed to
       // ctx.gatePlan before an approve verdict). ctx.approvedPlan is only the claim-time
@@ -2695,7 +2816,7 @@ export class CodexExecutor implements Executor {
         // Issue #1789: from the first gate submission until approval the server row is
         // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones);
+        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary());
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -2731,7 +2852,7 @@ export class CodexExecutor implements Executor {
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
-          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, undefined, settles);
+          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles);
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
@@ -2863,7 +2984,8 @@ export class CodexExecutor implements Executor {
       let epochNeedsRecreate = false;
       // Written only by an exhausted interlocked done with unmet milestones.
       let pendingIterationExhaustion = false;
-      const loopResult = (): ExecutorResult => ({
+      const loopResult = (): ExecutorResult => (summaryResult = {
+        ...(latestPlanSummary && summaryAllowed() ? { summaryPlan: latestPlanSummary.summary, summaryDeltas: latestPlanSummary.deltas } : {}),
         branch: ctx.branch,
         agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
@@ -3271,6 +3393,15 @@ export class CodexExecutor implements Executor {
       if (codeSummary) completed.codeCrossCheckSummary = codeSummary;
       return completed;
     } finally {
+      summaryState.closed = true;
+      await this.settleIntentSummary();
+      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
+        delete summaryResult.summaryPlan;
+        delete summaryResult.summaryDeltas;
+      }
+      this.summaryLifecycleClosed = true;
+      this.summaryRunActive = false;
+      lifecycleSignal.removeEventListener("abort", intentAbort);
       await settleInstall();
       ctx.signal?.removeEventListener("abort", forwardInstallAbort);
       if (!this.deps.deferRegistryTeardown || epoch === undefined) {
