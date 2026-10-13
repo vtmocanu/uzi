@@ -7,8 +7,8 @@
 # requires: REPO_ID UZI_WORKER_TOKEN UZI_BIN UZI_TOKEN_VAL
 # provides: -
 # handoff:  -
-# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
-# restores: api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
+# mutates:  compose:api(force-recreated: heartbeat-stale window raised for the outage; stopped/started per case for each outage), compose:agent(force-recreated: outbox knobs; short stub-outbox stream for the M6 cases; RESTARTED mid-outage for the boot-gate case; SIGKILLed + started for the #1742 cases), compose:outbox-api-placeholder(phase-only idle container using the built worker image; api DNS alias, no listener, credentials or mounts); eight stub runs created (the last two for the #1742 finalize-resume cases); the agent container is SIGKILLed and started again mid-outage in those two cases (case 8 does so twice; cases 7 and 8 run with the completion interlock on) and runs.requeue_count of each of those two runs is set to RUN_MAX_REQUEUES in-DB (SQL UPDATE, once, during its first cut with the API already stopped, before its FIRST restart only) so only the one-shot finalize allowance can requeue them; admin completion_interlock_rollout set false for cases 3-5, true from case 6; one run's started_at/completion_attempts back-dated in-DB to reach the timeout-sweep carve-out
+# restores: placeholder removed; api + agent force-recreated back to their defaults (stream length + quotas reset); completion_interlock_rollout back to true (also on EXIT); stub runs (incl. the two #1742 runs) cancelled best-effort
 # race-sensitive: yes
 # =============================================================================
 # PRD #1391 M5 (Run A) — the worker message OUTBOX survives an api outage. When the api
@@ -269,54 +269,77 @@ wait_permit_retrying() {
 set_interlock() {
   apiput /api/admin/settings "{\"settings\":{\"completion_interlock_rollout\":\"$1\"}}" >/dev/null
 }
-# Preserve stopped-API connection refusal. Only the worker resolves api from
-# /etc/hosts, so missing Docker DNS aliases cannot starve healthy forge lookups.
-OUTBOX_API_PINNED=0
+# Keep api resolvable while its process is stopped. The idle placeholder has no
+# listener, so TCP fails without forwarding missing-name lookups upstream.
+OUTBOX_RESTORE_NEEDED=0
 OUTBOX_BASE_COMPOSE=("${COMPOSE[@]}")
-pin_outbox_api_resolution() {
-  local container network subnet address
-  container="$("${COMPOSE[@]}" ps -q api)" || return
-  network="$(docker inspect "$container" | jq -er '.[0].NetworkSettings.Networks | keys | if length == 1 then .[0] else error("API must have one E2E network") end')" || return
-  subnet="$(docker network inspect "$network" | jq -er '[.[0].IPAM.Config[].Subnet | select(contains(":") | not)][0]')" || return
-  # Reserve the top usable address, away from this throwaway stack's small dynamic cohort.
-  address="$(jq -nr --arg subnet "$subnet" '
-    ($subnet | split("/")) as $s | ($s[1] | tonumber) as $p |
-    if $p < 1 or $p > 29 then error("E2E network subnet is too small") else . end |
-    ($s[0] | split(".") | map(tonumber)) as $a |
-    ($a[0]*16777216 + $a[1]*65536 + $a[2]*256 + $a[3] + pow(2;32-$p)-2) as $ip |
-    [($ip/16777216|floor),($ip/65536|floor)%256,($ip/256|floor)%256,$ip%256] | map(tostring) | join(".")')" || return
-  OUTBOX_IP_OVERRIDE="$RUNROOT/phase52-api-address.json"
-  jq -n --arg ip "$address" --arg network "$network" '{
-    services:{api:{networks:{default:{ipv4_address:$ip}}},agent:{extra_hosts:[("api:"+$ip)]}},
-    networks:{default:{external:true,name:$network}}}' > "$OUTBOX_IP_OVERRIDE"
-  COMPOSE+=(-f "$OUTBOX_IP_OVERRIDE")
-  OUTBOX_API_PINNED=1
+configure_outbox_api_alias() {
+  local image
+  image="$("${COMPOSE[@]}" images -q agent)" || fail "outbox phase: could not read built worker image for API placeholder"
+  [ -n "$image" ] || fail "outbox phase: built worker image missing for API placeholder"
+  OUTBOX_DNS_OVERRIDE="$RUNROOT/phase52-api-alias.json"
+  # Reuse the loaded image, bypass worker startup, and pass no credentials or mounts.
+  # A profile confines this extra service to explicit phase calls. Its unique name
+  # is outside uzi- so it cannot be confused with the developer's real stack.
+  jq -n --arg image "$image" --arg name "cdr-outbox-api-$PROJECT" '{services:{
+    "outbox-api-placeholder":{image:$image,pull_policy:"never",container_name:$name,
+      profiles:["outbox-api-cut"],entrypoint:["/usr/local/bin/node","-e","process.on(\"SIGTERM\", () => process.exit(0)); setInterval(() => {}, 2147483647)"],command:[],
+      user:"65534:65534",read_only:true,cap_drop:["ALL"],security_opt:["no-new-privileges:true"],
+      cpus:0.1,mem_limit:"64m",stop_grace_period:"2s",networks:{default:{aliases:["api"]}}}}}' > "$OUTBOX_DNS_OVERRIDE" \
+    || fail "outbox phase: could not write API alias placeholder overlay"
+  COMPOSE+=(-f "$OUTBOX_DNS_OVERRIDE" --profile outbox-api-cut)
+  OUTBOX_RESTORE_NEEDED=1
+}
+start_outbox_api_alias() {
+  "${COMPOSE[@]}" up -d --wait --no-deps outbox-api-placeholder >/dev/null \
+    || fail "outbox phase: API alias placeholder startup failed"
+}
+remove_outbox_api_alias() {
+  "${COMPOSE[@]}" rm -s -f outbox-api-placeholder >/dev/null \
+    || fail "outbox phase: API alias placeholder removal failed"
+}
+recreate_outbox_api() {
+  start_outbox_api_alias
+  "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null || fail "outbox phase: initial API recreation failed"
+  remove_outbox_api_alias
+  wait_http || fail "outbox phase: initial API HTTP readiness failed"
+  login || fail "outbox phase: initial API login failed"
+}
+recreate_outbox_agent() {
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || fail "outbox phase: agent recreation failed"
+  wait_worker_online || fail "outbox phase: agent registration failed"
 }
 api_cut() {
+  # Start FIRST: api always has an endpoint even across Docker's stop/start churn.
+  start_outbox_api_alias
   "${COMPOSE[@]}" stop api >/dev/null 2>&1 || fail "outbox phase: could not stop the api"
 }
 # api_back restores HTTP before judging an outage assertion.
 api_back() {
-  "${COMPOSE[@]}" up -d --wait api >/dev/null
-  wait_http
-  login
+  "${COMPOSE[@]}" up -d --wait api >/dev/null || fail "outbox phase: API restart failed"
+  # Remove AFTER health: neither edge creates a gap in the API DNS alias.
+  remove_outbox_api_alias
+  wait_http || fail "outbox phase: API HTTP recovery failed"
+  login || fail "outbox phase: API recovery login failed"
 }
 restore_outbox_resolution() {
-  [ "$OUTBOX_API_PINNED" = 1 ] || return 0
+  [ "$OUTBOX_RESTORE_NEEDED" = 1 ] || return 0
   mkdir -p "$RUNROOT/artifacts/52-api-outage-outbox"
-  "${COMPOSE[@]}" logs --no-color agent > "$RUNROOT/artifacts/52-api-outage-outbox/agent-before-address-restore.log" 2>/dev/null || true
-  COMPOSE=("${OUTBOX_BASE_COMPOSE[@]}")
+  "${COMPOSE[@]}" logs --no-color agent > "$RUNROOT/artifacts/52-api-outage-outbox/agent-before-api-restore.log" 2>/dev/null || true
   unset E2E_WORKER_HEARTBEAT_STALE WORKER_TRANSIENT_TRIP_MS WORKER_OUTBOX_RUN_MAX_BYTES UZI_STUB_OUTBOX_TICKS
-  "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null || return
-  wait_http || return
-  login || return
-  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || return
-  wait_worker_online || return
-  OUTBOX_API_PINNED=0
+  "${COMPOSE[@]}" up -d --wait --no-deps outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder startup failed' >&2; return 1; }
+  "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null || { echo 'outbox cleanup: API recreation failed' >&2; return 1; }
+  "${COMPOSE[@]}" rm -s -f outbox-api-placeholder >/dev/null || { echo 'outbox cleanup: API alias placeholder removal failed' >&2; return 1; }
+  COMPOSE=("${OUTBOX_BASE_COMPOSE[@]}")
+  wait_http || { echo 'outbox cleanup: API HTTP recovery failed' >&2; return 1; }
+  login || { echo 'outbox cleanup: API login failed' >&2; return 1; }
+  "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null || { echo 'outbox cleanup: agent recreation failed' >&2; return 1; }
+  wait_worker_online || { echo 'outbox cleanup: agent registration failed' >&2; return 1; }
+  OUTBOX_RESTORE_NEEDED=0
 }
 restore_outage_state() {
   local rc=$?
-  restore_outbox_resolution || echo 'outbox cleanup: API resolution restore failed' >&2
+  restore_outbox_resolution || echo 'outbox cleanup: API alias restore failed' >&2
   set_interlock true 2>/dev/null || true
   return "$rc"
 }
@@ -345,10 +368,8 @@ outage() {
 # Exported so it out-ranks the env-file's E2E_WORKER_HEARTBEAT_STALE=15s (compose ranks
 # shell env above --env-file), exactly as phase 46 exports UZI_E2E_MAX_CONCURRENT_RUNS.
 export E2E_WORKER_HEARTBEAT_STALE=300s
-pin_outbox_api_resolution || fail "outbox phase: could not pin agent API resolution"
-"${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
-wait_http
-login
+configure_outbox_api_alias
+recreate_outbox_api
 pass "api recreated with a 300s heartbeat-stale window so the outage cannot requeue the running run"
 
 # =============================================================================
@@ -356,8 +377,7 @@ pass "api recreated with a 300s heartbeat-stale window so the outage cannot requ
 say "CASE 1: spill + ordered drain (default quotas) — barrier, contiguity, no failed report"
 # Lower ONLY the spill trip window; leave the quotas at their defaults so no drop occurs.
 export WORKER_TRANSIENT_TRIP_MS=3s
-"${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
-wait_worker_online
+recreate_outbox_agent
 pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s (default quotas)"
 
 make_outbox_run
@@ -394,8 +414,7 @@ say "CASE 2: quota eviction -> per-seq tombstones (tiny WORKER_OUTBOX_RUN_MAX_BY
 # 1 KiB per-run quota: over the outage the run spills far more than that, so the oldest
 # segment is evicted to a range record whenever a new segment would exceed the quota.
 export WORKER_OUTBOX_RUN_MAX_BYTES=1024
-"${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
-wait_worker_online
+recreate_outbox_agent
 pass "agent recreated with WORKER_OUTBOX_RUN_MAX_BYTES=1024 (forces quota eviction under a longer spill)"
 
 make_outbox_run
@@ -437,8 +456,7 @@ fi
 say "M6 (Run B): write-ahead terminal reports survive an api outage (finish-during, restart, sweep carve-out; interlocked permit wait)"
 unset WORKER_OUTBOX_RUN_MAX_BYTES            # back to DEFAULT quotas (a clean spill, no eviction) for the M6 runs
 export UZI_STUB_OUTBOX_TICKS=20              # ~20s stream (vs the 90s Run A default), e2e-only; unset at restore
-"${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
-wait_worker_online
+recreate_outbox_agent
 pass "agent recreated with WORKER_TRANSIENT_TRIP_MS=3s + a short UZI_STUB_OUTBOX stream for the M6 terminal-replay cases"
 
 # rb_run_field RUN COL — a scalar runs column straight from the db (COL is a fixed literal from
