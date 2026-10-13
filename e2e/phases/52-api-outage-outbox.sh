@@ -278,9 +278,24 @@ api_cut() {
   OUTBOX_API_PAUSED=1
 }
 # api_back restores HTTP before judging an outage assertion.
+wait_api_container_healthy() {
+  local timeout="${1:-60}" container health=unknown deadline=$((SECONDS + ${1:-60}))
+  container="$("${COMPOSE[@]}" ps -q api)" || fail "outbox phase: could not identify the API container"
+  [ -n "$container" ] || fail "outbox phase: API container is absent"
+  while :; do
+    health="$(docker inspect --format '{{if .State.Health}}{{.State.Health.Status}}{{else}}none{{end}}' "$container")" || health=unknown
+    [ "$health" = healthy ] && return 0
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "outbox phase: API health did not recover after ${timeout}s (last health: $health)"
+    sleep 0.5
+  done
+}
 api_back() {
   "${COMPOSE[@]}" unpause api >/dev/null || return
   OUTBOX_API_PAUSED=0
+  # Pausing can expire Docker's healthcheck. Compose --wait refuses its cached
+  # unhealthy state before the next successful probe, so observe recovery first.
+  wait_api_container_healthy 60
   "${COMPOSE[@]}" up -d --wait api >/dev/null
   wait_http
   login
