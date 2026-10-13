@@ -301,7 +301,7 @@ describe("plan evidence rows and recording states", () => {
     const r = render(<PlanCrossCheck run={run({ plan_cross_check_summary: summary({ findings: {
       summary: "S".repeat(1000), items: [
         { file: "P".repeat(1000), severity: "info", summary: "T".repeat(10000), rationale: "R".repeat(5000) },
-        ...Array.from({ length: 20 }, () => ({ file: "omitted", summary: "omitted" })),
+        ...Array.from({ length: 20 }, () => ({ file: "omitted", severity: "info", summary: "omitted", rationale: "omitted" })),
       ],
     } }) })} />);
     const rows = r.container.querySelectorAll("li");
