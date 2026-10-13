@@ -53,7 +53,7 @@ it("announces each retained head once across checkpoints, a confirmed reconcile 
   const { gitlab } = fakeGitlab();
   const claim = gitlabClaim(19241);
   claim.claim_generation = 3;
-  const restore = publishAfter(3);
+  const restore = publishAfter(9);
   const heads: string[] = [];
   try {
     const exec: Executor = {

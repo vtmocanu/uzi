@@ -1,4 +1,5 @@
 import { afterEach, describe, it } from "node:test";
+import { establishTrackingOwnership } from "./publication-fixture.js";
 import { AsyncResource } from "node:async_hooks";
 import assert from "node:assert/strict";
 import { execFile, execFileSync, spawn } from "node:child_process";
@@ -283,7 +284,7 @@ async function hangUntilAborted(pack: Readable, signal?: AbortSignal): Promise<n
 }
 
 /** A publisher that behaves like the api broker's strict-descendant rule (pushbroker.Publish): apply
- *  the pack, answer published when the declared tip already IS the ref (AlreadyCurrent), refuse
+ *  the pack, answer published for an already-current tip only with the run's persisted checkpoint, refuse
  *  `not_descendant` (a 2xx skip) when the ref is set and the tip does not descend it, else advance
  *  the ref with a compare-and-swap. `ack` lets a call model a lost ACK: `landed` advances the ref
  *  and answers HTTP 500; `dropped` answers HTTP 500 without landing. Every answer is recorded.
@@ -293,6 +294,7 @@ function brokerPublish(
   originPath: string,
   ref: string,
   ack: (call: number) => "landed" | "dropped" | undefined = () => undefined,
+  persistedTip: () => string | undefined = () => undefined,
 ): { impl: Parameters<typeof stubPublish>[0]; answers: Array<{ call: number; tip: string; answer: unknown }> } {
   const answers: Array<{ call: number; tip: string; answer: unknown }> = [];
   const impl: Parameters<typeof stubPublish>[0] = async (call, tip, pack) => {
@@ -305,7 +307,9 @@ function brokerPublish(
       gitIn(originPath, ["index-pack", "--stdin", "--fix-thin"], bytes);
       const cur = refOr(originPath, ref);
       if (cur === tip) {
-        answer = { ok: true, body: { published: true, ref } };
+        answer = persistedTip() === tip
+          ? { ok: true, body: { published: true, ref } }
+          : { ok: true, body: { published: false, ref, skipped: "not_descendant" } };
       } else if (cur !== null && !isAncestorIn(originPath, cur, tip)) {
         answer = { ok: true, body: { published: false, ref, skipped: "not_descendant" } };
       } else {
@@ -715,7 +719,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
     const ctl = control();
     const pub = stubPublish(async (n, _tip, pack) => {
       await drain(pack);
-      return n < 2 ? { ok: false, httpStatus: 503 } : LANDED;
+      return n < 6 ? { ok: false, httpStatus: 503 } : LANDED;
     });
     const claim = gitlabClaim(1597_204);
     const seen: string[] = [];
@@ -740,7 +744,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         "publish_failed:rejected",
         "published",
       ]);
-      assert.equal(pub.count(), 3, "one publish per open interval");
+      assert.equal(pub.count(), 7, "two exhausted logical operations and one successful operation");
       const feed = statusTexts(claim.run_id);
       assert.deepEqual(
         feed.filter((t) => t.startsWith("checkpoint publish")),
@@ -1623,23 +1627,28 @@ describe("GitCache mid-turn primitives (issue #1597 M2)", () => {
     const calls: Array<{ args: string[]; stdin?: string }> = [];
     const seam = g as unknown as { spawnGit: (
       cwd: string, args: string[], stdin?: string,
-    ) => Promise<{ stdout: Readable }> };
+    ) => Promise<{ stdout: Readable; exited: Promise<number>; cancel: () => void }> };
     const original = seam.spawnGit.bind(g);
     seam.spawnGit = async (cwd, args, stdin) => {
       assert.equal(cwd, bare);
       calls.push({ args, stdin });
       const stdout = new PassThrough();
       stdout.end();
-      return { stdout };
+      return { stdout, exited: Promise.resolve(0), cancel: () => {} };
     };
     let out;
+    const range = { tipSha: tip, excludeSha: base };
     try {
-      out = await g.checkpointPack(bare, branch, undefined, { tipSha: tip, excludeSha: base });
+      out = await g.checkpointPack(bare, branch, undefined, range);
+      range.tipSha = base;
+      range.excludeSha = tip;
+      gitIn(bare, ["update-ref", `refs/uzi-runner/${branch}`, base]);
+      await out!.replay();
     } finally {
       seam.spawnGit = original;
     }
     assert.equal(out?.tipOid, tip);
-    assert.deepEqual(calls, [{ args: ["pack-objects", "--revs", "--stdout"], stdin: `${tip}\n^${base}\n` }],
+    assert.deepEqual(calls, Array.from({ length: 2 }, () => ({ args: ["pack-objects", "--revs", "--stdout"], stdin: `${tip}\n^${base}\n` })),
       "the real commit and floor passed validation before the pinned pack call");
     await assert.rejects(g.checkpointPack(bare, branch, undefined, { tipSha: "main", excludeSha: base }), /40-hex/);
   });
@@ -2595,6 +2604,35 @@ describe("issue #1963 confirmed real checkpoint scan floors", () => {
   });
 });
 
+for (const state of ["persisted", "absent", "attempt-only"] as const) {
+  it("same-tip broker ACK requires own persisted checkpoint: " + state, async () => {
+    const branch = "agent/same-tip-" + state;
+    const tip = commitIn(fx.originPath, "same-tip.txt", state);
+    gitIn(fx.originPath, ["branch", branch, tip]);
+    const g = mkGit(fx.dataDir);
+    const bare = await g.ensureClone(fx.originPath);
+    const context = await establishTrackingOwnership(g, bare, fx.originPath, branch, "same-tip", 1, "issue");
+    const ref = "refs/uzi-checkpoints/" + branch;
+    gitIn(fx.originPath, ["update-ref", ref, tip]);
+    const broker = brokerPublish(fx.originPath, ref, () => undefined,
+      () => state === "persisted" ? tip : undefined);
+    const pub = stubPublish(broker.impl);
+    const flight = { runId: "same-tip", runKind: "issue", claimGeneration: 1,
+      owedContext: Promise.resolve(context), lastCheckpointRefTip: state === "persisted" ? tip : "OLD",
+      lastAttemptedCheckpointRefTip: state === "attempt-only" ? tip : undefined,
+      reportedPublishOutcomes: new Set<string>(), runLog: nullLogger(), batcher: { emit() {} } };
+    try {
+      const outcome = await (mkRunner(g, turn(async () => {}), undefined) as unknown as {
+        publishCheckpointOutcome: (flight: unknown, bare: string, branch: string) => Promise<unknown>;
+      }).publishCheckpointOutcome(flight, bare, branch);
+      assert.deepEqual(outcome, state === "persisted" ? { published: true }
+        : { published: false, reason: "skipped", skipLabel: "not_descendant" });
+      assert.equal(flight.lastCheckpointRefTip, state === "persisted" ? tip : "OLD");
+      assert.equal(pub.count(), 1);
+    } finally { pub.restore(); }
+  });
+}
+
 describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () => {
   const workflow = ".github/workflows/ci.yml";
   const progress = { completed: ["m1"], in_progress: [] };
@@ -2626,7 +2664,8 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
             const realTip = commitIn(ctx.worktreePath, "r.txt", "real\n");
             commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid}\n`);
             await ctx.checkpoint!({ reap: true, progress });
-            assert.equal(pub.count(), 1, "the milestone publish was attempted");
+            const milestoneRequests = firstAck === "clean" ? 1 : 2;
+            assert.equal(pub.count(), milestoneRequests, "lost ACK replay is refused without persisted evidence");
             const overlay = pub.tips[0]!;
             assert.equal(
               parentsIn(g.barePathFor(fx.originPath), overlay).at(-1),
@@ -2642,11 +2681,11 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
             ctl.advance(INTERVAL_MS + 1);
             if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
             else await ctx.checkpoint!({ reap: false, progress });
-            assert.equal(pub.count(), 2);
-            const chain = pub.tips[1]!;
+            assert.equal(pub.count(), milestoneRequests + 1);
+            const chain = pub.tips[milestoneRequests]!;
             assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, newTip], "chain parents are [O, N]");
             assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
-            const second = (broker.answers[1]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+            const second = (broker.answers[milestoneRequests]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
             assert.deepEqual([second?.published, second?.skipped], [true, undefined], "no not_descendant refusal");
           }), ctl, { github }).execute(claim);
           if (turnErrors.length > 0) throw turnErrors[0];
@@ -2669,7 +2708,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
       const claim = githubClaim(iid);
       const { github } = fakeGitHub();
       const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
-      const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+      const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call >= 1 && call <= 3 ? "dropped" : undefined));
       const pub = stubPublish(broker.impl);
       try {
         await mkRunner(g, turn(async (ctx) => {
@@ -2681,7 +2720,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
           const r2 = commitIn(ctx.worktreePath, "r2.txt", "real 2\n");
           commitIn(fx.originPath, workflow, `name: ci\non: push\njobs: {}\n# advanced ${iid} b\n`);
           await ctx.checkpoint!({ reap: true, progress });
-          assert.equal(pub.count(), 2, "the second milestone publish was attempted");
+          assert.equal(pub.count(), 4, "the second milestone exhausted three requests");
           const o2 = pub.tips[1]!;
           assert.equal(parentsIn(g.barePathFor(fx.originPath), o2).at(-1), r2, "milestone 2 built an overlay over R2");
           assert.equal(refOr(fx.originPath, checkpointRef), o1, "O2 was dropped: the ref still sits at O1");
@@ -2689,13 +2728,13 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
           ctl.advance(INTERVAL_MS + 1);
           if (boundary === "tick") assert.equal(await ctl.fire(), "published", "the raw tick publish must land");
           else await ctx.checkpoint!({ reap: false, progress });
-          assert.equal(pub.count(), 3);
-          const chain = pub.tips[2]!;
+          assert.equal(pub.count(), 5);
+          const chain = pub.tips[4]!;
           const chainParents = parentsIn(fx.originPath, chain);
           assert.equal(chainParents[0], o2, "chain's first parent is O2");
           assert.equal(chainParents.at(-1), newTip, "chain's last parent is N");
           assert.equal(refOr(fx.originPath, checkpointRef), chain, "the ref advanced to the chain");
-          const last = (broker.answers[2]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
+          const last = (broker.answers[4]!.answer as { body?: { published?: boolean; skipped?: string } }).body;
           assert.deepEqual([last?.published, last?.skipped], [true, undefined], "no not_descendant refusal");
         }), ctl, { github }).execute(claim);
         if (turnErrors.length > 0) throw turnErrors[0];
@@ -2713,7 +2752,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
     const claim = githubClaim(iid);
     const { github } = fakeGitHub();
     const checkpointRef = `refs/uzi-checkpoints/agent/issue-${iid}`;
-    const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call === 1 ? "dropped" : undefined));
+    const broker = brokerPublish(fx.originPath, checkpointRef, (call) => (call >= 1 && call <= 3 ? "dropped" : undefined));
     const pub = stubPublish(broker.impl);
     try {
       await mkRunner(g, turn(async (ctx) => {
@@ -2734,7 +2773,7 @@ describe("issue #2733 raw checkpoint publishes chain over a prior overlay", () =
         const n2 = commitIn(ctx.worktreePath, "n2.txt", "raw N2\n");
         ctl.advance(INTERVAL_MS + 1);
         assert.equal(await ctl.fire(), "published", "the next tick must advance, not wedge on not_descendant");
-        const chain = pub.tips[2]!;
+        const chain = pub.tips[4]!;
         assert.deepEqual(parentsIn(fx.originPath, chain), [overlay, n2], "chained over the confirmed overlay");
         assert.equal(refOr(fx.originPath, checkpointRef), chain);
       }), ctl, { github }).execute(claim);

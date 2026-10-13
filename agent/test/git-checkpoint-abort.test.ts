@@ -125,7 +125,7 @@ it("an ordinary default-tip failure retains the existing best-effort raw-tip fal
     revParse: () => Promise<string>;
     isAncestorRef: () => Promise<boolean>;
     fetchDefaultTip: () => Promise<never>;
-    spawnGit: () => Promise<{ stdout: Readable; exited: Promise<number> }>;
+    spawnGit: () => Promise<{ stdout: Readable; exited: Promise<number>; cancel: () => void }>;
   };
   seam.trackingTip = async () => SHA;
   seam.scratchPublicationPreflight = async () => SHA;
@@ -133,7 +133,7 @@ it("an ordinary default-tip failure retains the existing best-effort raw-tip fal
   seam.revParse = async () => FLOOR;
   seam.isAncestorRef = async () => true;
   seam.fetchDefaultTip = async () => { throw new Error("forge unavailable"); };
-  seam.spawnGit = async () => ({ stdout: Readable.from([]), exited: Promise.resolve(0) });
+  seam.spawnGit = async () => ({ stdout: Readable.from([]), exited: Promise.resolve(0), cancel: () => {} });
 
   const packed = await cache.checkpointPack("/unused", "agent/issue-1914", { defaultBranch: "main" });
   assert.equal(packed?.tipOid, SHA, "only an ordinary overlay failure may use the raw tip");

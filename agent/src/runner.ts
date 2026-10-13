@@ -3285,7 +3285,7 @@ export class RunRunner {
             await this.reapForSink(
               executor,
               { boundary: "park", deadlineMs: this.codexBoundaryDeadlineMs },
-              async () => {
+              async (permit) => {
                 // PRD #759 M1: commit any uncommitted work in the runner-owned clone to a
                 // clearly-marked THROWAWAY commit (subject-prefixed wip(park):) so the
                 // fetch-back carries it to the local tracking ref and the #628 broker publishes
@@ -3321,6 +3321,7 @@ export class RunRunner {
                   barePath,
                   branch,
                   await this.buildCheckpointOverlay(claim, flight, barePath),
+                  permit?.signal,
                 );
               },
               flight,
@@ -10247,7 +10248,7 @@ export class RunRunner {
                     ? "aborted"
                     : `publish_failed:${outcome.reason}`;
                 // Advance the time-gate on every ATTEMPT (not just success): bounds broker retry
-                // cadence to <= 1 publish/interval/run even under a persistent broker failure. An owed
+                // cadence to <= 1 logical operation/interval/run (up to three internal HTTP requests). An owed
                 // (deferred) publish is settled by the attempt too (issue #1597 M2 round 4), so the gate
                 // — not pendingPublish — governs every retry.
                 flight.lastPublish = this.now();
@@ -13646,18 +13647,39 @@ export class RunRunner {
     // whole un-landed overlay chain; this is bounded by the broker's object cap and self-clears on
     // the first landed ACK.
     let packedTip: string | undefined;
-    let recoveryPack: Awaited<ReturnType<GitCache["checkpointPack"]>> = null;
+    let producer: NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>> | Awaited<ReturnType<NonNullable<Awaited<ReturnType<GitCache["checkpointPack"]>>>["replay"]>> | undefined;
+    let retried = false;
+    let producerExit: number | undefined;
+    const observeProducer = () => {
+      producerExit = undefined;
+      void producer!.exited.then(code => { producerExit = code; });
+    };
+    const abandon = async (checkFailure = false) => {
+      if (!producer) return;
+      // Observe an already-settled local failure before intentionally cancelling an unread tail.
+      await Promise.resolve();
+      const failed = producerExit !== undefined && producerExit !== 0;
+      producer.cancel();
+      if (!producer.pack.readableEnded) producer.pack.destroy();
+      await producer.exited;
+      producer = undefined;
+      if (checkFailure && failed) throw new Error("checkpoint pack producer failed");
+    };
     try {
+      signal?.throwIfAborted();
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      signal?.throwIfAborted();
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
         throw new SecretRemediationPendingError();
       }
       const packed = await this.git.checkpointPack(barePath, branch, overlay, pinned, onStep, sourceSha,
         async (wantedSha) => {
+          signal?.throwIfAborted();
           // The clean scan names the owned source, while ancestry judges the actual overlay/bridge.
           if (await this.checkpointRemediationHold(flight, barePath, wantedSha, reap, sourceSha)) {
             throw new SecretRemediationPendingError();
           }
+          signal?.throwIfAborted();
         },
         // issue #2733: chain a raw publish over a prior overlay tip so a lost-ack or confirmed
         // overlay does not wedge later tick/iteration publishes with `not_descendant`. The list is
@@ -13670,16 +13692,39 @@ export class RunRunner {
       // tracking tip unresolved (no tracking ref, or it could not be read) — nothing to pack; not a
       // publish failure, stay silent
       if (!packed) return { published: false, reason: "no_local_tip" };
-      if (flight.retainedEpisode) recoveryPack = packed;
+      producer = packed;
+      observeProducer();
       packedTip = packed.tipOid;
-      onStep?.("checkpoint_upload");
-      const res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, packed.pack, signal);
+      let res;
+      // Only an explicit 5xx is retriable. Three requests share the caller's deadline;
+      // any failed guard, transport exception or abort stops this logical operation.
+      for (let attempt = 1; attempt <= 3; attempt++) {
+        signal?.throwIfAborted();
+        onStep?.("checkpoint_upload");
+        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal);
+        if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
+        flight.lastAttemptedCheckpointRefTip = packed.tipOid;
+        const backoffMs = attempt === 1 ? 250 : 1_000;
+        flight.runLog.warn("checkpoint publish retry", { run_id: flight.runId, attempt, backoff_ms: backoffMs, http_status: res.httpStatus });
+        await abandon(true);
+        await sleep(backoffMs, signal);
+        signal?.throwIfAborted();
+        await this.requireTrackingOwned(flight, barePath, branch, sourceSha);
+        signal?.throwIfAborted();
+        producer = await packed.replay();
+        observeProducer();
+        retried = true;
+      }
+      if (!res) throw new Error("checkpoint publish produced no response");
       if (res.ok && res.body.published === true) {
         // An early HTTP success does not prove the streamed git pack completed. spawnGit's
         // exit promise never rejects and, inside a boundary, settles only after root reap.
         // Abandon an unread tail so the producer cannot stay blocked on pipe backpressure.
-        if (!packed.pack.readableEnded) packed.pack.destroy();
-        if (await packed.exited !== 0) throw new Error("checkpoint pack producer failed");
+        if (!producer!.pack.readableEnded) {
+          producer!.cancel();
+          producer!.pack.destroy();
+        }
+        if (await producer!.exited !== 0) throw new Error("checkpoint pack producer failed");
         // PRD #1062 M2 (#1036): a CONFIRMED publish advances the known checkpoint ref tip to the
         // declared tip (the overlay `O_ov`, or realTip on the no-overlay path), so the NEXT
         // overlay carries it as parent[0] (base-first) and stays a fast-forward the broker takes.
@@ -13693,7 +13738,7 @@ export class RunRunner {
         this.triggerLiveSettle(flight, packed.tipOid, "checkpoint");
         // issue #1597 M1: a failure/skip line is on the feed, so say it recovered — once — and
         // clear the dedupe set so a recurring failure is surfaced again rather than swallowed.
-        if (flight.reportedPublishOutcomes.size > 0) {
+        if (retried || flight.reportedPublishOutcomes.size > 0) {
           flight.reportedPublishOutcomes.clear();
           flight.runLog.info("checkpoint publishing recovered", { run_id: flight.runId });
           this.emitWorkerDiagnostic(flight, "status", "checkpoint publishing recovered — published to origin");
@@ -13761,10 +13806,7 @@ export class RunRunner {
       });
       return { published: false, reason: "error" };
     } finally {
-      if (recoveryPack) {
-        if (!recoveryPack.pack.readableEnded) recoveryPack.pack.destroy();
-        await recoveryPack.exited;
-      }
+      await abandon();
     }
   }
 

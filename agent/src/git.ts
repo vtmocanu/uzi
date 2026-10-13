@@ -8031,42 +8031,53 @@ export class GitCache {
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
      *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
     chainFrom?: readonly (string | undefined)[],
-  ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
+  ): Promise<{
+    tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void;
+    replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
+  } | null> {
+    // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
+    const openProducer = async (source: string, candidate: string, floor: string) => {
+      onStep?.("scratch_preflight");
+      await this.scratchPublicationPreflight(barePath, branch, source);
+      if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
+      await this.validateCheckpointFloor(barePath, floor, candidate);
+      await beforePack?.(candidate);
+      onStep?.("checkpoint_pack");
+      const { stdout, exited, cancel } = await this.spawnGit(
+        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n^${floor}\n`,
+      );
+      return { pack: stdout, exited, cancel };
+    };
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha) ||
-          (sourceSha !== undefined && sourceSha !== pinned.tipSha)) {
+      const { tipSha, excludeSha } = pinned;
+      if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
         });
       }
       onStep?.("scratch_preflight");
-      await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
-      let wanted = pinned.tipSha;
+      await this.scratchPublicationPreflight(barePath, branch, tipSha);
+      let wanted = tipSha;
       if (overlay) {
-        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay, onStep) ?? wanted;
+        wanted = await this.buildWorkflowOverlay(barePath, branch, tipSha, overlay, onStep) ?? wanted;
         onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
-      if (wanted === pinned.tipSha && chainFrom) {
-        const chain = await this.buildCheckpointChain(barePath, branch, pinned.tipSha, chainFrom, onStep);
+      if (wanted === tipSha && chainFrom) {
+        const chain = await this.buildCheckpointChain(barePath, branch, tipSha, chainFrom, onStep);
         if (chain) {
           wanted = chain;
           onStep?.("scratch_preflight");
           await this.scratchPublicationPreflight(barePath, branch, wanted);
         }
       }
-      await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
-      await beforePack?.(wanted);
-      onStep?.("checkpoint_pack");
-      const { stdout, exited } = await this.spawnGit(
-        barePath,
-        ["pack-objects", "--revs", "--stdout"],
-        `${wanted}\n^${pinned.excludeSha}\n`,
-      );
-      return { tipOid: wanted, pack: stdout, exited };
+      const candidate = wanted;
+      const replay = () => openProducer(tipSha, candidate, excludeSha);
+      return { tipOid: wanted, ...await replay(), replay };
     }
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
     if (!realTip) return null;
@@ -8120,15 +8131,11 @@ export class GitCache {
     // Validate the actual commit to be packed; an earlier overlay floor can be
     // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
+    // The initial validation establishes the floor as a literal SHA before capturing it.
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
-    await beforePack?.(wanted);
-    onStep?.("checkpoint_pack");
-    const { stdout, exited } = await this.spawnGit(
-      barePath,
-      ["pack-objects", "--revs", "--stdout"],
-      `${wanted}\n^${excludeSha}\n`,
-    );
-    return { tipOid: wantRev, pack: stdout, exited };
+    const floor = excludeSha!;
+    const replay = () => openProducer(realTip, wanted, floor);
+    return { tipOid: wanted, ...await replay(), replay };
   }
 
   private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {
