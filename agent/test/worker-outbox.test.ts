@@ -178,6 +178,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
     const reports: string[] = [];
     let r1Resolved = false;
     let retiredTerminal = 0;
+    const { logger, lines } = recordingLogger();
     const outbox = {
       uncleanRuns: () => [],
       isDisabled: () => false,
@@ -201,6 +202,13 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
         messagesThroughSeq: 0,
         claim_generation: gen,
       }),
+      // This legacy-reader fake has no authenticated identity context; the real
+      // settlement method is a no-op in that case, before journal retirement.
+      markTerminalServerSettled: async (id: string, gen: number, context?: unknown) => {
+        assert.equal(id, "r1");
+        assert.equal(gen, 5);
+        assert.equal(context, undefined);
+      },
       retireTerminal: async () => {
         retiredTerminal += 1;
       },
@@ -227,7 +235,7 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       idleChat,
       noJudge,
       noReview,
-      nullLogger(),
+      logger,
       okPreflight,
       outbox,
       new Map(),
@@ -239,13 +247,15 @@ describe("Worker outbox drainer (PRD #1391 M2)", () => {
       assert.deepStrictEqual(reports, [], "the boot resolve did not resolve the terminal (nothing pending yet)");
       // Let the drain retire the segments; the drainer must now re-resolve the pending terminal.
       release();
-      await pollUntil(() => r1Resolved, 2000, "the drainer re-resolves the run's pending terminal after retire");
+      await pollUntil(() => retiredTerminal >= 1, 2000, "the drainer resolves and retires the run's pending terminal");
     } finally {
       release(); // idempotent: never leave the drain gate blocking on a failure path (fail cleanly, no hang)
       controller.abort();
       await done;
     }
     assert.ok(r1Resolved, "the post-drain resolve sent the terminal for r1");
+    assert.equal(lines.some(line => JSON.stringify(line).includes("markTerminalServerSettled is not a function")), false,
+      JSON.stringify(lines));
     assert.ok(retiredTerminal >= 1, "the landed terminal (200) retired the journal — it did not strand");
   });
 
