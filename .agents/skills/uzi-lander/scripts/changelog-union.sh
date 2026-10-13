@@ -160,9 +160,9 @@ fold_resolve() {
     }
     # The release cut linkifies bare `(#N)` citations (scripts/changelog-links.sh) while it folds,
     # so a folded bullet in the BASE differs from its ancestor copy by `#N` -> `[#N](URL/pull|issues/N)`.
-    # norm() undoes that on base text only, and only for a link whose target number equals its text
-    # and that the ancestor bullet does not itself contain (PROT, per bullet): a citation already linked in the
-    # ancestor is compared as written, so an edit to it (url, repo, kind) is never forgiven.
+    # Fold gain/absence comparisons undo that only for links whose target number equals
+    # their text and that the ancestor Unreleased bullet does not contain (PROT, per bullet).
+    # Already-linked citations and branch edits stay compared as written.
     function norm(s,   o, m, pre, a, b) {
       o = ""
       while (match(s, /\[#[0-9]+\]\(https?:\/\/[^) \t\n]*\/(pull|issues)\/[0-9]+\)/)) {
@@ -173,7 +173,7 @@ fold_resolve() {
       }
       return o s
     }
-    # matchlink(b, a): is base block text b the ancestor block text a, up to the release-cut
+    # matchlink(b, a): is block text b the ancestor block text a, up to the release-cut
     # linkification of a bare `#N` in a? Links a itself carries are protected (PROT) for this call.
     function matchlink(b, a,   t) {
       split("", PROT); t = a
@@ -202,9 +202,12 @@ fold_resolve() {
         acnt[key]++
       }
       if (na == 0) die("the ancestor [Unreleased] holds no bullet block, so there is no fold to prove")
-      # A base block that is an ancestor block up to that linkification stands for it.
-      for (k = 1; k <= nb[2]; k++) for (i = 1; i <= na; i++)
-        if (AKH[i] == BH[2, k] && matchlink(BT[2, k], AKT[i])) { BN[2, k] = AKT[i]; break }
+      # Compare historical release counts on both sides with the same per-bullet
+      # linkification rule; an unchanged linked copy cannot count as a release gain.
+      # Ancestor Unreleased and branch blocks stay exact for branch-edit checks.
+      for (f = 1; f <= 2; f++) for (k = 1; k <= nb[f]; k++) if (f == 2 || !BU[f, k])
+        for (i = 1; i <= na; i++)
+          if (AKH[i] == BH[f, k] && matchlink(BT[f, k], AKT[i])) { BN[f, k] = AKT[i]; break }
       # A fold target is a release section, keyed by its [version] (never the date), that holds
       # a block MORE often in the base than in the ancestor: a new version, or an RC-first
       # stable-keyed section an rc.N cut folded into again.

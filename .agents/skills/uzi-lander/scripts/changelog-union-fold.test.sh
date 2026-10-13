@@ -263,6 +263,21 @@ grep -Fq "earlier cites" "$WORK/hist.main.md" || fail "hist fixture not built"
 mkconflict hist
 expect_ok hist
 
+# 16c. An already-linked historical copy is not a newly gained release copy when main
+#      merely deletes the bare-citation Unreleased bullet. Refuse and leave the conflict intact.
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Same (#2361)**\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linknogain.base.md"
+printf '%s## [Unreleased]\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linknogain.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **Same (#2361)**\n\n- **New**\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linknogain.branch.md"
+mkconflict linknogain; expect_refuse linknogain
+grep -Fq 'fold unproven' <<<"$OUT" || fail "linknogain: wrong refusal reason: $OUT"
+
+# 16d. The same historical copy plus one genuinely gained released copy does prove a fold.
+cp "$WORK/linknogain.base.md" "$WORK/linkgain.base.md"
+cp "$WORK/linknogain.branch.md" "$WORK/linkgain.branch.md"
+{ cat "$WORK/linknogain.main.md"; printf '\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n'; } > "$WORK/linkgain.main.md"
+printf '%s## [Unreleased]\n\n### Changed\n\n- **New**\n\n## [0.2.0] - 2026-02-01\n\n### Changed\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n\n- **Same ([#2361](https://github.com/o/r/pull/2361))**\n' "$HEAD_" > "$WORK/linkgain.want.md"
+mkconflict linkgain; expect_ok linkgain
+
 # 17. Linkification is the ONLY tolerated difference: a reworded released copy, a link whose
 #     target number differs from its text, and a released copy of a bullet that the ancestor
 #     held twice (one copy dropped) all still refuse.
