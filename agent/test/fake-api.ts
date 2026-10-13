@@ -1026,7 +1026,7 @@ export class FakeApi {
     }
     if (req.method === "POST" && p === "/api/worker/heartbeat") {
       this.heartbeats++;
-      this.heartbeatBodies.push(JSON.parse(body) as Record<string, unknown>);
+      this.heartbeatBodies.push(json);
       return send(res, 200, {});
     }
     if (req.method === "POST" && p === "/api/worker/runs/claim") {

@@ -173,10 +173,9 @@ describe("M2 serial Worker real completion custody", () => {
     api.enqueueClaim(second);
     const done = worker.run(controller.signal);
     try {
-      // Readiness polling is bounded at 5s; a failed first run cannot hang the test.
-      for (let i = 0; i < 500 && !secondExecuting; i++) await tick(10);
+      // Event-driven readiness: a worker that exits first fails at once; --test-timeout bounds a hang.
+      await Promise.race([secondStarted.promise, done.then(() => { throw new Error("worker exited before the second claim"); })]);
       assert.ok(secondExecuting, "the second real executor begins with capacity one");
-      await secondStarted.promise;
       assert.equal(firstHeld, true, "the first executor retained unresolved completion custody");
       assert.equal(run.isExecuting(first.run_id), false, "the first execute has settled");
       assert.deepEqual(fs.readFileSync(finalizePath), finalizeBytes, "existing finalize evidence survives execute settlement");
