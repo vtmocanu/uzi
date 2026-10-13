@@ -715,45 +715,48 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
     }
   });
 
-  it("(R2) a confirmed completion hold bypasses the finalize boundary: no finalize permit, no reconcile after the hold, not reported failed", async () => {
-    const { gitlab, calls } = fakeGitlab();
-    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-hold-"));
-    try {
-      api.setCompletionHoldResponse("paused");
-      const refuse = { on: false };
-      const rig = codexRig({ authMode: "subscription", refuseReconcile: () => refuse.on });
-      const runHome = path.join(homeRoot, "h");
-      const probe: Probe = { refresh: -1, release: -1 };
-      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
-        fs.mkdirSync(runHome, { recursive: true });
-        fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
-        commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
-        // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
-        git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-        mockCommittedTracking(git, HELD_HEAD);
-        git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
-        git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
-        git.checkpointPack = (async () => null) as typeof git.checkpointPack;
-        const entered = await ctx.enterCompletionHold?.(HOLD_REASON);
-        probe.outcome = entered;
-        if (entered) refuse.on = true;
-        probe.refresh = rig.refreshCalls();
-        probe.release = rig.releaseCalls();
-        return { branch: ctx.branch, completionHeld: { reason: HOLD_REASON } };
-      });
-      const claim = gitlabClaim(1785);
-      await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
-      assert.equal(probe.outcome, true, "the hold was entered");
-      assert.ok(!rig.boundaries.includes("finalize"), `no finalize boundary; got ${JSON.stringify(rig.boundaries)}`);
-      assert.equal(rig.refreshCalls(), probe.refresh, "no refresh reconcile after the confirmed hold");
-      assert.equal(rig.releaseCalls(), probe.release, "no release reconcile after the confirmed hold");
-      assert.equal(api.completionHoldRequests.length, 1, "one completion-hold request was sent");
-      assert.equal(calls.length, 0, "no push/MR");
-      assertKept(1785, claim.run_id, runHome, rig);
-    } finally {
-      fs.rmSync(homeRoot, { recursive: true, force: true });
-    }
-  });
+  for (const holdStatus of ["paused", ""] as const) {
+    it(`(R2) ${holdStatus === "paused" ? "a confirmed" : "an unresolved"} completion hold bypasses the finalize boundary: no finalize permit, no reconcile after the hold, not reported failed`, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-hold-"));
+      try {
+        api.setCompletionHoldResponse(holdStatus);
+        const refuse = { on: false };
+        const rig = codexRig({ authMode: "subscription", refuseReconcile: () => refuse.on });
+        const runHome = path.join(homeRoot, "h");
+        const probe: Probe = { refresh: -1, release: -1 };
+        const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+          fs.mkdirSync(runHome, { recursive: true });
+          fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
+          commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
+          // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
+          git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+          mockCommittedTracking(git, HELD_HEAD);
+          git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+          git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
+          git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+          const entered = await ctx.enterCompletionHold?.(HOLD_REASON);
+          probe.outcome = entered;
+          if (entered) refuse.on = true;
+          probe.refresh = rig.refreshCalls();
+          probe.release = rig.releaseCalls();
+          return { branch: ctx.branch, completionHeld: { reason: HOLD_REASON } };
+        });
+        const claim = gitlabClaim(1785);
+        await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
+        assert.equal(probe.outcome, true, "the hold was entered");
+        assert.ok(!rig.boundaries.includes("finalize"), `no finalize boundary; got ${JSON.stringify(rig.boundaries)}`);
+        assert.equal(rig.refreshCalls(), probe.refresh, "no refresh reconcile after the hold");
+        assert.equal(rig.releaseCalls(), probe.release, "no release reconcile after the hold");
+        assert.equal(api.completionHoldRequests.length, 1, "one completion-hold request was sent");
+        assert.equal(calls.length, 0, "no push/MR");
+        assertKept(1785, claim.run_id, runHome, rig);
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+
+  }
 
   for (const [name, httpStatus, iid] of [
     ["(C1) an unresolved wall park (503) bypasses finalize without generation proof", 503, 1786],

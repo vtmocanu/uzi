@@ -45,7 +45,7 @@ interface HoldProbe {
 // verdicts (`"throw"` makes verifyRunnerTrackingCovers throw that attempt, a boolean makes it
 // return that value). The script drives enterCompletionHold's bounded capture-retry loop across a
 // throw, a false, and a true so the loop — not a single constant verdict — is exercised.
-function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>): HoldProbe {
+function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>, afterHold?: () => void): HoldProbe {
   const held: { value: boolean | undefined } = { value: undefined };
   const captureAttempts = { count: 0 };
   const executor: Executor = {
@@ -67,6 +67,7 @@ function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>): HoldProb
 
       const entered = await ctx.enterCompletionHold!("test completion hold reason");
       held.value = entered;
+      afterHold?.();
       if (entered) return { branch: ctx.branch, completionHeld: { reason: "test completion hold reason" } };
       // A false return means keep-live-then-legacy-throw at the real call sites.
       throw new Error("legacy terminal (kept live, could not hold)");
@@ -90,6 +91,67 @@ function seedHome(): { homeDir: string; sentinel: string; root: string } {
 }
 
 describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
+  it("ambiguous ACK + exact running snapshot retains clone and HOME without a terminal report, even after executor error", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const probe = makeHoldExecutor(true);
+    const home = seedHome();
+    const claim = { ...gitlabClaim(1254), claim_generation: 7 };
+    const executor: Executor = {
+      run: async (ctx) => {
+        await probe.executor.run(ctx);
+        throw new Error("late executor error after unresolved hold");
+      },
+    };
+    try {
+      api.setCompletionHoldResponse("", 200);
+      api.parkRunOwnership = {
+        status: "running", claim_generation: 7, hold_reason: null, claim_released: false,
+      };
+      const readsBefore = api.ownershipRequests.length;
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 100,
+      }).execute(claim);
+
+      assert.equal(probe.held.value, true, "running cannot fence a delayed hold POST");
+      assert.deepEqual(api.ownershipRequests.slice(readsBefore), [claim.run_id], "one reconciliation read");
+      assert.ok(!statuses(claim.run_id).some((status) => ["completed", "failed", "cancelled"].includes(status)));
+      assert.equal(calls.length, 0);
+      assert.equal(fs.existsSync(worktreeDirFor(1254)), true);
+      assert.equal(fs.existsSync(home.sentinel), true);
+    } finally {
+      api.parkRunOwnership = undefined;
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  it("ambiguous ACK + exact unheld terminal proof permits normal cleanup", async () => {
+    const { gitlab } = fakeGitlab();
+    let readsAfterHold: string[] = [];
+    const readsBefore = api.ownershipRequests.length;
+    const { executor, held } = makeHoldExecutor(true, () => {
+      readsAfterHold = api.ownershipRequests.slice(readsBefore);
+    });
+    const home = seedHome();
+    const claim = { ...gitlabClaim(1255), claim_generation: 7 };
+    try {
+      api.setCompletionHoldResponse("", 200);
+      api.parkRunOwnership = {
+        status: "failed", claim_generation: 7, hold_reason: null, claim_released: false,
+      };
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 100,
+      }).execute(claim);
+
+      assert.equal(held.value, false);
+      assert.deepEqual(readsAfterHold, [claim.run_id], "one read before normal terminal cleanup");
+      assert.equal(fs.existsSync(worktreeDirFor(1255)), false);
+      assert.equal(fs.existsSync(home.sentinel), false);
+    } finally {
+      api.parkRunOwnership = undefined;
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
   it("verified capture + paused ACK → held: requests the hold with the captured head, preserves the clone and HOME", async () => {
     const { gitlab, calls } = fakeGitlab();
     const { executor, held } = makeHoldExecutor(true);

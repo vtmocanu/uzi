@@ -168,7 +168,11 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     const claim = interlockedClaim(1301);
     api.setCompletionPermitResponse(false, { denyReason: "missing_milestones" });
     // The hold ACK defaults to paused/200, so enterCompletionHold parks the run.
-
+    let checkpointPacks = 0;
+    git.checkpointPack = (async () => {
+      checkpointPacks++;
+      return null;
+    }) as typeof git.checkpointPack;
 
     await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, undefined, {
       recoveryRetryMs: 1,
@@ -179,6 +183,8 @@ describe("RunRunner — completion permit + PR-head verification (PRD #1226 M4 D
     assert.ok(!statuses(claim.run_id).includes("completed"), "a denied permit never completes");
     assert.ok(!statuses(claim.run_id).includes("failed"), "a denied permit holds, not fails");
     assert.strictEqual(api.completionHoldRequests.length, 1, "the run entered the completion hold");
+    assert.ok(api.completionHoldRequests[0]!.body.head, "the hold retains a verified local head");
+    assert.equal(checkpointPacks, 0, "post-permit capture skips the optional remote checkpoint");
   });
 
   it("granted but PR head != H → MR is created but the run does NOT complete; it holds", async () => {

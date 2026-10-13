@@ -2986,7 +2986,7 @@ export class WorkerClient {
    *  literally "paused", so both statuses are read off the body (like reportState) rather than a
    *  409 throwing through postJSON. Returns `{ status }` = the run's status from the response
    *  body (paused on a landed hold, the real status on a refusal); an unmodelled 2xx or an
-   *  unreadable body yields "" (never "paused" ⇒ retain, the safe default). A genuine transport
+   *  unreadable body yields "" (ambiguous: the runner retains artifacts and reconciles ownership). A genuine transport
    *  error or a non-200/409 4xx/5xx still throws RequestError. */
   async requestCompletionHold(
     runId: string,
@@ -3018,7 +3018,7 @@ export class WorkerClient {
       }
       if (res.status >= 400) throw await this.toError("POST", path, res);
       // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
-      // not "paused" and so retains the run.
+      // ambiguous; enterCompletionHold retains artifacts while reconciling ownership.
       return { status: "" };
     });
   }
