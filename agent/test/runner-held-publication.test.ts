@@ -139,15 +139,18 @@ describe("held publication of a failed run", () => {
     const server = heldServer(claim);
     skipCheckpoints();
     const work: Partial<Work> = {};
-    // Every message post fails permanently, so the batcher trips handlePermanentFailure: it journals
-    // `failed`, reaps, and sends it through journalAndSendTerminal. The executor then unwinds.
-    api.failMessagesNext(100, 401);
+    // Once armed, every message post fails permanently, so the batcher trips handlePermanentFailure: it
+    // journals `failed`, reaps, and sends it through journalAndSendTerminal. The executor then unwinds.
+    // Armed from inside the executor, after failingWork has written its WIP: armed earlier, a start-up
+    // post can trip the hook while the executor is still writing, so the freeze misses that WIP and the
+    // source stays dirty, which the inventory boundary rightly refuses to release.
     const outbox = new Outbox({
       root: path.join(fx.dataDir, "outbox"), log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
       maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000,
     });
     await outbox.init();
     const r = runner(failingWork(work, async ctx => {
+      api.failMessagesNext(100, 401);
       ctx.emit({ kind: "text", agent: "lead", payload: { text: "hello" } });
       await new Promise<void>((_resolve, reject) => {
         if (ctx.signal?.aborted) return reject(new Error("aborted"));
