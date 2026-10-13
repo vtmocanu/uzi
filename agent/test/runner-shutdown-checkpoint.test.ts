@@ -787,7 +787,7 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
   });
 
   it("names the last published checkpoint as the restart point when a prior checkpoint landed", async () => {
-    // Call 0 = the mid-run milestone checkpoint (lands); call 1 = the shutdown publish (HTTP 500).
+    // Request 0 lands the mid-run milestone; requests 1–3 exhaust the shutdown publication (HTTP 500).
     const { restore, count } = spyPublishWith(async (n) => (n === 0 ? LANDED : { ok: false, httpStatus: 500 }));
     try {
       const { feed } = await shutdownOnce(1597_12, {
@@ -796,7 +796,7 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
           commitInTree(ctx.worktreePath, "MORE.txt", "after the checkpoint\n");
         },
       });
-      assert.equal(count(), 2, "the mid-run checkpoint and the shutdown publish both ran");
+      assert.equal(count(), 4, "the mid-run checkpoint landed and shutdown exhausted three requests");
       assert.ok(
         feed.includes(
           notPublished(
@@ -812,8 +812,8 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
   });
 
   it("recovery: fail → succeed emits ONE recovered line; a later failure is shown again", async () => {
-    // Calls: 0 = HTTP 500 (surfaced), 1 = landed (recovered), 2 = HTTP 500 (surfaced AGAIN).
-    const { restore, count } = spyPublishWith(async (n) => (n === 1 ? LANDED : { ok: false, httpStatus: 500 }));
+    // Requests 0–2 exhaust HTTP 500 (surfaced), 3 lands (recovered), 4–6 exhaust HTTP 500 (surfaced AGAIN).
+    const { restore, count } = spyPublishWith(async (n) => (n === 3 ? LANDED : { ok: false, httpStatus: 500 }));
     try {
       const { feed } = await shutdownOnce(1597_13, {
         midRun: async (ctx) => {
@@ -822,7 +822,7 @@ describe("RunRunner — typed shutdown checkpoint outcome (issue #1597 M1)", () 
           commitInTree(ctx.worktreePath, "MORE.txt", "after the recovery\n");
         },
       });
-      assert.equal(count(), 3, "two mid-run publishes plus the shutdown publish");
+      assert.equal(count(), 7, "two exhausted failures surround one recovered mid-run publication");
       const FAILED = "checkpoint publish failed: HTTP 500";
       const RECOVERED = "checkpoint publishing recovered — published to origin";
       // Exactly one recovered line, between two failure lines: the recovery cleared the dedupe

@@ -1044,9 +1044,8 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         // The pause path is INSIDE its publish, holding the gate with a wip marker committed.
         ctl.advance(INTERVAL_MS + 1);
         tickOutcome = await ctl.fire();
-        return { ok: false, httpStatus: 500 }; // the pause fails → the marker is undone
       }
-      return LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED; // exhausted pause fails → marker is undone
     });
     const claim = gitlabClaim(1597_211);
     let parked: boolean | undefined;
@@ -1068,7 +1067,8 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
       assert.equal(parked, false);
       assert.equal(headSubject.startsWith("wip(park):"), false, "the marker was undone");
       assert.equal(tickOutcome, "gate_busy");
-      assert.equal(pub.count(), 1, "only the pause's own publish ran — the tick never published the marker");
+      assert.deepEqual(pub.tips, Array(3).fill(pub.tips[0]), "pause retries preserve the WIP tip");
+      assert.equal(pub.count(), 3, "only the pause's three requests ran — the tick never published the marker");
     } finally {
       await settleAndClean({ ctl, running: [running], restore: pub.restore, paths: [tmp] });
     }
@@ -3440,7 +3440,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
     const claim = gitlabClaim(1785_201);
     const pub = stubPublish(async (n, _tip, pack) => {
       await drain(pack);
-      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let laterTip = "";
     try {
@@ -3452,6 +3452,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
           await waitAbort(ctx.signal!);
           assert.equal(ctx.signal!.aborted, true);
           assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
           laterTip = commitIn(ctx.worktreePath, "after.txt", "after\n");
           ctl.advance(INTERVAL_MS + 1);
           assert.equal(await ctl.fire(), "published");
@@ -3460,7 +3461,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       ).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
       assert.equal(pub.tips.at(-1), laterTip);
-      assert.equal(pub.count(), 2);
+      assert.equal(pub.count(), 4);
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3474,7 +3475,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
     const claim = gitlabClaim(1785_203);
     const pub = stubPublish(async (n, _tip, pack) => {
       await drain(pack);
-      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let sha = "";
     try {
@@ -3486,8 +3487,9 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
               api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
               await waitAbort(ctx.signal!);
               assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
               sha = commitIn(ctx.worktreePath, "codex-after.txt", "after\\n");
-              assert.equal(pub.count(), 1, "the post-pause commit has not been published");
+              assert.equal(pub.count(), 3, "the post-pause commit has not been published");
               ctl.advance(INTERVAL_MS + 1);
               assert.equal(await ctl.fire(), "published");
             });
@@ -3513,7 +3515,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
     const pub = stubPublish(async (n, _tip, pack) => {
       outsidePermit.push(!codex.inPermit());
       await drain(pack);
-      return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let sha = "";
     let atReturn = -1;
@@ -3526,6 +3528,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
               api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
               await waitAbort(ctx.signal!);
               assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+              assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
               sha = commitIn(ctx.worktreePath, "codex-notick.txt", "after\\n");
               await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
               atReturn = pub.count();
@@ -3536,9 +3539,9 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         },
       }), undefined, { checkpointTickIntervalMs: 0 }).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
-      assert.equal(atReturn, 2);
+      assert.equal(atReturn, 4);
       assert.equal(pub.tips.at(-1), sha);
-      assert.deepEqual(outsidePermit, [true, true]);
+      assert.deepEqual(outsidePermit, [true, true, true, true]);
     } finally {
       pub.restore();
       fs.rmSync(tmp, { recursive: true, force: true });
@@ -3555,13 +3558,13 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       const landedTips: string[] = [];
       let owedSha = "";
       const pub = stubPublish(async (n, tip, pack, signal) => {
-        if (n === 1) {
+        if (n === 3) {
           entered.resolve();
           return hangUntilAborted(pack, signal);
         }
         await drain(pack);
-        if (n > 0) landedTips.push(tip);
-        return n === 0 ? { ok: false, httpStatus: 500 } : LANDED;
+        if (n > 3) landedTips.push(tip);
+        return n < 3 ? { ok: false, httpStatus: 500 } : LANDED;
       });
       let runner: RunRunner | undefined;
       try {
@@ -3573,9 +3576,10 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
                 api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
                 await waitAbort(ctx.signal!);
                 assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+                assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
                 owedSha = commitIn(ctx.worktreePath, "after-sticky.txt", "after\\n");
                 await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } });
-                assert.equal(pub.count(), 1, "the Codex milestone still owes its publish");
+                assert.equal(pub.count(), 3, "the Codex milestone still owes its publish");
                 ctl.fireNoWait();
                 await bounded(entered.promise, TEARDOWN_MS, "restarted tick publish entry");
                 const outcome = ctl.nextOutcome();
@@ -3588,7 +3592,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
                 if (stop === "cancel") {
                   assert.equal(ctx.cancelRequested?.(), true, "the executor sees the sticky cancel after the spent abort");
                 }
-                assert.equal(pub.count(), 2, "the owed publish was aborted, with no later delivery");
+                assert.equal(pub.count(), 4, "the owed publish was aborted, with no later delivery");
               });
               return { branch: ctx.branch };
             },
@@ -3600,7 +3604,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
           // This stub returns normally; the SDK, not this stub, turns the sticky flag into a cancel.
           assert.equal(finalStatus(claim.run_id), "completed", "the stub's normal return completes the run");
         }
-        assert.equal(pub.count(), 2);
+        assert.equal(pub.count(), 4);
         assert.ok(!landedTips.includes(owedSha), "the aborted deferred milestone never landed");
       } finally {
         await settleAndClean({ ctl, runners: runner ? [runner] : [], restore: pub.restore, paths: [tmp] });
@@ -3616,13 +3620,13 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
       const entered = deferred();
       const landedTips: string[] = [];
       const pub = stubPublish(async (n, tip, pack, signal) => {
-        if (n === 1) {
+        if (n === 3) {
           entered.resolve();
           return hangUntilAborted(pack, signal);
         }
         await drain(pack);
-        if (n > 1) landedTips.push(tip);
-        return n > 1 ? LANDED : { ok: false, httpStatus: 500 };
+        if (n > 3) landedTips.push(tip);
+        return n > 3 ? LANDED : { ok: false, httpStatus: 500 };
       });
       let owedSha = "";
       const g = mkGit(fx.dataDir, writeShim(tmp, "detect"));
@@ -3635,6 +3639,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
           api.setInputs(claim.run_id, [{ id: 1, kind: "pause", body: "now" }]);
           await waitAbort(ctx.signal!);
           assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+          assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
           owedSha = commitIn(ctx.worktreePath, "after-repeat.txt", "after\n");
           ctl.advance(INTERVAL_MS + 1);
           ctl.fireNoWait();
@@ -3646,7 +3651,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
             api.requestCredentialSwitch(claim.run_id, 1);
           }
           assert.equal(await bounded(outcome, TEARDOWN_MS, "restarted tick interruption"), "aborted");
-          assert.equal(pub.count(), 2);
+          assert.equal(pub.count(), 4);
           if (interrupt === "switch") {
             // An unreadable capture cannot verify a restore point. The fake API confirms the
             // failed-switch report, so this in-place attempt must give up and keep the claim.
@@ -3661,7 +3666,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         }), ctl, { recoveryRetryMs: 1 });
         await runner.execute(claim);
         assert.equal(ctl.outcomes[0], "aborted");
-        assert.equal(pub.tips[1], owedSha, "the restarted tick entered publish for the deferred commit");
+        assert.equal(pub.tips[3], owedSha, "the restarted tick entered publish for the deferred commit");
         assert.ok(!landedTips.includes(owedSha), "the interrupted deferred commit did not land");
         if (interrupt === "switch") {
           assert.equal(switchOutcome, "gave_up", "the executor handled the switch in place");
@@ -3689,9 +3694,9 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         try { return await hangUntilAborted(pack, signal); }
         finally { order.push("tick publish aborted"); }
       }
-      order.push(n === 1 ? "pause publish" : "later tick publish");
+      order.push(n < 4 ? "pause publish" : "later tick publish");
       await drain(pack);
-      return n === 1 ? { ok: false, httpStatus: 500 } : LANDED;
+      return n < 4 ? { ok: false, httpStatus: 500 } : LANDED;
     });
     let sha = "";
     try {
@@ -3704,6 +3709,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         await waitAbort(ctx.signal!);
         pauseRequested = true;
         assert.equal(await ctx.parkForPause!({ completedCount: 0 }), false);
+        assert.deepEqual(pub.tips.slice(-3), Array(3).fill(pub.tips.at(-1)), "pause retries preserve the captured tip");
         assert.equal(ctl.outcomes[0], "aborted", "the tick settled before the park acquired the sink");
         sha = commitIn(ctx.worktreePath, "after-active.txt", "after\\n");
         ctl.advance(INTERVAL_MS + 1);
@@ -3718,7 +3724,7 @@ describe("mid-turn checkpoint lifecycle after a declined pause (issue #1785)", (
         },
       }).execute(claim);
       assert.equal(finalStatus(claim.run_id), "completed");
-      assert.deepEqual(order, ["tick publish aborted", "pause quiesce", "pause publish", "later tick publish"]);
+      assert.deepEqual(order, ["tick publish aborted", "pause quiesce", "pause publish", "pause publish", "pause publish", "later tick publish"]);
       assert.equal(pub.tips.at(-1), sha);
     } finally {
       pub.restore();
@@ -3821,9 +3827,8 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
         delays.push(ctl.armedDelay()); // → one quick retry armed
         seen.push(await ctl.fire()); // the quick retry: gate still busy
         delays.push(ctl.armedDelay()); // → back to the normal cadence
-        return { ok: false, httpStatus: 500 }; // the pause fails; the run carries on
       }
-      return LANDED;
+      return n < 3 ? { ok: false, httpStatus: 500 } : LANDED; // exhausted pause fails; run carries on
     });
     const claim = gitlabClaim(1597_274);
     let sha = "";
@@ -3837,6 +3842,7 @@ describe("mid-turn checkpoint round 4: gate_busy quick retry (issue #1597 M2)", 
                 sha = commitIn(ctx.worktreePath, "R.txt", "r\n");
                 await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] } }); // deferred
                 assert.equal(await ctx.parkForPause!({ completedCount: 1 }), false);
+                assert.deepEqual(pub.tips, [sha, sha, sha], "pause retries preserve the deferred tip");
                 seen.push(await ctl.fire()); // gate free again: the owed publish goes out
                 // The published attempt SETTLED the owed publish: new work on a frozen clock now
                 // waits for the time gate instead of bypassing it on every tick.
