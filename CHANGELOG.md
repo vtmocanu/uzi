@@ -30,6 +30,11 @@ through `[0.52.0]`.)
 - **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
   Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
 
+### Fixed
+
+- **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
+  A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory that records its origin and is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

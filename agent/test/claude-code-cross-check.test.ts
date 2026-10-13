@@ -419,9 +419,11 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
       row_present: true, lead_claim_generation: 1, child_present: true, checker_run_id: "child", checker_claim_generation: 7, checker_status: clean ? "completed" : "failed",
       outcome: clean ? "completed" : "failed" }),
   } as unknown as WorkerClient;
+  let existingBareCalls = 0;
   const git = {
     ensureClone: async () => { assert.fail("code must not prepare origin"); },
     barePathFor: () => "/local-bare",
+    existingBarePathFor: async () => { existingBareCalls++; return "/local-bare"; },
     runnerCloneAtCommit: async (...args: unknown[]) => { calls.push(args); return root; },
     readBare: async (bare: string, args: unknown[], opts: any) => {
       assert.equal(bare, "/local-bare");
@@ -440,6 +442,7 @@ for (const truncated of [false, true]) for (const clean of [true, false]) it("ru
     assert.equal(c.cross_check?.stage === "code" && c.cross_check.code_diff, expectedDiff, "Claude committed diff uses its selected family tool names");
     assert.ok(prompt.includes(expectedDiff), "production Claude prompt carries the committed diff notice");
     assert.deepEqual(calls, [["/local-bare", "b".repeat(40), "child", "lead", 7]]);
+    assert.equal(existingBareCalls, 1, "the code branch resolves the local bare through existingBarePathFor");
     assert.equal(decisions.at(-1).outcome, clean ? "completed" : "failed");
     if (clean) assert.deepEqual(decisions.at(-1).findings, [finding]);
     else assert.equal(decisions.at(-1).reason_class, "confinement_failed");
@@ -497,7 +500,7 @@ it("cross-check diagnostics use fixed categories after token deregistration and 
     const client = { reportState: async () => ({ applied: true }), getInputs: async () => ({ inputs: [] }), postMessages: async () => {},
       reportCodeCrossCheckVerdict: async (_id: string, _gen: number, v: Record<string, unknown>) => { decisions.push(v); },
     } as unknown as WorkerClient;
-    const git = { barePathFor: () => "/bare", runnerCloneAtCommit: async () => root,
+    const git = { barePathFor: () => "/bare", existingBarePathFor: async () => "/bare", runnerCloneAtCommit: async () => root,
       readBare: async () => ({ text: "diff", truncated: false }), removeRunnerClone: async () => {},
     } as unknown as GitCache;
     const claimed = claim(); claimed.secrets.anthropic_oauth_token = sentinel;

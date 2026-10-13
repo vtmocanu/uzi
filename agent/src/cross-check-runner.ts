@@ -187,7 +187,7 @@ export class CrossCheckRunner {
       steering = new ChatSteering(this.client, runId, this.opts.pollMs ?? 1000, this.log, cancel,
         { onFollowUp: () => this.log.warn("cross-check ignores follow-up input", { run_id: runId }) }, generation);
       steering.start();
-      const bare = code ? this.git.barePathFor(claim.repo.clone_url)
+      const bare = code ? await this.git.existingBarePathFor(claim.repo.clone_url)
         : await this.git.ensureClone(claim.repo.clone_url, claim.secrets.forge_pat, claim.secrets.forge_username);
       cancel.signal.throwIfAborted();
       if (code) {
