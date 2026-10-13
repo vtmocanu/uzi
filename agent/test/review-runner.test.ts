@@ -221,7 +221,7 @@ describe("ReviewRunner", () => {
             return { text, end: { kind: "terminal", terminal: { outcome: "success" } } };
           } })) as never,
         });
-        await runner.execute(reviewClaim({ claim_generation: 7,
+        await runner.execute(reviewClaim({ last_seq: 1, claim_generation: 7,
           ...(harness === "codex" ? { secrets: { forge_pat: "pat", codex: {
             auth_mode: "api_key", access_token: "test-codex", capability: "cap-1",
           } } as never } : {}),
@@ -231,7 +231,7 @@ describe("ReviewRunner", () => {
         if (hasUsage) {
           assert.equal(calls.messages[0]!.id, "review-1", "spend belongs to the review, not its target");
           assert.equal(calls.messages[0]!.generation, 7);
-          assert.deepEqual(calls.messages[0]!.messages, [{ seq: 1, kind: "status", agent: "reviewer",
+          assert.deepEqual(calls.messages[0]!.messages, [{ seq: 2, kind: "status", agent: "reviewer",
             payload: { event: "result", modelUsage: snapshot } }]);
           assert.deepEqual(order, ["usage", "review"]);
         }

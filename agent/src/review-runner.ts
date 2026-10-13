@@ -279,8 +279,9 @@ export class ReviewRunner {
       }
       // Single-pass advisory usage uses the existing judge result-frame fold. The
       // advice helper flushes once on success or failure; no evidence posts nothing.
+      // Append after any claim-time notes to retain the accounting frame in the trace.
       if (modelUsage) {
-        await this.client.postMessages(reviewRunId, [{ seq: 1, kind: "status", agent: "reviewer",
+        await this.client.postMessages(reviewRunId, [{ seq: claim.last_seq + 1, kind: "status", agent: "reviewer",
           payload: { event: "result", modelUsage },
         }], claim.claim_generation);
       }
