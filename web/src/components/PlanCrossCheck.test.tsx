@@ -36,6 +36,38 @@ const cases: [unknown, unknown, string][] = [
   ["failed", "__proto__", "Outcome unavailable"], ["failed", "toString", "Outcome unavailable"],
   ["revise", "approve", "Outcome unavailable"], ["block", null, "Outcome unavailable"],
 ];
+describe("plan cross-check headers", () => {
+  it.each(["standalone", "inset"] as const)("renders a named %s shell and heading", (presentation) => {
+    const r = render(<MemoryRouter><PlanCrossCheck presentation={presentation}
+      run={run({ plan_cross_check_summary: summary({ checker_run_id: child }) })} /></MemoryRouter>);
+    const region = r.getByRole("region", { name: "Plan cross-check" });
+    const heading = within(region).getByRole("heading", { name: "Plan cross-check", level: presentation === "inset" ? 3 : 2 });
+    const shell = presentation === "inset" ? region : region.firstElementChild!;
+    for (const token of [presentation === "inset" ? "rounded-lg" : "rounded-xl", "border", "border-edge", "bg-surface", presentation === "inset" ? "p-4" : "p-5"]) {
+      expect(shell.classList.contains(token)).toBe(true);
+    }
+    expect(region.classList.contains("rounded-md")).toBe(false);
+    expect(region.classList.contains("p-3")).toBe(false);
+    if (presentation === "standalone") {
+      expect(region.classList.contains("border")).toBe(false);
+      expect(region.classList.contains("p-5")).toBe(false);
+    }
+    const link = within(region).getByRole("link", { name: "Open checker run" });
+    expect(link.closest("header")).toBe(heading.closest("header"));
+    expect(link.classList.contains("focus-visible:ring-brand/60")).toBe(true);
+  });
+  it("places the event link in its header without repeating event text", () => {
+    const r = render(<MemoryRouter><PlanCrossCheckEvent payload={{ verdict: "approve", reason_class: "approve", checker_run_id: child }} /></MemoryRouter>);
+    const region = r.getByRole("region", { name: "Plan cross-check event" });
+    const heading = within(region).getByRole("heading", { level: 2, name: "Plan cross-check of checked candidate: Passed" });
+    expect(within(region).getAllByText("Plan cross-check of checked candidate: Passed")).toHaveLength(1);
+    const link = within(region).getByRole("link", { name: "Open checker run" });
+    expect(link.closest("header")).toBe(heading.closest("header"));
+    expect(link.getAttribute("href")).toBe(`/runs/${child}`);
+    expect(region.firstElementChild?.classList.contains("rounded-xl")).toBe(true);
+  });
+});
+
 describe("M1 plan cross-check outcomes at real sinks", () => {
   it.each(cases)("%s / %s", (verdict, reason_class, label) => {
     const s = summary({ verdict: verdict as string, reason_class: reason_class as string | null });
@@ -109,7 +141,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
     expect(region.querySelector("script, img, [onerror]")).toBeNull();
     expect(within(region).getByText("bad").getAttribute("href")).toBeNull();
     expect(within(region).getByText("good").getAttribute("title")).toBe("review denied");
-    expect(within(region).queryByText("Checker run")).toBeNull();
+    expect(within(region).queryByText("Open checker run")).toBeNull();
     expect(region.textContent!.length).toBeLessThan(17500);
     expect(within(region).getByText("Findings truncated for display.")).toBeTruthy();
   });
@@ -127,7 +159,7 @@ describe("M1 plan cross-check outcomes at real sinks", () => {
   });
   it("links only validated checker IDs and accepts null findings", () => {
     const r = render(<MemoryRouter><PlanCrossCheck run={run({ plan_cross_check_summary: summary({ checker_run_id: child }) })} /></MemoryRouter>);
-    expect(r.getByRole("link", { name: "Checker run" }).getAttribute("href")).toBe(`/runs/${child}`);
+    expect(r.getByRole("link", { name: "Open checker run" }).getAttribute("href")).toBe(`/runs/${child}`);
     expect(r.getByText(/Checker cost: Unavailable/)).toBeTruthy();
   });
 });

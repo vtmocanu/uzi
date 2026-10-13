@@ -15,6 +15,20 @@ const summary: CodeCrossCheckSummary = {
 function view(over: Partial<CodeCrossCheckSummary> = {}) {
   return render(<MemoryRouter><CodeCrossCheck run={{ ...mockRuns[0], code_cross_check_summary: { ...summary, ...over } }} /></MemoryRouter>);
 }
+it("renders a named standalone Card with heading, outcome and checker action", () => {
+  view({ checker_run_id: "12345678-abcd-abcd-abcd-123456789abc" });
+  const region = screen.getByRole("region", { name: "Code cross-check" });
+  const heading = screen.getByRole("heading", { name: "Code cross-check · Advisory before publication", level: 2 });
+  const shell = region.firstElementChild!;
+  for (const token of ["rounded-xl", "border", "border-edge", "bg-surface", "p-5"]) expect(shell.classList.contains(token)).toBe(true);
+  for (const token of ["rounded-md", "p-3", "border", "p-5"]) expect(region.classList.contains(token)).toBe(false);
+  expect(screen.getAllByText("Completed")).toHaveLength(1);
+  expect(screen.getByText("Completed").closest("header")).toBe(heading.closest("header"));
+  const link = screen.getByRole("link", { name: "Open checker run" });
+  expect(link.closest("header")).toBe(heading.closest("header"));
+  expect(link.classList.contains("focus-visible:ring-brand/60")).toBe(true);
+  expect(region.querySelector(".animate-pulse")).toBeNull();
+});
 it("shows current empty evidence with both snapshot SHAs null and unavailable cost", () => {
   view();
   expect(screen.getByText("Completed")).toBeTruthy();
@@ -56,7 +70,7 @@ it("shows incomplete reason and superseded evidence warning", () => {
   expect(screen.getByText("Reason: Snapshot failed")).toBeTruthy();
   cleanup();
   view({ interrupted_at: "2026-10-09T00:00:00Z" });
-  expect(screen.getByText("Superseded · Earlier attempt evidence")).toBeTruthy();
+  expect(screen.getByText("Earlier attempt evidence").closest("header")?.textContent).toContain("Superseded");
   expect(screen.getByText(/they are not current findings/)).toBeTruthy();
 });
 it("renders hostile prose and paths safely, strict IDs, validated child and subscription cost", () => {
@@ -68,7 +82,7 @@ it("renders hostile prose and paths safely, strict IDs, validated child and subs
   expect(screen.getByText("Path: <img src=x>:2")).toBeTruthy();
   expect(container.querySelector("script, img")).toBeNull();
   expect(container.querySelector('a[href^="javascript:"]')).toBeNull();
-  expect(screen.getByRole("link", { name: "Checker run" }).getAttribute("href")).toBe("/runs/12345678-abcd-abcd-abcd-123456789abc");
+  expect(screen.getByRole("link", { name: "Open checker run" }).getAttribute("href")).toBe("/runs/12345678-abcd-abcd-abcd-123456789abc");
   expect(screen.getByText("Checker cost: No estimate · subscription usage")).toBeTruthy();
   expect(container.textContent).not.toContain("$0");
 });
@@ -98,7 +112,7 @@ it("associates persisted dispositions by stable identity and counts only finaliz
   expect(screen.queryByText(/1 addressed,/)).toBeNull();
   cleanup();
   view({ findings: persistedFindings, dispositions: persistedDispositions, finalized_at: "2026-10-11T00:00:00Z", interrupted_at: "2026-10-11T01:00:00Z" });
-  expect(screen.getByText("Superseded · Earlier attempt evidence")).toBeTruthy();
+  expect(screen.getByText("Earlier attempt evidence").closest("header")?.textContent).toContain("Superseded");
   expect(screen.getByText("Fixed first")).toBeTruthy();
   expect(screen.queryByText(/1 addressed,/)).toBeNull();
 });
@@ -156,7 +170,7 @@ it("rejects forged links and IDs and discloses field and item truncation", () =>
   view({ checker_run_id: "../settings", findings: Array.from({ length: 21 }, (_, i) => ({
     id: i === 0 ? "bad\n" : "f" + i, path: "界".repeat(900), title: "a".repeat(4000), detail: "b".repeat(4000), severity: "minor"
   })) });
-  expect(screen.queryByRole("link", { name: "Checker run" })).toBeNull();
+  expect(screen.queryByRole("link", { name: "Open checker run" })).toBeNull();
   expect(screen.getByText(/ID unavailable/)).toBeTruthy();
   expect(screen.getByText("Findings truncated for display.")).toBeTruthy();
   expect(screen.queryByText(/Finding: f20/)).toBeNull();

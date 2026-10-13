@@ -3,6 +3,7 @@ import type { Run } from "../lib/apiTypes";
 import { costDisplay, costHeadline } from "../lib/costStatus";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Markdown } from "./Markdown";
+import { Badge, Card, CardHeader } from "./ui";
 
 function plain(value: unknown, cap = 200): string {
   return typeof value === "string" ? stripUnsafeChars(value.slice(0, cap)).replace(/[\n\t]/g, " ") : "";
@@ -106,9 +107,13 @@ export function CodeCrossCheck({ run }: { run: Run }) {
   const cost = usage?.cost_status === "subscription" ? costHeadline(costDisplay("subscription", 0))
     : usage && Number.isFinite(usage.cost_usd) && usage.cost_usd >= 0
     ? costHeadline(costDisplay(usage.cost_status, usage.cost_usd)) : "Unavailable";
-  return <section aria-label="Code cross-check" className="rounded-md border border-edge p-3 text-sm space-y-2">
-    <h3 className="font-semibold">Code cross-check · Advisory before publication</h3>
-    <p>{historical ? "Superseded · Earlier attempt evidence" : outcome}</p>
+  return <section aria-label="Code cross-check" className="rounded-xl border-edge bg-surface">
+    <Card className="text-sm space-y-2">
+    <CardHeader title="Code cross-check · Advisory before publication"
+      badge={<Badge>{historical ? "Superseded" : outcome}</Badge>}
+      subtitle={historical ? "Earlier attempt evidence" : undefined}
+      actions={typeof s?.checker_run_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/i.test(s.checker_run_id) && <Link className="text-info underline underline-offset-2 hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60" to={`/runs/${s.checker_run_id}`}>Open checker run</Link>}
+    />
     {historical && <p>These findings concern an earlier attempt; they are not current findings.</p>}
     {s && <>
       {s.reason_class && <p>Reason: {reasonLabel(s.reason_class)}</p>}
@@ -122,7 +127,7 @@ export function CodeCrossCheck({ run }: { run: Run }) {
       <Findings value={s.findings} dispositions={evidence.entries} />
       <p>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"} · Model: {plain(s.checker_model) || "Unreported"} · Effort: {plain(s.checker_effort) || "Unreported"}</p>
       <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : ""}</p>
-      {typeof s.checker_run_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/i.test(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}
     </>}
+    </Card>
   </section>;
 }

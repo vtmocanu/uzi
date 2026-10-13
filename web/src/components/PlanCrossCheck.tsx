@@ -4,6 +4,7 @@ import { costDisplay, costHeadline } from "../lib/costStatus";
 import { formatTokens } from "../lib/formatTokens";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Markdown } from "./Markdown";
+import { Card, CardHeader } from "./ui";
 
 const reasons: Record<string, string> = {
   revise: "Changes requested", block: "Blocked",
@@ -93,10 +94,13 @@ function Findings({ value }: { value: unknown }) {
 
 export function PlanCrossCheckEvent({ payload, detail }: { payload: unknown; detail?: PlanCrossCheckSummary }) {
   const p = record(payload);
-  return <section aria-label="Plan cross-check event" className="rounded-md border border-edge p-3 text-sm">
-    <p>{planCheckEventText(payload, detail)}</p>
-    <Findings value={p.findings} />
-    {childId(p.checker_run_id) && <Link to={`/runs/${p.checker_run_id}`}>Checker run</Link>}
+  return <section aria-label="Plan cross-check event" className="rounded-xl border-edge bg-surface">
+    <Card className="text-sm space-y-2">
+      <CardHeader title={planCheckEventText(payload, detail)} actions={
+        childId(p.checker_run_id) && <Link className="text-info underline underline-offset-2 hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60" to={`/runs/${p.checker_run_id}`}>Open checker run</Link>
+      } />
+      <Findings value={p.findings} />
+    </Card>
   </section>;
 }
 
@@ -104,7 +108,7 @@ function sourceLabel(source: unknown): string {
   return source === "pin" || source === "worker default" ? source : "unknown";
 }
 
-export function PlanCrossCheck({ run }: { run: Run }) {
+export function PlanCrossCheck({ run, presentation = "standalone" }: { run: Run; presentation?: "standalone" | "inset" }) {
   const s = run.plan_cross_check_summary;
   const gate = run.plan_cross_check_gate_reason;
   if (!s && !gate && !run.plan_cross_check_required) return null;
@@ -112,8 +116,10 @@ export function PlanCrossCheck({ run }: { run: Run }) {
   const cost = usage?.cost_status === "subscription" ? costHeadline(costDisplay("subscription", 0))
     : usage && typeof usage.cost_usd === "number" && Number.isFinite(usage.cost_usd) && usage.cost_usd >= 0
     ? costHeadline(costDisplay(usage.cost_status, usage.cost_usd)) : "Unavailable";
-  return <section aria-label="Plan cross-check" className="rounded-md border border-edge p-3 text-sm space-y-2">
-    <h3 className="font-semibold">Plan cross-check</h3>
+  const content = <>
+    <CardHeader title="Plan cross-check" level={presentation === "inset" ? 3 : 2} actions={
+      childId(s?.checker_run_id) && <Link className="text-info underline underline-offset-2 hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60" to={`/runs/${s.checker_run_id}`}>Open checker run</Link>
+    } />
     {gate && <p>Current gate: {reasonLabel(gate) ?? "Reason unavailable"}</p>}
     {gate === "planning_diff_refused" && run.plan_cross_check_diff_refusal != null && <p>Refusal: {diffRefusalLabel(run.plan_cross_check_diff_refusal)}</p>}
     <p>{s ? `${s.historical ? "Earlier-plan evidence" : "Checked candidate"}: ${planCheckOutcome(s.verdict, s.reason_class)}` : "Outcome unavailable"}</p>
@@ -123,7 +129,9 @@ export function PlanCrossCheck({ run }: { run: Run }) {
       <p>Model: {plain(s.checker_model) || "Unreported"} ({sourceLabel(s.checker_model_source)}) · Effort: {plain(s.checker_effort) || "Unreported"} ({sourceLabel(s.checker_effort_source)})</p>
       {usage && <p>Checker tokens: {Number.isFinite(usage.input_tokens) && usage.input_tokens >= 0 ? formatTokens(usage.input_tokens) : "Unreported"} in · {Number.isFinite(usage.output_tokens) && usage.output_tokens >= 0 ? formatTokens(usage.output_tokens) : "Unreported"} out</p>}
       <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · no cost estimate recorded" : cost === "Unavailable" ? " · cost unavailable" : " · API-equivalent"}</p>
-      {childId(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}
     </>}
-  </section>;
+  </>;
+  return presentation === "inset"
+    ? <section aria-label="Plan cross-check" className="rounded-lg border border-edge bg-surface p-4 text-sm space-y-2">{content}</section>
+    : <section aria-label="Plan cross-check" className="rounded-xl border-edge bg-surface"><Card className="text-sm space-y-2">{content}</Card></section>;
 }

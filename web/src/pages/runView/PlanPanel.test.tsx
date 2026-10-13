@@ -129,6 +129,20 @@ function renderPanel(over: Partial<Run> = {}, onApprove = vi.fn()) {
   return { onApprove };
 }
 
+it.each([false, true])("places inset checker evidence below the gate header (revising %s)", (revising) => {
+  render(<PlanPanel run={run({ plan_cross_check_required: true })}
+    messages={revising ? [{ seq: 1, kind: "plan_revising", payload: {}, agent: null, agent_instance: null, agent_label: null, created_at: "" }] : []}
+    busy={false} canSteer={false} onApprove={vi.fn()} onReject={vi.fn()} />);
+  const gateHeading = screen.getByRole("heading", { level: 2, name: revising ? /Revising the plan/ : /Plan awaiting the owner's approval/ });
+  const region = screen.getByRole("region", { name: "Plan cross-check" });
+  expect(within(region).getByRole("heading", { level: 3, name: "Plan cross-check" })).toBeTruthy();
+  expect(gateHeading.compareDocumentPosition(region) & Node.DOCUMENT_POSITION_FOLLOWING).toBeTruthy();
+  const gateHeader = gateHeading.parentElement!.parentElement!;
+  expect(gateHeader.contains(region)).toBe(false);
+  expect(region.parentElement?.classList.contains("p-4")).toBe(true);
+  for (const token of ["rounded-lg", "border", "border-edge", "bg-surface", "p-4"]) expect(region.classList.contains(token)).toBe(true);
+});
+
 describe("derivePlanRevision — human and automatic feedback", () => {
   function message(seq: number, kind: string, payload: unknown): RunMessage {
     return { seq, kind, payload, agent: "lead", agent_instance: null, agent_label: null, created_at: "2026-01-01T00:00:00Z" };

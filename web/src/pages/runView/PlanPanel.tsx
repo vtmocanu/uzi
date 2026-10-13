@@ -504,7 +504,7 @@ export function PlanPanel({
           </div>
         </div>
         <div className="p-4">
-          <PlanCrossCheck run={run} />
+          <PlanCrossCheck run={run} presentation="inset" />
           <RevisionThread feedback={rev.latestFeedback} working />
         </div>
       </div>
@@ -518,7 +518,6 @@ export function PlanPanel({
 
   return (
     <div className="overflow-hidden rounded-xl border border-warn/50 bg-warn/5">
-      <PlanCrossCheck run={run} />
       <div className="flex flex-wrap items-center justify-between gap-3 border-b border-warn/30 bg-warn/10 px-4 py-3">
         <div>
           <h2 className="flex items-center gap-2 text-sm font-semibold text-warn">
@@ -576,6 +575,7 @@ export function PlanPanel({
         </div>
       </div>
       <div className="space-y-4 p-4">
+        <PlanCrossCheck run={run} presentation="inset" />
         {/* PRD #1795 D5: the verdict was refused (409 gate_revision_mismatch) and nothing
             was applied. The run is refetched by the caller; the notice says only what the
             reported revisions support. */}
