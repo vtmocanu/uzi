@@ -296,6 +296,23 @@ export class Worker {
       const authority = Promise.resolve().then(async () => {
         const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
           !this.admittedRunIds.has(entry.run_id) && !(this.activeRuns?.has(entry.run_id) ?? false);
+        const retireWithExistingAuthority = async (): Promise<boolean> => {
+          if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
+              !reportEligible()) return false;
+          if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return false;
+          const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
+          if (!eligible()) return false;
+          const retired = await outbox.retireFinalizeIfEligible(
+            entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
+          if (retired === true && incarnation && eligible())
+            await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+          return retired;
+        };
+        // Prefer the existing exact covering ACK clause before spending its deadline
+        // on an archive-only proof. Ownership, identity and live fences still apply.
+        if (typeof this.runner.recoveryFinalAcknowledged === "function" && reportEligible() &&
+            await this.runner.recoveryFinalAcknowledged(entry.run_id, entry.claim_generation) === true &&
+            await retireWithExistingAuthority()) return true;
         if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
           const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
@@ -306,16 +323,7 @@ export class Worker {
             return true;
           }
         }
-        if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
-            !reportEligible()) return;
-        if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return;
-        const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
-        if (!eligible()) return;
-        const retired = await outbox.retireFinalizeIfEligible(
-          entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
-        if (retired === true && incarnation && eligible())
-          await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
-        return retired;
+        return retireWithExistingAuthority();
       });
       finalizeAuthorities.set(key, authority);
       const settled = () => {
