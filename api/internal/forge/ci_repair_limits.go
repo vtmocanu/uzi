@@ -15,10 +15,12 @@ const (
 	ciRepairJSONBytes = 4 << 20
 	ciRepairFireBytes = 16 << 20
 
-	// Raw network bytes, charged below the gzip reader, in addition to the
-	// decompressed budgets above. The bound holds because budgeted requests use
+	// Transfer-decoded body bytes (still gzip-compressed), charged below the gzip
+	// reader, in addition to the decompressed budgets above. Budgeted requests use
 	// HTTP/1.1 only (forgeHTTP1Transport): over HTTP/2, padding and empty DATA
-	// frames never reach the response body and would bypass the counter.
+	// frames never reach the response body and would bypass the counter. HTTP/1.1
+	// framing (chunk lines, trailers, headers) is not charged here; the standard
+	// library caps it per response (chunked non-data limit, MaxResponseHeaderBytes).
 	ciRepairCompressedJSONBytes = 4 << 20
 	ciRepairCompressedFireBytes = 16 << 20
 )

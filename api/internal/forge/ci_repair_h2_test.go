@@ -7,6 +7,7 @@ import (
 	"io"
 	"net/http"
 	"net/http/httptest"
+	"strconv"
 	"testing"
 	"time"
 )
@@ -16,7 +17,7 @@ import (
 func h2Server(t *testing.T) (*httptest.Server, *x509.CertPool) {
 	t.Helper()
 	srv := httptest.NewUnstartedServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
-		_, _ = io.WriteString(w, `{"proto":`+string(rune('0'+r.ProtoMajor))+`}`)
+		_, _ = io.WriteString(w, `{"proto":`+strconv.Itoa(r.ProtoMajor)+`}`)
 	}))
 	srv.EnableHTTP2 = true
 	srv.StartTLS()
