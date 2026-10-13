@@ -3867,7 +3867,7 @@ export class RunRunner {
         }
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
         if (outcome === "released") {
-          // The flight ends: the finally retires the clone and preserves the HOME; the server
+          // The flight ends: the finally keeps the clone for recapture and preserves HOME; the server
           // requeued the run; a reclaim resumes at resume_phase on the newly-chosen token. No
           // terminal report — enterCredentialSwitch already reported credential_switch.
           runLog.info("credential switch released this claim; leaving the run for a reclaim on the new token");
@@ -10815,7 +10815,7 @@ export class RunRunner {
       // old token in place, so CLEAR the preserve flags enterCredentialSwitch set up front (its
       // step 2) — a later NORMAL completion must clean up the clone + HOME as usual, not preserve
       // them (D3/D14). On a RELEASE they are already correct (parked=true, preserveRecoveryClone=
-      // false) so the finally retires the clone and keeps the HOME for resume. The clear lives HERE,
+      // true) so the finally keeps the clone for recapture and HOME for resume. The clear lives HERE,
       // not inside enterCredentialSwitch, because the outer-catch safety net cannot continue in
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
