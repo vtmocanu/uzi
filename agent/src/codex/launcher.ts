@@ -278,7 +278,9 @@ function preflightObservation(line: string): { event?: string; id?: number; vali
   const result: { event?: string; id?: number; valid: boolean; oversize: boolean } = { valid: false, oversize: false };
   type Frame = { object: boolean; state: "first" | "key" | "colon" | "value" | "after"; processes: boolean; key?: string };
   const stack: Frame[] = [];
-  const token = /"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}\[\],:]/y;
+  // JSON strings exclude unescaped U+0000 through U+001F by grammar.
+  // oxlint-disable-next-line no-control-regex
+  const token = /"(?:[^"\\\u0000-\u001f]|\\(?:["\\/bfnrt]|u[0-9a-fA-F]{4}))*"|-?(?:0|[1-9][0-9]*)(?:\.[0-9]+)?(?:[eE][+-]?[0-9]+)?|true|false|null|[{}[\],:]/y;
   let offset = 0;
   let started = false;
   let entries = 0;

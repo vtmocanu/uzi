@@ -38,7 +38,7 @@ function broker(spawnCommand: SpawnCommandSeam, registry: ExecutionRegistry, cap
   });
 }
 const ticks = "18446744073709551615";
-function fakeRoot() {
+function fakeRoot(supervisorPid = 50, rss = 100) {
   const child = deferred<{ event: "child_exit"; code: number }>();
   const stdout = new PassThrough();
   const stderr = new PassThrough();
@@ -46,23 +46,27 @@ function fakeRoot() {
   let observations = 0;
   let observeHook: (() => Promise<ObservationOutcome>) | undefined;
   let disposeHeld = false;
+  const disposal = deferred<Awaited<ReturnType<CodexRootHandle["dispose"]>>>();
   let clean = true;
   let endOutput = true;
   let evidence: ObservationOutcome = {
     event: "observe", id: 1, state: "complete", supervisor: { pid: 50, startTime: ticks },
     root: { pid: 51, startTime: ticks }, processes: [{ pid: 51, startTime: ticks, ppid: 50, rss: 100 }],
   };
+  evidence = { ...evidence, supervisor: { pid: supervisorPid, startTime: ticks },
+    root: { pid: supervisorPid + 1, startTime: ticks },
+    processes: [{ pid: supervisorPid + 1, startTime: ticks, ppid: supervisorPid, rss }] };
   const handle: CodexRootHandle = {
-    started: { event: "started", supervisorPid: 50, childPid: 51, uid: 10003, subreaper: true,
+    started: { event: "started", supervisorPid, childPid: supervisorPid + 1, uid: 10003, subreaper: true,
       nondumpable: true, liveCapsZero: true, capBoundingSet: "0x0", noNewPrivs: true },
-    supervisorPid: 50, transport: { stdin: new PassThrough(), stdout, stderr },
+    supervisorPid, transport: { stdin: new PassThrough(), stdout, stderr },
     failed: undefined, whenFailed: new Promise(() => {}),
     snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
     observe: async () => { observations++; return observeHook ? observeHook() : evidence; },
     waitChild: async () => child.promise,
     dispose: async () => {
       disposes++;
-      if (disposeHeld) return new Promise(() => {});
+      if (disposeHeld) return disposal.promise;
       if (endOutput) { stdout.end(); stderr.end(); }
       return clean ? { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }
         : { clean: false, reason: "fixture unconfirmed" };
@@ -71,6 +75,10 @@ function fakeRoot() {
   return { handle, child, observations: () => observations, disposes: () => disposes,
     observeWith: (hook: () => Promise<ObservationOutcome>) => { observeHook = hook; },
     hangDisposal: () => { disposeHeld = true; },
+    completeDisposal: () => {
+      stdout.end(); stderr.end();
+      disposal.resolve({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } });
+    },
     change: (next: ObservationOutcome) => { evidence = next; },
     unconfirmed: () => { clean = false; }, hangOutput: () => { endOutput = false; },
     endOutput: () => { stdout.destroy(); stderr.destroy(); } };
@@ -388,6 +396,8 @@ test("unclean disposal retains root and exact memory outcome rather than generic
   const entry = c.commands.eligibleEntries()![0]!;
   c.commands.prepareOutcome(entry);
   c.commands.resolveToolOutcome(entry, { ...resultFor(entry), cancellation_confirmed: false, outcome: "unknown" });
+  assert.equal(root.disposes(), 0);
+  root.child.resolve({ event: "child_exit", code: 0 });
   const result = await reply;
   assert.equal(result.ok, false);
   if (result.ok) assert.fail("memory result expected");
@@ -395,4 +405,139 @@ test("unclean disposal retains root and exact memory outcome rather than generic
   assert.equal(c.commands.hasConfirmedStop(entry), false);
   assert.equal(c.commands.unregister(entry), false, "unconfirmed root remains retained");
   assert.equal(registry.hasLiveCommandRoot(), true);
+});
+
+test("pressure feedback never grants ordinary disposal for denied revoked or retired monitor authority", async () => {
+  for (const mode of ["denied", "revoked", "retired"] as const) {
+    const c = captured();
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+    const root = fakeRoot();
+    const sibling = fakeRoot(60, 1);
+    const siblingContext = c.commands.begin({ ...c.context, run_id: "44444444-4444-4444-8444-444444444444", flight: {} });
+    const siblingCapture = { ...c, context: siblingContext, flight: siblingContext.flight };
+    const siblingRegistry = new ExecutionRegistry(newLocalExecutionEpoch(2));
+    const siblingReply = broker(makeDefaultSpawnCommand(siblingRegistry, async () => sibling.handle, 100, WT, {}, "off",
+      undefined, undefined, 1000, siblingCapture), siblingRegistry, siblingCapture)
+      .handleToolCall({ ...rt, callId: "sibling" }, "Bash", { command: "printf sibling" }, "root");
+    const reply = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off",
+      undefined, undefined, 1000, c), registry, c)
+      .handleToolCall({ ...rt, callId: "call-private-fixture" }, "Bash", { command: "printf private-fixture" }, "root");
+    await until(() => c.commands.eligibleEntries()?.length === 2);
+    let revision = 1;
+    let feedback: WorkerMemoryPressureResult | undefined;
+    const monitor = new WorkerMemoryMonitor({
+      enabled: true, reserveBytes: 200, hysteresisBytes: 100, sampleMs: 100,
+      responseBudgetMs: 1000, rearmMs: 100, maxInterventions: 2,
+    }, {
+      commands: c.commands, now: () => performance.now(),
+      incarnation: () => ({ worker_id: c.context.worker_id, register_nonce: c.context.register_nonce, revision }),
+      sample: () => {
+        const time = performance.now();
+        const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
+        return { available: true, sampleId: 1, startedAtMs: time, completedAtMs: time,
+          currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+          pressure: { some: psi, full: psi } };
+      },
+      reserve: async (request) => {
+        if (mode === "revoked") revision++;
+        if (mode === "retired") c.commands.retire(c.context);
+        return { ...request, admitted: mode !== "denied", authorizing: mode !== "denied",
+          allowance: { limit: 2, used: mode === "denied" ? 2 : 1, remaining: mode === "denied" ? 0 : 1 } };
+      },
+      report: async (request) => ({ ...request, policy: { version: 1, max_interventions: 2 }, admitted: true, authorizing: false,
+        allowance: { limit: 2, used: 1, remaining: 1 } }),
+      feedback: async (result) => { feedback = result; }, preserve: async () => {},
+    });
+    try {
+      monitor.tick();
+      await monitor.settle();
+      assert.equal(feedback?.outcome, "no_signal", mode);
+      await new Promise((done) => setImmediate(done));
+      assert.equal(root.disposes(), 0, mode);
+      assert.equal(registry.hasLiveCommandRoot(), true, mode);
+      assert.equal(sibling.disposes(), 0, "unselected sibling survives");
+      root.child.resolve({ event: "child_exit", code: 0 });
+      const result = await reply;
+      assert.equal(result.ok, false);
+      if (result.ok) assert.fail("pressure feedback expected");
+      assert.equal(result.code, "worker_memory_pressure", "original callback accepts redacted display IDs");
+      assert.deepEqual(result.memoryPressure, feedback);
+      assert.ok(!JSON.stringify(result).includes("private-fixture"));
+      assert.ok(!projectToolOutput(result, (s) => s).includes("private-fixture"));
+      assert.equal(root.disposes(), 1, "ordinary primary exit permits cleanup");
+      assert.equal(sibling.disposes(), 0);
+    } finally {
+      root.child.resolve({ event: "child_exit", code: 0 });
+      sibling.child.resolve({ event: "child_exit", code: 0 });
+      await Promise.all([reply, siblingReply, monitor.stop()]);
+    }
+  }
+});
+
+test("timed out owned reap reconciles late clean completion without reviving its epoch or losing historical outcome", async () => {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const unaffected = new ExecutionRegistry(newLocalExecutionEpoch(2));
+  const root = fakeRoot();
+  root.hangDisposal();
+  const reply = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off",
+    undefined, undefined, 1000, c), registry, c)
+    .handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
+  await until(() => c.commands.eligibleEntries()?.length === 1);
+  const entry = c.commands.eligibleEntries()![0]!;
+  const historical = c.commands.prepareOutcome(entry);
+  const expected = { ...resultFor(entry), outcome: "unknown" as const, cancellation_confirmed: false };
+  c.commands.resolveToolOutcome(entry, expected);
+  root.child.resolve({ event: "child_exit", code: 0 });
+  const result = await reply;
+  assert.equal(result.ok, false);
+  if (result.ok) assert.fail("pressure result expected");
+  assert.deepEqual(result.memoryPressure, expected);
+  assert.equal(registry.isPoisoned(), true);
+  assert.equal(registry.reserveLaunch("command").kind, "denied");
+  assert.equal(unaffected.reserveLaunch("command").kind, "reserved");
+  assert.equal(registry.hasLiveCommandRoot(), true);
+  assert.equal(c.commands.hasConfirmedStop(entry), false);
+  const successor = c.commands.begin({ ...c.context, memory_episode: 1, flight: {} });
+  const latch = c.commands.acquireLatch(successor)!;
+  root.completeDisposal();
+  await until(() => !registry.hasLiveCommandRoot());
+  assert.equal(c.commands.hasConfirmedStop(entry), true);
+  assert.equal(c.commands.recordDrain(entry, { confirmed: false }), false, "exact original entry was removed");
+  assert.equal(c.commands.isCurrent(successor), true);
+  assert.equal(c.commands.admitsCommands(successor), false, "late completion cannot change successor latch");
+  c.commands.releaseLatch(latch);
+  assert.deepEqual(await historical, expected);
+  assert.equal(registry.isPoisoned(), true);
+  assert.equal(registry.reserveLaunch("command").kind, "denied");
+  // Retired entries count toward the observation cap. Fill it to prove the old entry is gone.
+  for (let i = 0; i < 256; i++) c.commands.register(successor, {
+    source: "codex-model-command", toolId: "fill-" + i, attemptId: "attempt", command: "fixture",
+    root: { pid: 100 + i, startTime: "10" }, observe: async () => { throw new Error("unused"); },
+    cancel: async () => {}, drain: async () => ({ confirmed: false }),
+  });
+  assert.equal(c.commands.eligibleEntries()?.length, 256);
+});
+
+test("full adapter refuses a mismatched callback result after private ID binding", async () => {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  const spawn = makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off",
+    undefined, undefined, 1000, c);
+  const reply = broker(async (argv, opts) => {
+    const result = await spawn(argv, opts);
+    return { ...result, memoryPressure: result.memoryPressure ? { ...result.memoryPressure, tool_id: "other-callback" } : undefined };
+  }, registry, c).handleToolCall({ ...rt, callId: "call-private-fixture" }, "Bash", { command: "printf fixture" }, "root");
+  await until(() => c.commands.eligibleEntries()?.length === 1);
+  const entry = c.commands.eligibleEntries()![0]!;
+  c.commands.prepareOutcome(entry);
+  c.commands.resolveToolOutcome(entry, resultFor(entry));
+  root.child.resolve({ event: "child_exit", code: 0 });
+  const result = await reply;
+  assert.equal(result.ok, false);
+  if (result.ok) assert.fail("mismatch expected");
+  assert.equal(result.code, "memory_result_mismatch");
+  assert.equal(result.memoryPressure, undefined);
+  assert.ok(!JSON.stringify(result).includes("private-fixture"));
 });

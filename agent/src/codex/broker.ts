@@ -293,6 +293,13 @@ interface ModelCommandMetadata extends CallbackRuntimeId {
   readonly command: string;
 }
 const modelCommands = new WeakMap<ModelCommandMetadata, CapturedMemoryContext | undefined>();
+const memoryCallbackIds = new WeakMap<ModelCommandMetadata, { toolId: string; attemptId: string }>();
+
+/** Bind display identifiers to the original worker-minted callback before redaction reaches its result. */
+export function bindMemoryCallback(metadata: ModelCommandMetadata, ids: { toolId: string; attemptId: string }): void {
+  if (!isBrokerModelCommand(metadata) || memoryCallbackIds.has(metadata)) throw new Error("invalid memory callback binding");
+  memoryCallbackIds.set(metadata, Object.freeze({ toolId: ids.toolId, attemptId: ids.attemptId }));
+}
 
 /** Identity membership is minted only by dispatchShell after screening. */
 export function isBrokerModelCommand(value: ModelCommandMetadata | undefined, captured?: CapturedMemoryContext): value is ModelCommandMetadata {
@@ -780,7 +787,8 @@ export class CodexCallbackBroker {
     }
     if (spawned.memoryPressure) {
       const result = spawned.memoryPressure;
-      if (result.tool_id !== metadata.toolId || result.attempt_id !== metadata.attemptId
+      const callbackIds = memoryCallbackIds.get(metadata) ?? metadata;
+      if (result.tool_id !== callbackIds.toolId || result.attempt_id !== callbackIds.attemptId
         || result.command_id !== metadata.commandId || !captured
         || result.run_id !== captured.context.run_id || result.worker_id !== captured.context.worker_id
         || result.claim_generation !== captured.context.claim_generation

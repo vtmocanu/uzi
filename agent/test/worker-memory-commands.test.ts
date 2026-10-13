@@ -370,3 +370,25 @@ test("old exact-entry completion evidence leaves replacement context and latch u
   assert.equal(registry.releaseLatch(latch), true);
   unsubscribe();
 });
+
+test("review: absent primary collision with unobserved sibling must refuse selection", () => {
+  const commands = new WorkerMemoryCommands();
+  const context = commands.begin({
+    run_id: "11111111-1111-4111-8111-111111111111",
+    worker_id: "22222222-2222-4222-8222-222222222222",
+    register_nonce: "nonce", claim_generation: 1, memory_episode: 0,
+    flight: {}, lifecycleRevision: 1,
+  });
+  const callbacks = { source: "codex-model-command" as const, toolId: "tool",
+    attemptId: "attempt", command: "inert fixture",
+    observe: async () => { throw new Error("not invoked"); },
+    cancel: async () => {}, drain: async () => ({ confirmed: false }) };
+  const a = commands.register(context, { ...callbacks,
+    root: { pid: 9, startTime: "10" }, primary: { pid: 10, startTime: "11" } });
+  commands.register(context, { ...callbacks, root: { pid: 10, startTime: "12" } });
+  const observation = { available: true, complete: true,
+    startedAtMs: 100, completedAtMs: 100, supervisor: a.root, primary: a.primary,
+    rows: [{ pid: 12, startTime: "10", rssBytes: 100 }] };
+  assert.equal(commands.select([{ entry: a, observation }], 100, 200), undefined,
+    "an absent primary must retain conservative PID overlap protection");
+});

@@ -1,5 +1,5 @@
 import type { CapturedMemoryContext, SpawnCommandOptions } from "./broker.js";
-import { isBrokerModelCommand } from "./broker.js";
+import { bindMemoryCallback, isBrokerModelCommand } from "./broker.js";
 import type { CodexRootHandle } from "./launcher.js";
 import type { ExecutionRegistry, RegisteredRoot, ReapOutcome } from "./registry.js";
 import type { WorkerMemoryCommands } from "../worker-memory-commands.js";
@@ -53,9 +53,23 @@ export async function enrollMemoryCommand(
   };
   // A primary that has already exited with no adopted children needs no enrollment.
   if (convert(initial, startedAtMs).rows.length === 0) return undefined;
-  const reap = (budgetMs = deadlineMs): Promise<ReapOutcome> =>
-    boundedCommandWait(registry.reapRoot(root, Math.min(deadlineMs, budgetMs)), Math.min(deadlineMs, budgetMs));
   let entry!: Entry;
+  const reap = async (budgetMs = deadlineMs): Promise<ReapOutcome> => {
+    const budget = Math.min(deadlineMs, budgetMs);
+    // Reconcile on the already owned reap promise, even when this foreground wait expires.
+    const completion = registry.reapRoot(root, budget).then((result) => {
+      if (result.ok) {
+        commands.recordDrain(entry, { confirmed: true });
+        commands.unregister(entry);
+      }
+      return result;
+    });
+    try { return await boundedCommandWait(completion, budget); }
+    catch (error) {
+      registry.poison({ category: "protocol", message: "command cleanup completion unconfirmed" });
+      throw error;
+    }
+  };
   const authorizedReap = async (authority: Parameters<Entry["cancel"]>[0]) => {
     const end = performance.now() + authority.remainingMs;
     if (!current() || authority.signal.aborted || !authority.authorized()) throw new Error("stale memory cancellation");
@@ -88,6 +102,7 @@ export async function enrollMemoryCommand(
       return { confirmed: result.ok, detail: result.ok ? undefined : "supervisor disposal unconfirmed" };
     },
   }, metadata.commandId);
+  bindMemoryCallback(metadata, entry);
   const outcome = commands.watchOutcome(entry);
   return {
     entry, outcome, reap,

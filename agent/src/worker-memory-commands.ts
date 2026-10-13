@@ -318,7 +318,8 @@ export class WorkerMemoryCommands {
           || !observation.primary || !rootValid(observation.primary)
           || key(observation.primary) !== key(entry.primary)
           || protectedPids.has(entry.root.pid) || protectedPids.has(entry.primary.pid)
-          || enrolledPids.get(entry.root.pid)?.some((other) => other !== entry)) invalid.add(index);
+          || enrolledPids.get(entry.root.pid)?.some((other) => other !== entry)
+          || enrolledPids.get(entry.primary.pid)?.some((other) => other !== entry)) invalid.add(index);
         for (const root of [entry.root, entry.primary]) {
           const identity = key(root);
           if (seen.has(identity)) continue;

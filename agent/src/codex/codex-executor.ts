@@ -5162,12 +5162,18 @@ export function makeDefaultSpawnCommand(
       });
       const terminal = launched.handle.waitChild(wallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
         .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
-      const first = await Promise.race([
+      const ordinary = Promise.race([
         terminal,
         aborted.then(() => ({ kind: "aborted" as const })),
         capTrip.then(() => ({ kind: "cap" as const })),
+      ]);
+      const first = await Promise.race([
+        ordinary,
         ...(memory ? [memory.outcome.then((result) => ({ kind: "memory" as const, result }))] : []),
       ]);
+      // A pressure outcome conveys tool feedback, never ordinary disposal authority.
+      // Keep this root owned in the foreground until exit, abort, cap or wall deadline.
+      const cleanupReason = first.kind === "memory" ? await ordinary : first;
       if (onAbort && opts.signal) opts.signal.removeEventListener("abort", onAbort);
       let cleanupError: unknown;
       let reaped = false;
@@ -5187,11 +5193,11 @@ export function makeDefaultSpawnCommand(
       }
       if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
       if (cleanupError) throw cleanupError;
-      if (first.kind === "aborted") throw new Error("command aborted");
-      if (first.kind === "deadline") throw new CommandDeadlineError(wallMs);
-      if (first.kind === "failed") throw first.error;
+      if (cleanupReason.kind === "aborted") throw new Error("command aborted");
+      if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(wallMs);
+      if (cleanupReason.kind === "failed") throw cleanupReason.error;
       return {
-        code: first.kind === "cap" || first.kind === "memory" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : first.code,
+        code: cleanupReason.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : cleanupReason.code,
         stdout,
         stderr,
       };
