@@ -1,5 +1,44 @@
 #!/usr/bin/env bash
 # sourced by run-e2e.sh; shared helpers used by >=2 phases (PRD #966 M1)
+# #2512 same-claim recovery: exact available capture before fresh seed and
+# post-clone inventory, with one successor claim. An explicit branch supports
+# gate-stage recovery before the stub has committed; finalize recovery derives it.
+wait_same_claim_capture_resume() {
+  local run="$1" gen="$2" timeout="${3:-60}" deadline=$((SECONDS + ${3:-60}))
+  local branch="${4:-}"
+  local log_file="$RUNROOT/.f42-capture.log" recovery_file="$RUNROOT/.f42-capture.json"
+  while :; do
+    "${COMPOSE[@]}" logs --no-color agent > "$log_file" 2>/dev/null \
+      || fail "issue 1742: could not read predecessor-capture evidence for $run"
+    uzi_cli run recovery "$run" --json > "$recovery_file" \
+      || fail "issue 1742: could not read recovery captures for $run"
+    if jq -Rse --arg run "$run" --argjson gen "$gen" --arg branch "$branch" --slurpfile recovery "$recovery_file" '
+      [split("\n")[] | sub("^[^{]*"; "") | fromjson?] as $events |
+      ($events | to_entries) as $indexed |
+      [$indexed[] | select(.value.run_id == $run and .value.msg == "run claimed") | .key] as $claims |
+      (if $branch != "" then $branch else first($events[] | select(.run_id == $run and .msg == "stub executor committed marker") | .branch) // "" end) as $branch |
+      [$indexed[] | select(.value.msg == "runner clone: seeding" and .value.branch == $branch
+        and (.value.path | test("-g" + ($gen | tostring) + "-[0-9a-f]{16}$"))) | .key] as $seeds |
+      [$indexed[] | select(.value.run_id == $run and .value.msg == "recovery: bundle uploaded (durable capture)"
+        and .value.server_state == "available" and (.value.server_capture_id | type == "string" and length > 0))]
+        | unique_by(.value.server_capture_id) as $captures |
+      [$indexed[] | select(.value.run_id == $run
+        and .value.msg == "recovery: prior open custody holds inventoried after clone"
+        and .value.claim_generation == $gen) | .key] as $ready |
+      [$recovery[0][] | select(.generation == $gen) | .captures[]? | select(.state == "available") | .id] as $available |
+      ($claims | length) == 2 and ($seeds | length) == 1 and ($captures | length) == 1
+      and ($ready | length) == 1 and ($available | length) == 1
+      and $available[0] == $captures[0].value.server_capture_id
+      and $claims[1] < $captures[0].key and $captures[0].key < $seeds[0] and $seeds[0] < $ready[0]
+    ' "$log_file" >/dev/null; then
+      pass "run $run: exact generation $gen captured retained work before fresh reseed without another claim"
+      return 0
+    fi
+    [ "$SECONDS" -lt "$deadline" ] \
+      || fail "issue 1742: run $run lacks the exact G+1 same-claim capture-before-reseed sequence after ${timeout}s"
+    sleep 0.5
+  done
+}
 # --- output helpers ----------------------------------------------------------
 say()  { printf '\n\033[1m==> %s\033[0m\n' "$1"; }
 # Failure-only metadata for a retained FINAL or an unstable custody baseline.
