@@ -233,6 +233,10 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   };
   const boot = await freshRunner.snapshotBootRecoveries();
   assert.ok(boot.some(record => record.captureId === uploaded.captureId && record.state === "uploaded"));
+  const generationPins = () => command(bare, ["for-each-ref", "--format=%(refname) %(objectname)",
+    `refs/uzi-recovery-pin/${claim.run_id}/${generation}`, `refs/uzi-coverage/${claim.run_id}/${generation}/`]);
+  const pinsBeforeFinal = generationPins();
+  assert.notEqual(pinsBeforeFinal, "", "the uploaded generation has recovery pins");
   await freshRunner.resumePendingRecoveries(undefined, boot);
   const inspector = new RecoveryCoordinator({
     client, git: freshGit, log: nullLogger(), recoveryRoot: freshGit.recoveryRoot, workerToken: token,
@@ -240,6 +244,8 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   const persisted = await inspector.inspect(claim.run_id);
   // FINAL preserves its authenticated authority while the exact terminal is pending.
   assert.ok(persisted.some(record => record.generation === generation && record.finalAcknowledged));
+  assert.equal(generationPins(), pinsBeforeFinal, "FINAL retains pins while the exact terminal is pending");
+  assert.equal(fs.existsSync(uploaded.bundlePath), false, "FINAL frees the acknowledged bundle before report retirement");
   assert.equal(server.finals(), 1, "exactly one successful custody release");
   assert.equal(server.isOpen(), false);
   assert.deepEqual((await client.listRecoveryHolds(claim.run_id)).holds, []);
@@ -253,6 +259,7 @@ it("completed guarded run settles its persisted terminal after loss of attribute
   assert.equal(freshOutbox.depthFor(claim.run_id)?.pendingMessages ?? 0, 0);
   await freshRunner.resumePendingRecoveries();
   assert.deepEqual(await inspector.inspect(claim.run_id), [], "the existing post-retirement recovery pass cleans the ACK cohort");
+  assert.equal(generationPins(), "", "post-retirement cleanup removes the generation pins");
   assert.equal(fs.existsSync(uploaded.bundlePath), false);
   assert.equal(server.finals(), 1, "a later recovery pass does not release twice");
 
