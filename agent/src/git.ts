@@ -7836,10 +7836,11 @@ export class GitCache {
       const markers = await this.readStoppedMarkers(barePath, entries);
       if (markers.malformed.length || markers.overflow.size) throw new Error("ACK malformed stopped marker");
       for (const { marker } of markers.valid) add(marker.branch, marker, marker.key);
-      for (const source of paths.values()) {
+      for (const [clonePath, source] of paths.entries()) {
         if (source.attemptId) {
           const ledger = ledgers.get(source.attemptId);
-          if (!ledger || ledger.branch !== source.branch || ledger.runId !== source.runId) throw new Error("ACK missing producer");
+          if (!ledger || ledger.branch !== source.branch || ledger.runId !== source.runId ||
+              ledger.clonePath !== clonePath) throw new Error("ACK missing producer");
         }
       }
       const observations: unknown[] = [];

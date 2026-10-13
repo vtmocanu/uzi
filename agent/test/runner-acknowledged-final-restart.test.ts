@@ -454,6 +454,33 @@ for (const { caller, afterUnlinkFault, liveClient } of [
     if (caller === "terminal replay") {
       if (!afterUnlinkFault && !liveClient) {
         const report = (await freshOutbox.readTerminalJournalForRetirement(claim.run_id, generation))!;
+        const configFile = path.join(bare, "config");
+        const configBytes = fs.readFileSync(configFile);
+        const ledgerKey = `uzi-attempts.${branch}.entry`;
+        const replacementPath = path.join(path.dirname(clone.path), `metadata-control.attempt-${attemptId}`);
+        const replacementEntries = ledger.split("\n").map(raw => {
+          const entry = JSON.parse(raw);
+          return entry.attemptId === attemptId ? { ...entry, clonePath: replacementPath } : entry;
+        });
+        assert.notEqual(replacementPath, clone.path);
+        assert.equal(fs.existsSync(replacementPath), false);
+        assert.ok(replacementEntries.some(entry => entry.attemptId === attemptId));
+        try {
+          command(bare, ["config", "--unset-all", ledgerKey]);
+          for (const entry of replacementEntries) command(bare, ["config", "--add", ledgerKey, JSON.stringify(entry)]);
+          assert.deepEqual(command(bare, ["config", "--get-all", ledgerKey]).split("\n").map(raw => JSON.parse(raw)),
+            replacementEntries, "replace every transition without appending conflicting producer history");
+          assert.equal(command(bare, ["config", "--get", `uzi-recovery.${branch}.clone`]), attribution,
+            "the valid journal still names the original producer path");
+          assert.deepEqual(await freshRunner.retireRecoveryReport(claim.run_id, generation, report.context),
+            { retired: false }, "same attempt at a different ledger clone path must retain the report");
+          assert.ok(await freshOutbox.readTerminalJournal(claim.run_id, generation));
+          assert.deepEqual(completionSnapshot(), bindingsBefore);
+          assert.deepEqual(await freshCoordinator.inspect(claim.run_id), records);
+          assert.equal(releases, 1);
+        } finally {
+          fs.writeFileSync(configFile, configBytes);
+        }
         const originalCustody = freshClient.getTerminalRejectionCustody;
         let custodyObserved = false;
         freshClient.getTerminalRejectionCustody = async (...args: Parameters<typeof originalCustody>) => {
