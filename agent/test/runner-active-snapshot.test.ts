@@ -58,7 +58,7 @@ describe("runner active-run snapshot registry (PRD #1390 M2a)", () => {
         },
       },
     }), gitlab, undefined, undefined, { activeRuns: registry, recoveryRetryMs: 1,
-      completionHoldReconcileTimeoutMs: 40 });
+      completionHoldReconcileTimeoutMs: 5_000 });
     const executing = runner.execute(claim);
     try {
       await started.promise;

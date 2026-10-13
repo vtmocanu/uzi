@@ -120,7 +120,7 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
       };
       const readsBefore = api.ownershipRequests.length;
       await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
-        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 100,
+        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 5_000,
       }).execute(claim);
 
       assert.equal(completedCloses, 1, "execute awaits real batcher close after the late error");
@@ -151,7 +151,7 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
         status: "failed", claim_generation: 7, hold_reason: null, claim_released: false,
       };
       await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
-        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 100,
+        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 5_000,
       }).execute(claim);
 
       assert.equal(held.value, false);

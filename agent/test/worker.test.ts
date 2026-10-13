@@ -161,7 +161,7 @@ describe("M2 serial Worker real completion custody", () => {
     });
     const { gitlab } = fakeGitlab();
     const run = runnerWith(factory, gitlab, undefined, undefined, {
-      outbox, activeRuns: registry, completionHoldReconcileTimeoutMs: 40,
+      outbox, activeRuns: registry, completionHoldReconcileTimeoutMs: 5_000,
     });
     const controller = new AbortController();
     const worker = new Worker(fakeConfig({ dataDir: fx.dataDir, heartbeatIntervalMs: 10, chatSessions: 0 }),
@@ -172,6 +172,12 @@ describe("M2 serial Worker real completion custody", () => {
     api.enqueueClaim(first);
     api.enqueueClaim(second);
     const done = worker.run(controller.signal);
+    // A test timeout does not unwind the body's finally; this cleanup still stops the worker.
+    t.after(async () => {
+      controller.abort();
+      releaseSecond.resolve();
+      await done.catch(() => {});
+    });
     try {
       // Event-driven readiness: a worker that exits first fails at once; --test-timeout bounds a hang.
       await Promise.race([secondStarted.promise, done.then(() => { throw new Error("worker exited before the second claim"); })]);

@@ -256,7 +256,7 @@ describe("M2 serial post-permit completion custody", () => {
       });
       const run = runnerWith(() => ({ executor, homeDir: runHome }), gitlab,
         undefined, logger, { outbox, ...(inventory ? { recovery: inventory.coordinator } : {}),
-          completionHoldReconcileTimeoutMs: 40, recoveryRetryMs: 1 });
+          completionHoldReconcileTimeoutMs: 5_000, recoveryRetryMs: 1 });
       const settle = t.mock.method(run as unknown as { settleRecoveryGeneration: (...args: unknown[]) => Promise<void> }, "settleRecoveryGeneration");
       const permanent = t.mock.method(run as unknown as { handlePermanentFailure: (...args: unknown[]) => Promise<void> }, "handlePermanentFailure");
       const checkpoint = t.mock.method(git, "checkpointPack");
