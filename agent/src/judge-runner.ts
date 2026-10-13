@@ -308,15 +308,15 @@ export class JudgeRunner {
 
     try {
       // Post the judge's own usage frame BEFORE the review + completion so the run_usage
-      // row exists (PRD #69 M6). A single-turn judge has no batcher/gapless-seq machinery
-      // in this lane, so seq:1 is safe.
+      // row exists (PRD #69 M6). Continue after any claim-time notes, such as a model
+      // fallback, so the accounting frame is not deduplicated against an existing seq.
       if (usageMessage) {
         // PRD #1247 M2 fix round: pass the claim's generation so the usage batch rides the m3
         // send-gate (postMessages applies includeClaimGeneration internally, gating on
         // generation > 0 && capability/feature) rather than being refused for a capability worker.
         await this.client.postMessages(
           judgeRunId,
-          [{ seq: 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
+          [{ seq: claim.last_seq + 1, kind: usageMessage.kind, agent: JUDGE_AGENT, payload: usageMessage.payload }],
           claim.claim_generation,
         );
       }

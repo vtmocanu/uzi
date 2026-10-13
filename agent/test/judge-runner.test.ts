@@ -190,6 +190,15 @@ function replyingQueryFnWithUsage(text: string): SdkQueryFn {
 }
 
 describe("JudgeRunner", () => {
+  it("Claude judge usage follows the claim's existing messages", async () => {
+    const { client, calls } = fakeClient(emptyTrace);
+    const runner = new JudgeRunner(client, nullLogger(), {
+      queryFn: replyingQueryFnWithUsage(JSON.stringify({ verdict: "ok", summary: "reviewed", recommendations: [] })),
+    });
+    await runner.execute(judgeClaim({ last_seq: 1 }));
+    assert.equal(calls.messages.length, 1);
+    assert.equal(calls.messages[0]!.messages[0]!.seq, 2);
+  });
   for (const authMode of ["api_key", "subscription"] as const) {
     for (const scenario of ["success", "error", "no_usage", "unreported"] as const) {
       it(`Codex judge usage: ${authMode} ${scenario}`, async () => {
@@ -217,7 +226,7 @@ describe("JudgeRunner", () => {
             },
           })) as never,
         });
-        await runner.execute(judgeClaim({ claim_generation: 7, secrets: { forge_pat: "",
+        await runner.execute(judgeClaim({ last_seq: 1, claim_generation: 7, secrets: { forge_pat: "",
           codex: { auth_mode: authMode, access_token: "test-codex", capability: "cap-1",
             ...(authMode === "subscription" ? { generation: 1, chatgpt_account_id: "test-account", chatgpt_plan_type: null } : {}),
           },
@@ -226,7 +235,7 @@ describe("JudgeRunner", () => {
         if (scenario !== "no_usage") {
           assert.equal(calls.messages[0]!.id, "judge-1");
           assert.equal(calls.messages[0]!.generation, 7);
-          assert.deepEqual(calls.messages[0]!.messages, [{ seq: 1, kind: "status", agent: "judge",
+          assert.deepEqual(calls.messages[0]!.messages, [{ seq: 2, kind: "status", agent: "judge",
             payload: { event: "result", modelUsage: snapshot } }]);
           assert.deepEqual(order, ["usage", "review"]);
         }

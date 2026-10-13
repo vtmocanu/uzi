@@ -31,7 +31,7 @@ through `[0.52.0]`.)
   Summary and Now entries on Haiku 4.5's dated and undated model IDs accept `inference_geo: "not_available"` because those rows predate geographic routing. Geo-capable models with that marker remain unpriced. The Anthropic table also corrects Sonnet 5.5 cache reads to $0.10 per million tokens; stored unreported rows are not backfilled.
 
 - **Codex judges record their own API-equivalent spend ([#2915](https://github.com/vtmocanu/uzi/issues/2915)).**
-  Judge passes report observed per-model usage before the verdict and completion, including a failed pass that already observed usage. Both credential modes preserve metered or unavailable cost status; past judge runs are not backfilled.
+  Judge passes report observed per-model usage before the verdict and completion, including a failed pass that already observed usage. Accounting frames follow existing claim-time notes so they remain in the trace. Both credential modes preserve metered or unavailable cost status; past judge runs are not backfilled.
 
 - **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
   A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
