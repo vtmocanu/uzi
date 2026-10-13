@@ -528,12 +528,13 @@ pass "case 3: run finished during the outage -> completed AFTER its gapless mess
 # EXISTING disk tree the restart resumes onto (the outbox init / reserve-grow-on-upgrade path runs
 # against it on boot). /data is the `agentdata` named volume, so the tree persists across a restart.
 say "CASE 4: agent restarted mid-outage -> boot gate lands the journaled outcome before any claim (SC3)"
-make_outbox_run
+make_outbox_run cut_barrier
 RUN_B2="$OUTBOX_RUN"
 GEN_B2="$(rb_run_field "$RUN_B2" claim_generation)"
 RQ_B2="$(rb_run_field "$RUN_B2" requeue_count)"
 say "cutting the api so run $RUN_B2 spills its messages and journals its terminal while down"
 api_cut
+release_outbox_cut_barrier "$RUN_B2"
 # Gate BEFORE the restart on the terminal being journaled AND its first live send lost: the run must
 # have spilled its messages AND installed its terminal journal (the batcher is final-flushed before
 # the terminal is journaled, so the message spill is already on disk by the time the journal line
@@ -572,7 +573,7 @@ pass "case 4: agent restart mid-outage -> boot gate landed the journaled complet
 # =============================================================================
 # CASE 5 — a run in the timeout-sweep CARVE-OUT (completion_attempts>0, set in the DB; the run itself is not interlocked) whose lost terminal lands on replay: it does not sit non-terminal forever.
 say "CASE 5: a sweep-carve-out run's lost terminal lands on replay (never sits non-terminal forever)"
-make_outbox_run
+make_outbox_run cut_barrier
 RUN_B3="$OUTBOX_RUN"
 GEN_B3="$(rb_run_field "$RUN_B3" claim_generation)"
 # Place the run in the completion-interlock carve-out the ordinary timeout sweep is DELIBERATELY
@@ -599,6 +600,7 @@ pass "case 5: past-wall carve-out run held at 'running' across the sweep (carve-
 # forever (the carve-out spares it from the timeout sweep AND the judge sweep never touches it).
 say "cutting the api so the carve-out run's terminal is journaled and its first send lost"
 api_cut
+release_outbox_cut_barrier "$RUN_B3"
 terminal_lost_b3=0; if wait_terminal_lost "$RUN_B3"; then terminal_lost_b3=1; fi
 api_back
 [ "$terminal_lost_b3" = 1 ] \
@@ -616,19 +618,22 @@ RB3_ORIGIN="$(apiget "/api/runs/$RUN_B3" | jq -r '.run.fail_origin // ""')"
 pass "case 5: the carve-out run's lost terminal landed on replay -> completed at gen $GEN_B3 (never sat non-terminal, never sweep-failed)"
 
 # =============================================================================
+# Cases 3-6 hold stub completion until the cut. Cases 7-8 require finalize before
+# their first cut and intentionally keep the stub ungated.
 # CASE 6 — an INTERLOCKED run finishing during the outage WAITS for the api to issue its completion
 # permit, then completes. Regression: its one-shot permit request used to throw `fetch failed` into
 # the generic catch, and the run was journaled and replayed as `failed` (#1644 made every issue run
 # interlocked by default, which is when this phase started failing).
 say "CASE 6: an interlocked run finishing during the outage waits for its completion permit, then completes"
 set_interlock true
-make_outbox_run
+make_outbox_run cut_barrier
 RUN_B4="$OUTBOX_RUN"
 GEN_B4="$(rb_run_field "$RUN_B4" claim_generation)"
 [ -n "$(rb_run_field "$RUN_B4" completion_contract_version)" ] \
   || fail "case 6: run $RUN_B4 was not stamped for the completion interlock (completion_contract_version is NULL), so it cannot prove the permit path"
 say "cutting the api so run $RUN_B4 reaches its completion permit while it is down"
 api_cut
+release_outbox_cut_barrier "$RUN_B4"
 permit_retrying_b4=0; if wait_permit_retrying "$RUN_B4"; then permit_retrying_b4=1; fi
 api_back
 [ "$permit_retrying_b4" = 1 ] \
