@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Claude cross-checks no longer fail with `confinement_failed` as soon as they start ([#2869](https://github.com/vtmocanu/uzi/issues/2869)).**
   The SDK's new builtin plugin-authoring plugin tripped the checker's confinement check; it is now disabled in checker, research and isolated job sessions, and confinement refusals log a fixed reason category. Takes effect after a release and worker rollout.
 
+- **Code cross-check: the lead now waits for its checker instead of publishing without it ([#2870](https://github.com/vtmocanu/uzi/issues/2870)).**
+  A checker row whose findings were not yet written (pending, timed out, checker unavailable, or a pre-snapshot failure) was served with `findings: null`, which the worker rejected, so the lead stopped waiting and its PR reported the check as unavailable. These rows now report an empty findings list; works with already-deployed workers.
+
 - **Runs list and Dashboard: the stalled and waits-on-you flags show their elapsed time inline ([#2836](https://github.com/vtmocanu/uzi/issues/2836)).**
   The progress flags read `◼ stalled · 14m` and `● waits on you · plan gate · 6m`, so the flag lines up with its neighbouring pills; the clock time moves to the tooltip.
 
