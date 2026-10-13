@@ -556,14 +556,15 @@ handoff_receipt_boundary() {
   local RUN_T=T RUN_M=M settled=""
   wait_completed_custody_receipt() { settled="$settled $1"; }
   assert_settled() { case " $settled " in *" $1 "*) ;; *) fail "handoff $1 leaves a pending receipt for custody seeding";; esac; }
+  assert_no_receipt_wait() { case " $settled " in *" $1 "*) fail "no-MR handoff $1 must not require an unstated custody receipt";; esac; }
   eval "$(awk '
     /^wait_completed_custody_receipt / { print }
-    /^RM_JSON=.*handoff rm/ { print "assert_settled T" }
+    /^RM_JSON=.*handoff rm/ { print "assert_no_receipt_wait T" }
     /^pass "task\/handoff coverage complete/ { print "assert_settled M" }
   ' "$ROOT/e2e/phases/70-handoff.sh")"
-  echo 'handoff receipts settle before branch deletion and next phase'
+  echo 'MR handoff receipt settles before the next phase; no-MR cleanup has no receipt gate'
 }
-custody_case "handoff cannot hand a changing receipt baseline to custody seeding" pass 'handoff receipts settle' handoff_receipt_boundary
+custody_case "only the MR handoff owes the prior receipt boundary" pass 'MR handoff receipt settles' handoff_receipt_boundary
 
 diagnostic_trap() {
   local phase="$1" status="$2"

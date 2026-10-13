@@ -155,8 +155,8 @@ hgit log -1 --format=%s FETCH_HEAD | grep -qF 'uzi stub' \
 pass "stub built on the marker: seed(README) <- marker(HANDOFF_MARKER.md) <- stub(UZI_RUN.md, 'uzi stub' commit)"
 
 # `handoff rm` on a completed non-MR task succeeds and deletes the branch.
-# Settle this exact generation before deleting its run/branch proof inputs.
-wait_completed_custody_receipt "$RUN_T"
+# A no-MR task has no completed-publication receipt contract. Branch cleanup is
+# authorized by the CLI's terminal/unused-branch checks, independently of custody.
 RM_JSON="$(cd "$WC" && uzi_cli handoff rm "$RUN_T" --json)" || fail "handoff rm on the completed no-MR run failed (exit $?): $RM_JSON"
 [ "$(printf '%s' "$RM_JSON" | jq -r '.deleted')" = "uzi/task/$RUN_T" ] \
   || fail "handoff rm --json should report the deleted branch: $(printf '%s' "$RM_JSON" | jq -c '.')"
@@ -202,7 +202,7 @@ pass "handoff rm on the --mr run was refused (exempt): $(printf '%s' "$RM_OUT_M"
 # The --mr task can still be finishing its archive FINAL after completion. Its
 # exact receipt must settle before phase 72 measures and seeds the custody limit.
 wait_completed_custody_receipt "$RUN_M"
-# Both runs have settled custody receipts. The --mr
-# run's branch + open MR are left in place BY DESIGN (exempt from rm) and are harmless to
+# The MR run's receipt settled. Its branch + open MR are left in place BY DESIGN
+# (exempt from rm) and are harmless to
 # later phases (M6's mr_rework operates on the phase-15 happy-path MR, not this one).
 pass "task/handoff coverage complete (no-MR leg rm'd; --mr leg exempt, left by design)"
