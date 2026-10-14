@@ -23,6 +23,11 @@ export const DEFAULT_CI_CONFIG_PATHS = [
   ".github/workflows/**",
 ];
 
+// DEFAULT_CI_REPAIR_CONFIG_PATHS is the worker-side floor for a GUARDED run (a default-branch
+// CI repair run, claim.config.ci_config_guard): the ci_fix floor plus the Forgejo workflow
+// directory. Guarded runs always union it with claim.config.ci_config_paths.
+export const DEFAULT_CI_REPAIR_CONFIG_PATHS = [...DEFAULT_CI_CONFIG_PATHS, ".forgejo/workflows/**"];
+
 // ciConfigPathToRegex converts one server-supplied CI-config path/glob to an
 // anchored, dotfile-safe RegExp. Supports: `**` (any path segments, incl. none),
 // `*` (any run of non-slash chars), and literal segments; a plain path (no
@@ -52,6 +57,35 @@ export function flagCIConfigPaths(changedFiles: string[], paths: string[]): stri
   const hits: string[] = [];
   for (const f of changedFiles) {
     const file = f.trim();
+    if (file === "") continue;
+    if (regexes.some((re) => re.test(file)) && !hits.includes(file)) {
+      hits.push(file);
+    }
+  }
+  return hits;
+}
+
+// ciConfigGuardRegex is the matcher for GUARDED runs only (the ci_fix lane keeps
+// ciConfigPathToRegex unchanged). The glob is server-trusted configuration, so it is trimmed and an
+// empty one is dropped by the caller; the FILE PATH is matched raw. `**/` is an optional run of any
+// characters ending in `/`, `**` is any characters, `*` is any character except `/`; "any"
+// includes newlines (`[\s\S]`, never `.`). Anchored on the full input, without the `m` flag.
+export function ciConfigGuardRegex(glob: string): RegExp {
+  const escaped = glob.trim().replace(/[.+?^${}()|[\]\\]/g, "\\$&");
+  const body = escaped.replace(/\*\*\/|\*\*|\*/g, (m) =>
+    m === "**/" ? "(?:[\\s\\S]*/)?" : m === "**" ? "[\\s\\S]*" : "[^/]*",
+  );
+  return new RegExp(`^${body}$`);
+}
+
+// flagCIConfigPathsRaw flags every changed file that matches ANY of the globs, matching the exact
+// raw git path: no trim, no normalisation (leading/trailing spaces, control characters, embedded
+// newlines and Unicode are all preserved). Only a fully empty entry is ignored. De-duplicated, in
+// input order.
+export function flagCIConfigPathsRaw(changedFiles: string[], globs: string[]): string[] {
+  const regexes = globs.map((g) => g.trim()).filter((g) => g !== "").map(ciConfigGuardRegex);
+  const hits: string[] = [];
+  for (const file of changedFiles) {
     if (file === "") continue;
     if (regexes.some((re) => re.test(file)) && !hits.includes(file)) {
       hits.push(file);

@@ -175,6 +175,7 @@ describe("held publication falls back to the archive", () => {
     ["invoked", c => ({ ok: true, body: { publication_id: PUBLICATION_ID, ref: `refs/uzi-held/${c.run}/${c.generation}`, tip: c.tip, state: "invoked" } })],
     ["409 refusal", () => ({ ok: false, httpStatus: 409, reason: "not_failed" })],
     ["413", () => ({ ok: false, httpStatus: 413, reason: "pack_too_large" })],
+    ["ci_config_guard refusal", () => ({ ok: false, httpStatus: 409, reason: "ci_config_guard" })],
     ["422", () => ({ ok: false, httpStatus: 422, reason: "pack_invalid" })],
     ["429", () => ({ ok: false, httpStatus: 429, reason: "busy" })],
     ["503", () => ({ ok: false, httpStatus: 503, reason: "forge_unavailable" })],

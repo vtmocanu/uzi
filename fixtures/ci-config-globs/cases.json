@@ -1,0 +1,797 @@
+{
+ "_doc": [
+  "Shared parity fixture for the guarded CI-config path matcher (issue #2865).",
+  "Read by the agent test (agent/test/ci-config-guard-raw.test.ts) and by the Go port in api/internal/pushbroker; both must agree on every entry.",
+  "Semantics: globs are server-trusted and trimmed (empty/blank ones dropped); file paths are matched RAW (no trim, no normalisation, a fully empty path is ignored).",
+  "'**/' = optional run of any characters ending in '/', '**' = any characters, '*' = any characters except '/'; 'any' includes newlines. Anchored on the whole path.",
+  "cases[]: {name, globs, path, match}: path matches iff it matches ANY glob.",
+  "changeSets[]: {name, globs, changed, flagged}: flagged is the de-duplicated, input-ordered subset of changed that matches, byte-exact.",
+  "String data only: control and non-ASCII characters are JSON escapes; no real CI file is ever written."
+ ],
+ "cases": [
+  {
+   "name": "floor: root gitlab-ci",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "floor: nested gitlab-ci via **/*",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "sub/.gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "floor: prefixed *.gitlab-ci.yml",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "a.gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "floor: deeply nested prefixed *.gitlab-ci.yml",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "x/y/a.gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "floor: .gitlab dir",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".gitlab/ci/a.yml",
+   "match": true
+  },
+  {
+   "name": "floor: github workflow",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/ci.yml",
+   "match": true
+  },
+  {
+   "name": "floor: github workflow deep",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/nested/deep/ci.yml",
+   "match": true
+  },
+  {
+   "name": "floor: github workflows dir with trailing slash",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/",
+   "match": true
+  },
+  {
+   "name": "floor: forgejo workflow",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".forgejo/workflows/x.yml",
+   "match": true
+  },
+  {
+   "name": "floor: workflows dir without trailing slash",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows",
+   "match": false
+  },
+  {
+   "name": "floor: sibling dir prefix workflowsx",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflowsx/a.yml",
+   "match": false
+  },
+  {
+   "name": "floor: anchored, nested copy of the workflows dir",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "docs/.github/workflows/a.yml",
+   "match": false
+  },
+  {
+   "name": "floor: ordinary source file",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "src/main.go",
+   "match": false
+  },
+  {
+   "name": "floor: case sensitive",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".GITHUB/workflows/a.yml",
+   "match": false
+  },
+  {
+   "name": "raw: leading space is a different directory name",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": " .github/workflows/a.yml",
+   "match": false
+  },
+  {
+   "name": "raw: trailing space is preserved and still under workflows",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a.yml ",
+   "match": true
+  },
+  {
+   "name": "raw: embedded newline matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a\n.yml",
+   "match": true
+  },
+  {
+   "name": "raw: trailing newline matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a.yml\n",
+   "match": true
+  },
+  {
+   "name": "raw: leading newline is a different path",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "\n.github/workflows/a.yml",
+   "match": false
+  },
+  {
+   "name": "raw: newline inside the protected directory name does not match the floor",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/work\nflows/x",
+   "match": false
+  },
+  {
+   "name": "raw: newline inside any path matches a bare **",
+   "globs": [
+    "**"
+   ],
+   "path": ".github/work\nflows/x",
+   "match": true
+  },
+  {
+   "name": "raw: tab matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a\t.yml",
+   "match": true
+  },
+  {
+   "name": "raw: other control characters matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a\u0001b\u007fc.yml",
+   "match": true
+  },
+  {
+   "name": "raw: carriage return matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a\r.yml",
+   "match": true
+  },
+  {
+   "name": "raw: line separator U+2028 matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/a\u2028.yml",
+   "match": true
+  },
+  {
+   "name": "unicode: NFC directory under **/*.gitlab-ci.yml",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "caf\u00e9/.gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "unicode: NFD directory under **/*.gitlab-ci.yml",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": "cafe\u0301/.gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "unicode: NFC glob matches NFC path",
+   "globs": [
+    "caf\u00e9/*.yml"
+   ],
+   "path": "caf\u00e9/a.yml",
+   "match": true
+  },
+  {
+   "name": "unicode: NFC glob does not match NFD path (no normalisation)",
+   "globs": [
+    "caf\u00e9/*.yml"
+   ],
+   "path": "cafe\u0301/a.yml",
+   "match": false
+  },
+  {
+   "name": "unicode: astral character matched by **",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "path": ".github/workflows/\ud83d\ude00.yml",
+   "match": true
+  },
+  {
+   "name": "star: single segment",
+   "globs": [
+    "docs/*.md"
+   ],
+   "path": "docs/a.md",
+   "match": true
+  },
+  {
+   "name": "star: does not cross a slash",
+   "globs": [
+    "docs/*.md"
+   ],
+   "path": "docs/sub/a.md",
+   "match": false
+  },
+  {
+   "name": "star: matches empty",
+   "globs": [
+    "docs/*.md"
+   ],
+   "path": "docs/.md",
+   "match": true
+  },
+  {
+   "name": "star: matches a newline",
+   "globs": [
+    "docs/*.md"
+   ],
+   "path": "docs/a\n.md",
+   "match": true
+  },
+  {
+   "name": "star: leading star",
+   "globs": [
+    "*.yml"
+   ],
+   "path": "a.yml",
+   "match": true
+  },
+  {
+   "name": "star: leading star does not cross a slash",
+   "globs": [
+    "*.yml"
+   ],
+   "path": "dir/a.yml",
+   "match": false
+  },
+  {
+   "name": "star: leading star matches only the extension",
+   "globs": [
+    "*.yml"
+   ],
+   "path": ".yml",
+   "match": true
+  },
+  {
+   "name": "star: middle segment",
+   "globs": [
+    "a/*/c"
+   ],
+   "path": "a/b/c",
+   "match": true
+  },
+  {
+   "name": "star: middle segment empty",
+   "globs": [
+    "a/*/c"
+   ],
+   "path": "a//c",
+   "match": true
+  },
+  {
+   "name": "star: middle segment does not cross a slash",
+   "globs": [
+    "a/*/c"
+   ],
+   "path": "a/b/d/c",
+   "match": false
+  },
+  {
+   "name": "star: trailing star",
+   "globs": [
+    "a/b*"
+   ],
+   "path": "a/bcd",
+   "match": true
+  },
+  {
+   "name": "star: trailing star does not cross a slash",
+   "globs": [
+    "a/b*"
+   ],
+   "path": "a/bc/d",
+   "match": false
+  },
+  {
+   "name": "globstar: leading **/ matches zero directories",
+   "globs": [
+    "**/ci.yml"
+   ],
+   "path": "ci.yml",
+   "match": true
+  },
+  {
+   "name": "globstar: leading **/ matches many directories",
+   "globs": [
+    "**/ci.yml"
+   ],
+   "path": "a/b/ci.yml",
+   "match": true
+  },
+  {
+   "name": "globstar: leading **/ must end in a slash",
+   "globs": [
+    "**/ci.yml"
+   ],
+   "path": "xci.yml",
+   "match": false
+  },
+  {
+   "name": "globstar: **/ spans a directory name with a newline",
+   "globs": [
+    "**/ci.yml"
+   ],
+   "path": "a\n/ci.yml",
+   "match": true
+  },
+  {
+   "name": "globstar: **/ anchored at the end",
+   "globs": [
+    "**/ci.yml"
+   ],
+   "path": "a/b/ci.yml\n",
+   "match": false
+  },
+  {
+   "name": "globstar: middle **/ matches zero directories",
+   "globs": [
+    "a/**/c"
+   ],
+   "path": "a/c",
+   "match": true
+  },
+  {
+   "name": "globstar: middle **/ matches one directory",
+   "globs": [
+    "a/**/c"
+   ],
+   "path": "a/b/c",
+   "match": true
+  },
+  {
+   "name": "globstar: middle **/ matches many directories",
+   "globs": [
+    "a/**/c"
+   ],
+   "path": "a/b/d/c",
+   "match": true
+  },
+  {
+   "name": "globstar: middle **/ needs a separator before c",
+   "globs": [
+    "a/**/c"
+   ],
+   "path": "a/xc",
+   "match": false
+  },
+  {
+   "name": "globstar: trailing ** matches the bare directory",
+   "globs": [
+    "a/**"
+   ],
+   "path": "a/",
+   "match": true
+  },
+  {
+   "name": "globstar: trailing ** matches a file",
+   "globs": [
+    "a/**"
+   ],
+   "path": "a/b",
+   "match": true
+  },
+  {
+   "name": "globstar: trailing ** needs the slash",
+   "globs": [
+    "a/**"
+   ],
+   "path": "a",
+   "match": false
+  },
+  {
+   "name": "globstar: ** without a slash spans slashes",
+   "globs": [
+    "a**b"
+   ],
+   "path": "a/x/b",
+   "match": true
+  },
+  {
+   "name": "globstar: ** without a slash spans newlines",
+   "globs": [
+    "a**b"
+   ],
+   "path": "a\nb",
+   "match": true
+  },
+  {
+   "name": "globstar: ** without a slash matches empty",
+   "globs": [
+    "a**b"
+   ],
+   "path": "ab",
+   "match": true
+  },
+  {
+   "name": "globstar: ** without a slash still anchors",
+   "globs": [
+    "a**b"
+   ],
+   "path": "ac",
+   "match": false
+  },
+  {
+   "name": "glob: configured glob is trimmed",
+   "globs": [
+    " .gitlab-ci.yml "
+   ],
+   "path": ".gitlab-ci.yml",
+   "match": true
+  },
+  {
+   "name": "glob: trimmed glob does not make the path lenient",
+   "globs": [
+    " .gitlab-ci.yml "
+   ],
+   "path": " .gitlab-ci.yml",
+   "match": false
+  },
+  {
+   "name": "glob: empty and blank globs are dropped",
+   "globs": [
+    "",
+    "   "
+   ],
+   "path": "anything",
+   "match": false
+  },
+  {
+   "name": "glob: empty path is ignored even with an empty glob",
+   "globs": [
+    ""
+   ],
+   "path": "",
+   "match": false
+  },
+  {
+   "name": "glob: regex metacharacters are literal",
+   "globs": [
+    "a.b+c(d)[e]{f}|g^h$i?.yml"
+   ],
+   "path": "a.b+c(d)[e]{f}|g^h$i?.yml",
+   "match": true
+  },
+  {
+   "name": "glob: a dot is not a wildcard",
+   "globs": [
+    "a.b"
+   ],
+   "path": "aXb",
+   "match": false
+  },
+  {
+   "name": "glob: a question mark is not a wildcard",
+   "globs": [
+    "a?"
+   ],
+   "path": "ab",
+   "match": false
+  },
+  {
+   "name": "glob: a backslash is literal",
+   "globs": [
+    "a\\b"
+   ],
+   "path": "a\\b",
+   "match": true
+  },
+  {
+   "name": "glob: plain path is exact",
+   "globs": [
+    "deploy/ci.yml"
+   ],
+   "path": "deploy/ci.yml.bak",
+   "match": false
+  }
+ ],
+ "changeSets": [
+  {
+   "name": "rename out of a protected directory lists both sides; the old side is flagged",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    ".github/workflows/a.yml",
+    "moved.yml"
+   ],
+   "flagged": [
+    ".github/workflows/a.yml"
+   ]
+  },
+  {
+   "name": "deletion of a protected file is flagged",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    ".github/workflows/ci.yml"
+   ],
+   "flagged": [
+    ".github/workflows/ci.yml"
+   ]
+  },
+  {
+   "name": "flagged paths are de-duplicated and keep input order",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    "b/.gitlab-ci.yml",
+    "src/x.go",
+    ".gitlab/a.yml",
+    "b/.gitlab-ci.yml"
+   ],
+   "flagged": [
+    "b/.gitlab-ci.yml",
+    ".gitlab/a.yml"
+   ]
+  },
+  {
+   "name": "a fully empty entry is ignored",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    "",
+    ".gitlab-ci.yml"
+   ],
+   "flagged": [
+    ".gitlab-ci.yml"
+   ]
+  },
+  {
+   "name": "raw paths are reported byte-exact",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    " .github/workflows/a.yml",
+    ".github/workflows/a.yml "
+   ],
+   "flagged": [
+    ".github/workflows/a.yml "
+   ]
+  },
+  {
+   "name": "a newline-bearing protected path is reported byte-exact",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    ".github/workflows/a\n.yml",
+    "src/a.go"
+   ],
+   "flagged": [
+    ".github/workflows/a\n.yml"
+   ]
+  },
+  {
+   "name": "an unprotected change set flags nothing",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**"
+   ],
+   "changed": [
+    "src/a.go",
+    "README.md"
+   ],
+   "flagged": []
+  },
+  {
+   "name": "claim paths unioned with the floor",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**",
+    "deploy/ci.yml"
+   ],
+   "changed": [
+    "deploy/ci.yml",
+    "src/a.go"
+   ],
+   "flagged": [
+    "deploy/ci.yml"
+   ]
+  }
+ ]
+}

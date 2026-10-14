@@ -897,6 +897,11 @@ export interface ClaimConfig {
    *  configured ci_config_path. The pre-push guard refuses an AUTO-approved ci_fix
    *  diff that touches any of these. omitted/empty for non-ci_fix runs. */
   ci_config_paths?: string[];
+  /** Default-branch CI repair runs: when true the worker refuses, at the early check and again
+   *  immediately before the final push, any diff that touches a protected CI-config path (the
+   *  claim's ci_config_paths unioned with the worker floor), whether or not a human approved the
+   *  plan. Absent/false for every other run. */
+  ci_config_guard?: boolean;
   /** Repo devbox.json packages opt-in (PRD #18 M5): whether the worker may union
    *  the repo's own devbox.json packages (packages-only) into the provisioned set.
    *  Delivered from M3 but always false until M5 wires the per-repo toggle. */
@@ -2316,6 +2321,7 @@ export interface PublishResponse {
     | "not_descendant"
     | "unsupported"
     | "workflow_scope"
+    | "ci_config_guard"
     | "superseded"
     | "tip_missing"
     | "pack_too_large"

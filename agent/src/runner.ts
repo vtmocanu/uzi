@@ -189,7 +189,7 @@ import {
 import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
-import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
+import { flagCIConfigPaths, flagCIConfigPathsRaw, DEFAULT_CI_CONFIG_PATHS, DEFAULT_CI_REPAIR_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSize } from "./pr-size.js";
 import { buildDeliveryContext } from "./pr-description-context.js";
 import { resolvePrdInputFromBare } from "./prd-link.js";
@@ -635,6 +635,7 @@ const PUBLISH_SKIP_LABELS = [
   "no_ref",
   "not_descendant",
   "workflow_scope",
+  "ci_config_guard",
   "superseded",
   "tip_missing",
   "pack_too_large",
@@ -845,6 +846,15 @@ class WorkflowScopeBlockedSignal extends PublicationRefusedSignal {
   constructor() {
     super("workflow scope blocked");
     this.name = "WorkflowScopeBlockedSignal";
+  }
+}
+
+/** The default-branch CI repair guard refused a candidate; failCIConfigGuard already terminally
+ *  reported, so unwind without pushing (permanent for withForgeRetry, like every refusal signal). */
+class CIConfigGuardRefusedSignal extends PublicationRefusedSignal {
+  constructor() {
+    super("ci config guard refused");
+    this.name = "CIConfigGuardRefusedSignal";
   }
 }
 
@@ -1280,6 +1290,37 @@ export function composeWorkflowScopeReason(paths: string[], patchPreserved = tru
     }
   }
   return prefix + list + suffix;
+}
+
+/** Display-only form of a git path for a refusal message: control characters (including newlines
+ *  and the C1 range) escaped, quoted, truncated. Matching never sees this form. */
+function displayGuardPath(path: string): string {
+  const quoted = JSON.stringify(path).replace(/[\u007f-\u009f\u2028\u2029]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return quoted.length > 80 ? `${quoted.slice(0, 79)}…` : quoted;
+}
+
+/** Failure reason for a default-branch CI repair run refused by the CI-config guard. `paths` null
+ *  means the diff could not be computed (fail closed). The path list is display-sanitised and
+ *  budgeted so the fixed tail always fits MAX_FAILURE_REASON_LEN. */
+export function composeCIConfigGuardReason(paths: string[] | null, patchPreserved = true): string {
+  const tail = " CI-config changes in this lane are reported, not pushed." +
+    (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
+  if (paths === null) {
+    return "CI-config guard: could not compute the diff to verify it does not change CI configuration (failing closed)." + tail;
+  }
+  const prefix = "CI-config guard: this run changes CI configuration: ";
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - tail.length - 1;
+  const shownPaths = paths.map(displayGuardPath);
+  let shown = Math.min(shownPaths.length, 5);
+  let list = "";
+  for (; shown > 0; shown--) {
+    const more = shownPaths.length - shown;
+    list = shownPaths.slice(0, shown).join(", ") + (more > 0 ? `, and ${more} more` : "");
+    if (list.length <= budget) break;
+  }
+  if (shown === 0) list = `${shownPaths.length} path(s)`;
+  return `${prefix}${list}.${tail}`;
 }
 
 /**
@@ -6794,6 +6835,57 @@ export class RunRunner {
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
     };
+    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
+    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
+    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
+    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
+    // is not enough on its own: it can be trustworthy AND carry findings.
+    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
+      if (rawPatch === null) return undefined;
+      const patch = redactText(rawPatch);
+      const scan = await this.git.scanPatchForSecrets(patch);
+      if (scan.trusted && scan.findings.length === 0) return patch;
+      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
+        run_id: runId,
+        site,
+        trusted: scan.trusted,
+        findings: scan.findings.length,
+      });
+      return undefined;
+    };
+
+    // Default-branch CI repair lane (claim.config.ci_config_guard): the worker backstop. Unlike the
+    // ci_fix guard below, a human approval does NOT exempt it: CI-config changes in this lane are
+    // reported, not pushed. It runs at two check points (here, and again on the exact owned SHA
+    // immediately before every final push attempt) with the raw-path matcher and the
+    // rename-aware diff; an uncomputable diff refuses too.
+    const ciConfigGuarded = claim.config?.ci_config_guard === true;
+    const ciConfigGuardGlobs = [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+    let ciConfigGuardReported = false;
+    const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
+      if (ciConfigGuardReported) return;
+      ciConfigGuardReported = true;
+      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
+      const reason = composeCIConfigGuardReason(paths, patch !== undefined);
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
+      runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
+      await closeBatcher();
+      await journalTerminalReport({ status: "failed", failure_reason: reason, preserved_patch: patch });
+    };
+    // Returns true when publication of `ref` must be refused (a protected path changed, or the
+    // diff could not be computed) after the terminal failure was reported.
+    const refuseOnCIConfigGuard = async (guardBarePath: string, ref: string): Promise<boolean> => {
+      const changed = await this.git.changedFilesNoRenames(guardBarePath, ref);
+      const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, ciConfigGuardGlobs);
+      if (flagged !== null && flagged.length === 0) return false;
+      await failCIConfigGuard(guardBarePath, ref, flagged);
+      return true;
+    };
+    if (ciConfigGuarded) {
+      const earlyGuardBarePath = barePath;
+      if (await refuseOnCIConfigGuard(earlyGuardBarePath, trackingRef)) return;
+    }
+
     // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
     // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
     // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
@@ -6834,24 +6926,6 @@ export class RunRunner {
     // Serves every forge-pushing kind (the failed path is not issue-gated).
     // The precheck compares tip blobs per path; the overlay keeps its separate conservative
     // changedFiles guard below.
-    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
-    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
-    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
-    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
-    // is not enough on its own: it can be trustworthy AND carry findings.
-    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
-      if (rawPatch === null) return undefined;
-      const patch = redactText(rawPatch);
-      const scan = await this.git.scanPatchForSecrets(patch);
-      if (scan.trusted && scan.findings.length === 0) return patch;
-      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
-        run_id: runId,
-        site,
-        trusted: scan.trusted,
-        findings: scan.findings.length,
-      });
-      return undefined;
-    };
     const workflowBarePath = barePath;
     const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
     const rethrowWorkflowAbort = (error: unknown) => {
@@ -7043,6 +7117,12 @@ export class RunRunner {
               await failClosingCommits(closing);
               throw new ClosingCommitRefusedSignal();
             }
+          }
+          // Default-branch CI repair lane: the authoritative CI-config check on the exact owned
+          // candidate about to be pushed, re-run on every attempt (a retry, an alignment or a bridge
+          // can change the candidate after the early check). Last gate before the push.
+          if (ciConfigGuarded && await refuseOnCIConfigGuard(finalizeBarePath, sourceSha)) {
+            throw new CIConfigGuardRefusedSignal();
           }
           await this.git.pushBranch(
             finalizeBarePath,

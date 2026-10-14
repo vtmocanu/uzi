@@ -9590,6 +9590,24 @@ export class GitCache {
   }
 
   /**
+   * Guarded-run variant of {@link changedFiles}: the same trusted `defaultBranchRef` three-dot
+   * merge-base diff, but with `--no-renames`, so a rename lists BOTH raw paths (moving a file out
+   * of a protected directory matches on its old path) and a deletion is listed. `-z` disables path
+   * quoting; the output is split only on NUL and never trimmed, so a path with a leading or
+   * trailing space or an embedded newline arrives byte-exact. `ref` may be a ref or a 40-hex SHA.
+   * Returns null (NOT []) when the diff cannot be computed, so the caller fails CLOSED.
+   */
+  async changedFilesNoRenames(barePath: string, ref: string): Promise<string[] | null> {
+    try {
+      const baseRef = await this.defaultBranchRef(barePath);
+      const out = await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", `${baseRef}...${ref}`]);
+      return out.split("\0").filter((entry) => entry !== "");
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * The commit messages a push of `tip` would publish: every commit reachable from `tip` and not
    * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
    * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on
