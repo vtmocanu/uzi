@@ -1552,3 +1552,26 @@ for (const stopAt of ["parser", "abort", "timeout"] as const) {
     }
   });
 }
+
+for (const settled of [false, true]) {
+  test(`#2958: long model turn ${settled ? "settled reset" : "interruption"} keeps source custody across a fresh claim`,
+    { skip: process.platform !== "linux" }, async t => {
+      const { expected, tip } = await ready();
+      const before = journal();
+      before.recovery.claimGeneration = 1;
+      writeJournal(before);
+      t.mock.method(Date, "now", () => before.recovery.deadline + 1);
+      if (settled) {
+        await cache.completeRecoveryEpisode(bare, branch, key, expected,
+          { settled: true, processedEvents: 1, attemptId: aid(2) });
+      }
+      const reservation = await recreate().reserveRecoveryIteration(bare, branch, key, expected, 1000, 2);
+      assert.equal(reservation.attempts, settled ? 1 : 2);
+      assert.equal(reservation.claimGeneration, 2);
+      assert.equal(reservation.startedAt, before.recovery.deadline + 1);
+      assert.equal(reservation.deadline, reservation.startedAt + 300_000);
+      assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "retained work\n");
+      assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+      assert.deepEqual(journal().retainedSources, before.retainedSources);
+    });
+}

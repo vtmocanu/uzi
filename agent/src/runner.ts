@@ -17236,7 +17236,8 @@ export class RunRunner {
       // This is monotone episode bookkeeping followed by an exact-generation terminal
       // report, not recovery authority. A new ownership GET could fail independently
       // of the fenced state endpoint and leave an exhausted claim cycling again.
-      if (episode && Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
+      if (episode && episode.stage !== "blocked" && episode.claimGeneration === flight.claimGeneration &&
+          Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
       let persistence = "";
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
@@ -17272,9 +17273,17 @@ export class RunRunner {
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;
       try {
         const now = Date.now();
-        reservation = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight),
-          Math.min(episode?.deadline ?? now + 300_000, now + 300_000),
-          () => this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs));
+        const newWindow = episode?.claimGeneration !== flight.claimGeneration;
+        const deadline = newWindow ? now + 300_000 : episode!.deadline;
+        reservation = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), deadline, async signal => {
+          // Only the authenticated current claim may bind/rebase a legacy or predecessor window.
+          // Do not install the predecessor's expired deadline before this proof can run.
+          if (newWindow) {
+            if (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1) throw new RetainedRecoveryStop();
+            await this.requireRetainedOwnership(flight, deadline, signal);
+          }
+          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration);
+        });
       } catch (error) {
         this.retainedLifecycleGuard(flight);
         if (error instanceof CredentialSwitchSignal) throw error;

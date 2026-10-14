@@ -125,10 +125,14 @@ archive alone does not undo that exposure.
 
 A claim discovers retained source before forge refresh or disk preflight
 and recovers it within that claim. Its source-bound durable budget reserves at most **3 total
-iterations**, blocked and nonblocked together, within **five minutes from
-the first reservation**, using the existing exponential retry cap of 16
-times the base delay. Crash, reclaim, capture, publication and successor
-handoff preserve that budget. Reset requires a trusted, successfully settled
+iterations**, blocked and nonblocked together. Each positively verified claim gets
+one **five-minute deadline window**, starting at its first reservation. Retries
+and process recreation within that claim preserve the window. A later verified
+claim renews only the deadline, retaining the cumulative count, source attribution
+and exponential retry cap of 16 times the base delay. A legacy episode without a
+claim fence binds once to a positively verified claim; its old claim identity is
+never inferred. Already-blocked episodes retain their original reason and never
+renew. Reset of the reservation count requires a trusted, successfully settled
 real model turn. Recovery adopts work on a fresh attempt path and model
 session even on an unwired worker; ordinary unwired keys that never entered
 retained recovery keep same-path continuity.

@@ -151,10 +151,11 @@ or disk preflight. The #1392 no-local-source forge park remains valid on the
 healthy path where discovery found no retained source. A retained source
 instead enters a durable episode bound to its identity, reserving work
 before capture: **3 total iterations**, blocked and nonblocked together,
-with a **five-minute deadline from the first reservation**. Retries use the
-existing exponential delay capped at 16 times the base. Crash, reclaim,
-capture, publication and successor handoff preserve the reservation and
-deadline. Reset requires a trusted, successfully settled real model turn.
+with a finite **five-minute deadline window**. The original first-reservation
+episode deadline policy is replaced by the #2958 amendment below. Retries use the
+existing exponential delay capped at 16 times the base. Capture, publication and
+successor handoff preserve the reservation count. Reset of that count requires
+a trusted, successfully settled real model turn.
 
 A permanent blocker or exhaustion reports terminal `failed` with
 `keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
@@ -320,3 +321,32 @@ Git-internal delta decompression is not bounded by it. Existing deadlines limit
 duration, and the shared worker cgroup does not isolate sibling runs. The
 residual worker resource-exhaustion risk accepted in #2512 on 2026-10-09 remains
 deferred; this amendment does not claim to solve it.
+
+## Amendment 2026-10-14: #2958, one deadline window per fenced claim
+
+A retained-recovery episode may outlive a park or an interrupted long model turn.
+Its cumulative reservation count stays bounded at three, but the five-minute
+window now belongs to a positively verified claim generation, rather than the
+whole episode. The runner proves current `running` ownership and the exact
+positive claim generation before establishing a new window. The journal persists
+`claimGeneration` beside `startedAt` and `deadline` (`startedAt + 300000`), under
+the existing source binding and bare lock. A higher verified generation rebases
+those timestamps once. Same-generation retry and process recreation do not renew
+it; a missing or older fence cannot refresh a bound window.
+
+Legacy episode records have no claim identity. They remain readable and can bind
+once to a positively verified current claim, with a fresh window and the existing
+count, backoff and source attribution. No predecessor attempt id is interpreted
+as a claim fence. An unfenced legacy caller keeps the original deadline policy.
+Clock rollback and invalid clocks still refuse; three charged reservations still
+refuse a fourth even across fresh claims. Only trusted settled model processing
+clears the episode and its cumulative count.
+
+The entry reservation wrapper permits ownership verification and this authorized
+rebase before applying the persisted window. Failure classification uses the
+current claim's window, never a superseded deadline. Already-blocked records stay
+blocked with their original reason, including decoded-history exhaustion; neither
+a reclaim nor a deployment upgrade revives them. Source protection, custody,
+publication proof, closure verification limits and retry backoff are unchanged.
+No claim fence, timer renewal or successful local verification authorizes deletion
+or release of retained work.
