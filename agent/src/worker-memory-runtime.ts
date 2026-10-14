@@ -118,7 +118,7 @@ export class WorkerMemoryRuntime {
   // Worker invokes stop before awaiting any runner cancellation. Monitor.stop
   // invalidates the registry synchronously, then joins its bounded work. Unsettled
   // sink receipts remain owned here after stop; abort is advisory, not settlement.
-  // Runner receipt reconciliation/clone release is a later wiring seam.
+  // RunRunner reconciles these captured-flight receipts before clone/session release.
   stop(): Promise<void> {
     this.client.revokeMemoryAuthority();
     return this.monitor.stop();
