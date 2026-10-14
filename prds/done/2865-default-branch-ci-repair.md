@@ -1,6 +1,6 @@
 # PRD #2865: Default-branch CI repair (scheduled `ci_watch` target)
 
-**Status**: Draft
+**Status**: Done (M1 implemented and verified 2026-10-14; live acceptance maintainer-owned, pending)
 **Issue**: #2865
 **Umbrella**: #2864 (child 1 of 2; child 2, CI artifacts as repair evidence, is #2866 and is blocked by this PRD)
 **Priority**: Medium
@@ -118,7 +118,7 @@ Nothing in this PRD's implementation or validation touches `.github/workflows/**
 
 ## Implementation status
 
-The design above describes what is implemented on the `agent/issue-2865` branch (modules 1 to 6, with docs in `docs/scheduling.md`, `docs/ci-autofix.md`, `docs/cli.md` and `CHANGELOG.md`). Live acceptance (below) is maintainer-owned and has not been done by the implementing run: nothing here was exercised against a real forge, a rolled worker fleet or a real red scheduled workflow.
+The design above describes what is implemented on the `agent/issue-2865` branch (modules 1 to 6, with docs in `docs/scheduling.md`, `docs/ci-autofix.md`, `docs/cli.md` and `CHANGELOG.md`). Verified by the implementing run: `task gate` (repo, api and controller slices; web and agent slices on the final tree) and `./e2e/run-store-it.sh` with every `*LiveDB` test this PRD added executed and passing, zero skipped. Live acceptance (below) is maintainer-owned and has not been done by the implementing run: nothing here was exercised against a real forge, a rolled worker fleet or a real red scheduled workflow.
 
 ## Live acceptance (not a milestone)
 

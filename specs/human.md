@@ -1315,7 +1315,7 @@ PRD at `prds/1786-preserve-worker-only-work.md`.
 
 ## Feature #2865 — Default-branch CI repair (`ci_watch` / `ci-repair`)
 
-Tracked as issue vtmocanu/uzi#2865; PRD at `prds/2865-default-branch-ci-repair.md`.
+Tracked as issue vtmocanu/uzi#2865; PRD at `prds/done/2865-default-branch-ci-repair.md`.
 
 - A red workflow on a repo's default branch is repaired by a scheduled `ci_watch` target, enabled as the `ci-repair` catalog default. It watches the default branch only; agent MR branches stay the `ci_fix` lane (PRD D3). (AI-synced 2026-10-14)
 - A fire inspects the newest completed execution of each watched workflow: green starts nothing; red starts one ordinary run that fixes on a new `uzi/prompt-<id>` branch and opens a PR, or finishes report-only. `main` is never touched and a human merges (D4). A loop guard (same failure signature after an attempt, or `CI_AUTOFIX_MAX_ATTEMPTS`) stops a persistently red workflow from looping. (AI-synced 2026-10-14)
