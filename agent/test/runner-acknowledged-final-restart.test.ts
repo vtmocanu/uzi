@@ -33,6 +33,9 @@ type BoundaryRunner = {
     action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained">;
 };
 
+// Report retirement refuses both proof paths off Linux (procfs process/no-follow checks).
+const linuxReportSkip = process.platform === "linux" ? false : "report retirement proofs require Linux procfs";
+
 // Both callers get independent stores and a complete production capture/release history.
 // The source boundary's execution lane is acquired by RunRunner, never planted in a map.
 for (const { caller, afterUnlinkFault, liveClient } of [
@@ -43,7 +46,7 @@ for (const { caller, afterUnlinkFault, liveClient } of [
   { caller: "terminal replay", afterUnlinkFault: false, liveClient: true },
   { caller: "worker finalize retry", afterUnlinkFault: false, liveClient: true },
 ] as const) {
-  it(`acknowledged archive with redundant settled FINAL retires ${caller} after runner loss${afterUnlinkFault ? " despite post-unlink proof failure" : ""}${liveClient ? " with active pre-release observation" : ""}`, async t => {
+  it(`acknowledged archive with redundant settled FINAL retires ${caller} after runner loss${afterUnlinkFault ? " despite post-unlink proof failure" : ""}${liveClient ? " with active pre-release observation" : ""}`, { skip: linuxReportSkip }, async t => {
     const claim = gitlabClaim(2883, { claim_generation: 29, inventory_guarded: true });
     const generation = claim.claim_generation!, token = "acknowledged-final-restart-key";
     const branch = "agent/issue-2883";
@@ -843,7 +846,7 @@ for (const { caller, afterUnlinkFault, liveClient } of [
   });
 }
 
-it("new report proof transport failure preserves existing physical archive authority within the same budget", async t => {
+it("new report proof transport failure preserves existing physical archive authority within the same budget", { skip: linuxReportSkip }, async t => {
   const f = await reportRetirementFixture(t);
   const recovery = Reflect.get(f.r, "recovery") as RecoveryCoordinator;
   const report = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
