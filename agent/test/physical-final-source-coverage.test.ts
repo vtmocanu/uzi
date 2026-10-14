@@ -8,8 +8,67 @@ import { reportRetirementFixture } from "./report-retirement-fixture.js";
 
 installHarness();
 
+for (const coveredFinal of [true, false]) {
+  it(coveredFinal
+    ? "real competing FINAL covered by SDK merge retires terminal and finalize reports"
+    : "real earlier divergent non-FINAL wrapper retires terminal and finalize reports", {
+    skip: process.platform === "linux" ? false : "physical source proof requires Linux",
+  }, async t => {
+    const f = await reportRetirementFixture(t, {
+      olderOpenHold: true, olderSource: false, priorPendingArchiveFinal: true,
+      coverPriorFinal: coveredFinal, priorArchiveWithoutFinal: !coveredFinal,
+    });
+    const prior = f.priorFinal!;
+    assert.equal(prior.generation, 1);
+    assert.notEqual(prior.finalAcknowledged, true);
+    assert.equal(prior.finalRequest?.disposition.kind, coveredFinal ? "archive" : undefined);
+    assert.notEqual(prior.sourceSha, prior.inventoryCurrentSha, "real synthetic coverage wrapper");
+    assert.equal(await git.ancestry(f.bare, prior.sourceSha, f.archive.sourceSha),
+      coveredFinal ? "ancestor" : "divergent");
+    assert.equal(await git.ancestry(f.bare, f.successorAdmission!.head, f.head), "ancestor");
+    assert.deepEqual(prior.originalRoots!.map(root => root.sha).sort(),
+      [f.predecessorH1, f.predecessorH2].sort());
+    const records = await f.coordinator.inspect(f.claim.run_id);
+    assert.deepEqual(records.find(record => record.captureId === prior.captureId), prior);
+    assert.equal(records.filter(record => record.generation === 2 && record.state === "uploaded").length, 1);
+    for (const head of [prior.originalSourceSha!, prior.inventoryCurrentSha!,
+      ...prior.originalRoots!.map(root => root.sha)]) {
+      assert.equal(await git.ancestry(f.bare, head, f.archive.sourceSha), "ancestor");
+    }
+    const restore = f.useHeadroom();
+    try {
+      const restarted = await f.restartedRunner();
+      const coordinator = f.recoveryOf(restarted.r);
+      assert.deepEqual(await coordinator.inspect(f.claim.run_id), records);
+      const report = await restarted.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation);
+      assert.ok(report);
+      const oldFinalCalls = f.calls.priorArchiveFinal;
+      assert.deepEqual(await restarted.r.retireRecoveryReport(f.claim.run_id, f.generation, report.context),
+        { retired: true, authority: "existing_archive" });
+      assert.equal(await restarted.outbox.readTerminalJournal(f.claim.run_id, f.generation), undefined);
+      assert.deepEqual(restarted.outbox.listPendingTerminals(), []);
+      assert.ok(restarted.observations.calls >= 4);
+      await f.assertCustody();
+      // Finalize proof is admitted only after real terminal retirement removes its prohibition.
+      assert.equal((await restarted.outbox.journalFinalize(f.claim.run_id, f.generation)).written, true);
+      const identity = restarted.outbox.finalizeRecordIdentity(f.claim.run_id, f.generation);
+      assert.ok(identity);
+      assert.deepEqual(await restarted.r.retireRecoveryReport(f.claim.run_id, f.generation, {
+        expectedIdentity: identity, signal: new AbortController().signal,
+        deadline: Date.now() + f.headroomMs,
+      }, "finalize", restarted.outbox), { retired: true, authority: "existing_archive" });
+      assert.equal(restarted.outbox.finalizeRecordIdentity(f.claim.run_id, f.generation), undefined);
+      assert.deepEqual(await coordinator.inspect(f.claim.run_id), records);
+      assert.equal(f.calls.priorArchiveFinal, oldFinalCalls, "report proofs send no old FINAL");
+      await f.assertCustody();
+      t.diagnostic("SYNTHETIC SERVER/PROCESS/TIME OBSERVATIONS; real producer, SDK ancestry, archives and Outbox retirement");
+      t.diagnostic(JSON.stringify({ events: f.historyEvents, coveredFinal }));
+    } finally { restore(); }
+  });
+}
+
 // Physical source/content proof uses Linux process semantics; other platforms skip explicitly.
-it("paused archive FINAL root drift precedes real successor admission and report retirement", {
+it("paused archive FINAL root drift retains the successor report", {
   skip: process.platform === "linux" ? false : "physical source proof requires Linux",
 }, async t => {
   const f = await reportRetirementFixture(t, {
@@ -108,19 +167,13 @@ it("paused archive FINAL root drift precedes real successor admission and report
     assert.ok(report);
     const oldFinalCalls = f.calls.priorArchiveFinal;
     const result = await restarted.r.retireRecoveryReport(f.claim.run_id, f.generation, report.context);
-    t.diagnostic("SYNTHETIC SERVER/PROCESS OBSERVATIONS; real paused producer, source boundary, admission, bundles, physical inventory and Outbox unlink");
+    t.diagnostic("SYNTHETIC SERVER/PROCESS OBSERVATIONS; real paused producer, source boundary, admission, bundles, physical inventory and Outbox retention");
     t.diagnostic(JSON.stringify({ events: f.historyEvents, oldFinal: prior.sourceSha,
       admitted: f.successorAdmission.head, archive: f.archive.sourceSha, result }));
-    if (process.env.UZI_EXPECT_FINAL_SOURCE_REFUSAL === "1") {
-      assert.deepEqual(result, { retired: false }, "desired refusal: uncovered pending FINAL must retain report");
-      assert.ok(await restarted.outbox.readTerminalJournal(f.claim.run_id, f.generation));
-    } else {
-      assert.deepEqual(result, { retired: true, authority: "existing_archive" },
-        "before-fix characterization omits pending old FINAL source");
-      assert.equal(await restarted.outbox.readTerminalJournal(f.claim.run_id, f.generation), undefined);
-      assert.deepEqual(restarted.outbox.listPendingTerminals(), []);
-      assert.ok(restarted.observations.calls >= 4);
-    }
+    assert.deepEqual(result, { retired: false }, "uncovered pending FINAL must retain report");
+    assert.ok(await restarted.outbox.readTerminalJournal(f.claim.run_id, f.generation));
+    assert.deepEqual(restarted.outbox.listPendingTerminals().map(p => [p.run_id, p.claim_generation]),
+      [[f.claim.run_id, f.generation]]);
     assert.deepEqual(await freshCoordinator.inspect(f.claim.run_id), records);
     assert.equal(f.calls.priorArchiveFinal, oldFinalCalls, "report proof sends no old FINAL");
     await f.assertCustody();

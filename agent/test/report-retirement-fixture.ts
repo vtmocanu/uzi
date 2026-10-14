@@ -29,6 +29,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
   currentArchiveReleased?: boolean;
   olderSource?: boolean;
   priorPendingArchiveFinal?: boolean;
+  priorArchiveWithoutFinal?: boolean;
+  coverPriorFinal?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
   const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
@@ -66,7 +68,10 @@ export async function reportRetirementFixture(t: TestContext, options: {
   client.getRunOwnership = async runId => {
     assert.equal(runId, claim.run_id);
     if (ownership.mode === "throw") throw new Error("ownership unavailable");
-    return { status: ownership.mode === "unknown" ? "unknown" : status,
+    // SYNTHETIC SERVER: lose ownership visibility after real G1 upload, before FINAL mint.
+    const beforePriorFinal = options.priorArchiveWithoutFinal && ownership.generation === 1 &&
+      captures.has("00000000-0000-4000-8000-000000002651");
+    return { status: ownership.mode === "unknown" || beforePriorFinal ? "unknown" : status,
       claim_generation: ownership.generation, inventory_guarded: true };
   };
   const captures = new Map<string, { manifest: RecoveryUploadManifest; bytes: Buffer }>();
@@ -212,11 +217,18 @@ export async function reportRetirementFixture(t: TestContext, options: {
     const reader = new RecoveryCoordinator({ client, git, log: nullLogger(),
       recoveryRoot: git.recoveryRoot, workerToken: token });
     const priorRecords = await reader.inspect(claim.run_id);
-    priorFinal = priorRecords.find(row => row.generation === 1 && row.finalRequest);
-    assert.ok(priorFinal?.finalRequest, "actual paused flight and due replay journal archive FINAL");
-    assert.equal(priorFinal.finalRequest.disposition.kind, "archive");
+    priorFinal = priorRecords.find(row => row.generation === 1 && row.state === "uploaded");
+    assert.ok(priorFinal, "actual paused flight and due replay uploaded G1 archive");
+    if (options.priorArchiveWithoutFinal) {
+      assert.equal(priorFinal.finalRequest, undefined, "ownership unavailable prevented FINAL mint");
+      assert.equal(calls.priorArchiveFinal, 0);
+      historyEvents.push("G1 real uploaded wrapper retained without FINAL (synthetic ownership unavailable)");
+    } else {
+      assert.ok(priorFinal.finalRequest, "actual paused flight and due replay journal archive FINAL");
+      assert.equal(priorFinal.finalRequest.disposition.kind, "archive");
+      assert.ok(calls.priorArchiveFinal > 0, "real archive FINAL was attempted and unavailable");
+    }
     assert.notEqual(priorFinal.finalAcknowledged, true);
-    assert.ok(calls.priorArchiveFinal > 0, "real archive FINAL was attempted and unavailable");
     assert.deepEqual(priorFinal.originalRoots!.map(root => root.sha).sort(),
       [predecessorH1, predecessorH2].sort(), "exact SDK H1/H2 roots frozen by G1");
     assert.equal(priorFinal.inventoryCurrentSha, predecessorH2);
@@ -274,6 +286,14 @@ export async function reportRetirementFixture(t: TestContext, options: {
         for await (const chunk of pack) assert.ok(chunk.length);
         return { ok: true, body: { published: false, ref: `refs/uzi-checkpoints/${ctx.branch}`, reason: "workflow_scope" } };
       };
+    }
+    if (options.coverPriorFinal) {
+      assert.ok(priorFinal?.bundlePath && priorFinal.finalRequest);
+      // Real SDK Git operations import and merge the old wrapper; no ancestry seam.
+      cmd(clone, ["fetch", priorFinal.bundlePath, RECOVERY_BUNDLE_REF + ":refs/heads/prior-archive"]);
+      cmd(clone, ["-c", "user.name=tester", "-c", "user.email=tester@example.test",
+        "-c", "commit.gpgsign=false", "merge", "--no-ff", "-m", "merge prior archive", "prior-archive"]);
+      historyEvents.push("G2 SDK merged actual G1 FINAL wrapper before H3");
     }
     head = commit("unpublished.txt");
     if (options.capturedWip) {
