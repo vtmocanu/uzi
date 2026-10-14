@@ -148,10 +148,14 @@ live mutation, hold discard, limit increase or redispatch was performed.
 ## Validation status
 
 Focused characterization passed as recorded above. Coder and researcher
-delegations returned transport failures, not review results. Landed-range
-independent review and the required serial agent/repository gates remain
-pending. M1 is not declared complete until those requirements are satisfied.
-M2 cap audit and M3 salvage/design checkpoint are not yet performed.
+delegations returned transport failures, not review results. Reviewer, tester
+and auditor independently ran the focused characterization successfully on
+`70bb9a4af0c26438bb819bb67c3849942c14241a`. Each reported the same
+restart-successor-counter coverage gap; the repair instruments the recreated
+cache separately. Scoped repair review and the required serial
+agent/repository gates remain pending. M1 is not declared complete until those
+requirements are satisfied. M2 cap audit and M3 salvage/design checkpoint are
+not yet performed.
 
 The eventual acceptance remains outstanding: owner-authorized recovery-positive
 red/green, blocker/current-cap controls, one pass per consent, every custody and

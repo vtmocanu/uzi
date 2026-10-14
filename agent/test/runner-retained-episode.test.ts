@@ -1888,12 +1888,14 @@ it("issue 2971 unique-content exhaustion stays blocked after a larger-cap restar
   const restarted = configuredCache(currentCap);
   // Independent local proof establishes admissibility; it grants no runner admission.
   assert.equal(await restarted.verifyRecoveryClosure(bare, exhaustedTip), true);
-  let restartedProofs = 0;
+  let restartedProofs = 0, restartedSuccessors = 0;
   restarted.verifyRecoveryClosure = async () => { restartedProofs++; throw new Error("blocked journal must not reverify"); };
+  const restartPrepare = restarted.prepareRecoverySuccessor.bind(restarted);
+  restarted.prepareRecoverySuccessor = async (...args) => { restartedSuccessors++; return restartPrepare(...args); };
   const restartLog = recordingLogger();
   await configuredRunner(restarted, factory(async () => { models++; throw new Error("must not model"); }), restartLog.logger).execute(claim);
-  assert.deepEqual({ restartedProofs, models, successors, releases },
-    { restartedProofs: 0, models: 0, successors: 0, releases: 0 });
+  assert.deepEqual({ restartedProofs, restartedSuccessors, models, successors, releases },
+    { restartedProofs: 0, restartedSuccessors: 0, models: 0, successors: 0, releases: 0 });
   assert.equal(command(bare, "config", `uzi-recovery.${clone.branch}.clone`), rawBlocked);
   assert.deepEqual(readJournal(bare, clone.branch), blocked);
   assert.equal(command(bare, "rev-parse", pin), sourceTip);
@@ -1907,7 +1909,7 @@ it("issue 2971 unique-content exhaustion stays blocked after a larger-cap restar
     initialReport: initialFailures[0]!.body.failure_reason, restartReport: failures[1]!.body.failure_reason,
     attempts: blocked.recovery.attempts, startedAt: blocked.recovery.startedAt,
     deadline: blocked.recovery.deadline, backoffMs: blocked.recovery.backoffMs,
-    blocker: blocked.recovery.blocker, initialProofs, restartedProofs, models, successors,
+    blocker: blocked.recovery.blocker, initialProofs, restartedProofs, models, successors, restartedSuccessors,
     custodyReleases: releases, sourceRetained: true, pinRetained: true, journalUnchanged: true,
     dirtyLiteral: "only local dirty work\n", independentLargerCapProof: true }));
 });
