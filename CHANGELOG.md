@@ -32,7 +32,8 @@ through `[0.52.0]`.)
 - **Owners at the custody admission limit can see which holds the server counts and why ([#2970](https://github.com/vtmocanu/uzi/issues/2970)).**
   The owner hold listing gains `counts_toward_admission` and `admission_reason` per open hold, read from a read-only per-hold projection in the same repeatable-read snapshot as the list and aggregate, so the three agree; `uzi run recovery` shows an `ADMISSION` column and the Workers page lists counted non-decision holds under "Admission information". A server that does not report membership leaves the fields absent, which clients treat as unknown rather than not counted. This is visibility only: the canonical `fn_custody_admission_count` accounting, hold classification and release/discard authority are unchanged.
 
-- Codex root leads can opt an authorized foreground Bash command into a fixed 120-minute bound with `long_running: true`; the default remains 60 minutes, and run-wall parking and cancellation still take precedence (#2986).
+- **Codex root leads can opt foreground Bash commands into a 120-minute bound ([#2986](https://github.com/vtmocanu/uzi/issues/2986)).**
+  Authorized commands use the fixed extended bound with `long_running: true`; the default remains 60 minutes. Run-wall parking remains authoritative, and cancellation arriving during deadline cleanup beats the command deadline without replacing an already-selected exit, output cap or nondeadline error.
 
 ### Fixed
 

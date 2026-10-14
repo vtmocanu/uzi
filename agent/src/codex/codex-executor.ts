@@ -5344,7 +5344,7 @@ export function makeDefaultSpawnCommand(
       const reaped = await registry.reapRoot(launched.root, reapDeadlineMs);
       if (!reaped.ok) throw new Error(COMMAND_ROOT_UNREAPED);
       await outputEnded;
-      if (opts.signal?.aborted || first.kind === "aborted") throw new Error("command aborted");
+      if (first.kind === "aborted" || (first.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
       if (first.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
       if (first.kind === "failed") throw first.error;
       return {

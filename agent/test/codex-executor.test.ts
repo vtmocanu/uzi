@@ -5689,7 +5689,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
   });
 
   describe("#2986 effective command bounds and cleanup races", () => {
-    function fixture(opts: { timeout?: boolean; elapsedMs?: number; clean?: boolean; onWait?: () => void; onDispose?: () => Promise<void>; deferDrain?: boolean } = {}) {
+    function fixture(opts: { timeout?: boolean; waitError?: Error; elapsedMs?: number; clean?: boolean; onWait?: () => void; onDispose?: () => Promise<void>; deferDrain?: boolean } = {}) {
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(2987));
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -5705,6 +5705,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
           assert.ok(typeof ms === "number", "the command seam supplies an explicit bound");
           state.waitMs = ms;
           opts.onWait?.();
+          if (opts.waitError) throw opts.waitError;
           if (opts.timeout || (opts.elapsedMs !== undefined && ms < opts.elapsedMs)) throw new SupervisedChildExitTimeoutError(ms);
           await held;
           return { event: "child_exit", code: 0 };
@@ -5803,6 +5804,53 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       assert.equal(error.message, "command aborted");
       assert.ok(!(error instanceof CommandDeadlineError));
     });
+    for (const long_running of [false, true]) {
+      for (const timing of ["during-dispose", "during-drain"] as const) {
+        for (const outcome of ["exit", "failed"] as const) {
+          it(`late abort preserves ${outcome} ${timing}, long_running=${long_running}`, async () => {
+            const abort = new AbortController();
+            const original = new Error("original nondeadline waitChild failure");
+            let entered!: () => void;
+            let release!: () => void;
+            const disposing = new Promise<void>(resolve => { entered = resolve; });
+            const disposal = new Promise<void>(resolve => { release = resolve; });
+            const f = fixture({
+              waitError: outcome === "failed" ? original : undefined,
+              deferDrain: timing === "during-drain",
+              onDispose: async () => { entered(); await disposal; },
+            });
+            let reaped!: () => void;
+            const cleanReap = new Promise<void>(resolve => { reaped = resolve; });
+            const reapRoot = f.registry.reapRoot.bind(f.registry);
+            f.registry.reapRoot = async (...args) => {
+              const result = await reapRoot(...args);
+              reaped();
+              return result;
+            };
+            let settled = false;
+            const running = f.spawn()(["/bin/sh", "-c", "echo fixture"], { long_running, signal: abort.signal })
+              .then(result => { settled = true; return result; }, (error: unknown) => { settled = true; return error; });
+            f.exit();
+            await disposing;
+            if (timing === "during-drain") {
+              release();
+              await cleanReap;
+              assert.equal(f.registry.hasLiveCommandRoot(), false);
+            }
+            assert.equal(settled, false);
+            abort.abort();
+            if (timing === "during-dispose") release();
+            else f.drain();
+            const result = await running;
+            if (outcome === "failed") assert.equal(result, original);
+            else assert.deepEqual(result, { code: 0, stdout: "last stdout", stderr: "last stderr" });
+            assert.equal(f.state.waitMs, long_running ? 7_200_000 : 3_600_000);
+            assert.equal(f.state.disposes, 1);
+            assert.equal(f.registry.hasLiveCommandRoot(), false);
+          });
+        }
+      }
+    }
     it("eligible deadline with unclean reap fails closed", async () => {
       const f = fixture({ timeout: true, clean: false });
       await assert.rejects(f.spawn(1, 20)(["/bin/sh", "-c", "echo fixture"], { long_running: true }), /did not reap cleanly/);
