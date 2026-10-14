@@ -27,6 +27,11 @@ through `[0.52.0]`.)
 - **Run lists show accounts across both harnesses, and the TUI keeps accounts close to their costs ([#2913](https://github.com/vtmocanu/uzi/issues/2913), [#2912](https://github.com/vtmocanu/uzi/issues/2912)).**
   Personal lists show every recorded account once you hold more than one credential across Claude and Codex, including one of each. A lone live credential named `default` displays as `claude` or `codex`; deleted accounts, admin views and run details retain their recorded labels. The TUI fits its account and cost cells to the visible rows while preserving conservative column thresholds; board titles fill the remaining space up to the judge and worker columns, with no fixed 60-column cap. Web lists refresh credential counts with their normal poll and retain last-good counts on failures. The Dashboard Active runs hint breaks the same total into `running`, `needs you`/`need you`, `queued` and `waiting to resume` counts, omitting empty buckets.
 
+### Fixed
+
+- **Read Codex gate logs during commands ([#2903](https://github.com/vtmocanu/uzi/issues/2903)).**
+  Codex can read gate logs while a shell command runs; other effects/checkpoints remain ordered.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
