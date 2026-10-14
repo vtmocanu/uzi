@@ -28,7 +28,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   olderOpenHold?: boolean;
   currentArchiveReleased?: boolean;
   olderSource?: boolean;
-  priorPendingHeldFinal?: boolean;
+  priorPendingArchiveFinal?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
   const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
@@ -38,13 +38,12 @@ export async function reportRetirementFixture(t: TestContext, options: {
   let status = "running";
   let manifest: RecoveryUploadManifest | undefined;
   let uploadedBytes: Buffer | undefined;
-  const calls = { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0, sends: 0, cancelledAcks: 0, heldFinal: 0 };
+  const calls = { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0, sends: 0, cancelledAcks: 0, priorArchiveFinal: 0 };
   const ownership = { mode: "healthy" as "healthy" | "unknown" | "throw", generation };
   const capture = { mode: "healthy" as "healthy" | "throw" | "expired" | "unbound" | "checksum" };
   const originalFetch = globalThis.fetch;
   let workerId = "";
-  api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report",
-    ...(options.priorPendingHeldFinal ? ["recovery_held_publication_v1"] : [])]);
+  api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report"]);
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     if (url.origin !== new URL(baseUrl).origin ||
@@ -70,47 +69,61 @@ export async function reportRetirementFixture(t: TestContext, options: {
     return { status: ownership.mode === "unknown" ? "unknown" : status,
       claim_generation: ownership.generation, inventory_guarded: true };
   };
-  client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [...(options.currentArchiveReleased ? [] : [{
+  const captures = new Map<string, { manifest: RecoveryUploadManifest; bytes: Buffer }>();
+  client.listRecoveryHolds = async runId => ({ run_id: runId, holds: [...(options.currentArchiveReleased || (options.priorPendingArchiveFinal && ownership.generation < generation) ? [] : [{
     hold_id: holdId, generation: archiveGeneration, inventory_guarded: true,
     has_available_capture: !!manifest,
   }]), ...(options.olderOpenHold ? [{ hold_id: "44444444-4444-4444-8444-444444444444",
-    generation: 1, inventory_guarded: true, has_available_capture: false }] : [])] });
+    generation: 1, inventory_guarded: true,
+    has_available_capture: options.priorPendingArchiveFinal === true && captures.has("00000000-0000-4000-8000-000000002651") }] : [])] });
+  const historyEvents: string[] = [];
+  let admissionCapture = false;
+  let unavailableAdmissionSource: string | undefined;
   let reserved: { sourceSha: string; digest: string; generation: number } | undefined;
   client.reserveRecoveryCapture = async (runId, req) => {
     assert.equal(runId, claim.run_id);
     assert.equal(req.run_id, claim.run_id);
-    assert.equal(req.generation, archiveGeneration);
     assert.match(req.source_sha, /^[0-9a-f]{40}$/);
     assert.match(req.coverage_digest!, /^[0-9a-f]{64}$/);
+    if (options.priorPendingArchiveFinal && (admissionCapture || req.source_sha === unavailableAdmissionSource)) {
+      unavailableAdmissionSource = req.source_sha;
+      historyEvents.push("G2 admission reserve unavailable; verified local bundle retained");
+      throw new Error("transient admission reserve unavailable");
+    }
+    assert.equal(req.generation, options.priorPendingArchiveFinal ? ownership.generation : archiveGeneration);
     reserved = { sourceSha: req.source_sha, digest: req.coverage_digest!, generation: req.generation! };
-    return { capture_id: captureId, state: "preparing" };
+    return { capture_id: options.priorPendingArchiveFinal && req.generation === 1
+      ? "00000000-0000-4000-8000-000000002651" : captureId, state: "preparing" };
   };
-  client.uploadRecoveryBundle = async (_run, _id, m, stream) => {
+  client.uploadRecoveryBundle = async (_run, id, m, stream) => {
     const chunks: Buffer[] = [];
     for await (const chunk of stream) chunks.push(Buffer.from(chunk));
     uploadedBytes = Buffer.concat(chunks);
     assert.equal(uploadedBytes.length, m.byte_size);
     assert.equal(createHash("sha256").update(uploadedBytes).digest("hex"), m.checksum);
     manifest = m;
-    return { capture_id: captureId, state: "available", manifest_bound: true };
+    captures.set(id, { manifest: m, bytes: uploadedBytes });
+    historyEvents.push(`G${ownership.generation} real archive uploaded`);
+    return { capture_id: id, state: "available", manifest_bound: true };
   };
   client.getRecoveryCaptureStatus = async (runId, requestedCapture) => {
     assert.equal(runId, claim.run_id);
-    assert.equal(requestedCapture, captureId);
+    const observed = captures.get(requestedCapture)?.manifest;
+    assert.ok(observed);
     if (capture.mode === "throw") throw new Error("capture status unavailable");
-    return { capture_id: captureId, state: "available",
+    return { capture_id: requestedCapture, state: "available",
       manifest_bound: capture.mode !== "unbound",
-      checksum: capture.mode === "checksum" ? "0".repeat(64) : manifest?.checksum,
-      byte_size: manifest?.byte_size,
+      checksum: capture.mode === "checksum" ? "0".repeat(64) : observed.checksum,
+      byte_size: observed.byte_size,
       expires_at: capture.mode === "expired" ? "2000-01-01T00:00:00Z" : "2099-01-01T00:00:00Z" };
   };
   client.releaseRecoveryCustody = async (runId, gen, _evidence, disposition) => {
-    if (options.priorPendingHeldFinal && gen === 1) {
+    if (options.priorPendingArchiveFinal && gen === 1) {
       assert.equal(runId, claim.run_id);
-      assert.equal(disposition?.kind, "held_publication");
-      calls.heldFinal++;
-      return { run_id: runId, generation: gen, released: false, holds_released: 0,
-        retained: true, reason: "held_publication_unavailable" };
+      assert.equal(disposition?.kind, "archive");
+      calls.priorArchiveFinal++;
+      historyEvents.push("G1 archive FINAL RPC unavailable (unacknowledged)");
+      throw new Error("archive FINAL unavailable");
     }
     calls.final++;
     return { run_id: claim.run_id, generation, released: false, holds_released: 0 };
@@ -160,13 +173,105 @@ export async function reportRetirementFixture(t: TestContext, options: {
     t.mock.method(git, "produceRecoveryBundle", (barePath: string, opts: Parameters<typeof produce>[1]) =>
       produce(barePath, { ...opts, maxBytes: 32 * 1024 }));
   }
+  let priorFinal: RecoveryRecord | undefined;
+  let predecessorClone: string | undefined;
+  let predecessorH1 = "", predecessorH2 = "";
+  let successorAdmission: { head: string; clone: string; stage?: string; restoreTip?: string; attemptId?: string } | undefined;
+  if (options.priorPendingArchiveFinal) {
+    assert.equal(options.olderOpenHold, true, "earlier producer requires its exact-generation hold");
+    ownership.generation = 1;
+    const predecessorStartedAt = Date.now();
+    let predecessorNow = predecessorStartedAt;
+    const predecessor = runner({ run: async ctx => {
+      clone = ctx.worktreePath;
+      predecessorClone = clone;
+      head = predecessorH1 = commit("predecessor-H1.txt");
+      await ctx.checkpoint!({ reap: false });
+      historyEvents.push("G1 SDK H1 checkpoint unconfirmed, owed");
+      head = predecessorH2 = commit("predecessor-H2.txt");
+      // Test clock crosses the harness's 20-second wall budget without a real wait.
+      // SetRunWallPark requires an expired deadline, not merely a pause request.
+      predecessorNow = predecessorStartedAt + 21_000;
+      assert.equal(await ctx.parkForWall!({ completedCount: 2, total: 3 }), "parked");
+      status = "paused";
+      historyEvents.push("G1 actual wall park accepted paused (checkpoint unconfirmed)");
+      return { branch: ctx.branch, walled: { reason: "run exceeded its wall-clock timeout" } };
+    } }, fakeGitlab().gitlab, token, { outbox, checkpointIntervalMs: 1, now: () => predecessorNow,
+      // SYNTHETIC PROCESS OBSERVATIONS only; park, producer, bundles and Git stay real.
+      quiesceRun: async () => ({
+        process: { state: "quiescent", processes: [], killed: [], detail: "" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      }),
+    });
+    await predecessor.execute({ ...claim, claim_generation: 1 });
+    assert.equal(predecessor.isExecuting(claim.run_id), false);
+    assert.equal(api.wallParkRequests.length, 1);
+    assert.equal(api.wallParkRequests[0]!.body.published, false);
+    const bootRecords = await predecessor.snapshotBootRecoveries();
+    await predecessor.resumePendingRecoveries(undefined, bootRecords);
+    const reader = new RecoveryCoordinator({ client, git, log: nullLogger(),
+      recoveryRoot: git.recoveryRoot, workerToken: token });
+    const priorRecords = await reader.inspect(claim.run_id);
+    priorFinal = priorRecords.find(row => row.generation === 1 && row.finalRequest);
+    assert.ok(priorFinal?.finalRequest, "actual paused flight and due replay journal archive FINAL");
+    assert.equal(priorFinal.finalRequest.disposition.kind, "archive");
+    assert.notEqual(priorFinal.finalAcknowledged, true);
+    assert.ok(calls.priorArchiveFinal > 0, "real archive FINAL was attempted and unavailable");
+    assert.deepEqual(priorFinal.originalRoots!.map(root => root.sha).sort(),
+      [predecessorH1, predecessorH2].sort(), "exact SDK H1/H2 roots frozen by G1");
+    assert.equal(priorFinal.inventoryCurrentSha, predecessorH2);
+    const source = await git.discoverRetainedRecovery(fx.originPath,
+      cmd(predecessorClone!, ["branch", "--show-current"]), "issue-2652", claim.run_id);
+    assert.ok(source, "real retained G1 source discoverable before successor admission");
+    assert.equal(source.journal.clonePath, predecessorClone);
+    // SYNTHETIC SERVER: owner extends the exhausted worker-side wall park within its cap.
+    // runtime.sql ExtendAndResumeWallPark adds budget and queues it; ClaimRun increments to 2.
+    // A bare ResumeRunNow would refuse the exhausted budget (api/internal/handler/resume.go).
+    assert.equal(status, "paused");
+    status = "queued";
+    historyEvents.push("supported owner ExtendAndResumeWallPark adds budget -> queued (synthetic server)");
+    ownership.generation = generation;
+    status = "running";
+    admissionCapture = true;
+    historyEvents.push("supported queued ClaimRun -> running G2 (synthetic server)");
+    client.publishCheckpoint = async (runId, tip, pack) => {
+      assert.equal(runId, claim.run_id);
+      const chunks: Buffer[] = [];
+      for await (const chunk of pack) chunks.push(Buffer.from(chunk));
+      const bytes = Buffer.concat(chunks);
+      assert.ok(bytes.length);
+      // Broker consumes the actual producer pack and updates the local forge before ACK.
+      execFileSync("git", ["-C", fx.originPath, "index-pack", "--stdin"], { input: bytes });
+      const branch = cmd(predecessorClone!, ["branch", "--show-current"]);
+      const ref = `refs/uzi-checkpoints/${branch}`;
+      cmd(fx.originPath, ["update-ref", ref, tip]);
+      assert.equal(cmd(fx.originPath, ["rev-parse", ref]), tip);
+      historyEvents.push("G2 admission checkpoint H2 confirmed on physical forge before freeze");
+      return { ok: true, body: { published: true, ref, tip } };
+    };
+  }
   api.refuseStateWith409(claim.run_id);
-  let foreground = true;
+  let foreground = !options.priorPendingArchiveFinal;
   const processObservation = { killed: [] as number[], calls: 0 };
   const r = runner({ run: async ctx => {
     executions++;
+    foreground = true;
     if (executions > 1) throw new Error("cancelled queued duplicate SDK flight");
     clone = ctx.worktreePath;
+    if (options.priorPendingArchiveFinal) {
+      const admitted = await git.discoverRetainedRecovery(fx.originPath,
+        cmd(clone, ["branch", "--show-current"]), "issue-2652", claim.run_id);
+      assert.ok(admitted, "public discovery reads the actual admitted successor");
+      successorAdmission = { head: cmd(clone, ["rev-parse", "HEAD"]), clone,
+        stage: admitted.journal.recovery?.stage, restoreTip: admitted.journal.recovery?.restoreTip,
+        attemptId: admitted.journal.attemptId };
+      admissionCapture = false;
+      historyEvents.push("G2 SDK admitted on actual fresh attempt");
+      client.publishCheckpoint = async (_run, _tip, pack) => {
+        for await (const chunk of pack) assert.ok(chunk.length);
+        return { ok: true, body: { published: false, ref: `refs/uzi-checkpoints/${ctx.branch}`, reason: "workflow_scope" } };
+      };
+    }
     head = commit("unpublished.txt");
     if (options.capturedWip) {
       fs.writeFileSync(path.join(clone, "marker.txt"), "captured WIP\n");
@@ -177,6 +282,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     await ctx.checkpoint!({ reap: false });
     entered.resolve();
     await leave.promise;
+    if (options.priorPendingArchiveFinal) foreground = false;
     throw new Error("cancelled unpublished SDK error");
   } }, fakeGitlab().gitlab, token, { outbox, activeRuns: registry, checkpointIntervalMs: 1,
     // SYNTHETIC PROCESS PROOF: fixture observation only; Git source/content proof stays real.
@@ -196,7 +302,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     throw new Error("execute settled before reaching the SDK fixture barrier");
   })]);
   assert.equal(r.isExecuting(claim.run_id), true, "actual SDK flight owns its execution tail");
-  assert.ok(registry.build().active.some(e => e.run_id === claim.run_id && e.claim_generation === generation));
+  if (!options.priorPendingArchiveFinal) assert.ok(registry.build().active.some(e => e.run_id === claim.run_id && e.claim_generation === generation));
   status = "cancelled";
   if (options.liveFlight) {
     // Seed a report while the actual SDK remains stopped at the event barrier.
@@ -211,6 +317,10 @@ export async function reportRetirementFixture(t: TestContext, options: {
     assert.ok(await outbox.readTerminalJournal(claim.run_id, generation), "real failed report remains pending");
   }
 
+  if (options.priorPendingArchiveFinal) {
+    const pending = await r.snapshotBootRecoveries();
+    await r.resumePendingRecoveries(undefined, pending.filter(record => record.generation === generation));
+  }
   const bare = git.barePathFor(fx.originPath);
   const branch = cmd(clone, ["branch", "--show-current"]);
   const context: PositiveOwedCandidateContext = {
@@ -219,41 +329,26 @@ export async function reportRetirementFixture(t: TestContext, options: {
   };
   const coordinator = new RecoveryCoordinator({ client, git, log: nullLogger(),
     recoveryRoot: git.recoveryRoot, workerToken: token });
-  let priorFinal: RecoveryRecord | undefined;
-  if (options.priorPendingHeldFinal) {
-    assert.equal(options.olderOpenHold, true, "historical FINAL needs its real exact-generation hold");
-    const earlierContext = { ...context, generation: 1 };
-    await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context: earlierContext });
-    assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
+  let archive: RecoveryRecord;
+  if (options.priorPendingArchiveFinal) {
+    // Actual terminal journal came from execute; normal due replay captured the G2 inventory.
+    archive = (await coordinator.inspect(claim.run_id)).find(row => row.generation === archiveGeneration && row.state === "uploaded")!;
+  } else {
+    await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
+    if (options.olderOpenHold && options.olderSource !== false) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
       inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
-    const earlier = await coordinator.freezeInventory({
-      context: earlierContext, currentSha: head, defaultBranch: "main",
-    });
-    assert.ok(earlier, "public freeze mints the historical coverage wrapper");
-    const physicalCoordinator = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
-    assert.equal(await physicalCoordinator.releaseHeldPublication(earlier,
-      "55555555-5555-4555-8555-555555555555"), "kept");
-    priorFinal = (await coordinator.inspect(claim.run_id)).find(row => row.captureId === earlier.captureId);
-    assert.ok(priorFinal?.finalRequest, "public held-publication writer persists FINAL");
-    assert.equal(priorFinal.finalAcknowledged === true, false, "public writer leaves historical FINAL unacknowledged");
-    assert.equal(calls.heldFinal, 1, "real runner boundary permits FINAL; server retains it");
-    // Ordinary successor work changes the aggregate inputs; the historical synthetic wrapper
-    // is a coverage ref, so owed discovery retains its work roots without adopting the wrapper.
-    head = commit("successor.txt");
+    assert.ok(await coordinator.pin({ runId: claim.run_id, generation: archiveGeneration,
+      inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
+    const inventory = await coordinator.freezeInventory({ context, currentSha: head, defaultBranch: "main" });
+    assert.ok(inventory, "real frozen inventory");
+    assert.equal((await coordinator.captureAndUpload({ record: inventory, barePath: bare, defaultBranch: "main" })).state, "uploaded");
+    archive = (await coordinator.inspect(claim.run_id)).find(row => row.captureId === inventory.captureId)!;
   }
-  await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
-  if (options.olderOpenHold && options.olderSource !== false) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
-    inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
-  assert.ok(await coordinator.pin({ runId: claim.run_id, generation: archiveGeneration,
-    inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
-  const inventory = await coordinator.freezeInventory({ context, currentSha: head, defaultBranch: "main" });
-  assert.ok(inventory, "real frozen inventory");
-  assert.equal((await coordinator.captureAndUpload({ record: inventory, barePath: bare, defaultBranch: "main" })).state, "uploaded");
-  const archive = (await coordinator.inspect(claim.run_id)).find(row => row.captureId === inventory.captureId)!;
+  assert.ok(archive, "real uploaded archive exists");
   assert.equal(archive.generation, archiveGeneration);
   assert.equal(archive.finalAcknowledged === true, false);
   assert.ok(archive.coverageDigest && archive.bundlePath && uploadedBytes);
-  assert.deepEqual(fs.readFileSync(archive.bundlePath), uploadedBytes);
+  assert.deepEqual(fs.readFileSync(archive.bundlePath), captures.get(archive.serverCaptureId!)!.bytes);
   cmd(bare, ["bundle", "verify", archive.bundlePath]);
   if (options.thinArchive) {
     const header = await readRecoveryBundleHeader(archive.bundlePath, archive.sourceSha);
@@ -268,7 +363,8 @@ export async function reportRetirementFixture(t: TestContext, options: {
     cmd(fresh, ["merge-base", "--is-ancestor", head, "recovered"]);
   }
   assert.equal(cmd(clone, ["status", "--porcelain"]), "", "clean captured source");
-  assert.equal(calls.final, 0);
+  assert.equal(calls.final, options.priorPendingArchiveFinal ? 1 : 0);
+  const finalCallsBeforeProof = calls.final;
   assert.equal(calls.cloneCleanup, 0);
   assert.deepEqual(reserved, { sourceSha: archive.sourceSha, digest: archive.coverageDigest,
     generation: archive.generation });
@@ -311,7 +407,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   const assertCustody = async () => {
     assert.deepEqual({ final: calls.final, cloneCleanup: calls.cloneCleanup,
       sourceDelete: calls.sourceDelete, pinDelete: calls.pinDelete },
-    { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0 });
+    { final: finalCallsBeforeProof, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0 });
     assert.equal(fs.statSync(clone).isDirectory(), true);
     assert.equal(cmd(bare, ["show-ref"]), refs, "source and recovery pins remain");
     for (const [file, bytes] of files) assert.deepEqual(fs.readFileSync(file), bytes, file);
@@ -451,6 +547,6 @@ export async function reportRetirementFixture(t: TestContext, options: {
             docker: { state: "not_wired", removed: [], detail: "" } };
         } }) };
   };
-  return { priorFinal, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
+  return { historyEvents, predecessorH1, predecessorH2, priorFinal, predecessorClone, successorAdmission, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }
