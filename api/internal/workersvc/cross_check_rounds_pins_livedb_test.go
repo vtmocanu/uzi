@@ -125,8 +125,12 @@ func TestCrossCheckRoundsPinsCapabilityRaceLiveDB(t *testing.T) {
 		afterAssembly: func(_ context.Context, _ store.Run, p *ClaimPayload, err error) {
 			assembled = true
 			during := mustRun(t, env, childID)
-			if len(during.CodexCapHash) != 0 || during.CodexClaimEpoch != before.CodexClaimEpoch {
+			if len(during.CodexCapHash) != 0 {
 				t.Fatal("preflight refusal minted credentials")
+			}
+			// ClaimRun revokes the previous epoch before assembly.
+			if during.CodexClaimEpoch != before.CodexClaimEpoch+1 {
+				t.Fatalf("preflight refusal epoch=%d, want %d", during.CodexClaimEpoch, before.CodexClaimEpoch+1)
 			}
 			if p != nil || !errors.Is(err, errCrossCheckPinsCapabilityMissing) {
 				t.Fatalf("race assembly payload=%v err=%v", p != nil, err)
@@ -139,9 +143,16 @@ func TestCrossCheckRoundsPinsCapabilityRaceLiveDB(t *testing.T) {
 	}
 	after := mustRun(t, env, childID)
 	cc, err := env.q.GetExactPlanCrossCheck(env.ctx, store.GetExactPlanCrossCheckParams{LeadRunID: lead, Round: 2})
-	if err != nil || after.Status != "queued" || len(after.CodexCapHash) != 0 || after.CodexClaimEpoch != before.CodexClaimEpoch+1 ||
+	if len(after.CodexCapHash) != 0 {
+		t.Fatal("capability refusal requeue retained minted credentials")
+	}
+	// Explicit refusal requeue revokes again after ClaimRun.
+	if after.CodexClaimEpoch != before.CodexClaimEpoch+2 {
+		t.Fatalf("capability refusal requeue epoch=%d, want %d", after.CodexClaimEpoch, before.CodexClaimEpoch+2)
+	}
+	if err != nil || after.Status != "queued" ||
 		cc.CheckerModel.Valid || cc.CheckerEffort.Valid || cc.CheckerModelSource.Valid || cc.CheckerEffortSource.Valid {
-		t.Fatalf("race changed credential/snapshot state: status=%s epoch=%d err=%v", after.Status, after.CodexClaimEpoch, err)
+		t.Fatalf("race changed status/snapshot state: status=%s err=%v", after.Status, err)
 	}
 }
 
