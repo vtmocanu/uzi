@@ -5059,10 +5059,11 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       generateIntentSummary: async () => null,
       generatePlanSummary: async (i: PlanSummaryInput) => { late = i; await new Promise<void>(() => {}); return null; },
     } as unknown as SummaryRunner;
-    const { fake, usage } = await runSwitchGiveUp({ startBeforeSwitch: true, runner, bound: 1, awaitRetry: false });
+    const { fake, probe } = await runSwitchGiveUp({ startBeforeSwitch: true, runner, bound: 1, awaitRetry: false });
     late!.onUsage?.({});
     assert.equal(fake.rec.planPosts.length, 0);
-    assert.equal(usage.length, 0);
+    // Read the live emits AFTER the late callback, so a regressed abandonment guard is visible.
+    assert.equal(probe.emits.filter(m => m.kind === "summary_usage").length, 0);
   });
 
   it("#2945 a reopened flight is aborted promptly by the re-armed lifecycle, with no post or usage", async () => {
