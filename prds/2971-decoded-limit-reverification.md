@@ -529,10 +529,11 @@ episode-policy ADR amendment if semantics change, and required serial gates.
   - the M1 fact-checker, independently, at `94594b12`.
 
   The M2 and M3 fact-checks ran no tests; those ranges change only this record.
-- **`task check-docs:web`.** The lead ran it before each record commit: exit 0.
+- **`task check-docs:web`.** The lead ran it on the final record candidate: exit 0,
+  log kept. Earlier interim runs printed OK but were not logged.
 - **Read-only validation per commit.** M0 by a reviewer; M1, M2 and M3 by a
   fact-checker. Each blocking finding was fixed in a follow-up commit, and the M2 fix
-  range was re-checked. The M3 fix range is re-checked by the commit that adds this
-  wording.
+  range was re-checked. The M3 fix range was re-checked at `1c7a6ac2`, and its
+  follow-up wording fix was re-checked too.
 - **Required gates.** `task gate:agent`, then `task gate:repo`: pending, run in the
   foreground after validation. Results are added below when recorded.
