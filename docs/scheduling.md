@@ -1138,8 +1138,11 @@ refuses (the publication is skipped, never passed) when a protected path
 differs or when it can't prove it doesn't: an invalid glob, an unknown or
 unfetched default branch, a tree walk that reaches **100,000** entries, a
 single name or path over 4096 bytes, or more than 64 MiB of path bytes in one
-walk. The server can't see a subtree the worker's pack omits, so the worker's
-merge-base check is the layer that covers that case.
+walk, or a differing subtree the worker's pack omits (the server can't prove
+it unchanged). So once the default branch has moved under a directory since
+the run started, the run's checkpoint and held-work publications are skipped
+(held work falls back to the recovery archive); the worker's own check still
+decides the final branch push.
 
 A refusal fails the run with a reason such as `CI-config guard: this run
 changes CI configuration: <up to 5 paths, and N more>. CI-config changes in

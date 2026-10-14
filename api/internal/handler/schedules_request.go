@@ -433,6 +433,12 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 		if req.Labels == nil {
 			m.Labels = nil
 		}
+		// Auto-approve is off for ci_watch unless the caller opts in (D10): a row converting
+		// INTO ci_watch does not carry the previous target's approval setting.
+		if req.AutoApprove == nil {
+			off := false
+			m.AutoApprove = &off
+		}
 	}
 	return m
 }

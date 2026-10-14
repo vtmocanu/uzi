@@ -105,19 +105,19 @@ func newCIConfigMatcher(globs []string) (match func(string) bool, ok bool, err e
 // It is depth-1 safe: the broker fetches the default branch at depth 1, so there is no history
 // to walk and no merge base. It compares the two root trees directly.
 //
-// This is a backstop for the trees present in the pack and the fetched refs, not the authority.
-// The worker's pack is `tip ^floor`, so a subtree the candidate shares with the floor is usually
-// absent from the broker's object store. When both sides hold a directory with differing hashes
-// and the candidate-side tree object is absent (plumbing.ErrObjectNotFound), that subtree is
-// skipped. The skip is NOT proof the run did not write it: an agent-authored merge whose extra
-// parent is outside the pack also leaves trees out. The worker's own merge-base guard over every
-// guarded checkpoint and held candidate (agent/src/runner.ts) is the layer that covers that case.
-// Once a checkpoint or branch ref exists on origin, fetchBaseRefs fetches it at depth 1, so its
-// inherited subtrees ARE present and compared: a later publication is refused when the default
-// branch changed a protected path after the run's base. That strictness is accepted (a non-fatal
-// checkpoint skip or held refusal; the worker's merge-base check decides the final branch push).
-// Still fail closed: a missing candidate ROOT tree, any missing default-side object, a
-// candidate-only directory whose tree is missing, and any other error.
+// It is a backstop beside the worker's own merge-base guard (agent/src/runner.ts), and it fails
+// closed on anything it cannot prove. The worker's pack is `tip ^floor`, so a subtree the
+// candidate shares with the floor is usually absent from the broker's object store. When both
+// sides hold a directory with differing hashes and the candidate-side tree object is absent,
+// the comparison is unknown and the publication is refused: absence does not prove the run
+// inherited the subtree unchanged (an agent-authored merge whose extra parent is outside the
+// pack also leaves trees out). Once a checkpoint or branch ref exists on origin, fetchBaseRefs
+// fetches it at depth 1, so its inherited subtrees are present and compared. The accepted cost
+// is that a guarded publication is refused whenever the default branch moved under a directory
+// since the run's floor: a non-fatal checkpoint skip or a held refusal (archive fallback); the
+// worker's merge-base check decides the final branch push. Also fail closed: a missing
+// candidate root tree, any missing default-side object, a candidate-only directory whose tree is
+// missing, and any other error.
 func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.Commit, defaultBranch string, globs []string) error {
 	match, ok, err := newCIConfigMatcher(globs)
 	if err != nil {
@@ -264,10 +264,9 @@ func (w *ciConfigWalk) pair(ea, eb object.TreeEntry, prefix string, depth int) e
 	path := prefix + ea.Name
 	switch {
 	case isDirEntry(ea) && isDirEntry(eb):
-		// The worker's pack omits trees reachable from its trusted floor; the run did not write
-		// a candidate subtree the store lacks. See ciConfigGuard.
+		// A candidate subtree the store lacks cannot be proven unchanged: refuse. See ciConfigGuard.
 		if _, err := w.s.EncodedObject(plumbing.TreeObject, ea.Hash); errors.Is(err, plumbing.ErrObjectNotFound) {
-			return nil
+			return fmt.Errorf("%w: a differing candidate subtree is not in the pack", ErrCIConfigGuard)
 		}
 		return w.diff(ea.Hash, eb.Hash, path+"/", depth+1)
 	case isDirEntry(ea) != isDirEntry(eb):

@@ -316,7 +316,14 @@ export function ScheduleModal({
   const clearCapacity = () => { setCapacityLimit(null); setCapacityRoom(null); };
   const changeTarget = (value: ScheduleTarget) => {
     if (value !== "sweep") clearCapacity();
-    if (!isEdit && !autoApproveTouched) setAutoApprove(value !== "ci_watch");
+    // ci_watch defaults auto-approve off (D10); an edit converting INTO ci_watch does not
+    // inherit the previous target's setting, and converting back restores the stored one.
+    if (!autoApproveTouched) {
+      if (!isEdit) setAutoApprove(value !== "ci_watch");
+      else if (editing.target !== "ci_watch") {
+        setAutoApprove(value === "ci_watch" ? false : editing.auto_approve);
+      }
+    }
     setTarget(value);
   };
   const changeTiming = (value: ScheduleTiming) => {

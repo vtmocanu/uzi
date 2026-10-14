@@ -182,6 +182,24 @@ func TestMergeScheduleCIWorkflowsPresence(t *testing.T) {
 	}
 }
 
+// A row converting INTO ci_watch does not inherit the previous target's auto-approve (D10):
+// omitted means off, an explicit choice is honored, and an existing ci_watch row keeps its own.
+func TestMergeScheduleConvertIntoCIWatchResetsAutoApprove(t *testing.T) {
+	prompt := store.RunSchedule{Target: "prompt", Timing: "recurring", Timezone: "UTC", CronExpr: pgtype.Text{String: "0 * * * *", Valid: true}, Prompt: pgtype.Text{String: "p", Valid: true}, AutoApprove: true}
+	if got := mergeSchedule(prompt, apitypes.ScheduleRequest{Target: "ci_watch"}); *got.AutoApprove {
+		t.Fatal("prompt (auto-approve on) -> ci_watch without auto_approve must come out off")
+	}
+	on := true
+	if got := mergeSchedule(prompt, apitypes.ScheduleRequest{Target: "ci_watch", AutoApprove: &on}); !*got.AutoApprove {
+		t.Fatal("an explicit auto_approve=true on conversion must be honored")
+	}
+	watch := prompt
+	watch.Target = "ci_watch"
+	if got := mergeSchedule(watch, apitypes.ScheduleRequest{Target: "ci_watch"}); !*got.AutoApprove {
+		t.Fatal("a ci_watch edit without auto_approve must keep the stored opt-in")
+	}
+}
+
 func TestOnlyEnabledFalseWhenCIWorkflowsPresent(t *testing.T) {
 	on := true
 	if !onlyEnabled(apitypes.ScheduleRequest{Enabled: &on}) {

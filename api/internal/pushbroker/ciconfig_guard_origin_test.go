@@ -177,25 +177,24 @@ func runBranchOpts(url, tip string, pack []byte) pushbroker.Options {
 func TestCIConfigGuardDefaultMovedSinceBase(t *testing.T) {
 	ctx := context.Background()
 
-	t.Run("clean tip publishes although the default branch moved", func(t *testing.T) {
+	// The candidate's docs/ tree is the base's, absent from the pack, and differs from the moved
+	// default: the broker cannot prove it unchanged, so it refuses (the accepted strictness).
+	t.Run("a clean tip whose inherited subtree is not in the pack is refused", func(t *testing.T) {
 		f, url, tip, pack := ciMovedDefault(t, "b.txt")
-		if _, err := pushbroker.Publish(ctx, runBranchOpts(url, tip, pack)); err != nil {
-			t.Fatalf("Publish: %v", err)
+		if _, err := pushbroker.Publish(ctx, runBranchOpts(url, tip, pack)); !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+			t.Fatalf("Publish err = %v, want ErrCIConfigGuard", err)
 		}
-		if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != tip {
-			t.Fatalf("checkpoint = %q, want %s", got, tip)
+		if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != "" {
+			t.Fatalf("checkpoint ref created at %s", got)
 		}
 	})
 
-	t.Run("clean pack is prepared although the default branch moved", func(t *testing.T) {
+	t.Run("a clean held pack whose inherited subtree is not in the pack is refused", func(t *testing.T) {
 		_, url, tip, pack := ciMovedDefault(t, "b.txt")
-		p, err := pushbroker.PrepareHeldPack(ctx, func() pushbroker.HeldPackOptions {
-			o := heldOpts(url, tip, pack)
-			o.CIConfigGuard, o.CIConfigPaths = true, ciFloor
-			return o
-		}())
-		if err != nil || p.Tip() != tip {
-			t.Fatalf("PrepareHeldPack = %v, %v; want prepared at %s", p, err, tip)
+		o := heldOpts(url, tip, pack)
+		o.CIConfigGuard, o.CIConfigPaths = true, ciFloor
+		if _, err := pushbroker.PrepareHeldPack(ctx, o); !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+			t.Fatalf("PrepareHeldPack err = %v, want ErrCIConfigGuard", err)
 		}
 	})
 
@@ -225,12 +224,11 @@ func (f *gitFixture) commitIn(path, content, msg string) string {
 	return f.commit(path, content, msg)
 }
 
-// A second publication refuses once a protected path changed on the default branch after the run's
-// base: the first checkpoint puts the run's tree (inherited subtrees included) on origin, and the
-// next publication fetches it at depth 1, so the inherited .gitlab tree is present and compared.
-// Accepted strictness: a non-fatal checkpoint skip; the worker's merge-base check decides the
-// final branch push.
-func TestCIConfigGuardSecondPublicationAfterProtectedChangeOnDefault(t *testing.T) {
+// Once a protected path changed on the default branch after the run's base, every guarded
+// publication of the run refuses: the first because its inherited .gitlab tree is not in the pack
+// (unknown, so refused), and none reaches origin. Accepted strictness: a non-fatal checkpoint
+// skip; the worker's merge-base check decides the final branch push.
+func TestCIConfigGuardRefusesAfterProtectedChangeOnDefault(t *testing.T) {
 	ctx := context.Background()
 	f := newGitFixture(t)
 	f.commitIn(".gitlab/ci.yml", "v1\n", "ci v1")
@@ -245,28 +243,23 @@ func TestCIConfigGuardSecondPublicationAfterProtectedChangeOnDefault(t *testing.
 	f.git("push", "origin", "moved:main")
 	url := f.cloneURL()
 
-	if _, err := pushbroker.Publish(ctx, runBranchOpts(url, c1, pack1)); err != nil {
-		t.Fatalf("Publish C1: %v", err)
+	for name, c := range map[string]struct {
+		tip  string
+		pack []byte
+	}{"C1": {c1, pack1}, "C2": {c2, pack2}} {
+		if _, err := pushbroker.Publish(ctx, runBranchOpts(url, c.tip, c.pack)); !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+			t.Fatalf("Publish %s err = %v, want ErrCIConfigGuard", name, err)
+		}
 	}
-	if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != c1 {
-		t.Fatalf("checkpoint = %q, want %s", got, c1)
-	}
-	_, err := pushbroker.Publish(ctx, runBranchOpts(url, c2, pack2))
-	if !errors.Is(err, pushbroker.ErrCIConfigGuard) {
-		t.Fatalf("Publish C2 err = %v, want ErrCIConfigGuard", err)
-	}
-	if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != c1 {
-		t.Fatalf("checkpoint advanced to %q despite the refusal", got)
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != "" {
+		t.Fatalf("checkpoint ref created at %s", got)
 	}
 }
 
-// KNOWN GAP, covered by the worker's merge-base guard and NOT by the broker: when the pack omits
-// the tree of a protected path the run changed (an agent-authored merge whose extra parent is
-// outside the pack), the broker skips that subtree as inherited and accepts the tip. This test
-// pins that the broker alone does not catch it; the worker runs its own merge-base guard over every
-// guarded checkpoint and held candidate before upload (agent/src/runner.ts), and that layer is the
-// authority for this case.
-func TestCIConfigGuardBrokerAloneMissesMergeParentOutsidePack(t *testing.T) {
+// An agent-authored merge whose extra parent is outside the pack leaves the changed protected
+// tree out of the broker's store. The broker cannot prove the subtree unchanged, so it refuses
+// both the checkpoint publish and the held preparation (nothing is sent).
+func TestCIConfigGuardRefusesMergeParentOutsidePack(t *testing.T) {
 	ctx := context.Background()
 	f := newGitFixture(t)
 	f.commitIn(".gitlab/ci.yml", "v1\n", "ci v1")
@@ -287,7 +280,18 @@ func TestCIConfigGuardBrokerAloneMissesMergeParentOutsidePack(t *testing.T) {
 	if err != nil {
 		t.Fatalf("pack-objects: %v", err)
 	}
-	if _, err := pushbroker.Publish(ctx, runBranchOpts(f.cloneURL(), tip, pack)); err != nil {
-		t.Fatalf("Publish = %v; the broker alone is expected to accept this (the worker guard is the layer for it)", err)
+	if _, err := pushbroker.Publish(ctx, runBranchOpts(f.cloneURL(), tip, pack)); !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+		t.Fatalf("Publish err = %v, want ErrCIConfigGuard", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != "" {
+		t.Fatalf("checkpoint ref created at %s", got)
+	}
+	o := heldOpts(f.cloneURL(), tip, pack)
+	o.CIConfigGuard, o.CIConfigPaths = true, ciFloor
+	if _, err := pushbroker.PrepareHeldPack(ctx, o); !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+		t.Fatalf("PrepareHeldPack err = %v, want ErrCIConfigGuard", err)
+	}
+	if got := f.originRef(heldRefName()); got != "" {
+		t.Fatalf("held ref created at %s", got)
 	}
 }

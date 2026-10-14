@@ -190,6 +190,22 @@ describe("ScheduleModal — ci_watch target (PRD #2865)", () => {
     expect("ci_workflows" in input && input.ci_workflows !== undefined).toBe(false);
   });
 
+  it("turns auto-approve off when an edit converts an auto-approved schedule into ci_watch", async () => {
+    const editing = await realMockApi.getSchedule("sch-pr0m");
+    expect(editing.auto_approve).toBe(true);
+    render(
+      <MemoryRouter>
+        <ScheduleModal editing={editing} onClose={vi.fn()} onSaved={vi.fn()} />
+      </MemoryRouter>,
+    );
+    expect(approveSwitch().getAttribute("aria-checked")).toBe("true");
+    pickTarget(/CI repair/);
+    expect(approveSwitch().getAttribute("aria-checked")).toBe("false");
+    // Converting back restores the stored setting.
+    pickTarget(/^Prompt/);
+    expect(approveSwitch().getAttribute("aria-checked")).toBe("true");
+  });
+
   it("edits a CI repair default: workflows and guidance editable, catalog fields omitted", async () => {
     const editing = { ...(await realMockApi.getSchedule("sch-def-ci-uzi")), ci_workflows: ["ci.yml", "kind-smoke.yml"] };
     mockApi.updateSchedule.mockResolvedValue(editing);
