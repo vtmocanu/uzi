@@ -535,5 +535,7 @@ episode-policy ADR amendment if semantics change, and required serial gates.
   fact-checker. Each blocking finding was fixed in a follow-up commit, and the M2 fix
   range was re-checked. The M3 fix range was re-checked at `1c7a6ac2`, and its
   follow-up wording fix was re-checked too.
-- **Required gates.** `task gate:agent`, then `task gate:repo`: pending, run in the
-  foreground after validation. Results are added below when recorded.
+- **Required gates.** `task gate:agent`, then `task gate:repo`, are run in the
+  foreground on the frozen candidate that contains this record, after validation.
+  Their recorded results are reported in the pull request for that candidate, not
+  here, so the record does not change after the gates have run.
