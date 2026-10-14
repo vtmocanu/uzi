@@ -232,6 +232,7 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
     const notOwned = new RequestError(
       "POST", `/api/worker/runs/${RUN}/state`, 404,
       '{"error":"run not found for this worker","reason":"run_not_owned"}',
+      undefined, { complete: true, bytes: 67 },
     );
     const mk = () => sweepClient({
       heartbeat: async (entries) => { latest = entries; },

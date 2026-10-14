@@ -42,13 +42,15 @@ const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "
 
 /** Issue #2950: the api's structured "this worker does not own the run" refusal of a /state
  *  report. Strict like `isRunOwnershipLost` (client.ts): a RequestError for POST 404 on exactly this
- *  run's /state path, a body of at most 1024 bytes that is a plain JSON object with EXACTLY the keys
+ *  run's /state path, a body read through EOF (`bodyEvidence.complete`) of at most 1024 raw bytes
+ *  (`bodyEvidence.bytes`, measured before trimming; no evidence fails closed) that is a plain JSON object with EXACTLY the keys
  *  `error` and `reason`, the fixed values below. Anything else (plain 404, HTML, extra/renamed key,
  *  another run's path, another method, another status) is not this answer and keeps today's
  *  retry behaviour. */
 function isRunNotOwnedStateRefusal(err: unknown, runId: string): boolean {
   if (!(err instanceof RequestError) || err.method !== "POST" || err.status !== 404 ||
-      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/state` || err.body.length > 1024) return false;
+      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/state` || err.body.length > 1024 ||
+      err.bodyEvidence?.complete !== true || err.bodyEvidence.bytes > 1024) return false;
   try {
     const body: unknown = JSON.parse(err.body);
     if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
