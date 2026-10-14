@@ -391,21 +391,24 @@ describe("m1 response usage", () => {
   });
 
   it("omits incomplete and impossible splits, accepts equality, and retains aggregate accounting", async () => {
-    const { harness, transport } = makeHarness();
+    const accountant = new CodexUsageAccountant();
+    const { harness, transport } = makeHarness({ accountant });
     const complete = tokenUsage(last, last);
     const incomplete = { ...complete, usage: { ...complete.usage, pricingEvidenceComplete: false } };
     const impossible = { inputTokens: 100, cachedInputTokens: 80, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
     const equality = { inputTokens: 100, cachedInputTokens: 70, cacheWriteInputTokens: 30, outputTokens: 40, totalTokens: 140 };
+    // doubled + equality keeps cumulative splits consistent and uncached input nondecreasing at 100.
     transport.push(incomplete).push(tokenUsage(doubled, impossible))
-      .push(tokenUsage({ inputTokens: 300, cachedInputTokens: 130, cacheWriteInputTokens: 80, outputTokens: 120, totalTokens: 420 }, equality))
+      .push(tokenUsage({ inputTokens: 300, cachedInputTokens: 130, cacheWriteInputTokens: 70, outputTokens: 120, totalTokens: 420 }, equality))
       .push(turnCompleted("completed"));
     const events = await collect(harness.startTurn(makeRequest()).events);
     assert.deepEqual(records(events).map(e => e.usage), [{ input_tokens: 0, cache_read_input_tokens: 70, cache_creation_input_tokens: 30, output_tokens: 40 }]);
     const terminal = events.find(e => e.kind === "turn_finished");
     assert.ok(terminal?.kind === "turn_finished");
     assert.deepEqual(terminal.terminal.usage?.wire?.modelUsage, { [provider.model]: {
-      inputTokens: 90, outputTokens: 120, cacheReadInputTokens: 130, cacheCreationInputTokens: 80, reasoningOutputTokens: 0, costStatus: "unreported",
+      inputTokens: 100, outputTokens: 120, cacheReadInputTokens: 130, cacheCreationInputTokens: 70, reasoningOutputTokens: 0, costStatus: "unreported",
     } });
+    assert.equal(accountant.usageIncomplete, false);
   });
 
   it("proved historical replay and unproved resume emit none; current resumed response emits once", async () => {
@@ -606,7 +609,7 @@ function makeHarness(
     credentialValue?: string;
     authMode?: CodexAppServerAuthMode;
     accountant?: CodexUsageAccountant;
-    onTokenUsageIncomplete?: () => void | Promise<void>;
+    onTokenUsageIncomplete?: (text: string) => void | Promise<void>;
     scrubProjected?: (s: string) => string;
     idNonce?: string;
     nowMs?: () => number;
@@ -684,8 +687,199 @@ function wedgeBroker(): { broker: CodexCallbackBroker; entered: Promise<void>; r
   return { broker, entered, release };
 }
 
+describe("#2878 M2 harness terminal", () => {
+  const entry = (inputTokens: number, outputTokens: number) => ({
+    inputTokens, outputTokens, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+    reasoningOutputTokens: 0, costStatus: "unreported",
+  });
+  const note = (inputTokens: number, outputTokens: number, threadId = "resumed-1", turnId = "tn-1") =>
+    tokenUsage({ inputTokens, outputTokens, totalTokens: inputTokens + outputTokens },
+      { inputTokens, outputTokens, totalTokens: inputTokens + outputTokens }, threadId, turnId);
+
+  for (const sameModel of [false, true]) {
+    it(`regression retains earlier child in terminal after root incomplete: ${sameModel ? "same model" : "distinct model"}`, async () => {
+      const { harness, transport } = makeHarness({ authMode: "api_key" });
+      const childModel = sameModel ? "gpt-6-astra" : "gpt-6.1-sol";
+      harness.recordChildThreadModel("child", childModel);
+      harness.registerChildSink("child", { push() {} });
+      transport.push(note(200, 100, "child", "child-turn"))
+        .push(turnStarted("resumed-1"))
+        .push(note(600, 180))
+        .push(turnCompleted("completed", undefined, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, sameModel
+          ? { "gpt-6-astra": entry(200, 100) }
+          : { "gpt-6-astra": entry(0, 0), [childModel]: {
+            ...entry(200, 100), costStatus: "metered", costUSD: 0.0014,
+          } }, "terminal retains proved child work even with a zero incomplete root");
+        assert.deepEqual(result.terminal.metrics?.cost, { kind: "unreported" });
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const invalid of ["raw bucket", "unknown identity", "missing turn", "activity"] as const) {
+    it(`regression baselined resumed root retains pre/post counters after invalid live ${invalid}`, async () => {
+      const accountant = new CodexUsageAccountant();
+      let notices = 0;
+      const { harness, transport } = makeHarness({ authMode: "api_key", accountant,
+        onTokenUsageIncomplete: () => { notices++; } });
+      let bad = note(9000, 900);
+      if (invalid === "raw bucket") {
+        bad = { ...bad, params: { threadId: "resumed-1", turnId: "tn-1", tokenUsage: {
+          total: { ...bd(), inputTokens: "invalid" }, last: bd(),
+        } } };
+      } else if (invalid === "unknown identity") {
+        bad = { ...bad, threadId: "", params: { ...bad.params as object, threadId: "" } };
+      } else if (invalid === "missing turn") {
+        bad = { ...bad, turnId: "", params: { ...bad.params as object, turnId: "" } };
+      }
+      const invalidNote: CodexNotification = invalid === "activity"
+        ? { kind: "activity", method: bad.method, params: { threadId: "resumed-1", turnId: "tn-1", tokenUsage: {} } }
+        : bad;
+      transport.push(note(1000, 200, "resumed-1", "historical"))
+        .push(turnStarted("resumed-1"))
+        .push(tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"))
+        .push(invalidNote)
+        .push(tokenUsage({ inputTokens: 1130, outputTokens: 230, totalTokens: 1360 },
+          { inputTokens: 30, outputTokens: 10, totalTokens: 40 }, "resumed-1"))
+        .push(turnCompleted("completed", undefined, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.equal(notices, 1);
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, { "gpt-6-astra": entry(130, 30) },
+          "retain validated strictly-newer usage on both sides of the latch");
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const invalid of ["raw bucket", "activity", "unknown identity", "missing turn"] as const) {
+    it(`regression invalid ${invalid} live note before baseline quarantines later replay`, async () => {
+      const accountant = new CodexUsageAccountant();
+      const notices: string[] = [];
+      const { harness, transport } = makeHarness({ authMode: "api_key", accountant,
+        onTokenUsageIncomplete: text => { notices.push(text); } });
+      const bad = note(9000, 900);
+      const invalidNote: CodexNotification = invalid === "activity"
+        ? { kind: "activity", method: bad.method,
+          params: { threadId: "resumed-1", turnId: "tn-1", tokenUsage: {} } }
+        : invalid === "raw bucket"
+          ? { ...bad, params: { threadId: "resumed-1", turnId: "tn-1",
+            tokenUsage: { total: { ...bd(), inputTokens: "invalid" }, last: bd() } } }
+          : invalid === "unknown identity"
+            ? { ...bad, threadId: "", params: { ...bad.params as object, threadId: "" } }
+            : { ...bad, turnId: "", params: { ...bad.params as object, turnId: "" } };
+      transport.push(invalidNote)
+        .push(note(1000, 200, "resumed-1", "historical"))
+        .push(turnStarted("resumed-1"))
+        .push(tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"))
+        .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.equal(accountant.hasBaseline("resumed-1"), false, "late history cannot erase attempted live work");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, { "gpt-6-astra": entry(0, 0) });
+        assert.deepEqual(result.terminal.metrics?.cost, { kind: "unreported" });
+        assert.equal(events.filter(e => e.kind === "usage_record").length, 0);
+        assert.equal(notices.length, 1);
+        assert.match(notices[0]!, invalid === "raw bucket" || invalid === "activity"
+          ? /invalid raw token usage/ : /invalid token usage identity/);
+        assert.match(notices[0]!, /baseline is unavailable/);
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const historicalOnly of [true, false]) {
+    it(`regression ${historicalOnly ? "recoverable historical malformation" : "live missing baseline quarantine"} terminal`, async () => {
+      const { harness, transport } = makeHarness({ authMode: "api_key" });
+      if (historicalOnly) transport.push({ kind: "activity", method: "thread/tokenUsage/updated",
+        params: { threadId: "resumed-1", turnId: "historical", tokenUsage: {} } });
+      else transport.push(turnStarted("resumed-1")).push(note(600, 180));
+      transport.push(note(1000, 200, "resumed-1", "historical")).push(turnStarted("resumed-1"))
+        .push(tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+          { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"))
+        .push(turnCompleted("completed", undefined, "resumed-1")).end();
+      try {
+        const events = await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage,
+          { "gpt-6-astra": historicalOnly ? entry(100, 20) : entry(0, 0) });
+      } finally { await harness.close(); }
+    });
+  }
+
+  for (const shape of ["equal", "reset", "advancing regression"] as const) {
+    it(`${shape === "advancing regression" ? "regression" : "compatibility"} real transport active ${shape}`, async () => {
+      // Decode NDJSON through the production transport, including deliberate split frames.
+      // The pinned resume fixtures prove replay ordering, not a reset/compaction incident cause.
+      const inbound = new PassThrough();
+      const outbound = new PassThrough();
+      const transport = createCodexTransport({ inbound, outbound });
+      const accountant = new CodexUsageAccountant();
+      const { harness } = makeHarness({ authMode: "api_key", accountant,
+        launchRoot: async () => ({ root: fakeRoot, transport, supervisorPid: 4321 }) });
+      let buffered = "";
+      outbound.setEncoding("utf8");
+      outbound.on("data", (chunk: string) => {
+        buffered += chunk;
+        let end: number;
+        while ((end = buffered.indexOf("\n")) !== -1) {
+          const frame = rec(JSON.parse(buffered.slice(0, end)));
+          buffered = buffered.slice(end + 1);
+          if (frame.id === undefined || typeof frame.method !== "string") continue;
+          inbound.write(JSON.stringify({ id: frame.id, result: defaultResponder(frame.method) }) + "\n");
+          if (frame.method !== "turn/start") continue;
+          const totals = shape === "equal" ? [1110, 210] : shape === "reset" ? [10, 2] : [1120, 210];
+          const sequence = [
+            note(1000, 200, "resumed-1", "historical"), turnStarted("resumed-1"),
+            tokenUsage({ inputTokens: 1100, outputTokens: 220, totalTokens: 1320 },
+              { inputTokens: 100, outputTokens: 20, totalTokens: 120 }, "resumed-1"),
+            tokenUsage({ inputTokens: totals[0], outputTokens: totals[1], totalTokens: totals[0]! + totals[1]! },
+              { inputTokens: 10, outputTokens: 2, totalTokens: 12 }, "resumed-1"),
+            turnCompleted("completed", undefined, "resumed-1"),
+          ];
+          for (const n of sequence) {
+            const line = JSON.stringify({ method: n.method, params: n.params }) + "\n";
+            inbound.write(line.slice(0, 17)); inbound.write(line.slice(17));
+          }
+        }
+      });
+      try {
+        const events = await withTimeout(collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events), 5000, shape);
+        const result = events.find(e => e.kind === "turn_finished");
+        assert.ok(result?.kind === "turn_finished");
+        assert.equal(accountant.usageIncomplete, shape === "advancing regression");
+        assert.deepEqual(result.terminal.usage?.wire?.modelUsage, { "gpt-6-astra":
+          shape === "advancing regression" ? entry(100, 20)
+            : { ...entry(100, 20), costStatus: "metered", costUSD: 0.002 } });
+      } finally { await harness.close(); inbound.destroy(); outbound.destroy(); }
+    });
+  }
+});
+
 // U1 resumed-claim accounting through completed turns, both credential modes.
 describe("CodexHarness: resumed usage evidence", () => {
+  const incompleteModels = (retained = false) => ({
+    "gpt-6-astra": {
+      inputTokens: retained ? 560 : 0, cacheReadInputTokens: retained ? 140 : 0,
+      cacheCreationInputTokens: 0, outputTokens: retained ? 210 : 0,
+      reasoningOutputTokens: retained ? 70 : 0, costStatus: "unreported",
+    },
+  });
+  const assertIncompleteUsage = (result: HarnessTerminal, retained = false) => {
+    assert.deepEqual(result.usage, {
+      basis: "turn", tokens: {},
+      wire: { usage: undefined, modelUsage: incompleteModels(retained) },
+    }, "terminal retains the exact proved lower bound and suppresses ambiguous provider usage");
+  };
   const historical = { inputTokens: 300, cachedInputTokens: 60, outputTokens: 90, reasoningOutputTokens: 30, totalTokens: 390 };
   const last = { inputTokens: 200, cachedInputTokens: 40, outputTokens: 60, reasoningOutputTokens: 20, totalTokens: 260 };
   const next = { inputTokens: 600, cachedInputTokens: 120, outputTokens: 180, reasoningOutputTokens: 60, totalTokens: 780 };
@@ -871,8 +1065,8 @@ describe("CodexHarness: resumed usage evidence", () => {
                 assert.equal(result.outcome, "success");
                 assert.equal(notices, 1);
                 assert.equal(accountant.usageIncomplete, true);
-                assert.equal(result.usage, undefined);
-                assert.equal(accountant.aggregateByModel(), undefined);
+                assertIncompleteUsage(result, position === "after");
+                assert.deepEqual(accountant.aggregateByModel(), incompleteModels(position === "after"));
                 assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
 
                 const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
@@ -882,7 +1076,7 @@ describe("CodexHarness: resumed usage evidence", () => {
                     .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
                   const retried = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
                   assert.equal(retried.outcome, "success");
-                  assert.equal(retried.usage, undefined);
+                  assertIncompleteUsage(retried, position === "after");
                   assert.equal(notices, 1);
                 } finally {
                   await retry.harness.close();
@@ -980,8 +1174,8 @@ describe("CodexHarness: resumed usage evidence", () => {
               costUSD: 0.01624,
             });
           } else {
-            assert.equal(result.usage, undefined);
-            assert.equal(accountant.aggregateByModel(), undefined);
+            assertIncompleteUsage(result);
+            assert.deepEqual(accountant.aggregateByModel(), incompleteModels());
             assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
           }
         } finally {
@@ -1097,10 +1291,9 @@ describe("CodexHarness: resumed usage evidence", () => {
       try {
         const result = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
         assert.equal(result.outcome, "success");
-        assert.equal(result.usage?.wire?.modelUsage, undefined);
-        assert.equal(result.usage, undefined);
+        assertIncompleteUsage(result);
         assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
-        assert.equal(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") }), undefined);
+        assert.deepEqual(accountant.aggregateByModel({ authMode, now: new Date("2026-10-05") }), incompleteModels());
         assert.equal(accountant.usageIncomplete, true);
         assert.equal(notices, 1, "retry cannot redeliver a failed notice callback");
       } finally { await retry.harness.close(); }
@@ -1131,10 +1324,10 @@ describe("CodexHarness: resumed usage evidence", () => {
           .push(turnCompleted("completed", undefined, "resumed-1")).end();
         const result = terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
         assert.equal(result.outcome, "success");
-        assert.equal(result.usage, undefined);
+        assertIncompleteUsage(result);
         assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
         assert.equal(accountant.usageIncomplete, true);
-        assert.equal(accountant.aggregateByModel(), undefined);
+        assert.deepEqual(accountant.aggregateByModel(), incompleteModels());
         assert.equal(notices, 1, "retry shares the once-per-claim diagnostic latch");
         await retry.harness.close();
       });
@@ -1217,17 +1410,17 @@ describe("CodexHarness: resumed usage evidence", () => {
           .push(turnCompleted("completed", { inputTokens: 9999 }, "resumed-1")).end();
         const result = terminal(await collect(harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events));
         assert.equal(result.outcome, "success");
-        assert.equal(result.usage, undefined);
+        assertIncompleteUsage(result);
         assert.deepEqual(result.metrics?.cost, { kind: "unreported" });
         assert.equal(notices, 1);
-        assert.equal(accountant.aggregateByModel(), undefined);
+        assert.deepEqual(accountant.aggregateByModel(), incompleteModels());
         await harness.close();
 
         const retry = makeHarness({ authMode, accountant, onTokenUsageIncomplete });
         retry.transport.push(replay()).push(turnStarted("resumed-1"))
           .push(tokenUsage(next, response, "resumed-1"))
           .push(turnCompleted("completed", undefined, "resumed-1")).end();
-        assert.equal(terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events)).usage, undefined);
+        assertIncompleteUsage(terminal(await collect(retry.harness.startTurn(makeRequest({ resumeSessionId: "resumed-1" })).events)));
         assert.equal(notices, 1);
         await retry.harness.close();
       });

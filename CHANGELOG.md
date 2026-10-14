@@ -27,38 +27,6 @@ through `[0.52.0]`.)
 - **Read Codex gate logs during commands ([#2903](https://github.com/vtmocanu/uzi/issues/2903)).**
   Codex can read gate logs while a shell command runs; other effects/checkpoints remain ordered.
 
-- **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
-  Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; remove a hand-set `workers.rollTargetVersion` when using the published chart's pin so a stale override cannot hold the next roll. Missing or conflicting image identity blocks chart publication.
-
-- **Keep archive evidence until pending reports retire ([#2854](https://github.com/vtmocanu/uzi/issues/2854)).**
-  An acknowledged recovery FINAL now preserves its exact generation journal and pins while a terminal or finalize report still needs them, including across restart, then retries the existing cleanup after retirement. Local bundle bytes are freed immediately.
-
-- **Haiku 4.5 usage with unavailable inference geography keeps its standard cost estimate ([#2914](https://github.com/vtmocanu/uzi/issues/2914)).**
-  Summary and Now entries on Haiku 4.5's dated and undated model IDs accept `inference_geo: "not_available"` because those rows predate geographic routing. Geo-capable models with that marker remain unpriced. The Anthropic table also corrects Sonnet 5.5 cache reads to $0.10 per million tokens; stored unreported rows are not backfilled.
-
-- **Codex judges record their own API-equivalent spend ([#2915](https://github.com/vtmocanu/uzi/issues/2915)).**
-  Judge passes report observed per-model usage before the verdict and completion, including a failed pass that already observed usage. Accounting frames follow existing claim-time notes so they remain in the trace. Accounting transport failures log a warning while the verdict still lands; stale claims are abandoned. Both credential modes preserve metered or unavailable cost status; past judge runs are not backfilled.
-
-- **Task reviews record model spend on both harnesses ([#2916](https://github.com/vtmocanu/uzi/issues/2916)).**
-  Handoff reviews report their own observed usage before publishing findings, including failed passes with cost evidence. Accounting frames follow existing claim-time notes so they remain in the trace. Accounting transport failures log a warning while findings still land; stale claims are abandoned. Codex preserves unavailable cost markers; Claude passes without provider cost log unavailable usage instead of fabricating metered zero. Past reviews are not backfilled.
-
-- **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
-  A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
-
-- **Resumed implementation prompts preserve milestone reporting guidance ([#2438](https://github.com/vtmocanu/uzi/issues/2438)).**
-  Resumed Claude implementation prompts retain the approved milestone tracker and reporting instructions; both harnesses display persisted completion declarations alongside local progress, and the lead is instructed to report finished work before `signal_done` in the same turn. This is prompt guidance, not a guarantee of model compliance; the completion interlock is unchanged and incomplete work remains blocked.
-
-### Changed
-
-- **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**
-  The existing sync interval checks advertised refs, then independently stages the configured ref; either operation can fail without preventing the other, and neither bumps the pin nor applies templates. The new instance housekeeping check `agentsource.update` reads persisted discovery facts only, warning for a newer tag or moved branch, reporting `ok` when no update is derived, `na` when disabled, unconfigured or SHA-pinned, and `unknown` before a recorded check or on a settings read failure. It never yields Danger; warnings and unknowns feed Admin/Health attention counts and a separate Instance advisory mark, with a direct link to agent-source settings. Bumping a tag pin clears the tag signal; applying a snapshot matching the recorded tip clears the branch signal. Failed discovery retains last-good facts, so Health does not diagnose discovery freshness or sync failures; template changes still require review and approval.
-
-- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
-  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
-
-- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
-  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
@@ -222,6 +190,15 @@ through `[0.52.0]`.)
 
 - **Checkpoint publishes can recover from an HTTP 5xx within the same logical operation ([#296](https://github.com/vtmocanu/uzi/issues/296)).**
   An explicit numeric HTTP 500–599 response now permits up to three HTTP requests total, with 250ms and 1000ms backoffs. Any supplied caller deadline or abort signal is shared across attempts; each HTTP request retains its own client timeout. Some callers supply no outer signal, so the first request's timeout does not bound the total operation; the outer checkpoint gate (default 20m) still limits logical operations. Each replay uses a fresh producer for the fixed original source, candidate and floor, rechecks ownership, scratch/floor safety and remediation, and explicitly cancels and settles the abandoned producer first. A confirming ACK requires producer exit zero. HTTP 4xx, nonconfirming 2xx, skips, local errors, transport throws and aborts are not retried. Intermediate 5xx responses stay in numeric operator retry logs; continuing 5xx failures reach the deduped feed after the third request, while a successful retry emits one positive recovery line even without an earlier feed failure. This does not guarantee durability for divergent heads or resolve the production HTTP 500 cause.
+
+- **Enabled agent sources discover updates automatically and surface them in Admin Health ([#2902](https://github.com/vtmocanu/uzi/issues/2902)).**
+  The existing sync interval checks advertised refs, then independently stages the configured ref; either operation can fail without preventing the other, and neither bumps the pin nor applies templates. The new instance housekeeping check `agentsource.update` reads persisted discovery facts only, warning for a newer tag or moved branch, reporting `ok` when no update is derived, `na` when disabled, unconfigured or SHA-pinned, and `unknown` before a recorded check or on a settings read failure. It never yields Danger; warnings and unknowns feed Admin/Health attention counts and a separate Instance advisory mark, with a direct link to agent-source settings. Bumping a tag pin clears the tag signal; applying a snapshot matching the recorded tip clears the branch signal. Failed discovery retains last-good facts, so Health does not diagnose discovery freshness or sync failures; template changes still require review and approval.
+
+- **Running percentages sit inside status pills on the Runs list and Dashboard ([#2899](https://github.com/vtmocanu/uzi/pull/2899)).**
+  A static fill and inline percentage replace the separate stacked progress bar, keeping milestone badges, the live status dot and waiting or stalled details visible; running and completion estimates also appear on phones and rows without estimates omit the dash placeholder.
+
+- **Automatic issue starts can select Claude or Codex with forge labels ([#2853](https://github.com/vtmocanu/uzi/issues/2853)).**
+  Issue schedules (including every sweep selector and run-now) and autopilot read fresh `harness::claude` or `harness::codex` labels without falling back to the other harness. Invalid labels or a conflicting schedule pin skip the issue; unpinned sweeps continue past label-selected credential refusals, while one-time single issues hold on disabled selected credentials. A labelled Codex autopilot issue can start for a consenting Codex-only owner; unlabelled autopilot keeps its legacy Anthropic-token gate. Manual starts and prompt/self-improve schedules keep their existing behavior. Maintainer landing step: create both labels on this repository's forge.
 
 ### Added
 
@@ -610,6 +587,42 @@ through `[0.52.0]`.)
 
 - **Codex issue runs get intent and human-gate plan summaries on their own credential ([#2833](https://github.com/vtmocanu/uzi/pull/2833)).**
   Codex issue runs now show intent summaries and plan summaries with divergence deltas at initial and revised human approval gates. They use the run's own credential on `gpt-6-luna` with low effort; advisory failures leave the run outcome unchanged.
+
+- **Runs admin worker badges stay visible on narrow screens ([#2862](https://github.com/vtmocanu/uzi/issues/2862)).**
+  The Factory status worker badge row wraps at phone widths so the last badge is not clipped.
+
+- **Checkpoint publication acknowledgments are capped at 64 KiB ([#2888](https://github.com/vtmocanu/uzi/issues/2888)).**
+  The worker now reads the checkpoint publish response through a streamed-byte cap instead of buffering it whole, so an oversized or endless acknowledgment is cancelled and treated as an ambiguous publish failure (the attempted tip is kept, nothing is confirmed) without echoing any of the body.
+
+- **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
+  Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; remove a hand-set `workers.rollTargetVersion` when using the published chart's pin so a stale override cannot hold the next roll. Missing or conflicting image identity blocks chart publication.
+
+- **Keep archive evidence until pending reports retire ([#2854](https://github.com/vtmocanu/uzi/issues/2854)).**
+  An acknowledged recovery FINAL now preserves its exact generation journal and pins while a terminal or finalize report still needs them, including across restart, then retries the existing cleanup after retirement. Local bundle bytes are freed immediately.
+
+- **Haiku 4.5 usage with unavailable inference geography keeps its standard cost estimate ([#2914](https://github.com/vtmocanu/uzi/issues/2914)).**
+  Summary and Now entries on Haiku 4.5's dated and undated model IDs accept `inference_geo: "not_available"` because those rows predate geographic routing. Geo-capable models with that marker remain unpriced. The Anthropic table also corrects Sonnet 5.5 cache reads to $0.10 per million tokens; stored unreported rows are not backfilled.
+
+- **Codex judges record their own API-equivalent spend ([#2915](https://github.com/vtmocanu/uzi/issues/2915)).**
+  Judge passes report observed per-model usage before the verdict and completion, including a failed pass that already observed usage. Accounting frames follow existing claim-time notes so they remain in the trace. Accounting transport failures log a warning while the verdict still lands; stale claims are abandoned. Both credential modes preserve metered or unavailable cost status; past judge runs are not backfilled.
+
+- **Task reviews record model spend on both harnesses ([#2916](https://github.com/vtmocanu/uzi/issues/2916)).**
+  Handoff reviews report their own observed usage before publishing findings, including failed passes with cost evidence. Accounting frames follow existing claim-time notes so they remain in the trace. Accounting transport failures log a warning while findings still land; stale claims are abandoned. Codex preserves unavailable cost markers; Claude passes without provider cost log unavailable usage instead of fabricating metered zero. Past reviews are not backfilled.
+
+- **Repos with a very long origin path no longer fail to clone with `ENAMETOOLONG` ([#2886](https://github.com/vtmocanu/uzi/issues/2886)).**
+  A bare repo cache name over 255 bytes is now a bounded `uzi-sha256-<digest>.git` directory. New clones record their origin, and a hashed-name directory is reused only for that exact origin; a mismatched, missing or unreadable stored origin is refused without a fetch or delete. Takes effect after a release and worker rollout.
+
+- **Resumed implementation prompts preserve milestone reporting guidance ([#2438](https://github.com/vtmocanu/uzi/issues/2438)).**
+  Resumed Claude implementation prompts retain the approved milestone tracker and reporting instructions; both harnesses display persisted completion declarations alongside local progress, and the lead is instructed to report finished work before `signal_done` in the same turn. This is prompt guidance, not a guarantee of model compliance; the completion interlock is unchanged and incomplete work remains blocked.
+
+- **Codex session scans stream within their entry budgets ([#2281](https://github.com/vtmocanu/uzi/issues/2281)).**
+  Session copying, presence checks and generation cleanup enumerate held directory descriptors one entry at a time; incomplete presence scans return unknown, and cleanup enumeration failures preserve the published generation.
+
+- **Codex retains proven usage when cost accounting becomes incomplete ([#2878](https://github.com/vtmocanu/uzi/issues/2878)).**
+  Proven token counters survive invalid usage and advancing cumulative regressions; affected model costs remain unreported, and a once-per-claim notice names the actual accounting cause and whether a proved baseline is available.
+
+- **Completed runs' pending reports can retire after restart loses their clones ([#2883](https://github.com/vtmocanu/uzi/issues/2883)).**
+  A separate report-only proof requires covering archive acknowledgment and fresh complete custody; unresolved recovery sources and publication reservations remain retained.
 
 ### Security
 
