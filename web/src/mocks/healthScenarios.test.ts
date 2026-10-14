@@ -1,7 +1,8 @@
 import { describe, expect, it, vi } from "vitest";
 
 import { healthApi } from "./mockApi/health";
-import { workersApi } from "./mockApi/workers";
+import { workersApi, workers } from "./mockApi/workers";
+import type { Worker } from "../lib/api";
 import { ownerOnlyWaitingOwnerId, ownerOnlyWaitingRunId } from "./data/health";
 import { mockScenario } from "./mockApi/shared";
 
@@ -14,6 +15,19 @@ vi.mock("./mockApi/shared", async (importOriginal) => ({
 }));
 
 describe("health scenario routing", () => {
+  it("counts all attention statuses with provisioning excluded", async () => {
+    const saved = workers.map((w) => ({ ...w }));
+    try {
+      const statuses: Worker["upgrade_status"][] = [
+        "upgrade_failed", "outdated", "capacity_blocked", "provisioning_failed", "provisioning", "unknown",
+      ];
+      workers.splice(0, workers.length, ...statuses.map((upgrade_status) => ({ ...saved[0], upgrade_status })));
+      expect((await workersApi.workerUpgradeSummary()).attention).toBe(4);
+    } finally {
+      workers.splice(0, workers.length, ...saved);
+    }
+  });
+
   it("appends healthy Codex pricing metadata with empty evidence", async () => {
     vi.mocked(mockScenario).mockReturnValue("health-silent");
     const doc = await healthApi.getAdminHealth();

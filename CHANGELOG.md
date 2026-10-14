@@ -11,7 +11,7 @@ stable `X.Y.Z` may describe a version that is still a candidate; the git tag car
 Format each bullet as a bold title on its own physical line, then the description directly on the
 next physical line (NO blank line between them), the description on ONE physical line (no
 mid-description newlines) indented two spaces so it stays inside the list item: a release's notes are
-this file's `## [X.Y.Z]` section verbatim (`scripts/changelog-section.sh body`), and GitHub renders
+the selected bullet blocks verbatim (`scripts/changelog-section.sh body`), and GitHub renders
 single newlines in a release body as hard `<br>` breaks, so the title and its description render on
 consecutive lines with nothing between them, while a hard-wrapped description would show as short,
 ragged lines and a blank line after the title would open a gap. Keeping the description on one
@@ -48,6 +48,9 @@ through `[0.52.0]`.)
 
 - **Busy workers holding custody no longer starve paced image rolls ([#2959](https://github.com/vtmocanu/uzi/issues/2959)).**
   Proven uncordoned old and current workers can provide serving coverage while retaining recovery custody. Data-PVC protection, drain release and duplicate-canary cancellation fences remain intact; retiring completed Deployment pacing metadata does not release custody. Pacing diagnostics distinguish missing coverage from exhausted roll slots and identify the blocking worker and predicate, including replacements admitted in the same tick.
+
+- **Hosted worker CPU/memory capacity blockers no longer appear as failed upgrades (#2419).**
+  Verified scheduler-only resource shortages have distinct web, CLI and TUI diagnostics, while first provisioning gets its own progress/failure labels. Storage and unknown faults retain failure visibility; typed cause validation survives mixed-version API writes. Live Kubernetes capacity/storage-control verification and fresh light/dark TUI PNG review remain maintainer-owned and incomplete.
 
 - **Admin Settings exposes the hosted worker quota ([#2960](https://github.com/vtmocanu/uzi/issues/2960)).**
   The Hosted worker quota card lets admins set the per-user persistent worker cap from 0 to 20, validates edits before saving, and shows server errors. Zero disables self-service provisioning without changing existing workers.

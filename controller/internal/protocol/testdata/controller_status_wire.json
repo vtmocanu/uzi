@@ -35,6 +35,18 @@
       "blocking_reason": null,
       "restart_count": 0,
       "last_exit_code": null
+    },
+    {
+      "id": "33333333-3333-3333-3333-333333333333",
+      "phase": "stuck",
+      "phase_since": "2026-07-26T09:46:00Z",
+      "target_image": "harbor.example.com/uzi/agent-base:0.11.7",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
     }
   ]
 }

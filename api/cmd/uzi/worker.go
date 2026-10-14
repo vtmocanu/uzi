@@ -100,7 +100,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// LARGEST RUN is PRD #1809 M6 (D8): the HOME size of the worker's largest run, so one
 			// run growing toward filling the data volume is visible before it does. "-" when the
 			// worker reports no run sizes; also before OUTBOX.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "ROLL", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 
@@ -358,7 +358,7 @@ func formatUptimeDuration(d time.Duration) string {
 // upgradeCell renders a worker's upgrade status for the table (PRD #113 M5).
 //
 // Words, not symbols: this column is read by operators and by agents parsing --json's
-// sibling, and the CLI's other columns are plain words too. The api's five-state enum is
+// sibling, and the CLI's other columns are plain words too. The API display status is
 // passed through as-is rather than re-mapped, so the CLI and the web badge can never
 // describe the same worker differently — a second vocabulary is a second thing to keep in
 // sync.
@@ -375,19 +375,22 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 		return "up to date"
 	case "upgrade_failed":
 		return "FAILED"
+	case "capacity_blocked", "provisioning", "provisioning_failed":
+		return workerRollLabel(w.UpgradeStatus)
 	default:
 		// outdated | upgrading, and any state a newer api adds. Passing an unrecognized
 		// value through is deliberate: a newer server's new state should read as itself,
 		// not as "-" hiding a state this build has no opinion about.
-		return strings.ReplaceAll(w.UpgradeStatus, "_", " ")
+		return cellText(strings.ReplaceAll(w.UpgradeStatus, "_", " "))
 	}
 }
 
-// blockingCell renders the compact container/reason behind an upgrade_failed roll for
+// blockingCell renders failure diagnostics and capacity guidance for
 // `uzi admin workers`'s BLOCKING column (PRD #1484 M3) — the cross-user answer to "why is
 // this owner's worker stuck rolling".
 //
-// "-" when neither field is set (every status other than upgrade_failed). Otherwise
+// Capacity blockage includes fixed remedy guidance even if diagnostics are absent.
+// Other statuses show "-" when neither diagnostic field is set. Otherwise
 // "<container>: <reason>" when both are present, or whichever single field is. Both are the
 // short k8s enums the controller reports and the api already sanitizes at write time
 // (control/format chars stripped, 64-byte cap) — `state.waiting.message` is deliberately
@@ -397,6 +400,9 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 func blockingCell(w apitypes.WorkerDTO) string {
 	container := strOr(w.UpgradeBlockingContainer, "")
 	reason := strOr(w.UpgradeBlockingReason, "")
+	if remedy := workerCapacityRemedy(w); remedy != "" {
+		return cellText(reason + " · " + remedy)
+	}
 	switch {
 	case container != "" && reason != "":
 		return cellText(container + ": " + reason)

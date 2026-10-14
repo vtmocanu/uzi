@@ -211,8 +211,8 @@ func (s *Service) Poll(ctx context.Context) (PollResponse, error) {
 			OrdinaryCoverage:       row.OrdinaryCoverage, CheckerCoverage: row.CheckerCoverage,
 			EvaluatedAt: evaluatedAt, ValidUntil: evaluatedAt,
 		}
-		never := row.Status == "offline" && !row.LastHeartbeatAt.Valid && !row.Version.Valid &&
-			!row.SnapshotRegisterNonce.Valid && !row.RegisteredPodUid.Valid && !row.RollHeartbeatAt.Valid
+		never := workersvc.NeverRegistered(row.Status, row.LastHeartbeatAt.Valid, row.Version.Valid,
+			row.SnapshotRegisterNonce.Valid, row.RegisteredPodUid.Valid, row.RollHeartbeatAt.Valid)
 		evidence.NeverRegistered = &never
 		if row.Version.Valid {
 			v := row.Version.String

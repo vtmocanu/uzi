@@ -2240,14 +2240,19 @@ The api folds both into one derived `upgrade_status` on the worker DTO, computed
 time and never stored, so it cannot go stale against the row it describes. Three separate
 timestamps make that safe, and collapsing any pair reopens a specific hole: the
 controller's own clock is display-only, the api stamps its own receipt time to drive
-signal freshness, and a third column anchors a ceiling on how long a controller may be
-believed about one roll — cleared only by the worker's own authenticated re-registration
-moving its version. Roll-health rows are reachable only by joining through `workers`,
+signal freshness, and a third column anchors a ceiling on transient upgrading progress,
+cleared only by the worker's own authenticated re-registration moving its version.
+Fresh stuck failures remain visible beyond that progress ceiling. Roll-health rows are reachable only by joining through `workers`,
 which is what makes the per-user scoping unavoidable.
 
 Rationale, the decision log, and the alternatives that were rejected are in
 `prds/done/113-worker-upgrade-status.md`. The user-facing behaviour is
 [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
+Scheduler-capacity and first-provision diagnosis preserve the existing wire phases
+and display-only boundary. The optional typed cause, strict parser, mixed-version
+persisted-signal revalidation and outstanding maintainer acceptance are recorded in
+[ADR-2419](adr/2419-scheduler-capacity-roll-cause.md).
 
 ### Worker image tag: decoupled from appVersion, drained instead of hard-killed (PRD #422)
 

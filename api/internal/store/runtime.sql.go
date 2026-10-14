@@ -8593,6 +8593,7 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
        rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
+       rh.blocking_kind      AS roll_blocking_kind,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        rh.observed_at        AS roll_observed_at,
@@ -8617,6 +8618,7 @@ type ListAllWorkersRow struct {
 	RollPodPhase          pgtype.Text        `json:"roll_pod_phase"`
 	RollBlockingContainer pgtype.Text        `json:"roll_blocking_container"`
 	RollBlockingReason    pgtype.Text        `json:"roll_blocking_reason"`
+	RollBlockingKind      pgtype.Text        `json:"roll_blocking_kind"`
 	RollRestartCount      pgtype.Int4        `json:"roll_restart_count"`
 	RollLastExitCode      pgtype.Int4        `json:"roll_last_exit_code"`
 	RollObservedAt        pgtype.Timestamptz `json:"roll_observed_at"`
@@ -8734,6 +8736,7 @@ func (q *Queries) ListAllWorkers(ctx context.Context) ([]ListAllWorkersRow, erro
 			&i.RollPodPhase,
 			&i.RollBlockingContainer,
 			&i.RollBlockingReason,
+			&i.RollBlockingKind,
 			&i.RollRestartCount,
 			&i.RollLastExitCode,
 			&i.RollObservedAt,
@@ -11271,6 +11274,7 @@ SELECT w.id, w.user_id, w.name, w.token_hash, w.status, w.last_heartbeat_at, w.v
        rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
+       rh.blocking_kind      AS roll_blocking_kind,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        -- observed_at is the API's own receipt time and the ONLY input to freshness.
@@ -11369,6 +11373,7 @@ type ListWorkersByUserRow struct {
 	RollPodPhase             pgtype.Text        `json:"roll_pod_phase"`
 	RollBlockingContainer    pgtype.Text        `json:"roll_blocking_container"`
 	RollBlockingReason       pgtype.Text        `json:"roll_blocking_reason"`
+	RollBlockingKind         pgtype.Text        `json:"roll_blocking_kind"`
 	RollRestartCount         pgtype.Int4        `json:"roll_restart_count"`
 	RollLastExitCode         pgtype.Int4        `json:"roll_last_exit_code"`
 	RollObservedAt           pgtype.Timestamptz `json:"roll_observed_at"`
@@ -11490,6 +11495,7 @@ func (q *Queries) ListWorkersByUser(ctx context.Context, userID uuid.UUID) ([]Li
 			&i.RollPodPhase,
 			&i.RollBlockingContainer,
 			&i.RollBlockingReason,
+			&i.RollBlockingKind,
 			&i.RollRestartCount,
 			&i.RollLastExitCode,
 			&i.RollObservedAt,
@@ -15179,6 +15185,7 @@ WITH prev AS (
        SET upgrading_since    = NULL,
            blocking_container = NULL,
            blocking_reason    = NULL,
+           blocking_kind      = NULL,
            restart_count      = 0,
            last_exit_code     = NULL,
            updated_at         = now()
@@ -15197,6 +15204,7 @@ WITH prev AS (
        AND (r.upgrading_since IS NOT NULL
             OR r.blocking_container IS NOT NULL
             OR r.blocking_reason IS NOT NULL
+            OR r.blocking_kind IS NOT NULL
             OR r.restart_count <> 0
             OR r.last_exit_code IS NOT NULL)
        -- COMPARE THE RELEASE, NOT THE STRING. Both sides are stripped of SemVer

@@ -131,6 +131,17 @@ type ObservedWorker struct {
 	// server to release the fence. Zero value means "no pod information",
 	// which RollHealth.Phase renders as the rolling gap.
 	Roll RollHealth
+	// Scheduler evidence is tick-local, including for young rolling pods. It is never serialized.
+	SchedulerCapacityReason string                  `json:"-"`
+	SchedulerMountedClaims  map[string]bool         `json:"-"` // namespace/name keys
+	SchedulerPendingClaims  []SchedulerPendingClaim `json:"-"`
+}
+
+// SchedulerPendingClaim retains namespace identity independently of legacy PVC folds.
+type SchedulerPendingClaim struct {
+	Namespace string
+	Name      string
+	CreatedAt time.Time
 }
 
 // RollHealth is one worker's roll state as read from its pod, and it is the answer
@@ -171,6 +182,8 @@ type RollHealth struct {
 	// incident wedged. Empty when nothing is blocking.
 	BlockingContainer string
 	BlockingReason    string
+	// BlockingKind is optional and populated only for a verified stuck cause.
+	BlockingKind string
 	// RestartCount is the blocking container's restart count, and LastExitCode its
 	// last termination exit code when it has one. LastExitCode is a pointer because 0
 	// is a meaningful exit code and "never terminated" must not render as a clean
@@ -344,6 +357,7 @@ func (l *Loop) report(ctx context.Context, observed []ObservedWorker, desired []
 			PodPhase:          o.Roll.PodPhase,
 			BlockingContainer: strPtr(o.Roll.BlockingContainer),
 			BlockingReason:    strPtr(o.Roll.BlockingReason),
+			BlockingKind:      strPtr(o.Roll.BlockingKind),
 			RestartCount:      o.Roll.RestartCount,
 			LastExitCode:      o.Roll.LastExitCode,
 		})

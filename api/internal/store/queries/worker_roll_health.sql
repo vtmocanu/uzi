@@ -23,13 +23,13 @@
 -- reported and rows accepted, rather than assuming.
 INSERT INTO worker_upgrade_reports (
     worker_id, phase, phase_since, target_image, pod_phase,
-    blocking_container, blocking_reason, restart_count, last_exit_code,
+    blocking_container, blocking_reason, restart_count, last_exit_code, blocking_kind,
     controller_reported_at, observed_at, upgrading_since,
     poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at
 )
 SELECT
     w.id, @phase, sqlc.narg('phase_since'), sqlc.narg('target_image'), sqlc.narg('pod_phase'),
-    sqlc.narg('blocking_container'), sqlc.narg('blocking_reason'), @restart_count, sqlc.narg('last_exit_code'),
+    sqlc.narg('blocking_container'), sqlc.narg('blocking_reason'), @restart_count, sqlc.narg('last_exit_code'), sqlc.narg('blocking_kind'),
     @controller_reported_at, @observed_at,
     -- First report of a non-terminal roll stamps the ceiling's anchor. A `settled`
     -- report stamps nothing: settled is not a roll in progress.
@@ -211,6 +211,8 @@ ON CONFLICT (worker_id) DO UPDATE SET
     last_exit_code         = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.last_exit_code
                                   ELSE worker_upgrade_reports.last_exit_code END,
+    -- Classification is a current observation, including absence on settled reports.
+    blocking_kind          = EXCLUDED.blocking_kind,
     controller_reported_at = EXCLUDED.controller_reported_at,
     observed_at            = EXCLUDED.observed_at,
     poll_interval_seconds  = EXCLUDED.poll_interval_seconds,
@@ -251,6 +253,12 @@ SELECT
     w.id AS worker_id,
     w.kind,
     w.version,
+    w.status,
+    w.last_heartbeat_at,
+    w.snapshot_register_nonce,
+    w.registered_pod_uid,
+    w.roll_heartbeat_at,
+    r.blocking_kind,
     r.phase,
     r.phase_since,
     r.target_image,

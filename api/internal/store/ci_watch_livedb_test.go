@@ -63,7 +63,7 @@ func TestCIWatchMigrationLiveDB(t *testing.T) {
 	if _, err := tx.Exec(ctx, "DELETE FROM run_schedules WHERE id = $1", s.ID); err != nil {
 		t.Fatal(err)
 	}
-	raw, err := os.ReadFile("migrations/00334_ci_watch.sql")
+	raw, err := os.ReadFile("migrations/00335_ci_watch.sql")
 	if err != nil {
 		t.Fatal(err)
 	}

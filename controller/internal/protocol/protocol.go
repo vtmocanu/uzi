@@ -193,6 +193,7 @@ type WorkerStatus struct {
 	PodPhase          string  `json:"pod_phase"`
 	BlockingContainer *string `json:"blocking_container"`
 	BlockingReason    *string `json:"blocking_reason"`
+	BlockingKind      *string `json:"blocking_kind,omitempty"`
 	RestartCount      int32   `json:"restart_count"`
 	LastExitCode      *int32  `json:"last_exit_code"`
 }

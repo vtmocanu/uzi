@@ -1131,7 +1131,7 @@ export function AppShell({ children }: { children: ReactNode }) {
   // as schedulesEnabled: no extra request, and it clears on the next nav poll once the
   // schedule is fixed.
   const [schedulesParked, setSchedulesParked] = useState(0);
-  // Workers needing attention (PRD #113 M6): upgrade_failed + outdated, minus muted,
+  // Workers needing attention: roll/provisioning failures, capacity blocks and outdated, minus muted,
   // counted server-side so this badge and the Workers page's badges cannot disagree.
   const [workersAttention, setWorkersAttention] = useState(0);
   // Open-findings badge (PRD #333 M7, D8). Owned here alongside the other nav counts, sourced

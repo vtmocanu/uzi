@@ -10,8 +10,10 @@
 package hostedsvc
 
 import (
-	"github.com/vtmocanu/uzi/api/internal/workersvc"
+	"encoding/json"
 	"time"
+
+	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
 
 // The poll is a GET and carries no request body.
@@ -175,16 +177,18 @@ type StatusReport struct {
 // value because 0 is a real observation; LastExitCode is a pointer because "exited 0"
 // and "never terminated" are different facts.
 type WorkerStatus struct {
-	Pacing            *Pacing    `json:"pacing,omitempty"`
-	ID                string     `json:"id"`
-	Phase             string     `json:"phase"`
-	PhaseSince        *time.Time `json:"phase_since"`
-	TargetImage       string     `json:"target_image"`
-	PodPhase          string     `json:"pod_phase"`
-	BlockingContainer *string    `json:"blocking_container"`
-	BlockingReason    *string    `json:"blocking_reason"`
-	RestartCount      int32      `json:"restart_count"`
-	LastExitCode      *int32     `json:"last_exit_code"`
+	// Raw JSON keeps an optional, unrecognized cause from failing fleet decoding.
+	BlockingKind      json.RawMessage `json:"blocking_kind,omitempty"`
+	Pacing            *Pacing         `json:"pacing,omitempty"`
+	ID                string          `json:"id"`
+	Phase             string          `json:"phase"`
+	PhaseSince        *time.Time      `json:"phase_since"`
+	TargetImage       string          `json:"target_image"`
+	PodPhase          string          `json:"pod_phase"`
+	BlockingContainer *string         `json:"blocking_container"`
+	BlockingReason    *string         `json:"blocking_reason"`
+	RestartCount      int32           `json:"restart_count"`
+	LastExitCode      *int32          `json:"last_exit_code"`
 }
 
 // RollEvidence is API-evaluated registration evidence, independent of pod readiness.

@@ -56,8 +56,8 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	if got.ReportedAt.IsZero() {
 		t.Error("ReportedAt did not decode; it is display-only but it must still arrive")
 	}
-	if len(got.Workers) != 2 {
-		t.Fatalf("decoded %d workers, want 2 — the golden pairs a stuck worker with a settled one on purpose", len(got.Workers))
+	if len(got.Workers) != 3 {
+		t.Fatalf("decoded %d workers, want 3 — legacy stuck, settled, and scheduler capacity", len(got.Workers))
 	}
 
 	// The stuck worker: every optional field populated.
@@ -117,6 +117,22 @@ func TestStatusReportConsumerContract(t *testing.T) {
 	}
 	if settled.RestartCount != 0 {
 		t.Errorf("workers[1].RestartCount = %d, want 0 as a VALUE", settled.RestartCount)
+	}
+	for i, legacy := range got.Workers[:2] {
+		if len(legacy.BlockingKind) != 0 {
+			t.Errorf("workers[%d].BlockingKind = %s, want omitted", i, legacy.BlockingKind)
+		}
+	}
+
+	capacity := got.Workers[2]
+	if capacity.Phase != "stuck" || capacity.PodPhase != "Pending" {
+		t.Errorf("workers[2] phase/pod_phase = %q/%q, want stuck/Pending", capacity.Phase, capacity.PodPhase)
+	}
+	if !bytes.Equal(capacity.BlockingKind, []byte(`"scheduler_capacity"`)) {
+		t.Errorf("workers[2].BlockingKind = %s, want raw scheduler_capacity string", capacity.BlockingKind)
+	}
+	if capacity.BlockingReason == nil || *capacity.BlockingReason != "scheduler capacity: insufficient cpu" {
+		t.Errorf("workers[2].BlockingReason = %v, want fixed CPU reason", capacity.BlockingReason)
 	}
 }
 
