@@ -5006,6 +5006,12 @@ export interface RecoveryCustodyHold {
   // Issue #2545: a hold released by held publication names its publication and forge ref.
   final_publication_id?: string;
   held_ref?: string;
+  // Server-derived admission membership of an OPEN hold (issue #2970). Absent means the
+  // server did not report it (older server, or a non-open hold); absent is never false.
+  counts_toward_admission?: boolean;
+  // Why the server counts or excludes the hold; a closed vocabulary rendered through
+  // admissionReasonLabel, never raw.
+  admission_reason?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the

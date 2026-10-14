@@ -3,7 +3,15 @@ import { Link } from "react-router-dom";
 
 import { api, type RecoveryCustodyHold, type RecoveryCustodyHolds } from "../lib/api";
 import { errorMessage } from "../lib/apiError";
-import { custodyHoldView, groupHoldsByWorker, recoveryCapacityUsed, type CustodyCheckpointView } from "../lib/recovery";
+import {
+  admissionInfoHolds,
+  admissionReasonLabel,
+  custodyHoldView,
+  groupHoldsByWorker,
+  isOwnerDecisionRow,
+  recoveryCapacityUsed,
+  type CustodyCheckpointView,
+} from "../lib/recovery";
 import { stripUnsafeChars } from "../lib/safeText";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { Badge, Button, Card, SectionTitle, cx } from "./ui";
@@ -41,10 +49,12 @@ export function RecoveryHoldsSurface() {
   if (!holds) return null;
   // Show owner decisions and exact MAC-rejected holds independently of attention.
   // The diagnostic changes visibility only; classification, actions and counts stay intact.
-  const visibleHolds = holds.holds.filter((h) =>
-    custodyHoldView(h).needsDecision || h.terminal_record_rejection === "mac_failure",
-  );
-  if (visibleHolds.length === 0) return null;
+  const visibleHolds = holds.holds.filter(isOwnerDecisionRow);
+  // At the custody limit the capacity can be consumed by holds that need no decision; list
+  // them so the panel explains the "at the limit" alert instead of hiding.
+  const info = admissionInfoHolds(holds);
+  const hasInfo = info.counted.length > 0 || info.unreported.length > 0;
+  if (visibleHolds.length === 0 && !hasInfo) return null;
   const groups = groupHoldsByWorker(visibleHolds);
   // Open holds per run, counted over the FULL listing (not just the decision rows): the
   // retained checkpoint ref follows custody, so discarding a run's last open hold also deletes
@@ -83,10 +93,12 @@ export function RecoveryHoldsSurface() {
         </p>
       </div>
 
-      <p className="text-sm text-muted">
-        Each hold retains one run's unpublished committed work so it survives a failed
-        finalization. These are the holds only you can resolve.
-      </p>
+      {groups.length > 0 && (
+        <p className="text-sm text-muted">
+          Each hold retains one run's unpublished committed work so it survives a failed
+          finalization. These are the holds only you can resolve.
+        </p>
+      )}
 
       <div className="space-y-4">
         {groups.map((g) => (
@@ -117,7 +129,84 @@ export function RecoveryHoldsSurface() {
           </section>
         ))}
       </div>
+
+      {hasInfo && (
+        <section aria-label="Admission information" className="space-y-3">
+          <h3 className="text-sm font-medium text-fg">Admission information</h3>
+          {info.counted.length > 0 && (
+            <InfoSection
+              label="Counting toward the limit"
+              copy="These holds currently consume admission capacity without requiring an owner decision. They stop counting only when the server's admission criteria exclude them or their custody settles."
+              holds={info.counted}
+              showReason
+            />
+          )}
+          {info.unreported.length > 0 && (
+            <InfoSection
+              label="Admission membership not reported"
+              copy="This server did not report whether these holds count toward the limit."
+              holds={info.unreported}
+              showReason={false}
+            />
+          )}
+        </section>
+      )}
     </Card>
+  );
+}
+
+function InfoSection({
+  label,
+  copy,
+  holds,
+  showReason,
+}: {
+  label: string;
+  copy: string;
+  holds: RecoveryCustodyHold[];
+  showReason: boolean;
+}) {
+  return (
+    <section aria-label={label}>
+      <div className="border-b border-edge pb-1">
+        <h4 className="text-sm font-medium text-fg">{label}</h4>
+        <p className="text-xs text-muted">{copy}</p>
+      </div>
+      <ul className="mt-2 space-y-2">
+        {holds.map((h) => (
+          <InfoHoldRow key={h.id} hold={h} showReason={showReason} />
+        ))}
+      </ul>
+    </section>
+  );
+}
+
+// InfoHoldRow is a read-only row for a hold that consumes admission capacity but needs no
+// decision: no discard, export or confirmation UI, only a link to the run for context.
+function InfoHoldRow({ hold, showReason }: { hold: RecoveryCustodyHold; showReason: boolean }) {
+  return (
+    <li className="rounded-lg border border-edge bg-raised/40 p-3">
+      <div className="flex flex-wrap items-start justify-between gap-x-3 gap-y-2">
+        <div className="min-w-0 space-y-1">
+          <div className="flex flex-wrap items-center gap-1.5">
+            <Badge tone="neutral" title="Claim generation — the exact attempt this hold protects.">
+              gen {hold.generation}
+            </Badge>
+            <span className="text-sm text-fg">
+              {hold.worker_name ? stripUnsafeChars(hold.worker_name) : "Unnamed worker"}
+            </span>
+            <span className="font-mono text-xs text-faint">run {shortId(hold.run_id)}</span>
+          </div>
+          {showReason && <p className="text-sm text-muted">{admissionReasonLabel(hold.admission_reason)}</p>}
+        </div>
+        <Link
+          to={`/runs/${hold.run_id}`}
+          className="inline-flex items-center gap-0.5 rounded-md border border-edge bg-raised px-2 py-1 text-xs font-medium text-fg hover:border-edge-strong"
+        >
+          View run <ChevronRightIcon />
+        </Link>
+      </div>
+    </li>
   );
 }
 
