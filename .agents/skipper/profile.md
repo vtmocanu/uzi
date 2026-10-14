@@ -58,6 +58,12 @@
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
+  - Each round flag active delivery runs with `budget_total_seconds - budget_used_seconds`
+    remaining below 1h or 15% of `budget_total_seconds`; read `uzi admin runs --json`
+    or `uzi run get RUN --json`. Total already includes `budget_extension_seconds`; missing fields are unknown.
+    Also flag `paused` runs with `hold_reason=budget_exhausted`. Ask the owning session
+    to judge progress and extend (`uzi run extend RUN --by <dur>`), then re-arm its poller, or say why not.
+    Respect `budget_extension_cap_seconds` per request (zero disables); skipper never extends runs itself.
   - Each round inspect this repo's `failed` delivery runs in the Patrol scope via
     `uzi run list --json` and known IDs; retain owner/newest-200 coverage limits.
     Exclude user cancellations, superseded runs, provider-limit parks and
