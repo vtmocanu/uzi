@@ -15,20 +15,20 @@ import (
 func TestValidatePVCCeilings(t *testing.T) {
 	resolver := testResolver(t)
 	// The largest claims in the shipped tables, named so a failure below is readable:
-	// nixSize is 20Gi flat, `m` and `l` DataSize are 25Gi, the dind default is 20Gi.
+	// nixSize is 20Gi flat, `m` DataSize is 25Gi and `l` is 50Gi, the dind default is 20Gi.
 	for _, tc := range []struct {
 		name              string
 		cfg               RenderConfig
 		wantErr           []string // substrings that must ALL appear; empty = must succeed
-		wantLargestPreset bool     // either M or L may supply the tied 25Gi maximum
+		wantLargestPreset bool     // L supplies the 50Gi maximum
 	}{
 		{
 			name: "no ceilings supplied: both tiers skipped",
 			cfg:  RenderConfig{},
 		},
 		{
-			name: "shipped ceilings: everything fits (l's 25Gi /data exactly)",
-			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "25Gi"},
+			name: "shipped ceilings: everything fits (l's 50Gi /data exactly)",
+			cfg:  RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "50Gi"},
 		},
 		{
 			name:    "restricted ceiling below nixSize",
@@ -36,9 +36,15 @@ func TestValidatePVCCeilings(t *testing.T) {
 			wantErr: []string{"restricted tier", "-nix", "20Gi", "UZI_WORKER_MAX_PVC_STORAGE", "10Gi"},
 		},
 		{
-			name:              "restricted ceiling below the largest preset's DataSize (the pre-#1757 20Gi)",
-			cfg:               RenderConfig{MaxPVCStorage: "20Gi"},
-			wantErr:           []string{"restricted tier", "-data", "25Gi"},
+			name:              "restricted ceiling below the largest preset's DataSize (the pre-#2013 25Gi)",
+			cfg:               RenderConfig{MaxPVCStorage: "25Gi"},
+			wantErr:           []string{"restricted tier", "-data", "50Gi"},
+			wantLargestPreset: true,
+		},
+		{
+			name:              "docker ceiling still at the pre-#2013 data size",
+			cfg:               RenderConfig{DockerMaxPVCStorage: "25Gi"},
+			wantErr:           []string{"docker tier", "-data", "50Gi", "25Gi"},
 			wantLargestPreset: true,
 		},
 		{
@@ -56,11 +62,11 @@ func TestValidatePVCCeilings(t *testing.T) {
 		},
 		{
 			name: "an override that FITS a raised ceiling is accepted",
-			cfg:  RenderConfig{MaxPVCStorage: "40Gi", DockerMaxPVCStorage: "40Gi", DinDDataSize: "40Gi"},
+			cfg:  RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "50Gi", DinDDataSize: "40Gi"},
 		},
 		{
-			name: "run-bound /data default (20Gi) fits the shipped 25Gi ceilings",
-			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "25Gi", EphemeralDataSize: ""},
+			name: "run-bound /data default (40Gi) fits the shipped 50Gi ceilings",
+			cfg:  RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "50Gi", EphemeralDataSize: ""},
 		},
 		{
 			// Issue #1815: an ephemeral (run-bound) worker's /data override above a
@@ -76,7 +82,7 @@ func TestValidatePVCCeilings(t *testing.T) {
 		},
 		{
 			name: "the two tiers are INDEPENDENT: a lowered docker ceiling does not implicate the restricted tier",
-			cfg:  RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "10Gi"},
+			cfg:  RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "10Gi"},
 			// dind-data is docker-only, but /nix and /data are claimed in BOTH tiers, so
 			// a 10Gi docker ceiling must implicate them for the DOCKER tier and leave the
 			// restricted tier alone.
@@ -95,8 +101,8 @@ func TestValidatePVCCeilings(t *testing.T) {
 				t.Fatalf("want an error naming %v, got nil — an oversized claim that boots is a fleet that "+
 					"provisions and never appears", tc.wantErr)
 			}
-			if tc.wantLargestPreset && !strings.Contains(err.Error(), `preset "m"`) && !strings.Contains(err.Error(), `preset "l"`) {
-				t.Errorf("error must name a preset with the 25Gi maximum: %v", err)
+			if tc.wantLargestPreset && !strings.Contains(err.Error(), `preset "l"`) {
+				t.Errorf("error must name the L preset with the 50Gi maximum: %v", err)
 			}
 			for _, want := range tc.wantErr {
 				if !strings.Contains(err.Error(), want) {
@@ -110,7 +116,7 @@ func TestValidatePVCCeilings(t *testing.T) {
 // The independence claim above, asserted directly rather than inferred from a
 // substring: a lowered DOCKER ceiling must not produce a restricted-tier complaint.
 func TestValidatePVCCeilingsKeepsTheTiersSeparate(t *testing.T) {
-	err := ValidatePVCCeilings(RenderConfig{MaxPVCStorage: "25Gi", DockerMaxPVCStorage: "10Gi"}, testResolver(t))
+	err := ValidatePVCCeilings(RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "10Gi"}, testResolver(t))
 	if err == nil {
 		t.Fatal("a 10Gi docker ceiling must be rejected: /nix alone is 20Gi")
 	}

@@ -368,7 +368,7 @@ func TestM2SnapshotRetainsOnlyCurrentAncestryIdentity(t *testing.T) {
 }
 
 func TestM2DuplicateCanariesNeverBlindlyBothRoll(t *testing.T) {
-	for _, mode := range []string{"pending", "replacement", "scaled", "maintenance", "no-physical-proof", "unknown-cancel", "no-incarnation-proof"} {
+	for _, mode := range []string{"pending", "replacement", "scaled", "maintenance", "custody", "no-physical-proof", "unknown-cancel", "no-incarnation-proof"} {
 		t.Run(mode, func(t *testing.T) {
 			var objects []runtime.Object
 			workers := []protocol.DesiredWorker{evidence(desired("w1"), m5Now), evidence(desired("w2"), m5Now)}
@@ -397,6 +397,9 @@ func TestM2DuplicateCanariesNeverBlindlyBothRoll(t *testing.T) {
 				}
 				if mode == "maintenance" && i == 1 {
 					workers[i].DindMaintenance = &protocol.DindMaintenance{Phase: "stopping"}
+				}
+				if mode == "custody" && i == 1 {
+					workers[i].CustodyHeld = true
 				}
 				objects = append(objects, physical...)
 			}

@@ -19,6 +19,9 @@
 //       NEVER rebinds to a newer generation);
 //     - 409 messages_pending → run the gap-fill loop, then re-send;
 //     - 409 gap_unrecoverable → mark the journal blocked (D13);
+//     - 404 {error:"run not found for this worker",reason:"run_not_owned"} on the run's /state
+//       path (issue #2950; first send AND gap-fill re-send) → mark the journal blocked
+//       (`run_not_owned`): permanent for the generation, kept intact, never resent or retired;
 //     - any other non-terminal 409 (running/claimed/paused/completion-permit mismatch) or an
 //       unreadable body / send failure → KEEP the journal for a later resolve.
 //
@@ -27,6 +30,7 @@
 // serves every terminal producer without importing the runner.
 
 import { RequestError, type WorkerClient } from "./client.js";
+import { WORKER_API_PREFIX } from "./protocol.js";
 import type { Logger } from "./log.js";
 import type { Outbox, ReportRetirementContext } from "./outbox.js";
 import { canonicalizeTerminalBody } from "./outbox.js";
@@ -35,6 +39,37 @@ import { errMessage } from "./util.js";
 
 /** Terminal server statuses settle the outcome, while custody can still defer journal retirement. */
 const TERMINAL_STATUSES: ReadonlySet<string> = new Set(["completed", "failed", "cancelled"]);
+
+/** Issue #2950: the api's structured "this worker does not own the run" refusal of a /state
+ *  report. Strict like `isRunOwnershipLost` (client.ts): a RequestError for POST 404 on exactly this
+ *  run's /state path, a body read through EOF (`bodyEvidence.complete`) of at most 1024 raw bytes
+ *  (`bodyEvidence.bytes`, measured before trimming; no evidence fails closed) that is a plain JSON object with EXACTLY the keys
+ *  `error` and `reason`, the fixed values below. Anything else (plain 404, HTML, extra/renamed key,
+ *  another run's path, another method, another status) is not this answer and keeps today's
+ *  retry behaviour. */
+function isRunNotOwnedStateRefusal(err: unknown, runId: string): boolean {
+  if (!(err instanceof RequestError) || err.method !== "POST" || err.status !== 404 ||
+      err.path !== `${WORKER_API_PREFIX}/runs/${runId}/state` || err.body.length > 1024 ||
+      err.bodyEvidence?.complete !== true || err.bodyEvidence.bytes > 1024) return false;
+  try {
+    const body: unknown = JSON.parse(err.body);
+    if (typeof body !== "object" || body === null || Array.isArray(body)) return false;
+    const keys = Object.keys(body).sort();
+    const rec = body as Record<string, unknown>;
+    return keys.length === 2 && keys[0] === "error" && keys[1] === "reason" &&
+      rec.reason === "run_not_owned" && rec.error === "run not found for this worker";
+  } catch { return false; }
+}
+
+/** Block the journal on the not-owned answer and log once. Never retires or deletes it. */
+async function blockRunNotOwned(deps: TerminalOutboxDeps, runId: string, claimGeneration: number): Promise<void> {
+  await deps.outbox.markTerminalBlocked(runId, claimGeneration, "run_not_owned");
+  deps.log.warn("outbox: terminal journal blocked: the api reports this worker does not own the run; keeping the outcome for operator/owner resolution", {
+    run_id: runId,
+    claim_generation: claimGeneration,
+    journal: `terminal-${claimGeneration}.json`,
+  });
+}
 
 /** The fixed reason a gap-fill tombstone records (PRD #1391 Run B M3). Mirrors Run A's dropped-range
  *  tombstone shape (event:"message_dropped" + reason) so the browser renders it the same way and the
@@ -285,6 +320,10 @@ async function resolvePendingTerminalOnce(deps: TerminalOutboxDeps, args: Resolv
   try {
     ack = await send(withTerminalFence(deps, journal.body, journal.messagesThroughSeq), signal);
   } catch (err) {
+    if (isRunNotOwnedStateRefusal(err, runId)) {
+      await blockRunNotOwned(deps, runId, claimGeneration);
+      return;
+    }
     // The send exhausted its bounded retries, hit a fatal 4xx we do not classify, or was aborted.
     // Leave the journal installed (the outcome is durable) for a later resolve, and do NOT rethrow.
     log.warn("outbox: terminal report send failed; leaving the journal for a later resolve", {
@@ -439,6 +478,10 @@ async function gapFillLoop(
     try {
       ack = await send(withTerminalFence(deps, body, fence), signal);
     } catch (err) {
+      if (isRunNotOwnedStateRefusal(err, runId)) {
+        await blockRunNotOwned(deps, runId, claimGeneration);
+        return;
+      }
       log.warn("outbox: terminal re-send failed after gap fill; leaving the journal", {
         run_id: runId,
         error: errMessage(err),

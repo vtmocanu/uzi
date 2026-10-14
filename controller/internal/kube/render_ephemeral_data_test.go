@@ -3,6 +3,7 @@ package kube
 import (
 	"os"
 	"path/filepath"
+	"strconv"
 	"testing"
 
 	corev1 "k8s.io/api/core/v1"
@@ -38,7 +39,7 @@ func TestEphemeralWorkerDataPVCIsDecoupledFromThePreset(t *testing.T) {
 		override string
 		want     string
 	}{
-		{"default", "", ephemeralDataDefaultSize},
+		{"default", "", "40Gi"},
 		{"override", "30Gi", "30Gi"},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
@@ -227,4 +228,66 @@ func chartStorageQuotas(t *testing.T) (out struct{ restricted, docker tierStorag
 		deployments:     docker,
 	}
 	return out
+}
+
+// The isolated lane admits only run-bound workers, so its data ceiling and fleet
+// storage budget follow the run-bound default rather than the persistent L preset.
+func TestRunBoundDataDefaultFitsTheIsolatedLane(t *testing.T) {
+	path := filepath.Join("..", "..", "..", "deploy", "chart", "values.yaml")
+	raw, err := os.ReadFile(path) //nolint:gosec // G304: reads the test-controlled chart path
+	if err != nil {
+		t.Fatal(err)
+	}
+	var v struct {
+		Workers struct {
+			DataSize     string `json:"ephemeralWorkerDataSize"`
+			IsolatedLane struct {
+				Quota struct {
+					RequestsStorage string `json:"requestsStorage"`
+					Deployments     string `json:"deployments"`
+				} `json:"quota"`
+				LimitRange struct {
+					MaxPVCStorage string `json:"maxPVCStorage"`
+				} `json:"limitRange"`
+			} `json:"isolatedLane"`
+		} `json:"workers"`
+	}
+	if err := yaml.Unmarshal(raw, &v); err != nil {
+		t.Fatal(err)
+	}
+	if v.Workers.DataSize != ephemeralDataDefaultSize {
+		t.Fatalf("chart run-bound default = %q, controller = %q", v.Workers.DataSize, ephemeralDataDefaultSize)
+	}
+	max := chartQuantity(t, path, "workers.isolatedLane.limitRange.maxPVCStorage", v.Workers.IsolatedLane.LimitRange.MaxPVCStorage)
+	quota := chartQuantity(t, path, "workers.isolatedLane.quota.requestsStorage", v.Workers.IsolatedLane.Quota.RequestsStorage)
+	count, err := strconv.Atoi(v.Workers.IsolatedLane.Quota.Deployments)
+	if err != nil || count <= 0 {
+		t.Fatalf("isolated lane deployment count = %q, error = %v", v.Workers.IsolatedLane.Quota.Deployments, err)
+	}
+	if len(preset.SizeNames()) == 0 || len(preset.TemplateNames()) == 0 {
+		t.Fatal("empty preset table would make the lane checks vacuous")
+	}
+	for _, template := range preset.TemplateNames() {
+		for _, size := range preset.SizeNames() {
+			w := protocol.DesiredWorker{ID: "isolated-fleet", Template: template, Size: size, Isolated: true, Ephemeral: true}
+			claims := pvcSizes(t, laneTestConfig(), w, testSpec(t, template, size))
+			if len(claims) != 2 {
+				t.Fatalf("isolated worker rendered %d claims, want data and nix", len(claims))
+			}
+			var perWorker resource.Quantity
+			for name, q := range claims {
+				if q.Cmp(max) > 0 {
+					t.Errorf("isolated %s/%s claim %s = %s exceeds ceiling %s", template, size, name, q.String(), max.String())
+				}
+				perWorker.Add(q)
+			}
+			var fleet resource.Quantity
+			for range count {
+				fleet.Add(perWorker)
+			}
+			if fleet.Cmp(quota) > 0 {
+				t.Errorf("isolated %s/%s fleet requests %s, quota %s", template, size, fleet.String(), quota.String())
+			}
+		}
+	}
 }

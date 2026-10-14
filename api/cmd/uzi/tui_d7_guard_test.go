@@ -229,7 +229,7 @@ var d7UntrustedFields = []string{
 	// Worker projections and attention text (tui_workers.go).
 	"workerName", "workerVersion", "templateDeclared", "templateReported",
 	"upgradeDetail", "upgradeTarget", "blockingContainer", "blockingReason",
-	"outboxBlockedText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
+	"outboxBlockedText", "outboxBlockedRunText", "quarantineText", "tokenLabel", "hostedSize", "capabilityText",
 	"workerOwner", "pressureText", "attnShort", "attnDetail",
 	"runWorkerName",
 	// Issue #2705: the run's health_reason on the crew rail's waiting line (railWaitingLine),

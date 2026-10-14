@@ -146,7 +146,7 @@ var sizes = map[string]Size{
 		CPULimit:      resource.MustParse("4"),
 		MemoryRequest: resource.MustParse("14Gi"),
 		MemoryLimit:   resource.MustParse("20Gi"),
-		DataSize:      resource.MustParse("25Gi"), // issue #1757: was 20Gi; bare clones + tracking refs outgrew it
+		DataSize:      resource.MustParse("50Gi"), // issue #2013: headroom for long runs and concurrent build caches
 	},
 }
 

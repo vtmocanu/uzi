@@ -678,8 +678,77 @@ it opts into the same intra-user residuals just covered. An ephemeral (run-bound
 hosted worker is recorded with a run cap of 1, whatever it advertises, since
 its run lane serves its bound run (or an eligible lease follow-up). Its separate
 cross-check lane can serve that run's plan checker. Its `/data` volume also has its own
-operator-set size, 20Gi by default, rather than its size preset's (see
+operator-set size, 40Gi by default, rather than its size preset's (see
 [Type and size](./hosted-workers.md#type-and-size)).
+
+### Hosted shared-CPU measurement protocol
+
+After release, a hosted deployment maintainer/operator with cluster access should
+carry out this protocol outside the code run. The conservative startup warning
+and its evidence limits are recorded in
+[ADR-2240](../adr/2240-hosted-worker-default-size.md#conservative-shared-cpu-warning-2026-10-14-2240).
+
+When `workers.maxConcurrentRuns` exceeds 1, the controller logs
+`hosted-worker-shared-cpu` once per available size in sorted size order, with
+`size`, `configured_run_slots`, `cpu_limit`, and `advisory`. It is silent at
+1 or less and is nonblocking. These are available configurations, not actual
+fleet sizes or active occupancy, and the warning sets no minimum comfortable CPU
+allocation. CPU requests/limits remain `s`: 250m/1 CPU and `m`/`l`: 1/4 CPU.
+The warning changes no resources, defaults, run-slot counts, or cross-check
+settings. Ephemeral defaults remain `m` and the persistent form preselects `l`.
+Deploying it affects controller logs without changing worker templates/resources
+or forcing a worker roll. Slot configuration changes retain the hash/drain rules
+above. An ephemeral worker's effective API run cap remains 1; its separate checker
+lane shares the container's CPU and memory limits.
+
+1. **Match the workload and alternate occupancy.** Use the same commit,
+   Node/libuv versions, worker image, `l` preset, command, test concurrency,
+   environment, and comparable node and deployment settings. Alternate at least
+   three completed uncontended trials and three completed trials with both run
+   slots busy. Record sibling workload and occupancy over each entire measurement
+   interval, including checker activity. Avoid same-repository serialization;
+   where feasible, keep the same pod and configuration while varying occupancy.
+   Record any deviations rather than treating unlike trials as matched.
+2. **Declare a reproducible cache policy.** Specify warm or cold preparation in
+   advance and record preparation, reuse, and sibling cache effects for every
+   trial. Report cold and warm results separately. Distinguish Docker image/build
+   caches from the per-run Go/npm command caches described under
+   [Resource stats and sizing](#resource-stats-and-sizing). Use only operator-owned disposable measurement
+   caches; never clear active-run caches.
+3. **Collect interval diagnostics and outcomes.** Preserve the existing gate
+   header from `scripts/real-procfs-skip-check.sh`: Node/libuv versions,
+   available parallelism, effective test concurrency, concurrency source, and
+   `cpu.max`, plus its unit-stage duration. Capture `cpu.max` and `cpu.stat`
+   before and after each unit stage and the full gate. Report deltas for
+   `usage_usec`, `nr_periods`, `nr_throttled`, and `throttled_usec`, with elapsed
+   time, stage and full-gate times, failures/timeouts, and stopped or incomplete
+   trials. Record sibling CPU use and node contention where accessible, and
+   mark unavailable data explicitly. Lifetime totals do not attribute CPU usage
+   or throttling to a measurement interval; shared-container deltas still need
+   sibling workload context.
+4. **Keep the CPU-limit experiment separate.** If the operator can provision it,
+   run the outstanding matched 2-CPU/4-CPU hosted comparison with the same
+   workload, cache policy, occupancy, and other settings. Comparing `m` with
+   `l` is invalid for this purpose: both have a 4-CPU limit. Keep coverage
+   unchanged and assess latency and failures together. Local container A/B
+   measurements and a focused batch containing only busy trials cannot replace
+   the hosted comparisons.
+5. **Publish the evidence before considering scaling.** Attach raw measurements,
+   ranges, and medians to [#2240](https://github.com/vtmocanu/uzi/issues/2240),
+   including stopped/incomplete trials. Only supportive evidence permits a new,
+   approved CPU-limit-only scaling design with a bounded formula and maximum,
+   admission/LimitRange compatibility, and the existing worker rollout process.
+   CPU requests, memory, sidecars, and slot counts are separate decisions.
+   Higher limits reserve no capacity and guarantee no CPU per slot. If the
+   evidence offers no actionable benefit, the maintainer may close the issue.
+
+As of October 13, three hosted runs were recorded: two verified with both slots
+occupied on persistent `l` workers and one with unknown occupancy. Unit stages
+took 2668–4533 seconds; 7 of 17 traced calls were deadline-stopped. There was no
+matched uncontended baseline, sibling CPU data, or interval counter evidence,
+and suite growth under [#2561](https://github.com/vtmocanu/uzi/issues/2561) competes
+as an explanation. The historical October 4 comparison is not a current
+controlled speedup measurement. Scaling remains unproven; #2240 stays open.
 
 ## Cross-check slots
 

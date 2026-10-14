@@ -95,28 +95,29 @@ commit is not pushed — it is discarded when the runner clone is torn down. The
 inverse guard. This mirrors the `not_code` precedent, and the lead prompt frames report_only
 as "no code change to land"; documented here, not guarded.
 
-**Checkpoint/resume — now ENFORCED (issue #299), was an accepted edge.** A `report_only`
-declared AFTER a mid-run checkpoint would leave the checkpoint refs published but un-landed
-(no branch, no MR — see [ADR-0122](0122-checkpoint-push-broker.md)) — orphaned
-`refs/uzi-checkpoints/*` on origin. This ADR originally rested that on the convention "a
-genuine zero-code run never checkpoints" and left it unguarded. Issue #299 makes the
-convention an enforced check at completion time: the `report_only` path in
-`agent/src/runner.ts` now FAILS with an actionable reason (mirroring the undeclared-empty-diff
-FAIL above) when the run published a checkpoint, so a report-only completion can no longer
-orphan one. Detection is the UNION of two worker-side signals — `lastPublishedTip` (a
-checkpoint THIS worker confirmably landed mid-run) OR `git.hasCheckpointRef` (origin's
-`refs/uzi-checkpoints/<branch>`, mirrored into the worker bare at fetch time, catching a
-checkpoint a PRIOR/cross-worker attempt landed). A genuine zero-code run trips neither
-(it never invokes the checkpoint callback — the "never checkpoints" convention above — so
-nothing is ever published) and still completes report-only. No
-checkpoint-ref *deletion* capability was added: the push broker only ever does a non-forced
-push, and refusing loudly (converting a silent remote orphan into an actionable terminal) is
-proportionate where a delete-ref RPC would be a new worker→api→forge trust-boundary
-capability. Deliberately CONSERVATIVE: because `hasCheckpointRef` keys on the branch name and
-nothing prunes `refs/uzi-checkpoints/<branch>` when a run's MR lands, the rare
-branch-reuse-with-a-lingering-ref case can refuse a genuinely-empty report-only run — but the
-ref it names is itself orphaned residue an operator should see, so erring toward surfacing it
-is the intended direction.
+**Checkpoint/resume: orphan guard (#299, refined by #759 and #2967).** A
+report-only completion opens no branch or MR to supersede a published checkpoint.
+The original convention, "a genuine zero-code run never checkpoints", is insufficient:
+worker recovery can publish content-free coverage commits without agent code changes.
+
+The guard checks both the mirrored `refs/uzi-checkpoints/<branch>` and this worker's
+exact confirmed publication tip, even if the local mirror is absent or stale.
+A checkpoint is content-free only when every commit reachable from its tip but not
+from the recovery floor matches a floor-reachable boundary parent's tree, including
+retained merge parents. Boundaries are the floor-reachable parents at the cut of
+that walk, not arbitrary historical trees. The floor is origin's branch when
+present, otherwise the resolved default branch. It can advance during reclaims:
+coverage over an older published base remains content-free even when today's floor
+tree differs. Conversely, an outside tree matching only the newer floor tip, with
+no matching boundary tree, does not prove content-free coverage.
+An outside tree matching no boundary, or unreadable proof, blocks completion. A confirmed
+publication with an unknown tip also blocks; a genuinely absent checkpoint without
+confirmed publication does not. The existing mirrored marker-only `wip(park):`
+exception (#759) retains its ancestry-based handling.
+
+No checkpoint ref is deleted or rewritten by this guard. Recovery coverage creation,
+preservation and publication are unchanged. This is a content proof for the existing
+report-only decision, not a new worker-to-forge deletion capability.
 
 **`report_md` rides the shared `RunDTO` embed.** `RunListItemDTO` embeds `RunDTO`
 (`api/internal/apitypes/run.go`), so `report_only`/`report_md` appear on the runs LIST as

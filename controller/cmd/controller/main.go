@@ -106,7 +106,7 @@ func main() {
 		// default.
 		DinDDataSize: cfg.WorkerDinDDataSize,
 		// A run-bound (Ephemeral) worker's /data PVC size (issue #1815); empty leaves
-		// the render default (20Gi). Run-bound, not ephemeral-storage.
+		// the render default (40Gi). Run-bound, not ephemeral-storage.
 		EphemeralDataSize: cfg.WorkerEphemeralDataSize,
 		// The worker container's requests.ephemeral-storage (issue #224 M-b), per tier;
 		// docker REPLACES plain. Empty leaves the render defaults (512Mi / 4Gi).
@@ -191,6 +191,8 @@ func main() {
 		log.Error("hosted-worker PVC sizes do not fit their namespace's LimitRange; refusing to start", "error", err)
 		os.Exit(1)
 	}
+
+	warnSharedCPU(log, cfg.WorkerMaxConcurrentRuns, resolver)
 
 	loop := reconcile.New(client, materializer, client, cfg.PollInterval, cfg.WorkerImageTag, log)
 

@@ -210,14 +210,15 @@ func (t *outboxTracker) runDepth(runID uuid.UUID) (entry OutboxEntry, workerID u
 }
 
 // workerAggregate sums a worker's outbox depth across its runs, for the DTO overlay.
-// blocked is the oldest non-empty BlockedReason (or nil). Returns all zero / nil
+// blocked is the oldest non-empty BlockedReason (or nil) and blockedRunID the run id the
+// worker reported on that same entry (or nil). Returns all zero / nil
 // when the worker has no tracked set, so a worker with no outbox shows nulls.
-func (t *outboxTracker) workerAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked *string) {
+func (t *outboxTracker) workerAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked, blockedRunID *string) {
 	t.mu.Lock()
 	defer t.mu.Unlock()
 	st, ok := t.workers[workerID]
 	if !ok {
-		return 0, 0, 0, nil
+		return 0, 0, 0, nil, nil
 	}
 	var oldest *OutboxEntry
 	for runID := range st.runs {
@@ -233,8 +234,10 @@ func (t *outboxTracker) workerAggregate(workerID uuid.UUID) (pendingMessages, pe
 	if oldest != nil {
 		reason := oldest.BlockedReason
 		blocked = &reason
+		id := oldest.RunID.String()
+		blockedRunID = &id
 	}
-	return pendingMessages, pendingTerminal, staleRetired, blocked
+	return pendingMessages, pendingTerminal, staleRetired, blocked, blockedRunID
 }
 
 // evict drops a worker's whole set — called when the worker is deleted, so a removed

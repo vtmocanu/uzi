@@ -342,6 +342,11 @@ export class RequestError extends Error {
     readonly body: string,
     /** The response's `Retry-After` in milliseconds, when it carried whole seconds. */
     readonly retryAfterHeaderMs?: number,
+    /** Whether `body` is the whole response: `complete` is true only when the body was read through
+     *  EOF within the error-body cap with no read error; `bytes` is the raw byte length read (before
+     *  decode and trim). Absent on errors not minted by toError, which therefore prove nothing about
+     *  completeness. */
+    readonly bodyEvidence?: { readonly complete: boolean; readonly bytes: number },
   ) {
     super(`${method} ${path} returned ${status}: ${body}`);
     this.name = "RequestError";
@@ -3830,12 +3835,17 @@ export class WorkerClient {
 
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {
     let text = "";
+    let evidence: { complete: boolean; bytes: number } = { complete: false, bytes: 0 };
     try {
-      text = (await readBoundedText(res, ERROR_BODY_MAX_BYTES)).slice(0, 4096).trim();
+      // The read loop stops at the cap without observing EOF, so a total below the cap is the only
+      // proof the body ended; a body of exactly the cap or more reports incomplete (fail closed).
+      const raw = await readBoundedBytes(res, ERROR_BODY_MAX_BYTES);
+      evidence = { complete: raw.length < ERROR_BODY_MAX_BYTES, bytes: raw.length };
+      text = new TextDecoder().decode(raw).slice(0, 4096).trim();
     } catch {
       // ignore body read failures — the status is the signal that matters.
     }
-    return new RequestError(method, path, res.status, text, retryAfterMsOf(res.headers.get("Retry-After")));
+    return new RequestError(method, path, res.status, text, retryAfterMsOf(res.headers.get("Retry-After")), evidence);
   }
 }
 
@@ -3901,7 +3911,12 @@ const ERROR_BODY_MAX_BYTES = 4096;
  *  With rejectOverflow, read through EOF (including at the exact cap) and reject any chunk
  *  exceeding the remaining byte budget before retaining or decoding it. */
 async function readBoundedText(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<string> {
-  if (!res.body) return "";
+  return new TextDecoder().decode(await readBoundedBytes(res, maxBytes, rejectOverflow, signal));
+}
+
+/** The raw-byte core of {@link readBoundedText}; same bounds and failure behaviour. */
+async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<Buffer> {
+  if (!res.body) return Buffer.alloc(0);
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
   let total = 0;
@@ -3927,7 +3942,7 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
     // result or error from propagating (#2888).
     void reader.cancel().catch(() => undefined);
   }
-  return new TextDecoder().decode(Buffer.concat(parts));
+  return Buffer.concat(parts);
 }
 
 /**

@@ -1056,13 +1056,41 @@ describe("RunRunner — checkpoint-publish outcome is visible on the feed (issue
   });
 });
 
-describe("RunRunner — report_only after a checkpoint is refused (issue #299)", () => {
+describe("RunRunner — report_only checkpoint orphan guard (issues #299 / #2967)", () => {
   // This pins the SAME-WORKER leg of the union guard: a run that publishes a checkpoint
   // mid-run (landedCheckpoint is set on the confirmed publish) and THEN declares
   // report_only must FAIL, because a report-only completion opens no branch/MR and would
   // orphan the published refs/uzi-checkpoints/<branch>. hasCommittedCheckpoint is NOT stubbed
   // here (the fixture bare carries no mirrored checkpoint ref — the publish went through
   // the client spy), so the guard trips on landedCheckpoint alone.
+  it("#2967 completes report_only after this worker published only recovery coverage", async () => {
+    const { gitlab, calls } = fakeGitlab();
+    const claim = gitlabClaim(2967);
+    const events: string[] = [];
+    const restoreFetch = spyFetch(events);
+    const restorePublish = spyPublish(events);
+    const exec: Executor = {
+      run: async (ctx) => {
+        // Worker coverage commits retain a tree without adding agent content.
+        for (const round of [0, 1]) execFileSync("git", ["-C", ctx.worktreePath,
+          "-c", "user.name=fixture", "-c", "user.email=fixture@example.test",
+          "-c", "commit.gpgsign=false", "commit", "--allow-empty", "-m",
+          `uzi recovery coverage fixture round ${round} batch 0`]);
+        await ctx.checkpoint!({ reap: true });
+        return { branch: ctx.branch, reportOnly: true, summary: "measurement report delivered" };
+      },
+      killAgentTree: () => events.push("kill"),
+    };
+    try { await runner(exec, gitlab).execute(claim); }
+    finally { restorePublish(); restoreFetch(); }
+    assert.ok(events.includes("publish"), "a real checkpoint pack was confirmed published");
+    assert.equal(api.states.some(s => s.runId === claim.run_id && s.body.status === "failed"), false);
+    const completed = api.states.find(s => s.runId === claim.run_id && s.body.status === "completed");
+    assert.ok(completed, "floor-tree-only confirmed publication permits report-only completion");
+    assert.equal(completed.body.report_only, true);
+    assert.equal(calls.length, 0, "no MR is opened");
+  });
+
   it("fails a report_only completion after this worker published a checkpoint", async () => {
     const { gitlab, calls } = fakeGitlab();
     const claim = gitlabClaim(67);
@@ -1084,9 +1112,11 @@ describe("RunRunner — report_only after a checkpoint is refused (issue #299)",
       restoreFetch();
     }
     assert.ok(events.includes("publish"), "the mid-run checkpoint published (sanity)");
-    const failed = api.states.find(
+    const failure = api.states.find(
       (s) => s.runId === claim.run_id && s.body.status === "failed",
-    )!.body;
+    );
+    assert.ok(failure, "exact confirmed publication with substantive work must fail report-only");
+    const failed = failure.body;
     assert.match(failed.failure_reason ?? "", /report_only/);
     assert.match(failed.failure_reason ?? "", /checkpoint/);
     const completed = api.states.find(

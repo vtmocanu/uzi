@@ -481,7 +481,7 @@ type RenderConfig struct {
 	// EphemeralDataSize is the /data PVC size for a RUN-BOUND worker
 	// (protocol.DesiredWorker.Ephemeral, issue #1815; UZI_WORKER_EPHEMERAL_DATA_SIZE).
 	// "Ephemeral" here means run-bound, NOT ephemeral-storage: this is unrelated to
-	// EphemeralRequest above. Empty ⇒ ephemeralDataDefaultSize ("20Gi"). For a
+	// EphemeralRequest above. Empty ⇒ ephemeralDataDefaultSize ("40Gi"). For a
 	// run-bound worker it REPLACES the preset's Size.DataSize (it is not a max of the
 	// two); a persistent worker's /data is untouched at every preset. A quantity
 	// string, validated (and required positive) at the controller's boot so the render
@@ -706,16 +706,16 @@ func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []
 // the preset table is shared with persistent workers whose /data must not move. It
 // REPLACES Size.DataSize for such a worker (not max(DataSize, this)).
 //
-// It must fit BOTH tiers' LimitRange maxPVCStorage (25Gi today) —
-// TestEphemeralDataDefaultFitsTheChartsLimitRangeMax reads them out of values.yaml —
-// and the tiers' quota.requestsStorage budget, which the fleet-storage test checks.
+// It must fit both worker tiers' ceilings (50Gi) and the isolated lane's (40Gi),
+// plus their fleet storage quotas. The run-bound data tests read these from the
+// chart and render the claims for every preset.
 // ValidatePVCCeilings checks an override against the live ceilings at boot.
 //
-// CHART MIRROR: deploy/chart/templates/worker-invariants.yaml carries a "20Gi" literal
+// CHART MIRROR: deploy/chart/templates/worker-invariants.yaml carries a "40Gi" literal
 // for this constant (Helm cannot read Go) so its run-bound /data guard checks the unset
 // path too, and deploy/chart/values.yaml ships workers.ephemeralWorkerDataSize at the
 // same value. Move all three together.
-const ephemeralDataDefaultSize = "20Gi"
+const ephemeralDataDefaultSize = "40Gi"
 
 // dataSize is the /data PVC size for w: the run-bound size (the cluster's
 // EphemeralDataSize override, else ephemeralDataDefaultSize) for an Ephemeral worker,

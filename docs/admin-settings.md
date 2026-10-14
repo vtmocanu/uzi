@@ -225,7 +225,10 @@ single setting bounds self-service provisioning:
 
 | Setting | Default | Controls |
 |---|---|---|
-| Hosted worker quota | 2 | Max hosted workers any one user may hold at once. `0` disables self-service entirely — the provision card disappears for everyone, but nobody's existing hosted workers are touched or hidden. |
+| `hosted_worker_quota` | 2 | Maximum persistent hosted workers each user may provision, from 0 to 20. Every size counts as one. Zero disables self-service provisioning without changing existing workers. Ephemeral workers have a separate cap. |
+
+Edit it in the **Hosted worker quota** card on **Admin → Instance**. The value
+must be an integer from `0` to `20`; it saves independently of the other cards.
 
 Every size counts the same 1 against this quota; see
 [Hosted workers](./hosted-workers.md#type-and-size). This setting exists (and

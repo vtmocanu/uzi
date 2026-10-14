@@ -260,6 +260,7 @@ func demoWorkers(now time.Time, runs []apitypes.RunListItemDTO) ([]apitypes.Work
 	all[7].Version, all[7].UpgradeStatus, all[7].AnthropicBindMode = str("0.84.0"), "outdated", "auto"
 	all[7].TemplateReported = str("node")
 	all[7].OutboxBlocked = str("terminal outcome refused: run was re-claimed (gen 4)")
+	all[7].OutboxBlockedRunID = str("6f0c2d4e-8a51-4b7e-9c3a-1d2e3f4a5b6c")
 	all[8].TemplateDeclared, all[8].TemplateReported, all[8].Capabilities = nil, nil, []string{}
 	all[8].ResidueQuarantinedAt = at(-20 * time.Minute)
 	all[8].ResidueQuarantineCause = str("runner-uid pid 4242 \"ssh-agent\" could not be attributed (env/cwd unreadable)")

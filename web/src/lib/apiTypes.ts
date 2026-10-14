@@ -1024,6 +1024,8 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
+  hosted_worker_quota: string;
   // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
   // "true"), round-tripping through GET/PUT /admin/settings like every other setting.
   // release_check_enabled is the master air-gap switch: when off, the api never calls
@@ -2494,6 +2496,10 @@ export interface Worker {
   outbox_pending_terminal?: number | null;
   outbox_stale_retired?: number | null;
   outbox_blocked?: string | null;
+  // The worker's own self-reported run id for the oldest blocked outcome (the entry
+  // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
+  // joined to a run's title or status.
+  outbox_blocked_run_id?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.

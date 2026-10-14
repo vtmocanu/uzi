@@ -11373,39 +11373,28 @@ export class GitCache {
     return (await this.tryGit(barePath, ["rev-parse", "--verify", "--quiet", `${ref}^{commit}`])) === 0;
   }
 
-  /** issue #299 / PRD #759 — true when origin's brokered checkpoint ref for `branch`
-   *  holds COMMITTED work that a report-only completion would orphan. `fetch()` mirrors
-   *  `refs/uzi-checkpoints/<branch>` into the bare best-effort on every fetch, so this
-   *  catches a checkpoint any PRIOR/cross-worker attempt landed; the runner pairs it with
-   *  its own `landedCheckpoint` to also catch a checkpoint THIS worker published mid-run
-   *  (not yet mirrored locally). The report-only completion guard uses the union to refuse
-   *  orphaning a published checkpoint.
-   *
-   *  The marker-only exception (PRD #759): a usage-limit park publishes a throwaway
-   *  `wip(park):` marker commit (WIP_PARK_COMMIT_PREFIX) to the checkpoint ref, and nothing
-   *  deletes it on resume. A checkpoint whose tip is ONLY such a marker — with no committed
-   *  milestone below it — is NOT committed work: it is an abandoned WIP marker, so this
-   *  returns false for it and a legitimate report-only completion is no longer failed on
-   *  its mere existence. The discriminator is ancestry, not descent: a marker-only checkpoint
-   *  is one whose parent is an ancestor-or-equal of the recovery floor; anything else (a
-   *  non-marker tip, or a marker whose parent STRICTLY DESCENDS the floor OR has DIVERGED from
-   *  it — the "main advanced during a park" shape) is a genuine committed milestone and still
-   *  returns true.
-   *
-   *  Only a SINGLE leading marker is ever stripped, and that is sufficient: the reseed's
-   *  `reset --soft` (see runnerClone, git.ts ~654-669) removes an adopted marker from the
-   *  branch history, so a resumed branch never carries a marker into the work the agent
-   *  builds on. Any subsequent park therefore plants its marker on a parent that is a real
-   *  commit or the base — never on another marker — so a one-marker strip cannot miss a
-   *  buried committed milestone. */
-  async hasCommittedCheckpoint(barePath: string, branch: string): Promise<boolean> {
+  /** Report-only orphan guard (#299, #759, #2967). Check both the mirrored ref and,
+   *  when this worker published, its exact confirmed tip (the mirror can be stale).
+   *  Recovery coverage is content-free only when EVERY commit outside the recovery
+   *  floor's history matches a floor-reachable boundary parent's tree. The current
+   *  floor can advance past the coverage base. Include all retained merge parents.
+   *  Missing confirmed-publication evidence blocks; a genuinely absent ref without
+   *  publication does not. The existing marker-only park exception remains below. */
+  async hasCommittedCheckpoint(
+    barePath: string,
+    branch: string,
+    confirmedPublication?: { tip: string | undefined },
+  ): Promise<boolean> {
+    if (confirmedPublication && (!confirmedPublication.tip ||
+        !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, confirmedPublication.tip)))) return true;
     const ref = `refs/uzi-checkpoints/${branch}`;
-    // 1) No checkpoint ref → nothing to orphan.
-    if (!(await this.refExists(barePath, ref))) return false;
-    // 2) Resolve the tip. A non-marker tip is a genuine committed checkpoint — return true,
-    //    byte-identical to the pre-PRD-759 existence check for every real checkpoint.
+    const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
+    if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
+    if (refStatus !== 0) return true;
     const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
-    if (!(await this.isWipParkMarker(barePath, tip))) return true;
+    if (!tip) return true;
+    if (!(await this.isWipParkMarker(barePath, tip)))
+      return !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, tip));
     // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
     //    below. A root-commit marker (no readable parent) has nothing committed below to
     //    orphan → false (mirrors the root-marker handling in runnerClone, git.ts ~585-591).
@@ -11448,6 +11437,44 @@ export class GitCache {
         error: err instanceof Error ? err.message : String(err),
       });
       return true;
+    }
+  }
+
+  /** Positive proof only: command failure, missing objects or truncated history block. */
+  private async checkpointHasOnlyBoundaryTrees(barePath: string, branch: string, tip: string): Promise<boolean> {
+    try {
+      if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") return false;
+      const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
+        ? `refs/remotes/origin/${branch}` : await this.defaultBranchRef(barePath);
+      const floor = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${floorRef}^{commit}`])).trim();
+      const exactTip = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${tip}^{commit}`])).trim();
+      const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${floor}^{tree}`])).trim();
+      // %T alone prints an object name even when that tree cannot be read.
+      await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${tree}^{tree}`]);
+      // Boundaries are the floor-reachable parents at this checkpoint's cut, not
+      // arbitrary published trees or today's newer floor tip. Walk every merge parent.
+      const walk = (await this.runGit(barePath, ["--no-replace-objects", "log", "--boundary",
+        "--format=%m %T", exactTip, "--not", floor, "--"])).trim();
+      if (walk === "") return true; // The tip is already reachable from the floor.
+      const boundaryTrees = new Set<string>();
+      const outsideTrees: string[] = [];
+      for (const line of walk.split("\n")) {
+        const row = /^([>-]) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(line);
+        if (!row) return false;
+        if (row[1] === "-") boundaryTrees.add(row[2]!);
+        else outsideTrees.push(row[2]!);
+      }
+      if (boundaryTrees.size === 0) return false;
+      for (const boundaryTree of boundaryTrees) {
+        if (boundaryTree !== tree)
+          await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${boundaryTree}^{tree}`]);
+      }
+      return outsideTrees.every(candidate => boundaryTrees.has(candidate));
+    } catch (error) {
+      if (error instanceof RunResidueBlockedError) throw error;
+      const abort = this.boundaryAbortError(error);
+      if (abort) throw abort;
+      return false;
     }
   }
 

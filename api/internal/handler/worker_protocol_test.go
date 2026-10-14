@@ -1176,6 +1176,29 @@ func TestWorkerStateForeignClaimDoesNotRevealCodexAlias(t *testing.T) {
 	}
 }
 
+// TestWorkerStateRunNotOwnedCarriesReason pins issue #2950: the not-owned 404 on /state carries
+// exactly {error, reason:"run_not_owned"} so the worker can block (not retire) a terminal journal.
+// No run body: a foreign worker learns nothing about the run.
+func TestWorkerStateRunNotOwnedCarriesReason(t *testing.T) {
+	runID := uuid.New()
+	h := newProtocolHandler(t, &protocolStore{ownedErr: pgx.ErrNoRows})
+	rec := httptest.NewRecorder()
+	h.WorkerRunState(rec, workerReq(http.MethodPost, `{"status":"completed"}`, runID))
+	if rec.Code != http.StatusNotFound {
+		t.Fatalf("status = %d, want 404 (body %q)", rec.Code, rec.Body.String())
+	}
+	var body map[string]any
+	if err := json.Unmarshal(rec.Body.Bytes(), &body); err != nil {
+		t.Fatalf("decode body %q: %v", rec.Body.String(), err)
+	}
+	if len(body) != 2 || body["reason"] != "run_not_owned" || body["error"] != "run not found for this worker" {
+		t.Fatalf("body = %v, want exactly {error: run not found for this worker, reason: run_not_owned}", body)
+	}
+	if _, has := body["run"]; has {
+		t.Fatalf("body carries a run: %v", body)
+	}
+}
+
 // TestWorkerStateJobParkingReportIs400 pins PRD #1908 D-E at the handler: a parking status for a
 // job run is a 400 whose message names the refusal (a job run never parks, and the state), not
 // the generic state list, which would include the very state refused.

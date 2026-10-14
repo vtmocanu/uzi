@@ -3011,9 +3011,9 @@ func (s *Service) ResidueQuarantineFor(workerID uuid.UUID) (ResidueQuarantine, b
 
 // OutboxAggregate returns a worker's summed outbox depth (PRD #1391 M5) for the
 // WorkerDTO overlay: pending messages, pending terminals, stale-retired frames, and
-// the oldest blocked reason (nil when nothing is blocked). All zero and nil when the
+// the oldest blocked reason and that entry's run id (nil when nothing is blocked). All zero and nil when the
 // worker has no tracked depth, so a worker with no outbox shows nulls.
-func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked *string) {
+func (s *Service) OutboxAggregate(workerID uuid.UUID) (pendingMessages, pendingTerminal, staleRetired int, blocked, blockedRunID *string) {
 	return s.outbox.workerAggregate(workerID)
 }
 

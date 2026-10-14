@@ -741,13 +741,13 @@ workers:
   # worker's CPU/memory still follow its preset (the api's UZI_EPHEMERAL_DEFAULT_SIZE
   # unless the run asks for one), but /data does not, because a run-bound worker holds
   # one clone for one run and its disk need tracks the repository, not the size. So an
-  # ephemeral `s` worker gets MORE than its preset's /data (5Gi → 20Gi) and an
-  # ephemeral `m` or `l` worker gets 20Gi, NOT their 25Gi. Persistent workers are
-  # untouched. Motivation: on 2026-09-27 an ephemeral `m` worker (10Gi /data) running a
+  # ephemeral `s` worker gets MORE than its preset's /data (5Gi → 40Gi) and an
+  # ephemeral `m` or `l` worker gets 40Gi, replacing its 25Gi or 50Gi preset.
+  # Persistent workers keep the preset sizing. Motivation: on 2026-09-27 an ephemeral `m` worker (10Gi /data) running a
   # uzi-on-uzi issue run hit 95% during `task gate:api` (Go build cache ~6.6G + module
   # cache ~1.9G).
   #
-  # CEILING: it must fit BOTH tiers' limitRange.maxPVCStorage (25Gi today), since a
+  # CEILING: it must fit BOTH tiers' limitRange.maxPVCStorage (50Gi today), since a
   # run-bound worker lands in either tier. worker-invariants.yaml refuses to render a
   # larger value (the empty/default path included), and the controller's boot check
   # (kube.ValidatePVCCeilings) refuses to start against the live ceilings.
@@ -755,8 +755,8 @@ workers:
   # CHANGING IT NEVER RESIZES AN EXISTING PVC: PVCs here are never patched (a size
   # change is delete + reprovision). Run-bound workers are short-lived, so the new size
   # arrives with the next one provisioned. Empty falls back to the controller's
-  # built-in 20Gi.
-  ephemeralWorkerDataSize: 20Gi
+  # built-in 40Gi.
+  ephemeralWorkerDataSize: 40Gi
   # Ephemeral worker lease (PRD #2006 -> the api's UZI_EPHEMERAL_LEASE). When an ephemeral
   # worker finishes its bound run it is NOT torn down at once: it stays idle for this long
   # so a follow-up run from the same owner on the same repository and branch (a rework,
@@ -804,20 +804,19 @@ workers:
   # = 20 CPU and 20 x 14Gi = 280Gi requested. Keep these ceilings aligned with
   # deployments x the default request, or admission caps the fleet below deployments
   # (issue #1341). ResourceQuotas are ceilings, not node-capacity reservations.
-  # STORAGE tracks `l` too: 20 x (25Gi data + 20Gi nix) = 900Gi of PVC.
+  # STORAGE tracks `l` too: 20 x (50Gi data + 20Gi nix) = 1400Gi of PVC.
   # Requests follow render.go; the rendered-fleet regression checks CPU, memory
   # and per-container LimitRange maxima.
   #
   # WORST CASE MEANS `l`, NOT `m`, AND THAT IS THE WHOLE POINT OF THE NUMBER. Nothing
   # scopes a size to a tier — preset.SizeNames() is global and render.go feeds
   # spec.Size.DataSize to both tiers — so any of these 20 workers may be an `l` with a
-  # 25Gi /data. Sizing on `m` (10Gi) gave 600Gi, which caps at 13 `l` workers against
-  # a tier advertising 20: the 14th is refused with a QUOTA error rather than a
-  # scheduling one. If `l` should not be
-  # available here, the fix is to scope it off the tier, not to under-budget.
+  # 50Gi /data. Sizing on `m` (25Gi) would admit only 12 persistent `l` workers
+  # against a tier advertising 20. If `l` should not be available here, the fix is
+  # to scope it off the tier, not to under-budget.
   #
-  # A RUN-BOUND worker's /data is a separate term (ephemeralWorkerDataSize above, 20Gi,
-  # issue #1815) that replaces the preset's DataSize for that worker. 20Gi <= l's 25Gi,
+  # A RUN-BOUND worker's /data is a separate term (ephemeralWorkerDataSize above, 40Gi,
+  # issue #1815) that replaces the preset's DataSize for that worker. 40Gi <= l's 50Gi,
   # so the per-worker worst case is still `l`'s and this number is unchanged.
   # TestShippedPVCDefaultsFitEachTiersStorageQuota (controller/internal/kube) renders
   # both worker shapes at every preset and checks the fleet against this value.
@@ -847,7 +846,7 @@ workers:
     enabled: true
     requestsCPU: "20"
     requestsMemory: 280Gi
-    requestsStorage: 900Gi
+    requestsStorage: 1400Gi
     persistentVolumeClaims: "40"
     # READ BY A CONTROLLER TEST, not merely documented here. This is the restricted
     # tier's fleet size, and TestShippedEphemeralDefaultsFitAWholeFleetOnRealNodes
@@ -861,11 +860,11 @@ workers:
   #
   # `max` MUST stay >= the LARGEST preset's limits (l = 4 CPU / 20Gi) or that preset
   # stops being admissible — which would surface as a worker that provisions and never
-  # appears. maxPVCStorage likewise >= l's /data (25Gi) and >= ephemeralWorkerDataSize
-  # (a run-bound worker's /data, 20Gi).
+  # appears. maxPVCStorage likewise >= l's /data (50Gi) and >= ephemeralWorkerDataSize
+  # (a run-bound worker's /data, 40Gi).
   #
-  # maxPVCStorage IS AT ITS CEILING TODAY: `l`'s DataSize is 25Gi (nixSize and a
-  # run-bound worker's /data are 20Gi), so
+  # maxPVCStorage IS AT ITS CEILING TODAY: `l`'s DataSize is 50Gi (nixSize is 20Gi and
+  # a run-bound worker's /data is 40Gi), so
   # LOWERING this value makes `l` workers' claims inadmissible and
   # nothing renders red — the rejection happens at admission, in the cluster, and the
   # worker simply never appears. The guards that catch it are
@@ -885,7 +884,7 @@ workers:
     max:
       cpu: "4"
       memory: 20Gi
-    maxPVCStorage: 25Gi
+    maxPVCStorage: 50Gi
   # --- the docker-capable worker tier (PRD #83 M3, PRD #89) ---------------------
   #
   # A SECOND, DEDICATED namespace running `pod-security.kubernetes.io/enforce:
@@ -993,14 +992,14 @@ workers:
     # Keep requests aligned with the rendered fleet, including sidecar overrides,
     # or admission caps it below deployments
     # (issue #1341). ResourceQuotas are ceilings, not capacity reservations.
-    # STORAGE tracks three PVCs each: 10 x (25Gi data + 20Gi nix + 20Gi dind) =
-    # 650Gi, and 10 x 3 = 30 claims. Raising a quota provisions nothing until
+    # STORAGE tracks three PVCs each: 10 x (50Gi data + 20Gi nix + 20Gi dind) =
+    # 900Gi, and 10 x 3 = 30 claims. Raising a quota provisions nothing until
     # workers exist.
     quota:
       enabled: true
       requestsCPU: "14"
       requestsMemory: 144Gi
-      requestsStorage: 650Gi
+      requestsStorage: 900Gi
       # BOTH CLAUSES OF WHAT THIS COMMENT USED TO SAY WERE FALSE, and issue #224 M-a
       # falsified the first of them a second time over. It read: "emptyDir dind data
       # roots land on node ephemeral storage; bound it so a runaway image pull cannot
@@ -1044,20 +1043,20 @@ workers:
       max:
         cpu: "4"
         memory: 20Gi
-      # FOUR claimants sit at or under this ceiling: `l`'s DataSize (25Gi) exactly,
+      # FOUR claimants sit at or under this ceiling: `l`'s DataSize (50Gi) exactly,
       # dindDataSize below, nixSize and a run-bound worker's /data
-      # (workers.ephemeralWorkerDataSize, issue #1815; 20Gi each). Raising any of them
+      # (20Gi nix/DinD; workers.ephemeralWorkerDataSize is 40Gi). Raising any of them
       # past it without raising this makes that claim inadmissible, and nothing renders
       # red — the LimitRange rejects it at admission and the worker provisions and never
       # appears. dindDataSize and ephemeralWorkerDataSize are guarded against this value
       # in worker-invariants.yaml; the other two are Go constants a chart cannot read and
       # are guarded by TestPresetPVCSizesFitTheChartsLimitRangeMax
       # (controller/internal/preset), which reads this value out of this file. The
-      # run-bound /data replaces DataSize for that worker and 20Gi <= l's 25Gi, so this
+      # run-bound /data replaces DataSize for that worker and 40Gi <= l's 50Gi, so this
       # tier's per-worker worst case (and quota.requestsStorage) is unchanged;
       # TestShippedPVCDefaultsFitEachTiersStorageQuota (controller/internal/kube) checks
       # it. Raise quota.requestsStorage above whenever you raise this.
-      maxPVCStorage: 25Gi
+      maxPVCStorage: 50Gi
     # The DinD sidecar's resource requests + limits (PRD #89 0.8.1). The controller renders
     # the sidecar with these (flattened to UZI_WORKER_DIND_{REQUEST,LIMIT}_{CPU,MEMORY}).
     # The default (250m/256Mi req, 2/2Gi lim) is enough for `docker`/compose that pulls
@@ -1083,7 +1082,7 @@ workers:
     # looking re-claim. On a PVC the daemon just runs out of room: the docker step
     # fails with ENOSPC, the pod lives, the tree lives.
     #
-    # The CEILING is limitRange.maxPVCStorage above (25Gi, set by `l`'s /data): the
+    # The CEILING is limitRange.maxPVCStorage above (50Gi, set by `l`'s /data): the
     # limitranger validates PVC creates, so a larger value is rejected at admission.
     # Raise both together, and raise quota.requestsStorage with them.
     # worker-invariants.yaml refuses to render the mismatched pair, so this is a
@@ -1176,16 +1175,17 @@ workers:
     # workers are run-bound (one run, then removed). CPU and memory ceilings cover
     # ten worst-case `l` workers from render.go (the ephemeral default is the smaller
     # `m`, #2412, but a run may ask for `l`): 10 x 1 CPU / 14Gi = 10 CPU / 140Gi.
+    # STORAGE: 10 x (40Gi run-bound data + 20Gi nix) = 600Gi across 20 claims.
     # The quota is a ceiling, not a reservation of node capacity.
     quota:
       enabled: true
       requestsCPU: "10"
       requestsMemory: 140Gi
-      requestsStorage: 400Gi
+      requestsStorage: 600Gi
       persistentVolumeClaims: "20"
       deployments: "10"
-    # `max` must stay >= the largest worker preset's limits and maxPVCStorage >= its
-    # /data and nix claims, exactly as for workers.limitRange above.
+    # `max` must stay >= the largest worker preset's limits. This lane is run-bound,
+    # so maxPVCStorage must admit ephemeralWorkerDataSize and the 20Gi nix claim.
     limitRange:
       enabled: true
       default:
@@ -1197,7 +1197,7 @@ workers:
       max:
         cpu: "4"
         memory: 20Gi
-      maxPVCStorage: 25Gi
+      maxPVCStorage: 40Gi
     # uzi-fetcher: a Deployment in the RELEASE namespace running /fetcher from the api
     # image (no new image). Lane workers dial it at
     # https://<fullname>-fetcher.<release-ns>.svc.<clusterDomain>:<port>; it dials the

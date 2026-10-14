@@ -143,6 +143,40 @@ journal, rather than the two writers ever disagreeing. Any future code path that
 discard a pending outcome must go through this same confirmed, atomic branch — never a bare
 status flip.
 
+**Amendment (#2950, 2026-10-14) — `run_not_owned` is a second block class, resolved outside the cancel branch.**
+When a worker reports a run it is not the current holder of (`runs.worker_id` is another worker or
+NULL, at any generation), the api answers `404 {"error":"run not found for this worker","reason":"run_not_owned"}`.
+The worker acts on exactly that structured answer (a plain, HTML, proxy or older-api 404 keeps the old
+keep-and-retry behaviour) and marks the terminal journal blocked with reason `run_not_owned` in both send
+paths. It never retires, deletes or resends it; the outcome bytes are kept and the block survives restart.
+
+- **Resolved outside the discarding-cancel branch.** This reporting worker cannot replay the outcome
+  at its recorded claim generation; another worker may own the run. The owner's cancel does not authorize
+  deletion of this unowned generation's journal, so the D13 branch does not apply. The block never retires
+  on a timer or sweep.
+- **Excluded from the lease and the overflow count, kept by physical protection.** The api's overflow
+  closure never covered unowned runs, and the api cannot lease a run it does not attribute to the worker;
+  counting the journal would turn an endless resend into an endless claim pause at cap 0. So it is left out
+  of the active snapshot lease entries and the pending-overflow count. The boot register snapshot stays
+  conservative (`pending_overflow` when anything is pending). The clone, recovery custody, finalize-record
+  retention and the heartbeat outbox report still include it.
+- **Invariant I-own.** If worker W holds a journal for (run R, generation g) and gets `run_not_owned`, W is
+  never again `runs.worker_id` while `claim_generation == g`. Sketch: `worker_id` returns to non-NULL only
+  via `ClaimRun`/`ClaimChatRun`, which both bump `claim_generation`, or `ParkRunCodexAccountUnavailable`.
+  That park runs only on the claim-assembly failure path that never delivers the claim (after releasing the
+  claimant's own hold) and moves ownership only to the live holder of an older generation's open custody
+  hold, whose reports at older generations hit `stale_claim`; status `claimed`, which the park requires, is
+  written only by the two claims, so at most one such move happens per generation. Pinned by the LiveDB test
+  `TestClaimObservedCaseReplayParksLiveDB`.
+- **Assumptions.** The other not-owned sources are permanent: lane mismatch (`runs.egress_profile_id` is
+  immutable by trigger and `workers.isolated_lane` is provisioning-only), `cross_check` at generation 0
+  never journals, and a deleted worker row does not return. If any becomes mutable, I-own must be re-proven.
+- **Resolution today** is the operator-assisted runbook in
+  [docs/hosted-workers.md](../docs/hosted-workers.md#run_not_owned-an-outcome-this-reporting-worker-cannot-replay).
+  A server-mediated owner discard is follow-up work. Its natural extension point is the existing
+  api-authorized deletion protocol (`agent/src/terminal-rejections.ts`, `terminal_rejection_report`,
+  `outbox.cleanupRejectedTerminalFiles`) and it needs its own authorization decision.
+
 ## Operational seams
 
 - **`hasLivePoller`'s terminal-pending flip, and its deliberate `mr_rework` side effect.**

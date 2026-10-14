@@ -889,13 +889,12 @@ describe("GitCache.hasCommittedCheckpoint (issue #771 / PRD #759)", () => {
   });
 
   it("returns TRUE for a real committed milestone tip (no marker)", async () => {
-    // Byte-identical to the pre-PRD-759 behaviour for every non-marker checkpoint tip.
+    // A substantive tree change still blocks after the #2967 coverage exception.
     const gitB = worker("workerB");
     const bareB = await gitB.ensureClone(fx.originPath);
     const branch = "agent/issue-771-real-tip";
     const floor = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main"]);
-    const floorTree = gitIn(bareB, ["rev-parse", "refs/remotes/origin/main^{tree}"]);
-    const milestone = mkCommit(bareB, floorTree, [floor], "real committed milestone");
+    const milestone = mkCommit(bareB, gitIn(bareB, ["mktree"]), [floor], "real committed milestone");
     gitIn(bareB, ["update-ref", `refs/uzi-checkpoints/${branch}`, milestone]);
     assert.strictEqual(
       await gitB.hasCommittedCheckpoint(bareB, branch),
@@ -990,5 +989,111 @@ describe("GitCache.hasCommittedCheckpoint (issue #771 / PRD #759)", () => {
       false,
       "a root-commit marker has nothing committed below to orphan",
     );
+  });
+});
+
+describe("GitCache.hasCommittedCheckpoint (#2967 floor-tree recovery coverage)", () => {
+  async function coverageFixture() {
+    const git = worker("coverage");
+    const bare = await git.ensureClone(fx.originPath);
+    const branch = "agent/issue-2967";
+    const floor = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+    const tree = gitIn(bare, ["rev-parse", `${floor}^{tree}`]);
+    const first = mkCommit(bare, tree, [floor], "uzi recovery coverage first round 0 batch 0");
+    const tip = mkCommit(bare, tree, [first], "uzi recovery coverage second round 0 batch 0");
+    return { git, bare, branch, floor, tree, tip };
+  }
+
+  it("#2967 allows a chain whose every commit carries the floor tree", async () => {
+    const f = await coverageFixture();
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, f.tip]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false);
+  });
+
+  it("#2967 allows old-base coverage after a claim fetch advances the floor", async () => {
+    const f = await coverageFixture();
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, f.tip]);
+    const advanced = advanceOriginMain("advanced.txt", "default branch advanced\n");
+    await f.git.ensureClone(fx.originPath);
+    assert.equal(gitIn(f.bare, ["rev-parse", "refs/remotes/origin/main"]), advanced);
+    assert.notEqual(gitIn(f.bare, ["rev-parse", `${advanced}^{tree}`]), f.tree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: f.tip }), false,
+      "coverage must be compared with its floor-reachable boundary, not the newer floor tip");
+  });
+
+  it("#2967 blocks an outside tree equal to the advanced floor but not its boundary", async () => {
+    const f = await coverageFixture();
+    const advanced = advanceOriginMain("advanced.txt", "default branch advanced\n");
+    await f.git.ensureClone(fx.originPath);
+    const advancedTree = gitIn(f.bare, ["rev-parse", `${advanced}^{tree}`]);
+    const tip = mkCommit(f.bare, advancedTree, [f.floor], "outside work copied from elsewhere");
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, tip]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip }), true,
+      "the latest floor tree is not evidence that this checkpoint merely wraps its boundary");
+  });
+
+  it("#2967 blocks an unreadable boundary tree when the current floor is newer", async () => {
+    const f = await coverageFixture();
+    advanceOriginMain("advanced.txt", "default branch advanced\n");
+    await f.git.ensureClone(fx.originPath);
+    fs.unlinkSync(path.join(f.bare, "objects", f.tree.slice(0, 2), f.tree.slice(2)));
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: f.tip }), true);
+  });
+
+  it("#2967 examines retained coverage parents, not only the tip tree", async () => {
+    const f = await coverageFixture();
+    const changedTree = gitIn(f.bare, ["mktree"]);
+    assert.notEqual(changedTree, f.tree);
+    const work = mkCommit(f.bare, changedTree, [f.floor], "retained committed milestone");
+    const tip = mkCommit(f.bare, f.tree, [f.tip, work], "uzi recovery coverage retained parent");
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, tip]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true);
+  });
+
+  for (const local of ["absent", "stale"] as const) {
+    it(`#2967 proves the exact confirmed publication when the local ref is ${local}`, async () => {
+      const f = await coverageFixture();
+      if (local === "stale") gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, f.tip]);
+      const work = mkCommit(f.bare, gitIn(f.bare, ["mktree"]), [f.floor], "published work");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: work }), true,
+        "a stale/absent mirror must not hide the confirmed published work");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: f.tip }), false,
+        "an available exact confirmed tip can prove coverage-only content without its mirror");
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: undefined }), true,
+        "confirmed publication with unknown tip fails closed");
+    });
+  }
+
+  it("#2967 checks the mirrored checkpoint as well as the confirmed tip", async () => {
+    const f = await coverageFixture();
+    const work = mkCommit(f.bare, gitIn(f.bare, ["mktree"]), [f.floor], "other retained work");
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, work]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: f.tip }), true);
+  });
+
+  for (const missing of ["tip", "floor", "tree"] as const) {
+    it(`#2967 blocks unreadable ${missing} proof`, async () => {
+      const f = await coverageFixture();
+      gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, f.tip]);
+      if (missing === "floor") {
+        fs.unlinkSync(path.join(f.bare, "objects", f.floor.slice(0, 2), f.floor.slice(2)));
+      } else if (missing === "tree") {
+        fs.unlinkSync(path.join(f.bare, "objects", f.tree.slice(0, 2), f.tree.slice(2)));
+      }
+      const tip = missing === "tip" ? "a".repeat(40) : f.tip;
+      assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip }), true);
+    });
+  }
+
+  it("#2967 blocks an existing ref whose commit object is unreadable", async () => {
+    const f = await coverageFixture();
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, f.tip]);
+    fs.unlinkSync(path.join(f.bare, "objects", f.tip.slice(0, 2), f.tip.slice(2)));
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), true);
+  });
+
+  it("#2967 still allows an absent checkpoint without a confirmed publication", async () => {
+    const f = await coverageFixture();
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false);
   });
 });

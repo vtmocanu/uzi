@@ -1924,12 +1924,11 @@ interface RunFlight {
   wallParkRefresh?: WallParkRefresh;
   lastPublish: number;
   lastPublishedTip: string | undefined;
-  /** PRD #1809 D8 (N1): THIS worker confirmed-landed a checkpoint mid-run (a time/milestone
-   *  checkpoint or an owner-pause publish). Separate from `lastPublishedTip`, which after a failed
-   *  fetch-back stays un-advanced (the packed tip is older than the clone HEAD) even though a
-   *  checkpoint DID land: the report-only orphan guards read this, not the tip. Not
-   *  `lastCheckpointRefTip`: that one is seeded from `claim.checkpoint_tip` (a prior/cross-worker
-   *  checkpoint, possibly a marker-only `wip(park):` one PRD #759 ignores). */
+  /** THIS worker confirmed a checkpoint publication (#1809). When true, report-only
+   *  guards prove the exact lastCheckpointRefTip content-free (#2967); that tip alone
+   *  is insufficient evidence of this worker publishing because it is seeded from the
+   *  claim. lastPublishedTip separately tracks clone HEAD for hasNewWork and can remain
+   *  unset after a failed fetch-back even when a checkpoint landed. */
   landedCheckpoint?: boolean;
   /** Issue #1832: the PRD #1809 D6 operation ("preflight", "clone/fetch") whose data-volume
    *  reclaim wait a PauseNowSignal interrupted (an owner `now` or a sweep `wall` pause; a `disk`
@@ -6324,26 +6323,15 @@ export class RunRunner {
     // NOT double-call it here (the not_code block's second call is a redundancy — not
     // copied). Returns before fetchAgentBranch: there is no branch to fetch or push.
     if (result.reportOnly) {
-      // issue #299: a report-only completion opens NO branch and NO MR, so if this run
-      // ALREADY published committed work to a checkpoint ref on origin
-      // (refs/uzi-checkpoints/<branch>), completing report-only would leave that ref
-      // orphaned — un-landed, with nothing to supersede it. ADR-0279 documented this as
-      // an accepted edge resting on the convention "a genuine zero-code run never
-      // checkpoints"; enforce that convention here instead. Detection is the UNION of
-      // two signals, each covering a gap the other has:
-      //   - landedCheckpoint: a checkpoint THIS worker confirmed-landed mid-run (set only
-      //     on a landed publish), which may not yet be mirrored into the bare's local ref.
-      //   - hasCommittedCheckpoint: origin's checkpoint ref, mirrored into the bare at
-      //     clone/fetch time — catches a checkpoint a PRIOR/cross-worker attempt landed.
-      //     Per PRD #759 it IGNORES a marker-only `wip(park):` checkpoint (an abandoned
-      //     usage-limit-park WIP marker with no committed milestone below it), while a
-      //     real committed milestone still blocks.
-      // A genuine zero-code run trips NEITHER (nothing committed ⇒ no pack ⇒ no publish),
-      // so it still completes report-only below. Refuse loudly, mirroring the
-      // undeclared-empty-diff FAIL path, rather than opening a delete-ref capability.
+      // #299/#2967: report-only opens no MR to supersede a published checkpoint.
+      // Check the prior/cross-worker mirrored ref AND this worker's exact confirmed
+      // publication, which may not be mirrored yet. Content-free recovery coverage
+      // carries no content; retained commits with differing trees still block.
+      // Missing evidence for a confirmed publication blocks. The prior-worker
+      // marker-only park exception remains in hasCommittedCheckpoint.
       const publishedCheckpoint =
-        landedCheckpoint ||
-        (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
+        await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
+          landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
       if (publishedCheckpoint) {
         batcher.emit({
           kind: "status",
@@ -6595,13 +6583,13 @@ export class RunRunner {
         // orphaning: if this run DID publish a checkpoint to origin (a mid-run milestone
         // landed there), there IS committed work to land, so fall through to the push+MR
         // path. Only the genuinely-empty case completes report-only with no MR. Detection
-        // reuses the SAME publishedCheckpoint union the declared-report_only path uses,
+        // reuses the SAME publishedCheckpoint proof the declared-report_only path uses,
         // which (PRD #759) ignores a marker-only `wip(park):` checkpoint while a real
         // committed milestone still blocks.
         if (result.scopeCapped) {
           const publishedCheckpoint =
-            landedCheckpoint ||
-            (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
+            await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
+              landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
           if (!publishedCheckpoint) {
             // Bind a zero slice to its committed base in the runner-owned clone, without pushing.
             let cappedHead: string | undefined;
@@ -6676,19 +6664,13 @@ export class RunRunner {
       // pushing — fail open) and [] on a CONFIRMED-empty diff. Only a confirmed-empty
       // diff completes report-only; a diff-failure must NOT be treated as empty.
       if (changedForPrompt !== null && changedForPrompt.length === 0) {
-        // issue #299: a report-only completion opens NO branch and NO MR, so if this run
-        // ALREADY published committed work to a checkpoint ref on origin
-        // (refs/uzi-checkpoints/<branch>), completing report-only would orphan that ref.
-        // This mirrors the declared report_only terminal above: detect via the UNION of
-        // landedCheckpoint (a checkpoint THIS worker confirmed-landed mid-run) and
-        // hasCommittedCheckpoint (origin's checkpoint ref, mirrored into the bare at
-        // clone/fetch time — catches a prior/cross-worker landing; per PRD #759 it ignores
-        // a marker-only `wip(park):` checkpoint while a real committed milestone still
-        // blocks). A genuine zero-code prompt run trips NEITHER and still completes
-        // report-only below.
+        // The same #299/#2967 orphan guard as declared report_only: check both
+        // mirrored and exact confirmed-published tips. Only positively proven
+        // published-boundary coverage (or the existing mirrored park-marker exception)
+        // carries no committed content; unknown confirmed publication still blocks.
         const publishedCheckpoint =
-          landedCheckpoint ||
-          (await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch));
+          await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,
+            landedCheckpoint ? { tip: flight.lastCheckpointRefTip } : undefined);
         if (publishedCheckpoint) {
           batcher.emit({
             kind: "status",

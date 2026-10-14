@@ -183,6 +183,30 @@ describe("Worker boot claim gate (PRD #1391 Run B M4)", () => {
     await done;
   });
 
+  it("issue #2950: a boot with only a run_not_owned blocked journal does not pause the claim loop", async () => {
+    const outbox = await mkOutbox();
+    await outbox.journalTerminal(RUN, 4, "running", 0, { status: "completed" });
+    await outbox.markTerminalBlocked(RUN, 4, "run_not_owned");
+    // Cap 0 (the cap-independent floor): counted, this entry would pause claims forever.
+    const registry = new ActiveRunRegistry(() => outbox.listPendingTerminals(), () => 0);
+    assert.equal(registry.claimsPausedByPendingOverflow(), false);
+    let claims = 0;
+    let reportStates = 0;
+    const client = fakeClient({
+      claimRun: async () => { claims += 1; return null; },
+      reportState: async () => { reportStates += 1; return { applied: true, status: "completed" } as StateAck; },
+    });
+    const controller = new AbortController();
+    const worker = new Worker(fakeConfig(), client, idleRunner, idleChat, noJudge, noReview, nullLogger(),
+      okPreflight, outbox, new Map(), registry);
+    const done = worker.run(controller.signal);
+    await pollUntil(() => claims >= 1, 2000, "the claim loop starts despite the blocked journal");
+    assert.equal(reportStates, 0, "a blocked journal is never sent");
+    assert.equal(outbox.hasPendingTerminal(RUN, 4), true, "the journal is kept");
+    controller.abort();
+    await done;
+  });
+
   it("issue #1742: a boot-resolved terminal also retires the run's finalize records at generation <= G", async () => {
     // A crash between installing G's terminal journal and retiring G's finalize record leaves both
     // files. The lister excludes the run while the journal is pending; once the boot resolve settles

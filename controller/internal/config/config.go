@@ -131,7 +131,7 @@ type Config struct {
 	// (protocol.DesiredWorker.Ephemeral, issue #1815; UZI_WORKER_EPHEMERAL_DATA_SIZE,
 	// chart key workers.ephemeralWorkerDataSize). "Ephemeral" here means run-bound, NOT
 	// ephemeral-storage: it is unrelated to WorkerEphemeralRequest above. Empty ⇒ the
-	// render side's built-in 20Gi. It REPLACES the preset's DataSize for a run-bound
+	// render side's built-in 40Gi. It REPLACES the preset's DataSize for a run-bound
 	// worker; persistent workers keep the preset's. Must be a positive quantity.
 	WorkerEphemeralDataSize string
 	// WorkerSecretMountPath overrides where the worker's join-token Secret mounts
@@ -291,7 +291,7 @@ type Config struct {
 	// workers evicted). Empty ⇒ the render side's built-in default (20Gi). Optional
 	// even when the docker tier is on, and validated as a k8s Quantity when set, so a
 	// typo fails at boot rather than at admission. Note the worker namespaces'
-	// LimitRange caps a PVC at maxPVCStorage (20Gi), so a larger value here is
+	// LimitRange caps a PVC at maxPVCStorage (50Gi by default on both worker tiers), so a larger value here is
 	// rejected by the apiserver unless that is raised too.
 	WorkerDinDDataSize string
 
