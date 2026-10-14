@@ -6071,7 +6071,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
 // advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
-// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "ci_config_guard" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
@@ -6182,6 +6182,9 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		PAT:           string(botPAT),
 		DeclaredTip:   tipOid,
 		Pack:          pack,
+		// Guarded repair runs (PRD #2865): the broker refuses a tip that touches a protected path.
+		CIConfigGuard: owned.CiConfigGuard,
+		CIConfigPaths: owned.CiConfigPaths,
 	}
 
 	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
@@ -6372,6 +6375,11 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
+	case errors.Is(err, pushbroker.ErrCIConfigGuard):
+		// A guarded run's tip touches a protected CI-config path (or the broker could not prove
+		// it does not): a benign best-effort skip, like workflow_scope. The worker's own
+		// merge-base check decides the final branch push.
+		return PublishResult{Published: false, Ref: ref, Skipped: "ci_config_guard", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	case errors.Is(err, pushbroker.ErrTipMissing):
 		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
 		// broker's content-free reason for the operator log (never serialized to the worker).
