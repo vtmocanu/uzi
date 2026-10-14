@@ -21,20 +21,36 @@ import (
 // This file can be copied alone into the pinned pre-capacity kube package. It
 // uses the existing fake-client Tick seam and asserts JSON literals, not new types.
 func TestSchedulerCapacityPortable(t *testing.T) {
-	dep, pod := capacityPortableObjects()
-	wire := capacityPortableTick(t, []runtime.Object{dep, pod}, false)
-	var row map[string]any
-	if err := json.Unmarshal(wire, &row); err != nil {
-		t.Fatal(err)
-	}
-	if row["phase"] != "stuck" {
-		t.Fatalf("phase: %s", wire)
-	}
-	if row["blocking_kind"] != "scheduler_capacity" {
-		t.Fatalf("blocking_kind missing scheduler_capacity: %s", wire)
-	}
-	if row["blocking_reason"] != "scheduler capacity: insufficient cpu" {
-		t.Fatalf("reason: %s", wire)
+	for _, tc := range []struct{ name, diagnostic, fixed string }{
+		{"cpu", "2 Insufficient cpu", "scheduler capacity: insufficient cpu"},
+		{"memory", "2 Insufficient memory", "scheduler capacity: insufficient memory"},
+		{"both", "1 Insufficient cpu, 1 Insufficient memory", "scheduler capacity: insufficient cpu and memory"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			dep, pod := capacityPortableObjects()
+			pod.CreationTimestamp = metav1.NewTime(m5Now.Add(-time.Minute))
+			pod.Status.Conditions[0].Message = "0/2 nodes are available: " + tc.diagnostic + "."
+			claim := pvcFor(capacityPortableID, "nix")
+			claim.Status.Phase = corev1.ClaimPending
+			claim.CreationTimestamp = metav1.NewTime(m5Now.Add(-time.Hour))
+			pod.Spec.Volumes = []corev1.Volume{{Name: "nix", VolumeSource: corev1.VolumeSource{
+				PersistentVolumeClaim: &corev1.PersistentVolumeClaimVolumeSource{ClaimName: claim.Name},
+			}}}
+			wire := capacityPortableTick(t, []runtime.Object{dep, pod, claim}, false)
+			var row map[string]any
+			if err := json.Unmarshal(wire, &row); err != nil {
+				t.Fatal(err)
+			}
+			if row["phase"] != "stuck" {
+				t.Fatalf("phase: %s", wire)
+			}
+			if row["blocking_kind"] != "scheduler_capacity" {
+				t.Fatalf("blocking_kind missing scheduler_capacity: %s", wire)
+			}
+			if row["blocking_reason"] != tc.fixed {
+				t.Fatalf("reason: %s", wire)
+			}
+		})
 	}
 }
 
