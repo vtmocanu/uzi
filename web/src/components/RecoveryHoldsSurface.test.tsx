@@ -604,7 +604,7 @@ describe("RecoveryHoldsSurface", () => {
     });
 
     it("gives info rows no discard button or export link", async () => {
-      await renderSurface(listing([counted("a", "terminal_run", { has_available_capture: true, capture_state: "available" })], atLimit));
+      await renderSurface(listing([counted("a", "terminal_run", { attention: "archive_ready", has_available_capture: true, capture_state: "available" })], atLimit));
       const section = screen.getByRole("region", { name: "Counting toward the limit" });
       expect(within(section).getAllByRole("listitem")).toHaveLength(1);
       expect(within(section).queryByRole("button", { name: /Discard held work/ })).toBeNull();
@@ -620,7 +620,7 @@ describe("RecoveryHoldsSurface", () => {
 
     it("keeps decision rows alongside the info rows", async () => {
       await renderSurface(
-        listing([hold({ id: "d1", attention: "source_only", worker_name: "decision-worker" }), counted("a", "terminal_run")], { custody_hold_limit: 2, admission_counted_holds: 2 }),
+        listing([hold({ id: "d1", attention: "source_only", worker_name: "decision-worker" }), counted("a", "terminal_run", { attention: "archive_ready", has_available_capture: true })], { custody_hold_limit: 2, admission_counted_holds: 2 }),
       );
       expect(screen.getByText(/These are the holds only you can resolve/)).toBeTruthy();
       expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
