@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Checkpoint publication acknowledgments are capped at 64 KiB ([#2888](https://github.com/vtmocanu/uzi/issues/2888)).**
+  The worker now reads the checkpoint publish response through a streamed-byte cap instead of buffering it whole, so an oversized or endless acknowledgment is cancelled and treated as an ambiguous publish failure (the attempted tip is kept, nothing is confirmed) without echoing any of the body.
+
 - **Published charts carry the verified worker roll target ([#2906](https://github.com/vtmocanu/uzi/issues/2906)).**
   Release packaging derives the exact baked version from signature-verified pinned worker images, including older worker pins, so persistent hosted-worker rolls no longer wait for a manual target-version mapping. Per-cluster overrides remain available; remove a hand-set `workers.rollTargetVersion` when using the published chart's pin so a stale override cannot hold the next roll. Missing or conflicting image identity blocks chart publication.
 
@@ -49,6 +52,12 @@ through `[0.52.0]`.)
 
 - **Resumed implementation prompts preserve milestone reporting guidance ([#2438](https://github.com/vtmocanu/uzi/issues/2438)).**
   Resumed Claude implementation prompts retain the approved milestone tracker and reporting instructions; both harnesses display persisted completion declarations alongside local progress, and the lead is instructed to report finished work before `signal_done` in the same turn. This is prompt guidance, not a guarantee of model compliance; the completion interlock is unchanged and incomplete work remains blocked.
+
+- **Codex session scans stream within their entry budgets ([#2281](https://github.com/vtmocanu/uzi/issues/2281)).**
+  Session copying, presence checks and generation cleanup enumerate held directory descriptors one entry at a time; incomplete presence scans return unknown, and cleanup enumeration failures preserve the published generation.
+
+- **Codex retains proven usage when cost accounting becomes incomplete ([#2878](https://github.com/vtmocanu/uzi/issues/2878)).**
+  Proven token counters survive invalid usage and advancing cumulative regressions; affected model costs remain unreported, and a once-per-claim notice names the actual accounting cause and whether a proved baseline is available.
 
 ### Changed
 

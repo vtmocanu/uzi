@@ -6,7 +6,6 @@ import { execFile, execFileSync, spawn } from "node:child_process";
 import { promisify } from "node:util";
 import { randomBytes } from "node:crypto";
 import fs from "node:fs";
-import os from "node:os";
 import path from "node:path";
 import { PassThrough, type Readable } from "node:stream";
 import type { ExecutorFactory, RunnerOptions } from "../src/runner.js";
@@ -18,6 +17,7 @@ import { GitCache } from "../src/git.js";
 import { nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { defaultGitleaksShim, shimCalls, writeGitleaksShim as writeShim } from "./gitleaks-shim.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { makeScratchRoot } from "./fixture-repo.js";
 import type { Logger } from "../src/log.js";
 import {
   api,
@@ -462,13 +462,13 @@ async function waitFor(pred: () => boolean, ms = 5_000): Promise<void> {
 /** How long teardown waits for each phase: execute() resolving, tick settlement, child death. */
 const TEARDOWN_MS = 20_000;
 
-async function bounded<T>(p: Promise<T>, ms: number, what: string): Promise<T> {
+async function bounded<T>(p: Promise<T>, ms: number, what: string, phase = "teardown"): Promise<T> {
   let t: ReturnType<typeof setTimeout> | undefined;
   try {
     return await Promise.race([
       p,
       new Promise<never>((_, reject) => {
-        t = setTimeout(() => reject(new Error(`teardown: ${what} did not happen within ${ms}ms`)), ms);
+        t = setTimeout(() => reject(new Error(`${phase}: ${what} did not happen within ${ms}ms`)), ms);
       }),
     ]);
   } finally {
@@ -551,7 +551,57 @@ async function settleAndClean(spec: {
 }
 
 function scratchDir(tag: string): string {
-  return fs.mkdtempSync(path.join(os.tmpdir(), `uzi-1597-m2-${tag}-`));
+  return makeScratchRoot(`uzi-1597-m2-${tag}-`);
+}
+
+/** How long a recovery scenario waits for runner A's executor to signal that it has committed. */
+const STARTUP_MS = 60_000;
+
+/**
+ * Wait for the executor's readiness signal, but fail fast and with a named startup error when the
+ * runner finishes or rejects before ever signalling (otherwise the test would hang to the per-test
+ * timeout). `running` is the runner's own execute() promise; its late settlement after `ready` wins
+ * is swallowed here, and the caller still awaits it in teardown.
+ */
+async function awaitReady(ready: Promise<void>, running: Promise<unknown>, label: string): Promise<void> {
+  const outcome = running.then(
+    () => {
+      throw new Error(`startup: ${label} finished before the executor signalled readiness`);
+    },
+    (e: unknown) => {
+      throw new Error(`startup: ${label} rejected before the executor signalled readiness`, { cause: e });
+    },
+  );
+  outcome.catch(() => undefined);
+  await bounded(Promise.race([ready, outcome]), STARTUP_MS, `${label} executor readiness`, "startup");
+}
+
+/** "complete": runner A's executor returns without signalling. "reject": additionally A's execute()
+ *  call rejects with a sentinel, as if the runner itself threw. */
+type StartupFault = "complete" | "reject";
+
+/** What a startup regression observes of a scenario that threw before returning. */
+interface StartupProbe {
+  pA?: Promise<unknown>;
+  tmp?: string;
+  sentinel?: Error;
+}
+
+/** Runner A's executor: the normal committing blockingTurn, or a turn that never signals. */
+function runnerAFactory(fault: StartupFault | undefined, body: (ctx: RunContext) => Promise<void>): ExecutorFactory {
+  return fault === undefined ? blockingTurn(body) : turn(async () => {});
+}
+
+/** For "reject", make the call site's own `runnerA.execute(claim)` settle as a rejection. */
+function injectRejection(runnerA: RunRunner, fault: StartupFault | undefined, probe: StartupProbe): void {
+  if (fault !== "reject") return;
+  const sentinel = new Error("injected runner rejection");
+  probe.sentinel = sentinel;
+  const realExecute = runnerA.execute.bind(runnerA);
+  runnerA.execute = (c) =>
+    realExecute(c).then(() => {
+      throw sentinel;
+    });
 }
 
 // ── (a) cross-worker recovery ────────────────────────────────────────────────────────────────
@@ -560,8 +610,14 @@ function scratchDir(tag: string): string {
  *  refs/uzi-checkpoints/<branch>; A is then "SIGKILLed" (no shutdown, timers stopped, data dir
  *  deleted). Worker B, on a FRESH data dir, re-claims the run as a resume carrying the recorded
  *  checkpoint tip. Returns whether B's runner clone contains A's commit. */
-async function crossWorker(iid: number, tickEnabled: boolean): Promise<{ recovered: boolean; publishes: number }> {
+async function crossWorker(
+  iid: number,
+  tickEnabled: boolean,
+  fault?: StartupFault,
+  probe: StartupProbe = {},
+): Promise<{ recovered: boolean; publishes: number }> {
   const tmp = scratchDir("xw");
+  probe.tmp = tmp;
   const shim = writeShim(tmp, "detect");
   const ctl = control();
   const branch = `agent/issue-${iid}`;
@@ -580,16 +636,18 @@ async function crossWorker(iid: number, tickEnabled: boolean): Promise<{ recover
   const claim = gitlabClaim(iid);
   const runnerA = mkRunner(
     mkGit(dataA, shim),
-    blockingTurn(async (ctx) => {
+    runnerAFactory(fault, async (ctx) => {
       commitIn(ctx.worktreePath, "A1.txt", "worker A's committed work\n");
       started.resolve();
     }),
     ctl,
     { checkpointTickIntervalMs: tickEnabled ? TICK_MS : 0 },
   );
+  injectRejection(runnerA, fault, probe);
   const pA = runnerA.execute(claim);
+  probe.pA = pA;
   try {
-    await started.promise;
+    await awaitReady(started.promise, pA, "cross-worker runner A");
     if (tickEnabled) {
       ctl.advance(INTERVAL_MS + 1);
       assert.equal(await ctl.fire(), "published");
@@ -619,10 +677,113 @@ async function crossWorker(iid: number, tickEnabled: boolean): Promise<{ recover
   } finally {
     pub.restore();
     runnerA.shutdown();
-    await pA.catch(() => undefined);
+    await bounded(pA.catch(() => undefined), TEARDOWN_MS, "the runner's execute()").catch((e: unknown) =>
+      teardownErrors.push(e),
+    );
     fs.rmSync(tmp, { recursive: true, force: true });
   }
 }
+
+/** Runner A of test (b): a same-worker run whose tick publish is rejected (HTTP 503), started and
+ *  awaited until its executor has committed. Shared by (b) and its startup regressions so both run
+ *  the same startup code. A startup failure tears the scenario down before it rethrows. */
+async function startSameWorkerA(iid: number, fault?: StartupFault, probe: StartupProbe = {}) {
+  const tmp = scratchDir("same");
+  probe.tmp = tmp;
+  const shim = writeShim(tmp, "detect");
+  const ctl = control();
+  const pub = stubPublish(async (_n, _tip, pack) => {
+    await drain(pack);
+    return { ok: false, httpStatus: 503 };
+  });
+  const branch = `agent/issue-${iid}`;
+  const dataDir = path.join(tmp, "data");
+  const g = mkGit(dataDir, shim);
+  const claim = gitlabClaim(iid);
+  let sha = "";
+  const started = deferred();
+  const runnerA = mkRunner(
+    g,
+    runnerAFactory(fault, async (ctx) => {
+      sha = commitIn(ctx.worktreePath, "SAME.txt", "same-worker work\n");
+      started.resolve();
+    }),
+    ctl,
+  );
+  injectRejection(runnerA, fault, probe);
+  const pA = runnerA.execute(claim);
+  probe.pA = pA;
+  const teardown = async (): Promise<void> => {
+    pub.restore();
+    runnerA.shutdown();
+    await bounded(pA.catch(() => undefined), TEARDOWN_MS, "the runner's execute()").catch((e: unknown) =>
+      teardownErrors.push(e),
+    );
+    fs.rmSync(tmp, { recursive: true, force: true });
+  };
+  try {
+    await awaitReady(started.promise, pA, "same-worker runner A");
+  } catch (e) {
+    await teardown();
+    throw e;
+  }
+  return { tmp, shim, ctl, iid, branch, dataDir, g, claim, runnerA, sha: () => sha, teardown };
+}
+
+describe("recovery startup readiness (#2887)", () => {
+  const scenarios: Array<{ name: string; start: (iid: number, fault: StartupFault, probe: StartupProbe) => Promise<unknown>; iid: number }> = [
+    { name: "cross-worker runner A", start: (iid, fault, probe) => crossWorker(iid, false, fault, probe), iid: 1597_291 },
+    { name: "same-worker runner A", start: (iid, fault, probe) => startSameWorkerA(iid, fault, probe), iid: 1597_293 },
+  ];
+  for (const sc of scenarios) {
+    (["complete", "reject"] as const).forEach((fault, i) => {
+      it(`${sc.name}: an executor that ${fault === "complete" ? "finishes" : "finishes and whose execute() rejects"} before signalling fails fast and tears down`, async () => {
+        const probe: StartupProbe = {};
+        const t0 = Date.now();
+        await assert.rejects(sc.start(sc.iid + i, fault, probe), (err: Error) => {
+          if (fault === "complete") {
+            assert.match(err.message, /startup: .* finished before/);
+          } else {
+            assert.match(err.message, /startup: .* rejected before/);
+            assert.ok(probe.sentinel);
+            assert.equal(err.cause, probe.sentinel);
+          }
+          return true;
+        });
+        assert.ok(Date.now() - t0 < STARTUP_MS, "failed before the startup bound");
+        assert.ok(probe.pA, "the call site's execute() promise was captured");
+        const outcome = await bounded(probe.pA.then(() => "resolved" as const, (e: unknown) => e), 5_000, "runner A settled");
+        if (fault === "reject") assert.equal(outcome, probe.sentinel, "the call site's own execute() rejected with the sentinel");
+        assert.equal(fs.existsSync(probe.tmp!), false, "the scratch root was removed");
+        assert.deepEqual(teardownErrors, [], "teardown completed cleanly");
+      });
+    });
+  }
+
+  for (const variant of ["resolves", "rejects"] as const) {
+    it(`awaitReady resolves when ready wins and the runner later ${variant}, with no unhandled rejection`, async () => {
+      const events: unknown[] = [];
+      const listener = (reason: unknown): void => {
+        events.push(reason);
+      };
+      process.on("unhandledRejection", listener);
+      try {
+        let markReady!: () => void;
+        const ready = new Promise<void>((r) => (markReady = r));
+        let settle!: (fail: boolean) => void;
+        const running = new Promise<void>((res, rej) => (settle = (fail) => (fail ? rej(new Error("late runner failure")) : res())));
+        const waited = awaitReady(ready, running, "unit runner");
+        markReady();
+        await waited;
+        settle(variant === "rejects");
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.deepEqual(events, []);
+      } finally {
+        process.off("unhandledRejection", listener);
+      }
+    });
+  }
+});
 
 describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
   it("(a) cross-worker recovery: a tick-published checkpoint lets a fresh worker resume A's commits; with the tick disabled it cannot", async () => {
@@ -636,31 +797,10 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
   });
 
   it("(b) same-worker missing source: a failed publish retains fetch-back but a re-claim cannot seed without its known source", async () => {
-    const tmp = scratchDir("same");
-    const shim = writeShim(tmp, "detect");
-    const ctl = control();
-    const pub = stubPublish(async (_n, _tip, pack) => {
-      await drain(pack);
-      return { ok: false, httpStatus: 503 };
-    });
-    const iid = 1597_203;
-    const branch = `agent/issue-${iid}`;
-    const dataDir = path.join(tmp, "data");
-    const g = mkGit(dataDir, shim);
-    const claim = gitlabClaim(iid);
-    let sha = "";
-    const started = deferred();
-    const runnerA = mkRunner(
-      g,
-      blockingTurn(async (ctx) => {
-        sha = commitIn(ctx.worktreePath, "SAME.txt", "same-worker work\n");
-        started.resolve();
-      }),
-      ctl,
-    );
-    const pA = runnerA.execute(claim);
+    const A = await startSameWorkerA(1597_203);
+    const { shim, ctl, iid, branch, dataDir, g, claim } = A;
+    const sha = A.sha();
     try {
-      await started.promise;
       ctl.advance(INTERVAL_MS + 1);
       assert.equal(await ctl.fire(), "publish_failed:rejected");
       const bare = g.barePathFor(fx.originPath);
@@ -708,10 +848,7 @@ describe("mid-turn checkpoint tick (issue #1597 M2)", () => {
         line.msg === "run failed" && line.error === "Retained recovery blocked: required source is missing; local work and custody retained"),
       "the exact missing-source failure is visible");
     } finally {
-      pub.restore();
-      runnerA.shutdown();
-      await pA.catch(() => undefined);
-      fs.rmSync(tmp, { recursive: true, force: true });
+      await A.teardown();
     }
   });
 

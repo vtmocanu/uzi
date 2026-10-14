@@ -1,11 +1,10 @@
 // PRD #1332 (M5A, C4a) — Codex per-thread/per-model token accounting.
 //
-// The production Codex registry retains NO model identity and drops the app-server's
-// `thread/tokenUsage/updated` notifications as generic activity, so a Codex run emits no
-// per-model usage. This module is the missing accounting spine: an IMMUTABLE
-// `threadId -> configured model` map plus a per-thread cumulative-snapshot reconciler that
-// the {@link CodexHarness} feeds every typed usage notification (root AND demuxed child) and
-// reads at each turn terminal to build the result-frame `modelUsage`.
+// The accounting spine for Codex runs: an IMMUTABLE `threadId -> configured model` map plus a
+// per-thread cumulative-snapshot reconciler. The {@link CodexHarness} feeds it every typed
+// `thread/tokenUsage/updated` notification (root AND demuxed child) and reads it at each turn
+// terminal to project the result frame's per-model `modelUsage`, metered or unreported per
+// model as COST below describes.
 //
 // RECONCILIATION (D5), stated as invariants the tests pin:
 //   - `total` is the thread's CUMULATIVE usage; `last` is the single most-recent response.
@@ -13,7 +12,7 @@
 //   - Each thread has a STARTING SNAPSHOT (baseline). A FRESH thread (thread/start) starts at
 //     zero, so its whole cumulative is this leg's work and a MISSED intermediate update is
 //     recovered by the later cumulative. A RESUMED thread needs proved replay: root usage with
-//     a historical turn id BEFORE the matching inbound turn/started boundary. Pinned 0.159.3
+//     a historical turn id BEFORE the matching inbound turn/started boundary. Pinned 0.160.1
 //     cold resume with excludeTurns:true was characterized in token-resume.test.ts: restored
 //     total and historical last precede that boundary even when consumption starts after the
 //     outbound turn/start. Baseline the FULL replay total; never price replay last. A shared
@@ -166,8 +165,23 @@ function responsesReconcileDelta(responseSum: Cumulative, delta: Cumulative): bo
   );
 }
 
+/** Closed internal causes; no provider text enters the diagnostic. */
+type IncompleteCause = "missing_replay_boundary" | "attempted_resume_without_baseline" | "invalid_identity" | "invalid_raw_usage" | "advancing_regression";
+
+const INCOMPLETE_CAUSES: Record<IncompleteCause, string> = {
+  missing_replay_boundary: "missing proved replay at the live boundary",
+  attempted_resume_without_baseline: "attempted resumed work ended without a proved replay baseline",
+  invalid_identity: "invalid token usage identity",
+  invalid_raw_usage: "invalid raw token usage",
+  advancing_regression: "advancing cumulative token usage regression",
+};
+
 /** The reconciliation state for one authorized thread. */
 interface ThreadAccount {
+  /** Bounded, sticky causes affect only this thread's model cost. */
+  readonly incompleteCauses: Set<IncompleteCause>;
+  /** Live work without a baseline prevents later replay from erasing attempted work. */
+  attributionQuarantined: boolean;
   /** The IMMUTABLE configured model for this thread (root or child). */
   readonly model: string;
   /** True when first registered by thread/resume: requires proved replay to establish its
@@ -175,7 +189,7 @@ interface ThreadAccount {
   readonly resumed: boolean;
   /** The starting snapshot; first fresh usage or proved historical replay establishes it. */
   baseline?: Cumulative;
-  /** The running per-bucket max of `total`; undefined until the first note. */
+  /** The last accepted cumulative snapshot; undefined until the first note. */
   maxTotal?: Cumulative;
   /** The magnitude of {@link maxTotal}, for the newer-than test. */
   maxMagnitude: number;
@@ -201,16 +215,27 @@ interface ThreadAccount {
  */
 export class CodexUsageAccountant {
   private readonly threads = new Map<string, ThreadAccount>();
-  private incomplete = false;
+  private noticeText?: string;
   private incompleteNoticeTaken = false;
 
   /** Sticky across all provider epochs of this claim; execution remains independent. */
-  markIncomplete(): void { this.incomplete = true; }
-  get usageIncomplete(): boolean { return this.incomplete; }
+  markIncomplete(threadId: string, cause: IncompleteCause, liveWithoutBaseline = false): void {
+    const acct = this.threads.get(threadId);
+    if (!acct) return;
+    acct.incompleteCauses.add(cause);
+    if (acct.baseline === undefined && acct.resumed &&
+        (liveWithoutBaseline || cause === "missing_replay_boundary" || cause === "attempted_resume_without_baseline"))
+      acct.attributionQuarantined = true;
+    this.noticeText ??= `Codex token accounting is incomplete: ${INCOMPLETE_CAUSES[cause]}. ${this.hasBaseline(threadId) ? "The proved baseline is retained; proven usage remains available." : "The baseline is unavailable; only proven usage is recorded."} Cost is unreported for the affected model. Execution continues.`;
+  }
+  get usageIncomplete(): boolean {
+    return [...this.threads.values()].some(acct => acct.incompleteCauses.size > 0);
+  }
+  get incompleteNoticeText(): string | undefined { return this.noticeText; }
 
   /** The shared accountant owns the claim-wide diagnostic latch, including failed callbacks. */
   takeIncompleteNotice(): boolean {
-    if (!this.incomplete || this.incompleteNoticeTaken) return false;
+    if (!this.usageIncomplete || this.incompleteNoticeTaken) return false;
     this.incompleteNoticeTaken = true;
     return true;
   }
@@ -227,7 +252,8 @@ export class CodexUsageAccountant {
    *  cumulative) from a fresh root/child (baselines at zero). */
   registerThread(threadId: string, model: string, resumed: boolean): void {
     if (threadId.length === 0 || this.threads.has(threadId)) return;
-    this.threads.set(threadId, { model, resumed, maxMagnitude: 0, responses: [], pricingEvidenceComplete: true });
+    this.threads.set(threadId, { model, resumed, maxMagnitude: 0, responses: [], pricingEvidenceComplete: true,
+      incompleteCauses: new Set(), attributionQuarantined: false });
   }
 
   /**
@@ -240,8 +266,9 @@ export class CodexUsageAccountant {
     let adopted: CodexAdoptedMeasurement | undefined;
     const acct = this.threads.get(threadId);
     if (acct === undefined) return; // unknown / unregistered thread — never attributed
+    if (acct.attributionQuarantined) return;
     if (acct.resumed && acct.baseline === undefined && !replay) {
-      this.markIncomplete();
+      this.markIncomplete(threadId, "missing_replay_boundary");
       return;
     }
     const total = toCumulative(usage.total);
@@ -269,6 +296,19 @@ export class CodexUsageAccountant {
     }
     const m = magnitude(usage.total);
     if (m > acct.maxMagnitude) {
+      // Raw input includes cached details, so growing raw buckets can still reduce priced uncached input.
+      const uncached = Math.max(total.inputTokens - total.cachedInputTokens - total.cacheWriteInputTokens, 0);
+      const acceptedUncached = Math.max(
+        acct.maxTotal.inputTokens - acct.maxTotal.cachedInputTokens - acct.maxTotal.cacheWriteInputTokens, 0,
+      );
+      if (uncached < acceptedUncached ||
+          total.inputTokens < acct.maxTotal.inputTokens ||
+          total.cachedInputTokens < acct.maxTotal.cachedInputTokens ||
+          total.cacheWriteInputTokens < acct.maxTotal.cacheWriteInputTokens ||
+          total.outputTokens < acct.maxTotal.outputTokens) {
+        this.markIncomplete(threadId, "advancing_regression");
+        return;
+      }
       acct.maxTotal = total;
       acct.maxMagnitude = m;
       // A genuinely newer note: `last` is this note's single most-recent response — record it as a
@@ -290,8 +330,9 @@ export class CodexUsageAccountant {
 
   /**
    * Aggregate the reconciled per-thread deltas by ACTUAL configured model into the result-frame
-   * `modelUsage` shape. Returns `undefined` when no charged usage was reconciled (so the harness
-   * omits `modelUsage` entirely, keeping a no-usage terminal byte-identical to before C4a).
+   * `modelUsage` shape. Returns `undefined` when no charged usage or incomplete model exists.
+   * Incomplete models retain proved tokens, including an explicit zero lower bound, so the server
+   * can degrade their existing cost status without changing token high-water marks.
    *
    * TOKEN buckets are always the cumulative `total` deltas (unchanged from C4a). COST (C4b, D5)
    * depends on `pricing`:
@@ -308,9 +349,9 @@ export class CodexUsageAccountant {
    *                                    tokens RETAINED and no `costUSD`.
    */
   aggregateByModel(pricing?: CodexPricingContext): Record<string, CodexModelUsageEntry> | undefined {
-    if (this.incomplete) return undefined;
     interface ModelAgg {
       tokens: Cumulative;
+      incomplete: boolean;
       /** True until a thread on this model fails to reconcile or has an unpriceable response.
        *  Only consulted when pricing context is present. */
       priceable: boolean;
@@ -320,9 +361,13 @@ export class CodexUsageAccountant {
     const byModel = new Map<string, ModelAgg>();
     const hasPricing = pricing !== undefined;
     for (const acct of this.threads.values()) {
-      if (acct.maxTotal === undefined) continue; // registered but saw no usage note
-      const charged = diffClamp(acct.maxTotal, acct.baseline ?? zeroCumulative());
-      const agg = byModel.get(acct.model) ?? { tokens: zeroCumulative(), priceable: true, costUSD: 0 };
+      const incomplete = acct.incompleteCauses.size > 0;
+      if (acct.maxTotal === undefined && !incomplete) continue;
+      const charged = acct.maxTotal === undefined ? zeroCumulative()
+        : diffClamp(acct.maxTotal, acct.baseline ?? zeroCumulative());
+      const agg = byModel.get(acct.model) ?? { tokens: zeroCumulative(), incomplete: false, priceable: true, costUSD: 0 };
+      agg.incomplete ||= incomplete;
+      if (incomplete) agg.priceable = false;
       addInto(agg.tokens, charged);
       if (hasPricing && agg.priceable) {
         // PRD #1332 m3 (CodeRabbit 4004800884): fail closed on pricing-evidence completeness FIRST.
@@ -360,9 +405,8 @@ export class CodexUsageAccountant {
       // Uncached input = total input minus the two detail buckets (D5), non-overlapping and
       // clamped >= 0, matching Claude's `input_tokens` (uncached) column semantics.
       const uncached = Math.max(c.inputTokens - c.cachedInputTokens - c.cacheWriteInputTokens, 0);
-      // Skip a model whose reconciled delta is entirely zero — a registered thread that
-      // produced no chargeable tokens is nothing to fold.
-      if (uncached === 0 && c.cachedInputTokens === 0 && c.cacheWriteInputTokens === 0 && c.outputTokens === 0) {
+      // Explicit zero entries preserve incomplete models; healthy unused models stay omitted.
+      if (!agg.incomplete && uncached === 0 && c.cachedInputTokens === 0 && c.cacheWriteInputTokens === 0 && c.outputTokens === 0) {
         continue;
       }
       const base = {

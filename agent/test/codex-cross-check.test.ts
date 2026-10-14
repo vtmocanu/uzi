@@ -761,6 +761,30 @@ for (const mode of ["success", "model-error", "unclean"] as const) {
  });
 }
 
+for (const shape of ["equal", "reset", "advancing regression"] as const) {
+ it(`#2878 M2 ${shape === "advancing regression" ? "regression" : "compatibility"} cross-check real transport ${shape}`, async () => {
+  const c = claim();
+  c.config = { default_model: "gpt-6.1-sol", default_effort: "high" };
+  const r = rig({ claim: c, notes: emit => {
+   const buckets = (inputTokens: number, outputTokens: number) => ({
+    inputTokens, outputTokens, cachedInputTokens: 0, cacheWriteInputTokens: 0,
+    reasoningOutputTokens: 0, totalTokens: inputTokens + outputTokens,
+   });
+   const send = (total: ReturnType<typeof buckets>, last: ReturnType<typeof buckets>) =>
+    emit({ method: "thread/tokenUsage/updated", params: { threadId: "thread", turnId: "turn", tokenUsage: { total, last } } });
+   send(buckets(1100, 220), buckets(1100, 220));
+   send(shape === "equal" ? buckets(1110, 210) : shape === "reset" ? buckets(10, 2) : buckets(1120, 210), buckets(10, 2));
+   r.terminal(emit);
+  } });
+  await r.run();
+  assert.deepEqual((r.usage.at(-1)!.modelUsage as Record<string, unknown>)["gpt-6.1-sol"], {
+   inputTokens: 1100, outputTokens: 220, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+   reasoningOutputTokens: 0, costStatus: shape === "advancing regression" ? "unreported" : "metered",
+   ...(shape === "advancing regression" ? {} : { costUSD: 0.0044 }),
+  }, "cross-check writer rejects whole advancing regression, ignores nonadvancing active notes");
+ });
+}
+
 it("subscription checker posts a metered API-equivalent amount for a known model", async () => {
  const c = claim(true);
  c.config = { default_model: "gpt-6.1-sol", default_effort: "high" };
