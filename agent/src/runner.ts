@@ -1915,12 +1915,12 @@ interface RunFlight {
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
    *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
   attempt: RunAttempt | undefined;
-  /** issue #1783 M2: on a Docker-wired worker, the id minted for this execution attempt BEFORE
+  /** issue #1783 M2: in attempt-path mode (Docker-wired or recovery-enabled), the id minted BEFORE
    *  its clone is seeded: it names the attempt clone path, the recovery journal entry, the
-   *  attempt ledger entry and the attempt marker alike. Undefined on an unwired worker. */
+   *  attempt ledger entry and the attempt marker alike. Undefined for a canonical-path seed. */
   attemptId: string | undefined;
   /** issue #1783 M2: this flight is capturing a PREDECESSOR attempt's retained clone (the C′
-   *  journal case on a Docker-wired worker): `worktreePath` is the predecessor's path, every
+   *  journal case in attempt-path mode): `worktreePath` is the predecessor's path, every
    *  quiescence proof is a `capture`-mode scan scoped to it, and a verified capture releases it
    *  IN PLACE (never retired, moved or reused). */
   predecessorCapture: boolean;
@@ -2493,10 +2493,10 @@ export class RunRunner {
   private readonly dockerHost: string | undefined;
   /** issue #1786: see {@link RunnerOptions.onSourceRetained}. */
   private readonly onSourceRetained: (() => void) | undefined;
-  /** issue #1783 M2: a Docker-wired worker (the resolved DockerWiring carries a dockerHost) seeds
-   *  every execution attempt at a FRESH `<key>.attempt-<attemptId>` clone path, so a late Docker
-   *  create binding a predecessor's path can never land in the successor's tree. Unwired workers
-   *  keep the canonical `<key>` path, byte-for-byte. */
+  /** issue #1783 M2: Docker wiring enables fresh `<key>.attempt-<attemptId>` paths by default,
+   *  separating a successor's tree from late Docker binds to a predecessor's path. Recovery can
+   *  enable attempt paths per flight even on unwired workers. Ordinary unwired keys use canonical
+   *  reseeding, including shared best-effort per-key residue retention. */
   private readonly attemptPaths: boolean;
   /** PRD #1809 D6 (N3): aborted by `shutdown()` beside `shuttingDownGlobal`, so a pre-clone wait
    *  (the data-volume reclaim wait, before the flight joins `activeRuns`) can end on a shutdown. */
@@ -4200,7 +4200,7 @@ export class RunRunner {
       // exactly as a residue-blocked run did before #2213: one latched when it failed, or one whose
       // latch was caught before or at the start of its settle (reportGenericFailure's pre-settle
       // check, settleRecoveryGeneration's entry check).
-      // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight on a Docker-wired worker) is
+      // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight in attempt-path mode) is
       // released IN PLACE — journal cleared (only now that its capture is verified), ledger
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
       // capture already ran behind the predecessor-scoped capture-mode proof.
@@ -4338,7 +4338,7 @@ export class RunRunner {
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
-      // issue #1783 M2: on a Docker-wired worker the next attempt runs at a NEW path with its own
+      // issue #1783 M2: in attempt-path mode the next attempt runs at a NEW path with its own
       // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
       // removed with it even on a park; a retained predecessor keeps its pair until the retention
       // sweep deletes both.
@@ -9102,8 +9102,9 @@ export class RunRunner {
     emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_succeeded", "complete", disposition);
   }
 
-  /** issue #1783 M2: the attempt-seed options a Docker-wired worker hands the git layer (see
-   *  AttemptSeedOptions); undefined on an unwired worker (today's canonical seed). */
+  /** issue #1783 M2: attempt-seed options when the flight's effective mode (falling back to the
+   *  worker's Docker default) enables attempt paths and an id exists. Recovery can enable this on
+   *  unwired workers too; otherwise undefined selects canonical free/retention/seed. */
   private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
     const attemptId = flight.attemptId;
     if (!(flight.effectiveAttemptPaths ?? this.attemptPaths) || attemptId === undefined) return undefined;
@@ -9132,7 +9133,7 @@ export class RunRunner {
         });
         if (!proof.blocked) return;
         // issue #1783 M2 review (N6): a non-dumpable runner-uid process ANYWHERE on the worker reads
-        // back unattributable, so failing the seed on it would fail every wired seed while one
+        // back unattributable, so failing the seed on it would fail each attempt-path seed while one
         // exists. This honours the plan's "move nothing when unverified" rule rather than bending
         // it: seeding a FRESH attempt path moves, frees and deletes nothing (no predecessor path is
         // touched), so it is allowed; every step that WOULD move or free something still requires
@@ -9162,6 +9163,8 @@ export class RunRunner {
         flight.attempt = attempt;
         this.liveAttempts.add(attempt);
       },
+      // Retention keeps its process-only posture: fresh-path seed relaxation never authorizes
+      // deletion, and quarantine is checked both before and after the affirmative process proof.
       quiescent: async (paths, canonical) => {
         if (retentionVetoed || residueQuarantine() !== undefined) return false;
         const proof = await this.quiesceRun(flight, flight.executor, {
@@ -9191,6 +9194,12 @@ export class RunRunner {
    * tree and may rename what is left: an unreadable process could be one whose cwd or open files are
    * inside it (a dev server, a container's bind), and deleting or moving its tree under it is exactly
    * the residue hazard this issue closes. So unverified blocks.
+   *
+   * After successful canonical free, the git layer uses these predicates for shared per-key
+   * residue retention before seeding. Unlike attempt retention, this callback forwards configured
+   * best-effort Docker handling; unwired workers acquire no daemon obligation. Deletion still
+   * requires an affirmative scoped seed-process verdict and no worker quarantine before/after proof;
+   * absent/off-Linux proof keeps excess, while classified control/recovery interruptions escape.
    */
   private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
     return {
@@ -9568,7 +9577,7 @@ export class RunRunner {
       }
       throw err;
     }
-    // issue #1783 M2: a Docker-wired worker mints this attempt's id BEFORE the seed: it names the
+    // issue #1783 M2: attempt-path mode mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
     // issue #1786: the mode read in discovery is stale by now (ensureClone ran since, and discovery
     // itself may have healed a stopped canonical source and persisted the mode, or a concurrently
@@ -9838,7 +9847,7 @@ export class RunRunner {
       this.openQuestionIds.set(runId, claim.open_question_id);
 
     let sessionId = claim.session_id ?? undefined;
-    // issue #1783 M2: on a Docker-wired worker every attempt runs at a FRESH clone path, and a
+    // issue #1783 M2: in attempt-path mode each attempt runs at a FRESH clone path, and a
     // session is keyed by HOME *and* cwd, so the earlier session can never resolve from here. Drop
     // it BEFORE either transcript check (so neither can report it resumable, even when the old
     // transcript is still under HOME): Claude starts a fresh session and Codex a fresh thread.
@@ -10653,7 +10662,7 @@ export class RunRunner {
     // buildSdkEnv), so every process the agent starts is attributable to it; its recorded roots
     // let a concurrent sibling's reaper attribute our unreadable processes by ancestry. Removed in
     // executeClaim's terminal finally, after the attempt's final reap.
-    // issue #1783 M2: a Docker-wired seed already registered this attempt live (inside the bare
+    // issue #1783 M2: an attempt-path seed already registered this attempt live (inside the bare
     // lock, under the id that names its clone path); reuse it so marker, path and journal agree.
     let attempt: RunAttempt;
     if (flight.attempt && flight.attempt.clonePath === resolvePath(runnerClone.path)) {
@@ -10801,7 +10810,7 @@ export class RunRunner {
       sessionId,
       priorWork,
       // issue #222: this run executed before (it reported a session), so this claim's
-      // reseed rebuilt the tree (wiped it, or on a Docker-wired worker seeded a fresh attempt
+      // reseed rebuilt the tree (wiped it, or in attempt-path mode seeded a fresh attempt
       // path), so whatever an earlier attempt left uncaptured is not in it. Read the RAW
       // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
       // a dropped-session resume still had its tree destroyed. Same discriminator the
@@ -12024,10 +12033,11 @@ export class RunRunner {
       // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
       // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
       let attributedReap: RunProcessReap | { failure: string } | undefined;
-      // A processOnly re-proof follows only runner-clone git, which runs with the worker's HOME
-      // (git.ts gitEnv), so nothing it starts carries the run's HOME unless it sets it deliberately;
-      // the sink's first proof already ran the attributed reap. A child that deliberately escapes
-      // both the clone and the HOME escapes both reaps alike (the documented worker-level residual).
+      // Process-only checks include attempt retention and re-proofs after runner-clone git.
+      // That git runs with the worker's HOME (git.ts gitEnv), so its children carry the run's HOME
+      // only if deliberately set; the sink's first proof already ran the attributed reap. Attempt
+      // retention keeps its existing process-only scan over candidate paths. A child deliberately
+      // escaping both clone and HOME escapes both reaps (the documented worker-level residual).
       if (
         !opts.processOnly &&
         (mode === "own" || flight.predecessorCapture) &&
@@ -12069,8 +12079,8 @@ export class RunRunner {
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
           // over OTHER attempts' paths has no supervisor behind it, so it always scans (issue #1783 M2).
           processes: (opts.forceProcessScan || !executor.safety || mode !== "own") && process.platform === "linux",
-          // A re-proof after a runner-clone git (processOnly) repeats only the process half: the
-          // Docker teardown already ran at the sink's first proof, and never blocks anyway.
+          // Process-only re-proofs and attempt retention omit Docker teardown. Canonical
+          // retention forwards the configured host; Docker handling stays best effort.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
           otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),

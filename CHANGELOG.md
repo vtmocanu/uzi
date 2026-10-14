@@ -27,6 +27,9 @@ through `[0.52.0]`.)
 - **Plan summary after a credential-switch give-up ([#2945](https://github.com/vtmocanu/uzi/issues/2945)).**
   A plan accepted on the retry that follows a credential switch that could not complete (the run continued on its old token) now gets its plan summary on Claude runs, instead of silently going without one; an accepted plan summary is also no longer dropped from the run result by an earlier give-up.
 
+- **Normal canonical reseeds safely reclaim excess quarantined clone residue, including on unwired workers.**
+  Workers now try to reclaim the oldest excess residue toward a best-effort target of five entries per clone key during normal canonical reseeding as well as attempt seeding. Recovery-protected, live or unproven entries stay, and worker quarantine vetoes deletion, so safety can leave more than five; this is not a hard disk bound (#1859).
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
