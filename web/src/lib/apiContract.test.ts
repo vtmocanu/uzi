@@ -622,6 +622,13 @@ void _releaseCheckStatusFull;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
   const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs" | "run_disk"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
+  const _workerPendingZero: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {
+    pending_outcome_count: 0,
+    pending_overflow: false,
+  };
+  const _workerPendingUnavailable: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {};
+  void _workerPendingZero;
+  void _workerPendingUnavailable;
   void _workerMissing;
   void _workerExtra;
   void _workerZero;
@@ -1725,17 +1732,6 @@ describe("worker pending outcome contract issue 2009", () => {
     expect(full).toHaveProperty("pending_overflow", true);
     expect(zero).not.toHaveProperty("pending_outcome_count");
     expect(zero).not.toHaveProperty("pending_overflow");
-  });
-
-  it("retains explicit authoritative zero and false separately from missing evidence", () => {
-    const evidence: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {
-      pending_outcome_count: 0,
-      pending_overflow: false,
-    };
-    const wire = JSON.parse(JSON.stringify(evidence));
-    expect(wire).toEqual({ pending_outcome_count: 0, pending_overflow: false });
-    const unavailable: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {};
-    expect(JSON.parse(JSON.stringify(unavailable))).toEqual({});
   });
 });
 

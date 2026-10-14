@@ -62,3 +62,15 @@ Contract Vitest (including the custom zero/false check), typecheck, build,
 canonical gates, integrated Go/TUI checks, review, commits, checkpointing, and
 M4 mutation/concurrency validation remain for main after both slices land.
 There is no CI, browser, full-stack, or Kubernetes proof from this slice.
+
+## Lead review cleanup
+
+After the shared Go fixtures landed, the lead executed integrated badge/parity/mock
+checks (224 tests at a8d01d69) and TypeScript checking successfully. Reviewer at
+that SHA identified the local-object JSON round-trip test above as redundant:
+its runtime assertions exercised only JSON built-ins. The lead removed those
+assertions and retained explicit zero/false and omission assignments inside the
+existing compile-time Worker contract block. Go DTO wire tests and actual badge
+zero/fallback cases provide runtime behavior evidence. This is a test-only
+cleanup; no production badge or API behavior changed. The cleanup receives
+scoped committed-range review and validation before M3 completion.

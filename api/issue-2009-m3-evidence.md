@@ -11,7 +11,8 @@ and omits both fields; snapshot read failure can retain independently valid
 aggregate authority. Nil store is unavailable, never authoritative zero.
 User/admin list and patch reuse the overlay. Old zero fixtures retain omissions;
 full fixtures record count 1 / overflow true, and explicit pointer zero/false
-marshals in focused Go and TypeScript wire cases.
+marshals in focused Go wire cases. TypeScript checks zero/false and omission
+compatibility at compile time, alongside actual badge behavior.
 
 CLI and web use aggregate counts when available, otherwise listed pending counts.
 Fresh overflow renders exactly "N confirmed pending; more may be pending", even
@@ -95,5 +96,13 @@ TUI/navigation tests, so its timing is not a matched M1 before/after measurement
 Exact matching regression timing and broader acceptance/mutations/canonical gates
 remain M4. Web implementer evidence records its own targeted before/after selection.
 
-The committed-tree read-only review and integration gate remain required before
-marking M3 complete. No final delivery is claimed here.
+At a8d01d69 reviewer and tester found no blocking M3 behavior defects. The reviewer
+suggested removing the redundant TypeScript local-object JSON round-trip test;
+the lead removed its runtime assertions and retained explicit zero/false and
+omission type checks in the existing compile-time worker contract block.
+Go wire serialization and real badge behavior remain the runtime evidence.
+
+Broader committed-tree Go apitypes/CLI package tests passed (jWI8WS), along with
+web Workers/Runs page integration (hkIOG0) and touched Go formatting (uBXLUQ).
+The cleanup commit requires its own scoped review and TypeScript/contract checks
+before marking M3 complete. No final delivery is claimed here.
