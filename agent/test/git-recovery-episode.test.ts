@@ -580,6 +580,8 @@ test("missing-source identity mismatches and missing known own source never over
   const ownPaths = fs.readdirSync(path.dirname(active)).sort();
   for (const attempt of [false, true]) {
     await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, {
+      isLive: () => false,
+      quiescent: async () => true,
       beforeFree: async () => { calls.push("free"); },
     }, runId, false, undefined, attempt ? {
       attemptId: aid(3), isLive: () => { calls.push("live"); return false; },

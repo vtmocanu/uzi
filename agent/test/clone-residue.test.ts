@@ -30,9 +30,10 @@ import {
 } from "../src/run-quiescence.js";
 import { RUN_ATTEMPT_ENV, RUN_CLONE_KEY_ENV } from "../src/worker-spawn-mark.js";
 import { defaultGitleaksShim } from "./gitleaks-shim.js";
-import { scopedRealView } from "./fake-proc.js";
+import { makeFakeProcRoot, plantInScope, plantUnreadableUnattributed, scopedRealView, withQuiescenceView } from "./fake-proc.js";
 import { restoreHermeticView } from "./setup/hermetic-proc.js";
 import { realProcfsSkip } from "./real-procfs.js";
+import { latchResidueQuarantine, residueQuarantine, resetResidueQuarantineForTests } from "../src/residue-quarantine.js";
 import { noProofReseed, nullLogger, recordingLogger, testGitCacheOptions } from "./helpers.js";
 import { api, client, fakeGitlab, fx, git, gitlabClaim, homeDir, installHarness, runnerWith } from "./runner-harness.js";
 
@@ -335,7 +336,7 @@ describe("issue #1783 M3: journal classification runs before any free; a journal
 
   function recordingReseed(): { reseed: CanonicalReseedOptions; calls: string[] } {
     const calls: string[] = [];
-    return { calls, reseed: { beforeFree: async (p) => void calls.push(p) } };
+    return { calls, reseed: { ...noProofReseed, beforeFree: async (p) => void calls.push(p) } };
   }
 
   async function primedCanonical(iid: number): Promise<{ b: string; canonical: string; hash: string }> {
@@ -671,7 +672,7 @@ describe("issue #1783 M3: a quarantined residue is never mistaken for a clone", 
     );
     assert.equal(fs.existsSync(path.join(residue, "agent", "src")), true, "one residue (under the cap) is kept");
     // A later canonical reseed of the same key leaves it alone too.
-    const again = await git.createOrAttachRunnerClone(b, iid, { beforeFree: async () => {} }, randomUUID());
+    const again = await git.createOrAttachRunnerClone(b, iid, { ...noProofReseed, beforeFree: async () => {} }, randomUUID());
     assert.equal(again.path, canonicalFor(iid));
     assert.equal(fs.existsSync(residue), true);
     assert.equal(fs.readdirSync(runnerRepoDir()).filter((n) => n.startsWith(".uzi-residue-")).length, 1);
@@ -846,7 +847,7 @@ describe("issue #1783 M3 rework: the canonical delete runs as the runner uid, an
     fs.rmSync(repoDir, { recursive: true, force: true });
     fs.symlinkSync(elsewhere, repoDir);
     const proofs: string[] = [];
-    await assert.rejects(git.createOrAttachRunnerClone(b, iid, { beforeFree: async (p) => void proofs.push(p) }, randomUUID()), (err: unknown) => {
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, { ...noProofReseed, beforeFree: async (p) => void proofs.push(p) }, randomUUID()), (err: unknown) => {
       assert.ok(err instanceof CloneResidueBlockedError);
       assert.match(err.detail, /runner repo dir is not a real directory/);
       return true;
@@ -1034,7 +1035,7 @@ describe("issue #1783 final: a timed-out canonical rm is waited out before any q
       return true;
     });
     let proofs = 0;
-    const counting: CanonicalReseedOptions = { beforeFree: async () => void proofs++ };
+    const counting: CanonicalReseedOptions = { ...noProofReseed, beforeFree: async () => void proofs++ };
     await assert.rejects(g.createOrAttachRunnerClone(b, iid, counting, randomUUID()), (err: unknown) => {
       assert.ok(err instanceof CloneResidueBlockedError, String(err));
       assert.match(err.detail, /an earlier runner-uid delete of this path may still be running/);
@@ -1115,4 +1116,421 @@ describe("issue #1783 final (R3): the clone key alone never puts a process in a 
     assert.equal(alive(pid), true);
     assert.equal(treeHash(canonical), hash, "nothing moved");
   });
+});
+
+
+describe("M1 canonical residue retention through the public seed path", () => {
+  const iid = 3901;
+  async function planted(count = 7): Promise<{ b: string; paths: string[] }> {
+    const b = await git.ensureClone(fx.originPath);
+    fs.mkdirSync(runnerRepoDir(), { recursive: true });
+    const paths = Array.from({ length: count }, (_, i) => path.join(runnerRepoDir(),
+      formatResidueName(`issue-${iid}`, `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`)));
+    for (const p of paths) {
+      fs.mkdirSync(p);
+      fs.writeFileSync(path.join(p, "kept.txt"), "residue");
+      fs.utimesSync(p, 1000, 1000);
+    }
+    return { b, paths };
+  }
+  afterEach(() => resetResidueQuarantineForTests());
+
+  it("ordinary canonical reseeds cap tied-mtime siblings at five, including repeated replenishment", async () => {
+    const { b, paths } = await planted();
+    const protectedNames = [formatResidueName("issue-3902", randomUUID()),
+      ".uzi-residue-issue-3901.residue-malformed", `issue-${iid}.attempt-${mintAttemptId(1)}`,
+      `.uzi-skills-issue-${iid}`, `issue-3902`];
+    for (const name of protectedNames) fs.mkdirSync(path.join(runnerRepoDir(), name));
+    const proofs: string[][] = [];
+    const opts = { ...noProofReseed, quiescent: async (ps: string[]) => { proofs.push(ps); return true; } };
+    for (let round = 0; round < 3; round++) {
+      const clone = await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+      assert.equal(clone.path, canonicalFor(iid));
+      assert.deepEqual(paths.map(p => fs.existsSync(p)), [false, false, true, true, true, true, true]);
+      if (round < 2) for (const p of paths.slice(0, 2)) { fs.mkdirSync(p); fs.utimesSync(p, 1000, 1000); }
+    }
+    assert.deepEqual(proofs, Array.from({ length: 3 }, () => paths.slice(0, 2).map(p => [p])).flat());
+    for (const name of protectedNames) assert.ok(fs.existsSync(path.join(runnerRepoDir(), name)));
+  });
+
+  for (const kind of ["false", "throw", "absent", "live", "mid-live", "quarantine", "mid-quarantine", "journal", "mid-journal"] as const) {
+    it(`keeps the original excess on ${kind}, without deleting newer replacements`, async () => {
+      const { b, paths } = await planted(6);
+      const rec = recordingLogger();
+      const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+      let live = kind === "live";
+      const journal = async () => {
+        const child = path.join(paths[0]!, "child");
+        fs.mkdirSync(child, { recursive: true });
+        execFileSync("git", ["-C", b, "config", "--local", "uzi-recovery.agent/other-retained.clone",
+          JSON.stringify({ clonePath: child, runId: randomUUID() })]);
+        fs.utimesSync(paths[0]!, 1000, 1000);
+      };
+      if (kind === "journal") await journal();
+      if (kind === "quarantine") latchResidueQuarantine({ cause: "test", site: "canonical_retention" }, nullLogger());
+      const opts: CanonicalReseedOptions = {
+        ...noProofReseed, isLive: () => live,
+        quiescent: async () => {
+          if (kind === "throw") throw new Error("unverified\n" + "x".repeat(300));
+          if (kind === "mid-live") live = true;
+          if (kind === "mid-quarantine") latchResidueQuarantine({ cause: "test", site: "canonical_retention" }, nullLogger());
+          if (kind === "mid-journal") await journal();
+          return kind === "absent" ? undefined as unknown as boolean : kind !== "false";
+        },
+      };
+      await g.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+      assert.ok(paths.every(p => fs.existsSync(p)));
+      assert.ok(rec.lines.some(l => String((l as { msg?: string }).msg).includes("keeping it")));
+      for (const entry of rec.lines) {
+        const line = entry as { reason?: string };
+        if (typeof line.reason === "string") {
+        assert.ok(line.reason.length <= 160);
+        assert.ok(!line.reason.includes("\n"));
+        }
+      }
+    });
+  }
+
+  it("unlinks residue symlinks and files without following an external target", async () => {
+    const { b, paths } = await planted();
+    const external = path.join(fx.dataDir, "external-retained");
+    fs.mkdirSync(external);
+    fs.writeFileSync(path.join(external, "keep"), "keep");
+    fs.rmSync(paths[0]!, { recursive: true }); fs.symlinkSync(external, paths[0]!);
+    fs.rmSync(paths[1]!, { recursive: true }); fs.writeFileSync(paths[1]!, "file");
+    fs.lutimesSync(paths[0]!, 1, 1); fs.utimesSync(paths[1]!, 1, 1);
+    await git.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(fs.existsSync(paths[0]!), false); assert.equal(fs.existsSync(paths[1]!), false);
+    assert.equal(fs.readFileSync(path.join(external, "keep"), "utf8"), "keep");
+  });
+
+  it("recovery interruption during proof propagates and leaves every residue", async () => {
+    const { b, paths } = await planted();
+    const controller = new AbortController();
+    await assert.rejects(git.withRecoveryOperation(controller.signal, Date.now() + 30000, () =>
+      git.createOrAttachRunnerClone(b, iid, { ...noProofReseed, quiescent: async () => {
+        controller.abort(new Error("retention interrupted")); throw controller.signal.reason;
+      } }, randomUUID())), /retention interrupted/);
+    assert.ok(paths.every(p => fs.existsSync(p)));
+    assert.equal(fs.existsSync(canonicalFor(iid)), false);
+  });
+
+  for (const failure of ["journal enumeration", "parent enumeration", "path validation"] as const) {
+    it(`unreadable ${failure} after the canonical guard aborts all residue reclamation`, async (t) => {
+      const { b, paths } = await planted();
+      fs.mkdirSync(canonicalFor(iid));
+      const rec = recordingLogger();
+      const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
+      let guarded = false;
+      let injected = false;
+      const originalRead = fs.promises.readdir.bind(fs.promises);
+      const originalStat = fs.promises.lstat.bind(fs.promises);
+      const gitSeam = g as unknown as { runGit: (cwd: string, args: string[]) => Promise<string> };
+      const originalGit = gitSeam.runGit.bind(g);
+      t.mock.method(gitSeam, "runGit", async (cwd: string, args: string[]) => {
+        if (guarded && !injected && failure === "journal enumeration" && args.includes("--list")) {
+          injected = true;
+          throw new Error("EACCES journal enumeration");
+        }
+        return originalGit(cwd, args);
+      });
+      t.mock.method(fs.promises, "readdir", async (...args: Parameters<typeof fs.promises.readdir>) => {
+        if (guarded && !injected && failure === "parent enumeration" && args[0] === runnerRepoDir()) {
+          injected = true;
+          throw new Error("EACCES parent enumeration");
+        }
+        return originalRead(...args);
+      });
+      t.mock.method(fs.promises, "lstat", async (...args: Parameters<typeof fs.promises.lstat>) => {
+        if (guarded && !injected && failure === "path validation" && args[0] === paths[1]) {
+          injected = true;
+          throw new Error("EACCES path validation");
+        }
+        return originalStat(...args);
+      });
+      let proofs = 0;
+      await g.createOrAttachRunnerClone(b, iid, {
+        ...noProofReseed, beforeFree: async () => { guarded = true; },
+        quiescent: async () => { proofs++; return true; },
+      }, randomUUID());
+      assert.ok(injected);
+      assert.equal(proofs, 0);
+      assert.ok(paths.every(p => fs.existsSync(p)));
+      assert.ok(rec.lines.some(l => /retention sweep failed/.test(String((l as { msg?: string }).msg))
+        && /EACCES/.test(String((l as { error?: string }).error))));
+    });
+  }
+
+  it("a canonical-free proof failure preserves its original typed failure and never sweeps", async () => {
+    const { b, paths } = await planted();
+    fs.mkdirSync(canonicalFor(iid));
+    const original = new CloneResidueBlockedError("canonical proof refused");
+    let proofs = 0;
+    await assert.rejects(git.createOrAttachRunnerClone(b, iid, {
+      ...noProofReseed, beforeFree: async () => { throw original; },
+      quiescent: async () => { proofs++; return true; },
+    }, randomUUID()), err => err === original);
+    assert.equal(proofs, 0);
+    assert.ok(paths.every(p => fs.existsSync(p)));
+    assert.ok(fs.existsSync(canonicalFor(iid)));
+  });
+
+  it("a failed runner-uid residue delete stops the canonical sweep and keeps the newer excess", async () => {
+    const { b, paths } = await planted();
+    const rec = recordingLogger();
+    const deletes: string[] = [];
+    const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(), retentionDelete: {
+        split: true, run: async (_command, args) => {
+          deletes.push(args.at(-1)!);
+          throw new Error("EACCES residue delete\n" + "x".repeat(300));
+        },
+      },
+    }));
+    await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.deepEqual(deletes, [paths[0]]);
+    assert.ok(paths.every(p => fs.existsSync(p)));
+    const warn = rec.lines.find(l => /retention sweep failed/.test(String((l as { msg?: string }).msg))) as { error: string };
+    assert.match(warn.error, /EACCES/);
+    assert.ok(warn.error.length <= 160);
+    assert.ok(!warn.error.includes("\n"));
+  });
+
+  it("an unsettled residue delete stops the canonical sweep; later sweeps refuse until close", async () => {
+    const { b, paths } = await planted();
+    const rec = recordingLogger();
+    const deletes: string[] = [];
+    let held: ChildProcess | undefined;
+    const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(), retentionDelete: {
+        split: true, timeoutMs: 5, closeWaitMs: 5, kill: () => false,
+        spawn: (_command, args) => {
+          const target = args.at(-1)!;
+          deletes.push(target);
+          const child = new EventEmitter() as unknown as ChildProcess;
+          Object.assign(child, { pid: 920001 + deletes.length, stderr: null });
+          if (target === paths[0] && !held) held = child;
+          else setImmediate(() => {
+            fs.rmSync(target, { recursive: true, force: true });
+            child.emit("close", 0, null);
+          });
+          return child;
+        },
+      },
+    }));
+    await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.deepEqual(deletes, [paths[0]]);
+    assert.ok(paths.every(p => fs.existsSync(p)));
+    assert.ok(rec.lines.some(l => /retention sweep failed/.test(String((l as { msg?: string }).msg))
+      && /may still be running/.test(String((l as { error?: string }).error))));
+    await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(deletes.filter(p => p === paths[0]).length, 1);
+    assert.ok(fs.existsSync(paths[0]!));
+    assert.ok(rec.lines.some(l => (l as { path?: string }).path === paths[0]
+      && /may still be running/.test(String((l as { reason?: string }).reason))));
+    held!.emit("close", null, "SIGKILL");
+    await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.equal(deletes.filter(p => p === paths[0]).length, 2);
+    assert.equal(fs.existsSync(paths[0]!), false);
+  });
+
+  for (const entry of ["directory", "file", "symlink"] as const) {
+    for (const veto of ["quarantine", "live", "path", "parent"] as const) {
+      it(`${veto} changing inside awaited delete lstat vetoes ${entry} destruction`, async (t) => {
+        const { b, paths } = await planted();
+        const target = paths[0]!;
+        const external = path.join(fx.dataDir, "external-kept");
+        fs.mkdirSync(external);
+        fs.writeFileSync(path.join(external, "keep"), "keep");
+        if (entry !== "directory") {
+          fs.rmSync(target, { recursive: true });
+          if (entry === "file") fs.writeFileSync(target, "keep");
+          else fs.symlinkSync(external, target);
+          fs.lutimesSync(target, 1000, 1000);
+        }
+        const rec = recordingLogger();
+        let live = false;
+        let checked = false;
+        const deletes: string[] = [];
+        const originalStat = fs.promises.lstat.bind(fs.promises);
+        let parentVetoed = false;
+        t.mock.method(fs.promises, "lstat", async (...args: Parameters<typeof fs.promises.lstat>) => {
+          const st = await originalStat(...args);
+          if (veto === "parent" && checked && !parentVetoed && args[0] === runnerRepoDir()) {
+            parentVetoed = true;
+            return Object.assign(Object.create(st) as fs.Stats, { isSymbolicLink: () => true, isDirectory: () => false });
+          }
+          return st;
+        });
+        const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+          gitleaksBin: defaultGitleaksShim(), retentionDelete: {
+            split: true, run: async (_command, args) => { deletes.push(args.at(-1)!); },
+            lstat: async p => {
+              const st = await fs.promises.lstat(p);
+              if (p === target) {
+                await Promise.resolve();
+                checked = true;
+                if (veto === "quarantine") latchResidueQuarantine({ cause: "test", site: "delete_lstat" }, nullLogger());
+                if (veto === "live") live = true;
+                if (veto === "path") throw new Error("EACCES delete path validation");
+              }
+              return st;
+            },
+          },
+        }));
+        await g.createOrAttachRunnerClone(b, iid, { ...noProofReseed, isLive: () => live }, randomUUID());
+        assert.ok(checked);
+        if (veto === "parent") assert.ok(parentVetoed, "parent is revalidated after the awaited target lstat");
+        assert.deepEqual(deletes, []);
+        assert.ok(paths.every(p => fs.existsSync(p)));
+        assert.equal(fs.readFileSync(path.join(external, "keep"), "utf8"), "keep");
+        assert.ok(rec.lines.some(l => /keeping it|retention sweep failed/.test(String((l as { msg?: string }).msg))));
+      });
+    }
+  }
+
+  // Exercise the actual private options creators without executing the slow recovery lifecycle.
+  function retentionOptions(extra: Parameters<typeof runnerWith>[4] = {}) {
+    const { factory } = transientFactory();
+    const runner = unwired(factory, extra);
+    const claim = gitlabClaim(iid);
+    const flight = {
+      runId: claim.run_id, attemptId: mintAttemptId(1), effectiveAttemptPaths: true,
+      executor: {}, runLog: nullLogger(), sinkGate: { run: async <T>(fn: () => Promise<T>) => fn() },
+    };
+    const creators = runner as unknown as {
+      canonicalReseedOptions: (flight: unknown) => CanonicalReseedOptions;
+      attemptSeedOptions: (claim: unknown, flight: unknown) => AttemptSeedOptions;
+    };
+    return {
+      canonical: creators.canonicalReseedOptions(flight),
+      attempt: creators.attemptSeedOptions(claim, flight),
+    };
+  }
+
+  for (const kind of ["empty", "live", "unattributed", "unreadable"] as const) {
+    it(`runner canonical retention uses the real proof with configured Docker: ${kind}`, { skip: process.platform !== "linux" }, async () => {
+      const { paths } = await planted(6);
+      const procRoot = makeFakeProcRoot();
+      const registry = new LiveAttemptRegistry();
+      const live = newRunAttempt(randomUUID(), 1, canonicalFor(iid), () => []);
+      if (kind === "live") registry.add(live);
+      if (kind === "live") plantInScope(procRoot, 424242, paths[0]!, { marker: live.marker, cloneKey: live.cloneKey });
+      if (kind === "unattributed") plantInScope(procRoot, 424242, paths[0]!);
+      if (kind === "unreadable") plantUnreadableUnattributed(procRoot, 424242);
+      const requests: QuiesceRunRequest[] = [];
+      const outcomes: QuiesceRunOutcome[] = [];
+      const dockerHost = `unix://${path.join(fx.dataDir, "absent-docker.sock")}`;
+      const opts = retentionOptions({
+        dockerHost, liveAttempts: registry, quiesceRun: async req => {
+          requests.push(req);
+          const outcome = await quiesceRunAttempt(req);
+          outcomes.push(outcome);
+          return outcome;
+        },
+      });
+      try {
+        await withQuiescenceView({ procRoot }, async () => {
+          assert.equal(await opts.canonical.quiescent([paths[0]!], canonicalFor(iid)), kind === "empty");
+          assert.equal(requests[0]?.dockerHost, dockerHost);
+          assert.equal(requests[0]?.mode, "seed");
+          assert.equal(requests[0]?.site, "canonical_retention");
+          assert.deepEqual(requests[0]?.targetPaths, [paths[0]]);
+          assert.equal(outcomes[0]?.docker.state, "docker_error");
+          assert.deepEqual(outcomes[0]?.process?.killed, []);
+          if (kind !== "empty") assert.ok(fs.existsSync(path.join(procRoot, "424242")), "no signal to a live or unattributed process");
+          if (kind === "unreadable") {
+            assert.equal(residueQuarantine()?.site, "canonical_retention");
+            fs.rmSync(path.join(procRoot, "424242"), { recursive: true });
+            assert.equal(await opts.canonical.quiescent([paths[0]!], canonicalFor(iid)), false);
+            assert.equal(requests.length, 1, "latched quarantine vetoes even a now-quiescent proof");
+          } else {
+            latchResidueQuarantine({ cause: "test", site: "before_proof" }, nullLogger());
+            assert.equal(await opts.canonical.quiescent([paths[0]!], canonicalFor(iid)), false);
+            assert.equal(requests.length, 1, "quarantine is checked before proof");
+          }
+        });
+      } finally {
+        fs.rmSync(procRoot, { recursive: true, force: true });
+      }
+    });
+  }
+
+  for (const kind of ["canonical", "attempt"] as const) {
+    it(`runner ${kind} retention checks quarantine before and after an affirmative proof`, async () => {
+      let proofs = 0;
+      const opts = retentionOptions({ quiesceRun: async () => {
+        proofs++;
+        latchResidueQuarantine({ cause: "test", site: "during_proof" }, nullLogger());
+        return quiescentOutcome();
+      } });
+      assert.equal(await opts[kind].quiescent(["retained"], canonicalFor(iid)), false);
+      assert.equal(proofs, 1, "quarantine set during an affirmative proof vetoes deletion");
+      assert.equal(await opts[kind].quiescent(["retained"], canonicalFor(iid)), false);
+      assert.equal(proofs, 1, "already quarantined skips the next proof");
+    });
+  }
+
+  it("a failed residue unlink stops the canonical sweep and preserves newer excess", async () => {
+    const { b, paths } = await planted();
+    const rec = recordingLogger();
+    const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+      gitleaksBin: defaultGitleaksShim(), retentionDelete: { lstat: async p => {
+        const st = await fs.promises.lstat(p);
+        return p === paths[0] ? Object.assign(Object.create(st) as fs.Stats,
+          { isSymbolicLink: () => true, isDirectory: () => false }) : st;
+      } },
+    }));
+    await g.createOrAttachRunnerClone(b, iid, noProofReseed, randomUUID());
+    assert.ok(paths.every(p => fs.existsSync(p)));
+    assert.ok(rec.lines.some(l => /retention sweep failed/.test(String((l as { msg?: string }).msg))
+      && /EISDIR|EPERM/.test(String((l as { error?: string }).error))));
+  });
+
+  it("runner attempt retention rejects an ABSENT process verdict through its real callback and stays process-only", async () => {
+    const requests: QuiesceRunRequest[] = [];
+    const opts = retentionOptions({
+      dockerHost: "unix:///absent-retention.sock", quiesceRun: async req => {
+        requests.push(req);
+        return { ...quiescentOutcome(), process: undefined };
+      },
+    });
+    assert.equal(await opts.attempt.quiescent(["retained"], canonicalFor(iid)), false);
+    assert.equal(requests[0]?.site, "attempt_retention");
+    assert.equal(requests[0]?.dockerHost, undefined);
+    assert.equal(requests[0]?.processes, process.platform === "linux");
+  });
+
+  it("fresh attempt unreadable relaxation preserves retentionVetoed after the quarantine latch resets", async () => {
+    const requests: QuiesceRunRequest[] = [];
+    const opts = retentionOptions({ quiesceRun: async req => {
+      requests.push(req);
+      return { ...quiescentOutcome(), process: {
+        state: "unverified", killed: [], detail: "unreadable",
+        processes: [{ pid: 424242, uid: process.getuid?.() ?? 0, comm: "node", cwd: "unreadable", reason: "unreadable_unattributed" }],
+      } };
+    } });
+    await opts.attempt.beforeSeed([], canonicalFor(iid));
+    resetResidueQuarantineForTests();
+    assert.equal(await opts.attempt.quiescent(["retained"], canonicalFor(iid)), false);
+    assert.equal(requests.length, 1, "this seed's veto survives a later affirmative proof");
+  });
+
+  for (const verdict of ["quiescent", "unverified", "absent"] as const) {
+    it(`runner canonical retention requests seed-mode proof and requires affirmative verdict: ${verdict}`, async () => {
+      const { paths } = await planted(6);
+      const calls: QuiesceRunRequest[] = [];
+      const { factory } = transientFactory();
+      await unwired(factory, { quiesceRun: async req => {
+        calls.push(req);
+        if (req.site !== "canonical_retention" || verdict === "quiescent") return quiescentOutcome();
+        return { ...quiescentOutcome(), process: verdict === "absent" ? undefined : { state: "unverified", processes: [], killed: [], detail: "unverified" } };
+      } }).execute(gitlabClaim(iid));
+      const req = calls.find(c => c.site === "canonical_retention");
+      assert.ok(req); assert.equal(req.mode, "seed"); assert.deepEqual(req.targetPaths, [paths[0]]);
+      assert.equal(req.dockerHost, undefined); assert.equal(req.cloneKey, newRunAttempt("r", 1, canonicalFor(iid), () => []).cloneKey);
+      assert.equal(fs.existsSync(paths[0]!), verdict !== "quiescent");
+      assert.ok(paths.slice(1).every(p => fs.existsSync(p)));
+    });
+  }
 });

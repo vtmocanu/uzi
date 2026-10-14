@@ -9162,7 +9162,7 @@ export class RunRunner {
         this.liveAttempts.add(attempt);
       },
       quiescent: async (paths, canonical) => {
-        if (retentionVetoed) return false;
+        if (retentionVetoed || residueQuarantine() !== undefined) return false;
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
           site: "attempt_retention",
@@ -9170,7 +9170,7 @@ export class RunRunner {
           clonePath: canonical,
           processOnly: true,
         });
-        return !proof.blocked;
+        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
       },
     };
   }
@@ -9192,6 +9192,15 @@ export class RunRunner {
    */
   private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
     return {
+      isLive: (p) => this.liveAttempts.isLivePath(p),
+      quiescent: async (paths, canonical) => {
+        if (residueQuarantine() !== undefined) return false;
+        const proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "seed", site: "canonical_retention", targetPaths: paths, clonePath: canonical,
+          propagateControl: true,
+        });
+        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
+      },
       beforeFree: async (canonical) => {
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",

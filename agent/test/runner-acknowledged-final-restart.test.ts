@@ -208,6 +208,8 @@ for (const { caller, afterUnlinkFault, liveClient } of [
     const bare = await git.ensureClone(fx.originPath);
     const attemptId = mintAttemptId(generation);
     const clone = await git.runnerCloneForBranch(bare, branch, "issue-2883", {
+      isLive: () => false,
+      quiescent: async () => true,
       beforeFree: async () => { throw new Error("seed cannot free a clone"); },
     }, claim.run_id, false, undefined, {
       attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),

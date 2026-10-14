@@ -1535,6 +1535,9 @@ export interface CanonicalReseedOptions {
    *  entry moves nothing a process can be inside). Throws (a {@link CloneResidueBlockedError}) to
    *  block: nothing is removed or moved. */
   beforeFree: (canonicalPath: string) => Promise<void>;
+  /** Retention predicates, with the same contract as AttemptSeedOptions. */
+  isLive: AttemptSeedOptions["isLive"];
+  quiescent: AttemptSeedOptions["quiescent"];
 }
 
 /**
@@ -2739,6 +2742,12 @@ export class GitCache {
       }
       if ((await this.journaledClonePaths(barePath)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
+      await this.sweepResidue(barePath, clonePath, reseed).catch((err: unknown) => {
+        this.checkRecoveryInterruption();
+        this.log.warn("runner clone retention sweep failed; nothing further removed", {
+          key, error: sanitizeForLog(gitErrorMessage(err), 157),
+        });
+      });
       return this.seedRunnerClone(barePath, branch, clonePath, runId, resume, expectedCheckpointTip, opts);
     });
   }
@@ -3079,7 +3088,6 @@ export class GitCache {
     attempt: AttemptSeedOptions,
   ): Promise<void> {
     const parent = path.dirname(canonical);
-    const key = path.basename(canonical);
     const names = await fs.readdir(parent);
     const journaled = [...(await this.journaledClonePaths(barePath))];
     const ledgers = await this.readAllAttemptLedgers(barePath);
@@ -3151,7 +3159,26 @@ export class GitCache {
       }
     }
 
-    // 2. This key's residue, oldest (mtime) first beyond the cap.
+    await this.sweepResidue(barePath, canonical, attempt);
+  }
+
+  /** Residue-only retention under the bare lock. Enumerate and validate the complete original
+   * candidate set before deleting; refusals never substitute a newer entry for an older one. */
+  private async sweepResidue(
+    barePath: string,
+    canonical: string,
+    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent">,
+  ): Promise<void> {
+    const parent = path.dirname(canonical);
+    const key = path.basename(canonical);
+    const validateParent = async (): Promise<void> => {
+      if (path.dirname(parent) !== path.resolve(this.runnerRoot)) throw new Error("not a direct runner repo dir");
+      const st = await fs.lstat(parent);
+      if (st.isSymbolicLink() || !st.isDirectory()) throw new Error("runner repo dir is not a real directory");
+    };
+    await validateParent();
+    const names = await fs.readdir(parent);
+    await this.journaledClonePaths(barePath);
     const isOwnResidue = (n: string): boolean => {
       const art = parseRetainedArtifactName(n);
       return art?.kind === "residue" && art.key === key;
@@ -3160,14 +3187,48 @@ export class GitCache {
     for (const name of names) {
       if (!isOwnResidue(name)) continue;
       const p = path.join(parent, name);
-      const st = await fs.lstat(p).catch(() => undefined);
-      if (st) residue.push({ p, name, mtimeMs: st.mtimeMs });
+      try {
+        const st = await fs.lstat(p);
+        residue.push({ p, name, mtimeMs: st.mtimeMs });
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+      }
     }
     residue.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
-      if (namedByJournal(r.p) || attempt.isLive(r.p)) continue;
-      if (!(await quiescent([r.p]))) continue;
-      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, { unlinkNonDirectory: true })) {
+      const refuse = (reason: string): false => {
+        this.log.warn("runner clone retention: refusing residue deletion; keeping it", {
+          path: r.p, reason: sanitizeForLog(reason, 157),
+        });
+        return false;
+      };
+      const open = (): boolean => {
+        this.checkRecoveryInterruption();
+        if (residueQuarantine() !== undefined) return refuse("worker quarantined");
+        if (predicates.isLive(r.p)) return refuse("live path");
+        return true;
+      };
+      const validate = async (): Promise<boolean> => {
+        await validateParent();
+        const journaled = await this.journaledClonePaths(barePath);
+        if ([...journaled].some((j) => isWithinPath(j, r.p))) return refuse("named by recovery journal");
+        return open();
+      };
+      if (!(await validate())) continue;
+      let proven: boolean;
+      try {
+        proven = await predicates.quiescent([r.p], canonical);
+      } catch (err) {
+        this.checkRecoveryInterruption();
+        refuse(gitErrorMessage(err));
+        continue;
+      }
+      if (!open()) continue;
+      if (proven !== true) { refuse("no affirmative quiescence proof"); continue; }
+      if (!(await validate())) continue;
+      if (await this.deleteRetainedArtifact(parent, r.p, isOwnResidue, {
+        unlinkNonDirectory: true, beforeDelete: validate, canDelete: open, strictValidation: true,
+      })) {
         this.log.info("runner clone retention: deleted quarantined residue", { path: r.p });
       }
     }
@@ -3202,10 +3263,10 @@ export class GitCache {
     parent: string,
     target: string,
     isExpected: (name: string) => boolean,
-    opts: { unlinkNonDirectory?: boolean } = {},
+    opts: { unlinkNonDirectory?: boolean; beforeDelete?: () => Promise<boolean>; canDelete?: () => boolean; strictValidation?: boolean } = {},
   ): Promise<boolean> {
     const refuse = (why: string): false => {
-      this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: why });
+      this.log.warn("runner clone retention: refusing to delete; keeping it", { path: target, reason: sanitizeForLog(why, 157) });
       return false;
     };
     const root = path.resolve(this.runnerRoot);
@@ -3215,24 +3276,39 @@ export class GitCache {
     // a second rm here would run beside it. Keep the target; a later sweep retries it after 'close'.
     for (const unsettled of this.unsettledDeletes.keys()) {
       if (isWithinPath(target, unsettled)) {
-        return refuse(`an earlier runner-uid delete of this path (${unsettled}) may still be running`);
+        return refuse("an earlier runner-uid delete of this path (or its parent) may still be running");
       }
     }
     const lstat = this.retentionDeleteSeam?.lstat ?? ((p: string) => fs.lstat(p));
+    let nonDirectory = false;
     try {
       const pst = await lstat(parent);
-      if (pst.isSymbolicLink() || !pst.isDirectory()) return refuse("the runner repo dir is not a real directory");
-      const st = await lstat(target);
-      if (st.isSymbolicLink() || !st.isDirectory()) {
-        if (!opts.unlinkNonDirectory) return refuse("not a real directory");
-        // issue #1783 M3: a symlink or file quarantined off the canonical path. unlink(2) removes
-        // the entry itself and never follows it; a directory swapped in meanwhile fails it (kept).
-        await fs.unlink(target);
-        return true;
+      if (pst.isSymbolicLink() || !pst.isDirectory()) {
+        if (opts.strictValidation) throw new Error("the runner repo dir is not a real directory");
+        return refuse("the runner repo dir is not a real directory");
       }
+      const st = await lstat(target);
+      nonDirectory = st.isSymbolicLink() || !st.isDirectory();
+      if (nonDirectory && !opts.unlinkNonDirectory) return refuse("not a real directory");
     } catch (err) {
       if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+      if (opts.strictValidation) throw err;
       return refuse(gitErrorMessage(err));
+    }
+    // Journal reads await after lstat; live/quarantine/control vetoes run synchronously at the
+    // destruction boundary, after every awaited validation (for unlink and recursive delete).
+    if (opts.beforeDelete && !(await opts.beforeDelete())) return false;
+    if (opts.canDelete && !opts.canDelete()) return false;
+    if (nonDirectory) {
+      try {
+        await fs.unlink(target);
+        return true;
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") return true;
+        refuse(gitErrorMessage(err));
+        if (opts.strictValidation) throw err;
+        return false;
+      }
     }
     try {
       await this.runRunnerUidDelete(target);
@@ -3240,7 +3316,8 @@ export class GitCache {
       // An rm that may still be alive: stop the whole sweep (the caller logs "nothing further
       // removed") rather than start another delete beside it.
       if (err instanceof RunnerDeleteUnsettledError) throw err;
-      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: gitErrorMessage(err) });
+      this.log.warn("runner clone retention: could not delete; keeping it", { path: target, error: sanitizeForLog(gitErrorMessage(err), 157) });
+      if (opts.strictValidation) throw err;
       return false;
     }
     return true;
