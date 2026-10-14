@@ -25,6 +25,8 @@
       "terminal_pending_since": "2020-01-02T03:04:05Z"
     }
   ],
+  "pending_outcome_count": 1,
+  "pending_overflow": true,
   "retaining_unpublished_work": true,
   "custody_decisions_needed": 1,
   "disk_pressure_threshold": 1.5,

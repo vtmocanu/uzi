@@ -337,10 +337,35 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	if w.CustodyDecisionsNeeded != nil && *w.CustodyDecisionsNeeded > 0 {
 		add(1, "⚑ unpublished work", "⚑ unpublished work needs an owner decision")
 	}
-	for _, run := range w.ReportedRuns {
-		if run.TerminalPending {
-			text := "◷ outcome pending " + workerAge(run.TerminalPendingSince, now)
-			add(1, text, text+" · not yet delivered/acknowledged")
+	if w.PendingOutcomeCount != nil || w.PendingOverflow != nil {
+		pending := int64(0)
+		for _, run := range w.ReportedRuns {
+			if run.TerminalPending {
+				pending++
+			}
+		}
+		if w.PendingOutcomeCount != nil {
+			pending = *w.PendingOutcomeCount
+		}
+		text := ""
+		if w.PendingOverflow != nil && *w.PendingOverflow {
+			text = fmt.Sprintf("%d confirmed pending; more may be pending", pending)
+		} else if pending > 0 {
+			noun := "pending outcomes"
+			if pending == 1 {
+				noun = "pending outcome"
+			}
+			text = fmt.Sprintf("%d %s", pending, noun)
+		}
+		if text != "" {
+			add(1, text, text)
+		}
+	} else {
+		for _, run := range w.ReportedRuns {
+			if run.TerminalPending {
+				text := "◷ outcome pending " + workerAge(run.TerminalPendingSince, now)
+				add(1, text, text+" · not yet delivered/acknowledged")
+			}
 		}
 	}
 	if w.OutboxPendingMessages != nil && *w.OutboxPendingMessages > 0 {

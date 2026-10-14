@@ -2377,6 +2377,12 @@ export interface Worker {
   // literals compile while the wire contract stays a never-null array (pinned by the api-contract
   // parity check against the recorded fixtures).
   reported_runs?: WorkerReportedRun[];
+  // Issue #2009: API-fresh evidence aggregate, independent of the listed snapshot rows.
+  // Explicit zero is authoritative; omitted on an unavailable/failed evidence query.
+  pending_outcome_count?: number;
+  // Fresh overflow evidence, not the historical worker flag. Explicit false is known;
+  // omission means unavailable. True means more outcomes may be pending beyond the count.
+  pending_overflow?: boolean;
   // True for ANY open custody hold, healthy live runs included. Protects local source
   // through deletion, cleanup and hosted-quota safety guards; independent of owner decisions.
   // Optional in TS (mocks/older payloads may omit it); the api always sends it.

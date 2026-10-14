@@ -70,6 +70,10 @@ type WorkerDTO struct {
 	// array, never null — the list/patch handlers overlay it from the DB and the DTO builders
 	// seed it to [] — so a worker the snapshot table has no row for encodes as [], not null.
 	ReportedRuns []WorkerReportedRunDTO `json:"reported_runs"`
+	// Pending aggregates are independently read server authority. Nil means unavailable;
+	// pointers preserve authoritative zero/false without changing legacy omissions.
+	PendingOutcomeCount *int64 `json:"pending_outcome_count,omitempty"`
+	PendingOverflow     *bool  `json:"pending_overflow,omitempty"`
 	// RetainingUnpublishedWork is true for ANY open custody hold, including healthy live
 	// runs. It protects local source through deletion, cleanup and hosted-quota safety guards.
 	// It is independent of owner decisions and false once all holds are released or discarded.

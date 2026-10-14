@@ -493,18 +493,16 @@ func compactBytes(n int64) string {
 //
 // An entry flagged terminal_pending is NOT a running execution: its outcome is journaled on the
 // worker but not yet delivered to the api (its phase still reads "running"). Those entries are
-// excluded from the phase tally and rendered as "N pending outcome(s)", with " (oldest <age>)"
-// from the oldest non-nil terminal_pending_since (omitted when every since is nil).
+// excluded from the phase tally. PendingOutcomeCount overrides the listed pending count,
+// even at zero, without an oldest annotation. Fresh PendingOverflow adds the confirmed
+// pending warning. Legacy responses use listed pending rows and their oldest known age.
 //
 // The raw reported_runs array also rides `--json` untouched (run_id/phase/claim_generation/
 // terminal_pending/terminal_pending_since per entry) for scripting, so an agent keys off the
 // structured fields rather than parsing this cell.
 func reportedRunsCell(w apitypes.WorkerDTO) string {
-	if len(w.ReportedRuns) == 0 {
-		return "-"
-	}
 	counts := make(map[string]int, len(w.ReportedRuns))
-	pending := 0
+	pending := int64(0)
 	var oldest *time.Time
 	for _, rr := range w.ReportedRuns {
 		if rr.TerminalPending {
@@ -534,7 +532,13 @@ func reportedRunsCell(w apitypes.WorkerDTO) string {
 	for _, ph := range extra {
 		parts = append(parts, fmt.Sprintf("%d %s", counts[ph], ph))
 	}
-	if pending > 0 {
+	if w.PendingOutcomeCount != nil {
+		pending = *w.PendingOutcomeCount
+		oldest = nil
+	}
+	if w.PendingOverflow != nil && *w.PendingOverflow {
+		parts = append(parts, fmt.Sprintf("%d confirmed pending; more may be pending", pending))
+	} else if pending > 0 {
 		noun := "pending outcomes"
 		if pending == 1 {
 			noun = "pending outcome"
@@ -544,6 +548,9 @@ func reportedRunsCell(w apitypes.WorkerDTO) string {
 			part += " (oldest " + formatUptimeDuration(reportedRunsNow().Sub(*oldest)) + ")"
 		}
 		parts = append(parts, part)
+	}
+	if len(parts) == 0 {
+		return "-"
 	}
 	return strings.Join(parts, ", ")
 }

@@ -26,6 +26,23 @@ function aggregateWorker(
 }
 
 describe("WorkerPendingOutcomeBadge issue 2009", () => {
+  it.each([
+    { pending_outcome_count: 0, pending_overflow: true },
+    { pending_overflow: true },
+  ])("renders zero with overflow and missing reported_runs: %j", (worker) => {
+    const { container } = render(<WorkerPendingOutcomeBadge worker={worker} nowMs={NOW} />);
+    const pill = screen.getByText("0 confirmed pending; more may be pending");
+    expect(pill.textContent).toBe("0 confirmed pending; more may be pending");
+    expect(pill.getAttribute("title")).toBe("Outcome journaled on this worker but not yet delivered to the api.\n");
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  it("renders an aggregate-only ordinary count when overflow is omitted", () => {
+    render(<WorkerPendingOutcomeBadge worker={{ pending_outcome_count: 2 }} nowMs={NOW} />);
+    expect(screen.getByText("2 pending outcomes").getAttribute("title"))
+      .toBe("Outcome journaled on this worker but not yet delivered to the api.\n");
+  });
+
   it("renders zero confirmed pending with overflow even when reported_runs is empty", () => {
     render(
       <WorkerPendingOutcomeBadge

@@ -1716,6 +1716,29 @@ it("plan-check findings permit a null item array", () => {
 });
 
 
+describe("worker pending outcome contract issue 2009", () => {
+  it.each([
+    ["owner", workerFull, workerZero],
+    ["admin", adminWorkerFull, adminWorkerZero],
+  ] as const)("records populated fresh evidence and legacy omissions for %s", (_scope, full, zero) => {
+    expect(full).toHaveProperty("pending_outcome_count", 1);
+    expect(full).toHaveProperty("pending_overflow", true);
+    expect(zero).not.toHaveProperty("pending_outcome_count");
+    expect(zero).not.toHaveProperty("pending_overflow");
+  });
+
+  it("retains explicit authoritative zero and false separately from missing evidence", () => {
+    const evidence: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {
+      pending_outcome_count: 0,
+      pending_overflow: false,
+    };
+    const wire = JSON.parse(JSON.stringify(evidence));
+    expect(wire).toEqual({ pending_outcome_count: 0, pending_overflow: false });
+    const unavailable: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {};
+    expect(JSON.parse(JSON.stringify(unavailable))).toEqual({});
+  });
+});
+
 describe("worker custody decision contract", () => {
   it("records populated counts while zero DTOs omit the optional field", () => {
     expect(workerFull.custody_decisions_needed).toBe(1);

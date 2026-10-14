@@ -459,27 +459,34 @@ func (h *Handler) overlayWorkerReports(dto *apitypes.WorkerDTO, workerID uuid.UU
 	h.overlayResidueQuarantine(dto, workerID)
 }
 
-// reportedRunsByWorker reads each listed worker's reported active runs (PRD #1390 M2c) from
-// the worker_active_runs snapshot table in ONE batched round-trip, grouped by worker id. The
-// batch is what keeps the two list endpoints off an N+1: ListWorkers and AdminListWorkers pass
-// every row's id at once, PatchWorker a one-element set. Every worker in workerIDs gets a
-// (possibly empty, never nil) slice, so overlayReportedRuns always attaches a JSON array — a
-// worker the table has no row for encodes reported_runs as [], not null. A query error is
-// logged and yields the all-empty map: reported_runs is a display overlay and must never fail
-// the response, mirroring overlayOutbox's nil-safe posture. A nil store (defensive; the handler
-// always wires one) also yields the all-empty map.
-func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUID) map[uuid.UUID][]apitypes.WorkerReportedRunDTO {
-	byWorker := make(map[uuid.UUID][]apitypes.WorkerReportedRunDTO, len(workerIDs))
+type workerReportedRuns struct {
+	runs       map[uuid.UUID][]apitypes.WorkerReportedRunDTO
+	aggregates map[uuid.UUID]store.ListWorkerPendingOutcomeAggregatesRow
+}
+
+// reportedRunsByWorker performs two independent batched display reads. Snapshot
+// failure leaves empty arrays; aggregate failure leaves authority unavailable.
+func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUID) workerReportedRuns {
+	result := workerReportedRuns{runs: make(map[uuid.UUID][]apitypes.WorkerReportedRunDTO, len(workerIDs)), aggregates: make(map[uuid.UUID]store.ListWorkerPendingOutcomeAggregatesRow)}
+	byWorker := result.runs
 	for _, id := range workerIDs {
 		byWorker[id] = []apitypes.WorkerReportedRunDTO{}
 	}
 	if len(workerIDs) == 0 || h.q == nil {
-		return byWorker
+		return result
+	}
+	aggregates, aggregateErr := h.q.ListWorkerPendingOutcomeAggregates(ctx, workerIDs)
+	if aggregateErr != nil {
+		slog.Error("overlay pending outcome aggregates", "error", aggregateErr)
+	} else {
+		for _, row := range aggregates {
+			result.aggregates[row.WorkerID] = row
+		}
 	}
 	rows, err := h.q.ListActiveRunsForWorkers(ctx, workerIDs)
 	if err != nil {
 		slog.Error("overlay reported runs", "error", err)
-		return byWorker
+		return result
 	}
 	for _, row := range rows {
 		dto := apitypes.WorkerReportedRunDTO{
@@ -494,20 +501,22 @@ func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUI
 		}
 		byWorker[row.WorkerID] = append(byWorker[row.WorkerID], dto)
 	}
-	return byWorker
+	return result
 }
 
-// overlayReportedRuns folds a worker's reported active runs (PRD #1390 M2c) onto its DTO,
-// mirroring overlayOutbox but reading the DB (via reportedRunsByWorker's batched result) rather
-// than an in-process tracker. It always sets a non-nil slice, so reported_runs marshals as a
-// JSON array even for a workerID byWorker has no entry for — belt-and-braces beside the batch,
-// which already pre-seeds a [] per id.
-func (h *Handler) overlayReportedRuns(dto *apitypes.WorkerDTO, byWorker map[uuid.UUID][]apitypes.WorkerReportedRunDTO, workerID uuid.UUID) {
-	runs := byWorker[workerID]
+// overlayReportedRuns preserves actual snapshot rows and independently available aggregates.
+func (h *Handler) overlayReportedRuns(dto *apitypes.WorkerDTO, result workerReportedRuns, workerID uuid.UUID) {
+	runs := result.runs[workerID]
 	if runs == nil {
 		runs = []apitypes.WorkerReportedRunDTO{}
 	}
 	dto.ReportedRuns = runs
+	dto.PendingOutcomeCount = nil
+	dto.PendingOverflow = nil
+	if aggregate, ok := result.aggregates[workerID]; ok {
+		dto.PendingOutcomeCount = &aggregate.PendingCount
+		dto.PendingOverflow = &aggregate.PendingOverflowFresh
+	}
 }
 
 // runDiskByWorker reads each listed worker's largest runs by HOME size (PRD #1809 M6, D8) in ONE
