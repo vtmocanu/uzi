@@ -1,11 +1,15 @@
 package workersvc
 
 import (
+	"bytes"
+	"errors"
+	"reflect"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -666,5 +670,410 @@ func TestHeartbeatReconcileDoesNotDeadlockLiveDB(t *testing.T) {
 	}
 	if got := statusOf(t, env, run); got != "running" {
 		t.Fatalf("run status = %q, want restored to running once the sibling lock released", got)
+	}
+}
+
+// outageCodexFlight starts at generation zero. Credential/binding fixtures do not
+// prove a claim: only Service.Claim below supplies the capability used by these tests.
+type outageCodexFlight struct {
+	env     codexTestEnv
+	f       codexRunFixture
+	p       *ClaimPayload
+	initial store.Run
+}
+
+func newOutageCodexFlight(t *testing.T, mode string) outageCodexFlight {
+	t.Helper()
+	env := setupCodexLiveDB(t)
+	var f codexRunFixture
+	if mode == codexAuthModeAPIKey {
+		f = newAPIKeyFixture(t, env)
+	} else {
+		f = newSubscriptionFixture(t, env)
+	}
+	resealBotPAT(t, env, f.userID)
+	env.exec("UPDATE runs SET status='queued', worker_id=NULL WHERE id=$1", f.runID)
+	before := mustRun(t, env, f.runID)
+	if before.ClaimGeneration != 0 || before.CodexClaimEpoch != 0 || len(before.CodexCapHash) != 0 {
+		t.Fatal("initial fixture must not seed generation, epoch or capability")
+	}
+	f.svc = New(env.q, env.box, testParams())
+	f.svc.SetTxBeginner(env.pool)
+	w, nonce, err := f.svc.Register(env.ctx, hbWorker(t, env, f.workerID), "m1-test", "base", nil, nil,
+		[]string{capability.CodexHarnessV1, capability.CodexRuntimeV2, capability.RecoveryArchiveV1, capability.CodexAccountParkV1}, nil)
+	if err != nil || nonce == "" {
+		t.Fatalf("initial Register: nonce present=%v err=%v", nonce != "", err)
+	}
+	f.wkr = w
+	payload, err := f.svc.Claim(env.ctx, w, nil)
+	if err != nil || payload == nil || payload.RunID != f.runID.String() || payload.Secrets.Codex == nil || payload.Secrets.Codex.Capability == "" {
+		t.Fatalf("initial Service.Claim: payload=%v err=%v", payload != nil, err)
+	}
+	initial := mustRun(t, env, f.runID)
+	if initial.ClaimGeneration != 1 || initial.ClaimReleasedAt.Valid || len(initial.CodexCapHash) == 0 {
+		t.Fatal("initial real claim did not install generation one authority")
+	}
+	if payload.Secrets.Codex.AccessToken != f.accessToken {
+		t.Fatal("initial claim did not return the bound access credential")
+	}
+	x := outageCodexFlight{env: env, f: f, p: payload, initial: initial}
+	x.assertAuthority(t, w, payload.Secrets.Codex.Capability, nil)
+	return x
+}
+
+func (x outageCodexFlight) scopes() []CodexOpScope {
+	if x.initial.CodexAuthMode.String == codexAuthModeAPIKey {
+		return []CodexOpScope{ScopeReleaseAccessToken}
+	}
+	return []CodexOpScope{ScopeReleaseAccessToken, ScopeStartRefresh, ScopePersistRecovery}
+}
+
+func (x outageCodexFlight) assertAuthority(t *testing.T, w store.Worker, wire string, want error) {
+	t.Helper()
+	for _, scope := range x.scopes() {
+		_, err := x.f.svc.AuthorizeCodexCredentialOp(x.env.ctx, w, x.f.runID, wire, scope)
+		if !errors.Is(err, want) {
+			t.Errorf("%s authority: got %v, want %v", scope, err, want)
+		}
+	}
+}
+
+func (x outageCodexFlight) beat(t *testing.T, epoch int64, nonce string, active []ActiveRunEntry) {
+	t.Helper()
+	if _, err := x.f.svc.Heartbeat(x.env.ctx, hbWorker(t, x.env, x.f.workerID), nil, nil,
+		&ActiveSnapshot{SnapshotEpoch: epoch, RegisterNonce: nonce, Active: active}); err != nil {
+		t.Fatalf("Heartbeat epoch %d: %v", epoch, err)
+	}
+}
+
+func (x outageCodexFlight) liveEntry(phase string) []ActiveRunEntry {
+	return []ActiveRunEntry{entry(x.f.runID, x.initial.ClaimGeneration, phase, false)}
+}
+
+// provisional executes the two production sweeper queries, with elapsed-time
+// fixtures rather than sleeping or disturbing a shared database.
+func (x outageCodexFlight) provisional(t *testing.T, path string) {
+	t.Helper()
+	x.env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '3 hours' WHERE id=$1", x.f.workerID)
+	x.env.exec("UPDATE runs SET claimed_at=now()-interval '3 hours' WHERE id=$1", x.f.runID)
+	found := false
+	cutoff := pgconv.Time(time.Now().Add(-time.Hour))
+	switch path {
+	case "stale_worker":
+		rows, err := x.env.q.RequeueRunsOfStaleWorkers(x.env.ctx, store.RequeueRunsOfStaleWorkersParams{MaxRequeues: 5, Cutoff: cutoff})
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.ID == x.f.runID {
+				found = true
+			}
+		}
+	case "claimed_never_started":
+		rows, err := x.env.q.SweepClaimedNeverStarted(x.env.ctx, cutoff)
+		if err != nil {
+			t.Fatal(err)
+		}
+		for _, row := range rows {
+			if row.ID == x.f.runID {
+				found = true
+			}
+		}
+	default:
+		t.Fatalf("unknown provisional path %q", path)
+	}
+	if !found || statusOf(t, x.env, x.f.runID) != "queued" {
+		t.Fatal("real provisional requeue did not return the flight")
+	}
+	if got := claimGenOf(t, x.env, x.f.runID); got != x.initial.ClaimGeneration {
+		t.Fatalf("provisional requeue advanced generation to %d", got)
+	}
+	wantCount := 0
+	if path == "stale_worker" {
+		wantCount = 1
+	}
+	if got := requeueCountOf(t, x.env, x.f.runID); got != wantCount {
+		t.Fatalf("provisional requeue charge=%d want=%d", got, wantCount)
+	}
+	gen, valid := staleReqGenOf(t, x.env, x.f.runID)
+	if valid != (path == "stale_worker") || (valid && gen != x.initial.ClaimGeneration) {
+		t.Fatalf("provisional provenance=%d/%v", gen, valid)
+	}
+}
+
+// custody reads immutable provenance and live pointers, not only the aggregate.
+type outageCustody struct {
+	ID, Owner, Run, Worker, LiveWorker, LiveRun uuid.UUID
+	Generation                                  int64
+	Identity, State                             string
+}
+
+func (x outageCodexFlight) custody(t *testing.T) []outageCustody {
+	t.Helper()
+	rows, err := x.env.pool.Query(x.env.ctx, `SELECT id,user_id,run_id,original_worker_id,
+		live_worker_id,live_run_id,generation,original_worker_identity,state
+		FROM recovery_custody_holds WHERE run_id=$1 ORDER BY generation,id`, x.f.runID)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer rows.Close()
+	var result []outageCustody
+	for rows.Next() {
+		var h outageCustody
+		if err := rows.Scan(&h.ID, &h.Owner, &h.Run, &h.Worker, &h.LiveWorker, &h.LiveRun, &h.Generation, &h.Identity, &h.State); err != nil {
+			t.Fatal(err)
+		}
+		result = append(result, h)
+	}
+	if err := rows.Err(); err != nil {
+		t.Fatal(err)
+	}
+	return result
+}
+
+func TestCodexProvisionalReadoptAuthorityLiveDB(t *testing.T) {
+	for _, path := range []string{"stale_worker", "claimed_never_started"} {
+		for _, mode := range []string{codexAuthModeSubscription, codexAuthModeAPIKey} {
+			for _, phase := range []string{"running", "awaiting_approval"} {
+				t.Run(path+"/"+mode+"/"+phase, func(t *testing.T) {
+					x := newOutageCodexFlight(t, mode)
+					holds := x.custody(t)
+					if len(holds) != 1 || holds[0].Generation != 1 || holds[0].Worker != x.f.workerID ||
+						holds[0].LiveWorker != x.f.workerID || holds[0].LiveRun != x.f.runID ||
+						holds[0].Owner != x.f.userID || holds[0].Run != x.f.runID ||
+						holds[0].Identity != workerIdentity(x.f.wkr) || holds[0].State != "open" {
+						t.Fatalf("initial real claim custody=%+v", holds)
+					}
+					nonce := hbWorker(t, x.env, x.f.workerID).SnapshotRegisterNonce.String
+					x.beat(t, 1, nonce, x.liveEntry(phase))
+					x.provisional(t, path)
+					// Queued denies every applicable scope; exact state-gate controls
+					// below keep an epoch failure from masking that predicate.
+					for _, scope := range x.scopes() {
+						if _, err := x.f.svc.AuthorizeCodexCredentialOp(x.env.ctx, x.f.wkr, x.f.runID, x.p.Secrets.Codex.Capability, scope); err == nil {
+							t.Errorf("queued accepted %s", scope)
+						}
+					}
+					x.beat(t, 2, nonce, x.liveEntry(phase))
+					r := mustRun(t, x.env, x.f.runID)
+					if r.Status != phase || r.ClaimGeneration != x.initial.ClaimGeneration || r.WorkerID != x.initial.WorkerID ||
+						r.ClaimReleasedAt.Valid || r.RequeueCount != 0 || r.StaleRequeueGeneration.Valid {
+						t.Fatalf("readopt: status=%s gen=%d count=%d provenance=%v released=%v", r.Status, r.ClaimGeneration, r.RequeueCount, r.StaleRequeueGeneration, r.ClaimReleasedAt)
+					}
+					if got := x.custody(t); !reflect.DeepEqual(got, holds) {
+						t.Fatalf("readopt changed custody: %+v", got)
+					}
+					beforeRepeat := r
+					x.beat(t, 2, nonce, x.liveEntry(phase))
+					x.beat(t, 3, nonce, x.liveEntry(phase))
+					if !reflect.DeepEqual(beforeRepeat, mustRun(t, x.env, x.f.runID)) || !reflect.DeepEqual(holds, x.custody(t)) {
+						t.Fatal("repeated/newer identical snapshot changed run, charge or custody")
+					}
+					// These assertions must reach authorization AFTER a real readopt.
+					// Old SQL independently fails preservation and returns the epoch sentinel.
+					t.Run("preserved_capability", func(t *testing.T) {
+						if r.CodexClaimEpoch != x.initial.CodexClaimEpoch || !bytes.Equal(r.CodexCapHash, x.initial.CodexCapHash) {
+							t.Fatalf("provisional readopt revoked capability: epoch %d -> %d hash retained=%v", x.initial.CodexClaimEpoch, r.CodexClaimEpoch, bytes.Equal(r.CodexCapHash, x.initial.CodexCapHash))
+						}
+					})
+					for _, scope := range x.scopes() {
+						t.Run(scope.String(), func(t *testing.T) {
+							if _, err := x.f.svc.AuthorizeCodexCredentialOp(x.env.ctx, x.f.wkr, x.f.runID, x.p.Secrets.Codex.Capability, scope); err != nil {
+								t.Fatalf("after real %s readopt: %s: %v (ErrCodexCapabilityEpoch=%v)", path, scope, err, errors.Is(err, ErrCodexCapabilityEpoch))
+							}
+							if scope == ScopeReleaseAccessToken {
+								got, err := x.f.svc.ReleaseCodexCredential(x.env.ctx, x.f.wkr, x.f.runID, x.p.Secrets.Codex.Capability)
+								if err != nil || got.AccessToken != x.f.accessToken {
+									t.Fatalf("release after readopt: %v token matches=%v", err, got.AccessToken == x.f.accessToken)
+								}
+							}
+						})
+					}
+				})
+			}
+		}
+	}
+}
+
+func TestCodexOutageAuthorityNegativeControlsLiveDB(t *testing.T) {
+	for _, state := range []string{"wrong_worker", "released", "queued", "completed", "failed", "cancelled", "limit_park", "account_park"} {
+		t.Run(state, func(t *testing.T) {
+			x := newOutageCodexFlight(t, codexAuthModeSubscription)
+			w := x.f.wkr
+			want := ErrCodexRunNotActivelyClaimed
+			switch state {
+			case "wrong_worker":
+				w.ID = seedSnapshotWorker(t, x.env, x.f.userID, "foreign-"+uuid.NewString())
+				want = ErrCodexWorkerMismatch
+			case "released":
+				x.env.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", x.f.runID)
+			case "limit_park", "account_park":
+				gen := x.initial.ClaimGeneration
+				if _, applied, err := x.f.svc.SetState(x.env.ctx, w, x.f.runID, StateRequest{State: "running", ClaimGeneration: &gen}); err != nil || !applied {
+					t.Fatalf("start: %v/%v", applied, err)
+				}
+				if state == "limit_park" {
+					x.f.svc.p.RunLimitMaxWaits = 5
+					x.f.svc.p.RunLimitMaxPark = 8 * 24 * time.Hour
+					x.env.exec("UPDATE runs SET wait_on_limit=true WHERE id=$1", x.f.runID)
+					parkCodexFlight(t, x.env, x.f.svc, w, x.f.runID, gen)
+				} else {
+					x.env.quarantineAccount(t, x.f.aliasID)
+					_, applied, err := x.f.svc.SetState(x.env.ctx, w, x.f.runID, StateRequest{
+						State: "recovery_wait", RecoveryCause: strPtr(recoveryCauseCodexAccountUnavailable),
+						ClaimGeneration: &gen, CheckpointContainsLatest: boolPtr(true), SessionID: strPtr("outage-park"),
+					})
+					if err != nil || !applied {
+						t.Fatalf("account park: %v/%v", applied, err)
+					}
+				}
+				r := mustRun(t, x.env, x.f.runID)
+				if len(r.CodexCapHash) != 0 || r.CodexClaimEpoch != x.initial.CodexClaimEpoch+1 {
+					t.Fatal("real park did not revoke")
+				}
+				want = ErrCodexCapabilityEpoch
+			default:
+				// Keep the genuine claim capability to isolate the status predicate.
+				x.env.exec("UPDATE runs SET status=$2 WHERE id=$1", x.f.runID, state)
+			}
+			x.assertAuthority(t, w, x.p.Secrets.Codex.Capability, want)
+		})
+	}
+}
+
+// The negative readoption controls also start with a real returned capability;
+// a rejected snapshot must never change phase/generation or refund a stale charge.
+func TestCodexProvisionalReadoptFencesLiveDB(t *testing.T) {
+	for _, path := range []string{"stale_worker", "claimed_never_started"} {
+		for _, control := range []string{"wrong_worker", "wrong_generation", "released", "terminal", "terminal_pending"} {
+			t.Run(path+"/"+control, func(t *testing.T) {
+				x := newOutageCodexFlight(t, codexAuthModeSubscription)
+				x.provisional(t, path)
+				w := hbWorker(t, x.env, x.f.workerID)
+				active := x.liveEntry("running")
+				switch control {
+				case "wrong_worker":
+					id := seedSnapshotWorker(t, x.env, x.f.userID, "foreign-"+uuid.NewString())
+					w = hbWorker(t, x.env, id)
+				case "wrong_generation":
+					active = []ActiveRunEntry{entry(x.f.runID, x.initial.ClaimGeneration+1, "running", false)}
+				case "released":
+					x.env.exec("UPDATE runs SET claim_released_at=now() WHERE id=$1", x.f.runID)
+				case "terminal":
+					x.env.exec("UPDATE runs SET status='completed' WHERE id=$1", x.f.runID)
+				case "terminal_pending":
+					active = []ActiveRunEntry{entry(x.f.runID, x.initial.ClaimGeneration, "running", true)}
+				}
+				before := mustRun(t, x.env, x.f.runID)
+				holds := x.custody(t)
+				if _, err := x.f.svc.Heartbeat(x.env.ctx, w, nil, nil,
+					&ActiveSnapshot{SnapshotEpoch: 1, RegisterNonce: w.SnapshotRegisterNonce.String, Active: active}); err != nil {
+					t.Fatal(err)
+				}
+				after := mustRun(t, x.env, x.f.runID)
+				if !reflect.DeepEqual(before, after) || !reflect.DeepEqual(holds, x.custody(t)) {
+					t.Fatalf("negative snapshot changed run/custody: status=%s generation=%d charge=%d", after.Status, after.ClaimGeneration, after.RequeueCount)
+				}
+				for _, scope := range x.scopes() {
+					if _, err := x.f.svc.AuthorizeCodexCredentialOp(x.env.ctx, w, x.f.runID, x.p.Secrets.Codex.Capability, scope); err == nil {
+						t.Errorf("negative snapshot authorized %s", scope)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestCodexOutageReregisterOmissionLiveDB(t *testing.T) {
+	x := newOutageCodexFlight(t, codexAuthModeSubscription)
+	oldNonce := hbWorker(t, x.env, x.f.workerID).SnapshotRegisterNonce.String
+	x.beat(t, 1, oldNonce, x.liveEntry("running"))
+	w, nonce, err := x.f.svc.Register(x.env.ctx, x.f.wkr, "m1-restart", "base", nil, nil, x.f.wkr.ProtocolCapabilities,
+		&ActiveSnapshot{SnapshotEpoch: 2, RegisterNonce: oldNonce, Active: []ActiveRunEntry{}})
+	if err != nil || nonce == oldNonce || nonce == "" {
+		t.Fatalf("real re-register: %v", err)
+	}
+	x.f.wkr = w
+	x.assertAuthority(t, w, x.p.Secrets.Codex.Capability, ErrCodexCapabilityEpoch)
+	before := mustRun(t, x.env, x.f.runID)
+	registeredEpoch := hbWorker(t, x.env, x.f.workerID).SnapshotEpoch
+	x.beat(t, 3, oldNonce, x.liveEntry("running"))
+	if !reflect.DeepEqual(before, mustRun(t, x.env, x.f.runID)) || hbWorker(t, x.env, x.f.workerID).SnapshotEpoch != registeredEpoch {
+		t.Fatal("old nonce replay changed run or snapshot epoch")
+	}
+	x.beat(t, registeredEpoch+1, nonce, []ActiveRunEntry{})
+	if statusOf(t, x.env, x.f.runID) != "queued" || countActiveRuns(t, x.env, x.f.workerID) != 0 ||
+		hbWorker(t, x.env, x.f.workerID).SnapshotEpoch != registeredEpoch+1 {
+		t.Fatal("valid new-nonce omission revived absent flight")
+	}
+	x.assertAuthority(t, w, x.p.Secrets.Codex.Capability, ErrCodexCapabilityEpoch)
+}
+
+func TestCodexOutageFreshClaimFenceLiveDB(t *testing.T) {
+	for _, path := range []string{"stale_worker", "claimed_never_started"} {
+		for _, sameWorker := range []bool{true, false} {
+			name := "different_worker"
+			if sameWorker {
+				name = "same_worker"
+			}
+			t.Run(path+"/"+name, func(t *testing.T) {
+				x := newOutageCodexFlight(t, codexAuthModeSubscription)
+				nonce := hbWorker(t, x.env, x.f.workerID).SnapshotRegisterNonce.String
+				x.beat(t, 1, nonce, x.liveEntry("running"))
+				x.provisional(t, path)
+				// The still-listed flight cannot be freshly claimed. Clear dedupe via
+				// a valid newer omission before testing ClaimRun's new-generation fence.
+				if p, err := x.f.svc.Claim(x.env.ctx, x.f.wkr, nil); err != nil || p != nil {
+					t.Fatalf("fresh snapshot dedupe: payload=%v err=%v", p != nil, err)
+				}
+				x.beat(t, 2, nonce, []ActiveRunEntry{})
+				if countActiveRuns(t, x.env, x.f.workerID) != 0 {
+					t.Fatal("omission did not clear snapshot dedupe")
+				}
+				w := hbWorker(t, x.env, x.f.workerID)
+				if !sameWorker {
+					id := seedSnapshotWorker(t, x.env, x.f.userID, "next-"+uuid.NewString())
+					x.env.exec("UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", id, w.ProtocolCapabilities)
+					w = hbWorker(t, x.env, id)
+					x.env.exec("UPDATE runs SET status_since=now()-interval '3 hours',updated_at=now()-interval '3 hours' WHERE id=$1", x.f.runID)
+					x.env.exec("UPDATE workers SET last_heartbeat_at=now()-interval '3 hours' WHERE id=$1", x.f.workerID)
+				}
+				before := mustRun(t, x.env, x.f.runID)
+				claimed, err := x.env.q.ClaimRun(x.env.ctx, claimRunParamsFor(w))
+				if err != nil || claimed.ID != x.f.runID {
+					t.Fatalf("real next ClaimRun: %v", err)
+				}
+				if claimed.ClaimGeneration != before.ClaimGeneration+1 || claimed.WorkerID != pgconv.UUID(w.ID) ||
+					claimed.StaleRequeueGeneration.Valid || claimed.ClaimReleasedAt.Valid {
+					t.Fatal("fresh claim generation/ownership/provenance")
+				}
+				t.Run("null_hash_and_epoch_before_mint", func(t *testing.T) {
+					if len(claimed.CodexCapHash) != 0 || claimed.CodexClaimEpoch != before.CodexClaimEpoch+1 {
+						t.Fatalf("fresh ClaimRun before mint: null hash=%v epoch=%d want=%d", len(claimed.CodexCapHash) == 0, claimed.CodexClaimEpoch, before.CodexClaimEpoch+1)
+					}
+				})
+				x.assertAuthority(t, w, x.p.Secrets.Codex.Capability, ErrCodexCapabilityEpoch)
+				fresh, err := x.f.svc.assembleClaim(x.env.ctx, w, claimed)
+				if err != nil || fresh == nil || fresh.Secrets.Codex == nil {
+					t.Fatalf("real assembly mint: %v", err)
+				}
+				after := mustRun(t, x.env, x.f.runID)
+				if after.CodexClaimEpoch != claimed.CodexClaimEpoch+1 || len(after.CodexCapHash) == 0 || fresh.Secrets.Codex.Capability == x.p.Secrets.Codex.Capability {
+					t.Fatal("assembly did not mint a new capability")
+				}
+				t.Run("epoch_after_claim_and_mint", func(t *testing.T) {
+					if after.CodexClaimEpoch != before.CodexClaimEpoch+2 {
+						t.Fatalf("after fresh ClaimRun and mint epoch=%d want=%d", after.CodexClaimEpoch, before.CodexClaimEpoch+2)
+					}
+				})
+				x.assertAuthority(t, w, fresh.Secrets.Codex.Capability, nil)
+				x.assertAuthority(t, w, x.p.Secrets.Codex.Capability, ErrCodexCapabilityEpoch)
+				holds := x.custody(t)
+				if len(holds) != 2 || holds[0].ID == holds[1].ID || holds[0].Worker != x.f.workerID || holds[0].Generation != 1 ||
+					holds[1].Worker != w.ID || holds[1].Generation != 2 || holds[0].State != "open" || holds[1].State != "open" {
+					t.Fatalf("next generation custody=%+v", holds)
+				}
+			})
+		}
 	}
 }
