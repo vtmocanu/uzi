@@ -122,6 +122,14 @@ func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []
 }
 
 func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMergedPredecessorCandidatesRow) {
+	// Isolate each attempted candidate, including a post-commit settlement hook.
+	// A panic cannot undo a committed discard; the existing retention backstop retries settlement.
+	// Never log the recovered value: it may contain forge response data or credentials.
+	defer func() {
+		if recover() != nil {
+			slog.Warn("merged predecessor reconciliation refused", "run_id", row.RunID, "reason", "candidate_panicked")
+		}
+	}()
 	// The candidate query takes a fresh exact owner-scoped connection snapshot.
 	// Never reuse the ordinary tick's connection or cached MR state.
 	f, err := s.ForgeForConnection(row.ForgeType, row.BaseUrl, row.TokenCiphertext)
@@ -130,6 +138,7 @@ func (s *Service) verifyMergedPredecessor(ctx context.Context, row store.ListMer
 		return
 	}
 	observationCtx, cancel := s.merged.timeout(ctx, 5*time.Second)
+	defer cancel()
 	observed, err := f.GetMergeRequest(observationCtx, row.ProjectID, row.MrIid)
 	observationErr := observationCtx.Err()
 	cancel()

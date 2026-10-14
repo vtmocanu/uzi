@@ -183,8 +183,9 @@ func TestMergedPredecessorAutomaticPollingLiveDB(t *testing.T) {
 			current, later, otherHold, otherRun := uuid.New(), uuid.New(), uuid.New(), uuid.New()
 			e.addHold(current, e.run, completedWorker, 2)
 			e.addHold(later, e.run, completedWorker, 3)
-			e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_title,issue_description,status,claim_generation) VALUES($1,$2,$3,'prompt','t','d','completed',2)", otherRun, e.worker.UserID, e.repo)
+			e.exec("INSERT INTO runs(id,user_id,repo_id,kind,issue_title,issue_description,status,claim_generation) VALUES($1,$2,$3,'prompt','t','d','running',2)", otherRun, e.worker.UserID, e.repo)
 			e.addHold(otherHold, otherRun, e.worker.ID, 1)
+			e.exec("UPDATE runs SET mr_iid=7,mr_state='merged' WHERE id=$1", otherRun) // A shared recorded PR grants no cross-run authority.
 			e.exec("UPDATE runs SET status='completed',claim_generation=2,worker_id=$2 WHERE id=$1", e.run, completedWorker)
 			aggregateBefore, err := e.recovery.ListHoldsForOwner(e.ctx, e.worker.UserID, true)
 			if err != nil {

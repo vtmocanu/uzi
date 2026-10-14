@@ -1,10 +1,13 @@
 package forgesvc
 
 import (
+	"bytes"
 	"context"
 	"errors"
 	"fmt"
+	"log/slog"
 	"slices"
+	"strings"
 	"sync"
 	"testing"
 	"time"
@@ -300,6 +303,130 @@ func TestMergedPredecessorEnumerationExpiresWithoutConsumingCandidate(t *testing
 	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
 	if reads != 1 || sink.calls != 1 {
 		t.Fatalf("candidate skipped after expired enumeration: reads=%d discards=%d", reads, sink.calls)
+	}
+}
+
+type mergedRecoveryFunc func(context.Context, recovery.VerifiedMergeSnapshot) (int64, error)
+
+func (fn mergedRecoveryFunc) DiscardMergedPredecessorHolds(ctx context.Context, snapshot recovery.VerifiedMergeSnapshot) (int64, error) {
+	return fn(ctx, snapshot)
+}
+
+func TestMergedPredecessorCandidatePanicIsolation(t *testing.T) {
+	var output bytes.Buffer
+	oldLogger := slog.Default()
+	slog.SetDefault(slog.New(slog.NewTextHandler(&output, nil)))
+	t.Cleanup(func() { slog.SetDefault(oldLogger) })
+	const privatePayload = "private forge response contents"
+	a, b := mergeID(1), mergeID(2)
+	var panickedContext context.Context
+	var reads []int64
+	f := &mergeForge{read: func(ctx context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads = append(reads, iid)
+		if iid == 201 {
+			panickedContext = ctx
+			panic(privatePayload)
+		}
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{
+		a: {mergeRow(a, 201, token)}, b: {mergeRow(b, 202, token)},
+	}}
+	ctx, cancel := context.WithCancel(context.Background())
+	defer cancel()
+	calls := 0
+	s.SetMergedPredecessorRecovery(q, mergedRecoveryFunc(func(context.Context, recovery.VerifiedMergeSnapshot) (int64, error) {
+		calls++
+		cancel() // End after the successful sibling, before exhaustion resets cursors.
+		return 1, nil
+	}))
+	s.ReconcileMergedPredecessors(ctx, []uuid.UUID{a, b})
+	if !slices.Equal(reads, []int64{201, 202}) || calls != 1 ||
+		s.merged.cursors[a] != mergeID(201) || s.merged.nextRepo != a {
+		t.Fatalf("panic lost sibling/cursor progress: reads=%v calls=%d cursors=%v next=%s", reads, calls, s.merged.cursors, s.merged.nextRepo)
+	}
+	if panickedContext == nil || panickedContext.Err() != context.Canceled {
+		t.Fatal("panic left the forge observation context alive")
+	}
+	if strings.Contains(output.String(), privatePayload) || !strings.Contains(output.String(), "candidate_panicked") {
+		t.Fatalf("panic logging exposed payload or omitted fixed reason: %s", output.String())
+	}
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a, b}) // Wrap for a later phase.
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a, b})
+	if !slices.Equal(reads, []int64{201, 202, 201, 202}) || calls != 2 {
+		t.Fatalf("next tick/wrap lost retry: reads=%v calls=%d", reads, calls)
+	}
+}
+
+func TestMergedPredecessorRecoveryPanicContinuesSiblings(t *testing.T) {
+	a, b := mergeID(1), mergeID(2)
+	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{
+		a: {mergeRow(a, 201, token)}, b: {mergeRow(b, 202, token)},
+	}}
+	calls := 0
+	s.SetMergedPredecessorRecovery(q, mergedRecoveryFunc(func(context.Context, recovery.VerifiedMergeSnapshot) (int64, error) {
+		calls++
+		if calls == 1 {
+			panic("settlement collaborator failed")
+		}
+		return 1, nil
+	}))
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a, b})
+	if calls != 2 {
+		t.Fatalf("recovery panic abandoned sibling: calls=%d", calls)
+	}
+}
+
+func TestMergedPredecessorExactRepositoryAttemptsAcrossPhases(t *testing.T) {
+	var reads []int64
+	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads = append(reads, iid)
+		if iid <= 220 {
+			return forge.MergeRequest{}, errors.New("persistent early failure")
+		}
+		return forge.MergeRequest{IID: iid, State: forge.MRStateOpened}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{}}
+	var repos []uuid.UUID
+	for n := 1; n <= 120; n++ {
+		repo := mergeID(n)
+		repos = append(repos, repo)
+		q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{mergeRow(repo, n+200, token)}
+	}
+	s.SetMergedPredecessorRecovery(q, &mergeSink{})
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	want := make([]int64, 100)
+	for n := range want {
+		want[n] = int64(n + 201)
+	}
+	if !slices.Equal(reads, want) {
+		t.Fatalf("first phase attempts=%v", reads)
+	}
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	for n := 301; n <= 320; n++ {
+		want = append(want, int64(n))
+	}
+	if !slices.Equal(reads, want) {
+		t.Fatalf("queued repositories starved or duplicated: attempts=%v", reads)
+	}
+	// Cursors wrap over bounded later phases, preserving the durable retry workset.
+	for phase := 0; phase < 3; phase++ {
+		s.ReconcileMergedPredecessors(context.Background(), repos)
+	}
+	retries := map[int64]int{}
+	for _, iid := range reads {
+		retries[iid]++
+	}
+	for iid := int64(201); iid <= 320; iid++ {
+		if retries[iid] < 2 {
+			t.Fatalf("repository candidate %d never retried: counts=%v", iid, retries)
+		}
 	}
 }
 
