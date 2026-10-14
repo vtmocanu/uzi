@@ -185,6 +185,8 @@ func main() {
 		os.Exit(1)
 	}
 
+	warnSharedCPU(log, cfg.WorkerMaxConcurrentRuns, resolver)
+
 	loop := reconcile.New(client, materializer, client, cfg.PollInterval, cfg.WorkerImageTag, log)
 
 	log.Info("controller starting",
