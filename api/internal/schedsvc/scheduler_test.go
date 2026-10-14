@@ -2332,6 +2332,34 @@ func TestTickBenignSkipPersistsLastFire(t *testing.T) {
 	}
 }
 
+// TestTickCIWatchGreenPersistsLastFire is acceptance example 1 on the cron path: a tick
+// fire (not run-now) of a ci_watch schedule whose watched workflows are all green starts
+// nothing, still advances, and persists last_fire with started 0 and one ci_green skip.
+func TestTickCIWatchGreenPersistsLastFire(t *testing.T) {
+	h := newCIHarness(t, ciGreenRun("1", 100, 0), ciGreenRun("2", 101, 1))
+	h.st.due = []store.RunSchedule{h.schedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	raw := h.st.advanceCalls[0].LastFire
+	if raw == nil {
+		t.Fatalf("green ci_watch fire must persist a last_fire, got nil")
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v (%s)", err, raw)
+	}
+	if len(rec.Started) != 0 || len(rec.Skips) != 1 || rec.Skips[0].Reason != string(SkipCIGreen) {
+		t.Fatalf("last_fire = %+v, want started:0 and one %q skip", rec, SkipCIGreen)
+	}
+	if h.runsCreated() != 0 || len(h.runs.ciRepairs) != 0 {
+		t.Fatalf("green fire started a run")
+	}
+}
+
 // ── PRD #1093: pause all schedules ───────────────────────────────────────────
 
 // runsCreated totals every run-creation seam call across all targets, so a "no run was

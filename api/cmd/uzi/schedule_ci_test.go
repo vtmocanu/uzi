@@ -10,6 +10,7 @@ import (
 	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/schedsvc"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -273,5 +274,29 @@ func TestScheduleGetCIEpisodeStates(t *testing.T) {
 	}
 	if strings.Contains(out, "watching") {
 		t.Errorf("stale generic 'watching' state in:\n%s", out)
+	}
+}
+
+// TestSkipReasonLabelsCoverEveryCIReason pins that every server-side ci_* skip reason
+// (schedsvc.AllSkipReasons) plus no_default_branch renders a human label rather than
+// falling back to the raw wire string, so a new reason added without a CLI label fails.
+func TestSkipReasonLabelsCoverEveryCIReason(t *testing.T) {
+	n := 0
+	for _, r := range schedsvc.AllSkipReasons {
+		s := string(r)
+		if !strings.HasPrefix(s, "ci_") && s != "no_default_branch" {
+			continue
+		}
+		n++
+		got := skipReasonLabel(s)
+		if got == "" || got == s {
+			t.Errorf("skip reason %q has no CLI label (renders %q)", s, got)
+		}
+	}
+	if n < 11 {
+		t.Fatalf("only %d ci skip reasons enumerated, want at least 11", n)
+	}
+	if got := skipReasonLabel("ci_green"); got != "CI is green" {
+		t.Errorf("ci_green label = %q", got)
 	}
 }

@@ -9757,6 +9757,8 @@ export class GitCache {
    * byte-exact. `ref` may be a ref or a 40-hex SHA.
    * Returns null (NOT []) when the diff cannot be computed (git failure, a merge base that is not
    * a 40-hex id, or NO merge base, e.g. unrelated histories), so the caller fails CLOSED.
+   * A non-SHA-1 repository (e.g. SHA-256 object format) yields 64-hex merge bases, which are not
+   * 40-hex ids, so it also returns null (fail closed) rather than a possibly partial list.
    */
   async changedFilesNoRenames(barePath: string, ref: string): Promise<string[] | null> {
     try {

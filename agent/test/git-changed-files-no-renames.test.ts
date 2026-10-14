@@ -17,16 +17,25 @@ beforeEach(() => {
   fx = makeFixture();
   git = new GitCache(fx.dataDir, nullLogger());
   tmp = fs.mkdtempSync(path.join(os.tmpdir(), "cfnr-"));
+  tick = 0;
 });
 afterEach(() => {
   fx.cleanup();
   fs.rmSync(tmp, { recursive: true, force: true });
 });
 
+// Every git call gets a distinct, strictly increasing author/committer date (one second apart
+// from a fixed epoch), so any commit (including merges) the call creates has a deterministic
+// timestamp. This keeps `merge-base --all` ordering and the criss-cross premise independent of
+// wall-clock time and of how fast the fixture commits run.
+const FIXTURE_EPOCH = 1_700_000_000;
+let tick = 0;
+
 function g(dir: string, args: string[]): string {
+  const date = `${FIXTURE_EPOCH + ++tick} +0000`;
   return execFileSync("git", ["-C", dir, "-c", "user.name=t", "-c", "user.email=t@example.invalid", "-c", "commit.gpgsign=false", ...args], {
     encoding: "utf8",
-    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" },
+    env: { ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null", GIT_AUTHOR_DATE: date, GIT_COMMITTER_DATE: date },
   }).trim();
 }
 
