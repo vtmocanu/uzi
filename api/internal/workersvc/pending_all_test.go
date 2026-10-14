@@ -39,6 +39,15 @@ func TestPendingAllDecodeIndependentFields(t *testing.T) {
 				if (snap.PendingAll != nil) != tc.available || len(snap.PendingAll) != tc.count {
 					t.Fatalf("pending_all = %#v, want available=%v count=%d", snap.PendingAll, tc.available, tc.count)
 				}
+				if tc.count == 1 {
+					wantGeneration := int64(0)
+					if tc.name == "maxint" {
+						wantGeneration = 9223372036854775807
+					}
+					if snap.PendingAll[0].RunID != id || snap.PendingAll[0].ClaimGeneration != wantGeneration {
+						t.Fatalf("decoded literal = %#v, want UUID %s generation %d", snap.PendingAll[0], id, wantGeneration)
+					}
+				}
 				if len(snap.Active) != 1 || snap.Active[0].RunID != id || !snap.Active[0].TerminalPending || !snap.PendingOverflow {
 					t.Fatalf("optional field damaged enclosing snapshot: %#v", snap)
 				}

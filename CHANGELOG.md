@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 - **The automatic CI-fix guard is hardened against CI-configuration changes.**
   `CI_AUTOFIX_CONFIG_PATHS` now adds to a fixed set of protected paths instead of replacing it.
 
+- **Pending outcomes keep their API age across worker snapshot rotation (#2009).**
+  Updated workers report complete pending identities so health warnings and worker counts survive active-list caps; fresh overflow is shown as “N confirmed pending; more may be pending” without inventing per-run ages. Coverage requires a worker fleet roll and a complete list within the ceiling in an accepted snapshot; rejected enclosing snapshots provide no pending identity coverage ([design and limits](adr/2009-pending-outcome-identities.md)).
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

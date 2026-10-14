@@ -43,6 +43,7 @@ func TestIssue2009PendingAggregateRoutesLiveDB(t *testing.T) {
 			cliMustExec(t, pool, "UPDATE runs SET status='completed' WHERE id=$1", id)
 		}
 	}
+	expectReported := true
 	check := func(t *testing.T, count *int64, overflow *bool) {
 		t.Helper()
 		for _, route := range []struct {
@@ -94,6 +95,12 @@ func TestIssue2009PendingAggregateRoutesLiveDB(t *testing.T) {
 			} else if dto.PendingOutcomeCount == nil || *dto.PendingOutcomeCount != *count || dto.PendingOverflow == nil || *dto.PendingOverflow != *overflow {
 				t.Fatalf("authority: %s", rec.Body.String())
 			}
+			if !expectReported {
+				if dto.ReportedRuns == nil || len(dto.ReportedRuns) != 0 {
+					t.Fatalf("expected empty actual reported rows: %+v", dto.ReportedRuns)
+				}
+				continue
+			}
 			if len(dto.ReportedRuns) != 1 || dto.ReportedRuns[0].RunID != listed.String() || dto.ReportedRuns[0].Phase != "awaiting_input" || dto.ReportedRuns[0].ClaimGeneration != 7 || !dto.ReportedRuns[0].TerminalPending || dto.ReportedRuns[0].TerminalPendingSince == nil || !dto.ReportedRuns[0].TerminalPendingSince.Equal(since) {
 				t.Fatalf("snapshot changed: %+v", dto.ReportedRuns)
 			}
@@ -124,6 +131,26 @@ func TestIssue2009PendingAggregateRoutesLiveDB(t *testing.T) {
 			t.Fatalf("snapshot failure lost authority: %+v", dto)
 		}
 	})
+	// Equal count, different members: the displayed tuple is stale while another
+	// current tuple supplies the aggregate. Snapshot ID and age remain unchanged.
+	cliMustExec(t, pool, "DELETE FROM worker_pending_outcome_identities WHERE worker_id=$1", worker)
+	cliMustExec(t, pool, "UPDATE runs SET claim_generation=8 WHERE id=$1", listed)
+	unlisted := uuid.New()
+	cliMustExec(t, pool, "INSERT INTO runs(id,user_id,kind,issue_title,issue_description,status,worker_id,claim_generation) VALUES($1,$2,'chat','t','d','running',$3,7)", unlisted, owner, worker)
+	cliMustExec(t, pool, "INSERT INTO worker_pending_outcome_identities(worker_id,run_id,claim_generation,first_seen_at,reported_until) VALUES($1,$2,7,now()-interval '9 hours',now()+interval '1 hour')", worker, unlisted)
+	count = 1
+	check(t, &count, &overflow)
+	// N=0 with fresh overflow and no actual reported rows is still authoritative.
+	cliMustExec(t, pool, "DELETE FROM worker_active_runs WHERE worker_id=$1", worker)
+	cliMustExec(t, pool, "UPDATE worker_pending_outcome_identities SET reported_until=now()-interval '1 second' WHERE worker_id=$1", worker)
+	expectReported = false
+	count = 0
+	check(t, &count, &overflow)
+	cliMustExec(t, pool, "UPDATE workers SET pending_overflow_until=now()-interval '1 second' WHERE id=$1", worker)
+	overflow = false
+	check(t, &count, &overflow)
+	cliMustExec(t, pool, "UPDATE workers SET pending_overflow=false,pending_overflow_until=NULL WHERE id=$1", worker)
+	check(t, &count, &overflow)
 	// A nil store is unavailable, never authoritative zero.
 	h.q = nil
 	var dto apitypes.WorkerDTO

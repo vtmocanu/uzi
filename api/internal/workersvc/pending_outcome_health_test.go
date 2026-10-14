@@ -57,14 +57,16 @@ func TestHealthOutcomeUndeliveredRung(t *testing.T) {
 			t.Fatalf("got %q/%q", h, reason)
 		}
 	})
-	t.Run("queued is never flagged", func(t *testing.T) {
-		r := runRow("queued")
-		r.StatusSince = ago(time.Second)
-		r.TerminalPendingSince = ago(threshold + time.Minute)
-		if _, reason := target(r); reason == reasonOutcomeUndelivered {
-			t.Fatal("queued run must not flag")
-		}
-	})
+	for _, status := range []string{"queued", "claimed", "awaiting_input", "awaiting_followup"} {
+		t.Run(status+" is never flagged", func(t *testing.T) {
+			r := runRow(status)
+			r.StatusSince = ago(time.Second)
+			r.TerminalPendingSince = ago(threshold + time.Minute)
+			if _, reason := target(r); reason == reasonOutcomeUndelivered {
+				t.Fatalf("%s run must not flag", status)
+			}
+		})
+	}
 	t.Run("non-positive heartbeat interval falls back to 15s", func(t *testing.T) {
 		p := testParams()
 		p.WorkerHeartbeatInterval = 0
