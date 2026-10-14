@@ -555,7 +555,7 @@ describe("Dashboard active run breakdown", () => {
     const tile = screen.getByText("Active runs").closest("a");
     expect(tile).not.toBeNull();
     expect(within(tile!).getByText("10")).toBeTruthy();
-    expect(within(tile!).getByText("1 running · 3 needs you · 2 queued · 4 waiting to resume")).toBeTruthy();
+    expect(within(tile!).getByText("1 running · 3 need you · 2 queued · 4 waiting to resume")).toBeTruthy();
   });
 
   it("shows only running when all three active runs are running", async () => {
@@ -563,6 +563,18 @@ describe("Dashboard active run breakdown", () => {
     renderDashboard();
     await flush();
     expect(screen.getByText("3 running")).toBeTruthy();
+  });
+
+  it.each([
+    { count: 1, hint: "1 needs you" },
+    { count: 2, hint: "2 need you" },
+  ])("uses the correct owner-action wording for $count runs", async ({ count, hint }) => {
+    mockApi.listRuns.mockResolvedValue({ runs: Array.from({ length: count }, (_, i) =>
+      aRun({ id: `owner-${i}`, status: "awaiting_input" }),
+    ) });
+    renderDashboard();
+    await flush();
+    expect(screen.getByText(hint)).toBeTruthy();
   });
 
   it.each([

@@ -257,7 +257,7 @@ export function Dashboard() {
   const activeHint = active.length
     ? [
         activeCounts.running ? `${activeCounts.running} running` : null,
-        activeCounts.needsYou ? `${activeCounts.needsYou} needs you` : null,
+        activeCounts.needsYou ? `${activeCounts.needsYou} ${activeCounts.needsYou === 1 ? "needs" : "need"} you` : null,
         activeCounts.queued ? `${activeCounts.queued} queued` : null,
         activeCounts.waiting ? `${activeCounts.waiting} waiting to resume` : null,
       ].filter(Boolean).join(" · ")
