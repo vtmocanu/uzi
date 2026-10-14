@@ -144,8 +144,10 @@ describe("issue #1742 restart fault probes", () => {
       assert.ok(snapshot, "the restarted Worker sends a register snapshot carrying the finalize record");
       assert.deepEqual(
         { ...snapshot, finalize_resume: snapshot.finalize_resume?.map((e) => ({ ...e, run_id: fixture.finalize_resume![0]!.run_id })) },
-        fixture,
-        "the register snapshot equals the shared contract fixture (run id normalized)",
+        // Keep the shared fixture as an older-worker payload without pending_all.
+        // This worker adds authoritative empty terminal identities independently of finalize_resume.
+        { ...fixture, pending_all: [] },
+        "the register snapshot matches the legacy finalize fixture plus empty terminal identities (run id normalized)",
       );
       assert.equal(snapshot.finalize_resume?.[0]?.run_id, claim.run_id);
       assert.deepEqual(await finalizeFiles(root, claim.run_id), [], "an accepted register retired the offered record");
