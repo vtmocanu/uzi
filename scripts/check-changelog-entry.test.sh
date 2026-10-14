@@ -9,7 +9,7 @@ ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 mkdir -p "$ROOT/.uzi/scratch"
 TMP="$(mktemp -d "$ROOT/.uzi/scratch/changelog-entry-test.XXXXXX")"
 trap 'rm -rf "$TMP"' EXIT
-FLOOR=74
+FLOOR=80
 cases=0
 passed=0
 
@@ -267,6 +267,33 @@ for name in bad.md 11111111-1111-5111-8111-111111111111.md 11111111-1111-4111-71
   echo malformed > "$W/changelog.d/$name"
   expect 1 "invalid filename cannot escape validation"
 done
+fresh nul-fragment-entry
+echo '// y' >> "$W/api/x.go"
+printf '### Fixed\0\0- **Outcome.**\0  Description.\0' > "$W/$fragment"
+expect 1 "NUL fragment cannot supply shipping entry"
+
+fresh split-bold-title-entry
+echo '// y' >> "$W/api/x.go"
+printf '### Fixed\n\n- **Outcome.** unbold prose **Other.**\n  Description.\n' > "$W/$fragment"
+expect 1 "split bold title cannot supply shipping entry"
+
+fresh ignored-invalid-name
+printf 'changelog.d/bad.md\n' > "$W/.gitignore"
+echo malformed > "$W/changelog.d/bad.md"
+expect 1 "ignored invalid filename rejects nonshipping success"
+
+fresh ignored-readme
+printf 'changelog.d/README.md\n' > "$W/.gitignore"
+echo arbitrary > "$W/changelog.d/README.md"
+expect 0 "ignored reserved README remains allowed"
+
+fresh ignored-canonical-name
+printf '%s\n' "$fragment" > "$W/.gitignore"
+echo malformed > "$W/$fragment"
+expect 0 "ignored canonical filename does not expand content validation"
+echo '// y' >> "$W/api/x.go"
+expect 1 "ignored canonical fragment supplies no shipping evidence"
+
 for unsafe in symlink dangling fifo directory nested readme-link parent-link parent-file; do
   fresh "unsafe-$unsafe"
   case "$unsafe" in

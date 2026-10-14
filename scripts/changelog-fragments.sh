@@ -35,6 +35,7 @@ case "$mode" in
   render-body|render-unreleased)
     [ "$#" -eq 1 ] || usage
     [ ! -L "$1" ] && [ -f "$1" ] || { changelog_fragment_error 'legacy input must be a regular file'; exit 1; }
+    changelog_fragment_no_nul "$1"
     changelog_fragment_inventory
     mkdir -p .uzi/scratch
     work="$(mktemp -d .uzi/scratch/changelog-render.XXXXXX)"
@@ -42,7 +43,7 @@ case "$mode" in
     if [ "$mode" = render-unreleased ]; then
       awk '
         /^## \[Unreleased\]$/ { seen++; active = 1; next }
-        /^## / { active = 0 }
+        /^## \[/ { active = 0 }
         active { print }
         END { if (seen != 1) exit 1 }
       ' < "$1" > "$work/legacy" || { changelog_fragment_error 'expected exactly one [Unreleased] section'; exit 1; }
