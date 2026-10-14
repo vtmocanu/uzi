@@ -41,6 +41,9 @@ through `[0.52.0]`.)
 - **Report-only runs accept content-free recovery checkpoints ([#2967](https://github.com/vtmocanu/uzi/issues/2967)).**
   Worker recovery-coverage commits no longer prevent report-only completion when every retained commit outside the recovery floor matches a floor-reachable boundary parent's tree, including when the default branch has advanced. Confirmed publication is checked by its exact tip even when the local checkpoint ref is absent or stale; differing retained work and unreadable proof still block completion.
 
+- **Busy workers holding custody no longer starve paced image rolls ([#2959](https://github.com/vtmocanu/uzi/issues/2959)).**
+  Proven old and current workers can provide serving coverage while retaining recovery custody. Data-PVC protection, drain release and reservation-cleanup fences remain intact. Pacing diagnostics distinguish missing coverage from exhausted roll slots and identify the blocking worker and predicate.
+
 - **Admin Settings exposes the hosted worker quota ([#2960](https://github.com/vtmocanu/uzi/issues/2960)).**
   The Hosted worker quota card lets admins set the per-user persistent worker cap from 0 to 20, validates edits before saving, and shows server errors. Zero disables self-service provisioning without changing existing workers.
 

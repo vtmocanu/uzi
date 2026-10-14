@@ -96,8 +96,13 @@ The promotion boundary in `controller/internal/kube/roll_pacing.go` requires:
 - API registration bound to that pod UID and the **exact** expected version.
 - A nonempty registration nonce changed from the reservation's prior nonce,
   followed by a heartbeat proven for that current nonce, fresh at API evaluation.
-- Frozen coverage still supplied, with no conflicting maintenance, pressure or
-  custody fence and no stuck roll observation.
+- Frozen coverage still supplied, with no conflicting maintenance or pressure
+  fence and no stuck roll observation.
+
+Custody protects sources rather than negating positive serving evidence (#2959).
+Old and current providers can supply coverage while holding custody; no free-slot
+guarantee is added. Custody still independently fences data-PVC destruction,
+drain release and duplicate/completed-peer reservation cleanup.
 
 Ready alone is insufficient. A registration nonce identifies a registration,
 not a pod: an old process can re-register at the same version and change nonce.
