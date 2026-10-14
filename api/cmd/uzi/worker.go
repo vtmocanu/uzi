@@ -358,7 +358,7 @@ func formatUptimeDuration(d time.Duration) string {
 // upgradeCell renders a worker's upgrade status for the table (PRD #113 M5).
 //
 // Words, not symbols: this column is read by operators and by agents parsing --json's
-// sibling, and the CLI's other columns are plain words too. The api's five-state enum is
+// sibling, and the CLI's other columns are plain words too. The API display status is
 // passed through as-is rather than re-mapped, so the CLI and the web badge can never
 // describe the same worker differently — a second vocabulary is a second thing to keep in
 // sync.
@@ -385,11 +385,12 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 	}
 }
 
-// blockingCell renders the compact container/reason behind an upgrade_failed roll for
+// blockingCell renders failure diagnostics and capacity guidance for
 // `uzi admin workers`'s BLOCKING column (PRD #1484 M3) — the cross-user answer to "why is
 // this owner's worker stuck rolling".
 //
-// "-" when neither field is set (every status other than upgrade_failed). Otherwise
+// Capacity blockage includes fixed remedy guidance even if diagnostics are absent.
+// Other statuses show "-" when neither diagnostic field is set. Otherwise
 // "<container>: <reason>" when both are present, or whichever single field is. Both are the
 // short k8s enums the controller reports and the api already sanitizes at write time
 // (control/format chars stripped, 64-byte cap) — `state.waiting.message` is deliberately
