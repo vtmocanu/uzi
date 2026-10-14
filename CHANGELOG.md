@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Changed
 
+- **Hosted controller warns about shared CPU with multiple configured run slots ([#2240](https://github.com/vtmocanu/uzi/issues/2240)).**
+  A nonblocking startup advisory describes each available size when the configured run-slot count exceeds one, without observing fleet occupancy or changing worker resources, defaults, slots, or rollout behavior. The operator protocol calls for matched hosted occupancy and CPU-limit measurements after release; scaling remains unproven and no speedup is promised.
+
 - **Run lists show accounts across both harnesses, and the TUI keeps accounts close to their costs ([#2913](https://github.com/vtmocanu/uzi/issues/2913), [#2912](https://github.com/vtmocanu/uzi/issues/2912)).**
   Personal lists show every recorded account once you hold more than one credential across Claude and Codex, including one of each. A lone live credential named `default` displays as `claude` or `codex`; deleted accounts, admin views and run details retain their recorded labels. The TUI fits its account and cost cells to the visible rows while preserving conservative column thresholds; board titles fill the remaining space up to the judge and worker columns, with no fixed 60-column cap. Web lists refresh credential counts with their normal poll and retain last-good counts on failures. The Dashboard Active runs hint breaks the same total into `running`, `needs you`/`need you`, `queued` and `waiting to resume` counts, omitting empty buckets.
 
