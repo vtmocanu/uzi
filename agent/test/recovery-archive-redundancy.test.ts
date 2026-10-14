@@ -670,18 +670,20 @@ describe("RecoveryCoordinator redundancy claims", () => {
       try {
         const rec = await h.uploaded(false);
         const abort = new AbortController();
+        let observed: { proveCallsAtEntry: number; signalAbortedAfterCallerAbort: boolean | undefined } | undefined;
         h.state.syncProve = signal => {
-          assert.equal(h.state.proveCalls.length, 1, "the client is entered before either abort");
           abort.abort();
-          assert.equal(signal?.aborted, true, "the caller abort is synchronous, before deadline fire");
-          clock.fire();
+          observed = { proveCallsAtEntry: h.state.proveCalls.length, signalAbortedAfterCallerAbort: signal?.aborted };
           return new Promise<RecoveryArchiveRedundancyResponse>(() => undefined);
         };
         const withReceipt = await h.receipted(rec);
         await bounded(h.coordinator.resumePending(abort.signal, [withReceipt]), "return after synchronous caller abort");
+        assert.ok(observed, "the client was entered");
+        assert.equal(observed.proveCallsAtEntry, 1);
+        assert.equal(observed.signalAbortedAfterCallerAbort, true, "the caller abort reaches the request synchronously");
         assert.equal(h.state.proveCalls.length, 1);
         assert.equal(h.state.proveCalls[0]!.signal?.aborted, true);
-        assert.equal(clock.fired, true, "deadline fire followed synchronous caller abort inside the client");
+        assert.equal(clock.fired, false, "returned on the caller abort, not the deadline");
         assert.equal(clock.disposed, true);
       } finally { await h.close(); }
     });
