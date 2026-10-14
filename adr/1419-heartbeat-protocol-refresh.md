@@ -117,3 +117,53 @@ Neither failure was reproduced on the base in isolation, so contention is suspec
 proven. Required PR CI must be green on the delivered head before merge; recurrence there
 remains blocking. The inherited DinD UUID-versus-base64url nonce mismatch recorded during
 planning is outside #1419; compatible fixture coverage does not claim that defect repaired.
+
+### Final validation addendum
+
+These checks preceded this documentation edit at code head `13e57689b54d3b4553de380a692428476446bdf0`.
+Earlier timings and failed exits above remain historical evidence. Log suffixes mean
+`.uzi/scratch/gate-log.<suffix>`; wall times are local, not CI; available CI timings are unmeasured.
+
+- API `fhx4vS`: EXIT=0, 536.24 s; opt-in composition `IBUDmE`: EXIT=0, 1661.56 s,
+  six Go controls (two expected pinned assertion failures), zero Go SKIP, zero Node skips/cancellations;
+  `gate:repo` `aR4qY1`: EXIT=0, 951.53 s.
+- Four agent prerequisites: `mbsf3p` 1.47 s, `CY2hEA` 0.95 s, `XywLvt` 5.49 s,
+  `ynEA6J` 3.89 s, each EXIT=0; changelog `A01zOg`: EXIT=0.
+  M4 `3voV50`: EXIT=0, 127.37 s, 183 passed, zero skips/cancellations;
+  `check:agent-shards` `BoLpGD`: EXIT=0, 0.51 s, 478 files, 239 per shard.
+  Both JUnit reports and the success-only M4 marker remain in `.uzi/scratch/m3-agent-shards`.
+
+**Final agent composition is incomplete, not green.** The three failures are grouped here:
+
+- Previously suspected flake: `retryable preparation publishes once before replay and restores human approve_plan`
+  did not recur on this attempt; its earlier failed exit and isolated controls remain above.
+- Previously suspected flake: `new report proof transport failure preserves existing physical archive authority within the same budget`
+  was shard 1's sole failure: `MmSB2g`, EXIT=201, 1527.67 s, 6450 tests,
+  6435 passed, one failed, 14 skipped, zero cancelled. Complete seven-test-file controls
+  candidate `5n1pYK` / base `zgKcDH`: EXIT=0, 41.58 / 35.37 s, zero skips/cancellations.
+- **Third failure: unresolved attribution, not a suspected flake.**
+  `M4 dependency wait physical Codex runner / real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses`
+  was shard 2's sole failure: `Dh5et9`, EXIT=201, 2406.70 s, 7971 tests,
+  7969 passed, one failed, one skipped, zero cancelled. The test took 47.11 s and reported
+  `timed out waiting for: first park and worker slot release` at the unchanged 10-second
+  predicate; `agent/test/codex-executor.test.ts:16728` identifies the ordinary owner-mode
+  loop, without distinguishing `now` from `after_milestone`. Exact focused one-test controls
+  candidate `Sbo1Xi` / base `zZpjWu`: EXIT=0, 26.34 / 28.78 s, zero skips/cancellations,
+  with identical umask 022, scratch TMPDIR and
+  `node --import tsx --test --test-timeout=120000 --test-concurrency=1 --test-name-pattern='M4 dependency wait physical Codex runner' test/codex-executor.test.ts`.
+
+Read-only triage found no demonstrated diff regression, but attribution remains unresolved. The fixture's
+real client receives a worker ID without negotiated features/nonce and heartbeat 200 `{}`;
+separate `sweepClient` mocks are unused. Candidate bounded reading and base `cc44`'s `res.text()`
+both parse complete `{}` and return undefined without advertisement updates. Heartbeat runs
+in parallel; `run.finally` releases capacity/protection. No heartbeat-to-completion await/data
+dependency was established, but shared event-loop/transport contention cannot be excluded:
+complete `{}` semantic equivalence is not scheduler/timing independence. No matched-load base
+reproduction was performed; earlier base passes were isolated and insufficient.
+
+The latest conditional approval permits delivery with the third failure unresolved.
+Calling it a suspected flake requires the same failure on base under matched shard load
+or a code-level proof of independence; neither is complete. Merge requires attribution
+and green required PR CI on the exact delivered head. Recurrence of any of these named
+tests or any heartbeat-related failure in PR CI blocks merge and returns as a finding,
+not a rerun. There is no blanket flake exemption.
