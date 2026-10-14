@@ -19,8 +19,8 @@ installHarness();
 const settings = { enabled: true as const, reserveBytes: 100, hysteresisBytes: 100,
   sampleMs: 2, responseBudgetMs: 200, rearmMs: 10, maxInterventions: 2 };
 
-async function until(predicate: () => boolean) {
-  const deadline = Date.now() + 3000;
+async function until(predicate: () => boolean, timeoutMs = 3000) {
+  const deadline = Date.now() + timeoutMs;
   while (!predicate()) {
     assert.ok(Date.now() < deadline, "bounded runner memory fixture wait");
     await new Promise(resolve => setTimeout(resolve, 2));
@@ -334,6 +334,7 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     api.setOwnershipStatus(f.claim.run_id, "claimed", 7);
     fs.writeFileSync(homeDir + "/session-proof", "original session");
     let captures = 0, enrollments = 0, modelRequests = 0, proof = false;
+    let started: number | undefined;
     let executorError: unknown;
     const begin = f.memory.begin.bind(f.memory);
     f.memory.begin = (...args) => {
@@ -363,6 +364,7 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
             });
           };
           let launch: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
+          started = performance.now();
           assert.throws(() => { launch = ctx.capturedMemory!(); }, /retained recovery/i);
           if (launch!) { enroll(ctx); modelRequests++; }
           assert.throws(() => ctx.capturedMemory!(), /retained recovery/i,
@@ -374,12 +376,12 @@ for (const verdict of ["accepted", "ambiguous", "generation", "deadline"] as con
     };
     git.worktreeStatus = async () => [];
     if (verdict === "ambiguous") api.overrideStateStatus(f.claim.run_id, "running");
-    const started = performance.now();
     try {
       await runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
         { memoryRuntime: f.memory, codexBoundaryDeadlineMs: verdict === "deadline" ? 200 : 5000 }).execute(f.claim);
       if (executorError) throw executorError;
       assert.equal(proof, true, "actual RunRunner executor reached the first trusted accessor");
+      assert.ok(started !== undefined, "elapsed clock anchored at the first trusted accessor");
       if (verdict === "deadline") assert.ok(performance.now() - started < 1500,
         "initial exhaustion shares the bounded owner deadline");
       assert.equal(captures, 1, "hold prevents a successor context and allowance reset");
@@ -652,12 +654,16 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
   let successor: ReturnType<NonNullable<RunContext["capturedMemory"]>>;
   let nativeAck: StateAck | undefined, parkSignal: AbortSignal | undefined;
   let successorWork: Promise<void> | undefined;
+  let started: number | undefined, rescue: ReturnType<typeof setTimeout> | undefined;
   const report = client.reportState.bind(client);
   client.reportState = async (...args) => {
     const ack = await report(...args);
     if (args[1].recovery_cause === "worker_memory_pressure") {
       nativeAck = ack;
       parkSignal = args[2];
+      // Start rescue at the blocked port, leaving room for the original 200ms stop,
+      // successor's 5000ms local capture and intervening fixture work. Finally releases and joins it.
+      rescue = setTimeout(() => release.resolve(), 10000);
       // Intentionally ignore abort after a REAL client-validated receipt.
       await release.promise;
     }
@@ -671,23 +677,21 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     run: async ctx => {
       const command = enroll(ctx);
       original = command.captured.flight as MemoryFlightProof;
+      started = performance.now();
       f.pressure(950);
       const result = await command.captured.commands.watchOutcome(command.entry);
       ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
       throw new Error("quiet retained stop");
     },
   };
-  // Rescue ignores abort too; the original work is always released and joined in finally.
-  // Reclaim performs real local capture; allow its positive 5000ms budget before rescue.
-  const rescue = setTimeout(() => release.resolve(), 5000);
   const runner = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 });
-  const started = performance.now();
   const work = runner.execute(f.claim);
   try {
     await until(() => nativeAck !== undefined);
     assert.ok(nativeAck!.memoryParkAccepted, "receipt derives from the native public memory-hold DTO");
     await work;
+    assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "runner deadline does not wait for uncooperative park return");
     const operation = original!.workerMemory!.operation!;
     assert.ok(operation, "original preservation promise remains on its flight");
@@ -718,7 +722,7 @@ test("M3 late native park ACK stays owned after deadline and cannot mutate a rec
     successorWork = runnerWith(() => ({ executor: nextExecutor }), fakeGitlab().gitlab, undefined, log,
       { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 5000 }).execute(next);
     try {
-      await until(() => successor !== undefined);
+      await until(() => successor !== undefined, 5000);
     } catch {
       assert.fail("successor executor admission: " + JSON.stringify(api.states) + successorLog.join("\\n"));
     }
@@ -829,12 +833,14 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
   const monitoring = f.memory.run();
   const release = releaseGate();
   let original: MemoryFlightProof | undefined, sending = false, sendSignal: AbortSignal | undefined;
+  let started: number | undefined, rescue: ReturnType<typeof setTimeout> | undefined;
   const post = client.postMessages.bind(client);
   client.postMessages = async (...args) => {
     await post(...args);
     if (args[1].some(message => message.payload.event === "worker_memory_pressure")) {
       sending = true;
       sendSignal = args[3];
+      rescue = setTimeout(() => release.resolve(), 2000);
       await release.promise; // Native feed ACK is withheld by an intentionally uncooperative adapter.
     }
   };
@@ -842,12 +848,11 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
   const executor: Executor = { run: async ctx => {
     const command = enroll(ctx);
     original = command.captured.flight as MemoryFlightProof;
+    started = performance.now();
     f.pressure(950);
     await command.captured.commands.watchOutcome(command.entry);
     throw new Error("quiet retained stop");
   } };
-  const rescue = setTimeout(() => release.resolve(), 2000);
-  const started = performance.now();
   const work = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
     { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 200 }).execute(f.claim);
   try {
@@ -860,6 +865,7 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
     let settled = false;
     void operation.then(() => { settled = true; });
     await work;
+    assert.ok(started !== undefined, "elapsed clock anchored at the pressure trigger");
     assert.ok(performance.now() - started < 1500, "uncooperative feedback does not defeat owner deadline");
     assert.equal(settled, false);
     assert.equal(sendSignal!.aborted, true);
