@@ -57,7 +57,7 @@ func TestWorkerRegisterAdvertisesHeartbeatOutboxFeature(t *testing.T) {
 // TestWorkerHeartbeatOverlaysOutboxOntoDTO pins that a heartbeat reporting a non-zero
 // outbox depth reaches the returned WorkerDTO via overlayOutbox: the depth is recorded
 // in the tracker for this worker (Heartbeat) and overlaid onto the response DTO for the
-// same worker. Disabling overlayOutbox (making it a no-op) leaves the four fields null
+// same worker. Disabling overlayOutbox (making it a no-op) leaves the five fields null
 // and fails this test.
 func TestWorkerHeartbeatOverlaysOutboxOntoDTO(t *testing.T) {
 	h := newProtocolHandler(t, &protocolStore{})
