@@ -10,7 +10,14 @@ import { nullLogger } from "./helpers.js";
 
 let fx: Fixture, bare: string, base: string, tip: string, cache: GitCache;
 let baseOids: string[], tipOids: string[], uniqueBytes: number, baseBytes: number, limit: number;
-const gitEnv = () => ({ ...process.env, GIT_CONFIG_GLOBAL: "/dev/null", GIT_CONFIG_SYSTEM: "/dev/null" });
+function gitEnv(): NodeJS.ProcessEnv {
+  const env: NodeJS.ProcessEnv = { ...process.env };
+  for (const key of Object.keys(env)) if (key.startsWith("GIT_")) delete env[key];
+  env.GIT_CONFIG_GLOBAL = "/dev/null";
+  env.GIT_CONFIG_SYSTEM = "/dev/null";
+  env.GIT_TERMINAL_PROMPT = "0";
+  return env;
+}
 function git(dir: string, args: string[], input?: string): string {
   return execFileSync("git", ["-C", dir, ...args], { env: gitEnv(), encoding: "utf8", input, stdio: "pipe" }).trim();
 }
