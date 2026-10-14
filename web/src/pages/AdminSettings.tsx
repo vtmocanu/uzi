@@ -39,6 +39,7 @@ import {
   DEFAULT_DARK_THEME,
 } from "../lib/theme";
 import { JudgeSettingsCard } from "./adminSettings/JudgeSettingsCard";
+import { HostedWorkerQuotaCard } from "./adminSettings/HostedWorkerQuotaCard";
 import { EphemeralWorkersCard } from "./adminSettings/EphemeralWorkersCard";
 import { UpdatesSettingsCard } from "./adminSettings/UpdatesSettingsCard";
 import { SummarySettingsCard } from "./adminSettings/SummarySettingsCard";
@@ -281,6 +282,7 @@ export function AdminSettings() {
           { id: "run-health", label: "Run health" },
           { id: "docker-allowlist", label: "Docker workers" },
           { id: "review-bots", label: "Review bots" },
+          { id: "hosted-worker-quota", label: "Hosted worker quota" },
           { id: "ephemeral-workers", label: "Ephemeral workers" },
           { id: "capability-scheduling", label: "Capability scheduling" },
           { id: "completion-interlock", label: "Completion check" },
@@ -515,6 +517,12 @@ export function AdminSettings() {
       {!loading && saved && (
         <section id="review-bots" className="scroll-mt-6">
           <TrustedReviewBotsCard settings={saved} sources={sources} onSaved={applyResponse} />
+        </section>
+      )}
+
+      {!loading && saved && (
+        <section id="hosted-worker-quota" className="scroll-mt-6">
+          <HostedWorkerQuotaCard settings={saved} onSaved={applyResponse} />
         </section>
       )}
 

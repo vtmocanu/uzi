@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Admin Settings exposes the hosted worker quota ([#2960](https://github.com/vtmocanu/uzi/issues/2960)).**
+  The Hosted worker quota card lets admins set the per-user persistent worker cap from 0 to 20, validates edits before saving, and shows server errors. Zero disables self-service provisioning without changing existing workers.
+
 - **GitHub pipeline discovery prefers the newest Actions suite.**
   When workflow discovery falls back to checks, a newer Actions suite now takes priority over an older suite already represented by check runs. If the preferred suite returns no workflow, discovery still recovers the older native workflow before synthesizing a status, preserving job and log access.
 

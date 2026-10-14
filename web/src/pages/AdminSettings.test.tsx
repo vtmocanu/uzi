@@ -58,6 +58,7 @@ const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
   judge_cooldown_seconds: "60",
   judge_daily_budget: "0",
   ephemeral_workers_enabled: "false",
+  hosted_worker_quota: "2",
   ci_autofix_enabled: "true",
   now_summary_enabled: "true",
   release_check_enabled: "true",
@@ -1607,5 +1608,16 @@ describe("DockerAllowlistCard — instance identities", () => {
     fireEvent.click(save());
     await screen.findByText("Docker worker repo allowlist saved.");
     expect(save().disabled).toBe(true);
+  });
+});
+
+describe("AdminSettings hosted worker quota (#2960)", () => {
+  it("renders the current quota control and section link", async () => {
+    mockApi.getSettings.mockResolvedValue({ ...response(), settings: { ...settings(), hosted_worker_quota: "3" } });
+    renderPage();
+    const quota = await screen.findByRole("spinbutton", { name: "Hosted workers per user" });
+    expect((quota as HTMLInputElement).value).toBe("3");
+    expect(screen.getByRole("button", { name: "Save hosted worker quota" })).toHaveProperty("disabled", true);
+    expect(screen.getByRole("link", { name: "Hosted worker quota" }).getAttribute("href")).toBe("#hosted-worker-quota");
   });
 });

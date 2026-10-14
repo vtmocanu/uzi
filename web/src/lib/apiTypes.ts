@@ -1024,6 +1024,8 @@ export interface AppSettings {
   // users can still individually opt in on the Workers page. Web-only surfacing — the
   // key already round-trips through GET/PUT /admin/settings.
   ephemeral_workers_enabled: string;
+  // Per-user persistent hosted-worker quota: integer 0..20, default 2. Zero disables provisioning.
+  hosted_worker_quota: string;
   // Upstream release-check toggles (PRD #836). Both the text "true"/"false" (default
   // "true"), round-tripping through GET/PUT /admin/settings like every other setting.
   // release_check_enabled is the master air-gap switch: when off, the api never calls
