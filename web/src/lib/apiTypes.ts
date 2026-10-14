@@ -1925,7 +1925,18 @@ export type ScheduleSkipReason =
   | "harness_label_invalid"
   | "schedules_paused"
   | "no_usable_credential"
-  | "credential_disabled";
+  | "credential_disabled"
+  | "ci_green"
+  | "ci_already_handled"
+  | "ci_halted_no_progress"
+  | "ci_halted_attempt_cap"
+  | "ci_watched_not_seen"
+  | "ci_unsupported"
+  | "no_default_branch"
+  | "ci_capacity"
+  | "ci_evidence_limited"
+  | "ci_not_failed"
+  | "ci_config_changed";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {

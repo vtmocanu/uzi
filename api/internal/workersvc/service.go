@@ -1098,6 +1098,10 @@ type Store interface {
 	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
 	// only for an interlocked queued run already past its health threshold.
 	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCIConfigGuard backs PRD #2865's queued-reason rung: a GUARDED
+	// queued run (runs.ci_config_guard) whose owner has NO online worker self-reporting the
+	// 'ci_config_guard_v1' protocol capability gets reasonNoCIConfigGuardCapableWorker.
+	CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
 	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
 	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
@@ -2009,6 +2013,10 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
+	// the create transaction after the run INSERT and before the episode write, so a test can
+	// inject a failure and prove the run and the episode roll back together.
+	ciRepairAfterInsert func(runID uuid.UUID) error
 	// codexFreezeFn is the createRunAtomic Codex-binding freeze, a SEAM defaulting (nil) to
 	// s.freezeCodexBinding (PRD #1429 M1). It exists so a test can inject a failing freeze and
 	// prove the create transaction rolls the run INSERT back (D1: a freeze failure leaves NO

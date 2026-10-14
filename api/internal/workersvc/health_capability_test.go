@@ -3,12 +3,14 @@ package workersvc
 import (
 	"context"
 	"errors"
+	"strings"
 	"testing"
 	"time"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 
+	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/vault"
 )
@@ -499,5 +501,57 @@ func TestHealthQueuedCapabilityReasonSurvivesReorder(t *testing.T) {
 	}
 	if len(fs.capsCalls) != 1 {
 		t.Fatalf("issued %d caps lookups, want 1 (the capability check must run past the vault/no-worker guards)", len(fs.capsCalls))
+	}
+}
+
+// -------------------------------------------------------------------------
+// PRD #2865: the CI-config-guard rung. A GUARDED queued run whose owner has NO online worker
+// reporting ci_config_guard_v1 surfaces reasonNoCIConfigGuardCapableWorker, naming the capability.
+
+func guardSvc(guarded bool, count int64) (*healthFakeStore, *Service, store.ListActiveRunsForHealthRow) {
+	r := queuedRunPastThreshold()
+	r.CiConfigGuard = guarded
+	fs := &healthFakeStore{
+		active:            []store.ListActiveRunsForHealthRow{r},
+		satisfyingCIGuard: count,
+		onlineWorkers:     1,
+		freeSlotWorkers:   1,
+	}
+	return fs, healthSvc(fs, defaultHealthSettings()), r
+}
+
+func TestHealthQueuedNoCIConfigGuardCapableWorkerFlagsReason(t *testing.T) {
+	fs, svc, r := guardSvc(true, 0)
+	if n := svc.detectRunHealth(context.Background(), t0); n != 1 {
+		t.Fatalf("changed = %d, want 1", n)
+	}
+	w := lastWrite(t, fs, r.ID)
+	if w.HealthReason.String != reasonNoCIConfigGuardCapableWorker {
+		t.Fatalf("reason = %q, want %q", w.HealthReason.String, reasonNoCIConfigGuardCapableWorker)
+	}
+	if !strings.Contains(w.HealthReason.String, capability.CIConfigGuardV1) {
+		t.Fatalf("reason %q must name %s", w.HealthReason.String, capability.CIConfigGuardV1)
+	}
+	if len(fs.ciGuardCalls) != 1 || fs.ciGuardCalls[0] != r.UserID {
+		t.Fatalf("guard lookups = %v, want exactly one for user %s", fs.ciGuardCalls, r.UserID)
+	}
+}
+
+func TestHealthQueuedCIConfigGuardCapableWorkerFallsThrough(t *testing.T) {
+	fs, svc, r := guardSvc(true, 1)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String != reasonWaitingWorker {
+		t.Fatalf("reason = %q, want the generic %q", w.HealthReason.String, reasonWaitingWorker)
+	}
+}
+
+func TestHealthQueuedUnguardedRunNeverCIConfigGuardReason(t *testing.T) {
+	fs, svc, r := guardSvc(false, 0)
+	svc.detectRunHealth(context.Background(), t0)
+	if w := lastWrite(t, fs, r.ID); w.HealthReason.String == reasonNoCIConfigGuardCapableWorker {
+		t.Fatal("emitted the guard reason for an unguarded run")
+	}
+	if len(fs.ciGuardCalls) != 0 {
+		t.Fatalf("issued %d guard lookups for an unguarded run", len(fs.ciGuardCalls))
 	}
 }

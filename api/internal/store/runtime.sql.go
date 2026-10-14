@@ -1045,6 +1045,10 @@ WITH claimant AS MATERIALIZED (
       -- stored workers.protocol_capabilities column, passed by the Go caller.
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY($15::text[]))
+      -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+      -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+      -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+      AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY($15::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
@@ -1302,6 +1306,10 @@ WITH claimant AS MATERIALIZED (
                 -- the claimant's @worker_protocol_caps above).
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
+                -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+                -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+                -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+                AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
                 -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
                 -- claim it (its OWN Codex claim clause above blocks it) — making the run permanently
@@ -2298,6 +2306,10 @@ WHERE run.id = $9
         $10::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+  -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+  -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+  AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
   AND (run.completion_contract_version IS NULL
@@ -2465,6 +2477,28 @@ SELECT count(*) FROM workers WHERE user_id = $1 AND status = 'online'
 // online" purposes — do not add a draining predicate.
 func (q *Queries) CountOnlineWorkersForUser(ctx context.Context, userID uuid.UUID) (int64, error) {
 	row := q.db.QueryRow(ctx, countOnlineWorkersForUser, userID)
+	var count int64
+	err := row.Scan(&count)
+	return count, err
+}
+
+const countOnlineWorkersSatisfyingCIConfigGuard = `-- name: CountOnlineWorkersSatisfyingCIConfigGuard :one
+SELECT count(*) FROM workers w
+WHERE w.user_id = $1
+  AND w.status = 'online'
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities)
+`
+
+// PRD #2865: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
+// 'ci_config_guard_v1' PROTOCOL capability. It drives the queued-reason resolver's CI-config-guard
+// rung: a 0 here for a GUARDED queued run (runs.ci_config_guard) means every online worker
+// predates the guard, so ClaimRun's standalone guard clause can never be satisfied. Mirrors
+// CountOnlineWorkersSatisfyingProtocol's filters.
+func (q *Queries) CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error) {
+	row := q.db.QueryRow(ctx, countOnlineWorkersSatisfyingCIConfigGuard, userID)
 	var count int64
 	err := row.Scan(&count)
 	return count, err
@@ -8269,7 +8303,7 @@ SELECT id, user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
-       egress_profile_id, job_protocol,
+       egress_profile_id, job_protocol, ci_config_guard,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
@@ -8354,6 +8388,7 @@ type ListActiveRunsForHealthRow struct {
 	ReleasedWorkerID          pgtype.UUID        `json:"released_worker_id"`
 	EgressProfileID           pgtype.UUID        `json:"egress_profile_id"`
 	JobProtocol               pgtype.Int2        `json:"job_protocol"`
+	CiConfigGuard             bool               `json:"ci_config_guard"`
 	StaleRequeuePinnable      bool               `json:"stale_requeue_pinnable"`
 	StaleRequeueWorkerName    string             `json:"stale_requeue_worker_name"`
 	CrossCheckPinRequired     bool               `json:"cross_check_pin_required"`
@@ -8465,6 +8500,7 @@ func (q *Queries) ListActiveRunsForHealth(ctx context.Context, codexCuratedModel
 			&i.ReleasedWorkerID,
 			&i.EgressProfileID,
 			&i.JobProtocol,
+			&i.CiConfigGuard,
 			&i.StaleRequeuePinnable,
 			&i.StaleRequeueWorkerName,
 			&i.CrossCheckPinRequired,
@@ -10582,6 +10618,10 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10647,6 +10687,10 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10886,7 +10930,9 @@ WHERE r.status = 'queued'
       TRUE
   -- Orphan PLAN children retain the legacy capability-gap provisioning path;
   -- the CODE exclusion above keeps known CODE children on their own worker.
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
+  -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
+  -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, $3::boolean, r.repo_id, r.kind, r.egress_profile_id, $4::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -10910,6 +10956,10 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL

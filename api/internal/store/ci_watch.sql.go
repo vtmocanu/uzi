@@ -204,8 +204,28 @@ func (q *Queries) LockCIWatchEpisode(ctx context.Context, arg LockCIWatchEpisode
 	return i, err
 }
 
-const lockRunScheduleForUser = `-- name: LockRunScheduleForUser :one
+const lockRepoForCIWatch = `-- name: LockRepoForCIWatch :one
 
+SELECT default_branch FROM repos WHERE id = $1 FOR SHARE
+`
+
+// CI episode transitions use a transaction-bound Queries.WithTx. Lock the parent
+// first, then admit/read the episode in a SECOND statement (fresh READ COMMITTED
+// snapshot). All starts, halts and resets take parent then episode in this order.
+// Config edits and target conversions retain episodes; only schedule deletion cascades.
+// Share-locks the repo row and returns its default branch. Taken BEFORE
+// LockRunScheduleForUser in every ci_watch start, halt and reset transaction (lock order:
+// pinned secret, repo, schedule, episode, run): repo deletion locks the repo and then
+// cascades to its schedules, so taking the schedule first would cycle with it. pgx.ErrNoRows
+// means the repo is gone.
+func (q *Queries) LockRepoForCIWatch(ctx context.Context, id uuid.UUID) (pgtype.Text, error) {
+	row := q.db.QueryRow(ctx, lockRepoForCIWatch, id)
+	var default_branch pgtype.Text
+	err := row.Scan(&default_branch)
+	return default_branch, err
+}
+
+const lockRunScheduleForUser = `-- name: LockRunScheduleForUser :one
 SELECT id, user_id, repo_id, target, issue_iid, labels, prompt, timing, cron_expr, run_at, timezone, next_fire_at, last_fired_at, auto_approve, wait_on_limit, enabled, status, created_at, updated_at, max_issues, guidance, model, override_subagent_model, last_fire, origin, catalog_slug, customized, sibling_group_id, mr_rework_enabled, output_mode, harness, credential_override_mode, credential_override_secret_id, capacity_limit, capacity_room_needed, remove_label_on_dispatch, recent_fires, ci_workflows FROM run_schedules WHERE id = $1 AND user_id = $2 FOR UPDATE
 `
 
@@ -214,10 +234,6 @@ type LockRunScheduleForUserParams struct {
 	UserID uuid.UUID `json:"user_id"`
 }
 
-// CI episode transitions use a transaction-bound Queries.WithTx. Lock the parent
-// first, then admit/read the episode in a SECOND statement (fresh READ COMMITTED
-// snapshot). All starts, halts and resets take parent then episode in this order.
-// Config edits and target conversions retain episodes; only schedule deletion cascades.
 func (q *Queries) LockRunScheduleForUser(ctx context.Context, arg LockRunScheduleForUserParams) (RunSchedule, error) {
 	row := q.db.QueryRow(ctx, lockRunScheduleForUser, arg.ID, arg.UserID)
 	var i RunSchedule

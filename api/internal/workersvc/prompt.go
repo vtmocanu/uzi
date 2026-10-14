@@ -6,6 +6,7 @@ import (
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
+	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/store"
@@ -38,6 +39,41 @@ var ErrActivePromptExists = errors.New("a prompt run is already active for this 
 // the owner configured. A second active run for the schedule is rejected by the
 // partial unique index → ErrActivePromptExists.
 func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *CredentialOverride, explicit *Harness) (store.Run, error) {
+	return s.createPromptRunShared(ctx, promptRunInput{
+		userID: userID, repoID: repoID, scheduleID: scheduleID, title: title, prompt: prompt,
+		autoApprove: autoApprove, waitOnLimit: waitOnLimit, mrReworkEnabled: mrReworkEnabled, model: model,
+		overrideSubagentModel: overrideSubagentModel, credOverride: credOverride, explicit: explicit,
+	}, nil)
+}
+
+// promptRunInput is the field set shared by CreatePromptRun and CreateCIRepairRun.
+type promptRunInput struct {
+	userID, repoID, scheduleID uuid.UUID
+	title, prompt              string
+	autoApprove, waitOnLimit   bool
+	mrReworkEnabled            *bool
+	model                      *string
+	overrideSubagentModel      bool
+	credOverride               *CredentialOverride
+	explicit                   *Harness
+}
+
+// promptRunGuard is what CreateCIRepairRun adds to the shared prompt-run create (PRD #2865):
+// the run is stamped ci_config_guard with the floor-unioned ci_config_paths, and two hooks run
+// INSIDE the create transaction. before runs after the pinned-secret share lock and before the
+// run INSERT (it takes the repo, schedule and episode locks and rechecks); after runs once the
+// run row exists (the episode write). A nil promptRunGuard is a plain prompt run.
+type promptRunGuard struct {
+	ciConfigPaths []string
+	before        func(ctx context.Context, q Store) error
+	after         func(ctx context.Context, q Store, run store.Run) error
+}
+
+// createPromptRunShared is the body CreatePromptRun and CreateCIRepairRun share: ownership,
+// guardDefaultBranch, createRunResolved, checkStoredOverrideEnabled and lockPinnedOverrideEnabled.
+func (s *Service) createPromptRunShared(ctx context.Context, in promptRunInput, g *promptRunGuard) (store.Run, error) {
+	userID, repoID, scheduleID := in.userID, in.repoID, in.scheduleID
+	credOverride := in.credOverride
 	row, err := s.q.GetRepoForUser(ctx, store.GetRepoForUserParams{ID: repoID, UserID: userID})
 	if err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
@@ -51,7 +87,7 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 	// PRD #1429 M2: resolve + freeze the harness in the same transaction as the INSERT. explicit is
 	// the schedule's pinned run_schedules.harness (nil ⇒ implicit D11); the fire-time codex+override
 	// conflict is gated by the scheduler's firePrompt (D5).
-	run, err := s.createRunResolved(ctx, userID, explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
+	run, err := s.createRunResolved(ctx, userID, in.explicit, func(q Store, resolved resolvedHarness) (store.Run, error) {
 		// PRD #1732 D2: a stored pin disabled since the schedule was saved starts no run on
 		// it (ErrCredentialDisabled -> the credential_disabled skip), inside the create tx.
 		if err := checkStoredOverrideEnabled(ctx, q, userID, credOverride); err != nil {
@@ -63,29 +99,46 @@ func (s *Service) CreatePromptRun(ctx context.Context, userID, repoID, scheduleI
 		if err := lockPinnedOverrideEnabled(ctx, q, userID, credOverride, nil); err != nil {
 			return store.Run{}, err
 		}
-		return q.CreatePromptRun(ctx, store.CreatePromptRunParams{
+		params := store.CreatePromptRunParams{
 			UserID:           userID,
 			RepoID:           repoID,
 			ScheduleID:       scheduleID,
-			IssueTitle:       title,
-			IssueDescription: prompt,
-			AutoApprove:      autoApprove,
-			WaitOnLimit:      waitOnLimit,
+			IssueTitle:       in.title,
+			IssueDescription: in.prompt,
+			AutoApprove:      in.autoApprove,
+			WaitOnLimit:      in.waitOnLimit,
 			// PRD #841 M1: the schedule's mr_rework override, stamped THROUGH live-inherit
 			// (D1) — nil ⇒ NULL ⇒ the run follows the owner default at read time.
-			MrReworkEnabled: pgconv.BoolPtr(mrReworkEnabled),
+			MrReworkEnabled: pgconv.BoolPtr(in.mrReworkEnabled),
 			// PRD #300: the schedule's per-schedule model override, frozen onto this run.
 			// nil → NULL → the run inherits the owner's per-user Worker default.
-			Model: pgconv.TextPtr(model),
+			Model: pgconv.TextPtr(in.model),
 			// PRD #305: the schedule's "apply model also to agents" opt-in, frozen onto this
 			// run at fire time (M1 stores only; delivery M3, worker behaviour M4).
-			OverrideSubagentModel: overrideSubagentModel,
+			OverrideSubagentModel: in.overrideSubagentModel,
 			// PRD #1247 M6: the schedule's stored credential override (nil ⇒ inherit).
 			CredentialOverrideMode:     pgOverrideMode(credOverride),
 			CredentialOverrideSecretID: pgOverrideSecretID(credOverride),
 			// PRD #1429 M2 (D1 auditor invariant): the D11-resolved harness frozen in-tx.
 			Harness: string(resolved.Harness),
-		})
+		}
+		if g != nil {
+			if err := g.before(ctx, q); err != nil {
+				return store.Run{}, err
+			}
+			params.CiConfigGuard = pgtype.Bool{Bool: true, Valid: true}
+			params.CiConfigPaths = g.ciConfigPaths
+		}
+		run, err := q.CreatePromptRun(ctx, params)
+		if err != nil {
+			return store.Run{}, err
+		}
+		if g != nil {
+			if err := g.after(ctx, q, run); err != nil {
+				return store.Run{}, err
+			}
+		}
+		return run, nil
 	})
 	if err != nil {
 		if isUniqueViolation(err) {

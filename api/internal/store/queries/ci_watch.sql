@@ -3,6 +3,14 @@
 -- snapshot). All starts, halts and resets take parent then episode in this order.
 -- Config edits and target conversions retain episodes; only schedule deletion cascades.
 
+-- name: LockRepoForCIWatch :one
+-- Share-locks the repo row and returns its default branch. Taken BEFORE
+-- LockRunScheduleForUser in every ci_watch start, halt and reset transaction (lock order:
+-- pinned secret, repo, schedule, episode, run): repo deletion locks the repo and then
+-- cascades to its schedules, so taking the schedule first would cycle with it. pgx.ErrNoRows
+-- means the repo is gone.
+SELECT default_branch FROM repos WHERE id = @id FOR SHARE;
+
 -- name: LockRunScheduleForUser :one
 SELECT * FROM run_schedules WHERE id = @id AND user_id = @user_id FOR UPDATE;
 

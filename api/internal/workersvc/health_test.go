@@ -118,6 +118,10 @@ type healthFakeStore struct {
 	// queuedReason completion-capability LiveDB tests; this side pins the ARM.
 	satisfyingProtocol    int64
 	satisfyingProtocolErr error
+	// satisfyingCIGuard is the canned CountOnlineWorkersSatisfyingCIConfigGuard answer (PRD #2865).
+	satisfyingCIGuard    int64
+	satisfyingCIGuardErr error
+	ciGuardCalls         []uuid.UUID
 	// protocolCalls records every lookup's user id, so a test can prove the rung asks about THIS
 	// run's user and that the guards ahead of it (and the non-interlocked case) short-circuit.
 	protocolCalls []uuid.UUID
@@ -284,6 +288,13 @@ func (f *healthFakeStore) CountOnlineWorkersSatisfyingProtocol(_ context.Context
 		return 0, f.satisfyingProtocolErr
 	}
 	return f.satisfyingProtocol, nil
+}
+func (f *healthFakeStore) CountOnlineWorkersSatisfyingCIConfigGuard(_ context.Context, userID uuid.UUID) (int64, error) {
+	f.ciGuardCalls = append(f.ciGuardCalls, userID)
+	if f.satisfyingCIGuardErr != nil {
+		return 0, f.satisfyingCIGuardErr
+	}
+	return f.satisfyingCIGuard, nil
 }
 func (f *healthFakeStore) CountOnlineEligibleWorkersForRepo(_ context.Context, arg store.CountOnlineEligibleWorkersForRepoParams) (int64, error) {
 	f.eligCalls = append(f.eligCalls, arg)
