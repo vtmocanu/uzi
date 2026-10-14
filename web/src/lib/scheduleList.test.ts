@@ -85,6 +85,14 @@ describe("scheduleDisplayName", () => {
     expect(scheduleDisplayName(sched({ origin: "default", catalog_slug: "retired-job" }), entries)).toBe("retired-job");
   });
 
+  it("targetTitle names a ci_watch schedule by its watched workflows (PRD #2865)", () => {
+    expect(targetTitle(sched({ target: "ci_watch" }))).toBe("CI repair · all workflows");
+    expect(targetTitle(sched({ target: "ci_watch", ci_workflows: [] }))).toBe("CI repair · all workflows");
+    expect(targetTitle(sched({ target: "ci_watch", ci_workflows: ["ci.yml", "release.yml"] }))).toBe(
+      "CI repair · ci.yml, release.yml",
+    );
+  });
+
   it("targetTitle truncates a long prompt", () => {
     const t = targetTitle(sched({ target: "prompt", prompt: "x".repeat(60) }));
     expect(t.startsWith("Prompt: ")).toBe(true);

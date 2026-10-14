@@ -1902,7 +1902,7 @@ export interface Memory {
 // owner-scoped intent to create run(s) at future time(s). Mirrors the Go
 // apitypes.ScheduleDTO — snake_case, byte-for-byte.
 
-export type ScheduleTarget = "issue" | "sweep" | "prompt" | "self_improve";
+export type ScheduleTarget = "issue" | "sweep" | "prompt" | "self_improve" | "ci_watch";
 export type ScheduleTiming = "once" | "recurring";
 // active — armed; fired — a `once` schedule that has already fired (terminal);
 // error — parked because its owner/token/repo is gone (surfaced, not dropped).

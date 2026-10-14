@@ -110,6 +110,7 @@ import type {
   RunNowResponse,
   RunReview,
   RunSocketLike,
+  CIEpisodePage,
   Schedule,
   ScheduleCatalog,
   ScheduleInput,
@@ -2033,6 +2034,11 @@ const realApi = {
   createSchedule: (repoId: string, input: ScheduleInput) =>
     request<Schedule>("POST", `/repos/${repoId}/schedules`, input),
   getSchedule: (id: string) => request<Schedule>("GET", `/schedules/${id}`),
+  // PRD #2865: one page of a ci_watch schedule's per-workflow episode state. The detail
+  // GET above carries the first page in `ci_episodes`; pass its opaque next_cursor here
+  // to read the next one. A null next_cursor in the response means the list is exhausted.
+  listScheduleCIEpisodes: (id: string, cursor: string) =>
+    request<CIEpisodePage>("GET", `/schedules/${id}/ci-episodes?cursor=${encodeURIComponent(cursor)}`),
   // PATCH merges (field present = apply, absent = keep). The per-row enable toggle
   // sends just { enabled }, which the server flips without re-validating the config.
   updateSchedule: (id: string, input: ScheduleInput) =>

@@ -25,8 +25,21 @@ export function targetTitle(s: Schedule): string {
       return s.prompt ? `Prompt: ${truncate(s.prompt, 42)}` : "Prompt";
     case "self_improve":
       return "Self-improvement";
+    case "ci_watch":
+      return s.ci_workflows && s.ci_workflows.length > 0
+        ? `CI repair · ${truncate(s.ci_workflows.join(", "), 42)}`
+        : "CI repair · all workflows";
   }
 }
+
+// CI_WATCH_TARGET_NAME is the human name of the ci_watch target (PRD #2865), shared by
+// the modal's target picker, the list's kind pill and the schedule's CI detail panel.
+export const CI_WATCH_TARGET_NAME = "Default-branch CI repair";
+
+// CI_WATCH_APPROVE_NOTE is shown wherever a ci_watch schedule's auto-approve choice is
+// made or reviewed (PRD #2865 D10): why the flag defaults off, verbatim.
+export const CI_WATCH_APPROVE_NOTE =
+  "Off by default: this job reads CI logs, which can contain text from dependencies, tests or outside contributors. Review the plan before the run changes code. You can turn it on.";
 
 function truncate(s: string, n: number): string {
   return s.length > n ? `${s.slice(0, n - 1)}…` : s;
