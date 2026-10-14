@@ -1010,6 +1010,36 @@ describe("GitCache.hasCommittedCheckpoint (#2967 floor-tree recovery coverage)",
     assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch), false);
   });
 
+  it("#2967 allows old-base coverage after a claim fetch advances the floor", async () => {
+    const f = await coverageFixture();
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, f.tip]);
+    const advanced = advanceOriginMain("advanced.txt", "default branch advanced\n");
+    await f.git.ensureClone(fx.originPath);
+    assert.equal(gitIn(f.bare, ["rev-parse", "refs/remotes/origin/main"]), advanced);
+    assert.notEqual(gitIn(f.bare, ["rev-parse", `${advanced}^{tree}`]), f.tree);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: f.tip }), false,
+      "coverage must be compared with its floor-reachable boundary, not the newer floor tip");
+  });
+
+  it("#2967 blocks an outside tree equal to the advanced floor but not its boundary", async () => {
+    const f = await coverageFixture();
+    const advanced = advanceOriginMain("advanced.txt", "default branch advanced\n");
+    await f.git.ensureClone(fx.originPath);
+    const advancedTree = gitIn(f.bare, ["rev-parse", `${advanced}^{tree}`]);
+    const tip = mkCommit(f.bare, advancedTree, [f.floor], "outside work copied from elsewhere");
+    gitIn(f.bare, ["update-ref", `refs/uzi-checkpoints/${f.branch}`, tip]);
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip }), true,
+      "the latest floor tree is not evidence that this checkpoint merely wraps its boundary");
+  });
+
+  it("#2967 blocks an unreadable boundary tree when the current floor is newer", async () => {
+    const f = await coverageFixture();
+    advanceOriginMain("advanced.txt", "default branch advanced\n");
+    await f.git.ensureClone(fx.originPath);
+    fs.unlinkSync(path.join(f.bare, "objects", f.tree.slice(0, 2), f.tree.slice(2)));
+    assert.equal(await f.git.hasCommittedCheckpoint(f.bare, f.branch, { tip: f.tip }), true);
+  });
+
   it("#2967 examines retained coverage parents, not only the tip tree", async () => {
     const f = await coverageFixture();
     const changedTree = gitIn(f.bare, ["mktree"]);

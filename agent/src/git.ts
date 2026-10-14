@@ -11376,7 +11376,8 @@ export class GitCache {
   /** Report-only orphan guard (#299, #759, #2967). Check both the mirrored ref and,
    *  when this worker published, its exact confirmed tip (the mirror can be stale).
    *  Recovery coverage is content-free only when EVERY commit outside the recovery
-   *  floor's history has that floor's tree, including all retained merge parents.
+   *  floor's history matches a floor-reachable boundary parent's tree. The current
+   *  floor can advance past the coverage base. Include all retained merge parents.
    *  Missing confirmed-publication evidence blocks; a genuinely absent ref without
    *  publication does not. The existing marker-only park exception remains below. */
   async hasCommittedCheckpoint(
@@ -11385,7 +11386,7 @@ export class GitCache {
     confirmedPublication?: { tip: string | undefined },
   ): Promise<boolean> {
     if (confirmedPublication && (!confirmedPublication.tip ||
-        !(await this.checkpointHasOnlyFloorTrees(barePath, branch, confirmedPublication.tip)))) return true;
+        !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, confirmedPublication.tip)))) return true;
     const ref = `refs/uzi-checkpoints/${branch}`;
     const refStatus = await this.tryGitExit(barePath, ["show-ref", "--verify", "--quiet", ref]);
     if (refStatus === 1) return false; // Proven absence, not an unreadable ref or failed command.
@@ -11393,7 +11394,7 @@ export class GitCache {
     const tip = (await this.tryGitStdout(barePath, ["rev-parse", "--verify", `${ref}^{commit}`])).trim();
     if (!tip) return true;
     if (!(await this.isWipParkMarker(barePath, tip)))
-      return !(await this.checkpointHasOnlyFloorTrees(barePath, branch, tip));
+      return !(await this.checkpointHasOnlyBoundaryTrees(barePath, branch, tip));
     // 3) The tip IS a `wip(park):` marker. The committed work (if any) is its parent and
     //    below. A root-commit marker (no readable parent) has nothing committed below to
     //    orphan → false (mirrors the root-marker handling in runnerClone, git.ts ~585-591).
@@ -11440,7 +11441,7 @@ export class GitCache {
   }
 
   /** Positive proof only: command failure, missing objects or truncated history block. */
-  private async checkpointHasOnlyFloorTrees(barePath: string, branch: string, tip: string): Promise<boolean> {
+  private async checkpointHasOnlyBoundaryTrees(barePath: string, branch: string, tip: string): Promise<boolean> {
     try {
       if ((await this.runGit(barePath, ["rev-parse", "--is-shallow-repository"])).trim() !== "false") return false;
       const floorRef = (await this.refExists(barePath, `refs/remotes/origin/${branch}`))
@@ -11450,9 +11451,25 @@ export class GitCache {
       const tree = (await this.runGit(barePath, ["--no-replace-objects", "rev-parse", "--verify", `${floor}^{tree}`])).trim();
       // %T alone prints an object name even when that tree cannot be read.
       await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${tree}^{tree}`]);
-      const trees = (await this.runGit(barePath,
-        ["--no-replace-objects", "log", "--format=%T", exactTip, "--not", floor, "--"])).trim();
-      return trees === "" || trees.split("\n").every(candidate => candidate === tree);
+      // Boundaries are the floor-reachable parents at this checkpoint's cut, not
+      // arbitrary published trees or today's newer floor tip. Walk every merge parent.
+      const walk = (await this.runGit(barePath, ["--no-replace-objects", "log", "--boundary",
+        "--format=%m %T", exactTip, "--not", floor, "--"])).trim();
+      if (walk === "") return true; // The tip is already reachable from the floor.
+      const boundaryTrees = new Set<string>();
+      const outsideTrees: string[] = [];
+      for (const line of walk.split("\n")) {
+        const row = /^([>-]) ([0-9a-f]{40}|[0-9a-f]{64})$/.exec(line);
+        if (!row) return false;
+        if (row[1] === "-") boundaryTrees.add(row[2]!);
+        else outsideTrees.push(row[2]!);
+      }
+      if (boundaryTrees.size === 0) return false;
+      for (const boundaryTree of boundaryTrees) {
+        if (boundaryTree !== tree)
+          await this.runGit(barePath, ["--no-replace-objects", "cat-file", "-e", `${boundaryTree}^{tree}`]);
+      }
+      return outsideTrees.every(candidate => boundaryTrees.has(candidate));
     } catch (error) {
       if (error instanceof RunResidueBlockedError) throw error;
       const abort = this.boundaryAbortError(error);

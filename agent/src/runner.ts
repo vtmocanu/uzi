@@ -6267,7 +6267,7 @@ export class RunRunner {
     if (result.reportOnly) {
       // #299/#2967: report-only opens no MR to supersede a published checkpoint.
       // Check the prior/cross-worker mirrored ref AND this worker's exact confirmed
-      // publication, which may not be mirrored yet. Floor-tree-only recovery coverage
+      // publication, which may not be mirrored yet. Content-free recovery coverage
       // carries no content; retained commits with differing trees still block.
       // Missing evidence for a confirmed publication blocks. The prior-worker
       // marker-only park exception remains in hasCommittedCheckpoint.
@@ -6608,7 +6608,7 @@ export class RunRunner {
       if (changedForPrompt !== null && changedForPrompt.length === 0) {
         // The same #299/#2967 orphan guard as declared report_only: check both
         // mirrored and exact confirmed-published tips. Only positively proven
-        // floor-tree coverage (or the existing mirrored park-marker exception)
+        // published-boundary coverage (or the existing mirrored park-marker exception)
         // carries no committed content; unknown confirmed publication still blocks.
         const publishedCheckpoint =
           await this.git.hasCommittedCheckpoint(barePath, runnerClone.branch,

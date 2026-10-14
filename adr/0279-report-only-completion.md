@@ -103,9 +103,14 @@ worker recovery can publish content-free coverage commits without agent code cha
 The guard checks both the mirrored `refs/uzi-checkpoints/<branch>` and this worker's
 exact confirmed publication tip, even if the local mirror is absent or stale.
 A checkpoint is content-free only when every commit reachable from its tip but not
-from the recovery floor has that floor tip's tree, including retained merge parents.
-The floor is origin's branch when present, otherwise the resolved default branch.
-Any differing tree or unreadable proof blocks report-only completion. A confirmed
+from the recovery floor matches a floor-reachable boundary parent's tree, including
+retained merge parents. Boundaries are the floor-reachable parents at the cut of
+that walk, not arbitrary historical trees. The floor is origin's branch when
+present, otherwise the resolved default branch. It can advance during reclaims:
+coverage over an older published base remains content-free even when today's floor
+tree differs. Conversely, an outside tree matching only the newer floor tip, with
+no matching boundary tree, does not prove content-free coverage.
+An outside tree matching no boundary, or unreadable proof, blocks completion. A confirmed
 publication with an unknown tip also blocks; a genuinely absent checkpoint without
 confirmed publication does not. The existing mirrored marker-only `wip(park):`
 exception (#759) retains its ancestry-based handling.
