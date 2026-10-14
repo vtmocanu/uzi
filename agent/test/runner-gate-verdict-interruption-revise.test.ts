@@ -2,6 +2,7 @@ import { describe, it } from "node:test";
 import assert from "node:assert/strict";
 import type { ClaimResponse, UserInput } from "../src/protocol.js";
 import { api, installHarness } from "./runner-harness.js";
+import { waitForTestEvent } from "./helpers.js";
 import {
   PLAN_V1,
   FEEDBACK,
@@ -12,6 +13,7 @@ import {
   until,
   scenario,
   assertRevisedOnResume,
+  assertRetainedResume,
   resumeAndApprove,
 } from "./runner-gate-verdict-interruption-fixture.js";
 
@@ -19,12 +21,12 @@ installHarness();
 
 describe("#1604 — (c) a switch requested during the revision turn", () => {
   for (const session of ["kept", "none"] as const) {
-    it(`deferral holds, the revised plan and the revise settle before the release; the reclaim (${session === "kept" ? "session kept" : "no session"}) ${session === "kept" ? "re-presents the revised plan" : "plans afresh (no re-presentation)"} with no second revision`, () =>
+    it(`deferral holds, the revised plan and the revise settle before the release; the reclaim (${session === "kept" ? "prior session carried, fresh retained attempt" : "no session"}) ${session === "kept" ? "re-presents the revised plan" : "plans afresh (no re-presentation)"} with no second revision`, () =>
       scenario(async (s) => {
         const first = await s.toFirstGate();
         const block = s.model.block("revise");
         const [row] = s.send(s.input("revise_plan", FEEDBACK));
-        await block.entered;
+        await waitForTestEvent(block.entered, "model turn entered");
         api.requestCredentialSwitch(s.runId, 1);
         await tick(100);
         assert.ok(!s.statuses(first).includes("credential_switch"), "the switch is deferred while the revision turn runs");
@@ -40,6 +42,7 @@ describe("#1604 — (c) a switch requested during the revision turn", () => {
         assert.equal(api.isApplied(s.runId, row!.id), true, "nothing is left to replay");
         assert.equal(s.model.count("revise", flight.turnFrom), 0, "no second revision");
         if (session === "kept") {
+          assertRetainedResume(s, flight);
           assert.equal(s.gates(flight)[0]?.plan_md, revisedPlan(1), "the resumed gate shows the revised plan");
           assert.equal(s.model.count("plan", flight.turnFrom), 0, "no re-plan");
         } else {
@@ -122,7 +125,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
         s.input("follow_up", "also update the changelog"),
         s.answer("q-not-open"),
       );
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       assert.ok(await until(() => api.isApplied(s.runId, fu!.id) && api.isApplied(s.runId, ans!.id), 3_000), "the follow_up and answer are applied while the revision runs");
       assert.equal(api.isApplied(s.runId, rev!.id), false, "the revise waits for its revised plan");
       block.release();
@@ -142,7 +145,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
       const [rev] = s.send(s.input("revise_plan", FEEDBACK));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       const gets = api.inputGets.get(s.runId) ?? 0;
       assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) >= gets + 10, 3_000), "the channel keeps polling during the revision");
       const [fu] = s.send(s.input("follow_up", "keep the public API"));
@@ -170,7 +173,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       assert.ok(s.statuses(first).includes("credential_switch"), s.statuses(first).join(","));
       assert.equal(s.persistedGate()?.plan_md, PLAN_V1, "the server still holds the submitted plan");
       const { flight, gateAt } = await resumeAndApprove(s, s.resumeClaim("kept"));
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+      assertRevisedOnResume(s, flight, FEEDBACK, "retained");
       assert.ok(s.appliedAt(row!.id, flight.timelineFrom) > gateAt, "applied after the replayed revision was persisted");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }));
@@ -194,7 +197,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
       s.send(s.input("revise_plan", FEEDBACK));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       const [rej] = s.send(s.input("reject_plan", "no"));
       assert.ok(await until(() => api.isAcked(s.runId, rej!.id)));
       block.release();
@@ -210,7 +213,7 @@ describe("#1604 — boundaries of the revise receipt", () => {
     scenario(async (s) => {
       const block = s.model.block("plan");
       const first = s.start(s.claim());
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       const [rej, ap] = s.send(s.input("reject_plan", "no"), s.input("approve_plan"));
       assert.ok(await until(() => api.isAcked(s.runId, ap!.id)));
       block.release();
@@ -227,7 +230,7 @@ describe("#1604 — receipt scheduling around a revise that becomes ready", () =
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
       const [rev] = s.send(s.input("revise_plan", FEEDBACK));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       api.delayInputReceipts("ack", 1_500);
       const [fu] = s.send(s.input("follow_up", "keep the changelog"));
       assert.ok(await until(() => api.inputReceiptCalls.some((c) => c.kind === "ack" && c.ids.includes(fu!.id))));
@@ -251,7 +254,7 @@ describe("#1604 — receipt scheduling around a revise that becomes ready", () =
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
       const [rev] = s.send(s.input("revise_plan", FEEDBACK));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       api.delayInputReceipts("applied", 800);
       const [fu] = s.send(s.input("follow_up", "keep the changelog"));
       assert.ok(await until(() => api.inputReceiptCalls.some((c) => c.kind === "applied" && c.ids.includes(fu!.id))));

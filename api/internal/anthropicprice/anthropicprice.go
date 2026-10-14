@@ -1,6 +1,7 @@
 // Package anthropicprice prices one Anthropic Messages API usage record from a recorded public
-// price table (issue #2014, ADR-2014 D6). The result is an ESTIMATE shown apart from the metered
-// total; it is never billed money and never merged into run_usage_totals.
+// price table (issue #2014, ADR-2014 D6). Callers keep interrupted-session estimates apart
+// from run_usage_totals, or record summary/Now pass costs as API-equivalent usage. Neither
+// reading proves billed money.
 //
 // Provenance. Every rate below was transcribed from Anthropic's official pricing page, fetched
 // during the run that introduced this package (see AnthropicPriceSourceURL and
@@ -24,7 +25,7 @@ import (
 
 // AnthropicPriceTableVersion identifies this table. It changes whenever a rate, a model row or a
 // pricing rule changes, so a stored-nothing estimate can say which table produced it.
-const AnthropicPriceTableVersion = "anthropic-standard-2026-10-03"
+const AnthropicPriceTableVersion = "anthropic-standard-2026-10-13"
 
 // AnthropicPriceSourceURL is the official pricing page the rates were transcribed from.
 const AnthropicPriceSourceURL = "https://platform.claude.com/docs/en/about-claude/pricing"
@@ -36,14 +37,16 @@ const AnthropicPriceFetchedAt = "2026-10-03"
 
 // Standard-pricing markers a usage record must carry (or omit) to be priced from this table.
 const (
-	standardServiceTier  = "standard"
-	standardSpeed        = "standard"
-	standardInferenceGeo = "global"
+	standardServiceTier     = "standard"
+	standardSpeed           = "standard"
+	standardInferenceGeo    = "global"
+	unavailableInferenceGeo = "not_available"
 )
 
 // rates is one model's price in hundredths of a microdollar per token (USD per MTok x 100).
 type rates struct {
 	input, cacheRead, cacheWrite5m, cacheWrite1h, output int64
+	predatesInferenceGeo                                 bool
 }
 
 // table maps an exact API model id to its rates. USD per MTok, from the pricing page "Model
@@ -53,23 +56,29 @@ type rates struct {
 //	Claude Opus 5.5     4   /  5    /  8   / 0.20 / 20
 //	Claude Opus 5       5   /  6.25 / 10   / 0.50 / 25
 //	Claude Opus 4.8     5   /  6.25 / 10   / 0.50 / 25
-//	Claude Sonnet 5.5   2   /  2.50 /  4   / 0.20 / 10
+//	Claude Sonnet 5.5   2   /  2.50 /  4   / 0.10 / 10
 //	Claude Haiku 4.5    1   /  1.25 /  2   / 0.10 /  5
 //
 // No long-context premium row exists: the fetched pages state the 1M context window is at
 // standard pricing for the 4.6-and-later models listed, and Haiku 4.5's window is 200K.
+// Sonnet 5.5's cache-hit rate was corrected from the pricing page on 2026-10-13.
 var table = map[string]rates{
 	"claude-fable-5-1":          {input: 1000, cacheRead: 25, cacheWrite5m: 1250, cacheWrite1h: 2000, output: 5000},
 	"claude-opus-5-5":           {input: 400, cacheRead: 20, cacheWrite5m: 500, cacheWrite1h: 800, output: 2000},
 	"claude-opus-5":             {input: 500, cacheRead: 50, cacheWrite5m: 625, cacheWrite1h: 1000, output: 2500},
 	"claude-opus-4-8":           {input: 500, cacheRead: 50, cacheWrite5m: 625, cacheWrite1h: 1000, output: 2500},
-	"claude-sonnet-5-5":         {input: 200, cacheRead: 20, cacheWrite5m: 250, cacheWrite1h: 400, output: 1000},
-	"claude-haiku-4-5-20251001": {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500},
-	"claude-haiku-4-5":          {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500},
+	"claude-sonnet-5-5":         {input: 200, cacheRead: 10, cacheWrite5m: 250, cacheWrite1h: 400, output: 1000},
+	"claude-haiku-4-5-20251001": {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500, predatesInferenceGeo: true},
+	"claude-haiku-4-5":          {input: 100, cacheRead: 10, cacheWrite5m: 125, cacheWrite1h: 200, output: 500, predatesInferenceGeo: true},
 }
 
 // Usage is one message's token usage and the response markers that decide whether it is priced
 // at the standard rates. Empty ServiceTier, Speed and InferenceGeo mean the field was absent.
+// InferenceGeo "not_available" is accepted only for rows known to predate geographic routing:
+// https://platform.claude.com/docs/en/manage-claude/usage-cost-api#data-residency.
+// These earlier models use standard pricing:
+// https://platform.claude.com/docs/en/about-claude/pricing#data-residency-pricing.
+// On geo-capable models the marker cannot establish standard pricing and stays unpriced.
 type Usage struct {
 	Model                    string
 	InputTokens              int64
@@ -107,7 +116,8 @@ func (c Cost) USD() float64 {
 
 // Price prices one message. ok is false, and the Cost meaningless, when the message cannot be
 // priced from this table: the model is not a row, service_tier / speed / inference_geo is present
-// and not the standard value, cache-creation tokens arrive without a consistent 5m/1h split, or a
+// and not the standard value (except inference_geo "not_available" on a row known to predate
+// geographic routing), cache-creation tokens arrive without a consistent 5m/1h split, or a
 // token count is negative. Callers must treat !ok as "cost unknown", never as zero.
 func Price(u Usage) (Cost, bool) {
 	r, found := table[u.Model]
@@ -120,7 +130,9 @@ func Price(u Usage) (Cost, bool) {
 	if u.Speed != "" && u.Speed != standardSpeed {
 		return Cost{}, false
 	}
-	if u.InferenceGeo != "" && u.InferenceGeo != standardInferenceGeo {
+	geoStandard := u.InferenceGeo == "" || u.InferenceGeo == standardInferenceGeo ||
+		(u.InferenceGeo == unavailableInferenceGeo && r.predatesInferenceGeo)
+	if !geoStandard {
 		return Cost{}, false
 	}
 	if u.InputTokens < 0 || u.CacheReadInputTokens < 0 || u.CacheCreationInputTokens < 0 || u.OutputTokens < 0 {

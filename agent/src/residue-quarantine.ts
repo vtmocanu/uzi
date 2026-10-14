@@ -52,6 +52,33 @@ export class RunResidueBlockedError extends Error {
   }
 }
 
+/**
+ * issue #1786: a stopped generation's clone is retained, not discarded, and a bound marker (or a
+ * ledger `reclaimed` journal that names it) refuses its reuse. Thrown under the bare lock by the
+ * seed and discovery paths in place of adopting, capturing or freeing the retained canonical clone.
+ * A RunResidueBlockedError, so the run follows the existing `worker_residue_blocked` handling; the
+ * message names the run, its generation (or `none`), the path and the inspect command.
+ */
+export class RetainedStoppedSourceError extends RunResidueBlockedError {
+  readonly runId: string | undefined;
+  readonly generation: number | "none" | "unknown";
+  readonly clonePath: string;
+  constructor(info: { runId?: string; generation: number | null | "unknown"; clonePath: string }) {
+    const generation = info.generation === null ? "none" : info.generation;
+    const run = info.runId === undefined ? "unknown" : info.runId;
+    // The base class bounds and cleans the detail (160 characters); the operator hint is fixed text.
+    // Keep the tail of a long path (the clone key and attempt id), so the 160-character bound
+    // never cuts the part that identifies it.
+    const where = info.clonePath.length > 72 ? `...${info.clonePath.slice(-69)}` : info.clonePath;
+    super(`retained stopped work: run ${run.slice(0, 40)} generation ${generation} at ${where}`);
+    this.message = `${REASON_WORKER_RESIDUE_BLOCKED}: ${this.detail}; inspect it with the worker-local retained-source command before reusing this clone`;
+    this.name = "RetainedStoppedSourceError";
+    this.runId = info.runId;
+    this.generation = generation;
+    this.clonePath = info.clonePath;
+  }
+}
+
 /** Where a quarantine refusal fired (logs only). */
 export type ResidueQuarantineRefusalSite = "git" | "provider_turn" | "claim";
 

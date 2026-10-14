@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { WorkerClient } from "../src/client.js";
@@ -30,7 +31,7 @@ it("inventory wrapper propagates recovery cancellation instead of returning unkn
 
 for (const lane of ["archive", "ordinary"] as const) {
   it(`worker preserves the admission fence after ${lane} finalize unlink`, async t => {
-    const root = await fs.mkdtemp(path.resolve(import.meta.dirname, "../../.uzi/scratch/worker-fence-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "worker-fence-"));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1024 * 1024,
       maxBytes: 16 * 1024 * 1024, retentionMs: 86400000 });
@@ -43,8 +44,9 @@ for (const lane of ["archive", "ordinary"] as const) {
       recoveryInventoryPending: async () => lane === "archive",
       isExecuting: () => false,
       retireRecoveryReport: async (_run: string, _generation: number, context: ReportRetirementContext) => {
-        if (lane !== "archive") return false;
-        return outbox.retireFinalizeIfEligible(run, generation, () => true, context.signal!, context.expectedIdentity!);
+        if (lane !== "archive") return { retired: false };
+        const retired = await outbox.retireFinalizeIfEligible(run, generation, () => true, context.signal!, context.expectedIdentity!);
+        return retired ? { retired: true, authority: "existing_archive" } : { retired: false };
       },
       notifyPublicationCompletionRetired: async () => { notifications++; },
     };
@@ -199,7 +201,7 @@ it("worker notifies exactly once after successful archive finalize unlink, never
   const retire = f.r.retireRecoveryReport.bind(f.r);
   t.mock.method(f.r, "retireRecoveryReport", async (...args: Parameters<typeof retire>) => {
     const result = await retire(...args);
-    results.push(result);
+    results.push(result.retired);
     return result;
   });
   let notifications = 0;

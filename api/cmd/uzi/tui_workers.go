@@ -526,7 +526,7 @@ func workerCrossCheckSlots(w apitypes.WorkerDTO) string {
 	}
 	return itoa(w.ActiveCrossChecks) + "/" + cap
 }
-func (m tuiModel) workersSummary(width int) string {
+func (m tuiModel) workersSummary(width int, hideIdleCrossChecks bool) string {
 	if m.workers.admin != m.board.admin || len(m.workers.rows) == 0 {
 		return ""
 	}
@@ -589,7 +589,9 @@ func (m tuiModel) workersSummary(width int) string {
 		if !showCount {
 			cross = fmt.Sprintf("%d/%s checks", crossUsed, crossDenom)
 		}
-		parts = append(parts, cross)
+		if !hideIdleCrossChecks || crossUsed != 0 {
+			parts = append(parts, cross)
+		}
 		if showAdmission {
 			if holding > 0 {
 				parts = append(parts, paintSeg(m.pal.amber, nil, false, fmt.Sprintf("%d holding", holding)))
@@ -684,13 +686,13 @@ func (m tuiModel) workerUsage(pct float64, cells int) string {
 	n := min(cells, max(0, int(pct*float64(cells)/100+0.5)))
 	return paintSeg(m.workerUsageColor(pct), nil, false, strings.Repeat("▮", n)) + paintSeg(m.pal.faintC, nil, false, strings.Repeat("▯", cells-n)) + paintSeg(m.workerUsageColor(pct), nil, false, fmt.Sprintf(" %.0f%%", pct))
 }
-func (m tuiModel) workerFleetTitleLines(title string) []string {
-	status := m.workersSummary(m.width)
+func (m tuiModel) workerFleetTitleLines(title string, hideIdleCrossChecks bool) []string {
+	status := m.workersSummary(m.width, hideIdleCrossChecks)
 	if status == "" {
 		return []string{clampVisual(title, m.width)}
 	}
 	// Fit the fleet's optional segments into the title's remaining space first.
-	compact := m.workersSummary(max(0, m.width-visualWidth(title)-2))
+	compact := m.workersSummary(max(0, m.width-visualWidth(title)-2), hideIdleCrossChecks)
 	if gap := m.width - visualWidth(title) - visualWidth(compact); gap >= 2 {
 		return []string{title + strings.Repeat(" ", gap) + compact}
 	}
@@ -845,7 +847,7 @@ func (m tuiModel) renderWorkersBody(height int, full bool) string {
 	columns := m.workerTableWidths(rows, width)
 	var lines []string
 	if full {
-		lines = append(lines, m.workerFleetTitleLines(" "+m.tabStrip(m.board.admin, viewWorkers, false))...)
+		lines = append(lines, m.workerFleetTitleLines(" "+m.tabStrip(m.board.admin, viewWorkers, false), false)...)
 	}
 	if m.board.adminDenied {
 		lines = append(lines, clampVisual("factory workers need an admin (uza_) token — showing your workers", width))

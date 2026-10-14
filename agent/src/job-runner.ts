@@ -43,6 +43,7 @@ import { z } from "zod";
 
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { MessageBatcher } from "./batcher.js";
+import { chunkedTimeout } from "./chunked-timeout.js";
 import { JobFileTimeoutError, type WorkerClient } from "./client.js";
 import type { EmittedMessage } from "./executor.js";
 import { buildFetchToolsServer, FETCH_SERVER_NAME, SOURCES_DIR } from "./fetch-tools.js";
@@ -975,12 +976,11 @@ export class JobRunner {
     const deadlineAt = args.startedAt + args.budgetMs;
     let cancelled = false;
     let timedOut = false;
-    const timer = setTimeout(() => {
+    const timer = chunkedTimeout(() => {
       timedOut = true;
       log.warn("job exceeded its wall-clock budget during input downloads; aborting", { budget_ms: args.budgetMs });
       session.abort();
-    }, Math.max(0, deadlineAt - Date.now()));
-    timer.unref?.();
+    }, Math.max(0, deadlineAt - Date.now()), { unref: true });
     const stopPoll = new AbortController();
     const poll = this.watchCancel(args.runId, args.generation, stopPoll.signal, log, () => {
       cancelled = true;
@@ -999,7 +999,7 @@ export class JobRunner {
       if (why) throw new JobFileFailure(why, err);
       throw err;
     } finally {
-      clearTimeout(timer);
+      timer.cancel();
       stopPoll.abort();
       await poll.catch(() => undefined);
     }
@@ -1088,13 +1088,12 @@ export class JobRunner {
     };
 
     // The wall-clock budget: abort and report failed. A job never parks.
-    const deadline = setTimeout(() => {
+    const deadline = chunkedTimeout(() => {
       timedOut = true;
       log.warn("job exceeded its wall-clock budget; aborting", { budget_ms: args.budgetMs });
       session.abort();
       reap();
-    }, args.budgetMs);
-    deadline.unref?.();
+    }, args.budgetMs, { unref: true });
 
     // The cancel poll: an owner cancel is a run input of kind `cancel`.
     const stopPoll = new AbortController();
@@ -1144,7 +1143,7 @@ export class JobRunner {
     } catch (err) {
       iterationError = err;
     } finally {
-      clearTimeout(deadline);
+      deadline.cancel();
       stopPoll.abort();
       await poll.catch(() => undefined);
       reap();

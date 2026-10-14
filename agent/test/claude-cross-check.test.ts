@@ -120,7 +120,7 @@ describe("buildClaudeCrossCheckOptions: the checker's confinement", () => {
       assert.equal(o.cwd, s.checkout);
       assert.ok(Number.isInteger(o.maxTurns) && o.maxTurns! > 0 && o.maxTurns! <= 100, "a bounded turn budget");
       assert.equal(typeof o.spawnClaudeCodeProcess, "function", "the runner-uid detached spawn");
-      assert.deepEqual((o.settings as { enabledPlugins: Record<string, boolean> }).enabledPlugins, { "agents-md@builtin": false });
+      assert.deepEqual((o.settings as { enabledPlugins: Record<string, boolean> }).enabledPlugins, { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false });
     } finally { fs.rmSync(s.root, { recursive: true, force: true }); }
   });
 

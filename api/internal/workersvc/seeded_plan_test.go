@@ -308,7 +308,7 @@ func TestCreateRunNonSeededIsByteIdenticalToPreFeature(t *testing.T) {
 	t.Run("autopilot never seeds", func(t *testing.T) {
 		fs := seededIssueStore()
 		svc := New(fs, newBox(t), testParams())
-		if _, err := svc.CreateAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "desc"); err != nil {
+		if _, err := svc.CreateAutopilotRun(context.Background(), uuid.New(), uuid.New(), 4, "desc", nil); err != nil {
 			t.Fatalf("CreateAutopilotRun: %v", err)
 		}
 		check(t, fs.createRunParams)

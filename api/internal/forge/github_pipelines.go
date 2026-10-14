@@ -152,27 +152,29 @@ func (g *github) latestPipelineFromChecks(ctx context.Context, slug repoSlug, re
 		headSHA = headSHAFromChecks(runs, suites)
 	}
 
-	// ACTIONS-RECOVERY (primary): if any check-run belongs to a github-actions
-	// check-suite — or, when no check-run does, the head lists a github-actions
-	// check-SUITE directly (the check-runs list can be empty/unavailable while the suite
-	// is present, issue #1005) — re-query workflow-runs filtered by that suite id. GitHub
-	// lists an Actions run under checks even when the branch/head_sha-filtered
-	// workflow-runs list is (transiently) empty, so this recovers a NATIVE workflow-run
-	// pipeline — its id is a workflow-RUN id, the same space as the normal path, keeping
-	// ListPipelineJobs/JobLogTail working. Pick the newest Actions check-SUITE id so a
-	// re-run's suite wins (that suite id only SELECTS the run to recover; the returned
-	// pipeline's id is the workflow-run id, not the suite id).
+	// ACTIONS-RECOVERY (primary): query the maximum eligible Actions suite id across
+	// both sources first; the suite-filtered workflow-run response can be empty
+	// (possibly transiently), so try the check-run-derived older Actions suite before
+	// synthesis. At most two distinct queries run, and either error stops recovery.
+	// Return a NATIVE workflow-run id, keeping ListPipelineJobs/JobLogTail working;
+	// the suite id only selects the run and is not the returned pipeline id.
 	if suiteID, ok := newestActionsSuiteIDFromChecks(runs, suites); ok {
-		opt := &gh.ListWorkflowRunsOptions{
-			CheckSuiteID: suiteID,
-			ListOptions:  gh.ListOptions{PerPage: 1},
+		suiteIDs := []int64{suiteID}
+		if olderID, ok := newestActionsSuiteID(runs); ok && olderID != suiteID {
+			suiteIDs = append(suiteIDs, olderID)
 		}
-		wf, _, err := g.client.Actions.ListRepositoryWorkflowRuns(ctx, slug.owner, slug.repo, opt)
-		if err != nil {
-			return Pipeline{}, g.wrapErr("latest pipeline from checks", err)
-		}
-		if wf != nil && len(wf.WorkflowRuns) > 0 && wf.WorkflowRuns[0] != nil {
-			return toGitHubPipeline(wf.WorkflowRuns[0]), nil
+		for _, id := range suiteIDs {
+			opt := &gh.ListWorkflowRunsOptions{
+				CheckSuiteID: id,
+				ListOptions:  gh.ListOptions{PerPage: 1},
+			}
+			wf, _, err := g.client.Actions.ListRepositoryWorkflowRuns(ctx, slug.owner, slug.repo, opt)
+			if err != nil {
+				return Pipeline{}, g.wrapErr("latest pipeline from checks", err)
+			}
+			if wf != nil && len(wf.WorkflowRuns) > 0 && wf.WorkflowRuns[0] != nil {
+				return toGitHubPipeline(wf.WorkflowRuns[0]), nil
+			}
 		}
 	}
 
@@ -307,20 +309,13 @@ func newestActionsSuiteID(runs []*gh.CheckRun) (int64, bool) {
 	return best, found
 }
 
-// newestActionsSuiteIDFromChecks resolves the newest github-actions check-SUITE id from
-// BOTH sources, so ACTIONS-RECOVERY still fires when a head carries a github-actions
-// check-SUITE that no check-RUN surfaced — the check-runs list can be empty or
-// unavailable while the suite is present (issue #1005). Check-runs win first (via
-// newestActionsSuiteID, which reads their embedded suites); only when they name no
-// Actions suite does the suites list contribute — a gh.CheckSuite whose App.Slug ==
-// "github-actions" with a non-zero id, newest id winning. ok is false when neither
-// source names an Actions suite (the external-CI case that falls through to synthesis).
+// newestActionsSuiteIDFromChecks returns the maximum non-zero github-actions suite id
+// across both sources for ACTIONS-RECOVERY to query first; the suite-filtered
+// workflow-run response can be empty (possibly transiently), so recovery tries the
+// check-run-derived older Actions suite before synthesis. ok is false when neither
+// source names an eligible Actions suite.
 func newestActionsSuiteIDFromChecks(runs []*gh.CheckRun, suites []*gh.CheckSuite) (int64, bool) {
-	if id, ok := newestActionsSuiteID(runs); ok {
-		return id, true
-	}
-	var best int64
-	var found bool
+	best, found := newestActionsSuiteID(runs)
 	for _, s := range suites {
 		if s.GetApp().GetSlug() != "github-actions" {
 			continue

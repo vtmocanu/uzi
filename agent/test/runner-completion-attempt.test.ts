@@ -218,6 +218,117 @@ afterEach(() => {
   }
 });
 
+describe("approved m1 resume reconciliation", () => {
+  for (const ack of ["present", "absent"] as const) {
+    it(`m1 resume display combines local progress with ${ack} ACK`, async () => {
+      const milestones = ["m1", "m2", "m3"].map((id) => ({ id, title: `Title ${id}` }));
+      const report = {
+        type: "assistant", session_id: "sess-1",
+        message: { content: [{ type: "tool_use", id: "progress", name: "mcp__uzi__report_progress",
+          input: { completed: ["m2"], in_progress: ["m1", "m3"] } }] },
+      } as unknown as SDKMessage;
+      const { queryFn, turns } = fakeTurns([[report, resultSuccess()], [signalDone(), resultSuccess()]]);
+      const probe = makeCompletionCtx({ interlock: false });
+      const pushed: unknown[] = [];
+      Object.assign(probe.ctx, {
+        planApproved: true, approvedPlan: "Approved", sessionId: "sess-1", frozenMilestones: milestones,
+        reportIteration: async () => ack === "present" ? { completedIds: ["m1", "unknown-server"] } : undefined,
+        reportProgress: async (progress: unknown) => { pushed.push(progress); },
+      });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      const second = turns[1]!.promptText!;
+      assert.match(second, ack === "present" ? /\[m1\] Title m1 — done/ : /\[m1\] Title m1 — in progress/);
+      assert.match(second, /\[m2\] Title m2 — done/);
+      assert.match(second, /\[m3\] Title m3 — in progress/);
+      assert.doesNotMatch(second, /unknown-server/);
+      assert.equal(second.includes("Prior completion declarations may be unknown"), ack === "absent");
+      assert.deepEqual(pushed, [{ completed: ["m2"], in_progress: ["m1", "m3"] }]);
+    });
+  }
+  for (const list of [undefined, null, []]) {
+    it(`m1 resume no breakdown: ${JSON.stringify(list)}`, async () => {
+      const { queryFn, turns } = fakeTurns([[signalDone(), resultSuccess()]]);
+      const probe = makeCompletionCtx({ interlock: false });
+      Object.assign(probe.ctx, { planApproved: true, approvedPlan: "Approved", sessionId: "sess-1",
+        frozenMilestones: list, reportIteration: async () => ({ completedIds: ["m1"] }) });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.doesNotMatch(turns[0]!.promptText!, /Keep this tracker honest|Immediately before|\[m1\]/);
+    });
+  }
+  for (const declaration of ["progress", "done", "unfinished", "seeded", "reviewed", "gated"] as const) {
+    it(`m1 resume first prompt and completion: ${declaration}`, async () => {
+      // f93ddb57: seq1969 resumed iter1, 2279 missing m4, 2280 iter2, 2284–88
+      // redundant checks, 2290–93 declarations (~67s). ed894e5c: 5523 committed/reviewed
+      // m1–8, 5526 missing m3–9, 5527 iter2, 5529–38 reports; maintainer-owned m9
+      // remained incomplete. Scripts prove delivery/mechanics, not model compliance.
+      const milestones = ["m1", "m2", "m3", "m4"].map((id) => ({ id, title: `Title ${id}` }));
+      const progressMessage = {
+        type: "assistant", session_id: "sess-1",
+        message: { content: [{ type: "tool_use", id: "progress",
+          name: "mcp__uzi__report_progress", input: { completed: ["m4"], in_progress: [] } }] },
+      } as unknown as SDKMessage;
+      const messages = ["progress", "seeded", "reviewed", "gated"].includes(declaration)
+        ? [progressMessage, signalDone({ milestones_completed: ["m4"] }), resultSuccess()]
+        : [signalDone(declaration === "done" ? { milestones_completed: ["m4"] } : {}), resultSuccess()];
+      const planMessage = submitPlan("Approved m1–m4");
+      (planMessage as unknown as { message: { content: { input: Record<string, unknown> }[] } })
+        .message.content[0]!.input.milestones = milestones;
+      const { queryFn, turns } = fakeTurns(declaration === "gated"
+        ? [[planMessage, resultSuccess()], messages] : [messages]);
+      const probe = makeCompletionCtx();
+      Object.assign(probe.ctx, {
+        planApproved: true, approvedPlan: "Approved m1–m4", sessionId: "sess-1",
+        frozenMilestones: milestones,
+      });
+      if (declaration === "seeded") Object.assign(probe.ctx, { seeded: true, sessionId: null });
+      if (declaration === "reviewed") Object.assign(probe.ctx, { reviewedPlanResume: true, sessionId: null });
+      if (declaration === "gated") Object.assign(probe.ctx, {
+        planApproved: false, sessionId: null, frozenMilestones: [{ id: "stale", title: "Stale claim" }],
+      });
+      const persisted = new Set(["m1", "m2", "m3"]);
+      probe.ctx.reportIteration = async (n) => {
+        probe.iterations.push(n);
+        return { completedIds: [...persisted], completedCount: persisted.size };
+      };
+      const pushed: unknown[] = [];
+      probe.ctx.reportProgress = async (progress) => {
+        pushed.push(progress);
+        for (const id of progress.completed ?? []) persisted.add(id);
+      };
+      probe.ctx.recordCompletionAttempt = async (args) => {
+        probe.attemptCalls.push(args);
+        for (const id of args.declared) persisted.add(id);
+        return { unmet: milestones.filter((m) => !persisted.has(m.id)).map((m) => m.id),
+          attemptCount: probe.attemptCalls.length };
+      };
+      const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+      assert.deepEqual(pushed, ["progress", "seeded", "reviewed", "gated"].includes(declaration)
+        ? [{ completed: ["m4"], in_progress: [] }] : [], "only provider progress is pushed");
+      const implementTurns = declaration === "gated" ? turns.slice(1) : turns;
+      const first = implementTurns[0]!.promptText!;
+      assert.doesNotMatch(first, /Stale claim/);
+      for (const m of milestones) assert.match(first, new RegExp(`\\[${m.id}\\] ${m.title}`), "first prompt carries frozen context");
+      for (const id of ["m1", "m2", "m3"]) assert.ok(first.includes(`[${id}] Title ${id} — done`),
+        "first prompt reconciles every persisted ID");
+      assert.match(first, /\[m4\] Title m4 — not started/, "unreported work requires reconciliation");
+      assert.match(first, /Immediately before .*signal_done/, "before-done reconciliation reaches first prompt");
+      if (declaration === "unfinished") {
+        assert.ok(result.completionHeld);
+        assert.equal(probe.attemptCalls.length, 3);
+        assert.equal(probe.holdReasons.length, 1);
+        assert.match(turns[1]!.promptText!, /Title m4/, "completion follow-up retains frozen title");
+      } else {
+        assert.equal(implementTurns.length, 1, "no reentry");
+        assert.deepEqual(probe.iterations, [1]);
+        assert.equal(probe.attemptCalls.length, 1);
+        assert.deepEqual(probe.attemptCalls[0]!.declared, ["m4"]);
+        assert.equal(result.completionHeld, undefined);
+        assert.deepEqual(probe.holdReasons, []);
+      }
+    });
+  }
+});
+
 describe("SdkExecutor completion interlock (PRD #1226 M3)", () => {
   it("(a) checkpoints BEFORE the attempt, passing the declaration + head from the worktree fingerprint", async () => {
     const { queryFn } = fakeTurns([[submitPlan("plan"), resultSuccess()], [signalDone({ milestones_completed: ["m1"] }), resultSuccess()]]);

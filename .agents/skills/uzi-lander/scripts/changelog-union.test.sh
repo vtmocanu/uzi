@@ -675,4 +675,71 @@ printf '## [Unreleased]\n\n### Fixed\n\n- **main only**\n\n- **branch only**\n\n
 bash "$SCRIPT" "$WORK/novote.md" > "$WORK/novote.out" 2>&1 || fail "no-vote union failed: $(cat "$WORK/novote.out")"
 diff -u "$WORK/novote.want" "$WORK/novote.md" || fail "no-vote union dropped a side's blank line"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept"
+# 13. Fresh [Unreleased] after a release fold (no pair of entries to vote), both sides add one
+#     bullet under the same `### Changed`: the join follows the file's convention, which the
+#     released sections show (a blank line between bullets), instead of touching bullets.
+REL13='## [0.1.0] - 2026-01-01
+
+### Changed
+
+- **old a**
+  old a desc
+
+- **old b**
+  old b desc
+'
+printf '## [Unreleased]\n\n### Changed\n\n<<<<<<< HEAD\n- **main new**\n  main desc\n||||||| base\n=======\n- **branch new**\n  branch desc\n>>>>>>> branch\n\n%s' "$REL13" > "$WORK/fresh.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **main new**\n  main desc\n\n- **branch new**\n  branch desc\n\n%s' "$REL13" > "$WORK/fresh.want"
+bash "$SCRIPT" "$WORK/fresh.md" > "$WORK/fresh.out" 2>&1 || fail "fresh union failed: $(cat "$WORK/fresh.out")"
+diff -u "$WORK/fresh.want" "$WORK/fresh.md" || fail "fresh-[Unreleased] union lost the blank line between bullets"
+# the same for a --collapse of two single-bullet `### Changed` repeats
+printf '## [Unreleased]\n\n### Changed\n\n- **a**\n  a desc\n\n### Changed\n\n- **b**\n  b desc\n\n%s' "$REL13" > "$WORK/freshc.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **a**\n  a desc\n\n- **b**\n  b desc\n\n%s' "$REL13" > "$WORK/freshc.want"
+bash "$SCRIPT" --collapse "$WORK/freshc.md" > "$WORK/freshc.out" 2>&1 || fail "fresh collapse failed: $(cat "$WORK/freshc.out")"
+diff -u "$WORK/freshc.want" "$WORK/freshc.md" || fail "fresh-[Unreleased] collapse lost the blank line between bullets"
+# a file whose released sections are tight keeps tight joins (the convention is the file's, not a default)
+printf '## [Unreleased]\n\n### Changed\n\n<<<<<<< HEAD\n- **main new**\n||||||| base\n=======\n- **branch new**\n>>>>>>> branch\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n' > "$WORK/tight.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **main new**\n- **branch new**\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n' > "$WORK/tight.want"
+bash "$SCRIPT" "$WORK/tight.md" > "$WORK/tight.out" 2>&1 || fail "tight union failed: $(cat "$WORK/tight.out")"
+diff -u "$WORK/tight.want" "$WORK/tight.md" || fail "a tight file's union gained a blank line"
+
+# 14. The fallback vote reads released `## [x.y.z]` sections only: a blank-separated non-release
+#     section (here `## Notes`) does not turn a tight file's join into a blank one, and a tie
+#     among released pairs keeps the join touching.
+printf '## [Unreleased]\n\n### Changed\n\n<<<<<<< HEAD\n- **m**\n||||||| base\n=======\n- **b**\n>>>>>>> branch\n\n## Notes\n\n- **x**\n\n- **y**\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n\n- **old c**\n' > "$WORK/tie.md"
+printf '## [Unreleased]\n\n### Changed\n\n- **m**\n- **b**\n\n## Notes\n\n- **x**\n\n- **y**\n\n## [0.1.0] - 2026-01-01\n\n### Changed\n\n- **old a**\n- **old b**\n\n- **old c**\n' > "$WORK/tie.want"
+bash "$SCRIPT" "$WORK/tie.md" > "$WORK/tie.out" 2>&1 || fail "tie union failed: $(cat "$WORK/tie.out")"
+diff -u "$WORK/tie.want" "$WORK/tie.md" || fail "non-release sections or a tie changed the join"
+
+# Base-aware mode folds only this PR's heading, never pre-existing duplicates.
+cat > "$WORK/scoped-base.md" <<'EOF'
+## [Unreleased]
+
+### Added
+
+- main first
+
+### Fixed
+
+- main fix
+
+### Added
+
+- main last
+
+## [1.0.0]
+
+- released
+EOF
+awk '{print} /^## \[Unreleased\]/{print ""; print "### Added"; print ""; print "- branch own"}' "$WORK/scoped-base.md" > "$WORK/scoped.md"
+bash "$SCRIPT" --collapse --base "$WORK/scoped-base.md" "$WORK/scoped.md" > "$WORK/scoped.out" 2>&1 || fail "base-aware collapse failed: $(cat "$WORK/scoped.out")"
+awk 'NF && $0 != "- branch own"' "$WORK/scoped.md" > "$WORK/scoped.actual"
+awk 'NF' "$WORK/scoped-base.md" > "$WORK/scoped.want"
+diff -u "$WORK/scoped.want" "$WORK/scoped.actual" || fail "collapse moved main's headings or bullets"
+[ "$(grep -c '^### Added$' "$WORK/scoped.md")" -eq 2 ] || fail "base-aware mode did not remove only the added heading"
+awk '{print} /^- main fix$/{print "<<<<<<< HEAD"; print "||||||| parent"; print "======="; print "### Fixed"; print ""; print "- branch own"; print ">>>>>>> branch"}' "$WORK/scoped-base.md" > "$WORK/scoped-union.md"
+bash "$SCRIPT" --base "$WORK/scoped-base.md" "$WORK/scoped-union.md" > "$WORK/scoped-union.out" 2>&1 || fail "base-aware union failed: $(cat "$WORK/scoped-union.out")"
+awk 'NF && $0 != "- branch own"' "$WORK/scoped-union.md" > "$WORK/scoped-union.actual"
+diff -u "$WORK/scoped.want" "$WORK/scoped-union.actual" || fail "union moved main's headings or bullets"
+
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept, and base-aware preservation"

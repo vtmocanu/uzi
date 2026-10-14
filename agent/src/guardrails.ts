@@ -201,6 +201,7 @@ const REASON_PS = "denied by guardrail: inspecting the process table is not perm
 const REASON_PROC = "denied by guardrail: reading /proc is not permitted";
 const REASON_MASS_SIGNAL = "denied by guardrail: mass-signal kill commands (pkill, killall, skill, fuser -k, kill of a broadcast/process-group target, or kill of PIDs enumerated by lsof/pgrep/ps/fuser/pidof) can kill the agent's own process tree; stop a background task through the harness, or kill \"$pid\" with the exact PID saved at launch (run it as its own command, without lsof/pgrep/ps/fuser/pidof in the same command)";
 const REASON_SECRET_FILE = "denied by guardrail: reading the worker credential file is not permitted";
+const REASON_OPS_CHANNEL = "denied by guardrail: the worker's operator retained-source channel is for the operator, not the agent";
 // PRD #83 M1 (Q3): docker is inert without a daemon sidecar wired (DOCKER_HOST/keystone
 // resolver). Content-free — never echo the command.
 const REASON_DOCKER_NO_DAEMON = "denied by guardrail: docker requires a daemon sidecar, which this worker has none wired";
@@ -231,6 +232,14 @@ const MAX_DEPTH = 6;
 // split; see docs/proc-hardening.md). The specific UZI_WORKER_TOKEN_FILE path (if
 // outside this prefix) is added at the hook via `extraSecretPaths`.
 export const SECRET_PATH_PREFIXES: readonly string[] = ["/run/secrets/"];
+
+// issue #1786: the operator retained-source channel (its client in the image and its Unix socket
+// under the data dir). A Bash-only deny with its OWN reason, deliberately NOT part of
+// SECRET_PATH_PREFIXES (which also feeds the file-tool path classification): the repo files
+// agent/src/ops/retained-source* stay readable, editable and committable, and only a Bash
+// command naming the INSTALLED client or the socket is refused. Defense in depth only: the uid
+// split (uidSplitActive) is the boundary, and on a single-uid worker this is a bar-raise.
+const OPS_CHANNEL_PATHS: readonly string[] = ["/app/src/ops/retained-source.mjs", "/ops/retained-source.sock"];
 
 /**
  * The worker-credential paths the guards deny for a configured UZI_WORKER_TOKEN_FILE,
@@ -1002,6 +1011,7 @@ function analyzeSimple(cmd: string[], secretPaths: readonly string[], dockerWire
   if (ENUMERATORS.has(base)) ctx.enumerator = true;
   if (cmd.some((w) => w.includes("/proc/"))) return deny(REASON_PROC);
   if (cmd.some((w) => hitsSecret(w, secretPaths))) return deny(REASON_SECRET_FILE);
+  if (cmd.some((w) => hitsSecret(w, OPS_CHANNEL_PATHS))) return deny(REASON_OPS_CHANNEL);
   if (base === "printenv" || base === "env") {
     // Allow reading a diagnostic var by name (`printenv PATH`) but deny enumeration:
     // ≥1 positional AND every positional in the allowlist. This is the `printenv` rule —
@@ -1138,6 +1148,7 @@ function screenWithDepth(
   if (depth > MAX_DEPTH) return deny(REASON_DEPTH);
   if (command.includes("/proc/")) return deny(REASON_PROC);
   if (hitsSecret(command, secretPaths)) return deny(REASON_SECRET_FILE);
+  if (hitsSecret(command, OPS_CHANNEL_PATHS)) return deny(REASON_OPS_CHANNEL);
   // Keep scanning after the first denial so `ctx` sees every segment: the mass-signal
   // check in screenBashCommand must see the `kill` in `pid=$(pgrep node); kill $pid`
   // even though the earlier `pgrep` segment already denied. The FIRST denial is still

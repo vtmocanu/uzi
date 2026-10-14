@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import { createHash } from "node:crypto";
 
 import { SdkExecutor } from "../src/sdk-executor.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
 import { forceIncompleteHomeHelper } from "./forced-home-helper.js";
 import { scanRunProcesses, reapRunProcesses } from "../src/run-procs.js";
 import { TOKEN, api, baseUrl, client, installHarness } from "./runner-harness.js";
@@ -89,7 +89,7 @@ describe("#2230 scripted model process isolation", () => {
       const block = s.model.block("implement");
       const flight = await s.toFirstGate();
       s.send(s.input("approve_plan"));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       helper.enabled = true;
       block.release();
       await s.finish(flight);
@@ -126,7 +126,7 @@ describe("#1604 — a revise interrupted mid-revision turn is replayed and revis
         const first = await s.toFirstGate();
         const block = s.model.block("revise");
         const [revise] = s.send(s.input("revise_plan", FEEDBACK));
-        await block.entered;
+        await waitForTestEvent(block.entered, "model turn entered");
         await tick(60); // several poll ticks: on base the APPLIED goes out here
         await s.shutdown(first);
         assert.ok(!s.statuses(first).includes("failed"), "a shutdown never fails the run");
@@ -159,7 +159,7 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
       assert.ok(s.statuses(first).includes("credential_switch"), `the switch released the claim: ${s.statuses(first).join(",")}`);
       assert.equal(api.isAcked(s.runId, row.id), false, "the released claim never ACKed the revise");
       const { flight, gateAt } = await resumeAndApprove(s, s.resumeClaim("kept"));
-      assertRevisedOnResume(s, flight, FEEDBACK, "kept");
+      assertRevisedOnResume(s, flight, FEEDBACK, "retained");
       assert.ok(s.appliedAt(row.id, flight.timelineFrom) > gateAt, "applied only after the revised plan was persisted");
       assert.ok(s.statuses(flight).includes("completed"), s.statuses(flight).join(","));
     }, {}, "(a) unACKed revise: reclaim revises the submitted plan"));
@@ -189,6 +189,43 @@ describe("#1604 — (a) a verdict still unACKed when a switch releases the claim
       assert.equal(s.model.count("implement"), 0, "nothing was implemented");
       assert.equal(s.gates(flight).length, 0, "the plan is never offered once the reject is read");
       assert.ok(api.isApplied(s.runId, row.id), "the reject is applied with the plan_rejected failed transition");
+    }));
+
+  it("releaseAtGate waits for the shown plan when its POST follows the gate state", async (t) =>
+    scenario(async (s) => {
+      const post = client.postMessages.bind(client);
+      let release!: () => void;
+      const held = new Promise<void>((resolve) => { release = resolve; });
+      let entered!: () => void;
+      const posting = new Promise<void>((resolve) => { entered = resolve; });
+      let attempts = 0;
+      t.mock.method(client, "postMessages", async (...args: Parameters<typeof post>) => {
+        if (args[0] === s.runId && args[1].some((m) => m.kind === "plan" &&
+          (m.payload as { plan_md?: unknown }).plan_md === PLAN_V1)) {
+          if (++attempts === 1) {
+            entered();
+            throw new Error("initial plan delivery retry");
+          }
+          await held;
+        }
+        return post(...args);
+      });
+      const releasing = releaseAtGate(s, () => s.send(s.input("approve_plan", SELECTION))[0]!, "unacked");
+      void releasing.catch(() => undefined);
+      try {
+        await waitForTestEvent(posting, "initial plan POST entered");
+        assert.ok(await until(() => s.gates().length === 1), "gate state arrived while the plan POST is held");
+        assert.equal(api.messages(s.runId).some((m) => m.kind === "plan"), false);
+        assert.equal(s.rowsOf("approve_plan").length, 0, "no verdict before the plan is shown");
+      } finally {
+        release();
+        await releasing;
+      }
+      const flight = s.start(s.resumeClaim("kept"));
+      await s.finish(flight);
+      assert.ok(s.statuses(flight).includes("completed"), JSON.stringify(s.texts(flight)));
+      assert.equal(s.texts(flight).includes(REPLAY_STALE_VERDICT_NOTICE), false);
+      assert.equal(api.humanPlanApproved(s.runId), true);
     }));
 
   for (const verdict of ["approve_plan", "reject_plan"] as const) {
@@ -289,7 +326,7 @@ describe("#1604 — a reject interrupted before its failed report is replayed an
     scenario(async (s) => {
       const block = s.model.block("plan");
       const first = s.start(s.claim());
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       const stopDropping = api.dropStatesWhen(s.runId, (b) => b.status === "failed");
       const [row] = s.send(s.input("reject_plan", "wrong approach"));
       assert.ok(await until(() => api.isAcked(s.runId, row!.id)));

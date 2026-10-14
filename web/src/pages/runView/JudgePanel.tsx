@@ -21,7 +21,7 @@ import { formatDuration } from "../../components/RunEvent";
 import { formatTokens } from "../../lib/formatTokens";
 import { costDisplay, costHeadline, costSubLabel } from "../../lib/costStatus";
 import { Markdown } from "../../components/Markdown";
-import { Alert, Badge, Button, Card, Spinner, cx } from "../../components/ui";
+import { Alert, Badge, Button, Card, CardHeader, Spinner, cx } from "../../components/ui";
 import { TriageActions } from "../../components/triage/TriageActions";
 import { TriageDisposedRow } from "../../components/triage/TriageDisposedRow";
 import { TriageStateChip } from "../../components/triage/TriageStateChip";
@@ -413,15 +413,14 @@ export function JudgePanel({
 
   return (
     <Card className="space-y-4 p-4">
-      <div className="flex flex-wrap items-center justify-between gap-2">
-        <div className="flex flex-wrap items-center gap-2">
-          <h2 className="text-xs font-semibold uppercase tracking-wider text-faint">Run review</h2>
+      <CardHeader title="Run review" level={2} badge={<>
           {review && <Badge tone={verdictTone(review.verdict)}>{verdictLabel(review.verdict)}</Badge>}
           {review?.status === "failed" && (
             <Badge tone="neutral" title="The judge model call failed; the deterministic findings below still landed.">
               judge incomplete
             </Badge>
           )}
+        </>} subtitle={review?.judge_model && <>
           {/* Issue #124: worker-reported, scrubbed at ingest by sanitizeSelfReported, so
               rows written before that strip learned Cf still carry it. NOTE this is the
               REVIEW DTO's judge_model (api.ts:1085), not the admin SETTING of the same name
@@ -431,9 +430,7 @@ export function JudgePanel({
           {review?.judge_model && (
             <span className="text-xs text-faint">via {stripUnsafeChars(review.judge_model)}</span>
           )}
-        </div>
-        {rerunButton}
-      </div>
+        </>} actions={rerunButton} />
 
       {actionErr && <Alert message={actionErr} />}
       {loadErr && <Alert message={loadErr} />}

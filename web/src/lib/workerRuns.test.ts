@@ -72,9 +72,9 @@ describe("dedicated cross-check capacity", () => {
     expect(workerCrossCheckBadge({ active_cross_checks: 0, max_cross_check_slots: cap as number | null })).toBeNull();
   });
 
-  it.each([null, 0])("keeps running checks visible after cap changes to %s", (cap) => {
-    expect(workerCrossCheckBadge({ active_cross_checks: 1, max_cross_check_slots: cap })?.label)
-      .toBe(`1/${cap ?? "?"} cross-checks`);
+  it.each([null, 0, undefined])("keeps running checks visible after cap changes to %s", (cap) => {
+    expect(workerCrossCheckBadge({ active_cross_checks: 1, max_cross_check_slots: cap as number | null })?.label)
+      .toBe(`1/${cap ?? "?"} cross-check`);
   });
 
   it("shows idle dedicated capacity in a neutral tone", () => {
@@ -87,5 +87,27 @@ describe("dedicated cross-check capacity", () => {
     expect(workerCrossCheckBadge({ active_cross_checks: 2, max_cross_check_slots: 3 })).toEqual({
       label: "2/3 cross-checks", tone: "warning", title: "Running 2 of 3 cross-check slots",
     });
+  });
+});
+
+describe("cross-check labels and controls", () => {
+  it.each([
+    [0, 1, "0/1 cross-checks", "neutral"],
+    [1, 1, "1/1 cross-check", "warning"],
+    [1, 2, "1/2 cross-check", "warning"],
+    [2, 2, "2/2 cross-checks", "warning"],
+  ] as const)("labels %s active checks at capacity %s", (active, cap, label, tone) => {
+    expect(workerCrossCheckBadge({ active_cross_checks: active, max_cross_check_slots: cap })).toEqual({
+      label, tone, title: `Running ${active} of ${cap} cross-check slots`,
+    });
+  });
+  it.each([null, undefined, 0])("preserves unknown or zero capacity %s", (cap) => {
+    for (const active of [1, 2]) {
+      expect(workerCrossCheckBadge({ active_cross_checks: active, max_cross_check_slots: cap as number | null })).toEqual({
+        label: `${active}/${cap ?? "?"} ${active === 1 ? "cross-check" : "cross-checks"}`,
+        tone: "warning",
+        title: cap == null ? `Running ${active} cross-checks; slot capacity is unadvertised` : `Running ${active} of 0 cross-check slots`,
+      });
+    }
   });
 });

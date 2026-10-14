@@ -30,7 +30,7 @@ import type {
 import { sleep } from "../src/util.js";
 import { FakeRecoveryClient } from "./codex-reap-fixture.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runnerWith } from "./runner-harness.js";
 
 installHarness();
 
@@ -141,6 +141,7 @@ async function runGen1(s: Stores, claim: ClaimResponse, opts: { file?: string; d
     },
   });
   const { gitlab } = fakeGitlab();
+  api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation!);
   await runnerWith(factory, gitlab, undefined, nullLogger(), { recovery: s.coord, settlement: s.settlement }).execute(claim);
   assert.ok(api.states.some((x) => x.runId === claim.run_id && x.body.status === "recovery_wait"), "gen1 parked");
   fs.rmSync(homeRoot, { recursive: true, force: true });
@@ -155,13 +156,37 @@ async function runGen2(
   outbox?: Outbox,
 ): Promise<void> {
   const { gitlab } = fakeGitlab();
-  await runnerWith(() => ({ executor: new StubExecutor(nullLogger()) }), gitlab, undefined, nullLogger(), {
+  api.setOwnershipStatus(claim.run_id, "running", claim.claim_generation!);
+  const report = client.reportState.bind(client);
+  client.reportState = async (runId, body) => {
+    const ack = await report(runId, body);
+    if (runId === claim.run_id && body.status === "completed" && ack.applied && ack.status === "completed") {
+      api.setOwnershipStatus(runId, "completed", claim.claim_generation!, false);
+    }
+    return ack;
+  };
+  const runner = runnerWith(() => {
+    const executor = new StubExecutor(nullLogger());
+    return { executor: { run: async (ctx: RunContext) => {
+      let processedEvents = 0;
+      const result = await executor.run({ ...ctx, emit: message => { processedEvents++; ctx.emit(message); } });
+      assert.ok(processedEvents > 0, "the fixture completed a turn with observed model output");
+      await ctx.onModelTurnSettled?.(processedEvents);
+      return result;
+    } } };
+  }, gitlab, undefined, nullLogger(), {
     recovery: s.coord,
     settlement: s.settlement,
     settleClient,
     ...(outbox ? { outbox } : {}),
-  }).execute(claim);
-  assert.ok(api.states.some((x) => x.runId === claim.run_id && x.body.status === "completed"), "gen2 completed");
+  });
+  try {
+    await runner.execute(claim);
+    assert.ok(api.states.some((x) => x.runId === claim.run_id && x.body.status === "completed"), `gen2 completed: ${JSON.stringify(api.states)}`);
+  } finally {
+    runner.shutdown();
+    client.reportState = report;
+  }
 }
 
 async function mkOutbox(root: string): Promise<Outbox> {
@@ -243,14 +268,14 @@ describe("real-git adoption → settle (issue #1582 M2)", () => {
     });
   }
 
-  it("checkpoint leg: gen2 adopts this run's own mirrored checkpoint (no tracking ref) and settles the exact candidates", async () => {
+  it("retained source wins the mirrored checkpoint: gen2 adopts gen1 without a tracking ref and settles the exact candidates", async () => {
     const iid = 6104;
     const s = stores(git);
     const gen1Claim = gitlabClaim(iid, { claim_generation: 1 });
     const gen1Head = await runGen1(s, gen1Claim);
     const branch = branchOf(iid);
-    // gen1's tip was published as this run's own checkpoint on the forge; the tracking ref is gone,
-    // so the reseed takes the owner-anchored checkpoint leg rather than the tracking leg.
+    // Keep the real mirrored checkpoint available with no tracking ref. The retained source
+    // takes precedence over that legacy fallback and must preserve the same committed work.
     gitOut(bare(), "push", "-q", fx.originPath, `${gen1Head}:refs/uzi-checkpoints/${branch}`);
     gitOut(bare(), "update-ref", "-d", `refs/uzi-runner/${branch}`);
     // Retire the transient ownership metadata after the existing checkpoint/archive guarantee.
@@ -265,18 +290,30 @@ describe("real-git adoption → settle (issue #1582 M2)", () => {
       session_id: gen1Claim.session_id ?? "sess-gen1",
       checkpoint_tip: gen1Head,
     } as ClaimResponse;
-    const legs: string[] = [];
-    const orig = git.createOrAttachRunnerClone.bind(git);
-    git.createOrAttachRunnerClone = async (...args: Parameters<GitCache["createOrAttachRunnerClone"]>) => {
+    const seeds: Array<{ source: string; path: string; head: string; tree: string }> = [];
+    const orig = git.prepareRecoverySuccessor.bind(git);
+    git.prepareRecoverySuccessor = async (...args) => {
       const clone = await orig(...args);
-      legs.push(clone.seededFrom);
+      seeds.push({ source: args[3].clonePath, path: clone.path,
+        head: gitOut(clone.path, "rev-parse", "HEAD"), tree: gitOut(clone.path, "write-tree") });
       return clone;
     };
     const settleClient = new FakeSettleClient(released);
-    await runGen2(s, gen2Claim, settleClient);
-    assert.deepEqual(legs, ["checkpoint"], "the REAL seeding took the checkpoint leg");
+    try {
+      await runGen2(s, gen2Claim, settleClient);
+    } finally {
+      git.prepareRecoverySuccessor = orig;
+    }
+    assert.equal(seeds.length, 1, "the REAL retained source seeded one fresh successor");
+    const seed = seeds[0]!;
+    assert.notEqual(seed.path, seed.source, "retained admission uses a fresh attempt path");
+    assert.ok(fs.existsSync(path.join(seed.source, ".git")), "the predecessor remains after completion");
+    assert.equal(gitOut(seed.source, "rev-parse", "HEAD"), gen1Head);
+    assert.equal(seed.head, gen1Head);
+    assert.equal(seed.tree, gitOut(bare(), "rev-parse", `${gen1Head}^{tree}`));
+    assert.equal(refOrNull(fx.originPath, `refs/uzi-checkpoints/${branch}`), gen1Head);
     const pushed = gitOut(fx.originPath, "rev-parse", branch);
-    assert.equal(settleClient.calls.length, 1, "the checkpoint adoption produced a settle");
+    assert.equal(settleClient.calls.length, 1, "the retained adoption with a mirrored checkpoint produced a settle");
     assert.deepEqual(settleClient.calls[0]!.req, {
       predecessor_generation: 1,
       successor_generation: 2,
@@ -288,7 +325,7 @@ describe("real-git adoption → settle (issue #1582 M2)", () => {
     assert.deepEqual(await s.settlement.listRun(gen2Claim.run_id), []);
   });
 
-  it("a recovered wip(park) marker: no generation that adopts past it records evidence for it (gen2 and gen3); a contained sibling still settles", async () => {
+  it("a retained wip(park) marker: no generation that adopts past it records evidence for it (gen2 and gen3); a contained sibling still settles", async () => {
     const iid = 6105;
     const branch = branchOf(iid);
     const s = stores(git);
@@ -302,50 +339,76 @@ describe("real-git adoption → settle (issue #1582 M2)", () => {
     assert.match(gitOut(bare(), "log", "-1", "--format=%s", marker), /^wip\(park\):/, "precondition: a real wip(park) marker");
     assert.equal(gitOut(bare(), "rev-parse", `${marker}^`), gen1Head, "the marker sits on gen1's committed head");
 
-    // gen2 resumes on the REAL tracking leg, recovers the marker (reset --soft), commits, parks again.
-    const seeds: Array<{ seededFrom: string; wipRecovered?: boolean; baseCommit: string }> = [];
-    const orig = git.createOrAttachRunnerClone.bind(git);
-    git.createOrAttachRunnerClone = async (...args: Parameters<GitCache["createOrAttachRunnerClone"]>) => {
+    // Observe real retained seeding before model admission: reset --soft leaves marker work staged.
+    const seeds: Array<{ source: string; path: string; wipRecovered?: boolean; baseCommit: string; head: string; tree: string; staged: string }> = [];
+    const orig = git.prepareRecoverySuccessor.bind(git);
+    git.prepareRecoverySuccessor = async (...args) => {
       const clone = await orig(...args);
-      seeds.push({ seededFrom: clone.seededFrom, wipRecovered: clone.wipRecovered, baseCommit: clone.baseCommit });
+      seeds.push({ source: args[3].clonePath, path: clone.path,
+        wipRecovered: clone.wipRecovered, baseCommit: clone.baseCommit,
+        head: gitOut(clone.path, "rev-parse", "HEAD"), tree: gitOut(clone.path, "write-tree"),
+        staged: gitOut(clone.path, "diff", "--cached", "--name-only") });
       return clone;
     };
-    s.recoveryClient.holds = [{ hold_id: HOLD_G1, generation: 1, has_available_capture: true }];
-    const gen2Claim = { ...gen1Claim, claim_generation: 2 } as ClaimResponse;
-    const gen2Head = await runGen1(s, gen2Claim, { file: "GEN2.txt" });
-    assert.deepEqual(seeds[0], { seededFrom: "tracking", wipRecovered: true, baseCommit: gen1Head }, "gen2 recovered the marker");
-    assert.ok(!isAncestor(bare(), marker, gen2Head), "the marker is out of gen2's history");
-    assert.deepEqual(await s.settlement.listRun(gen1Claim.run_id), [], "gen2 recorded no evidence for gen1's marker");
-    assert.equal(refOrNull(bare(), `refs/uzi-settle/${gen1Claim.run_id}/${HOLD_G1}/source`), null, "no pin for gen1");
+    try {
+      s.recoveryClient.holds = [{ hold_id: HOLD_G1, generation: 1, has_available_capture: true }];
+      const gen2Claim = { ...gen1Claim, claim_generation: 2 } as ClaimResponse;
+      const gen2Head = await runGen1(s, gen2Claim, { file: "GEN2.txt" });
+      assert.equal(seeds.length, 1);
+      assert.equal(seeds[0]!.wipRecovered, true, "gen2 recovered the marker");
+      assert.equal(seeds[0]!.baseCommit, gen1Head);
+      assert.equal(seeds[0]!.head, gen1Head, "real reset --soft removes the marker from HEAD");
+      assert.equal(seeds[0]!.tree, gitOut(bare(), "rev-parse", `${marker}^{tree}`));
+      assert.equal(seeds[0]!.staged, "WIP.txt", "the marker delta remains staged for model admission");
+      assert.notEqual(seeds[0]!.path, seeds[0]!.source);
+      assert.equal(gitOut(seeds[0]!.source, "rev-parse", "HEAD"), marker);
+      assert.equal(fs.readFileSync(path.join(seeds[0]!.source, "WIP.txt"), "utf8"), "uncommitted parked work\n");
+      assert.ok(!isAncestor(bare(), marker, gen2Head), "the marker is out of gen2's history");
+      assert.deepEqual(await s.settlement.listRun(gen1Claim.run_id), [], "gen2 recorded no evidence for gen1's marker");
+      assert.equal(refOrNull(bare(), `refs/uzi-settle/${gen1Claim.run_id}/${HOLD_G1}/source`), null, "no pin for gen1");
+      const g2 = (await s.coord.inspect(gen1Claim.run_id)).find(r => r.generation === 2);
+      assert.ok(g2, "gen2 left an authenticated source journal");
+      assert.notEqual(g2.sourceSha, marker, "gen2 never journals gen1's removed marker as its source");
+      assert.ok(isAncestor(bare(), g2.sourceSha, gen2Head), "gen2's journaled source is contained in its committed tip");
 
-    // gen3 resumes NORMALLY on gen2's committed tip (no marker to recover) and completes.
-    s.recoveryClient.holds = [
-      { hold_id: HOLD_G1, generation: 1, has_available_capture: true },
-      { hold_id: HOLD_OTHER, generation: 2, has_available_capture: true },
-    ];
-    const gen3Claim = { ...gen1Claim, claim_generation: 3 } as ClaimResponse;
-    const settleClient = new FakeSettleClient(released);
-    await runGen2(s, gen3Claim, settleClient);
-    assert.equal(seeds[1]!.seededFrom, "tracking");
-    assert.notEqual(seeds[1]!.wipRecovered, true, "gen3 recovered no marker of its own");
-    const pushed = gitOut(fx.originPath, "rev-parse", branch);
-    assert.deepEqual(
-      settleClient.calls.map((c) => [c.holdId, c.req]),
-      [
+      // gen3 resumes NORMALLY on gen2's committed tip (no marker to recover) and completes.
+      s.recoveryClient.holds = [
+        { hold_id: HOLD_G1, generation: 1, has_available_capture: true },
+        { hold_id: HOLD_OTHER, generation: 2, has_available_capture: true },
+      ];
+      const gen3Claim = { ...gen1Claim, claim_generation: 3 } as ClaimResponse;
+      const settleClient = new FakeSettleClient(released);
+      await runGen2(s, gen3Claim, settleClient);
+      assert.equal(seeds.length, 2);
+      assert.equal(seeds[1]!.source, seeds[0]!.path, "gen3 recaptures gen2's retained source");
+      assert.notEqual(seeds[1]!.path, seeds[1]!.source);
+      assert.equal(seeds[1]!.head, gen2Head);
+      assert.equal(seeds[1]!.tree, gitOut(bare(), "rev-parse", `${gen2Head}^{tree}`));
+      assert.equal(seeds[1]!.staged, "");
+      assert.ok(fs.existsSync(path.join(seeds[0]!.source, ".git")), "gen1 remains after completion");
+      assert.ok(fs.existsSync(path.join(seeds[1]!.source, ".git")), "gen2 remains after completion");
+      assert.notEqual(seeds[1]!.wipRecovered, true, "gen3 recovered no marker of its own");
+      const pushed = gitOut(fx.originPath, "rev-parse", branch);
+      assert.deepEqual(
+        settleClient.calls.map((c) => [c.holdId, c.req]),
         [
-          HOLD_OTHER,
-          { predecessor_generation: 2, successor_generation: 3, pushed_sha: pushed, source_sha: gen2Head, adopted_sha: gen2Head },
+          [
+            HOLD_OTHER,
+            { predecessor_generation: 2, successor_generation: 3, pushed_sha: pushed, source_sha: g2.sourceSha, adopted_sha: gen2Head },
+          ],
         ],
-      ],
-      "only gen2's contained source is settled; gen1's marker is never sent",
-    );
-    assert.equal(refOrNull(bare(), `refs/uzi-settle/${gen3Claim.run_id}/${HOLD_G1}/source`), null, "no pin for gen1's marker");
-    assert.deepEqual(await s.settlement.listRun(gen3Claim.run_id), [], "gen2's hold released; nothing recorded for gen1");
-    assert.deepEqual(
-      (await s.coord.inspect(gen3Claim.run_id)).map((r) => r.generation),
-      [1],
-      "gen1's journal (the marker source) is retained",
-    );
+        "only gen2's contained source is settled; gen1's marker is never sent",
+      );
+      assert.equal(refOrNull(bare(), `refs/uzi-settle/${gen3Claim.run_id}/${HOLD_G1}/source`), null, "no pin for gen1's marker");
+      assert.deepEqual(await s.settlement.listRun(gen3Claim.run_id), [], "gen2's hold released; nothing recorded for gen1");
+      assert.deepEqual(
+        (await s.coord.inspect(gen3Claim.run_id)).map((r) => r.generation),
+        [1],
+        "gen1's journal (the marker source) is retained",
+      );
+    } finally {
+      git.prepareRecoverySuccessor = orig;
+    }
   });
 });
 
@@ -583,7 +646,6 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
       },
     );
     try {
-      api.setOwnershipStatus(gen2Claim.run_id, "completed", 2, false);
       await runGen2(s, gen2Claim, crashingClient, outbox1);
       assert.equal(crashingClient.calls.length, 1, "the live settle was attempted after the ACK");
       assert.equal(pendingAtSettle, false, "the settle ran after the outbox terminal journal was retired, not inside the send");

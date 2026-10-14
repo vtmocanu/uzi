@@ -31,7 +31,7 @@ const NONESSENTIAL = "CLAUDE_CODE_DISABLE_NONESSENTIAL_TRAFFIC";
 /** A worker-credential deny set (the path is assembled so no literal names the credential). */
 const SECRET_PATHS = [["", "run", "secrets", "worker_token"].join("/")];
 
-/** The REAL init frame the pinned SDK emitted for these options (see its _provenance). */
+/** The real historical SDK 0.3.284 init frame for these options (see its _provenance). */
 function realInit(): Record<string, unknown> {
   const p = path.join(import.meta.dirname, "fixtures", "isolated-init-frame.json");
   return JSON.parse(fs.readFileSync(p, "utf8")) as Record<string, unknown>;
@@ -178,7 +178,7 @@ describe("isolated executor: the init check (fail closed on the EFFECTIVE tool s
     assert.deepEqual([...ISOLATED_TOOLS], ["Read", "Write", "Edit", "Grep", "Glob", "mcp__uzi_fetch__fetch_url"]);
   });
 
-  it("accepts the real init frame the pinned SDK emits for these options", () => {
+  it("accepts the historical SDK 0.3.284 init frame for these options", () => {
     assert.equal(checkIsolatedInit(realInit()), undefined);
   });
 

@@ -108,6 +108,10 @@ type Settings interface {
 	HealthEnabled(ctx context.Context) (bool, error)
 	ReleaseCheckEnabled(ctx context.Context) (bool, error)
 	ReleaseStatus(ctx context.Context) (settings.ReleaseStatus, error)
+	AgentSourceEnabled(context.Context) (bool, error)
+	AgentSourceRepoURL(context.Context) (string, error)
+	AgentSourceRef(context.Context) (string, error)
+	AgentSourceStatus(context.Context) (settings.AgentSourceStatus, error)
 }
 
 // dbStat is the db check's raw probe result. Separating it from the severity logic is what
@@ -303,6 +307,7 @@ func (s *Service) Evaluate(ctx context.Context) (Doc, error) {
 		s.checkCustodyHolds(ctx, now),
 		s.checkRecoveryStorage(ctx, now),
 		s.checkReleaseCheck(ctx, now),
+		s.checkAgentSourceUpdate(ctx),
 		s.checkCodexPricing(ctx, now),
 	}
 

@@ -241,7 +241,9 @@ source "$ROOT/e2e/lib.sh"
 "$ROOT/e2e/reclaim-leaked-e2e.sh" "$PROJECT" || true
 
 say "building images"
+storage_diagnostic_snapshot before-build
 "${COMPOSE[@]}" build >/dev/null
+storage_diagnostic_snapshot after-build
 
 say "starting db + api + web + forge-fake"
 "${COMPOSE[@]}" up -d --wait db api web forge-fake

@@ -10,8 +10,8 @@ With autopilot on, adding the **autopilot label** (default `autopilot`, see
 [Admin settings](./admin-settings.md)) alongside the **run-eligibility label**
 (default `uzi`) — or assigning the issue to the uzi-bot account instead — to a
 GitLab issue starts a run for you, unattended: no plan-approval step,
-spending your own Anthropic token. The plan is still recorded in run
-history as an audit trail, and the merge request stays your human review
+using your own credential for the selected harness. The plan is still
+recorded in run history as an audit trail, and the merge request stays your human review
 gate. Off by default, and opt-in per user — see below. If you also opt in to
 [Plan cross-check](./cross-check.md), a plan must pass a check by the other
 model family (Codex for a Claude lead, Claude for a Codex lead) before
@@ -37,11 +37,11 @@ else's exact username first blocks their own later save with that value.
 ## 2. Opt in
 
 Open **Settings → Autopilot** and check **Enable autopilot for my
-account**. Off by default; attribution only ever spends your own Anthropic
-token, and only for issues that trace back to you. An autopilot run is an
-ordinary run, so it spends whatever the worker that claims it is bound to —
-your default unless you pointed that worker somewhere else (see
-[Anthropic tokens](./anthropic-token.md)).
+account**. Off by default; attribution spends your own model credentials
+for issues that trace back to you. Harness selection does not grant consent
+or change forge-identity matching. Configure credentials for the selected
+harness in Settings; Claude token bindings still follow
+[Anthropic tokens](./anthropic-token.md).
 
 ## 3. Add the label in GitLab
 
@@ -65,6 +65,29 @@ Consent and attribution still key on the **autopilot-label add event**, not
 the assignment: an assignment has no adder to resolve, so it never bypasses
 the who-added-it rule above — it only widens which issues become autopilot
 candidates once the autopilot label lands.
+
+## Which harness autopilot uses
+
+After owner opt-in and forge-identity checks, uzi captures the consenting
+candidate's current forge issue. Exact `harness::codex` or
+`harness::claude` selects that harness explicitly and requires a usable
+credential for it, without fallback. A Codex-only owner with a usable Codex
+credential can therefore start a `harness::codex` issue without an
+Anthropic token. Both recognized labels or another `harness::*` value are
+invalid; duplicate copies of the same recognized label are allowed.
+
+With **no harness label**, the legacy gate still requires an Anthropic
+token to be present; actual harness selection later follows existing
+automatic resolution (D11). Separate model defaults stay separate.
+Issue harness labels affect automatic issue starts, not manual web/CLI
+creation or chat `start_run`; see the
+[scheduling precedence table](./scheduling.md#which-harness-a-schedule-runs-on).
+
+Invalid labels or a refused selected-harness credential start no run.
+The poller logs the static reason through `poller: autopilot create run`
+and leaves the label-add event unrecorded for the next poll to retry.
+There is no new issue comment for these refusals; the existing
+**No eligible user** comment path is unchanged.
 
 ## What happens next
 
@@ -122,10 +145,12 @@ Two things worth knowing before you label an issue:
 ## Retry
 
 Autopilot only reacts to a label being *added*; fix whatever blocked it
-(map your username, opt in, add the PRD link, shorten an oversized
-description), then remove and re-add the autopilot label. A failed run is
-retried the same way. Toggling the label with nothing else changed is
-otherwise a no-op — a run never auto-retries on its own.
+(map your username, opt in, shorten an oversized description), then
+remove and re-add the autopilot label for a recorded refusal. A failed
+run is retried the same way. Harness-label and selected-credential
+refusals leave the event unrecorded: correct the harness label or repair
+its credential and the next poll retries without re-adding autopilot.
+A failed run itself does not automatically restart.
 
 ## Mid-run label changes
 

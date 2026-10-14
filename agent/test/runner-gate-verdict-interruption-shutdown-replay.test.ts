@@ -135,7 +135,7 @@ describe("shutdown at an observed plan gate", () => {
         // Hold a delivery read while the owner sends a bound approval. Shutdown must leave that
         // row pending for the next claim, rather than routing it on the first flight.
         assert.ok(heldGet, "the gate installed its input-read barrier");
-        await heldGet.entered;
+        await waitForTestEvent(heldGet.entered, "held input GET entered");
         assertHeldInputGet(s.runId);
         const [pending] = s.send(s.input("approve_plan"));
         const stored = api.inputRows(s.runId).find((row) => row.id === pending!.id)!;

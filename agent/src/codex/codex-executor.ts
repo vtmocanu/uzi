@@ -21,7 +21,7 @@
 // `process.env`.
 //
 // SCOPE (R4): this does NOT clone SdkExecutor's Claude-lane extras (empty-turn retry,
-// plan/intent summary hooks, health/interleave sentinels, interactive OWNER park).
+// health/interleave sentinels, interactive OWNER park).
 // Issue #2099 is the one retry that IS in scope: a turn that fails with a transient PROVIDER
 // classification (CodexTurnFailedError: transport or exact rateLimitExceeded token;
 // see isCodexTransientClassification)
@@ -75,7 +75,7 @@ import type { DockerWiring } from "../docker-wiring.js";
 import { PlanRejectedError, stampPrSummaryHead, type EmittedMessage, type Executor, type ExecutorResult, type RunContext, type WallParkOutcome, type WallParkRefresh } from "../executor.js";
 import type { PrSummaryClaim } from "../signals.js";
 import { PauseNowSignal } from "../steering.js";
-import { resolveRunKind } from "../run-kind.js";
+import { isRunSummaryKind, resolveRunKind } from "../run-kind.js";
 import {
   STALL_LIMIT,
   REASON_COMPLETION_NO_PROGRESS,
@@ -112,6 +112,8 @@ import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts,
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
 import { errMessage } from "../util.js";
+import { SummaryRunner, type PlanSummaryResult } from "../summary-runner.js";
+import { resolvePrdInput } from "../prd-link.js";
 import { appendLeadTextTail, emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "../plan-missing.js";
 import { makeTextRedactor } from "../redact.js";
 import { resolveAgentSelection, seedAgentSelection, type AgentSelection, type AgentTemplate, type AskUserQuestion, type ClaimSkill, type IterationBudget, type Milestone, type MilestoneProgress } from "../protocol.js";
@@ -487,8 +489,9 @@ function codexMilestoneNote(
   milestones: readonly Milestone[] | undefined,
   progress: MilestoneProgress | undefined,
   progressMissedLastTurn: boolean,
+  serverCompletedIds?: readonly string[],
 ): string {
-  const shared = milestoneStatusNote(milestones, progress, progressMissedLastTurn);
+  const shared = milestoneStatusNote(milestones, progress, progressMissedLastTurn, serverCompletedIds);
   return shared ? `${shared}\n\n${CODEX_MILESTONE_DISPATCH_NOTE}` : "";
 }
 
@@ -1257,7 +1260,7 @@ export interface CodexAdviceHarnessBuildParams {
   readonly binding: CodexBinding;
   readonly signal?: AbortSignal;
   /** PRD #2603: "deny" makes the call's app-server refresh bridge fail instead of calling
-   *  refreshCodex, for a caller that shares the run's credential (the Now summary). */
+   *  refreshCodex, for callers sharing the run's credential (Now, intent and plan summaries). */
   readonly refresh?: "deny";
 }
 
@@ -1755,6 +1758,13 @@ export interface CodexExecutorDeps {
 
 export interface CodexExecutorOptions {
   readonly capturedMemory?: CapturedMemoryContext;
+  /** Advisory seams; the default runner uses the shared provisioning HOME and advice factory. */
+  readonly summaryRunner?: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
+  /** Abort join bound, default 3000 ms; capture additionally caps it to its remaining deadline. */
+  readonly summarySettleMs?: number;
+  readonly codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
+  /** Original summary claim block, validated by SummaryRunner; undefined uses the standalone binding. */
+  readonly summaryClaimCodex?: unknown;
   readonly binding: CodexBinding;
   readonly client: WorkerClient;
   readonly provider: CodexProviderConfig;
@@ -1963,6 +1973,9 @@ export class CodexExecutor implements Executor {
    */
   async settleForCredentialFreeCapture(deadlineMs: number, purpose: "capture" | "cancel" = "capture"): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    this.summaryLifecycleClosed = true;
+    if (!this.summaryRunActive) this.summaryCapturedBeforeStart = true;
+    await this.closeAndSettlePlanSummary(Math.max(0, deadlineAt - Date.now()));
     if (purpose === "cancel") {
       // Owner cancellation spends one deadline independently of the spent lifecycle signal.
       // Close admission and drain before joining the installer, then observe the drain again:
@@ -2132,6 +2145,67 @@ export class CodexExecutor implements Executor {
     // report. pendingInterruption then drops implementation into driveTurnWithWallPark.
   }
 
+  private summaryLifecycleClosed = false;
+  private summaryRunActive = false;
+  private summaryCapturedBeforeStart = false;
+  private intentFlight?: { ctrl: AbortController; done: Promise<void>; delivered: boolean; abandoned: boolean };
+  private planFlight?: { ctrl: AbortController; done: Promise<void>; delivered: boolean; abandoned: boolean; closed: boolean; generation: number };
+  private readonly planFlights = new Set<NonNullable<CodexExecutor["planFlight"]>>();
+
+  /** Admission closes before yielding; both passes drain concurrently under one sink bound.
+   * Late generation/POST acknowledgements cannot update a closed or abandoned flight. */
+  async closeAndSettlePlanSummary(deadlineMs?: number): Promise<void> {
+    this.summaryLifecycleClosed = true;
+    // Generic cleanup drains existing work; only credential-free capture fences
+    // an unstarted leg. Do not poison a fresh execution or executor reuse.
+    const flights = [...this.planFlights];
+    for (const flight of flights) { flight.closed = true; flight.ctrl.abort(); }
+    const bound = Math.min(this.opts.summarySettleMs ?? 3_000, Math.max(0, deadlineMs ?? Infinity));
+    const deadlineAt = Date.now() + bound;
+    await Promise.all([
+      this.settleIntentSummary(deadlineAt),
+      ...flights.map(async flight => {
+        if (flight.abandoned) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const settled = await Promise.race([
+            flight.done.then(() => true, () => true),
+            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, deadlineAt - Date.now())); }),
+          ]);
+          if (!settled) {
+            flight.abandoned = true;
+            this.log.warn("plan summary did not settle within the bound");
+          }
+        } finally { clearTimeout(timer); }
+      }),
+    ]);
+  }
+
+  private readonly summaryRunner: Pick<SummaryRunner, "generateIntentSummary" | "generatePlanSummary">;
+
+  /** Abort once and join within one bound; abandonment drops all late results and usage. */
+  private async settleIntentSummary(deadlineAt?: number): Promise<void> {
+    const flight = this.intentFlight;
+    if (!flight) return;
+    flight.ctrl.abort();
+    if (flight.abandoned) return;
+    const bound = Math.min(this.opts.summarySettleMs ?? 3_000,
+      deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
+    let timer: ReturnType<typeof setTimeout> | undefined;
+    try {
+      const settled = await Promise.race([
+        flight.done.then(() => true),
+        new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), bound); }),
+      ]);
+      if (!settled) {
+        flight.abandoned = true;
+        this.log.warn("intent summary did not settle within the bound");
+      }
+    } finally {
+      clearTimeout(timer);
+    }
+  }
+
   private readonly log: Logger;
   private readonly homeRoot: string;
   private readonly provisionHomeDir: string;
@@ -2153,6 +2227,9 @@ export class CodexExecutor implements Executor {
     this.provisionHomeDir = opts.provisionHomeDir ?? this.homeRoot;
     this.provisionRoot = opts.provisionRoot ?? path.join(path.dirname(this.provisionHomeDir), "provision");
     this.opts = opts;
+    this.summaryRunner = opts.summaryRunner ?? new SummaryRunner(log, {
+      homeRoot: this.provisionHomeDir, codexAdviceHarnessFactory: opts.codexAdviceHarnessFactory,
+    });
     this.deps = deps;
     this.sessionStore = deps.sessionStore ?? CodexSessionStore;
   }
@@ -2193,6 +2270,16 @@ export class CodexExecutor implements Executor {
   }
 
   async run(ctx: RunContext): Promise<ExecutorResult> {
+    this.intentFlight = undefined;
+    this.planFlight = undefined;
+    // A capture before run starts closes admission permanently for that unstarted leg.
+    const summaryState = { closed: this.summaryCapturedBeforeStart };
+    this.summaryCapturedBeforeStart = false;
+    this.summaryLifecycleClosed = false;
+    this.summaryRunActive = true;
+    let planGeneration = 0;
+    let latestPlanSummary: PlanSummaryResult | undefined;
+    let summaryResult: ExecutorResult | undefined;
     this.depsInstall = undefined;
     this.safety = undefined;
     // Everything that needs the worktree is built at the TOP of run() (the executor is
@@ -2282,6 +2369,7 @@ export class CodexExecutor implements Executor {
     // recreates it at the implement loop top (epochNeedsRecreate). The fresh epoch's newer session
     // state is captured by its own persists; until then the store keeps the pre-sink generation.
     const beforeReapingSink = async (): Promise<void> => {
+      await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
       await settleInstall();
       if (reapedSinceLastPersist || !epoch) return;
       await epoch.persistSession();
@@ -2308,6 +2396,77 @@ export class CodexExecutor implements Executor {
     else ctx.signal?.addEventListener("abort", forwardLifecycleAbort, { once: true });
     const lifecycleSignal = ctx.terminalLifecycleSignal
       ? AbortSignal.any([lifecycleAbort.signal, ctx.terminalLifecycleSignal]) : lifecycleAbort.signal;
+    const intentAbort = (): void => {
+      this.intentFlight?.ctrl.abort(lifecycleSignal.reason);
+      for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(lifecycleSignal.reason); }
+    };
+    lifecycleSignal.addEventListener("abort", intentAbort, { once: true });
+    const summaryResultAllowed = (): boolean => !lifecycleSignal.aborted
+      && !ctx.cancelRequested?.() && !ctx.claimFenced?.();
+    const summaryAllowed = (): boolean => !summaryState.closed && !this.summaryLifecycleClosed
+      && summaryResultAllowed();
+    const summaryBinding = {
+      auth_mode: binding.authMode, access_token: binding.accessToken, capability: binding.capability,
+      ...(binding.authMode === "subscription" ? {
+        generation: binding.generation, chatgpt_account_id: binding.chatgptAccountId,
+        chatgpt_plan_type: null,
+      } : {}),
+    };
+    const summariesOn = isRunSummaryKind(ctx.kind);
+    const prdInputP = summariesOn
+      ? resolvePrdInput(ctx.issueDescription, ctx.worktreePath, ctx.issueIid, this.log) : undefined;
+    const summaryInputs = async () => ({
+      claim: { run_id: ctx.runId, secrets: {
+        codex: this.opts.summaryClaimCodex !== undefined ? this.opts.summaryClaimCodex : summaryBinding,
+      } },
+      token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
+      issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
+    });
+    const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
+      const generation = ++planGeneration;
+      if (this.planFlight) { this.planFlight.closed = true; this.planFlight.ctrl.abort(); }
+      latestPlanSummary = undefined;
+      // A later accepted candidate may start fresh after a refused capture/switch.
+      this.summaryLifecycleClosed = false;
+      let flight: CodexExecutor["planFlight"];
+      return planMd => {
+        if (flight) return flight.done;
+        if (!summariesOn || !summaryAllowed() || generation !== planGeneration) return Promise.resolve();
+        flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false,
+          abandoned: false, closed: false, generation };
+        const owned = flight;
+        this.planFlight = owned;
+        this.planFlights.add(owned);
+        const allowed = (): boolean => summaryAllowed() && generation === planGeneration
+          && this.planFlight === owned && !owned.closed && !owned.abandoned && !owned.ctrl.signal.aborted;
+        owned.done = (async () => {
+          try {
+            if (!allowed()) return;
+            const inputs = await summaryInputs();
+            if (!allowed()) return;
+            const result = await this.summaryRunner.generatePlanSummary({
+              ...inputs, planMd, signal: AbortSignal.any([lifecycleSignal, owned.ctrl.signal]),
+              // Spend observed during bounded settlement counts even after close/abort; only
+              // abandonment, a fence or a superseding flight drops it (as for the intent pass).
+              onUsage: usage => {
+                if (owned.delivered || owned.abandoned || this.planFlight !== owned
+                  || generation !== planGeneration || ctx.claimFenced?.()) return;
+                owned.delivered = true;
+                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
+              },
+            });
+            if (!result || !allowed()) return;
+            await this.opts.client.postPlanSummary(ctx.runId, {
+              ...result, plan_md: planMd.replaceAll("\u0000", ""),
+            });
+            if (allowed()) latestPlanSummary = result;
+          } catch (error) {
+            this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
+          } finally { this.planFlights.delete(owned); }
+        })();
+        return owned.done;
+      };
+    };
     const installAbort = new AbortController();
     const installState: NonNullable<CodexExecutor["depsInstall"]> = {
       abort: installAbort, cancellation: lifecycleSignal,
@@ -2573,6 +2732,30 @@ export class CodexExecutor implements Executor {
 
       // Plan → approval gate, exactly like SdkExecutor (fail-closed): a pre-approved resume
       // skips the planning turn and the gate.
+      if (summariesOn && !ctx.summaryIntentPresent && summaryAllowed()) {
+        const flight = { ctrl: new AbortController(), done: Promise.resolve(), delivered: false, abandoned: false };
+        this.intentFlight = flight;
+        if (lifecycleSignal.aborted) intentAbort();
+        flight.done = (async () => {
+          try {
+            const inputs = await summaryInputs();
+            if (!summaryAllowed() || flight.ctrl.signal.aborted) return;
+            const summary = await this.summaryRunner.generateIntentSummary({
+              ...inputs, signal: flight.ctrl.signal,
+              onUsage: usage => {
+                if (flight.delivered || flight.abandoned || ctx.claimFenced?.() || this.intentFlight !== flight) return;
+                flight.delivered = true;
+                ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: usage } });
+              },
+            });
+            if (summary && !flight.abandoned && !flight.ctrl.signal.aborted && summaryAllowed() && this.intentFlight === flight) {
+              await this.opts.client.postIntentSummary(ctx.runId, summary);
+            }
+          } catch (error) {
+            this.log.warn("intent summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
+          }
+        })();
+      }
       const preApproved = ctx.planApproved === true && !!ctx.approvedPlan?.trim();
       // #1586: the exact plan version the in-process gate approved (the LAST planMd handed to
       // ctx.gatePlan before an approve verdict). ctx.approvedPlan is only the claim-time
@@ -2699,7 +2882,7 @@ export class CodexExecutor implements Executor {
         // Issue #1789: from the first gate submission until approval the server row is
         // awaiting_approval and can never park, so a vault-lock latch must not change a turn's outcome.
         pauseNow.vaultLock.gateOpen = true;
-        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones);
+        let verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary());
         const maxRevisions = planMaxRevisionsOf(ctx.config);
         // Human revises only: an automatic (cross-check) round never spends this budget, so a later
         // human revise keeps its full plan_max_revisions (sdk-executor parity, PRD #2150/#2460).
@@ -2735,7 +2918,7 @@ export class CodexExecutor implements Executor {
           if (planMd === undefined || planMd.trim().length === 0) {
             throw new TrustedExecutionRefusal("codex plan turn produced no plan on revision");
           }
-          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, undefined, settles);
+          verdict = await ctx.gatePlan(planMd, planResult.rejectedMilestones ?? planResult.milestones, beginPlanSummary(), settles);
         }
         if (verdict.kind === "reject") throw new PlanRejectedError(verdict.reason);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCEL);
@@ -2850,7 +3033,7 @@ export class CodexExecutor implements Executor {
       // Issue #1514: every completed id seen this run; latestProgress is pruned across checkpoints.
       const seenCompletedIds = new Set<string>();
       const isIssueRun = resolveRunKind(ctx.kind) === "issue";
-      const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn);
+      const milestoneNote = (): string => codexMilestoneNote(milestones, latestProgress, progressMissedLastTurn, lastServedScope?.completedIds);
       const interlockedIssue = ctx.completionInterlock && resolveRunKind(ctx.kind) === "issue"
         && !ctx.interactive && !!ctx.recordCompletionAttempt;
       // Issue #1764 (PRD #1190 parity with sdk-executor): honour a seeded/steered pause at the
@@ -2867,7 +3050,8 @@ export class CodexExecutor implements Executor {
       let epochNeedsRecreate = false;
       // Written only by an exhausted interlocked done with unmet milestones.
       let pendingIterationExhaustion = false;
-      const loopResult = (): ExecutorResult => ({
+      const loopResult = (): ExecutorResult => (summaryResult = {
+        ...(latestPlanSummary && summaryResultAllowed() ? { summaryPlan: latestPlanSummary.summary, summaryDeltas: latestPlanSummary.deltas } : {}),
         branch: ctx.branch,
         agentSelection,
         ...(completionHeld ? { completionHeld } : {}),
@@ -3110,6 +3294,7 @@ export class CodexExecutor implements Executor {
             await epoch.persistSession();
             // Set before awaiting the sink: an error after reap must not persist a deleted home.
             reapedSinceLastPersist = true;
+            await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
             await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
             progressMissedLastTurn = false;
             consecutiveMisses = 0;
@@ -3140,6 +3325,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
+          await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "milestone_checkpoint" });
           // Issue #1674 (PRD #390 M3 / PRD #1224 parity): a milestone boundary re-arms enforcement
           // and drops only the checkpointed ids, keeping a concurrent sibling's in-progress state.
@@ -3198,6 +3384,7 @@ export class CodexExecutor implements Executor {
           // Issue #1764: set BEFORE the await, so a checkpoint that reaps and then throws still
           // keeps the finally from persisting the deleted home.
           reapedSinceLastPersist = true;
+          await this.closeAndSettlePlanSummary(boundaryDeadlineMs);
           await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
           const worktreeFingerprint = ctx.worktreeFingerprint ? await ctx.worktreeFingerprint() : null;
           const head = worktreeFingerprint === null ? null : (worktreeFingerprint.split("\n", 1)[0] ?? null);
@@ -3275,6 +3462,15 @@ export class CodexExecutor implements Executor {
       if (codeSummary) completed.codeCrossCheckSummary = codeSummary;
       return completed;
     } finally {
+      summaryState.closed = true;
+      await this.closeAndSettlePlanSummary();
+      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || lifecycleSignal.aborted)) {
+        delete summaryResult.summaryPlan;
+        delete summaryResult.summaryDeltas;
+      }
+      this.summaryLifecycleClosed = true;
+      this.summaryRunActive = false;
+      lifecycleSignal.removeEventListener("abort", intentAbort);
       await settleInstall();
       ctx.signal?.removeEventListener("abort", forwardInstallAbort);
       if (!this.deps.deferRegistryTeardown || epoch === undefined) {
@@ -3612,10 +3808,10 @@ export class CodexExecutor implements Executor {
         // epoch 0. Every new CodexExecutor.run invocation starts again at epoch 0, so a re-claim gets
         // a fresh lineage even when thread/resume emits no thread/started notification.
         accountant,
-        onTokenUsageIncomplete: () => {
+        onTokenUsageIncomplete: (text) => {
           ctx.emit({ kind: "status", agent: "worker", payload: {
             event: "codex_token_usage_incomplete",
-            text: "Token usage for this resumed claim is unavailable; recorded run totals are incomplete. Execution continues.",
+            text,
           } });
         },
         emitClaimInit: epochIndex === 0,
@@ -4244,6 +4440,7 @@ export class CodexExecutor implements Executor {
         ...(at.total !== undefined ? { total: at.total } : {}),
       },
     });
+    if (ctx.parkForPause) await this.closeAndSettlePlanSummary();
     return (await ctx.parkForPause?.(at)) ?? false;
   }
 

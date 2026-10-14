@@ -484,7 +484,8 @@ browser ──WS+REST──▶ web (nginx) ──▶ api (Go)  ◀──HTTP (co
 
 ### Server/worker trust boundary
 
-The worker never receives inbound connections; every call is worker → `api`
+The worker never receives inbound network connections (its only inbound endpoint is a
+worker-local `0600` Unix socket for operator exec, not network-reachable); every call is worker → `api`
 (`POST/GET /api/worker/*`), authenticated by a Bearer join token whose sha256
 the server looks up (`mw.RequireWorker`) — never a session cookie, so there is
 no CSRF step on this path. The token is shown once, at issuance (Settings →
@@ -850,12 +851,27 @@ time-driven. `api/internal/schedsvc`'s engine is a single-instance background
 actor (a wake ticker over the durable `run_schedules.next_fire_at` due-gate,
 `FOR UPDATE SKIP LOCKED` claim, a `Boot()` immediate tick so a fire missed
 across a restart happens on the next wake rather than backfilling the missed
-cadences). A due schedule fires through the same `workersvc.CreateRun`/
-`CreateAutopilotRun` seam autopilot uses, so the eligibility gate
-(`isEligibleIssue`, PRD #764 M1, widened by PRD #767 M2 to also match
-`assignee_ids` against the connection's `bot_forge_user_id`), the fresh-label
-fetch, active-run dedup, and the usage-limit park all apply as for a manual
-start. Its **ad-hoc prompt** target has no issue to seam through, so it lands
+cadences). A due issue schedule uses `workersvc.CreateScheduledRun` or
+`CreateScheduledAutopilotRun`. These share the underlying create body with
+manual `CreateRun` and the poller's `CreateAutopilotRun`, so the eligibility
+gate (`isEligibleIssue`, PRD #764 M1, widened by PRD #767 M2 to also match
+`assignee_ids` against the connection's `bot_forge_user_id`), active-run
+dedup, and usage-limit park apply as for a manual start. Automatic issue starts additionally select the harness from fresh
+`issueinput.Capture` labels (`harness::codex` / `harness::claude`), across
+every issue schedule selector and the autopilot poller. Namespace validation
+precedes pin comparison inside the fire; a label cannot replace a differing
+schedule pin or trigger cross-harness credential fallback. The once-schedule
+stored-token/pin disabled precheck remains before forge selection.
+Unpinned sweeps treat label-selected credential refusals per candidate;
+stored-pin/override disable keeps the existing hold/stop boundary, including
+a stored-token-only recheck when resolution fails before the insert guard.
+The poller retains consent/identity checks before capture and the legacy
+Anthropic-token presence gate for unlabelled issues, while a valid Codex
+label permits a consenting Codex-only owner with a usable credential.
+Manual run creation and chat `start_run` retain their selection behavior.
+See [ADR-2853](adr/2853-automatic-issue-harness-labels.md) for precedence,
+credential-disable boundaries and the maintainer landing step.
+Its **ad-hoc prompt** target has no issue to seam through, so it lands
 via a dedicated INSERT as a `prompt` run kind: repo-ful, issue-less,
 `schedule_id`-keyed for dedup, MR-opening on the `ci_fix` shape. A **sweep**
 target fans out over the oldest open issues matching its label; `max_issues`
@@ -2122,9 +2138,11 @@ claims a Codex-indicating run, which stays queued instead. See
 [PRD #1493](prds/1493-codex-k8s-uid-split-profile.md) for the full design and
 Decision Log, and [docs/configuration.md](docs/configuration.md#controller)
 for the operator-facing knobs. See [ADR-1106](adr/1106-codex-harness.md) for
-the Codex harness's own execution design (the app-server architecture,
+the Codex harness's own execution design; automatic issue harness selection
+is recorded separately in [ADR-2853](adr/2853-automatic-issue-harness-labels.md).
+ADR-1106 covers the app-server architecture,
 capability owners, and the untrusted-construction boundary the uid split
-exists to satisfy), and [ADR-0285](adr/0285-worker-egress-tier-trust-model.md)
+exists to satisfy. See [ADR-0285](adr/0285-worker-egress-tier-trust-model.md)
 for the two-tier egress trust model the Codex hosts above (restricted-tier
 allowlist) were added against.
 
@@ -2242,7 +2260,9 @@ stays unchanged, it rolls zero worker pods. A controller change that alters the
 worker template can still cause a paced same-image roll (notably #1470's pod UID
 environment); the image pin alone does not prevent template rolls. Advancing
 the worker fleet is a deliberate operator step: bump `workers.image.tag` to a
-new concrete version with its verified exact `workers.rollTargetVersion`.
+new concrete version. Published charts supply its verified exact
+`workers.rollTargetVersion`; set a matching override only for a custom worker pin
+or a source-chart deployment.
 
 **Paced replacement (#1470 M2)** adds admission before that drain. The chart
 enforces controller replicas `0` or `1`, with Recreate; disabled hosting/controller
@@ -2283,7 +2303,9 @@ capacity and fresh old-worker drain confirmation, not replacement promotion.
 
 `workers.rollTargetVersion` must name the pinned image's **verified exact baked
 stamp**, including ADR-1720's `+g<commit>`, even for published bare SemVer tags.
-The controller cannot derive that stamp from a bare tag or the worker being
+Published charts supply the stamp automatically; custom pins and source-chart
+deployments need a matching verified override. The controller cannot derive
+that stamp from a bare tag or the worker being
 promoted. Registration keeps its 64-byte display limit; altered/truncated
 versions withhold the incarnation binding. Missing mapping or evidence holds
 rather than falling back to unpaced replacement.
@@ -2373,7 +2395,7 @@ pods themselves stays out of scope, owned by cluster monitoring. See
 rationale, and the deferred items (version skew, per-connection sync freshness).
 
 The health registry supplies each check's `scope` (#2293): `db`,
-`db.size`, `controller.report`, `loops`, `fleet.roll` and `pricing.codex` are `instance`;
+`db.size`, `controller.report`, `loops`, `fleet.roll`, `agentsource.update` and `pricing.codex` are `instance`;
 the rest are `owner`. `fleet.roll` remains instance infrastructure even for a single owner.
 The server emits `blocking` on every document, true exactly when an instance
 check is danger. Overall status, counts, attention pips, history and CLI exit

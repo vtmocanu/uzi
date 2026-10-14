@@ -25,10 +25,10 @@ func TestWorkersDemoFleet(t *testing.T) {
 	}
 	m := workersScene(true, "workers-list-120")
 	want := "workers · 9 · 8 online · 5/12 run slots in use +1 ?cap · 0/? cross-checks · 1 holding · 1 draining · 7 need attention"
-	if got := stripANSI(m.workersSummary(120)); got != want {
+	if got := stripANSI(m.workersSummary(120, false)); got != want {
 		t.Fatalf("summary %q", got)
 	}
-	if title := m.workerFleetTitleLines("▚▚ uzi · floor"); !strings.Contains(stripANSI(title[0]), "need attention") {
+	if title := m.workerFleetTitleLines("▚▚ uzi · floor", false); !strings.Contains(stripANSI(title[0]), "need attention") {
 		t.Fatal("compact floor title omitted attention", title)
 	}
 	var names []string
@@ -210,9 +210,22 @@ func TestWorkersScenesContentAndBounds(t *testing.T) {
 			t.Run(name+map[bool]string{true: "/dark", false: "/light"}[dark], func(t *testing.T) {
 				m := workersScene(dark, name)
 				frame := stripANSI(m.View().Content)
-				for _, want := range []string{"workers", "runs", "checks", "need attention"} {
+				for _, want := range []string{"workers", "runs", "need attention"} {
 					if !strings.Contains(frame, want) {
 						t.Errorf("missing %q\n%s", want, frame)
+					}
+				}
+				if name == "floor-fleet" || name == "split-workers-top" {
+					if title := renderedFleetTitle(m); strings.Contains(title, "checks") {
+						t.Errorf("idle shared title contains checks: %q", title)
+					}
+				}
+				if name != "floor-fleet" && !strings.Contains(frame, "CHECKS") {
+					t.Errorf("Workers CHECKS table missing\n%s", frame)
+				}
+				if name != "floor-fleet" && name != "split-workers-top" {
+					if title := renderedFleetTitle(m); !strings.Contains(title, "0/? cross-checks") && !strings.Contains(title, "0/? checks") {
+						t.Errorf("full Workers idle capacity missing: %q", title)
 					}
 				}
 				if strings.Contains(name, "factory") || strings.Contains(name, "cordoned") {
@@ -672,7 +685,7 @@ func TestWorkerSortSeverityNameAndIDTies(t *testing.T) {
 	if !reflect.DeepEqual(ids, []string{"danger", "warn", "info", "a", "b"}) {
 		t.Fatal(ids)
 	}
-	if !strings.Contains(m.workersSummary(120), "2 need attention") {
+	if !strings.Contains(m.workersSummary(120, false), "2 need attention") {
 		t.Fatal("info counted as attention")
 	}
 }
@@ -726,10 +739,10 @@ func TestWorkersSummaryDropsSegmentsInPriorityOrder(t *testing.T) {
 				{w: apitypes.WorkerDTO{ID: "held", Status: "online", ActiveRuns: tc.used, MaxConcurrentRuns: &tc.cap, RetainingUnpublishedWork: true, CustodyDecisionsNeeded: custodyCount(1)}},
 				{w: apitypes.WorkerDTO{ID: "unknown", Status: "online"}},
 			}
-			if wide := m.workersSummary(160); !strings.Contains(wide, "+1 ?cap") || !strings.Contains(wide, "1 holding") || !strings.Contains(wide, "2 online") {
+			if wide := m.workersSummary(160, false); !strings.Contains(wide, "+1 ?cap") || !strings.Contains(wide, "1 holding") || !strings.Contains(wide, "2 online") {
 				t.Fatalf("fixture lacks optional segments: %q", wide)
 			}
-			if got := stripANSI(m.workersSummary(visualWidth(tc.want))); got != tc.want || visualWidth(got) > visualWidth(tc.want) {
+			if got := stripANSI(m.workersSummary(visualWidth(tc.want), false)); got != tc.want || visualWidth(got) > visualWidth(tc.want) {
 				t.Fatalf("narrowed summary = %q, want %q", got, tc.want)
 			}
 		})
@@ -1001,10 +1014,10 @@ func TestWorkersZeroSummaryAndMaximumAttentionBounds(t *testing.T) {
 		}
 	}
 	m.workers.rows = nil
-	if m.workersSummary(80) != "" {
+	if m.workersSummary(80, false) != "" {
 		t.Fatal("empty summary charged")
 	}
-	if title := m.workerFleetTitleLines("workers"); len(title) != 1 || title[0] != "workers" {
+	if title := m.workerFleetTitleLines("workers", false); len(title) != 1 || title[0] != "workers" {
 		t.Fatal("empty fleet added chrome", title)
 	}
 	m.height = 34

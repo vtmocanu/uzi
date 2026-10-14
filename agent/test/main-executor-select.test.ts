@@ -56,6 +56,25 @@ function baseDeps(overrides: Partial<BuildRunExecutorDeps> = {}): BuildRunExecut
   };
 }
 
+it("2833 forwards shared advice factory to Codex summary runner while stub stays inert", () => {
+  const factory = (async () => { throw new Error("should not construct during selection"); }) as
+    import("../src/codex/codex-executor.js").CodexAdviceHarnessFactory;
+  const deps = baseDeps({ codexAdviceHarnessFactory: factory });
+  const rawCodex = { ...VALID_SUBSCRIPTION_CODEX, claim_metadata: "original subscription claim" };
+  const result = buildRunExecutor("run-summary", rawCodex, deps);
+  assert.ok(result.executor instanceof CodexExecutor);
+  const executor = result.executor as unknown as {
+    opts: { codexAdviceHarnessFactory?: unknown; summaryClaimCodex?: unknown };
+    summaryRunner: { homeRoot: string; codexAdviceHarnessFactory?: unknown };
+  };
+  assert.equal(executor.opts.codexAdviceHarnessFactory, factory);
+  assert.equal(executor.opts.summaryClaimCodex, rawCodex);
+  assert.equal(executor.summaryRunner.homeRoot, SDK_HOME_ROOT);
+  assert.equal(executor.summaryRunner.codexAdviceHarnessFactory, factory);
+  const stub = buildRunExecutor("run-summary", VALID_SUBSCRIPTION_CODEX, { ...deps, executorKind: "stub" });
+  assert.ok(stub.executor instanceof StubExecutor);
+});
+
 describe("buildRunExecutor — the stub-before-codex reorder (PRD #1429 M6)", () => {
   it("stub executor + a codex-bound claim returns StubExecutor, NOT CodexExecutor", () => {
     const result = buildRunExecutor("run-1", VALID_SUBSCRIPTION_CODEX, baseDeps({ executorKind: "stub" }));

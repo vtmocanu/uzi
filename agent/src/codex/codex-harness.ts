@@ -235,7 +235,7 @@ export interface CodexHarnessOptions {
    *  single-epoch or test construction) this defaults to a fresh accountant. */
   readonly accountant?: CodexUsageAccountant;
   /** Fixed, claim-wide usage diagnostic. Failure must never interrupt model execution. */
-  readonly onTokenUsageIncomplete?: () => void | Promise<void>;
+  readonly onTokenUsageIncomplete?: (text: string) => void | Promise<void>;
   /** Emit this executor claim leg's one explicit `initialized` event. The first provider epoch sets
    *  this true; recreated internal epochs set it false, so each worker claim creates exactly one
    *  persisted usage-lineage marker regardless of app-server `thread/started` behavior. */
@@ -528,7 +528,7 @@ export class CodexHarness implements RunHarness {
   // the claim leg's cumulative-since-baseline modelUsage, which one server lineage row de-duplicates
   // with GREATEST. A later worker claim gets a new accountant and a new explicit init lineage.
   private readonly accountant: CodexUsageAccountant;
-  private readonly onTokenUsageIncomplete?: () => void | Promise<void>;
+  private readonly onTokenUsageIncomplete?: (text: string) => void | Promise<void>;
   private resumedRoot = false;
   private resumeBoundarySeen = false;
   private resumeReplay?: Extract<CodexNotification, { kind: "token_usage_updated" }>["usage"];
@@ -1174,22 +1174,34 @@ export class CodexHarness implements RunHarness {
         yield { kind: "initialized", model: this.currentModel, sessionId: this.threadId };
       }
 
-      // One reader, one serial request mapping, and a bounded FIFO. Readiness is stamped
+      // One reader, one serial effect mapping, one Bash-only Read observation, and a bounded FIFO. Readiness is stamped
       // at handoff, including while the consumer is suspended at a yield.
       type ReadState = { promise: Promise<void>; source: Promise<IteratorResult<CodexNotification>>;
         ready?: number; step?: IteratorResult<CodexNotification>; error?: unknown; failed?: boolean };
-      type Mapping = { promise: Promise<void>; ready?: number; event?: HarnessEvent; error?: unknown; failed?: boolean };
+      type Mapping = { promise: Promise<void>; bash?: boolean; bytes?: number; ready?: number; event?: HarnessEvent; error?: unknown; failed?: boolean };
       let read: ReadState | undefined;
       let mapping: Mapping | undefined;
+      let observation: Mapping | undefined;
       let terminal: CodexNotification | undefined;
       let terminalSeen = false;
-      const beginMapping = (note: CodexNotification): void => {
-        const state: Mapping = { promise: Promise.resolve() };
+      // Eligibility is scheduling only; routeToolCall still owns identity, grants and replies.
+      const activeTool = (note: CodexNotification): string | undefined => {
+        if (note.kind !== "activity" || note.requestId === undefined || note.method !== "item/tool/call")
+          return undefined;
+        const p = asObject(note.params);
+        if (!p || asString(p.threadId) !== this.threadId || asString(p.turnId) !== this.activeTurnId)
+          return undefined;
+        const tool = asString(p.tool);
+        return tool === undefined ? undefined : canonicalizeCodexToolName(tool);
+      };
+      const beginMapping = (note: CodexNotification, bytes?: number): void => {
+        const state: Mapping = { promise: Promise.resolve(), bash: activeTool(note) === "Bash", bytes };
         state.promise = this.mapNote(transport, note, request.signal).then(
           event => { state.event = event; state.ready = ++this.readinessOrdinal; },
           error => { state.error = error; state.failed = true; state.ready = ++this.readinessOrdinal; },
         );
-        mapping = state;
+        if (bytes !== undefined) observation = state;
+        else mapping = state;
       };
       for (;;) {
         if (this.turnClosed || request.signal.aborted || this.stopRequested) {
@@ -1203,10 +1215,19 @@ export class CodexHarness implements RunHarness {
         // Keep normal readiness/drain ordering, but never admit a queued callback
         // once EOF or failure is already known.
         const readEnded = read?.ready !== undefined && (read.failed || read.step?.done);
-        if (!mapping && deferred.length > 0 && !readEnded) {
+        if (!mapping && !observation && deferred.length > 0 && !readEnded) {
           const entry = deferred.shift()!;
           deferredBytes -= entry.bytes;
           beginMapping(entry.note);
+        }
+        // Search the single bounded collection for the oldest Read only while Bash
+        // is pending. Keep its budget charged until settlement; failures block siblings.
+        if (mapping?.bash && mapping.ready === undefined && !observation && !readEnded) {
+          const index = deferred.findIndex(entry => activeTool(entry.note) === "Read");
+          if (index >= 0) {
+            const entry = deferred.splice(index, 1)[0]!;
+            beginMapping(entry.note, entry.bytes);
+          }
         }
         if (!read && !terminalSeen) {
           const source = this.pendingNote ?? notes.next();
@@ -1218,21 +1239,26 @@ export class CodexHarness implements RunHarness {
           );
           read = state;
         }
-        if (terminal && !mapping && deferred.length === 0) {
+        if (terminal && !mapping && !observation && deferred.length === 0) {
           beginMapping(terminal);
           terminal = undefined;
           // The active terminal is mapped without starting another notification read.
         }
         const readReady = read?.ready ?? Infinity;
         const outboxReady = this.outbox[0]?.ready ?? Infinity;
-        const mappedReady = mapping?.ready ?? Infinity;
+        const effectReady = mapping?.ready ?? Infinity;
+        const observationReady = observation?.ready ?? Infinity;
+        const mappedReady = Math.min(effectReady, observationReady);
         if (outboxReady < readReady && outboxReady < mappedReady) {
           yield this.outbox.shift()!.event;
           continue;
         }
         if (mappedReady < readReady) {
-          const completed = mapping!;
-          mapping = undefined;
+          const completed = observationReady < effectReady ? observation! : mapping!;
+          if (completed === observation) {
+            deferredBytes -= completed.bytes!;
+            observation = undefined;
+          } else mapping = undefined;
           if (completed.failed) {
             refuseDeferred();
             yield* this.closeDispatchesOnFailure(ordinal);
@@ -1279,6 +1305,7 @@ export class CodexHarness implements RunHarness {
             abortPromise, this.outboxReady(),
             ...(read ? [read.promise] : []),
             ...(mapping ? [mapping.promise] : []),
+            ...(observation ? [observation.promise] : []),
           ]);
           continue;
         }
@@ -1343,10 +1370,10 @@ export class CodexHarness implements RunHarness {
           continue;
         }
         if (step.value.kind === "activity" && step.value.requestId !== undefined) {
-          if (mapping || deferred.length > 0) {
+          if (mapping || observation || deferred.length > 0) {
             let bytes: number;
             try {
-              bytes = deferred.length >= 4096 ? Infinity : boundedJsonBytes(step.value, 64 * 1024 * 1024 - deferredBytes);
+              bytes = deferred.length + (observation ? 1 : 0) >= 4096 ? Infinity : boundedJsonBytes(step.value, 64 * 1024 * 1024 - deferredBytes);
             } catch {
               // This request is not yet in deferred: refuse it explicitly before
               // failing siblings; routeToolCall still owns the active callback's reply.
@@ -1357,7 +1384,7 @@ export class CodexHarness implements RunHarness {
             }
             // Bound before admission. Overflow refuses this request and all queued siblings;
             // the already-dispatched callback retains routeToolCall's sole reply ownership.
-            if (deferred.length >= 4096 || bytes > 64 * 1024 * 1024 - deferredBytes) {
+            if (deferred.length + (observation ? 1 : 0) >= 4096 || bytes > 64 * 1024 * 1024 - deferredBytes) {
               refuse(transport, step.value);
               refuseDeferred();
               yield* this.closeDispatchesOnFailure(ordinal);
@@ -1377,7 +1404,7 @@ export class CodexHarness implements RunHarness {
       // An attempted resumed turn may persist new work before its RPC reply or replay boundary.
       // A later epoch must not baseline that work away as history of this same claim.
       if (attemptedResumedRoot !== undefined && !this.accountant.hasBaseline(attemptedResumedRoot))
-        this.accountant.markIncomplete();
+        this.accountant.markIncomplete(attemptedResumedRoot, "attempted_resume_without_baseline");
       if (onAbort) request.signal.removeEventListener("abort", onAbort);
       if (this.stopTurn === settleStop) this.stopTurn = undefined;
       // Close the outbox for this turn: a callback settling after the stream ended drops its
@@ -1398,7 +1425,7 @@ export class CodexHarness implements RunHarness {
   private async deliverIncompleteNotice(): Promise<void> {
     if (!this.onTokenUsageIncomplete || !this.accountant.takeIncompleteNotice()) return;
     // One attempt per shared claim. A rejected diagnostic is nonfatal, with no retry.
-    try { await this.onTokenUsageIncomplete(); } catch { /* execution continues */ }
+    try { await this.onTokenUsageIncomplete(this.accountant.incompleteNoticeText!); } catch { /* execution continues */ }
   }
 
   private async ensureRoot(signal?: AbortSignal): Promise<void> {
@@ -2084,7 +2111,8 @@ export class CodexHarness implements RunHarness {
         // A matching completion without a start cannot prove the historical boundary.
         if (note.kind === "turn_started" && this.resumeReplay)
           this.accountant.record(this.threadId!, this.resumeReplay, true);
-        else if (!this.accountant.hasBaseline(this.threadId!)) this.accountant.markIncomplete();
+        else if (!this.accountant.hasBaseline(this.threadId!))
+          this.accountant.markIncomplete(this.threadId!, "missing_replay_boundary");
         this.resumeBoundarySeen = true;
       }
     }
@@ -2097,7 +2125,8 @@ export class CodexHarness implements RunHarness {
       // usage. Foreign/child turn IDs do not taint root; retain opaque nonblank IDs as-is.
       if (threadId === undefined || threadId.trim() === "" ||
           (root && (turnId === undefined || turnId.trim() === ""))) {
-        this.accountant.markIncomplete();
+        this.accountant.markIncomplete(this.threadId!, "invalid_identity",
+          !this.resumeBoundarySeen && (turnId === this.activeTurnId || turnId === undefined || turnId.trim() === ""));
         return;
       }
     }
@@ -2105,12 +2134,16 @@ export class CodexHarness implements RunHarness {
       if (this.resumeBoundarySeen && note.kind === "token_usage_updated" &&
           note.turnId !== this.activeTurnId) return;
       if (note.kind !== "token_usage_updated" || !validResumedUsage(note)) {
-        this.accountant.markIncomplete();
+        // A malformed current-live note is attempted work, not recoverable history.
+        const turnId = note.kind === "token_usage_updated"
+          ? note.turnId : asString(asObject(note.params)?.turnId);
+        this.accountant.markIncomplete(this.threadId!, "invalid_raw_usage",
+          !this.resumeBoundarySeen && turnId === this.activeTurnId);
         return;
       }
       if (!this.resumeBoundarySeen) {
         if (note.turnId === this.activeTurnId) {
-          this.accountant.markIncomplete();
+          this.accountant.markIncomplete(this.threadId!, "missing_replay_boundary");
           return;
         }
         // Multiple/stale replay snapshots may precede the boundary. Pick the largest full
@@ -2179,15 +2212,14 @@ export class CodexHarness implements RunHarness {
     // now carrying each model's closed `costStatus` (and `costUSD` when metered) projected from
     // the run's auth mode against the D5 price table (C4b). The reducer emits
     // `terminal.usage.wire.modelUsage`, so the reconciled deltas + cost ride out there. When no
-    // usage was reconciled, aggregateByModel() is undefined and the terminal usage is left
-    // byte-identical to before C4a. `now` is the real clock at the terminal point; the price
+    // usage was reconciled and no model is incomplete, aggregateByModel() is undefined and the
+    // terminal usage is left byte-identical to before C4a. `now` is the real clock at the terminal point; the price
     // table keeps the injectable-clock seam (D5) so the Sol boundary is deterministic in tests.
     const pricing = this.authMode === undefined ? undefined : { authMode: this.authMode, now: new Date() };
     const modelUsage = this.accountant.aggregateByModel(pricing);
     // An ambiguous base turn usage must not bypass the incomplete claim accounting.
-    const usage = this.accountant.usageIncomplete
-      ? undefined
-      : attachModelUsage(normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
+    const usage = attachModelUsage(this.accountant.usageIncomplete
+      ? undefined : normalizeCodexUsage(turn?.usage, "turn"), modelUsage);
     // The RUN-level API-equivalent cost: metered/unreported, folded with D5's unreported
     // dominance. Undefined auth mode leaves it `unreported` (price-free), matching `modelUsage`.
     const cost = this.authMode === undefined ? { kind: "unreported" as const } : deriveCodexRunCost(modelUsage);

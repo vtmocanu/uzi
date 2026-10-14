@@ -129,9 +129,10 @@ func (h *Handler) ListRuns(w http.ResponseWriter, r *http.Request) {
 	writeRunList(w, r, out)
 }
 
-// AdminListRuns returns every non-terminal run across all users (admin-only,
-// gated by RequireAdmin on the route). Powers the Agents-status overview. ?view=summary
-// serves the compact rows exactly as ListRuns does.
+// AdminListRuns returns the newest 500 non-terminal runs across all users, excluding
+// chat, judge, and cross-check runs (admin-only, gated by RequireAdmin on the route).
+// Powers the Agents-status overview. ?view=summary serves the compact rows exactly
+// as ListRuns does.
 func (h *Handler) AdminListRuns(w http.ResponseWriter, r *http.Request) {
 	rows, err := h.wsvc.ListActiveRunsAll(r.Context())
 	if err != nil {

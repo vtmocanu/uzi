@@ -482,17 +482,54 @@ and falling back to the durable bare tracking ref when no clone survives:
   commits not on `origin/main` + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`),
   plus a self-describing status set (`run.json`, `plan.md`, `progress.txt` with milestones
   DONE vs LEFT, `log-tail.ndjson`). It picks the clone (canonical or `.attempt-*`) by
-  the bare's journal/ledger identity plus branch, resolves worker→pod FRESH each call, searches all
+  the bare's journal/ledger identity plus branch (a detached kept canonical clone is attributed by its `uzi-stopped.<runId>.entry` marker, which names only that key's canonical dir), resolves worker→pod FRESH each call, searches all
   persistent workers when the current pod lost the clone, and falls back to the durable
   runner tracking ref. The result vocabulary is `OK` (live clone + bundle), `PART` (live
   clone, uncommitted/status only), `BARE` (committed history only; no live WIP), and `FAIL`.
   An active-run `FAIL` exits 1, so callers cannot misread a status-only attempt as a backup.
+  For an active or failed run it captures every attributed source on every running worker pod: the
+  primary keeps `<stem>.tgz` (selection unchanged) and each other source is
+  `<stem>.source-N.tgz` (N from 2; members prefixed `<stem>.source-N.`, `meta.txt` names
+  `clone=<path>`) with its own verify and `OK`/`PART` line. Attributed sources are the journal
+  or protected-descriptor sources, the `uzi-stopped` marker canonical, and attempt clones whose
+  last ledger entry for the run is `live` or `reclaimed` (an unreadable attempt clone counts only on that evidence or when a journal names it); on a pod other than the one supplying
+  the primary only attributed sources are added. Completed and cancelled runs capture
+  protected-descriptor or marker sources and attempt clones whose last ledger entry for the run
+  is `live` or `reclaimed` (the plain journal is ignored; a retired or abandoned attempt is never
+  a source, and a terminal status does not prove a predecessor's unique work is preserved). If an attributed
+  source is listed but unreadable, any capture (primary or extra) is not verified, or a probe of
+  the search failed (a kubectl listing or exec, an unreadable bare repository), whether the run
+  was captured from a clone or fell back to the bare tracking ref, it logs
+  `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`
+  (`<m>` counts the sources found, clones or the tracking ref the run tried to capture, plus
+  attributed unreadable ones), exits 1 and does not advance `latest`; any archive that did verify
+  is kept. When nothing is captured at all (no readable clone and no owned tracking ref), a failed
+  search instead logs `FAIL <run> (<label>) status=<st>: status saved, but the source search was
+  inconclusive (<reasons>); retry` (still exit 1, `latest` not advanced); each reason names the
+  failing pod or namespace for a kubectl listing or exec failure (`exec into pod <ns>/<pod> failed`,
+  `listing Running pods in namespace <ns> failed`), an errored probe, an unreadable `.git`
+  (`a candidate's .git on pod <ns>/<pod> could not be read`) and an attributed source listed but
+  unreadable (`attributed source <path> on pod <ns>/<pod> is listed but unreadable`); capture
+  failures name the source path. A same-stem directory without `.git` is skipped only when it is positively empty;
+  a nonempty or unlistable one that the journal (active and failed runs only), a protected descriptor, a `live`/`reclaimed` ledger entry or the stopped marker names is an
+  attributed source that is listed but unreadable: incomplete coverage when another source was
+  captured, else the no-capture inconclusive FAIL line above; either way exit 1 and `latest` not
+  advanced. A directory none of those name is not an attributed source, but on
+  a run that captures nothing a `.git` that exists but cannot be read in any same-stem directory, even an
+  unattributed one, still makes the search inconclusive (FAIL, retry): a known limitation. Cost: every
+  cycle execs into every Running pod in `UZI_WORKER_NS` for each bound run (a handful of probes
+  per pod), and one pod that cannot be exec'd into fails every bound run's cycle until it is fixed (the FAIL line names it and verified artifacts are kept). Do not drop its namespace from `UZI_WORKER_NS` unless you have verified that namespace holds no source a tracked run needs: excluding it hides those sources from the search, so their work is no longer backed up and the backup could read green without it (it lists namespaces, so
+  excluding a pod means excluding its namespace).
   A `queued` run without a worker binding gets a status-only `SNAP` and stays in
   the loop. A requeued run can retain its worker and clone; capture that work.
   A `failed` run bound to a worker is captured while its clone or owned tracking ref
   survives (recovery custody can keep an ephemeral worker alive), else `SNAP`; a search
   that could not complete (a kubectl listing or exec failed) is `FAIL`, never `SNAP`;
-  `completed` and `cancelled` runs are always `SNAP`.
+  `completed` and `cancelled` runs bound to a worker are captured when an exact protected
+  descriptor, a matching stopped marker or a `live`/`reclaimed` ledger entry names a
+  surviving source, else `SNAP`; for them
+  too, a search that could not complete (a failed kubectl listing or exec, an unreadable
+  marker, an invalid descriptor or an unreadable attributed attempt clone) is `FAIL`, never `SNAP`.
   Deployment coordinates come from env
   (`UZI_CTX`, `UZI_WORKER_NS`, `UZI_REPO_SLUG` — the last derived from `origin` if unset),
   never hard-coded. **Always pass `UZI_CTX` explicitly**: unset, it falls back to the
@@ -575,7 +612,11 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    `recover/issue-N`. Before publishing the seed, account for every dirty and untracked
    file in the backup. Put substantive unpublished work in a verified recovery commit,
    or restore it into the successor through the recovery procedure before it runs: a
-   clean checkout of TIP alone does not bring over the backup's uncommitted work. Keep
+   clean checkout of TIP alone does not bring over the backup's uncommitted work. Check
+   for `<stem>.source-N.tgz` archives beside `<stem>.tgz` and restore each the same way,
+   from its own prefixed members; an `incomplete coverage` FAIL means some attributed source
+   was not captured or verified (any archive that did verify is kept), so do not treat the
+   backup as complete. Keep
    the ref and the backup until both committed and uncommitted work are verified in the
    successor.
 2. **Cancel normally, then verify the run is terminal** (`uzi run get RUN --json | jq -r

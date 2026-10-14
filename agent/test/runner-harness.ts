@@ -53,7 +53,7 @@ export let homeDir: string;
  * test body reads whatever this hook most recently assigned -- which is why
  * splitting runner.test.ts needed no edits inside any test body.
  */
-export function installHarness(): void {
+export function installHarness(clientOptions: { httpTimeoutMs?: number } = {}): void {
   // issue #2213: a runner flow over a planted unreadable process latches the worker-wide quarantine.
   resetResidueQuarantineAfterEach();
   beforeEach(async (t) => {
@@ -65,6 +65,7 @@ export function installHarness(): void {
     client = new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
       sleep: async () => {},
       terminalRetrySchedule: [1, 1],
+      ...clientOptions,
     });
   });
 
@@ -330,6 +331,9 @@ export function runnerWith(
     // Spread LAST so a test can override checkpointIntervalMs / now (PRD #267) and any
     // other RunnerOptions field. Optional: existing call sites pass nothing.
     ...extra,
+    // Checkpoint publish retries (HTTP 5xx) wait no real backoff; a test that passes its own
+    // checkpointTestHooks keeps this default unless it sets retryBackoffMs itself.
+    checkpointTestHooks: { retryBackoffMs: [0, 0], ...extra?.checkpointTestHooks },
   });
 }
 

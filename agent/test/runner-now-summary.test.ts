@@ -125,6 +125,34 @@ function workingExecutor(done: () => boolean, maxMs = 4000): Executor {
 }
 
 describe("RunRunner Now summary wiring (PRD #2603)", () => {
+  for (const kind of ["self_improve", "prompt"] as const) {
+  it(`M1 Now runner ${kind} eligibility`, async () => {
+    const calls: { options: unknown; prompt: unknown }[] = [];
+    const claim = claimFor(2603, { kind });
+    api.nowSummary.set(claim.run_id, true);
+    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+    try {
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0, 200), { homeRoot, queryFn: summaryQuery(calls) }).execute(claim);
+    } finally {
+      fs.rmSync(homeRoot, { recursive: true, force: true });
+    }
+    const notes = notesOf(claim.run_id);
+    assert.equal(notes.length, 1, "one call per 5 minute window");
+    const p = notes[0]!.payload as Record<string, unknown>;
+    assert.equal(p.text, "Running the api gate for the docs milestone");
+    assert.equal(p.milestone_id, "m1");
+    assert.deepEqual(Object.keys(p).sort(), ["milestone_id", "model_usage", "text"]);
+    assert.deepEqual((p.model_usage as Record<string, unknown>)[HAIKU], { inputTokens: 21, outputTokens: 8, cacheReadInputTokens: 0, cacheCreationInputTokens: 0, costUSD: 0.0003 });
+    assert.equal(notes[0]!.agent, "worker");
+    assert.equal(calls.length, 1);
+    const opts = calls[0]!.options as { model?: string; env?: Record<string, string>; thinking?: unknown };
+    assert.equal(opts.model, "haiku");
+    assert.equal(opts.env?.CLAUDE_CODE_MAX_OUTPUT_TOKENS, "256");
+    assert.deepEqual(opts.thinking, { type: "disabled" });
+    assert.equal(opts.env?.CLAUDE_CODE_OAUTH_TOKEN, "oauth-fixture-token", "the run's own credential");
+  });
+
+  }
   it("posts one progress_note with the usage on the run's stream when the poll says the setting is on", async () => {
     const calls: { options: unknown; prompt: unknown }[] = [];
     const claim = claimFor(2603);
@@ -232,14 +260,15 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     }) as unknown as CodexAdviceHarnessFactory;
   }
 
-  it("a Codex-harness claim with a binding posts a luna note with its usage through the injected factory", async () => {
-    const claim = claimFor(2606, { secrets: CODEX_SECRETS });
+  for (const kind of ["issue", "self_improve", "prompt"] as const) {
+  it(`M1 Now runner Codex ${kind} eligibility`, async () => {
+    const claim = claimFor(2606, { kind, secrets: CODEX_SECRETS });
     api.nowSummary.set(claim.run_id, true);
     const rec = { builds: [] as unknown[], requests: [] as AdviceRequest[] };
     const sdkCalls: { options: unknown; prompt: unknown }[] = [];
     const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
     try {
-      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0), { homeRoot, queryFn: summaryQuery(sdkCalls), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
+      await runnerFor(workingExecutor(() => notesOf(claim.run_id).length > 0, 250), { homeRoot, queryFn: summaryQuery(sdkCalls), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
     } finally {
       fs.rmSync(homeRoot, { recursive: true, force: true });
     }
@@ -259,7 +288,42 @@ describe("RunRunner Now summary wiring (PRD #2603)", () => {
     assert.equal(built.runId, claim.run_id);
     assert.equal(built.refresh, "deny");
     assert.equal(built.binding.authMode, "subscription");
+    assert.equal(built.binding.capability, CODEX_SECRETS.codex.capability, "original claim binding");
   });
+
+  }
+
+  it("M1 Now runner judge is excluded by the shared eligibility predicate", async () => {
+    const { isRunSummaryKind } = await import("../src/run-kind.js");
+    assert.equal(isRunSummaryKind("judge"), false);
+  });
+
+  for (const kind of ["issue", "self_improve", "prompt"] as const) {
+    it(`M1 Now runner ${kind} without milestones emits no note`, async () => {
+      const claim = claimFor(2610, { kind, secrets: CODEX_SECRETS });
+      api.nowSummary.set(claim.run_id, true);
+      const rec = { builds: [] as unknown[], requests: [] as AdviceRequest[] };
+      const calls: { options: unknown; prompt: unknown }[] = [];
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "now-wiring-"));
+      const executor: Executor = { run: async ctx => {
+        // No reportProgress: tool activity cannot invent a milestone.
+        for (let frame = 0; frame < 8; frame++) {
+          ctx.emit({ kind: "tool_use", agent: "lead", payload: { id: "t", name: "Bash", input: { command: "x", description: "Run the api gate" } } });
+          await new Promise(resolve => setTimeout(resolve, 10));
+        }
+        commitMarker(ctx.worktreePath);
+        return { branch: ctx.branch };
+      } };
+      try {
+        await runnerFor(executor, { homeRoot, queryFn: summaryQuery(calls), codexAdviceHarnessFactory: lunaFactory(rec) }).execute(claim);
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+      assert.equal(rec.requests.length, 0);
+      assert.equal(calls.length, 0);
+      assert.equal(notesOf(claim.run_id).length, 0);
+    });
+  }
 
   it("a Codex account that refuses the model leaves the run unaffected and shows no summary", async () => {
     const claim = claimFor(2608, { secrets: CODEX_SECRETS });

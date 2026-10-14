@@ -91,6 +91,31 @@ if [ "${1:-}" = run ] && [ "${2:-}" = list ]; then
         *) printf '108\n' ;;
       esac
       ;;
+    conf-superseded|conf-failure|stale-read)
+      # FAIL on the first job read, FAIL_WITH_CANCELLED on the confirming re-read.
+      n=0; [ -f "$LIST_COUNT" ] && n=$(cat "$LIST_COUNT")
+      n=$((n+1)); printf '%s' "$n" > "$LIST_COUNT"
+      final=cancelled; [ "$MODE" = conf-failure ] && final=failure
+      case " $* " in
+        *" --commit "*)
+          if [ "$n" -eq 1 ]; then printf '110\tin_progress\t\tCI\n'
+          else printf '110\tcompleted\t%s\tCI\n' "$final"; fi ;;
+        *) printf '110\n' ;;
+      esac
+      ;;
+    agg-superseded|agg-failure)
+      # An aggregator job fails beside its cancelled shards while the run is in progress;
+      # the run then concludes cancelled (superseded) or failure (a real red).
+      n=0; [ -f "$LIST_COUNT" ] && n=$(cat "$LIST_COUNT")
+      n=$((n+1)); printf '%s' "$n" > "$LIST_COUNT"
+      final=cancelled; [ "$MODE" = agg-failure ] && final=failure
+      case " $* " in
+        *" --commit "*)
+          if [ "$n" -eq 1 ]; then printf '109\tin_progress\t\tCI\n'
+          else printf '109\tcompleted\t%s\tCI\n' "$final"; fi ;;
+        *) printf '109\n' ;;
+      esac
+      ;;
     *) echo "unknown MODE=$MODE" >&2; exit 1 ;;
   esac
   exit 0
@@ -108,14 +133,47 @@ if [ "${1:-}" = run ] && [ "${2:-}" = view ]; then
     printf 'in_progress\t\tCI\thttps://example.invalid/job/105\t105\n'
   elif [ "$MODE" = jobs-cancelled ] || [ "$MODE" = jobs-cancelled-success ] || [ "$MODE" = jobs-cancelled-failure ]; then
     case " $* " in
-      *" --json conclusion "*)
+      *" --json status,conclusion "*)
         case "$MODE" in
-          jobs-cancelled-success) printf 'success\n' ;;
-          jobs-cancelled-failure) printf 'failure\n' ;;
-          *) printf '\n' ;;
+          jobs-cancelled-success) printf 'completed\tsuccess\n' ;;
+          jobs-cancelled-failure) printf 'completed\tfailure\n' ;;
+          *) printf 'in_progress\t\n' ;;
         esac ;;
       *) printf 'completed\tsuccess\tlint\thttps://example.invalid/job/1061\t1061\n'
          printf 'completed\tcancelled\ttest\thttps://example.invalid/job/1062\t1062\n' ;;
+    esac
+  elif [ "$MODE" = conf-superseded ] || [ "$MODE" = conf-failure ] || [ "$MODE" = stale-read ]; then
+    case " $* " in
+      *" --json status,conclusion "*)
+        n=0; [ -f "$VIEW_COUNT" ] && n=$(cat "$VIEW_COUNT")
+        n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
+        if [ "$MODE" = stale-read ]; then
+          # An in-progress run still carrying an old non-empty conclusion.
+          if [ "$n" -le 2 ]; then printf 'in_progress\tfailure\n'; else printf 'completed\tcancelled\n'; fi
+        elif [ "$n" -eq 1 ]; then printf 'in_progress\t\n'
+        elif [ "$MODE" = conf-failure ]; then printf 'completed\tfailure\n'
+        else printf 'completed\tcancelled\n'; fi ;;
+      *)
+        j=0; [ -f "$JOB_COUNT" ] && j=$(cat "$JOB_COUNT")
+        j=$((j+1)); printf '%s' "$j" > "$JOB_COUNT"
+        if [ "$j" -eq 1 ] && [ "$MODE" != stale-read ]; then
+          printf 'in_progress\t\ttest-agent-shard (1/2)\thttps://example.invalid/job/1101\t1101\n'
+        else
+          printf 'completed\tcancelled\ttest-agent-shard (1/2)\thttps://example.invalid/job/1101\t1101\n'
+        fi
+        printf 'completed\tfailure\ttest-agent\thttps://example.invalid/job/1103\t1103\n' ;;
+    esac
+  elif [ "$MODE" = agg-superseded ] || [ "$MODE" = agg-failure ]; then
+    case " $* " in
+      *" --json status,conclusion "*)
+        n=0; [ -f "$VIEW_COUNT" ] && n=$(cat "$VIEW_COUNT")
+        n=$((n+1)); printf '%s' "$n" > "$VIEW_COUNT"
+        if [ "$n" -eq 1 ]; then printf 'in_progress\t\n'
+        elif [ "$MODE" = agg-failure ]; then printf 'completed\tfailure\n'
+        else printf 'completed\tcancelled\n'; fi ;;
+      *) printf 'completed\tcancelled\ttest-agent-shard (1/2)\thttps://example.invalid/job/1091\t1091\n'
+         printf 'completed\tcancelled\ttest-agent-shard (2/2)\thttps://example.invalid/job/1092\t1092\n'
+         printf 'completed\tfailure\ttest-agent\thttps://example.invalid/job/1093\t1093\n' ;;
     esac
   else
     printf 'completed\tsuccess\tCI\thttps://example.invalid/job/%s\t%s\n' "${3:-run}" "${3:-0}"
@@ -127,7 +185,7 @@ exit 1
 STUB
 chmod +x "$WORK/bin/gh" "$WORK/bin/sleep"
 export PATH="$WORK/bin:$PATH"
-export CALLS="$WORK/calls" LIST_COUNT="$WORK/list-count" VIEW_COUNT="$WORK/view-count" API_COUNT="$WORK/api-count"
+export CALLS="$WORK/calls" LIST_COUNT="$WORK/list-count" VIEW_COUNT="$WORK/view-count" API_COUNT="$WORK/api-count" JOB_COUNT="$WORK/job-count"
 
 : > "$CALLS"
 MODE=full; export MODE
@@ -326,4 +384,62 @@ rc=$?
 set -e
 [ "$rc" -eq 1 ] || fail "--branch concluded-failure run with a cancelled job was not a failure, rc=$rc: $(cat "$WORK/jobs-cancelled-failure-branch.out")"
 
-echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green"
+# An aggregator that fails because its shards were cancelled by concurrency must not
+# exit 1 before the run concludes: a run concluding cancelled is superseded (exit 4), a run
+# concluding failure stays a failure (exit 1).
+for m in agg-superseded agg-failure; do
+  MODE=$m; export MODE
+  rm -f "$LIST_COUNT" "$VIEW_COUNT"
+  set +e
+  bash "$SCRIPT" --sha "$FULL_SHA" --repo test/repo --interval 0 --max-ticks 3 > "$WORK/$m-sha.out" 2>&1
+  rc=$?
+  set -e
+  want=4; [ "$m" = agg-failure ] && want=1
+  [ "$rc" -eq "$want" ] || fail "--sha $m: want exit $want, rc=$rc: $(cat "$WORK/$m-sha.out")"
+  grep -Fq 'waiting for the run' "$WORK/$m-sha.out" \
+    || fail "--sha $m did not wait for the run conclusion: $(cat "$WORK/$m-sha.out")"
+  rm -f "$LIST_COUNT" "$VIEW_COUNT"
+  set +e
+  bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 3 > "$WORK/$m-branch.out" 2>&1
+  rc=$?
+  set -e
+  want=2; [ "$m" = agg-failure ] && want=1
+  [ "$rc" -eq "$want" ] || fail "--branch $m: want exit $want, rc=$rc: $(cat "$WORK/$m-branch.out")"
+  grep -Fq 'waiting for the run' "$WORK/$m-branch.out" \
+    || fail "--branch $m did not wait for the run conclusion: $(cat "$WORK/$m-branch.out")"
+done
+
+# The confirming re-read can turn FAIL into FAIL_WITH_CANCELLED; that must wait for the
+# run's conclusion too (cancelled = superseded, failure = red).
+for m in conf-superseded conf-failure; do
+  MODE=$m; export MODE
+  for mode_args in "--sha $FULL_SHA" "--branch main"; do
+    rm -f "$LIST_COUNT" "$VIEW_COUNT" "$JOB_COUNT"
+    set +e
+    # shellcheck disable=SC2086
+    bash "$SCRIPT" $mode_args --repo test/repo --interval 0 --max-ticks 3 > "$WORK/$m.out" 2>&1
+    rc=$?
+    set -e
+    case "$m:$mode_args" in
+      conf-superseded:--sha*) want=4 ;;
+      conf-superseded:*) want=2 ;;
+      *) want=1 ;;
+    esac
+    [ "$rc" -eq "$want" ] || fail "$m ($mode_args): want exit $want, rc=$rc: $(cat "$WORK/$m.out")"
+    grep -Fq 'waiting for the run' "$WORK/$m.out" \
+      || fail "$m ($mode_args) confirmed a failure without waiting for the run: $(cat "$WORK/$m.out")"
+  done
+done
+
+# --branch: an in-progress run carrying a stale non-empty conclusion is not concluded.
+MODE=stale-read; export MODE
+rm -f "$LIST_COUNT" "$VIEW_COUNT" "$JOB_COUNT"
+set +e
+bash "$SCRIPT" --branch main --repo test/repo --interval 0 --max-ticks 3 > "$WORK/stale-read.out" 2>&1
+rc=$?
+set -e
+[ "$rc" -eq 2 ] || fail "--branch stale conclusion on an in-progress run was taken as final, rc=$rc: $(cat "$WORK/stale-read.out")"
+grep -Fq 'waiting for the run' "$WORK/stale-read.out" \
+  || fail "--branch stale-read did not wait for the run: $(cat "$WORK/stale-read.out")"
+
+echo "PASS watch-run-ci: SHA validation/retry/canonicalization, transient empty recovery, pending heartbeat (xpg_echo-safe), default intervals and tick limits, live failed-job logs, cancelled jobs never green, aggregator red beside cancelled shards waits for the run verdict"

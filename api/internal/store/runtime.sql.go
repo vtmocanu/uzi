@@ -8076,8 +8076,9 @@ type ListActiveRunsAllRow struct {
 	PriorityClass string      `json:"priority_class"`
 }
 
-// Admin Agents-status: every non-terminal run across all users, with repo path,
-// worker name, and owner email for the admin overview.
+// Admin Agents-status: the newest 500 non-terminal runs across all users, excluding
+// chat, judge, and cross-check runs, with repo path, worker name, and owner email
+// for the admin overview.
 // PRD #1908: LEFT JOINs so a repo-less JOB run (repo_id NULL) is listed with NULL repo_path and
 // forge_type (see ListRunsForUser).
 func (q *Queries) ListActiveRunsAll(ctx context.Context, backgroundGraceCutoff pgtype.Timestamptz) ([]ListActiveRunsAllRow, error) {

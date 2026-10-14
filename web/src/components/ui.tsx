@@ -12,6 +12,7 @@ import {
   type TextareaHTMLAttributes,
 } from "react";
 import { Link } from "react-router-dom";
+import type { RunProgress } from "../lib/apiTypes";
 import { ArrowLeftIcon, EyeIcon, EyeOffIcon } from "./icons";
 
 export function cx(...parts: (string | false | null | undefined)[]): string {
@@ -55,6 +56,34 @@ export function Card({
     >
       {children}
     </div>
+  );
+}
+
+export function CardHeader({
+  title,
+  level = 2,
+  badge,
+  subtitle,
+  actions,
+}: {
+  title: ReactNode;
+  level?: 2 | 3;
+  badge?: ReactNode;
+  subtitle?: ReactNode;
+  actions?: ReactNode;
+}) {
+  const Heading = level === 3 ? "h3" : "h2";
+  return (
+    <header className="flex items-center justify-between gap-2 flex-wrap">
+      <div className="min-w-0">
+        <div className="flex flex-wrap items-center gap-2">
+          <Heading className="text-sm font-semibold text-fg">{title}</Heading>
+          {badge}
+        </div>
+        {subtitle && <div className="mt-1 text-xs text-muted">{subtitle}</div>}
+      </div>
+      {actions && <div className="ml-auto flex flex-wrap items-center justify-end gap-2">{actions}</div>}
+    </header>
   );
 }
 
@@ -569,24 +598,45 @@ const RUN_STATUS_LABELS: Record<string, string> = {
   provider_outage: "waiting for provider",
 };
 
-export function StatusPill({ status }: { status: string }) {
+// A running or live completion row may attach its server estimate to the status pill.
+// Other callers and non-percent states retain the ordinary status presentation.
+export function StatusPill({ status, progress }: { status: string; progress?: RunProgress | null }) {
   const cfg = RUN_STATUS_TONES[status] ?? { tone: "neutral" as BadgeTone };
   const label = RUN_STATUS_LABELS[status] ?? status.replace(/_/g, " ");
+  const showsProgress = status === "running" || status === "completion_checking" || status === "completion_reworking";
+  const pct = showsProgress && progress?.state === "percent" &&
+    typeof progress.pct === "number" && Number.isFinite(progress.pct)
+    ? Math.max(0, Math.min(100, Math.round(progress.pct))) : null;
+  const valueText = pct === null ? undefined :
+    `${status === "running" ? "Running" : label}, about ${pct}%${progress && progress.milestone_total > 0
+      ? `; ${progress.milestone_done} of ${progress.milestone_total} milestones done` : ""}`;
   return (
     <span
+      role={pct === null ? undefined : "progressbar"}
+      aria-valuemin={pct === null ? undefined : 0}
+      aria-valuemax={pct === null ? undefined : 100}
+      aria-valuenow={pct ?? undefined}
+      aria-label={pct === null ? undefined : "Run progress"}
+      aria-valuetext={valueText}
       className={cx(
         "inline-flex items-center gap-1.5 rounded-full border px-2 py-0.5 text-[11px] font-medium",
-        BADGE_TONES[cfg.tone],
+        pct === null ? BADGE_TONES[cfg.tone] :
+          "relative sm:min-w-32 sm:shrink-0 justify-center overflow-hidden border-info/40 bg-info/10 text-fg tabular-nums",
       )}
     >
+      {pct !== null && (
+        <span aria-hidden="true" data-status-progress-fill
+          className="absolute inset-y-0 left-0 bg-info/20" style={{ width: `${pct}%` }} />
+      )}
       <span
         aria-hidden="true"
         className={cx(
-          "h-1.5 w-1.5 rounded-full bg-current",
+          "h-1.5 w-1.5 rounded-full",
+          pct === null ? "bg-current" : "relative bg-info",
           cfg.pulse && "animate-pulse",
         )}
       />
-      {label}
+      {pct === null ? label : <span className="relative" aria-hidden="true">{label} · {pct}%</span>}
     </span>
   );
 }

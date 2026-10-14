@@ -52,9 +52,11 @@ function oldestFirst(a: PendingTerminal, b: PendingTerminal): number {
  * maps a live run's id to its current phase + the `claim_generation` it was claimed at, written by
  * the run lane (RunRunner) and the judge/review runners as they start, transition, and finish.
  *
- * PRD #1391 Run B M4 folds in the PENDING-TERMINAL half: a run whose terminal outcome is journaled
+ * PRD #1391 Run B M4 folds in the UNSETTLED-TERMINAL half: a run whose terminal outcome is journaled
  * and awaiting replay is listed `terminal_pending: true` (the api then keeps it unclaimable and its
  * generation unbumped), sourced from the outbox pending-lister threaded in at construction. When the
+ * exact journal has an authenticated server-settled observation, it remains custody evidence but
+ * does not join this set or its overflow count (ADR-2921). Live execution entries remain independent.
  * pending set exceeds the server cap the snapshot sets `pending_overflow: true` and the listed subset
  * ROTATES deterministically (blocked-first fills `cap - 1` slots, the last slot round-robins over
  * every omitted entry oldest-first) so every pending run is leased within `omitted + 1` snapshots and
@@ -155,7 +157,7 @@ export class ActiveRunRegistry {
    * whenever anything is pending).
    */
   claimsPausedByPendingOverflow(): boolean {
-    const count = this.pendingLister ? this.pendingLister().length : 0;
+    const count = this.pendingOutcomes().length;
     if (count === 0) return false;
     return count > this.effectiveCap();
   }
@@ -165,6 +167,10 @@ export class ActiveRunRegistry {
   private effectiveCap(): number {
     const cap = this.capGetter ? this.capGetter() : undefined;
     return cap !== undefined && Number.isFinite(cap) && cap > 0 ? Math.floor(cap) : 0;
+  }
+
+  private pendingOutcomes(): PendingTerminal[] {
+    return this.pendingLister?.().filter(entry => entry.server_settled !== true) ?? [];
   }
 
   /**
@@ -178,7 +184,7 @@ export class ActiveRunRegistry {
    */
   buildRegisterSnapshot(finalizeResume: readonly FinalizeResumeEntry[] = []): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.pendingLister ? this.pendingLister() : [];
+    const pending = this.pendingOutcomes();
     return {
       snapshot_epoch: this.epoch,
       active: [],
@@ -199,7 +205,7 @@ export class ActiveRunRegistry {
    */
   build(): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.pendingLister ? this.pendingLister() : [];
+    const pending = this.pendingOutcomes();
     const pendingByRun = new Map(pending.map((p) => [p.run_id, p]));
 
     const active: ActiveSnapshotEntry[] = [];

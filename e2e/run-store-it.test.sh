@@ -11,7 +11,10 @@ set -euo pipefail
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 SCRIPT="$HERE/run-store-it.sh"
 
-TMP="$(mktemp -d)"
+ROOT="$(cd "$HERE/.." && pwd)"
+mkdir -p "$ROOT/.uzi/scratch"
+TMP="$(mktemp -d "$ROOT/.uzi/scratch/store-it-test.XXXXXX")"
+export TMPDIR="$TMP"
 trap 'rm -rf "$TMP"' EXIT
 
 FAKEBIN="$TMP/bin"
@@ -29,6 +32,7 @@ LOG="$TMP/docker.log"
 cat > "$FAKEBIN/docker" <<EOF
 #!/usr/bin/env bash
 printf '%s\n' "\$*" >> '$LOG'
+if [ "\$1" = run ]; then printf '%s\0' "\$@" > '$TMP/run.argv'; fi
 case "\$1" in
   image) exit 0 ;;
   run)   exit 0 ;;
@@ -48,6 +52,17 @@ fails=0
 # the infrastructure-failure path, firing the EXIT trap (cleanup). A non-zero exit
 # is expected; `|| true` keeps `set -e` from aborting the test on it.
 UZI_STORE_IT_PG_WAIT_SECS=1 bash "$SCRIPT" >/dev/null 2>&1 || true
+
+# Assert exact argument boundaries; a flattened $* log cannot prove the mount.
+python3 - "$TMP/run.argv" "$ROOT" <<'PYARGV'
+import pathlib, sys
+args = pathlib.Path(sys.argv[1]).read_bytes().split(b'\0')[:-1]
+mount = ('type=bind,source=' + sys.argv[2] + '/e2e/test-database-marker.sql,'
+         'target=/docker-entrypoint-initdb.d/10-uzi-test-database-marker.sql,readonly').encode()
+assert args.count(b'--mount') == 1, args
+assert args[args.index(b'--mount') + 1] == mount, args
+print('PASS: exact read-only initialization marker mount argv')
+PYARGV
 
 rm_count="$(grep -c '^rm ' "$LOG" || true)"
 rm_line="$(grep -m1 '^rm ' "$LOG" || true)"

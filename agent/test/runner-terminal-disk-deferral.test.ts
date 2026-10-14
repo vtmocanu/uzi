@@ -357,7 +357,9 @@ describe("terminal execution disk deferral", () => {
         assert.equal(f.reclaims(), 1);
         assert.deepEqual(latest, [undefined, undefined, undefined], "no publish ACK means no latest-checkpoint claim");
         assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "cap ACK causes no extra failure report");
-        assert.equal(fs.existsSync(f.clone()), false, "server-terminal cap uses normal cleanup");
+        // issue #1786: a terminal ACK is reporting evidence, not a source proof. A verified capture that is
+        // still covered at the exit uses normal cleanup; the unverified (degraded) one keeps its clone.
+        assert.equal(fs.existsSync(f.clone()), !verified, verified ? "server-terminal cap uses normal cleanup" : "an unverified capture keeps the clone");
       } finally { client.reportState = report; }
     });
   }
@@ -386,7 +388,51 @@ describe("terminal execution disk deferral", () => {
     });
   }
   it("fresh generations exhaust the counted disk cap without replay or a second failure", { skip: LINUX_CAPTURE }, async () => {
-    const options = { generation: 4 };
+    const modelPaths: string[] = [];
+    const parkedJournals: RecoveryJournalEntry[] = [];
+    const readJournal = (): RecoveryJournalEntry => JSON.parse(readGit(git.barePathFor(fx.originPath),
+      "config", "--local", "--get", "uzi-recovery.agent/issue-2201.clone"));
+    const assertCloneBytes = (clonePath: string): void => {
+      assert.equal(fs.readFileSync(path.join(clonePath, "COMMITTED.txt"), "utf8"), "committed sentinel\n");
+      assert.equal(fs.readFileSync(path.join(clonePath, "DIRTY.txt"), "utf8"), "dirty sentinel\n");
+    };
+    const admissionChecks: (() => void)[] = [];
+    const options = { generation: 4, observe: (ctx: import("../src/executor.js").RunContext) => {
+      // Capture at model admission; assert outside the executor so a failed oracle
+      // cannot be mistaken for the opaque rejection that this case exercises.
+      const predecessors = [...modelPaths];
+      const generation = options.generation;
+      const admitted = predecessors.length > 0 ? readJournal() : undefined;
+      const transcript = predecessors.length > 0 ? fs.readFileSync(path.join(f.home, "session"), "utf8") : undefined;
+      const inheritedBytes = predecessors.length > 0 ? ["COMMITTED.txt", "DIRTY.txt"].map(name =>
+        fs.readFileSync(path.join(ctx.worktreePath, name), "utf8")) : undefined;
+      const aborted = ctx.signal?.aborted;
+      admissionChecks.push(() => {
+        assert.equal(ctx.runId, f.claim.run_id);
+        assert.equal(ctx.sessionId ?? null, null, "no SDK session was reported by this fixture");
+        assert.equal(aborted, false, "this claim admits its own live model turn");
+        assert.ok(!predecessors.includes(ctx.worktreePath), "each claim executes at a fresh path");
+        if (admitted) {
+          assert.match(ctx.worktreePath, new RegExp(`\\.attempt-.*-g${generation}-`));
+          assert.deepEqual(inheritedBytes, ["committed sentinel\n", "dirty sentinel\n"]);
+          assert.equal(transcript, "transcript", "the successor sees the retained HOME before the fixture writes it");
+          assert.equal(admitted.runId, ctx.runId);
+          assert.equal(admitted.clonePath, ctx.worktreePath);
+          assert.ok(admitted.attemptId);
+          assert.equal(admitted.recovery?.stage, "ready-for-model");
+          assert.equal(admitted.recovery?.attempts, predecessors.length);
+          assert.deepEqual(admitted.recovery?.successor, {
+            runId: admitted.runId, clonePath: admitted.clonePath, attemptId: admitted.attemptId,
+            restoreTip: admitted.restoreTip,
+          });
+          assert.deepEqual(admitted.retainedSources?.map(source => source.clonePath).sort(), [...predecessors].sort(),
+            "recapture retains every predecessor's journal authority");
+          assert.equal(admitted.recovery?.source.clonePath, predecessors[0], "the episode keeps its original source");
+        }
+        for (const predecessor of predecessors) assertCloneBytes(predecessor);
+      });
+      modelPaths.push(ctx.worktreePath);
+    } };
     const f = fixture(options);
     const report = client.reportState.bind(client);
     let counted = 0;
@@ -413,21 +459,51 @@ describe("terminal execution disk deferral", () => {
         f.setRoomy();
         api.setOwnershipStatus(f.claim.run_id, "claimed", options.generation);
         await f.runner.execute(f.claim);
+        assert.equal(admissionChecks.length, leg + 1);
+        admissionChecks[leg]!();
         assert.equal(f.calls(), leg + 1);
         assert.equal(f.reclaims(), leg + 1);
         assert.equal(counted, leg + 1);
         assert.equal(records.length, leg + 1);
         await new Promise((resolve) => setTimeout(resolve, 10));
         assert.equal(f.calls(), leg + 1, "park/terminal ACK cannot replay the executor");
-        if (leg < 3) assert.equal(fs.existsSync(path.join(f.home, "session")), true);
+        assert.equal(f.clone(), modelPaths[leg], "clone() names the latest executed attempt");
+        const parked = readJournal();
+        assert.equal(parked.runId, f.claim.run_id);
+        assert.equal(parked.clonePath, modelPaths[leg]);
+        assert.deepEqual(parked.retainedSources?.map(source => source.clonePath).sort() ?? [],
+          modelPaths.slice(0, leg).sort());
+        if (leg > 0) {
+          assert.equal(parked.recovery?.stage, "ready-for-model", "a rejected turn never settles the retained episode");
+          assert.equal(parked.recovery?.attempts, leg);
+          assert.equal(parked.attemptId, parked.recovery?.successor?.attemptId);
+        }
+        parkedJournals.push(parked);
+        for (const clonePath of modelPaths) assertCloneBytes(clonePath);
+        if (leg < 3) assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
       }
       assert.deepEqual(records.map((r) => r.ack.status), ["recovery_wait", "recovery_wait", "recovery_wait", "failed"]);
       assert.deepEqual(records.map((r) => r.body.claim_generation), [4, 5, 6, 7]);
       // Server origin stamping is proved by TestDiskParkCapFailsRunLiveDB, not this ACK model.
       assert.equal(api.states.filter((s) => s.body.status === "failed").length, 0, "no second generic failure report");
       assert.equal(f.forge.calls.length, 0, "no finalize/MR");
-      assert.equal(fs.existsSync(f.clone()), false, "terminal cap ACK cleans up the clone");
-      assert.equal(fs.existsSync(f.home), false, "terminal cap ACK cleans up the session");
+      // recoverRetainedClaim carries episode custody into each rejected successor;
+      // retainStoppedSource keeps that custody even when the tracking ref covers its bytes.
+      // The onModelTurnSettled hook was never reached, and this unguarded claim has no
+      // covering FINAL for the verified-successor retirement in executeClaim's finally.
+      assert.notEqual(f.claim.inventory_guarded, true);
+      assert.equal(modelPaths.length, 4);
+      assert.equal(new Set(modelPaths).size, 4);
+      for (const clonePath of modelPaths) {
+        assert.equal(fs.existsSync(clonePath), true, "terminal ACK does not release retained episode custody");
+        assertCloneBytes(clonePath);
+      }
+      assert.deepEqual(readJournal(), parkedJournals[3], "terminal cleanup preserves the latest lineage journal");
+      assert.ok(readGit(git.barePathFor(fx.originPath), "for-each-ref", "--format=%(refname)",
+        `refs/uzi-recovery-episode/${f.claim.run_id}/`), "episode pins remain attributable");
+      // executeClaim also preserves the shared HOME while retained episode custody remains.
+      assert.equal(fs.existsSync(f.home), true, "terminal cap ACK does not release the retained session");
+      assert.equal(fs.readFileSync(path.join(f.home, "session"), "utf8"), "transcript");
     } finally { client.reportState = report; }
   });
 

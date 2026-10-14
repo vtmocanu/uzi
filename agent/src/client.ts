@@ -2181,7 +2181,10 @@ export class WorkerClient {
    * rather than throwing, and a 2xx with an empty body returns `{ ok: false, httpStatus }`
    * too (the publish could not be confirmed). A 2xx with a parseable body returns
    * `{ ok: true, body }` — which the caller further inspects for a best-effort skip
-   * (`published: false`). The bearer/version header assembly mirrors fetchRaw; the same
+   * (`published: false`). The acknowledgment is read through {@link readBoundedText} under
+   * {@link CHECKPOINT_PUBLISH_ACK_MAX_BYTES}: an oversized body, a read failure or an abort
+   * THROWS (a `ResponseBodyOverflowError` for overflow), which leaves the publish outcome
+   * ambiguous for the caller. The bearer/version header assembly mirrors fetchRaw; the same
    * per-request timeout is used — generous enough for a real pack, and an abort is just
    * another best-effort miss (it throws, caught by the caller's warn-and-swallow).
    */
@@ -2192,6 +2195,9 @@ export class WorkerClient {
     boundarySignal?: AbortSignal,
   ): Promise<PublishResult> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
+    const signal = boundarySignal
+      ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
+      : AbortSignal.timeout(this.httpTimeoutMs);
     const init: RequestInit = {
       method: "POST",
       headers: {
@@ -2204,13 +2210,17 @@ export class WorkerClient {
       // undici requires `duplex: "half"` for a streamed (Readable) request body; without it
       // the fetch throws before sending. (oxlint no-invalid-fetch-options accepts this shape.)
       duplex: "half",
-      signal: boundarySignal
-        ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
-        : AbortSignal.timeout(this.httpTimeoutMs),
+      signal,
     };
     const res = await fetch(this.baseUrl + path, init);
-    if (res.status < 200 || res.status >= 300) return { ok: false, httpStatus: res.status };
-    const text = await res.text();
+    if (res.status < 200 || res.status >= 300) {
+      // Discard remote content without exposing it or changing the HTTP outcome.
+      await res.body?.cancel().catch(() => undefined);
+      return { ok: false, httpStatus: res.status };
+    }
+    // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
+    // records the publish as ambiguous instead of reading an unbounded acknowledgment.
+    const text = await readBoundedText(res, CHECKPOINT_PUBLISH_ACK_MAX_BYTES, true, signal);
     // A 2xx with no body cannot confirm the publish landed; treat it as a non-confirming
     // outcome carrying the 2xx code rather than fabricating a body.
     if (!text) return { ok: false, httpStatus: res.status };
@@ -3149,7 +3159,7 @@ export class WorkerClient {
    *  literally "paused", so both statuses are read off the body (like reportState) rather than a
    *  409 throwing through postJSON. Returns `{ status }` = the run's status from the response
    *  body (paused on a landed hold, the real status on a refusal); an unmodelled 2xx or an
-   *  unreadable body yields "" (never "paused" ⇒ retain, the safe default). A genuine transport
+   *  unreadable body yields "" (ambiguous: the runner retains artifacts and reconciles ownership). A genuine transport
    *  error or a non-200/409 4xx/5xx still throws RequestError. */
   async requestCompletionHold(
     runId: string,
@@ -3181,7 +3191,7 @@ export class WorkerClient {
       }
       if (res.status >= 400) throw await this.toError("POST", path, res);
       // A 2xx we do not model (e.g. 204 from an older server): no status came back, which is
-      // not "paused" and so retains the run.
+      // ambiguous; enterCompletionHold retains artifacts while reconciling ownership.
       return { status: "" };
     });
   }
@@ -3696,6 +3706,29 @@ export class WorkerClient {
     return true;
   }
 
+  /** One fresh, observational custody proof; eligible is scoped to this callback only. */
+  async withAcknowledgedFinalReportCustody(
+    runId: string, generation: number, budget: { signal: AbortSignal; deadline: number },
+    action: (eligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    const workerId = this.registeredWorkerId;
+    const eligible = () => !!workerId && workerId === this.registeredWorkerId &&
+      this.hasFeature("recovery_inventory_v1") && this.hasFeature("terminal_rejection_report") &&
+      !budget.signal.aborted && Date.now() < budget.deadline;
+    if (!terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0 || !eligible()) return;
+    const ownership = await this.getRunOwnership(runId, budget);
+    if (!eligible() || ownership.status !== "completed" || ownership.claim_generation !== generation ||
+        ownership.inventory_guarded !== true) return;
+    const custody = await this.getTerminalRejectionCustody(runId, generation, workerId!,
+      budget.signal, Math.max(1, budget.deadline - Date.now()));
+    if (!eligible() || !custody || custody.outcome !== "settled" || !custody.complete ||
+        !custody.exact_complete || !custody.sibling_complete || custody.exact_count < 1 ||
+        custody.exact_count !== custody.exact_holds.length || custody.sibling_count !== 0 ||
+        custody.sibling_holds.length !== 0 || !custody.exact_holds.some(h => h.state === "released") ||
+        !custody.exact_holds.every(h => h.state === "released" || h.state === "discarded")) return;
+    await action(eligible);
+  }
+
   async getTerminalRejectionCustody(runId: string, generation: number, workerId: string, signal?: AbortSignal, timeoutMs = this.httpTimeoutMs): Promise<TerminalRejectionCustodyResponse | undefined> {
     if (!this.hasFeature("terminal_rejection_report")) return undefined;
     if (!terminalUUID(runId) || !terminalUUID(workerId) || !terminalGeneration(generation)) throw terminalResponseError();
@@ -3823,6 +3856,8 @@ const CROSS_CHECK_RESPONSE_MAX_BYTES = 6 * 1024 * 1024;
 const RECOVERY_RELEASE_RESPONSE_MAX_BYTES = 16 * 1024;
 /** Maximum success body size for the Codex release and refresh envelopes. */
 const CODEX_SUCCESS_BODY_MAX_BYTES = 64 * 1024;
+/** Operational cap on the checkpoint publication acknowledgment; counts streamed bytes, not Content-Length. */
+const CHECKPOINT_PUBLISH_ACK_MAX_BYTES = 64 * 1024;
 
 /** Read through EOF, including at the exact cap; never retain or decode an overflowing chunk. */
 async function readCodexSuccessText(res: Response): Promise<string> {
@@ -3888,7 +3923,9 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
   } finally {
     signal?.removeEventListener("abort", abort);
     // Release the connection whether the body ended, hit the cap, or failed (a no-op once ended).
-    await reader.cancel().catch(() => undefined);
+    // Best effort and not awaited: a source whose cancel never settles must not keep the caller's
+    // result or error from propagating (#2888).
+    void reader.cancel().catch(() => undefined);
   }
   return new TextDecoder().decode(Buffer.concat(parts));
 }
@@ -3906,9 +3943,10 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
  * Without maxAckBytes, TOTAL by construction: every failure — an unreadable stream, malformed JSON, a
  * body with no run, a non-string status, a non-numeric budget, an older server that sent
  * nothing — yields the field absent rather than throwing. That is not defensiveness for
- * its own sake: the status caller's rule is a POSITIVE test for one literal, so a missing
- * status means "not parked", and a missing budget means "no budget update" — both the safe
- * answer to every one of those failures. A throw here would instead surface as a state
+ * its own sake: each caller's rule is a POSITIVE test for one literal, so a missing status
+ * means "unconfirmed", never a confirmed outcome, and a missing budget means "no budget
+ * update". What unconfirmed implies is the caller's: a state report treats it as not parked,
+ * while a completion hold retains its artifacts and reconciles ownership. A throw here would instead surface as a state
  * report that appears to have failed, and would be retried against a server that already
  * applied it.
  */

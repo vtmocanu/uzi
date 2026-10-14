@@ -155,7 +155,7 @@ func TestBackgroundCreateRunAssessmentDefault(t *testing.T) {
 				case "manual":
 					_, err = svc.CreateRun(parent, user, repo, 4, "d", nil, nil, false, nil, nil, nil)
 				case "autopilot":
-					_, err = svc.CreateAutopilotRun(parent, user, repo, 4, "d")
+					_, err = svc.CreateAutopilotRun(parent, user, repo, 4, "d", nil)
 				case "schedule_manual":
 					_, err = svc.CreateScheduledRun(parent, user, repo, 4, "d", nil, nil, nil, false, nil, nil, nil)
 				case "schedule_auto":

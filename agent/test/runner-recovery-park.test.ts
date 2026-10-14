@@ -115,7 +115,8 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
       const { factory, paths } = recoveryFactory(homeRoot, iid, (wt) => {
         sha = commitInTree(wt, "WORK.txt", "recovered work\n");
       });
-      await runnerWith(factory, gitlab).execute(gitlabClaim(iid));
+      // issue #1786: the clone is released only when coverage is revalidated for this claim generation.
+      await runnerWith(factory, gitlab).execute(gitlabClaim(iid, { claim_generation: 1 }));
       const p = paths();
       // The park was reported after the best-effort capture (the causal fence); with a real
       // git the local restore point verified, so the feed line is the full-durability one.
@@ -134,10 +135,10 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
         sha,
         "the tracking ref covers the committed tip after a verified recovery capture",
       );
-      // The two resume dirs survive the park (flight.parked carve-out); the clone is removed.
+      // The two resume dirs survive the park (flight.parked carve-out); the clone is retained for recapture.
       assert.strictEqual(fs.existsSync(p.pluginDir), true, "plugin dir survives a park");
       assert.strictEqual(fs.existsSync(p.runHome), true, "run HOME survives a park");
-      assert.strictEqual(fs.existsSync(p.worktree), false, "the clone is removed on a park");
+      assert.strictEqual(fs.existsSync(p.worktree), true, "the clone is retained for recapture on a park");
       // A truthful, auto-resume park notice — the FULL-DURABILITY line (a verified local
       // restore point), distinct from the degraded "last durable checkpoint" wording the
       // capture-shortfall path emits.
@@ -222,7 +223,7 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
       const { factory, paths } = recoveryFactory(homeRoot, iid, (wt) => {
         commitInTree(wt, "WORK.txt", "work\n");
       });
-      const claim = gitlabClaim(iid);
+      const claim = gitlabClaim(iid, { claim_generation: 1 });
       // 200 + a status that is NOT recovery_wait: applied is true, but the run is not parked.
       api.overrideStateStatus(claim.run_id, "failed");
       await runnerWith(factory, gitlab).execute(claim);
@@ -250,7 +251,7 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
       const { factory, paths } = recoveryFactory(homeRoot, iid, (wt) => {
         commitInTree(wt, "WORK.txt", "work\n");
       });
-      const claim = gitlabClaim(iid);
+      const claim = gitlabClaim(iid, { claim_generation: 1 });
       // The recovery_wait report is refused with a 409 carrying a DIFFERENT run status (the
       // run was cancelled/parked concurrently under the worker). reportState reads a 409
       // inline as { applied: false, status: "cancelled" }, so ack.status !== "recovery_wait"

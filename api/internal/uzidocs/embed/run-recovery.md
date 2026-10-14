@@ -89,6 +89,21 @@ credential-driven promotion exclude this cause in the
 
 ## What you'll see
 
+The worker feed may say that **retained heads are retained locally with no
+confirmed checkpoint coverage**. This reports current local retention, not
+an immediate recovery failure. Inspect status with `uzi run recovery` or
+`uzi run export`; export still requires an available archive and can refuse.
+An **Earlier recovery archive covers retained heads** message reports that
+separate archive evidence while local custody remains retained.
+
+A **Confirmed checkpoint covers previously retained heads** message resolves
+only the listed, previously announced heads after positive checkpoint
+coverage removes their owed pins. Divergent remaining heads stay retained.
+These best-effort feed rows can be absent when delivery is refused or the
+feed is closed; they are not cleanup authority, a custody-release receipt,
+an MR/push confirmation or a promise of archive availability. They do not
+change the **Recovery archives** section or its **Needs action** state.
+
 The run page shows a **Recovery archives** section on any run that failed to
 finalize, and on any run that already has a retained capture even before it
 reaches a final status. Each retained capture is in one of these six states:
@@ -361,8 +376,8 @@ claim's only copy.
 Inventory-capable workers pin each divergent unpublished head locally at
 `refs/uzi-owed/<run-id>/<sha>` before replacing its tracking head. These
 pins retain the original SHAs without descendant compaction. Feed notices
-separate **worker-local, not checkpoint durable** heads from confirmed
-remote copies: a local pin does not survive loss of that worker's disk.
+report **local retention with no confirmed checkpoint coverage** separately
+from remote confirmation: a local pin does not survive loss of that worker's disk.
 Only containment in a broker-confirmed or claim-confirmed remote head can
 clear a candidate through publication reconciliation; a local tracking ref
 or checkpoint bridge is not that evidence.
@@ -381,6 +396,173 @@ retained heads with `uzi run recovery` or `uzi run export`. The feed lists a
 retained head once: a later checkpoint or a resume on the same worker
 announces only heads it has not announced, and archive notices are tracked
 separately from head notices.
+
+### When a run is stopped by a stale or fenced claim
+
+A worker stops a flight when its claim has gone stale (`stale_claim`) or when an
+input receipt fenced it. In each case the worker keeps the clone's unfetched commits and its dirty
+and untracked files instead of tearing the clone down. It stops the flight's own
+processes first, then makes no further report, publish or tracking write through
+the stopped claim, and records the source as retained:
+
+- **Attempt clone (Docker-wired worker):** the attempt ledger entry is marked
+  `reclaimed` and the plain recovery journal is cleared.
+- **Canonical clone:** a `uzi-stopped` marker is written, bound by digest to the
+  exact plain journal, and that journal is cleared. The key's attempt mode is
+  persisted first, so the worker never seeds that canonical path again. The marker,
+  not the journal, now attributes and protects the kept clone. If the clear never
+  landed (a crash after the marker write), the next discovery finishes it.
+
+A stale or fenced stop keeps the clone even when it is clean and its HEAD is
+already anchored. The worker still checks coverage, and logs the verdict as a
+diagnostic only ("coverage verified (diagnostic only)"), because the check is a
+snapshot: a writer that writes and exits between the status read and the final
+process scan is invisible to it, and releasing the clone would delete that
+writer's bytes. The clone waits for explicit operator discard. A clone counts as
+covered when its HEAD is anchored (a tracking tip this run and generation owns,
+an owed pin of this run, or a commit already on the worker bare's default branch,
+for a flight that never committed past its seed base) and every
+local ref of the clone, in any namespace, points at a commit reachable from
+that HEAD or from a ref of the worker's bare repository, with no stash entry. A
+commit that only the clone holds (on another local branch, under a tag or under
+`refs/remotes/`) or a stash entry makes it not covered. Gitignored files are not covered by any capture, so they do not
+make a clone that is otherwise anchored not covered. Accepted residuals: commits reachable
+only from the reflog (for example after an agent's `git reset --hard`) are not
+counted as source, and a bare ref that justified coverage can later move (a
+forge force-push, pin settlement).
+
+Coverage is also refused (`not_covered`) in these cases, which matter where coverage
+still gates release (terminal exits, below); on parks it is diagnostic:
+
+- **Populated submodule.** A `.git/modules` store, or a gitlink path that holds
+  anything but nothing or an empty directory, is never covered, even with
+  `ignore=all` set in `.gitmodules` or config. The status read runs with
+  `--ignore-submodules=none`, and the parent proof says nothing about a
+  submodule's own files, commits or refs.
+- **Late writer.** If the final process proof had to kill a writer, the earlier
+  byte checks do not cover what it wrote. The residual is a writer that writes and
+  exits between the status read and that proof. Stopped and park exits keep the
+  clone regardless of coverage. Completed, failed and cancelled terminal exits
+  retain their existing covered release; that residual remains open under
+  [#2852](https://github.com/vtmocanu/uzi/issues/2852).
+- **Docker teardown failed.** The proof scans processes only, so it is skipped
+  unless the Docker half was `not_wired` or `docker_unconfirmed`.
+
+The coverage proof and the inventory's status reads on a kept clone take no
+optional index locks, so they do not rewrite the clone's index.
+
+A later claim of the issue (a newer generation of the same run, or a different
+run) starts on a fresh path on every worker and leaves the retained clone
+untouched. On a Docker-wired (attempt-path) worker that is a fresh attempt. On a
+worker with no Docker host, persisting the attempt mode switches that issue's key
+to fresh attempt paths: it no longer fails with `worker_residue_blocked`. The
+claim re-reads the attempt mode right before seeding and retries once on a fresh
+path if the mode landed late. Consequences:
+
+- That key stays in attempt mode on that worker permanently, so later claims start
+  a fresh model session; the work carries over through the tracking ref and
+  checkpoints, not the old session.
+- Every stale or fenced stop keeps its clone until an operator discards it, even
+  a clean one the bare already holds. Attempt-ledger `reclaimed` entries stay
+  until discard, so disk use grows per stop. On a worker with no Docker host,
+  every stopped canonical clone (even one stopped while planning, clean at its
+  seed base) persists the key's attempt mode. Stopped markers count toward the
+  per-run cap of 64; past it the record is `unknown` and the clone stays under
+  its plain journal.
+- A dirty kept clone keeps the run's hold open, so inspect routes it to
+  `owner_hold_discard`.
+- The run's final inventory counts marker-kept paths. A missing one makes that
+  run's inventory unknown until the source is discarded.
+
+The source is kept in every fail-closed case, but what a later run sees differs:
+
+- **`worker_residue_blocked`** (message naming the worker-local inspect command),
+  only when marker evidence names the path or the run: the marker evidence is
+  malformed or over its cap, or the journal digest bound to a marker no longer
+  matches. Separately, the fresh seed's existing quiescence check finding
+  unattributed processes in the key's footprint is refused the same way.
+- **Nothing recorded.** If persisting the attempt mode or the marker fails, no
+  marker exists. The clone stays
+  under its plain journal and routes as before: the same run's next claim enters
+  ordinary retained recovery, a different run goes through the existing
+  foreign-journal handling (terminal-orphan handling), and inspect lists it as a
+  marker-less plain-journal leftover.
+- **Journal no longer names the source.** If, when the stop is recorded, the
+  journal is absent or already names another source, nothing is written and that
+  journal keeps its own routing. Inspect then does not list the kept clone (a
+  narrow race). If the journal was absent, the next canonical claim on that key
+  frees the path as before; the journal is written before any model runs, so that
+  clone holds only its fresh seed.
+- **Corrupt attempt mode or failed heal.** A malformed attempt-mode value, or a
+  failed write while discovery completes a detachment, fails the run closed with
+  "Retained recovery blocked: corrupt journal or unsafe local recovery storage"
+  (the default failure origin, not `worker_residue_blocked`).
+- **Residue quarantine latched.** The attempt mode and marker are still written
+  and the source is reported retained, but the journal is kept. A quarantined
+  worker claims nothing until its container restarts; the next discovery then
+  completes the detachment.
+
+Recovery handler exits decide once, when the handler exits. A capture taken
+earlier, remembered or degraded, never counts as proof. Which record a kept clone
+leaves, and whether coverage can release it, depends on the exit:
+
+- **Exits that stop the flight** (a stopped confirm, another generation, a stale
+  park report) record the source as retained, as above, and keep it even when
+  covered; the verdict is diagnostic only.
+- **Park release paths** (recovery, provider outage, credential-switch, disk and
+  live non-terminal final parks) keep the exact clone and its existing recovery
+  journal even when covered, with no `uzi-stopped` marker or `reclaimed` entry.
+  Coverage is diagnostic when checked; shutdown still skips the check. A
+  successful direct credential switch also keeps the clone for recapture.
+- **Terminal exits** (`completed`, `failed`, `cancelled`) retain their existing
+  covered release at the handler's exit. Otherwise the clone and plain journal
+  stay; a kept terminal clone still follows existing terminal-orphan handling.
+- An owner-authorized cancel of a non-credential run keeps its normal cleanup; a credential-deferred captured cancel is revalidated at cleanup, and a retained result keeps the clone.
+
+On the same worker, the next claim follows retained-source recovery
+(`recoverRetainedClaim`) to recapture late bytes onto a fresh attempt path and
+model session. Failed or unknown recapture keeps the source. The old parked
+source also stays after successful recapture and completion: recapture or a new
+claim alone does not authorize deletion. Existing verified-successor retirement
+applies to its exact successor where authorized; the covering FINAL path retires
+that successor and reanchors the journal to retained predecessors. It does not
+delete the old parked predecessor. Otherwise use explicit operator discard.
+Stopped and fenced sources still require operator discard.
+
+Keeping the old parked source costs storage, including after resume. On an
+unwired worker retained recovery also starts a fresh path and model session,
+instead of ordinary same-path continuity; Docker-wired resumes already start
+fresh sessions. Capacity pressure does not authorize deletion. This is a partial
+fix for #2852: real writer exclusion and safe reclaim in the Docker lane remain
+open, and no new rename, state, TTL or disposal mechanism is added.
+
+To find these sources, run an aggregate inspect (see
+[Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)):
+it lists protected and episode-journaled sources, stopped-source markers and
+attempt-ledger entries. An attempt clone (Docker-wired workers) kept by a park or
+terminal exit is listed through its ledger entry. A canonical clone kept under its
+plain journal (no marker) is also listed, with marker state `none`, journal state
+`plain`, and can be discarded with the same digest confirmation only when the
+server reports the run terminal (`completed`, `failed` or `cancelled`; see the
+disposition notes below). The same run's resume on that worker still recaptures it,
+and the next run's existing terminal-orphan handling still moves it to retention as
+before. Park timing, report count and order, and retries are unchanged.
+
+This is **local retention only**. It is not a published checkpoint, an archive or
+server custody, and nothing about it appears in the feed or in `uzi run recovery`
+as a hold:
+
+- A restart of the same worker pod keeps the retained clone.
+- Replacing the pod loses an `emptyDir` clone on the Docker tier, even though the
+  bare repository's ledger entry or marker survive on the data volume. Inspect
+  then reports the source as missing, never as empty.
+- Tearing down the PVC loses both.
+
+A successor's release of the old hold is not proof that the old clone's dirty
+bytes were preserved; only a published checkpoint, an archive or the retained
+clone itself holds them. A retained source is removed only through the
+worker-local inspect and discard commands in
+[Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard).
 
 ### Guarded inventory and final custody transfer
 
@@ -869,6 +1051,193 @@ it does not establish the cause of the historical refusal in
 [issue #1848](https://github.com/vtmocanu/uzi/issues/1848): the supplied report
 lacked the deployed worker revision, classification request status, and
 underlying retirement error.
+
+### Retained sources with no open hold (worker-local inspect and discard)
+
+A retained source can outlive its server hold: the hold was released or discarded,
+but a worker-local record (attempt ledger, recovery journal, marker) still names the
+clone, so it keeps blocking reclaim or occupying disk. The server views above cannot
+show or discard it. The worker exposes a small operator channel for exactly this case:
+a read-only **inspect** and a guarded **discard**, run on the worker itself.
+
+- **Socket.** The worker listens on `<dataDir>/ops/retained-source.sock` (a
+  worker-owned `0700` directory holding a `0600` socket). There is no TCP listener. If
+  the channel cannot be set up the worker logs it and keeps running; the channel is
+  then unavailable, not the worker.
+- **Invocation.** Run the helper as the `worker` user, with a scrubbed environment and
+  the image-owned node binary. `/usr/bin/env -i` plus that binary is why a planted `NODE_OPTIONS`,
+  `NODE_PATH` or tsx cache cannot influence it. **Never run the client as root:** the
+  client file is owned by the worker uid (the image runs `chown -R worker:worker /app`),
+  so running it as root would execute a worker-writable script with root privileges.
+  Plain `docker exec` runs as root on compose, and `kubectl exec` has no user flag, so
+  under the uid split (the container itself runs as root) you must drop to the worker uid
+  first:
+
+  ```sh
+  # Docker Compose
+  docker exec -u worker <agent container> \
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
+
+  # Kubernetes, single-UID workers (the default, workers.uidSplit.enabled: false):
+  # the container already runs as the worker uid
+  kubectl exec -c worker <pod> -- \
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
+
+  # Kubernetes, split-UID workers: drop to the worker uid (10001) first;
+  # /bin/setpriv is the util-linux binary in the image
+  kubectl exec -c worker <pod> -- \
+    /bin/setpriv --reuid=10001 --regid=10001 --init-groups \
+    --inh-caps=-all --ambient-caps=-all --bounding-set=-all --no-new-privs \
+    /usr/bin/env -i PATH=/usr/local/bin:/usr/bin:/bin /usr/local/bin/node /app/src/ops/retained-source.mjs \
+    inspect --run <run-id> --generation <n|none> --attempt <attempt-id|canonical>
+  ```
+
+  Every binary in these commands is named by an absolute, root-owned path because the
+  image `PATH` includes runner-writable directories (`/opt/uzi-toolchain/bin` and the nix
+  profile `bin`) ahead of `/bin`; a bare `env` or `setpriv` could run a runner-planted
+  program as root or as the worker uid.
+
+  Under `/usr/bin/env -i` the client cannot read `UZI_DATA_DIR` and defaults to `/data`; for a
+  non-default data directory pass `--socket <path>` naming the socket. As defense in
+  depth, the run's Bash guardrail denies commands that name the installed client or the
+  socket path from inside a run; the uid split, not that guardrail, is the real boundary.
+
+**Inspect** is read-only and content-free. It reports the generation (or `none`), the
+attempt or `canonical`, the ledger, journal and marker state, a descriptor digest,
+whether the source is present, and its size in bytes. A size that hit the scan budget is
+reported as partial or unknown, never as `0`. Server hold state comes from the worker
+API (this worker's open holds); an empty list means the hold is absent or released,
+never something inferred from local files. When a source is selected
+(`--run`/`--generation`/`--attempt`) it names one disposition; an aggregate inspect (no
+selector) only lists sources, without holds or a disposition:
+
+| Disposition | Meaning and next step |
+|---|---|
+| `owner_hold_discard <hold-id>` | A server hold still owns the source. Use `uzi run discard <run-id> --hold <hold-id> --yes`. |
+| `resolve_local_record` | A local recovery, settlement or terminal record still holds the source. Resolve it through its existing path; this command adds no new resolution. |
+| `local_discard` / `local_protected_discard` | Nothing else holds the source; it may be discarded with the command below (protected for episode or protected sources). |
+| `refused` | Named consumers still use the source. The output lists them. |
+
+A canonical clone kept under its plain journal by a park or terminal exit (marker
+state `none`, journal state `plain`) has no marker, so the worker cannot tell locally
+whether the run is still parked. An absent or released hold does not prove the run is
+terminal: a hold can be released (claim released, capture available) or never opened
+(`paused` and `limit_wait` parks, workers with recovery disabled) while the run is
+still parked. Discard therefore needs positive lifecycle evidence: for a selected
+source inspect and discard read the run's status through the worker's existing
+ownership probe (`GET /api/worker/runs/{id}/ownership`), and it must be `completed`,
+`failed` or `cancelled`. Inspect shows the result as the consumer
+`run_state:terminal:<status>`, `run_state:<status>` (a non-terminal status) or
+`run_state:unknown`, and `lifecycleRead` (`terminal`, `not_terminal` or `unknown`). An
+aggregate inspect reads no lifecycle and shows `run_state:not_read`, with no blocker.
+The disposition follows what the worker can see:
+
+- An open server hold gives `owner_hold_discard` (the refusal for an actively parked
+  run), a local record gives `resolve_local_record`, and a live flight refuses.
+- A status the probe cannot establish (a 404, an error, a timeout or a malformed body)
+  refuses with the blocker `run_state_unknown`; any other status refuses with
+  `run_state_not_terminal`. Nothing is deleted.
+- Otherwise it is `local_discard`, which loses every byte not already in a capture,
+  published checkpoint or the tracking ref and clears that plain journal, so a later
+  resume seeds fresh.
+
+The probe is scoped to the worker: once the run's `worker_id` moves off this worker (a
+requeue after a released claim, or a claim elsewhere) it reads 404, so the leftover is
+refused. It stays kept, its bytes retained. An open hold of this worker on the run
+gives `owner_hold_discard` (the owner's server-side hold discard) even when the
+lifecycle read is unknown, and a cross-worker predecessor's hold can stay open; a local
+record gives `resolve_local_record`. With neither, the lifecycle read decides. Its only
+automatic reclaim is a later run of that branch's terminal-orphan handling on this
+worker, which moves the clone to `<dataDir>/runner-quarantine/` (retained, never deleted
+automatically; the retention sweep never touches `runner-quarantine/`) and frees
+the canonical path; a protected source or an attempt clone is kept in place instead.
+Cross-worker reclaim needs a lifecycle read that is not worker-scoped (new API); it is
+an open follow-up and is not shipped.
+
+A kept canonical clone with a `uzi-stopped` marker is listed with marker state
+`detached` (no active journal names it), or `bound` while its plain journal is
+still pending. Marker state `mismatch` means an active journal names the path but
+no longer matches the marker's digest; it is always refused (blocker
+`marker_mismatch`). A source with mismatched or malformed marker evidence is kept
+and is not reclaimable through this channel (fail closed): it needs manual
+investigation by the maintainer.
+
+**Discard** is the same invocation with `discard` in place of `inspect` and
+`--confirm <descriptor digest from inspect>` added; pass `--protected` as well for an
+episode or protected source. It closes new claims briefly, waits at most 5 s for
+in-flight claims, requires the worker to be idle, reserves the run, then deletes the
+exact source under one lock. It never cancels a run or stops the worker.
+
+- On a Docker-wired worker, discard itself runs the Docker teardown, which
+  force-removes containers that bind-mount the clone (with their anonymous
+  volumes), and is refused unless that teardown reported `docker_unconfirmed` (a bounded
+  observation: two consecutive listings found no known container mounting the clone;
+  a container create the Docker daemon had already accepted could still complete afterwards). A `docker_error` or any other state
+  refuses the request. Discard clears a journal
+  only when it still names that source, never a successor's.
+- A busy channel, a drain timeout (claims did not drain in 5 s), a non-idle worker, a
+  reserved run, a wrong digest or an unreadable holds read is **refused**, and nothing is
+  deleted. If the lookup that locates the source ran out of its budget or could not read a
+  repository, the refusal says `inspect_partial` rather than `not_found`; retry the inspect.
+- Running out the 30 s operation deadline reports `unknown`; a partial delete reports
+  `incomplete`.
+- Per-source results are `removed`, `retained`, `missing` or `unknown`. Metadata is
+  retired only when every path is verified gone.
+- The client exits non-zero on anything other than a successful result.
+
+> **Discard destroys possibly unique work.** Inspect first, and export or back up
+> anything you may want before confirming (the `uzi-watcher` skill's `backup-runs.sh`
+> is the existing backup procedure). `backup-runs.sh` attributes a detached kept
+> canonical clone through its exact `uzi-stopped.<runId>.entry` marker (the
+> canonical path only, never an attempt clone). For an active or failed run it captures every
+> attributed source on every running worker pod: the primary as `<stem>.tgz` (selection
+> unchanged) and each other source as `<stem>.source-N.tgz` (N from 2, members prefixed
+> `<stem>.source-N.`, `meta.txt` naming `clone=<path>`). Attributed sources are the journal
+> or protected-descriptor sources, the marker canonical, and attempt clones whose last
+> ledger entry for the run is `live` or `reclaimed` (an unreadable one counts as attributed
+> only on that evidence, or when a journal names it); completed and cancelled runs capture
+> protected-descriptor or marker sources and the same `live`/`reclaimed` attempt clones (the
+> plain journal is ignored for them, and a retired or abandoned attempt is never a source: a
+> terminal status does not prove a predecessor's unique work is preserved). If an attributed source is listed but
+> unreadable, any capture is not verified, or a probe of the search failed (a kubectl
+> listing or exec, an unreadable bare repository), it logs
+> `FAIL <run> (<label>): incomplete coverage: <k> of <m> attributed sources captured (<reasons>)`,
+> where `<m>` counts the sources found (clones or the tracking ref the run tried to
+> capture) plus attributed unreadable ones, exits 1 and does not advance `latest`; any
+> archive that did verify is kept. When nothing is captured at all (no readable clone and
+> no owned tracking ref), a failed search instead logs
+> `FAIL <run> (<label>) status=<st>: status saved, but the source search was inconclusive (<reasons>); retry`
+> (still exit 1, `latest` not advanced); each reason names the failing pod or namespace
+> for a kubectl listing or exec failure (`exec into pod <ns>/<pod> failed`, `listing Running pods in
+> namespace <ns> failed`), an errored probe, an unreadable `.git` (`a candidate's .git on pod
+> <ns>/<pod> could not be read`) and an attributed source listed but unreadable (`attributed source
+> <path> on pod <ns>/<pod> is listed but unreadable`); capture failures name the source path. A
+> same-stem directory without `.git` is skipped only when it is positively empty; a nonempty
+> or unlistable one that the journal (active and failed runs only), a protected descriptor, a `live`/`reclaimed` ledger entry or the stopped marker names is an
+> attributed source that is listed but unreadable: incomplete coverage when another source was
+> captured, else the no-capture inconclusive FAIL line above; either way exit 1 and `latest`
+> not advanced. A directory none of those name is not an attributed source. Cost: every cycle execs into every Running pod in `UZI_WORKER_NS` for each
+> bound run, and one pod that cannot be exec'd into fails every bound run's cycle until it
+> is fixed (the FAIL line names it and verified artifacts are kept). Do not drop its
+> namespace from `UZI_WORKER_NS` (which lists namespaces, not pods) unless you have verified
+> that namespace holds no source a tracked run needs: excluding it hides those sources from
+> the search, so their work is no longer backed up and the backup could read green without it.
+
+What the channel does not promise:
+
+- **Not a model boundary.** On single-UID workers (the default hosted Kubernetes
+  deployment, `uidSplit.enabled: false`) the model's shell runs as the worker's own uid
+  and can reach the socket and modify `/app`. The channel adds no capability beyond that
+  uid's existing write access to `/data/runner`. Under the uid split the runner uids
+  cannot connect.
+- **Durability follows the clone's storage.** A same-pod worker process restart keeps
+  the clone. Pod replacement loses an `emptyDir` clone (the Docker-tier `/data/runner`)
+  even though the bare-config ledger and marker survive; inspect reports such a source as
+  missing, never as empty work. PVC teardown loses both.
+- **Gitignored files are not covered.** No capture covers them; coverage is `HEAD` plus
+  tracked and untracked non-ignored bytes.
 
 ## What this is not: the threat model
 

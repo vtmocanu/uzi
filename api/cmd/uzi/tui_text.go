@@ -85,8 +85,8 @@ func shortRunID(id string) string {
 	return string(r[:8])
 }
 
-// padCell right-pads to n RUNES. Rune-based to match capCell, so a multibyte title
-// does not shift the column.
+// padCell truncates and right-pads to n runes, matching capCell. Use padVisual
+// for terminal columns: a wide rune occupies more than one column.
 func padCell(s string, n int) string {
 	c := capCell(s, n)
 	if pad := n - len([]rune(c)); pad > 0 {

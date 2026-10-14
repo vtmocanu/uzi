@@ -1,12 +1,15 @@
 import { mockCommittedTracking } from "./runner-tracking-fixture.js";
-import { describe, it } from "node:test";
+import { describe, it, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import type { Executor, RunContext } from "../src/executor.js";
+import { MessageBatcher } from "../src/batcher.js";
 import {
   api,
+  client,
+  deferred,
   fakeGitlab,
   git,
   gitlabClaim,
@@ -15,7 +18,7 @@ import {
   worktreeDirFor,
 } from "./runner-harness.js";
 
-installHarness();
+installHarness({ httpTimeoutMs: 100 });
 
 // PRD #1226 M4 (D3/D6): the Runner's enterCompletionHold seam, driven end-to-end through the real
 // runner (clone seed → executor → phasePublish → finally). The injected executor calls
@@ -45,7 +48,7 @@ interface HoldProbe {
 // verdicts (`"throw"` makes verifyRunnerTrackingCovers throw that attempt, a boolean makes it
 // return that value). The script drives enterCompletionHold's bounded capture-retry loop across a
 // throw, a false, and a true so the loop — not a single constant verdict — is exercised.
-function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>): HoldProbe {
+function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>, afterHold?: () => void): HoldProbe {
   const held: { value: boolean | undefined } = { value: undefined };
   const captureAttempts = { count: 0 };
   const executor: Executor = {
@@ -67,6 +70,7 @@ function makeHoldExecutor(verdict: boolean | Array<"throw" | boolean>): HoldProb
 
       const entered = await ctx.enterCompletionHold!("test completion hold reason");
       held.value = entered;
+      afterHold?.();
       if (entered) return { branch: ctx.branch, completionHeld: { reason: "test completion hold reason" } };
       // A false return means keep-live-then-legacy-throw at the real call sites.
       throw new Error("legacy terminal (kept live, could not hold)");
@@ -90,6 +94,76 @@ function seedHome(): { homeDir: string; sentinel: string; root: string } {
 }
 
 describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
+  it("ambiguous ACK + exact running snapshot retains clone and HOME without a terminal report, even after executor error", async (t) => {
+    const close = MessageBatcher.prototype.close;
+    let completedCloses = 0;
+    t.mock.method(MessageBatcher.prototype, "close", async function (
+      this: MessageBatcher, ...args: Parameters<MessageBatcher["close"]>
+    ) {
+      await close.apply(this, args);
+      completedCloses++;
+    });
+    const { gitlab, calls } = fakeGitlab();
+    const probe = makeHoldExecutor(true);
+    const home = seedHome();
+    const claim = { ...gitlabClaim(1254), claim_generation: 7 };
+    const executor: Executor = {
+      run: async (ctx) => {
+        await probe.executor.run(ctx);
+        throw new Error("late executor error after unresolved hold");
+      },
+    };
+    try {
+      api.setCompletionHoldResponse("", 200);
+      api.parkRunOwnership = {
+        status: "running", claim_generation: 7, hold_reason: null, claim_released: false,
+      };
+      const readsBefore = api.ownershipRequests.length;
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 5_000,
+      }).execute(claim);
+
+      assert.equal(completedCloses, 1, "execute awaits real batcher close after the late error");
+      assert.equal(probe.held.value, true, "running cannot fence a delayed hold POST");
+      assert.deepEqual(api.ownershipRequests.slice(readsBefore), [claim.run_id], "one reconciliation read");
+      assert.ok(!statuses(claim.run_id).some((status) => ["completed", "failed", "cancelled"].includes(status)));
+      assert.equal(calls.length, 0);
+      assert.equal(fs.existsSync(worktreeDirFor(1254)), true);
+      assert.equal(fs.existsSync(home.sentinel), true);
+    } finally {
+      api.parkRunOwnership = undefined;
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
+  it("ambiguous ACK + exact unheld terminal proof permits normal cleanup", async () => {
+    const { gitlab } = fakeGitlab();
+    let readsAfterHold: string[] = [];
+    const readsBefore = api.ownershipRequests.length;
+    const { executor, held } = makeHoldExecutor(true, () => {
+      readsAfterHold = api.ownershipRequests.slice(readsBefore);
+    });
+    const home = seedHome();
+    const claim = { ...gitlabClaim(1255), claim_generation: 7 };
+    try {
+      api.setCompletionHoldResponse("", 200);
+      api.parkRunOwnership = {
+        status: "failed", claim_generation: 7, hold_reason: null, claim_released: false,
+      };
+      await runnerWith(() => ({ executor, homeDir: home.homeDir }), gitlab, undefined, undefined, {
+        recoveryRetryMs: 1, completionHoldReconcileTimeoutMs: 5_000,
+      }).execute(claim);
+
+      assert.equal(held.value, false);
+      assert.deepEqual(readsAfterHold, [claim.run_id], "one read before normal terminal cleanup");
+      assert.equal(fs.existsSync(worktreeDirFor(1255)), false);
+      assert.equal(fs.existsSync(home.sentinel), false);
+    } finally {
+      api.parkRunOwnership = undefined;
+      fs.rmSync(home.root, { recursive: true, force: true });
+    }
+  });
+
   it("verified capture + paused ACK → held: requests the hold with the captured head, preserves the clone and HOME", async () => {
     const { gitlab, calls } = fakeGitlab();
     const { executor, held } = makeHoldExecutor(true);
@@ -204,4 +278,239 @@ describe("RunRunner — recoverable completion hold (PRD #1226 M4 D6)", () => {
       fs.rmSync(home.root, { recursive: true, force: true });
     }
   });
+});
+
+const exactHeld = {
+  status: "paused", claim_generation: 7, hold_reason: "completion_blocked", claim_released: false,
+};
+const exactTerminal = {
+  status: "failed", claim_generation: 7, hold_reason: null, claim_released: false,
+};
+
+/** Drive the public execute seam and observe git publication independently of forge traffic. */
+async function reconcileCase(
+  t: TestContext,
+  configure: (runId: string) => void,
+  retained = true,
+  budget: number | null = 5_000,
+): Promise<void> {
+  const forge = fakeGitlab();
+  let reconciliationReads: string[] = [];
+  const probe = makeHoldExecutor(true, () => { reconciliationReads = [...api.ownershipRequests]; });
+  const home = seedHome();
+  const claim = { ...gitlabClaim(2816), claim_generation: 7 };
+  const push = t.mock.method(git, "pushBranch", async () => {
+    throw new Error("unexpected git push");
+  });
+  configure(claim.run_id);
+  try {
+    await runnerWith(() => ({ executor: probe.executor, homeDir: home.homeDir }), forge.gitlab,
+      undefined, undefined, {
+        recoveryRetryMs: 1,
+        ...(budget === null ? {} : { completionHoldReconcileTimeoutMs: budget }),
+      }).execute(claim);
+    assert.equal(probe.held.value, retained);
+    assert.deepEqual(reconciliationReads, [claim.run_id], "exactly one reconciliation read");
+    if (retained) assert.deepEqual(api.ownershipRequests, [claim.run_id]);
+    assert.equal(api.completionHoldRequests.length, 1);
+    assert.equal(api.completionHoldRequests[0]!.body.head, CAPTURED_HEAD);
+    assert.equal(push.mock.callCount(), 0, "no git push");
+    assert.deepEqual(forge.all, [], "no forge reads or writes");
+    if (retained)
+      assert.ok(!statuses(claim.run_id).some((s) => ["completed", "failed", "cancelled"].includes(s)));
+    assert.equal(fs.existsSync(worktreeDirFor(2816)), retained, "clone custody");
+    assert.equal(fs.existsSync(home.sentinel), retained, "HOME custody");
+  } finally {
+    fs.rmSync(home.root, { recursive: true, force: true });
+  }
+}
+
+describe("completion hold ambiguous wire acknowledgements", () => {
+  const acknowledgements = [
+    "transport lost", "HTTP timeout", "failed body read", "empty body", "malformed JSON",
+    "missing status", "empty status", "unknown status", "unmodelled HTTP response",
+  ];
+  for (const ack of acknowledgements) {
+    it(`commits exact completion hold before ${ack}`, async (t) => {
+      let bodyReadFailed = false;
+      const fetchReal = globalThis.fetch;
+      if (ack === "failed body read") {
+        t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof fetch>) => {
+          const response = await fetchReal(...args);
+          if (String(args[0]).endsWith("/completion/hold")) {
+            // Receipt and commit happen on the real server; only the body reader fails.
+            t.mock.method(response, "text", async () => {
+              bodyReadFailed = true;
+              throw new Error("injected body read failure");
+            });
+          }
+          return response;
+        });
+      }
+      await reconcileCase(t, (runId) => {
+        api.completionHoldWire.set(runId, (res) => {
+          api.committedHoldOwnership.set(runId, { ...exactHeld });
+          if (ack === "transport lost") { res.destroy(); return; }
+          if (ack === "HTTP timeout") return; // client abort bounds this open request
+          if (ack === "unmodelled HTTP response") { res.writeHead(204); res.end(); return; }
+          const raw = ack === "malformed JSON" ? "{" :
+            ack === "missing status" ? '{"run":{}}' :
+            ack === "empty status" ? '{"run":{"status":""}}' :
+            ack === "unknown status" ? '{"run":{"status":"unrecognised"}}' :
+            ack === "failed body read" ? '{"run":{"status":"paused"}}' : "";
+          res.writeHead(200, { "Content-Type": "application/json" });
+          res.end(raw);
+        });
+      });
+      assert.equal(bodyReadFailed, ack === "failed body read");
+      assert.deepEqual([...api.committedHoldOwnership.values()], [exactHeld]);
+    });
+  }
+});
+
+describe("completion hold ownership proof fields", () => {
+  const cases: Array<{ name: string; body: unknown; retained?: boolean; httpStatus?: number }> = [
+    ...["completed", "failed", "cancelled"].map((status) => ({
+      name: `exact unheld ${status} permits cleanup`, body: { ...exactTerminal, status }, retained: false,
+    })),
+    { name: "exact completion hold retains", body: exactHeld },
+    ...["running", "paused", "pool_wait", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "recovery_wait", "unknown"].map((status) => ({
+      name: `status ${status} cannot prove refusal`, body: { ...exactTerminal, status },
+    })),
+    ...["user_pause", "budget_exhausted", "provider_unavailable", "recovery"].map((hold_reason) => ({
+      name: `other pause reason ${hold_reason}`, body: { ...exactHeld, hold_reason },
+    })),
+    ...[0, -1, 0.5, Number.MAX_SAFE_INTEGER + 1, "7", undefined, 6, 8].map((claim_generation) => ({
+      name: `terminal generation ${String(claim_generation)}`, body: { ...exactTerminal, claim_generation },
+    })),
+    ...[true, null, undefined, "false"].map((claim_released) => ({
+      name: `terminal release ${String(claim_released)}`, body: { ...exactTerminal, claim_released },
+    })),
+    ...["", undefined, "completion_blocked"].map((hold_reason) => ({
+      name: `terminal hold reason ${String(hold_reason)}`, body: { ...exactTerminal, hold_reason },
+    })),
+    { name: "null ownership", body: null },
+    { name: "nonobject ownership", body: "failed" },
+    ...[404, 503].map((httpStatus) => ({ name: `ownership HTTP ${httpStatus}`, body: {}, httpStatus })),
+  ];
+  for (const c of cases) {
+    it(c.name, async (t) => {
+      await reconcileCase(t, (runId) => {
+        api.completionHoldWire.set(runId, (res) => { res.writeHead(200); res.end(""); });
+        api.ownershipWire.set(runId, (res) => {
+          res.writeHead(c.httpStatus ?? 200, { "Content-Type": "application/json" });
+          res.end(JSON.stringify(c.body));
+        });
+      }, c.retained ?? true);
+    });
+  }
+
+  it("running read cannot fence a POST applied only after that read", async (t) => {
+    const applied = deferred();
+    let applyPendingPost: (() => void) | undefined;
+    await reconcileCase(t, (runId) => {
+      api.committedHoldOwnership.set(runId, { ...exactTerminal, status: "running" });
+      api.completionHoldWire.set(runId, () => {
+        // The client times out while the server keeps the original request pending.
+        applyPendingPost = () => {
+          api.committedHoldOwnership.set(runId, { ...exactHeld });
+          applied.resolve();
+        };
+      });
+      api.ownershipWire.set(runId, (res) => {
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(JSON.stringify(api.committedHoldOwnership.get(runId)), () => {
+          assert.ok(applyPendingPost, "the original POST is still pending");
+          applyPendingPost();
+        });
+      });
+    });
+    await applied.promise;
+    assert.deepEqual([...api.committedHoldOwnership.values()], [exactHeld]);
+  });
+
+  it("uses the 5000ms production reconciliation budget without waiting for expiry", async (t) => {
+    const read = client.getRunOwnership.bind(client);
+    let observedBudget = 0;
+    t.mock.method(client, "getRunOwnership", async (runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }) => {
+      assert.ok(options && !(options instanceof AbortSignal));
+      observedBudget = options.deadline - Date.now();
+      return read(runId, options);
+    });
+    await reconcileCase(t, (runId) => {
+      api.setCompletionHoldResponse("", 200);
+      api.committedHoldOwnership.set(runId, exactHeld);
+    }, true, null);
+    assert.ok(observedBudget > 4900 && observedBudget <= 5000, `budget=${observedBudget}`);
+  });
+
+  for (const budget of [0, -1, NaN, Infinity, -Infinity]) {
+    it(`rejects invalid reconciliation budget ${budget}`, () => {
+      const { gitlab } = fakeGitlab();
+      assert.throws(() => runnerWith(() => ({ executor: makeHoldExecutor(true).executor }), gitlab,
+        undefined, undefined, { completionHoldReconcileTimeoutMs: budget }),
+      /completionHoldReconcileTimeoutMs must be positive and finite/);
+    });
+  }
+});
+
+describe("completion hold streamed ownership bounds", () => {
+  for (const overflow of [false, true]) {
+    it(overflow ? "cancels open body overflow before deadline abort" : "bounds a stalled ownership body", async (t) => {
+      const events: string[] = [];
+      const fetchReal = globalThis.fetch;
+      let signal: AbortSignal | undefined;
+      let readStarted = 0;
+      let readDuration = 0;
+      let readError: unknown;
+      let abortedAtRejection: boolean | undefined;
+      let liveAtStall: boolean | undefined;
+      t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof fetch>) => {
+        const ownership = /\/runs\/([^/]+)\/ownership$/.exec(String(args[0]));
+        if (!ownership) return fetchReal(...args);
+        // Answer without a real round trip: awaiting the fake API first let a loaded host spend
+        // the whole budget before the stalled body existed, so there was nothing to cancel.
+        api.ownershipRequests.push(ownership[1]!);
+        signal = args[1]?.signal ?? undefined;
+        liveAtStall = signal !== undefined && !signal.aborted;
+        signal?.addEventListener("abort", () => { events.push("abort"); }, { once: true });
+        readStarted = performance.now();
+        return new Response(new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(new TextEncoder().encode('{"status":'));
+            if (overflow) controller.enqueue(new Uint8Array(16 * 1024 + 1));
+            // Deliberately never close: only cancellation can release this body.
+          },
+          cancel() { events.push("cancel"); },
+        }), { status: 200 });
+      });
+      const read = client.getRunOwnership.bind(client);
+      t.mock.method(client, "getRunOwnership", async (runId: string, options?: AbortSignal | { signal?: AbortSignal; deadline: number }) => {
+        try { return await read(runId, options); }
+        catch (error) {
+          readDuration = performance.now() - readStarted;
+          events.push("reject");
+          readError = error;
+          abortedAtRejection = signal?.aborted;
+          throw error;
+        }
+      });
+      await reconcileCase(t, (runId) => {
+        api.setCompletionHoldResponse("", 200);
+        api.committedHoldOwnership.set(runId, exactHeld);
+      }, true, overflow ? 5_000 : 1_000);
+      assert.equal(liveAtStall, true, "the stalled body exists while the deadline is live");
+      assert.ok(events.includes("cancel"));
+      assert.ok(events.indexOf("cancel") < events.indexOf("reject"), "cancel is requested before rejection");
+      if (overflow) {
+        assert.match(String(readError), /exceeds 16384 bytes/);
+        assert.equal(abortedAtRejection, false, "overflow rejection precedes deadline");
+        assert.ok(!events.slice(0, events.indexOf("reject")).includes("abort"));
+      }
+      else assert.ok(events.indexOf("abort") < events.indexOf("reject"));
+      // Scheduling margin over the 1 s stall budget; overflow rejects long before its deadline.
+      assert.ok(readDuration < (overflow ? 1_000 : 5_000), `bounded read took ${readDuration}ms`);
+      t.diagnostic(`ownership ${overflow ? "overflow" : "stall"} duration_ms=${readDuration.toFixed(2)} events=${events.join(",")}`);
+    });
+  }
 });

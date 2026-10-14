@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"strings"
 	"testing"
+	"time"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
@@ -82,5 +83,56 @@ func TestScheduleListHarnessColumn(t *testing.T) {
 	}
 	if got := implicitFields[len(implicitFields)-1]; got != "-" {
 		t.Errorf("an unpinned schedule's HARNESS cell should be exactly \"-\", got %q in row: %q", got, implicitLine)
+	}
+}
+
+func TestScheduleHarnessSkipRendering(t *testing.T) {
+	for _, tc := range []struct {
+		reason string
+		label  string
+		hint   string
+	}{
+		{"harness_label_conflict", "issue harness label conflicts with schedule pin", "match the issue harness label to the schedule pin, or change the pin"},
+		{"harness_label_invalid", "invalid issue harness labels", "keep exactly one of harness::codex or harness::claude and remove other harness::* labels"},
+	} {
+		t.Run(tc.reason, func(t *testing.T) {
+			skips := []apitypes.LastFireSkip{{IssueIID: ptrInt64(96), Title: "Harness choice", Reason: tc.reason}}
+			t.Run("run-now", func(t *testing.T) {
+				fc := &uzicli.FakeClient{RunNowResult: apitypes.RunNowResponse{Matched: 1, Skips: skips}}
+				out, _, code := runCLI(t, fakeEnv(fc), "schedule", "run-now", "sch_harness")
+				if code != uzicli.ExitOK {
+					t.Fatalf("exit = %d, want 0", code)
+				}
+				want := "#96  " + tc.label + "   # " + tc.hint
+				if !strings.Contains(out, want) {
+					t.Errorf("run-now missing %q\n%s", want, out)
+				}
+				if strings.Contains(out, tc.reason) {
+					t.Errorf("raw reason leaked into run-now\n%s", out)
+				}
+			})
+			t.Run("get", func(t *testing.T) {
+				fire := apitypes.LastFire{FiredAt: time.Date(2026, 10, 13, 9, 0, 0, 0, time.UTC), Matched: 1, Skips: skips}
+				fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+					"sch_harness": {ID: "sch_harness", Target: "sweep", Timing: "recurring", CronExpr: "0 9 * * *", Status: "active", Enabled: true, LastFire: &fire, RecentFires: []apitypes.LastFire{fire}},
+				}}
+				out, _, code := runCLI(t, fakeEnv(fc), "schedule", "get", "sch_harness")
+				if code != uzicli.ExitOK {
+					t.Fatalf("exit = %d, want 0", code)
+				}
+				for _, heading := range []string{"Last fire:", "Recent fires:"} {
+					if !strings.Contains(out, heading) {
+						t.Errorf("missing %q\n%s", heading, out)
+					}
+				}
+				want := "#96  " + tc.label + "  Harness choice"
+				if got := strings.Count(out, want); got != 2 {
+					t.Errorf("want label in last and recent fires, got %d copies of %q\n%s", got, want, out)
+				}
+				if strings.Contains(out, tc.reason) {
+					t.Errorf("raw reason leaked into schedule get\n%s", out)
+				}
+			})
+		})
 	}
 }

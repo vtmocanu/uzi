@@ -1,8 +1,11 @@
+import { useState } from "react";
 import { Link } from "react-router-dom";
 import type { Run } from "../lib/apiTypes";
 import { costDisplay, costHeadline } from "../lib/costStatus";
+import { isTerminalRun } from "../lib/runStatus";
 import { stripUnsafeChars } from "../lib/safeText";
 import { Markdown } from "./Markdown";
+import { Badge, Card, CardHeader, type BadgeTone } from "./ui";
 
 function plain(value: unknown, cap = 200): string {
   return typeof value === "string" ? stripUnsafeChars(value.slice(0, cap)).replace(/[\n\t]/g, " ") : "";
@@ -48,6 +51,8 @@ function dispositionEvidence(findings: unknown, value: unknown, finalized: boole
 }
 
 function Findings({ value, dispositions }: { value: unknown; dispositions: Map<string, Disposition> }) {
+  const [open, setOpen] = useState(false);
+  const tones: Record<string, BadgeTone> = { critical: "danger", major: "warning", minor: "info" };
   const items = Array.isArray(value) ? value : [];
   let remaining = 32768;
   let truncated = items.length > 20;
@@ -69,7 +74,7 @@ function Findings({ value, dispositions }: { value: unknown; dispositions: Map<s
   };
   const seen = new Set<string>();
   const content = items.slice(0, 20).map((item, index) => {
-    if (!item || typeof item !== "object") return <p key={index}>Finding unavailable</p>;
+    if (!item || typeof item !== "object") return <article key={index} className="flex flex-col gap-1.5 px-3 py-2.5 sm:flex-row sm:items-start sm:gap-3">Finding unavailable</article>;
     const f = item as Record<string, unknown>;
     const id = typeof f.id === "string" && /^[A-Za-z0-9_-]{1,64}(?![\s\S])/.test(f.id) && !seen.has(f.id) ? f.id : "";
     if (id) seen.add(id);
@@ -77,16 +82,24 @@ function Findings({ value, dispositions }: { value: unknown; dispositions: Map<s
     const path = plain(bounded(f.path, 512), 512);
     const title = bounded(f.title, 512);
     const detail = bounded(f.detail, 2048);
-    return <article key={index} className="space-y-2">
-      <p>Finding: {id || "ID unavailable"} · {["critical", "major", "minor"].includes(String(f.severity)) ? String(f.severity) : "Severity unavailable"}</p>
-      {path && <p>Path: {path}{Number.isSafeInteger(f.line) && (f.line as number) > 0 && (f.line as number) <= 2147483647 ? `:${f.line}` : ""}</p>}
-      <Markdown content={title} />
-      <Markdown content={detail} />
-      {disposition && <><p>Disposition: {disposition.disposition}</p><Markdown content={disposition.reason} /></>}
+    const known = typeof f.severity === "string" && Object.prototype.hasOwnProperty.call(tones, f.severity);
+    return <article key={index} className="flex flex-col gap-1.5 px-3 py-2.5 sm:flex-row sm:items-start sm:gap-3">
+      <span className="shrink-0 sm:w-20"><Badge wrap tone={known ? tones[f.severity as string] : "neutral"}>{known ? f.severity as string : "Severity unavailable"}</Badge></span>
+      <div className="min-w-0 flex-1 space-y-1">
+        <p className="text-xs text-muted">Finding: {id ? <code className="rounded bg-raised px-1.5 py-0.5 font-mono break-all">{stripUnsafeChars(id)}</code> : "ID unavailable"}</p>
+        {path && <p className="text-xs text-muted">Path: <code className="rounded bg-raised px-1.5 py-0.5 font-mono break-all">{path}</code>{Number.isSafeInteger(f.line) && (f.line as number) > 0 && (f.line as number) <= 2147483647 ? `:${f.line}` : ""}</p>}
+        <div className="judge-prose break-words"><Markdown content={title} /></div>
+        <div className="judge-prose break-words text-muted"><Markdown content={detail} /></div>
+        {disposition && <><p>Disposition: <Badge>{disposition.disposition}</Badge></p><div className="judge-prose break-words"><Markdown content={disposition.reason} /></div></>}
+      </div>
     </article>;
   });
-  return <div className="max-h-96 overflow-auto space-y-3">
-    {content}
+  return <div className="space-y-3">
+    {content.length > 0 && <div className="divide-y divide-edge rounded-md border border-edge">{content.slice(0, 3)}</div>}
+    {content.length > 3 && <details open={open} onToggle={e => setOpen(e.currentTarget.open)}>
+      <summary className="cursor-pointer rounded-sm text-muted focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60">{open ? "Hide" : "Show"} {content.length - 3} more findings</summary>
+      <div className="divide-y divide-edge rounded-md border border-edge">{content.slice(3)}</div>
+    </details>}
     {truncated && <p>Findings truncated for display.</p>}
     {!Array.isArray(value) && <p>Findings unavailable</p>}
     {Array.isArray(value) && items.length === 0 && <p>No findings recorded.</p>}
@@ -98,7 +111,7 @@ export function CodeCrossCheck({ run }: { run: Run }) {
   if (!s && !run.code_cross_check_required) return null;
   const historical = s?.interrupted_at != null;
   const outcome = s?.outcome === "pending" ? "Pending" : s?.outcome === "completed" ? "Completed"
-    : s?.outcome === "failed" ? "Incomplete" : "Outcome unavailable";
+    : s?.outcome === "failed" ? "Incomplete" : !s && run.code_cross_check_required ? isTerminalRun(run.status) ? "Not recorded" : "Pending" : "Outcome unavailable";
   const evidence = dispositionEvidence(s?.findings, s?.dispositions, s?.finalized_at != null);
   const counts = { addressed: 0, declined: 0, not_reported: 0 };
   for (const d of evidence.entries.values()) counts[d.disposition]++;
@@ -106,23 +119,32 @@ export function CodeCrossCheck({ run }: { run: Run }) {
   const cost = usage?.cost_status === "subscription" ? costHeadline(costDisplay("subscription", 0))
     : usage && Number.isFinite(usage.cost_usd) && usage.cost_usd >= 0
     ? costHeadline(costDisplay(usage.cost_status, usage.cost_usd)) : "Unavailable";
-  return <section aria-label="Code cross-check" className="rounded-md border border-edge p-3 text-sm space-y-2">
-    <h3 className="font-semibold">Code cross-check · Advisory before publication</h3>
-    <p>{historical ? "Superseded · Earlier attempt evidence" : outcome}</p>
+  return <section aria-label="Code cross-check" className="rounded-xl border-edge bg-surface">
+    <Card className="text-sm space-y-2">
+    <CardHeader title="Code cross-check · Advisory before publication"
+      badge={<Badge>{historical ? "Superseded" : outcome}</Badge>}
+      subtitle={historical ? "Earlier attempt evidence" : undefined}
+      actions={typeof s?.checker_run_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/i.test(s.checker_run_id) && <Link className="text-info underline underline-offset-2 hover:underline focus-visible:rounded-sm focus-visible:outline-none focus-visible:ring-2 focus-visible:ring-brand/60" to={`/runs/${s.checker_run_id}`}>Open checker run</Link>}
+    />
     {historical && <p>These findings concern an earlier attempt; they are not current findings.</p>}
+    {!s && <p>{isTerminalRun(run.status) ? "This run ended without a code cross-check result." : "Runs after implementation, before the PR is published."}</p>}
+    {s?.outcome === "pending" && <p>No result recorded yet.</p>}
     {s && <>
       {s.reason_class && <p>Reason: {reasonLabel(s.reason_class)}</p>}
-      {typeof s.head_commit === "string" && /^[a-f0-9]{40}(?![\s\S])/i.test(s.head_commit) && <p>Checked SHA: {s.head_commit}</p>}
-      {s.custom_guidance_applied === true && <p>
-        Custom guidance applied{typeof s.guidance_digest === "string" && /^[0-9a-f]{12}/i.test(s.guidance_digest)
-          && <> <code className="font-mono">{s.guidance_digest.slice(0, 12).toLowerCase()}</code></>}
-      </p>}
-      <p>{evidence.state}</p>
+      <p>{evidence.state === "Pending report" ? "Dispositions pending" : evidence.state}</p>
       {!historical && s.outcome === "completed" && evidence.state === "Finalized" && <p>{counts.addressed} addressed, {counts.declined} declined, {counts.not_reported} not reported</p>}
       <Findings value={s.findings} dispositions={evidence.entries} />
-      <p>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"} · Model: {plain(s.checker_model) || "Unreported"} · Effort: {plain(s.checker_effort) || "Unreported"}</p>
-      <p>Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : ""}</p>
-      {typeof s.checker_run_id === "string" && /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}(?![\s\S])/i.test(s.checker_run_id) && <Link to={`/runs/${s.checker_run_id}`}>Checker run</Link>}
+      <p className="flex flex-wrap gap-x-1 break-all text-xs text-muted">
+        <span>Family: {s.checker_harness === "codex" ? "Codex" : s.checker_harness === "claude" ? "Claude" : "Unreported"}</span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Model: {plain(s.checker_model) || "Unreported"}</span></span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Effort: {plain(s.checker_effort) || "Unreported"}</span></span>
+        <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checker cost: {cost}{usage?.cost_status === "subscription" ? " · subscription usage" : ""}</span></span>
+        {typeof s.head_commit === "string" && /^[a-f0-9]{40}(?![\s\S])/i.test(s.head_commit) && <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Checked SHA: <code className="font-mono" title={s.head_commit}>{s.head_commit.slice(0, 12)}</code></span></span>}
+        {s.custom_guidance_applied === true && <span className="inline-flex max-w-full gap-x-1"><span className="shrink-0"> · </span><span className="min-w-0">Custom guidance applied{typeof s.guidance_digest === "string" && /^[0-9a-f]{12}/i.test(s.guidance_digest)
+          && <> <code className="font-mono">{s.guidance_digest.slice(0, 12).toLowerCase()}</code></>}
+        </span></span>}
+      </p>
     </>}
+    </Card>
   </section>;
 }

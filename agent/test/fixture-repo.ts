@@ -93,18 +93,14 @@ function callerSites(): string[] {
 }
 
 /**
- * Build a throwaway git "origin" on disk. A bare clone of a local path needs no
- * network and no auth, so the whole worktree lifecycle is exercisable offline.
- *
- * `files` (repo-relative path → contents) are committed alongside the README, so
- * a test can ship a repo that carries e.g. its own `.claude/agents/`.
+ * Normalize a freshly created scratch root. A setgid TMPDIR can lend the root a
+ * foreign group and special bits; normalize only this root before any descendants
+ * inherit its metadata. On failure the root is removed (ledgered) and the ORIGINAL
+ * error is rethrown.
  */
-export function makeFixture(files: Record<string, string> = {}, opts: { testName?: string } = {}): Fixture {
-  const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
-  // Recorded before the git work so a later throw in makeFixture still leaves a created line.
-  ledger("created", base, { file: process.argv[1] ?? null, test: opts.testName ?? null, site: callerSites() });
+function normalizeRoot(base: string): void {
   try {
-    // A setgid TMPDIR can lend makeFixture a foreign group and special bits.
+    // A setgid TMPDIR can lend a fixture or scratch root a foreign group and special bits.
     // Normalize only this root before any descendants inherit its metadata.
     if (process.platform !== "win32" && process.getuid && process.getgid) {
       fs.chownSync(base, process.getuid(), process.getgid());
@@ -119,6 +115,32 @@ export function makeFixture(files: Record<string, string> = {}, opts: { testName
     }
     throw error;
   }
+}
+
+/**
+ * Create a private (uid/gid-owned, 0700) scratch root under os.tmpdir() whose
+ * descendants cannot inherit a setgid TMPDIR's foreign group or setgid bit.
+ * The parent directory is never touched. The caller removes the root.
+ */
+export function makeScratchRoot(prefix: string): string {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), prefix));
+  ledger("created", base, { file: process.argv[1] ?? null, test: null, site: callerSites() });
+  normalizeRoot(base);
+  return base;
+}
+
+/**
+ * Build a throwaway git "origin" on disk. A bare clone of a local path needs no
+ * network and no auth, so the whole worktree lifecycle is exercisable offline.
+ *
+ * `files` (repo-relative path → contents) are committed alongside the README, so
+ * a test can ship a repo that carries e.g. its own `.claude/agents/`.
+ */
+export function makeFixture(files: Record<string, string> = {}, opts: { testName?: string } = {}): Fixture {
+  const base = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-agent-test-"));
+  // Recorded before the git work so a later throw in makeFixture still leaves a created line.
+  ledger("created", base, { file: process.argv[1] ?? null, test: opts.testName ?? null, site: callerSites() });
+  normalizeRoot(base);
   const originPath = path.join(base, "origin");
   const dataDir = path.join(base, "data");
   fs.mkdirSync(originPath);

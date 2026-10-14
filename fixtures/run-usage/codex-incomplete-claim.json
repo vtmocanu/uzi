@@ -1,0 +1,68 @@
+{
+  "earlierMetered": {
+    "event": "result",
+    "subtype": "completed",
+    "modelUsage": {
+      "gpt-6-astra": {
+        "inputTokens": 100,
+        "outputTokens": 20,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "costStatus": "metered",
+        "costUSD": 0.002
+      }
+    }
+  },
+  "incompleteRootDistinctChild": {
+    "event": "result",
+    "subtype": "completed",
+    "modelUsage": {
+      "gpt-6-astra": {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "costStatus": "unreported"
+      },
+      "gpt-6.1-sol": {
+        "inputTokens": 200,
+        "outputTokens": 100,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "costStatus": "metered",
+        "costUSD": 0.0014
+      }
+    }
+  },
+  "incompleteRootSameModelChild": {
+    "event": "result",
+    "subtype": "completed",
+    "modelUsage": {
+      "gpt-6-astra": {
+        "inputTokens": 200,
+        "outputTokens": 100,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "costStatus": "unreported"
+      }
+    }
+  },
+  "zeroIncomplete": {
+    "event": "result",
+    "subtype": "completed",
+    "modelUsage": {
+      "gpt-6-astra": {
+        "inputTokens": 0,
+        "outputTokens": 0,
+        "cacheReadInputTokens": 0,
+        "cacheCreationInputTokens": 0,
+        "reasoningOutputTokens": 0,
+        "costStatus": "unreported"
+      }
+    }
+  }
+}

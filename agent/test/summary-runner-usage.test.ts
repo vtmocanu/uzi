@@ -1,11 +1,10 @@
 // Issue #2686: the SummaryRunner reports each pass's observed model usage through `onUsage`
 // (at most once, only when usage evidence arrived), for the intent, plan and PR-description
-// passes on Claude and the PR-description pass on Codex.
+// passes on Claude and Codex.
 
-import { after, describe, it } from "node:test";
+import { after, before, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import { promises as fs } from "node:fs";
-import os from "node:os";
 import path from "node:path";
 
 import { SummaryRunner, type DeliverySummaryClaimView, type DeliverySummaryInput } from "../src/summary-runner.js";
@@ -23,6 +22,9 @@ type Scenario = "success" | "error" | "timeout" | "unparseable" | "no_usage";
 const SCENARIOS: Scenario[] = ["success", "error", "timeout", "unparseable", "no_usage"];
 
 const homeRoots: string[] = [];
+before(async () => {
+  await fs.mkdir(path.resolve("../.uzi/scratch"), { recursive: true });
+});
 after(async () => {
   await Promise.all(homeRoots.map((d) => fs.rm(d, { recursive: true, force: true })));
 });
@@ -63,14 +65,20 @@ function claudeQuery(pass: string, scenario: Scenario): SdkQueryFn {
   } as unknown as SdkQueryFn;
 }
 
-function codexFactory(pass: string, scenario: Scenario) {
+function codexFactory(pass: string, scenario: Scenario, pending?: {
+  started(req: { usageObserver?: (u: AdviceUsageSnapshot) => void; signal: AbortSignal }): void;
+  settle: Promise<void>;
+}) {
   return (async () => ({
     kind: "codex" as const,
-    run: async (req: { usageObserver?: (u: AdviceUsageSnapshot) => void }) => {
+    run: async (req: { usageObserver?: (u: AdviceUsageSnapshot) => void; signal: AbortSignal }) => {
       if (scenario !== "no_usage") {
         req.usageObserver?.({ [CODEX_MODEL]: { inputTokens: 3, outputTokens: 2, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } });
       }
-      if (scenario === "timeout") await new Promise(() => {});
+      if (pending) {
+        pending.started(req);
+        await pending.settle;
+      } else if (scenario === "timeout") await new Promise(() => {});
       if (scenario === "error") throw new Error("codex failed");
       return { text: textFor(pass, scenario), end: { kind: "terminal", terminal: { outcome: "success" } } };
     },
@@ -78,7 +86,7 @@ function codexFactory(pass: string, scenario: Scenario) {
 }
 
 async function newRunner(opts: { queryFn?: SdkQueryFn; codex?: unknown; log: Logger }): Promise<SummaryRunner> {
-  const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "summary-usage-test-"));
+  const homeRoot = await fs.mkdtemp(path.resolve("../.uzi/scratch/summary-usage-test-"));
   homeRoots.push(homeRoot);
   return new SummaryRunner(opts.log, {
     queryFn: opts.queryFn,
@@ -126,6 +134,8 @@ interface Case {
 const CASES: Case[] = [
   { name: "intent (Claude)", pass: "intent", model: HAIKU, codex: false, run: (r, onUsage) => r.generateIntentSummary({ ...base, onUsage }) },
   { name: "plan (Claude)", pass: "plan", model: HAIKU, codex: false, run: (r, onUsage) => r.generatePlanSummary({ ...base, planMd: "# plan", onUsage }) },
+  { name: "intent (Codex)", pass: "intent", model: CODEX_MODEL, codex: true, run: (r, onUsage) => r.generateIntentSummary({ ...base, claim: codexClaim, onUsage }) },
+  { name: "plan (Codex)", pass: "plan", model: CODEX_MODEL, codex: true, run: (r, onUsage) => r.generatePlanSummary({ ...base, claim: codexClaim, planMd: "# plan", onUsage }) },
   {
     name: "pr_description (Claude)",
     pass: "pr_description",
@@ -181,7 +191,7 @@ for (const pass of ["intent", "plan"] as const) {
         seen();
         await new Promise(() => {});
       } as unknown as SdkQueryFn;
-      const homeRoot = await fs.mkdtemp(path.join(os.tmpdir(), "summary-usage-test-"));
+      const homeRoot = await fs.mkdtemp(path.resolve("../.uzi/scratch/summary-usage-test-"));
       homeRoots.push(homeRoot);
       const r = new SummaryRunner(nullLogger(), { queryFn, homeRoot, modelTimeoutMs: 600_000 });
       const ctrl = new AbortController();
@@ -215,3 +225,39 @@ describe("a delivery call whose deadline is spent", () => {
     assert.equal(calls.length, 0);
   });
 });
+
+for (const pass of ["intent", "plan"] as const) {
+  for (const ending of ["abort", "timeout"] as const) {
+    for (const evidence of [true, false]) {
+      it(`${pass} (Codex): ${ending}, ${evidence ? "observed usage" : "no evidence"}, suppresses late usage`, async () => {
+        const calls: AdviceUsageSnapshot[] = [];
+        const { log, warns } = logs();
+        let observed!: (req: { usageObserver?: (u: AdviceUsageSnapshot) => void; signal: AbortSignal }) => void;
+        const started = new Promise<{ usageObserver?: (u: AdviceUsageSnapshot) => void; signal: AbortSignal }>((resolve) => (observed = resolve));
+        let settle!: () => void;
+        const pending = new Promise<void>((resolve) => (settle = resolve));
+        const r = await newRunner({ log, codex: codexFactory(pass, evidence ? "success" : "no_usage", { started: observed, settle: pending }) });
+        const ctrl = new AbortController();
+        const input = { ...base, claim: codexClaim, signal: ctrl.signal, onUsage: (u: AdviceUsageSnapshot) => void calls.push(u) };
+        const out = pass === "intent" ? r.generateIntentSummary(input) : r.generatePlanSummary({ ...input, planMd: "# plan" });
+        const req = await started;
+        if (ending === "abort") ctrl.abort();
+        assert.equal(await out, null);
+        assert.equal(req.signal.aborted, true);
+        assert.equal(calls.length, evidence ? 1 : 0);
+        if (evidence) assert.equal(calls[0]![CODEX_MODEL]!.inputTokens, 3);
+        const unavailable = warns.filter((w) => w.message === "summary pass usage unavailable");
+        assert.equal(unavailable.length, evidence ? 0 : 1);
+        if (!evidence) assert.equal(unavailable[0]!.fields?.pass, pass);
+
+        // The fixture finishes only after the pass's bounded settle and usage flush.
+        req.usageObserver?.({ [CODEX_MODEL]: { inputTokens: 99, outputTokens: 99, cacheReadInputTokens: 0, cacheCreationInputTokens: 0 } });
+        settle();
+        await pending;
+        await new Promise<void>((resolve) => setImmediate(resolve));
+        assert.equal(calls.length, evidence ? 1 : 0);
+        if (evidence) assert.equal(calls[0]![CODEX_MODEL]!.inputTokens, 3);
+      });
+    }
+  }
+}

@@ -47,7 +47,7 @@ func TestSteerStateVaultLocked(t *testing.T) {
 // Codex and generic recovery words, and it fits the board's status-word cell. Reddening
 // mutation: drop the vaultLockedCause arm in stateGlyphWord (it falls back to "recovery wait").
 func TestStateGlyphWordVaultLocked(t *testing.T) {
-	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", vaultLockedCause)
+	glyph, word := stateGlyphWord(statusRecoveryWait, "", false, false, "", "", vaultLockedCause)
 	if glyph != "~" || word != "vault wait" {
 		t.Errorf("vault_locked token = (%q, %q), want (~, vault wait)", glyph, word)
 	}

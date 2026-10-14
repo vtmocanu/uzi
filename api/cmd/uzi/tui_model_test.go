@@ -1037,13 +1037,13 @@ func TestTUIBoardCredentialCell(t *testing.T) {
 		if reason != "" {
 			r.AnthropicSelectReason = &reason
 		}
-		if s := stripANSI(m.boardCredSeg(r, nil)); !strings.Contains(s, "personal") || strings.Contains(s, "●") {
+		if s := stripANSI(m.boardCredSeg(r, nil, boardCredWidth)); !strings.Contains(s, "personal") || strings.Contains(s, "●") {
 			t.Errorf("credential cell (reason %q): want the label without a dot, got %q", reason, s)
 		}
 	}
 
 	// It is the label, not a constant.
-	if s := stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{AnthropicSecretLabel: &meta}}, nil)); !strings.Contains(s, "meta") {
+	if s := stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{AnthropicSecretLabel: &meta}}, nil, boardCredWidth)); !strings.Contains(s, "meta") {
 		t.Errorf("credential cell: want the meta label, got %q", s)
 	}
 
@@ -1051,13 +1051,13 @@ func TestTUIBoardCredentialCell(t *testing.T) {
 	codexLabel := "codex\nother"
 	codexCell := stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
 		Harness: "codex", AnthropicSecretLabel: &meta, CodexSecretLabel: &codexLabel,
-	}}, nil))
+	}}, nil, boardCredWidth))
 	if !strings.Contains(codexCell, "codex") || strings.Contains(codexCell, "meta") || strings.Contains(codexCell, "\n") || strings.Contains(codexCell, "(deleted)") {
 		t.Errorf("Codex board cell must use its sanitized snapshot only: %q", codexCell)
 	}
 
 	// No recorded credential (pre-#111 or unclaimed): a blank cell, never a guessed placeholder.
-	if s := strings.TrimSpace(stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{}, nil))); s != "" {
+	if s := strings.TrimSpace(stripANSI(m.boardCredSeg(apitypes.RunListItemDTO{}, nil, boardCredWidth))); s != "" {
 		t.Errorf("no-credential cell must be blank, got %q", s)
 	}
 }
@@ -1133,7 +1133,7 @@ func TestTUIBoardCredentialCounts(t *testing.T) {
 			}
 			next, _ := m.Update(msg)
 			m = next.(tuiModel)
-			if m.boardShowCred() != (tc.claude > 1 || tc.codex > 1) {
+			if m.boardShowCred() != (tc.claude+tc.codex > 1) {
 				t.Fatalf("boardShowCred=%t for counts=%+v", m.boardShowCred(), msg)
 			}
 			// Meter refreshes cannot change the credential count.
@@ -1146,8 +1146,8 @@ func TestTUIBoardCredentialCounts(t *testing.T) {
 	}
 }
 
-// The personal board reserves a credential column if either harness has multiple
-// credentials, and fills each row according to its own harness. Admin always shows it.
+// The personal board reserves a credential column if the viewer has multiple
+// credentials across both harnesses, and fills every known harness. Admin always shows it.
 func TestTUIBoardCredentialGate(t *testing.T) {
 	meta := "meta"
 	runs := []apitypes.RunListItemDTO{
@@ -1179,7 +1179,7 @@ func TestTUIBoardCredentialGate(t *testing.T) {
 		t.Errorf("admin factory board must always show the credential\n%s", out)
 	}
 
-	// Each harness gates its own row from ListSecrets, independently of meters.
+	// A shared total-count gate fills both harnesses, independently of meters.
 	claudeLabel, codexLabel := "claude", "codex"
 	mixed := []apitypes.RunListItemDTO{
 		{RunDTO: apitypes.RunDTO{ID: "cccccccc-1111", Kind: "issue", Status: "running", IssueTitle: "Claude row", Harness: "claude", AnthropicSecretLabel: &claudeLabel, CodexSecretLabel: &codexLabel}},
@@ -1192,17 +1192,17 @@ func TestTUIBoardCredentialGate(t *testing.T) {
 		wantClaude  bool
 		wantCodex   bool
 	}{
-		{"one each", 1, 1, false, false},
-		{"two codex", 1, 2, false, true},
-		{"two claude", 2, 1, true, false},
+		{"one each", 1, 1, true, true},
+		{"two codex", 1, 2, true, true},
+		{"two claude", 2, 1, true, true},
 		{"two each", 2, 2, true, true},
 	} {
 		t.Run(tc.name, func(t *testing.T) {
 			m := tuiTestModel(t, &uzicli.FakeClient{Runs: mixed}, "")
 			m = drive(m, boardRunsMsg{reqID: m.board.waitID, runs: mixed})
 			m = drive(m, secretsMsg{count: tc.claudeCount, codexCount: tc.codexCount})
-			claudeRow := stripANSI(m.boardRow(mixed[0], false, boardMarkerCols{}))
-			codexRow := stripANSI(m.boardRow(mixed[1], false, boardMarkerCols{}))
+			claudeRow := stripANSI(m.boardRow(mixed[0], false, boardMarkerCols{}, m.boardAccountCols(mixed)))
+			codexRow := stripANSI(m.boardRow(mixed[1], false, boardMarkerCols{}, m.boardAccountCols(mixed)))
 			if got := strings.Contains(claudeRow, claudeLabel); got != tc.wantClaude {
 				t.Errorf("Claude row credential visible = %t, want %t: %q", got, tc.wantClaude, claudeRow)
 			}
@@ -1217,7 +1217,7 @@ func TestTUIBoardCredentialGate(t *testing.T) {
 	admMixed := press(t, tuiTestModel(t, &uzicli.FakeClient{}, ""), keyAdmin)
 	admMixed = drive(admMixed, boardRunsMsg{reqID: admMixed.board.waitID, admin: true, runs: mixed})
 	for _, r := range mixed {
-		row := stripANSI(admMixed.boardRow(r, false, boardMarkerCols{}))
+		row := stripANSI(admMixed.boardRow(r, false, boardMarkerCols{}, admMixed.boardAccountCols(mixed)))
 		if r.Harness == "codex" && !strings.Contains(row, codexLabel) {
 			t.Errorf("admin Codex row missing alias: %q", row)
 		}
@@ -1587,26 +1587,26 @@ func TestTUIBoardCostCell(t *testing.T) {
 
 	// A metered cost renders whole dollars, no decimal.
 	real := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 9.4, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(real, nil)); !strings.Contains(s, "$9") || strings.Contains(s, ".") {
+	if s := stripANSI(m.boardCostSeg(real, nil, boardCostWidth)); !strings.Contains(s, "$9") || strings.Contains(s, ".") {
 		t.Errorf("cost cell: want whole-dollar $9 with no decimal, got %q", s)
 	}
 
 	// A subscription-status run (even at $0 with recorded tokens) → "n/a", never "$0".
 	sub := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(sub, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$0") {
+	if s := stripANSI(m.boardCostSeg(sub, nil, boardCostWidth)); !strings.Contains(s, "n/a") || strings.Contains(s, "$0") {
 		t.Errorf("cost cell: a subscription-status run must render n/a without dollars, got %q", s)
 	}
 
 	// An unreported-status run → "n/a", never a dollar figure.
 	unrep := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "unreported", CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(unrep, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$") {
+	if s := stripANSI(m.boardCostSeg(unrep, nil, boardCostWidth)); !strings.Contains(s, "n/a") || strings.Contains(s, "$") {
 		t.Errorf("cost cell: an unreported-status run must render n/a with no dollar figure, got %q", s)
 	}
 
 	// The pre-M1 empty cost_status folds to the SAME safe "n/a" bucket, never a dollar figure
 	// guessed from cost_usd == 0 (the exact bug D7 retires).
 	legacy := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(legacy, nil)); !strings.Contains(s, "n/a") {
+	if s := stripANSI(m.boardCostSeg(legacy, nil, boardCostWidth)); !strings.Contains(s, "n/a") {
 		t.Errorf("cost cell: an empty-status run must render n/a, got %q", s)
 	}
 
@@ -1614,18 +1614,18 @@ func TestTUIBoardCostCell(t *testing.T) {
 	// value a newer server can add to the wire enum) must fold to the SAME safe "n/a" bucket,
 	// never a dollar figure — mirroring web costStatus.ts's hostile-enum coverage (D7).
 	future := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "future-v2", CostUSD: 0, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(future, nil)); !strings.Contains(s, "n/a") || strings.Contains(s, "$") {
+	if s := stripANSI(m.boardCostSeg(future, nil, boardCostWidth)); !strings.Contains(s, "n/a") || strings.Contains(s, "$") {
 		t.Errorf("cost cell: an unrecognised future cost_status must render n/a with no dollar figure, got %q", s)
 	}
 
 	// A sub-dollar metered cost renders "<$1" (so a real cost never shows as $0).
 	subdollar := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.3, InputTokens: 100}}}
-	if s := stripANSI(m.boardCostSeg(subdollar, nil)); !strings.Contains(s, "<$1") {
+	if s := stripANSI(m.boardCostSeg(subdollar, nil, boardCostWidth)); !strings.Contains(s, "<$1") {
 		t.Errorf("cost cell: a sub-dollar cost must render <$1, got %q", s)
 	}
 
 	// nil Usage (a pre-#40 or unclaimed run) draws a blank cell.
-	if s := strings.TrimSpace(stripANSI(m.boardCostSeg(apitypes.RunListItemDTO{}, nil))); s != "" {
+	if s := strings.TrimSpace(stripANSI(m.boardCostSeg(apitypes.RunListItemDTO{}, nil, boardCostWidth))); s != "" {
 		t.Errorf("nil-Usage cost cell must be blank, got %q", s)
 	}
 
@@ -1633,7 +1633,7 @@ func TestTUIBoardCostCell(t *testing.T) {
 	// render "$100000" (7 > boardCostWidth), which without the board-cell cap would blow
 	// the column; fmtCostBoard abbreviates it so the cell stays exactly boardCostWidth.
 	huge := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 100000, InputTokens: 100}}}
-	hs := stripANSI(m.boardCostSeg(huge, nil))
+	hs := stripANSI(m.boardCostSeg(huge, nil, boardCostWidth))
 	if w := visualWidth(hs); w != boardCostWidth {
 		t.Errorf("cost cell for a huge cost must be exactly boardCostWidth=%d, got width %d (%q)", boardCostWidth, w, hs)
 	}
@@ -1644,7 +1644,7 @@ func TestTUIBoardCostCell(t *testing.T) {
 	// Even an absurd value above the $9999G abbreviation ceiling stays within the cell:
 	// the overflow marker is fixed-width, so the invariant holds for ALL inputs.
 	absurd := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1e13, InputTokens: 100}}}
-	as := stripANSI(m.boardCostSeg(absurd, nil))
+	as := stripANSI(m.boardCostSeg(absurd, nil, boardCostWidth))
 	if w := visualWidth(as); w != boardCostWidth {
 		t.Errorf("cost cell for an absurd cost must be exactly boardCostWidth=%d, got width %d (%q)", boardCostWidth, w, as)
 	}
@@ -1761,7 +1761,7 @@ func TestTUIBoardSemanticStatusAndSummary(t *testing.T) {
 		t.Errorf("board has no background-fill SGR; the warm selection bar is missing\n%s", out)
 	}
 	// The NO_COLOR-safe state glyph for a running run survives independent of colour.
-	if g, _ := stateGlyphWord("running", "", false, false, ""); !strings.Contains(out, g) {
+	if g, _ := stateGlyphWord("running", "", false, false, "", ""); !strings.Contains(out, g) {
 		t.Errorf("running state glyph %q absent from the board\n%s", g, out)
 	}
 }

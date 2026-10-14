@@ -235,6 +235,84 @@ describe("StubExecutor — issue #1742 re-execution on a resumed worktree", () =
 });
 
 describe("StubExecutor — PRD #1391 M5 outbox-outage sentinel", () => {
+  it("gates only the first claim for case 7 and leaves its resumed execution ungated", async () => {
+    const wt = makeWorktree(), resumedWt = makeWorktree(), runId = randomUUID();
+    const controller = new AbortController();
+    const marker = `/tmp/cdr-outbox-cut-${runId}`;
+    let ready!: () => void;
+    const waiting = new Promise<void>(resolve => { ready = resolve; });
+    const first = makeCtx({ runId, claimGeneration: 1, worktreePath: wt.path,
+      issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_FIRST_CUT_BARRIER`,
+      emit: m => { if ((m.payload as {text?: string}).text === "stub: outbox waiting for API cut") ready(); },
+    });
+    const executor = new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 1 });
+    let finished = false;
+    const work = executor.run(first.ctx).then(() => { finished = true; });
+    try {
+      await Promise.race([waiting, work]);
+      assert.equal(finished, false, "first claim cannot hand off finalize until the API is cut");
+      fs.writeFileSync(marker, "cut\n", {flag:"wx"});
+      await work;
+      assert.equal(fs.existsSync(marker), false);
+      const resumed = makeCtx({ runId, claimGeneration: 2, worktreePath: resumedWt.path,
+        signal: controller.signal,
+        issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_FIRST_CUT_BARRIER` });
+      resumed.ctx.emit = m => {
+        resumed.emitted.push(m);
+        if ((m.payload as {text?: string}).text === "stub: outbox waiting for API cut")
+          throw new Error("resumed claim unexpectedly entered the cut barrier");
+      };
+      await executor.run(resumed.ctx);
+      assert.ok(!resumed.emitted.some(m => (m.payload as {text?: string}).text === "stub: outbox waiting for API cut"),
+        "case 7's resumed claim must complete without a second outage");
+    } finally { controller.abort(); fs.rmSync(marker, {force:true}); wt.cleanup(); resumedWt.cleanup(); }
+  });
+  it("rejects an unknown generation for the first-claim-only barrier", async () => {
+    const wt = makeWorktree();
+    try {
+      const { ctx } = makeCtx({ runId: randomUUID(), worktreePath: wt.path,
+        issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_FIRST_CUT_BARRIER` });
+      await assert.rejects(new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 1 }).run(ctx),
+        /invalid stub outbox barrier claim generation/);
+    } finally { wt.cleanup(); }
+  });
+  it("aborts the stub-only cut barrier without finishing the run", async () => {
+    const wt = makeWorktree(), controller = new AbortController();
+    let ready!: () => void;
+    const waiting = new Promise<void>(resolve => { ready = resolve; });
+    const { ctx } = makeCtx({ runId: randomUUID(), worktreePath: wt.path, signal: controller.signal,
+      issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_CUT_BARRIER`,
+      emit: m => { if ((m.payload as {text?: string}).text === "stub: outbox waiting for API cut") ready(); },
+    });
+    const work = new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 1 }).run(ctx);
+    const rejected = assert.rejects(work, /test cut cancelled/);
+    try {
+      await waiting;
+      controller.abort(new Error("test cut cancelled"));
+      await rejected;
+    } finally { controller.abort(); wt.cleanup(); }
+  });
+  it("holds completion through arbitrarily slow helper startup until the exact cut marker", async () => {
+    const wt = makeWorktree(), runId = randomUUID();
+    const marker = `/tmp/cdr-outbox-cut-${runId}`;
+    let ready!: () => void;
+    const waiting = new Promise<void>(resolve => { ready = resolve; });
+    const { ctx } = makeCtx({ runId, claimGeneration: 2, worktreePath: wt.path,
+      issueDescription: `${STUB_OUTBOX_SENTINEL} UZI_STUB_OUTBOX_CUT_BARRIER`,
+      emit: m => { if ((m.payload as {text?: string}).text === "stub: outbox waiting for API cut") ready(); },
+    });
+    let finished = false;
+    const work = new StubExecutor(nullLogger(), { outboxTickMs: 0, outboxTicks: 1 }).run(ctx)
+      .then(() => { finished = true; });
+    try {
+      await Promise.race([waiting, work]);
+      assert.equal(finished, false, "stream completion must not release the terminal before the cut");
+      fs.writeFileSync(marker, "cut\n", {flag:"wx"});
+      await work;
+      assert.equal(finished, true);
+      assert.equal(fs.existsSync(marker), false, "the exact release marker is consumed");
+    } finally { fs.rmSync(marker, {force:true}); wt.cleanup(); }
+  });
   // outboxTickMs: 0 + a small outboxTicks make the steady stream run instantly so the
   // unit test is fast; the real e2e leaves the STUB_OUTBOX_* defaults (a ~90s window).
   const outboxTicks = (emitted: EmittedMessage[]) =>

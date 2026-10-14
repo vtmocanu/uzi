@@ -33,7 +33,11 @@ exists.**
 - **A) A backup snapshot** (`scripts/backup-runs.sh` / `backup-loop.sh`) — preferred when
   one exists: it needs no kube access and it captured uncommitted work too. The snapshot
   dir holds `STEM.tgz` (bundle + `uncommitted.patch` + `untracked.tar.gz` + `meta.txt`)
-  plus `run.json` / `plan.md` / `progress.txt` / `log-tail.ndjson`.
+  plus `run.json` / `plan.md` / `progress.txt` / `log-tail.ndjson`. A run with more than
+  one attributed source also has `STEM.source-N.tgz` (N from 2), each with its members
+  prefixed `STEM.source-N.`; restore each from its own archive and members (below). An
+  `incomplete coverage` FAIL means some attributed source was not captured or verified, so
+  the snapshot is not a complete backup.
 - **B) The live PVC** (the worker pod still exists) — bundle `REF` out of the bare clone
   per *Recovering a failed run's work from the worker PVC* above, then start at step 1.
 - **C) The run's retained checkpoint or recovery ref** (PRD #1810: the branch checkpoint
@@ -75,6 +79,11 @@ cd <the repo>                              # your normal checkout; work happens 
    # a W of your own (the exact commands are backup-runs.sh's CAPTURE block).
    #   BUNDLE=/path/to/r.bundle; FETCH_REF=REF; W=""
    ```
+   An extra source (`SNAP/STEM.source-N.tgz`) is restored the same way from its own archive:
+   `gzip -t` and extract it into its own `W`, and read its members under the `STEM.source-N.`
+   prefix (`STEM.source-N.bundle`, `STEM.source-N.uncommitted.patch`,
+   `STEM.source-N.untracked.tar.gz`), with its `meta.txt` naming `clone=<path>`. Use a
+   separate `recover/STEM-source-N` branch and worktree per source, never one over another.
 2. **Prove the bundle is restorable** from INSIDE the real repo (it has the prerequisite
    base commit the bundle excludes) — this runs for every bundle source:
    ```sh

@@ -21,7 +21,7 @@ import (
 // no effect. Reddening mutation: drop the "revising" case from stateGlyphWord → an
 // awaiting_approval+is_revising run renders ⚑ / "plan gate", so both assertions fail.
 func TestStateGlyphWordRevising(t *testing.T) {
-	glyph, word := stateGlyphWord("awaiting_approval", "", false, true, "")
+	glyph, word := stateGlyphWord("awaiting_approval", "", false, true, "", "")
 	if glyph != "↻" {
 		t.Errorf("revising glyph = %q, want %q", glyph, "↻")
 	}
@@ -29,11 +29,11 @@ func TestStateGlyphWordRevising(t *testing.T) {
 		t.Errorf("revising word = %q, want %q (must not be the awaiting_approval plan-gate label)", word, "revising")
 	}
 	// A distinct glyph from the plan gate, so the spine reads the two apart under NO_COLOR.
-	if gateGlyph, _ := stateGlyphWord("awaiting_approval", "", false, false, ""); glyph == gateGlyph {
+	if gateGlyph, _ := stateGlyphWord("awaiting_approval", "", false, false, "", ""); glyph == gateGlyph {
 		t.Errorf("revising and the plan gate share glyph %q — they must be distinguishable without colour", glyph)
 	}
 	// is_revising is gated on awaiting_approval: it has no effect on any other status.
-	if _, w := stateGlyphWord("running", "", false, true, ""); w != "running" {
+	if _, w := stateGlyphWord("running", "", false, true, "", ""); w != "running" {
 		t.Errorf("is_revising leaked onto a running run: word = %q, want %q", w, "running")
 	}
 }
@@ -44,7 +44,7 @@ func TestStateGlyphWordRevising(t *testing.T) {
 // it stops matching indigo and starts matching amber.
 func TestStateColorRevising(t *testing.T) {
 	p := newPalette(true)
-	revising := bgFillSGR(p.stateColor("awaiting_approval", "", false, true))
+	revising := bgFillSGR(p.stateColor("awaiting_approval", "", false, true, ""))
 	if revising != bgFillSGR(p.indigo) {
 		t.Error("revising colour is not indigo; a re-planning run must share planning's calm/info ink")
 	}
@@ -52,7 +52,7 @@ func TestStateColorRevising(t *testing.T) {
 		t.Error("revising resolved to amber, the needs-you attention ink; it must read as working, not waiting")
 	}
 	// Health precedence is unchanged: a stalled revising run is still the stall colour.
-	if bgFillSGR(p.stateColor("awaiting_approval", "stalled", false, true)) != bgFillSGR(p.stall) {
+	if bgFillSGR(p.stateColor("awaiting_approval", "stalled", false, true, "")) != bgFillSGR(p.stall) {
 		t.Error("stalled health no longer overrides the revising bucket; the precedence rule regressed")
 	}
 }

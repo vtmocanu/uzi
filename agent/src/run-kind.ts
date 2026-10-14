@@ -27,6 +27,12 @@ export function resolveRunKind(kind: RunKind | undefined): RunKind {
   return kind ?? "issue";
 }
 
+/** Inline intent, plan and Now summaries share kind eligibility; missing kind defaults to issue. */
+export function isRunSummaryKind(kind: RunKind | undefined): boolean {
+  const resolved = resolveRunKind(kind);
+  return resolved === "issue" || resolved === "self_improve" || resolved === "prompt";
+}
+
 /** The context a kind's `completionLine` renders from: the source branch and, for a task, the
  *  branch it was cut from. The agents line, sections, bridge sentence and footer are rendered
  *  around the line by the completion block (pr-description.ts renderCompletionBlock). */

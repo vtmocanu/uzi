@@ -120,6 +120,7 @@ function runnerWithGit(
     // committed work back to the tracking ref — handlePausePark then does the publish itself,
     // so these tests exercise its publish path directly.
     checkpointIntervalMs: 0,
+    checkpointTestHooks: { retryBackoffMs: [0, 0] },
   });
 }
 
@@ -621,6 +622,12 @@ describe("RunRunner — M2 explicit park callback", () => {
         }
         finally { callbackReads = api.ownershipRequests.length - readsBefore; }
         callbackPublications = publish.calls.length;
+        if (options.publishFailure) {
+          for (let i = 0; i < callbackPublications; i += 3) {
+            const tips = publish.calls.slice(i, i + 3).map(call => call.tipOid);
+            assert.deepEqual(tips, Array(3).fill(tips[0]), "each failed capture retries the same tip");
+          }
+        }
         if (options.questionTransport === "replay" && result.kind === "answer")
           commitInTree(ctx.worktreePath, "WORK.txt", "work after recovered guidance\n");
         return result.kind === "paused"
@@ -633,6 +640,7 @@ describe("RunRunner — M2 explicit park callback", () => {
       const runner = options.deadlineRetry || options.interruptWait
         ? new RunRunner(client, git, factory, nullLogger(), 20, undefined, {
             pollMs: 5, questionTimeoutMs: 600, gitlab, checkpointIntervalMs: 0,
+            checkpointTestHooks: { retryBackoffMs: [0, 0] },
             now: () => clockStart + (options.interruptWait ? (callbackEntries > 1 ? 200 : 0) : questions * 601),
             setTimer: (cb, ms) => {
               timerDelays.push(ms);
@@ -665,7 +673,7 @@ describe("RunRunner — M2 explicit park callback", () => {
       const outcome = await exercise({ publishFailure: true, interruptReconcile, resumeGuardedWall: true });
       assert.equal(outcome.callbackEntries, 2);
       assert.equal(outcome.pauseAttempts, 1, "a refused wall is not a consumed owner command");
-      assert.equal(outcome.callbackPublications, 2, "one failed pause publication and one wall capture");
+      assert.equal(outcome.callbackPublications, 6, "one exhausted pause and one exhausted wall capture, each with three requests");
       assert.equal(outcome.boundedReads, 1, "the false pause still requires one bounded diagnostic read");
       assert.equal(outcome.callbackReads, 2, "one pause diagnostic plus the existing refused-wall probe");
       assert.equal(outcome.questions, 1);
@@ -730,7 +738,7 @@ describe("RunRunner — M2 explicit park callback", () => {
   it("does not republish failed work after a refused wall without a fresh command", async () => {
     const outcome = await exercise({ publishFailure: true, guardedWall: true, resumeGuardedWall: true });
     assert.equal(outcome.pauseAttempts, 1);
-    assert.equal(outcome.callbackPublications, 2, "one failed pause publication and one wall capture");
+    assert.equal(outcome.callbackPublications, 6, "one exhausted pause and one exhausted wall capture, each with three requests");
     assert.equal(outcome.result?.kind, "answer");
   });
 

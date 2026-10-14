@@ -909,6 +909,8 @@ describe("RunRunner — live settle on a confirmed checkpoint publish (issue #17
       tipOid: r.published,
       pack: { readableEnded: true },
       exited: Promise.resolve(0),
+      cancel: () => {},
+      replay: async () => ({ pack: { readableEnded: true }, exited: Promise.resolve(0), cancel: () => {} }),
     });
     (client as unknown as { publishCheckpoint: unknown }).publishCheckpoint = async () => {
       if (result instanceof Error) throw result;

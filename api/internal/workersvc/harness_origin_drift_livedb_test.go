@@ -147,15 +147,11 @@ func runOriginDriftOrigins(t *testing.T, env codexTestEnv, svc *Service, userID,
 		assertRunHarness(t, env, run.ID, want)
 	})
 
-	// Fix 2 (review): the label-poller's autopilot origin, distinct from the scheduled
-	// autopilot case above — CreateAutopilotRun is its OWN seam (the poller's, kept
-	// deliberately untouched from the scheduler's CreateScheduledAutopilotRun so a widened
-	// scheduler seam can never change label-driven autopilot behaviour), and until now it had
-	// no origin-drift coverage of its own alongside the other rewired origins in this table.
+	// Poller creation inherits defaults when it supplies no issue-label selection.
 	t.Run("label-poller autopilot (Service.CreateAutopilotRun)", func(t *testing.T) {
 		iid := iidBase + 6
 		seedEligibleIssue(t, env, repoID, iid)
-		run, err := svc.CreateAutopilotRun(env.ctx, userID, repoID, iid, "desc")
+		run, err := svc.CreateAutopilotRun(env.ctx, userID, repoID, iid, "desc", nil)
 		if err != nil {
 			t.Fatalf("CreateAutopilotRun: %v", err)
 		}

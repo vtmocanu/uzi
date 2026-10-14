@@ -65,9 +65,12 @@ for that nonce. Missing proof holds the roll; re-registering an old process at
 the same version is not replacement proof. The user-chosen worker name stays
 unchanged.
 
-Operators set `workers.rollTargetVersion` from the pinned image's verified baked
-stamp, including build metadata, even when the image tag is a bare release
-number. Do not copy the API version or infer the target from the new worker.
+Published charts set `workers.rollTargetVersion` automatically from the pinned
+image's signature-verified baked stamp, including build metadata. Per-cluster
+overrides still win. When overriding the worker image pin or using an unpackaged
+source chart, set a matching independently verified target stamp. Remove a hand-set per-cluster
+`workers.rollTargetVersion` when using the published chart's worker pin; otherwise
+it becomes stale at the next pin bump and holds the roll again. Do not copy the API version or infer the target from the new worker.
 Registration's existing 64-byte version limit still applies: a version changed
 by sanitization or truncation cannot supply promotion proof. Recovery needs an
 explicit operator decision; there is no automatic rollback or unpaced fallback.

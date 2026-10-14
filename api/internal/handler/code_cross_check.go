@@ -37,10 +37,16 @@ func codeCrossCheckResponse(cc store.CrossCheck) apitypes.CodeCrossCheck {
 		id := uuid.UUID(cc.CheckerRunID.Bytes).String()
 		child = &id
 	}
+	// Only DecideCodeCrossCheck writes findings; pending, pre-snapshot, expired and dead-child rows
+	// keep the column NULL. The worker decoder requires an array (issue #2870), so absent is empty.
+	findings := cc.Findings
+	if len(findings) == 0 {
+		findings = []byte("[]")
+	}
 	return apitypes.CodeCrossCheck{CustomGuidanceApplied: cc.GuidanceText.String != "", GuidanceDigest: hex.EncodeToString(cc.GuidanceDigest), RepoInstructionsCommit: text(cc.RepoInstructionsCommit), RepoInstructionsEnabled: cc.RepoInstructionsEnabled, RepoInstructionsDigest: hex.EncodeToString(cc.RepoInstructionsDigest), Stage: "code", Round: cc.Round, CandidateGeneration: cc.LeadClaimGeneration,
 		BaseCommit: text(cc.BaseCommit), HeadCommit: text(cc.HeadCommit), CandidateDigest: hex.EncodeToString(cc.CandidateDigest),
 		CheckerRunID: child, CheckerHarness: text(cc.CheckerHarness), CheckerModel: text(cc.CheckerModel), CheckerEffort: text(cc.CheckerEffort),
-		Outcome: cc.Outcome.String, ReasonClass: text(cc.ReasonClass), Findings: cc.Findings, Dispositions: cc.Dispositions, InterruptedAt: timestamp(cc.InterruptedAt),
+		Outcome: cc.Outcome.String, ReasonClass: text(cc.ReasonClass), Findings: findings, Dispositions: cc.Dispositions, InterruptedAt: timestamp(cc.InterruptedAt),
 		FinalizedAt: timestamp(cc.FinalizedAt), DeadlineAt: cc.DeadlineAt.Time}
 }
 

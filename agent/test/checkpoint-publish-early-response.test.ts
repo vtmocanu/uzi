@@ -16,7 +16,7 @@ import { nullLogger, testGitCacheOptions } from "./helpers.js";
 
 // The production API drains the request before reporting published:true. These subprocesses
 // also cover an early peer response, where the HTTP result alone cannot confirm git's work.
-type Mode = "early" | "abort" | "success" | "success-refused";
+type Mode = "early" | "early500" | "retained-early500" | "abort" | "success" | "success-refused";
 
 async function child(mode: Mode): Promise<void> {
   const fx = makeFixture();
@@ -33,12 +33,20 @@ async function child(mode: Mode): Promise<void> {
   const shimDir = fs.mkdtempSync(path.join(fs.realpathSync(os.tmpdir()), "ckpt-git-shim-"));
   const release = path.join(shimDir, "release");
   const shim = path.join(shimDir, "git");
-  fs.writeFileSync(shim, `#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = pack-objects ] && [ '${mode}' != success ] && [ '${mode}' != success-refused ]; then\n    printf PACK\n    while [ ! -f '${release}' ] && [ -d '${shimDir}' ]; do sleep 0.01; done\n    echo 'intentional pack failure' >&2\n    exit 47\n  fi\ndone\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
+  const startedMarker = path.join(shimDir, "started");
+  fs.writeFileSync(shim, `#!/bin/sh\nfor arg in "$@"; do\n  if [ "$arg" = pack-objects ] && [ '${mode}' != success ] && [ '${mode}' != success-refused ]; then\n    if [ '${mode}' = early500 ] || [ '${mode}' = retained-early500 ]; then\n      if [ -f '${startedMarker}' ]; then exec /usr/bin/git "$@"; fi\n      touch '${startedMarker}'\n    fi\n    printf PACK\n    while [ ! -f '${release}' ] && [ -d '${shimDir}' ]; do sleep 0.01; done\n    echo 'intentional pack failure' >&2\n    exit 47\n  fi\ndone\nexec /usr/bin/git "$@"\n`, { mode: 0o755 });
   const oldPath = process.env.PATH;
   process.env.PATH = `${shimDir}:${oldPath}`;
 
   const abort = new AbortController();
+  let requests = 0;
   const server = http.createServer((req, res) => {
+    requests++;
+    if ((mode === "early500" || mode === "retained-early500") && requests === 1) {
+      res.writeHead(500);
+      res.end();
+      return;
+    }
     if (mode === "abort") {
       abort.abort();
       res.destroy();
@@ -54,15 +62,21 @@ async function child(mode: Mode): Promise<void> {
   await new Promise<void>((resolve) => server.listen(0, "127.0.0.1", resolve));
   const port = (server.address() as { port: number }).port;
   const client = new WorkerClient(`http://127.0.0.1:${port}`, "test-token", "test", nullLogger());
-  const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch }) } }), nullLogger(), 1);
+  const runner = new RunRunner(client, git, () => ({ executor: { run: async () => ({ branch }) } }), nullLogger(), 1, undefined,
+    { checkpointTestHooks: { retryBackoffMs: [0, 0] } });
   const privateGit = git as unknown as {
     spawnGit: (cwd: string, args: string[], stdin?: string) => Promise<{ exited: Promise<number> }>;
   };
   const realSpawn = privateGit.spawnGit.bind(git);
   let producerExit: Promise<number> | undefined;
+  const producerExits: number[] = [];
   privateGit.spawnGit = async (cwd, args, stdin) => {
     const started = await realSpawn(cwd, args, stdin);
-    if (args[0] === "pack-objects") producerExit = started.exited;
+    if (args[0] === "pack-objects") {
+      assert.equal(producerExits.length, requests, "previous producer settled before opening a retry");
+      producerExit = started.exited;
+      void started.exited.then(code => producerExits.push(code));
+    }
     return started;
   };
   const realPack = git.checkpointPack.bind(git);
@@ -80,6 +94,7 @@ async function child(mode: Mode): Promise<void> {
   if (mode === "success-refused") batcher.reserveCandidateTransport().cancel();
   const flight = {
     runId: "run-1725",
+    retainedEpisode: mode === "retained-early500",
     runKind: "issue",
     claimGeneration: 1,
     owedContext: Promise.resolve(context),
@@ -97,7 +112,7 @@ async function child(mode: Mode): Promise<void> {
     fs.writeFileSync(release, "go");
     const exit = await producerExit;
     process.stdout.write(JSON.stringify({ outcome, confirmed: flight.lastCheckpointRefTip,
-      attempted: flight.lastAttemptedCheckpointRefTip, packedTip, exit, warnings,
+      attempted: flight.lastAttemptedCheckpointRefTip, packedTip, exit, warnings, requests, producerExits,
       seq: batcher.currentSeq(), outcomes: [...flight.reportedPublishOutcomes] }) + "\n");
   } finally {
     await batcher.close();
@@ -112,7 +127,7 @@ async function child(mode: Mode): Promise<void> {
 if (process.env.UZI_1725_CHILD === "1") {
   await child(process.env.UZI_1725_MODE as Mode);
 } else {
-  for (const mode of ["early", "abort", "success", "success-refused"] as const) it(`${mode} checkpoint publication settles the producer`, () => {
+  for (const mode of ["early", "early500", "retained-early500", "abort", "success", "success-refused"] as const) it(`${mode} checkpoint publication settles the producer`, () => {
     const script = fileURLToPath(import.meta.url);
     // The child's own TMPDIR, owned and removed here (issue #2020): a timeout kill skips the
     // child's `finally`, which would otherwise leak its fixture and git shim dir.
@@ -134,7 +149,12 @@ if (process.env.UZI_1725_CHILD === "1") {
     const observed = JSON.parse(result.stdout.trim());
     assert.match(observed.packedTip, /^[0-9a-f]{40}$/);
     assert.equal(typeof observed.exit, "number");
-    if (mode === "success" || mode === "success-refused") {
+    if (mode === "success" || mode === "success-refused" || mode === "early500" || mode === "retained-early500") {
+      if (mode === "early500" || mode === "retained-early500") {
+        assert.equal(observed.requests, 2);
+        assert.equal(observed.producerExits.length, 2);
+        assert.notEqual(observed.producerExits[0], 0);
+      }
       assert.equal(observed.exit, 0);
       assert.deepEqual(observed.outcome, { published: true });
       assert.equal(observed.confirmed, observed.packedTip);

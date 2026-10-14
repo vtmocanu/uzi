@@ -1,6 +1,7 @@
-// PRD #1171: pinned Codex 0.160.0 app-server authentication.
+// PRD #1171: pinned Codex 0.160.1 app-server authentication.
 //
-// The wire contract comes from upstream commit a956835d020762cb2b570053af06f643a11c0ecc (0.160.0):
+// The wire contract comes from upstream commit a956835d020762cb2b570053af06f643a11c0ecc (0.160.0),
+// unchanged in 0.160.1:
 //   - initialize with experimentalApi, then the initialized notification;
 //   - account/login/start with apiKey or experimental chatgptAuthTokens;
 //   - account/chatgptAuthTokens/refresh as a server-initiated request.
@@ -311,7 +312,7 @@ class AppServerAuthSession implements CodexAppServerAuthSession {
       throw protocolError("codex initialize returned an invalid response");
     }
 
-    // Pinned 0.160.0 (as 0.153.2) serializes this notification with no params field.
+    // Pinned 0.160.1 (as 0.160.0 and 0.153.2) serializes this notification with no params field.
     transport.notify(INITIALIZED_METHOD);
 
     // Install the auth-only read-path pump before sending login. Normally it becomes

@@ -18,6 +18,7 @@ import { describe, expect, it } from "vitest";
 import type { SecretMeta } from "./api";
 import {
   anthropicTokenCount,
+  showsRunAccounts,
   codexCredentialCount,
   hasAnthropicToken as hasToken,
   hasAnyCodexCredential,
@@ -87,15 +88,14 @@ describe("hasToken (Dashboard / Board / IssueView gates)", () => {
   });
 });
 
-// PRD #295: the Runs-list credential badge gates on ">1 Anthropic token", so the
-// count is the shared, tested predicate rather than an inlined `.length > 1` at the
-// call site. The `> 1` comparison lives in RunsList; this asserts the count itself.
+// These tests pin per-harness counts; showsRunAccounts applies the shared
+// total-count threshold used by both personal list surfaces.
 describe("anthropicTokenCount (Runs-list credential-badge gate)", () => {
   it("is 0 for a token-less user", () => {
     expect(anthropicTokenCount([])).toBe(0);
   });
 
-  it("is 1 for the single-token user (badge stays hidden — nothing to say)", () => {
+  it("is 1 for a single Anthropic token", () => {
     expect(anthropicTokenCount([secret()])).toBe(1);
   });
 
@@ -108,8 +108,7 @@ describe("anthropicTokenCount (Runs-list credential-badge gate)", () => {
     ).toBe(2);
   });
 
-  // The gate must count only anthropic tokens: a user with one anthropic token and
-  // some other secret kind is still a single-token user and must see no badge.
+  // The Anthropic counter excludes other kinds; Codex credentials have their own counter.
   it("ignores secrets of another kind", () => {
     expect(
       anthropicTokenCount([
@@ -128,6 +127,15 @@ describe("codexCredentialCount", () => {
       secret({ kind: "openai_api_key", id: "key", is_default: false }),
     ])).toBe(2);
     expect(codexCredentialCount([secret()])).toBe(0);
+  });
+});
+
+describe("showsRunAccounts", () => {
+  it.each([
+    [0, 0, false], [1, 0, false], [0, 1, false],
+    [1, 1, true], [2, 0, true], [0, 2, true], [2, 1, true], [1, 2, true],
+  ])("with Claude=%i and Codex=%i shows accounts=%s", (claude, codex, shown) => {
+    expect(showsRunAccounts({ claude, codex })).toBe(shown);
   });
 });
 

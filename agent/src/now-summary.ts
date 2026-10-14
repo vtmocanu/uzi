@@ -1,4 +1,6 @@
-// The "Now" summary controller (PRD #2603): while an issue run executes a milestone, a small
+import { isRunSummaryKind } from "./run-kind.js";
+import type { RunKind } from "./protocol.js";
+// The "Now" summary controller (PRD #2603): while an eligible run executes a milestone, a small
 // model on the run's own credential writes one plain sentence (at most 120 characters) of what
 // the run is doing, and the worker posts it as a `progress_note` run message.
 //
@@ -198,7 +200,7 @@ export interface NowSummaryDeps {
    *  carries the Anthropic token the pass uses. `codex` is set only for a Codex-harness run whose
    *  claim carries a validated binding and a wired advice-harness factory (the shape
    *  ReadOnlyModelPassOpts.codex takes); both absent ⇒ the run never makes a call. */
-  claim: { issueRun: boolean; claude: boolean; codex?: NonNullable<ReadOnlyModelPassOpts["codex"]> };
+  claim: { kind: RunKind | undefined; claude: boolean; codex?: NonNullable<ReadOnlyModelPassOpts["codex"]> };
   /** Post a run message (the runner binds the run's batcher). Must not feed observeFrame. */
   emit(m: EmittedMessage): void;
   /** The model pass. Production passes runReadOnlyModelPass. */
@@ -359,7 +361,7 @@ export class NowSummaryController {
     const d = this.deps;
     return (
       d.steering.nowSummaryEnabled() &&
-      d.claim.issueRun &&
+      isRunSummaryKind(d.claim.kind) &&
       (d.claim.claude || d.claim.codex !== undefined) &&
       !this.stopped &&
       this.holdDepth === 0 &&

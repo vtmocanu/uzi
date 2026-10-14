@@ -1,11 +1,12 @@
 #!/usr/bin/env bash
 # takeover.sh — one-shot snapshot of a uzi run and/or its PR, so a session taking over
-# mid-flight starts from facts instead of a hand-rolled survey. Read-only.
+# mid-flight starts from facts instead of a hand-rolled survey. Only claims write.
 #
 # Usage: takeover.sh (<run-id> | <PR-number>) [--repo OWNER/REPO] [--no-claim]
 #   A bare number is a PR; anything else is a uzi run id (prefix ok). Each resolves the
 #   other when it can: a run's mr_iid -> PR; a PR -> the newest non-rework uzi run that
-#   opened it. --repo defaults to the checkout's origin (gh repo view).
+#   opened it. --repo defaults to the checkout's origin (gh repo view; if that fails, a
+#   github.com https or git@ origin URL).
 #   Unless --no-claim, an open PR is CLAIMED for this session (claims.sh) so other landers
 #   see it, and a resolved run's run-<RUN_ID> key is claimed first (under its lock); either
 #   held by another live session stops here with NEXT=claimed_by_other. Claiming the PR
@@ -45,9 +46,25 @@
 # warning goes to stderr: uzi's poller may auto-start an mr_rework on new review comments.
 # This script only reads; it never changes the setting.
 # Exit 0 on a snapshot, 3 on usage / could not resolve the target, 4 on NEXT=claimed_by_other.
+# The entire snapshot (including helper/peer calls and retries) has a 120-second deadline,
+# configurable with TAKEOVER_TIMEOUT_SECONDS (positive seconds). A deadline ends with
+# UNKNOWN=1 and NEXT=unknown, exits 124, and stops this snapshot's descendant processes.
 set -uo pipefail
 
 HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# Bound the whole snapshot rather than only its direct gh/uzi calls: sourced helpers and
+# claim-time peer lookups can block too. The supervisor preserves normal output/status.
+if [ "${1:-}" = --deadline-child ]; then
+  shift
+else
+  command -v python3 >/dev/null || {
+    echo "UNKNOWN=1"
+    echo "NEXT=unknown (python3 missing)"
+    exit 3
+  }
+  exec python3 "$HERE/takeover-deadline.py" "${TAKEOVER_TIMEOUT_SECONDS:-120}" \
+    bash "$0" --deadline-child "$@"
+fi
 # shellcheck source=lib/greptile-verdict.sh
 . "$HERE/lib/greptile-verdict.sh"
 # shellcheck source=lib/review-threads.sh
@@ -66,14 +83,25 @@ while [ $# -gt 0 ]; do
   case "$1" in
     --repo) REPO="${2:?}"; shift 2;;
     --no-claim) CLAIM=0; shift;;
-    -h|--help) sed -n '2,44p' "$0"; exit 3;;
+    -h|--help) sed -n '2,45p' "$0"; exit 3;;
     -*) echo "unknown flag: $1" >&2; exit 3;;
     *) if [ -z "$TARGET" ]; then TARGET="$1"; else echo "unexpected arg: $1" >&2; exit 3; fi; shift;;
   esac
 done
 [ -n "$TARGET" ] || { echo "usage: takeover.sh (<run-id> | <PR-number>) [--repo OWNER/REPO]" >&2; exit 3; }
+# origin_repo: OWNER/REPO from a github.com origin remote (https://github.com/O/R or
+# git@github.com:O/R, optional .git), else fail. The fallback when gh cannot infer it.
+origin_repo() {
+  local url owner name
+  url=$(git remote get-url origin 2>/dev/null) || return 1
+  [[ $url =~ ^(https://github\.com/|git@github\.com:)([A-Za-z0-9._-]+)/([A-Za-z0-9._-]+)$ ]] || return 1
+  owner=${BASH_REMATCH[2]}; name=${BASH_REMATCH[3]%.git}
+  [ -n "$name" ] || return 1
+  echo "$owner/$name"
+}
 if [ -z "$REPO" ]; then
-  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || { echo "cannot infer --repo" >&2; exit 3; }
+  REPO=$(gh repo view --json nameWithOwner -q .nameWithOwner 2>/dev/null) || REPO=$(origin_repo) \
+    || { echo "cannot infer --repo" >&2; exit 3; }
 fi
 echo "REPO=$REPO"
 stale=$(skill_scripts_stale "$HERE")

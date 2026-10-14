@@ -252,21 +252,51 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
       });
     });
 
+    // The ownership read must happen AFTER the typed report is sent and its ack lost, so the
+    // handler reaches the lost-ack branch. The flip happens inside the drop matcher.
     it(`${harness}: a lost ack followed by a paused/provider_unavailable ownership read is the accepted park`, async () => {
       await withHome(async (homeRoot) => {
         client.protocolFeatures = FEATURES;
         const rig = rigFor(harness, { turns: 1 }, homeRoot);
-        const claim = gitlabClaim(3306, { claim_generation: 3 });
-        const stop = api.dropStatesWhen(claim.run_id, (b) => b.recovery_cause === "provider_outage");
-        api.setOwnershipStatus(claim.run_id, "paused", 3, undefined, HOLD);
+        const claim = gitlabClaim(3330, { claim_generation: 3 });
+        api.setOwnershipStatus(claim.run_id, "running", 3);
+        const stop = api.dropStatesWhen(claim.run_id, (b) => {
+          if (b.recovery_cause !== "provider_outage") return false;
+          api.setOwnershipStatus(claim.run_id, "paused", 3, undefined, HOLD);
+          return true;
+        });
         try {
           await rig.runner.execute(claim);
         } finally {
           stop();
         }
         assert.equal(parks(claim.run_id).length, 0, "the typed report was dropped before it was recorded");
-        assert.equal(fs.existsSync(worktreeDirFor(3306)), true, "a held run keeps its clone");
-        assert.equal(fs.existsSync(rig.homePath()), true);
+        assert.equal(fs.existsSync(worktreeDirFor(3330)), true, "a held run keeps its clone");
+        assert.equal(fs.existsSync(rig.homePath()), true, "HOME is kept");
+        assert.equal(rig.custody(), 0);
+        assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), false);
+      });
+    });
+
+    it(`${harness}: a lost ack, an unproven reap and a recovery_wait ownership read keeps the clone`, async () => {
+      await withHome(async (homeRoot) => {
+        client.protocolFeatures = FEATURES;
+        const rig = rigFor(harness, { turns: 1, failReap: true }, homeRoot);
+        const claim = gitlabClaim(3331, { claim_generation: 3 });
+        api.setOwnershipStatus(claim.run_id, "running", 3);
+        const stop = api.dropStatesWhen(claim.run_id, (b) => {
+          if (b.recovery_cause !== "provider_outage") return false;
+          api.setOwnershipStatus(claim.run_id, "recovery_wait", 3);
+          return true;
+        });
+        try {
+          await rig.runner.execute(claim);
+        } finally {
+          stop();
+        }
+        assert.equal(fs.existsSync(worktreeDirFor(3331)), true, "clone kept: the reap was never proven");
+        assert.equal(fs.existsSync(rig.homePath()), true, "HOME is kept");
+        assert.equal(rig.custody(), 0, "no settlement without positive proof");
         assert.equal(api.states.some((s) => s.runId === claim.run_id && s.body.status === "failed"), false);
       });
     });
@@ -343,14 +373,24 @@ describe("RunRunner #1733 — a provider outage parks typed provider_outage", ()
     await withHome(async (homeRoot) => {
       client.protocolFeatures = FEATURES;
       const rig = rigFor("claude", { turns: 1 }, homeRoot);
-      const claim = gitlabClaim(3308, { claim_generation: 3 });
-      const stop = api.dropStatesWhen(claim.run_id, (b) => b.recovery_cause === "provider_outage");
-      api.setOwnershipStatus(claim.run_id, "paused", 3);
+      const claim = gitlabClaim(3308, { claim_generation: 3, inventory_guarded: true });
+      api.setOwnershipStatus(claim.run_id, "running", 3, true);
+      let matchedTypedReport = false;
+      // Flip ownership after the typed report so the lost-ack path runs; a guarded claim
+      // would enter settlement if paused without the provider hold were wrongly accepted.
+      const stop = api.dropStatesWhen(claim.run_id, (b) => {
+        if (b.recovery_cause !== "provider_outage") return false;
+        matchedTypedReport = true;
+        api.setOwnershipStatus(claim.run_id, "paused", 3, true);
+        return true;
+      });
       try {
         await rig.runner.execute(claim);
       } finally {
         stop();
       }
+      assert.equal(matchedTypedReport, true, "the typed provider-outage report reached the drop matcher");
+      assert.equal(parks(claim.run_id).length, 0, "the typed report was dropped before it was recorded");
       assert.equal(rig.custody(), 0, "nothing settled: the ownership read is not the provider hold");
       assert.equal(feedTexts(claim.run_id).some((t) => /provider outage/.test(t)), false);
     });

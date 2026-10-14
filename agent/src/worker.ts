@@ -14,7 +14,7 @@ import type { Logger } from "./log.js";
 import type { Config } from "./config.js";
 import type { ActiveSnapshot, ClaimResponse, OutboxHeartbeatEntry, StateAck, StateRequest, WorkerStats } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
-import type { DindPruneController } from "./dind-prune.js";
+import type { DindPruneController, DindPruneGate } from "./dind-prune.js";
 import type { DindMaintenanceController } from "./dind-maintenance.js";
 import { makeTerminalOutboxDeps, resolvePendingTerminal, type SendTerminalState } from "./terminal-resolve.js";
 import { dataVolumeUsedFraction, StatsCollector } from "./stats.js";
@@ -142,6 +142,14 @@ export class Worker {
     private readonly dindMaintenance?: DindMaintenanceController,
     private readonly terminalRejections?: TerminalRejectionCoordinator,
     private readonly crossCheckRunner?: Pick<CrossCheckRunner, "execute"> & Partial<Pick<CrossCheckRunner, "snapshotBootCodeSnapshots" | "cleanupBootCodeSnapshots">>,
+    // issue #1786: the shared claim gate, injected unconditionally (main.ts builds it for every
+    // worker). All three claim lanes use it even when no DinD controller exists, so the operator
+    // retained-source channel can close them. Falls back to a controller's gate only when none
+    // is injected (older callers and tests).
+    private readonly claimGate?: DindPruneGate,
+    // issue #1786: the operator retained-source channel (a local 0600 Unix socket). `serve` is
+    // started alongside the claim loops and settles after the signal aborts and the socket is closed.
+    private readonly retainedSource?: { serve(signal: AbortSignal): Promise<void> },
     private readonly memory?: Pick<WorkerMemoryRuntime, "run" | "stop">,
   ) {
     // Existing constructor callers with a real outbox/client also reconcile after restart.
@@ -292,26 +300,35 @@ export class Worker {
       const authority = Promise.resolve().then(async () => {
         const reportEligible = () => !signal.aborted && !authorityWait.signal.aborted && Date.now() < deadline &&
           !this.admittedRunIds.has(entry.run_id) && !(this.activeRuns?.has(entry.run_id) ?? false);
+        const retireWithExistingAuthority = async (): Promise<boolean> => {
+          if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
+              !reportEligible()) return false;
+          if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return false;
+          const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
+          if (!eligible()) return false;
+          const retired = await outbox.retireFinalizeIfEligible(
+            entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
+          if (retired === true && incarnation && eligible())
+            await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
+          return retired;
+        };
+        // Prefer the existing exact covering ACK clause before spending its deadline
+        // on an archive-only proof. Ownership, identity and live fences still apply.
+        if (typeof this.runner.recoveryFinalAcknowledged === "function" && reportEligible() &&
+            await this.runner.recoveryFinalAcknowledged(entry.run_id, entry.claim_generation) === true &&
+            await retireWithExistingAuthority()) return true;
         if (typeof this.runner.retireRecoveryReport === "function" && reportEligible()) {
           const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
           }, "finalize", outbox);
-          if (retired === true) {
+          if (retired.retired) {
+            if (retired.authority === "acknowledged_final_report_only") return true;
             if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
               entry.run_id, entry.claim_generation, incarnation);
             return true;
           }
         }
-        if (outbox.finalizeRecordIdentity(entry.run_id, entry.claim_generation) !== identity ||
-            !reportEligible()) return;
-        if (await this.hasFinalizeAuthority(entry, identity, registrationLower) !== true) return;
-        const eligible = () => reportEligible() && !this.isFinalizeRunLive(entry.run_id);
-        if (!eligible()) return;
-        const retired = await outbox.retireFinalizeIfEligible(
-          entry.run_id, entry.claim_generation, eligible, authorityWait.signal, identity);
-        if (retired === true && incarnation && eligible())
-          await this.runner.notifyPublicationCompletionRetired(entry.run_id, entry.claim_generation, incarnation);
-        return retired;
+        return retireWithExistingAuthority();
       });
       finalizeAuthorities.set(key, authority);
       const settled = () => {
@@ -469,7 +486,11 @@ export class Worker {
       const dindMaintenance = this.dindMaintenance?.loop(signal) ?? Promise.resolve();
       // PRD #1809 D7: the periodic disk reclaim, only when enabled. Its loop never throws.
       const diskReclaim = this.diskPressure ? this.diskPressure.loop(signal) : Promise.resolve();
-      tasks.push(settlement, dindPrune, dindMaintenance, diskReclaim, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal));
+      // The retained-source channel joins the same abort and shutdown lifecycle as claim loops.
+      const retainedSource = this.retainedSource?.serve(signal).catch((err) => {
+        this.log.warn("retained-source channel stopped", { error: errMessage(err) });
+      }) ?? Promise.resolve();
+      tasks.push(settlement, dindPrune, dindMaintenance, diskReclaim, retainedSource, this.claimLoop(signal), this.chatClaimLoop(signal), this.crossCheckClaimLoop(signal));
       await Promise.all(tasks);
     } finally {
       // Boot/registration failures also stop and join loops already started.
@@ -1164,7 +1185,7 @@ export class Worker {
     const cap = crossCheckLane ? this.config.crossCheckSlots : this.config.maxConcurrentRuns;
     const active = crossCheckLane ? this.crossCheckActive : this.runActive;
     const lane = crossCheckLane ? "cross-check" : "run";
-    const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
+    const gate = this.claimGate ?? this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedAtCapacity = false;
     let loggedQuarantined = false;
     while (!signal.aborted) {
@@ -1387,7 +1408,7 @@ export class Worker {
    */
   private async chatClaimLoop(signal: AbortSignal): Promise<void> {
     const active = this.chatActive;
-    const gate = this.dindMaintenance?.gate ?? this.dindPrune?.gate;
+    const gate = this.claimGate ?? this.dindMaintenance?.gate ?? this.dindPrune?.gate;
     let loggedQuarantined = false;
     while (!signal.aborted) {
       // issue #2213: the same quarantine gate as the run lane (see claimLoop).

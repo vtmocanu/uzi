@@ -1,0 +1,49 @@
+{
+  "before": {
+    "type": "system",
+    "subtype": "init",
+    "claude_code_version": "2.1.290",
+    "tools": [
+      "Glob",
+      "Grep",
+      "Read"
+    ],
+    "agents": [
+      "claude",
+      "general-purpose",
+      "statusline-setup"
+    ],
+    "mcp_servers": [],
+    "skills": [
+      "doctor",
+      "plugin-authoring"
+    ],
+    "plugins": [
+      {
+        "name": "cc-plugin-plugin-authoring",
+        "path": "builtin",
+        "source": "cc-plugin-plugin-authoring@builtin"
+      }
+    ]
+  },
+  "after": {
+    "type": "system",
+    "subtype": "init",
+    "claude_code_version": "2.1.290",
+    "tools": [
+      "Glob",
+      "Grep",
+      "Read"
+    ],
+    "agents": [
+      "claude",
+      "general-purpose",
+      "statusline-setup"
+    ],
+    "mcp_servers": [],
+    "skills": [
+      "doctor"
+    ],
+    "plugins": []
+  }
+}

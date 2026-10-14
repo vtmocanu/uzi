@@ -3,7 +3,7 @@ import { minsAgo } from "./time";
 
 // Admin-health fixtures (PRD #1484 M4). These stand in for GET /api/admin/health in mock
 // mode and back the Health-tab component tests. They mirror the real registry
-// (api/internal/healthsvc): all 20 of its check ids, in the SAME stable order the
+// (api/internal/healthsvc): all 21 of its check ids, in the SAME stable order the
 // server emits (service.go Evaluate), so the demo and the tests exercise a well-formed document.
 //
 // Summaries here are illustrative demo copy, not byte-for-byte the server's templates — the
@@ -31,6 +31,7 @@ const CHECK_META: { id: string; scope: string; group: string; title: string; doc
   { id: "custody.holds", scope: "owner", group: "housekeeping", title: "Recovery custody holds", doc: null },
   { id: "recovery.storage", scope: "owner", group: "housekeeping", title: "Recovery storage", doc: null },
   { id: "release.check", scope: "owner", group: "housekeeping", title: "Upstream release", doc: null },
+  { id: "agentsource.update", scope: "instance", group: "housekeeping", title: "Agent source update", doc: "agent-source" },
   { id: "pricing.codex", scope: "instance", group: "housekeeping", title: "Codex price coverage", doc: "admin-health" },
 ];
 
@@ -55,6 +56,7 @@ const OK_SUMMARY: Record<string, string> = {
   "custody.holds": "No owner is at the custody-hold admission limit.",
   "recovery.storage": "0 captures currently marked quota-refused.",
   "release.check": "This instance is on a recent release.",
+  "agentsource.update": "Agent source is up to date.",
   "pricing.codex": "no recent Codex usage on unpriced models",
 };
 

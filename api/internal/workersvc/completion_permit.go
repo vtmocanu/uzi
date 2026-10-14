@@ -316,6 +316,114 @@ func scopeCapEligibility(run store.Run) (eligible, verifiable bool) {
 		int64(len(done)) >= int64(run.ScopeCeiling.Int32) && len(done) < len(ms), true
 }
 
+// headlessCompletedUnion validates full structural delivery independently of scope eligibility.
+func headlessCompletedUnion(run store.Run, req StateRequest) ([]byte, bool) {
+	ms, err := DecodeMilestones(run.MilestonesFrozen)
+	if err != nil || !strings.HasPrefix(strings.TrimSpace(string(run.MilestonesFrozen)), "[") {
+		return nil, false
+	}
+	var c completionContract
+	if err := json.Unmarshal(run.CompletionContract, &c); err != nil ||
+		c.Profile != contractProfileStructural || !run.ContractRevision.Valid ||
+		c.Revision < 1 || c.Revision != int(run.ContractRevision.Int32) ||
+		!run.CompletionContractVersion.Valid || run.CompletionContractVersion.Int32 != 1 ||
+		c.Criteria == nil || len(c.Criteria) != len(ms) {
+		return nil, false
+	}
+	// The typed decoder maps missing and null fields alike. Require the reserved
+	// structural slots as well so malformed criterion objects cannot authorize a slice.
+	var shape struct{ Criteria []map[string]json.RawMessage }
+	if err := json.Unmarshal(run.CompletionContract, &shape); err != nil {
+		return nil, false
+	}
+	for _, cr := range shape.Criteria {
+		if string(cr["audit"]) != "null" {
+			return nil, false
+		}
+	}
+	frozen := make(map[string]string, len(ms))
+	for _, m := range ms {
+		if m.ID == "" {
+			return nil, false
+		}
+		if _, exists := frozen[m.ID]; exists {
+			return nil, false
+		}
+		frozen[m.ID] = m.Title
+	}
+	criteria := make(map[string]completionCriterion, len(ms))
+	seen := make(map[string]bool, len(ms))
+	for _, cr := range c.Criteria {
+		title, exists := frozen[cr.MilestoneID]
+		if !exists || seen[cr.MilestoneID] || cr.ID != cr.MilestoneID+".c1" ||
+			cr.Text != title || cr.Audit != nil || cr.FindingIDs == nil || len(cr.FindingIDs) != 0 {
+			return nil, false
+		}
+		seen[cr.MilestoneID] = true
+		criteria[cr.ID] = cr
+	}
+	if c.Scope != nil {
+		partition := make(map[string]bool, len(ms))
+		for _, id := range c.Scope.In {
+			if _, exists := frozen[id]; !exists || partition[id] {
+				return nil, false
+			}
+			partition[id] = true
+		}
+		for _, d := range c.Scope.Out {
+			if _, exists := frozen[d.MilestoneID]; !exists || partition[d.MilestoneID] ||
+				d.Reason == "" || d.Revision < 1 || d.Revision > c.Revision {
+				return nil, false
+			}
+			partition[d.MilestoneID] = true
+		}
+		if len(partition) != len(ms) {
+			return nil, false
+		}
+	}
+	accepted := make(map[string]bool, len(c.Accepted))
+	for _, a := range c.Accepted {
+		cr, exists := criteria[a.ID]
+		if !exists || accepted[a.ID] || a.MilestoneID != cr.MilestoneID || a.Text != cr.Text ||
+			a.Reason == "" || a.Revision < 1 || a.Revision > c.Revision {
+			return nil, false
+		}
+		accepted[a.ID] = true
+	}
+
+	// Validate persisted arrays before unionMilestoneIDs, which discards decode errors.
+	if len(run.MilestonesCompleted) > 0 && !strings.HasPrefix(strings.TrimSpace(string(run.MilestonesCompleted)), "[") {
+		return nil, false
+	}
+	completed, err := DecodeMilestoneIDs(run.MilestonesCompleted)
+	if err != nil {
+		return nil, false
+	}
+	members := make(map[string]bool, len(frozen))
+	for id := range frozen {
+		members[id] = true
+	}
+	if validateProgressIDs(members, &completed) == nil {
+		return nil, false
+	}
+	declared, _ := progressParams(run.Kind, run.MilestonesFrozen, req.MilestonesCompleted, nil)
+	merged := unionMilestoneIDs(run.MilestonesCompleted, declared)
+	ids, err := DecodeMilestoneIDs(merged)
+	if err != nil || len(ids) != len(frozen) {
+		return nil, false
+	}
+	done := make(map[string]bool, len(ids))
+	for _, id := range ids {
+		done[id] = true
+	}
+	for id := range frozen {
+		if !done[id] {
+			return nil, false
+		}
+	}
+	return merged, true
+}
+
 // frozenMilestoneIDs returns the ids of a run's frozen milestone list (nil/empty when none),
 // the fail-closed "everything is unmet" set computeUnmetCriteria hands back for an unverifiable
 // contract.
@@ -644,9 +752,10 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 }
 
 // completeRunWithPermitLease runs an INTERLOCKED run's terminal completion through a single pgx
-// transaction (PRD #1226 M2, D4): lock the run FOR UPDATE, consume the permit issued for the
-// exact (run, contract_revision, head) identity, write `completed`, and (via the documented
-// seam below) leave room for later generation activation — all atomically.
+// transaction (PRD #1226 M2, D4). Publication completion consumes the permit issued for
+// the exact (run, contract_revision, head) identity. A headless full report-only issue
+// delivery instead validates its frozen contract and positive claim generation under the
+// same run lock. Both paths write `completed` atomically with terminal lease handling.
 //
 // It returns (rows, idempotent, lease, err):
 //   - rows==1, idempotent==false: a genuine new completion applied; SetState runs its terminal
@@ -656,9 +765,9 @@ func unionMilestoneIDs(existing, declared []byte) []byte {
 //     transaction is rolled back so nothing (not even the permit) is consumed, and SetState
 //     surfaces applied=false (409). This is "a gated report without a valid permit updates
 //     nothing and remains non-terminal".
-//   - rows==0, idempotent==true: the run is ALREADY completed and THIS worker's permit for the
-//     identity was already consumed — a retry after response loss. SetState returns success
-//     WITHOUT re-running the terminal automation (it fired on the original completion).
+//   - rows==0, idempotent==true: a retry after response loss matches either THIS worker's
+//     consumed permit or its headless completed report at the same claim generation.
+//     SetState returns success WITHOUT re-running terminal automation.
 //
 // A nil txBeginner is fail-closed (error): an interlocked run never completes non-atomically.
 //
@@ -699,10 +808,14 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		clean, _ := stripNUL(*req.Branch)
 		branch = strings.TrimSpace(clean)
 	}
-	// No head or an unfrozen revision cannot match a permit → non-terminal (fail-closed). This is
+	// Publication completion requires a head; full-delivery issue reports instead validate
+	// their frozen structural contract and declaration under the lock. This is
 	// a cheap early-out on the pre-tx `owned` snapshot before we open a transaction; the
 	// AUTHORITATIVE revision is re-derived from the LOCKED row below.
-	if head == "" || !owned.ContractRevision.Valid {
+	headless := req.State == "completed" && req.ReportOnly != nil && *req.ReportOnly &&
+		(req.ScopeCapped == nil || !*req.ScopeCapped) && owned.Kind == "issue" && owned.CompletionContractVersion.Valid &&
+		req.Head == nil && req.Branch == nil && req.MrIID == nil && req.MrWebURL == nil && req.CompletionFinalHead == nil
+	if (!headless && head == "") || !owned.ContractRevision.Valid {
 		return 0, false, lease, nil
 	}
 	workerID := pgconv.UUID(wkr.ID)
@@ -737,6 +850,20 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		return 0, false, lease, err
 	}
 
+	if err := validateCappedReportOnly(run, req); err != nil {
+		return 0, false, lease, err
+	}
+	if headless {
+		if run.Kind != "issue" || !run.CompletionContractVersion.Valid {
+			return 0, false, lease, nil
+		}
+		if req.ClaimGeneration == nil {
+			return 0, false, lease, ErrMissingClaimGeneration
+		}
+		if *req.ClaimGeneration <= 0 {
+			return 0, false, lease, ErrStaleClaim
+		}
+	}
 	// PRD #1247 M5 (D3): the generation fence, evaluated INSIDE this permit transaction's FOR
 	// UPDATE lock (an interlocked completion cannot nest under SetState's fence tx without
 	// self-deadlock, so it fences here instead). A capability worker stamps req.ClaimGeneration;
@@ -781,6 +908,40 @@ func (s *Service) completeRunWithPermitLease(ctx context.Context, wkr store.Work
 		return 0, false, lease, nil
 	}
 	rev := run.ContractRevision.Int32
+	if headless {
+		if run.Branch.Valid || run.MrIid.Valid || run.MrWebUrl.Valid || run.CompletionFinalHead.Valid {
+			return 0, false, lease, nil
+		}
+		completed, valid := headlessCompletedUnion(run, req)
+		if !valid {
+			return 0, false, lease, nil
+		}
+		if run.Status == "completed" {
+			if !run.ReportOnly || run.ReportMd != completedParams.ReportMd {
+				return 0, false, lease, nil
+			}
+			if err := tx.Commit(ctx); err != nil {
+				return 0, false, lease, err
+			}
+			return 0, true, lease, nil
+		}
+		completedParams.MilestonesCompleted = completed
+		completedParams.StopKind = pgconv.TextOrNull("")
+		if contractHasDeferrals(run.CompletionContract) {
+			completedParams.StopKind = pgconv.TextOrNull("scope_reduced")
+		}
+		rows, err = qtx.SetRunCompleted(ctx, completedParams)
+		if err != nil || rows != 1 {
+			return 0, false, lease, err
+		}
+		if leaseTx {
+			lease = s.enterEphemeralLeaseTx(ctx, tx, wkr, run.ID, run.ClaimGeneration)
+		}
+		if err := tx.Commit(ctx); err != nil {
+			return 0, false, terminalLeaseOutcome{}, err
+		}
+		return rows, false, lease, nil
+	}
 
 	// Retry after response loss: the run is already completed. If THIS worker's permit for the
 	// identity was already consumed, we completed it once and the response was lost → idempotent

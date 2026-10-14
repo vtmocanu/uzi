@@ -77,8 +77,20 @@ func TestAdminHealthAuthLiveDB(t *testing.T) {
 	if err := json.Unmarshal(rec.Body.Bytes(), &doc); err != nil {
 		t.Fatalf("decode health doc: %v (body %s)", err, rec.Body.String())
 	}
-	if len(doc.Checks) != 20 {
-		t.Fatalf("health doc carries %d checks, want the 20 checks (11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + pricing.codex from PRD #2560 + db.size from issue #2623 + recovery.storage)\nbody: %s", len(doc.Checks), rec.Body.String())
+	if len(doc.Checks) != 21 {
+		t.Fatalf("health doc carries %d checks, want the 21 checks (11 M1 + controller.report, loops, forge.ciwatch from M2 + forge.sync from M3 + fleet.rundisk from PRD #1809 M6 + fleet.quarantine from issue #2213 + pricing.codex from PRD #2560 + db.size from issue #2623 + recovery.storage + agentsource.update)\nbody: %s", len(doc.Checks), rec.Body.String())
+	}
+	foundUpdate := false
+	for i, c := range doc.Checks {
+		if c.ID == "agentsource.update" {
+			foundUpdate = true
+			if i == 0 || i+1 >= len(doc.Checks) || doc.Checks[i-1].ID != "release.check" || doc.Checks[i+1].ID != "pricing.codex" {
+				t.Fatalf("agent source update registry position: %+v", doc.Checks)
+			}
+		}
+	}
+	if !foundUpdate {
+		t.Fatal("health doc missing agentsource.update")
 	}
 	if doc.Status == "" {
 		t.Fatalf("health doc status is empty\nbody: %s", rec.Body.String())

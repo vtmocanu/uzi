@@ -39,14 +39,15 @@ async function until(predicate: () => boolean) {
   }
 }
 function build(cfg: Config, client: WorkerClient, memory?: WorkerMemoryRuntime,
-  outbox?: Outbox, runnerOverrides: object = {}, isolatedRunner?: IsolatedRunner) {
+  outbox?: Outbox, runnerOverrides: object = {}, isolatedRunner?: IsolatedRunner,
+  retainedSource?: { serve(signal: AbortSignal): Promise<void> }) {
   const runner = { shutdown: () => {}, resumePendingRecoveries: async () => {}, settlePendingPredecessors: async () => {},
     observeSettlementTerminalAck: async () => {}, ...runnerOverrides } as unknown as RunRunner;
   return new Worker(cfg, client, runner, {} as ChatRunner, {} as JudgeRunner, {} as ReviewRunner,
     nullLogger(), () => ({ ok: true, missing: [] }), outbox, undefined, undefined, undefined,
     undefined, undefined, undefined,
     (dataDir) => new StatsCollector({ dataDir, processRss: () => 1 }),
-    isolatedRunner, undefined, undefined, undefined, undefined, memory);
+    isolatedRunner, undefined, undefined, undefined, undefined, undefined, retainedSource, memory);
 }
 function rig(overrides: object = {}, reader?: Pick<WorkerMemoryReader, "sample">) {
   let samples = 0;
@@ -332,7 +333,7 @@ for (const memoryGuard of [undefined, { enabled: false as const }, settings]) {
   });
 }
 
-test("memory-enabled worker advertises both protocols and joins the cross-check loop on shutdown", async () => {
+test("memory-enabled worker advertises both protocols and joins cross-check and retained-source loops on shutdown", async () => {
   const cfg = config();
   cfg.crossCheckSlots = 1;
   const entered = deferred();
@@ -340,6 +341,9 @@ test("memory-enabled worker advertises both protocols and joins the cross-check 
   let advertised: string[] = [];
   let slots: number | undefined;
   let checks = 0;
+  let sourceStarts = 0;
+  let sourceSignal: AbortSignal | undefined;
+  const sourceRelease = deferred();
   const f = rig({
     register: async (_name: string, _template: string, _max: number, _caps: string[],
       caps: string[], _snapshot: unknown, capacity: number) => {
@@ -355,7 +359,13 @@ test("memory-enabled worker advertises both protocols and joins the cross-check 
     },
   });
   const controller = new AbortController();
-  const worker = build(cfg, f.client, f.memory);
+  const worker = build(cfg, f.client, f.memory, undefined, {}, undefined, {
+    serve: async signal => {
+      sourceStarts++;
+      sourceSignal = signal;
+      await sourceRelease.promise;
+    },
+  });
   let settled = false;
   const done = worker.run(controller.signal).finally(() => { settled = true; });
   let timer: ReturnType<typeof setTimeout> | undefined;
@@ -372,12 +382,18 @@ test("memory-enabled worker advertises both protocols and joins the cross-check 
     assert.equal(f.client.memoryIncarnation, undefined);
     assert.equal(settled, false, "shutdown joins the in-flight cross-check claim");
     release.resolve();
+    await new Promise<void>((resolve) => setImmediate(resolve));
+    assert.equal(sourceStarts, 1, "one boot gate starts one retained-source channel");
+    assert.equal(sourceSignal?.aborted, true, "retained-source shares worker shutdown");
+    assert.equal(settled, false, "shutdown also joins the retained-source channel");
+    sourceRelease.resolve();
     await Promise.race([done, bounded]);
     assert.equal(checks, 1, "one boot gate starts one cross-check loop");
   } finally {
     if (timer !== undefined) clearTimeout(timer);
     controller.abort();
     release.resolve();
+    sourceRelease.resolve();
     await done;
     await f.memory.stop();
   }

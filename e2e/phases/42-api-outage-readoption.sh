@@ -52,9 +52,16 @@ run_field() { db_psql "SELECT $2 FROM runs WHERE id = '$1'"; }
 custody_open() { db_psql "SELECT count(*) FROM recovery_custody_holds WHERE run_id = '$1' AND state = 'open'"; }
 # war_lists WORKER RUN — "1" if the worker_active_runs snapshot table lists RUN for WORKER.
 war_lists() { db_psql "SELECT count(*) FROM worker_active_runs WHERE worker_id = '$1' AND run_id = '$2'"; }
-# cancel_run RUN — best-effort server-side cancel (frees the worker slot; the HOLD sentinel is
+# cancel_run RUN — best-effort cancel input (the HOLD sentinel is
 # abort-aware, so a cancel unwinds it promptly). Never reddens a passed case.
-cancel_run() { apipost "/api/runs/$1/inputs" '{"kind":"cancel","body":""}' >/dev/null 2>&1 || true; }
+cancel_run() {
+  local response failed=0
+  response="$(apipost "/api/runs/$1/inputs" '{"kind":"cancel","body":""}' 2>/dev/null)" || failed=1
+  mkdir -p "$RUNROOT/artifacts/fixture-settlement"
+  printf '%s' "$response" | jq -cRs --arg run "$1" --argjson failed "$failed" \
+    '(try fromjson catch {}) as $reply | {run_id:$run,request_failed:($failed == 1),server_side:$reply.server_side,status:$reply.status}' \
+    >> "$RUNROOT/artifacts/fixture-settlement/cancel.jsonl" || true
+}
 
 # make_hold_run — create + approve a UZI_STUB_HOLD stub run and leave it genuinely `running`
 # (the stub holds one tool call open, so `stalled` is suppressed). Leaves the id in HOLD_RUN
@@ -187,6 +194,7 @@ apiget /api/admin/workers \
   || fail "case b: uzi admin workers did not report both runs for worker $WORKER1"
 pass "case b: re-adopted to exact phase — requeue refunded, provenance cleared, gen unchanged, gate queued-interval banked ($BP_G_BEFORE -> $BP_G_AFTER), no new custody hold, worker_active_runs + admin workers list both"
 cancel_run "$E"; cancel_run "$G"
+wait_runs_terminal_off_worker 60 "$E" "$G"
 
 # =============================================================================
 # CASE (a) — BOOT GRACE (proves M1). The api is stopped under both live runs for longer than
@@ -209,7 +217,12 @@ sleep 20
 "${COMPOSE[@]}" up -d --wait api >/dev/null
 wait_http
 login
-# Give the worker a heartbeat cycle to reconnect, then assert nothing was requeued INSIDE the
+# Unchanged statuses are immediately readable throughout boot grace. Require an
+# actual post-restore heartbeat before cancelling, otherwise the stale-poller
+# fallback can cancel server-side without delivering an input to these live flights.
+API_A_RESTORED_AT="$(db_psql 'SELECT clock_timestamp()')"
+wait_worker_heartbeat_after "$WORKER1" "$API_A_RESTORED_AT" 30
+# Assert nothing was requeued INSIDE the
 # grace: both read their original status, neither was charged, and the gate run's park time did
 # NOT move (the durable proof that the boot sweep's stale passes were skipped).
 wait_status "$EA" running 30
@@ -222,6 +235,7 @@ BP_GA_AFTER="$(run_field "$GA" budget_paused_seconds)"
 [ "$BP_GA_AFTER" = "$BP_GA_BEFORE" ] || fail "case a: GATE run park time moved across the restart ($BP_GA_BEFORE -> $BP_GA_AFTER) — a stale requeue fired inside the boot grace"
 pass "case a: boot grace held — both runs read their ORIGINAL status, no requeue, no provenance, gate park time unchanged ($BP_GA_BEFORE)"
 cancel_run "$EA"; cancel_run "$GA"
+wait_runs_terminal_off_worker 60 "$EA" "$GA"
 
 # =============================================================================
 # CASE (c) — silent execution loss (missing path) + no sibling steal + one reclaim (M2b/M3).
@@ -314,6 +328,7 @@ GEN_X1="$(run_field "$X" claim_generation)"
 [ "$GEN_X1" = "$((GEN_X0 + 1))" ] || fail "case c: reclaim did not advance the generation by exactly one ($GEN_X0 -> $GEN_X1)"
 pass "case c: first worker's claim loop reclaimed X exactly once — generation $GEN_X0 -> $GEN_X1"
 cancel_run "$X"
+wait_runs_terminal_off_worker 60 "$X"
 
 # =============================================================================
 # CASE (d) — api ROLLBACK simulation (proves D7). Restart the api with
@@ -368,9 +383,13 @@ unset UZI_ACTIVE_SNAPSHOT_DISABLED UZI_E2E_MAX_CONCURRENT_RUNS UZI_E2E_DROP_ON_S
 "${COMPOSE[@]}" up -d --wait --no-deps --force-recreate api >/dev/null
 wait_http
 login
+# The rollback fallback cleared negotiated features. Observe cancellation before
+# restarting the worker, then let its new register re-enable the empty snapshot.
+wait_status "$ED" cancelled 60
 RA_RESTORE_AT="$(date -u +%Y-%m-%dT%H:%M:%SZ)"
 "${COMPOSE[@]}" up -d --no-deps --force-recreate agent >/dev/null
 wait_worker_online
+wait_runs_terminal_off_worker 60 "$ED"
 pass "api + agent recreated back to their defaults"
 
 # Best-effort cleanup of any run this phase left non-terminal (a cancel of a terminal run is a

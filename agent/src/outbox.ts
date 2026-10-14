@@ -202,6 +202,8 @@ export interface PendingTerminal {
   blocked: boolean;
   blocked_reason?: TerminalBlockedReason;
   since: number;
+  /** Process-local exact journal observation, never persisted or deletion authority. */
+  server_settled?: boolean;
 }
 
 /** PRD #1391 M3b: a pending terminal journal's durable payload, returned by
@@ -1457,6 +1459,7 @@ export class Outbox {
           claim_generation: t.claimGeneration,
           phase: t.phaseAtJournal,
           blocked: t.blocked,
+          ...(!this.disabled && this.terminalRetirementIdentities.get(t)?.serverSettled === true ? { server_settled: true } : {}),
           ...(t.blockedReason !== undefined ? { blocked_reason: t.blockedReason } : {}),
           since: t.since,
         });
@@ -1485,6 +1488,7 @@ export class Outbox {
       if (observation.kind === "absent") {
         // "absent" also covers ENOENT from ancestry inspection; re-prove it before dropping bookkeeping.
         if (!pending || !await this.terminalPositivelyAbsent(runId, fileName)) return false;
+        this.terminalRetirementIdentities.delete(pending);
         terminals?.delete(claimGeneration);
         return true;
       }
@@ -1495,6 +1499,7 @@ export class Outbox {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT" ||
             !await this.terminalPositivelyAbsent(runId, fileName)) return false;
       }
+      if (pending) this.terminalRetirementIdentities.delete(pending);
       terminals?.delete(claimGeneration);
       return true;
     });
@@ -1596,6 +1601,7 @@ export class Outbox {
       await fs
         .rm(path.join(this.runDir(runId), rs.terminals.get(claimGeneration)!.fileName), { force: true })
         .catch(() => undefined);
+      this.terminalRetirementIdentities.delete(rs.terminals.get(claimGeneration)!);
       rs.terminals.delete(claimGeneration);
       // Reuse the message path's staleRetired mechanism (D11): a durable, monotone per-run count.
       // A terminal outcome is one "frame" lost, so the counter advances by one; installManifest
@@ -1679,7 +1685,25 @@ export class Outbox {
 
   private readonly authenticatedLifetimes = new WeakMap<object, string>();
   private readonly authenticatedFileVersions = new WeakMap<object, string>();
-  private readonly terminalRetirementIdentities = new WeakMap<object, { identity: Readonly<object>; payload: string; lifetime: string }>();
+  private readonly terminalRetirementIdentities = new WeakMap<object, {
+    identity: Readonly<object>; payload: string; lifetime: string; serverSettled?: boolean;
+  }>();
+
+  /** A terminal reply settles admission only for the authenticated journal sent. */
+  async markTerminalServerSettled(runId: string, generation: number, context?: ReportRetirementContext): Promise<void> {
+    if (this.disabled || !context?.expectedIdentity) return;
+    await this.withRunLock(runId, async () => {
+      const meta = this.runs.get(runId)?.terminals.get(generation);
+      const binding = meta && this.terminalRetirementIdentities.get(meta);
+      if (!meta || !binding || binding.identity !== context.expectedIdentity) return;
+      const parsed = await this.readTerminalAuthed(runId, generation, undefined, context);
+      if (!parsed || this.terminalRetirementIdentities.get(meta) !== binding ||
+          this.authenticatedLifetimes.get(parsed) !== binding.lifetime || terminalRetirementPayload(parsed) !== binding.payload ||
+          this.runs.get(runId)?.terminals.get(generation) !== meta || context.signal?.aborted ||
+          (context.deadline !== undefined && Date.now() >= context.deadline) || context.eligible?.() === false) return;
+      binding.serverSettled = true;
+    }, context.signal);
+  }
 
   /** Report-only unlink: no asynchronous proof callback runs under O. Once unlink starts,
    * its actual settlement owns O, even when the caller deadline expires. */
@@ -1697,6 +1721,7 @@ export class Outbox {
       const file = path.join(this.runDir(runId), meta.fileName);
       if (!await this.installedLifetimeMatches(file, binding.lifetime, context, this.authenticatedFileVersions.get(parsed)) || context.eligible?.() === false) return false;
       await fs.unlink(file);
+      this.terminalRetirementIdentities.delete(meta);
       this.runs.get(runId)?.terminals.delete(generation);
       return true;
     }, context.signal);
@@ -2273,6 +2298,11 @@ export class Outbox {
       observation.kind = code === "ENOENT" ? "absent" : code === "ELOOP" ? "symlink" : "unreadable";
       return result;
     } finally {
+      if (observation.kind !== "authenticated" && generation !== undefined) {
+        const meta = this.runs.get(runId)?.terminals.get(generation);
+        const binding = meta?.fileName === fileName && this.terminalRetirementIdentities.get(meta);
+        if (binding) binding.serverSettled = false;
+      }
       if (fh) await fh.close();
     }
   }

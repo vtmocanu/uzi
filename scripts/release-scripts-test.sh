@@ -28,6 +28,7 @@
 # --shipping-paths-only runs the #1466 regressions without the full release suite.
 # --identity-only [oracle-path] runs identity fixtures, optionally against a frozen oracle.
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
+# --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -44,6 +45,8 @@ ORACLE="$SCRIPTS_DIR/assert-changelog-covers-release.sh"
 GHCR_BASELINE="${GHCR_BASELINE_VERIFY:-}"
 [ "${1:-}" != "--ghcr-only" ] || GHCR_BASELINE="${GHCR_BASELINE_VERIFY:-${2:-}}"
 SECTION="$SCRIPTS_DIR/changelog-section.sh"
+bash "$SCRIPTS_DIR/changelog-rc-bullets.test.sh" "$SECTION" || exit 1
+[ "${1:-}" != "--frozen-rc-only" ] || exit 0
 
 for s in "$ORACLE" "$SECTION"; do
   [ -x "$s" ] || { echo "release-scripts-test: $s not found/executable" >&2; exit 2; }
@@ -567,6 +570,7 @@ seed_repo() {
   cp "$SCRIPTS_DIR/lib/shipping-paths.sh" "$d/scripts/lib/shipping-paths.sh"
   cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
+  cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
   cat > "$d/deploy/chart/Chart.yaml" <<'YAML'
 apiVersion: v2
@@ -774,9 +778,24 @@ ghcr_cut_seed() {
   git -C "$d" tag v0.1.1
   if [ "$mode" = promote ] || [ "$mode" = skip-promote ] || [ "$mode" = promote-only ]; then
     # A published RC with a tag-tree pin distinct from the current HEAD pin.
+    # Publication requires its changelog section and normalized links in the tag.
+    cat > "$d/CHANGELOG.md" <<'MD'
+# Changelog
+
+## [Unreleased]
+
+## [0.2.0] - 2026-10-01
+### Added
+- Initial RC (#100)
+
+## [0.1.0] - 2026-09-01
+### Added
+- Initial (#100)
+MD
+    (cd "$d" && UZI_CHANGELOG_REPO_URL=https://github.com/vtmocanu/uzi bash scripts/changelog-links.sh)
     sed 's/0.1.0/0.2.0-rc.1/g' "$d/deploy/chart/Chart.yaml" > "$d/chart.tmp"
     mv "$d/chart.tmp" "$d/deploy/chart/Chart.yaml"
-    git -C "$d" add deploy/chart/Chart.yaml
+    git -C "$d" add deploy/chart/Chart.yaml CHANGELOG.md
     gcommit "$d" "chore(release): v0.2.0-rc.1"
     git -C "$d" tag v0.2.0-rc.1
     add_origin "$d"; push_tag_to_origin "$d" v0.2.0-rc.1
@@ -822,6 +841,7 @@ MD
          skip && /^## \[/ {skip=0}
          !skip {print}' "$d/CHANGELOG.md" > "$d/changelog.tmp"
     mv "$d/changelog.tmp" "$d/CHANGELOG.md"
+    (cd "$d" && UZI_CHANGELOG_REPO_URL=https://github.com/vtmocanu/uzi bash scripts/changelog-links.sh)
     git -C "$d" add CHANGELOG.md
     sed 's/0.1.0/0.2.0-rc.1/g' "$d/deploy/chart/Chart.yaml" > "$d/chart.tmp"
     mv "$d/chart.tmp" "$d/deploy/chart/Chart.yaml"
@@ -1874,14 +1894,27 @@ assert_contains "dependency merge: bullet cites #300" "#300" "$(dep_bullet "$SDA
 assert_eq "dependency merge: bullet sits under [0.2.0] ### Changed" "### Changed" \
   "$(awk '/^## \[0\.2\.0\]/{s=1;next} s&&/^## \[/{exit} s&&/^### /{h=$0} s&&/^- \*\*Routine dependency updates/{print h; exit}' "$SDA/CHANGELOG.md")"
 
-# The next candidate adds a Dockerfile digest bump: the existing bullet is extended.
+# The next candidate adds a Dockerfile digest bump: the shipped bullet stays frozen.
 git -C "$SDA" tag v0.2.0-rc.1
 add_dep "$SDA" agent/src/Dockerfile "chore(deps): update node digest to abc123 (#302)"
 run_rc "$SDA" 0.2.0
 assert_eq "next RC with a new dependency merge exits 0" "0" "$RC_RC"
-assert_eq "next RC extends the bullet instead of adding one" "1" "$(dep_bullets "$SDA")"
-assert_contains "extended bullet still cites #300" "#300" "$(dep_bullet "$SDA")"
-assert_contains "extended bullet cites #302" "#302" "$(dep_bullet "$SDA")"
+assert_eq "next RC appends a fresh bullet instead of editing the shipped one" "2" "$(dep_bullets "$SDA")"
+assert_contains "original bullet still cites #300" "#300" "$(dep_bullet "$SDA")"
+assert_contains "new bullet cites #302" "#302" "$(dep_bullet "$SDA")"
+# Exercise the release-cut hook itself, not only the standalone block checker.
+git -C "$SDA" tag v0.2.0-rc.2
+frozen_head="$(git -C "$SDA" rev-parse HEAD)"
+awk '{sub(/Dependency manifest and image bumps/, "Edited dependency work"); print}' "$SDA/CHANGELOG.md" > "$SDA/changed.md"
+mv "$SDA/changed.md" "$SDA/CHANGELOG.md"
+git -C "$SDA" add CHANGELOG.md
+gcommit "$SDA" "docs: edit a shipped bullet"
+before_rejected_cut="$(git -C "$SDA" rev-parse HEAD)"
+run_rc "$SDA" 0.2.0
+assert_eq "release cut rejects an edited shipped dependency block" "3" "$RC_RC"
+assert_contains "release cut names the frozen block failure" "frozen published RC bullet" "$RC_OUT"
+assert_eq "rejected frozen-block cut makes no commit" "$before_rejected_cut" "$(git -C "$SDA" rev-parse HEAD)"
+git -C "$SDA" reset -q --hard "$frozen_head"
 
 # A dependency-only window: [Unreleased] is empty, yet the cut has something to release.
 SDB="$(mktemp -d)"; seed_repo "$SDB"

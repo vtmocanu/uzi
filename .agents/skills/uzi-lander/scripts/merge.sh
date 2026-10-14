@@ -4,7 +4,8 @@
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
 # Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--expect-closes N[,N...]|none] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
-#   --expect-head   the head you reviewed/watched; a different current head refuses (exit 8)
+#   --expect-head   reviewed full SHA or unique hex prefix (7+); resolve prefixes on the forge
+#                   before comparing; a different current head refuses (exit 8)
 #                   so a push that landed after your last look is never merged unseen. The
 #                   merge itself passes --match-head-commit, so a push in the window between
 #                   the preflight and the merge is refused by GitHub as well.
@@ -56,7 +57,10 @@
 #   9  the merge command returned but the PR is not MERGED (auto-merge deferred / async
 #      mergeability lag) — poll `gh pr view --json state` yourself before the CI watch
 #  10  a `chore(release):` commit's CI is still running on main: merging now would supersede
-#      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run
+#      it and force the release to re-cut. Wait for it (or ask its releaser), then re-run.
+#      Exception, each run decided and named on its own: allowed when its tag is already on
+#      origin at that commit AND release-ci-coverage.py reports the tag covered without the run
+#      (see release_run_unneeded); any error or unknown keeps the refusal
 #  11  closing references differ from --expect-closes: fix the PR body (drop the closing
 #      keyword, e.g. reword "does not close #N" to "Refs #N"), then re-run
 set -uo pipefail
@@ -132,8 +136,22 @@ if [ "$CONFIRM_ONLY" -eq 1 ]; then
 fi
 
 [ "$state" = "OPEN" ] || { echo "PR #$PR is $state"; exit 3; }
-if [ -n "$EXPECT" ] && ! printf '%s' "$head" | grep -q "^$EXPECT"; then
-  echo "HEAD MISMATCH: current ${head:0:8}, expected ${EXPECT:0:8} — a push landed after your last look; re-review"; exit 8
+if [ -n "$EXPECT" ]; then
+  if ! [[ "$EXPECT" =~ ^[[:xdigit:]]{7,40}$ ]]; then
+    echo "bad --expect-head: require a full SHA or hex prefix of at least 7 characters" >&2; exit 2
+  fi
+  EXPECT=$(printf '%s' "$EXPECT" | tr 'ABCDEF' 'abcdef')
+  if [ "${#EXPECT}" -lt 40 ]; then
+    prefix=$EXPECT
+    EXPECT=$(gh api "repos/$REPO/commits/$prefix" --jq .sha 2>/dev/null) \
+      || { echo "cannot resolve --expect-head prefix $prefix uniquely; current $head; not merging" >&2; exit 3; }
+    if ! [[ "$EXPECT" =~ ^[0-9a-f]{40}$ ]] || [[ "$EXPECT" != "$prefix"* ]]; then
+      echo "invalid resolved --expect-head for $prefix; current $head; not merging" >&2; exit 3
+    fi
+  fi
+  if [ "$head" != "$EXPECT" ]; then
+    echo "HEAD MISMATCH: current $head, expected $EXPECT; a push landed after your last look; re-review"; exit 8
+  fi
 fi
 echo "head=${head:0:8} mergeable=$mg mergeStateStatus=$ms"
 
@@ -269,6 +287,39 @@ if [ "$(printf '%s' "$blk" | jq 'length')" -gt 0 ]; then
   exit 5
 fi
 
+# A release commit's own main CI is NOT needed once its tag is on origin: release.yml proves
+# coverage with `release-ci-coverage.py coverage <sha>`, which accepts a metadata-only release
+# commit on its green parent (at most two hops) and counts a cancelled run as absent. So an
+# in-flight run is safe to supersede only when (a) its title names the release tag, (b) that tag
+# already exists on origin and peels to exactly this run's commit (a cut still awaiting its CI
+# has no tag yet), and (c) the coverage script, run the way the release scripts run it (read-only,
+# --wait 0, no --tag so the unverified-hotfix exception never counts), reports success. A pending
+# run is never evidence in that script, so success means coverage holds without it. Prints the
+# rule that decided; returns 0 only when allowed. Any error or unknown state returns 1.
+release_run_unneeded() {  # $1 = run head sha, $2 = run title
+  local sha=$1 title=$2 tag ref typ osha root out
+  [ -n "$sha" ] || { echo "run has no head sha"; return 1; }
+  tag=$(printf '%s' "$title" | sed -nE 's/^chore\(release\): (v(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)\.(0|[1-9][0-9]*)(-rc\.[1-9][0-9]*)?)([^0-9A-Za-z.-].*)?$/\1/p')
+  [ -n "$tag" ] || { echo "title names no release tag"; return 1; }
+  ref=$(gh api "repos/$REPO/git/ref/tags/$tag" 2>/dev/null) || { echo "tag $tag is not on origin (a cut still awaiting its CI) or unreadable"; return 1; }
+  typ=$(printf '%s' "$ref" | jq -r '.object.type // empty' 2>/dev/null); osha=$(printf '%s' "$ref" | jq -r '.object.sha // empty' 2>/dev/null)
+  if [ "$typ" = tag ] && [ -n "$osha" ]; then
+    ref=$(gh api "repos/$REPO/git/tags/$osha" 2>/dev/null) || { echo "annotated tag $tag object unreadable"; return 1; }
+    typ=$(printf '%s' "$ref" | jq -r '.object.type // empty' 2>/dev/null); osha=$(printf '%s' "$ref" | jq -r '.object.sha // empty' 2>/dev/null)
+  fi
+  [ "$typ" = commit ] && [ "$osha" = "$sha" ] || { echo "tag $tag does not point at this run's commit"; return 1; }
+  root=$(git -C "$HERE" rev-parse --show-toplevel 2>/dev/null) && [ -f "$root/scripts/release-ci-coverage.py" ] \
+    || { echo "release-ci-coverage.py not found next to this checkout"; return 1; }
+  git -C "$root" cat-file -e "$sha^{commit}" 2>/dev/null || git -C "$root" fetch -q origin "$sha" 2>/dev/null \
+    || { echo "commit ${sha:0:8} not available locally"; return 1; }
+  if out=$(cd "$root" && python3 -I scripts/release-ci-coverage.py coverage "$sha" --repo "$REPO" --wait 0 2>&1); then
+    echo "tag $tag is on origin at ${sha:0:8} and release-ci-coverage reports its coverage satisfied without this run"
+    return 0
+  fi
+  echo "release-ci-coverage does not report coverage for $tag without this run ($(printf '%s' "$out" | tail -1 | cut -c1-160))"
+  return 1
+}
+
 # ---- a release cut waiting on main CI — FAIL CLOSED -----------------------------------------
 # A merge supersedes main's in-flight runs (concurrency), so landing while a
 # `chore(release):` commit's CI runs cancels it and forces the release to re-cut (exit 10).
@@ -292,14 +343,27 @@ for st in queued in_progress waiting requested pending; do
     | map(if type == "object" and (.status|type) == "string" and (.display_title|type) == "string"
             and (.head_sha|type) == "string" and (.id|type) == "number" then . else error("record") end)
     | [.[] | select(.status != "completed" and (.display_title|startswith("chore(release):")))
-        | "\(.name // "?") #\(.id) \(.head_sha[0:8]) \(.display_title)"] | join("\n")' 2>/dev/null) \
+        | "\(.head_sha)\t\(.name // "?") #\(.id) \(.head_sha[0:8])\t\(.display_title)"] | join("\n")' 2>/dev/null) \
     || { echo "cannot parse main's $st workflow runs; not merging"; exit 2; }
   [ -n "$hit" ] && rel="${rel:+$rel
 }$hit"
 done
 if [ -n "$rel" ]; then
-  printf '%s\n' "$rel" | sed 's/^/  in flight on main: /'
-  echo "a release cut is waiting on main CI; wait for it (or ask its releaser), then re-run"; exit 10
+  blocked=""
+  while IFS=$'\t' read -r rsha rdesc rtitle; do
+    [ -n "$rsha" ] || continue
+    if why=$(release_run_unneeded "$rsha" "$rtitle"); then
+      echo "  release run $rdesc allowed: $why"
+    else
+      echo "  release run $rdesc refused: $why"
+      blocked="${blocked:+$blocked
+}$rdesc $rtitle"
+    fi
+  done <<< "$rel"
+  if [ -n "$blocked" ]; then
+    printf '%s\n' "$blocked" | sed 's/^/  in flight on main: /'
+    echo "a release cut is waiting on main CI; wait for it (or ask its releaser), then re-run"; exit 10
+  fi
 fi
 
 # ---- merge lock (repo-wide, 10-min TTL) ----------------------------------------------------

@@ -11,9 +11,88 @@ import { RecoveryCoordinator, canonicalJson, type InventorySourceBoundaryContext
 import { createHash, createHmac } from "node:crypto";
 import { GitCache, RecoveryBundleTooLargeError, type OwedCandidate, type PositiveOwedCandidateContext } from "../src/git.js";
 import { nullLogger, testGitCacheOptions } from "./helpers.js";
+import { buildRecoveryLiveTiming } from "../src/main.js";
 
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
+
+it("stub redrive wiring recaptures stale inventory and FINALs within the receipt window", async () => {
+  const f = await fixture(true);
+  try {
+    f.state.finalError = new Error("API cut");
+    f.state.sourceRefused = true;
+    f.state.diagnostic = { check: "execution_tail_present" };
+    const old = await f.freeze();
+    assert.ok(old);
+    await f.capture(old);
+    f.state.sourceRefused = false;
+    f.state.candidates.push({ sha: H2, pinRef: "refs/owed/new-work", contexts: [f.context] });
+    f.state.ancestors.add(H2);
+    const uploaded = (await f.coordinator.inspect("run-1"))[0]!;
+    await f.coordinator.resumePending(undefined, [uploaded]);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.reason, "inventory_snapshot_changed");
+    Object.assign(f.git, { recoveryRoot: path.join(f.root, "journal") });
+    const runner = new RunRunner(f.client as never, f.git as never,
+      () => { throw new Error("unreached executor"); }, f.log, 20, "local-worker-fixture", {
+        now: () => f.state.now,
+        recoveryLiveTiming: buildRecoveryLiveTiming("stub", f.log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }),
+      });
+    await runner.resumeLiveRecoveries(f.state.now);
+    const recovery = (runner as unknown as { recovery: RecoveryCoordinator }).recovery;
+    const fresh = (await recovery.inspect("run-1")).find(r => r.captureId !== old.captureId && r.state === "uploaded");
+    assert.ok(fresh, "live discovery must recapture the changed inventory");
+    assert.notEqual(fresh.coverageDigest, old.coverageDigest);
+    assert.equal(fresh.finalAcknowledged, undefined, "cut still prevents FINAL");
+    f.state.finalError = undefined;
+    f.state.closeOnRelease = true;
+    f.state.now += 5_000;
+    await runner.resumeLiveRecoveries(f.state.now);
+    assert.ok((await recovery.inspect("run-1")).some(r => r.captureId === fresh.captureId && r.finalAcknowledged),
+      "next bounded pass must FINAL the fresh capture, not wait on production backoff");
+    assert.equal(f.state.open, false);
+    assert.equal(f.state.uploads, 2);
+  } finally { await f.close(); }
+});
+
+it("pending-report ACK cleanup leaves every live-pass slot available for a fresh FINAL", async t => {
+  const f = await fixture();
+  try {
+    const pending = new Set<string>();
+    for (const runId of ["ack-1", "ack-2", "ack-3", "ack-4", "fresh"]) {
+      const context = { ...f.context, runId };
+      f.state.candidates = [{ sha: H, pinRef: `refs/owed/${runId}`, contexts: [context] }];
+      await f.coordinator.pin({ runId, generation: 7, kind: "issue", branch: "task", sourceSha: H, inventoryGuarded: true });
+      const record = await f.coordinator.freezeInventory({ context, currentSha: H, defaultBranch: "main" });
+      assert.ok(record);
+      if (runId === "fresh") f.state.finalError = new Error("FINAL transport unavailable");
+      await f.capture(record);
+      if (runId !== "fresh") {
+        pending.add(runId);
+        assert.ok((await f.coordinator.inspect(runId)).some(r => r.finalAcknowledged));
+      }
+    }
+    f.state.finalError = undefined;
+    f.state.candidates = [];
+    Object.assign(f.git, { cleanupRecoveryGeneration: async () => "removed" });
+    const live = f.make(false, (runId, generation) => generation === 7 && pending.has(runId));
+    // Pin the queue order independently of filesystem directory enumeration.
+    // Every returned record still comes from the real authenticated journal reader.
+    const snapshot = live.snapshotBootRecords.bind(live);
+    t.mock.method(live, "snapshotBootRecords", async () => (await snapshot())
+      .sort((a, b) => Number(a.runId === "fresh") - Number(b.runId === "fresh")));
+    const before = f.finals.length;
+    await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+    assert.equal(f.finals.length, before + 1, "fresh FINAL must run in the first pass, ahead of four deferred ACKs");
+    for (const runId of pending) assert.ok((await live.inspect(runId)).some(r => r.finalAcknowledged),
+      "pending report retains its authenticated ACK");
+    pending.clear();
+    f.state.now += 30_000;
+    await live.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+    for (const runId of ["ack-1", "ack-2", "ack-3", "ack-4"]) assert.deepEqual(await live.inspect(runId), [],
+      "report retirement makes deferred cleanup eligible again");
+    assert.equal(f.finals.length, before + 1, "cleanup does not replay acknowledged FINALs");
+  } finally { await f.close(); }
+});
 
 for (const failure of ["none", "bundle", "ack", "pins", "unreadable", "foreign", "uncovered", "attacker-path"] as const) {
   it(`M2 checked cleanup retains authority on ${failure} and retries without upload`, async t => {
@@ -822,12 +901,13 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   log.warn = (message, fields) => {
     if (message === "recovery: inventory source boundary retained") logs.push(fields!);
   };
-  const make = (sourceBoundary: boolean | "runner" = false) => {
+  const make = (sourceBoundary: boolean | "runner" = false,
+    pendingGenerationReport?: (runId: string, generation: number) => boolean) => {
     let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
       action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
     const coordinator = new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
-    log, client: client as never, git: git as never, now: () => state.now,
+    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport,
     withInventorySourceBoundary: sourceBoundary === "runner" ? (context, action) =>
       physical.withInventorySourceBoundary(context, action) : sourceBoundary ? async (context, action) => {
       if (state.sourceRefused) {

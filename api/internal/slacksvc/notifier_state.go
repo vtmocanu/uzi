@@ -17,6 +17,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
@@ -820,6 +821,17 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 		return nil, false
 	}
 
+	switch slackHumanStopReason(rc) {
+	case "cancelled":
+		return cancelledThreadBlocks(linkElem), fmt.Sprintf("Cancelled · %s#%d", repo, iid(rc.IssueIid)), true
+	case "plan_rejected":
+		blocks = []slack.Block{threadSectionBlock("🚫 *Stopped (plan rejected)*")}
+		if el, has := linkElem(); has {
+			blocks = append(blocks, slack.NewContextBlock("slack_thread_plan_rejected_ctx", el))
+		}
+		return blocks, fmt.Sprintf("Stopped (plan rejected) · %s#%d", repo, iid(rc.IssueIid)), true
+	}
+
 	switch rc.Status {
 	case "completed":
 		// PRD #634 (surface-only): a run that completed because an operator scope
@@ -855,9 +867,6 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 
 	case "failed":
 		reason := strings.TrimSpace(rc.FailureReason.String)
-		if reason == "run cancelled" {
-			return cancelledThreadBlocks(linkElem), fmt.Sprintf("Cancelled · %s#%d", repo, iid(rc.IssueIid)), true
-		}
 		// issue #1418: a failed run whose committed work is human-landable reads
 		// "❌ *Failed — needs landing*", mirroring the completed arm's scope-capped suffix.
 		// unrecoverable/none fail exactly as before (plain "Failed").
@@ -878,9 +887,6 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 			blocks = append(blocks, slack.NewContextBlock("slack_thread_failed_ctx", el))
 		}
 		return blocks, fallback, true
-
-	case "cancelled":
-		return cancelledThreadBlocks(linkElem), fmt.Sprintf("Cancelled · %s#%d", repo, iid(rc.IssueIid)), true
 
 	case "limit_wait":
 		// The ONE non-terminal case, ruled rather than accidental. The reasoning and the
@@ -940,8 +946,8 @@ func renderThreadBlocks(rc store.GetSlackRunContextRow, base string) (blocks []s
 	}
 }
 
-// cancelledThreadBlocks is the shared shape for both cancellation paths — a `failed`
-// row whose reason is the sentinel "run cancelled", and a genuine `cancelled` status.
+// cancelledThreadBlocks is the shared shape for a failed row stamped cancelled
+// and a genuine cancelled status.
 // A single 🚫 section plus the run deep link (when a base URL resolves).
 func cancelledThreadBlocks(linkElem func() (slack.MixedElement, bool)) []slack.Block {
 	blocks := []slack.Block{threadSectionBlock("🚫 *Cancelled*")}
@@ -1007,13 +1013,28 @@ func slackLandingState(rc store.GetSlackRunContextRow) string {
 	return workersvc.DeriveLandingState(fo, rc.HasPreservedPatch, rc.HasAvailableCapture)
 }
 
+// slackHumanStopReason converts nullable stop metadata for the shared classifier.
+func slackHumanStopReason(rc store.GetSlackRunContextRow) string {
+	stopKind := ""
+	if rc.StopKind.Valid {
+		stopKind = rc.StopKind.String
+	}
+	return runpresentation.HumanStopReason(rc.Status, stopKind)
+}
+
 // statusGlyph is the canonical (emoji, label) pair for a run's status on the root line
 // (PRD #268 M2). Every glyph is emoji-presentation so the DM reads consistently beside
 // the full-color ✅ ❌ 🚫. The MR ref is NOT inlined into the completed label — the MR
 // now rides the root's context block (mrContextElem) — and the milestone/health flags
-// live there too, not glued onto the label. A `failed` row whose reason is the sentinel
-// "run cancelled" reads as Cancelled, exactly as the old statusLabel special-cased it.
+// live there too, not glued onto the label. Human stops take precedence over
+// the needs-landing label and are classified by runpresentation.HumanStopReason.
 func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
+	switch slackHumanStopReason(rc) {
+	case "cancelled":
+		return "🚫", "Cancelled"
+	case "plan_rejected":
+		return "🚫", "Stopped (plan rejected)"
+	}
 	switch rc.Status {
 	case "queued":
 		return "⏳", "Queued"
@@ -1053,9 +1074,6 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 	case "completed":
 		return "✅", "Completed"
 	case "failed":
-		if strings.TrimSpace(rc.FailureReason.String) == "run cancelled" {
-			return "🚫", "Cancelled"
-		}
 		// issue #1418: name the "needs landing" bucket on the root/DM status line when the
 		// failed run's committed work is human-landable; keep the ❌ glyph. unrecoverable/none
 		// read as plain "Failed", exactly as before.
@@ -1063,8 +1081,6 @@ func statusGlyph(rc store.GetSlackRunContextRow) (emoji, label string) {
 			return "❌", "Failed — needs landing"
 		}
 		return "❌", "Failed"
-	case "cancelled":
-		return "🚫", "Cancelled"
 	default:
 		// An unknown enum keeps its raw string with no glyph, mirroring the old default
 		// arm — a byte-honest degrade rather than a fabricated emoji.

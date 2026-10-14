@@ -96,9 +96,8 @@ func renderRunDetail(p *uzicli.Printer, r apitypes.RunDTO) error {
 		{"TRIGGER", r.TriggerSource},
 		// RunDTO.IsRevising (issue #2760) is the server-derived "mid-revise replan" flag,
 		// so a re-planning run reads "revising" here instead of waiting on the owner.
-		// displayRunStatus (issue #1418) additionally reads "needs landing" for a failed run
-		// whose landing_state is needs_landing; every other status is unchanged.
-		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)},
+		// displayRunStatus resolves human stops before the needs_landing failure label.
+		{"STATUS", displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""))},
 		{"TITLE", runTitle(r)},
 		{"BRANCH", strOr(r.Branch, "-")},
 		{mrAbbrev(r.ForgeType), int64Or(r.MrIID, "-")},
@@ -873,8 +872,8 @@ func milestoneRows(r apitypes.RunDTO) [][]string {
 	return rows
 }
 
-// progressRow renders the PROGRESS row of `uzi run get` (PRD #2602), the CLI twin of the web
-// progress cell and the TUI board PROG column. It reads the server-derived RunDTO.Progress and
+// progressRow renders the PROGRESS row of `uzi run get` (PRD #2602), sharing progress
+// state semantics with the web and TUI surfaces. It reads server-derived RunDTO.Progress and
 // returns nil when it is absent (a terminal run, or an older server), so those runs render
 // byte-for-byte as before. Forms: `≈70% · milestone 3 of 3` (k is the active milestone's place
 // in the frozen order, else `N of M done`; the pct is clamped to 0..100), `stalled · since 16:41`
@@ -2265,7 +2264,7 @@ func codexAccountActionShort(r apitypes.RunDTO) string {
 // (PRD #1809) a data_volume_full park adds "(waiting for disk space)".
 // A run held on credential_disabled (PRD #1732 D14) gets "(credential disabled)" likewise.
 func runStatusCell(r apitypes.RunListItemDTO) string {
-	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState)
+	s := displayRunStatus(r.Status, r.IsPlanning, r.IsRevising, r.LandingState, strOr(r.StopKind, ""))
 	if isOwnerRequiredWorkerHold(r.RunDTO) {
 		return workerExhaustionLine(r.RunDTO)
 	}

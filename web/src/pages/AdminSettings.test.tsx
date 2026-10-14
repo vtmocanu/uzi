@@ -2,8 +2,10 @@
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import { useState } from "react";
 import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
-import { MemoryRouter } from "react-router-dom";
+import { Link, MemoryRouter, Route, Routes } from "react-router-dom";
 import { AdminSettings } from "./AdminSettings";
+import { AdminHealth } from "./AdminHealth";
+import { healthySilentDoc } from "../mocks/data/health";
 import { DockerAllowlistCard } from "./adminSettings/DockerAllowlistCard";
 import { api, ApiError } from "../lib/api";
 import { setDemoMode } from "../lib/demoMode";
@@ -16,6 +18,8 @@ vi.mock("../lib/api", async (importActual) => {
     ...actual,
     api: {
       getSettings: vi.fn(),
+      getAdminHealth: vi.fn(),
+      adminListWorkers: vi.fn(),
       updateSettings: vi.fn(),
       vaultMigration: vi.fn(),
       adminListDockerAllowlistRepos: vi.fn(),
@@ -34,6 +38,7 @@ vi.mock("../lib/api", async (importActual) => {
 vi.mock("../auth/AuthContext", () => ({ useAuth: () => ({ refresh: vi.fn().mockResolvedValue(undefined) }) }));
 
 const mockApi = vi.mocked(api);
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
 
 // A full AppSettings fixture; tests override the fields they exercise.
 const settings = (over: Partial<import("../lib/api").AppSettings> = {}) => ({
@@ -190,6 +195,8 @@ const releaseCheck = (
 
 beforeEach(() => {
   mockApi.getSettings.mockResolvedValue(response());
+  mockApi.getAdminHealth.mockResolvedValue(healthySilentDoc());
+  mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
   mockApi.getReleaseCheck.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.checkReleaseNow.mockResolvedValue({ release_check: releaseCheck() });
   mockApi.vaultMigration.mockResolvedValue({ master_sealed: 0 });
@@ -219,6 +226,9 @@ beforeEach(() => {
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.restoreAllMocks();
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 function renderPage() {
@@ -231,6 +241,51 @@ function renderPage() {
 
 const input = (name: string) => screen.getByLabelText(name) as HTMLInputElement;
 const saveButton = () => screen.getByRole("button", { name: /save settings/i }) as HTMLButtonElement;
+
+describe("agent-source Health navigation", () => {
+  it("uses a fixed internal link and scrolls after deferred settings load and later fragment changes", async () => {
+    const doc = healthySilentDoc();
+    const check = doc.checks.find((c) => c.id === "agentsource.update")!;
+    check.severity = "warn";
+    check.action = "Untrusted action https://example.com/#arbitrary";
+    doc.counts = { ok: 20, warn: 1, danger: 0, unknown: 0, na: 0 };
+    mockApi.getAdminHealth.mockResolvedValue(doc);
+    let resolveSettings!: (value: ReturnType<typeof response>) => void;
+    mockApi.getSettings.mockReturnValue(new Promise((resolve) => { resolveSettings = resolve; }));
+    const scroll = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { configurable: true, value: scroll });
+    render(
+      <MemoryRouter initialEntries={["/admin/health"]}>
+        <Link to="/admin/settings#other">Other fragment</Link>
+        <Link to="/admin/settings#agent-source">Source fragment</Link>
+        <Routes>
+          <Route path="/admin/health" element={<AdminHealth />} />
+          <Route path="/admin/settings" element={<AdminSettings />} />
+        </Routes>
+      </MemoryRouter>,
+    );
+    const link = await screen.findByRole("link", { name: "Review agent source updates" });
+    expect(link.getAttribute("href")).toBe("/admin/settings#agent-source");
+    fireEvent.click(link);
+    await waitFor(() => expect(mockApi.getSettings).toHaveBeenCalledTimes(1));
+    expect(document.getElementById("agent-source")).toBeNull();
+    expect(mockApi.getAgentSource).not.toHaveBeenCalled();
+    scroll.mockClear();
+    await act(async () => { resolveSettings(response()); });
+    await waitFor(() => expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1));
+    const section = document.getElementById("agent-source")!;
+    expect(section).toBeTruthy();
+    expect(scroll.mock.contexts).toContain(section);
+    expect(scroll).toHaveBeenCalledWith({ block: "start" });
+    await within(section).findByRole("heading", { name: /Agent source/ });
+    scroll.mockClear();
+    fireEvent.click(screen.getByRole("link", { name: "Other fragment" }));
+    expect(scroll).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("link", { name: "Source fragment" }));
+    await waitFor(() => expect(scroll.mock.contexts).toContain(section));
+    expect(mockApi.getSettings).toHaveBeenCalledTimes(1);
+  });
+});
 
 describe("AdminSettings — vault migration (PRD #32)", () => {
   it("hides the migration notice when nothing is master-sealed", async () => {

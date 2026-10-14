@@ -526,115 +526,81 @@ describe("Dashboard usage cards (PRD #40)", () => {
   });
 });
 
-// PRD #35 (web-ux F2). `!isTerminalRun` was doing duty as "actively working", which was
-// harmless while every non-terminal status resolved in minutes. `limit_wait` is the
-// first that lasts HOURS by design, so the hint became a claim that is simply false.
-describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
+// Active means every non-terminal run; the hint separates execution, owner
+// input, queued work and holds without changing the tile's total.
+describe("Dashboard active run breakdown", () => {
   const flush = async () => {
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 0));
-    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
   };
 
-  it("keeps the old copy exactly when nothing is parked", () => {
-    // The regression guard. A factory with no parked run must read as it always did —
-    // this change is meant to be invisible until it has something to say.
-    return (async () => {
-      mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "running" }), aRun({ id: "r2", status: "queued" })] });
-      renderDashboard();
-      await flush();
-      expect(screen.getByText("agents at work")).toBeTruthy();
-    })();
-  });
-
-  it("🔴 splits the hint when a run is parked, rather than calling it work", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "queued" }),
-        aRun({ id: "r3", status: "limit_wait" }),
-      ],
-    });
+  it("shows a mixed breakdown in state order while counting every active run", async () => {
+    // Deliberately interleave buckets; the hint order must not follow API ordering.
+    mockApi.listRuns.mockResolvedValue({ runs: [
+      aRun({ id: "paused", status: "paused" }),
+      aRun({ id: "queued", status: "queued" }),
+      aRun({ id: "input", status: "awaiting_input" }),
+      aRun({ id: "running", status: "running" }),
+      aRun({ id: "followup", status: "awaiting_followup" }),
+      aRun({ id: "claimed", status: "claimed" }),
+      aRun({ id: "approval", status: "awaiting_approval" }),
+      aRun({ id: "recovery", status: "recovery_wait" }),
+      aRun({ id: "pool", status: "pool_wait" }),
+      aRun({ id: "limit", status: "limit_wait" }),
+      aRun({ id: "done", status: "completed" }),
+      aRun({ id: "failed", status: "failed" }),
+      aRun({ id: "cancelled", status: "cancelled" }),
+    ] });
     renderDashboard();
     await flush();
-    expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+    const tile = screen.getByText("Active runs").closest("a");
+    expect(tile).not.toBeNull();
+    expect(within(tile!).getByText("10")).toBeTruthy();
+    expect(within(tile!).getByText("1 running · 3 need you · 2 queued · 4 waiting to resume")).toBeTruthy();
   });
 
-  // Issue #754: pool_wait is the same kind of self-resuming hold as limit_wait, so it
-  // must NOT be counted as "at work" either. A pool hold is blocked on a pooled token,
-  // not on a usage limit, which is why the generalized copy reads "waiting to resume"
-  // rather than the limit-specific wording.
-  it("🔴 counts a pool_wait run as waiting-to-resume, not as work", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "queued" }),
-        aRun({ id: "r3", status: "pool_wait" }),
-      ],
-    });
+  it("shows only running when all three active runs are running", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun(), aRun({ id: "r2" }), aRun({ id: "r3" })] });
     renderDashboard();
     await flush();
-    expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
-    // The pool hold is a resource wait, never a usage-limit wait — the old copy would
-    // have been a lie about WHY it is parked.
-    expect(screen.queryByText(/waiting on a usage limit/)).toBeNull();
+    expect(screen.getByText("3 running")).toBeTruthy();
   });
 
-  // Issue #1197: recovery_wait is the same kind of self-resuming hold again — a
-  // transient-recovery park that auto-resumes on a capped backoff — so it must NOT be
-  // counted as "at work" either. Same generalized "waiting to resume" copy.
-  it("🔴 counts a recovery_wait run as waiting-to-resume, not as work", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "queued" }),
-        aRun({ id: "r3", status: "recovery_wait" }),
-      ],
-    });
+  it.each([
+    { count: 1, hint: "1 needs you" },
+    { count: 2, hint: "2 need you" },
+  ])("uses the correct owner-action wording for $count runs", async ({ count, hint }) => {
+    mockApi.listRuns.mockResolvedValue({ runs: Array.from({ length: count }, (_, i) =>
+      aRun({ id: `owner-${i}`, status: "awaiting_input" }),
+    ) });
     renderDashboard();
     await flush();
-    expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+    expect(screen.getByText(hint)).toBeTruthy();
   });
 
-  it("🔴 counts all three hold kinds together in the waiting bucket", async () => {
-    // The three self-resuming holds share one honest bucket; the working count drops by all.
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "limit_wait" }),
-        aRun({ id: "r3", status: "pool_wait" }),
-        aRun({ id: "r4", status: "recovery_wait" }),
-      ],
-    });
+  it.each([
+    ["awaiting_approval", "1 needs you"], ["awaiting_input", "1 needs you"],
+    ["awaiting_followup", "1 needs you"],
+    ["queued", "1 queued"], ["claimed", "1 queued"],
+    ["limit_wait", "1 waiting to resume"], ["pool_wait", "1 waiting to resume"],
+    ["recovery_wait", "1 waiting to resume"], ["paused", "1 waiting to resume"],
+  ] as const)("shows just the non-zero bucket for %s", async (status, hint) => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status })] });
     renderDashboard();
     await flush();
-    expect(screen.getByText("1 at work · 3 waiting to resume")).toBeTruthy();
+    expect(screen.getByText(hint)).toBeTruthy();
   });
 
-  it("🔴 still COUNTS the parked run — splitting the hint must not hide it", async () => {
-    // The opposite failure, and the reason this is a hint change rather than a filter:
-    // excluding parked runs from the tile would make them vanish from the one surface
-    // that says how much is in flight.
-    mockApi.listRuns.mockResolvedValue({
-      runs: [aRun({ status: "running" }), aRun({ id: "r3", status: "limit_wait" })],
-    });
-    const { container } = renderDashboard();
-    await flush();
-    expect(screen.getByText("Active runs")).toBeTruthy();
-    expect(container.textContent).toContain("1 at work · 1 waiting to resume");
-    // The tile's value is 2, not 1.
-    const tile = screen.getByText("Active runs").closest("a") ?? screen.getByText("Active runs").parentElement;
-    expect(tile?.textContent).toMatch(/2/);
-  });
-
-  it("reads 'nothing in flight' when every run is terminal", async () => {
-    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "completed" })] });
+  it.each([
+    { name: "empty", runs: [] },
+    { name: "only terminal", runs: [aRun({ status: "completed" }), aRun({ id: "failed", status: "failed" }), aRun({ id: "cancelled", status: "cancelled" })] },
+  ])("reads nothing in flight for $name runs", async ({ runs }) => {
+    mockApi.listRuns.mockResolvedValue({ runs });
     renderDashboard();
     await flush();
-    expect(screen.getByText("nothing in flight")).toBeTruthy();
+    const tile = screen.getByText("Active runs").closest("a");
+    expect(tile).not.toBeNull();
+    expect(within(tile!).getByText("0")).toBeTruthy();
+    expect(within(tile!).getByText("nothing in flight")).toBeTruthy();
   });
 });
 
@@ -724,6 +690,21 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
   const withStats = (over: Partial<Worker>): Worker =>
     aWorker({ stats_source: "cgroup", stats_mem_bytes: 1_000_000, ...over });
 
+  it("hides idle cross-checks while retaining active checks", async () => {
+    mockApi.listWorkers.mockResolvedValue({ workers: [
+      withStats({ id: "lane-idle", name: "idle-lane-worker", active_runs: 0, max_concurrent_runs: 1, active_cross_checks: 0, max_cross_check_slots: 1 }),
+      withStats({ id: "lane-active", name: "active-lane-worker", active_runs: 1, max_concurrent_runs: 1, active_cross_checks: 1, max_cross_check_slots: 1 }),
+    ] });
+    renderDashboard();
+    const idleRow = (await screen.findByText("idle-lane-worker")).closest("li");
+    const activeRow = (await screen.findByText("active-lane-worker")).closest("li");
+    expect(idleRow).not.toBeNull();
+    expect(activeRow).not.toBeNull();
+    expect(within(activeRow!).getByTitle("Running 1 of 1 cross-check slots")).toBeTruthy();
+    expect(within(idleRow!).getByText("0/1 runs")).toBeTruthy();
+    expect(within(idleRow!).queryByText("0/1 cross-checks")).toBeNull();
+  });
+
   it("shows separate cap-one badges and drains dedicated cross-checks", async () => {
     mockApi.listWorkers.mockResolvedValue({
       workers: [withStats({
@@ -735,7 +716,7 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     renderDashboard();
     await flush();
     expect(screen.getByText("Worker load")).toBeTruthy();
-    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-checks"));
+    expect(screen.getByText("1/1 runs")).not.toBe(screen.getByText("1/1 cross-check"));
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -748,7 +729,7 @@ describe("Dashboard Worker-load card surfaces the cordon badge (PRD #496)", () =
     });
     renderDashboard();
     await flush();
-    expect(screen.getByText("1/1 cross-checks")).toBeTruthy();
+    expect(screen.getByText("1/1 cross-check")).toBeTruthy();
     expect(screen.getByText("draining")).toBeTruthy();
   });
 
@@ -865,10 +846,9 @@ describe("Dashboard usage recency refresh (#2399)", () => {
   });
 });
 
-// PRD #2602 M1: the recent-runs row carries the server-derived Progress cell beside the
-// milestone badge; a row without `progress` (pre-feature server) renders no cell.
-describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
-  it("shows `70%` with a progressbar for a percent run and nothing for a run without progress", async () => {
+// The recent-runs row keeps milestone counts beside the running status estimate.
+describe("Dashboard recent-run status progress", () => {
+  it("shows server progress inside the running status pill and keeps an ordinary pill without an estimate", async () => {
     mockApi.listRuns.mockResolvedValue({
       runs: [
         aRun({
@@ -899,9 +879,12 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     const row = screen.getByText("Percent run").closest("li")!;
     const bar = within(row).getByRole("progressbar");
     expect(bar.getAttribute("aria-valuenow")).toBe("70");
-    expect(bar.textContent).toBe("70%");
-    // The cell sits in the raised badge cluster right after the M2/3 badge.
-    expect(bar.closest("[data-run-progress]")?.parentElement?.previousElementSibling?.textContent).toBe("M2/3");
+    expect(bar.getAttribute("aria-valuetext")).toBe("Running, about 70%; 2 of 3 milestones done");
+    // Milestone counts stay visible beside the status estimate at every width.
+    expect(within(row).getByText("M2/3")).toBeTruthy();
+    expect(bar.textContent).toBe("running · 70%");
+    expect(bar.closest(".hidden")).toBeNull();
+    expect(row.querySelector('[data-run-progress="percent"]')).toBeNull();
     const old = screen.getByText("Pre-feature run").closest("li")!;
     expect(old.querySelector("[data-run-progress]")).toBeNull();
   });
@@ -936,6 +919,44 @@ describe("Dashboard — recent-run Progress cell (PRD #2602)", () => {
     expect(cell.textContent).toContain("(looping)");
     const health = within(row).getByText(/^⚠ looping/);
     expect(health.parentElement?.className).toBe("contents sm:hidden");
+  });
+  it("the stalled cell ages on the page clock (useNow), not on a private Date.now()", async () => {
+    vi.useFakeTimers();
+    const T0 = Date.parse("2026-07-05T12:00:00Z");
+    vi.setSystemTime(T0);
+    mockApi.listRuns.mockResolvedValue({
+      runs: [
+        aRun({
+          id: "s",
+          issue_title: "Stalled run",
+          status: "running",
+          health: "stalled",
+          health_since: new Date(T0 - 5 * 60_000).toISOString(),
+          progress: { state: "stalled", pct: null, milestone_done: 1, milestone_total: 3, active_milestone_id: "b", phase: "" },
+        }),
+      ],
+    });
+    renderDashboard();
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(0);
+    });
+    const visible = () =>
+      screen.getByText("Stalled run").closest("li")!.querySelector('[data-run-progress="stalled"] [aria-hidden="true"]:not(:first-child)')!
+        .textContent;
+    expect(visible()).toBe(" · 5m");
+    // The wall clock jumps 10m, but the 30s useNow tick has not fired. The 10s poll re-renders
+    // the page, and the cell must still read the page clock.
+    vi.setSystemTime(T0 + 10 * 60_000);
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(10_000);
+    });
+    expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
+    expect(visible()).toBe(" · 5m");
+    // Once the 30s tick fires the page clock catches up.
+    await act(async () => {
+      await vi.advanceTimersByTimeAsync(20_000);
+    });
+    expect(visible()).toBe(" · 15m");
   });
 });
 

@@ -1,9 +1,11 @@
 // @vitest-environment jsdom
 import { afterEach, beforeEach, describe, it, expect, vi } from "vitest";
 import type { ReactElement } from "react";
-import { cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 import { AppShell, forgeIcon } from "./AppShell";
+import { AdminShell } from "./AdminShell";
+import { AgentSourceSettingsCard } from "../pages/adminSettings/AgentSourceSettingsCard";
 import { GitIcon, GitLabIcon } from "./icons";
 import { api } from "../lib/api";
 import { useAuth } from "../auth/AuthContext";
@@ -62,6 +64,9 @@ vi.mock("../lib/api", () => ({
     // The shared HealthStatusProvider (PRD #1484 M5) fetches only for an admin; the health
     // pip tests below set a document, every other test runs as a non-admin and never calls it.
     getAdminHealth: vi.fn(),
+    getAgentSource: vi.fn(),
+    updateSettings: vi.fn(),
+    applyAgentSource: vi.fn(),
   },
 }));
 vi.mock("../auth/AuthContext", () => ({ useAuth: vi.fn() }));
@@ -203,6 +208,7 @@ const emptyTriage = { total: 0, todo: 0, filed: 0, done: 0, dismissed: 0, false_
 
 afterEach(() => {
   cleanup();
+  vi.useRealTimers();
   vi.clearAllMocks();
 });
 
@@ -639,6 +645,74 @@ describe("the workers-attention poll's cleanup (PRD #113 M7)", () => {
       spy.mockRestore();
       vi.useRealTimers();
     }
+  });
+});
+
+describe("agent source card and shared navigation Health pipeline", () => {
+  it.each(["tag", "branch"])("clears both navigation pips after actual card %s action and next poll", async (mode) => {
+    window.localStorage.setItem("uzi_mock_scenario", "agent-source-update");
+    vi.resetModules();
+    const real = (await import("../mocks/mockApi")).mockApi;
+    await real.login("vlad@uzi.local", "x");
+    if (mode === "branch") await real.updateSettings({ agent_source_ref: "main" });
+    const auth = vi.mocked(useAuth)();
+    vi.mocked(useAuth).mockReturnValue({ ...auth, user: { ...user, is_admin: true } });
+    mockApi.getAdminHealth.mockImplementation(real.getAdminHealth);
+    mockApi.getAgentSource.mockImplementation(real.getAgentSource);
+    mockApi.updateSettings.mockImplementation(real.updateSettings);
+    mockApi.applyAgentSource.mockImplementation(real.applyAgentSource);
+    vi.useFakeTimers();
+    render(
+      <MemoryRouter initialEntries={["/admin/settings"]}>
+        <AppShell>
+          <AdminShell description={null}><AgentSourceSettingsCard /></AdminShell>
+        </AppShell>
+      </MemoryRouter>,
+    );
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(1);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1); // the card alone
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    const generic = "1 health check needs attention: 1 warning";
+    expect(screen.getAllByLabelText(generic)).toHaveLength(2); // sidebar + Health tab
+    const badge = mode === "tag" ? "Update available: v1.10.0" : "Source moved";
+    expect(screen.getByText(badge)).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /collapse sidebar/i }));
+    const collapsedAdmin = screen.getByRole("link", { name: generic });
+    expect(collapsedAdmin.getAttribute("title")).toBe("Admin");
+    expect(within(collapsedAdmin).getByText(generic).className).toContain("sr-only");
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    fireEvent.click(screen.getByRole("button", { name: /expand sidebar/i }));
+    expect(screen.getAllByLabelText(generic)).toHaveLength(2);
+    mockApi.getAdminHealth.mockRejectedValueOnce(new Error("offline"));
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(2);
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    expect(screen.getAllByLabelText(generic)).toHaveLength(2);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(1);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+    expect(mockApi.applyAgentSource).not.toHaveBeenCalled();
+    fireEvent.click(screen.getByRole("button", { name: mode === "tag" ? /Bump pin/ : "Approve & apply" }));
+    await act(async () => { await vi.advanceTimersByTimeAsync(1000); });
+    if (mode === "tag") {
+      expect(mockApi.updateSettings).toHaveBeenCalledExactlyOnceWith({ agent_source_ref: "v1.10.0" });
+    } else {
+      expect(mockApi.applyAgentSource).toHaveBeenCalledExactlyOnceWith("9f2c17a4e0b3d6c8a1f5");
+    }
+    expect(screen.queryByText(badge)).toBeNull();
+    // Health is still its last document until its normal 10-second poll.
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(mockApi.getAdminHealth).toHaveBeenCalledTimes(3);
+    expect(mockApi.getAgentSource).toHaveBeenCalledTimes(2); // action refresh only
+    expect(screen.queryByRole("img", { name: "Agent source update available" })).toBeNull();
+    expect(screen.queryByLabelText(generic)).toBeNull();
+    const read = real.getAgentSource();
+    await act(async () => { await vi.advanceTimersByTimeAsync(300); });
+    const persisted = await read;
+    expect(persisted.agent_source.status.update_available).toBe(false);
+    if (mode === "tag") expect(persisted.agent_source.config.ref).toBe("v1.10.0");
+    else expect(persisted.agent_source.status.last_applied_sha).toBe("9f2c17a4e0b3d6c8a1f5");
   });
 });
 

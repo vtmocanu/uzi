@@ -8,7 +8,8 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
-// Issue #1418 M4: a `failed` run whose server-derived landing_state is "needs_landing" must
+// Issue #1418 M4: these genuinely failed fixtures have no human stop reason.
+// A failed run whose server-derived landing_state is "needs_landing" must
 // render the human word "needs landing" (its committed work is human-landable) across the CLI
 // surfaces, while an "unrecoverable" / "none" failed run keeps reading "failed". `uzi run get`
 // additionally prints a one-line pointer to `uzi run export` for the needs_landing case only.

@@ -612,8 +612,8 @@ EOF
 
 # autocite_dependency_merges <base>: cite every DEP_REFS merge the [base] section does not
 # already cite by either identity (the oracle's own matching: `#N` not followed by a digit,
-# or the literal short SHA) in ONE `### Changed` bullet. An existing bullet is extended rather than
-# duplicated, so a next candidate, a re-run or a hand-drafted citation never repeats one.
+# or the literal short SHA) in a fresh `### Changed` bullet. Never extend an earlier
+# block: it may already be frozen by a published RC. Already-cited merges are skipped.
 DEP_BULLET_TITLE='Routine dependency updates'
 autocite_dependency_merges() {
   local base="$1" sec ref short n new="" tmp
@@ -636,28 +636,19 @@ EOF
       print "- **" title " (" refs ").**"
       print "  Dependency manifest and image bumps that carry no entry of their own."
     }
-    # Pass 1: does the section already carry the bullet? Then pass 2 only extends it.
-    FNR == NR {
-      if (index($0, h) == 1) s = 1; else if (s && /^## \[/) s = 0
-      if (s && index($0, "- **" title " (") == 1 && /\)\.\*\*$/) have = 1
-      next
-    }
     index($0, h) == 1 && !done { inB = 1; print; next }
     inB && /^## \[/ {
       if (!done) { if (!blank) print ""; print "### Changed"; print ""; bullet(); print "" }
       inB = 0; done = 1; print; next
     }
-    inB && !done && index($0, "- **" title " (") == 1 && /\)\.\*\*$/ {
-      sub(/\)\.\*\*$/, ", " refs ").**"); print; done = 1; next
-    }
-    inB && !done && !have && /^### Changed[[:space:]]*$/ { print; print ""; bullet(); pending = 1; done = 1; next }
+    inB && !done && /^### Changed[[:space:]]*$/ { print; print ""; bullet(); pending = 1; done = 1; next }
     pending { pending = 0; if ($0 ~ /[^[:space:]]/) print "" }
     { print; blank = ($0 !~ /[^[:space:]]/) }
     END {
       if (inB && !done) { if (!blank) print ""; print "### Changed"; print ""; bullet() }
       else if (!done && !inB) { print "release-cut: no ## [" base "] section to cite dependency merges in" > "/dev/stderr"; exit 3 }
     }
-  ' CHANGELOG.md CHANGELOG.md > "$tmp" || { rm -f "$tmp"; echo "release-cut: citing dependency merges failed; CHANGELOG untouched" >&2; exit 3; }
+  ' CHANGELOG.md > "$tmp" || { rm -f "$tmp"; echo "release-cut: citing dependency merges failed; CHANGELOG untouched" >&2; exit 3; }
   mv "$tmp" CHANGELOG.md
   echo "  CHANGELOG: cited dependency merge(s) $new under [$base] ### Changed"
 }
@@ -686,6 +677,7 @@ promote_inflight() {
     awk -v sec="$IB" -v d="$TODAY" '$0 ~ "^## \\[" sec "\\]" && !done { print "## [" sec "] - " d; done=1; next } {print}' CHANGELOG.md > cl.tmp && mv cl.tmp CHANGELOG.md
     bash scripts/worker-tag-autobump.sh "$IB" || exit 1
     bash scripts/changelog-links.sh || exit 1
+    bash scripts/changelog-section.sh check-rc-bullets "$IB" || exit 1
     git add -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh >/dev/null 2>&1 || true
     git commit -q -m "chore(release): $tagB (promotes $INFLIGHT)" || exit 1
   ) || { echo "release-cut: promote commit failed" >&2; cleanup_promote; exit 1; }
@@ -865,6 +857,11 @@ WT="$(awk -F'"' '/^PINNED_TAG=/{print $2; exit}' scripts/assert-worker-tag-decou
 echo "  worker tag now: ${WT:-<unreadable>} (rolls the fleet iff it changed from the prior pin)"
 run_links
 echo "  changelog-links: refreshed"
+# Freeze blocks already shipped by a candidate, before any release commit/tag.
+bash scripts/changelog-section.sh check-rc-bullets "$TAG" || {
+  echo "release-cut: frozen RC bullet check failed; add a new bullet instead" >&2
+  exit 3
+}
 
 git add -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh 2>/dev/null || true
 

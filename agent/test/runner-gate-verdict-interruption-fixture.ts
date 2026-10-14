@@ -27,8 +27,8 @@ import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { RunRunner, RunnerOptions } from "../src/runner.js";
 import { type Executor } from "../src/executor.js";
 import type { AgentTemplate, ClaimResponse, StateRequest, UserInput } from "../src/protocol.js";
-import { nullLogger } from "./helpers.js";
-import { api, fakeGitlab, gitlabClaim, runnerWith, simulateCommittedWork } from "./runner-harness.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
+import { api, fx, git, fakeGitlab, gitlabClaim, runnerWith, simulateCommittedWork } from "./runner-harness.js";
 
 
 // --- fixtures ----------------------------------------------------------------------------------
@@ -90,7 +90,7 @@ const revisedMilestones = (n: number) => [{ id: `rm${n}`, title: `revised milest
 // --- the scripted model ------------------------------------------------------------------------
 
 type TurnKind = "plan" | "revise" | "implement";
-interface Turn { kind: TurnKind; prompt: string; resume: string | undefined }
+interface Turn { kind: TurnKind; prompt: string; resume: string | undefined; cwd: string | undefined }
 
 function assistantMsg(content: unknown[]): SDKMessage {
   return { type: "assistant", session_id: SID, message: { content } } as unknown as SDKMessage;
@@ -139,7 +139,7 @@ class Model {
     for await (const p of params.prompt) prompt += JSON.stringify(p);
     let kind: TurnKind = prompt.includes(REVISE_MARK) ? "revise" : prompt.includes(PLAN_MARK) ? "plan" : "implement";
     if (this.answerTurnPending) kind = "revise";
-    this.turns.push({ kind, prompt, resume: (params.options as { resume?: string }).resume });
+    this.turns.push({ kind, prompt, resume: (params.options as { resume?: string }).resume, cwd: params.options.cwd });
     const signal = params.options.abortController!.signal;
     {
       const block = this.answerTurnPending ? undefined : this.blocks[kind].shift();
@@ -240,6 +240,9 @@ export class Scenario {
   claim(overrides: Partial<ClaimResponse> = {}): ClaimResponse {
     this.generation++;
     api.setInputClaimGeneration(this.runId, this.generation);
+    // The worker starts execution only after this generation owns the running row.
+    // Seed at claim assembly so a case can still override ownership before start().
+    api.setOwnershipStatus(this.runId, "running", this.generation);
     const lastSeq = Math.max(0, ...api.messages(this.runId).map((m) => m.seq));
     return { ...this.base, claim_generation: this.generation, last_seq: lastSeq, ...overrides };
   }
@@ -572,7 +575,20 @@ export async function scenario(
 }
 
 
-export function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: string, session: "kept" | "lost" | "none"): void {
+export function assertRetainedResume(s: Scenario, flight: Flight): void {
+  assert.ok(s.texts(flight).includes("retained work verified on a fresh local attempt; predecessor sources and custody retained"), "the reclaim used retained recovery");
+  assert.ok(s.texts(flight).some((text) => text.includes("in a fresh working directory, so its earlier session is not resumed")), "the fresh attempt breaks the earlier session lineage");
+  const predecessor = git.runnerClonePath(git.barePathFor(fx.originPath), `issue-${s.base.issue_iid}`);
+  assert.ok(fs.existsSync(predecessor), "the predecessor clone remains in place");
+  const turns = s.turns(flight);
+  if (turns.length > 0) assert.equal(turns[0]!.resume, undefined, "the first model turn starts a fresh session");
+  for (const turn of turns) {
+    assert.ok(turn.cwd, "the model runs in an explicit working directory");
+    assert.notEqual(turn.cwd, predecessor, "the model never reuses the retained predecessor");
+  }
+}
+
+export function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: string, session: "kept" | "lost" | "none" | "retained"): void {
   const gates = s.gates(flight);
   assert.ok(gates.length >= 1, `the resumed claim reached the gate: ${s.statuses(flight).join(",")}`);
   assert.ok(
@@ -585,6 +601,7 @@ export function assertRevisedOnResume(s: Scenario, flight: Flight, feedback: str
   assert.equal(s.turns(flight).filter((t) => t.kind === "plan").length, 0, "no fresh planning turn re-planned the run");
   if (session === "kept") assert.equal(revise[0]!.resume, SID, "with the session kept the revision turn resumes it");
   else {
+    if (session === "retained") assertRetainedResume(s, flight);
     assert.equal(revise[0]!.resume, undefined, "with no session the revision turn starts fresh");
     assert.ok(revise[0]!.prompt.includes("step one: the plan the owner asked to revise"), "a session-less revision prompt carries the prior plan text");
     assert.ok(revise[0]!.prompt.includes(PLAN_MARK), "a session-less revision prompt carries the full planning prompt");
@@ -628,6 +645,12 @@ export async function resumeAndApprove(s: Scenario, claim: ClaimResponse, select
 /** Park the first claim at its gate, then let a credential switch release it while `row` is sent. */
 export async function releaseAtGate(s: Scenario, send: () => UserInput, when: "unacked" | "acked"): Promise<{ first: Flight; row: UserInput }> {
   const first = await s.toFirstGate();
+  // The state report can precede the feed POST. Verdicts in this helper are for a
+  // plan the owner has seen; wait for that persisted frame, even when the claim
+  // intentionally omits resume_plan_at.
+  assert.ok(await until(() => api.messages(s.runId).some((m) =>
+    m.seq > first.seqFrom && m.kind === "plan" &&
+    (m.payload as { plan_md?: unknown }).plan_md === PLAN_V1)), "the initial plan frame is persisted before the verdict");
   if (when === "unacked") api.requestCredentialSwitch(s.runId, 1);
   else api.pendSwitchAfterNextAck(s.runId, 1);
   const row = send();
@@ -669,7 +692,7 @@ export async function pathB(
   const first = await s.toFirstGate();
   const block = s.model.block("revise");
   s.send(s.input("revise_plan", FEEDBACK));
-  await block.entered;
+  await waitForTestEvent(block.entered, "revision turn entered");
   api.requestCredentialSwitch(s.runId, 1);
   await tick(30);
   const [row] = s.send(s.input(kind, kind === "approve_plan" ? SELECTION : "wrong approach"));
@@ -686,5 +709,9 @@ export async function pathB(
   const flight = s.start(claim);
   assert.ok(await until(() => s.gates(flight).length >= 1 || flight.finished), s.statuses(flight).join(","));
   await tick(200);
+  // The resumeAtGate predicate in sdk-executor.ts uses resumePhase and approvedPlan independently of sessionId:
+  // retained recovery breaks the session lineage but still re-presents B (no fresh plan turn).
+  assert.equal(s.model.count("plan", flight.turnFrom), 0, "retained Path B never replans");
+  assertRetainedResume(s, flight);
   return { flight, row: row! };
 }

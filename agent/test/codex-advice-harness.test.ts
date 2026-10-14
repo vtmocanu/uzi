@@ -1317,6 +1317,27 @@ describe("CodexAdviceHarness: gpt-6-luna is in the contract (no fallback)", () =
   });
 });
 
+describe("#2878 M2 advice direct writer", () => {
+  for (const shape of ["equal", "reset", "advancing regression"] as const) {
+    it(`${shape === "advancing regression" ? "regression" : "compatibility"} advice ${shape} retains proved counters`, async () => {
+      const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });
+      const seen: AdviceUsageSnapshot[] = [];
+      const total = shape === "equal" ? bdown(1110, 210)
+        : shape === "reset" ? bdown(10, 2) : bdown(1120, 210);
+      bits.transport.push(threadStarted())
+        .push(tokenUsage(bdown(1100, 220), bdown(1100, 220)))
+        .push(tokenUsage(total, bdown(10, 2)))
+        .push(agentMessage("ok")).push(turnCompleted("completed")).end();
+      await bits.harness.run(makeAdviceRequest({ model: LUNA, usageObserver: u => seen.push(u) }), noThrowPolicy);
+      assert.deepEqual(seen.at(-1)?.[LUNA], {
+        inputTokens: 1100, outputTokens: 220, cacheReadInputTokens: 0, cacheCreationInputTokens: 0,
+        costStatus: shape === "advancing regression" ? "unreported" : "metered",
+        ...(shape === "advancing regression" ? {} : { costUSD: 0.00022 }),
+      }, "advice writer preserves counters and downgrades only an advancing regression");
+    });
+  }
+});
+
 describe("CodexAdviceHarness: usage observer", () => {
   it("reports the reconciled per-model tokens and table cost after every accepted note, ignoring duplicate, stale and foreign notes", async () => {
     const bits = makeHarness({ authMode: "api_key", now: FIXED_NOW });

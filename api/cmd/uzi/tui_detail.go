@@ -12,6 +12,7 @@ import (
 	"github.com/charmbracelet/x/ansi"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
@@ -708,6 +709,9 @@ func (m tuiModel) detailHeaderLines() []string {
 		// RunDTO.IsRevising (issue #2760): a run mid-revise replan keeps status
 		// awaiting_approval, so the token must read revising, not the plan-gate amber.
 		tok := m.pal.runStateToken(d.run, d.run.IsRevising)
+		if label := runpresentation.HumanStopLabel(d.run.Status, strOr(d.run.StopKind, "")); label != "" {
+			tok.word = label
+		}
 		statusTag = lipgloss.NewStyle().Foreground(tok.color).Render(tok.glyph + " " + tok.word)
 		if dur := runDuration(d.run, time.Now()); dur != "" {
 			statusTag += m.pal.faint.Render(" · " + dur)

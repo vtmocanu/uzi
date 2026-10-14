@@ -325,9 +325,18 @@ describe("the intent settlement edge cases", () => {
     assert.equal(probe.usage().length, 0, "a late usage report is not emitted");
   });
 
-  it("a fenced claim emits no summary_usage", async () => {
+  it("a fenced claim emits no summary_usage", async (t) => {
     const o = observer();
-    const probe = makeCtx({ gatePlan: async () => (await o.observed, approve), claimFenced: () => true });
+    let fenced = false;
+    const probe = makeCtx({
+      signal: t.signal,
+      gatePlan: async () => {
+        await o.observed;
+        fenced = true;
+        return approve;
+      },
+      claimFenced: () => fenced,
+    });
     const exec = newExec(spawningTurns([[submitPlan("plan"), resultSuccess()], [signalDone(), resultSuccess()]]), realIntentRunner(summaryHome, o.hooks));
     await exec.run(probe.ctx);
     assert.ok(o.sawAbort(), "the pass was still aborted");

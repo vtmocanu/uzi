@@ -5,7 +5,7 @@
 
 import { cleanup, render, screen } from "@testing-library/react";
 import { afterEach, describe, expect, it } from "vitest";
-import { Card, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
+import { Card, CardHeader, CountPill, RUN_STATUS_TONES, Select, StatusPill, Toggle } from "./ui";
 import { effectiveRunStatus, runBadge } from "../lib/runBadge";
 import type { LatestRun, RunStatus } from "../lib/api";
 
@@ -37,7 +37,75 @@ function latestRun(status: string): LatestRun {
 
 afterEach(cleanup);
 
+describe("CardHeader", () => {
+  it.each([2, 3] as const)("renders heading level %s and its slots", (level) => {
+    render(<CardHeader title="Review" level={level} badge={<span>Passed</span>}
+      subtitle="Checked candidate" actions={<button>Open evidence</button>} />);
+    const heading = screen.getByRole("heading", { name: "Review", level });
+    const header = heading.closest("header")!;
+    expect(heading.className).toBe("text-sm font-semibold text-fg");
+    expect(header.classList.contains("flex-wrap")).toBe(true);
+    expect(header.textContent).toContain("Passed");
+    expect(screen.getByText("Checked candidate").closest("header")).toBe(header);
+    expect(screen.getByRole("button").parentElement?.classList.contains("ml-auto")).toBe(true);
+  });
+});
+
 describe("StatusPill", () => {
+  const progress = { state: "percent" as const, pct: 40, milestone_done: 1,
+    milestone_total: 3, active_milestone_id: "m2", phase: "" as const };
+
+  it("puts the server percentage and static fill inside the running status pill", () => {
+    const { container } = render(<StatusPill status="running" progress={progress} />);
+    const bar = screen.getByRole("progressbar", { name: "Run progress" });
+    expect(bar.textContent).toBe("running · 40%");
+    expect(bar.getAttribute("aria-valuenow")).toBe("40");
+    expect(bar.getAttribute("aria-valuemin")).toBe("0");
+    expect(bar.getAttribute("aria-valuemax")).toBe("100");
+    expect(bar.getAttribute("aria-valuetext")).toBe("Running, about 40%; 1 of 3 milestones done");
+    expect(bar.hasAttribute("title")).toBe(false);
+    expect((bar.querySelector("[data-status-progress-fill]") as HTMLElement).style.width).toBe("40%");
+    expect(bar.className).toContain("sm:min-w-32");
+    expect(bar.querySelector("[data-status-progress-fill]")?.className).not.toContain("animate-pulse");
+    expect(container.querySelector(".bg-info.animate-pulse")).toBeTruthy();
+  });
+
+  it.each([
+    ["completion_checking", "Checking completion"],
+    ["completion_reworking", "Reworking unmet milestones"],
+  ])("completion states retain percentage: %s", (status, label) => {
+    render(<StatusPill status={status} progress={progress} />);
+    const bar = screen.getByRole("progressbar", { name: "Run progress" });
+    expect(bar.textContent).toBe(`${label} · 40%`);
+    expect(bar.getAttribute("aria-valuenow")).toBe("40");
+    expect(bar.getAttribute("aria-valuetext")).toBe(`${label}, about 40%; 1 of 3 milestones done`);
+    expect(bar.hasAttribute("title")).toBe(false);
+    expect((bar.querySelector("[data-status-progress-fill]") as HTMLElement).style.width).toBe("40%");
+  });
+
+  it.each(["planning", "revising", "queued", "completed", "awaiting_input", "completion_blocked"])("%s ignores a percentage", status => {
+    const { container } = render(<StatusPill status={status} progress={progress} />);
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
+    expect(container.textContent).not.toContain("%");
+  });
+
+  it.each(["waiting", "stalled", "queued", "planning", "parked", "none"] as const)("running ignores the %s progress state", state => {
+    const { container } = render(<StatusPill status="running" progress={{ ...progress, state }} />);
+    expect(container.textContent).toBe("running");
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
+  });
+
+  it.each([null, NaN, Infinity])("invalid pct %s retains an ordinary running pill", pct => {
+    const { container } = render(<StatusPill status="running" progress={{ ...progress, pct }} />);
+    expect(container.textContent).toBe("running");
+    expect(container.querySelector('[role="progressbar"]')).toBeNull();
+  });
+
+  it.each([[-10,0],[140,100]])("bounds pct %s to %s", (pct, bounded) => {
+    render(<StatusPill status="running" progress={{ ...progress, pct }} />);
+    expect(screen.getByRole("progressbar").getAttribute("aria-valuenow")).toBe(String(bounded));
+  });
+
   // PRD #88: RUN_STATUS_TONES falls to `{ tone: "neutral" }` for an unknown status, so a
   // status missing from the map renders as a calm grey pill — the same treatment
   // `cancelled` gets. That is the exact wrong reading for a run blocked on a human, and

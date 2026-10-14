@@ -97,7 +97,7 @@ function usage(input: number, output: number, extra: Partial<AdviceUsageSnapshot
   };
 }
 
-function harness(over: { claude?: boolean; codex?: boolean; issueRun?: boolean; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
+function harness(over: { claude?: boolean; codex?: boolean; kind?: import("../src/protocol.js").RunKind; enabled?: boolean; ignoreAbort?: boolean; redact?: (s: string) => string } = {}) {
   const clock = new FakeClock();
   const emitted: EmittedMessage[] = [];
   const calls: PassCall[] = [];
@@ -116,7 +116,7 @@ function harness(over: { claude?: boolean; codex?: boolean; issueRun?: boolean; 
   const deps: NowSummaryDeps = {
     steering,
     claim: {
-      issueRun: over.issueRun ?? true,
+      kind: over.kind ?? "issue",
       claude: over.codex ? false : (over.claude ?? true),
       ...(over.codex
         ? { codex: { runId: "run-1", binding: { authMode: "api_key", capability: "cap" } as never, buildHarness: (() => { throw new Error("the controller must go through runPass"); }) as never } }
@@ -475,7 +475,7 @@ describe("NowSummaryController: gate", () => {
   });
 
   it("a non-issue run makes no call", async () => {
-    const h = harness({ issueRun: false });
+    const h = harness({ kind: "judge" });
     await running(h);
     assert.equal(h.calls.length, 0);
   });

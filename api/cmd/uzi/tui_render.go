@@ -10,6 +10,7 @@ import (
 	lipgloss "charm.land/lipgloss/v2"
 
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/runpresentation"
 )
 
 // D7's render layer: every untrusted string the TUI draws passes through sanitizeTTY
@@ -218,13 +219,14 @@ func displayHealth(health string) string {
 }
 
 // stateGlyphWord is the DISPLAY vocabulary for a run's state — a single-cell glyph and a
-// human word — shared by the board row, the board strip and the detail header so they can
-// never disagree (the baseline rendered `stalled` differently on the board and the header;
-// this is the single source that fixes that class of drift). The underlying status/health
-// strings still drive all logic, filtering and sorting; this only changes what is shown.
+// human word — shared by the board row, the board strip and the detail header for consistent
+// state precedence. Human stops use the compact word here; the detail header adds the full
+// reason. The underlying status/health strings still drive all logic, filtering and
+// sorting; this only changes what is shown.
 //
-// HEALTH OVERRIDE: except during recovery_wait, a WARN health flag (stalled/looping/slow) replaces the status token
-// entirely with ▲ + the health word, because a run that needs attention is what the board
+// HEALTH OVERRIDE: except for human stops and recovery_wait, a WARN health flag
+// (stalled/looping/slow) replaces the status token entirely with ▲ + the health word,
+// because a run that needs attention is what the board
 // is FOR. ok/empty health shows the status token. The word is the DISPLAY word from
 // displayHealth, so the `slow` enum PRD #1170 kept (D1) reads as "near timeout" here while
 // every logic path still keys off the raw enum.
@@ -239,14 +241,18 @@ func displayHealth(health string) string {
 // #1766: "vault_locked" reads "vault wait" (the run is waiting for vault unlock). PRD #1809:
 // "data_volume_full" reads "disk wait" (the worker's data volume is full or nearly full).
 //
-// LANDING (issue #1418): landingState is the run's server-derived LandingState. A `failed` run
-// whose value is "needs_landing" reads the word "needs landing" instead of "failed" — its
-// committed work is human-landable — while the glyph (✗) and the alarm COLOUR (in stateColor)
+// LANDING (issue #1418): landingState is the run's server-derived LandingState. After human
+// stops are resolved, a genuinely failed run whose value is "needs_landing" reads the word
+// "needs landing" instead of "failed" — its committed work is human-landable — while the
+// glyph (✗) and the alarm COLOUR (in stateColor)
 // stay the failed ones. It is a plain param (not folded into the cause variadic) so the two
 // status-specific qualifiers never share a slot; every other landing_state ("unrecoverable",
 // "none", "") reads as an ordinary failed run. landing_state is a closed server enum, so it is
 // branched on directly (no d7 guard needed — see tui_d7_guard_test.go).
-func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) (glyph, word string) {
+func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingState, stopKind string, cause ...string) (glyph, word string) {
+	if runpresentation.HumanStopReason(status, stopKind) != "" {
+		return "·", "stopped"
+	}
 	// Recovery does no work while parked; stale health must not hide its wait state.
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return "▲", displayHealth(health)
@@ -322,9 +328,10 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 	case "completed":
 		return "✓", "done"
 	case "failed":
-		// issue #1418: a failed run whose committed work is human-landable reads "needs
-		// landing"; the ✗ glyph and the alarm colour (stateColor) stay the failed ones, so it
-		// still reads as a failure that now has a recovery path. Other landing_state buckets
+		// issue #1418: after human stops are resolved, a genuinely failed run reads "needs
+		// landing" when its committed work is human-landable; the ✗ glyph and the alarm
+		// colour (stateColor) stay the failed ones, so it still reads as a failure that now
+		// has a recovery path. Other landing_state buckets
 		// ("unrecoverable"/"none"/"") read as an ordinary failed run.
 		if landingState == landingStateNeedsLanding {
 			return "✗", "needs landing"
@@ -338,9 +345,12 @@ func stateGlyphWord(status, health string, isPlanning, isRevising bool, landingS
 }
 
 // stateColor is the colour half of the state token, resolved from the same ANDON tokens.
-// Health warn wins (→ stall orange), except recovery_wait ignores stale health;
-// otherwise the status maps to its material.
-func (p palette) stateColor(status, health string, isPlanning, isRevising bool) color.Color {
+// Human stops use faint ink. Other health warnings use stall orange, except
+// recovery_wait ignores stale health; otherwise the status maps to its material.
+func (p palette) stateColor(status, health string, isPlanning, isRevising bool, stopKind string) color.Color {
+	if runpresentation.HumanStopReason(status, stopKind) != "" {
+		return p.faintC
+	}
 	if status != statusRecoveryWait && stalledHealth[health] {
 		return p.stall
 	}
@@ -372,12 +382,12 @@ type runToken struct {
 	color color.Color
 }
 
-// stateToken is the ONE shared helper the design mandates: (glyph, colour, word) from a
-// run's status/health/planning, used on the board row, the board strip and the detail
-// header so they cannot render one run three ways.
-func (p palette) stateToken(status, health string, isPlanning, isRevising bool, landingState string, cause ...string) runToken {
-	g, w := stateGlyphWord(status, health, isPlanning, isRevising, landingState, cause...)
-	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising)}
+// stateToken shares a run's glyph, colour and compact word across the board row,
+// board strip and detail header. detailHeaderLines expands human stops to their full
+// HumanStopLabel while retaining the shared glyph and colour.
+func (p palette) stateToken(status, health string, isPlanning, isRevising bool, landingState, stopKind string, cause ...string) runToken {
+	g, w := stateGlyphWord(status, health, isPlanning, isRevising, landingState, stopKind, cause...)
+	return runToken{glyph: g, word: w, color: p.stateColor(status, health, isPlanning, isRevising, stopKind)}
 }
 
 // codexReloginHold reports whether a run is held on its Codex account AND the account needs
@@ -414,6 +424,9 @@ const (
 // runStateToken gives typed provider, Codex relogin and credential holds their
 // own tokens; other runs use stateToken. Provider markers require matching status.
 func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
+	if runpresentation.HumanStopReason(r.Status, strOr(r.StopKind, "")) != "" {
+		return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""))
+	}
 	if isProviderUnavailableHold(r) {
 		return runToken{glyph: "⊘", word: providerHoldWord, color: p.amber}
 	}
@@ -426,7 +439,7 @@ func (p palette) runStateToken(r apitypes.RunDTO, isRevising bool) runToken {
 	if isCredentialDisabledHold(r) {
 		return runToken{glyph: credDisabledGlyph, word: credDisabledWord, color: p.amber}
 	}
-	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.RecoveryWaitCause, ""))
+	return p.stateToken(r.Status, r.Health, r.IsPlanning, isRevising, r.LandingState, strOr(r.StopKind, ""), strOr(r.RecoveryWaitCause, ""))
 }
 
 // verdictColor maps a judge verdict to a severity colour: issues → alarm red, everything

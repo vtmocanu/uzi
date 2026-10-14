@@ -309,7 +309,7 @@ func TestWorkerExhaustionCLIInputs(t *testing.T) {
 }
 
 func TestWorkerExhaustionCLITUILabels(t *testing.T) {
-	glyph, word := stateGlyphWord("recovery_wait", "stalled", false, false, "", "worker_requeue_exhausted")
+	glyph, word := stateGlyphWord("recovery_wait", "stalled", false, false, "", "", "worker_requeue_exhausted")
 	if glyph == "" || word != "requeue limit" {
 		t.Errorf("glyph %q word %q", glyph, word)
 	}

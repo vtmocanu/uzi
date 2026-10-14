@@ -124,13 +124,14 @@ func readRetentionBookkeeping(t *testing.T, e interlockLiveDB, runID uuid.UUID) 
 }
 
 // TestSweepRetentionPassBudgetLiveDB: with a forge that hangs until its context ends and several
-// due settling records (each settle calls the hanging delete), Sweep returns within the pass budget
-// plus one per-record timeout plus generous slack, and a LATER pass of the same Sweep ran (the
-// upload-retry-window expiry flipped a stalled capture). Sweep runs the UNCONFINED pass, so any
-// leftover records of a reused database are driven against the hanging forge too; the bound holds
-// regardless, since every record, leftover or not, is subject to the same budget. On the code
-// before the budget each record took the 2-minute retentionOpTimeout and Sweep did not return
-// within the bound.
+// due settling records (each settle calls the hanging delete), ReconcileCheckpointRetentions
+// returns within the pass budget plus one per-record timeout plus generous slack for reads and
+// bookkeeping on a healthy DB fixture. It runs the UNCONFINED pass, so leftover records of a
+// reused database are driven against the hanging forge too; every record is subject to the same
+// budget. Check that the budget left seeded records untouched before a separate, untimed Sweep
+// verifies upload-retry-window expiry flips a stalled capture. Other Sweep passes are untimed.
+// Before the budget each record took the 2-minute retentionOpTimeout and the retention pass did
+// not return within the bound.
 func TestSweepRetentionPassBudgetLiveDB(t *testing.T) {
 	e := setupInterlockLiveDB(t)
 	h := newHangingForge(t)
@@ -139,7 +140,7 @@ func TestSweepRetentionPassBudgetLiveDB(t *testing.T) {
 	const (
 		budget    = 300 * time.Millisecond
 		opTimeout = 200 * time.Millisecond
-		bound     = 5 * time.Second // budget + opTimeout + generous slack for the other passes
+		bound     = 5 * time.Second // retention watchdog includes reads/bookkeeping on a healthy DB fixture; other Sweep passes are untimed
 	)
 	svc := newHangingRetentionSvc(t, e, h, p, budget, opTimeout)
 
@@ -160,41 +161,29 @@ func TestSweepRetentionPassBudgetLiveDB(t *testing.T) {
 	           VALUES ($1, $2, $3, $4, 'ident', 'H', $5, 'preparing', now() - interval '2 days')`,
 		captureID, hold, holdRun, e.userID, uuid.NewString())
 
-	type sweepOut struct {
-		res SweepResult
-		err error
-	}
-	done := make(chan sweepOut, 1)
+	done := make(chan error, 1)
 	start := time.Now()
 	go func() {
-		res, err := svc.Sweep(e.ctx)
-		done <- sweepOut{res, err}
+		_, err := svc.ReconcileCheckpointRetentions(e.ctx)
+		done <- err
 	}()
-	var out sweepOut
+	var retentionErr error
 	select {
-	case out = <-done:
+	case retentionErr = <-done:
 	case <-time.After(bound):
-		t.Errorf("Sweep did not return within %s (pass budget %s, per-record timeout %s): the retention pass is not bounded",
+		t.Errorf("ReconcileCheckpointRetentions did not return within %s (pass budget %s, per-record timeout %s): the retention pass is not bounded",
 			bound, budget, opTimeout)
 		h.unblock()
-		out = <-done
+		retentionErr = <-done
 	}
 	elapsed := time.Since(start)
-	if out.err != nil {
-		t.Fatalf("Sweep: %v", out.err)
+	if retentionErr != nil {
+		t.Fatalf("ReconcileCheckpointRetentions: %v", retentionErr)
 	}
-	t.Logf("Sweep returned after %s; hanging forge calls: %d", elapsed.Round(time.Millisecond), h.calls.Load())
+	t.Logf("ReconcileCheckpointRetentions returned after %s; hanging forge calls: %d", elapsed.Round(time.Millisecond), h.calls.Load())
 
 	if h.calls.Load() == 0 {
 		t.Fatal("the retention pass never reached the hanging forge; the bound was not exercised")
-	}
-	var captureState string
-	if err := e.pool.QueryRow(e.ctx, `SELECT state FROM recovery_captures WHERE id = $1`, captureID).Scan(&captureState); err != nil {
-		t.Fatalf("read capture: %v", err)
-	}
-	if captureState != "needs_action" || out.res.RecoveryStalled < 1 {
-		t.Fatalf("stalled capture = %q, RecoveryStalled = %d; want needs_action and >= 1 (the pass after the retention pass ran)",
-			captureState, out.res.RecoveryStalled)
 	}
 	// The budget, not the page, ended the pass: at most a couple of hanging records fit in it, so
 	// some seeded record was never started (attempts still 0, no last_error).
@@ -206,6 +195,19 @@ func TestSweepRetentionPassBudgetLiveDB(t *testing.T) {
 	}
 	if untouched == 0 {
 		t.Fatalf("every one of the %d seeded records was started; want the spent budget to leave some for the next tick", seeded)
+	}
+
+	res, err := svc.Sweep(e.ctx)
+	if err != nil {
+		t.Fatalf("Sweep: %v", err)
+	}
+	var captureState string
+	if err := e.pool.QueryRow(e.ctx, `SELECT state FROM recovery_captures WHERE id = $1`, captureID).Scan(&captureState); err != nil {
+		t.Fatalf("read capture: %v", err)
+	}
+	if captureState != "needs_action" || res.RecoveryStalled < 1 {
+		t.Fatalf("stalled capture = %q, RecoveryStalled = %d; want needs_action and >= 1 (the pass after the retention pass ran)",
+			captureState, res.RecoveryStalled)
 	}
 }
 

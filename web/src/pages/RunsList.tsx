@@ -54,7 +54,7 @@ import { RunCredential } from "../components/RunCredential";
 import { HarnessBadge } from "../components/HarnessBadge";
 import { stripUnsafeChars } from "../lib/safeText";
 import { formatUptimeSince } from "../lib/formatUptimeSince";
-import { anthropicTokenCount, codexCredentialCount } from "../lib/hasToken";
+import { anthropicTokenCount, codexCredentialCount, showsRunAccounts } from "../lib/hasToken";
 import { usePollWhileVisible } from "../lib/usePollWhileVisible";
 import { lanePaging } from "../lib/boardColumns";
 import { groupRuns, runMatchesQuery } from "../lib/runGroups";
@@ -147,33 +147,32 @@ export function RunsLayout() {
   const [runs, setRuns] = useState<RunSummaryItem[]>([]);
   const [error, setError] = useState("");
   const [loading, setLoading] = useState(true);
-  // PRD #295 / #1730: per-harness credential counts for the personal badge gate,
-  // computed once from the viewer's secrets. A run shows its badge only when the
-  // viewer holds more than one credential of that run's harness.
+  // Personal badges show once the viewer holds >1 credential across both harnesses.
+  // Per-harness counts also distinguish a lone credential labelled "default".
   const [credentialCounts, setCredentialCounts] = useState({ claude: 0, codex: 0 });
 
-  // The one runs fetch, extracted so an Expedite/undo can re-run it (reload below). The
-  // isAlive guard defaults to always-true for a reload (the component is mounted when the
-  // user clicks) and is a mount-scoped flag for the initial load, so an in-flight first
-  // fetch never setStates after unmount.
-  const load = useCallback(async (isAlive: () => boolean = () => true) => {
+  // A secrets failure preserves the last-good counts (initially zero) and never
+  // prevents runs from refreshing. Explicit reloads and periodic polls share this.
+  const refreshCredentialCounts = useCallback(async (isAlive: () => boolean = () => true) => {
     try {
-      const [{ runs }, { secrets }] = await Promise.all([
-        api.listRuns({ view: "summary" }),
-        // Best-effort (like Dashboard's usage calls): the secrets fetch only powers
-        // the cosmetic ">1 token" credential-badge gate, so a secrets-endpoint
-        // failure must not blank the whole Runs area. Fall back to no badge.
-        api.listSecrets().catch(() => ({ secrets: [] })),
-      ]);
-      if (!isAlive()) return;
-      setRuns(runs);
-      setCredentialCounts({ claude: anthropicTokenCount(secrets), codex: codexCredentialCount(secrets) });
-    } catch (err) {
-      if (isAlive()) setError(errorMessage(err, "Failed to load runs"));
-    } finally {
-      if (isAlive()) setLoading(false);
+      const { secrets } = await api.listSecrets();
+      if (isAlive()) setCredentialCounts({ claude: anthropicTokenCount(secrets), codex: codexCredentialCount(secrets) });
+    } catch {
+      // keep the last-good counts
     }
   }, []);
+
+  const load = useCallback(async (isAlive: () => boolean = () => true) => {
+    await Promise.all([
+      api.listRuns({ view: "summary" }).then(({ runs }) => {
+        if (isAlive()) setRuns(runs);
+      }).catch((err: unknown) => {
+        if (isAlive()) setError(errorMessage(err, "Failed to load runs"));
+      }),
+      refreshCredentialCounts(isAlive),
+    ]);
+    if (isAlive()) setLoading(false);
+  }, [refreshCredentialCounts]);
 
   useEffect(() => {
     let alive = true;
@@ -183,22 +182,17 @@ export function RunsLayout() {
     };
   }, [load]);
 
-  // Liveness (PRD #518): re-fetch only the volatile runs list every 10s while the
-  // tab is visible (catching up immediately on focus), so runs moving queued →
-  // running → completed/failed, and new runs appearing, show without a manual
-  // browser refresh — matching Board and Dashboard. A transient poll failure keeps
-  // the last-good rows: unlike the first load, this swallows its error and never
-  // routes through setError/setLoading, so a blip cannot re-flash the skeleton or
-  // pop an error banner. The credential-badge secrets/credentialCounts stay mount-only
-  // (they change rarely), so the poll re-fetches api.listRuns({ view: "summary" }) alone.
+  // Refresh rows and credential counts independently every 10s while visible,
+  // catching up on focus. Each endpoint keeps its last-good state on failure;
+  // polls never re-flash the skeleton or show an error banner.
   const poll = useCallback(async () => {
-    try {
-      const { runs } = await api.listRuns({ view: "summary" });
-      setRuns(runs);
-    } catch {
-      // keep the last-good list
-    }
-  }, []);
+    await Promise.all([
+      api.listRuns({ view: "summary" }).then(({ runs }) => setRuns(runs)).catch(() => {
+        // keep the last-good rows
+      }),
+      refreshCredentialCounts(),
+    ]);
+  }, [refreshCredentialCounts]);
   usePollWhileVisible(poll, 10000);
 
   const pastCount = loading ? null : runs.filter((r) => isTerminalRun(r.status)).length;
@@ -233,6 +227,14 @@ export function RunsLayout() {
   );
 }
 
+// Personal list presentation only: admin callers leave credentialCount undefined.
+function listCredentialDisplayLabel(run: RunSummaryItem, credentialCount?: number): string | undefined {
+  const codex = run.harness === "codex";
+  const label = codex ? run.codex_secret_label : run.anthropic_secret_label;
+  const id = codex ? run.codex_secret_id : run.anthropic_secret_id;
+  return credentialCount === 1 && id !== null && label === "default" ? run.harness : undefined;
+}
+
 // Exported for a focused row-level test (PRD #1064 M3: the "now" line, terminal-hiding
 // and the ◐ badge suffix), rendered inside a Router without the full layout fetch.
 export function RunRow({
@@ -241,6 +243,7 @@ export function RunRow({
   showOwner,
   waitingForVault = false,
   showCredential = false,
+  credentialCount,
   owned = false,
   onExpedited,
 }: {
@@ -255,11 +258,13 @@ export function RunRow({
   waitingForVault?: boolean;
   // showCredential (PRD #295): render the compact credential badge in the pill
   // cluster. Gated off by default; the caller decides (personal list: viewer holds
-  // >1 token; admin factory list: always). RunCredential itself self-hides on a run
+  // >1 credential across both harnesses; admin factory list: always).
+  // RunCredential itself self-hides on a run
   // with no label, so a mixed list needs no per-row guard beyond this flag. The
   // compact badge is inherently non-linked (it lives inside this row's own <Link>),
   // so there is no linkable flag to thread through.
   showCredential?: boolean;
+  credentialCount?: number;
   // owned (PRD #320 M6): the viewer owns this run, so the Expedite/undo action may show.
   // RunSummaryItem carries no per-row is_mine, so ownership is threaded from the caller: the
   // personal Active list is all the viewer's own runs (owned), the admin factory list is
@@ -493,9 +498,9 @@ export function RunRow({
                   {msBadge.label}
                 </Badge>
               )}
-              {/* PRD #2602: the server-derived progress cell, beside the milestone badge
-                  it estimates from; hidden with it under waitingForVault. */}
-              <RunProgressCell run={run} />
+              {/* PRD #2602: the waiting/stalled progress flags; percentages appear in the
+                  status pill. Hidden with milestones under waitingForVault. */}
+              <RunProgressCell run={run} now={now} />
               {/* The health flag (PRD #47) sits beside the status pill; hidden here
                   when waitingForVault already explains a locked queued run, and when
                   the progress cell's stalled flag already shows the stall. */}
@@ -506,7 +511,7 @@ export function RunRow({
               {/* PRD #320 M6: the queue-priority pill (Deprioritized/Expedited/Restored),
                   self-hiding on a normal or non-queued run. */}
               <RunPriorityBadge priority={run.priority} status={run.status} />
-              <StatusPill status={pillStatus} />
+              <StatusPill status={pillStatus} progress={run.progress} />
               {/* PRD #320 M6: the owner-only Expedite/undo control, queued rows only. It is
                   raised above the card's stretched-link overlay (relative z-10, issue #485
                   NB1) so the click hits the button rather than the run-details Link; it
@@ -531,10 +536,10 @@ export function RunRow({
                   {isExpedited ? "Undo" : "Expedite"}
                 </button>
               )}
-              {/* PRD #295: which Anthropic token this run's claim billed. Gated by
-                  the caller (personal list: viewer holds >1 token) and self-hiding
+              {/* Which account this run used. Gated by
+                  the caller (personal list: viewer holds >1 credential) and self-hiding
                   on a run with no recorded label. */}
-              {showCredential && <RunCredential run={run} variant="compact" />}
+              {showCredential && <RunCredential run={run} variant="compact" displayLabel={listCredentialDisplayLabel(run, credentialCount)} />}
             </>
           )}
         </div>
@@ -644,7 +649,8 @@ export function RunsList() {
                       run={r}
                       now={now}
                       waitingForVault={!vaultUnlocked && r.status === "queued"}
-                      showCredential={credentialCounts[r.harness] > 1}
+                      showCredential={showsRunAccounts(credentialCounts)}
+                      credentialCount={credentialCounts[r.harness]}
                       // The personal Active list is all the viewer's own runs, so the
                       // Expedite/undo action is offered here (PRD #320 M6); reload
                       // refreshes the pill + ordering after the mutation.
@@ -739,7 +745,7 @@ export function RunsList() {
                         <span className="ml-2 text-xs text-faint">up {formatUptimeSince(w.online_since)}</span>
                       )}
                     </div>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {hasTemplateDrift(w.template_declared, w.template_reported) && (
                         <Badge
                           tone="warning"
@@ -753,7 +759,7 @@ export function RunsList() {
                       </Badge>
                       <AdminWorkerResources worker={w} />
                       <WorkerCordonBadge worker={w} />
-                      <WorkerRunBadge worker={w} />
+                      <WorkerRunBadge worker={w} hideIdleCrossChecks />
                       <WorkerPendingOutcomeBadge worker={w} />
                       <WorkerCustodyBadge worker={w} />
                     </div>
@@ -939,7 +945,11 @@ export function RunsHistory() {
               </h3>
               <ul className="space-y-2">
                 {g.runs.map((r) => (
-                  <RunRow key={r.id} run={r} now={now} showCredential={credentialCounts[r.harness] > 1} />
+                  <RunRow
+                    key={r.id} run={r} now={now}
+                    showCredential={showsRunAccounts(credentialCounts)}
+                    credentialCount={credentialCounts[r.harness]}
+                  />
                 ))}
               </ul>
             </div>

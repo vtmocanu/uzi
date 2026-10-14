@@ -2,11 +2,11 @@
 // that produces two plain-English run summaries — an "intent" summary (what a run will
 // implement, from the issue + PRD) and a "plan" summary + deltas (what the proposed
 // plan will do and how it diverges from the original ask). Unlike the Judge it is NOT a
-// run kind: it runs INLINE inside a normal, in-flight issue run (Decision 1), on the
-// owner's Anthropic token, reusing ONLY the Judge's tool-less model-call MECHANICS —
-// buildSdkEnv with its own ephemeral homeDir, one tool-less turn, a wall-clock
-// Promise.race timeout, and extractJsonObject for the plan/deltas JSON (Decision 1's
-// "what is reused"). It imports none of the JudgeRunner's lifecycle.
+// run kind: it runs INLINE inside a normal, in-flight eligible run (Decision 1), on the
+// claim's harness: Codex uses the injected isolated advice factory with private
+// model/effort pins and refresh denied; absent Codex uses the legacy Anthropic token
+// and model. It reuses the read-only model pass's timeout, usage and abort mechanics,
+// and extractJsonObject for plan/deltas JSON, without the JudgeRunner's lifecycle.
 //
 // The load-bearing contract (Decision 2/10): generation is ADVISORY and NEVER blocks —
 // both public methods swallow every failure (timeout, model error, empty output, JSON
@@ -45,11 +45,15 @@ import type { Logger } from "./log.js";
 // deterministic tests.
 const SUMMARY_MODEL_TIMEOUT_MS = summaryModelTimeoutMs(process.env);
 
+// Issue #2833 M1: private intent/plan pins, independent of the delivery editor model.
+const CODEX_INTENT_PLAN_MODEL = "gpt-6-luna";
+const CODEX_INTENT_PLAN_EFFORT = "low";
+
 /** PRD #1798 M5: the Claude model the editor pass runs on when the claim carries no usable
  *  `summary_model`. The api resolves `summary_model` (user value, else the instance setting,
- *  default "haiku": api/internal/settings/keys.go DefaultSummaryModel) only onto ISSUE-run claims
- *  (protocol.ts ClaimResponse.summary_model), so any other claim would otherwise fall to the SDK's
- *  own default model. This mirrors the api default the intent/plan summaries effectively run on;
+ *  default "haiku": api/internal/settings/keys.go DefaultSummaryModel) onto ordinary run claims
+ *  (protocol.ts ClaimResponse.summary_model). Older servers may omit it, which would otherwise
+ *  select the SDK's own default model. This mirrors the api default the intent/plan summaries effectively run on;
  *  not shared across the TS/Go boundary, change it with DefaultSummaryModel. */
 export const DEFAULT_DELIVERY_SUMMARY_MODEL = "haiku";
 
@@ -88,6 +92,9 @@ export interface PlanSummaryResult {
 /** Common inputs to a summary turn. `prdText` is the resolved PRD body (M3b) or null
  *  when the run has no linked PRD — the summary then works from title + body alone. */
 export interface IntentSummaryInput {
+  /** Claim shape selects Codex when present and valid; malformed Codex fails closed.
+   *  With no Codex block, the legacy token/model inputs below are used unchanged. */
+  claim?: { readonly run_id: string; readonly secrets: { readonly codex?: unknown } };
   token: string;
   model: string;
   issueTitle: string;
@@ -114,9 +121,9 @@ export interface SummaryRunnerOptions {
   /** Wall-clock cap on a model turn; default SUMMARY_MODEL_TIMEOUT_MS. Injectable so a
    *  test can drive the timeout path in milliseconds. */
   modelTimeoutMs?: number;
-  /** PRD #1798 D13: the injected Codex advice-harness factory (main.ts builds the production
-   *  one). A Codex claim's delivery summary runs through it; without it a Codex claim gets no
-   *  delivery summary (null), never a silent Claude substitution. */
+  /** The injected Codex advice-harness factory (main.ts builds the production one).
+   *  Codex intent, plan and delivery summaries require it; without it they return null,
+   *  never a silent Claude substitution. Intent/plan passes deny shared credential refresh. */
   codexAdviceHarnessFactory?: CodexAdviceHarnessFactory;
   /** Injectable clock (epoch ms) for the delivery deadline; default Date.now. */
   now?: () => number;
@@ -417,9 +424,25 @@ export class SummaryRunner {
   private async runModel(pass: "intent" | "plan", input: IntentSummaryInput, prompt: string): Promise<string> {
     const reportUsage = this.usageReporter(pass, input.onUsage);
     try {
+      const selection = selectCodexBinding({ codex: input.claim?.secrets.codex });
+      let harness: Pick<ReadOnlyModelPassOpts, "token" | "model" | "effort" | "codex">;
+      if (selection.kind === "codex") {
+        if (!this.codexAdviceHarnessFactory) throw new Error("Codex claim but no Codex advice-harness factory is wired");
+        harness = {
+          model: CODEX_INTENT_PLAN_MODEL,
+          effort: CODEX_INTENT_PLAN_EFFORT,
+          codex: {
+            runId: input.claim!.run_id,
+            binding: selection.binding,
+            buildHarness: this.codexAdviceHarnessFactory,
+            refresh: "deny",
+          },
+        };
+      } else {
+        harness = { token: input.token, model: input.model };
+      }
       return await runReadOnlyModelPass({
-        token: input.token,
-        model: input.model,
+        ...harness,
         systemPrompt: SUMMARY_SYSTEM_PROMPT,
         prompt,
         homeRoot: this.homeRoot,

@@ -1422,7 +1422,7 @@ export interface ClaimResponse extends ClaimMemoryState {
   judge_model?: string | null;
   /** The model the inline run-summary generator runs on (PRD #362), resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
-   *  ISSUE-run claim assembly. Rides the issue-run claim (unlike judge_model, which
+   *  ordinary run claim assembly. Rides eligible run claims (unlike judge_model, which
    *  is judge-only); absent on older servers. */
   summary_model?: string | null;
   /** True when the run's INTENT summary is already set (PRD #362 M3c, Decision 3):

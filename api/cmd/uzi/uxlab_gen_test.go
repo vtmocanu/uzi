@@ -84,9 +84,23 @@ func TestGenerateUXLabFrames(t *testing.T) {
 
 	// scenes maps a base name to a builder that returns the rendered frame for a theme.
 	scenes := map[string]func(dark bool) string{
-		"board-populated": func(d bool) string { return boardPopulated(d, now) },
-		"board-codex":     func(d bool) string { return boardCodex(d, now) },
-		"board-empty":     boardEmpty,
+		"board-human-stop-own-unselected":   func(d bool) string { return humanStopBoardScene(d, false, false) },
+		"board-human-stop-own-selected":     func(d bool) string { return humanStopBoardScene(d, false, true) },
+		"board-human-stop-admin-unselected": func(d bool) string { return humanStopBoardScene(d, true, false) },
+		"board-human-stop-admin-selected":   func(d bool) string { return humanStopBoardScene(d, true, true) },
+		"detail-human-stop-cancel":          func(d bool) string { return humanStopDetailScene(d, "cancel") },
+		"detail-human-stop-reject":          func(d bool) string { return humanStopDetailScene(d, "reject") },
+		"detail-human-stop-stop":            func(d bool) string { return humanStopDetailScene(d, "stop") },
+		"detail-human-stop-failure":         func(d bool) string { return humanStopDetailScene(d, "failure") },
+		"board-wide-title-120":              func(d bool) string { return boardWideTitleScene(d, now, 120) },
+		"board-wide-title-200":              func(d bool) string { return boardWideTitleScene(d, now, 200) },
+		"board-accounts-one-each-100":       func(d bool) string { return boardAccountScene(d, now, 1, 100) },
+		"board-accounts-two-plus-one-100":   func(d bool) string { return boardAccountScene(d, now, 2, 100) },
+		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
+		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
+		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
+		"board-empty":                       boardEmpty,
 		"board-restart-hint": func(d bool) string {
 			m := uxModel(&uzicli.FakeClient{}, "", d)
 			m.showVersion = true
@@ -194,6 +208,31 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
+	for _, split := range []bool{false, true} {
+		for _, width := range []int{200, 80} {
+			for _, active := range []int{0, 1} {
+				surface := "board"
+				if split {
+					surface = "split"
+				}
+				state := "idle"
+				if active != 0 {
+					state = "active"
+				}
+				name := surface + "-cross-checks-" + state + "-" + itoa(width)
+				scenes[name] = func(dark bool) string {
+					m := crossCheckFleetScene(dark, split, width, active)
+					m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: boardRuns(now)})
+					if split {
+						m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo()}})
+						m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+					}
+					return m.View().Content
+				}
+			}
+		}
+	}
+
 	for _, scene := range uxAnswerScenes() {
 		scenes[scene.name] = func(dark bool) string { return scene.build(dark, now).model.View().Content }
 	}
@@ -291,6 +330,23 @@ func splitScene(dark bool, now time.Time, scene string) string {
 		m = key(m, "u")
 	}
 	return m.View().Content
+}
+
+// crossCheckFleetScene shares the shipped render path with the regression fixtures.
+// The offline worker's activity and capacity must not contribute to the title.
+func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	height := 16
+	if split {
+		height = 60
+	}
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m.workers.rows = []workerRow{
+		{w: apitypes.WorkerDTO{ID: "online-a", Name: "online-a", Status: "online", MaxConcurrentRuns: ip32(2), MaxCrossCheckSlots: ip32(2), ActiveCrossChecks: active}},
+		{w: apitypes.WorkerDTO{ID: "online-b", Name: "online-b", Status: "online", MaxConcurrentRuns: ip32(2), MaxCrossCheckSlots: ip32(2)}},
+		{w: apitypes.WorkerDTO{ID: "offline", Name: "offline", Status: "offline", MaxConcurrentRuns: ip32(9), MaxCrossCheckSlots: ip32(9), ActiveCrossChecks: 7}},
+	}
+	return m
 }
 
 var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
@@ -489,7 +545,7 @@ func boardRuns(now time.Time) []apitypes.RunListItemDTO {
 	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 1187.0, InputTokens: 40_000_000, CacheReadTokens: 900_000_000, CacheCreationTokens: 2_000_000, OutputTokens: 3_200_000} // → $1187
 	runs[5].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 0.32, InputTokens: 8_000, CacheReadTokens: 40_000, CacheCreationTokens: 500, OutputTokens: 900}                         // → <$1
 	runs[6].Usage = &apitypes.UsageDTO{CostStatus: "subscription", CostUSD: 0, InputTokens: 120_000, CacheReadTokens: 300_000, CacheCreationTokens: 0, OutputTokens: 5_000}                    // → n/a
-	// PRD #2602: the PROG column, mirroring TUI mock 1 — a percent (55% here: 2 of 4 done), a
+	// PRD #2602: the merged milestone/percentage cell — a percent (55% here: 2 of 4 done), a
 	// stalled run, a looping run (also stalled), a run waiting on the plan gate, and a parked run.
 	pct := 55
 	runs[0].Progress = &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4, ActiveMilestoneID: "m3"}
@@ -657,33 +713,37 @@ func boardRevising(dark bool, now time.Time) string {
 // draws an all-empty ▱▱▱ bar — the graphical 0/N, never –/N text. No credential labels, so
 // the MILE column clears the width gate at the lab's 100 cols instead of being dropped.
 func boardMilestones(dark bool, now time.Time) string {
-	pct70 := 70
+	pct55 := 55
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
-		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, Progress: &apitypes.RunProgress{State: "percent", Pct: &pct70}}}, // two in flight (#1176)
+		{RunDTO: apitypes.RunDTO{ID: "a1b2c3d4-1111", Kind: "issue", Status: "running", IssueTitle: "Add rate-limit headroom to the scheduler poll", CreatedAt: now.Add(-4 * time.Minute), Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, MilestonesInProgress: []string{"m3", "m4"}, Progress: &apitypes.RunProgress{State: "percent", Pct: &pct55}}}, // two in flight (#1176)
 		{RunDTO: apitypes.RunDTO{ID: "d4e5f6a7-1111", Kind: "issue", Status: "running", IssueTitle: "Port the judge to per-model usage folding", CreatedAt: now.Add(-1 * time.Minute), Milestones: []apitypes.Milestone{{ID: "m1"}, {ID: "m2"}, {ID: "m3"}}}},                                                                                                                 // nil completed ⇒ never reported
 		{RunDTO: apitypes.RunDTO{ID: "c9d0e1f2-1111", Kind: "issue", Status: "running", IssueTitle: "Tighten the retry backoff jitter", CreatedAt: now.Add(-12 * time.Minute)}},                                                                                                                                                                                               // no frozen list ⇒ no bar
 	}})
 	return m.View().Content
 }
 
-// boardProgress renders the own-board PROG column (PRD #2602) at 116 cols with no credential
-// column: the bar form (percent + 8-cell bar) plus the waiting, stalled, parked and queued
-// flags. The 100-col scenes show the narrow form (percent or short flag) instead.
+// boardProgress renders the merged milestone/percentage cell at 116 columns.
+// Status words carry ordinary state flags; waiting under stalled health is an exception.
 func boardProgress(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{}
 	m := uxModel(fake, "", dark)
 	m = step(m, tea.WindowSizeMsg{Width: 116, Height: frameHeight})
-	pct := 70
+	pct := 55
 	mk := func(id, status, title string, age time.Duration, p *apitypes.RunProgress) apitypes.RunListItemDTO {
 		return apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: id, Kind: "issue", Status: status, IssueTitle: title, CreatedAt: now.Add(-age),
 			Milestones: milestoneList, MilestonesCompleted: []string{"m1", "m2"}, Progress: p}}
 	}
+	stalled := mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"})
+	stalled.Health = "stalled"
+	waiting := mk("f6a7b8c9-1111", "awaiting_approval", "Approve the retry plan while stalled", 15*time.Minute, &apitypes.RunProgress{State: "waiting"})
+	waiting.Health = "stalled"
 	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{
 		mk("a1b2c3d4-1111", "running", "Add rate-limit headroom to the scheduler poll", 4*time.Minute, &apitypes.RunProgress{State: "percent", Pct: &pct, MilestoneDone: 2, MilestoneTotal: 4}),
 		mk("b2c3d4e5-1111", "awaiting_input", "Pick the retry policy for webhook delivery", 9*time.Minute, &apitypes.RunProgress{State: "waiting"}),
-		mk("c3d4e5f6-1111", "running", "Refactor the forge sync loop for the GitHub driver", 51*time.Minute, &apitypes.RunProgress{State: "stalled"}),
+		stalled,
+		waiting,
 		mk("d4e5f6a7-1111", "limit_wait", "Port the judge to per-model usage folding", 22*time.Minute, &apitypes.RunProgress{State: "parked"}),
 		mk("e5f6a7b8-1111", "queued", "Tighten the retry backoff jitter", time.Minute, &apitypes.RunProgress{State: "queued"}),
 	}})
@@ -1419,5 +1479,72 @@ func helpFrame(dark bool) string {
 func quitFrame(dark bool) string {
 	m := uxModel(&uzicli.FakeClient{}, "", dark)
 	m = key(m, keyQuit)
+	return m.View().Content
+}
+
+// humanStopBoardScene includes conflicting cancellation metadata, stale health,
+// landing metadata, a genuine failure and active work in the shipped board.
+func humanStopBoardScene(dark, admin, selected bool) string {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	m.board.admin = admin
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, admin: admin, runs: humanStopRows()})
+	if selected {
+		for i, r := range m.board.visible() {
+			if r.ID == "reject" {
+				m.board.cursor = i
+				break
+			}
+		}
+	}
+	return m.View().Content
+}
+
+func humanStopDetailScene(dark bool, id string) string {
+	m := uxModel(&uzicli.FakeClient{}, id, dark)
+	for _, r := range humanStopRows() {
+		if r.ID == id {
+			m = applyDetail(m, r.RunDTO, nil)
+			break
+		}
+	}
+	return m.View().Content
+}
+
+// Mixed credentials share measured cells across the needs-you, floor and done bands.
+func boardAccountScene(dark bool, now time.Time, claudeCount, width int) string {
+	runs := boardRuns(now)[:4]
+	for i := range runs {
+		runs[i].AnthropicSecretID, runs[i].AnthropicSecretLabel = sp("claude-id"), sp("default")
+	}
+	runs[0].Harness = "codex"
+	runs[0].CodexSecretID, runs[0].CodexSecretLabel = sp("codex-id"), sp("default")
+	runs[0].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 3}
+	if claudeCount > 1 {
+		runs[2].AnthropicSecretLabel = sp("acct-a")
+	}
+	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 10}
+	runs[3].Status = "completed"
+	runs[3].AnthropicSecretLabel, runs[3].AnthropicSecretID = nil, nil
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m.width = width
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	m = step(m, secretsMsg{count: claudeCount, codexCount: 1})
+	return m.View().Content
+}
+
+// Wide titles consume the space before the reserved judge and worker columns.
+func boardWideTitleScene(dark bool, now time.Time, width int) string {
+	runs := boardRuns(now)[:4]
+	runs[0].IssueTitle = strings.Repeat("Keep account labels readable while aligning costs and judge markers across the board. ", 5)
+	runs[0].JudgeVerdict, runs[0].JudgeTodoCount = sp("issues"), 2
+	for i := range runs {
+		runs[i].WorkerName = sp("worker-a")
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m.width = width
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	m = step(m, secretsMsg{count: 2, codexCount: 1})
 	return m.View().Content
 }

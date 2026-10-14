@@ -143,15 +143,16 @@ and no queued run.
 
 ## Run summaries
 
-**Summary model** sets which model [run summaries](./run-summaries.md)
-generate on, instance-wide (`haiku` by default — summaries are cheap and run
-once or twice per run, so the default favors speed and cost over depth). Each user
-can override it for their own runs from **Settings → Run defaults → Run
-summaries → Summary model**; the admin default only applies while they
-haven't. Summary generation always spends the run owner's own Anthropic
-token, never the admin's, same as the judge above. There's no kill-switch
-for the intent and plan summaries, since a failed or slow summary is skipped
-silently and never blocks a run.
+**Summary model** sets which model [Claude run summaries](./run-summaries.md)
+generate on, instance-wide (`haiku` by default). Each user can override it
+for their own Claude runs from **Settings → Run defaults → Run summaries →
+Summary model**; the admin default applies while they haven't. Codex intent
+and plan summaries use fixed `gpt-6-luna` with low effort, independent of
+this picker, with no fallback model. Both lanes spend the run owner's own
+credential for the run's original harness: an Anthropic token for Claude,
+or the bound OpenAI API key or Codex subscription for Codex. There's no
+kill-switch for the intent and plan summaries; failed, refused or slow
+summaries are skipped without changing the run's outcome.
 
 **Model-written Now line** (`now_summary_enabled`, on by default) is the
 instance kill switch for the [Now summary](./run-activity.md#now-summary): the

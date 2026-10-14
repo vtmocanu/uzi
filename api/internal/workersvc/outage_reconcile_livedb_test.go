@@ -315,6 +315,126 @@ func TestMissingRequeuedUnderCapLiveDB(t *testing.T) {
 	}
 }
 
+// TestMissingCompletionHoldDeferralLifecycleLiveDB follows an unresolved completion-hold
+// deferral through presence, fenced absence, and under-cap requeue while a paused sibling stays held.
+func TestMissingCompletionHoldDeferralLifecycleLiveDB(t *testing.T) {
+	env := setupCodexLiveDB(t)
+	userID, _, repoID := env.seedCodexInfra(t)
+	p := testParams()
+	svc := snapshotSvc(env, p)
+	initialTime := time.Now().UTC().Truncate(time.Microsecond)
+	now := initialTime
+	svc.SetClock(func() time.Time { return now })
+	spy := &stateSpy{}
+	svc.SetBroadcaster(spy)
+
+	wk := seedSnapshotWorker(t, env, userID, "nonce-A")
+	const generation int64 = 3
+	run := seedOutageRun(t, env, userID, repoID, wk, "running", "issue", generation, 0)
+	held := seedOutageRun(t, env, userID, repoID, wk, "paused", "issue", generation, 0)
+	// seedOutageRun backdates status_since; restore a fresh resumed claim for the fence.
+	// A completion hold retains its content until completion, including during a resume.
+	for _, id := range []uuid.UUID{run, held} {
+		env.exec(`UPDATE runs SET status_since = $2, hold_reason = 'completion_blocked',
+		          hold_captured_head = 'completion-head', completion_attempts = 1 WHERE id = $1`, id, now)
+	}
+	env.exec(`UPDATE runs SET claim_released_at = $2 WHERE id = $1`, held, now)
+
+	assertRun := func(t *testing.T, id uuid.UUID, wantStatus string, wantCount int, wantReleased bool) {
+		t.Helper()
+		var status, reason, head string
+		var gen int64
+		var count, attempts int
+		var released, finished bool
+		var releaseAt *time.Time
+		if err := env.pool.QueryRow(env.ctx, `SELECT status, claim_generation, requeue_count,
+		        COALESCE(hold_reason, ''), COALESCE(hold_captured_head, ''), completion_attempts,
+		        claim_released_at IS NOT NULL, finished_at IS NOT NULL, claim_released_at
+		        FROM runs WHERE id = $1`, id).Scan(
+			&status, &gen, &count, &reason, &head, &attempts, &released, &finished, &releaseAt); err != nil {
+			t.Fatalf("read lifecycle run: %v", err)
+		}
+		if status != wantStatus || gen != generation || count != wantCount || released != wantReleased || finished {
+			t.Fatalf("run %s: status=%q generation=%d requeues=%d released=%v finished=%v; want %q/%d/%d/%v/false",
+				id, status, gen, count, released, finished, wantStatus, generation, wantCount, wantReleased)
+		}
+		if reason != "completion_blocked" || head != "completion-head" || attempts != 1 {
+			t.Fatalf("completion hold changed: reason=%q head=%q attempts=%d", reason, head, attempts)
+		}
+		if id == held && (releaseAt == nil || !releaseAt.Equal(initialTime)) {
+			t.Fatalf("paused sibling claim release changed: %v, want %v", releaseAt, initialTime)
+		}
+		if _, valid := staleReqGenOf(t, env, id); valid {
+			t.Fatal("missing lifecycle fabricated stale requeue provenance")
+		}
+	}
+	heartbeat := func(t *testing.T, epoch int64, active []ActiveRunEntry) {
+		t.Helper()
+		_, err := svc.Heartbeat(env.ctx, hbWorker(t, env, wk), nil, nil,
+			&ActiveSnapshot{SnapshotEpoch: epoch, RegisterNonce: "nonce-A", Active: active})
+		if err != nil {
+			t.Fatalf("Heartbeat epoch %d: %v", epoch, err)
+		}
+		if got := hbWorker(t, env, wk).SnapshotEpoch; got != epoch {
+			t.Fatalf("persisted snapshot epoch: got %d, want %d", got, epoch)
+		}
+	}
+	assertHeld := func(t *testing.T) {
+		t.Helper()
+		assertRun(t, held, "paused", 0, true)
+		if status, ok := spy.statusFor(held); ok {
+			t.Fatalf("paused sibling published a transition to %q", status)
+		}
+	}
+	assertNoTransition := func(t *testing.T) {
+		t.Helper()
+		if status, ok := spy.statusFor(run); ok {
+			t.Fatalf("deferred run published a transition to %q", status)
+		}
+	}
+
+	if !t.Run("present_exact_generation_control", func(t *testing.T) {
+		heartbeat(t, 1, []ActiveRunEntry{entry(run, generation, "running", false)})
+		row, ok := readActiveRun(t, env, wk, run)
+		if !ok || row.gen != generation || row.phase != "running" || row.epoch != 1 ||
+			row.terminalPending || row.untilValid {
+			t.Fatalf("present snapshot = %+v, exists=%v; want exact-generation live running without terminal pending", row, ok)
+		}
+		assertRun(t, run, "running", 0, false)
+		assertHeld(t)
+		assertNoTransition(t)
+	}) {
+		return
+	}
+	if !t.Run("empty_before_missing_fence_defers", func(t *testing.T) {
+		now = initialTime.Add(p.WorkerHeartbeatInterval)
+		heartbeat(t, 2, []ActiveRunEntry{})
+		if got := countActiveRuns(t, env, wk); got != 0 {
+			t.Fatalf("empty snapshot retained %d active rows (including terminal pending)", got)
+		}
+		assertRun(t, run, "running", 0, false)
+		assertHeld(t)
+		assertNoTransition(t)
+	}) {
+		return
+	}
+	t.Run("newer_empty_after_missing_fence_requeues_control", func(t *testing.T) {
+		now = initialTime.Add(p.WorkerHeartbeatStale + p.WorkerHeartbeatInterval + time.Second)
+		heartbeat(t, 3, []ActiveRunEntry{})
+		assertRun(t, run, "queued", 1, false)
+		assertHeld(t)
+		if got := countActiveRuns(t, env, wk); got != 0 {
+			t.Fatalf("requeue fabricated %d active rows (including terminal pending)", got)
+		}
+		if status, ok := spy.statusFor(run); !ok || status != "queued" || len(spy.events) != 1 {
+			t.Fatalf("requeue broadcast = (%q,%v), events=%v; want one queued transition", status, ok, spy.events)
+		}
+	})
+	t.Run("paused_completion_blocked_control", func(t *testing.T) {
+		assertHeld(t)
+	})
+}
+
 // TestMissingFailedOverCapFailFirstLiveDB: over-cap missing run is FAILED (fail-first) while an
 // under-cap sibling in the SAME heartbeat is requeued — proving the fail-before-requeue ordering and
 // that the fail funnels the worker-lost transition to the judge/broadcaster.

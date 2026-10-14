@@ -1,4 +1,4 @@
-// Pinned Codex 0.160.0 app-server dynamic-tool registration for the worker-owned
+// Pinned Codex 0.160.1 app-server dynamic-tool registration for the worker-owned
 // callback boundary. The app-server receives only the immutable grant's model-visible
 // subset. Native environments are disabled separately on every fresh thread.
 
@@ -59,7 +59,7 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
       };
     case "Read":
       return {
-        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Files over 1 MiB are denied.",
+        description: "Read text lines through the worker-owned no-symlink boundary inside the current worktree (offset defaults to 1, limit to 200; at most 64 KiB). Unranged binary reads return exact base64. Files over 1 MiB are denied. Reads may run while a shell command is pending and are not a snapshot of concurrent changes.",
         inputSchema: {
           ...objectSchema({
             path: STRING,

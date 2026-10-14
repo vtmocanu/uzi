@@ -46,8 +46,8 @@ func TestEffectiveRunStatus(t *testing.T) {
 func TestPlanningStatusColour(t *testing.T) {
 	p := newPalette(true)
 
-	planning := p.stateColor("running", "", true, false) // running + is_planning → planning
-	running := p.stateColor("running", "", false, false)
+	planning := p.stateColor("running", "", true, false, "") // running + is_planning → planning
+	running := p.stateColor("running", "", false, false, "")
 	if bgFillSGR(planning) == bgFillSGR(running) {
 		t.Error("planning and running resolve to the same colour; the planning phase is not visually distinct")
 	}
@@ -55,7 +55,7 @@ func TestPlanningStatusColour(t *testing.T) {
 		t.Error("planning resolved to the faint default; its own indigo entry is not being read")
 	}
 	// Health precedence: a stalled planning run is still the stall colour (triage wins).
-	if bgFillSGR(p.stateColor("running", "stalled", true, false)) != bgFillSGR(p.stall) {
+	if bgFillSGR(p.stateColor("running", "stalled", true, false, "")) != bgFillSGR(p.stall) {
 		t.Error("stalled health no longer overrides the planning bucket; the precedence rule regressed")
 	}
 }
@@ -63,10 +63,10 @@ func TestPlanningStatusColour(t *testing.T) {
 // TestStatusGlyphPlanning pins the NO_COLOR-safe state glyph (D3): planning is a hollow circle
 // ("nothing committed yet"), distinct from running's filled dot.
 func TestStatusGlyphPlanning(t *testing.T) {
-	if got, _ := stateGlyphWord("running", "", true, false, ""); got != "○" {
+	if got, _ := stateGlyphWord("running", "", true, false, "", ""); got != "○" {
 		t.Errorf("planning glyph = %q, want %q", got, "○")
 	}
-	if got, _ := stateGlyphWord("running", "", false, false, ""); got != "●" {
+	if got, _ := stateGlyphWord("running", "", false, false, "", ""); got != "●" {
 		t.Errorf("running glyph = %q, want %q", got, "●")
 	}
 }

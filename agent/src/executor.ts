@@ -1,6 +1,7 @@
 import { execFile } from "node:child_process";
 import { promisify } from "node:util";
 import fs from "node:fs/promises";
+import { watch } from "node:fs";
 import path from "node:path";
 import type { Logger } from "./log.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
@@ -199,7 +200,7 @@ export interface RunContext {
   /** PRD #362 M3c: the model the inline run-summary generator runs on, resolved
    *  user-value-wins from users.summary_model over the instance summary_model at
    *  issue-run claim assembly. Absent ⇒ the generator uses the SDK/account default
-   *  model. Only the SDK executor's summary hooks read it; the stub ignores it. */
+   *  model. Claude summary hooks read it; Codex intent/plan summaries use fixed model pins. */
   summaryModel?: string;
   /** PRD #362 M3c (Decision 3): the run's INTENT summary is already set, so the
    *  executor skips intent generation on a resume/re-claim rather than re-spending
@@ -260,10 +261,10 @@ export interface RunContext {
   /** Per-run caps (timeouts in SECONDS, iterations); converted at use sites. */
   config?: ClaimConfig | null;
   /** PRD #1064 M1 (Decision 2, resumed runs): the run's FROZEN milestone list as carried
-   *  on the claim (`ClaimResponse.milestones`). The implement loop assigns its own
-   *  `frozenMilestones` at the plan gate, but that stays undefined on a PRE-APPROVED RESUME
-   *  (no gate runs there), so the transition-frame closure falls back to THIS list for the
-   *  `<title>` on a re-claimed run. Absent/null ⇒ a titleless frame (`milestone m2 started`)
+   *  on the claim (`ClaimResponse.milestones`). The implement loop uses the gate's list
+   *  on a fresh approval and this claim's list on a pre-approved resume. Transition frames
+   *  also fall back to this list for the `<title>` on a re-claimed run. Absent/null ⇒ a
+   *  titleless frame (`milestone m2 started`)
    *  rather than a skip. Never load-bearing — a milestone with no title still emits a frame. */
   frozenMilestones?: Milestone[] | null;
   /** SDK session to resume; null/absent for a fresh run. The runner clears this when
@@ -371,24 +372,17 @@ export interface RunContext {
    * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
    * the report (additive-optional; a run with no milestones is unchanged).
    *
-   * PRD #362 M3c: `onAwaitingApproval` is an ADVISORY callback the gate invokes AFTER
-   * it persists `plan_md` (the awaiting_approval report) and BEFORE it blocks on the
-   * verdict. The plan-summary hook rides it: the summary's stale-write guard value is
-   * `runs.plan_md`, so the POST can only match once the gate has persisted it — posting
-   * before the gate always 409s against a NULL/previous plan_md and is silently dropped.
-   * It is NEVER invoked on the autopilot short-circuit (which DOES persist plan_md via
-   * its running report / SetRunAutopilotPlan, RC1 #1197, but never invokes this callback),
-   * so an auto-approved run generates no plan summary. The gate swallows any throw.
-   *
-   * Issue #1604: `settles` is the input id of the revise this plan revises (the revise
-   * verdict's `inputId`). The runner marks that revise final only once this gate's
-   * awaiting_approval report is applied (the revised plan is persisted); a declined or failed
-   * report, or an absent id, leaves it unapplied, so an interruption replays it.
+   * Advisory hook after accepted plan persistence. Human gates await it before their
+   * verdict wait; autopilot starts it without waiting before implementation. The
+   * callback receives the actual stored candidate, including a checked canonical plan.
+   * `settles` identifies the revise input this plan answers: it is finalized only
+   * after the revised plan's awaiting_approval report is applied; refusal or failure
+   * leaves that input replayable after interruption.
    */
   gatePlan?(
     planMd: string,
     milestones?: Milestone[],
-    onAwaitingApproval?: (planMd: string) => Promise<void>,
+    onPlanPersisted?: (planMd: string) => Promise<void>,
     settles?: number,
   ): Promise<PlanVerdict>;
   /**
@@ -710,10 +704,10 @@ export interface RunContext {
    *  legacy throw (the runner wires it in production; an unwired seam, as in tests, never fires
    *  the hold).
    *
-   *  Returns TRUE when the run ENTERED the verified hold (parked; the runner preserved the clone
-   *  and HOME and the caller latches {@link ExecutorResult.completionHeld} and breaks so the runner
-   *  skips finalization). Returns FALSE when the hold could NOT be entered — capture was never
-   *  verified, or the server did not ACK `paused` — so the run is KEPT LIVE and nothing was cleaned
+   *  Returns TRUE for a confirmed hold or unresolved delivery: the runner preserves clone
+   *  and HOME and the caller latches {@link ExecutorResult.completionHeld} to skip finalization.
+   *  Returns FALSE if capture was never verified or explicit proof refused the hold;
+   *  nothing was cleaned
    *  up; the caller then falls through to the LEGACY terminal throw (never the destructive
    *  cleanup). The implementation MUST NOT run the destructive clone/HOME cleanup on the false
    *  path. */
@@ -817,10 +811,10 @@ export interface ExecutorResult {
   /** Latest accepted declaration that an issue delivery leaves the issue open. */
   nonClosing?: { reason: string };
   /** PRD #1798 M2: the plain-English summary of the approved plan that the in-flight plan
-   *  summary pass produced and the api accepted (sdk-executor generateAndPostPlanSummary),
-   *  latched from the LAST successful generation of this run. Absent whenever that pass did not
-   *  run or did not succeed, which is normal: a resumed run past its gate and every Codex run
-   *  never produce one. */
+   *  summary pass produced and the api accepted,
+   *  latched after API acceptance. Codex latches only for the current gate generation: a newer
+   *  gate clears its previous latch even if its replacement fails. Absent when the pass did not run or succeed,
+   *  including a resumed run past its gate. */
   summaryPlan?: string;
   /** PRD #1798 M2: the tagged deltas (added / changed / dropped) that accompanied
    *  `summaryPlan`, from the same generation. Present only alongside `summaryPlan`. */
@@ -843,7 +837,7 @@ export interface ExecutorResult {
    *  completion attempt, or a post-attempt budget/stall/wall/idle exhaustion, routed to
    *  `ctx.enterCompletionHold` instead of throwing. The runner reads it in phasePublish to SKIP
    *  finalization (no push, no PR, no completion report), exactly like `pausedAt`: the hold seam
-   *  already parked the run (M4). `reason` is the static, content-free failure-reason constant the
+   *  retained the run, either confirmed parked or unresolved. `reason` is the static, content-free failure-reason constant the
    *  route used. Only ever set when `ctx.enterCompletionHold` is wired (M4); nil in M3 production
    *  (the seam is unwired, so the executor falls back to the legacy throw). StubExecutor never
    *  sets it. */
@@ -888,6 +882,8 @@ export class PlanRejectedError extends Error {
  */
 export interface Executor {
   run(ctx: RunContext): Promise<ExecutorResult>;
+  /** Close summary admission synchronously, then abort/join within the remaining sink deadline. */
+  closeAndSettlePlanSummary?(deadlineMs?: number): Promise<void>;
   /**
    * Group-kill every subprocess the agent spawned for the last run. The runner
    * calls this BEFORE any PAT-bearing git op (push) so an agent-backgrounded
@@ -1801,6 +1797,40 @@ export class StubExecutor implements Executor {
           payload: { text: `stub: outbox tick ${i}` },
         });
         await sleep(outboxTickMs);
+      }
+      // Stub-only E2E barrier: helper startup may outlast the stream. The harness
+      // releases this exact run only after stopping the API, never by elapsed time.
+      const cutBarrier = ctx.issueDescription.includes("UZI_STUB_OUTBOX_CUT_BARRIER");
+      const firstClaimBarrier = ctx.issueDescription.includes("UZI_STUB_OUTBOX_FIRST_CUT_BARRIER");
+      if (firstClaimBarrier && (!Number.isSafeInteger(ctx.claimGeneration) || ctx.claimGeneration! < 1))
+        throw new Error("invalid stub outbox barrier claim generation");
+      if (cutBarrier || (firstClaimBarrier && ctx.claimGeneration === 1)) {
+        if (!/^[0-9a-f]{8}-(?:[0-9a-f]{4}-){3}[0-9a-f]{12}$/i.test(ctx.runId))
+          throw new Error("invalid stub outbox barrier run id");
+        const name = `cdr-outbox-cut-${ctx.runId}`;
+        const file = path.join("/tmp", name);
+        await new Promise<void>((resolve, reject) => {
+          let done = false;
+          const finish = (error?: unknown) => {
+            if (done) return;
+            done = true;
+            watcher.close();
+            clearTimeout(timer);
+            ctx.signal?.removeEventListener("abort", abort);
+            if (error) reject(error); else resolve();
+          };
+          const abort = () => finish(ctx.signal?.reason ?? new Error("stub outbox barrier aborted"));
+          const check = () => { void fs.access(file).then(() => finish(), error => {
+            if ((error as NodeJS.ErrnoException).code !== "ENOENT") finish(error);
+          }); };
+          const watcher = watch("/tmp", (_event, changed) => { if (changed === name) check(); });
+          watcher.on("error", finish);
+          const timer = setTimeout(() => finish(new Error("stub outbox cut barrier timeout")), 180_000);
+          ctx.signal?.addEventListener("abort", abort, { once: true });
+          if (ctx.signal?.aborted) abort(); else check();
+          ctx.emit({ kind: "status", agent: "worker", payload: { text: "stub: outbox waiting for API cut" } });
+        });
+        await fs.unlink(file).catch(() => undefined);
       }
       return;
     }

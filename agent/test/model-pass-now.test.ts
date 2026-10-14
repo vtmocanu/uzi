@@ -238,8 +238,8 @@ describe("the Codex advice path: bounded settle and usage", () => {
   });
 });
 
-describe("existing callers are unchanged", () => {
-  it("SummaryRunner sets no cap, no thinking and passes no signal or usage callback", async () => {
+describe("caller option policy", () => {
+  it("SummaryRunner keeps output-cap and thinking defaults", async () => {
     const seen: { options?: SdkOptions } = {};
     const queryFn = ((params: { options: SdkOptions }) => {
       seen.options = params.options;
@@ -256,11 +256,15 @@ describe("existing callers are unchanged", () => {
     assert.equal("thinking" in seen.options!, false);
   });
 
-  it("none of the four callers names a new option", () => {
+  it("callers keep restricted options and only approved callers forward usage", () => {
+    const forwardsUsage = new Set([
+      "summary-runner.ts", // #2686: summary passes report their spend.
+      "judge-runner.ts", // #2915: Codex judges report their spend.
+      "review-runner.ts", // #2916: task reviews report their spend.
+    ]);
     for (const f of ["judge-runner.ts", "review-runner.ts", "summary-runner.ts", "pr-description-eval-cli.ts"]) {
       const src = readFileSync(new URL(`../src/${f}`, import.meta.url), "utf8");
-      // Issue #2686: the summary runner now forwards onUsage (and signal) for its spend.
-      const needles = f === "summary-runner.ts" ? ["maxOutputTokens", "usageObserver", "thinking:"] : ["maxOutputTokens", "onUsage", "usageObserver", "thinking:"];
+      const needles = forwardsUsage.has(f) ? ["maxOutputTokens", "usageObserver", "thinking:"] : ["maxOutputTokens", "onUsage", "usageObserver", "thinking:"];
       for (const needle of needles) {
         assert.ok(!src.includes(needle), `${f} must not pass ${needle}`);
       }

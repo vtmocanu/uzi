@@ -429,7 +429,7 @@ export const mockCrewRuns: Run[] = [
     status: "running",
     health: "looping",
     health_reason: "no new tool calls in the last few minutes",
-    health_since: minsAgo(3),
+    health_since: minsAgo(125), // an hours-long stall: the Progress cell reads `◼ stalled · 2h 5m` (#2836)
   }),
   demoIssueRun({
     id: "run-degraded",

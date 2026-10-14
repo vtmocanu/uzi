@@ -4,6 +4,10 @@ import (
 	"context"
 	"encoding/json"
 	"errors"
+	"fmt"
+	"reflect"
+
+	gh "github.com/google/go-github/v92/github"
 	"net"
 	"net/http"
 	"net/http/httptest"
@@ -365,6 +369,202 @@ func checkRun(id int, name, status string, conclusion any, htmlURL, appSlug stri
 }
 
 func writeJSON(w http.ResponseWriter, v any) { _ = json.NewEncoder(w).Encode(v) }
+
+// Both entry points must prefer the maximum Actions suite and preserve older
+// check-run-derived native recovery when the preferred response is empty.
+func TestGitHubActionsSuiteRecoveryOrder(t *testing.T) {
+	const sha = "0123456789abcdef0123456789abcdef01234567"
+	for _, tc := range []struct {
+		name        string
+		runApp      string
+		runSuite    int
+		noRuns      bool
+		noSuites    bool
+		suiteID     int
+		preferred   string
+		older       string
+		wantQueries []string
+		wantID      int64
+		wantStatus  string
+		wantURL     string
+		wantError   bool
+		wantNone    bool
+	}{
+		{name: "newest-native", runApp: "github-actions", runSuite: 100, suiteID: 200, preferred: "native", older: "native", wantQueries: []string{"200"}, wantID: 2000, wantStatus: "failure", wantURL: "https://github.com/acme/widgets/actions/runs/2000"},
+		{name: "newest-native-success", runApp: "github-actions", runSuite: 100, suiteID: 200, preferred: "native-success", older: "error", wantQueries: []string{"200"}, wantID: 2000, wantStatus: "success", wantURL: "https://github.com/acme/widgets/actions/runs/2000"},
+		{name: "older-native", runApp: "github-actions", runSuite: 100, suiteID: 200, older: "native", wantQueries: []string{"200", "100"}, wantID: 1000, wantStatus: "success", wantURL: "https://github.com/acme/widgets/actions/runs/1000"},
+		{name: "preferred-error", runApp: "github-actions", runSuite: 100, suiteID: 200, preferred: "error", older: "native", wantQueries: []string{"200"}, wantError: true},
+		{name: "older-error", runApp: "github-actions", runSuite: 100, suiteID: 200, older: "error", wantQueries: []string{"200", "100"}, wantError: true},
+		{name: "same-suite", runApp: "github-actions", runSuite: 200, suiteID: 200, wantQueries: []string{"200"}, wantID: 200, wantStatus: "success", wantURL: "check-url"},
+		{name: "absent-run-suite", runApp: "github-actions", suiteID: 200, wantQueries: []string{"200"}, wantID: 200, wantStatus: "success", wantURL: "check-url"},
+		{name: "non-actions-run", runApp: "external-ci", runSuite: 100, suiteID: 200, wantQueries: []string{"200"}, wantID: 200, wantStatus: "success", wantURL: "check-url"},
+		{name: "zero-run-suite", runApp: "github-actions", suiteID: 200, wantQueries: []string{"200"}, wantID: 200, wantStatus: "success", wantURL: "check-url"},
+		{name: "absent-runs", noRuns: true, suiteID: 200, wantQueries: []string{"200"}, wantNone: true},
+		{name: "both-empty", runApp: "github-actions", runSuite: 100, suiteID: 200, wantQueries: []string{"200", "100"}, wantID: 200, wantStatus: "success", wantURL: "check-url"},
+		{name: "nil-response", runApp: "github-actions", runSuite: 100, suiteID: 200, preferred: "null", older: "native", wantQueries: []string{"200", "100"}, wantID: 1000, wantStatus: "success", wantURL: "https://github.com/acme/widgets/actions/runs/1000"},
+		{name: "nil-first", runApp: "github-actions", runSuite: 100, suiteID: 200, preferred: "nil-first", older: "native", wantQueries: []string{"200", "100"}, wantID: 1000, wantStatus: "success", wantURL: "https://github.com/acme/widgets/actions/runs/1000"},
+		{name: "no-eligible", runApp: "external-ci", runSuite: 100, noSuites: true, wantID: 100, wantStatus: "success", wantURL: "check-url"},
+		{name: "no-checks", noRuns: true, noSuites: true, wantNone: true},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			for _, mr := range []bool{false, true} {
+				name := "branch"
+				if mr {
+					name = "MR"
+				}
+				t.Run(name, func(t *testing.T) {
+					var queries []string
+					checkRef := "feature"
+					if mr {
+						checkRef = sha
+					}
+					m := newMockGitHub(t, map[string]http.HandlerFunc{
+						"/repos/acme/widgets/pulls/4": func(w http.ResponseWriter, _ *http.Request) {
+							writeJSON(w, map[string]any{"number": 4, "head": map[string]any{"sha": sha, "ref": "feature"}})
+						},
+						"/repos/acme/widgets/actions/runs": func(w http.ResponseWriter, r *http.Request) {
+							suite := r.URL.Query().Get("check_suite_id")
+							if suite == "" {
+								if mr && r.URL.Query().Get("head_sha") != sha {
+									t.Error("initial MR workflow query must use head SHA")
+								}
+								if !mr && r.URL.Query().Get("branch") != "feature" {
+									t.Error("initial branch workflow query must use branch ref")
+								}
+								writeJSON(w, map[string]any{"workflow_runs": []any{}})
+								return
+							}
+							queries = append(queries, suite)
+							if r.URL.Query().Get("per_page") != "1" {
+								t.Error("recovery must request one workflow")
+							}
+							response := tc.preferred
+							id, status := 2000, "failure"
+							if suite == "100" {
+								response = tc.older
+								id, status = 1000, "success"
+							} else if suite != "200" {
+								t.Errorf("unexpected suite query %q", suite)
+							}
+							switch response {
+							case "error":
+								w.WriteHeader(http.StatusInternalServerError)
+								writeJSON(w, map[string]any{"message": "suite lookup failed"})
+							case "native", "native-success":
+								if response == "native-success" {
+									status = "success"
+								}
+								writeJSON(w, map[string]any{"workflow_runs": []any{map[string]any{
+									"id": id, "head_sha": sha, "head_branch": "feature",
+									"status": "completed", "conclusion": status,
+									"html_url": fmt.Sprintf("https://github.com/acme/widgets/actions/runs/%d", id),
+								}}})
+							case "null":
+								writeJSON(w, nil)
+							case "nil-first":
+								writeJSON(w, map[string]any{"workflow_runs": []any{nil}})
+							default:
+								writeJSON(w, map[string]any{"workflow_runs": []any{}})
+							}
+						},
+						"/repos/acme/widgets/commits/" + checkRef + "/check-runs": func(w http.ResponseWriter, _ *http.Request) {
+							runs := []map[string]any{}
+							if !tc.noRuns {
+								cr := checkRun(11, "ci", "completed", "success", "check-url", tc.runApp, tc.runSuite, sha)
+								cr["head_sha"] = sha
+								switch tc.name {
+								case "absent-run-suite":
+									delete(cr, "check_suite")
+								case "zero-run-suite":
+									cr["check_suite"] = map[string]any{"id": 0, "head_sha": sha}
+								}
+								runs = append(runs, cr)
+							}
+							writeJSON(w, map[string]any{"check_runs": runs})
+						},
+						"/repos/acme/widgets/commits/" + sha + "/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+							suites := []map[string]any{}
+							if !tc.noSuites {
+								suites = append(suites, map[string]any{"id": tc.suiteID, "app": map[string]any{"slug": "github-actions"}, "head_sha": sha})
+							}
+							writeJSON(w, map[string]any{"check_suites": suites})
+						},
+						"/repos/acme/widgets/commits/feature/check-suites": func(w http.ResponseWriter, _ *http.Request) {
+							if !tc.noRuns {
+								t.Error("branch suites query must be pinned to check-run SHA")
+							}
+							suites := []map[string]any{}
+							if !tc.noSuites {
+								suites = append(suites, map[string]any{"id": tc.suiteID, "app": map[string]any{"slug": "github-actions"}, "head_sha": sha})
+							}
+							writeJSON(w, map[string]any{"check_suites": suites})
+						},
+					})
+					d := newGitHubDriver(t, m, "dummy-token")
+					var p Pipeline
+					var err error
+					if mr {
+						p, err = d.LatestMRPipeline(context.Background(), 7, 4)
+					} else {
+						p, err = d.LatestPipeline(context.Background(), 7, "feature")
+					}
+					if tc.wantError {
+						if err == nil || errors.Is(err, ErrNoPipeline) || !strings.Contains(err.Error(), "latest pipeline from checks") || !strings.Contains(err.Error(), "suite lookup failed") {
+							t.Errorf("want wrapped workflow lookup error, got pipeline %+v, error %v", p, err)
+						}
+						if p != (Pipeline{}) {
+							t.Errorf("error must not return synthesized pipeline: %+v", p)
+						}
+					} else if tc.wantNone {
+						if !errors.Is(err, ErrNoPipeline) {
+							t.Errorf("want ErrNoPipeline, got %+v, %v", p, err)
+						}
+					} else if err != nil || p.ID != tc.wantID || p.SHA != sha || p.Status != tc.wantStatus || p.WebURL != tc.wantURL {
+						t.Errorf("pipeline = %+v, error = %v; want ID %d SHA %s status %s URL %s", p, err, tc.wantID, sha, tc.wantStatus, tc.wantURL)
+					}
+					if !reflect.DeepEqual(queries, tc.wantQueries) {
+						t.Errorf("suite queries = %v, want %v", queries, tc.wantQueries)
+					}
+				})
+			}
+		})
+	}
+}
+
+func TestNewestActionsSuiteIDFromChecks(t *testing.T) {
+	run := func(id int64, app string) *gh.CheckRun {
+		return &gh.CheckRun{App: &gh.App{Slug: new(app)}, CheckSuite: &gh.CheckSuite{ID: new(id)}}
+	}
+	suite := func(id int64, app string) *gh.CheckSuite {
+		return &gh.CheckSuite{ID: new(id), App: &gh.App{Slug: new(app)}}
+	}
+	for _, tc := range []struct {
+		name   string
+		runs   []*gh.CheckRun
+		suites []*gh.CheckSuite
+		want   int64
+		ok     bool
+	}{
+		{"suites-newer", []*gh.CheckRun{run(100, "github-actions")}, []*gh.CheckSuite{suite(200, "github-actions")}, 200, true},
+		{"runs-newer", []*gh.CheckRun{run(200, "github-actions")}, []*gh.CheckSuite{suite(100, "github-actions")}, 200, true},
+		{"equal", []*gh.CheckRun{run(200, "github-actions")}, []*gh.CheckSuite{suite(200, "github-actions")}, 200, true},
+		{"runs-only", []*gh.CheckRun{run(100, "github-actions")}, nil, 100, true},
+		{"suites-only", nil, []*gh.CheckSuite{suite(200, "github-actions")}, 200, true},
+		{"ascending", []*gh.CheckRun{run(50, "github-actions"), run(100, "github-actions")}, []*gh.CheckSuite{suite(150, "github-actions"), suite(200, "github-actions")}, 200, true},
+		{"reversed", []*gh.CheckRun{run(100, "github-actions"), run(50, "github-actions")}, []*gh.CheckSuite{suite(200, "github-actions"), suite(150, "github-actions")}, 200, true},
+		{"app-guards", []*gh.CheckRun{run(900, "other"), run(800, ""), run(100, "github-actions")}, []*gh.CheckSuite{suite(700, "other"), suite(600, ""), suite(200, "github-actions")}, 200, true},
+		{"zero-and-nil", []*gh.CheckRun{nil, {}, run(0, "github-actions")}, []*gh.CheckSuite{nil, {}, suite(0, "github-actions")}, 0, false},
+		{"no-eligible", []*gh.CheckRun{run(100, "other")}, []*gh.CheckSuite{suite(200, "other")}, 0, false},
+		{"empty", nil, nil, 0, false},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			id, ok := newestActionsSuiteIDFromChecks(tc.runs, tc.suites)
+			if id != tc.want || ok != tc.ok {
+				t.Fatalf("got (%d, %v), want (%d, %v)", id, ok, tc.want, tc.ok)
+			}
+		})
+	}
+}
 
 // TestGitHubLatestMRPipelineRecoversActionsRunFromChecks is the reported repro
 // (issue #1005): the head_sha-filtered workflow-runs list is empty, but the head

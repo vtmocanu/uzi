@@ -68,6 +68,11 @@ services:
       - "127.0.0.1:${E2E_WEB_PORT}:8080"
 
   db:
+    volumes:
+      - type: bind
+        source: ./e2e/test-database-marker.sql
+        target: /docker-entrypoint-initdb.d/10-uzi-test-database-marker.sql
+        read_only: true
     # PRD #97 M5: merge start_interval into the base db healthcheck (pg_isready test etc.
     # stay in docker-compose.yml). db is first in the `--wait` chain, so a 1s start probe
     # shortens the whole boot (api depends_on db: service_healthy). Needs Engine >=25.
@@ -302,6 +307,9 @@ services:
       # UZI_E2E_DROP_ON_SENTINEL above; the api-outage-outbox phase (52) exports it for its Run B
       # cases and unsets it at restore. Read by agent/src/executor.ts.
       UZI_STUB_OUTBOX_TICKS: ${UZI_STUB_OUTBOX_TICKS:-}
+      # Phase 52 only: fast retry spacing for stale inventory recapture. The worker
+      # ignores this outside executor=stub; production timers and the cap are unchanged.
+      UZI_E2E_RECOVERY_FAST_REDRIVE: ${UZI_E2E_RECOVERY_FAST_REDRIVE:-}
       # Chat lane (PRD #39): fast turn pickup + a SHORT worker-driven idle window so the
       # e2e sees idle-completion in seconds instead of the 60m default. This agent-side
       # value is only the FALLBACK — the effective window is the api's claim-config

@@ -866,6 +866,8 @@ export const mockRuns: Run[] = [
     pipeline_web_url: null,
     fix_verdict: null,
     status: "awaiting_followup",
+    // Parked 1h12m ago: the Progress cell reads `waits on you · follow-up · 1h 12m` (#2836).
+    status_since: minsAgo(72),
     requeue_count: 0,
     iteration_count: 3,
     auto_approve: false,

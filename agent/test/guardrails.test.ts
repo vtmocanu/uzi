@@ -1586,3 +1586,55 @@ describe("path guard — SDK spill read allowance (#2332)", () => {
     assert.strictEqual(screenToolPath(x, wt, wt, [], undefined).denied, true);
   });
 });
+
+// issue #1786 M0b: the operator retained-source channel. A Bash-only deny with its own reason; the
+// repo files stay ordinary files, and the file-tool path classification is untouched.
+describe("operator retained-source channel (Bash-only deny, defense in depth)", () => {
+  const installedClient = "/app/src/ops/retained-source.mjs";
+  const socket = "/data/ops/retained-source.sock";
+
+  it("denies a Bash command naming the installed client or the socket, with its own reason", () => {
+    for (const cmd of [
+      `node ${installedClient} inspect --run x`,
+      `env -i PATH=/usr/local/bin /usr/local/bin/node ${installedClient} discard`,
+      `cat ${installedClient}`,
+      `sh -c 'node ${installedClient}'`,
+      `echo '{"op":"inspect"}' | nc -U ${socket}`,
+      `socat - UNIX-CONNECT:${socket}`,
+      `python3 -c "import socket; s=socket.socket(socket.AF_UNIX); s.connect('${socket}')"`,
+      "cat /app/src/ops/retained-\"\"source.mjs",
+    ]) {
+      const r = screenBashCommand(cmd);
+      assert.strictEqual(r.denied, true, cmd);
+      assert.match(r.reason ?? "", /retained-source channel/, cmd);
+      assert.doesNotMatch(r.reason ?? "", /credential file/, "its own reason, not the secret-file one");
+    }
+  });
+
+  it("still allows git and shell work on the repo's own channel files", () => {
+    for (const cmd of [
+      "git add agent/src/ops/retained-source.mjs",
+      "git diff -- agent/src/ops/retained-source-server.ts",
+      "cat agent/src/ops/retained-source.mjs",
+      "git add agent/src/ops/retained-source.mjs agent/test/retained-source-channel.test.ts",
+      "grep -n listen agent/src/ops/retained-source-server.ts",
+    ]) {
+      assert.strictEqual(screenBashCommand(cmd).denied, false, cmd);
+    }
+  });
+
+  it("does not change the file-tool path classification of the repo files", () => {
+    const root = fs.mkdtempSync(path.join(os.tmpdir(), "ops-guard-"));
+    try {
+      for (const rel of ["agent/src/ops/retained-source.mjs", "agent/src/ops/retained-source-server.ts"]) {
+        assert.strictEqual(screenToolPath(path.join(root, rel), root, root).denied, false, rel);
+      }
+      // The installed copy is outside the worktree: the pre-existing reason applies, not the ops one.
+      const outside = screenToolPath(installedClient, root, root);
+      assert.strictEqual(outside.denied, true);
+      assert.doesNotMatch(outside.reason ?? "", /retained-source channel/);
+    } finally {
+      fs.rmSync(root, { recursive: true, force: true });
+    }
+  });
+});

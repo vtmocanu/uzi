@@ -4,7 +4,7 @@ import assert from "node:assert/strict";
 
 import { SteeringChannel } from "../src/steering.js";
 import { StubExecutor } from "../src/executor.js";
-import { nullLogger } from "./helpers.js";
+import { nullLogger, waitForTestEvent } from "./helpers.js";
 import { api, installHarness } from "./runner-harness.js";
 import {
   PLAN_V1,
@@ -46,7 +46,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       try {
         const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
         assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delayed GET entered the fake API");
-        await hold.entered;
+        await waitForTestEvent(hold.entered, "input GET entered");
         assertHeldInputGet(s.runId);
         assert.equal(s.gates(flight).length, 0, "no plan is offered before the held GET returns");
         hold.release();
@@ -105,7 +105,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       api.failInputGets(s.runId, 0);
       await s.finish(flight, 2_000);
       const { flight: again, gateAt } = await resumeAndApprove(s, s.resumeClaimAtV1());
-      assertRevisedOnResume(s, again, FEEDBACK, "kept");
+      assertRevisedOnResume(s, again, FEEDBACK, "retained");
       assert.ok(s.appliedAt(rows[0]!.id, again.timelineFrom) > gateAt);
       assert.ok(s.statuses(again).includes("completed"), s.statuses(again).join(","));
     }));
@@ -162,7 +162,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       try {
         const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK), s.input("cancel"));
         assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delivery GET entered the fake API");
-        await hold.entered;
+        await waitForTestEvent(hold.entered, "input GET entered");
         assertHeldInputGet(s.runId);
         assert.equal(s.gates(flight).length, 0, "no plan was offered while delivery was held");
         hold.release();
@@ -184,7 +184,7 @@ describe("#1604 — delivery on resume: no plan is offered before the inputs sen
       try {
         const { flight } = resumeWith(s, s.input("revise_plan", FEEDBACK));
         assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > 0), "the delivery GET entered the fake API");
-        await hold.entered;
+        await waitForTestEvent(hold.entered, "input GET entered");
         assertHeldInputGet(s.runId);
         assert.equal(s.gates(flight).length, 0, "no gate was offered while the revise was unread");
         const [approve] = s.send(s.input("approve_plan"));
@@ -209,7 +209,7 @@ describe("#1604 — replay across claims", () => {
       const release = api.holdNextInputReceipt("applied");
       const block = s.model.block("revise");
       const [row] = s.send(s.input("revise_plan", FEEDBACK));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       await tick(60);
       first.runner.shutdown();
       await until(() => first.finished, 1_500);
@@ -304,7 +304,7 @@ describe("#1604 review — a replayed verdict never applies to a plan no human s
       try {
         const flight = s.start(s.resumeClaim("kept"), { executor: () => new StubExecutor(nullLogger(), { planGate: true }) });
         assert.ok(await until(() => (api.inputGets.get(s.runId) ?? 0) > afterReads, 3_000), "the post-retry GET entered the fake API");
-        await hold.entered;
+        await waitForTestEvent(hold.entered, "input GET entered");
         assertHeldInputGet(s.runId);
         await new Promise<void>((resolve) => setImmediate(resolve));
         assert.equal(s.gates(flight).length, 0, "the stub cannot offer its gate before the replayed backlog is read");
@@ -334,7 +334,7 @@ describe("#1604 review — the ready lane never mixes kinds under a pending swit
       const first = await s.toFirstGate();
       const block = s.model.block("revise");
       const [rev] = s.send(s.input("revise_plan", FEEDBACK));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       const [rej] = s.send(s.input("reject_plan", "no"));
       assert.ok(await until(() => api.isAcked(s.runId, rej!.id)));
       api.requestCredentialSwitch(s.runId, 1);
@@ -376,7 +376,7 @@ describe("#1604 review — resumed-gate edges", () => {
       const first = await s.toFirstGate();
       const block = s.model.block("implement");
       s.send(s.input("approve_plan"));
-      await block.entered;
+      await waitForTestEvent(block.entered, "model turn entered");
       const [rev, rej] = s.send(s.input("revise_plan", "too late"), s.input("reject_plan", "too late"));
       assert.ok(await until(() => api.isApplied(s.runId, rev!.id) && api.isApplied(s.runId, rej!.id), 3_000), "both are applied while implementing");
       block.release();

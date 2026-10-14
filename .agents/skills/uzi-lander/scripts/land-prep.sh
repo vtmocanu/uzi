@@ -58,7 +58,7 @@
 #      side deletes or rewords a line of the diff3 base section (rebases run with
 #      merge.conflictStyle=diff3), or when the union would repeat a `## [<version>]` heading.
 #      After every completed rebase that leaves CHANGELOG.md in the branch diff, repeated
-#      `### <Section>` headings under [Unreleased] are collapsed in a separate
+#      branch-added `### <Section>` headings under [Unreleased] are collapsed in a separate
 #      "chore: collapse duplicate CHANGELOG section headings" commit (only if it changes
 #      anything)
 #   6  migration renumber needs hand work — the helper's report is printed and the tree is
@@ -82,11 +82,8 @@
 #      branch-head check has no such tolerance.
 #   9  the branch deletes CHANGELOG.md lines the base carries (usually a conflict resolved
 #      from a stale copy, e.g. a --fresh backup); restore them, or pass
-#      --allow-changelog-removals for a deliberate reword. Deleted `### ` headings and
-#      blank lines are not a removal only when they are exactly what
-#      `changelog-union.sh --collapse` makes of the branch's file; bullets the collapse
-#      moves (a base [Unreleased] repeating a `### ` section with another between the
-#      copies) are not a removal when HEAD deletes nothing relative to the base's collapse
+#      --allow-changelog-removals for a deliberate reword. Preserve base headings
+#      and bullet order; collapse only branch-added duplicate subsections.
 #  10  the branch is uzi-owned (agent/*, uzi/*) and changes .github/workflows files: pushing
 #      it would make every later uzi push there fail (worker PAT lacks workflow scope).
 #      Split the workflow edit into a separate PR, or --allow-workflow-edit
@@ -258,13 +255,16 @@ delta_paths() {
 # (changelog-union.sh), stage it and continue; a later commit may stop again, hence the loop.
 # Returns 0 once the rebase completes, 1 on any other stop (the rebase is left in progress).
 union_continue() {
-  local conflicted cu_out
+  local conflicted cu_out base_file
   while rebase_in_progress; do
     conflicted=$(git diff --name-only --diff-filter=U | LC_ALL=C sort -u)
     [ "$conflicted" = "CHANGELOG.md" ] || return 1
-    if ! cu_out=$(bash "$HERE/changelog-union.sh" CHANGELOG.md 2>&1); then
-      printf '%s\n' "$cu_out"; return 1
+    base_file=$(mktemp) || return 1
+    git show :2:CHANGELOG.md > "$base_file" || { rm -f "$base_file"; return 1; }
+    if ! cu_out=$(bash "$HERE/changelog-union.sh" --base "$base_file" CHANGELOG.md 2>&1); then
+      rm -f "$base_file"; printf '%s\n' "$cu_out"; return 1
     fi
+    rm -f "$base_file"
     git add CHANGELOG.md || return 1
     log "auto-resolved the CHANGELOG.md conflict at $(git rev-parse --short REBASE_HEAD 2>/dev/null || echo '?') (union of both sides)"
     if GIT_EDITOR=true git -c merge.conflictStyle=diff3 rebase --continue >/dev/null 2>&1; then return 0; fi
@@ -272,16 +272,19 @@ union_continue() {
   return 1
 }
 # collapse_changelog BASEREF: after a completed rebase, when the branch touches CHANGELOG.md,
-# collapse repeated `### <Section>` headings under [Unreleased] (a clean rebase keeps both
+# collapse only branch-added repeated `### <Section>` headings under [Unreleased] (a clean rebase keeps both
 # when a commit adds its own heading next to the base's). Committed separately, and only
 # when it changed the file; the CHANGELOG guard accepts such a pure heading collapse.
 collapse_changelog() {
-  local touched cu_out
+  local touched cu_out base_file
   touched=$(git diff --name-only "$1...HEAD" -- CHANGELOG.md) || return 1
   [ -n "$touched" ] || return 0
-  if ! cu_out=$(bash "$HERE/changelog-union.sh" --collapse CHANGELOG.md 2>&1); then
-    printf '%s\n' "$cu_out"; log "CHANGELOG.md heading collapse refused"; return 1
+  base_file=$(mktemp) || return 1
+  git show "$1:CHANGELOG.md" > "$base_file" || { rm -f "$base_file"; return 1; }
+  if ! cu_out=$(bash "$HERE/changelog-union.sh" --collapse --base "$base_file" CHANGELOG.md 2>&1); then
+    rm -f "$base_file"; printf '%s\n' "$cu_out"; log "CHANGELOG.md heading collapse refused"; return 1
   fi
+  rm -f "$base_file"
   git diff --quiet -- CHANGELOG.md && return 0
   git commit -q -m "chore: collapse duplicate CHANGELOG section headings" -- CHANGELOG.md || return 1
   log "collapsed duplicate CHANGELOG.md section headings ($(git rev-parse --short HEAD))"
@@ -342,7 +345,7 @@ if [ -f "$LEASE_FILE" ]; then
     echo "RESULT=base_moved"; exit 8
   fi
 else
-  [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase" >&2; exit 8; }
+  [ "$SKIP_REBASE" -eq 0 ] || { echo "no lease recorded for #$PR in this worktree; run once without --skip-rebase (a worktree ahead of the remote, e.g. after a manual commit, is accepted and records the lease)" >&2; exit 8; }
   # A NEW landing: the worktree must already contain the remote head, or be fast-forwarded
   # to it NOW (a failed fast-forward records no lease); anything else is a divergence no
   # lease can vouch for.
@@ -423,15 +426,8 @@ if [ -n "$added_paths" ]; then
 fi
 
 # ---- CHANGELOG guard ------------------------------------------------------------------------
-# A rebase conflict resolved from a stale copy (a --fresh backup, an older branch state)
-# silently deletes entries that landed on the base meanwhile. The branch adds its own entry;
-# it has no business removing the base's. One removal is accepted, EXACTLY: hunks that only
-# delete blank lines and `### ` headings pass when restoring those lines into HEAD's file and
-# running `changelog-union.sh --collapse` on the result reproduces HEAD's file byte for byte,
-# i.e. the deletions are precisely what collapse_changelog would make. A heading deleted
-# anywhere else (the first copy, the only copy, every copy) strands its bullets under the
-# wrong section and stops here. Runs again after a pre-push base-move rebase, which can
-# union-resolve CHANGELOG.md.
+# Preserve every nonblank base line, including subsection headings. Normalize only
+# branch-added duplicate headings; base cleanup requires a separate reviewed change.
 # changelog_placement_guard: a CLEAN rebase can still misfile the branch's CHANGELOG.md work.
 # When the base folds [Unreleased] into a new `## [x.y.z]` section, git can apply the branch's
 # new bullets under that RELEASED section without a conflict (measured 2026-10-01), so
@@ -507,80 +503,16 @@ changelog_placement_guard() {
   fi
 }
 changelog_guard() {
-  local cl_diff removed gd heads moved
+  local cl_diff removed
   [ "$ALLOW_CL_RM" -eq 0 ] || return 0
-  if ! cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md); then
-    echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3
-  fi
-  gd=$(mktemp -d "${TMPDIR:-/tmp}/land-prep-${PR}-clguard.XXXXXX") || exit 3
-  printf '%s\n' "$cl_diff" > "$gd/diff"
-  git show HEAD:CHANGELOG.md > "$gd/head.raw" 2>/dev/null || : > "$gd/head.raw"
-  # Emits every removed line that is not part of a heading-only deletion hunk (stdout), and
-  # writes: pre = HEAD with the heading-only deletions restored; head = HEAD as awk prints
-  # it (same newline handling as pre); heads = the restored heading lines.
-  if ! removed=$(awk -v pre="$gd/pre" -v headout="$gd/head" -v heads="$gd/heads" '
-    function flush(   i, ok, hd) {
-      if (nr == 0) return
-      ok = (nadd == 0); hd = 0
-      for (i = 1; i <= nr; i++) {
-        if (R[i] ~ /^[ \t]*$/) continue
-        if (R[i] ~ /^### /) { hd = 1; continue }
-        ok = 0
-      }
-      if (ok && hd) { for (i = 1; i <= nr; i++) { ins[at] = ins[at] R[i] "\n"; if (R[i] ~ /^### /) print R[i] > heads } }
-      else for (i = 1; i <= nr; i++) print "-" R[i]
-      nr = 0
-    }
-    FILENAME == ARGV[1] {
-      if (/^@@/) {
-        flush(); inh = 1; nadd = 0
-        x = $3; sub(/^\+/, "", x); split(x, a, ","); at = a[1] + 0
-        next
-      }
-      if (!inh) next
-      if (/^-/) R[++nr] = substr($0, 2)
-      else if (/^\+/) nadd++
-      next
-    }
-    { H[++nh] = $0 }
-    END {
-      flush()
-      printf "" > heads; printf "" > pre; printf "" > headout
-      if (0 in ins) printf "%s", ins[0] > pre
-      for (i = 1; i <= nh; i++) {
-        print H[i] > pre; print H[i] > headout
-        if (i in ins) printf "%s", ins[i] > pre
-      }
-    }
-  ' "$gd/diff" "$gd/head.raw"); then
-    rm -rf "$gd"; echo "cannot read the CHANGELOG.md diff" >&2; exit 3
-  fi
-  if [ -z "$removed" ] && [ -s "$gd/heads" ]; then
-    heads=$(cat "$gd/heads")
-    if ! bash "$HERE/changelog-union.sh" --collapse "$gd/pre" > /dev/null 2>&1 || ! cmp -s "$gd/pre" "$gd/head"; then
-      removed=$(printf '%s\n' "$heads" | sed 's/^/-/')
-      log "the deleted CHANGELOG.md heading(s) are not exactly a --collapse of the branch's file (bullets would change section)"
-    fi
-  fi
-  # A base whose [Unreleased] repeats a `### <Section>` with another section between the
-  # copies: collapse_changelog moves the later copy's bullets up under the first, so the
-  # diff shows them deleted in place (and re-added). That is a move, not a removal, exactly
-  # when HEAD deletes no non-blank line relative to the base's own --collapse result.
-  if [ -n "$removed" ] && git show "origin/$BASE:CHANGELOG.md" > "$gd/base" 2>/dev/null; then
-    cp "$gd/base" "$gd/base.collapsed"
-    if bash "$HERE/changelog-union.sh" --collapse "$gd/base.collapsed" > /dev/null 2>&1 \
-      && ! cmp -s "$gd/base" "$gd/base.collapsed"; then
-      if ! moved=$({ diff -U0 "$gd/base.collapsed" "$gd/head.raw" || [ "$?" -eq 1 ]; } \
-        | awk '/^@@/ {inh = 1; next} !inh {next} /^-/ {l = substr($0, 2); if (l !~ /^[ \t]*$/) print "-" l}'); then
-        rm -rf "$gd"; echo "cannot diff CHANGELOG.md against the collapsed base" >&2; exit 3
-      fi
-      if [ -z "$moved" ]; then
-        removed=""
-        log "CHANGELOG.md: the only deletions move origin/$BASE's repeated [Unreleased] section bullets under their first heading (a --collapse of the base), not a removal"
-      fi
-    fi
-  fi
-  rm -rf "$gd"
+  cl_diff=$(git diff --unified=0 "origin/$BASE..HEAD" -- CHANGELOG.md) \
+    || { echo "cannot diff CHANGELOG.md against origin/$BASE" >&2; exit 3; }
+  # Branch-only heading normalization deletes no existing nonblank base line.
+  # Include headings: a base subsection must remain in its original position.
+  removed=$(printf '%s\n' "$cl_diff" | awk '
+    /^@@/ {inh = 1; next}
+    inh && /^-/ {line = substr($0, 2); if (line !~ /^[ \t]*$/) print "-" line}
+  ') || exit 3
   if [ -n "$removed" ]; then
     log "branch deletes CHANGELOG.md line(s) that origin/$BASE carries:"
     printf '%s\n' "$removed" | cut -c1-160

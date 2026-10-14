@@ -44,6 +44,7 @@ The buddy reviews the exact final body (pin its hash) and the label set; `review
 Standing user grant for issues a session files in this repo. It does not cover backlog triage, schedule changes or merging.
 
 - A new issue meeting every criterion gets `on-deck` + `uzi` + `reviewed` + `area::*`/`priority::*` at filing, once the buddy approved its exact title, body and labels. Post body and labels together; never add `bug` or `Planned`.
+- A newly filed issue whose change belongs to one harness carries its matching `harness::codex` or `harness::claude` label, never both. This is an explicit filing decision; runtime selection does not infer a harness from file paths. These labels select the automatic-start harness, not a sweep lane or eligibility signal; include them in the buddy's label review.
 - Before requesting that approval, run the freshness check and settle routine implementation choices yourself. Ask the user only for unavailable evidence or a product/design decision. A body change needs fresh approval.
 - Anything else (PRD, large or multi-outcome work, an excluded risk class, a failed criterion): name the reason and ask the user for its disposition unless already given: hold, gated dispatch (uzi-watcher), local work, or an explicitly authorized sweep. Never fall back to `bug`/`Planned` on your own.
 - A non-maintainer report keeps issue-triage's maintainer-written-body rule; this grant never overrides server permission gating, withheld comments or a plan gate.

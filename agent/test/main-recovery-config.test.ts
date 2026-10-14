@@ -3,7 +3,7 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import { execFileSync, spawnSync } from "node:child_process";
 import { loadConfig } from "../src/config.js";
-import { buildWorkerGitCache } from "../src/main.js";
+import { buildWorkerGitCache, buildRecoveryLiveTiming } from "../src/main.js";
 import { GitCache } from "../src/git.js";
 import { RecoveryClosureLimitError } from "../src/recovery-closure.js";
 import { makeFixture } from "./fixture-repo.js";
@@ -13,6 +13,20 @@ test("startup uses the live worker GitCache factory", () => {
   const main = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
   assert.match(main, /const git = buildWorkerGitCache\(config, log, \(runId\) => outbox\.hasPhysicalTerminalProtection\(runId\)\)/);
   assert.equal((main.match(/new GitCache\(/g) ?? []).length, 1);
+});
+
+test("fast recovery redrive is opt-in and ignored with a warning outside stub", () => {
+  const warnings: string[] = [];
+  const log = nullLogger();
+  log.warn = message => { warnings.push(message); };
+  assert.equal(buildRecoveryLiveTiming("stub", log, {}), undefined);
+  assert.equal(buildRecoveryLiveTiming("stub", log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "500" }), undefined);
+  assert.equal(buildRecoveryLiveTiming("sdk", log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }), undefined);
+  assert.deepEqual(warnings, ["UZI_E2E_RECOVERY_FAST_REDRIVE ignored outside the stub executor"]);
+  assert.deepEqual(buildRecoveryLiveTiming("stub", log, { UZI_E2E_RECOVERY_FAST_REDRIVE: "1" }),
+    { liveBackoffBaseMs: 1000, liveBackoffCapMs: 5000 });
+  const main = fs.readFileSync(new URL("../src/main.ts", import.meta.url), "utf8");
+  assert.match(main, /recoveryLiveTiming: buildRecoveryLiveTiming\(config.executor, log\)/);
 });
 
 test("invalid decoded configuration stops worker startup with a clear error", () => {

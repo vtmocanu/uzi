@@ -91,7 +91,7 @@ func TestWorkerCustodyDecisionSurfaces(t *testing.T) {
 						if tc.cue {
 							want += fmt.Sprintf(" · %d holding · %d need attention", n, n)
 						}
-						if got := stripANSI(m.workersSummary(180)); got != want {
+						if got := stripANSI(m.workersSummary(180, false)); got != want {
 							t.Fatalf("summary got %q, want %q", got, want)
 						}
 					}
@@ -115,7 +115,7 @@ func TestWorkersHealthyCustodySummary(t *testing.T) {
 				}})
 			}
 			want := fmt.Sprintf("workers · %d · %d online · %d/%d run slots in use · 0/? cross-checks", n, n, n, n*2)
-			if got := stripANSI(m.workersSummary(180)); got != want {
+			if got := stripANSI(m.workersSummary(180, false)); got != want {
 				t.Fatalf("healthy custody summary: got %q, want %q", got, want)
 			}
 		})
@@ -161,7 +161,7 @@ func TestWorkerCustodyDecisionSortAndIndependentWarnings(t *testing.T) {
 			t.Fatalf("%s decision severity %d", r.w.ID, got)
 		}
 	}
-	requireWorkerText(t, stripANSI(m.workersSummary(200)), "4 need attention", "2 holding")
+	requireWorkerText(t, stripANSI(m.workersSummary(200, false)), "4 need attention", "2 holding")
 	for _, count := range []*int{nil, custodyCount(0), custodyCount(2)} {
 		blocked.w.CustodyDecisionsNeeded = count
 		m.workers.rows = []workerRow{blocked}
@@ -172,7 +172,7 @@ func TestWorkerCustodyDecisionSortAndIndependentWarnings(t *testing.T) {
 		} else if strings.Contains(row, "+1") || strings.Contains(row, "holding") {
 			t.Fatalf("old boolean added an independent warning: %q", row)
 		}
-		requireWorkerText(t, stripANSI(m.workersSummary(200)), "1 need attention")
+		requireWorkerText(t, stripANSI(m.workersSummary(200, false)), "1 need attention")
 		if got := workerSeverity(blocked, now); got != 0 {
 			t.Fatalf("outbox severity changed: %d", got)
 		}

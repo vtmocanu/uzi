@@ -8,9 +8,9 @@ import type { Milestone, MilestoneProgress } from "./protocol.js";
  *     previous turn's final snapshot) and advanced across the turn's several observations,
  *     so an id newly `in_progress`/`completed` emits its transition frame exactly ONCE and
  *     a repeat emits nothing;
- *   - the frozen milestone titles, taken from the loop-scope frozen list (assigned at the
- *     gate) or, when that is undefined (a pre-approved resume), the claim's frozen list on
- *     `ctx.frozenMilestones`; a missing title degrades to a titleless frame, never a skip.
+ *   - the frozen milestone titles, taken from the loop-scope frozen list (from approval
+ *     or the resumed claim), with `ctx.frozenMilestones` as a fallback when unavailable;
+ *     a missing title degrades to a titleless frame, never a skip.
  * It emits the D2 frames and enqueues the immediate running push via `ctx.reportProgress`.
  */
 export function makeProgressObserver(

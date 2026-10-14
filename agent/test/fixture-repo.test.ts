@@ -5,7 +5,7 @@ import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
 import { fileURLToPath } from "node:url";
-import { makeFixture, type Fixture } from "./fixture-repo.js";
+import { makeFixture, makeScratchRoot, type Fixture } from "./fixture-repo.js";
 import { GitCache } from "../src/git.js";
 import { createLogger } from "../src/log.js";
 
@@ -206,7 +206,131 @@ function normalizationFailureChild(): void {
   assert.deepEqual(fs.readdirSync(process.env.TMPDIR!), ["ledger"]);
 }
 
-if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
+type Meta = { path: string; mode: number; uid: number; gid: number };
+
+function collectMetadata(base: string): Meta[] {
+  const metadata: Meta[] = [];
+  function collect(target: string): void {
+    const stat = fs.lstatSync(target);
+    metadata.push({ path: path.relative(base, target), mode: stat.mode & 0o7777, uid: stat.uid, gid: stat.gid });
+    if (stat.isDirectory()) for (const entry of fs.readdirSync(target)) collect(path.join(target, entry));
+  }
+  collect(base);
+  return metadata;
+}
+
+// Child of the makeScratchRoot permission matrix. TMPDIR is the parent under test.
+//   portable: a plain parent at the default umask; no POSIX identity needed.
+//   scratch:  makeScratchRoot, then the production GitCache guards over a real clone.
+//   raw:      a RAW mkdtemp root in the same parent (acceptance control / refusal calibration).
+async function scratchPermissionsChild(): Promise<void> {
+  const mode = process.env.UZI_SCRATCH_PERMISSIONS_CHILD as "portable" | "scratch" | "raw";
+  const kind = process.env.UZI_SCRATCH_PARENT_KIND;
+  const outer = process.env.TMPDIR!;
+  if (process.env.UZI_SCRATCH_UMASK !== undefined) process.umask(Number(process.env.UZI_SCRATCH_UMASK));
+  if (mode === "portable") {
+    const root = makeScratchRoot("scratch-portable-");
+    try {
+      assert.equal(path.dirname(fs.realpathSync(root)), fs.realpathSync(outer), "the root is a new directory inside the parent");
+      const nested = path.join(root, "data", "repos", "x");
+      fs.mkdirSync(nested, { recursive: true });
+      fs.writeFileSync(path.join(nested, "f.txt"), "hello\n");
+      assert.equal(fs.readFileSync(path.join(nested, "f.txt"), "utf8"), "hello\n");
+    } finally { fs.rmSync(root, { recursive: true, force: true }); }
+    assert.deepEqual(fs.readdirSync(outer), [], "removing the root leaves the parent as before");
+    return;
+  }
+  const origin = makeFixture();
+  let root: string | undefined;
+  try {
+    root = mode === "scratch" ? makeScratchRoot("scratch-matrix-") : fs.mkdtempSync(path.join(outer, "raw-matrix-"));
+    const rootStat = fs.lstatSync(root);
+    if (mode === "scratch") {
+      assert.equal(rootStat.uid, process.getuid!(), "root uid");
+      assert.equal(rootStat.gid, process.getgid!(), "root gid");
+      assert.equal(rootStat.mode & 0o7777, 0o700, "root mode");
+    }
+    const dataDir = path.join(root, "data");
+    fs.mkdirSync(dataDir);
+    const cache = new GitCache(dataDir, createLogger("error"));
+    const bare = await cache.ensureClone(origin.originPath);
+    const meta = collectMetadata(root);
+    console.log(JSON.stringify({ mode, kind, meta }));
+    const repos = meta.find(m => m.path === path.join("data", "repos"))!;
+    const discover = (): Promise<unknown> =>
+      cache.discoverRetainedRecovery(origin.originPath, "agent/issue-1", "issue-1", "run-1");
+    if (mode === "raw" && kind === "foreign") {
+      // Calibration: a raw root under a foreign-group setgid parent at umask 002 hands `repos`
+      // a foreign group with group-write, which the production guard refuses.
+      assert.notEqual(repos.gid, process.getgid!(), "repos inherited the foreign gid");
+      assert.ok((repos.mode & 0o2000) !== 0, "repos is setgid");
+      assert.ok((repos.mode & 0o020) !== 0, "repos is group-writable");
+      await assert.rejects(cache.codeSnapshotCandidate(bare, "lead"), /unsafe worker bare directory/);
+      await assert.rejects(discover(), /unsafe (worker bare directory|recovery bare config)/);
+    } else {
+      if (mode === "scratch") {
+        for (const entry of meta) {
+          assert.equal(entry.uid, process.getuid!(), entry.path + " uid");
+          assert.equal(entry.gid, process.getgid!(), entry.path + " gid");
+          assert.equal(entry.mode & 0o002, 0, entry.path + " world write");
+        }
+      }
+      assert.equal(await cache.codeSnapshotCandidate(bare, "lead"), undefined);
+      if (mode === "scratch") assert.equal(await discover(), undefined, "recovery discovery raises no guard error");
+    }
+  } finally {
+    try { if (root) fs.rmSync(root, { recursive: true, force: true }); } finally { origin.cleanup(); }
+  }
+  assert.deepEqual(fs.readdirSync(outer), [], "child teardown leaves the parent empty");
+}
+
+function scratchNormalizationFailureChild(): void {
+  const operation = process.env.UZI_SCRATCH_NORMALIZATION_FAILURE as "chownSync" | "chmodSync";
+  // With UZI_SCRATCH_CLEANUP_FAILURE the root's removal also fails: the original error must survive.
+  const cleanupFails = process.env.UZI_SCRATCH_CLEANUP_FAILURE === "1";
+  const originals = { chownSync: fs.chownSync, chmodSync: fs.chmodSync, rmSync: fs.rmSync };
+  const failure = new Error("injected scratch normalization failure");
+  const cleanupFailure = new Error("injected scratch cleanup failure");
+  let target: fs.PathLike | undefined;
+  let caught: unknown;
+  try {
+    const fail = (root: fs.PathLike): never => { target = root; throw failure; };
+    if (operation === "chownSync") fs.chownSync = fail;
+    else fs.chmodSync = fail;
+    if (cleanupFails) {
+      fs.rmSync = ((p: fs.PathLike, opts?: fs.RmOptions) => {
+        if (target !== undefined && String(p) === String(target)) throw cleanupFailure;
+        return originals.rmSync(p, opts);
+      }) as typeof fs.rmSync;
+    }
+    try { makeScratchRoot("scratch-fail-"); } catch (error) { caught = error; }
+  } finally {
+    if (operation === "chownSync") fs.chownSync = originals.chownSync;
+    else fs.chmodSync = originals.chmodSync;
+    fs.rmSync = originals.rmSync;
+  }
+  assert.equal(fs[operation], originals[operation]);
+  assert.equal(fs.rmSync, originals.rmSync);
+  assert.equal(caught, failure, "preserves the exact normalization error");
+  assert.ok(target);
+  const lines = readLedger(process.env.UZI_TMPDIR_GUARD_LEDGER!);
+  if (cleanupFails) {
+    // The failed removal is not recorded, and the retained root is cleaned up here.
+    assert.equal(fs.existsSync(target), true);
+    assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target]]);
+    fs.rmSync(target, { recursive: true, force: true });
+  } else {
+    assert.equal(fs.existsSync(target), false);
+    assert.deepEqual(lines.map(line => [line.event, line.path]), [["created", target], ["removed", target]]);
+  }
+  assert.deepEqual(fs.readdirSync(process.env.TMPDIR!), ["ledger"]);
+}
+
+if (process.env.UZI_SCRATCH_PERMISSIONS_CHILD) {
+  await scratchPermissionsChild();
+} else if (process.env.UZI_SCRATCH_NORMALIZATION_FAILURE) {
+  scratchNormalizationFailureChild();
+} else if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
   await permissionsChild();
 } else if (process.env.UZI_FIXTURE_NORMALIZATION_FAILURE) {
   normalizationFailureChild();
@@ -242,7 +366,7 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
             for (const key of Object.keys(childEnv)) {
               if (key.startsWith("GIT_") || key === "UZI_TMPDIR_GUARD_LEDGER" ||
                   key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
-                  key === "UZI_FIXTURE_NORMALIZATION_FAILURE") delete childEnv[key];
+                  key === "UZI_FIXTURE_NORMALIZATION_FAILURE" || key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
             }
             const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
               cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 60_000,
@@ -262,13 +386,114 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
             UZI_FIXTURE_NORMALIZATION_FAILURE: operation, UZI_TMPDIR_GUARD_LEDGER: path.join(outer, "ledger") };
           for (const key of Object.keys(childEnv)) {
             if (key.startsWith("GIT_") || key === "UZI_FIXTURE_PERMISSIONS_CHILD" ||
-                key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD") delete childEnv[key];
+                key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
+                key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
           }
           const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
             cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 60_000,
           });
           assert.ifError(r.error);
           assert.equal(r.status, 0, r.stdout + r.stderr);
+        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+      });
+    }
+  });
+
+  describe("makeScratchRoot root permissions", () => {
+    const supported = process.platform !== "win32" && !!process.getgid && !!process.getuid && !!process.getgroups;
+    const foreignGid = supported ? process.getgroups!().find(gid => gid !== process.getgid!()) : undefined;
+
+    // Runs one child with TMPDIR=<parent>. Child flags are stripped from the inherited environment.
+    function runChild(parent: string, extra: Record<string, string>, ledger?: string): void {
+      const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: parent, TEMP: parent, TMP: parent,
+        TSX_DISABLE_CACHE: "1", ...extra };
+      for (const key of Object.keys(childEnv)) {
+        if (key.startsWith("GIT_") || key === "UZI_TMPDIR_GUARD_LEDGER" || key === "UZI_FIXTURE_PERMISSIONS_CHILD" ||
+            key === "UZI_FIXTURE_REPO_CHILD" || key === "UZI_FIXTURE_REPO_POISON_CHILD" ||
+            key === "UZI_FIXTURE_NORMALIZATION_FAILURE" ||
+            (key.startsWith("UZI_SCRATCH_") && !(key in extra))) delete childEnv[key];
+      }
+      if (ledger) childEnv.UZI_TMPDIR_GUARD_LEDGER = ledger;
+      const r = spawnSync(process.execPath, ["--import", "tsx", SELF], {
+        cwd: AGENT_DIR, env: childEnv, encoding: "utf8", timeout: 90_000,
+      });
+      assert.ifError(r.error);
+      assert.equal(r.status, 0, r.stdout + r.stderr);
+    }
+
+    it("returns a private root inside a plain parent that nested directories can use and that removes cleanly", () => {
+      const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-plain-"));
+      try {
+        runChild(outer, { UZI_SCRATCH_PERMISSIONS_CHILD: "portable", UZI_SCRATCH_PARENT_KIND: "plain" });
+        assert.deepEqual(fs.readdirSync(outer), []);
+      } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+    });
+
+    it("gives an owned 0700 root whose bare clones pass the production guards (plain parent, default umask)",
+      { skip: !supported ? "POSIX identity unavailable" : false }, () => {
+        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-posix-"));
+        try {
+          runChild(outer, { UZI_SCRATCH_PERMISSIONS_CHILD: "scratch", UZI_SCRATCH_PARENT_KIND: "plain" });
+          assert.deepEqual(fs.readdirSync(outer), []);
+        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+      });
+
+    const parents = [
+      { kind: "plain", name: "plain", gid: supported ? process.getgid!() : 0, mode: 0o770, raw: false },
+      { kind: "own", name: "own-group setgid", gid: supported ? process.getgid!() : 0, mode: 0o2770, raw: true },
+      { kind: "foreign", name: "foreign-group setgid", gid: foreignGid, mode: 0o2770, raw: true },
+    ];
+    // Sets up an owned outer parent with the given group and mode, runs `children`, then checks
+    // the parent is unchanged and empty.
+    function withParent(parent: (typeof parents)[number], mask: number, children: string[]): void {
+      const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-"));
+      try {
+        fs.chownSync(outer, process.getuid!(), parent.gid!);
+        fs.chmodSync(outer, parent.mode);
+        const before = fs.statSync(outer);
+        assert.equal(before.gid, parent.gid);
+        assert.equal(before.mode & 0o7777, parent.mode);
+        const env = { UZI_SCRATCH_PARENT_KIND: parent.kind, UZI_SCRATCH_UMASK: String(mask) };
+        for (const child of children) runChild(outer, { ...env, UZI_SCRATCH_PERMISSIONS_CHILD: child });
+        const after = fs.statSync(outer);
+        assert.deepEqual([after.uid, after.gid, after.mode], [before.uid, before.gid, before.mode],
+          "parent ownership and mode remain unchanged");
+        assert.deepEqual(fs.readdirSync(outer), []);
+      } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+    }
+    const identitySkip = (parent: (typeof parents)[number]) =>
+      !supported ? "POSIX identity unavailable" : parent.gid === undefined ? "foreign supplementary group unavailable" : false;
+    for (const parent of parents) {
+      for (const mask of [0o002, 0o022]) {
+        // The own-group raw root is accepted on every POSIX platform; the foreign-group raw refusal
+        // is a Linux setgid-inheritance calibration and runs in its own Linux-only test below.
+        const rawCase = parent.raw && parent.kind !== "foreign";
+        it(`${parent.name} parent with umask ${mask.toString(8)}: the scratch root is accepted${rawCase ? "; a raw root is accepted" : ""}`, {
+          skip: identitySkip(parent),
+        }, () => withParent(parent, mask, rawCase ? ["scratch", "raw"] : ["scratch"]));
+      }
+    }
+    {
+      const foreign = parents.find(p => p.kind === "foreign")!;
+      it("foreign-group setgid parent with umask 2: a raw root inherits the foreign group and is refused (Linux setgid calibration)", {
+        skip: process.platform !== "linux" ? "Linux setgid directory inheritance required" : identitySkip(foreign),
+      }, () => withParent(foreign, 0o002, ["raw"]));
+    }
+
+    for (const operation of ["chownSync", "chmodSync"]) {
+      it(`cleans up and records a failed scratch root ${operation}`, { skip: !supported ? "POSIX identity unavailable" : false }, () => {
+        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-failure-"));
+        try {
+          runChild(outer, { UZI_SCRATCH_NORMALIZATION_FAILURE: operation }, path.join(outer, "ledger"));
+        } finally { fs.rmSync(outer, { recursive: true, force: true }); }
+      });
+    }
+
+    for (const operation of ["chownSync", "chmodSync"]) {
+      it(`keeps the ${operation} error when removing the failed scratch root also fails`, { skip: !supported ? "POSIX identity unavailable" : false }, () => {
+        const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-cleanup-failure-"));
+        try {
+          runChild(outer, { UZI_SCRATCH_NORMALIZATION_FAILURE: operation, UZI_SCRATCH_CLEANUP_FAILURE: "1" }, path.join(outer, "ledger"));
         } finally { fs.rmSync(outer, { recursive: true, force: true }); }
       });
     }
@@ -288,7 +513,7 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
             UZI_FIXTURE_REPO_POISON_CHILD: scenario,
           };
           for (const key of Object.keys(childEnv)) {
-            if (key.startsWith("GIT_")) delete childEnv[key];
+            if (key.startsWith("GIT_") || key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
           }
           delete childEnv.UZI_FIXTURE_REPO_CHILD;
           delete childEnv.UZI_TMPDIR_GUARD_LEDGER;
@@ -354,6 +579,7 @@ if (process.env.UZI_FIXTURE_PERMISSIONS_CHILD) {
       try {
         const childEnv: NodeJS.ProcessEnv = { ...process.env, TMPDIR: outer, UZI_FIXTURE_REPO_CHILD: "1" };
         delete childEnv.UZI_TMPDIR_GUARD_LEDGER; // the guard sets its own
+        for (const key of Object.keys(childEnv)) if (key.startsWith("UZI_SCRATCH_")) delete childEnv[key];
         const r = spawnSync(GUARD, [process.execPath, "--import", "tsx", SELF], {
           cwd: AGENT_DIR,
           env: childEnv,

@@ -166,13 +166,15 @@ output: prefixed
 # Static and quoted at every use. Task renders the value before echoing each
 # command, so the resolved pin stays visible without accepting shell input.
 vars:
+  # renovate: datasource=github-releases depName=gitleaks/gitleaks
+  GITLEAKS_VERSION: "v8.30.1"
   # renovate: datasource=github-releases depName=golangci-lint-taskfile packageName=golangci/golangci-lint
   GOLANGCI_LINT_VERSION: v2.14.0
   # The pinned OpenAPI diff tool behind check:api-v1-compat (PRD #1908 Decision 11). Passed to
   # scripts/oasdiff.sh as an ARGUMENT, like the golangci-lint pin above, so `task`'s echo shows the
   # resolved version. The wrapper carries the per-arch sha256 pins and refuses any other version.
   # renovate: datasource=github-releases depName=oasdiff-taskfile packageName=oasdiff/oasdiff
-  OASDIFF_VERSION: v1.32.1
+  OASDIFF_VERSION: v1.33.0
 
 # THE TWO SANCTIONED INCLUDES (rule 3), and they are LOCAL, not remote. Both reuse
 # `./homebrew-tap.yml`, a VENDORED copy of vtmocanu/task's reusable brew mechanic (see its
@@ -316,6 +318,7 @@ tasks:
       # Hermetic contract for the mirror.gcr.io-then-Docker-Hub image pull CI uses
       # (scripts/docker-pull-fallback.sh): a fake `docker`, no network.
       - task: test:docker-pull-fallback
+      - task: test:cosign-sign-retry
       # Hermetic cleanup-ownership contract for the opt-in test:web-nginx script
       # (scripts/assert-web-nginx.sh): fake docker/helm/yq, no network.
       - task: test:web-nginx-cleanup
@@ -351,6 +354,7 @@ tasks:
       # (`docker rm -v`); the missing `-v` leaked one pg volume per run and filled
       # the worker's Docker data-root. Before `scan:secrets` (deliberately last).
       - task: test:store-it-cleanup
+      - task: test:reset-recovery-tables
       # hermetic (~11s, fake docker, no daemon; Linux-only via `platforms`): the opt-in
       # codex-git-trust wrapper's bind/cleanup/exit-code/signal contract (#1769). Its
       # SIGTERM case waits out the 10s kill grace, so it is not sub-second.
@@ -426,6 +430,8 @@ tasks:
       # without one. Its hermetic suite runs first so a gutted check cannot read green.
       - task: test:changelog-entry
       - task: check:changelog-entry
+      - task: test:changelog-rc-bullets
+      - task: check:changelog-rc-bullets
       - task: test:livedb-skip-guard
       # CI and the baked worker share one SAST engine (#2093): CI installs the
       # worker lock's semgrep, and this fails if CI grows a pin of its own.
@@ -1012,6 +1018,11 @@ tasks:
     cmds:
       - ./scripts/scan-secrets.test.sh
 
+  test:cosign-sign-retry:
+    desc: hermetic transient signing retry and fatal refusal checks
+    cmds:
+      - ./scripts/cosign-sign-retry.test.sh
+
   test:docker-pull-fallback:
     desc: hermetic mirror-first, Docker Hub fallback contract for CI image pulls (fake docker, no network)
     cmds:
@@ -1062,6 +1073,16 @@ tasks:
       # `uzi` stack, store-it, the current run, and an EPERM/alive pid are all skipped).
       - ./e2e/reclaim-leaked-e2e.test.sh
 
+  test:reset-recovery-tables:
+    desc: hermetic reset client and refusal contract
+    cmds:
+      - bash ./e2e/reset-recovery-tables.test.sh
+
+  test:reset-recovery-tables:live:
+    desc: owned throwaway PostgreSQL reset safety and initialization proof
+    cmds:
+      - bash ./e2e/reset-recovery-tables.live.test.sh
+
   test:store-it-cleanup:
     desc: behavioral test that run-store-it.sh's teardown removes the throwaway Postgres ANONYMOUS VOLUME (fake docker, hermetic)
     cmds:
@@ -1097,16 +1118,20 @@ tasks:
       - ./scripts/check-e2e-driver.sh
 
   test:e2e-lib:
-    desc: hermetic regression for e2e DB reads, regating and evidence-preserving custody waits, tally-guarded (no stack, no docker)
+    desc: hermetic regression for e2e DB reads, custody waits, storage evidence and meter fixtures (no stack, no docker)
     cmds:
       # e2e/lib.test.sh extracts the real _psql_strip_tags out of e2e/lib.sh (which cannot be sourced
       # -- its top level provisions the whole stack) and drives it over stdin. It prints a mandatory
-      # `cases=N passed=N` tally and exits nonzero unless every case (>= 121) is green, so a gutted
+      # `cases=N passed=N` tally and exits nonzero unless every case (>= 152) is green, so a gutted
       # zero-case run cannot read green. Guards the psql command-tag corruption fix for scalar reads,
       # that no e2e phase invokes psql outside db_psql/db_psql_rows (#1511), and that wait_regated only
       # passes on a gate re-shown by a NEW claim (#1739). Custody waits preserve evidence
-      # on both success and timeout and require the exact guarded forge-park receipt.
+      # on both success and timeout and validate final custody receipt identities.
       - ./e2e/lib.test.sh
+      - bash ./e2e/outage-cut.test.sh
+      - bash ./e2e/heartbeat-settlement.test.sh
+      - bash ./e2e/storage-diagnostic.test.sh
+      - bash ./e2e/codex-meter-fixture.test.sh
 
   test:uzi-watcher-backups:
     desc: hermetic tests of uzi-watcher live-clone/bare-ref backups, retention, detached loop and the label-sync create retry
@@ -1156,13 +1181,25 @@ tasks:
       - ./.agents/skills/uzi-lander/scripts/pr-findings.test.sh
       - ./.agents/skills/uzi-lander/scripts/merge.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover.test.sh
+      - python3 -B ./.agents/skills/uzi-lander/scripts/takeover-timeout.test.py
       - ./.agents/skills/uzi-lander/scripts/takeover-mr-rework.test.sh
       - ./.agents/skills/uzi-lander/scripts/takeover-run-claim.test.sh
+      - ./.agents/skills/uzi-lander/scripts/takeover-repo-fallback.test.sh
       - ./.agents/skills/uzi-lander/scripts/orphans.test.sh
       - ./.agents/skills/uzi-lander/scripts/watch-run-ci.test.sh
       - ./.agents/skills/uzi-lander/scripts/attribute-failures.test.sh
       - ./.agents/skills/uzi-lander/scripts/test-linux.test.sh
       - python3 -B ./.agents/skills/uzi-lander/scripts/ci-timing-report.test.py
+
+  check:changelog-rc-bullets:
+    desc: shipped RC changelog bullets remain byte-identical
+    cmds:
+      - bash scripts/changelog-section.sh check-rc-bullets HEAD
+
+  test:changelog-rc-bullets:
+    desc: hermetic frozen RC bullet guard regressions
+    cmds:
+      - bash scripts/changelog-rc-bullets.test.sh
 
   test:release-scripts:
     desc: offline fixture test of the release-train scripts (builds a temp git repo; PRD 1265)
@@ -1176,7 +1213,13 @@ tasks:
       # exits nonzero on any failure. Watch it fail on the unmodified scripts. See the
       # script header.
       - ./scripts/release-scripts-test.sh
+      - ./scripts/worker-roll-target.test.sh
       - python3 -I -B scripts/release-ci-coverage.test.py
+
+  test:worker-roll-target-package:
+    desc: "offline packaged-chart stamp/override regressions; needs Helm, ci.yml helm-chart job (not task gate; #2906)"
+    cmds:
+      - ./scripts/chart-inject-roll-target.test.sh
 
   test:agent-runtime-key:
     desc: offline fixture test of scripts/agent-runtime-key.sh (builds temp git repos; issue 1720)
@@ -1462,15 +1505,9 @@ tasks:
       # SHOWS THEM MOVING, the same reason `lint:shell` carries its severity and
       # its version pin rather than defaulting them inside the script.
       #
-      # THE VERSION IS THE ONLY VERSION RECORD THERE IS. Built from source (`go install`), gitleaks'
-      # own `version` subcommand prints the literal string "version is set by build
-      # process" -- measured 2026-08-03 -- because the release workflow stamps it
-      # with ldflags and a source build does not. So NOTHING CAN ASSERT THE RUNNING
-      # BINARY'S VERSION the way `lint:shell` asserts shellcheck's; this line is the
-      # pin, and a `gitleaks version` assertion written against it would compare a
-      # sentence to a number. Pinned `go install` for the reason carry-forward item 6
-      # gives for golangci-lint: the official image would be this pipeline's first
-      # unpinned effective toolchain.
+      # GITLEAKS_VERSION is the shared scan/test installation pin. Source builds do
+      # not stamp the `version` subcommand; scan-secrets verifies Go main-module
+      # metadata instead, falling back to its pinned private install when unknown.
       #
       # THE CANARY PATHS ARE ARGUMENTS for the reason `lint:yaml` passes its config
       # path: they are separate tracked files that can be deleted, moved or edited,
@@ -1507,7 +1544,16 @@ tasks:
       # on the walk is what keeps a contributor's verdict equal to CI's, since
       # gitleaks does not honour `.gitignore`; findings in untracked files are
       # printed and do NOT gate.
-      - ./scripts/scan-secrets.sh v8.30.1 scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
+      - ./scripts/scan-secrets.sh "{{.GITLEAKS_VERSION}}" scripts/gitleaks-canary.txt api/internal/config/gitleaks_canary_test.go
+
+  install:gitleaks:
+    desc: install the shared scanner pin into an explicit private GOBIN
+    preconditions:
+      - sh: test -n "$GOBIN"
+        msg: set GOBIN to a private tool directory
+    cmds:
+      - go install "github.com/zricethezav/gitleaks/v8@{{.GITLEAKS_VERSION}}"
+      - go version -m "$GOBIN/gitleaks"
 
   sast:semgrep:
     desc: semgrep SAST over the tree, with a canary proving the scanner ran

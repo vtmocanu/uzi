@@ -4,8 +4,13 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHash } from "node:crypto";
+import { RecoveryCoordinator, type RecoveryArchiveClient, type RecoveryBundleProducer } from "../src/recovery.js";
+import type { PositiveOwedCandidateContext } from "../src/git.js";
 import { type Readable } from "node:stream";
-import { type Executor } from "../src/executor.js";
+import { type Executor, type RunContext } from "../src/executor.js";
+import { Outbox } from "../src/outbox.js";
+import { nullLogger } from "./helpers.js";
 import { LimitReachedError } from "../src/limit.js";
 import { PauseNowSignal } from "../src/steering.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
@@ -17,6 +22,7 @@ import {
   api,
   client,
   fakeGitlab,
+  fx,
   git,
   gitlabClaim,
   installHarness,
@@ -42,6 +48,272 @@ import {
 
 installHarness();
 installRecoveryRootCleanup();
+
+// Real MAC-authenticated inventory journal semantics, with synthesized Git inputs as in
+// recovery-inventory.test.ts. The runner's Git operations, outbox and Codex safety stay real.
+function acknowledgedCompletionInventory(runId: string, generation: number) {
+  let context!: PositiveOwedCandidateContext;
+  let sourceHeads: string[] = [];
+  let aggregateSha = "";
+  let open = true;
+  let manifest: { checksum: string; byte_size: number } | undefined;
+  let releases = 0;
+  let physicalCleanups = 0;
+  const captureId = "m2-archive";
+  const status = () => ({
+    capture_id: captureId, state: manifest ? "available" as const : "preparing" as const,
+    manifest_bound: !!manifest, checksum: manifest?.checksum, byte_size: manifest?.byte_size,
+    expires_at: "2099-01-01T00:00:00Z",
+  });
+  const archive: RecoveryArchiveClient = {
+    hasFeature: feature => feature === "recovery_inventory_v1",
+    getRunOwnership: async id => {
+      assert.equal(id, runId);
+      return { status: "paused", claim_generation: generation, inventory_guarded: true };
+    },
+    listRecoveryHolds: async id => {
+      assert.equal(id, runId);
+      return { run_id: runId, holds: open ? [{
+        hold_id: "m2-hold", generation, inventory_guarded: true, has_available_capture: false,
+      }] : [] };
+    },
+    reserveRecoveryCapture: async (id, request) => {
+      assert.equal(id, runId);
+      assert.equal(request.generation, generation);
+      assert.equal(request.source_sha, aggregateSha);
+      return { capture_id: captureId, state: "preparing" };
+    },
+    getRecoveryCaptureStatus: async (id, capture) => {
+      assert.equal(id, runId);
+      assert.equal(capture, captureId);
+      return status();
+    },
+    uploadRecoveryBundle: async (id, capture, uploaded, stream) => {
+      assert.equal(id, runId);
+      assert.equal(capture, captureId);
+      const chunks: Buffer[] = [];
+      for await (const chunk of stream) chunks.push(Buffer.from(chunk));
+      const bytes = Buffer.concat(chunks);
+      assert.equal(uploaded.checksum, createHash("sha256").update(bytes).digest("hex"));
+      assert.equal(uploaded.byte_size, bytes.length);
+      manifest = { checksum: uploaded.checksum, byte_size: uploaded.byte_size };
+      return status();
+    },
+    releaseRecoveryCustody: async (id, gen, evidence, disposition) => {
+      assert.equal(id, runId);
+      assert.equal(gen, generation);
+      assert.equal(evidence, undefined, "an incomplete run has no publication settlement evidence");
+      assert.equal(disposition?.kind, "archive");
+      assert.ok(manifest);
+      releases++;
+      open = false;
+      return { run_id: runId, generation, released: true, holds_released: 1 };
+    },
+  };
+  const producer: RecoveryBundleProducer = {
+    enumerateOwedCandidates: async () => sourceHeads.map(sha => ({
+      sha, pinRef: `refs/owed/${sha}`, contexts: [structuredClone(context)],
+    })),
+    readInventoryCloneHeads: async () => ({ kind: "verified", heads: sourceHeads, clones: [], foreignOwners: [] }),
+    buildRecoveryCoverage: async (_bare, ctx, roots, currentSha) => {
+      assert.deepEqual(ctx, context);
+      assert.ok(roots.includes(currentSha));
+      assert.deepEqual([...roots].sort(), [...sourceHeads].sort());
+      const fingerprint = createHash("sha256").update(JSON.stringify({ roots, currentSha })).digest("hex");
+      aggregateSha = fingerprint.slice(0, 40);
+      return { sha: aggregateSha, fingerprint,
+        coverageRef: `refs/uzi-recovery/m2-${generation}`, originalShas: [...roots], currentSha };
+    },
+    resolveRecoveryBareDir: async bare => bare === path.basename(context.barePath) ? context.barePath : undefined,
+    ancestry: async (_bare, source, target) => sourceHeads.includes(source) && target === aggregateSha ? "ancestor" : "unknown",
+    fetchDefaultTip: async () => { throw new Error("guarded archive must be credential free"); },
+    produceRecoveryBundle: async (_bare, opts) => {
+      assert.equal(opts.sourceSha, aggregateSha);
+      assert.equal(opts.forgeTip, undefined);
+      assert.equal(opts.guardedDefaultBranch, "main");
+      // Self-contained empty pack at the synthesized Git seam; no prerequisites.
+      const pack = Buffer.concat([Buffer.from("PACK"), Buffer.from([0, 0, 0, 2, 0, 0, 0, 0])]);
+      const bytes = Buffer.concat([Buffer.from(`# v2 git bundle\n${opts.sourceSha} refs/heads/recovered-source\n\n`),
+        pack, createHash("sha1").update(pack).digest()]);
+      fs.writeFileSync(opts.outPath, bytes);
+      return { bundlePath: opts.outPath, sourceSha: opts.sourceSha, byteSize: bytes.length,
+        checksum: createHash("sha256").update(bytes).digest("hex"),
+        chunkCount: 1, prerequisiteShas: [], selfContained: true, alreadyPublished: false };
+    },
+    cleanupRecoveryGeneration: async () => {
+      physicalCleanups++;
+      return "retained"; // Keep the acknowledged journal available to the runner's real guard.
+    },
+  };
+  const coordinator = new RecoveryCoordinator({
+    recoveryRoot: path.join(fx.dataDir, "m2-inventory"), workerToken: "local-worker-fixture",
+    log: nullLogger(), client: archive, git: producer,
+  });
+  return {
+    coordinator,
+    acknowledge: async (ctx: RunContext, head: string) => {
+      assert.ok(ctx.defaultBranchCommit);
+      context = { runId, generation, kind: "issue", branch: ctx.branch,
+        barePath: git.barePathFor(fx.originPath),
+        defaultIdentity: { ref: "refs/remotes/origin/main", sha: ctx.defaultBranchCommit } };
+      sourceHeads = [...new Set([head, ...(await coordinator.inspect(runId)).map(record => record.sourceSha)])];
+      await coordinator.pin({ runId, generation, kind: "issue", branch: ctx.branch, sourceSha: head, inventoryGuarded: true });
+      const record = await coordinator.freezeInventory({ context, currentSha: head, defaultBranch: "main" });
+      assert.ok(record);
+      assert.ok(record.originalRoots?.some(root => root.sha === head), "the actual committed source is covered");
+      await coordinator.captureAndUpload({ record, barePath: context.barePath, defaultBranch: "main" });
+      const acknowledged = (await coordinator.inspect(runId)).find(r => r.captureId === record.captureId);
+      assert.equal(acknowledged?.finalAcknowledged, true);
+      assert.equal(acknowledged?.finalRequest?.disposition.kind, "archive");
+      assert.equal(acknowledged?.inventoryCurrentSha, head);
+      assert.equal(releases, 1);
+      assert.equal(physicalCleanups, 1);
+      assert.deepEqual(await archive.getRunOwnership!(runId), {
+        status: "paused", claim_generation: generation, inventory_guarded: true,
+      }, "archive authority belongs to the exact inactive guarded generation");
+      assert.equal(await coordinator.inventoryCleanupState(runId, generation), "acknowledged", "real journal authority exists before the completion hold");
+    },
+  };
+}
+
+describe("M2 serial post-permit completion custody", () => {
+  for (const scenario of ["running", "other pause", "completion pause", "paused ACK", "deadline", "message failure",
+    "completion pause with inventory ACK", "paused ACK with inventory ACK", "running with inventory ACK"] as const) {
+    const acknowledged = scenario.endsWith("with inventory ACK");
+    const pausedAck = scenario.startsWith("paused ACK");
+    const completionPause = scenario.startsWith("completion pause");
+    it(`M2 serial post-permit ${scenario}: ${acknowledged ? "acknowledged inventory authority" : "absent inventory authority"} with real Codex safety`, async (t) => {
+      const iid = 28160;
+      const generation = 7;
+      const claim = gitlabClaim(iid, {
+        claim_generation: generation,
+        config: { completion_contract_version: 1, contract_revision: 1 },
+      });
+      const { gitlab, all } = fakeGitlab();
+      const { logger, lines } = recordingLogger();
+      const root = path.join(fx.dataDir, "outbox");
+      const outbox = new Outbox({
+        root, log: nullLogger(), runMaxBytes: 64 * 1024 * 1024,
+        maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000,
+      });
+      await outbox.init();
+      const inventory = acknowledged ? acknowledgedCompletionInventory(claim.run_id, generation) : undefined;
+      const finalize = path.join(root, claim.run_id, `finalize-${generation}.json`);
+      const runHome = path.join(fx.dataDir, "m2-home");
+      const marker = path.join(runHome, "session.marker");
+      const deadline = manualDeadline("finalize");
+      const rig = codexRig({ armDeadline: deadline.armDeadline });
+      let saved!: Buffer;
+      let head!: string;
+      let signal: AbortSignal | undefined;
+      let context!: RunContext;
+      let ownershipReadsAfterHold = 0;
+      let ownerClassification: { status: string; claim_generation: number; claim_released: boolean; inventory_guarded: boolean; hold_reason: string | null } | undefined;
+      let pushesAtHold = 0;
+      const executor = new FakeCodexExecutor(rig.safety, async (ctx) => {
+        context = ctx;
+        signal = ctx.signal;
+        fs.mkdirSync(runHome, { recursive: true });
+        fs.writeFileSync(marker, "resume evidence\n");
+        commitInTree(ctx.worktreePath, "M2.txt", "post-permit work\n");
+        const localHead = await git.worktreeHead(ctx.worktreePath);
+        assert.ok(localHead);
+        head = localHead;
+        await inventory?.acknowledge(ctx, head);
+        assert.equal((await outbox.journalFinalize(claim.run_id, generation)).written, true);
+        saved = fs.readFileSync(finalize);
+        return { branch: ctx.branch };
+      });
+      api.setRegisterProtocolFeatures(["claim_generation_fence"]);
+      await client.register("m2-codex");
+      api.setCompletionPermitResponse(false, { denyReason: "incomplete" });
+      api.completionHoldWire.set(claim.run_id, (res) => {
+        ownershipReadsAfterHold = api.ownershipRequests.length;
+        pushesAtHold = push.mock.callCount();
+        assert.equal(deadline.armed(), 1, "the outer finalize boundary is already held");
+        assert.deepEqual(rig.boundaries, ["finalize"], "capture takes no nested checkpoint boundary");
+        if (scenario === "message failure") api.failMessagesNext(100, 401);
+        res.writeHead(200, { "Content-Type": "application/json" });
+        res.end(pausedAck ? '{"run":{"status":"paused"}}' : "");
+      });
+      api.ownershipWire.set(claim.run_id, (res) => {
+        if (scenario === "deadline") {
+          // The hold outcome is unresolved before this real HTTP reconciliation starts.
+          deadline.fire();
+          // Finish the test-owned response immediately; expiry is event-driven, not a real wait.
+        }
+        if (scenario === "message failure") {
+          context.emit({ kind: "text", agent: "lead", payload: { text: "buffered after ambiguous hold" } });
+        }
+        res.writeHead(200, { "Content-Type": "application/json" });
+        ownerClassification = {
+          status: scenario.startsWith("running") || scenario === "message failure" || scenario === "deadline" ? "running" : "paused",
+          claim_generation: generation, claim_released: false, inventory_guarded: acknowledged,
+          hold_reason: completionPause ? "completion_blocked" :
+            scenario === "other pause" ? "user_pause" : null,
+        };
+        res.end(JSON.stringify(ownerClassification));
+      });
+      const run = runnerWith(() => ({ executor, homeDir: runHome }), gitlab,
+        undefined, logger, { outbox, ...(inventory ? { recovery: inventory.coordinator } : {}),
+          completionHoldReconcileTimeoutMs: 5_000, recoveryRetryMs: 1 });
+      const settle = t.mock.method(run as unknown as { settleRecoveryGeneration: (...args: unknown[]) => Promise<void> }, "settleRecoveryGeneration");
+      const permanent = t.mock.method(run as unknown as { handlePermanentFailure: (...args: unknown[]) => Promise<void> }, "handlePermanentFailure");
+      const checkpoint = t.mock.method(git, "checkpointPack");
+      const push = t.mock.method(git, "pushBranch");
+      await run.execute(claim);
+      const confirmed = completionPause || pausedAck;
+      assert.equal(api.completionPermitRequests.length, 1);
+      assert.equal(api.completionPermitRequests[0]!.body.claim_generation, generation);
+      assert.equal(api.completionPermitRequests[0]!.body.head, head);
+      assert.equal(api.completionHoldRequests.length, 1);
+      assert.equal(api.completionHoldRequests[0]!.body.claim_generation, generation);
+      assert.equal(api.completionHoldRequests[0]!.body.head, head, "the hold carries the verified real local HEAD");
+      assert.equal(ownershipReadsAfterHold, 0, "no ownership reconciliation before hold delivery");
+      assert.equal(api.ownershipRequests.length, confirmed && !acknowledged ? (pausedAck ? 1 : 2) : (pausedAck && acknowledged ? 0 : 1));
+      if (!pausedAck || !acknowledged) {
+        const owner = ownerClassification;
+        assert.ok(owner);
+        assert.equal(owner.status, confirmed || scenario === "other pause" ? "paused" : "running");
+        assert.equal(owner.claim_generation, generation);
+        assert.equal(owner.inventory_guarded, acknowledged);
+        assert.equal(owner.hold_reason, completionPause ? "completion_blocked" : scenario === "other pause" ? "user_pause" : null);
+      }
+      if (inventory) assert.equal(await inventory.coordinator.inventoryCleanupState(claim.run_id, generation), "acknowledged");
+      assert.deepEqual(all, [], "permit denial opens no MR or closing description");
+      assert.equal(pushesAtHold, 1, "the ordinary finalize branch push precedes permit denial");
+      assert.equal(push.mock.callCount(), pushesAtHold, "no remote checkpoint push after denial");
+      assert.equal(checkpoint.mock.callCount(), 0, "no optional remote checkpoint");
+      assert.deepEqual(rig.boundaries, ["finalize"], "the real outer boundary completes without nesting");
+      assert.deepEqual(rig.disposeBoundaries, ["terminal"]);
+      assert.equal(rig.registry.state(), "disposed");
+      assert.equal(run.isExecuting(claim.run_id), false);
+      assert.ok(fs.existsSync(worktreeDirFor(iid)));
+      assert.ok(fs.existsSync(marker));
+      assert.ok(!statuses(claim.run_id).some((s) => ["failed", "completed", "cancelled"].includes(s)));
+      assert.deepEqual(outbox.listPendingTerminals(), [], "no competing failure journal");
+      assert.equal(settle.mock.callCount(), 0, "no recovery generation settlement");
+      if (scenario !== "deadline") {
+        const retained = lines.find((l) => (l as { msg?: string }).msg === "completion hold retained; skipping finalization") as Record<string, unknown> | undefined;
+        assert.equal(retained?.hold_outcome, confirmed ? "confirmed" : "unresolved", "other pause reasons cannot classify as a completion hold");
+      } else assert.equal(deadline.fired(), 1);
+      const retired = confirmed && acknowledged;
+      assert.equal(fs.existsSync(finalize), !retired, "confirmed custody needs acknowledged inventory authority; unresolved custody retains even with that authority");
+      if (!retired) {
+        assert.deepEqual(fs.readFileSync(finalize), saved, "the existing authenticated record survives unchanged");
+        assert.deepEqual(outbox.listPendingFinalizes(), [{ run_id: claim.run_id, claim_generation: generation }]);
+      } else assert.deepEqual(outbox.listPendingFinalizes(), []);
+      if (scenario === "message failure") {
+        assert.equal(permanent.mock.callCount(), 1, "real batcher closure invokes the permanent failure callback");
+        assert.ok(lines.some((l) => (l as { msg?: string }).msg === "message batcher breaker tripped"));
+        assert.equal(signal?.aborted, false, "the permanent callback cannot abort unresolved custody");
+        context.emit({ kind: "text", agent: "lead", payload: { text: "late closed transport probe" } });
+        assert.ok(lines.some((l) => (l as { msg?: string }).msg === "run message emitted after the batcher closed; not delivered"),
+          "the competing failure leaves the transport closed");
+      }
+    });
+  }
+});
 
 describe("Codex durability executable resolution", () => {
   it("pins Git and gitleaks to absolute image paths and rejects other relative names", () => {
@@ -715,45 +987,48 @@ describe("RunRunner issue #1784 - Codex finalize boundary on a hold or wall park
     }
   });
 
-  it("(R2) a confirmed completion hold bypasses the finalize boundary: no finalize permit, no reconcile after the hold, not reported failed", async () => {
-    const { gitlab, calls } = fakeGitlab();
-    const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-hold-"));
-    try {
-      api.setCompletionHoldResponse("paused");
-      const refuse = { on: false };
-      const rig = codexRig({ authMode: "subscription", refuseReconcile: () => refuse.on });
-      const runHome = path.join(homeRoot, "h");
-      const probe: Probe = { refresh: -1, release: -1 };
-      const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
-        fs.mkdirSync(runHome, { recursive: true });
-        fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
-        commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
-        // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
-        git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
-        mockCommittedTracking(git, HELD_HEAD);
-        git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
-        git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
-        git.checkpointPack = (async () => null) as typeof git.checkpointPack;
-        const entered = await ctx.enterCompletionHold?.(HOLD_REASON);
-        probe.outcome = entered;
-        if (entered) refuse.on = true;
-        probe.refresh = rig.refreshCalls();
-        probe.release = rig.releaseCalls();
-        return { branch: ctx.branch, completionHeld: { reason: HOLD_REASON } };
-      });
-      const claim = gitlabClaim(1785);
-      await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
-      assert.equal(probe.outcome, true, "the hold was entered");
-      assert.ok(!rig.boundaries.includes("finalize"), `no finalize boundary; got ${JSON.stringify(rig.boundaries)}`);
-      assert.equal(rig.refreshCalls(), probe.refresh, "no refresh reconcile after the confirmed hold");
-      assert.equal(rig.releaseCalls(), probe.release, "no release reconcile after the confirmed hold");
-      assert.equal(api.completionHoldRequests.length, 1, "one completion-hold request was sent");
-      assert.equal(calls.length, 0, "no push/MR");
-      assertKept(1785, claim.run_id, runHome, rig);
-    } finally {
-      fs.rmSync(homeRoot, { recursive: true, force: true });
-    }
-  });
+  for (const holdStatus of ["paused", ""] as const) {
+    it(`(R2) ${holdStatus === "paused" ? "a confirmed" : "an unresolved"} completion hold bypasses the finalize boundary: no finalize permit, no reconcile after the hold, not reported failed`, async () => {
+      const { gitlab, calls } = fakeGitlab();
+      const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-1784-hold-"));
+      try {
+        api.setCompletionHoldResponse(holdStatus);
+        const refuse = { on: false };
+        const rig = codexRig({ authMode: "subscription", refuseReconcile: () => refuse.on });
+        const runHome = path.join(homeRoot, "h");
+        const probe: Probe = { refresh: -1, release: -1 };
+        const exec = new FakeCodexExecutor(rig.safety, async (ctx) => {
+          fs.mkdirSync(runHome, { recursive: true });
+          fs.writeFileSync(path.join(runHome, "session.marker"), "resume me\n");
+          commitInTree(ctx.worktreePath, "WORK.txt", "work before the hold\n");
+          // Deterministic capture verdict (the clone is already seeded), as runner-completion-hold does.
+          git.worktreeStatus = (async () => []) as typeof git.worktreeStatus;
+          mockCommittedTracking(git, HELD_HEAD);
+          git.verifyRunnerTrackingCovers = (async () => true) as typeof git.verifyRunnerTrackingCovers;
+          git.trackingTip = (async () => HELD_HEAD) as typeof git.trackingTip;
+          git.checkpointPack = (async () => null) as typeof git.checkpointPack;
+          const entered = await ctx.enterCompletionHold?.(HOLD_REASON);
+          probe.outcome = entered;
+          if (entered) refuse.on = true;
+          probe.refresh = rig.refreshCalls();
+          probe.release = rig.releaseCalls();
+          return { branch: ctx.branch, completionHeld: { reason: HOLD_REASON } };
+        });
+        const claim = gitlabClaim(1785);
+        await runnerWith(() => ({ executor: exec, homeDir: runHome }), gitlab).execute(claim);
+        assert.equal(probe.outcome, true, "the hold was entered");
+        assert.ok(!rig.boundaries.includes("finalize"), `no finalize boundary; got ${JSON.stringify(rig.boundaries)}`);
+        assert.equal(rig.refreshCalls(), probe.refresh, "no refresh reconcile after the hold");
+        assert.equal(rig.releaseCalls(), probe.release, "no release reconcile after the hold");
+        assert.equal(api.completionHoldRequests.length, 1, "one completion-hold request was sent");
+        assert.equal(calls.length, 0, "no push/MR");
+        assertKept(1785, claim.run_id, runHome, rig);
+      } finally {
+        fs.rmSync(homeRoot, { recursive: true, force: true });
+      }
+    });
+
+  }
 
   for (const [name, httpStatus, iid] of [
     ["(C1) an unresolved wall park (503) bypasses finalize without generation proof", 503, 1786],

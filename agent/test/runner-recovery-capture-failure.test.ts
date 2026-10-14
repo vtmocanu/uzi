@@ -57,7 +57,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     it(`${failure} failure retains active work until capture verifies`, async () => {
       const { gitlab } = fakeGitlab();
       const iid = failure === "wip" ? 1301 : failure === "fetch" ? 1302 : 1303;
-      const claim = gitlabClaim(iid);
+      const claim = gitlabClaim(iid, { claim_generation: 1 });
       const fixture = factoryFor(claim, failure === "fetch");
       const secondFailure = deferred();
       let attempts = 0;
@@ -96,7 +96,9 @@ describe("recovery capture retry and restart safety (#1197)", () => {
         assert.equal(api.states.some((s) => s.body.status === "failed"), false);
         const bare = git.barePathFor(fx.originPath);
         assert.equal(gitRead(bare, "show", `refs/uzi-runner/agent/issue-${iid}:ONLY_COPY.txt`), "must survive recovery");
-        assert.equal(fs.existsSync(fixture.clone()), false, "only verified work permits clone cleanup");
+        assert.ok(fs.existsSync(path.join(fixture.clone(), ".git")), "the verified park keeps the exact clone");
+        const journal = JSON.parse(gitRead(bare, "config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`)) as RecoveryJournalEntry;
+        assert.equal(journal.clonePath, fixture.clone(), "the covered park keeps its clone journal");
       } finally {
         allowCapture = true;
         runner.shutdown();
@@ -261,7 +263,7 @@ describe("recovery capture retry and restart safety (#1197)", () => {
 
   it("same-run claims wait for delayed ACK and cleanup, then refresh their message cursors", async () => {
     const { gitlab } = fakeGitlab();
-    const claim = gitlabClaim(1308);
+    const claim = gitlabClaim(1308, { claim_generation: 1 });
     const ackReached = deferred();
     const releaseAck = deferred();
     const cleanupReached = deferred();
@@ -270,12 +272,15 @@ describe("recovery capture retry and restart safety (#1197)", () => {
     const releaseSecond = deferred();
     let firstEmit: import("../src/executor.js").RunContext["emit"] | undefined;
     let factories = 0;
+    let modelRuns = 0;
     const factory: ExecutorFactory = () => {
-      const attempt = ++factories;
+      factories++;
       return {
         homeDir: path.join(homeDir, claim.run_id),
         executor: {
           run: async (ctx) => {
+            const attempt = ++modelRuns;
+            assert.equal(ctx.sessionId, undefined, "each retained-source claim starts a fresh session");
             if (attempt === 1) firstEmit = ctx.emit;
             if (attempt === 2) { secondStarted.resolve(); await releaseSecond.promise; }
             ctx.emit({ kind: "status", payload: { text: `execution-${attempt}` } });
@@ -285,23 +290,46 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       };
     };
     const originalReport = client.reportState.bind(client);
+    const originalPost = client.postMessages.bind(client);
+    const originalMessages = client.getChatRunMessages.bind(client);
+    const latePersisted = deferred();
+    client.postMessages = async (...args) => {
+      await originalPost(...args);
+      if (api.messages(claim.run_id).filter(m => /^late-\d+$/.test(String(m.payload.text))).length === 450) {
+        latePersisted.resolve();
+      }
+    };
     let parks = 0;
     client.reportState = async (runId, body) => {
-      const ack = await originalReport(runId, body);
-      if (body.status === "recovery_wait" && ++parks === 1) {
+      const park = body.status === "recovery_wait" ? ++parks : 0;
+      if (park === 1) {
         ackReached.resolve();
         await releaseAck.promise;
       }
+      const ack = await originalReport(runId, body);
+      if (park === 2) api.setOwnershipStatus(claim.run_id, "running", 3);
       return ack;
     };
-    // issue #1315: terminal cleanup now retires the clone ATOMICALLY (rename-to-holding
-    // then journal-clear) instead of removeRunnerClone + clearRecoveryCapture. Intercept
-    // the SAME cleanup step to keep the duplicate-claim serialization coverage.
-    const originalRetire = git.retireRunnerClone.bind(git);
-    let removals = 0;
-    git.retireRunnerClone = async (bareArg, clone, branchArg, runIdArg, opts) => {
-      if (++removals === 1) { cleanupReached.resolve(); await releaseCleanup.promise; }
-      return originalRetire(bareArg, clone, branchArg, runIdArg, opts);
+    // Parks retain the clone. Hold the final stopped-source proof to exercise serialization
+    // through cleanup without relying on physical clone retirement.
+    let cleanups = 0;
+    const quiesceRun: NonNullable<import("../src/runner.js").RunnerOptions["quiesceRun"]> = async req => {
+      if (req.site === "stopped_source" && ++cleanups === 1) {
+        cleanupReached.resolve();
+        await releaseCleanup.promise;
+      }
+      return {
+        process: { state: "quiescent", processes: [], killed: [], detail: "fixture roots reaped" },
+        docker: { state: "not_wired", removed: [], detail: "" },
+      };
+    };
+    const waitForEvent = async (event: Promise<void>, label: string) => {
+      let timer: ReturnType<typeof setTimeout> | undefined;
+      try {
+        await Promise.race([event, new Promise<never>((_, reject) => {
+          timer = setTimeout(() => reject(new Error(`fixture never reached ${label}`)), 10_000);
+        })]);
+      } finally { clearTimeout(timer); }
     };
     const pages: Array<{ after: number; count: number }> = [];
     client.getChatRunMessages = async (runId, after = 0, limit = 200) => {
@@ -310,40 +338,35 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       pages.push({ after, count: page.length });
       return page.map((m) => ({ ...m, agent: m.agent ?? null, created_at: "2026-09-08T00:00:00Z" }));
     };
-    // PRD #1391 Run B M4: a queued duplicate now PROBES ownership before executing. The fake answers
-    // the default {status:"running"} with no generation ⇒ same-generation running ⇒ the router
-    // PROCEEDS (a duplicate is no longer executed blindly, it is gated on the probe). This test asserts
-    // that proceed-and-serialize behaviour through the `factories` counts below; the probe's own
-    // end-vs-proceed DECISION is covered directly in runner-claim-router.test.ts. (A raw
-    // getRunOwnership call count is NOT asserted here: the recovery-capture park loop also probes
-    // ownership, so the count cannot isolate the gate's own probe.)
-    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 });
+    // Queue fenced successor claims while each predecessor still owns its ACK/cleanup tail.
+    api.setOwnershipStatus(claim.run_id, "running", 1);
+    const runner = runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5, quiesceRun });
     const pending = [runner.execute(claim)];
     try {
-      await ackReached.promise;
+      await waitForEvent(ackReached.promise, "first park ACK");
       // Promotion took this snapshot while the previous worker response was lost.
-      const duplicate = { ...claim, last_seq: Math.max(0, ...api.messages(claim.run_id).map((m) => m.seq)) };
+      const duplicate = { ...claim, claim_generation: 2, last_seq: Math.max(0, ...api.messages(claim.run_id).map((m) => m.seq)) };
       pending.push(runner.execute(duplicate));
       assert.equal(factories, 1, "duplicate factory work must wait for the entire previous execution");
       for (let i = 0; i < 450; i++) firstEmit!({ kind: "status", payload: { text: `late-${i}` } });
+      await waitForEvent(latePersisted.promise, "450 late messages persisted before park application");
+      assert.equal((await client.getRunOwnership(claim.run_id)).status, "running");
       releaseAck.resolve();
-      await cleanupReached.promise;
+      await waitForEvent(cleanupReached.promise, "stopped-source cleanup");
       assert.equal(factories, 1, "even a completed batcher does not release clone/session cleanup ownership");
       assert.equal(pages.length, 0, "cursor refresh happens only after all previous cleanup");
       const firstFinalSeq = Math.max(...api.messages(claim.run_id).map((m) => m.seq));
       assert.ok(firstFinalSeq > duplicate.last_seq + 400, "the stale claim predates multiple pages of late messages");
+      api.setOwnershipStatus(claim.run_id, "running", 2);
       releaseCleanup.resolve();
-      await secondStarted.promise;
-      // PRD #1391 Run B M4: the queued duplicate probed ownership after the previous execution
-      // settled and, seeing the SAME-generation `running` row, proceeded to execute (factories → 2).
-      pending.push(runner.execute(duplicate));
-      assert.equal(factories, 2, "same-generation running probe ⇒ the queued duplicate proceeds; the first completion cannot delete a later queued chain entry");
+      await waitForEvent(secondStarted.promise, "second model admission");
+      pending.push(runner.execute({ ...duplicate, claim_generation: 3 }));
+      assert.equal(modelRuns, 2, "the successor starts only after the predecessor cleanup");
+      assert.equal(factories, 2, "the queued successor factory starts only after predecessor cleanup");
       releaseSecond.resolve();
       await Promise.all(pending);
-      // Each queued duplicate PROBES ownership and — because the row stays same-generation running —
-      // proceeds; a stale generation or a terminal/held row would have ended the attempt with no
-      // report instead (covered by runner-claim-router.test.ts).
-      assert.equal(factories, 3, "queued duplicates probe ownership and, at the same generation, still execute — none is silently dropped");
+      assert.equal(modelRuns, 3, "each fenced queued claim runs once after the preceding tail settles");
+      assert.equal(factories, 3, "each queued claim constructs its own fixture executor");
       const messages = api.messages(claim.run_id);
       for (const attempt of [1, 2, 3]) {
         const emitted = messages.find((m) => m.payload.text === `execution-${attempt}`);
@@ -358,6 +381,9 @@ describe("recovery capture retry and restart safety (#1197)", () => {
       releaseAck.resolve(); releaseCleanup.resolve(); releaseSecond.resolve();
       runner.shutdown();
       await Promise.allSettled(pending);
+      client.reportState = originalReport;
+      client.postMessages = originalPost;
+      client.getChatRunMessages = originalMessages;
     }
   });
 

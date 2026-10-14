@@ -230,6 +230,10 @@ export class FakeApi {
   private memoryWorkerId: string | undefined;
   readonly workerPauseRequests: Array<{ runId: string; generation: unknown }> = [];
   parkRunOwnership: { status: string; claim_generation: number; hold_reason: string | null; claim_released: boolean } | undefined;
+  /** Per-run wire fixtures; absent entries preserve the legacy incomplete ownership DTO. */
+  readonly completionHoldWire = new Map<string, (res: http.ServerResponse) => void>();
+  readonly ownershipWire = new Map<string, (res: http.ServerResponse) => void>();
+  readonly committedHoldOwnership = new Map<string, unknown>();
   guardedQuestionStatus: string | undefined;
   workerPauseRefused = false;
   workerPauseReason: string | undefined;
@@ -275,6 +279,8 @@ export class FakeApi {
   // --- records -------------------------------------------------------------
   readonly registers: RecordedRegister[] = [];
   heartbeats = 0;
+  readonly heartbeatBodies: Record<string, unknown>[] = [];
+  registerNonce: string | undefined;
   unauthorized = 0;
   stateAttempts = 0;
   readonly states: Array<{ runId: string; body: StateRequest }> = [];
@@ -1022,10 +1028,12 @@ export class FakeApi {
       }
       if (this.registerProtocolFeatures !== undefined)
         registerBody.protocol_features = this.registerProtocolFeatures;
+      if (this.registerNonce !== undefined) registerBody.register_nonce = this.registerNonce;
       return send(res, 200, registerBody);
     }
     if (req.method === "POST" && p === "/api/worker/heartbeat") {
       this.heartbeats++;
+      this.heartbeatBodies.push(json);
       return send(res, 200, {});
     }
     if (req.method === "POST" && p === "/api/worker/runs/claim") {
@@ -1391,6 +1399,10 @@ export class FakeApi {
     if (req.method === "GET" && ownMatch) {
       const runId = ownMatch[1] as string;
       this.ownershipRequests.push(runId);
+      const wire = this.ownershipWire.get(runId);
+      if (wire) return wire(res);
+      if (this.committedHoldOwnership.has(runId))
+        return send(res, 200, this.committedHoldOwnership.get(runId));
       if (this.parkRunOwnership) return send(res, 200, this.parkRunOwnership);
       const o = this.ownershipByRun.get(runId);
       if (!o) return send(res, 200, { status: "running" });
@@ -1468,6 +1480,8 @@ export class FakeApi {
     if (req.method === "POST" && holdMatch) {
       const runId = holdMatch[1] as string;
       this.completionHoldRequests.push({ runId, body: json });
+      const wire = this.completionHoldWire.get(runId);
+      if (wire) return wire(res);
       return send(res, this.completionHoldHttpStatus, {
         run: { id: runId, status: this.completionHoldStatus },
       });
@@ -1597,7 +1611,10 @@ export class FakeApi {
       res.end(raw.body);
       return;
     }
-    const body = json as unknown as StateRequest;
+    const body = { ...json } as unknown as StateRequest;
+    // Mirror worker state decoding: PostgreSQL plans persist without NUL bytes.
+    // worker_messages_poison_livedb_test.go exercises this server contract.
+    if (body.plan_md !== undefined) body.plan_md = body.plan_md.replaceAll("\u0000", "");
     const typedRefusal = this.typedParkRefusal.get(runId);
     if (typedRefusal !== undefined && typedRefusal.remaining > 0 && body.recovery_cause === "provider_outage") {
       typedRefusal.remaining--;

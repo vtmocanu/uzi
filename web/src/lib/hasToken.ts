@@ -23,19 +23,20 @@ export function hasAnthropicToken(secrets: SecretMeta[]): boolean {
   return secrets.some((s) => s.kind === "anthropic_token" && s.enabled !== false);
 }
 
-// anthropicTokenCount is the ">1 token" gate for the Runs-list credential badge
-// (PRD #295): a single-token user's every run billed the one token, so the badge
-// says nothing and is hidden. It lives here beside `hasAnthropicToken` for the same
-// reason that predicate does — one exported, tested function keeps the threshold in
-// a single place rather than inlining `.filter(...).length > 1` at the call site,
-// where narrowing the kind check would leave the caller's test green while the gate
-// counted the wrong thing.
+// Per-harness counters include disabled credentials for historical account display.
+// The shared showsRunAccounts helper applies the list's total-count threshold.
 export function anthropicTokenCount(secrets: SecretMeta[]): number {
   return secrets.filter((s) => s.kind === "anthropic_token").length;
 }
 
 export function codexCredentialCount(secrets: SecretMeta[]): number {
   return secrets.filter((s) => s.kind === "codex_auth" || s.kind === "openai_api_key").length;
+}
+
+// Personal lists show accounts once the viewer holds multiple credentials,
+// including one of each harness. Admin lists always show accounts.
+export function showsRunAccounts(counts: { claude: number; codex: number }): boolean {
+  return counts.claude + counts.codex > 1;
 }
 
 // isCodexUsable mirrors the server's D11 Codex-availability rule EXACTLY (PRD #1429

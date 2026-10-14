@@ -657,6 +657,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     let committedTip = "";
     let softSkipped = false;
     const claim = gitlabClaim(1923, {
+      claim_generation: 1,
       repo: { id: "r1", url: "https://github.com/org/repo", clone_url: fx.originPath, forge_type: "github" },
     });
     const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {
@@ -699,18 +700,24 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
 
       firstFlight = false;
       vaultLocked = false;
-      const rig2 = codexRig({ vaultLocked: () => vaultLocked });
-      const exec2 = new FakeCodexExecutor(rig2.safety, async (ctx) => {
-        reclaimedTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"],
-          { env: GIT_ENV, encoding: "utf8" }).trim();
-        assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "M1.txt"), "utf8"), "saved in the worker bare\n");
-        await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
-        secondCheckpointReturned = true;
-        assert.equal(confirmedTips.length, 1, "the reclaim's guarded checkpoint received the first published ACK");
-        assert.notEqual(confirmedTips[0], committedTip, "the reclaimed candidate was wrapped for the advanced workflow");
-        return { branch: ctx.branch };
-      }, rig2.settle);
-      await runnerWith(() => ({ executor: exec2 }), gitlab, undefined, undefined, {
+      api.setOwnershipStatus(claim.run_id, "running", 2);
+      const factory2 = () => {
+        const rig2 = codexRig({ vaultLocked: () => vaultLocked });
+        const exec2 = new FakeCodexExecutor(rig2.safety, async (ctx) => {
+          reclaimedTip = execFileSync("git", ["-C", ctx.worktreePath, "rev-parse", "HEAD"],
+            { env: GIT_ENV, encoding: "utf8" }).trim();
+          assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "M1.txt"), "utf8"), "saved in the worker bare\n");
+          assert.equal(confirmedTips.length, 1, "predecessor recapture published before model admission");
+          await ctx.checkpoint!({ reap: true, progress: { completed: ["m1"], in_progress: [] }, sink: "milestone_checkpoint" });
+          secondCheckpointReturned = true;
+          assert.equal(confirmedTips.length, 2, "the fresh attempt's guarded checkpoint received a published ACK");
+          assert.equal(confirmedTips[0], committedTip, "credential-free predecessor recapture published the saved candidate");
+          assert.notEqual(confirmedTips[1], committedTip, "the fresh attempt checkpoint was wrapped for the advanced workflow");
+          return { branch: ctx.branch };
+        }, rig2.settle);
+        return { executor: exec2 };
+      };
+      await runnerWith(factory2, gitlab, undefined, undefined, {
         github, checkpointIntervalMs: 0, checkpointTickIntervalMs: 0,
       }).execute({ ...claim, claim_generation: 2 });
     } finally {
@@ -720,7 +727,7 @@ describe("RunRunner #1914 — a slow checkpoint overlay remains owed", () => {
     }
     assert.equal(reclaimedTip, committedTip, "the second claim recovered the exact committed milestone");
     assert.equal(secondCheckpointReturned, true, "the reclaimed flight retried publication");
-    assert.ok(statuses(claim.run_id).includes("completed"));
+    assert.ok(statuses(claim.run_id).includes("completed"), JSON.stringify(api.states));
     assert.ok(!statuses(claim.run_id).includes("failed"));
   });
 

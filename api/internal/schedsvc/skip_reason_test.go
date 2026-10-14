@@ -29,6 +29,8 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipSelfImproveMRCapReached: true,
 		SkipOpenMRExists:            true,
 		SkipCodexOverrideConflict:   true,
+		SkipHarnessLabelConflict:    true,
+		SkipHarnessLabelInvalid:     true,
 		SkipSchedulesPaused:         true,
 		SkipNoUsableCredential:      true,
 		SkipCredentialDisabled:      true,

@@ -23,6 +23,8 @@ import { RunDiskLocks } from "./run-disk-locks.js";
 import {
   ATTEMPT_ID_RE,
   attemptClonePath,
+  attemptGeneration,
+  cloneKeyOf,
   compareAttemptIds,
   formatResidueName,
   isRetainedArtifactName,
@@ -33,7 +35,7 @@ import {
 import { InvalidRecoveryClonePathError, recoveryProgress, recoverySource, sameRecoverySource, type RecoveryBlocker, type RecoveryProgress, type RecoverySource } from "./recovery-progress.js";
 import { sanitizeForLog } from "./run-quiescence.js";
 import { RECOVERY_DECODED_LIMIT, validateRecoveryDecodedLimitBytes, RecoveryClosureLimitError, verifyClosureFrames, type ClosureBudget, type ClosureObject } from "./recovery-closure.js";
-import { REASON_WORKER_RESIDUE_BLOCKED, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
+import { REASON_WORKER_RESIDUE_BLOCKED, RetainedStoppedSourceError, RunResidueBlockedError, assertNoCredentialedGitWhileQuarantined, assertResidueQuarantineOpen, residueQuarantine } from "./residue-quarantine.js";
 
 import {
   commitsScannedFromStderr,
@@ -858,6 +860,14 @@ const SECRET_SCAN_REPORT_MAX_BYTES = 16 * 1024 * 1024;
 
 /** A full 40-hex commit SHA (issue #1597 M2: pinned checkpoint ranges are validated with it). */
 const SHA40_RE = /^[0-9a-f]{40}$/;
+/** Env that stops replace refs from bending reachability or tree reads in the stopped-source proof. */
+const NO_REPLACE_ENV: NodeJS.ProcessEnv = { GIT_NO_REPLACE_OBJECTS: "1" };
+const NO_REPLACE = { env: NO_REPLACE_ENV };
+/** Read-only `status` of a kept clone: GIT_OPTIONAL_LOCKS=0 stops git rewriting the clone's .git/index stat cache. */
+const READ_ONLY_STATUS = { env: { ...NO_REPLACE_ENV, GIT_OPTIONAL_LOCKS: "0" } as NodeJS.ProcessEnv };
+/** Bounds for the stopped-source ref proof: shas per rev-list argv, and refs beyond which coverage is not claimed. */
+const LOCAL_REF_REVLIST_CHUNK = 500;
+const MAX_LOCAL_REF_SHAS = 20000;
 
 /** How long an aborted prepared ref transaction may take to exit on its own before it is killed. */
 const PREPARED_ABORT_GRACE_MS = 5_000;
@@ -1159,6 +1169,18 @@ export class ForeignRetainedRecoveryError extends Error {
   constructor() { super("foreign retained recovery"); }
 }
 
+/**
+ * issue #2886: a bare cache directory named by the bounded `uzi-sha256-<hex>.git` form does not
+ * provably belong to the origin being asked for (stored origin missing, duplicated, unreadable or
+ * different, or the path is not a bare). Fail closed: nothing is fetched, deleted or rewritten.
+ */
+export class BareCacheIdentityError extends Error {
+  constructor(readonly bareName: string) {
+    super(`bare cache identity check failed: ${bareName}`);
+    this.name = "BareCacheIdentityError";
+  }
+}
+
 export class RetainedRecoveryBlockedError extends Error {
   readonly reason = "source_missing";
   constructor(readonly barePath: string, readonly branch: string, readonly key: string,
@@ -1186,9 +1208,12 @@ export interface RecoveryJournalEntry extends RecoverySource {
 // toward the abandoned cap and never deleted. Each seed compacts the key to its last value per
 // attemptId (see compactAttemptLedger).
 // The watcher's backup script (.agents/skills/uzi-watcher/scripts/backup-runs.sh) reads exactly
-// this key and these field names: keep them byte-for-byte. It reads `state` only to report a BARE
-// backup's attempt as retired, which requires every entry for the run to be `retired` or
-// `abandoned`; any other value, including a new one, reads as "attempt state unknown".
+// this key and these field names: keep them byte-for-byte. It reads `state` in three places: an
+// attempt whose last entry for the run is `live` or `reclaimed` is an attributed source it captures
+// (and counts as a coverage gap when unreadable); protected-descriptor validation accepts only the
+// four states above (any other fails that capture closed); and a BARE backup's attempt reads as
+// retired only when every entry for the run is `retired` or `abandoned`. A new state therefore needs
+// a matching backup-runs.sh change.
 function attemptLedgerKey(branch: string): string {
   return `uzi-attempts.${branch}.entry`;
 }
@@ -1268,6 +1293,202 @@ function attemptLedgerValue(entry: AttemptLedgerEntry): string {
     clonePath: entry.clonePath,
     state: entry.state,
   });
+}
+
+// ─── issue #1786 — retained stopped sources ────────────────────────────────────────────────
+//
+// A stopped generation's clone is kept, not discarded, until an operator
+// explicitly disposes of it. An ATTEMPT clone is retained through the ledger's never-deleted
+// `reclaimed` state (see attemptLedgerKey); a CANONICAL clone, which has no ledger identity, through
+// the bounded multi-valued bare-config marker `uzi-stopped.<runId>.entry` below. The marker grants
+// no capture, adoption or release authority: it only refuses reuse of the path it names.
+
+/** Does `text` contain `p` as a whole path, i.e. not immediately followed by a clone-key character? */
+function namesWholePath(text: string, p: string): boolean {
+  for (let i = text.indexOf(p); i >= 0; i = text.indexOf(p, i + 1)) {
+    if (!/[A-Za-z0-9_-]/.test(text.charAt(i + p.length))) return true;
+  }
+  return false;
+}
+
+function stoppedMarkerKey(runId: string): string {
+  return `uzi-stopped.${runId}.entry`;
+}
+
+/** One marker value is at most this many bytes; a longer one is malformed, never truncated. */
+const STOPPED_MARKER_MAX_BYTES = 4096;
+
+/** The stopped-canonical marker (see {@link stoppedMarkerKey}). `journalDigest` is the sha256 of the
+ *  EXACT canonical journal value the marker protects, so a changed journal never inherits it. */
+export interface StoppedSourceMarker {
+  version: 1;
+  runId: string;
+  /** The claim generation the stopped flight ran under; null when it carried none. */
+  generation: number | null;
+  branch: string;
+  key: string;
+  clonePath: string;
+  journalDigest: string;
+  reason: string;
+  at: string;
+}
+
+/** The operator-facing identity of one retained source. `attempt` is an attempt id, or `canonical`. */
+export interface RetainedSourceSelector {
+  runId: string;
+  generation: number | "none";
+  attempt: string;
+}
+
+/** The server's open custody holds for the run, as READ by the caller (GitCache never calls the API).
+ *  `unknown` is a failed, oversized or malformed read and refuses every disposition. */
+export type RetainedHoldsSnapshot =
+  | { state: "read"; holds: Array<{ id: string; generation: number }> }
+  | { state: "unknown" };
+
+/** A local custody record of the run, named separately from the server hold state. */
+export interface RetainedLocalRecord {
+  kind: "recovery" | "settlement" | "terminal";
+  generation: number | null;
+  name: string;
+  /** The existing resolution path for this record kind. */
+  resolution: string;
+}
+
+/** The ONE disposition inspect reports for a source. */
+export type RetainedDisposition =
+  | { kind: "owner_hold_discard"; holdIds: string[] }
+  | { kind: "resolve_local_record"; records: RetainedLocalRecord[] }
+  | { kind: "local_discard" }
+  | { kind: "local_protected_discard" }
+  | { kind: "refused"; consumers: string[] };
+
+export interface RetainedSourcePart {
+  clonePath: string;
+  attempt: string;
+  generation: number | "none";
+  presence: "present" | "missing" | "unsafe";
+  ledgerState: AttemptLedgerState | "none";
+  live: boolean;
+  allocatedBytes: number | null;
+}
+
+/** Content-free evidence for one retained source (or one protected episode of several). */
+export interface RetainedSourceEvidence {
+  /** The worker bare that holds this source's metadata; pass it back to discard to skip the scan. */
+  barePath: string;
+  runId: string;
+  branch: string;
+  key: string;
+  kind: "attempt" | "canonical" | "protected";
+  generation: number | "none";
+  attempt: string;
+  ledgerState: AttemptLedgerState | "none";
+  journalState: "none" | "plain" | "other" | "episode" | "descriptor" | "episode_and_descriptor";
+  /** `bound`: the active journal names this source and matches the marker's digest. `detached`: no
+   *  active journal names the marker's path (the normal state of a kept canonical source: the journal
+   *  was cleared when the marker was written). `mismatch`: an active journal names the path with
+   *  another digest, or a non-plain journal names it. */
+  markerState: "none" | "bound" | "detached" | "mismatch" | "malformed";
+  presence: "present" | "missing" | "unsafe";
+  /** sha256 over the exact ledger value, or marker (+ the active journal only when bound), or journal+descriptor, plus lstat dev:ino. */
+  descriptor: string;
+  allocatedBytes: number | null;
+  bytesState: "measured" | "partial" | "unknown";
+  sources: RetainedSourcePart[];
+  consumers: string[];
+  localRecords: RetainedLocalRecord[];
+  holds: { state: "read" | "unknown" | "not_read"; ids: string[] };
+  disposition: RetainedDisposition | undefined;
+}
+
+/** The server's lifecycle verdict for a run, read by the caller (never by GitCache) before it
+ *  inspects or discards. `terminal` is positive evidence; every other state keeps a marker-less
+ *  canonical source. */
+export type RetainedLifecycleSnapshot =
+  | { state: "terminal"; status: "completed" | "failed" | "cancelled" }
+  | { state: "not_terminal"; status: string }
+  | { state: "unknown" };
+
+export interface RetainedInspectOptions {
+  /** Restrict to one source. Absent ⇒ an aggregate view (no disposition: holds are per run). */
+  selector?: RetainedSourceSelector;
+  /** Restrict to one bare (tests; the operator channel scans every bare). */
+  barePath?: string;
+  /** The holds snapshot for the selector's run, read by the caller BEFORE inspecting. */
+  holds?: RetainedHoldsSnapshot;
+  /** The run's lifecycle snapshot, read alongside `holds`; absent ⇒ `run_state:not_read` in the aggregate view. */
+  lifecycle?: RetainedLifecycleSnapshot;
+  isLivePath: (clonePath: string) => boolean;
+  /** Injected clock (ms) and budget; default Date.now and {@link RETAINED_INSPECT_BUDGET_MS}. */
+  now?: () => number;
+  budgetMs?: number;
+  /** Test seam: smaller caps on the measurement walk than the defaults. */
+  measureCaps?: RetainedMeasureCaps;
+}
+
+export interface RetainedInspectResult {
+  sources: RetainedSourceEvidence[];
+  /** True when enumeration or measurement hit the budget or the descriptor cap. */
+  partial: boolean;
+  /** Bares whose retained metadata could not be read. */
+  unreadable: number;
+  sampledAt: string;
+}
+
+export interface RetainedDiscardOptions {
+  selector: RetainedSourceSelector;
+  /** The descriptor digest inspect reported; the exact value, or nothing is deleted. */
+  confirm: string;
+  holds: RetainedHoldsSnapshot;
+  /** The run's lifecycle snapshot; absent counts as unknown (a marker-less canonical source is kept). */
+  lifecycle?: RetainedLifecycleSnapshot;
+  isLivePath: (clonePath: string) => boolean;
+  /** Capture-mode scoped quiescence over every source path and its skills sibling; false refuses. */
+  quiesce: (paths: string[]) => Promise<boolean>;
+  barePath?: string;
+  signal?: AbortSignal;
+  /** The single operation deadline (default {@link RETAINED_OP_DEADLINE_MS}). */
+  deadlineMs?: number;
+}
+
+export type RetainedSourceOutcome = "removed" | "retained" | "missing" | "unknown";
+
+export type RetainedDiscardResult =
+  | { kind: "refused"; reason: string; consumers: string[]; disposition?: RetainedDisposition }
+  | {
+      /** done: every path is gone and the metadata retired; incomplete: something remains;
+       *  unknown: an error or the deadline interrupted the operation (everything not proven gone stays). */
+      kind: "done" | "incomplete" | "unknown";
+      sources: Array<{ clonePath: string; outcome: RetainedSourceOutcome }>;
+      metadata: "retired" | "kept";
+    };
+
+/** The inspect budget (ms), the descriptor cap and the destructive operation deadline (ms). */
+const RETAINED_INSPECT_BUDGET_MS = 5_000;
+export const RETAINED_MAX_DESCRIPTORS = 64;
+const RETAINED_OP_DEADLINE_MS = 30_000;
+/** Caps on the byte measurement walk: entries visited, directories pending, directory depth. */
+const RETAINED_MEASURE_MAX_ENTRIES = 100_000;
+const RETAINED_MEASURE_MAX_PENDING = 10_000;
+const RETAINED_MEASURE_MAX_DEPTH = 256;
+
+/** Overrides of the measurement caps (tests inject small ones). */
+export interface RetainedMeasureCaps {
+  maxEntries?: number;
+  maxPending?: number;
+  maxDepth?: number;
+}
+
+function sha256Hex(s: string): string {
+  return createHash("sha256").update(s).digest("hex");
+}
+
+/** The generation an attempt id carries, for evidence: `null` for `gx` (none), `unreadable` for a
+ *  `g<N>` whose N is not a safe integer (never mapped to `none`, which would be a different source). */
+function attemptGenerationEvidence(attemptId: string): { generation: number | null; unreadable: boolean } {
+  const g = attemptGeneration(attemptId);
+  return { generation: g ?? null, unreadable: g === undefined && /-g[0-9]+-/.test(attemptId) };
 }
 
 /** How many abandoned attempts (each with its skills sibling) the retention sweep keeps per key. */
@@ -1611,6 +1832,57 @@ export type InventoryReadCause =
   | "attribution_unreadable" | "clone_ancestor_invalid" | "clone_path_invalid"
   | "clone_head_unreadable" | "git_or_filesystem_error" | "other";
 
+/** issue #1786: every marker of a bare, parsed. `malformed` and `overflow` are evidence that cannot
+ *  be attributed to a path, so they refuse reuse of any path of the same run and are never repaired. */
+interface StoppedMarkers {
+  valid: Array<{ marker: StoppedSourceMarker; raw: string }>;
+  malformed: Array<{ runId: string; raw: string }>;
+  overflow: Set<string>;
+}
+
+/** issue #1786: one physical source of a gathered retained record. */
+interface GatheredPart {
+  clonePath: string;
+  attemptId: string | undefined;
+  generation: number | null;
+  presence: "present" | "missing" | "unsafe";
+  devIno: string;
+  ledgerState: AttemptLedgerState | "none";
+}
+
+/** issue #1786: one retained record of a bare (an attempt source, a marked canonical source, or a
+ *  protected/episode descriptor), gathered under the bare lock. */
+interface GatheredRecord {
+  kind: "attempt" | "canonical" | "protected";
+  runId: string;
+  branch: string;
+  key: string;
+  parts: GatheredPart[];
+  /** The journal this record is bound to: the episode journal, or the canonical plain journal. */
+  journal: RecoveryJournalEntry | undefined;
+  /** The EXACT active journal value of `branch` (also when it is not this record's journal). */
+  activeRaw: string | undefined;
+  descriptorRaw: string | undefined;
+  /** The re-serialized descriptor, the form the locked discard core compares. */
+  descriptorSnapshot: string | undefined;
+  journalState: RetainedSourceEvidence["journalState"];
+  markerState: RetainedSourceEvidence["markerState"];
+  markerRaw: string | undefined;
+  ledgerRaw: string | undefined;
+  digest: string;
+  /** Problems that make this record's attribution or evidence unusable. */
+  problems: string[];
+  /** Other journals/descriptors naming one of this record's paths: path → namers. */
+  namers: Map<string, string[]>;
+}
+
+interface GatheredBare {
+  barePath: string;
+  records: GatheredRecord[];
+  /** Every last-value ledger entry, for the live-successor check. */
+  ledger: Map<string, AttemptLedgerEntry & { branch: string }>;
+}
+
 export class GitCache {
   private readonly reposRoot: string;
   /** Runner-owned clone store (the working trees). A distinct /data subtree from the
@@ -1649,7 +1921,7 @@ export class GitCache {
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
-  private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number }>();
+  private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number; configBytes: number }>();
 
   /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
   async withReportProofBudget<T>(budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>): Promise<T> {
@@ -1660,7 +1932,7 @@ export class GitCache {
     const timer = setTimeout(() => timeout.abort(new Error("report proof deadline")), Math.max(0, deadline - Date.now()));
     try {
       if (Date.now() >= deadline) timeout.abort(new Error("report proof deadline"));
-      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0 }, action);
+      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0, configBytes: parent?.configBytes ?? 0 }, action);
     } finally { clearTimeout(timer); }
   }
 
@@ -1814,6 +2086,43 @@ export class GitCache {
     return path.join(this.reposRoot, bareDirName(repoUrl));
   }
 
+  /**
+   * The bare cache path for an origin that must already exist locally: no fetch, no creation.
+   * A hashed-name bare must carry this exact origin (see {@link BareCacheIdentityError}); a path
+   * that does not exist is returned as-is, like {@link barePathFor}.
+   */
+  async existingBarePathFor(repoUrl: string): Promise<string> {
+    const barePath = this.barePathFor(repoUrl);
+    if (await lstatPresent(barePath)) await this.assertBareOriginIdentity(barePath, repoUrl);
+    return barePath;
+  }
+
+  /** Read the stored `uzi.cacheOrigin` of a bare. Only `ok` admits reuse of a hashed-name bare. */
+  private async readBareCacheOrigin(barePath: string): Promise<BareCacheOrigin> {
+    let out: string;
+    try {
+      out = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+    } catch (err) {
+      if (err instanceof RunResidueBlockedError) throw err;
+      const abort = this.boundaryAbortError(err);
+      if (abort) throw abort;
+      return { kind: "unreadable" };
+    }
+    // `--null` entries are `key\nvalue`, or a bare `key` when the entry has no value.
+    const entries = out.split("\0").filter(item => item === BARE_CACHE_ORIGIN_KEY || item.startsWith(BARE_CACHE_ORIGIN_KEY + "\n"));
+    if (entries.length === 0) return { kind: "absent" };
+    if (entries.length !== 1 || !entries[0]!.includes("\n")) return { kind: "invalid" };
+    return { kind: "ok", value: entries[0]!.slice(BARE_CACHE_ORIGIN_KEY.length + 1) };
+  }
+
+  /** issue #2886: a hashed-name bare is reusable only for the origin stored in it at clone time. */
+  private async assertBareOriginIdentity(barePath: string, repoUrl: string): Promise<void> {
+    const name = path.basename(barePath);
+    if (!HASHED_BARE_NAME.test(name)) return;
+    const stored = await this.readBareCacheOrigin(barePath);
+    if (stored.kind !== "ok" || stored.value !== repoUrl) throw new BareCacheIdentityError(name);
+  }
+
   /** Resolve a recovery journal basename to a real bare directly under the private repos root. */
   async resolveRecoveryBareDir(bareDir: string): Promise<string | undefined> {
     if (
@@ -1840,6 +2149,11 @@ export class GitCache {
       try { if ((await this.runGit(barePath, ["rev-parse", "--is-bare-repository"])).trim() !== "true") return undefined; }
       catch { return undefined; }
     } else if (!(await isBareRepo(barePath))) return undefined;
+    // issue #2886: a hashed name is trusted only when the origin stored in the bare hashes to it.
+    if (HASHED_BARE_NAME.test(bareDir)) {
+      const stored = await this.readBareCacheOrigin(barePath);
+      if (stored.kind !== "ok" || bareDirName(stored.value) !== bareDir) return undefined;
+    }
     return barePath;
   }
 
@@ -1913,6 +2227,7 @@ export class GitCache {
     return this.withLock(barePath, async () => {
       await fs.mkdir(this.reposRoot, { recursive: true });
       if (await isBareRepo(barePath)) {
+        await this.assertBareOriginIdentity(barePath, repoUrl);
         this.log.info("repo cache: fetching", { bare: barePath });
         // Issue #134: reassert IDEMPOTENTLY on the warm path, BEFORE the fetch (the first
         // object-writing command, hence the first spawner). cloneBare only runs on the very
@@ -1928,6 +2243,10 @@ export class GitCache {
           label: "clone/fetch",
         });
       } else {
+        // issue #2886: never clone over (or beside) something occupying a hashed name.
+        if (HASHED_BARE_NAME.test(path.basename(barePath)) && await lstatPresent(barePath)) {
+          throw new BareCacheIdentityError(path.basename(barePath));
+        }
         this.log.info("repo cache: cloning bare", { url: repoUrl, bare: barePath });
         await withForgeRetry(() => this.cloneBare(repoUrl, barePath, pat, scope, username), {
           schedule: this.retry?.schedule,
@@ -2386,6 +2705,8 @@ export class GitCache {
       // recovery capture failed. The journal is in WORKER-owned bare config, never
       // in the runner-owned clone. An unreadable journal fails closed before rm.
       const pending = await this.readRecoveryCapture(barePath, branch);
+      // issue #1786: a retained stopped canonical clone refuses reuse before any journal case.
+      await this.assertNoStoppedMarker(barePath, clonePath, pending);
       if (pending) {
         // issue #1315 — three fail-closed cases. The git layer NEVER probes owner
         // status and NEVER disposes; it only classifies. Only Case B is reclaimable,
@@ -2610,6 +2931,8 @@ export class GitCache {
       const canonical = this.runnerClonePath(barePath, key);
       const clonePath = attemptClonePath(canonical, attempt.attemptId);
       const pending = await this.readRecoveryCapture(barePath, branch);
+      // issue #1786: a retained stopped canonical clone refuses reuse before any journal case.
+      if (pending) await this.assertNoStoppedMarker(barePath, pending.clonePath, pending);
       if (pending) {
         const shape = this.clonePathShape(pending.clonePath, canonical);
         const idMismatch =
@@ -5285,6 +5608,7 @@ export class GitCache {
   async detachTerminalRetained(barePath: string, branch: string, key: string, expected: RecoveryJournalEntry): Promise<void> {
     expected = parseRecoveryJournal(JSON.stringify(expected));
     await this.withLock(barePath, async () => {
+      await this.refuseMarkedPaths(barePath, this.recoverySources(expected).map((x) => x.clonePath), expected.runId);
       const records = await this.protectedRecoveries(barePath);
       const prior = records.find(r => r.journal.runId === expected.runId);
       const value = JSON.stringify({ version: 1, branch, key, journal: expected });
@@ -5485,7 +5809,10 @@ export class GitCache {
 
   /** Credential-free effective path mode, independent of recovery journal disposition. */
   async recoveryAttemptMode(repoUrl: string, key: string): Promise<boolean> {
-    return this.readRecoveryAttemptMode(this.barePathFor(repoUrl), key);
+    const barePath = this.barePathFor(repoUrl);
+    await this.assertRecoveryBare(barePath);
+    await this.assertBareOriginIdentity(barePath, repoUrl);
+    return this.readRecoveryAttemptMode(barePath, key);
   }
 
   private async readRecoveryAttemptMode(barePath: string, key: string): Promise<boolean> {
@@ -5510,12 +5837,53 @@ export class GitCache {
     if (!await this.pathPresent(barePath)) return undefined;
     await this.assertRecoveryBare(barePath);
     return this.withLock(barePath, async () => {
-      const journal = await this.readRecoveryCapture(barePath, branch);
-      if (!journal) return undefined;
+      await this.assertBareOriginIdentity(barePath, repoUrl);
+      const stored = await this.readRecoveryCaptureWithRaw(barePath, branch);
+      if (!stored) return undefined;
+      const journal = stored.journal;
+      // issue #1786: a pending plain journal that a VALID marker names exactly (same run and path,
+      // digest of this very raw value) is a stopped canonical source whose journal clear never landed
+      // (a crash after the marker write). Heal it: persist the key's attempt mode, then clear that
+      // exact journal. The kept clone is not touched, adopted or captured.
+      if (await this.healBoundStoppedJournal(barePath, branch, stored)) return undefined;
+      // issue #1786: a retained stopped canonical clone is never adopted or captured.
+      await this.assertNoStoppedMarker(barePath, journal.clonePath, journal);
       if (journal.runId !== runId) throw new ForeignRetainedRecoveryError();
       await this.checkedRecovery(barePath, branch, key, journal);
       return { barePath, journal };
     });
+  }
+
+  /**
+   * Under the bare lock: finish a stopped canonical source's retention whose journal clear never
+   * landed. Heals only when ALL hold: the journal is plain and canonical-shaped (no attempt id, no
+   * recovery episode, no retained sources); a VALID marker names exactly its run, branch and clone
+   * path with `journalDigest === sha256(raw)`; the marker's run has no malformed or overflowing
+   * marker evidence; and no residue latch is set. It then persists the marker key's attempt mode
+   * (read back) and clears that exact raw journal value. Returns true only when the journal is
+   * cleared. A failed write throws, keeping everything, so the caller's refusal is never relaxed.
+   */
+  private async healBoundStoppedJournal(barePath: string, branch: string, stored: { journal: RecoveryJournalEntry; raw: string }): Promise<boolean> {
+    const { journal, raw } = stored;
+    if (journal.attemptId !== undefined || journal.recovery || journal.retainedSources?.length) return false;
+    if (residueQuarantine() !== undefined) return false;
+    const markers = await this.readStoppedMarkers(barePath);
+    const named = JSON.stringify(journal.clonePath).slice(1, -1);
+    if (markers.overflow.has(journal.runId) ||
+        markers.malformed.some((m) => m.runId === journal.runId || m.raw.includes(named))) return false;
+    const digest = sha256Hex(raw);
+    const bound = markers.valid.find(({ marker }) => marker.runId === journal.runId && marker.branch === branch &&
+      marker.clonePath === journal.clonePath && marker.journalDigest === digest);
+    if (!bound) return false;
+    const key = bound.marker.key;
+    if (!(await this.readRecoveryAttemptMode(barePath, key))) {
+      await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+    }
+    if (!(await this.readRecoveryAttemptMode(barePath, key))) throw new Error("attempt mode persistence failed");
+    if (residueQuarantine() !== undefined) return false;
+    if ((await this.readRecoveryCaptureRaw(barePath, branch)) !== raw) return false;
+    await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+    return true;
   }
 
   /** Precharge one of three total iterations before capture. Legacy journals start at zero.
@@ -5776,82 +6144,1431 @@ export class GitCache {
     barePath: string, branch: string, key: string, expected: RecoverySource, ownerDiscard: true,
   ): Promise<void> {
     if (ownerDiscard !== true) throw new Error("explicit owner discard required");
-    await this.withLock(barePath, async () => {
-      recoverySource({ runId: expected.runId, clonePath: expected.clonePath,
-        ...(expected.attemptId === undefined ? {} : { attemptId: expected.attemptId }) }); // Validate before constructing the descriptor key.
-      const protectedRecord = (await this.protectedRecoveries(barePath, expected.runId))[0];
-      if (protectedRecord && (protectedRecord.branch !== branch || protectedRecord.key !== key ||
-          !sameRecoverySource(protectedRecord.journal, expected))) throw new Error("protected recovery identity changed");
-      const journal = await this.checkedRecovery(barePath, branch, key, expected, true, protectedRecord?.journal);
-      for (const source of this.recoverySources(journal)) {
-        if (!this.clonePathShape(source.clonePath, this.runnerClonePath(barePath, key))) throw new Error("recovery key mismatch");
+    await this.withLock(barePath, () => this.discardRetainedRecoveryUnderLock(barePath, branch, key, expected));
+  }
+
+  /**
+   * issue #1786: the body of {@link discardRetainedRecovery}, for a caller that ALREADY holds the
+   * bare lock (the lock is not reentrant, so the operator protected discard must not take it a
+   * second time between deleting the source paths and retiring this metadata). Same behavior as
+   * the public wrapper. With `expectedSnapshot` it additionally refuses when the protected
+   * descriptor or the active journal is no longer exactly the value the caller snapshotted.
+   */
+  private async discardRetainedRecoveryUnderLock(
+    barePath: string, branch: string, key: string, expected: RecoverySource,
+    expectedSnapshot?: { descriptor: string | undefined; active: string | undefined },
+  ): Promise<void> {
+    recoverySource({ runId: expected.runId, clonePath: expected.clonePath,
+      ...(expected.attemptId === undefined ? {} : { attemptId: expected.attemptId }) }); // Validate before constructing the descriptor key.
+    const protectedRecord = (await this.protectedRecoveries(barePath, expected.runId))[0];
+    if (protectedRecord && (protectedRecord.branch !== branch || protectedRecord.key !== key ||
+        !sameRecoverySource(protectedRecord.journal, expected))) throw new Error("protected recovery identity changed");
+    if (expectedSnapshot) {
+      const now = {
+        descriptor: protectedRecord === undefined ? undefined
+          : JSON.stringify({ version: 1, branch: protectedRecord.branch, key: protectedRecord.key, journal: protectedRecord.journal }),
+        active: await this.readRecoveryCaptureRaw(barePath, branch),
+      };
+      if (now.descriptor !== expectedSnapshot.descriptor || now.active !== expectedSnapshot.active) {
+        throw new Error("retained recovery descriptor changed since the snapshot");
       }
-      // The worker-owned run namespace retains attribution for every capture, including
-      // superseded tips and pins created before a failed journal write. Validate the
-      // complete snapshot before deleting anything; sibling run namespaces are excluded.
-      const prefix = `refs/uzi-recovery-episode/${journal.runId}/`;
-      // Loose enumeration is specific to the files backend. --list also succeeds
-      // for an absent setting, without treating a failed config read as absence.
-      const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
-      for (const entry of config.split("\0")) {
-        const separator = entry.indexOf("\n");
-        const name = separator < 0 ? entry : entry.slice(0, separator);
-        if (name.toLowerCase() === "extensions.refstorage" &&
-            (separator < 0 || entry.slice(separator + 1) !== "files")) throw new Error("unsupported recovery ref backend");
+    }
+    const journal = await this.checkedRecovery(barePath, branch, key, expected, true, protectedRecord?.journal);
+    for (const source of this.recoverySources(journal)) {
+      if (!this.clonePathShape(source.clonePath, this.runnerClonePath(barePath, key))) throw new Error("recovery key mismatch");
+    }
+    // The worker-owned run namespace retains attribution for every capture, including
+    // superseded tips and pins created before a failed journal write. Validate the
+    // complete snapshot before deleting anything; sibling run namespaces are excluded.
+    const prefix = `refs/uzi-recovery-episode/${journal.runId}/`;
+    // Loose enumeration is specific to the files backend. --list also succeeds
+    // for an absent setting, without treating a failed config read as absence.
+    const config = await this.runGit(barePath, ["config", "--local", "--no-includes", "--null", "--list"]);
+    for (const entry of config.split("\0")) {
+      const separator = entry.indexOf("\n");
+      const name = separator < 0 ? entry : entry.slice(0, separator);
+      if (name.toLowerCase() === "extensions.refstorage" &&
+          (separator < 0 || entry.slice(separator + 1) !== "files")) throw new Error("unsupported recovery ref backend");
+    }
+    // Probe outer-to-inner before Git or readdir traverses the loose namespace.
+    // Missing ancestors allow packed-only pins; unsafe ancestors refuse cleanup.
+    let looseDir: string | undefined = barePath;
+    for (const part of ["refs", "uzi-recovery-episode", journal.runId]) {
+      looseDir = path.join(looseDir, part);
+      let st: Stats;
+      try { st = await fs.lstat(looseDir); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        looseDir = undefined;
+        break;
       }
-      // Probe outer-to-inner before Git or readdir traverses the loose namespace.
-      // Missing ancestors allow packed-only pins; unsafe ancestors refuse cleanup.
-      let looseDir: string | undefined = barePath;
-      for (const part of ["refs", "uzi-recovery-episode", journal.runId]) {
-        looseDir = path.join(looseDir, part);
-        let st: Stats;
-        try { st = await fs.lstat(looseDir); }
-        catch (err) {
-          if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-          looseDir = undefined;
-          break;
-        }
-        if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+      if (!st.isDirectory() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
+          ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
+        throw new Error("unsafe recovery pin namespace");
+      }
+    }
+    const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", prefix]);
+    const pins = listing.trim().split("\n").filter(Boolean).map(line => {
+      const [ref, oid, symref, extra] = line.split("\0");
+      const tip = ref?.startsWith(prefix) ? ref.slice(prefix.length) : "";
+      if (ref === undefined || symref !== "" || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
+      return { ref, tip };
+    });
+    // Git omits dangling symbolic and broken loose refs. One flat pass, no retries:
+    // every loose ref must appear in the validated direct-pin snapshot before deletion.
+    // Any failed sibling check refuses the entire discard and keeps all attribution.
+    if (looseDir !== undefined) {
+      const directRefs = new Set(pins.map(pin => pin.ref));
+      for (const name of await fs.readdir(looseDir)) {
+        const st = await fs.lstat(path.join(looseDir, name));
+        if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
             ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
-          throw new Error("unsafe recovery pin namespace");
+          throw new Error("invalid recovery pin identity");
         }
+        // Git's regular SHA lock files are not refs; leave deletion to report contention.
+        if (name.endsWith(".lock") && SHA40_RE.test(name.slice(0, -5))) continue;
+        if (!SHA40_RE.test(name) || !directRefs.has(prefix + name)) throw new Error("invalid recovery pin identity");
       }
-      const listing = await this.runGit(barePath, ["for-each-ref", "--format=%(refname)%00%(objectname)%00%(symref)", prefix]);
-      const pins = listing.trim().split("\n").filter(Boolean).map(line => {
-        const [ref, oid, symref, extra] = line.split("\0");
-        const tip = ref?.startsWith(prefix) ? ref.slice(prefix.length) : "";
-        if (ref === undefined || symref !== "" || extra !== undefined || !SHA40_RE.test(tip) || oid !== tip) throw new Error("invalid recovery pin identity");
-        return { ref, tip };
-      });
-      // Git omits dangling symbolic and broken loose refs. One flat pass, no retries:
-      // every loose ref must appear in the validated direct-pin snapshot before deletion.
-      // Any failed sibling check refuses the entire discard and keeps all attribution.
-      if (looseDir !== undefined) {
-        const directRefs = new Set(pins.map(pin => pin.ref));
-        for (const name of await fs.readdir(looseDir)) {
-          const st = await fs.lstat(path.join(looseDir, name));
-          if (!st.isFile() || st.isSymbolicLink() || st.uid !== process.getuid?.() || (st.mode & 0o002) !== 0 ||
-              ((st.mode & 0o020) !== 0 && (st.gid !== process.getgid?.() || (uidSplitActive() && st.gid === RUNNER_UID)))) {
-            throw new Error("invalid recovery pin identity");
-          }
-          // Git's regular SHA lock files are not refs; leave deletion to report contention.
-          if (name.endsWith(".lock") && SHA40_RE.test(name.slice(0, -5))) continue;
-          if (!SHA40_RE.test(name) || !directRefs.has(prefix + name)) throw new Error("invalid recovery pin identity");
-        }
-      }
-      // One attempt per enumerated pin, no retries. The first failed delete stops
-      // cleanup and keeps the journal; a later explicit discard can retry remaining pins.
-      for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "--no-deref", "-d", ref, tip]);
-      if (protectedRecord) {
-        await this.runGit(barePath, ["config", "--local", "--unset-all", `uzi-retained.${expected.runId}.journal`]);
-        const active = await this.readRecoveryCapture(barePath, branch);
-        if (active && JSON.stringify(active) === JSON.stringify(journal)) {
-          await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
-        }
-      } else {
+    }
+    // One attempt per enumerated pin, no retries. The first failed delete stops
+    // cleanup and keeps the journal; a later explicit discard can retry remaining pins.
+    for (const { ref, tip } of pins) await this.runGit(barePath, ["update-ref", "--no-deref", "-d", ref, tip]);
+    if (protectedRecord) {
+      await this.runGit(barePath, ["config", "--local", "--unset-all", `uzi-retained.${expected.runId}.journal`]);
+      const active = await this.readRecoveryCapture(barePath, branch);
+      if (active && JSON.stringify(active) === JSON.stringify(journal)) {
         await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
       }
-    });
+    } else {
+      await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+    }
+  }
+
+  // ─── issue #1786 — retained stopped sources ──────────────────────────────────────────────
+
+  /** A real directory with a real `.git` directory: the shape of a clone that can be retained. */
+  private async realCloneDir(p: string): Promise<boolean> {
+    try {
+      const st = await fs.lstat(p);
+      if (st.isSymbolicLink() || !st.isDirectory()) return false;
+      const git = await fs.lstat(path.join(p, ".git"));
+      return git.isDirectory() && !git.isSymbolicLink();
+    } catch {
+      return false;
+    }
+  }
+
+  /** lstat classification of one source path (never follows a symlink): a real directory is
+   *  `present` with its dev:ino identity, ENOENT is `missing`, anything else is `unsafe`. */
+  private async clonePresence(p: string): Promise<{ presence: "present" | "missing" | "unsafe"; devIno: string }> {
+    try {
+      const st = await fs.lstat(p);
+      if (st.isSymbolicLink() || !st.isDirectory()) return { presence: "unsafe", devIno: "unsafe" };
+      return { presence: "present", devIno: `${st.dev}:${st.ino}` };
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return { presence: "missing", devIno: "missing" };
+      return { presence: "unsafe", devIno: "unsafe" };
+    }
+  }
+
+  /** Strict parse of one stopped marker value (see {@link StoppedSourceMarker}); throws on anything
+   *  that is not exactly the documented shape. Never truncates and never repairs. */
+  private async parseStoppedMarker(barePath: string, runId: string, value: string): Promise<StoppedSourceMarker> {
+    if (Buffer.byteLength(value, "utf8") > STOPPED_MARKER_MAX_BYTES) throw new Error("oversized stopped marker");
+    const parsed: unknown = JSON.parse(value);
+    if (typeof parsed !== "object" || parsed === null || Array.isArray(parsed)) throw new Error("invalid stopped marker");
+    const o = parsed as Record<string, unknown>;
+    if (Object.keys(o).sort().join(",") !== "at,branch,clonePath,generation,journalDigest,key,reason,runId,version") {
+      throw new Error("invalid stopped marker keys");
+    }
+    if (o.version !== 1 || o.runId !== runId) throw new Error("invalid stopped marker identity");
+    if (o.generation !== null && (!Number.isSafeInteger(o.generation) || (o.generation as number) < 0)) throw new Error("invalid stopped marker generation");
+    if (typeof o.branch !== "string" || o.branch === "" || o.branch.length > 256) throw new Error("invalid stopped marker branch");
+    await this.runGit(barePath, ["check-ref-format", "--branch", o.branch]);
+    if (typeof o.key !== "string" || o.key.length > 160 || !/^[A-Za-z0-9_-]+$/.test(o.key)) throw new Error("invalid stopped marker key");
+    if (typeof o.clonePath !== "string") throw new Error("invalid stopped marker path");
+    recoverySource({ runId, clonePath: o.clonePath });
+    const shape = this.clonePathShape(o.clonePath, this.runnerClonePath(barePath, o.key));
+    if (!shape || shape.attemptId !== undefined) throw new Error("stopped marker path is not the key's canonical clone");
+    if (typeof o.journalDigest !== "string" || !/^[0-9a-f]{64}$/.test(o.journalDigest)) throw new Error("invalid stopped marker digest");
+    if (typeof o.reason !== "string" || !/^[A-Za-z0-9_.:-]{1,64}$/.test(o.reason)) throw new Error("invalid stopped marker reason");
+    if (typeof o.at !== "string" || o.at.length > 40 || Number.isNaN(Date.parse(o.at))) throw new Error("invalid stopped marker time");
+    return o as unknown as StoppedSourceMarker;
+  }
+
+  /** Every stopped marker of the bare, under the caller's lock. A run with more than
+   *  {@link MAX_OWED_CANDIDATES_PER_RUN} values is `overflow` (none of its values is parsed). */
+  private async readStoppedMarkers(barePath: string, list?: string[]): Promise<StoppedMarkers> {
+    const items = list ?? (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const byRun = new Map<string, string[]>();
+    for (const item of items) {
+      const nl = item.indexOf("\n");
+      const m = /^uzi-stopped\.(.+)\.entry$/.exec(nl < 0 ? item : item.slice(0, nl));
+      if (!m) continue;
+      const values = byRun.get(m[1]!) ?? [];
+      values.push(nl < 0 ? "" : item.slice(nl + 1));
+      byRun.set(m[1]!, values);
+    }
+    const out: StoppedMarkers = { valid: [], malformed: [], overflow: new Set() };
+    for (const [runId, values] of byRun) {
+      if (values.length > MAX_OWED_CANDIDATES_PER_RUN) {
+        out.overflow.add(runId);
+        continue;
+      }
+      for (const raw of values) {
+        try {
+          out.valid.push({ marker: await this.parseStoppedMarker(barePath, runId, raw), raw });
+        } catch {
+          out.malformed.push({ runId, raw });
+        }
+      }
+    }
+    return out;
+  }
+
+  /** Remove the markers of `runId` that `drop` selects, by one atomic rewrite of the key (never a
+   *  value-regex `--unset`). Values that are kept, malformed ones included, are rewritten verbatim. */
+  private async removeStoppedMarkers(barePath: string, runId: string, drop: (raw: string) => boolean): Promise<void> {
+    const key = stoppedMarkerKey(runId);
+    const items = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const values = items.filter((i) => i.startsWith(`${key}\n`)).map((i) => i.slice(key.length + 1));
+    const kept = values.filter((v) => !drop(v));
+    if (kept.length === values.length) return;
+    await this.rewriteLedgerAtomically(barePath, key, kept);
+  }
+
+  /**
+   * issue #1786: under the bare lock, refuse the reuse of a canonical clone path a stopped marker
+   * names. Any marker for the path refuses (bound to the pending journal by digest, digest-mismatched,
+   * or with no journal pending while the path still exists); so does unattributable marker evidence
+   * (a malformed value, or an overflowing run) of the pending journal's run, or whose text names the
+   * path. The marker is kept on every outcome except one: a marker whose path is verifiably gone
+   * (ENOENT) and which no journal or protected descriptor names protects nothing, so it is RETIRED
+   * here under the lock rather than left to rebind to a later source at the same path. Throws
+   * {@link RetainedStoppedSourceError}.
+   */
+  private async assertNoStoppedMarker(barePath: string, clonePath: string, pending: RecoveryJournalEntry | undefined): Promise<void> {
+    const markers = await this.readStoppedMarkers(barePath);
+    const named = JSON.stringify(clonePath).slice(1, -1);
+    for (const { marker, raw } of markers.valid) {
+      if (marker.clonePath !== clonePath) continue;
+      if (pending === undefined && await this.stoppedMarkerIsStale(barePath, clonePath)) {
+        await this.removeStoppedMarkers(barePath, marker.runId, (v) => v === raw);
+        continue;
+      }
+      throw new RetainedStoppedSourceError({ runId: marker.runId, generation: marker.generation, clonePath });
+    }
+    for (const m of markers.malformed) {
+      if (pending?.runId === m.runId || m.raw.includes(named)) {
+        throw new RetainedStoppedSourceError({ runId: m.runId, generation: "unknown", clonePath });
+      }
+    }
+    if (pending !== undefined && markers.overflow.has(pending.runId)) {
+      throw new RetainedStoppedSourceError({ runId: pending.runId, generation: "unknown", clonePath });
+    }
+  }
+
+  /** Under the bare lock: refuse (throw, keep everything) when a stopped marker names one of `paths`
+   *  (compared resolved), or unattributable marker evidence does (malformed text naming a path, or an
+   *  overflowing `runId`), so a marked canonical source is never retired, moved or detached out from under
+   *  its marker (which would leave a stale marker that could later rebind to other work). */
+  private async refuseMarkedPaths(barePath: string, paths: string[], runId?: string): Promise<void> {
+    const markers = await this.readStoppedMarkers(barePath);
+    const wanted = paths.map((x) => path.resolve(x));
+    for (const { marker } of markers.valid) {
+      if (wanted.includes(path.resolve(marker.clonePath))) {
+        throw new RetainedStoppedSourceError({ runId: marker.runId, generation: marker.generation, clonePath: marker.clonePath });
+      }
+    }
+    // Fail closed on unattributable evidence, by the rule of assertNoStoppedMarker: a malformed
+    // marker of the owner run, or one whose text names a path; and an overflowing owner run.
+    for (const m of markers.malformed) {
+      const hit = paths.find((x) => m.raw.includes(JSON.stringify(path.resolve(x)).slice(1, -1)));
+      if (hit !== undefined || (runId !== undefined && m.runId === runId)) {
+        throw new RetainedStoppedSourceError({ runId: m.runId, generation: "unknown", clonePath: hit ?? paths[0] ?? "" });
+      }
+    }
+    if (runId !== undefined && markers.overflow.has(runId)) {
+      throw new RetainedStoppedSourceError({ runId, generation: "unknown", clonePath: paths[0] ?? "" });
+    }
+  }
+
+  /** A marker's path is stale only when it is verifiably absent (ENOENT; any other error
+   *  propagates) and no active journal or protected descriptor names it. Under the bare lock. */
+  private async stoppedMarkerIsStale(barePath: string, clonePath: string): Promise<boolean> {
+    if (await this.pathPresent(clonePath)) return false;
+    return ![...(await this.journaledClonePaths(barePath))].some((j) => isWithinPath(j, clonePath) || isWithinPath(clonePath, j));
+  }
+
+  /** The EXACT stored journal of `branch` with its parse, or undefined. */
+  private async readRecoveryCaptureWithRaw(barePath: string, branch: string): Promise<{ journal: RecoveryJournalEntry; raw: string } | undefined> {
+    const raw = await this.readRecoveryCaptureRaw(barePath, branch);
+    return raw === undefined ? undefined : { journal: parseRecoveryJournal(raw), raw };
+  }
+
+  /**
+   * issue #1786 — retain a stopped ATTEMPT clone (a Docker-wired worker) under the ledger's
+   * never-deleted `reclaimed` state, in ONE bare-lock section with no nested lock. Validates that
+   * the source is this run's `live` (or already `reclaimed`) attempt at exactly this path, a real
+   * directory with a real `.git`; appends ledger `reclaimed` (even when the active journal now names
+   * another source, so an unjournaled `live` entry never becomes a sweep candidate); then clears
+   * the active journal ONLY when it is plain and names exactly this source (ledger first, the order
+   * of {@link releaseAttemptInPlace}). An episode or completed-successor journal is never touched.
+   * With the residue quarantine latched nothing is written (the journal, when it names the source,
+   * keeps protecting it). Any validation or persistence failure returns `unknown`, writes nothing
+   * further and deletes nothing: the source and every record stay. Idempotent.
+   */
+  async retainStoppedAttempt(
+    barePath: string, branch: string, input: { runId: string; clonePath: string; attemptId: string },
+  ): Promise<"retained" | "unknown"> {
+    try {
+      return await this.withLock(barePath, async () => {
+        await this.assertRecoveryBare(barePath);
+        const source = recoverySource({ runId: input.runId, clonePath: input.clonePath, attemptId: input.attemptId });
+        const parsed = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
+        if (parsed?.attemptId !== input.attemptId) return "unknown";
+        const entry = (await this.readAttemptLedger(barePath, branch)).get(input.attemptId);
+        if (!entry || entry.runId !== input.runId || entry.clonePath !== source.clonePath ||
+            (entry.state !== "live" && entry.state !== "reclaimed")) return "unknown";
+        if (!(await this.realCloneDir(source.clonePath))) return "unknown";
+        const pending = await this.readRecoveryCapture(barePath, branch);
+        const named = pending !== undefined && sameRecoverySource(pending, source);
+        if (residueQuarantine() !== undefined) return named ? "retained" : "unknown";
+        if (entry.state === "live") {
+          await this.appendAttemptLedger(barePath, branch, { ...entry, state: "reclaimed" });
+        }
+        if (named && !pending.recovery && !pending.retainedSources?.length) {
+          // issue #2213: a latch that landed during the awaits above keeps the journal.
+          if (residueQuarantine() !== undefined) return "retained";
+          await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+        }
+        return "retained";
+      });
+    } catch (err) {
+      this.log.warn("could not retain a stopped attempt source; it and its records are kept", {
+        clone: input.clonePath, error: gitErrorMessage(err),
+      });
+      return "unknown";
+    }
+  }
+
+  /**
+   * issue #1786 — retain a stopped CANONICAL clone (no attempt identity) with a bounded marker
+   * bound by digest to the exact plain journal, in ONE bare-lock section. The plain journal must
+   * name exactly `(runId, clonePath)` with no attempt id. Order: (1) every validation (journal
+   * identity, path shape, a real clone directory, malformed or overflowing marker evidence, the
+   * per-run cap) with nothing written; (2) the key's attempt mode `uzi-attemptmode.<key>.enabled`
+   * is persisted and read back, so no later run of the key seeds this canonical path again (an
+   * unwired worker then falls back to a fresh attempt path); (3) the marker is written and read
+   * back; (4) a residue latch that landed during the awaits above keeps the journal (the marker is
+   * already durable: `retained`); (5) the active journal is cleared, but only while its raw value
+   * is still exactly the one the digest was computed from. The marker, not the journal, now
+   * attributes and protects the kept source. A failed clear leaves the journal (the next discovery
+   * heals it, see {@link discoverRetainedRecovery}) and still answers `retained`. Any mismatch (a
+   * successor journal, an episode journal, a replaced path), malformed or overflowing marker
+   * evidence, or a failure before the marker is durable returns `unknown` and writes no marker.
+   * Idempotent: the same marker completes steps 2 and 5 when the journal is still bound, and an
+   * already-cleared journal with this exact marker is `retained`.
+   */
+  async markStoppedCanonical(
+    barePath: string, branch: string, key: string,
+    input: { runId: string; clonePath: string; generation: number | null; reason: string },
+  ): Promise<"retained" | "unknown"> {
+    try {
+      return await this.withLock(barePath, async () => {
+        await this.assertRecoveryBare(barePath);
+        if (!/^[A-Za-z0-9_-]{1,160}$/.test(key)) return "unknown";
+        const source = recoverySource({ runId: input.runId, clonePath: input.clonePath });
+        if (source.clonePath !== this.runnerClonePath(barePath, key)) return "unknown";
+        if (input.generation !== null && (!Number.isSafeInteger(input.generation) || input.generation < 0)) return "unknown";
+        const current = await this.readRecoveryCaptureWithRaw(barePath, branch);
+        if (current && (current.journal.attemptId !== undefined || current.journal.recovery || current.journal.retainedSources?.length ||
+            !sameRecoverySource(current.journal, source))) return "unknown";
+        if (!(await this.realCloneDir(source.clonePath))) return "unknown";
+        const markers = await this.readStoppedMarkers(barePath);
+        if (markers.overflow.has(input.runId) || markers.malformed.some((m) => m.runId === input.runId)) return "unknown";
+        let mine = markers.valid.filter((m) => m.marker.runId === input.runId);
+        const same = mine.find((m) => m.marker.clonePath === source.clonePath);
+        const persistMode = async (): Promise<void> => {
+          if (!(await this.readRecoveryAttemptMode(barePath, key))) {
+            await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);
+          }
+          if (!(await this.readRecoveryAttemptMode(barePath, key))) throw new Error("attempt mode persistence failed");
+        };
+        // Steps 4 and 5. Only the journal whose raw the marker's digest was computed from is cleared.
+        const clearBoundJournal = async (raw: string): Promise<void> => {
+          // issue #2213: a latch that landed during the awaits above keeps the journal.
+          if (residueQuarantine() !== undefined) return;
+          try {
+            if ((await this.readRecoveryCaptureRaw(barePath, branch)) !== raw) return;
+            await this.runGit(barePath, ["config", "--local", recoveryCaptureKey(branch), ""]);
+          } catch (err) {
+            this.log.warn("could not clear the journal of a marked canonical source; it is kept and heals at the next discovery", {
+              clone: input.clonePath, error: gitErrorMessage(err),
+            });
+          }
+        };
+        // An existing marker of this path binds the generation it was written for: a different one
+        // is another stopped source's marker, never inherited or rewritten here.
+        if (same) {
+          if (same.marker.generation !== input.generation || same.marker.key !== key || same.marker.branch !== branch) return "unknown";
+          if (current === undefined) {
+            await persistMode();
+            return "retained";
+          }
+          if (same.marker.journalDigest !== sha256Hex(current.raw)) return "unknown";
+          await persistMode();
+          await clearBoundJournal(current.raw);
+          return "retained";
+        }
+        if (!current) return "unknown";
+        const digest = sha256Hex(current.raw);
+        // Markers of this run whose path is verifiably gone and unnamed protect nothing: retire them.
+        for (const m of mine) {
+          if (await this.stoppedMarkerIsStale(barePath, m.marker.clonePath)) {
+            await this.removeStoppedMarkers(barePath, input.runId, (v) => v === m.raw);
+            mine = mine.filter((x) => x !== m);
+          }
+        }
+        if (mine.length >= MAX_OWED_CANDIDATES_PER_RUN) return "unknown";
+        const marker: StoppedSourceMarker = {
+          version: 1, runId: input.runId, generation: input.generation, branch, key,
+          clonePath: source.clonePath, journalDigest: digest, reason: input.reason, at: new Date().toISOString(),
+        };
+        const value = JSON.stringify(marker);
+        await this.parseStoppedMarker(barePath, input.runId, value); // the writer obeys the reader
+        await persistMode();
+        await this.runGit(barePath, ["config", "--local", "--add", stoppedMarkerKey(input.runId), value]);
+        const readback = await this.readStoppedMarkers(barePath);
+        if (!readback.valid.some((m) => m.raw === value)) return "unknown";
+        await clearBoundJournal(current.raw);
+        return "retained";
+      });
+    } catch (err) {
+      this.log.warn("could not mark a stopped canonical source; it and its journal are kept", {
+        clone: input.clonePath, error: gitErrorMessage(err),
+      });
+      return "unknown";
+    }
+  }
+
+  /**
+   * issue #1786 — is a stopped source's current state still covered by `capturedHead` RIGHT NOW? A
+   * cached capture success is not coverage: the clone can change after a verified capture. Under the
+   * bare lock (which excludes fetch-back, promotion and adoption writers) it returns `covered` only
+   * when ALL hold: the active journal is still plain and names exactly this source and no stopped
+   * marker exists for the run; the path is a real directory with a real `.git`; the clone HEAD
+   * equals `capturedHead`; `git status` is readable and empty (no dirty tracked and no untracked
+   * non-ignored bytes beyond the capture; gitignored files are not part of any capture); every
+   * local ref (branches, tags, remotes, any other namespace) is reachable from `capturedHead` or
+   * from a ref of the worker bare, and no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
+   * under committed tracking ownership that still names `owner.runId` and `owner.generation`, or
+   * by an owed pin of the run, or by being an ancestor of the bare's default-branch ref; `quiesce` answered true both before (`"before"`) and after (`"after"`) the reads. The caller's "after" answer must also be false when that scan found and reaped a writer, because the byte checks ran before it. Residual: a writer that writes and exits between the status read and the "after" proof is invisible to both, so on stopped and park exits (`RunRunner.retainStoppedSource`) the verdict is diagnostic and never authority to discard; only terminal coverage authorizes release, with the late-writer snapshot residual still open under #2852. Anything
+   * else, a thrown error included, is `not_covered` and the caller retains the source.
+   */
+  async verifyStoppedSourceCovered(
+    barePath: string, branch: string, key: string,
+    source: { runId: string; clonePath: string; attemptId?: string },
+    capturedHead: string | undefined,
+    owner: { runId: string; generation: number },
+    quiesce: (paths: string[], phase: "before" | "after") => Promise<boolean>,
+  ): Promise<"covered" | "not_covered"> {
+    if (capturedHead === undefined || !SHA40_RE.test(capturedHead) || owner.runId !== source.runId ||
+        !Number.isSafeInteger(owner.generation) || owner.generation <= 0) return "not_covered";
+    try {
+      return await this.withLock(barePath, async () => {
+        await this.assertRecoveryBare(barePath);
+        const src = recoverySource({ runId: source.runId, clonePath: source.clonePath,
+          ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) });
+        if (!/^[A-Za-z0-9_-]+$/.test(key)) return "not_covered";
+        const shape = this.clonePathShape(src.clonePath, this.runnerClonePath(barePath, key));
+        if (!shape || shape.attemptId !== src.attemptId) return "not_covered";
+        const pending = await this.readRecoveryCapture(barePath, branch);
+        if (!pending || pending.recovery || pending.retainedSources?.length || !sameRecoverySource(pending, src)) return "not_covered";
+        const markers = await this.readStoppedMarkers(barePath);
+        if (markers.valid.some((m) => m.marker.runId === src.runId || m.marker.clonePath === src.clonePath) ||
+            markers.malformed.some((m) => m.runId === src.runId) || markers.overflow.has(src.runId)) return "not_covered";
+        if (!(await this.realCloneDir(src.clonePath))) return "not_covered";
+        if (!(await quiesce([src.clonePath], "before"))) return "not_covered";
+        if ((await this.worktreeHead(src.clonePath)) !== capturedHead) return "not_covered";
+        if (!(await this.worktreeCleanHardened(src.clonePath))) return "not_covered";
+        if (!(await this.localRefsReachableFrom(barePath, src.clonePath, capturedHead))) return "not_covered";
+        let anchored = false;
+        if ((await this.checkedTrackingSha(barePath, branch)) === capturedHead) {
+          anchored = (await this.committedTrackingOwnershipUnderLock(barePath, branch, owner.runId, capturedHead, owner.generation)).kind === "owned";
+        }
+        if (!anchored) anchored = await this.hasOwedAnchorUnderLock(barePath, owner.runId, capturedHead);
+        // A clean head that is already an ancestor of the bare's default-branch ref (a flight that never
+        // committed past its seed base, e.g. one stopped while planning) holds no worker-only commit:
+        // the forge's default branch has it, as in resolveRestartSource's `on_default`.
+        if (!anchored) anchored = await this.headOnDefaultUnderLock(barePath, capturedHead);
+        if (!anchored) return "not_covered";
+        // The same source is still the one that was read: same identity, journal and quiescence.
+        if (!(await this.realCloneDir(src.clonePath))) return "not_covered";
+        const again = await this.readRecoveryCapture(barePath, branch);
+        if (!again || !sameRecoverySource(again, src)) return "not_covered";
+        if (!(await quiesce([src.clonePath], "after"))) return "not_covered";
+        return "covered";
+      });
+    } catch (err) {
+      this.log.warn("stopped source coverage could not be revalidated; it is retained", { clone: source.clonePath, error: gitErrorMessage(err) });
+      return "not_covered";
+    }
+  }
+
+  /** Is `head` an ancestor of the bare's default-branch ref (`refs/remotes/origin/<default>` or the mirror-layout
+   *  `refs/heads/<default>`)? Caller holds the bare lock. Any failed read is `false`.
+   *  Residual: the default ref can move after the lock (forge force-push, fetch, gc); low impact, since the
+   *  commit came from the forge. Commits reachable only from the reflog are out of scope. */
+  private async headOnDefaultUnderLock(barePath: string, head: string): Promise<boolean> {
+    try {
+      const db = await this.defaultBranchName(barePath);
+      if (db === undefined || !(await this.isPlainBranchName(barePath, db))) return false;
+      for (const ref of [`refs/remotes/origin/${db}`, `refs/heads/${db}`]) {
+        if (!(await this.refExists(barePath, ref))) continue;
+        if ((await this.tryGit(barePath, ["merge-base", "--is-ancestor", head, ref])) === 0) return true;
+      }
+    } catch { /* not provable */ }
+    return false;
+  }
+
+  /**
+   * Is every local ref of the clone, in every namespace (heads, tags, notes, `refs/remotes/` and
+   * any other), already held by the worker bare, and is there no stash? A ref value is acceptable
+   * iff its commit is reachable from `head` OR from any ref of the worker bare: the seed gives the
+   * clone a local default branch and every bare tag, and a resumed branch can be older than main,
+   * so those must not make a fully fetched clone look unfinished. A commit that only the clone
+   * holds (a side branch, a tag, a commit planted under `refs/remotes/`) is worker-only source that
+   * a clean tree at `head` does not show, and no capture of `head` holds it. The ref values are read
+   * as the runner uid in the clone; the reachability question is ONE `rev-list <shas> --not <head>
+   * --all` in the bare (worker uid, replace refs disabled in both repositories), where any output
+   * means "not covered" and any error, a clone-local commit missing from the bare included, also
+   * means "not covered". The `refs/stash` refusal is a belt: stash commits are never reachable
+   * from the bare. Any failed read is `false`.
+   *
+   * `--objects` makes a ref naming a blob, tree or tag object count as held only when the bare
+   * reaches that object from one of its refs, not when it merely has it as unreachable loose data.
+   *
+   * Residual: coverage is decided atomically under the bare lock and retirement deletes no bare
+   * refs, but after the lock a justifying bare ref (another run's tracking ref, a settled pin, a
+   * pruned `refs/remotes/`) can move and its objects be garbage-collected. Side refs accept ANY
+   * bare ref (the forge or other flows keep their own copy), whereas the head anchor in
+   * {@link verifyStoppedSourceCovered} must be owned by this run and generation, be an owed pin, or be an ancestor of the bare's default-branch ref.
+   */
+  private async localRefsReachableFrom(barePath: string, cwd: string, head: string): Promise<boolean> {
+    try {
+      // Per-worktree HEADs and refs of a linked worktree are invisible to for-each-ref and status,
+      // so any `.git/worktrees/` entry (or an unreadable directory) makes coverage unprovable.
+      const wt = await fs.readdir(path.join(cwd, ".git", "worktrees")).then((n) => n, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return [] as string[];
+        throw err;
+      });
+      if (wt.length > 0) return false;
+      const out = await this.runGitAsRunner(cwd, ["for-each-ref", "--format=%(objectname) %(refname)"], { env: NO_REPLACE_ENV });
+      const shas = new Set<string>();
+      for (const line of out.split("\n")) {
+        if (line === "") continue;
+        const sp = line.indexOf(" ");
+        const sha = line.slice(0, sp), ref = line.slice(sp + 1);
+        if (sp < 0 || !/^(?:[0-9a-f]{40}|[0-9a-f]{64})$/.test(sha)) return false;
+        if (ref === "refs/stash") return false;
+        shas.add(sha);
+      }
+      if (shas.size > MAX_LOCAL_REF_SHAS) return false;
+      const all = [...shas];
+      for (let i = 0; i < all.length; i += LOCAL_REF_REVLIST_CHUNK) {
+        const chunk = all.slice(i, i + LOCAL_REF_REVLIST_CHUNK);
+        const extra = await this.runGitWithEnv(barePath, ["rev-list", "--objects", "-n", "1", ...chunk, "--not", head, "--all"], NO_REPLACE_ENV);
+        if (extra.trim() !== "") return false;
+      }
+      return true;
+    } catch (err) {
+      this.log.debug("stopped source local refs could not be proven held", { cwd, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+  /**
+   * Is the clone's tracked and untracked non-ignored state provably empty? The clone's own git
+   * config is runner-writable, so the proof does not take its settings on trust. Command-line `-c`
+   * overrides (they outrank every config file) pin: the excludes file (`/dev/null`), the worktree
+   * root, the stat and ctime checks, the file-mode check and `core.ignoreCase=false`; they turn
+   * every untracked file into a status entry and disable the untracked cache and the fsmonitor.
+   * The index flags are read separately, because an assume-unchanged or skip-worktree entry hides
+   * a modified tracked file from `status`. REFUSED (false, not provable) rather than overridden:
+   * a `.git/info/attributes` file; any config key starting `filter.`, `include.`, `includeif.`,
+   * `extensions.worktreeconfig` or `core.attributesfile` (clean/smudge filters and config
+   * indirection cannot be blanket-disabled); and `core.ignorecase` set true in any form git parses as true. What IS still trusted:
+   * the ignore rules of the tree's `.gitignore` files and of `.git/info/exclude`, which define the
+   * scope the WIP capture's `git add -A` honours too, so an ignored file is outside both. Any
+   * such flag, any status entry, or any failed read is `false`. Submodules: `status` runs with
+   * `--ignore-submodules=none`, and a `.git/modules` store or a populated (non-empty or non-directory)
+   * gitlink path is `false`, since the parent proof cannot cover a submodule's own files, commits and refs.
+   */
+  private async worktreeCleanHardened(cwd: string): Promise<boolean> {
+    const hardened = [
+      "-c", "core.excludesFile=/dev/null", "-c", `core.worktree=${cwd}`, "-c", "core.trustctime=true",
+      "-c", "core.checkStat=default", "-c", "core.fileMode=true", "-c", "core.ignoreCase=false",
+      "-c", "status.showUntrackedFiles=all", "-c", "core.untrackedCache=false", "-c", "core.fsmonitor=false",
+    ];
+    try {
+      const attributes = await fs.lstat(path.join(cwd, ".git", "info", "attributes")).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      });
+      if (attributes) return false;
+      // Scope-less read (global/system are pinned to /dev/null): it follows include/includeIf and
+      // config.worktree exactly as `status` does, which `--local` would not.
+      const config = await this.runGitAsRunner(cwd, ["config", "--null", "--list"], NO_REPLACE);
+      const entries = config.split("\0");
+      if (entries.some((e) => /^(filter\.|include\.|includeif\.|extensions\.worktreeconfig|core\.attributesfile)/i.test(e))) return false;
+      // A case-folding clone could hide a tracked `readme` behind an untracked `README`. The
+      // `core.ignoreCase=false` override above makes status case-sensitive; this refusal is the
+      // second, independent defense: a clone that claims case-folding in any form git reads as true
+      // (true/yes/on, any non-zero integer with an optional k/m/g suffix, or a bare key) is not provable.
+      for (const e of entries) {
+        const nl = e.indexOf("\n");
+        const key = (nl === -1 ? e : e.slice(0, nl)).toLowerCase();
+        if (key !== "core.ignorecase") continue;
+        if (nl === -1) return false; // a bare key is boolean true
+        const v = e.slice(nl + 1).trim().toLowerCase();
+        if (v === "true" || v === "yes" || v === "on") return false;
+        if (/^[+-]?(0x[0-9a-f]+|[0-9]+)[kmg]?$/.test(v) && !/^[+-]?(0x)?0+[kmg]?$/.test(v)) return false;
+      }
+      // Submodules: `.gitmodules` / config `ignore = all` would hide a dirty or newer submodule from
+      // `status`, so it runs with `--ignore-submodules=none`. The parent proof still says nothing about
+      // a populated submodule's own files, commits or refs, so any trace of one is not provable: a
+      // `.git/modules` store, or an index gitlink (mode 160000) whose worktree path holds anything but
+      // nothing or an empty real directory (an uninitialized submodule).
+      const modules = await fs.lstat(path.join(cwd, ".git", "modules")).then(() => true, (err: NodeJS.ErrnoException) => {
+        if (err.code === "ENOENT") return false;
+        throw err;
+      });
+      if (modules) return false;
+      const staged = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "--stage", "-z"], NO_REPLACE);
+      for (const entry of staged.split("\0")) {
+        const m = /^160000 [0-9a-f]+ [0-3]\t([\s\S]+)$/.exec(entry);
+        if (!m) continue;
+        const gitlink = path.join(cwd, m[1]!);
+        const st = await fs.lstat(gitlink).catch((err: NodeJS.ErrnoException) => {
+          if (err.code === "ENOENT") return undefined;
+          throw err;
+        });
+        if (st === undefined) continue;
+        if (!st.isDirectory() || st.isSymbolicLink()) return false;
+        if ((await fs.readdir(gitlink)).length > 0) return false;
+      }
+      const status = await this.runGitAsRunner(cwd, [...hardened, "status", "--porcelain", "--ignore-submodules=none"], READ_ONLY_STATUS);
+      if (status.split("\n").some((l) => l.length > 0)) return false;
+      const flags = await this.runGitAsRunner(cwd, ["-c", "core.fsmonitor=false", "ls-files", "-v", "-z"], NO_REPLACE);
+      for (const entry of flags.split("\0")) {
+        if (entry.length === 0) continue;
+        // `H` is a normal entry; a lowercase tag is assume-unchanged and `S`/`s` is skip-worktree.
+        if (!/^[HMRCK?U] /.test(entry)) return false;
+      }
+      return true;
+    } catch (err) {
+      this.log.debug("stopped source status could not be proven clean", { cwd, error: gitErrorMessage(err) });
+      return false;
+    }
+  }
+
+  /** The worker's bares, or just `only`. A non-bare entry is skipped; a bare that cannot be read is
+   *  reported by the caller. */
+  private async retainedBares(only?: string): Promise<string[]> {
+    if (only !== undefined) return [only];
+    let names: string[];
+    try {
+      names = await fs.readdir(this.reposRoot);
+    } catch (err) {
+      if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
+      throw err;
+    }
+    const out: string[] = [];
+    for (const name of names.sort()) {
+      if (!name.endsWith(".git")) continue;
+      const p = path.join(this.reposRoot, name);
+      const st = await fs.lstat(p).catch(() => undefined);
+      if (st?.isDirectory() && !st.isSymbolicLink()) out.push(p);
+    }
+    return out;
+  }
+
+  /**
+   * Gather every retained record of one bare, under the caller's bare lock: attempt sources (ledger
+   * `live`/`reclaimed`/`abandoned` entries that no protected record owns), canonical sources (valid
+   * stopped markers; `bound` when the active journal names the source with the marker's digest,
+   * `detached` when no active journal names its path, which is how a kept canonical source normally
+   * reads once the marker is durable, `mismatch` otherwise; plus the marker-less plain-journal
+   * canonical record, a kept clone under its plain journal with no marker), and protected or episode
+   * descriptors. Pure reads. Unreadable evidence is reported as `problems`, never skipped.
+   */
+  private async gatherRetainedUnderLock(barePath: string): Promise<GatheredBare> {
+    await this.assertRecoveryBare(barePath);
+    const list = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const runnerRoot = path.resolve(this.runnerRoot);
+    const ledger = new Map<string, AttemptLedgerEntry & { branch: string }>();
+    const ledgerRaw = new Map<string, string>();
+    const ledgerPaths = new Map<string, Set<string>>();
+    const active = new Map<string, { raw: string; journal: RecoveryJournalEntry | undefined }>();
+    const descriptorRaw = new Map<string, string>();
+    const bareProblems: string[] = [];
+    for (const item of list) {
+      const nl = item.indexOf("\n");
+      if (nl < 0) continue;
+      const k = item.slice(0, nl);
+      const v = item.slice(nl + 1);
+      let m = /^uzi-attempts\.(.+)\.entry$/.exec(k);
+      if (m) {
+        const e = parseAttemptLedgerEntry(v);
+        if (e) {
+          ledger.set(e.attemptId, { ...e, branch: m[1]! });
+          ledgerRaw.set(e.attemptId, v);
+          const ids = ledgerPaths.get(e.clonePath) ?? new Set<string>();
+          ids.add(e.attemptId);
+          ledgerPaths.set(e.clonePath, ids);
+        }
+        continue;
+      }
+      m = /^uzi-recovery\.(.+)\.clone$/.exec(k);
+      if (m) {
+        if (v === "") {
+          active.delete(m[1]!);
+          continue;
+        }
+        let journal: RecoveryJournalEntry | undefined;
+        try {
+          journal = parseRecoveryJournal(v);
+        } catch {
+          this.checkRecoveryInterruption();
+          bareProblems.push(`unreadable_journal:${sanitizeForLog(m[1]!, 64)}`);
+        }
+        active.set(m[1]!, { raw: v, journal });
+        continue;
+      }
+      m = /^uzi-retained\.([^.]+)\.journal$/.exec(k);
+      if (m) descriptorRaw.set(m[1]!, v);
+    }
+    let descriptors: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
+    try {
+      descriptors = await this.protectedRecoveries(barePath);
+    } catch {
+      this.checkRecoveryInterruption();
+      bareProblems.push("protected_descriptors_unreadable");
+    }
+    const markers = await this.readStoppedMarkers(barePath, list);
+
+    // path → the journals, descriptors and markers that name it.
+    const namers = new Map<string, string[]>();
+    const name = (p: string, who: string): void => {
+      namers.set(p, [...(namers.get(p) ?? []), who]);
+    };
+    for (const [branch, a] of active) {
+      if (a.journal) for (const s of this.recoverySources(a.journal)) name(s.clonePath, `active:${branch}:${a.journal.runId}`);
+    }
+    for (const d of descriptors) for (const s of this.recoverySources(d.journal)) name(s.clonePath, `descriptor:${d.journal.runId}`);
+    for (const { marker } of markers.valid) name(marker.clonePath, `marker:${marker.runId}`);
+
+    const runProblems = (runId: string): string[] => {
+      const out = [...bareProblems];
+      if (markers.malformed.some((x) => x.runId === runId)) out.push("marker_malformed");
+      if (markers.overflow.has(runId)) out.push("marker_overflow");
+      return out;
+    };
+    const part = async (clonePath: string, attemptId: string | undefined, generation: number | null): Promise<GatheredPart> => {
+      const { presence, devIno } = await this.clonePresence(clonePath);
+      const e = attemptId === undefined ? undefined : ledger.get(attemptId);
+      return { clonePath, attemptId, generation, presence, devIno, ledgerState: e && e.clonePath === clonePath ? e.state : "none" };
+    };
+    const records: GatheredRecord[] = [];
+    const owned = new Set<string>();
+
+    // Protected descriptors and active episode journals.
+    const protectedJournals: Array<{ branch: string; key: string; journal: RecoveryJournalEntry; descriptor: string | undefined }> =
+      descriptors.map((d) => ({ ...d, descriptor: descriptorRaw.get(d.journal.runId) }));
+    for (const [branch, a] of active) {
+      const j = a.journal;
+      if (!j || !(j.recovery || j.retainedSources?.length)) continue;
+      if (descriptors.some((d) => d.journal.runId === j.runId && JSON.stringify(d.journal) === JSON.stringify(j))) continue;
+      const parsed = parseAttemptPath(j.clonePath, runnerRoot);
+      protectedJournals.push({ branch, key: parsed?.key ?? path.basename(j.clonePath), journal: j, descriptor: undefined });
+    }
+    for (const p of protectedJournals) {
+      const activeHere = active.get(p.branch);
+      const sameActive = activeHere?.journal !== undefined && JSON.stringify(activeHere.journal) === JSON.stringify(p.journal);
+      const problems = runProblems(p.journal.runId);
+      if (!/^[A-Za-z0-9_-]+$/.test(p.key)) problems.push("attribution_unknown");
+      else {
+        try {
+          await this.attributedRecovery(barePath, p.branch, p.key, p.journal, p.descriptor === undefined ? undefined : p.journal);
+        } catch {
+          this.checkRecoveryInterruption();
+          problems.push("attribution_unknown");
+        }
+      }
+      const parts: GatheredPart[] = [];
+      for (const s of this.recoverySources(p.journal)) {
+        owned.add(s.clonePath);
+        const gen = s.attemptId === undefined ? { generation: null, unreadable: false } : attemptGenerationEvidence(s.attemptId);
+        if (gen.unreadable) problems.push("attribution_unknown");
+        parts.push(await part(s.clonePath, s.attemptId, gen.generation));
+      }
+      const journalState: GatheredRecord["journalState"] = p.descriptor !== undefined
+        ? (sameActive ? "episode_and_descriptor" : "descriptor") : "episode";
+      const descriptorSnapshot = p.descriptor === undefined ? undefined
+        : JSON.stringify({ version: 1, branch: p.branch, key: p.key, journal: p.journal });
+      const activeRaw = activeHere?.raw;
+      records.push({
+        kind: "protected", runId: p.journal.runId, branch: p.branch, key: p.key, parts, journal: p.journal,
+        activeRaw, descriptorRaw: p.descriptor, descriptorSnapshot, journalState, markerState: "none",
+        markerRaw: undefined, ledgerRaw: undefined, problems, namers,
+        digest: sha256Hex(["retained-source-v1", "protected", p.descriptor ?? "", activeRaw ?? "", ...parts.map((x) => x.devIno)].join("\n")),
+      });
+    }
+
+    // Canonical sources: one record per valid marker. A kept canonical source normally has NO active
+    // journal (markStoppedCanonical clears it once the marker is durable): that is `detached`. The
+    // active journal matters only when it names the marker's path.
+    for (const { marker, raw } of markers.valid) {
+      const a = active.get(marker.branch);
+      const named = a?.journal !== undefined && this.recoverySources(a.journal).some((s) => s.clonePath === marker.clonePath);
+      const plainShaped = named && !a.journal!.recovery && !a.journal!.retainedSources?.length;
+      const plain = plainShaped && a.journal!.attemptId === undefined &&
+        sameRecoverySource(a.journal!, { runId: marker.runId, clonePath: marker.clonePath });
+      const bound = plain && sha256Hex(a.raw) === marker.journalDigest;
+      const p = await part(marker.clonePath, undefined, marker.generation);
+      records.push({
+        kind: "canonical", runId: marker.runId, branch: marker.branch, key: marker.key, parts: [p],
+        journal: plain ? a.journal : undefined, activeRaw: a?.raw, descriptorRaw: undefined, descriptorSnapshot: undefined,
+        journalState: !named ? "none" : plain ? "plain" : plainShaped ? "other" : "episode",
+        markerState: bound ? "bound" : named ? "mismatch" : "detached", markerRaw: raw, ledgerRaw: undefined,
+        problems: runProblems(marker.runId), namers,
+        // The active journal's bytes are part of the descriptor only when it is this source's own.
+        digest: sha256Hex(["retained-source-v1", "canonical", raw, bound ? a!.raw : "", p.devIno].join("\n")),
+      });
+    }
+
+    // Canonical sources left under their PLAIN journal with no marker (a park or terminal exit that
+    // kept the clone, retainStoppedSource with record "none"). They need the same explicit reclaim
+    // path as a marked source. Evidence is conservative but exact: a valid marker hides the record
+    // only by its parsed clonePath, a malformed marker when its text carries the path (raw or
+    // JSON-escaped) not followed by a key character (so a marker for issue-290 never hides issue-29,
+    // while unquoted garbage naming the path still does), the journal's own run
+    // overflowing keeps it out, and a path that a protected record owns is that record's.
+    const malformedTexts = markers.malformed.map((x) => x.raw);
+    for (const [branch, a] of active) {
+      const j = a.journal;
+      if (!j || j.attemptId !== undefined || j.recovery || j.retainedSources?.length) continue;
+      if (markers.overflow.has(j.runId) || owned.has(j.clonePath)) continue;
+      const key = path.basename(j.clonePath);
+      if (!/^[A-Za-z0-9_-]+$/.test(key)) continue;
+      const shape = this.clonePathShape(j.clonePath, this.runnerClonePath(barePath, key));
+      if (!shape || shape.attemptId !== undefined) continue;
+      const forms = [j.clonePath, JSON.stringify(j.clonePath).slice(1, -1)];
+      if (markers.valid.some((x) => x.marker.clonePath === j.clonePath) ||
+          malformedTexts.some((t) => forms.some((f) => namesWholePath(t, f)))) continue;
+      const p = await part(j.clonePath, undefined, null);
+      records.push({
+        kind: "canonical", runId: j.runId, branch, key, parts: [p], journal: j, activeRaw: a.raw,
+        descriptorRaw: undefined, descriptorSnapshot: undefined, journalState: "plain", markerState: "none",
+        markerRaw: undefined, ledgerRaw: undefined, problems: runProblems(j.runId), namers,
+        digest: sha256Hex(["retained-source-v1", "canonical-plain", a.raw, p.devIno].join("\n")),
+      });
+    }
+
+    // Attempt sources: the ledger's last value per attempt id, not owned by a protected record.
+    for (const e of ledger.values()) {
+      if (e.state === "retired" || owned.has(e.clonePath)) continue;
+      const parsed = parseAttemptPath(e.clonePath, runnerRoot);
+      const problems = runProblems(e.runId);
+      const key = parsed?.key ?? "";
+      if (!parsed || parsed.attemptId !== e.attemptId || e.runId === "" || !/^[A-Za-z0-9_-]+$/.test(key) ||
+          this.clonePathShape(e.clonePath, this.runnerClonePath(barePath, key))?.attemptId !== e.attemptId) {
+        problems.push("attribution_unknown");
+      }
+      const gen = attemptGenerationEvidence(e.attemptId);
+      if (gen.unreadable) problems.push("attribution_unknown");
+      const p = await part(e.clonePath, e.attemptId, gen.generation);
+      const a = active.get(e.branch);
+      const plainNames = a?.journal !== undefined && !a.journal.recovery && !a.journal.retainedSources?.length &&
+        sameRecoverySource(a.journal, { runId: e.runId, clonePath: e.clonePath, attemptId: e.attemptId });
+      records.push({
+        kind: "attempt", runId: e.runId, branch: e.branch, key, parts: [p], journal: undefined,
+        activeRaw: a?.raw, descriptorRaw: undefined, descriptorSnapshot: undefined,
+        journalState: plainNames ? "plain" : "none", markerState: "none", markerRaw: undefined,
+        ledgerRaw: ledgerRaw.get(e.attemptId), problems, namers,
+        digest: sha256Hex(["retained-source-v1", "attempt", ledgerRaw.get(e.attemptId) ?? "", p.devIno].join("\n")),
+      });
+    }
+    // A path the ledger names under two attempt ids is shared evidence: flag every record on it.
+    for (const r of records) {
+      for (const p of r.parts) if ((ledgerPaths.get(p.clonePath)?.size ?? 0) > 1) r.problems.push("shared_ledger_path");
+    }
+    return { barePath, records, ledger };
+  }
+
+  /** Own-run owed pins, episode pins, and whether any of this run's owed shas is also pinned by
+   *  another run (a shared owed pin). Reads only ref names. */
+  private async owedPinSummary(barePath: string, runId: string): Promise<{ owed: number; episode: number; shared: boolean }> {
+    const owedRefs = (await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", "refs/uzi-owed/"])).split("\n").filter(Boolean);
+    const mine = new Set<string>();
+    const others = new Set<string>();
+    for (const ref of owedRefs) {
+      const m = /^refs\/uzi-owed\/([^/]+)\/([0-9a-f]{40})$/.exec(ref);
+      if (!m) continue;
+      if (m[1] === runId) mine.add(m[2]!);
+      else others.add(m[2]!);
+    }
+    const episode = (await this.runGit(barePath, ["for-each-ref", "--format=%(refname)", `refs/uzi-recovery-episode/${runId}/`])).split("\n").filter(Boolean).length;
+    return { owed: mine.size, episode, shared: [...mine].some((sha) => others.has(sha)) };
+  }
+
+  /** The run's local custody records, named separately from the server hold state. */
+  private async listLocalRecords(runId: string): Promise<RetainedLocalRecord[]> {
+    const out: RetainedLocalRecord[] = [];
+    const roots = [
+      { root: this.recoveryRoot, kind: "recovery" as const, field: "generation", resolution: "recovery record owner disposition" },
+      { root: this.recoverySettlementRoot, kind: "settlement" as const, field: "predecessorGeneration", resolution: "settlement replay" },
+    ];
+    for (const { root, kind, field, resolution } of roots) {
+      let names: string[];
+      try {
+        names = (await fs.readdir(path.join(root, runId))).sort();
+      } catch (err) {
+        if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+        throw err;
+      }
+      for (const n of names.slice(0, MAX_OWED_CANDIDATES_PER_RUN)) {
+        out.push({ kind, generation: await this.readRecordGeneration(path.join(root, runId, n), field), name: sanitizeForLog(n, 96), resolution });
+      }
+    }
+    if (await this.hasPhysicalTerminalProtection(runId)) {
+      out.push({ kind: "terminal", generation: null, name: "terminal_protection", resolution: "terminal record retirement" });
+    }
+    return out;
+  }
+
+  /** Best-effort, informational generation of a local record (a bounded no-follow read). */
+  private async readRecordGeneration(file: string, field: string): Promise<number | null> {
+    if (!file.endsWith(".json")) return null;
+    try {
+      const fh = await fs.open(file, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW);
+      try {
+        const buf = Buffer.alloc(65536);
+        const { bytesRead } = await fh.read(buf, 0, buf.length, 0);
+        const g = (JSON.parse(buf.subarray(0, bytesRead).toString("utf8")) as Record<string, unknown>)[field];
+        return Number.isSafeInteger(g) ? (g as number) : null;
+      } finally {
+        await fh.close();
+      }
+    } catch {
+      return null;
+    }
+  }
+
+  /**
+   * Evaluate one gathered record into its consumers, blockers, local records and the ONE
+   * disposition. Server hold state (`holds`), local custody records and the source consumers are
+   * three independent facts and none is inferred from another: no hold id is ever derived from a
+   * local file, and `custodyHeld` is local protection only.
+   */
+  private async evaluateRetained(
+    g: GatheredBare, rec: GatheredRecord,
+    ctx: { holds: RetainedHoldsSnapshot | undefined; lifecycle?: RetainedLifecycleSnapshot; isLivePath: (p: string) => boolean },
+  ): Promise<{
+    blockers: string[]; consumers: string[]; localRecords: RetainedLocalRecord[]; live: Map<string, boolean>;
+    holdsView: RetainedSourceEvidence["holds"]; disposition: RetainedDisposition | undefined;
+  }> {
+    const blockers = [...rec.problems];
+    const consumers: string[] = [];
+    if (residueQuarantine() !== undefined) blockers.push("worker_quarantined");
+    const live = new Map<string, boolean>();
+    for (const p of rec.parts) {
+      const isLive = ctx.isLivePath(p.clonePath);
+      live.set(p.clonePath, isLive);
+      if (isLive) blockers.push(`live:${path.basename(p.clonePath)}`);
+      if (p.presence === "unsafe") blockers.push(`unsafe_path:${path.basename(p.clonePath)}`);
+    }
+    try {
+      const pins = await this.owedPinSummary(g.barePath, rec.runId);
+      if (pins.owed > 0) consumers.push(`owed_pins:${pins.owed}`);
+      if (pins.episode > 0) consumers.push(`episode_pins:${pins.episode}`);
+      if (pins.shared) blockers.push("shared_owed_pin");
+    } catch {
+      this.checkRecoveryInterruption();
+      blockers.push("owed_pins_unreadable");
+    }
+    const own = new Set([`active:${rec.branch}:${rec.runId}`, `descriptor:${rec.runId}`, `marker:${rec.runId}`]);
+    for (const p of rec.parts) {
+      const others = (rec.namers.get(p.clonePath) ?? []).filter((w) => (rec.kind === "attempt" ? true : !own.has(w)));
+      if (others.length > 0) blockers.push(`${rec.kind === "attempt" ? "named_by_journal" : "named_by_other_journal"}:${others.map((w) => sanitizeForLog(w, 64)).join("+")}`);
+    }
+    if (rec.kind === "attempt") {
+      const p = rec.parts[0]!;
+      consumers.push(`ledger:${p.ledgerState}`);
+      if (p.ledgerState === "live") blockers.push("ledger_live");
+      if (p.ledgerState === "none") blockers.push("attribution_unknown");
+      try {
+        if (rec.key === "" || (await this.classifyOwnerClonePath(g.barePath, rec.branch, rec.key, rec.runId, p.clonePath)) !== "attempt") {
+          blockers.push("attribution_unknown");
+        }
+      } catch {
+        this.checkRecoveryInterruption();
+        blockers.push("attribution_unknown");
+      }
+      const keyOf = cloneKeyOf(p.clonePath).cloneKey;
+      for (const e of g.ledger.values()) {
+        if (e.attemptId !== p.attemptId && cloneKeyOf(e.clonePath).cloneKey === keyOf && ctx.isLivePath(e.clonePath)) {
+          blockers.push(`live_successor:${e.attemptId}`);
+        }
+      }
+    } else if (rec.kind === "canonical") {
+      if (rec.markerState === "none") {
+        // A canonical source left under its plain journal: no marker, and the journal is plain by
+        // construction. The worker cannot know locally whether the run is still parked, so the
+        // caller supplies the server's lifecycle verdict. Only a terminal status (absorbing) lets the
+        // source be discarded; a non-terminal or unreadable status (including a 404 for a run this
+        // worker no longer holds) keeps it. The blockers are soft, so an open hold or a local record
+        // still reports its more specific disposition. In the aggregate view (no holds, so no
+        // disposition) the lifecycle is simply not read.
+        const lc = ctx.lifecycle;
+        if (lc === undefined && ctx.holds === undefined) {
+          consumers.push("run_state:not_read");
+        } else if (lc?.state === "terminal") {
+          consumers.push(`run_state:terminal:${lc.status}`);
+        } else if (lc?.state === "not_terminal") {
+          consumers.push(`run_state:${sanitizeForLog(lc.status, 32)}`);
+          blockers.push("run_state_not_terminal");
+        } else {
+          consumers.push("run_state:unknown");
+          blockers.push("run_state_unknown");
+        }
+      } else {
+        consumers.push(`marker:${rec.markerState}`);
+        if (rec.markerState !== "bound" && rec.markerState !== "detached") blockers.push(`marker_${rec.markerState}`);
+        // Only an active journal that names this source can be wrong about it; a successor's journal
+        // elsewhere on the branch is not this source's journal.
+        if (rec.journalState !== "none" && rec.journalState !== "plain") blockers.push("journal_not_plain");
+      }
+      try {
+        if ((await this.classifyOwnerClonePath(g.barePath, rec.branch, rec.key, rec.runId, rec.parts[0]!.clonePath)) !== "canonical") {
+          blockers.push("attribution_unknown");
+        }
+      } catch {
+        this.checkRecoveryInterruption();
+        blockers.push("attribution_unknown");
+      }
+    } else {
+      consumers.push(`journal:${rec.journalState}`, `sources:${rec.parts.length}`);
+      if (rec.journal?.recovery?.stage === "adopting") blockers.push("adopting");
+      try {
+        await this.enumerateOwedUnderLock(g.barePath, rec.runId);
+      } catch {
+        this.checkRecoveryInterruption();
+        blockers.push("owed_metadata_unreadable");
+      }
+    }
+    let localRecords: RetainedLocalRecord[] = [];
+    try {
+      localRecords = await this.listLocalRecords(rec.runId);
+    } catch {
+      this.checkRecoveryInterruption();
+      blockers.push("local_records_unreadable");
+    }
+    // A malformed or oversized snapshot is a failed read: it can only refuse.
+    const given = ctx.holds;
+    const holds: RetainedHoldsSnapshot | undefined = given === undefined || given.state === "unknown" ? given
+      : given.state === "read" && Array.isArray(given.holds) && given.holds.length <= 256 &&
+        given.holds.every((h) => typeof h?.id === "string" && h.id.length > 0 && h.id.length <= 160 &&
+          Number.isSafeInteger(h.generation) && h.generation >= 0) ? given : { state: "unknown" };
+    // Any open hold of this worker on the run counts, whatever its generation: the run's inventory
+    // includes every ledger entry across generations (readInventoryCloneHeadsUnderLock), so a hold of
+    // another generation still depends on this source.
+    const open = holds?.state === "read" ? holds.holds : [];
+    const holdsView: RetainedSourceEvidence["holds"] = holds === undefined ? { state: "not_read", ids: [] }
+      : holds.state === "unknown" ? { state: "unknown", ids: [] } : { state: "read", ids: open.map((h) => h.id).sort() };
+    const uniq = [...new Set(blockers)];
+    const soft = (b: string): boolean => b.startsWith("shared_") || b.startsWith("named_by_") ||
+      b === "run_state_not_terminal" || b === "run_state_unknown";
+    let disposition: RetainedDisposition | undefined;
+    if (holds === undefined) disposition = undefined;
+    else if (holds.state === "unknown") disposition = { kind: "refused", consumers: ["holds_unknown", ...uniq] };
+    else if (uniq.some((b) => !soft(b))) disposition = { kind: "refused", consumers: uniq };
+    else if (open.length > 0) disposition = { kind: "owner_hold_discard", holdIds: open.map((h) => h.id).sort() };
+    else if (localRecords.length > 0) disposition = { kind: "resolve_local_record", records: localRecords };
+    else if (uniq.length > 0) disposition = { kind: "refused", consumers: uniq };
+    else disposition = rec.kind === "protected" ? { kind: "local_protected_discard" } : { kind: "local_discard" };
+    return { blockers: uniq, consumers, localRecords, live, holdsView, disposition };
+  }
+
+  private matchesRetainedSelector(rec: GatheredRecord, sel: RetainedSourceSelector): boolean {
+    if (rec.runId !== sel.runId) return false;
+    return rec.parts.some((p) =>
+      (sel.generation === "none" ? p.generation === null : p.generation === sel.generation) &&
+      (p.attemptId ?? "canonical") === sel.attempt);
+  }
+
+  /** Sum of allocated bytes under `root` by an lstat walk that never follows a symlink. Stops at the
+   *  deadline of the injected clock, or at a cap on the entries visited, the pending-directory stack
+   *  or the directory depth (the tree is runner-written and hostile), and then reports
+   *  `complete: false`, never a total of zero and never a total claimed complete. */
+  private async measureAllocated(
+    root: string, now: () => number, deadline: number, caps: RetainedMeasureCaps = {},
+  ): Promise<{ bytes: number; complete: boolean }> {
+    const maxEntries = caps.maxEntries ?? RETAINED_MEASURE_MAX_ENTRIES;
+    const maxPending = caps.maxPending ?? RETAINED_MEASURE_MAX_PENDING;
+    const maxDepth = caps.maxDepth ?? RETAINED_MEASURE_MAX_DEPTH;
+    let bytes = 0;
+    let visited = 0;
+    try {
+      bytes += (await fs.lstat(root)).blocks * 512;
+    } catch {
+      return { bytes: 0, complete: false };
+    }
+    const stack: Array<{ dir: string; depth: number }> = [{ dir: root, depth: 0 }];
+    while (stack.length > 0) {
+      const { dir, depth } = stack.pop()!;
+      let handle;
+      try {
+        handle = await fs.opendir(dir);
+      } catch {
+        return { bytes, complete: false };
+      }
+      try {
+        for (;;) {
+          if (now() >= deadline) return { bytes, complete: false };
+          const ent = await handle.read();
+          if (!ent) break;
+          if (++visited > maxEntries) return { bytes, complete: false };
+          const p = path.join(dir, ent.name);
+          let st: Stats;
+          try {
+            st = await fs.lstat(p);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code === "ENOENT") continue;
+            return { bytes, complete: false };
+          }
+          bytes += st.blocks * 512;
+          if (st.isDirectory() && !st.isSymbolicLink()) {
+            if (depth + 1 > maxDepth || stack.length >= maxPending) return { bytes, complete: false };
+            stack.push({ dir: p, depth: depth + 1 });
+          }
+        }
+      } finally {
+        await handle.close().catch(() => undefined);
+      }
+    }
+    return { bytes, complete: true };
+  }
+
+  /**
+   * issue #1786 — content-free evidence for retained stopped sources, read-only. One budget (default
+   * five seconds, injectable clock) covers enumeration and byte measurement; exhausting it, or more
+   * than {@link RETAINED_MAX_DESCRIPTORS} descriptors, gives `partial`, and an unmeasured source
+   * reports `null` bytes, never zero. Pass the holds snapshot the caller read for the selector's run
+   * to get a disposition.
+   */
+  async inspectRetainedSources(opts: RetainedInspectOptions): Promise<RetainedInspectResult> {
+    const now = opts.now ?? Date.now;
+    const budgetMs = opts.budgetMs ?? RETAINED_INSPECT_BUDGET_MS;
+    const deadline = now() + budgetMs;
+    let partial = false;
+    let unreadable = 0;
+    type Evaluated = Awaited<ReturnType<GitCache["evaluateRetained"]>>;
+    const found: Array<{ g: GatheredBare; rec: GatheredRecord; ev: Evaluated }> = [];
+    const exhausted = (err: unknown): boolean =>
+      now() >= deadline || (err instanceof Error && (err.name === "AbortError" || err.name === "TimeoutError" || /deadline exhausted/.test(err.message)));
+    const byIdentity = (x: { rec: GatheredRecord }, y: { rec: GatheredRecord }): number =>
+      (x.rec.runId < y.rec.runId ? -1 : x.rec.runId > y.rec.runId ? 1 : 0) ||
+      (x.rec.parts[0]!.clonePath < y.rec.parts[0]!.clonePath ? -1 : x.rec.parts[0]!.clonePath > y.rec.parts[0]!.clonePath ? 1 : 0);
+    try {
+      // One recovery clock covers the bare locks (queued waits included), the gather and the
+      // evaluation; exhausting it is `partial`, never a silently shorter list.
+      // (An injected clock governs the budget in tests; the real-time guard then stays at the default.)
+      const realBudgetMs = opts.now === undefined ? budgetMs : Math.max(budgetMs, RETAINED_INSPECT_BUDGET_MS);
+      await this.withRecoveryOperation(new AbortController().signal, Date.now() + realBudgetMs, async () => {
+        for (const bare of await this.retainedBares(opts.barePath)) {
+          if (now() >= deadline) {
+            partial = true;
+            break;
+          }
+          try {
+            // Gather AND evaluate in the same critical section: the disposition is computed from the
+            // same lock-held snapshot as the descriptor it is reported with.
+            await this.withLock(bare, async () => {
+              const g = await this.gatherRetainedUnderLock(bare);
+              const matching = g.records
+                .filter((rec) => opts.selector === undefined
+                  // The aggregate view omits an attempt a running flight is still using.
+                  ? !(rec.kind === "attempt" && rec.parts[0]!.ledgerState === "live" && opts.isLivePath(rec.parts[0]!.clonePath))
+                  : this.matchesRetainedSelector(rec, opts.selector))
+                .map((rec) => ({ g, rec }))
+                .sort(byIdentity)
+                .slice(0, RETAINED_MAX_DESCRIPTORS + 1);
+              for (const { rec } of matching) {
+                const ev = await this.evaluateRetained(g, rec, {
+                  holds: opts.selector === undefined ? undefined : opts.holds,
+                  ...(opts.selector === undefined || opts.lifecycle === undefined ? {} : { lifecycle: opts.lifecycle }),
+                  isLivePath: opts.isLivePath,
+                });
+                found.push({ g, rec, ev });
+              }
+            });
+          } catch (err) {
+            if (exhausted(err)) {
+              partial = true;
+              break;
+            }
+            unreadable++;
+            this.log.warn("retained source inspection could not read a bare", { error: gitErrorMessage(err) });
+          }
+        }
+      });
+    } catch (err) {
+      if (exhausted(err)) partial = true;
+      else {
+        unreadable++;
+        this.log.warn("retained source inspection could not enumerate the bares", { error: gitErrorMessage(err) });
+      }
+    }
+    found.sort(byIdentity);
+    if (found.length > RETAINED_MAX_DESCRIPTORS) {
+      partial = true;
+      found.length = RETAINED_MAX_DESCRIPTORS;
+    }
+    const sources: RetainedSourceEvidence[] = [];
+    for (const { g, rec, ev } of found) {
+      const parts: RetainedSourcePart[] = [];
+      let measured = 0;
+      let unmeasured = 0;
+      let total = 0;
+      for (const p of rec.parts) {
+        let bytes: number | null = null;
+        if (p.presence === "missing") bytes = 0;
+        else if (p.presence === "present") {
+          const m = await this.measureAllocated(p.clonePath, now, deadline, opts.measureCaps);
+          bytes = m.complete ? m.bytes : null;
+          if (!m.complete) partial = true;
+        }
+        if (bytes === null) unmeasured++;
+        else {
+          measured++;
+          total += bytes;
+        }
+        parts.push({
+          clonePath: p.clonePath, attempt: p.attemptId ?? "canonical", generation: p.generation ?? "none",
+          presence: p.presence, ledgerState: p.ledgerState, live: ev.live.get(p.clonePath) ?? false, allocatedBytes: bytes,
+        });
+      }
+      const head = rec.parts[0]!;
+      sources.push({
+        barePath: g.barePath, runId: rec.runId, branch: rec.branch, key: rec.key, kind: rec.kind,
+        generation: head.generation ?? "none", attempt: head.attemptId ?? "canonical", ledgerState: head.ledgerState,
+        journalState: rec.journalState, markerState: rec.markerState,
+        presence: rec.parts.some((p) => p.presence === "unsafe") ? "unsafe"
+          : rec.parts.every((p) => p.presence === "missing") ? "missing" : "present",
+        descriptor: rec.digest, allocatedBytes: unmeasured === 0 ? total : measured === 0 ? null : total,
+        bytesState: unmeasured === 0 ? "measured" : measured === 0 ? "unknown" : "partial",
+        sources: parts, consumers: [...ev.consumers, ...ev.blockers.map((b) => `blocker:${b}`)], localRecords: ev.localRecords,
+        holds: ev.holdsView, disposition: ev.disposition,
+      });
+    }
+    return { sources, partial, unreadable, sampledAt: new Date(now()).toISOString() };
+  }
+
+  /**
+   * issue #1786 — operator discard of a PLAIN retained source: an attempt in ledger state `reclaimed`
+   * or `abandoned` that no journal names, or a canonical source whose marker is bound to its plain journal or detached
+   * (no active journal names it; a successor's journal is never cleared), or a marker-less canonical
+   * source left under its plain journal (the journal is cleared with the clone), or a `gx` attempt (confirmed with generation `none`). See
+   * {@link discardRetainedSource} for the shared sequence and refusals.
+   */
+  discardStoppedSource(opts: RetainedDiscardOptions): Promise<RetainedDiscardResult> {
+    return this.discardRetainedSource("plain", opts);
+  }
+
+  /**
+   * issue #1786 — operator discard of a PROTECTED source (an episode journal and/or a
+   * `uzi-retained.<runId>.journal` descriptor): disposes of every source path and then retires the
+   * descriptor, the episode pins and the journal through the locked core of
+   * {@link discardRetainedRecovery}, all inside ONE bare-lock section. Refuses unless inspect's
+   * disposition is `local_protected_discard`.
+   */
+  discardProtectedSource(opts: RetainedDiscardOptions): Promise<RetainedDiscardResult> {
+    return this.discardRetainedSource("protected", opts);
+  }
+
+  /**
+   * The shared discard sequence. The caller read the server holds BEFORE this call (no network
+   * call happens under the lock). Locate the record, then take the bare lock ONCE and, inside it:
+   * re-gather and recheck the descriptor digest and every refusal, run the caller's capture-mode
+   * quiescence over the source paths and their skills siblings, delete each path with
+   * {@link deleteRetainedArtifact} (which takes no lock of its own), and only when every path is
+   * confirmed gone retire the metadata (the locked core for protected sources, ledger `retired`
+   * for attempts, the journal and marker for a canonical source) before releasing the lock. A
+   * partial failure keeps the descriptor and every path not proven gone. One deadline covers the
+   * whole operation; exhausting it keeps whatever is not yet proven gone and reports `unknown`.
+   *
+   * The pre-lock hold-read invariant belongs to the caller, not to this method: the holds snapshot
+   * is only as current as the caller's proof that nothing can open a new hold on the run between the
+   * read and the end of the disposal. The operator channel gives that proof (claim gate closed,
+   * in-flight claims drained, local idle proven, the run's reservation held through the disposal;
+   * the claim CTE is the only production hold insertion). GitCache never calls the API.
+   */
+  private async discardRetainedSource(mode: "plain" | "protected", opts: RetainedDiscardOptions): Promise<RetainedDiscardResult> {
+    const sel = opts.selector;
+    const refused = (reason: string, consumers: string[] = [], disposition?: RetainedDisposition): RetainedDiscardResult =>
+      ({ kind: "refused", reason, consumers, ...(disposition ? { disposition } : {}) });
+    if (!/^[A-Za-z0-9_-]{1,160}$/.test(sel.runId) || !/^[0-9a-f]{64}$/.test(opts.confirm) ||
+        (sel.generation !== "none" && (!Number.isSafeInteger(sel.generation) || sel.generation < 0)) ||
+        (sel.attempt !== "canonical" && !ATTEMPT_ID_RE.test(sel.attempt))) return refused("invalid_request");
+    if (opts.holds.state === "read" &&
+        (!Array.isArray(opts.holds.holds) || opts.holds.holds.some((h) => typeof h?.id !== "string" || !Number.isSafeInteger(h.generation)))) {
+      return refused("holds_unknown", ["holds_unknown"]);
+    }
+    const outcomes: Array<{ clonePath: string; outcome: RetainedSourceOutcome }> = [];
+    let metadata: "retired" | "kept" = "kept";
+    const wantKinds = mode === "protected" ? ["protected"] : ["attempt", "canonical"];
+    try {
+      return await this.withRecoveryOperation(opts.signal ?? new AbortController().signal,
+        Date.now() + (opts.deadlineMs ?? RETAINED_OP_DEADLINE_MS), async () => {
+          // Locate the bare. With `opts.barePath` (what inspect reports) the destructive section
+          // below is the ONLY bare-lock entry; without it each candidate bare is gathered under its
+          // own short lock first, released before that section.
+          let bare = opts.barePath;
+          if (bare === undefined) {
+            const matches: string[] = [];
+            for (const candidate of await this.retainedBares()) {
+              const g = await this.withLock(candidate, () => this.gatherRetainedUnderLock(candidate)).catch(() => undefined);
+              if (g?.records.some((r) => wantKinds.includes(r.kind) && this.matchesRetainedSelector(r, sel))) matches.push(candidate);
+            }
+            if (matches.length === 0) return refused("not_found");
+            if (matches.length > 1) return refused("ambiguous", ["multiple_bares"]);
+            bare = matches[0]!;
+          }
+          const lockedBare = bare;
+          return this.withLock(lockedBare, async () => {
+            const bare = lockedBare;
+            const g = await this.gatherRetainedUnderLock(bare);
+            const candidates = g.records.filter((r) => this.matchesRetainedSelector(r, sel));
+            if (candidates.length !== 1) return refused(candidates.length === 0 ? "not_found" : "ambiguous");
+            const rec = candidates[0]!;
+            if (!wantKinds.includes(rec.kind)) return refused("wrong_discard_kind", [rec.kind]);
+            if (rec.digest !== opts.confirm) return refused("descriptor_changed");
+            const ev = await this.evaluateRetained(g, rec, {
+              holds: opts.holds, ...(opts.lifecycle ? { lifecycle: opts.lifecycle } : {}), isLivePath: opts.isLivePath,
+            });
+            const want = mode === "protected" ? "local_protected_discard" : "local_discard";
+            if (ev.disposition?.kind !== want) {
+              return refused(ev.disposition?.kind ?? "refused",
+                ev.disposition?.kind === "refused" ? ev.disposition.consumers : ev.blockers, ev.disposition);
+            }
+            // The existing protected-source checks, then the exclusivity ones (evaluateRetained).
+            let snapshot: { descriptor: string | undefined; active: string | undefined } | undefined;
+            if (rec.kind === "protected") {
+              const journal = rec.journal!;
+              const expected = recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+                ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) });
+              const missingSome = rec.parts.some((p) => p.presence === "missing");
+              await this.checkedRecovery(bare, rec.branch, rec.key, expected, missingSome, rec.descriptorRaw === undefined ? undefined : journal);
+              await this.attributedRecovery(bare, rec.branch, rec.key, expected, rec.descriptorRaw === undefined ? undefined : journal);
+              await this.protectedRecoveries(bare, rec.runId);
+              snapshot = { descriptor: rec.descriptorSnapshot, active: rec.activeRaw };
+            }
+            for (const p of rec.parts) outcomes.push({ clonePath: p.clonePath, outcome: "retained" });
+            const paths = rec.parts.flatMap((p) => [p.clonePath, path.join(path.dirname(p.clonePath), `.uzi-skills-${path.basename(p.clonePath)}`)]);
+            if (!(await opts.quiesce(paths))) return refused("not_quiescent", ["writers_not_proven_gone"]);
+            // A latch that landed during the caller's quiescence, or at any later point, keeps the
+            // remaining sources and every record: nothing further is deleted or retired.
+            const stopped = (): RetainedDiscardResult => ({ kind: "unknown", sources: outcomes, metadata });
+            if (residueQuarantine() !== undefined) return stopped();
+            for (const [i, p] of rec.parts.entries()) {
+              this.checkRecoveryInterruption();
+              if (residueQuarantine() !== undefined) return stopped();
+              const parent = path.dirname(p.clonePath);
+              const base = path.basename(p.clonePath);
+              const skills = `.uzi-skills-${base}`;
+              try {
+                // The skills sibling first (see sweepRetainedArtifacts): a failed clone delete then
+                // orphans nothing.
+                if (!(await this.deleteRetainedArtifact(parent, path.join(parent, skills), (n) => n === skills))) {
+                  outcomes[i]!.outcome = "retained";
+                  continue;
+                }
+                // A latch that landed during the skills delete keeps the clone itself.
+                if (residueQuarantine() !== undefined) return stopped();
+                if (!(await this.deleteRetainedArtifact(parent, p.clonePath, (n) => n === base))) {
+                  outcomes[i]!.outcome = "retained";
+                  continue;
+                }
+              } catch (err) {
+                outcomes[i]!.outcome = "unknown";
+                this.log.warn("retained source delete could not be settled; it and its records are kept", { clone: p.clonePath, error: gitErrorMessage(err) });
+                break;
+              }
+              const after = await this.clonePresence(p.clonePath);
+              outcomes[i]!.outcome = after.presence !== "missing" ? "unknown" : p.presence === "missing" ? "missing" : "removed";
+            }
+            if (!outcomes.every((o) => o.outcome === "removed" || o.outcome === "missing")) {
+              return { kind: "incomplete", sources: outcomes, metadata };
+            }
+            this.checkRecoveryInterruption();
+            if (residueQuarantine() !== undefined) return stopped();
+            // Every path is gone; retire the metadata inside the same critical section.
+            if (rec.kind === "protected") {
+              const journal = rec.journal!;
+              await this.discardRetainedRecoveryUnderLock(bare, rec.branch, rec.key,
+                recoverySource({ runId: journal.runId, clonePath: journal.clonePath,
+                  ...(journal.attemptId === undefined ? {} : { attemptId: journal.attemptId }) }), snapshot);
+            } else if (rec.kind === "canonical") {
+              // Only a journal that names exactly this source (bound) is cleared, and only while its
+              // raw is unchanged; a detached marker never touches a successor's journal.
+              if (rec.markerState === "bound" && (await this.readRecoveryCaptureRaw(bare, rec.branch)) === rec.activeRaw) {
+                await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+              } else if (rec.markerState === "none") {
+                // A plain-journal source: clear the journal only while its raw is unchanged AND it
+                // still names exactly this (runId, clonePath) plain canonical source.
+                const raw = await this.readRecoveryCaptureRaw(bare, rec.branch);
+                if (raw !== undefined && raw === rec.activeRaw) {
+                  let still = false;
+                  try {
+                    const j = parseRecoveryJournal(raw);
+                    still = j.attemptId === undefined && !j.recovery && !j.retainedSources?.length &&
+                      sameRecoverySource(j, { runId: rec.runId, clonePath: rec.parts[0]!.clonePath });
+                  } catch {
+                    still = false;
+                  }
+                  if (still) await this.runGit(bare, ["config", "--local", recoveryCaptureKey(rec.branch), ""]);
+                }
+              }
+            }
+            for (const p of rec.parts) {
+              if (p.attemptId !== undefined && p.ledgerState !== "none" && p.ledgerState !== "retired") {
+                await this.appendAttemptLedger(bare, g.ledger.get(p.attemptId)?.branch ?? rec.branch,
+                  { attemptId: p.attemptId, runId: rec.runId, clonePath: p.clonePath, state: "retired" });
+              }
+            }
+            if (rec.kind === "canonical" && rec.markerState !== "none") {
+              const target = rec.parts[0]!.clonePath;
+              // The exact marker value, or one whose PARSED path is exactly this source's; a malformed
+              // value is never matched by text (a path that is a prefix of another is not a match).
+              await this.removeStoppedMarkers(bare, rec.runId, (raw) => {
+                if (raw === rec.markerRaw) return true;
+                try {
+                  return (JSON.parse(raw) as { clonePath?: unknown } | null)?.clonePath === target;
+                } catch {
+                  return false;
+                }
+              });
+            }
+            metadata = "retired";
+            return { kind: "done", sources: outcomes, metadata };
+          });
+        });
+    } catch (err) {
+      this.log.warn("retained source discard was interrupted; whatever is not proven gone stays", { error: gitErrorMessage(err) });
+      return { kind: "unknown", sources: outcomes.map((o) => (o.outcome === "removed" || o.outcome === "missing" ? o : { ...o, outcome: o.outcome === "unknown" ? "unknown" : "retained" })), metadata };
+    }
   }
 
   /** Read only worker-journaled/ledger-owned heads. Ref files are size-bounded;
@@ -5952,6 +7669,15 @@ export class GitCache {
           if (entry.runId !== runId) { foreignOwners.add(entry.runId); continue; }
           paths.set(entry.clonePath, { branch: entry.branch, runId });
         }
+        // issue #1786: a kept canonical clone is attributed by its stopped marker once the journal is
+        // cleared, so a valid marker of this run names its path as the plain journal did. A marker's
+        // path joins ownRetainedPaths, so a missing marker-kept clone makes the run's inventory
+        // unknown until discard: stricter than a plain own-run journal, whose missing path is skipped.
+        for (const { marker } of (await atFailure("git_or_filesystem_error", () => this.readStoppedMarkers(barePath, entries))).valid) {
+          if (marker.runId !== runId) { foreignOwners.add(marker.runId); continue; }
+          ownRetainedPaths.add(marker.clonePath);
+          paths.set(marker.clonePath, { branch: marker.branch, runId });
+        }
         const heads = new Set<string>();
         const clones: Array<{ clonePath: string; branch: string; runId: string; head?: string; identity?: string }> = [];
         clonePaths: for (const [clone, owner] of paths) {
@@ -5984,41 +7710,7 @@ export class GitCache {
             throw err;
           }
           if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
-          const head = await atFailure("clone_head_unreadable", async () => {
-            const gitdir = path.join(clone, ".git");
-            const gs = await fs.lstat(gitdir);
-            if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
-            const readRef = async (relative: string): Promise<string> => {
-              const parts = relative.split("/");
-              for (let i = 1; i < parts.length; i++) {
-                const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
-                if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
-              }
-              const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-              try {
-                const stat = await file.stat();
-                if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
-                const bytes = Buffer.alloc(1024 * 1024 + 1);
-                const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-                if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
-                return bytes.subarray(0, bytesRead).toString("utf8").trim();
-              } finally { await file.close(); }
-            };
-            let head = await readRef("HEAD");
-            if (head.startsWith("ref: ")) {
-              const ref = head.slice(5);
-              if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
-                  ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
-              try { head = await readRef(ref); }
-              catch (err) {
-                if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-                const packed = await readRef("packed-refs");
-                head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
-              }
-            }
-            if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
-            return head;
-          });
+          const head = await atFailure("clone_head_unreadable", () => this.readReportCloneHead(clone));
           heads.add(head);
           clones.push({ clonePath: clone, ...owner,
             ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
@@ -6033,6 +7725,204 @@ export class GitCache {
       this.checkRecoveryInterruption();
       if (physicalFailure) this.warnRecoveryPhysicalFailure();
     }
+  }
+
+  /** Metadata-only ACK observer. One bounded snapshot drives every parser and
+   * relationship; at most 256 paths are probed once, and any ambiguity refuses all. */
+  async readAcknowledgedReportSourcesUnderLock(barePath: string, runId: string): Promise<
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }>;
+      snapshot: string } | { kind: "unknown"; cause?: string }
+  > {
+    try {
+      this.checkReportProof();
+      const budget = this.reportProofs.getStore();
+      if (!budget || !OWED_RUN_ID.test(runId) ||
+          await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return { kind: "unknown" };
+      const configPath = path.join(barePath, "config");
+      const file = await fs.open(configPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      let raw: Buffer, identity: string;
+      try {
+        const before = await file.stat({ bigint: true });
+        if (!before.isFile() || before.uid !== BigInt(process.getuid!()) ||
+            (before.mode & 0o002n) !== 0n ||
+            ((before.mode & 0o020n) !== 0n && (before.gid !== BigInt(process.getgid!()) ||
+              (uidSplitActive() && before.gid === BigInt(RUNNER_UID)))) || before.size > 1048576n) throw new Error("unsafe ACK config");
+        const bytes = Buffer.alloc(1048577);
+        let length = 0;
+        while (length < bytes.length) {
+          this.checkReportProof();
+          const read = await file.read(bytes, length, bytes.length - length, null);
+          if (!read.bytesRead) break;
+          length += read.bytesRead;
+        }
+        if (length > 1048576) throw new Error("oversized ACK config");
+        raw = bytes.subarray(0, length);
+        const after = await file.stat({ bigint: true });
+        const named = await fs.lstat(configPath, { bigint: true });
+        identity = `${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:${before.ctimeNs}`;
+        for (const stat of [after, named]) {
+          if (stat.isSymbolicLink() || identity !== `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`)
+            throw new Error("ACK config changed");
+        }
+      } finally { await file.close(); }
+      const parsed = await this.execScoped("git", ["config", "--file", "-", "--no-includes", "--null", "--list"],
+        { env: gitEnv(), input: raw, maxBuffer: 1048576, timeout: GIT_TIMEOUT_MS });
+      if ((budget.configBytes += raw.length + Buffer.byteLength(parsed.stdout) + Buffer.byteLength(parsed.stderr)) > 4194304)
+        throw new Error("ACK config cumulative bound");
+      const entries = parsed.stdout.split("\0").filter(Boolean);
+      if (entries.length > 1024) throw new Error("ACK config value count");
+      const journals = new Map<string, RecoveryJournalEntry>();
+      const protectedRecords: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
+      const ledgers = new Map<string, AttemptLedgerEntry & { branch: string }>();
+      const paths = new Map<string, { branch: string; runId: string; attemptId?: string }>();
+      const add = (branch: string, source: RecoverySource, key?: string) => {
+        recoverySource({ runId: source.runId, clonePath: source.clonePath,
+          ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) });
+        const attempt = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
+        const cloneKey = key ?? attempt?.key ?? path.basename(source.clonePath);
+        if (!/^[A-Za-z0-9_-]+$/.test(cloneKey)) throw new Error("ACK clone key");
+        const shape = this.clonePathShape(source.clonePath, this.runnerClonePath(barePath, cloneKey));
+        if (!shape || shape.attemptId !== source.attemptId) throw new Error("ACK source path attribution");
+        const prior = paths.get(source.clonePath);
+        if (prior && (prior.branch !== branch || prior.runId !== source.runId || prior.attemptId !== source.attemptId))
+          throw new Error("ACK conflicting path");
+        paths.set(source.clonePath, { branch, runId: source.runId, attemptId: source.attemptId });
+        if (paths.size > 256) throw new Error("ACK path bound");
+      };
+      const seenProtected = new Set<string>();
+      for (const item of entries) {
+        this.checkReportProof();
+        const nl = item.indexOf("\n");
+        const name = nl < 0 ? item : item.slice(0, nl);
+        const value = nl < 0 ? "" : item.slice(nl + 1);
+        if (/^(include\.|includeif\.|core\.worktree$|core\.hookspath$|core\.sshcommand$)/i.test(name) ||
+            Buffer.byteLength(value) > 65536) throw new Error("ACK unsafe config value");
+        if (name.startsWith("uzi-retained.")) {
+          const match = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
+          if (!match || seenProtected.has(name)) throw new Error("ACK protected identity");
+          seenProtected.add(name);
+          const descriptor = JSON.parse(value);
+          if (!descriptor || descriptor.version !== 1 ||
+              Object.keys(descriptor).sort().join(",") !== "branch,journal,key,version" ||
+              typeof descriptor.branch !== "string" || !descriptor.branch ||
+              typeof descriptor.key !== "string" || !/^[A-Za-z0-9_-]+$/.test(descriptor.key)) throw new Error("ACK protected schema");
+          const journal = parseRecoveryJournal(JSON.stringify(descriptor.journal));
+          if (journal.runId !== match[1] || (!journal.recovery && !journal.retainedSources?.length)) throw new Error("ACK protected run");
+          protectedRecords.push({ branch: descriptor.branch, key: descriptor.key, journal });
+        }
+        const recovery = /^uzi-recovery\.(.+)\.clone$/.exec(name);
+        if (recovery) {
+          if (value) journals.set(recovery[1]!, parseRecoveryJournal(value));
+          else journals.delete(recovery[1]!);
+        }
+        const ledger = /^uzi-attempts\.(.+)\.entry$/.exec(name);
+        if (ledger) {
+          const entry = parseAttemptLedgerEntry(value);
+          if (!entry || !OWED_RUN_ID.test(entry.runId)) throw new Error("ACK ledger schema");
+          const prior = ledgers.get(entry.attemptId);
+          if (prior && (prior.branch !== ledger[1] || prior.runId !== entry.runId || prior.clonePath !== entry.clonePath))
+            throw new Error("ACK ledger identity conflict");
+          ledgers.set(entry.attemptId, { ...entry, branch: ledger[1]! });
+        }
+      }
+      for (const [branch, journal] of journals) for (const source of this.recoverySources(journal)) add(branch, source);
+      for (const record of protectedRecords) {
+        const active = journals.get(record.branch);
+        if (active?.runId === record.journal.runId && JSON.stringify(active) !== JSON.stringify(record.journal))
+          throw new Error("ACK protected conflict");
+        for (const source of this.recoverySources(record.journal)) add(record.branch, source, record.key);
+      }
+      for (const entry of ledgers.values()) add(entry.branch, entry);
+      const markers = await this.readStoppedMarkers(barePath, entries);
+      if (markers.malformed.length || markers.overflow.size) throw new Error("ACK malformed stopped marker");
+      for (const { marker } of markers.valid) add(marker.branch, marker, marker.key);
+      for (const [clonePath, source] of paths.entries()) {
+        if (source.attemptId) {
+          const ledger = ledgers.get(source.attemptId);
+          if (!ledger || ledger.branch !== source.branch || ledger.runId !== source.runId ||
+              ledger.clonePath !== clonePath) throw new Error("ACK missing producer");
+        }
+      }
+      const observations: unknown[] = [];
+      const clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }> = [];
+      for (const [clonePath, owner] of paths) {
+        if (owner.runId !== runId) continue;
+        const root = path.resolve(this.runnerRoot);
+        if (path.resolve(clonePath) !== clonePath || path.dirname(path.dirname(clonePath)) !== root) throw new Error("ACK unsafe path");
+        // Probe from the existing worker-owned data directory, including a missing runner root.
+        const chain = [path.dirname(root), root, path.dirname(clonePath), clonePath];
+        let missing = false;
+        for (const dir of chain) {
+          this.checkReportProof();
+          try {
+            const stat = await fs.lstat(dir, { bigint: true });
+            if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("ACK unsafe ancestor");
+            observations.push([dir, "present", String(stat.dev), String(stat.ino), String(stat.uid), String(stat.mode)]);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT" || dir === chain[0]) throw err;
+            observations.push([dir, "missing"]);
+            missing = true;
+            break;
+          }
+        }
+        if (missing) continue;
+        const stat = await fs.lstat(clonePath);
+        const head = await this.readReportCloneHead(clonePath);
+        clones.push({ clonePath, branch: owner.branch, runId, head, identity: `${stat.dev}:${stat.ino}` });
+      }
+      this.checkReportProof();
+      return { kind: "verified", heads: [...new Set(clones.map(c => c.head))], clones,
+        snapshot: JSON.stringify([identity, raw.toString("base64"), observations, clones]) };
+    } catch (err) {
+      this.checkReportProof();
+      return { kind: "unknown", cause: gitErrorMessage(err) };
+    }
+  }
+
+  /** Shared strict HEAD observer; a present clone never substitutes missing content. */
+  private async readReportCloneHead(clone: string): Promise<string> {
+    const gitdir = path.join(clone, ".git");
+    const gs = await fs.lstat(gitdir);
+    if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
+    const readRef = async (relative: string): Promise<string> => {
+      const parts = relative.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
+        if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+      }
+      const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
+        const bytes = Buffer.alloc(1024 * 1024 + 1);
+        const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+        if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
+        return bytes.subarray(0, bytesRead).toString("utf8").trim();
+      } finally { await file.close(); }
+    };
+    let head = await readRef("HEAD");
+    if (head.startsWith("ref: ")) {
+      const ref = head.slice(5);
+      if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
+          ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
+      try { head = await readRef(ref); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        const packed = await readRef("packed-refs");
+        head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+      }
+    }
+    if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+    return head;
+
+  }
+
+  /** The EXACT stored value of one branch's recovery journal (undefined when absent or cleared). */
+  private async readRecoveryCaptureRaw(barePath: string, branch: string): Promise<string | undefined> {
+    const entries = (await this.runGit(barePath, ["config", "--local", "--null", "--list"])).split("\0");
+    const prefix = `${recoveryCaptureKey(branch)}\n`;
+    const value = entries.filter((item) => item.startsWith(prefix)).at(-1)?.slice(prefix.length);
+    return value ? value : undefined;
   }
 
   private async readRecoveryCapture(barePath: string, branch: string, snapshot?: string[]): Promise<RecoveryJournalEntry | undefined> {
@@ -6360,42 +8250,53 @@ export class GitCache {
      *  that is not already contained in it (see {@link buildCheckpointChain}), so the broker sees a
      *  strict descendant of the ref. Optional: absent ⇒ today's raw behaviour. */
     chainFrom?: readonly (string | undefined)[],
-  ): Promise<{ tipOid: string; pack: Readable; exited: Promise<number> } | null> {
+  ): Promise<{
+    tipOid: string; pack: Readable; exited: Promise<number>; cancel: () => void;
+    replay: () => Promise<{ pack: Readable; exited: Promise<number>; cancel: () => void }>;
+  } | null> {
+    // Replay closes over literal OIDs and the original guard; it never rebuilds an overlay.
+    const openProducer = async (source: string, candidate: string, floor: string) => {
+      onStep?.("scratch_preflight");
+      await this.scratchPublicationPreflight(barePath, branch, source);
+      if (candidate !== source) await this.scratchPublicationPreflight(barePath, branch, candidate);
+      await this.validateCheckpointFloor(barePath, floor, candidate);
+      await beforePack?.(candidate);
+      onStep?.("checkpoint_pack");
+      const { stdout, exited, cancel } = await this.spawnGit(
+        barePath, ["pack-objects", "--revs", "--stdout"], `${candidate}\n^${floor}\n`,
+      );
+      return { pack: stdout, exited, cancel };
+    };
     // A pinned range uses literal commit OIDs for the pack floor and candidate.
     // If an overlay is requested, its wrapper becomes the wanted OID while the
     // excluded floor remains pinned.
     if (pinned) {
-      if (!SHA40_RE.test(pinned.tipSha) || !SHA40_RE.test(pinned.excludeSha) ||
-          (sourceSha !== undefined && sourceSha !== pinned.tipSha)) {
+      const { tipSha, excludeSha } = pinned;
+      if (!SHA40_RE.test(tipSha) || !SHA40_RE.test(excludeSha) ||
+          (sourceSha !== undefined && sourceSha !== tipSha)) {
         throw new ScratchPublicationError("pinned checkpoint range must be two 40-hex commit SHAs", undefined, {
           kind: "checkpoint_range", step: "checkpoint_floor", detail: "pinned range is not two 40-hex commit SHAs",
         });
       }
       onStep?.("scratch_preflight");
-      await this.scratchPublicationPreflight(barePath, branch, pinned.tipSha);
-      let wanted = pinned.tipSha;
+      await this.scratchPublicationPreflight(barePath, branch, tipSha);
+      let wanted = tipSha;
       if (overlay) {
-        wanted = await this.buildWorkflowOverlay(barePath, branch, pinned.tipSha, overlay, onStep) ?? wanted;
+        wanted = await this.buildWorkflowOverlay(barePath, branch, tipSha, overlay, onStep) ?? wanted;
         onStep?.("scratch_preflight");
         await this.scratchPublicationPreflight(barePath, branch, wanted);
       }
-      if (wanted === pinned.tipSha && chainFrom) {
-        const chain = await this.buildCheckpointChain(barePath, branch, pinned.tipSha, chainFrom, onStep);
+      if (wanted === tipSha && chainFrom) {
+        const chain = await this.buildCheckpointChain(barePath, branch, tipSha, chainFrom, onStep);
         if (chain) {
           wanted = chain;
           onStep?.("scratch_preflight");
           await this.scratchPublicationPreflight(barePath, branch, wanted);
         }
       }
-      await this.validateCheckpointFloor(barePath, pinned.excludeSha, wanted);
-      await beforePack?.(wanted);
-      onStep?.("checkpoint_pack");
-      const { stdout, exited } = await this.spawnGit(
-        barePath,
-        ["pack-objects", "--revs", "--stdout"],
-        `${wanted}\n^${pinned.excludeSha}\n`,
-      );
-      return { tipOid: wanted, pack: stdout, exited };
+      const candidate = wanted;
+      const replay = () => openProducer(tipSha, candidate, excludeSha);
+      return { tipOid: wanted, ...await replay(), replay };
     }
     const realTip = sourceSha ?? await this.trackingTip(barePath, branch);
     if (!realTip) return null;
@@ -6449,15 +8350,11 @@ export class GitCache {
     // Validate the actual commit to be packed; an earlier overlay floor can be
     // reachable through the wrapper's first parent but not through realTip.
     const wanted = wantRev;
+    // The initial validation establishes the floor as a literal SHA before capturing it.
     await this.validateCheckpointFloor(barePath, excludeSha, wanted);
-    await beforePack?.(wanted);
-    onStep?.("checkpoint_pack");
-    const { stdout, exited } = await this.spawnGit(
-      barePath,
-      ["pack-objects", "--revs", "--stdout"],
-      `${wanted}\n^${excludeSha}\n`,
-    );
-    return { tipOid: wantRev, pack: stdout, exited };
+    const floor = excludeSha!;
+    const replay = () => openProducer(realTip, wanted, floor);
+    return { tipOid: wanted, ...await replay(), replay };
   }
 
   private async validateCheckpointFloor(barePath: string, floor: string | null, candidate: string): Promise<void> {
@@ -7305,6 +9202,15 @@ export class GitCache {
       }
       // issue #2213: a latch that landed during the protection read keeps the clone.
       refuseUnderQuarantine();
+      // issue #1786: a marked stopped canonical source is removed only by the operator discard.
+      // Only an owned removal is checked: the standalone (checker) removals can run under a bare lock.
+      const parent = path.dirname(path.resolve(clonePath));
+      if (path.dirname(parent) === path.resolve(this.runnerRoot)) {
+        const bare = path.join(this.reposRoot, `${path.basename(parent)}.git`);
+        if (await this.pathPresent(bare)) {
+          await this.withLock(bare, () => this.refuseMarkedPaths(bare, [path.resolve(clonePath)], ownerRunId));
+        }
+      }
     }
     // The pinned teardown awaits several opens and stats before it deletes anything, so a
     // latch landing in that window is rechecked synchronously at each destructive dispatch.
@@ -7401,6 +9307,8 @@ export class GitCache {
       if (pending?.runId !== ownerRunId || pending.clonePath !== clonePath) {
         throw new CapturePathMismatchError(pending?.clonePath ?? "", clonePath, branch, ownerRunId);
       }
+      // issue #1786: a marked stopped canonical source is retired only by the operator discard.
+      await this.refuseMarkedPaths(barePath, [clonePath], ownerRunId);
       const verified = opts.verifiedSuccessor;
       let anchored: RecoveryJournalEntry | undefined;
       if (verified) {
@@ -8108,7 +10016,9 @@ export class GitCache {
    */
   async worktreeStatus(cwd: string): Promise<string[] | null> {
     try {
-      const out = await this.runGitAsRunner(cwd, ["status", "--porcelain"]);
+      // GIT_OPTIONAL_LOCKS=0: the inventory boundary reads a kept clone, and a plain status would
+      // refresh (rewrite) its .git/index stat cache.
+      const out = await this.runGitAsRunner(cwd, ["status", "--porcelain"], { env: { GIT_OPTIONAL_LOCKS: "0" } });
       return out.split("\n").filter((l) => l.length > 0);
     } catch (err) {
       this.log.debug("fingerprint git status failed (→ null, cannot assert unchanged)", {
@@ -9388,7 +11298,7 @@ export class GitCache {
     // non-empty dir → a deterministic "already exists" failure (permanent), converting a
     // transient into a permanent one. This guarantees each retry starts from a clean bare.
     try {
-      await this.runGit(undefined, ["clone", "--bare", "--", repoUrl, dest], pat, scope, username);
+      await this.runGit(undefined, ["clone", "--bare", "-c", `${BARE_CACHE_ORIGIN_KEY_CONFIG}=${repoUrl}`, "--", repoUrl, dest], pat, scope, username);
       // Convert the mirror refspec to remote-tracking so future fetches write to
       // refs/remotes/origin/*. Under (b) the bare's refs/heads/* stay the
       // stale mirror; the agent branch is resolved via refs/remotes/origin/* (resume)
@@ -10392,9 +12302,12 @@ export class GitCache {
    * write). Single-uid (#58): `runnerCommand` is a passthrough, so this is a plain git.
    * issue #1783: carries the worker spawn mark only for {@link runnerGitCarriesWorkerMark}'s
    * subcommands; every other runner git runs unmarked (its plants stay reapable).
+   * `opts.env` is merged AFTER gitEnv()'s pins, so it can override them: callers must pass only
+   * benign keys (e.g. GIT_NO_REPLACE_OBJECTS) and never GIT_CONFIG_* or any other
+   * security-relevant key.
    */
-  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number } = {}): Promise<string> {
-    const base = gitEnv();
+  private async runGitAsRunner(cwd: string | undefined, args: string[], opts: { timeoutMs?: number; env?: NodeJS.ProcessEnv } = {}): Promise<string> {
+    const base = { ...gitEnv(), ...opts.env };
     // issue #1783 (R4): worker-marked ONLY when the subcommand can run no code the clone
     // configures (runnerGitCarriesWorkerMark), so a concurrent reap never kills that op. Every
     // other runner git here (status, add, commit, checkout, reset, merge, rebase, …) can start an
@@ -10960,24 +12873,29 @@ export class GitCache {
       if (abort) throw abort;
       return { kind: "not_owned" };
     }
-    return this.withLock(barePath, async () => {
-      const observed = await this.observeTrackingUnderLock(barePath, branch);
-      if (!observed?.sha || !observed.owner?.context || observed.owner.runId !== runId ||
-          (expectedSha !== undefined && observed.sha !== expectedSha) ||
-          (generation !== undefined && observed.owner.generation !== generation)) return { kind: "not_owned" };
-      try {
-        const context = await this.parseOwedContext(barePath,
-          await this.readOwedFile(barePath, observed.owner.context));
-        if ("origin" in context || this.contextName(context) !== observed.owner.context ||
-            context.runId !== runId || context.branch !== branch ||
-            context.generation !== observed.owner.generation) return { kind: "not_owned" };
-        return { kind: "owned", sha: observed.sha, context };
-      } catch (cause) {
-        const abort = this.boundaryAbortError(cause);
-        if (abort) throw abort;
-        return { kind: "not_owned" };
-      }
-    });
+    return this.withLock(barePath, () => this.committedTrackingOwnershipUnderLock(barePath, branch, runId, expectedSha, generation));
+  }
+
+  /** {@link committedTrackingOwnership} for a caller that already holds the bare lock. The
+   *  arguments are pre-validated by the public wrapper (or by the caller's own checks). */
+  private async committedTrackingOwnershipUnderLock(barePath: string, branch: string, runId: string,
+    expectedSha?: string, generation?: number): Promise<CommittedTrackingOwnership> {
+    const observed = await this.observeTrackingUnderLock(barePath, branch);
+    if (!observed?.sha || !observed.owner?.context || observed.owner.runId !== runId ||
+        (expectedSha !== undefined && observed.sha !== expectedSha) ||
+        (generation !== undefined && observed.owner.generation !== generation)) return { kind: "not_owned" };
+    try {
+      const context = await this.parseOwedContext(barePath,
+        await this.readOwedFile(barePath, observed.owner.context));
+      if ("origin" in context || this.contextName(context) !== observed.owner.context ||
+          context.runId !== runId || context.branch !== branch ||
+          context.generation !== observed.owner.generation) return { kind: "not_owned" };
+      return { kind: "owned", sha: observed.sha, context };
+    } catch (cause) {
+      const abort = this.boundaryAbortError(cause);
+      if (abort) throw abort;
+      return { kind: "not_owned" };
+    }
   }
 
   private async hasOwedAnchorUnderLock(barePath: string, runId: string, sha: string): Promise<boolean> {
@@ -12826,10 +14744,21 @@ async function isBareRepo(p: string): Promise<boolean> {
   return pathExists(path.join(p, "HEAD"));
 }
 
+/** issue #2886: the bounded bare name {@link bareDirName} falls back to; detected by format. */
+const HASHED_BARE_NAME = /^uzi-sha256-[0-9a-f]{64}\.git$/;
+/** Config key (as `git config --list` prints it, lowercased) holding the origin a bare was cloned from. */
+const BARE_CACHE_ORIGIN_KEY = "uzi.cacheorigin";
+/** The same key in the spelling `git clone -c` takes. */
+const BARE_CACHE_ORIGIN_KEY_CONFIG = "uzi.cacheOrigin";
+type BareCacheOrigin = { kind: "ok"; value: string } | { kind: "absent" } | { kind: "invalid" } | { kind: "unreadable" };
+
 /**
  * Filesystem-safe, collision-free bare-clone dir name for a repo URL: host plus
  * each path segment joined by '+'. '+' is illegal in GitHub/GitLab path
  * segments, so two names collide only for the same repo on the same host.
+ * A name over 255 UTF-8 bytes (one path component's limit) is replaced by
+ * `uzi-sha256-<sha256 hex of the raw input>.git`; such a bare records its origin in
+ * `uzi.cacheOrigin` and is reused only when that matches (issue #2886).
  * Examples:
  *   https://gitlab.com/org/repo.git  -> gitlab.com+org+repo.git
  *   git@gitlab.com:org/repo          -> gitlab.com+org+repo.git
@@ -12849,6 +14778,7 @@ export function bareDirName(rawUrl: string): string {
   let name = parts.join("+");
   if (!name.endsWith(".git")) name += ".git";
   if (name === ".git") name = "repo.git";
+  if (Buffer.byteLength(name, "utf8") > 255) return `uzi-sha256-${sha256Hex(rawUrl)}.git`;
   return name;
 }
 

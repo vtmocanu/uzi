@@ -46,7 +46,7 @@ func runAllPathsAssigned(t *testing.T, wire func(*Service), labels, assigneeIDs 
 		return err
 	})
 	invoke("CreateAutopilotRun", func(svc *Service) error {
-		_, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc")
+		_, err := svc.CreateAutopilotRun(context.Background(), user, repo, 4, "desc", nil)
 		return err
 	})
 	invoke("CreateScheduledAutopilotRun", func(svc *Service) error {

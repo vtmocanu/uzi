@@ -1,7 +1,9 @@
-import { afterEach, beforeEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it, type TestContext } from "node:test";
+import type { Dir, Dirent } from "node:fs";
 import assert from "node:assert/strict";
 import fsp from "node:fs/promises";
-import { existsSync, mkdtempSync, rmSync } from "node:fs";
+import { constants as FS, existsSync, mkdtempSync, rmSync } from "node:fs";
+import { execFileSync } from "node:child_process";
 import { tmpdir } from "node:os";
 import { randomBytes } from "node:crypto";
 import { dirname, join } from "node:path";
@@ -70,7 +72,542 @@ async function waitFor(cond: () => boolean, label: string, ms = 3000): Promise<v
   }
 }
 
+// The fake iterator deliberately has no return/finally cleanup. Only production
+// can close its real Dir on a synthetic error or early stop.
+interface ScanPlan {
+  path: string;
+  entry?: (index: number) => Dirent | undefined | Promise<Dirent | undefined>;
+  fault?: { phase: "open" | "iterate"; code: string; after?: number };
+}
+function scanEntry(name: string, directory = false): Dirent {
+  return {
+    name, parentPath: "",
+    isDirectory: () => directory, isFile: () => !directory,
+    isSymbolicLink: () => false, isBlockDevice: () => false,
+    isCharacterDevice: () => false, isFIFO: () => false, isSocket: () => false,
+  } as Dirent;
+}
+async function probeScans(t: TestContext, plans: ScanPlan[]) {
+  const identities = await Promise.all(plans.map((plan) => fsp.stat(plan.path)));
+  const open = fsp.open;
+  const opendir = fsp.opendir;
+  const readdir = fsp.readdir;
+  const records: { plan: ScanPlan; dir: Dir; yielded: number; buffer: number | undefined; beforeClose?: string }[] = [];
+  const handles: Awaited<ReturnType<typeof fsp.open>>[] = [];
+  const faults: string[] = [];
+  let eager = 0;
+  const match = async (path: Parameters<typeof fsp.opendir>[0]) => {
+    const st = await fsp.stat(path).catch(() => undefined);
+    return st ? identities.findIndex((id) => id.dev === st.dev && id.ino === st.ino) : -1;
+  };
+  t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+    const handle = await open(...args);
+    const id = await handle.stat();
+    const index = identities.findIndex((st) => st.dev === id.dev && st.ino === id.ino);
+    if (index >= 0) {
+      handles.push(handle);
+      const close = handle.close.bind(handle);
+      t.mock.method(handle, "close", async () => {
+        for (const record of records.filter((r) => r.plan === plans[index])) {
+          try { await record.dir.read(); record.beforeClose = "OPEN"; }
+          catch (error) { record.beforeClose = (error as NodeJS.ErrnoException).code; }
+        }
+        return close();
+      });
+    }
+    return handle;
+  });
+  t.mock.method(fsp, "readdir", async (path: Parameters<typeof fsp.readdir>[0], ...options: unknown[]) => {
+    if (await match(path) >= 0) { eager++; throw new Error("eager enumeration forbidden"); }
+    return Reflect.apply(readdir, fsp, [path, ...options]);
+  });
+  t.mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+    const index = await match(args[0]);
+    if (index < 0) return opendir(...args);
+    const plan = plans[index]!;
+    assert.match(String(args[0]), /^\/proc\/self\/fd\/\d+$/, "enumerate the held fd itself");
+    if (plan.fault?.phase === "open") {
+      faults.push(plan.fault.code);
+      throw Object.assign(new Error("injected enumeration open"), { code: plan.fault.code });
+    }
+    const dir = await opendir(...args);
+    const record = { plan, dir, yielded: 0, buffer: args[1]?.bufferSize, beforeClose: undefined as string | undefined };
+    records.push(record);
+    const real = dir[Symbol.asyncIterator].bind(dir);
+    t.mock.method(dir, Symbol.asyncIterator, () => {
+      const iterator = real();
+      let index = 0;
+      return {
+        [Symbol.asyncIterator]() { return this; },
+        async next() {
+          if (plan.fault?.phase === "iterate" && index === (plan.fault.after ?? 1)) {
+            faults.push(plan.fault.code);
+            throw Object.assign(new Error("injected enumeration advance"), { code: plan.fault.code });
+          }
+          const next = plan.entry
+            ? { value: await plan.entry(index), done: false }
+            : await iterator.next();
+          index++;
+          if (next.done || next.value === undefined) return { done: true as const, value: undefined };
+          record.yielded++;
+          return { done: false as const, value: next.value };
+        },
+      };
+    });
+    return dir;
+  });
+  return {
+    records, faults,
+    async verify() {
+      assert.equal(eager, 0, "no targeted eager listings");
+      for (const record of records) {
+        assert.equal(record.buffer, 1);
+        assert.equal(record.beforeClose, "ERR_DIR_CLOSED", "real Dir closes BEFORE held FileHandle");
+        await assert.rejects(record.dir.read(), { code: "ERR_DIR_CLOSED" });
+      }
+      for (const handle of handles) assert.equal(handle.fd, -1);
+    },
+    yields(path: string) { return records.filter((r) => r.plan.path === path).map((r) => r.yielded); },
+  };
+}
+
 const LINUX_ONLY = process.platform !== "linux" ? "no /proc/self/fd on this host: fd-anchored Codex sessions require Linux" : false;
+
+describe("streamed session scans", { skip: LINUX_ONLY }, () => {
+  let root: string;
+  let source: string;
+  let store: string;
+  const claimed = "aaaaaaaa-bbbb-cccc-dddd-eeeeeeeeeeee";
+  const rollout = `rollout-${claimed}.jsonl`;
+  beforeEach(() => {
+    root = mkdtempSync(join(tmpdir(), "uzi-stream-scans-"));
+    source = join(root, "source");
+    store = join(root, "store");
+  });
+  afterEach(() => rmSync(root, { recursive: true, force: true }));
+
+  for (const operation of ["inspect", "inspectSession"] as const) {
+    it(`${operation}: a candidate swapped to a FIFO cannot block the store lock`, async (t) => {
+      await writeFileAt(join(source, "sessions", rollout), "{}");
+      await CodexSessionStore.persist(source, store);
+      const sessions = join((await currentGenDir(store))!, "sessions");
+      const candidate = join(sessions, rollout);
+      const identity = await fsp.stat(sessions);
+      const probe = await probeScans(t, [{ path: sessions }]);
+      const open = fsp.open;
+      let fired = 0;
+      let yieldedAtSwap: number | undefined;
+      let observedFlags: Parameters<typeof fsp.open>[1];
+      let candidateHandle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+      let result;
+      try {
+        t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+          const path = String(args[0]);
+          if (path.endsWith(`/${rollout}`)) {
+            const st = await fsp.stat(dirname(path)).catch(() => undefined);
+            if (st && st.dev === identity.dev && st.ino === identity.ino) {
+              fired++;
+              yieldedAtSwap = probe.records[0]?.yielded;
+              await fsp.unlink(candidate);
+              execFileSync("mkfifo", [candidate]);
+              observedFlags = args[1];
+              // Refuse a blocking open so the unfixed code fails without hanging.
+              if (typeof observedFlags !== "number" || !(observedFlags & FS.O_NONBLOCK)) {
+                throw new Error("candidate open would block on the FIFO");
+              }
+              candidateHandle = await open(...args);
+              return candidateHandle;
+            }
+          }
+          return open(...args);
+        });
+        result = operation === "inspect"
+          ? await CodexSessionStore.inspect(store)
+          : await CodexSessionStore.inspectSession(store, claimed);
+      } finally { t.mock.restoreAll(); }
+      assert.equal(fired, 1);
+      assert.equal(yieldedAtSwap, 1, "regular candidate was yielded before the swap");
+      assert.ok(typeof observedFlags === "number" && (observedFlags & FS.O_NONBLOCK),
+        "presence candidate open must be nonblocking");
+      assert.equal((await fsp.lstat(candidate)).isFIFO(), true);
+      assert.ok(candidateHandle, "the real FIFO was opened");
+      assert.equal(candidateHandle.fd, -1, "FIFO FileHandle closes after rejecting its stat");
+      assert.equal(result, "absent");
+      assert.deepEqual(probe.yields(sessions), [1]);
+      await probe.verify();
+    });
+  }
+
+  for (const operation of ["inspect", "inspectSession"] as const) {
+    for (const outcome of ["cap", "success", "exhaustion"] as const) {
+      it(`${operation}: shared recursive budget, denied entries, ${outcome} and closure`, async (t) => {
+        await writeFileAt(join(source, "sessions", "branch", rollout), "{}");
+        await CodexSessionStore.persist(source, store);
+        const sessions = join((await currentGenDir(store))!, "sessions");
+        const child = join(sessions, "branch");
+        const probe = await probeScans(t, [
+          { path: sessions, entry: (i) => [scanEntry("auth-dir", true), scanEntry("branch", true)][i] },
+          { path: child, entry: (i) => [scanEntry("junk.txt"), scanEntry(outcome === "exhaustion" ? "other.txt" : rollout), scanEntry("beyond.txt")][i] },
+        ]);
+        let result;
+        try {
+          const opts = { scanCap: outcome === "cap" ? 2 : 5 };
+          result = operation === "inspect" ? await CodexSessionStore.inspect(store, opts)
+            : await CodexSessionStore.inspectSession(store, claimed, opts);
+        } finally { t.mock.restoreAll(); }
+        assert.equal(result, outcome === "cap" ? "unknown" : outcome === "success" ? "present" : "absent");
+        assert.deepEqual(probe.yields(sessions), [2]);
+        assert.deepEqual(probe.yields(child), [outcome === "cap" ? 1 : outcome === "success" ? 2 : 3]);
+        await probe.verify();
+      });
+    }
+  }
+
+  for (const operation of ["inspect", "inspectSession"] as const) {
+    it(`${operation}: retains its existing depth policy independently of scan entries`, async (t) => {
+      const depth = DEFAULT_SESSION_STORE_BOUNDS.maxDepth! + 1;
+      const components = Array.from({ length: depth }, () => "branch");
+      const gen = await seedGeneration(store, { [join(...components, rollout)]: "{}" });
+      const sessions = join(store, "generations", gen, "sessions");
+      const paths = Array.from({ length: depth + 1 }, (_, i) => join(sessions, ...components.slice(0, i)));
+      const probe = await probeScans(t, paths.map((path) => ({ path })));
+      let result;
+      try {
+        result = operation === "inspect" ? await CodexSessionStore.inspect(store, { scanCap: depth + 1 })
+          : await CodexSessionStore.inspectSession(store, claimed, { scanCap: depth + 1 });
+      } finally { t.mock.restoreAll(); }
+      assert.equal(result, operation === "inspect" ? "present" : "unknown");
+      assert.equal(probe.records.length, operation === "inspect" ? depth + 1 : depth);
+      assert.ok(probe.records.every((record) => record.yielded === 1));
+      await probe.verify();
+    });
+  }
+
+  it("persist: recursive scan bound preserves current and charges nonallowlisted directories", async (t) => {
+    await writeFileAt(join(source, "sessions", rollout), "old");
+    await CodexSessionStore.persist(source, store);
+    const previous = await currentGenId(store);
+    await fsp.mkdir(join(source, "sessions", "branch"));
+    const sessions = join(source, "sessions");
+    const probe = await probeScans(t, [
+      { path: sessions, entry: (i) => [scanEntry(rollout), scanEntry("auth-dir", true), scanEntry("branch", true)][i] },
+      { path: join(sessions, "branch"), entry: (i) => i < 5 ? scanEntry("junk.txt") : undefined },
+    ]);
+    let error: unknown;
+    try {
+      await CodexSessionStore.persist(source, store, { bounds: { ...DEFAULT_SESSION_STORE_BOUNDS, maxScanEntries: 3 } });
+    } catch (caught) { error = caught; }
+    finally { t.mock.restoreAll(); }
+    assert.ok(error instanceof CodexSessionStoreBoundError);
+    assert.equal(error.bound, "maxScanEntries");
+    assert.equal(error.limit, 3);
+    assert.equal(await currentGenId(store), previous);
+    assert.equal(await CodexSessionStore.inspectSession(store, claimed), "present");
+    assert.deepEqual(probe.yields(sessions), [3]);
+    assert.deepEqual(probe.yields(join(sessions, "branch")), [1]);
+    await probe.verify();
+  });
+
+  for (const operation of ["adopt", "seed"] as const) {
+    it(`${operation}: default scan budget stops at a bounded recursive prefix`, async (t) => {
+      await writeFileAt(join(source, "sessions", rollout), "prefix");
+      await fsp.mkdir(join(source, "sessions", "branch"));
+      await CodexSessionStore.persist(source, store);
+      const sessions = operation === "adopt" ? join((await currentGenDir(store))!, "sessions") : join(source, "sessions");
+      const cap = DEFAULT_SESSION_STORE_BOUNDS.maxScanEntries;
+      const probe = await probeScans(t, [
+        { path: sessions, entry: (i) => [scanEntry(rollout), scanEntry("auth-dir", true), scanEntry("branch", true)][i] },
+        { path: join(sessions, "branch"), entry: (i) => i < cap + 10 ? scanEntry("junk.txt") : undefined },
+      ]);
+      const dest = join(root, "dest");
+      let result;
+      try {
+        result = operation === "adopt" ? await CodexSessionStore.adopt(store, dest)
+          : await seedCodexSessionArtifacts(sessions, join(dest, "sessions"));
+      } finally { t.mock.restoreAll(); }
+      assert.deepEqual(result, operation === "adopt" ? { files: 1 } : { files: 1, bytes: 6 });
+      assert.deepEqual(probe.yields(sessions), [3]);
+      assert.deepEqual(probe.yields(join(sessions, "branch")), [cap - 2]);
+      assert.deepEqual(await collectRelFiles(dest), [`sessions/${rollout}`]);
+      await probe.verify();
+    });
+  }
+
+  it("persist cleanup: independent budgets, kept generations and deletion only within the consumed prefix", async (t) => {
+    await writeFileAt(join(source, "sessions", rollout), "new");
+    await CodexSessionStore.persist(source, store);
+    const previous = (await currentGenId(store))!;
+    const gens = join(store, "generations");
+    for (const name of ["old-first", "old-beyond"]) await fsp.mkdir(join(gens, name));
+    for (const name of [".current.tmp.first", ".current.tmp.last", ".current.tmp.beyond"]) await writeFileAt(join(store, name), "temp");
+    const probe = await probeScans(t, [
+      { path: join(source, "sessions"), entry: (i) => i === 0 ? scanEntry(rollout) : undefined },
+      { path: store, entry: (i) => [scanEntry(".current.tmp.first"), scanEntry("unrelated.txt"), scanEntry(".current.tmp.last"), scanEntry(".current.tmp.beyond"), scanEntry(".current.tmp.unconsumed")][i] },
+      { path: gens, entry: async (i) => [scanEntry((await currentGenId(store))!, true), scanEntry(previous, true), scanEntry("old-first", true), scanEntry("old-beyond", true), scanEntry("unconsumed", true)][i] },
+    ]);
+    try {
+      await CodexSessionStore.persist(source, store, { bounds: { ...DEFAULT_SESSION_STORE_BOUNDS, maxScanEntries: 3 } });
+    } finally { t.mock.restoreAll(); }
+    const current = (await currentGenId(store))!;
+    assert.notEqual(current, previous);
+    assert.equal(existsSync(join(gens, current)), true);
+    assert.equal(existsSync(join(gens, previous)), true);
+    assert.equal(existsSync(join(gens, "old-first")), false);
+    assert.equal(existsSync(join(gens, "old-beyond")), true);
+    assert.equal(existsSync(join(store, ".current.tmp.first")), false);
+    assert.equal(existsSync(join(store, ".current.tmp.last")), false);
+    assert.equal(existsSync(join(store, ".current.tmp.beyond")), true);
+    assert.deepEqual(probe.yields(join(source, "sessions")), [1]);
+    assert.deepEqual(probe.yields(store), [4]);
+    assert.deepEqual(probe.yields(gens), [4]);
+    await probe.verify();
+  });
+
+  it("persist: copy and both cleanup scans exhaust and close their held descriptors", async (t) => {
+    await writeFileAt(join(source, "sessions", "branch", rollout), "new");
+    await CodexSessionStore.persist(source, store);
+    const previous = (await currentGenId(store))!;
+    const gens = join(store, "generations");
+    await fsp.mkdir(join(gens, "orphan"));
+    await writeFileAt(join(store, ".current.tmp.orphan"), "temp");
+    const sessions = join(source, "sessions");
+    const probe = await probeScans(t, [
+      { path: sessions }, { path: join(sessions, "branch") },
+      { path: store }, { path: gens },
+    ]);
+    let result;
+    try { result = await CodexSessionStore.persist(source, store); }
+    finally { t.mock.restoreAll(); }
+    assert.equal(result.files, 1);
+    assert.deepEqual(probe.yields(sessions), [1]);
+    assert.deepEqual(probe.yields(join(sessions, "branch")), [1]);
+    assert.equal(probe.records.length, 4, "copy levels, reap and sweep all streamed");
+    assert.equal(probe.yields(gens)[0], 3, "new, previous and orphan consumed before exhaustion");
+    assert.equal(probe.yields(store)[0], 3, "current, generations and stale temp consumed");
+    assert.equal(existsSync(join(gens, previous)), true);
+    assert.equal(existsSync(join(gens, "orphan")), false);
+    assert.equal(existsSync(join(store, ".current.tmp.orphan")), false);
+    await probe.verify();
+  });
+
+  for (const operation of ["adopt", "seed"] as const) {
+    it(`${operation}: within-budget copy exhausts and closes each recursive iterator`, async (t) => {
+      await writeFileAt(join(source, "sessions", "branch", rollout), "copy");
+      await CodexSessionStore.persist(source, store);
+      const sessions = operation === "adopt" ? join(await currentGenDir(store), "sessions") : join(source, "sessions");
+      const probe = await probeScans(t, [{ path: sessions }, { path: join(sessions, "branch") }]);
+      const dest = join(root, "dest");
+      let result;
+      try {
+        result = operation === "adopt" ? await CodexSessionStore.adopt(store, dest)
+          : await seedCodexSessionArtifacts(sessions, join(dest, "sessions"));
+      } finally { t.mock.restoreAll(); }
+      assert.equal(result.files, 1);
+      assert.equal(await fsp.readFile(join(dest, "sessions", "branch", rollout), "utf8"), "copy");
+      assert.deepEqual(probe.yields(sessions), [1]);
+      assert.deepEqual(probe.yields(join(sessions, "branch")), [1]);
+      assert.equal(probe.records.length, 2);
+      await probe.verify();
+    });
+  }
+
+  for (const operation of ["inspect", "inspectSession", "copy"] as const) {
+    for (const nested of [false, true]) {
+      for (const phase of ["open", "iterate"] as const) {
+        for (const code of ["ENOENT", "ENOTDIR", "EIO", "ELOOP"]) {
+          it(`${operation}: ${nested ? "nested" : "root"} enumeration ${phase} ${code} policy and cleanup`, async (t) => {
+            await writeFileAt(join(source, "sessions", rollout), "prefix");
+            await writeFileAt(join(source, "sessions", "branch", "junk.txt"), "x");
+            await writeFileAt(join(source, "sessions", "after.jsonl"), "sibling");
+            await CodexSessionStore.persist(source, store);
+            const sessions = operation === "copy" ? join(source, "sessions") : join((await currentGenDir(store))!, "sessions");
+            // Copy skips an unreadable directory and continues siblings. Presence
+            // must not call incomplete root OR nested enumeration absence.
+            if (operation !== "copy") await fsp.mkdir(join(sessions, "branch"), { recursive: true });
+            const probe = await probeScans(t, [
+              { path: sessions, entry: (i) => (operation === "copy"
+                ? [scanEntry(rollout), scanEntry("branch", true), scanEntry("after.jsonl")]
+                : [scanEntry("branch", true)])[i], fault: nested ? undefined : { phase, code } },
+              { path: join(sessions, "branch"), entry: (i) => i < 3 ? scanEntry("junk.txt") : undefined, fault: nested ? { phase, code } : undefined },
+            ]);
+            let result;
+            try {
+              result = operation === "copy" ? await CodexSessionStore.persist(source, store)
+                : operation === "inspect" ? await CodexSessionStore.inspect(store)
+                : await CodexSessionStore.inspectSession(store, claimed);
+            } finally { t.mock.restoreAll(); }
+            if (operation === "copy") {
+              assert.equal((result as PersistResult).files, nested ? 2 : phase === "open" ? 0 : 1);
+              assert.equal(await currentGenId(store) !== undefined, true);
+            } else assert.equal(result, "unknown");
+            assert.deepEqual(probe.faults, [code], "fault really fired");
+            assert.deepEqual(probe.yields(nested ? join(sessions, "branch") : sessions), phase === "open" ? [] : [1]);
+            await probe.verify();
+          });
+        }
+      }
+    }
+  }
+
+  for (const operation of ["inspect", "inspectSession"] as const) {
+    for (const target of ["sessions", "child", "file"] as const) {
+      for (const code of ["ENOENT", "ENOTDIR", "ELOOP", "EIO"]) {
+        it(`${operation}: ${target} open ${code} classification`, async (t) => {
+          await writeFileAt(join(source, "sessions", "branch", rollout), "{}");
+          await CodexSessionStore.persist(source, store);
+          const gen = (await currentGenDir(store))!;
+          const parent = target === "sessions" ? gen : target === "child" ? join(gen, "sessions") : join(gen, "sessions", "branch");
+          const identity = await fsp.stat(parent);
+          const name = target === "sessions" ? "sessions" : target === "child" ? "branch" : rollout;
+          const open = fsp.open;
+          let fired = 0;
+          t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+            const path = String(args[0]);
+            if (path.endsWith(`/${name}`)) {
+              const st = await fsp.stat(dirname(path)).catch(() => undefined);
+              if (st && st.dev === identity.dev && st.ino === identity.ino) {
+                fired++;
+                throw Object.assign(new Error("injected child open"), { code });
+              }
+            }
+            return open(...args);
+          });
+          let result;
+          try {
+            result = operation === "inspect" ? await CodexSessionStore.inspect(store)
+              : await CodexSessionStore.inspectSession(store, claimed);
+          } finally { t.mock.restoreAll(); }
+          const unknown = code === "EIO"
+            || (target === "sessions" && operation === "inspect" && code === "ELOOP")
+            || (target === "file" && operation === "inspectSession" && code === "ENOTDIR");
+          assert.equal(result, unknown ? "unknown" : "absent");
+          assert.equal(fired, 1);
+        });
+      }
+    }
+
+    it(`${operation}: real session, child and candidate symlinks never supply presence`, async () => {
+      await writeFileAt(join(source, "sessions", "branch", rollout), "{}");
+      await CodexSessionStore.persist(source, store);
+      const gen = (await currentGenDir(store))!;
+      const sessions = join(gen, "sessions");
+      const outside = join(root, "outside");
+      await writeFileAt(join(outside, rollout), "outside");
+      const inspect = () => operation === "inspect" ? CodexSessionStore.inspect(store) : CodexSessionStore.inspectSession(store, claimed);
+      await fsp.rm(join(sessions, "branch"), { recursive: true });
+      await fsp.symlink(outside, join(sessions, "branch"));
+      await fsp.symlink(join(outside, rollout), join(sessions, rollout));
+      assert.equal(await inspect(), "absent");
+      await fsp.rename(sessions, join(gen, "saved"));
+      await fsp.symlink(outside, sessions);
+      // Linux O_DIRECTORY|O_NOFOLLOW reports ENOTDIR for this symlink.
+      assert.equal(await inspect(), "absent");
+    });
+
+    for (const target of ["sessions", "child", "ancestor"] as const) {
+      it(`${operation}: ${target} swap after open stays on the pinned inode`, async (t) => {
+        await writeFileAt(join(source, "sessions", "branch", "junk.txt"), "x");
+        await CodexSessionStore.persist(source, store);
+        const gen = (await currentGenDir(store))!;
+        const sessions = join(gen, "sessions");
+        const child = join(sessions, "branch");
+        await writeFileAt(join(child, "junk.txt"), "x");
+        const outside = join(root, "outside");
+        await writeFileAt(join(outside, rollout), "outside");
+        const pinned = target === "child" ? child : sessions;
+        const identity = await fsp.stat(pinned);
+        const probe = await probeScans(t, [{ path: pinned }]);
+        const open = fsp.open;
+        let swapped = false;
+        t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+          const handle = await open(...args);
+          const st = await handle.stat();
+          if (!swapped && st.dev === identity.dev && st.ino === identity.ino) {
+            swapped = true;
+            const moved = target === "ancestor" ? gen : pinned;
+            await fsp.rename(moved, `${moved}-saved`);
+            await fsp.symlink(outside, moved);
+          }
+          return handle;
+        });
+        let result;
+        try {
+          result = operation === "inspect" ? await CodexSessionStore.inspect(store)
+            : await CodexSessionStore.inspectSession(store, claimed);
+        } finally { t.mock.restoreAll(); }
+        assert.equal(swapped, true);
+        assert.equal(result, "absent", "outside rollout must not be observed");
+        assert.equal(probe.records.length, 1);
+        assert.equal(probe.records[0]!.yielded, 1);
+        await probe.verify();
+      });
+    }
+  }
+
+  for (const seam of ["read", "write"] as const) {
+    it(`copy consumer ${seam} error is not swallowed as enumeration failure`, async (t) => {
+      await writeFileAt(join(source, "sessions", rollout), "old");
+      await CodexSessionStore.persist(source, store);
+      const previous = await currentGenId(store);
+      const identity = await fsp.stat(join(source, "sessions", rollout));
+      const probe = await probeScans(t, [{ path: join(source, "sessions") }]);
+      const open = fsp.open;
+      let fired = 0;
+      t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+        const handle = await open(...args);
+        const st = await handle.stat();
+        if ((seam === "read" && st.dev === identity.dev && st.ino === identity.ino)
+          || (seam === "write" && String(args[0]).endsWith(`/${rollout}`) && st.ino !== identity.ino)) {
+          t.mock.method(handle, seam === "read" ? "read" : "writeFile", async () => {
+            fired++;
+            throw Object.assign(new Error("injected consumer I/O"), { code: "EIO" });
+          });
+        }
+        return handle;
+      });
+      let error;
+      try { await CodexSessionStore.persist(source, store); }
+      catch (caught) { error = caught; }
+      finally { t.mock.restoreAll(); }
+      assert.ok(error);
+      assert.equal(fired, 1);
+      assert.equal(await currentGenId(store), previous);
+      await probe.verify();
+    });
+  }
+
+  for (const target of ["sweep", "reap"] as const) {
+    for (const phase of ["open", "iterate"] as const) {
+      for (const code of ["ENOENT", "ENOTDIR", "EIO", "ELOOP"]) {
+        it(`post-publication ${target} ${phase} ${code} stays local`, async (t) => {
+          await writeFileAt(join(source, "sessions", rollout), "old");
+          await CodexSessionStore.persist(source, store);
+          const previous = (await currentGenId(store))!;
+          await writeFileAt(join(source, "sessions", rollout), "new");
+          const gens = join(store, "generations");
+          await fsp.mkdir(join(gens, "orphan"));
+          await writeFileAt(join(store, ".current.tmp.orphan"), "temp");
+          const path = target === "sweep" ? store : gens;
+          const probe = await probeScans(t, [{
+            path, entry: (i) => i < 3 ? scanEntry(target === "sweep" ? "junk.txt" : previous, target === "reap") : undefined,
+            fault: { phase, code },
+          }]);
+          let result;
+          try { result = await CodexSessionStore.persist(source, store); }
+          finally { t.mock.restoreAll(); }
+          assert.equal(result.files, 1);
+          const current = (await currentGenId(store))!;
+          assert.notEqual(current, previous);
+          assert.equal(await fsp.readFile(join(gens, current, "sessions", rollout), "utf8"), "new");
+          assert.equal(existsSync(join(gens, previous)), true);
+          assert.equal(await CodexSessionStore.inspectSession(store, claimed), "present");
+          assert.deepEqual(probe.faults, [code]);
+          await probe.verify();
+        });
+      }
+    }
+  }
+});
 
 describe("claimed Codex thread lookup", () => {
   it("finds only the claimed rollout in the current generation", { skip: LINUX_ONLY }, async () => {
@@ -401,6 +938,108 @@ describe(
         return true;
       },
     );
+  });
+
+  it("session directory enumeration stops after the first over-cap entry", async (t) => {
+    const sessionsDir = join(codexHome, "sessions");
+    for (let i = 0; i < 80; i += 1) {
+      await writeFileAt(join(sessionsDir, `junk-${i}.txt`), "x");
+    }
+    const tiny: SessionStoreBounds = { ...DEFAULT_SESSION_STORE_BOUNDS, maxFiles: 1, maxScanEntries: 5 };
+    const sourceIdentity = await fsp.stat(sessionsDir);
+    const originalOpen = fsp.open;
+    const originalOpendir = fsp.opendir;
+    const originalReaddir = fsp.readdir;
+    let sourceHandle: Awaited<ReturnType<typeof fsp.open>> | undefined;
+    const directories: Awaited<ReturnType<typeof fsp.opendir>>[] = [];
+    const bufferSizes: (number | undefined)[] = [];
+    const closedBeforeHandle: (string | undefined)[] = [];
+    let eagerAttempts = 0;
+    let yieldedEntries = 0;
+    let persistError: unknown;
+
+    // Match the inode pinned by the production source handle, including fd aliases.
+    const isHeldSource = async (path: Parameters<typeof fsp.opendir>[0]): Promise<boolean> => {
+      if (!sourceHandle || sourceHandle.fd < 0) return false;
+      const [held, listed] = await Promise.all([sourceHandle.stat(), fsp.stat(path)]);
+      return held.dev === listed.dev && held.ino === listed.ino;
+    };
+
+    try {
+      t.mock.method(fsp, "open", async (...args: Parameters<typeof fsp.open>) => {
+        const handle = await originalOpen(...args);
+        const identity = await handle.stat();
+        if (identity.dev === sourceIdentity.dev && identity.ino === sourceIdentity.ino) {
+          sourceHandle = handle;
+          const originalClose = handle.close.bind(handle);
+          t.mock.method(handle, "close", async () => {
+            // Node's Dir iterator closes internally; a public close() spy misses it.
+            for (const directory of directories) {
+              let code: string | undefined;
+              try {
+                await directory.read();
+              } catch (error) {
+                code = (error as NodeJS.ErrnoException).code;
+              }
+              closedBeforeHandle.push(code);
+            }
+            return originalClose();
+          });
+        }
+        return handle;
+      });
+      t.mock.method(fsp, "readdir", async (
+        path: Parameters<typeof fsp.readdir>[0],
+        ...options: unknown[]
+      ) => {
+        if (await isHeldSource(path)) {
+          eagerAttempts += 1;
+          throw new Error("eager source directory enumeration is forbidden");
+        }
+        return Reflect.apply(originalReaddir, fsp, [path, ...options]);
+      });
+      t.mock.method(fsp, "opendir", async (...args: Parameters<typeof fsp.opendir>) => {
+        const targeted = await isHeldSource(args[0]);
+        const directory = await originalOpendir(...args);
+        if (targeted) {
+          directories.push(directory);
+          bufferSizes.push(args[1]?.bufferSize);
+          const originalIterator = directory[Symbol.asyncIterator].bind(directory);
+          t.mock.method(directory, Symbol.asyncIterator, async function* () {
+            // Returning from this wrapper forwards iterator cleanup to the real Dir.
+            for await (const entry of originalIterator()) {
+              yieldedEntries += 1;
+              yield entry;
+            }
+          });
+        }
+        return directory;
+      });
+      try {
+        await CodexSessionStore.persist(codexHome, storeDir, { bounds: tiny });
+      } catch (error) {
+        persistError = error;
+      }
+    } finally {
+      t.mock.restoreAll();
+    }
+
+    // Assert outside the listing-error catch in copyAllowlistedSessions and all mocks.
+    assert.equal(eagerAttempts, 0, "source enumeration must not attempt eager readdir");
+    assert.equal(directories.length, 1, "the held source directory must be streamed");
+    assert.deepEqual(bufferSizes, [1], "streaming must buffer only one entry");
+    assert.equal(yieldedEntries, tiny.maxScanEntries + 1, "stop at the first over-cap junk entry");
+    for (const directory of directories) {
+      await assert.rejects(() => directory.read(), { code: "ERR_DIR_CLOSED" });
+    }
+    assert.deepEqual(closedBeforeHandle, ["ERR_DIR_CLOSED"], "Dir must close before its source handle");
+    assert.ok(sourceHandle, "the source directory handle was observed");
+    assert.equal(sourceHandle.fd, -1, "the held source handle must also close");
+    assert.ok(persistError instanceof CodexSessionStoreBoundError);
+    assert.equal(persistError.bound, "maxScanEntries");
+    assert.equal(persistError.limit, tiny.maxScanEntries);
+    assert.equal(await currentGenId(storeDir), undefined, "an over-cap scan must publish no pointer");
+    assert.equal(existsSync(join(storeDir, "current")), false, "no current pointer was created");
   });
 
   it("FIX 2: a within-bounds nested tree copies with the correct files/bytes tally", async () => {

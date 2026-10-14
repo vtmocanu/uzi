@@ -1252,10 +1252,12 @@ func pushRefSpec(ref string) config.RefSpec {
 // health pings. Its concrete transport supports go-git's endpoint TLS/proxy options.
 // The client follows a redirect only while it stays on the original request's scheme,
 // hostname and effective port (redirectguard.SameOrigin), composed after go-git's
-// own policy (redirects only on the initial discovery request). go-git alone admits
-// a same-host redirect that changes scheme or port, and net/http re-sends the
-// BasicAuth header to the same hostname, so without this the PAT could leave in
-// cleartext or reach another port before go-git's later endpoint check runs.
+// own policy (redirects only on the initial discovery request; since v5.19.3 it also
+// refuses an https-to-http downgrade and strips credentials across origin changes,
+// except a same-host, default-port http-to-https upgrade). go-git alone still
+// follows a same-host redirect to another port or from http to https, so without
+// this the discovery request could be served by an origin other than the
+// configured one before go-git's later endpoint check runs.
 var brokerHTTPClient = &http.Client{
 	// Explicit, not nil: go-git type-asserts *http.Transport when an endpoint carries
 	// TLS or proxy options.

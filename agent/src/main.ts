@@ -10,7 +10,7 @@ import { selectCodexBinding, CodexSelectionError } from "./codex/select.js";
 import { CodexExecutor, FailClosedExecutor, CODEX_PRODUCTION_PROVIDER, makeProductionCodexAdviceHarnessFactory } from "./codex/codex-executor.js";
 import { ChatExecutor, type ChatExecutorLike } from "./chat-executor.js";
 import { StubChatExecutor } from "./chat-executor-stub.js";
-import { RunRunner, type ExecutorFactory, type RunExecution } from "./runner.js";
+import { RunRunner, type ExecutorFactory, type RunExecution, type RunnerOptions } from "./runner.js";
 import { ChatRunner } from "./chat-runner.js";
 import { Outbox, deriveTerminalReserveBytes } from "./outbox.js";
 import { ActiveRunRegistry } from "./active-run-registry.js";
@@ -28,6 +28,7 @@ import { stubJobQueryFn } from "./job-runner-stub.js";
 import { Worker } from "./worker.js";
 import { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import { createDindPrune, DindPruneGate } from "./dind-prune.js";
+import { RetainedSourceServer } from "./ops/retained-source-server.js";
 import { DindMaintenanceController } from "./dind-maintenance.js";
 import { reclaimStrandedRunHomes, type RunStatusLookup } from "./home-reclaim.js";
 import { CachesDroppedMemo, DiskPressureController, modelPassMinAgeMs, runDiskReclaimPass } from "./disk-reclaim.js";
@@ -56,6 +57,20 @@ export function buildWorkerGitCache(
     recoveryDecodedLimitBytes: config.recoveryDecodedLimitBytes,
     terminalRecordProtection,
   });
+}
+
+/** Only the stub lane may accelerate retry spacing. No predicates or pass cap change. */
+export function buildRecoveryLiveTiming(
+  executor: ExecutorKind,
+  log: Logger,
+  env: NodeJS.ProcessEnv = process.env,
+): RunnerOptions["recoveryLiveTiming"] {
+  if (env.UZI_E2E_RECOVERY_FAST_REDRIVE !== "1") return undefined;
+  if (executor !== "stub") {
+    log.warn("UZI_E2E_RECOVERY_FAST_REDRIVE ignored outside the stub executor");
+    return undefined;
+  }
+  return { liveBackoffBaseMs: 1_000, liveBackoffCapMs: 5_000 };
 }
 
 /**
@@ -148,6 +163,7 @@ let shutdownSignal: "SIGINT" | "SIGTERM" | undefined;
  *  supplies lightweight stand-ins (a `nullLogger()`, a throwaway `WorkerClient`, a
  *  temp dir, a fabricated `DockerWiring`). */
 export interface BuildRunExecutorDeps {
+  codexAdviceHarnessFactory?: import("./codex/codex-executor.js").CodexAdviceHarnessFactory;
   log: Logger;
   client: WorkerClient;
   sdkHomeRoot: string;
@@ -255,6 +271,8 @@ export function buildRunExecutor(runId: string, codex: ClaimCodexSecrets | undef
       runHome,
       {
         binding: selection.binding,
+        summaryClaimCodex: codex,
+        codexAdviceHarnessFactory: deps.codexAdviceHarnessFactory,
         client,
         provider: CODEX_PRODUCTION_PROVIDER,
         // The nix/devbox provisioning HOME + root stay SHARED worker-lifetime paths
@@ -510,6 +528,7 @@ async function main(): Promise<void> {
       client,
       sdkHomeRoot,
       executorKind: config.executor,
+      codexAdviceHarnessFactory,
       stubPlanGate: config.stubPlanGate,
       workerTokenFile: config.workerTokenFile,
       dockerWiring: config.dockerWiring,
@@ -567,9 +586,14 @@ async function main(): Promise<void> {
     thresholdOf: () => client.diskPressureThreshold,
     reclaim: () => reclaimNow?.() ?? Promise.resolve(),
   });
+  // issue #1786: the runner's stopped-source retention exits notify the operator channel (built below
+  // from the runner), which logs the bounded retained count and bytes. Late-bound for that reason.
+  let notifyRetained: (() => void) | undefined;
   const runner = new RunRunner(client, git, makeExecutor, log, config.messageBatchMs, config.workerToken, {
     memoryRuntime: memory,
+    recoveryLiveTiming: buildRecoveryLiveTiming(config.executor, log),
     pollMs: config.pollIntervalMs,
+    onSourceRetained: () => notifyRetained?.(),
     planApprovalTimeoutMs: config.planApprovalTimeoutMs,
     checkpointIntervalMs: config.checkpointIntervalMs,
     // issue #1597 M2: the mid-turn checkpoint tick cadence (CHECKPOINT_TICK_INTERVAL; 0 disables).
@@ -828,6 +852,13 @@ async function main(): Promise<void> {
           log,
         })
       : undefined;
+  // issue #1786: the operator retained-source channel (a local 0600 Unix socket, started and closed
+  // by Worker.run). Its idle probe reads the worker's own active sets, hence the late-bound `worker`.
+  const retainedSource = new RetainedSourceServer({
+    dataDir: config.dataDir, git, client, gate: dindGate, runner, log,
+    isIdle: () => worker?.isIdle() ?? false,
+  });
+  notifyRetained = () => { void retainedSource.reportRetained(); };
   worker = new Worker(
     config,
     client,
@@ -850,6 +881,10 @@ async function main(): Promise<void> {
     dindMaintenance,
     terminalRejections,
     crossCheckRunner,
+    // issue #1786: the claim gate is shared with the operator retained-source channel on every
+    // worker, DinD or not.
+    dindGate,
+    retainedSource,
     memory,
   );
 

@@ -38,7 +38,7 @@ export function workerCrossCheckBadge(
   const active = w.active_cross_checks;
   if ((cap == null || cap <= 0) && active === 0) return null;
   return {
-    label: `${active}/${cap ?? "?"} cross-checks`,
+    label: `${active}/${cap ?? "?"} ${active === 1 ? "cross-check" : "cross-checks"}`,
     tone: active > 0 ? "warning" : "neutral",
     title: cap == null
       ? `Running ${active} cross-checks; slot capacity is unadvertised`

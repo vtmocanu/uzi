@@ -394,3 +394,21 @@ describe("RunCredential chip structure (web-ux F19/F20/F21)", () => {
     expect(badge?.textContent).toMatch(/console-key/);
   });
 });
+
+it("keeps the recorded snapshot in the tooltip when the compact label is substituted", () => {
+  render(<RunCredential run={cred({ label: "default" })} variant="compact" displayLabel="claude" />);
+  const label = screen.getByText("claude");
+  expect(label.parentElement?.title).toContain('“default”');
+});
+
+it("ignores list label overrides on full detail chips", () => {
+  render(<RunCredential run={cred({ label: "default" })} displayLabel="claude" />);
+  expect(screen.getByText("default")).toBeTruthy();
+  expect(screen.queryByText("claude")).toBeNull();
+});
+
+
+it("shows the recorded default on full detail chips without a list override", () => {
+  render(<RunCredential run={cred({ label: "default" })} />);
+  expect(screen.getByText("default")).toBeTruthy();
+});

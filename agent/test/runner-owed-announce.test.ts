@@ -7,7 +7,8 @@ import type { Readable } from "node:stream";
 import type { Executor } from "../src/executor.js";
 import type { TrackingUpdateResult } from "../src/git.js";
 import { MAX_OWED_CANDIDATES_PER_RUN } from "../src/git.js";
-import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { noProofReseed } from "./helpers.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import { RunRunner } from "../src/runner.js";
 import { CandidateReservationRefusedError } from "../src/batcher.js";
 
@@ -46,14 +47,14 @@ function announcedLabels(runId: string): string[] {
   return api.messages(runId)
     .map((m) => (m.payload as { text?: string }).text ?? "")
     .filter((t) => t.startsWith("Retained heads "))
-    .flatMap((t) => /^Retained heads (.*?) are worker-local/.exec(t)![1]!.split(", "));
+    .flatMap((t) => /^Retained heads (.*?) are /.exec(t)![1]!.split(", "));
 }
 
 it("announces each retained head once across checkpoints, a confirmed reconcile and a resume", async () => {
   const { gitlab } = fakeGitlab();
   const claim = gitlabClaim(19241);
   claim.claim_generation = 3;
-  const restore = publishAfter(3);
+  const restore = publishAfter(9);
   const heads: string[] = [];
   try {
     const exec: Executor = {
@@ -147,7 +148,7 @@ type AnnounceFlight = {
   batcher: { emit(message: unknown): void };
 };
 const announce = (RunRunner.prototype as unknown as {
-  announceOwedHeads(flight: AnnounceFlight, heads: string[]): void;
+  announceOwedHeads(flight: AnnounceFlight, heads: string[], archived?: boolean): void;
 }).announceOwedHeads;
 const sha = (n: number): string => n.toString(16).padStart(2, "0").repeat(20);
 const rowHeads = (message: unknown): string =>
@@ -190,4 +191,140 @@ it("a refusal after an earlier row succeeds re-announces only the refused row", 
   assert.equal(emitted.length, 2, "the retry emits only the refused row");
   assert.ok(rowHeads(emitted[1]).includes(sha(9).slice(0, 12)));
   assert.ok(!rowHeads(emitted[1]).includes(sha(1).slice(0, 12)));
+});
+
+type ReconcileFlight = AnnounceFlight & {
+  runId: string;
+  runLog: { info(message: string, details?: unknown): void; warn(message: string, details?: unknown): void };
+};
+const reconcile = (RunRunner.prototype as unknown as {
+  reconcileConfirmedOwed(flight: ReconcileFlight, bare: string, confirmed: string): Promise<void>;
+}).reconcileConfirmedOwed;
+function announcementProbe() {
+  const emitted: unknown[] = [];
+  const logs: string[] = [];
+  const flight: ReconcileFlight = {
+    runId: "owed-m2", owedFeedClosed: false,
+    owedAnnounced: { heads: new Set(), archived: new Set() },
+    batcher: { emit(message) { emitted.push(message); } },
+    runLog: { info(message) { logs.push(message); }, warn(message) { logs.push(message); } },
+  };
+  return { flight, emitted, logs };
+}
+const resolutionRows = (emitted: unknown[]) => emitted.map(rowHeads).filter(t => t.startsWith("Confirmed checkpoint covers previously retained heads "));
+
+it("ordinary and earlier-archive announcements describe distinct evidence", () => {
+  const { flight, emitted } = announcementProbe();
+  announce.call(null, flight, [sha(1)]);
+  announce.call(null, flight, [sha(2)], true);
+  assert.match(rowHeads(emitted[0]), /retained locally.*no confirmed checkpoint coverage/);
+  assert.match(rowHeads(emitted[0]), /Inspect status with uzi run recovery or uzi run export/);
+  assert.doesNotMatch(rowHeads(emitted[0]), /needs action|durable|success/i);
+  assert.match(rowHeads(emitted[1]), /^Earlier recovery archive covers retained heads/);
+  assert.ok(flight.owedAnnounced.archived.has(sha(2)));
+});
+
+it("real Git partial, divergent and full confirmation resolves only covered announced heads", async () => {
+  const bare = await git.ensureClone(fx.originPath);
+  const base = gitIn(bare, ["rev-parse", "refs/remotes/origin/main"]);
+  const branch = "agent/owed-m2";
+  const { flight, emitted } = announcementProbe();
+  const clone = (await git.runnerCloneForBranch(bare, branch, "issue-m2", noProofReseed, flight.runId)).path;
+  const context = { runId: flight.runId, generation: 1, branch, kind: "issue" as const, barePath: bare,
+    defaultIdentity: { ref: "refs/remotes/origin/main", sha: base } };
+  const a = rewrite(clone, "a", base);
+  assert.equal((await git.fetchAgentBranch(bare, clone, branch, flight.runId, { context })).kind, "updated");
+  const b = rewrite(clone, "b-divergent", base);
+  assert.equal((await git.fetchAgentBranch(bare, clone, branch, flight.runId, { context })).kind, "updated");
+  announce.call(null, flight, [a]);
+  announce.call(null, flight, [b], true);
+  const target = { git, announceOwedHeads: announce };
+  await reconcile.call(target, flight, bare, base);
+  assert.equal(resolutionRows(emitted).length, 0, "a divergent confirmation resolves neither root");
+  await reconcile.call(target, flight, bare, a);
+  assert.deepEqual((await git.enumerateOwedCandidates(bare, flight.runId)).map(c => c.sha), [b]);
+  assert.equal(resolutionRows(emitted).length, 1);
+  assert.ok(resolutionRows(emitted)[0]!.includes(a.slice(0, 12)));
+  assert.ok(!resolutionRows(emitted)[0]!.includes(b.slice(0, 12)));
+  await reconcile.call(target, flight, bare, a);
+  assert.equal(resolutionRows(emitted).length, 1, "repeated reconciliation is silent");
+  await reconcile.call(target, flight, bare, b);
+  assert.equal((await git.enumerateOwedCandidates(bare, flight.runId)).length, 0);
+  assert.equal(resolutionRows(emitted).length, 2);
+  assert.ok(resolutionRows(emitted)[1]!.includes(b.slice(0, 12)));
+  assert.equal(flight.owedAnnounced.heads.size + flight.owedAnnounced.archived.size, 0);
+});
+
+it("resolution deduplicates valid announced heads into eight-label rows, excluding unannounced removals", async () => {
+  const { flight, emitted } = announcementProbe();
+  const heads = Array.from({ length: 10 }, (_, i) => sha(i + 1));
+  announce.call(null, flight, heads.slice(0, 9));
+  announce.call(null, flight, [heads[0]!], true);
+  flight.owedAnnounced.heads.add("invalid");
+  const target = {
+    git: { reconcileOwedCandidates: async () => ({ removedShas: [...heads, heads[0]!, "invalid"], retainedShas: [] }) },
+    announceOwedHeads: announce,
+  };
+  await reconcile.call(target, flight, "unused", sha(20));
+  const rows = resolutionRows(emitted);
+  assert.equal(rows.length, 2);
+  assert.equal(rows[0]!.match(/[0-9a-f]{12}/g)?.length, 8);
+  assert.equal(rows[1]!.match(/[0-9a-f]{12}/g)?.length, 1);
+  assert.ok(!rows.join(" ").includes(heads[9]!.slice(0, 12)));
+  assert.equal(flight.owedAnnounced.heads.size + flight.owedAnnounced.archived.size, 0);
+  await reconcile.call(target, flight, "unused", sha(20));
+  assert.equal(resolutionRows(emitted).length, 2, "no new durable or retry ledger");
+});
+
+for (const closed of [false, true]) {
+  it(`a ${closed ? "closed feed" : "refused resolution"} clears ledgers and preserves remaining announcements`, async () => {
+    const { flight, emitted, logs } = announcementProbe();
+    announce.call(null, flight, [sha(1)]);
+    announce.call(null, flight, [sha(1)], true);
+    emitted.length = 0;
+    flight.owedFeedClosed = closed;
+    flight.batcher.emit = message => {
+      if (closed) assert.fail("closed feed must be log-only");
+      if (rowHeads(message).startsWith("Confirmed checkpoint covers")) throw new CandidateReservationRefusedError("cancelled");
+      emitted.push(message);
+    };
+    const target = {
+      git: { reconcileOwedCandidates: async () => ({ removedShas: [sha(1)], retainedShas: [sha(2)] }) },
+      announceOwedHeads: announce,
+    };
+    await reconcile.call(target, flight, "unused", sha(20));
+    assert.ok(!flight.owedAnnounced.heads.has(sha(1)));
+    assert.ok(!flight.owedAnnounced.archived.has(sha(1)));
+    assert.equal(resolutionRows(emitted).length, 0);
+    assert.ok(logs.some(t => /resolution.*not delivered/.test(t)));
+    assert.ok(!logs.some(t => /reconciliation failed/.test(t)));
+    if (!closed) assert.ok(emitted.map(rowHeads).some(t => t.includes(sha(2).slice(0, 12))));
+    else assert.ok(logs.some(t => /retained heads after feed close/.test(t)));
+  });
+}
+
+it("refused resolution and throwing diagnostics do not block later rows or remaining heads", async () => {
+  const { flight, emitted } = announcementProbe();
+  const heads = Array.from({ length: 9 }, (_, i) => sha(i + 1));
+  announce.call(null, flight, heads);
+  emitted.length = 0;
+  let refused = false;
+  flight.batcher.emit = message => {
+    if (!refused) {
+      refused = true;
+      throw new CandidateReservationRefusedError("cancelled");
+    }
+    emitted.push(message);
+  };
+  flight.runLog.info = () => { throw new Error("diagnostic unavailable"); };
+  const target = {
+    git: { reconcileOwedCandidates: async () => ({ removedShas: heads, retainedShas: [sha(10)] }) },
+    announceOwedHeads: announce,
+  };
+  await reconcile.call(target, flight, "unused", sha(20));
+  assert.equal(resolutionRows(emitted).length, 1, "the second row is still attempted");
+  assert.ok(resolutionRows(emitted)[0]!.includes(sha(9).slice(0, 12)));
+  assert.ok(!resolutionRows(emitted)[0]!.includes(sha(1).slice(0, 12)));
+  assert.deepEqual([...flight.owedAnnounced.heads], [sha(10)]);
+  assert.ok(emitted.map(rowHeads).some(t => t.startsWith("Retained heads ") && t.includes(sha(10).slice(0, 12))));
 });

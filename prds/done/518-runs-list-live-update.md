@@ -85,3 +85,7 @@ All changes are in `web/src/pages/RunsList.tsx` plus its test `web/src/pages/Run
 - Any websocket/SSE list-level push channel.
 - Changing the poll interval on Board/Dashboard, or extracting a shared runs-list data hook across surfaces.
 - The single-run detail live stream (already live via `/api/ws`).
+
+## Decision Log
+
+- 2026-10-13: #2912 supersedes design invariant 2 for personal lists: `listSecrets` now refreshes on the existing poll independently of runs, preserving last-good counts on failure.

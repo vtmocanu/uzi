@@ -1,5 +1,16 @@
 # Worker memory foundation reconciliation — issue #2396
 
+## Resumed reconciliation — 2026-10-14, validation pending
+
+This run preserves published floor `0bc24b959f85d8ef5adcf322f4c3240a6bf2eec3` and merges default `ebbe088d01959ec74e0826a0887af3e3e49ce3b5` without rewriting either history. The earlier sections below remain historical evidence for their named revisions, not acceptance of this merge.
+
+Conflict resolutions combine the captured memory capability with upstream summary settlement, Read scheduling, retained-source admission and shutdown. Worker construction keeps upstream's gate/channel arguments and adds the memory runtime afterward; the lifecycle fixture now verifies that the memory-enabled worker starts and joins the retained-source channel once. Runner failure/release paths keep both unresolved-completion and memory-custody protections. The credential-free settlement helper retains the memory cancellation purpose while settling upstream plan summaries under the same remaining deadline. Test doubles supply the bounded supervisor observation interface.
+
+The implementation delegation ended without a report; retained edits were inspected by the lead. A completed SQL generation run used `go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate` (log `gate-log.ZFFLat`, EXIT=0); no additional generated drift resulted. A combined retained test log (`gate-log.MiFJfB`, EXIT=1) failed the late native park successor-admission case; its isolated rerun (`gate-log.2hn1fy`, EXIT=0) does not establish a baseline failure or close the combined-run concern. Current committed-range review and integration checks remain pending.
+
+A read-only current-worker sample returned `available: false, reason: absent`; no load, usable headroom or sizing recommendation follows. The provisioned agent SDK/knip and web knip still match the pre-merge manifests, not upstream's updated versions. They were not reinstalled. Tests in that dependency environment cannot establish final matched-lockfile acceptance. M2 required real-process lane enrollment, M3 documentation/surfaces and M4 real-cgroup/CI calibration remain unfinished. Production enablement stays disabled.
+
+
 This record supersedes the current-state statements in `worker-memory-validation.md`; that earlier record remains historical evidence for its named revisions and commands. M1 implementation and required local validation are **complete** at the fixture-isolation candidate below. M2–M5 have not been implemented in this resumed run. Real adapter integration and private-cgroup calibration remain unverified; production enablement remains disabled.
 
 ## Source and contract seam

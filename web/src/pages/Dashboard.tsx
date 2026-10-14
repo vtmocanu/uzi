@@ -7,7 +7,7 @@
 import { useCallback, useEffect, useState } from "react";
 import { Link } from "react-router-dom";
 import { useAuth } from "../auth/AuthContext";
-import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type SelfUsage, type Worker } from "../lib/api";
+import { api, isTerminalRun, type AdminUsage, type RunSummaryItem, type RunStatus, type SelfUsage, type Worker } from "../lib/api";
 import { hasAnthropicToken } from "../lib/hasToken";
 import {
   effectiveRunStatus,
@@ -36,6 +36,23 @@ import { CheckIcon, ChevronRightIcon } from "../components/icons";
 import { stripUnsafeChars } from "../lib/safeText";
 import { useDemoMode } from "../lib/demoMode";
 import { maskName, maskRepoPath } from "../lib/demoMask";
+
+// Exhaustive over the wire status union; a new status needs an explicit bucket.
+const activeRunBuckets: Record<RunStatus, "running" | "needsYou" | "queued" | "waiting" | null> = {
+  running: "running",
+  awaiting_approval: "needsYou",
+  awaiting_input: "needsYou",
+  awaiting_followup: "needsYou",
+  queued: "queued",
+  claimed: "queued",
+  limit_wait: "waiting",
+  pool_wait: "waiting",
+  recovery_wait: "waiting",
+  paused: "waiting",
+  completed: null,
+  failed: null,
+  cancelled: null,
+};
 
 interface Overview {
   runs: RunSummaryItem[];
@@ -223,50 +240,28 @@ export function Dashboard() {
 
   if (!user) return null;
 
-  // PRD #35 (web-ux F2): "active" is still every non-terminal run — the TILE's count is
-  // right, and a parked run genuinely is in flight. What was wrong is the HINT, which
-  // said "agents at work" over a set that can contain runs where no agent is working
-  // and none will for hours.
-  //
-  // Split rather than excluded, deliberately: dropping parked runs from the count would
-  // make them vanish from the one surface that says how much is in flight, which is the
-  // opposite failure. `!isTerminalRun` as a proxy for "actively working" is the actual
-  // defect, and it is only visible now because limit_wait is the first non-terminal
-  // status that lasts hours by design.
-  //
-  // Issue #754: pool_wait is the same KIND of hold — non-terminal, self-resuming,
-  // blocked on a resource (a pooled token) rather than actively working — so it joins
-  // the waiting bucket too. The copy is deliberately "waiting to resume" rather than the
-  // old "waiting on a usage limit": that older wording is TRUE only for limit_wait and
-  // false for a pool hold, so the honest generalization is the resource-agnostic phrase
-  // that holds for both.
-  //
-  // Issue #1197: recovery_wait is the same KIND again — a non-terminal, self-resuming
-  // hold (a transient-recovery park that auto-resumes on a capped backoff). It counts
-  // as waiting, not "at work", for exactly the reasons limit_wait/pool_wait do; the
-  // resource-agnostic "waiting to resume" copy holds for it too.
+  // The tile counts every non-terminal run. Its hint separates execution,
+  // owner input (including an interactive follow-up), queued work and resume holds.
+  // Raw running includes planning and review iterations; it counts runs, not agents.
   const active = data?.runs.filter((r) => !isTerminalRun(r.status)) ?? [];
-  // PRD #1190: an owner pause also waits to resume, on demand.
-  const waiting = active.filter(
-    (r) =>
-      r.status === "limit_wait" ||
-      r.status === "pool_wait" ||
-      r.status === "recovery_wait" ||
-      r.status === "paused",
-  );
-  const working = active.length - waiting.length;
+  const activeCounts = { running: 0, needsYou: 0, queued: 0, waiting: 0 };
+  for (const run of active) {
+    const bucket = activeRunBuckets[run.status];
+    if (bucket) activeCounts[bucket]++;
+  }
   // PRD #1349 M6 (D8/D10): recovery_wait_count, derived CLIENT-SIDE from the runs the
   // dashboard already polls — the count of the owner's runs currently self-healing in the
   // recovery_wait park. Surfaced in the custody alert for diagnosis (it explains why holds
   // may be accumulating); no backend field and no lifetime cap on the count.
   const recoveryWaitCount = data?.runs.filter((r) => r.status === "recovery_wait").length ?? 0;
-  // "8 at work · 1 waiting to resume" only when there is something to disambiguate; a
-  // factory with nothing parked keeps exactly the copy it had.
-  const activeHint = !active.length
-    ? "nothing in flight"
-    : waiting.length
-      ? `${working} at work · ${waiting.length} waiting to resume`
-      : "agents at work";
+  const activeHint = active.length
+    ? [
+        activeCounts.running ? `${activeCounts.running} running` : null,
+        activeCounts.needsYou ? `${activeCounts.needsYou} ${activeCounts.needsYou === 1 ? "needs" : "need"} you` : null,
+        activeCounts.queued ? `${activeCounts.queued} queued` : null,
+        activeCounts.waiting ? `${activeCounts.waiting} waiting to resume` : null,
+      ].filter(Boolean).join(" · ")
+    : "nothing in flight";
   const recent = data?.runs.slice(0, 5) ?? [];
   // Step 4 is a SETUP fact, not live health: a worker counts as brought online if
   // it is online now OR has ever registered (last_heartbeat_at is stamped at
@@ -351,7 +346,7 @@ export function Dashboard() {
                       {w.status}
                     </Badge>
                     <WorkerCordonBadge worker={w} />
-                    <WorkerRunBadge worker={w} />
+                    <WorkerRunBadge worker={w} hideIdleCrossChecks />
                     <span className="truncate text-sm font-medium text-fg">{w.name}</span>
                   </div>
                   <WorkerStatLine worker={w} />
@@ -533,13 +528,13 @@ export function Dashboard() {
                         {msBadge.label}
                       </Badge>
                     )}
-                    {/* PRD #2602: the server-derived progress cell (percent or a flag);
+                    {/* PRD #2602: the server-derived waiting/stalled flags;
                         renders nothing for a pre-feature server or a terminal run. This
-                        cluster does not wrap, so below sm the cell yields its ~60px to the
+                        cluster does not wrap, so below sm the flags yield their space to the
                         truncating title (the M badge still carries the count there); the
                         Runs list rows wrap and keep it at every width. */}
                     <span className="hidden sm:contents">
-                      <RunProgressCell run={r} />
+                      <RunProgressCell run={r} now={now} />
                     </span>
                     {/* A stalled cell already says so (with the health word in its
                         tooltip), so the health badge yields to it from sm up and stays
@@ -551,7 +546,7 @@ export function Dashboard() {
                     ) : (
                       <RunHealthBadge run={r} />
                     )}
-                    <StatusPill status={effectiveRunStatus(r)} />
+                    <StatusPill status={effectiveRunStatus(r)} progress={r.progress} />
                   </div>
                 </div>
               </li>

@@ -6,6 +6,7 @@ import os from "node:os";
 import path from "node:path";
 import { createHash, randomUUID } from "node:crypto";
 import { Readable } from "node:stream";
+import { setTimeout as realDelay } from "node:timers/promises";
 import type { HookInput, Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
 
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
@@ -28,6 +29,7 @@ import type { ClaimResponse, JobResultRequest, OutgoingMessage, StateRequest, Us
 import type { SdkQueryFn } from "../src/sdk-executor.js";
 import { stubJobQueryFn } from "../src/job-runner-stub.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
+import { NATIVE_LIMIT, overflowClock } from "./overflow-clock.js";
 
 const GEN = 7;
 const roots: string[] = [];
@@ -937,6 +939,120 @@ describe("JobRunner input files (PRD #1909 M3)", () => {
     assert.strictEqual(last.status, "failed");
     assert.match(last.failure_reason!, /^job input files refused: job input file name is not a storage name/);
   });
+
+  describe("a wall budget above the native timer range (#2771)", () => {
+    const BUDGET_S = 2_160_000;
+    const BUDGET_MS = BUDGET_S * 1000;
+    const isWall = (d: number) => d > 60_000;
+    type Clock = ReturnType<typeof overflowClock>;
+
+    /** Wait on real timers (unaffected by the mocked globals) until `cond` holds; fail clearly at the bound. */
+    async function waitFor(cond: () => boolean, what: string): Promise<void> {
+      for (let i = 0; i < 2000; i++) {
+        if (cond()) return;
+        await realDelay(5);
+      }
+      assert.fail(`timed out waiting for ${what}`);
+    }
+    const wallPending = (clock: Clock) => clock.pending().filter((x) => isWall(x.delay));
+
+    /** Drive the wall deadline across the native limit and assert it fires only at the full budget. */
+    async function driveWall(clock: Clock, aborted: () => boolean, reported: () => boolean): Promise<void> {
+      await waitFor(() => wallPending(clock).length > 0, "the wall chunk to be armed");
+      clock.move(1);
+      clock.deliver(isWall);
+      assert.strictEqual(aborted(), false, "a clamped native timer must not abort the job at once");
+      assert.strictEqual(reported(), false, "no failed state before the budget elapses");
+      clock.move(NATIVE_LIMIT - 1);
+      clock.deliver(isWall);
+      assert.strictEqual(aborted(), false);
+      assert.ok(wallPending(clock).some((x) => x.delay === BUDGET_MS - NATIVE_LIMIT), "the remainder chunk is re-armed");
+      clock.move(BUDGET_MS - 1 - NATIVE_LIMIT);
+      clock.deliver(isWall);
+      assert.strictEqual(aborted(), false, "one ms before the budget");
+      clock.move(1);
+      clock.deliver(isWall);
+      assert.strictEqual(aborted(), true, "aborted at the full budget");
+    }
+    function assertWallTimers(clock: Clock): void {
+      clock.assertSafe(isWall);
+      const walls = clock.requests.filter((x) => isWall(x.delay));
+      assert.ok(walls.length >= 2);
+      for (const w of walls) assert.strictEqual(w.unrefs, 1, "every wall chunk is unref'd");
+    }
+
+    it("the input-download deadline does not abort early and fires at the full budget", async (t) => {
+      const clock = overflowClock(t);
+      clock.defaultClock();
+      let signal: AbortSignal | undefined;
+      let stream: Readable | undefined;
+      const { client, calls } = fakeClient({
+        downloadJobFile: async (_id, _f, _g, sink, sig) => {
+          signal = sig;
+          const r = new Readable({ read() {} });
+          stream = r;
+          r.push(body.subarray(0, 4));
+          sig?.addEventListener("abort", () => r.destroy(new Error("The operation was aborted")), { once: true });
+          await sink(r);
+        },
+      });
+      const flag = { ran: false };
+      const done = newRunner(client, await tmpJobsRoot(), noSession(flag)).execute(jobClaim({ budget_wall_seconds: BUDGET_S }, { files: [fileEntry()] }));
+      // Wait for the writer to be consuming the body (error listener attached, first chunk read), not
+      // merely for the call: an abort before then destroys a stream nobody listens to.
+      await waitFor(() => stream !== undefined && stream.listenerCount("error") > 0 && stream.readableLength === 0, "the download body to be consumed");
+      await driveWall(clock, () => signal!.aborted, () => calls.states.some((s) => s.body.status === "failed"));
+      await done;
+      assert.strictEqual(flag.ran, false);
+      const last = calls.states.at(-1)!.body;
+      assert.strictEqual(last.status, "failed");
+      assert.match(last.failure_reason!, /exceeded its wall-clock budget of 2160000s/);
+      assertWallTimers(clock);
+    });
+
+    it("the session deadline does not abort early and fires at the full budget", async (t) => {
+      const clock = overflowClock(t);
+      clock.defaultClock();
+      let signal: AbortSignal | undefined;
+      const { client, calls } = fakeClient();
+      const qf = scripted(async function* ({ options, hang }) {
+        signal = options.abortController!.signal;
+        yield INIT_OK;
+        await hang();
+        throw Object.assign(new Error("aborted"), { name: "AbortError" });
+      });
+      const { logger, lines } = recordingLogger();
+      const runner = new JobRunner(client, logger, { queryFn: qf, jobsRoot: await tmpJobsRoot(), batchMs: 5, cancelPollMs: 10 });
+      const done = runner.execute(jobClaim({ budget_wall_seconds: BUDGET_S }));
+      await waitFor(() => signal !== undefined, "the session to start");
+      await driveWall(clock, () => signal!.aborted, () => calls.states.some((s) => s.body.status === "failed"));
+      await done;
+      assert.ok(lines.some((l) => (l as { msg?: string }).msg === "job exceeded its wall-clock budget; aborting"));
+      const last = calls.states.at(-1)!.body;
+      assert.strictEqual(last.status, "failed");
+      assert.match(last.failure_reason!, /exceeded its wall-clock budget of 2160000s/);
+      assertWallTimers(clock);
+    });
+
+    // Checks cancel-on-finish for both deadlines (the download one is armed only when the job has
+    // files); it is not a regression guard for the overflow itself.
+    for (const withFiles of [false, true]) {
+      it(`a job that completes early leaves no wall chunk pending (${withFiles ? "with" : "without"} input files)`, async (t) => {
+        const clock = overflowClock(t);
+        clock.defaultClock();
+        const { client, calls } = fakeClient(withFiles ? { downloadJobFile: send(body) } : {});
+        const qf = scripted(async function* ({ options }) {
+          yield INIT_OK;
+          await callSubmit(options, GOOD_RESULT);
+          yield RESULT_OK;
+        });
+        await newRunner(client, await tmpJobsRoot(), qf).execute(jobClaim({ budget_wall_seconds: BUDGET_S }, withFiles ? { files: [fileEntry()] } : {}));
+        assert.strictEqual(calls.states.at(-1)!.body.status, "completed");
+        assert.strictEqual(clock.requests.filter((x) => isWall(x.delay)).length, withFiles ? 2 : 1, "each armed deadline was requested once");
+        assert.deepStrictEqual(wallPending(clock).map((x) => x.delay), []);
+      });
+    }
+  });
 });
 
 describe("JobRunner output files (PRD #1909 M4)", { skip: process.platform !== "linux" ? "requires Linux descriptor-relative output opens" : false }, () => {
@@ -1388,7 +1504,7 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(o.skills, []);
       assert.deepStrictEqual(o.settingSources, []);
       assert.strictEqual(o.strictMcpConfig, true);
-      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false }, disableSkillShellExecution: true });
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false }, disableSkillShellExecution: true });
       for (const banned of ["Bash", "WebFetch", "WebSearch", "Agent", "Task", "Skill", "MultiEdit", "NotebookEdit"]) {
         assert.ok((o.disallowedTools ?? []).includes(banned), `${banned} is disallowed`);
         assert.ok(!(o.tools as string[]).includes(banned));
@@ -1402,7 +1518,7 @@ describe("JobRunner lane mode: profile-bound jobs (PRD #1976)", () => {
       assert.deepStrictEqual(o.skills, ["uzi:brand-voice"]);
       assert.deepStrictEqual(o.plugins, [{ type: "local", path: "/data/jobs/run/.uzi-skills-work", skipMcpDiscovery: true }]);
       assert.ok(!(o.disallowedTools ?? []).includes("Skill"));
-      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false }, disableSkillShellExecution: true });
+      assert.deepStrictEqual(o.settings, { enabledPlugins: { "agents-md@builtin": false, "cc-plugin-plugin-authoring@builtin": false }, disableSkillShellExecution: true });
     });
 
     it("keeps the Glob/Grep escape guard and the sources/ write guard on", async () => {

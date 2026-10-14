@@ -6,23 +6,28 @@ audience: user
 
 # Run summaries
 
-Every run gets two short plain-English summaries, so you can tell what it's
-doing without opening the issue or reading the raw plan:
+Issue (`issue`), self-improvement (`self_improve`), and prompt (`prompt`) runs
+can get short plain-English intent and plan summaries on both Claude and
+Codex, so you can tell what they're doing without reading the original ask
+or the raw plan:
 
 - **Intent summary** — "what this run will implement", compiled from the
-  issue title and body (plus a linked PRD, when there is one) shortly after
+  run's title and body (plus a linked PRD, when there is one) shortly after
   the run starts. It shows as a one-line preview on the runs list and as a
   card on the run page.
-- **Plan summary + deltas** — "what the proposed plan will do", compiled the
-  moment the agent's plan reaches the approval gate. Alongside it, a short
-  tagged list of how the plan diverged from the original ask: **added**,
-  **changed**, or **dropped**. The card reads **Proposed plan** while the run
-  sits at the gate and relabels to **Approved plan** once you approve — the
-  same text, not a regenerated one. A revised plan (after **Request
-  changes**) regenerates both.
+- **Plan summary + deltas** — "what the proposed plan will do", compiled
+  after the server accepts and persists the plan, at either the human
+  approval gate (`awaiting_approval`) or autopilot approval. A refused plan
+  write starts no summary pass. Alongside it, a short tagged list of how the
+  plan diverged from the original ask: **added**, **changed**, or **dropped**.
+  The card reads **Proposed plan** while the run sits at the gate and relabels
+  to **Approved plan** once you approve — the same text, not a regenerated
+  one. A revised plan (after **Request changes**) regenerates both after
+  that plan is accepted and persisted.
 
-Both summaries are generated on **your own Anthropic token**, on a cheap
-model by default, so they cost very little next to the run itself.
+Both summaries use **the run owner's own credential for the run's original
+harness**: an Anthropic token for Claude, or the bound OpenAI API key or
+Codex subscription for Codex.
 
 ## Read the deltas as a heads-up, not a substitute
 
@@ -34,20 +39,35 @@ issue could shape to hide something (say, a dropped security step). Always
 read the actual plan before approving; the deltas are there to draw your eye,
 not to replace that read.
 
-## It's advisory — it never blocks your run
+## It's advisory — failures don't stop your run
 
-Summary generation runs alongside the real work, never in place of it. If it
-fails or times out, it's simply skipped: the card falls back to the issue
-title and the run proceeds exactly as if summaries didn't exist. A seeded or
-pre-approved run (one that skips planning) gets an intent summary only —
-there's no plan gate for a plan summary to attach to.
+If summary generation fails, is refused or times out, it's simply skipped:
+the card falls back to the run title and the run proceeds. After autopilot
+persists an approved plan, its summary runs alongside implementation without
+waiting for the summary. At a human gate, the worker awaits the plan summary
+attempt before waiting for your verdict, so that attempt can add a delay;
+its failure does not prevent approval or implementation.
+
+Planning and seeded or pre-approved runs of all three kinds are eligible for
+an intent summary on both harnesses, unless an intent summary already exists.
+Intent generation runs alongside planning or implementation without delaying it.
+A plan summary requires accepted plan persistence through the plan gate.
+Without that persistence there is no plan-summary pass, including seeded or
+pre-approved runs and pre-approved resumes that skip the gate.
 
 ## The Now summary
 
-A third, separate kind of summary is the **Now** line on a running run's
-progress card, in the TUI detail and in `uzi run get`: one sentence of at most
-120 characters on what the active lane is doing right now. It differs from the
-intent and plan summaries above:
+A third, separate kind of summary is the **Now** line: one sentence of at most
+120 characters on what the active lane is doing right now. The worker can
+write it for `issue`, `self_improve`, and `prompt` runs on both Claude and
+Codex, but requires an active frozen milestone. Milestoneless self-improvement
+and prompt runs get no Now summary; scheduling a run alone enables none.
+
+Display still requires percent progress on the run's progress card, in the
+TUI detail and in `uzi run get`. The current progress data supplies percent
+progress for issue runs, not self-improvement or prompt runs, so worker
+eligibility does not make the Now line visible for those two kinds. It differs
+from the intent and plan summaries above:
 
 - **It repeats while the run works.** The intent and plan summaries are
   written once (or again after a revised plan); the Now line is rewritten as
@@ -72,12 +92,17 @@ across devices.
 
 ## Which model it runs on
 
-The instance default is **haiku** — summaries are lightweight and run once
-or twice per run, so a fast, cheap model is the right default. From
-**Settings → Run defaults → Run summaries**, the **Summary model** picker
-lets you override that for your own runs; leave it on **Inherit** to use the
-instance default. See [Admin settings](./admin-settings.md#run-summaries) for
-the instance-wide setting.
+For **Claude** intent and plan summaries, the instance default is **haiku**.
+From **Settings → Run defaults → Run summaries**, the **Summary model** picker
+lets you override that for your own Claude runs; leave it on **Inherit** to
+use the instance default. See
+[Admin settings](./admin-settings.md#run-summaries) for the instance-wide setting.
+
+**Codex** intent and plan summaries use **gpt-6-luna** with **low** effort.
+They do not follow the Summary model setting and have no fallback model.
+Codex summary calls use the existing run credential and are denied credential
+refresh; an expired credential makes the summary fail.
+The Now summary keeps its separate scheduler, switches and model selection.
 
 ## From the CLI
 

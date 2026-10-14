@@ -42,8 +42,10 @@ set; two partial workers cannot provide that set by union.
    **unpaced**; do not change the worker pin in this window.
 2. Deploy the new chart/RBAC and singleton controller at the steady worker pin,
    with `workers.forceRoll: false`, positive `workers.rollConcurrency: 1`, and
-   `workers.rollTargetVersion` set to that image's independently verified exact
-   baked stamp, including `+g<commit>`. A bare published SemVer image tag is not
+   `workers.rollTargetVersion` matching that image's independently verified exact
+   baked stamp, including `+g<commit>`. Published charts inject the verified stamp
+   during release packaging; per-cluster overrides still win. A custom worker pin
+   or an unpackaged source chart needs a matching verified override. A bare published SemVer image tag is not
    enough to derive ADR-1720's stamp. Do not copy the API version, infer the target
    from a replacement or strip build metadata.
 3. Verify controller poll evidence and report support, plus permission for
@@ -55,8 +57,9 @@ set; two partial workers cannot provide that set by union.
    `UZI_WORKER_NAME=uzi-pod:$(UZI_POD_UID)` changes the template at the steady pin.
    Worker images and user-chosen names stay unchanged. Confirm current-UID proof
    before proceeding to an image-pin change.
-5. Advance the worker pin together with its verified exact target version only
-   after that cohort closes. Do not downgrade an active paced roll. A new
+5. Advance the worker pin only after that cohort closes. Published charts carry
+   the verified exact target version; set it explicitly only for a custom worker
+   pin or a source-chart deployment. Do not downgrade an active paced roll. A new
    controller with an old API must hold for missing proof, without unpaced fallback.
 
 `workers.drainDeadline` bounds only an admitted busy image turn. For a disposable

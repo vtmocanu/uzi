@@ -48,16 +48,17 @@
 // an ABSENT source yields an empty tally (the fresh-root "nothing to persist" contract).
 // Each source file is copied through the OPEN fd — its size taken from an `fstat` on
 // that pinned fd and AT MOST that many bytes read — so a file that grows after the stat
-// can never be read unboundedly. The copy is bounded on every axis — a per-file byte
-// cap, a total byte cap, a file-count cap, a per-entry scan cap that charges EVERY entry
-// examined (not just copied), AND a recursion-DEPTH cap — so a hostile tree cannot make
-// the walk run unboundedly even when it copies nothing. The depth cap is load-bearing
-// beyond total work: the fd-anchored walk holds an open source AND dest directory fd at
-// EVERY level simultaneously (~2·depth open fds), so a deep single-child source chain in
-// the untrusted codexHome would otherwise exhaust the process fd table (EMFILE, ≈ depth
-// 510 at the default 1024 fd limit) long before the per-entry scan cap — which bounds
-// total entries but NOT depth — is reached; the depth cap bounds the simultaneous-fd
-// count directly.
+// can never be read past the recorded size. Copy limits separately cap per-file bytes,
+// total bytes and copied files. Streaming enumeration buffers one JS entry per level;
+// its shared recursive scan counter charges EVERY yielded entry before filtering,
+// stopping at the first over-cap entry (cap + 1). This bounds JS listing allocation
+// and entry processing, not kernel/libuv work or recursive rmAt. Copy and exact-session
+// depth caps are separate from entry budgets; generic presence adds no depth cap.
+// Copy skips local enumeration errors; presence reports unknown; cleanup skips local
+// enumeration errors with independent sweep/reap budgets. The depth cap is load-bearing
+// beyond entry work: the copy holds source, destination and enumeration descriptors
+// at every active level. A deep single-child source chain could otherwise exhaust the
+// process fd table before the entry cap, which bounds total entries but NOT depth.
 //
 // ─── PUBLICATION MODEL: immutable generations + one atomically-renamed pointer ──
 // The store is NOT a single mutable `sessions/` dir. `persist` writes each fresh copy into its
@@ -102,8 +103,8 @@
 import fsp from "node:fs/promises";
 import type { FileHandle } from "node:fs/promises";
 import { constants as FS } from "node:fs";
-import type { Stats } from "node:fs";
-import { extname, isAbsolute, join, relative, resolve } from "node:path";
+import type { Dir, Dirent, Stats } from "node:fs";
+import { extname, resolve } from "node:path";
 import { randomBytes } from "node:crypto";
 
 import type { SessionPresence } from "../harness.js";
@@ -160,26 +161,25 @@ export interface SessionStoreBounds {
   /** Maximum size of any single copied file. */
   readonly maxFileBytes: number;
   /** Maximum number of directory ENTRIES the copy walk may examine in one operation,
-   *  counting EVERY entry lstat'd (files, dirs, non-allowlisted junk), not just the
-   *  ones copied. Bounds total work so an adversarial `sessions/` full of
-   *  non-allowlisted entries cannot make the walk run unboundedly. Must comfortably
+   *  counting EVERY entry yielded (files, dirs, non-allowlisted junk), not just the
+   *  ones copied. Bounds JS entry processing so an adversarial `sessions/` full of
+   *  non-allowlisted entries cannot evade the scan budget. Must comfortably
    *  exceed `maxFiles` so a legitimate full-size copy is never starved by the scan. */
   readonly maxScanEntries: number;
   /** Maximum directory-recursion DEPTH of the copy walk (top-level `sessions/` is depth
    *  0; its immediate subdirs are depth 1, and so on). OPTIONAL: when undefined the walk
    *  uses {@link DEFAULT_SESSION_STORE_MAX_DEPTH}, so existing bounds objects need no
    *  change. Unlike `maxScanEntries` (which bounds total entries but NOT depth), this
-   *  bounds the number of directory fds held OPEN simultaneously (~2·depth, one source +
-   *  one dest per level) so a deep single-child chain in the untrusted source cannot
+   *  bounds simultaneously open directory descriptors (source, destination and
+   *  enumeration per active level) so a deep single-child chain in the untrusted source cannot
    *  exhaust the process fd table (EMFILE). A real rollout tree is only a few levels. */
   readonly maxDepth?: number;
 }
 
 /** Module-private default recursion-DEPTH cap, used by the copy walk when
  *  `bounds.maxDepth` is undefined. A real rollout tree is only a few levels deep, so 64
- *  is generous while still bounding the ~2·depth directory fds the fd-anchored walk holds
- *  open simultaneously — a deep single-child chain in the untrusted source can no longer
- *  recurse toward the process fd-table limit (EMFILE ≈ depth 510 at the default 1024). */
+ *  is generous while bounding the copy's source, destination and enumeration directory
+ *  descriptors held simultaneously. The entry budget separately bounds JS entry work. */
 const DEFAULT_SESSION_STORE_MAX_DEPTH = 64;
 
 /** Conservative production caps. A real rollout subtree is a handful of JSONL files;
@@ -189,7 +189,7 @@ export const DEFAULT_SESSION_STORE_BOUNDS: SessionStoreBounds = {
   maxTotalBytes: 512 * 1024 * 1024, // 512 MiB
   maxFileBytes: 64 * 1024 * 1024, // 64 MiB
   maxScanEntries: 100_000, // 10× maxFiles: headroom for dirs on a legit full copy
-  maxDepth: DEFAULT_SESSION_STORE_MAX_DEPTH, // caps simultaneous dir fds (~2·depth)
+  maxDepth: DEFAULT_SESSION_STORE_MAX_DEPTH, // caps active levels holding source, destination and enumeration fds
 };
 
 /** Result of {@link CodexSessionStore.persist}. */
@@ -264,18 +264,36 @@ function isAllowedSessionArtifact(name: string): boolean {
 
 // ─── Confinement helpers ─────────────────────────────────────────────────────────
 
-/** True iff `target` resolves to `root` itself or a descendant of it — the openat2
- *  "resolve within the given dir" confinement, applied to every path we touch. */
-function isWithin(root: string, target: string): boolean {
-  const rel = relative(root, target);
-  return rel === "" || (!rel.startsWith("..") && !isAbsolute(rel));
-}
-
-async function tryLstat(path: string): Promise<Stats | undefined> {
+/** Stream the pinned inode with one buffered JS entry, without a listing array.
+ * Only opening/advancing enumeration uses the local skip policy; consumer bounds,
+ * reads, writes and recursive failures stay outside those catches. Each consumer
+ * owns its entry budget, shared recursively; depth budgets are separate. These
+ * bound JS entry allocation/work, not kernel/libuv work, unrelated operations,
+ * or recursive deletion performed by rmAt.
+ */
+async function* scanDirectory(
+  parent: FileHandle,
+  skipEnumerationErrors = false,
+): AsyncGenerator<Dirent> {
+  let directory: Dir;
   try {
-    return await fsp.lstat(path);
-  } catch {
-    return undefined;
+    directory = await fsp.opendir(`/proc/self/fd/${parent.fd}`, { bufferSize: 1 });
+  } catch (error) {
+    if (skipEnumerationErrors) return;
+    throw error;
+  }
+  try {
+    // Consumer work runs outside this generator. A consumer return/throw unwinds
+    // the Dir iterator; only errors opening or advancing enumeration are skipped.
+    try {
+      for await (const entry of directory) yield entry;
+    } catch (error) {
+      if (!skipEnumerationErrors) throw error;
+    }
+  } finally {
+    // Exhaustion closes internally; on return/throw close before the held parent.
+    // Cleanup (including ERR_DIR_CLOSED) must not mask the consumer's result.
+    await directory.close().catch(() => {});
   }
 }
 
@@ -284,14 +302,14 @@ interface CopyTally {
   bytes: number;
 }
 
-/** Open a single readdir CHILD `name` relative to an already-open parent directory
+/** Open a single directory-entry CHILD `name` relative to an already-open parent directory
  *  handle, using the Linux magic-symlink `/proc/self/fd/<fd>/<name>`. Because the
  *  parent fd pins the directory INODE, a concurrent rename/swap of any ancestor path
  *  cannot redirect where `name` resolves — this is `openat(parent, name, …)` emulated
  *  in userland (the load-bearing anti-TOCTOU guard for the whole walk). `O_NOFOLLOW`
  *  in `flags` additionally makes `name` itself un-followable if it is a symlink.
  *
- *  `name` is always a single component straight from `readdir`, which never yields a
+ *  `name` is always a single component from a directory entry, which never yields a
  *  separator or `.`/`..`; we still reject those defensively (fail closed) so a bug or a
  *  hostile dirent can never turn this into a multi-component or parent traversal. */
 async function openAt(
@@ -339,8 +357,8 @@ async function readBounded(fh: FileHandle, size: number): Promise<Buffer> {
  * redirect resolution out of either root — the openat2 "resolve within the given dir"
  * guarantee the earlier pathname-based re-open (lstat-then-readdir-by-path) could not
  * give. Symlinks (files or dirs) are never followed; non-regular files, non-allowlisted
- * names, and auth-shaped (deny-substring) names/dirs are skipped; the copy is bounded
- * on every axis.
+ * names, and auth-shaped (deny-substring) names/dirs are skipped. Streaming bounds
+ * JS entry allocation and processing separately from file/byte and depth limits.
  *
  * `throwOnBound` distinguishes the two contracts: `persist` passes `true` (fail
  * CLOSED — a breach throws and the partial store is not trusted); `adopt` passes
@@ -353,10 +371,10 @@ async function readBounded(fh: FileHandle, size: number): Promise<Buffer> {
  * empty. Every entry examined charges the per-entry `visited` counter against
  * `bounds.maxScanEntries`, and every descent charges the `depth` argument against
  * `bounds.maxDepth` (default {@link DEFAULT_SESSION_STORE_MAX_DEPTH}) BEFORE the child
- * directory fd is opened, so neither an adversarial wide tree of non-allowlisted entries
- * nor a deep single-child chain (which would hold ~2·depth source+dest dir fds open
- * across the recursion and exhaust the process fd table) can make the walk run
- * unboundedly even copying zero — the walk is bounded on every axis, entries AND depth.
+ * directory fd is opened. The entry budget is shared across recursion and consumes
+ * at most cap + 1 entries, including rejected names; the separate depth limit bounds
+ * simultaneously held source/destination directory handles. Local enumeration I/O
+ * skips that directory, while consumer bounds/read/write errors retain their policy.
  */
 async function copyAllowlistedSessions(
   srcSessionsDir: string,
@@ -380,15 +398,8 @@ async function copyAllowlistedSessions(
     destDirFh: FileHandle,
     depth: number,
   ): Promise<boolean> => {
-    let entries;
-    try {
-      // Listing the fd's own inode (via /proc/self/fd) keeps the read anchored: it
-      // enumerates exactly the directory the fd pins, not a re-resolved pathname.
-      entries = await fsp.readdir(`/proc/self/fd/${srcDirFh.fd}`, { withFileTypes: true });
-    } catch {
-      return true; // an unreadable subdir is skipped (fail-safe); the walk continues
-    }
-    for (const entry of entries) {
+    // An enumeration failure skips this directory; sibling copying continues.
+    for await (const entry of scanDirectory(srcDirFh, true)) {
       // Charge EVERY entry examined, not just the ones copied, so a `sessions/` stuffed
       // with non-allowlisted junk cannot make this walk run unboundedly.
       visited += 1;
@@ -402,8 +413,8 @@ async function copyAllowlistedSessions(
       if (entry.isDirectory()) {
         if (nameHasDenySubstring(name)) continue; // never descend an auth-shaped dir
         // Depth cap BEFORE opening the child dir fd, so we never open even one fd past the
-        // limit. The fd-anchored walk holds a source AND dest dir fd at every level
-        // simultaneously (~2·depth), so an unbounded-depth chain in the untrusted source
+        // limit. The walk holds source, destination and enumeration fds at every
+        // active level, so an unbounded-depth chain in the untrusted source
         // would exhaust the process fd table (EMFILE); cap it on the same fail-closed /
         // fail-safe split every other bound uses.
         if (depth + 1 > maxDepth) {
@@ -545,34 +556,53 @@ export async function seedCodexSessionArtifacts(
   );
 }
 
-/** Scan for the FIRST allowlisted artifact under `sessionsDir`, bounded by
- *  `scanCap` entries so a pathological tree cannot make `inspect` walk forever. A
- *  breach throws {@link CodexSessionStoreBoundError}, which `inspect` maps to the
- *  tri-state "unknown". */
-async function hasAllowlistedArtifact(sessionsDir: string, scanCap: number): Promise<boolean> {
-  const root = resolve(sessionsDir);
+/** Find the FIRST allowlisted artifact under a held sessions descriptor. The
+ * shared recursive entry budget consumes at most scanCap + 1 entries, with one JS
+ * entry buffered per active level and no presence depth cap. Bounds and incomplete
+ * enumeration propagate to inspect as "unknown"; rejected child opens are skipped.
+ * The historical bound identity remains CodexSessionStoreBoundError("maxFiles").
+ */
+async function hasAllowlistedArtifact(sessionsDir: FileHandle, scanCap: number): Promise<boolean> {
   let visited = 0;
-
-  const walk = async (relDir: string): Promise<boolean> => {
-    const entries = await fsp.readdir(join(root, relDir), { withFileTypes: true });
-    for (const entry of entries) {
+  const walk = async (dir: FileHandle): Promise<boolean> => {
+    for await (const entry of scanDirectory(dir)) {
       if (++visited > scanCap) throw new CodexSessionStoreBoundError("maxFiles", scanCap);
-      const relPath = relDir === "" ? entry.name : `${relDir}/${entry.name}`;
-      const abs = join(root, relPath);
-      if (!isWithin(root, abs)) continue;
-      const st = await tryLstat(abs);
-      if (!st || st.isSymbolicLink()) continue;
-      if (st.isDirectory()) {
+      if (entry.isDirectory()) {
         if (nameHasDenySubstring(entry.name)) continue;
-        if (await walk(relPath)) return true;
-        continue;
+        let child: FileHandle;
+        try {
+          child = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") continue;
+          throw error;
+        }
+        try {
+          if (await walk(child)) return true;
+        } finally {
+          await closeQuietly(child);
+        }
+      } else if (entry.isFile() && isAllowedSessionArtifact(entry.name)) {
+        let file: FileHandle;
+        try {
+          // Open nonblocking before stat so a candidate raced to a FIFO cannot
+          // block inspect; file.stat() below rejects it as nonregular.
+          file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
+        } catch (error) {
+          const code = (error as NodeJS.ErrnoException).code;
+          if (code === "ENOENT" || code === "ENOTDIR" || code === "ELOOP") continue;
+          throw error;
+        }
+        try {
+          if ((await file.stat()).isFile()) return true;
+        } finally {
+          await closeQuietly(file);
+        }
       }
-      if (st.isFile() && isAllowedSessionArtifact(entry.name)) return true;
     }
     return false;
   };
-
-  return walk("");
+  return walk(sessionsDir);
 }
 
 // ─── Generation + pointer publication (fd-anchored transaction layer) ───────────
@@ -741,16 +771,11 @@ async function publishPointer(storeFd: FileHandle, genId: string): Promise<void>
 
 /** Remove leftover `.current.tmp.*` files (a crashed publish's residue). Safe with no reader
  *  coordination: a temp is only ever renamed onto `current` by its own creator, so a leftover is
- *  abandoned and read by no one. Bounded by the scan cap. Relative to the held `storeDir` dirfd. */
+ *  abandoned and read by no one. A separate entry budget bounds enumeration only, not recursive
+ *  rmAt. Local enumeration failures stop this sweep. Relative to the held `storeDir` dirfd. */
 async function sweepStaleTemps(storeFd: FileHandle, bounds: SessionStoreBounds): Promise<void> {
-  let entries;
-  try {
-    entries = await fsp.readdir(`/proc/self/fd/${storeFd.fd}`, { withFileTypes: true });
-  } catch {
-    return;
-  }
   let scanned = 0;
-  for (const entry of entries) {
+  for await (const entry of scanDirectory(storeFd, true)) {
     if ((scanned += 1) > bounds.maxScanEntries) return;
     if (entry.isFile() && entry.name.startsWith(POINTER_TMP_PREFIX)) {
       await rmAt(storeFd, entry.name).catch(() => {});
@@ -760,21 +785,16 @@ async function sweepStaleTemps(storeFd: FileHandle, bounds: SessionStoreBounds):
 
 /** Reap every generation directory except those in `keep` (the new + previous generation).
  *  Reader-safe because every store operation is serialized (see the per-store lock below): no
- *  reader can be mid-read of a generation while a persist reaps. Bounded by the scan cap;
- *  best-effort per entry. Relative to the held `generations/` dirfd. */
+ *  reader can be mid-read of a generation while a persist reaps. Its independent entry budget
+ *  bounds enumeration, not recursive rmAt. Local enumeration failures stop this reap;
+ *  deletion is best-effort per entry. Relative to the held `generations/` dirfd. */
 async function reapGenerations(
   gensFd: FileHandle,
   keep: Set<string>,
   bounds: SessionStoreBounds,
 ): Promise<void> {
-  let entries;
-  try {
-    entries = await fsp.readdir(`/proc/self/fd/${gensFd.fd}`, { withFileTypes: true });
-  } catch {
-    return;
-  }
   let scanned = 0;
-  for (const entry of entries) {
+  for await (const entry of scanDirectory(gensFd, true)) {
     if ((scanned += 1) > bounds.maxScanEntries) return;
     if (!entry.isDirectory() || keep.has(entry.name)) continue;
     await rmAt(gensFd, entry.name).catch(() => {});
@@ -1035,6 +1055,7 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
         let storeFd: FileHandle | undefined;
         let gensFd: FileHandle | undefined;
         let genFd: FileHandle | undefined;
+        let sessionsFd: FileHandle | undefined;
         try {
           try {
             storeFd = await resolveDir(storeDir);
@@ -1059,17 +1080,21 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
             return "unknown";
           }
           try {
-            const found = await hasAllowlistedArtifact(
-              `/proc/self/fd/${genFd.fd}/${SESSION_ALLOWED_SUBDIR}`,
-              opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxFiles,
-            );
-            return found ? "present" : "absent";
+            sessionsFd = await openAt(genFd, SESSION_ALLOWED_SUBDIR, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
           } catch (error) {
             const code = (error as NodeJS.ErrnoException).code;
-            if (code === "ENOENT" || code === "ENOTDIR") return "absent";
-            return "unknown"; // bound breach or unexpected I/O → uncertainty
+            return code === "ENOENT" || code === "ENOTDIR" ? "absent" : "unknown";
+          }
+          try {
+            return await hasAllowlistedArtifact(
+              sessionsFd,
+              opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxFiles,
+            ) ? "present" : "absent";
+          } catch {
+            return "unknown"; // bounds or incomplete enumeration are uncertainty
           }
         } finally {
+          await closeQuietly(sessionsFd);
           await closeQuietly(genFd);
           await closeQuietly(gensFd);
           await closeQuietly(storeFd);
@@ -1101,24 +1126,26 @@ export function createCodexSessionStore(hooks: CodexSessionStoreHooks = {}): Cod
           const scanCap = opts.scanCap ?? DEFAULT_SESSION_STORE_BOUNDS.maxScanEntries;
           const walk = async (dir: FileHandle, depth: number): Promise<boolean> => {
             if (depth > DEFAULT_SESSION_STORE_MAX_DEPTH) throw new CodexSessionStoreBoundError("maxDepth", DEFAULT_SESSION_STORE_MAX_DEPTH);
-            const entries = await fsp.readdir(`/proc/self/fd/${dir.fd}`, { withFileTypes: true });
-            for (const entry of entries) {
+            for await (const entry of scanDirectory(dir)) {
               if (++visited > scanCap) throw new CodexSessionStoreBoundError("maxScanEntries", scanCap);
               if (entry.isDirectory() && !nameHasDenySubstring(entry.name)) {
                 let child: FileHandle | undefined;
                 try {
                   child = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_DIRECTORY | FS.O_NOFOLLOW);
-                  if (await walk(child, depth + 1)) return true;
                 } catch (error) {
                   const code = (error as NodeJS.ErrnoException).code;
                   if (code !== "ENOENT" && code !== "ELOOP" && code !== "ENOTDIR") throw error;
+                  continue;
+                }
+                try {
+                  if (await walk(child, depth + 1)) return true;
                 } finally {
                   await closeQuietly(child);
                 }
               } else if (entry.isFile() && entry.name.endsWith(`-${sessionId}.jsonl`) && isAllowedSessionArtifact(entry.name)) {
                 let file: FileHandle | undefined;
                 try {
-                  file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW);
+                  file = await openAt(dir, entry.name, FS.O_RDONLY | FS.O_NOFOLLOW | FS.O_NONBLOCK);
                   if ((await file.stat()).isFile()) return true;
                 } catch (error) {
                   const code = (error as NodeJS.ErrnoException).code;

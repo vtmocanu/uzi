@@ -78,7 +78,7 @@ import {
   dockerScratchResumeNote,
   isNotCodePlan,
 } from "./prompt.js";
-import { resolveRunKind } from "./run-kind.js";
+import { isRunSummaryKind, resolveRunKind } from "./run-kind.js";
 import { isDecisionsMemoKind } from "./decisions-memo.js";
 import { dropRunCaches, type RunCacheDropResult } from "./run-caches.js";
 import { defaultEnvProbeSpawner, environmentFactsSummary, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "./env-probe.js";
@@ -803,6 +803,37 @@ export class SdkExecutor implements Executor {
   private readonly intentSettleBoundMs: number;
   /** Issue #2686: this run's in-flight intent-summary pass, undefined when none started. */
   private intentFlight: IntentFlight | undefined;
+  private planGeneration = 0;
+  private summaryLifecycle = { closed: false };
+  private planFlight?: IntentFlight & { generation: number; closed: boolean };
+  private readonly planFlights = new Set<IntentFlight & { generation: number; closed: boolean }>();
+
+  /** Close admission before yielding. Intent and all owned plan flights drain concurrently
+   * within one short bound; an ignored abort is abandoned and cannot publish or emit usage. */
+  async closeAndSettlePlanSummary(deadlineMs?: number): Promise<void> {
+    this.summaryLifecycle.closed = true;
+    const flights = [...this.planFlights];
+    for (const flight of flights) { flight.closed = true; flight.ctrl.abort(); }
+    const bound = Math.min(this.intentSettleBoundMs, deadlineMs ?? Infinity);
+    await Promise.all([
+      this.settleIntentSummary(Math.max(0, bound)),
+      ...flights.map(async flight => {
+        if (flight.abandoned) return;
+        let timer: ReturnType<typeof setTimeout> | undefined;
+        try {
+          const settled = await Promise.race([
+            flight.done.then(() => true, () => true),
+            new Promise<boolean>(resolve => { timer = setTimeout(() => resolve(false), Math.max(0, bound)); }),
+          ]);
+          if (!settled) {
+            flight.abandoned = true;
+            this.log.warn("plan summary did not settle within the bound");
+          }
+        } finally { clearTimeout(timer); }
+      }),
+    ]);
+  }
+
   /** PRD #516 M1: timeout for the per-turn `getContextUsage()` control call. */
   private readonly contextUsageTimeoutMs: number;
   /** issue #1197 (D-RC2b): base in-process backoff between positively-empty turn
@@ -840,7 +871,7 @@ export class SdkExecutor implements Executor {
    *  seam; `beginTurn()`/`accept()`/`finish()` are all on that interface. */
   private reducer: RunTurnReducer;
   /** PRD #1798 M2: the last plan summary + deltas the api accepted this run
-   *  (generateAndPostPlanSummary), forwarded as ExecutorResult.summaryPlan/summaryDeltas.
+   *  (beginPlanSummary), forwarded as ExecutorResult.summaryPlan/summaryDeltas.
    *  Reset per run in run(). */
   private latestPlanSummary: PlanSummaryResult | undefined;
 
@@ -933,6 +964,10 @@ export class SdkExecutor implements Executor {
    * signal is signalled group-only, with no bare-pid fallback (issue #1656).
    */
   killAgentTree(): void {
+    // Last defense for synchronous callers; async destructive seams join first.
+    this.summaryLifecycle.closed = true;
+    for (const flight of this.planFlights) { flight.closed = true; flight.ctrl.abort(); }
+    this.intentFlight?.ctrl.abort();
     for (const pid of this.spawnedPids) {
       if (this.deadCliPids.has(pid)) this.killCliGroup(pid);
       else this.kill(pid);
@@ -982,6 +1017,7 @@ export class SdkExecutor implements Executor {
    * build survives the group kill. Never throws.
    */
   async reapAttributedProcesses(): Promise<RunProcessReap> {
+    await this.closeAndSettlePlanSummary();
     // The background deps install carries the run's HOME, so the HOME-attributed reap would count
     // it as a survivor and kill npm's children. Tear it down first. A switch that gives up and
     // continues in place loses it: best-effort by design (the agent installs the dependencies itself).
@@ -1041,70 +1077,63 @@ export class SdkExecutor implements Executor {
     }
   }
 
-  /**
-   * PRD #362 M3c PLAN-summary hook. AWAITS a plan summary + deltas for `approvedPlan`
-   * (blocking, up to the model timeout INTERNAL to generatePlanSummary — Decision 2:
-   * it blocks gate ENTRY, never the terminal outcome), then posts it carrying
-   * `plan_md: approvedPlan` as the Decision 3 stale-write guard value.
-   *
-   * ORDERING (code review PR #387, finding 1): this MUST run AFTER the gate has persisted
-   * plan_md, or the server guard `plan_md = @expected` matches 0 rows and 409s the write.
-   * It is therefore wired as the gate's `onAwaitingApproval` callback — the gate reports
-   * awaiting_approval (SetRunAwaitingApproval writes `approvedPlan`, NUL-stripped, to
-   * runs.plan_md) and THEN invokes this, so `planMd` here is the exact persisted text and
-   * the guard matches (a superseded plan → 409, dropped). The autopilot short-circuit
-   * persists plan_md via its running report (SetRunAutopilotPlan, RC1 #1197) but never
-   * invokes the callback, so it generates no plan summary.
-   *
-   * ADVISORY: issue runs only, token + client + resolved-PRD present, and EVERYTHING is
-   * wrapped — a null (timeout / model error / unusable output), a 409 stale, a 400 bad
-   * deltas, or any throw is logged and swallowed so a summary failure NEVER blocks the
-   * gate or changes the run's outcome.
-   */
-  private async generateAndPostPlanSummary(
-    ctx: RunContext,
-    approvedPlan: string,
-    prdInputP: Promise<PrdInput> | undefined,
-  ): Promise<void> {
-    const token = ctx.oauthToken?.trim();
-    const isIssue = ctx.kind === "issue" || ctx.kind === undefined;
-    if (!isIssue || !token || !this.client || !prdInputP) return;
-    // PRD #1798 M2: a new generation supersedes the latched summary of an earlier plan, so a
-    // re-plan whose summary then fails never forwards the OLD plan's summary on the result.
-    this.latestPlanSummary = undefined;
-    try {
-      const prd = await prdInputP;
-      const r = await this.summaryRunner.generatePlanSummary({
-        token,
-        model: ctx.summaryModel ?? "",
-        issueTitle: ctx.issueTitle,
-        issueBody: ctx.issueDescription,
-        prdText: prd.prdText,
-        planMd: approvedPlan,
-        onUsage: (u) => {
-          if (ctx.claimFenced?.()) return;
-          ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: u } });
-        },
-      });
-      if (r) {
-        await this.client.postPlanSummary(ctx.runId, {
-          summary: r.summary,
-          deltas: r.deltas,
-          // Mirror the server's NUL-strip (SetRunAwaitingApproval stores
-          // stripNULParam(plan_md)) so the stale-write guard's `plan_md = @expected`
-          // matches the stored column even for a NUL-bearing plan — otherwise a lone
-          // 0x00 in the plan text would silently 409 every plan-summary write.
-          plan_md: approvedPlan.replaceAll("\u0000", ""),
-        });
-        // PRD #1798 M2: latch only after the api ACCEPTED it (a 409 stale / 400 throws above).
-        this.latestPlanSummary = { summary: r.summary, deltas: r.deltas };
-      }
-    } catch (err) {
-      this.log.warn("plan summary hook failed", {
-        run_id: ctx.runId,
-        error: errMessage(err),
-      });
+  /** Prepare once per candidate, before persistence; retries share the owned callback flight. */
+  private beginPlanSummary(ctx: RunContext, prdInputP: Promise<PrdInput> | undefined): (planMd: string) => Promise<void> {
+    const generation = ++this.planGeneration;
+    if (this.planFlight) {
+      this.planFlight.closed = true;
+      this.planFlight.ctrl.abort();
     }
+    this.latestPlanSummary = undefined;
+    const lifecycle = this.summaryLifecycle;
+    lifecycle.closed = false;
+    let flight: (IntentFlight & { generation: number; closed: boolean }) | undefined;
+    return planMd => {
+      if (flight) return flight.done;
+      const token = ctx.oauthToken?.trim();
+      if (!isRunSummaryKind(ctx.kind) || !token || !this.client || !prdInputP ||
+          lifecycle.closed || generation !== this.planGeneration) return Promise.resolve();
+      // Own the flight before the first await, including a repeated storage callback.
+      flight = { ctrl: new AbortController(), done: Promise.resolve(), abandoned: false,
+        delivered: false, generation, closed: false };
+      const owned = flight;
+      this.planFlight = owned;
+      this.planFlights.add(owned);
+      const allowed = (): boolean => this.planFlight === owned && generation === this.planGeneration
+        && this.summaryLifecycle === lifecycle && !lifecycle.closed && !owned.closed
+        && !owned.abandoned && !owned.ctrl.signal.aborted && !ctx.claimFenced?.()
+        && !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !ctx.signal?.aborted;
+      owned.done = (async () => {
+        try {
+          if (!allowed()) return;
+          const prd = await prdInputP;
+          if (!allowed()) return;
+          const result = await this.summaryRunner.generatePlanSummary({
+            token, model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
+            issueBody: ctx.issueDescription, prdText: prd.prdText, planMd,
+            signal: AbortSignal.any([owned.ctrl.signal,
+              ...(ctx.signal ? [ctx.signal] : []),
+              ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : [])]),
+            // Spend observed during bounded settlement counts even after close/abort; only
+            // abandonment, a fence or a superseding flight drops it (as for the intent pass).
+            onUsage: usage => {
+              if (owned.delivered || owned.abandoned || this.planFlight !== owned
+                || generation !== this.planGeneration || ctx.claimFenced?.()) return;
+              owned.delivered = true;
+              ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
+            },
+          });
+          if (!result || !allowed()) return;
+          await this.client!.postPlanSummary(ctx.runId, {
+            ...result, plan_md: planMd.replaceAll("\u0000", ""),
+          });
+          if (allowed()) this.latestPlanSummary = result;
+        } catch (error) {
+          this.log.warn("plan summary hook failed", { run_id: ctx.runId, error: errMessage(error) });
+        } finally { this.planFlights.delete(owned); }
+      })();
+      return owned.done;
+    };
   }
 
   /** issue #1830: false from the start of {@link run} until the background JS-deps install has been
@@ -1128,15 +1157,23 @@ export class SdkExecutor implements Executor {
     this.harness.setUsageSink(ctx.usage);
     this.latestPlanSummary = undefined;
     this.intentFlight = undefined;
+    this.summaryLifecycle = { closed: false };
+    this.planFlight = undefined;
+    this.planGeneration++;
+    let summaryResult: ExecutorResult | undefined;
     const drive = await this.phaseSetup(ctx);
     try {
       const early = await this.phasePlanGate(ctx, drive);
-      if (early !== undefined) return early;
-      return await this.phaseRunLoop(ctx, drive);
+      if (early !== undefined) return (summaryResult = early);
+      return (summaryResult = await this.phaseRunLoop(ctx, drive));
     } finally {
       // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
       // open, so its observed usage is emitted rather than dropped by a closed batcher.
-      await this.settleIntentSummary();
+      await this.closeAndSettlePlanSummary();
+      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || ctx.signal?.aborted || ctx.terminalLifecycleSignal?.aborted)) {
+        delete summaryResult.summaryPlan;
+        delete summaryResult.summaryDeltas;
+      }
       this.disarmWall(drive.state);
       if (ctx.signal) ctx.signal.removeEventListener("abort", drive.onSignal);
       // PRD #121 M2: no install may outlive the run. On every path that never reached
@@ -1304,9 +1341,8 @@ export class SdkExecutor implements Executor {
     let latestProgress: MilestoneProgress | undefined = undefined;
     // PRD #122 M6: the milestone list FROZEN at the gate, hoisted out of the block-scoped
     // `candidateMilestones` inside the plan-and-gate block so the implement loop can name
-    // the milestones in its prompt. Assigned once the gate resolves `approve`; it stays
-    // undefined on the pre-approved resume path (no plan-and-gate block runs there) —
-    // acceptable for M6, which introduces no claim change to carry it across a resume.
+    // the milestones in its prompt. Assigned once the gate resolves `approve`, or from
+    // ctx.frozenMilestones when a pre-approved resume skips the plan-and-gate block.
     // Initialized undefined for the same reason as latestProgress above: it is
     // assigned in phasePlanGate through the carrier, not here.
     let frozenMilestones: Milestone[] | undefined = undefined;
@@ -1852,13 +1888,13 @@ export class SdkExecutor implements Executor {
        *  infers the cap has none. */
       const budget = { asked: 0 };
 
-      // --- PRD #362 M3c: inline run-summary hooks (advisory, issue runs only) ---
-      // Guard ALL summary work: issue runs only (kind "issue" or undefined), an OAuth
+      // --- PRD #362 M3c: inline run-summary hooks (advisory, eligible kinds) ---
+      // Guard summary work by kind, an OAuth
       // token, and a client to POST to — a stub/e2e run without a token or client is
       // unaffected. resolvePrdInput is memoized ONCE per run (a single file read) and
       // reused by BOTH hooks; it never throws.
       const summariesOn =
-        (ctx.kind === "issue" || ctx.kind === undefined) &&
+        isRunSummaryKind(ctx.kind) &&
         !!oauthToken &&
         !!this.client;
       const prdInputP: Promise<PrdInput> | undefined = summariesOn
@@ -1884,6 +1920,7 @@ export class SdkExecutor implements Executor {
         flight.done = (async () => {
           try {
             const prd = await prdInputP!;
+            if (flight.abandoned || flight.ctrl.signal.aborted || ctx.claimFenced?.() || ctx.cancelRequested?.()) return;
             const summary = await this.summaryRunner.generateIntentSummary({
               token: oauthToken,
               model: ctx.summaryModel ?? "",
@@ -1892,12 +1929,13 @@ export class SdkExecutor implements Executor {
               prdText: prd.prdText,
               signal: flight.ctrl.signal,
               onUsage: (u) => {
-                if (flight.delivered || flight.abandoned || ctx.claimFenced?.()) return;
+                if (this.intentFlight !== flight || flight.delivered || flight.abandoned || ctx.claimFenced?.()) return;
                 flight.delivered = true;
                 ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "intent", model_usage: u } });
               },
             });
-            if (summary) await this.client!.postIntentSummary(ctx.runId, summary);
+            if (summary && this.intentFlight === flight && !flight.abandoned && !flight.ctrl.signal.aborted
+                && !ctx.claimFenced?.() && !ctx.cancelRequested?.()) await this.client!.postIntentSummary(ctx.runId, summary);
           } catch (err) {
             this.log.warn("intent summary hook failed", {
               run_id: ctx.runId,
@@ -1922,6 +1960,7 @@ export class SdkExecutor implements Executor {
           },
         });
         approvedPlan = ctx.approvedPlan!;
+        frozenMilestones = ctx.frozenMilestones ?? undefined;
       } else {
         // --- Phase 1: planning turn ------------------------------------------
         // A ci_fix run (PRD #6) diagnoses a failed pipeline from its frozen snapshot
@@ -2134,15 +2173,7 @@ export class SdkExecutor implements Executor {
         // guarantee the only way past this block is an `approve` (see the explicit guard).
         if (!ctx.gatePlan)
           throw new TrustedExecutionRefusal("plan gate is not wired for this run");
-        // PRD #362 M3c PLAN hook (Decision 2): generate + post the plan summary as the
-        // gate's onAwaitingApproval callback, so it fires AFTER the gate persists plan_md
-        // (the summary's stale-write guard value) and BEFORE the verdict wait — blocking
-        // gate ENTRY up to the model timeout but NEVER the terminal outcome. Posting it
-        // before the gate (as an earlier revision did) always 409s against a NULL/previous
-        // plan_md and is silently dropped. The autopilot short-circuit persists plan_md via
-        // its running report (SetRunAutopilotPlan, RC1 #1197) but never invokes the callback,
-        // so an auto-approved run generates no plan summary. Advisory — the
-        // helper swallows every failure.
+        // Prepare the advisory pass per candidate; gate persistence owns its admission.
         // PRD #1247 M5b (data-integrity fix): the plan gate is a HELD idle state — a credential
         // switch trips by rejecting the parked gate waiter with a CredentialSwitchSignal. Handle it
         // IN PLACE at EVERY gate wait via runThroughSwitch: "released" ends the flight (surface
@@ -2155,10 +2186,10 @@ export class SdkExecutor implements Executor {
         let verdict: PlanVerdict;
         if (resumedRevise) verdict = resumedRevise;
         else {
+          const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
           const g0 = await this.runThroughSwitch(ctx, state, () =>
-            ctx.gatePlan!(approvedPlan, gateMilestones, (planMd) =>
-              this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
-            ),
+            ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted),
+
             ctx.continueExistingPlanGate,
           );
           if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
@@ -2261,13 +2292,14 @@ export class SdkExecutor implements Executor {
           candidateMilestones = turn.milestones;
           gateMilestones = turn.rejectedMilestones ?? turn.milestones;
           // PRD #362 M3c: a re-plan REGENERATES the plan summary (Decision 2), fired from
-          // the gate's onAwaitingApproval callback (after the re-report persists the NEW
+          // the gate's onPlanPersisted callback (after the re-report persists the NEW
           // plan_md) so its stale-write guard matches the new plan.
+          const onPlanPersisted = this.beginPlanSummary(ctx, prdInputP);
           const gRev = await this.runThroughSwitch(ctx, state, () =>
             ctx.gatePlan!(
               approvedPlan,
               gateMilestones,
-              (planMd) => this.generateAndPostPlanSummary(ctx, planMd, prdInputP),
+              onPlanPersisted,
               settles,
             ),
             ctx.continueExistingPlanGate,
@@ -2676,7 +2708,7 @@ export class SdkExecutor implements Executor {
         // Interlocked rework continues directly to this boundary. Check its existing attempt
         // state after the fresh cap and any upward budget lift, before another provider turn.
         if (isIssueRun && ctx.completionInterlock && completionAttempted && iteration > maxIterations) {
-          if (await routeCompletionHold(ctx, REASON_MAX_ITERATIONS, completionAttempted)) {
+          if (await this.routeSummaryHold(ctx, REASON_MAX_ITERATIONS, completionAttempted)) {
             completionHeld = { reason: REASON_MAX_ITERATIONS };
             break;
           }
@@ -2740,7 +2772,7 @@ export class SdkExecutor implements Executor {
           served?.budgetExhausted &&
           ctx.completionInterlock &&
           completionAttempted &&
-          (await routeCompletionHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
+          (await this.routeSummaryHold(ctx, REASON_COMPLETION_BUDGET_EXHAUSTED, completionAttempted))
         ) {
           completionHeld = { reason: REASON_COMPLETION_BUDGET_EXHAUSTED };
           break;
@@ -2874,11 +2906,11 @@ export class SdkExecutor implements Executor {
             // byte-identical to before (it never carried this). First turn only.
             priorWork: preApproved ? ctx.priorWork : undefined,
             // PRD #122 M6: name the frozen milestones and their live status so the lead
-            // can see the boundaries and checkpoint at each one. Both undefined on the
-            // pre-approved resume path (frozenMilestones is never assigned there) and on
-            // any run with no approved breakdown, which makes the note additive-absent.
+            // can see the boundaries and checkpoint at each one. A pre-approved resume
+            // uses the claim's frozen list; no approved breakdown adds no note.
             milestones: frozenMilestones,
             progress: latestProgress,
+            serverCompletedIds: lastServedScope?.completedIds,
             // PRD #390 M3: escalate this turn when the PREVIOUS work turn left the tracker with no
             // milestone in progress on a milestone-bearing run.
             progressMissedLastTurn,
@@ -2909,7 +2941,7 @@ export class SdkExecutor implements Executor {
           if (ctx.cancelRequested?.()) throw new Error(REASON_CANCELLED);
           throwIfDiskStop(ctx);
           if (ctx.pauseModeRequested?.() === "wall") {
-            if (completionAttempted && await routeCompletionHold(ctx, REASON_WALL, completionAttempted)) {
+            if (completionAttempted && await this.routeSummaryHold(ctx, REASON_WALL, completionAttempted)) {
               completionHeld = { reason: REASON_WALL };
               return true;
             }
@@ -3011,7 +3043,10 @@ export class SdkExecutor implements Executor {
           // clarification turn free.
           const asked = turn.questions;
           if (asked?.length) {
-            if (turn.checkpoint) await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            if (turn.checkpoint) {
+              await this.closeAndSettlePlanSummary();
+              await ctx.checkpoint?.({ reap: true, progress: latestProgress });
+            }
             if (clarificationRounds++ >= questionMax(ctx.config ?? null) + 1) throw new Error("clarification rounds exhausted during implementation");
             // PRD #1247 M5b (data-integrity fix): the clarification park is a HELD idle state — a
             // credential switch can trip while awaiting the answer (steering rejects the answer waiter
@@ -3096,7 +3131,7 @@ export class SdkExecutor implements Executor {
           if (
             err instanceof Error &&
             (err.message === REASON_WALL || err.message === REASON_IDLE) &&
-            (await routeCompletionHold(ctx, err.message, completionAttempted))
+            (await this.routeSummaryHold(ctx, err.message, completionAttempted))
           ) {
             completionHeld = { reason: err.message };
             break;
@@ -3138,6 +3173,7 @@ export class SdkExecutor implements Executor {
         // still terminates: the `if (turn.done) break;` below wins because we skip the
         // continue when done.
         if (turn.checkpoint && !turn.done) {
+          await this.closeAndSettlePlanSummary();
           await ctx.checkpoint?.({ reap: true, progress: latestProgress });
           // PRD #390 M3: a cooperative checkpoint is a milestone boundary = progress evidence.
           // Re-arm enforcement for the NEXT milestone: reset the miss streak and escalation flag,
@@ -3221,6 +3257,7 @@ export class SdkExecutor implements Executor {
             // semantics. The backstops are the worker PVC (the commits survive on disk) and a
             // later checkpoint re-push. reap:true — the same reap-before-git ordering the done
             // path uses; the session transcript survives on disk, so the next turn resumes it.
+            await this.closeAndSettlePlanSummary();
             await ctx.checkpoint?.({ reap: true, progress: latestProgress });
             // Fix 3: the run has now parked at least once. Latch it so no resumed follow-up
             // turn re-emits the first-turn-only scaffolding (see `first` above and hasParked).
@@ -3345,6 +3382,7 @@ export class SdkExecutor implements Executor {
             //    BEFORE any denial/feedback, so a rework prompt or a hold never loses it.
             //    reap:true is the same reap-before-git ordering the done/interactive-park paths
             //    use; the session transcript survives on disk so the SAME session resumes.
+            await this.closeAndSettlePlanSummary();
             await ctx.checkpoint?.({ reap: true, progress: latestProgress, sink: "done_checkpoint" });
             // 2. Read the branch tip + worktree fingerprint. The runner's worktreeFingerprint is
             //    `${tip}\n${porcelain}`, so the FIRST line is the branch head (null when the
@@ -3446,7 +3484,7 @@ export class SdkExecutor implements Executor {
                 },
               });
               if (
-                await routeCompletionHold(
+                await this.routeSummaryHold(
                   ctx,
                   REASON_COMPLETION_NO_PROGRESS,
                   completionAttempted,
@@ -3508,7 +3546,7 @@ export class SdkExecutor implements Executor {
           // (M4) rather than failing; PRE-attempt (or with the seam unwired) it throws the legacy
           // REASON_MAX_ITERATIONS exactly as before.
           if (
-            await routeCompletionHold(
+            await this.routeSummaryHold(
               ctx,
               REASON_MAX_ITERATIONS,
               completionAttempted,
@@ -3593,7 +3631,7 @@ export class SdkExecutor implements Executor {
             // legacy REASON_NO_PROGRESS. The #281 detector itself is unchanged for the
             // NON-completion phase (before any completion attempt), which is the common case.
             if (
-              await routeCompletionHold(
+              await this.routeSummaryHold(
                 ctx,
                 REASON_NO_PROGRESS,
                 completionAttempted,
@@ -3758,12 +3796,12 @@ export class SdkExecutor implements Executor {
    * abandoned: it was aborted and its late usage is dropped, so waiting again could only add a
    * bound), false at the bound.
    */
-  private async waitIntentSummary(): Promise<boolean> {
+  private async waitIntentSummary(boundMs = this.intentSettleBoundMs): Promise<boolean> {
     const flight = this.intentFlight;
     if (flight === undefined || flight.abandoned) return true;
     let timer: ReturnType<typeof setTimeout> | undefined;
     const timedOut = new Promise<false>((resolve) => {
-      timer = setTimeout(() => resolve(false), this.intentSettleBoundMs);
+      timer = setTimeout(() => resolve(false), boundMs);
     });
     try {
       return await Promise.race([flight.done.then(() => true as const, () => true as const), timedOut]);
@@ -3777,12 +3815,12 @@ export class SdkExecutor implements Executor {
    * its already-observed usage. Idempotent; never throws; never waits for the generation
    * timeout. A pass still running at the bound is abandoned (its late usage is dropped).
    */
-  private async settleIntentSummary(): Promise<void> {
+  private async settleIntentSummary(boundMs = this.intentSettleBoundMs): Promise<void> {
     const flight = this.intentFlight;
     if (flight === undefined) return;
     flight.ctrl.abort();
     if (flight.abandoned) return;
-    if (!(await this.waitIntentSummary())) {
+    if (!(await this.waitIntentSummary(boundMs))) {
       flight.abandoned = true;
       this.log.warn("intent summary: the aborted pass did not settle within the bound; its late usage is dropped");
     }
@@ -3799,7 +3837,7 @@ export class SdkExecutor implements Executor {
   private async attemptCredentialSwitch(ctx: RunContext): Promise<"released" | "gave_up" | undefined> {
     if (!ctx.attemptCredentialSwitch) return undefined;
     await this.waitIntentSummary();
-    await this.settleIntentSummary();
+    await this.closeAndSettlePlanSummary();
     return ctx.attemptCredentialSwitch();
   }
 
@@ -4578,6 +4616,11 @@ export class SdkExecutor implements Executor {
    * caller latches pausedAt and breaks; false ⇒ the caller CONTINUES the run (a failed publish,
    * or an executor with no parkForPause wired — the stub/tests, where a pause is inert).
    */
+  private async routeSummaryHold(ctx: RunContext, reason: string, attempted: boolean): Promise<boolean> {
+    if (attempted && ctx.enterCompletionHold) await this.closeAndSettlePlanSummary();
+    return routeCompletionHold(ctx, reason, attempted);
+  }
+
   private async requestPause(
     ctx: RunContext,
     at: { completedCount: number; total?: number },
@@ -4595,6 +4638,7 @@ export class SdkExecutor implements Executor {
         ...(at.total !== undefined ? { total: at.total } : {}),
       },
     });
+    if (ctx.parkForPause) await this.closeAndSettlePlanSummary();
     return (await ctx.parkForPause?.(at)) ?? false;
   }
 
@@ -4623,6 +4667,7 @@ export class SdkExecutor implements Executor {
         ...(at.total !== undefined ? { total: at.total } : {}),
       },
     });
+    if (ctx.parkForWall) await this.closeAndSettlePlanSummary();
     return ctx.parkForWall ? await ctx.parkForWall(at) : undefined;
   }
 

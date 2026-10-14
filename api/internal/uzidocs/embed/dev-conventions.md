@@ -679,6 +679,15 @@ scenarios are mutually exclusive by construction. Known values:
   it and capacity stays `ok` below 24h, without an episode.
   `health-silent` (the default too) serves an all-passing document.
   Requires a signed-in admin.
+- `agent-source-update` — `/admin/health?mock=agent-source-update` seeds an
+  enabled source pinned to `v1.2.0` with persisted discovery of `v1.10.0`.
+  The `agentsource.update` instance housekeeping check warns without a
+  blocking episode or Danger banner. Admin and Health attention counts and
+  the Instance advisory mark share the source card's update state; follow
+  Health's link to `/admin/settings#agent-source` to review it. Bumping the
+  tag pin clears the warning without an apply; with a branch ref, applying a
+  snapshot matching the recorded tip clears it. Requires a signed-in admin.
+  (#2902.)
 
 ### What keeps the mock build current
 

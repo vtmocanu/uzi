@@ -4,7 +4,7 @@
 // naming every non-zero severity. Asserted by accessible name and visible count, never by
 // a colour class. AdminShell is mounted standalone, so useHealthStatus self-fetches.
 import { afterEach, describe, expect, it, vi } from "vitest";
-import { cleanup, render, screen, waitFor, within } from "@testing-library/react";
+import { act, cleanup, render, screen, waitFor, within } from "@testing-library/react";
 import { MemoryRouter } from "react-router-dom";
 
 import { AdminShell } from "./AdminShell";
@@ -16,10 +16,15 @@ vi.mock("../lib/api", async (importOriginal) => {
   return { ...actual, api: { getAdminHealth: vi.fn() } };
 });
 const mockApi = vi.mocked(api);
+const originalScrollIntoView = Object.getOwnPropertyDescriptor(HTMLElement.prototype, "scrollIntoView");
 
 afterEach(() => {
   cleanup();
   vi.clearAllMocks();
+  vi.useRealTimers();
+  vi.restoreAllMocks();
+  if (originalScrollIntoView) Object.defineProperty(HTMLElement.prototype, "scrollIntoView", originalScrollIntoView);
+  else Reflect.deleteProperty(HTMLElement.prototype, "scrollIntoView");
 });
 
 async function renderShell(doc: HealthDoc) {
@@ -33,6 +38,53 @@ async function renderShell(doc: HealthDoc) {
   );
   await waitFor(() => expect(mockApi.getAdminHealth).toHaveBeenCalled());
 }
+
+describe("AdminShell agent source pip", () => {
+  function sourceDoc(severity: string | null) {
+    const doc = healthySilentDoc();
+    doc.checks = doc.checks.flatMap((c) => c.id === "agentsource.update"
+      ? severity === null ? [] : [{ ...c, severity }]
+      : [c]);
+    return doc;
+  }
+
+  it.each(["warn", "unknown"])("renders a worded %s shape on Instance only", async (severity) => {
+    await renderShell(sourceDoc(severity));
+    const label = severity === "warn" ? "Agent source update available" : "Agent source update status unavailable";
+    const pip = await screen.findByRole("img", { name: label });
+    expect(screen.getByRole("link", { name: new RegExp("Instance") }).contains(pip)).toBe(true);
+    expect(pip.querySelector(severity === "warn" ? "polygon" : 'circle[fill="none"]')).toBeTruthy();
+    expect(pip.classList.contains(severity === "warn" ? "text-warn" : "text-muted")).toBe(true);
+  });
+
+  it.each(["ok", "na", "danger", null])("hides the dedicated pip for %s", async (severity) => {
+    await renderShell(sourceDoc(severity));
+    expect(within(screen.getByRole("link", { name: "Instance" })).queryByRole("img")).toBeNull();
+  });
+
+  it("scrolls when dedicated severity or presence changes with aggregate attention unchanged", async () => {
+    vi.useFakeTimers();
+    const scroll = vi.fn();
+    Object.defineProperty(HTMLElement.prototype, "scrollIntoView", { value: scroll, configurable: true });
+    const warn = sourceDoc("warn");
+    const unknown = sourceDoc("unknown");
+    const absent = sourceDoc(null);
+    // A different check keeps the aggregate count/tone constant across the swap.
+    for (const doc of [warn, unknown, absent]) doc.counts = { ok: 19, warn: 1, danger: 1, unknown: 0, na: 0 };
+    mockApi.getAdminHealth.mockResolvedValueOnce(warn).mockResolvedValueOnce(unknown).mockResolvedValueOnce(absent);
+    render(<MemoryRouter initialEntries={["/admin/settings"]}><AdminShell description={null}>body</AdminShell></MemoryRouter>);
+    await act(async () => { await Promise.resolve(); });
+    expect(screen.getByRole("img", { name: "Agent source update available" })).toBeTruthy();
+    scroll.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByRole("img", { name: "Agent source update status unavailable" })).toBeTruthy();
+    expect(scroll).toHaveBeenCalled();
+    scroll.mockClear();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(within(screen.getByRole("link", { name: "Instance" })).queryByRole("img")).toBeNull();
+    expect(scroll).toHaveBeenCalled();
+  });
+});
 
 describe("AdminShell health tab pip", () => {
   it("names danger and warning separately on an incident, with the attention total visible", async () => {

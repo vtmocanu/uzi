@@ -96,16 +96,19 @@ type apRunCall struct {
 	userID, repoID uuid.UUID
 	iid            int64
 	desc           string
+	explicit       *workersvc.Harness
 }
 
 type apRuns struct {
-	err   error
-	calls []apRunCall
-	ops   *[]string
+	err         error
+	calls       []apRunCall
+	ops         *[]string
+	resolveErr  error
+	resolutions []*workersvc.Harness
 }
 
-func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, iid int64, desc string) (store.Run, error) {
-	r.calls = append(r.calls, apRunCall{userID, repoID, iid, desc})
+func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID, iid int64, desc string, explicit *workersvc.Harness) (store.Run, error) {
+	r.calls = append(r.calls, apRunCall{userID, repoID, iid, desc, explicit})
 	if r.ops != nil {
 		*r.ops = append(*r.ops, "create")
 	}
@@ -113,6 +116,11 @@ func (r *apRuns) CreateAutopilotRun(_ context.Context, userID, repoID uuid.UUID,
 		return store.Run{}, r.err
 	}
 	return store.Run{ID: uuid.New()}, nil
+}
+
+func (r *apRuns) ResolveHarnessForUser(_ context.Context, _ uuid.UUID, explicit *workersvc.Harness) (workersvc.Harness, error) {
+	r.resolutions = append(r.resolutions, explicit)
+	return *explicit, r.resolveErr
 }
 
 type apLabeler struct {
@@ -134,6 +142,7 @@ type apNote struct {
 
 type apForge struct {
 	forgetest.BaseFake
+	fetches   int
 	events    map[int64][]forge.LabelEvent
 	eventsErr error
 	issue     forge.Issue
@@ -149,8 +158,11 @@ func (f *apForge) ListIssueLabelEvents(_ context.Context, _, iid int64) ([]forge
 	}
 	return f.events[iid], nil
 }
-func (f *apForge) GetIssue(context.Context, int64, int64) (forge.Issue, error) {
-	return f.issue, f.issueErr
+func (f *apForge) GetIssue(_ context.Context, _ int64, iid int64) (forge.Issue, error) {
+	f.fetches++
+	issue := f.issue
+	issue.IID = iid
+	return issue, f.issueErr
 }
 func (f *apForge) CreateIssueNote(_ context.Context, _, iid int64, body string) (forge.IssueNote, error) {
 	if f.noteErr != nil {
