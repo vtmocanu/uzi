@@ -8,6 +8,14 @@ Comment-only commit `974d49921b253c03b0310e2ec374d66883bfc5ba` replaces the obso
 
 This section is the current-state record. The earlier sections below are historical records at their own named revisions. **M1 is not complete:** the full agent gate was interrupted, two observed failures remain unclassified, and the unchanged LiveDB sweep plus real command-only subprocess proof have not executed in this resumed integration. M4 and M5 remain unstarted.
 
+### Follow-up live sweep — M1 remains incomplete
+
+At evidence-only candidate `6842646ff1dde3cbfdc27e75dca799e8ab4be8f9`, the lead ran unchanged `./e2e/run-store-it.sh` in the foreground. It returned **FAIL, EXIT=1** (`gate-log.ZaOR5m`). Store, handler, forgesvc and schedsvc completed with plain package PASS lines. Named memory archive custody, owner-only Cancel/Release, reservation concurrency/binding/replay/no-refund, claim incarnation, allowance preservation, revision and feed-deduplication cases executed and passed. This is fresh live proof of those named cases, not a passing full sweep.
+
+Workersvc reached its existing cumulative 15-minute package timeout (900.174 seconds); the panic named `TestWorkerExhaustionEpisodeAccountingLiveDB/ordinary/owner_ordinary` with zero seconds reported for the currently running case. This does not establish a deadlock or failure in that case, nor establish a pre-existing failure. The sweep stopped before recovery/poller and the final skip/completeness guard. No test timeout, filter or shipping script was changed. Next triage must use the smallest useful named candidate/base comparison before repeating the full sweep; remaining cumulative-runtime uncertainty must be reported.
+
+The read-only documentation delegation for `974d4992..6842646f` failed in transport and supplied no completed review. That attempt is not review coverage; retry the combined evidence-only range. Earlier completed source reviews remain as recorded below. M1 is still in progress: full agent gate, classified failure evidence, successful unchanged full live sweep and the real command-only supervisor proof remain outstanding.
+
 ### Observed checks and environment
 
 Worker-provisioned agent/web dependency trees matched the seed lockfiles but differed from the merged transitive versions. Initial `task deps-check:agent deps-check:web` failed (`gate-log.oWI02q`, EXIT=201). Incremental `npm install --ignore-scripts --no-audit --no-fund` reconciled agent (`gate-log.52BkzC`, EXIT=0) and web (`gate-log.W9FMu0`, EXIT=0), without deleting node_modules or changing tracked manifests/lockfiles. The intermediate check passed agent and failed web (`gate-log.7RHco9`, EXIT=201). Subsequent canonical checks matched both complete installed trees. Task 3.54.0 was provisioned under worker scratch; no shipping dependency or gate recipe changed.
