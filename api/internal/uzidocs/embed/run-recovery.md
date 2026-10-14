@@ -167,8 +167,16 @@ explicit discard. The guarded prerequisite-free archive/empty-inventory
 release conditions below remain unchanged.
 
 The configured budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads; nested operations
-share the same delivered-byte counter. Object contents stream through a pipe
+recovery operation. Successfully verified objects are cached per bare identity
+within that operation; only uncached objects are hashed and charged. Nested
+operations share the cache and delivered-byte counter. Every check still walks
+the complete closure and checks object presence, type and size. The operation-wide
+cache entry bound leaves overflow objects uncached and fully verified. A fresh
+operation starts empty. Reuse assumes immutable worker-owned object storage;
+corruption, replaced loose objects or pack files, or an added alternate object
+store can escape later hashing within unchanged directory identities and matching
+cached type/size metadata. The user explicitly accepted this additional risk on
+2026-10-14. Object contents stream through a pipe
 chunk and bounded header, without content buffers proportional to the cap.
 Metadata listings retain the existing 64 MiB output cap (`GIT_MAX_BUFFER`);
 object arrays remain bounded by that listing. The delivered-byte cap is **not a
@@ -183,8 +191,8 @@ The blocker shows exact cap bytes, plus GiB for caps of at least 1 GiB. A
 previously blocked journal remains blocked after restart or a cap increase:
 its reason reports previous decoded verification exhaustion, the current cap,
 and that the prior cap was not recorded. This changes neither the 64 MiB
-encoded archive cap nor archive storage quotas, and adds no deduplication or
-history exclusion. Cancellation and existing deadlines still apply.
+encoded archive cap nor archive storage quotas. Per-operation object
+deduplication does not exclude any reachable history from the walk. Cancellation and existing deadlines still apply.
 
 A healthy run with an unknown publish outcome continues in the same claim
 generation, retaining its tip, owed roots and publication time gate.

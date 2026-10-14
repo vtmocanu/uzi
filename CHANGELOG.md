@@ -52,6 +52,9 @@ through `[0.52.0]`.)
 - **Hosted worker CPU/memory capacity blockers no longer appear as failed upgrades (#2419).**
   Verified scheduler-only resource shortages have distinct web, CLI and TUI diagnostics, while first provisioning gets its own progress/failure labels. Storage and unknown faults retain failure visibility; typed cause validation survives mixed-version API writes. Live Kubernetes capacity/storage-control verification and fresh light/dark TUI PNG review remain maintainer-owned and incomplete.
 
+- **Retained recovery avoids charging verified shared history repeatedly ([#2979](https://github.com/vtmocanu/uzi/issues/2979)).**
+  Recovery and retained credential switches reuse verified objects within one operation, preserving complete closure walks, missing-object checks and the finite decoded-content limit. New operations start with an empty cache; the documented object-storage assumptions and accepted corruption risk apply.
+
 - **Retained recovery gets one deadline window per verified claim ([#2958](https://github.com/vtmocanu/uzi/issues/2958)).**
   A fresh claim can recover work after a long turn or park without inheriting an expired predecessor deadline. Same-claim retries retain their deadline, reservation counts remain cumulative, and already-blocked episodes keep their original reason and custody.
 
@@ -60,6 +63,9 @@ through `[0.52.0]`.)
 
 - **Large hosted workers have more build-cache headroom ([#2013](https://github.com/vtmocanu/uzi/issues/2013)).**
   New persistent L workers request 50Gi of data storage, and run-bound workers default to 40Gi independently of their CPU/memory preset. Both worker tiers admit 50Gi PVCs, and default storage quotas cover 20 restricted or 10 Docker workers at their largest preset; the isolated lane admits 40Gi data claims and budgets 600Gi for ten run-bound workers. Existing data PVCs retain their capacity; operators can expand them in place on a compatible StorageClass using the deployment runbook. Cluster overrides must raise their PVC ceilings and recalculate storage quotas. Post-release long-run acceptance remains outstanding.
+
+- **The TUI DONE band shows age since finish ([#2965](https://github.com/vtmocanu/uzi/issues/2965)).**
+  Terminal rows use the same finish timestamp as their sort order, falling back to the last update when no finish timestamp is recorded. Active rows keep their age since creation.
 
 - **GitHub pipeline discovery prefers the newest Actions suite.**
   When workflow discovery falls back to checks, a newer Actions suite now takes priority over an older suite already represented by check runs. If the preferred suite returns no workflow, discovery still recovers the older native workflow before synthesizing a status, preserving job and log access.
