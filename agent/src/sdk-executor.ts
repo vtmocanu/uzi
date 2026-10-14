@@ -1155,12 +1155,14 @@ export class SdkExecutor implements Executor {
 
   /** Issue #2945: after a credential-switch give-up closed the lifecycle, reopen a plan candidate
    *  that never began generating so the storage retry can still summarize the accepted plan. A
-   *  started flight, a superseded candidate, a fence, a cancel or a live lifecycle abort never reopens. */
+   *  started flight, a superseded candidate, a fence, a cancel, a live lifecycle abort or a pending
+   *  immediate pause (now/wall/disk; the re-armed lifecycle does not carry it) never reopens. */
   private reopenPlanSummary(ctx: RunContext): void {
     const c = this.planCandidate;
     if (!c || c.generation !== this.planGeneration || c.lifecycle !== this.summaryLifecycle || c.generated) return;
+    const pause = ctx.pauseModeRequested?.();
     if (ctx.claimFenced?.() || ctx.cancelRequested?.() || ctx.terminalLifecycleSignal?.aborted
-      || ctx.lifecycleSignal?.()?.aborted) return;
+      || ctx.lifecycleSignal?.()?.aborted || pause === "now" || pause === "wall" || pause === "disk") return;
     c.lifecycle.closed = false;
     c.flight = undefined;
   }

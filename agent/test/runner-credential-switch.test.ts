@@ -520,7 +520,8 @@ describe("RunRunner — resume phase after a credential switch (PRD #1247 M5b D1
 // Issue #2945: a plan accepted on the storage retry that follows a credential-switch give-up still
 // gets its summary. Real runner + real SdkExecutor; only the summary model and POST are faked.
 describe("plan summary after a credential-switch give-up (issue #2945)", () => {
-  type Mode = "storage-throw" | "ack" | "second-switch" | "pause-now" | "usage-in-settle";
+  type Mode = "storage-throw" | "ack" | "second-switch" | "pause-now" | "usage-in-settle"
+    | "pause-now-during-switch" | "pause-wall-during-switch";
 
   async function scenario(mode: Mode) {
     newApi();
@@ -554,7 +555,9 @@ describe("plan summary after a credential-switch give-up (issue #2945)", () => {
     const postPlanSummary = client.postPlanSummary;
     const reportState = client.reportState;
     client.postPlanSummary = async (_id, body) => { posts.push(body.plan_md); };
-    if (mode === "storage-throw" || mode === "second-switch" || mode === "pause-now") {
+    const pauseDuringSwitch = mode === "pause-now-during-switch" ? "now"
+      : mode === "pause-wall-during-switch" ? "wall" : undefined;
+    if (mode === "storage-throw" || mode === "second-switch" || mode === "pause-now" || pauseDuringSwitch) {
       client.reportState = async (id, body, ...rest) => {
         if (id === runId && body.status === "awaiting_approval" && !thrown) {
           thrown = true;
@@ -568,7 +571,7 @@ describe("plan summary after a credential-switch give-up (issue #2945)", () => {
       };
     }
     if (mode === "ack") api.armStateAckCredentialSwitchOnce(runId, 1, "awaiting_approval");
-    const approveAt = mode === "storage-throw" ? 1 : 2;
+    const approveAt = mode === "storage-throw" || pauseDuringSwitch ? 1 : 2;
     let gates = 0;
     api.onState(runId, (b) => {
       if (b.status !== "awaiting_approval") return;
@@ -582,7 +585,16 @@ describe("plan summary after a credential-switch give-up (issue #2945)", () => {
         ctxRef = ctx;
         // A capture that never verifies: the switch gives up and the run continues on the old token.
         git.worktreeStatus = (async () => ["M src/impl.ts"]) as typeof git.worktreeStatus;
-        git.commitWipMarker = (async () => false) as typeof git.commitWipMarker;
+        let pausedDuringSwitch = false;
+        git.commitWipMarker = (async () => {
+          // An immediate pause routed while the give-up's capture is still in flight.
+          if (pauseDuringSwitch && !pausedDuringSwitch) {
+            pausedDuringSwitch = true;
+            api.setInputs(runId, [{ id: 7_002, kind: "pause", body: pauseDuringSwitch }]);
+            assert.ok(await until(() => ctx.pauseModeRequested?.() === pauseDuringSwitch, 3_000), "pause routed during the switch");
+          }
+          return false;
+        }) as typeof git.commitWipMarker;
         return (result = await sdk.run(ctx));
       },
       closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
@@ -632,6 +644,16 @@ describe("plan summary after a credential-switch give-up (issue #2945)", () => {
     assert.equal(r.usage.length, 0);
     assert.equal(r.result?.summaryPlan, undefined);
   });
+
+  for (const mode of ["pause-now-during-switch", "pause-wall-during-switch"] as const) {
+    it(`a ${mode === "pause-now-during-switch" ? "now" : "wall"} pause routed during the give-up never reopens the summary`, async () => {
+      const r = await scenario(mode);
+      assert.ok(r.statuses.includes("credential_switch_failed"), "the switch gave up");
+      assert.equal(r.calls.length, 0, "a pending immediate pause must not start a summary");
+      assert.equal(r.posts.length, 0);
+      assert.equal(r.result?.summaryPlan, undefined);
+    });
+  }
 
   it("usage reported during the bounded settlement of a switch-closed flight is emitted exactly once", async () => {
     const r = await scenario("usage-in-settle");
