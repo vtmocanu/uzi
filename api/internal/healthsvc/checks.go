@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -95,7 +96,15 @@ func sincePtr(t time.Time) *string {
 // terminal escapes / bidi overrides; SanitizeBounded then caps the length. The result
 // carries no control characters and is at most maxEvidenceBytes long.
 func safe(v string) string {
-	return termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
+	clean := termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
+	if len(clean) > maxEvidenceBytes {
+		end := maxEvidenceBytes
+		for end > 0 && !utf8.RuneStart(clean[end]) {
+			end--
+		}
+		clean = clean[:end]
+	}
+	return clean
 }
 
 // humanDur renders a duration for a summary: whole minutes under an hour, else Hh Mm.
@@ -391,7 +400,7 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	c.Evidence = []apitypes.HealthEvidenceDTO{
 		{Label: "Target tag", Value: tagLabel},
 		{Label: "Blocking container", Value: orDash(safe(blockingCont))},
-		{Label: "Blocking reason", Value: reasonLabel},
+		{Label: "Blocking reason", Value: safe(reasonLabel)},
 		{Label: "Worker", Value: orDash(safe(firstStuckName))},
 		{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))},
 	}

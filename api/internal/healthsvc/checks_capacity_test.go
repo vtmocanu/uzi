@@ -5,12 +5,29 @@ import (
 	"strings"
 	"testing"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
 )
+
+func TestFleetEvidenceUTF8Bound(t *testing.T) {
+	reason := strings.Repeat("A", maxEvidenceBytes-1) + "😀"
+	storage := hostedRow("storage", workersvc.PhaseStuck, 0, reason, "data", "new")
+	capacity := capacityHealthRow("scheduler capacity: insufficient memory")
+	svc := New(Config{HostedWorkerVersion: "new"})
+	check := svc.checkFleetRoll(fixedNow, []store.ListAllWorkersRow{storage, capacity}, true)
+	for _, evidence := range check.Evidence {
+		if len(evidence.Value) > maxEvidenceBytes || !utf8.ValidString(evidence.Value) {
+			t.Fatalf("unbounded or invalid UTF-8 evidence %q: %q", evidence.Label, evidence.Value)
+		}
+	}
+	if !strings.Contains(check.Summary, "scheduler capacity: insufficient memory") || !strings.Contains(check.Summary, strings.Repeat("A", 20)) || check.Severity != sevDanger {
+		t.Fatalf("mixed faults concealed: %+v", check)
+	}
+}
 
 func capacityHealthRow(reason string) store.ListAllWorkersRow {
 	w := hostedRow("capacity", workersvc.PhaseStuck, 0, reason, "", "new")
