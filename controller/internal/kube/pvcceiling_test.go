@@ -65,7 +65,7 @@ func TestValidatePVCCeilings(t *testing.T) {
 			cfg:  RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "50Gi", DinDDataSize: "40Gi"},
 		},
 		{
-			name: "run-bound /data default (20Gi) fits the shipped 50Gi ceilings",
+			name: "run-bound /data default (40Gi) fits the shipped 50Gi ceilings",
 			cfg:  RenderConfig{MaxPVCStorage: "50Gi", DockerMaxPVCStorage: "50Gi", EphemeralDataSize: ""},
 		},
 		{

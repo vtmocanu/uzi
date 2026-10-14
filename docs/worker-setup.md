@@ -647,7 +647,7 @@ it opts into the same intra-user residuals just covered. An ephemeral (run-bound
 hosted worker is recorded with a run cap of 1, whatever it advertises, since
 its run lane serves its bound run (or an eligible lease follow-up). Its separate
 cross-check lane can serve that run's plan checker. Its `/data` volume also has its own
-operator-set size, 20Gi by default, rather than its size preset's (see
+operator-set size, 40Gi by default, rather than its size preset's (see
 [Type and size](./hosted-workers.md#type-and-size)).
 
 ## Cross-check slots

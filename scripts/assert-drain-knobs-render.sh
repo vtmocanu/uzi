@@ -136,12 +136,12 @@ else
   echo "OK (c): --set workers.drainDeadline override renders '$got_deadline_override'"
 fi
 
-# (d) issue #1815: workers.ephemeralWorkerDataSize renders its 20Gi default, and an
+# (d) issue #1815: workers.ephemeralWorkerDataSize renders its 40Gi default, and an
 # explicit numeric 0 reaches the controller (which refuses a non-positive size at boot)
 # instead of reading as unset under a `with` and silently keeping the default.
 got_eph=$(render_env "$CHART" "UZI_WORKER_EPHEMERAL_DATA_SIZE")
-if [ "$got_eph" != "20Gi" ]; then
-  echo "FAIL (d): UZI_WORKER_EPHEMERAL_DATA_SIZE is '$got_eph', expected the default '20Gi'" >&2
+if [ "$got_eph" != "40Gi" ]; then
+  echo "FAIL (d): UZI_WORKER_EPHEMERAL_DATA_SIZE is '$got_eph', expected the default '40Gi'" >&2
   fail=1
 else
   echo "OK (d): default render pins UZI_WORKER_EPHEMERAL_DATA_SIZE to '$got_eph'"
@@ -153,6 +153,27 @@ if [ "$got_eph_zero" != "0" ]; then
 else
   echo "OK (d): --set workers.ephemeralWorkerDataSize=0 reaches the controller as '0'"
 fi
+
+# Issue #2013: the shared run-bound default must also fit the isolated lane.
+# Empty/null uses the controller's 40Gi fallback, so this path must be guarded too.
+for eph in 40Gi null; do
+  if ! helm template uzi "$CHART" -f "$SCRIPT_DIR/../deploy/values/ci-render.yaml" \
+    --set "workers.ephemeralWorkerDataSize=$eph" \
+    --set workers.isolatedLane.limitRange.maxPVCStorage=40Gi >/dev/null; then
+    echo "FAIL: isolated 40Gi ceiling refused run-bound size $eph" >&2
+    fail=1
+  fi
+  if helm template uzi "$CHART" -f "$SCRIPT_DIR/../deploy/values/ci-render.yaml" \
+    --set "workers.ephemeralWorkerDataSize=$eph" \
+    --set workers.isolatedLane.limitRange.maxPVCStorage=25Gi >"$WORK/isolated.yaml" 2>"$WORK/isolated.err"; then
+    echo "FAIL: isolated 25Gi ceiling admitted run-bound size $eph" >&2
+    fail=1
+  elif ! grep -Fq 'workers.isolatedLane.limitRange.maxPVCStorage' "$WORK/isolated.err"; then
+    echo "FAIL: isolated refusal did not name its PVC ceiling" >&2
+    cat "$WORK/isolated.err" >&2
+    fail=1
+  fi
+done
 
 # Issue #1470: pacing knobs and enforced singleton topology.
 got_concurrency=$(render_env "$CHART" "UZI_WORKER_ROLL_CONCURRENCY")

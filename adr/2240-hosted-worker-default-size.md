@@ -95,7 +95,7 @@ Decision and hosted acceptance: [#2412](https://github.com/vtmocanu/uzi/issues/2
 ## Data-capacity amendment, 2026-10-14 (#2013)
 
 Persistent `l` data grows to 50Gi for long-run build-cache headroom. The `m`
-preset stays at 25Gi, run-bound data retains its separate 20Gi default, and the
+preset stays at 25Gi, run-bound data defaults to 40Gi across all lanes, and the
 creation defaults above remain in effect. Both worker tiers' PVC ceilings and
 storage quotas cover the new largest preset. Existing data PVCs retain their
 capacity; operators can expand them in place where storage supports it using

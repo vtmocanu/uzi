@@ -2702,7 +2702,7 @@ func TestSeedScriptUsesTarNotCp(t *testing.T) {
 
 // Issue #2412: both persistent and run-bound M workers get four CPUs of burst
 // headroom and the prior L CPU request. Persistent data grows; run-bound data
-// keeps its independent 20Gi default.
+// keeps its independent 40Gi default.
 func TestMediumWorkerResourcesForBothLifetimes(t *testing.T) {
 	for _, ephemeral := range []bool{false, true} {
 		t.Run(fmt.Sprintf("ephemeral=%t", ephemeral), func(t *testing.T) {
@@ -2712,7 +2712,7 @@ func TestMediumWorkerResourcesForBothLifetimes(t *testing.T) {
 			resources := dep.Spec.Template.Spec.Containers[0].Resources
 			wantData := "25Gi"
 			if ephemeral {
-				wantData = "20Gi"
+				wantData = "40Gi"
 			}
 			claims := pvcSizes(t, testConfig(), w, testSpec(t, "base", "m"))
 			data, ok := claims[dataPVCName(w.ID)]

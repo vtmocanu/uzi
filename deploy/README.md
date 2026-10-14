@@ -398,7 +398,8 @@ nothing else by design.
 New persistent L workers request 50Gi of `/data` (#2013). Existing PVCs keep their
 capacity; the controller creates missing claims but does not resize existing
 `/data` claims or revert an operator's expansion. M remains 25Gi, and run-bound
-workers use `workers.ephemeralWorkerDataSize` (20Gi by default).
+workers use `workers.ephemeralWorkerDataSize` (40Gi by default). Expand an existing
+run-bound data PVC to 40Gi using the same procedure while retaining its contents.
 
 Before upgrading, raise any per-cluster overrides of both worker tiers'
 `limitRange.maxPVCStorage` to at least 50Gi. The controller refuses to start if a
@@ -407,9 +408,11 @@ configured ceiling cannot admit the largest preset. Recalculate each tier's
 the effective Docker `dindDataSize`. Defaults cover 20 restricted workers at
 `20 x (50 + 20) = 1400Gi` and 10 Docker workers at
 `10 x (50 + 20 + 20) = 900Gi`. For example, a 30Gi DinD override needs 1000Gi for
-10 Docker workers. Allow budget for existing claims and their requested growth.
+10 Docker workers. The isolated lane needs 600Gi for ten run-bound workers
+(`10 x (40 + 20)`), with a PVC ceiling of at least 40Gi. Its chart guard also checks
+run-bound data overrides. Allow budget for existing claims and their requested growth.
 
-For each existing L worker's data PVC, inspect its request and StorageClass:
+For each existing L or run-bound worker's data PVC, inspect its request and StorageClass:
 
 ```sh
 kubectl -n '<worker-namespace>' get pvc '<worker>-data' -o yaml
@@ -417,8 +420,9 @@ kubectl get storageclass '<storage-class>' -o yaml
 ```
 
 The StorageClass must have `allowVolumeExpansion: true`, and its CSI driver must
-support expansion. If the request is below 50Gi and quota and storage capacity
-permit the increase, expand the PVC in place:
+support expansion. If the request is below the desired size and quota and storage
+capacity permit the increase, expand the PVC in place. This example targets a persistent L worker;
+use `40Gi` for a run-bound worker and never shrink a larger existing claim:
 
 ```sh
 kubectl -n '<worker-namespace>' patch pvc '<worker>-data' --type=merge \
