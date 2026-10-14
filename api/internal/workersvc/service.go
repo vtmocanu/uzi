@@ -2386,7 +2386,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if wkr.Kind == "hosted" && len(podUID) == 1 && podUID[0] != uuid.Nil {
 		registeredPodUID = pgconv.UUID(podUID[0])
 	}
-	if maxCrossCheckSlots != nil && (*maxCrossCheckSlots < 0 || *maxCrossCheckSlots > 16) {
+	if maxCrossCheckSlots != nil && !ValidAdvertisedCrossCheckSlots(*maxCrossCheckSlots) {
 		return store.Worker{}, "", errors.New("max_cross_check_slots must be between 0 and 16")
 	}
 
@@ -2718,7 +2718,12 @@ type RunDiskSample struct {
 // and leases left as they were, and the reconciliation is skipped — so an invalid snapshot never
 // turns a heartbeat into a 400 and liveness is still refreshed. When no snapshot is carried (or
 // no tx beginner is wired), it takes the plain single-statement path, exactly as before.
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot) (store.Worker, error) {
+// A protocol refresh also requires this transaction; without a beginner it is skipped.
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot, refreshes ...*ProtocolRefresh) (store.Worker, error) {
+	var refresh *ProtocolRefresh
+	if len(refreshes) > 0 {
+		refresh = refreshes[0]
+	}
 	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
 	// fail, and doing it unconditionally means an empty report clears the set even on
 	// a tick that carries no stats.
@@ -2755,8 +2760,8 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		}
 	}
 	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
-	// single-statement liveness write, unchanged.
-	if snapshot == nil || s.txBeginner == nil {
+	// single-statement liveness write. Without a transaction, refresh is skipped.
+	if (snapshot == nil && refresh == nil) || s.txBeginner == nil {
 		updated, err := s.q.HeartbeatWorker(ctx, arg)
 		if err != nil {
 			return store.Worker{}, err
@@ -2778,6 +2783,25 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	updated, err := qtx.HeartbeatWorker(ctx, arg)
 	if err != nil {
 		return store.Worker{}, err
+	}
+	// Fence against the current row returned by the locking liveness UPDATE.
+	// Refresh precedes snapshot validation, preserving worker -> recovery lock order.
+	if refresh != nil && updated.SnapshotRegisterNonce.Valid && refresh.RegisterNonce == updated.SnapshotRegisterNonce.String &&
+		ValidAdvertisedConcurrentRuns(refresh.MaxConcurrentRuns) && ValidAdvertisedCrossCheckSlots(refresh.MaxCrossCheckSlots) {
+		cap := EffectiveConcurrentRuns(&refresh.MaxConcurrentRuns, updated.Ephemeral)
+		updated, err = qtx.RefreshWorkerProtocol(ctx, store.RefreshWorkerProtocolParams{
+			ID: updated.ID, RegisterNonce: refresh.RegisterNonce,
+			ProtocolCapabilities: capability.FilterProtocol(refresh.ProtocolCapabilities),
+			MaxConcurrentRuns:    int32(*cap),
+			MaxCrossCheckSlots:   int32(refresh.MaxCrossCheckSlots),
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+	}
+	if refresh != nil && (!updated.SnapshotRegisterNonce.Valid || refresh.RegisterNonce != updated.SnapshotRegisterNonce.String ||
+		!ValidAdvertisedConcurrentRuns(refresh.MaxConcurrentRuns) || !ValidAdvertisedCrossCheckSlots(refresh.MaxCrossCheckSlots)) {
+		slog.Warn("worker protocol refresh rejected; ignoring report")
 	}
 	entries, valid, err := s.validatedActiveSnapshot(updated, snapshot, snapshotModeHeartbeat)
 	if err != nil {

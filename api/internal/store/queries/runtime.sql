@@ -438,6 +438,20 @@ UPDATE workers SET
 WHERE id = @id
 RETURNING *;
 
+-- name: RefreshWorkerProtocol :one
+-- Called only after HeartbeatWorker locks and returns the current incarnation.
+-- Preserve every stored name, including names this server no longer recognizes.
+UPDATE workers
+SET protocol_capabilities = ARRAY(
+        SELECT DISTINCT name
+        FROM unnest(COALESCE(workers.protocol_capabilities, '{}'::text[])
+                    || @protocol_capabilities::text[]) AS names(name)
+        ORDER BY name),
+    max_concurrent_runs = GREATEST(workers.max_concurrent_runs, @max_concurrent_runs::integer),
+    max_cross_check_slots = GREATEST(workers.max_cross_check_slots, @max_cross_check_slots::integer)
+WHERE id = @id AND snapshot_register_nonce = @register_nonce::text
+RETURNING *;
+
 -- name: GetWorkerForUpdate :one
 -- PRD #1390 M2a: lock the worker row FOR UPDATE at the top of the Register transaction, in
 -- the canonical worker-row lock order shared with the stale-worker passes' `locked` CTE and

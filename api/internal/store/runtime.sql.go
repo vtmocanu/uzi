@@ -15106,6 +15106,113 @@ func (q *Queries) RecordWallParkCapturedHead(ctx context.Context, arg RecordWall
 	return result.RowsAffected(), nil
 }
 
+const refreshWorkerProtocol = `-- name: RefreshWorkerProtocol :one
+UPDATE workers
+SET protocol_capabilities = ARRAY(
+        SELECT DISTINCT name
+        FROM unnest(COALESCE(workers.protocol_capabilities, '{}'::text[])
+                    || $1::text[]) AS names(name)
+        ORDER BY name),
+    max_concurrent_runs = GREATEST(workers.max_concurrent_runs, $2::integer),
+    max_cross_check_slots = GREATEST(workers.max_cross_check_slots, $3::integer)
+WHERE id = $4 AND snapshot_register_nonce = $5::text
+RETURNING id, user_id, name, token_hash, status, last_heartbeat_at, version, created_at, updated_at, template_declared, template_reported, max_concurrent_runs, stats_cpu_pct, stats_mem_bytes, stats_mem_limit_bytes, stats_source, kind, hosted_size, hosted_generation, docker_enabled, anthropic_secret_id, anthropic_bind_mode, online_since, draining_since, capabilities, ephemeral, ephemeral_run_id, stats_disk_nix_bytes, stats_disk_nix_total_bytes, stats_disk_data_bytes, stats_disk_data_total_bytes, stats_disk_pressure_streak, protocol_capabilities, snapshot_epoch, snapshot_register_nonce, pending_overflow, pending_overflow_until, stats_disk_dind_bytes, stats_disk_dind_total_bytes, stats_disk_dind_inodes, stats_disk_dind_total_inodes, stats_disk_data_inodes, stats_disk_data_total_inodes, isolated_lane, lease_since, lease_repo_id, lease_branch, dind_register_floor, dind_meter_epoch, dind_meter_at, dind_pressure_streak, dind_meter_over, dind_below_threshold, maintenance_owns_drain, nix_pressure, data_pressure, maintenance_id, maintenance_nonce, maintenance_phase, maintenance_deployment_uid, maintenance_pvc_uid, maintenance_register_nonce, maintenance_fenced, maintenance_ready_ack, maintenance_ack_at, maintenance_activity_floor, max_cross_check_slots, registered_pod_uid, roll_heartbeat_at, draining_reason
+`
+
+type RefreshWorkerProtocolParams struct {
+	ProtocolCapabilities []string  `json:"protocol_capabilities"`
+	MaxConcurrentRuns    int32     `json:"max_concurrent_runs"`
+	MaxCrossCheckSlots   int32     `json:"max_cross_check_slots"`
+	ID                   uuid.UUID `json:"id"`
+	RegisterNonce        string    `json:"register_nonce"`
+}
+
+// Called only after HeartbeatWorker locks and returns the current incarnation.
+// Preserve every stored name, including names this server no longer recognizes.
+func (q *Queries) RefreshWorkerProtocol(ctx context.Context, arg RefreshWorkerProtocolParams) (Worker, error) {
+	row := q.db.QueryRow(ctx, refreshWorkerProtocol,
+		arg.ProtocolCapabilities,
+		arg.MaxConcurrentRuns,
+		arg.MaxCrossCheckSlots,
+		arg.ID,
+		arg.RegisterNonce,
+	)
+	var i Worker
+	err := row.Scan(
+		&i.ID,
+		&i.UserID,
+		&i.Name,
+		&i.TokenHash,
+		&i.Status,
+		&i.LastHeartbeatAt,
+		&i.Version,
+		&i.CreatedAt,
+		&i.UpdatedAt,
+		&i.TemplateDeclared,
+		&i.TemplateReported,
+		&i.MaxConcurrentRuns,
+		&i.StatsCpuPct,
+		&i.StatsMemBytes,
+		&i.StatsMemLimitBytes,
+		&i.StatsSource,
+		&i.Kind,
+		&i.HostedSize,
+		&i.HostedGeneration,
+		&i.DockerEnabled,
+		&i.AnthropicSecretID,
+		&i.AnthropicBindMode,
+		&i.OnlineSince,
+		&i.DrainingSince,
+		&i.Capabilities,
+		&i.Ephemeral,
+		&i.EphemeralRunID,
+		&i.StatsDiskNixBytes,
+		&i.StatsDiskNixTotalBytes,
+		&i.StatsDiskDataBytes,
+		&i.StatsDiskDataTotalBytes,
+		&i.StatsDiskPressureStreak,
+		&i.ProtocolCapabilities,
+		&i.SnapshotEpoch,
+		&i.SnapshotRegisterNonce,
+		&i.PendingOverflow,
+		&i.PendingOverflowUntil,
+		&i.StatsDiskDindBytes,
+		&i.StatsDiskDindTotalBytes,
+		&i.StatsDiskDindInodes,
+		&i.StatsDiskDindTotalInodes,
+		&i.StatsDiskDataInodes,
+		&i.StatsDiskDataTotalInodes,
+		&i.IsolatedLane,
+		&i.LeaseSince,
+		&i.LeaseRepoID,
+		&i.LeaseBranch,
+		&i.DindRegisterFloor,
+		&i.DindMeterEpoch,
+		&i.DindMeterAt,
+		&i.DindPressureStreak,
+		&i.DindMeterOver,
+		&i.DindBelowThreshold,
+		&i.MaintenanceOwnsDrain,
+		&i.NixPressure,
+		&i.DataPressure,
+		&i.MaintenanceID,
+		&i.MaintenanceNonce,
+		&i.MaintenancePhase,
+		&i.MaintenanceDeploymentUid,
+		&i.MaintenancePvcUid,
+		&i.MaintenanceRegisterNonce,
+		&i.MaintenanceFenced,
+		&i.MaintenanceReadyAck,
+		&i.MaintenanceAckAt,
+		&i.MaintenanceActivityFloor,
+		&i.MaxCrossCheckSlots,
+		&i.RegisteredPodUid,
+		&i.RollHeartbeatAt,
+		&i.DrainingReason,
+	)
+	return i, err
+}
+
 const registerWorker = `-- name: RegisterWorker :one
 WITH prev AS (
     SELECT workers.id, workers.version AS old_version FROM workers WHERE workers.id = $1
