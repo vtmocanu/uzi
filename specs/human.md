@@ -1309,6 +1309,8 @@ PRD at `prds/1786-preserve-worker-only-work.md`.
 
 - Board titles use all remaining terminal columns before the reserved judge marker and worker column, with no fixed title cap. This supersedes the board-title cap recorded in frozen `specs/ai.md` §559. (AI-synced 2026-10-14, #2922)
 
+- The Dashboard Active runs tile counts every non-terminal run and lists non-zero state counts in order: running; needs you (approval, input or follow-up); queued (queued or claimed); waiting to resume (usage, pool, recovery holds or owner pause). An empty active set reads "nothing in flight". (AI-synced 2026-10-14, #2922)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is

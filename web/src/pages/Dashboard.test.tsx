@@ -526,115 +526,69 @@ describe("Dashboard usage cards (PRD #40)", () => {
   });
 });
 
-// PRD #35 (web-ux F2). `!isTerminalRun` was doing duty as "actively working", which was
-// harmless while every non-terminal status resolved in minutes. `limit_wait` is the
-// first that lasts HOURS by design, so the hint became a claim that is simply false.
-describe("Dashboard — parked runs are not 'agents at work' (PRD #35)", () => {
+// Active means every non-terminal run; the hint separates execution, owner
+// input, queued work and holds without changing the tile's total.
+describe("Dashboard active run breakdown", () => {
   const flush = async () => {
-    await act(async () => {
-      await new Promise((r) => setTimeout(r, 0));
-    });
+    await act(async () => { await new Promise((resolve) => setTimeout(resolve, 0)); });
   };
 
-  it("keeps the old copy exactly when nothing is parked", () => {
-    // The regression guard. A factory with no parked run must read as it always did —
-    // this change is meant to be invisible until it has something to say.
-    return (async () => {
-      mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "running" }), aRun({ id: "r2", status: "queued" })] });
-      renderDashboard();
-      await flush();
-      expect(screen.getByText("agents at work")).toBeTruthy();
-    })();
-  });
-
-  it("🔴 splits the hint when a run is parked, rather than calling it work", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "queued" }),
-        aRun({ id: "r3", status: "limit_wait" }),
-      ],
-    });
+  it("shows a mixed breakdown in state order while counting every active run", async () => {
+    // Deliberately interleave buckets; the hint order must not follow API ordering.
+    mockApi.listRuns.mockResolvedValue({ runs: [
+      aRun({ id: "paused", status: "paused" }),
+      aRun({ id: "queued", status: "queued" }),
+      aRun({ id: "input", status: "awaiting_input" }),
+      aRun({ id: "running", status: "running" }),
+      aRun({ id: "followup", status: "awaiting_followup" }),
+      aRun({ id: "claimed", status: "claimed" }),
+      aRun({ id: "approval", status: "awaiting_approval" }),
+      aRun({ id: "recovery", status: "recovery_wait" }),
+      aRun({ id: "pool", status: "pool_wait" }),
+      aRun({ id: "limit", status: "limit_wait" }),
+      aRun({ id: "done", status: "completed" }),
+      aRun({ id: "failed", status: "failed" }),
+      aRun({ id: "cancelled", status: "cancelled" }),
+    ] });
     renderDashboard();
     await flush();
-    expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+    const tile = screen.getByText("Active runs").closest("a");
+    expect(tile).not.toBeNull();
+    expect(within(tile!).getByText("10")).toBeTruthy();
+    expect(within(tile!).getByText("1 running · 3 needs you · 2 queued · 4 waiting to resume")).toBeTruthy();
   });
 
-  // Issue #754: pool_wait is the same kind of self-resuming hold as limit_wait, so it
-  // must NOT be counted as "at work" either. A pool hold is blocked on a pooled token,
-  // not on a usage limit, which is why the generalized copy reads "waiting to resume"
-  // rather than the limit-specific wording.
-  it("🔴 counts a pool_wait run as waiting-to-resume, not as work", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "queued" }),
-        aRun({ id: "r3", status: "pool_wait" }),
-      ],
-    });
+  it("shows only running when all three active runs are running", async () => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun(), aRun({ id: "r2" }), aRun({ id: "r3" })] });
     renderDashboard();
     await flush();
-    expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
-    // The pool hold is a resource wait, never a usage-limit wait — the old copy would
-    // have been a lie about WHY it is parked.
-    expect(screen.queryByText(/waiting on a usage limit/)).toBeNull();
+    expect(screen.getByText("3 running")).toBeTruthy();
   });
 
-  // Issue #1197: recovery_wait is the same kind of self-resuming hold again — a
-  // transient-recovery park that auto-resumes on a capped backoff — so it must NOT be
-  // counted as "at work" either. Same generalized "waiting to resume" copy.
-  it("🔴 counts a recovery_wait run as waiting-to-resume, not as work", async () => {
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "queued" }),
-        aRun({ id: "r3", status: "recovery_wait" }),
-      ],
-    });
+  it.each([
+    ["awaiting_approval", "1 needs you"], ["awaiting_input", "1 needs you"],
+    ["awaiting_followup", "1 needs you"],
+    ["queued", "1 queued"], ["claimed", "1 queued"],
+    ["limit_wait", "1 waiting to resume"], ["pool_wait", "1 waiting to resume"],
+    ["recovery_wait", "1 waiting to resume"], ["paused", "1 waiting to resume"],
+  ] as const)("shows just the non-zero bucket for %s", async (status, hint) => {
+    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status })] });
     renderDashboard();
     await flush();
-    expect(screen.queryByText("agents at work")).toBeNull();
-    expect(screen.getByText("2 at work · 1 waiting to resume")).toBeTruthy();
+    expect(screen.getByText(hint)).toBeTruthy();
   });
 
-  it("🔴 counts all three hold kinds together in the waiting bucket", async () => {
-    // The three self-resuming holds share one honest bucket; the working count drops by all.
-    mockApi.listRuns.mockResolvedValue({
-      runs: [
-        aRun({ status: "running" }),
-        aRun({ id: "r2", status: "limit_wait" }),
-        aRun({ id: "r3", status: "pool_wait" }),
-        aRun({ id: "r4", status: "recovery_wait" }),
-      ],
-    });
+  it.each([
+    { name: "empty", runs: [] },
+    { name: "only terminal", runs: [aRun({ status: "completed" }), aRun({ id: "failed", status: "failed" }), aRun({ id: "cancelled", status: "cancelled" })] },
+  ])("reads nothing in flight for $name runs", async ({ runs }) => {
+    mockApi.listRuns.mockResolvedValue({ runs });
     renderDashboard();
     await flush();
-    expect(screen.getByText("1 at work · 3 waiting to resume")).toBeTruthy();
-  });
-
-  it("🔴 still COUNTS the parked run — splitting the hint must not hide it", async () => {
-    // The opposite failure, and the reason this is a hint change rather than a filter:
-    // excluding parked runs from the tile would make them vanish from the one surface
-    // that says how much is in flight.
-    mockApi.listRuns.mockResolvedValue({
-      runs: [aRun({ status: "running" }), aRun({ id: "r3", status: "limit_wait" })],
-    });
-    const { container } = renderDashboard();
-    await flush();
-    expect(screen.getByText("Active runs")).toBeTruthy();
-    expect(container.textContent).toContain("1 at work · 1 waiting to resume");
-    // The tile's value is 2, not 1.
-    const tile = screen.getByText("Active runs").closest("a") ?? screen.getByText("Active runs").parentElement;
-    expect(tile?.textContent).toMatch(/2/);
-  });
-
-  it("reads 'nothing in flight' when every run is terminal", async () => {
-    mockApi.listRuns.mockResolvedValue({ runs: [aRun({ status: "completed" })] });
-    renderDashboard();
-    await flush();
-    expect(screen.getByText("nothing in flight")).toBeTruthy();
+    const tile = screen.getByText("Active runs").closest("a");
+    expect(tile).not.toBeNull();
+    expect(within(tile!).getByText("0")).toBeTruthy();
+    expect(within(tile!).getByText("nothing in flight")).toBeTruthy();
   });
 });
 
