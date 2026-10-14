@@ -2,6 +2,7 @@ import { test, type TestContext } from "node:test";
 import assert from "node:assert/strict";
 import { GitCache, type RecoveryJournalEntry } from "../src/git.js";
 import { recoveryProgress } from "../src/recovery-progress.js";
+import { RequestError } from "../src/client.js";
 import { RunRunner } from "../src/runner.js";
 import { nullLogger } from "./helpers.js";
 
@@ -228,3 +229,65 @@ test("first recovery window durably charges before ownership probes and preserve
   assert.equal(f.read().recovery?.blocker, "budget_exhausted");
   assert.match(report, /budget exhausted/);
 });
+
+for (const fault of ["network", "503"] as const) {
+  test(`renewal ${fault} proof failure stops retryably without changing the predecessor episode`, async t => {
+    const f = fixture(t);
+    await f.reserve(1);
+    f.advance(300_001);
+    const before = f.read();
+    let reports = 0, proofs = 0;
+    const runner = Object.assign(Object.create(RunRunner.prototype), {
+      git: f.recreate(), recoveryRetryMs: 1, codexBoundaryDeadlineMs: 1000,
+      shutdownSignal: new AbortController(),
+      client: { getRunOwnership: async () => {
+        if (fault === "503") throw new RequestError("GET", "/ownership", 503, "service unavailable");
+        throw new TypeError("fetch failed");
+      } },
+      cloneCoordinates: () => ({ branch: "branch" }),
+      retainedLifecycleGuard: () => {},
+      retainedLifecycleSignal: () => new AbortController().signal,
+      settleForCredentialCapture: async () => { proofs++; return { kind: "unproven" }; },
+      reportGenericFailure: async () => { reports++; },
+    });
+    await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
+    }, "key", f.read()));
+    assert.deepEqual(f.read(), before, "a transient renewal proof cannot charge, rebase or block saved work");
+    assert.equal(reports, 0, "no terminal failure report; leave the claim for bounded missing-flight requeue");
+    assert.equal(proofs, 0, "no capture authority without ownership proof");
+    const next = await f.reserve(3);
+    assert.equal(next.attempts, 2, "a later valid claim can still reserve the remaining budget");
+    assert.equal(next.claimGeneration, 3);
+  });
+}
+
+for (const outcome of ["typed 404", "terminal", "foreign generation"] as const) {
+  test(`renewal ${outcome} remains a stop with its predecessor unchanged`, async t => {
+    const f = fixture(t);
+    await f.reserve(1);
+    f.advance(300_001);
+    const before = f.read();
+    let reports = 0, proofs = 0;
+    const runner = Object.assign(Object.create(RunRunner.prototype), {
+      git: f.recreate(), recoveryRetryMs: 1, codexBoundaryDeadlineMs: 1000,
+      shutdownSignal: new AbortController(),
+      client: { getRunOwnership: async () => {
+        if (outcome === "typed 404") throw new RequestError("GET", `/api/worker/runs/${f.source.runId}/ownership`,
+          404, JSON.stringify({ error: "run not found for this worker" }));
+        return { status: outcome === "terminal" ? "completed" : "running", claim_generation: outcome === "terminal" ? 2 : 3 };
+      } },
+      cloneCoordinates: () => ({ branch: "branch" }),
+      retainedLifecycleGuard: () => {},
+      retainedLifecycleSignal: () => new AbortController().signal,
+      settleForCredentialCapture: async () => { proofs++; return { kind: "unproven" }; },
+      reportGenericFailure: async () => { reports++; },
+    });
+    await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
+      barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
+    }, "key", f.read()));
+    assert.deepEqual(f.read(), before);
+    assert.equal(reports, 0);
+    assert.equal(proofs, 0);
+  });
+}

@@ -332,7 +332,13 @@ window; its reservation is durably charged before ownership probes, preserving
 #2512's outage and cancellation accounting. Renewing an existing episode instead
 requires a current `running` ownership proof with the exact positive generation
 before rebasing its window. A lost claim stops that renewal without changing or
-blocking the predecessor episode. The journal persists
+blocking the predecessor episode. If that renewal proof instead fails transiently
+(transport, timeout, retryable HTTP status), the flight logs a retryable diagnostic
+and stops without a terminal report, charge, rebase or blocker. The existing
+missing-flight sweeper governs requeue and its finite worker-loss allowance; it
+may hold exhaustion for an owner decision. This is not an uncharged capture retry:
+no recovery operation was authorized. First-window and same-window ownership
+outages retain #2512's charged, three-reservation retry handling. The journal persists
 `claimGeneration` beside `startedAt` and `deadline` (`startedAt + 300000`), under
 the existing source binding and bare lock. A higher verified generation rebases
 those timestamps once. Same-generation retry and process recreation do not renew

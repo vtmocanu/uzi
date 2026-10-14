@@ -9,7 +9,7 @@ import fs from "node:fs/promises";
 import os from "node:os";
 import { basename as pathBasename, dirname as pathDirname, join, resolve as resolvePath } from "node:path";
 import type { WorkerClient } from "./client.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, HELD_PUBLICATION_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
@@ -17280,7 +17280,20 @@ export class RunRunner {
           // The acquired claim positively fences a first window; precharge it before probes
           // as #2512 requires. Only rebasing an existing episode needs an extra ownership
           // proof, before applying its predecessor deadline or changing that episode.
-          if (newWindow && episode) await this.requireRetainedOwnership(flight, deadline, signal);
+          if (newWindow && episode) {
+            try { await this.requireRetainedOwnership(flight, deadline, signal); }
+            catch (error) {
+              this.retainedLifecycleGuard(flight);
+              if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+              if (!isTransient(error)) throw error;
+              // No renewed-window authority was established. Keep the predecessor untouched
+              // and leave this flight nonterminal for bounded missing-flight requeue.
+              flight.runLog.warn("retained recovery renewal ownership unavailable; stopping claim for retry", {
+                error: sanitizeForLog(errMessage(error)), claim_generation: flight.claimGeneration,
+              });
+              throw new RetainedRecoveryStop();
+            }
+          }
           return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration);
         });
       } catch (error) {
