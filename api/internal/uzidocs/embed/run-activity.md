@@ -571,10 +571,19 @@ differ in what they carry; the run page has more.
 
 ### Now summary
 
-While an issue run is working a milestone, a small model can write one plain
-sentence (at most 120 characters) saying what the active lane is doing, and
-the progress card, the TUI detail and `uzi run get` show it next to the
-estimate. It is **on by default**; see [Turning it off](#turning-the-now-summary-off).
+While an issue (`issue`), self-improvement (`self_improve`), or prompt
+(`prompt`) run is working an active frozen milestone, the worker can call a
+small model on either Claude or Codex to write one plain sentence (at most
+120 characters) saying what the active lane is doing. Milestoneless
+self-improvement and prompt runs get no Now summary; scheduling a run alone
+enables none. It is **on by default**; see
+[Turning it off](#turning-the-now-summary-off).
+
+Worker eligibility is separate from display: the progress card, the TUI
+detail and `uzi run get` show the line next to a percent estimate. The current
+progress data supplies percent progress for issue runs, not self-improvement
+or prompt runs, so eligibility does not make the line visible for those two
+kinds.
 
 - **Run page**: a `Now: <text> · model summary · <age>` line under the row
   named by `progress.active_milestone_id`, alongside its phase and iteration
@@ -594,9 +603,9 @@ ingests it, and it is capped at 120 characters.
 
 **When it shows.** Only on the single-run read (the run page, `uzi run get`,
 the TUI detail), never on the dashboard, runs list or TUI board. It needs the
-progress state to be a percent (an executing, healthy issue run with a frozen
-milestone list), an active milestone, and the Now summary enabled both by the admin switch and
-in the run owner's settings.
+progress state to be a percent (currently an executing, healthy issue run
+with a frozen milestone list), an active milestone, and the Now summary
+enabled both by the admin switch and in the run owner's settings.
 It shows the newest note written for the *current* milestone, so a note from
 an earlier milestone never lingers. A waiting, parked, queued or stalled run
 shows no note, even one written for its still-active milestone. The note
