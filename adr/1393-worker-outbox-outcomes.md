@@ -150,9 +150,10 @@ The worker acts on exactly that structured answer (a plain, HTML, proxy or older
 keep-and-retry behaviour) and marks the terminal journal blocked with reason `run_not_owned` in both send
 paths. It never retires, deletes or resends it; the outcome bytes are kept and the block survives restart.
 
-- **Resolved outside the discarding-cancel branch.** No owning worker exists to replay against, and the
-  owner's cancel cannot reach a terminal or unowned run, so the D13 branch does not apply. The block never
-  retires on a timer or sweep.
+- **Resolved outside the discarding-cancel branch.** This reporting worker cannot replay the outcome
+  at its recorded claim generation; another worker may own the run. The owner's cancel does not authorize
+  deletion of this unowned generation's journal, so the D13 branch does not apply. The block never retires
+  on a timer or sweep.
 - **Excluded from the lease and the overflow count, kept by physical protection.** The api's overflow
   closure never covered unowned runs, and the api cannot lease a run it does not attribute to the worker;
   counting the journal would turn an endless resend into an endless claim pause at cap 0. So it is left out
@@ -171,7 +172,7 @@ paths. It never retires, deletes or resends it; the outcome bytes are kept and t
   immutable by trigger and `workers.isolated_lane` is provisioning-only), `cross_check` at generation 0
   never journals, and a deleted worker row does not return. If any becomes mutable, I-own must be re-proven.
 - **Resolution today** is the operator-assisted runbook in
-  [docs/hosted-workers.md](../docs/hosted-workers.md#run_not_owned-a-finished-outcome-no-worker-owns).
+  [docs/hosted-workers.md](../docs/hosted-workers.md#run_not_owned-an-outcome-this-reporting-worker-cannot-replay).
   A server-mediated owner discard is follow-up work. Its natural extension point is the existing
   api-authorized deletion protocol (`agent/src/terminal-rejections.ts`, `terminal_rejection_report`,
   `outbox.cleanupRejectedTerminalFiles`) and it needs its own authorization decision.

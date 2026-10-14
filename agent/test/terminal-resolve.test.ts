@@ -778,16 +778,20 @@ describe("run_not_owned /state refusal (issue #2950)", () => {
     assert.equal(scripted.bodies.length, 2, "no further sends");
   });
 
+  // All shape/route/status controls carry complete wire evidence, so their own predicate must
+  // refuse them. Missing/incomplete evidence has separate controls below.
+  const controlError = (method: string, path: string, status: number, body: string): RequestError =>
+    new RequestError(method, path, status, body, undefined, complete(body));
   const controls: Array<[string, RequestError]> = [
-    ["plain 404 without reason", new RequestError("POST", statePath("r1"), 404, '{"error":"run not found for this worker"}')],
-    ["HTML 404", new RequestError("POST", statePath("r1"), 404, "<html><body>404 page not found</body></html>")],
-    ["wrong key (code instead of reason)", new RequestError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","code":"run_not_owned"}')],
-    ["extra key", new RequestError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","reason":"run_not_owned","x":1}')],
-    ["another run's path", new RequestError("POST", statePath("r2"), 404, NOT_OWNED_BODY)],
-    ["GET method", new RequestError("GET", statePath("r1"), 404, NOT_OWNED_BODY)],
-    ["409 with the same body", new RequestError("POST", statePath("r1"), 409, NOT_OWNED_BODY)],
-    ["array body", new RequestError("POST", statePath("r1"), 404, "[]")],
-    ["wrong error text", new RequestError("POST", statePath("r1"), 404, '{"error":"nope","reason":"run_not_owned"}')],
+    ["plain 404 without reason", controlError("POST", statePath("r1"), 404, '{"error":"run not found for this worker"}')],
+    ["HTML 404", controlError("POST", statePath("r1"), 404, "<html><body>404 page not found</body></html>")],
+    ["wrong key (code instead of reason)", controlError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","code":"run_not_owned"}')],
+    ["extra key", controlError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","reason":"run_not_owned","x":1}')],
+    ["another run's path", controlError("POST", statePath("r2"), 404, NOT_OWNED_BODY)],
+    ["GET method", controlError("GET", statePath("r1"), 404, NOT_OWNED_BODY)],
+    ["409 with the same body", controlError("POST", statePath("r1"), 409, NOT_OWNED_BODY)],
+    ["array body", controlError("POST", statePath("r1"), 404, "[]")],
+    ["wrong error text", controlError("POST", statePath("r1"), 404, '{"error":"nope","reason":"run_not_owned"}')],
   ];
   controls.push(["exact body but no completeness evidence", new RequestError("POST", statePath("r1"), 404, NOT_OWNED_BODY)]);
   controls.push(["exact body but evidence says incomplete", new RequestError("POST", statePath("r1"), 404, NOT_OWNED_BODY, undefined, { complete: false, bytes: 0 })]);
