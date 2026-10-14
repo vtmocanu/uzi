@@ -925,6 +925,9 @@ export class Worker {
           residueQuarantine(),
         );
         ok = true;
+        // Heartbeat negotiation can grow or shrink support without a new incarnation.
+        // Preserve maintenance identity/custody/fences; only its optional-use gate changes.
+        this.dindMaintenance?.updateNegotiation(this.client.hasFeature("dind_maintenance_v1"));
         // issue #1759 M3: the api's custody flag, stamped here with this heartbeat's SEND
         // time (the flag reflects the api's view as of the request, so a heartbeat sent
         // before a claim and returning after that run ended must not look newer than the

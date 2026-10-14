@@ -206,11 +206,15 @@ describe("heartbeat outbox negotiation (PRD #1391 M5)", () => {
     assert.ok(hb1[1]!.body && !("outbox" in hb1[1]!.body), "the stripped retry carried NO outbox");
     assert.strictEqual(c.hasFeature("heartbeat_outbox"), false, "a stripped success clears the whole feature set");
 
-    // And a subsequent heartbeat sends nothing negotiated, even with depth to report.
+    // A later regular tick discovers a complete advert; the following tick sends outbox.
+    srv.cfg.heartbeat = () => ({ status: 200, body: JSON.stringify({ protocol_features: ["heartbeat_outbox"] }) });
     await c.heartbeat(undefined, [entry]);
     const hb2 = heartbeats();
     assert.strictEqual(hb2.length, 3);
-    assert.ok(hb2[2]!.body && !("outbox" in hb2[2]!.body), "features stay cleared until restart");
+    assert.ok(hb2[2]!.body && !("outbox" in hb2[2]!.body), "discovery tick still uses the cleared cache");
+    assert.strictEqual(c.hasFeature("heartbeat_outbox"), true);
+    await c.heartbeat(undefined, [entry]);
+    assert.deepStrictEqual(heartbeats()[3]!.body?.outbox, [entry]);
   });
 });
 
