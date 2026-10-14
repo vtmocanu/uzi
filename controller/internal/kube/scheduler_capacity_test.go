@@ -454,6 +454,22 @@ func TestSchedulerCapacityDuplicateDeploymentNamespaces(t *testing.T) {
 	}
 }
 
+func TestSchedulerCapacityForeignContainerFault(t *testing.T) {
+	dep, pod := capacityPortableObjects()
+	dep.Namespace, pod.Namespace = "other-workers", "other-workers"
+	fault := waiting(workerPod(capacityPortableID, "", time.Hour), "worker", "CrashLoopBackOff", 4, false)
+	m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{}, io.Discard, fault, dep, pod)
+	m.cfg.DockerNamespace = dep.Namespace
+	observed, err := m.Observe(context.Background())
+	if err != nil {
+		t.Fatal(err)
+	}
+	if len(observed) != 1 || observed[0].Roll.BlockingKind != "" || observed[0].SchedulerCapacityReason != "" ||
+		observed[0].Roll.BlockingReason != "CrashLoopBackOff" || observed[0].Roll.RestartCount != 4 {
+		t.Fatalf("foreign container fault overwritten by capacity: %+v", observed)
+	}
+}
+
 func TestSchedulerCapacityPodOnlyAndGap(t *testing.T) {
 	dep, pod := capacityPortableObjects()
 	for name, objects := range map[string][]runtime.Object{"pod_only": {pod}, "no_pod": {dep}} {

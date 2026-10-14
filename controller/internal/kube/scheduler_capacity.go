@@ -116,7 +116,7 @@ type schedulerCapacityObservation struct {
 // recordSchedulerCapacity adds evidence without changing ordinary pod selection or
 // failure classification. Only a unique live current pod can justify a typed cause.
 func recordSchedulerCapacity(o *reconcile.ObservedWorker, pods []corev1.Pod, deploymentNamespace string, replicaFailure bool) {
-	if !o.HasDeployment || o.DeploymentTerminating || o.SpecHash == "" || replicaFailure {
+	if !o.HasDeployment || o.DeploymentTerminating || o.SpecHash == "" || replicaFailure || o.Namespace != deploymentNamespace {
 		return
 	}
 	var current *corev1.Pod
