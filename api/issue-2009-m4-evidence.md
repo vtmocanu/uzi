@@ -89,10 +89,38 @@ node --import tsx --test --test-timeout=120000 --test-concurrency=1 test/issue-1
 ~~~
 Base private: 489 pass/0 fail/0 skip, exit 0, wall 65.655428372s (`gate-log.W9dMGB`). Candidate private: 488 pass/1 fail/0 skip, exit 1, wall 69.765246888s (`gate-log.lgxrIk`). The remaining failure was the changed-wire #1742 equality expectation, fixed and focused-tested in `c9c8dcb2` above. The original failed full gate remains a reported failed check with its base/environment evidence; it is not silently converted to green.
 
-### Next validation work
+### Completed canonical validation (2026-10-14)
 
-Repeat `task gate:agent` over the committed frozen tree using a private non-setgid scratch TMPDIR, then serially run `task gate:api` with UZI_TEST_DATABASE_URL unset and an **absolute** private GOLANGCI_LINT_CACHE, `task gate:web`, `task gate:repo`, `task check:changelog-entry`, and `./e2e/run-store-it.sh` with absolute scratch TMPDIR. Each foreground command needs its own mktemp scratch log, observed exit and elapsed time; assert the LiveDB sweep ran with zero skips. All these completion results remain pending.
+All completion checks below ran serially in the foreground on the clean frozen commit `e749ba45dafd8873842117f50129bae837b081ed`. Subsequent changes are verification documentation only. Each completed command has a separate scratch log with observed exit and elapsed nanoseconds. GOMAXPROCS=2, UZI_TEST_DATABASE_URL unset, absolute GOLANGCI_LINT_CACHE, and an owned mode-0700/non-setgid TMPDIR under absolute worktree `.uzi/scratch` were used. The LiveDB script also used that absolute private scratch subdirectory rather than the provisioned setgid root; this environment-only adjustment preserves the fixture ownership control above. No dependencies, workflows, test timeouts or production behavior changed.
 
-If the next full agent attempt reaches the command deadline, do not repeat it whole: use every gate prerequisite, both serial CI shard legs with matching JUnit names, `task test:codex-m4`, and `task check:agent-shards`. Preserve both JUnit files and success-only `shard-1.codex-m4` containing `passed` (CI ci.yml:660–670; checker requires this marker). No test, timeout, dependency, workflow or production change. Apply the user's isolated candidate/base unchanged-code failure rule and report an incomplete composition accurately if applicable.
+The corrected `task gate:agent` attempt (`gate-log.pCa9ik`) reached the 60-minute command deadline and the runtime reaped its process tree. This is an **interrupted check, not a pass**; no shell EXIT footer was produced. Its unit stage completed with 14,369 passes, zero failures, 15 skips and zero real-procfs skips (unit duration 3,493,973.706576ms). The following M4 stage was interrupted. Following the user's deadline contingency, the full command was not repeated; every prerequisite and both CI shard legs were run once, serially, with their own logs:
 
-After final gates, update this record to actual results, review any new committed evidence/fix ranges, mark M4 complete, checkpoint as instructed, and only then signal delivery. No linked PRD exists. Include accepted rejected-enclosing-snapshot/fleet/ceiling limits from ADR 2009 and deferred CI timing note in final PR summary.
+| Command | Exit | Wall seconds | Scratch log suffix |
+| --- | ---: | ---: | --- |
+| task deps-check:agent | 0 | 1.876336803 | 3bZ9oA |
+| task lint:agent | 0 | 0.865347141 | EuHWyD |
+| task deadcode:agent | 0 | 5.565339409 | xGWOQs |
+| task typecheck:agent | 0 | 7.557444954 | 2FvS7V |
+| UZI_AGENT_TEST_SHARD=1/2 UZI_AGENT_TEST_JUNIT=shard-1.xml task test:agent:shard | 0 | 1955.174128653 | 6S44mq |
+| UZI_AGENT_TEST_SHARD=2/2 UZI_AGENT_TEST_JUNIT=shard-2.xml task test:agent:shard | 0 | 1311.904290614 | 3JrIPl |
+| task test:codex-m4 | 0 | 114.635468091 | qpHeGb |
+| UZI_AGENT_SHARD_REPORT_DIR=<absolute scratch reports directory> task check:agent-shards | 0 | 0.445462131 | XxoCaJ |
+
+Shard 1: 7,981 passes, zero failures, one skip. Shard 2: 6,388 passes, zero failures, 14 skips. Both report zero real-procfs skips. M4: 183 passes, zero failures/skips; completeness satisfies the required [claude/U, codex/U, codex/P] matrix. Both JUnit reports are retained in `.uzi/scratch/m4-composition-reports`; `shard-1.codex-m4` contains `passed` and was written only after M4 exit 0. The checker confirmed all 476 tracked agent test files ran exactly once across the two shards. The **serial composition passes**; it does not erase the interrupted full command or the earlier failed candidate recorded above. No suspected contention-flake exception was needed.
+
+| Remaining canonical command | Exit | Wall seconds | Scratch log suffix |
+| --- | ---: | ---: | --- |
+| task gate:api (UZI_TEST_DATABASE_URL unset) | 0 | 976.426485217 | aKP4pZ |
+| task gate:web, first attempt | 201 | 614.636765323 | 1boIsy |
+| task gate:web, corrected Chromium environment | 0 | 533.276955605 | OCBM6Y |
+| task gate:repo | 0 | 915.904196898 | LqV7RS |
+| task check:changelog-entry | 0 | 0.286666602 | UC6fJd |
+| ./e2e/run-store-it.sh | 0 | 1785.908526865 | mdyu58 |
+
+The failed web gate reached browser launch but executed no browser tests: Chromium reported `FATAL: Socket path too long` for its Unix SingletonSocket under the long absolute TMPDIR. Narrow candidate/base controls from fresh archives (provisioned web/node_modules symlink, no installation) ran `npm run test:browser -- src/components/UsageCards.browser.test.tsx --reporter=verbose`: direct launch failed before tests on candidate e749ba45 (exit 1, wall 4s, CRZQS2) and task base ed2f53b7 (exit 1, wall 5s, LGMDB0). The selected test and browser config are unchanged between refs.
+
+A scratch-only executable wrapper, selected through the existing UZI_WEB_BROWSER_CHROMIUM override, sets TMPDIR to the relative path from the browser's current directory to an owned scratch directory, then execs the exact `/opt/uzi-toolchain/bin/chromium "$@"`. All browser arguments and the provisioned binary remain unchanged; artifacts remain under worktree scratch. Wrapper controls passed the same four real browser tests with zero skips on candidate (exit 0, wall 10s, 3v1iJu) and base (exit 0, wall 9s, YM7Rzr). This observed environment correction justified the full web retry. Corrected gate:web passed 7,000 main tests and all 26 browser tests; the earlier failed check remains reported.
+
+The API gate passed including pinned sqlc drift validation and API tests. The repository gate and changelog entry check passed. The integration script provisioned its throwaway Docker Postgres (`uzi-store-it-143445`) and ran the seven-package LiveDB sweep with race/p1/count1: store, handler, forgesvc, schedsvc, workersvc, recovery and poller. Script summary: **2,810 top-level LiveDB tests passed, zero skipped**. Independently counted verbose output: 7,306 RUN/PASS cases including subtests, zero SKIP and zero FAIL. Thus this is executed LiveDB evidence, not merely exit zero.
+
+Local runtimes do not establish CI timing or execution; green required PR CI remains a merge prerequisite. No linked PRD exists. Final delivery retains the accepted rejected-enclosing-snapshot/fleet/ceiling limits from ADR 2009 and the deferred CI timing note from the reviewer of 6ddf16e0. All implementation and repair ranges were reviewed as recorded above; this final evidence-only range still requires its own review before completion/checkpoint.
