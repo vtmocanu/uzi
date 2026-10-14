@@ -104,9 +104,18 @@ func schedulerClause(s string, expected uint32, names []string) (uint32, [2]bool
 	return n, seen, sum >= uint64(n)
 }
 
+// schedulerCapacityObservation collects evidence across all configured namespace
+// folds for one Observe call. Ordinary roll derivation remains namespace-local.
+type schedulerCapacityObservation struct {
+	pods                map[string][]corev1.Pod
+	blocked             map[string]bool
+	deploymentNamespace map[string]string
+	podListFailed       bool
+}
+
 // recordSchedulerCapacity adds evidence without changing ordinary pod selection or
 // failure classification. Only a unique live current pod can justify a typed cause.
-func recordSchedulerCapacity(o *reconcile.ObservedWorker, pods []corev1.Pod, replicaFailure bool) {
+func recordSchedulerCapacity(o *reconcile.ObservedWorker, pods []corev1.Pod, deploymentNamespace string, replicaFailure bool) {
 	if !o.HasDeployment || o.DeploymentTerminating || o.SpecHash == "" || replicaFailure {
 		return
 	}
@@ -121,7 +130,7 @@ func recordSchedulerCapacity(o *reconcile.ObservedWorker, pods []corev1.Pod, rep
 		}
 		current = p
 	}
-	if current == nil || current.Spec.NodeName != "" || current.Status.Phase != corev1.PodPending {
+	if current == nil || current.Namespace != deploymentNamespace || current.Spec.NodeName != "" || current.Status.Phase != corev1.PodPending {
 		return
 	}
 	for _, statuses := range [][]corev1.ContainerStatus{current.Status.InitContainerStatuses, current.Status.ContainerStatuses, current.Status.EphemeralContainerStatuses} {
@@ -145,7 +154,7 @@ func recordSchedulerCapacity(o *reconcile.ObservedWorker, pods []corev1.Pod, rep
 				return
 			}
 			reason = schedulerCapacityMessage(c.Message)
-		case corev1.PodReady, corev1.ContainersReady:
+		case corev1.PodReady, corev1.ContainersReady, corev1.PodReadyToStartContainers:
 			if seenReady[c.Type] || c.Status != corev1.ConditionFalse {
 				return
 			}
@@ -159,7 +168,7 @@ func recordSchedulerCapacity(o *reconcile.ObservedWorker, pods []corev1.Pod, rep
 	o.SchedulerMountedClaims = map[string]bool{}
 	for _, v := range current.Spec.Volumes {
 		if v.PersistentVolumeClaim != nil {
-			o.SchedulerMountedClaims[v.PersistentVolumeClaim.ClaimName] = true
+			o.SchedulerMountedClaims[current.Namespace+"/"+v.PersistentVolumeClaim.ClaimName] = true
 		}
 	}
 	if o.Roll.Phase == protocol.PhaseStuck {

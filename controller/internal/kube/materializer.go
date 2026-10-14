@@ -156,14 +156,21 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 		namespaces = append(namespaces, m.cfg.IsolatedNamespace)
 	}
 	deploymentCounts := map[string]int{}
+	capacityEvidence := schedulerCapacityObservation{
+		pods:                map[string][]corev1.Pod{},
+		blocked:             map[string]bool{},
+		deploymentNamespace: map[string]string{},
+	}
 	for _, ns := range namespaces {
-		if err := m.observeNamespace(ctx, ns, byID, deploymentCounts); err != nil {
+		if err := m.observeNamespace(ctx, ns, byID, deploymentCounts, &capacityEvidence); err != nil {
 			return nil, err
 		}
 	}
 
 	out := make([]reconcile.ObservedWorker, 0, len(byID))
 	for _, o := range byID {
+		// Capacity uniqueness is proved only after every configured namespace fold.
+		recordSchedulerCapacity(o, capacityEvidence.pods[o.ID], capacityEvidence.deploymentNamespace[o.ID], capacityEvidence.podListFailed || capacityEvidence.blocked[o.ID] || deploymentCounts[o.ID] != 1)
 		out = append(out, *o)
 	}
 	// Strand synthesis runs over the ASSEMBLED slice, after every observeNamespace fold
@@ -195,6 +202,16 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 		}
 		var timedOut []target
 		for _, t := range targets {
+			// A later namespace fold may hide an older Pending claim of the same
+			// name. Retain legacy volume priority while checking every observed claim.
+			if t.phase != string(corev1.ClaimPending) || t.created == nil || m.now().Sub(*t.created) < pvcBindTimeout {
+				for _, claim := range w.SchedulerPendingClaims {
+					if claim.Name == t.name && m.now().Sub(claim.CreatedAt) >= pvcBindTimeout {
+						t.phase, t.created = string(corev1.ClaimPending), &claim.CreatedAt
+						break
+					}
+				}
+			}
 			if t.phase != string(corev1.ClaimPending) || t.created == nil {
 				continue
 			}
@@ -209,8 +226,11 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 			continue
 		}
 		capacity := w.SchedulerCapacityReason != ""
-		for _, t := range timedOut {
-			if !w.SchedulerMountedClaims[t.name] {
+		for _, claim := range w.SchedulerPendingClaims {
+			if m.now().Sub(claim.CreatedAt) < pvcBindTimeout {
+				continue
+			}
+			if !w.SchedulerMountedClaims[claim.Namespace+"/"+claim.Name] {
 				capacity = false
 			}
 		}
@@ -233,7 +253,7 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 
 // observeNamespace folds one namespace's stamped Deployments and PVCs into byID,
 // recording the namespace each worker was seen in so teardown can target it.
-func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker, deploymentCounts map[string]int) error {
+func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker, deploymentCounts map[string]int, capacityEvidence *schedulerCapacityObservation) error {
 	get := func(id string) *reconcile.ObservedWorker {
 		if o, ok := byID[id]; ok {
 			return o
@@ -258,7 +278,6 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// which PRD #113 declined to grant (`events: list` was refused) and which this does
 	// not reopen.
 	replicaFailures := map[string]string{}
-	hasReplicaFailure := map[string]bool{}
 
 	deployments, err := m.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -273,23 +292,14 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		}
 		o := get(id)
 		deploymentCounts[id]++
-		if deploymentCounts[id] > 1 {
-			// A second Deployment makes the desired hash ambiguous, including across
-			// namespace folds. Retire any capacity evidence from the earlier fold.
-			o.SchedulerCapacityReason = ""
-			o.SchedulerMountedClaims = nil
-			if o.Roll.BlockingKind == "scheduler_capacity" {
-				o.Roll.BlockingKind = ""
-				o.Roll.BlockingReason = ""
-			}
-		}
+		capacityEvidence.deploymentNamespace[id] = ns
 		o.HasDeployment = true
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
 		for _, c := range d.Status.Conditions {
 			if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
-				hasReplicaFailure[id] = true
+				capacityEvidence.blocked[id] = true
 			}
 		}
 		if img := workerImage(d); img != "" {
@@ -334,6 +344,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// flight would otherwise read the doomed volume's size as live. Compute the flag
 		// once and let each case decide what it means for that claim.
 		terminating := p.DeletionTimestamp != nil
+		if !terminating && p.Status.Phase == corev1.ClaimPending && (p.Name == nixPVCName(id) || p.Name == dataPVCName(id) || p.Name == dindDataPVCName(id)) {
+			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time})
+		}
 		switch p.Name {
 		case dataPVCName(id):
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
@@ -381,6 +394,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// maintenanceObservation and waits on any read failure.
 	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		// A failed namespace list prevents a fleet-wide uniqueness proof.
+		capacityEvidence.podListFailed = true
 		m.log.Warn("listing pods failed; legacy reconciliation continues and DinD maintenance requires a successful recheck",
 			"namespace", ns, "error", err)
 		return nil
@@ -394,6 +409,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			continue
 		}
 		byWorker[id] = append(byWorker[id], *p)
+		capacityEvidence.pods[id] = append(capacityEvidence.pods[id], *p)
 		o := get(id)
 		o.WorkerPodCount++
 		if p.DeletionTimestamp == nil && p.UID != "" && p.Annotations[AnnotationSpecHash] == o.SpecHash {
@@ -431,7 +447,6 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// pod readiness rather than deployment drift — see rollhealth.go's header.
 		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, replicaFailures[o.ID], now)
 		o.Roll.TargetImage = targetImages[o.ID]
-		recordSchedulerCapacity(o, byWorker[o.ID], hasReplicaFailure[o.ID] || deploymentCounts[o.ID] != 1)
 	}
 	// A worker seen ONLY as pods (its Deployment already gone, its pods still
 	// terminating) gets roll health too — teardown is in flight and the row is honest

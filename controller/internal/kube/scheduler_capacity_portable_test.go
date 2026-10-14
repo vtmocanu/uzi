@@ -51,8 +51,17 @@ func capacityPortableObjects() (*appsv1.Deployment, *corev1.Pod) {
 
 func capacityPortableTick(t *testing.T, objects []runtime.Object, failPods bool, reversePVCList ...bool) json.RawMessage {
 	t.Helper()
+	reverse := len(reversePVCList) != 0 && reversePVCList[0]
+	return capacityPortableTickConfigured(t, objects, failPods, reverse, nil)
+}
+
+func capacityPortableTickConfigured(t *testing.T, objects []runtime.Object, failPods, reversePVCList bool, configure func(*Materializer)) json.RawMessage {
+	t.Helper()
 	m, client := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{}, io.Discard, objects...)
-	if len(reversePVCList) != 0 && reversePVCList[0] {
+	if configure != nil {
+		configure(m)
+	}
+	if reversePVCList {
 		list, err := client.CoreV1().PersistentVolumeClaims(testConfig().Namespace).List(context.Background(), metav1.ListOptions{})
 		if err != nil {
 			t.Fatal(err)

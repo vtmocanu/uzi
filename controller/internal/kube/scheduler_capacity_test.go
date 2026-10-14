@@ -25,6 +25,7 @@ func TestSchedulerCapacityTickCorpus(t *testing.T) {
 		phase, reason                       string
 		capacity, failPods                  bool
 		noDeployment, noPod, reversePVCList bool
+		configure                           func(*Materializer)
 	}
 	const cpu = "scheduler capacity: insufficient cpu"
 	const memory = "scheduler capacity: insufficient memory"
@@ -201,6 +202,59 @@ func TestSchedulerCapacityTickCorpus(t *testing.T) {
 			return nil
 		}},
 	}
+	for _, status := range []corev1.ConditionStatus{corev1.ConditionFalse, corev1.ConditionTrue, corev1.ConditionUnknown} {
+		for _, duplicate := range []bool{false, true} {
+			cases = append(cases, scenario{
+				name:     "sandbox_" + string(status) + map[bool]string{false: "_single", true: "_duplicate"}[duplicate],
+				capacity: status == corev1.ConditionFalse && !duplicate,
+				reason:   map[bool]string{true: cpu}[status == corev1.ConditionFalse && !duplicate],
+				mutate: func(_ *appsv1.Deployment, p *corev1.Pod) []runtime.Object {
+					condition := corev1.PodCondition{Type: corev1.PodReadyToStartContainers, Status: status}
+					p.Status.Conditions = append(p.Status.Conditions, condition)
+					if duplicate {
+						p.Status.Conditions = append(p.Status.Conditions, condition)
+					}
+					return nil
+				},
+			})
+		}
+	}
+	for _, reverse := range []bool{false, true} {
+		configure := func(m *Materializer) {
+			if reverse {
+				m.cfg.Namespace, m.cfg.DockerNamespace = "other-workers", testConfig().Namespace
+			} else {
+				m.cfg.DockerNamespace = "other-workers"
+			}
+		}
+		order := map[bool]string{false: "_capacity_first", true: "_capacity_last"}[reverse]
+		cases = append(cases, scenario{name: "other_namespace_current_pod" + order, configure: configure, phase: map[bool]string{false: "stuck", true: "rolling"}[reverse],
+			mutate: func(_ *appsv1.Deployment, p *corev1.Pod) []runtime.Object {
+				other := p.DeepCopy()
+				other.Namespace = "other-workers"
+				other.Status.Phase = corev1.PodRunning
+				other.Spec.NodeName = "assigned"
+				return []runtime.Object{other}
+			}})
+		cases = append(cases, scenario{name: "other_namespace_claim_folded" + order, configure: configure,
+			mutate: func(_ *appsv1.Deployment, p *corev1.Pod) []runtime.Object {
+				p.CreationTimestamp = metav1.NewTime(m5Now.Add(-time.Minute))
+				mount(p, "nix")
+				foreign := oldClaim("nix")
+				foreign.Namespace = "other-workers"
+				local := oldClaim("nix")
+				local.Status.Phase = corev1.ClaimBound
+				return []runtime.Object{foreign, local}
+			}})
+		cases = append(cases, scenario{name: "other_namespace_claim" + order, configure: configure,
+			mutate: func(_ *appsv1.Deployment, p *corev1.Pod) []runtime.Object {
+				p.CreationTimestamp = metav1.NewTime(m5Now.Add(-time.Minute))
+				mount(p, "nix")
+				claim := oldClaim("nix")
+				claim.Namespace = "other-workers"
+				return []runtime.Object{claim}
+			}})
+	}
 	for _, mounted := range []string{"nix", "data"} {
 		for _, reverse := range []bool{false, true} {
 			mounted, reverse := mounted, reverse
@@ -272,7 +326,7 @@ func TestSchedulerCapacityTickCorpus(t *testing.T) {
 			if tc.mutate != nil {
 				objects = append(objects, tc.mutate(dep, pod)...)
 			}
-			wire := capacityPortableTick(t, objects, tc.failPods, tc.reversePVCList)
+			wire := capacityPortableTickConfigured(t, objects, tc.failPods, tc.reversePVCList, tc.configure)
 			var row map[string]any
 			if err := json.Unmarshal(wire, &row); err != nil {
 				t.Fatal(err)
@@ -293,7 +347,7 @@ func TestSchedulerCapacityTickCorpus(t *testing.T) {
 				if row["phase"] != phase {
 					t.Fatalf("phase want %s: %s", phase, wire)
 				}
-				if !tc.noDeployment && !(tc.failPods && row["pod_phase"] == "") && row["target_image"] != "example.com/agent:1.2.3" {
+				if !tc.noDeployment && (!tc.failPods || row["pod_phase"] != "") && row["target_image"] != "example.com/agent:1.2.3" {
 					t.Fatalf("TargetImage lost: %s", wire)
 				}
 				if tc.capacity {
@@ -305,6 +359,9 @@ func TestSchedulerCapacityTickCorpus(t *testing.T) {
 				}
 				if tc.reason != "" && row["blocking_reason"] != tc.reason {
 					t.Fatalf("ordinary failure lost: %s", wire)
+				}
+				if strings.Contains(tc.name, "other_namespace_claim") && (row["pod_phase"] != "Pending" || row["blocking_container"] != nixPVCName(capacityPortableID) || row["blocking_reason"] != "stranded Pending past 10m0s bind-timeout; no auto-rollback") {
+					t.Fatalf("foreign claim must retain ordinary storage failure: %s", wire)
 				}
 				if strings.Contains(tc.name, "mixed_claims") && row["blocking_container"] != nixPVCName(capacityPortableID) {
 					t.Fatalf("/nix priority lost: %s", wire)
@@ -336,6 +393,38 @@ func TestSchedulerCapacityTickCorpus(t *testing.T) {
 	}
 	if !bytes.Equal(got, want) {
 		t.Fatalf("Tick corpus drift: regenerate with RECORD_CAPACITY_CORPUS=1 go test -count=1 ./internal/kube -run '^TestSchedulerCapacityTickCorpus$'")
+	}
+}
+
+func TestSchedulerCapacityLivePodAcrossNamespaces(t *testing.T) {
+	for _, tier := range []string{"docker", "isolated"} {
+		for _, reverse := range []bool{false, true} {
+			t.Run(tier+map[bool]string{false: "_capacity_first", true: "_capacity_last"}[reverse], func(t *testing.T) {
+				dep, pod := capacityPortableObjects()
+				other := pod.DeepCopy()
+				other.Namespace = "other-workers"
+				other.Status.Phase = corev1.PodRunning
+				other.Spec.NodeName = "assigned"
+				m, _ := newMatWithRecycle(t, nil, DrainPolicy{}, RecyclePolicy{}, io.Discard, dep, pod, other)
+				first, second := dep.Namespace, other.Namespace
+				if reverse {
+					first, second = second, first
+				}
+				m.cfg.Namespace = first
+				if tier == "docker" {
+					m.cfg.DockerNamespace = second
+				} else {
+					m.cfg.IsolatedNamespace = second
+				}
+				observed, err := m.Observe(context.Background())
+				if err != nil {
+					t.Fatal(err)
+				}
+				if len(observed) != 1 || observed[0].SchedulerCapacityReason != "" || observed[0].Roll.BlockingKind != "" {
+					t.Fatalf("second live current pod retained capacity evidence: %+v", observed)
+				}
+			})
+		}
 	}
 }
 

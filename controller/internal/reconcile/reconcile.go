@@ -132,8 +132,16 @@ type ObservedWorker struct {
 	// which RollHealth.Phase renders as the rolling gap.
 	Roll RollHealth
 	// Scheduler evidence is tick-local, including for young rolling pods. It is never serialized.
-	SchedulerCapacityReason string          `json:"-"`
-	SchedulerMountedClaims  map[string]bool `json:"-"`
+	SchedulerCapacityReason string                  `json:"-"`
+	SchedulerMountedClaims  map[string]bool         `json:"-"` // namespace/name keys
+	SchedulerPendingClaims  []SchedulerPendingClaim `json:"-"`
+}
+
+// SchedulerPendingClaim retains namespace identity independently of legacy PVC folds.
+type SchedulerPendingClaim struct {
+	Namespace string
+	Name      string
+	CreatedAt time.Time
 }
 
 // RollHealth is one worker's roll state as read from its pod, and it is the answer
