@@ -7461,7 +7461,8 @@ func (s *Service) ListAllWorkers(ctx context.Context) ([]store.ListAllWorkersRow
 	return s.q.ListAllWorkers(ctx)
 }
 
-// ListActiveRunsAll returns every non-terminal run across all users (admin).
+// ListActiveRunsAll returns the newest 500 non-terminal runs across all users
+// (admin), excluding chat, judge, and cross-check runs.
 func (s *Service) ListActiveRunsAll(ctx context.Context) ([]store.ListActiveRunsAllRow, error) {
 	return s.q.ListActiveRunsAll(ctx, s.activeRunsPriorityCutoff())
 }

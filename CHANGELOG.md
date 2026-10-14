@@ -29,6 +29,8 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- `uzi admin runs` help now says it lists the newest 500 active runs.
+
 - **Idle cross-check counts no longer crowd TUI board and split titles ([#2894](https://github.com/vtmocanu/uzi/issues/2894)).**
   Shared fleet titles omit cross-check capacity while online workers have no active cross-checks, recovering board space; active counts and the full Workers capacity readout remain visible.
 
