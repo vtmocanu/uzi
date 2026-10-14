@@ -206,20 +206,27 @@ describe("RunRunner M2 — unknown refresh sink retries and local recovery", () 
     client.publishCheckpoint = publish;
     const publication = countPublishes(() => true);
     try {
-      const ready = codexRig();
+      api.setOwnershipStatus(claim.run_id, "running", 4);
+      const rigs: ReturnType<typeof codexRig>[] = [];
       let checkpointRetried = false;
-      const exec = new FakeCodexExecutor(ready.safety, async (ctx) => {
-        assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "utf8"), "uncommitted edit\n", "local-only recovery source restored");
-        await ctx.checkpoint!({ reap: true });
-        // The overlay-less Codex checkpoint defers its scan outside the permit.
-        await ctx.checkpoint!({ reap: false });
-        checkpointRetried = true;
-        return { branch: ctx.branch };
-      }, ready.settle);
-      await runnerWith(() => ({ executor: exec }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute({ ...claim, claim_generation: 4 });
+      const factory = () => {
+        const ready = codexRig();
+        rigs.push(ready);
+        const exec = new FakeCodexExecutor(ready.safety, async (ctx) => {
+          assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "utf8"), "uncommitted edit\n", "local-only recovery source restored");
+          await ctx.checkpoint!({ reap: true });
+          // The overlay-less Codex checkpoint defers its scan outside the permit.
+          await ctx.checkpoint!({ reap: false });
+          checkpointRetried = true;
+          return { branch: ctx.branch };
+        }, ready.settle);
+        return { executor: exec };
+      };
+      await runnerWith(factory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute({ ...claim, claim_generation: 4 });
+      const ready = rigs.at(-1)!;
       assert.ok(checkpointRetried, `resume retries checkpoint publication through a ready boundary: ${JSON.stringify(api.states)}`);
-      assert.equal(publication.count(), 1, "the direct resume retries checkpoint publication exactly once");
-      assert.equal(parkReports(claim.run_id).length, 1, "no predecessor recapture flight");
+      assert.equal(publication.count(), 2, "predecessor recapture and the fresh attempt each publish once");
+      assert.equal(parkReports(claim.run_id).length, 1, "recapture does not send an additional park report");
       assert.deepEqual(ready.boundaries, ["checkpoint", "finalize"], "publication and MR cross ready boundaries");
       assert.ok(ready.refreshCalls() >= 1, "the resumed finalize reconciled ready");
       assert.equal(mrCalls.length, 1, "the resumed claim created the MR");

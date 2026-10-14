@@ -52,16 +52,18 @@ choice.
 An ephemeral (run-bound) worker, the kind uzi provisions for a single run and
 removes once that run finishes and its idle lease ends (see [Ephemeral worker
 lease](#ephemeral-worker-lease)), is the exception on `/data`: its `/data` is
-its own setting, 20Gi by default and set by the operator, whatever size the
+its own setting, 40Gi by default and set by the operator, whatever size the
 worker runs at. Its CPU and memory still follow its size.
 
 New ephemeral hosted workers default to **M** (1 CPU / 8Gi memory
 requested, 4 CPU / 12Gi memory limits), saving 6Gi of memory reservation per
 worker compared with **L**. New persistent workers still preselect **L**
 (1 CPU / 14Gi requested, 4 CPU / 20Gi limits) for more memory headroom.
-Both **M** and **L** now allocate 25Gi of persistent `/data`; ephemeral data
-retains its independent 20Gi default. Existing persistent **M** data volumes
-stay at 10Gi until reprovisioned: the controller does not resize existing PVCs.
+New persistent **M** workers allocate 25Gi of `/data`, and **L** workers allocate
+50Gi. Ephemeral data uses its independent 40Gi default. Existing data volumes
+keep their current capacity: the controller does not resize existing PVCs.
+Operators can [expand them in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)
+on a StorageClass that supports volume expansion.
 Existing workers keep their stored size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
 Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, or `l`);

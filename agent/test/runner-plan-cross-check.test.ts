@@ -314,11 +314,26 @@ describe("U2 real runner checked gate", () => {
       seen.push(await ctx.gatePlan!("human revision", undefined, undefined, human.inputId));
       return { branch: ctx.branch };
     } };
-    await start(exec, c);
-    assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "reject"]);
-    assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
-    assert.equal(api.crossCheckLatestRequests.length, 1);
-    assert.equal(gates(c.run_id).length, 2);
+    const { log, warnings } = diagnosticLogger();
+    const forge = fakeGitlab();
+    const run = runnerWith(() => ({ executor: exec }), forge.gitlab, undefined, log, {
+      planCrossCheckTiming: timing, planApprovalTimeoutMs: 4000,
+    });
+    try {
+      await run.execute(c);
+      assert.deepEqual(seen.map((v) => v.kind), ["revise", "revise", "reject"]);
+      assert.deepEqual(api.crossCheckRequests.map((r) => r.body.round), [1, 2]);
+      assert.equal(api.crossCheckLatestRequests.length, 1);
+      assert.equal(gates(c.run_id).length, 2);
+    } catch (error) {
+      console.error("local human revision failure:", JSON.stringify({
+        verdicts: seen.map((v) => v.kind), warnings,
+        states: api.states.filter((s) => s.runId === c.run_id).map((s) => s.body),
+        rounds: api.crossCheckRequests.map((r) => r.body.round),
+        latestReads: api.crossCheckLatestRequests.length,
+      }));
+      throw error;
+    }
   });
 
   for (const reason of ["block", "timed_out", "model_error", "checker_failed", "revisions_exhausted"] as const) {

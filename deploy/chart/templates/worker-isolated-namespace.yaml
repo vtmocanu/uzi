@@ -44,7 +44,8 @@ metadata:
     {{- end }}
 {{- if .Values.workers.isolatedLane.quota.enabled }}
 {{- /*
-  The lane's own ResourceQuota, the restricted tier's shape. Same side effect: a quota on
+  The lane's own ResourceQuota covers 10 x (40Gi run-bound data + 20Gi nix) =
+  600Gi across 20 claims. Same side effect: a quota on
   requests.cpu or requests.memory makes admission reject a pod with a container that
   declares none, so the controller renders explicit requests on every container.
 */}}
@@ -68,7 +69,8 @@ spec:
 {{- if .Values.workers.isolatedLane.limitRange.enabled }}
 {{- /*
   The backstop, never the source: every lane worker pod arrives from the controller with
-  explicit requests and limits. `max` must stay >= the largest worker preset's limits.
+  explicit requests and limits. `max` must stay >= the largest worker preset's limits;
+  maxPVCStorage must admit run-bound data (40Gi by default) and the 20Gi nix claim.
 */}}
 ---
 apiVersion: v1

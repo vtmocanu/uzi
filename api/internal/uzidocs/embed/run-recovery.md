@@ -388,7 +388,7 @@ counted as source, and a bare ref that justified coverage can later move (a
 forge force-push, pin settlement).
 
 Coverage is also refused (`not_covered`) in these cases, which matter where coverage
-still gates release (recovery parks and terminal exits, below):
+still gates release (terminal exits, below); on parks it is diagnostic:
 
 - **Populated submodule.** A `.git/modules` store, or a gitlink path that holds
   anything but nothing or an empty directory, is never covered, even with
@@ -397,8 +397,10 @@ still gates release (recovery parks and terminal exits, below):
   submodule's own files, commits or refs.
 - **Late writer.** If the final process proof had to kill a writer, the earlier
   byte checks do not cover what it wrote. The residual is a writer that writes and
-  exits between the status read and that proof. Stopped exits no longer rely on
-  the check to release the clone for this reason; park and terminal exits still do.
+  exits between the status read and that proof. Stopped and park exits keep the
+  clone regardless of coverage. Completed, failed and cancelled terminal exits
+  retain their existing covered release; that residual remains open under
+  [#2852](https://github.com/vtmocanu/uzi/issues/2852).
 - **Docker teardown failed.** The proof scans processes only, so it is skipped
   unless the Docker half was `not_wired` or `docker_unconfirmed`.
 
@@ -463,12 +465,32 @@ leaves, and whether coverage can release it, depends on the exit:
 - **Exits that stop the flight** (a stopped confirm, another generation, a stale
   park report) record the source as retained, as above, and keep it even when
   covered; the verdict is diagnostic only.
-- **Parks** (`recovery_wait`, a live non-terminal status, shutdown) and **terminal
-  exits** release a clone proven covered at the handler's exit; otherwise they keep the clone and its plain recovery journal with no `uzi-stopped` marker
-  and no `reclaimed` entry; inspect lists a kept canonical clone as described below. A resume on the same worker recaptures bytes written
-  after the earlier capture. A kept terminal clone is later moved by the next run's
-  terminal-orphan handling, as before.
+- **Park release paths** (recovery, provider outage, credential-switch, disk and
+  live non-terminal final parks) keep the exact clone and its existing recovery
+  journal even when covered, with no `uzi-stopped` marker or `reclaimed` entry.
+  Coverage is diagnostic when checked; shutdown still skips the check. A
+  successful direct credential switch also keeps the clone for recapture.
+- **Terminal exits** (`completed`, `failed`, `cancelled`) retain their existing
+  covered release at the handler's exit. Otherwise the clone and plain journal
+  stay; a kept terminal clone still follows existing terminal-orphan handling.
 - An owner-authorized cancel of a non-credential run keeps its normal cleanup; a credential-deferred captured cancel is revalidated at cleanup, and a retained result keeps the clone.
+
+On the same worker, the next claim follows retained-source recovery
+(`recoverRetainedClaim`) to recapture late bytes onto a fresh attempt path and
+model session. Failed or unknown recapture keeps the source. The old parked
+source also stays after successful recapture and completion: recapture or a new
+claim alone does not authorize deletion. Existing verified-successor retirement
+applies to its exact successor where authorized; the covering FINAL path retires
+that successor and reanchors the journal to retained predecessors. It does not
+delete the old parked predecessor. Otherwise use explicit operator discard.
+Stopped and fenced sources still require operator discard.
+
+Keeping the old parked source costs storage, including after resume. On an
+unwired worker retained recovery also starts a fresh path and model session,
+instead of ordinary same-path continuity; Docker-wired resumes already start
+fresh sessions. Capacity pressure does not authorize deletion. This is a partial
+fix for #2852: real writer exclusion and safe reclaim in the Docker lane remain
+open, and no new rename, state, TTL or disposal mechanism is added.
 
 To find these sources, run an aggregate inspect (see
 [Retained sources with no open hold](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)):

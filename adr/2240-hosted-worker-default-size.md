@@ -79,9 +79,9 @@ persistent data volumes grow from 10Gi to 25Gi. Ephemeral data retains its
 separate 20Gi default. Existing persistent `m` data PVCs keep 10Gi until
 reprovisioned; the controller never patches an existing PVC's size.
 
-Compared with today's `l`, this saves 6Gi of memory reservation per ephemeral
-worker with the same CPU request and burst ceiling. The shipped CPU/storage
-quotas and LimitRange maxima already admit `l`'s 1/4 CPU and 25Gi data.
+Compared with the `l` preset at this amendment, this saves 6Gi of memory
+reservation per ephemeral worker with the same CPU request and burst ceiling. The shipped CPU/storage
+quotas and LimitRange maxima at that point admitted `l`'s 1/4 CPU and 25Gi data.
 Existing `m` workers receive the CPU change through the normal controller
 spec-hash roll and drain rules.
 
@@ -91,6 +91,16 @@ CPU contention. A single-run peak measured under #2127 fits the medium memory
 budget, but arbitrary repository workloads may need an explicit larger size.
 
 Decision and hosted acceptance: [#2412](https://github.com/vtmocanu/uzi/issues/2412).
+
+## Data-capacity amendment, 2026-10-14 (#2013)
+
+Persistent `l` data grows to 50Gi for long-run build-cache headroom. The `m`
+preset stays at 25Gi, run-bound data defaults to 40Gi across all lanes, and the
+creation defaults above remain in effect. Both worker tiers' PVC ceilings and
+storage quotas cover the new largest preset. Existing data PVCs retain their
+capacity; operators can expand them in place where storage supports it using
+the [deployment runbook](../deploy/README.md#expanding-existing-worker-data-volumes).
+The controller does not gain a PVC resize path or permission.
 
 ## Conservative shared-CPU warning, 2026-10-14 (#2240)
 

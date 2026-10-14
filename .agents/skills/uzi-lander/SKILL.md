@@ -379,8 +379,10 @@ changes it); trust it over a handover's claim.
    stop is exit 5. When the base cut a release that folded `[Unreleased]` (the fold is proven from the
    three index stages), it instead keeps the base and inserts only the branch's new bullet blocks under
    their `###` headings; an edited or deleted ancestor bullet, an unproven fold or a duplicate refuses.
-   Duplicate `###` headings under `[Unreleased]` get their own collapse commit.
-   Union and collapse keep every existing blank line; only their own joins follow `[Unreleased]`'s convention.
+   Collapse only PR-added duplicate `###` headings under `[Unreleased]`, in a
+   separate commit. Preserve main's existing headings and bullet order, including
+   duplicates; unrelated changelog cleanup belongs in its own reviewed change.
+   Union preserves existing entry gaps; only new joins choose a separator.
    Exit 5 = any other conflict, worktree left mid-rebase: resolve (a union of both sides is
    usual for a shared list), `git -c merge.conflictStyle=diff3 rebase --continue` (a later
    CHANGELOG stop needs the diff3 base to auto-union), re-run with `--skip-rebase`. Exit 6 = the

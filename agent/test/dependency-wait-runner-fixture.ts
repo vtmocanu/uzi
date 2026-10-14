@@ -112,8 +112,9 @@ function gitRead(tree: string, ...args: string[]): string {
 
 /**
  * Both real executors run through the same physical runner/worker seams as owner pauses.
- * Two executions are capped by the caller's test timeout, with a ten-second owner-resume
- * observation deadline; failures abort and await the worker before cleanup.
+ * Two executions are capped by the caller's test timeout; owner-resume observation
+ * has thirty-second headroom with diagnostics. Failures abort and await the worker
+ * before cleanup. Initial readiness is event-driven and observes caller cancellation.
  */
 export async function exerciseDependencyWaitRunner(
   build: (ctx: RunContext, home: string) => Executor,
@@ -228,6 +229,19 @@ export async function exerciseDependencyWaitRunner(
       return next;
     };
     // RunRunner + real HTTP remain intact; only the worker's claim source is scripted.
+    // Physical clone, Git, checkpoint and HTTP work need headroom on a contended host.
+    const waitForEvent = async (pred: () => boolean, label: string): Promise<void> => {
+      try {
+        await pollUntil(() => { signal.throwIfAborted(); return pred(); }, 30_000, label);
+      } catch (cause) {
+        throw new Error(`${label} did not settle within 30000ms: ${JSON.stringify({
+          ownerMode: ownerMode ?? "dependency_wait", executions, releases, idleClaims, resumed,
+          protections, protectedExecutions, published: published.length, questions,
+          active: active.has(claim.run_id), executing: runner.isExecuting(claim.run_id),
+          states: api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status),
+        })}`, { cause });
+      }
+    };
     signal.throwIfAborted();
     signal.addEventListener("abort", abortReady, { once: true });
     try {
@@ -289,7 +303,7 @@ export async function exerciseDependencyWaitRunner(
       testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     runner = new RunRunner(client, resumeGit, factory, nullLogger(), 20, undefined, options);
     queued = { ...claim, claim_generation: 2, checkpoint_tip: published[0], branch: "agent/issue-2657", pause_pending: true, pause_mode: "now" };
-    await pollUntil(() => resumed && releases === 2, 10_000, "owner resume and second park");
+    await waitForEvent(() => resumed && releases === 2, "owner resume and second park");
     assert.equal(executions, 2, "released admission allows the same run to be claimed again");
     assert.equal(protections, 2);
     assert.equal(protectedExecutions, 0);

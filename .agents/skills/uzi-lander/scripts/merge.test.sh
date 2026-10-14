@@ -63,6 +63,7 @@ if [ "\${1:-}" = pr ] && [ "\${2:-}" = view ]; then
       c=0; [ -f "$WORK/calls" ] && c=\$(cat "$WORK/calls"); c=\$((c+1)); echo "\$c" > "$WORK/calls"
       [ "\$c" -ge 2 ] || oid= ;;
   esac
+  if [ "\${CONFIRM_AFTER_MERGE:-0}" = 1 ] && [ -s "$WORK/merge.log" ]; then st=MERGED; oid='$MSHA'; fi
   case "\$*" in
     *closingIssuesReferences*)
       [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1
@@ -85,6 +86,8 @@ fi
 # (CS_MODE alert|broken), issue comments (COMMENTS_FILE) and reviews (none). Default: clear.
 if [ "\${1:-}" = api ]; then
   case "\$*" in
+    *'/commits/deadbee '*) [ "\${EXPECT_AMBIGUOUS:-0}" = 1 ] && exit 1; echo '$HEAD'; exit 0 ;;
+    *'/commits/abcdef0 '*) echo 'abcdef0123456789abcdef0123456789abcdef01'; exit 0 ;;
     *'/pulls/42/commits'*) [ "\${CLOSES_FAIL:-0}" = 1 ] && exit 1; printf '[%s]\n' "\${COMMITS_JSON:-[]}"; exit 0 ;;
     *'/pulls/42 --jq .commits'*) printf '%s\n' "\${COMMIT_COUNT:-\$(printf '%s' "\${COMMITS_JSON:-[]}" | jq length)}"; exit 0 ;;
     *'/protection/required_status_checks'*)
@@ -270,6 +273,35 @@ merge_run() { # label -> rc, output in $WORK/m.<label>
   rc=$?
   set -e
 }
+# Exact-head review accepts a unique short SHA, resolves it before comparing,
+# and still pins the full head server-side. Mismatch diagnostics never truncate.
+CHECKS_JSON=$(jq -cn '[{name:"ci",bucket:"pass"}]')
+CHECKS_RC=0; export CHECKS_JSON CHECKS_RC
+MERGE_ARGS=(--expect-head deadbee)
+CONFIRM_AFTER_MERGE=1; export CONFIRM_AFTER_MERGE
+merge_run short_head
+[ "$rc" -eq 0 ] || fail "matching seven-character head rc=$rc: $(cat "$WORK/m.short_head")"
+[ -e "$WORK/merge.log" ] || fail "matching seven-character head refused: $(cat "$WORK/m.short_head")"
+grep -qF -- "--match-head-commit $HEAD" "$WORK/merge.log" || fail "short head weakened the server-side full-head lock"
+MERGE_ARGS=(--expect-head abcdef0)
+merge_run short_mismatch
+[ "$rc" -eq 8 ] || fail "short mismatch rc=$rc, want 8"
+grep -qF -- "current $HEAD, expected abcdef0123456789abcdef0123456789abcdef01" "$WORK/m.short_mismatch" || fail "mismatch must show both full SHAs: $(cat "$WORK/m.short_mismatch")"
+[ ! -e "$WORK/merge.log" ] || fail "short mismatch reached merge"
+MERGE_ARGS=(--expect-head deadbeef00000000000000000000000000000000)
+merge_run shared_display_prefix
+grep -qF -- "current $HEAD, expected deadbeef00000000000000000000000000000000" "$WORK/m.shared_display_prefix" || fail "same displayed prefix hid full mismatch: $(cat "$WORK/m.shared_display_prefix")"
+for bad in deadbe 'deadbee.*'; do
+  MERGE_ARGS=(--expect-head "$bad")
+  merge_run invalid_head
+  [ "$rc" -eq 2 ] || fail "invalid head '$bad' rc=$rc, want 2"
+  [ ! -e "$WORK/merge.log" ] || fail "invalid head reached merge"
+done
+MERGE_ARGS=(--expect-head deadbee); EXPECT_AMBIGUOUS=1; export EXPECT_AMBIGUOUS
+merge_run ambiguous_head
+[ "$rc" -eq 3 ] || fail "ambiguous/unresolvable prefix rc=$rc, want 3"
+[ ! -e "$WORK/merge.log" ] || fail "ambiguous prefix reached merge"
+unset MERGE_ARGS EXPECT_AMBIGUOUS CONFIRM_AFTER_MERGE
 CHECKS_JSON='[]' CHECKS_RC=0; export CHECKS_JSON CHECKS_RC
 export RULES_JSON='[{"type":"required_status_checks","parameters":{"required_status_checks":[{"context":"ci"}]}}]'
 merge_run empty

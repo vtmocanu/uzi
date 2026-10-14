@@ -324,12 +324,12 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assertRecoverable(r.clone(), late!, "row 7");
     assert.deepEqual(parked, [true], "the handler still reports the run parked");
     // A park exit keeps the plain journal: no stopped-source marker, so the resume recaptures the bytes.
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
     assert.deepEqual(retainedReasons(r.lines), []);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
-  it("row 7 control: a capture still current and anchored at the exit lets the clone go; the park is unchanged", async () => {
+  it("row 7 control: a capture still current and anchored at the exit keeps the clone; the park is unchanged", async () => {
     const iid = 17905;
     const r = credRig(iid);
     let waits = 0;
@@ -337,12 +337,13 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     (r.runner as unknown as { waitRecoveryRetry: unknown }).waitRecoveryRetry = (...a: unknown[]) => { waits++; return waitRetry(...a); };
     const parked = spyHandlerResults(r.runner);
     await r.runner.execute(r.claim);
-    assert.equal(fs.existsSync(r.clone()), false, "covered: normal teardown");
+    assert.equal(fs.existsSync(r.clone()), true, "covered park: diagnostic only");
     assert.deepEqual(parked, [true]);
     assert.deepEqual(api.states.filter((s) => s.runId === r.claim.run_id).map((s) => s.body.status),
       ["running", "running", "running", "recovery_wait"], "the same park reports in the same order");
     assert.equal(waits, 0, "no new waits");
-    assert.deepEqual(coveredReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(coveredReasons(r.lines), []);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
     assert.deepEqual(retainedReasons(r.lines), []);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
@@ -365,7 +366,7 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     }
     assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "shared tracking move");
     assert.equal(parkReports(r.claim.run_id).length, 1);
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
@@ -387,6 +388,22 @@ describe("RunRunner #1786 M2 — the recovery handler's exits keep an unpreserve
     assertRecoverable(r.clone(), late!, "row 8");
     assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack_terminal"]);
     assert.deepEqual(stopMarkers(r.claim.run_id), [], "a terminal exit keeps the plain journal");
+  });
+
+  it("clean terminal park ACK releases a covered clone (recovery_park_ack_terminal)", async () => {
+    const r = credRig(17910);
+    const report = client.reportState.bind(client);
+    client.reportState = async (runId, body, signal) => (body.status === "recovery_wait"
+      ? ({ applied: true, status: "failed" } as never) : report(runId, body, signal));
+    try {
+      await r.runner.execute(r.claim);
+    } finally {
+      client.reportState = report;
+    }
+    assert.equal(fs.existsSync(r.clone()), false, "terminal coverage still releases the clone");
+    assert.deepEqual(coveredReasons(r.lines), ["recovery_park_ack_terminal"]);
+    assert.deepEqual(keptReasons(r.lines), []);
+    assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
   it("row 9: a StaleClaimError on the park report keeps the source and reports nothing further", async () => {
@@ -498,7 +515,7 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
       assertRecoverable(r.clone(), writeExpectedAfterWip(late!, r.clone()), `transient ${kind}`);
       assert.deepEqual(parked, [true]);
       // The one revalidation runs at the handler's cleanup, after the park ACK; a park keeps the plain journal.
-      assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+      assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
       assert.deepEqual(stopMarkers(r.claim.run_id), []);
     });
   }
@@ -517,18 +534,18 @@ describe("RunRunner #1786 M2 — the transient recovery park revalidates coverag
       client.reportState = report;
     }
     assertRecoverable(r.clone(), writeExpectedAfterWip(r.worked(), r.clone()), "transient shared tracking");
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 
-  it("control: a capture still current and anchored lets the clone go; one park report, no wait", async () => {
+  it("control: a capture still current and anchored keeps the clone; one park report, no wait", async () => {
     const iid = 17925;
     const r = transientRig(iid);
     let waits = 0;
     const waitRetry = (r.runner as unknown as { waitRecoveryRetry: (...a: unknown[]) => Promise<void> }).waitRecoveryRetry.bind(r.runner);
     (r.runner as unknown as { waitRecoveryRetry: unknown }).waitRecoveryRetry = (...a: unknown[]) => { waits++; return waitRetry(...a); };
     await r.runner.execute(r.claim);
-    assert.equal(fs.existsSync(r.clone()), false, "covered: the park cleans the clone as before");
+    assert.equal(fs.existsSync(r.clone()), true, "covered park: the clone stays for recapture");
     assert.equal(fs.existsSync(path.join(homeDir, r.claim.run_id)), true, "the session survives the park");
     assert.deepEqual(api.states.filter((s) => s.runId === r.claim.run_id).map((s) => s.body.status).filter((s) => s !== "running"),
       ["recovery_wait"]);
@@ -887,7 +904,7 @@ describe("RunRunner #1786 M2 rework — no return path of the handler releases a
     });
   }
 
-  it("control: the same exits with nothing written after the capture let the covered clone go", async () => {
+  it("control: the same exits with nothing written after the capture keep the covered clone", async () => {
     const r = transientRig(17934);
     const parked = spyHandlerResults(r.runner);
     const report = client.reportState.bind(client);
@@ -899,8 +916,9 @@ describe("RunRunner #1786 M2 rework — no return path of the handler releases a
       client.reportState = report;
     }
     assert.deepEqual(parked, [false]);
-    assert.equal(fs.existsSync(r.clone()), false, "covered at cleanup: normal teardown");
-    assert.deepEqual(coveredReasons(r.lines).length, 1);
+    assert.equal(fs.existsSync(r.clone()), true, "covered nonterminal exit: diagnostic only");
+    assert.deepEqual(coveredReasons(r.lines).length, 0);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
   });
 
   it("PROBE-A: a transient park retained at cleanup on a canonical worker does not block the same run's next claim; the late bytes reach it", async () => {
@@ -920,7 +938,7 @@ describe("RunRunner #1786 M2 rework — no return path of the handler releases a
       client.reportState = report;
     }
     assert.ok(late);
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
     assert.deepEqual(stopMarkers(r.claim.run_id), [], "no uzi-stopped marker on a park");
     assertRecoverable(r.clone(), late!, "the parked clone");
 
@@ -962,7 +980,7 @@ describe("RunRunner #1786 M2 rework — no return path of the handler releases a
     assert.ok(fs.existsSync(r.clone()));
     assert.ok(!ledgerStates(iid).includes("reclaimed"));
     assert.equal(journalCount(iid), 1);
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
   });
 
   it("the captured head is bound: shared tracking moves to the seed head and the clone is reset to it after the capture, so the captured head is no longer anchored and the clone is kept", async () => {
@@ -991,7 +1009,7 @@ describe("RunRunner #1786 M2 rework — no return path of the handler releases a
     assert.ok(moved);
     assert.deepEqual(parked, [true]);
     assert.ok(fs.existsSync(r.clone()), "kept: the captured head is no longer anchored");
-    assert.deepEqual(keptReasons(r.lines), ["recovery_park_ack"]);
+    assert.deepEqual(keptReasons(r.lines), ["recovery_park_keep"]);
     assert.deepEqual(stopMarkers(r.claim.run_id), []);
   });
 

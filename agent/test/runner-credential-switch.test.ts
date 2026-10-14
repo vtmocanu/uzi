@@ -176,7 +176,7 @@ function seedHome(): { homeDir: string; sentinel: string; root: string } {
 }
 
 describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
-  it("verified capture + queued ack → RELEASED: reports credential_switch, retires the clone, preserves HOME", async () => {
+  it("verified capture + queued ack → RELEASED: reports credential_switch, keeps the clone for recapture, preserves HOME", async () => {
     const { gitlab, calls } = fakeGitlab();
     const { executor } = makeSwitchExecutor("verified");
     const home = seedHome();
@@ -193,9 +193,9 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       assert.ok(!statuses(claim.run_id).includes("failed"), "a released run is not failed");
       assert.ok(!statuses(claim.run_id).includes("credential_switch_failed"), "a released run did NOT give up");
       assert.strictEqual(calls.length, 0, "a released run opens no MR");
-      // Released ⇒ the clone is RETIRED (work is durable on the tracking ref + best-effort origin),
+      // Released ⇒ the clone is KEPT for recapture (work is durable on the tracking ref + best-effort origin),
       // and the HOME is PRESERVED (parked) for a same-worker resume.
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1260)), false, "the clone is retired on release");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1260)), true, "the clone is kept for recapture on release");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME (SDK session) is preserved for resume");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
@@ -215,7 +215,7 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
 
       assert.ok(statuses(claim.run_id).includes("credential_switch"), "a verified-but-unpublished capture still releases");
       assert.ok(!statuses(claim.run_id).includes("credential_switch_failed"), "it did NOT give up on a failed publish");
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1261)), false, "the clone is retired on release");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1261)), true, "the clone is kept for recapture on release");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for resume");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
@@ -332,7 +332,7 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       assert.ok(!s.includes("completed"), "a released run skips finalize");
       assert.ok(!s.includes("failed"), "a released run is not failed");
       assert.strictEqual(calls.length, 0, "a released run opens no MR");
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1270)), false, "the clone is retired on the accepted release");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1270)), true, "the clone is kept for recapture on the accepted release");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
@@ -373,7 +373,7 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
     }
   });
 
-  it("release via ctx.attemptCredentialSwitch ENDS: switchReleased skips finalize (no completed/MR), clone retired, HOME preserved", async () => {
+  it("release via ctx.attemptCredentialSwitch ENDS: switchReleased skips finalize (no completed/MR), clone kept for recapture, HOME preserved", async () => {
     const { gitlab, calls } = fakeGitlab();
     const { executor } = makeInPlaceSwitchExecutor("verified");
     const home = seedHome();
@@ -389,7 +389,7 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       assert.ok(!s.includes("completed"), "phasePublish SKIPS finalize on switchReleased — no completed report");
       assert.ok(!s.includes("failed"), "a released run is not failed");
       assert.strictEqual(calls.length, 0, "a released run opens no MR");
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1265)), false, "the clone is retired on release");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1265)), true, "the clone is kept for recapture on release");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });
@@ -419,7 +419,7 @@ describe("RunRunner — held-state credential switch (PRD #1247 M5b)", () => {
       // The marker is LEFT at HEAD on release — the reclaim reseeds and reset-softs it.
       assert.ok(!marker.undoCalled, "the marker is NOT undone on release (undoWipMarker never fired)");
       assert.strictEqual(marker.headIsMarker, true, "the wip(park) marker is LEFT at HEAD for the reclaim's reseed");
-      assert.strictEqual(fs.existsSync(worktreeDirFor(1266)), false, "the clone is retired on release");
+      assert.strictEqual(fs.existsSync(worktreeDirFor(1266)), true, "the clone is kept for recapture on release");
       assert.strictEqual(fs.existsSync(home.sentinel), true, "the HOME is preserved for the reclaim");
     } finally {
       fs.rmSync(home.root, { recursive: true, force: true });

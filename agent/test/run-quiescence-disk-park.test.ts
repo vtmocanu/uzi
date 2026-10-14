@@ -224,11 +224,11 @@ describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone i
       assert.equal(gitOut(seen.clone, ["log", "-1", "--format=%s"]), "work", "no wip(park): marker was committed");
       assert.match(gitOut(seen.clone, ["status", "--porcelain"]), /UNCOMMITTED\.txt/, "the in-flight file is left uncommitted");
       assert.equal(trackingSha(iid), null, "no fetch-back: the tracking ref is untouched");
-      // The capture stopped at its first proof: its post-marker re-proof never ran.
-      assert.equal(
-        calls.filter((c) => c.site !== "recovery_capture").length,
-        0,
-        `no re-proof ran: the capture stopped at its first proof (${calls.map((c) => c.site).join(",")})`,
+      // Blocked captures never reach the post-marker proof; stopped-source cleanup only scans.
+      assert.deepEqual(
+        calls.filter((c) => c.site !== "recovery_capture").map((c) => ({ site: c.site, mode: c.mode })),
+        [{ site: "stopped_source", mode: "own" }],
+        "only the diagnostic stopped-source scan follows the blocked capture proofs",
       );
       // No publish and no PAT-bearing overlay.
       assert.equal(pub.calls(), 0, "no checkpoint published");
@@ -274,14 +274,17 @@ describe("issue #1783 x PRD #1826: a mid-run data_volume_full park whose clone i
 
     assert.ok(order.includes("attributed-reap"), "the attributed reap ran");
     assert.ok(calls.some((c) => c.site === "recovery_capture"), "the capture's proof ran and passed");
-    // The verified capture fetched a wip(park): marker (holding the uncommitted file) into the
-    // tracking ref, which is what lets the finally retire the clone (the negative cases keep it).
+    // The verified capture fetched a wip(park): marker holding the uncommitted file into the
+    // tracking ref; the exact covered clone remains on disk across the park.
     const bare = git.barePathFor(fx.originPath);
     const tip = trackingSha(iid);
     assert.ok(tip, "the capture fetched back into the tracking ref");
     assert.match(gitOut(bare, ["log", "-1", "--format=%s", tip]), /^wip\(park\):/, "a wip(park): marker was committed");
     assert.match(gitOut(bare, ["ls-tree", "--name-only", tip]), /UNCOMMITTED\.txt/, "the marker captured the uncommitted file");
-    assert.equal(fs.existsSync(seen.clone), false, "a verified capture releases the clone to normal retirement");
+    assert.ok(fs.existsSync(path.join(seen.clone, ".git")), "the verified park retains the exact clone");
+    assert.equal(fs.readFileSync(path.join(seen.clone, "UNCOMMITTED.txt"), "utf8"), "in flight\n");
+    const journal = JSON.parse(gitOut(bare, ["config", "--local", "--get", `uzi-recovery.agent/issue-${iid}.clone`])) as { clonePath: string };
+    assert.equal(journal.clonePath, seen.clone, "the covered park retains the clone journal");
     assert.ok(pub.calls() >= 1, "the checkpoint was published");
     assert.ok(spy.overlays() >= 1, "the checkpoint overlay was built");
 

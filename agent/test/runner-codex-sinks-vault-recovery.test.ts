@@ -221,7 +221,7 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
     client.protocolFeatures = [VAULT_FEATURE];
     let locked = true;
     const rig1 = codexRig({ vaultLocked: () => locked });
-    // issue #1786: the park ACK releases the clone only when its coverage is revalidated, which needs a claim generation.
+    // A park keeps the predecessor clone even after a verified capture.
     const claim = gitlabClaim(1773, { claim_generation: 1 });
     const exec1 = new FakeCodexExecutor(rig1.safety, async (ctx) => {
       commitInTree(ctx.worktreePath, "RESUME.txt", "work saved across the vault lock\n");
@@ -239,20 +239,37 @@ describe("RunRunner #1766 — a vault-locked Codex deferral parks the run for re
       "the park report changes no milestone, contract or budget field",
     );
 
+    const predecessor = worktreeDirFor(1773);
+    assert.ok(fs.existsSync(predecessor), "the parked clone is retained before resume");
     locked = false;
-    const rig2 = codexRig({ vaultLocked: () => locked });
+    api.setOwnershipStatus(claim.run_id, "running", 2);
+    const resumeRigs: ReturnType<typeof codexRig>[] = [];
     let resumedContent = "";
-    const exec2 = new FakeCodexExecutor(rig2.safety, async (ctx) => {
-      resumedContent = fs.readFileSync(path.join(ctx.worktreePath, "RESUME.txt"), "utf8");
-      return { branch: ctx.branch };
-    }, rig2.settle);
-    await runnerWith(() => ({ executor: exec2 }), gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 })
-      .execute({ ...claim, claim_generation: 2 });
+    let resumedPath = "";
+    let resumedSession: string | null | undefined;
+    const resumeFactory = () => {
+      const rig = codexRig({ vaultLocked: () => locked });
+      resumeRigs.push(rig);
+      return { executor: new FakeCodexExecutor(rig.safety, async (ctx) => {
+        resumedPath = ctx.worktreePath;
+        resumedSession = ctx.sessionId;
+        resumedContent = fs.readFileSync(path.join(ctx.worktreePath, "RESUME.txt"), "utf8");
+        assert.equal(resumedContent, "work saved across the vault lock\n",
+          "recaptured content is present before model execution");
+        return { branch: ctx.branch };
+      }, rig.settle) };
+    };
+    await runnerWith(resumeFactory, gitlab, undefined, nullLogger(), { recoveryRetryMs: 5 })
+      .execute({ ...claim, claim_generation: 2, session_id: "predecessor-session" });
+    assert.notEqual(resumedPath, predecessor, "retained-route resume uses a fresh attempt");
+    assert.match(path.basename(resumedPath), /\.attempt-/);
+    assert.ok(resumedSession == null, "retained-route resume drops the predecessor session");
+    assert.ok(fs.existsSync(predecessor), "completed recapture retains the predecessor clone");
     assert.equal(resumedContent, "work saved across the vault lock\n", "flight 2 reseeded the parked work");
     assert.equal(calls.length, 1, "flight 2 created the MR");
     assert.ok(statuses(claim.run_id).includes("completed"), "flight 2 completed");
     assert.ok(!statuses(claim.run_id).includes("failed"));
-    assert.ok(rig2.refreshCalls() >= 1, "flight 2's finalize reconciled ready");
+    assert.ok(resumeRigs.reduce((n, rig) => n + rig.refreshCalls(), 0) >= 1, "flight 2's finalize reconciled ready");
   });
 
   it("(f) a failed fetch-back and a failed park report retry visibly, then park; custody is never released", async () => {
