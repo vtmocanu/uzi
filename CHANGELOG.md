@@ -32,6 +32,11 @@ through `[0.52.0]`.)
 - **Owners at the custody admission limit can see which holds the server counts and why ([#2970](https://github.com/vtmocanu/uzi/issues/2970)).**
   The owner hold listing gains `counts_toward_admission` and `admission_reason` per open hold, read from a read-only per-hold projection in the same repeatable-read snapshot as the list and aggregate, so the three agree; `uzi run recovery` shows an `ADMISSION` column and the Workers page lists counted non-decision holds under "Admission information". A server that does not report membership leaves the fields absent, which clients treat as unknown rather than not counted. This is visibility only: the canonical `fn_custody_admission_count` accounting, hold classification and release/discard authority are unchanged.
 
+### Fixed
+
+- **Backups accept recovery claim deadline windows.**
+  Retained-source backups accept the optional claim generation written by workers and reject malformed claim fences in protected descriptors and ordinary recovery journals (Refs #2958).
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
