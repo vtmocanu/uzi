@@ -67,7 +67,9 @@ The independently runnable `#2986 base RED` executor test uses only existing
 imports and the original function signature, with an additive options cast.
 Its inert supervisor models elapsed=3,600,001 ms: the old bound rejects
 immediately, whereas 7,200,000 ms returns success with independent stdout and
-stderr. The test was run against an immutable export of the pre-fix base\n2b84c993316bb33f3fb4f9cc7fd13674383b7dc6 and failed with\nCommandDeadlineError(3600000); the fixed candidate passed.
+stderr. The test was run against an immutable export of the pre-fix base
+2b84c993316bb33f3fb4f9cc7fd13674383b7dc6 and failed with
+CommandDeadlineError(3600000); the fixed candidate passed.
 
 Focused tests pin absent/false/true waitMs, root/child/unknown/grant mismatch,
 malformed flags, canonical/wire aliases and changed replay. Short eligible
@@ -84,4 +86,6 @@ owns the command. Real-broker ADR-2903 fixtures read a growing known log with
 checkpoint and effects queued for both ordinary and eligible commands.
 
 These are hermetic focused checks, not a real supervisor, live Codex, Kubernetes,
-full-stack proof. The required full gate is task gate:agent; its result and\nmeasured timings are reported with the implementation. CI critical-path impact\nand deployment validation remain unmeasured.
+full-stack proof. The required full gate is task gate:agent; its result and
+measured timings are reported with the implementation. CI critical-path impact
+and deployment validation remain unmeasured.

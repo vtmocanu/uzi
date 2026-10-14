@@ -5662,6 +5662,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       transport: { stdin: new PassThrough(), stdout, stderr },
       snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
       waitChild: async (ms) => {
+        assert.ok(typeof ms === "number", "the command seam supplies an explicit bound");
         waitMs = ms;
         const elapsed = 3_600_001;
         if (ms < elapsed) throw new SupervisedChildExitTimeoutError(ms);
@@ -5688,7 +5689,7 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
   });
 
   describe("#2986 effective command bounds and cleanup races", () => {
-    function fixture(opts: { timeout?: boolean; clean?: boolean; onWait?: () => void; onDispose?: () => Promise<void>; deferDrain?: boolean } = {}) {
+    function fixture(opts: { timeout?: boolean; elapsedMs?: number; clean?: boolean; onWait?: () => void; onDispose?: () => Promise<void>; deferDrain?: boolean } = {}) {
       const registry = new ExecutionRegistry(newLocalExecutionEpoch(2987));
       const stdout = new PassThrough();
       const stderr = new PassThrough();
@@ -5701,9 +5702,10 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
         transport: { stdin: new PassThrough(), stdout, stderr },
         snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
         waitChild: async ms => {
+          assert.ok(typeof ms === "number", "the command seam supplies an explicit bound");
           state.waitMs = ms;
           opts.onWait?.();
-          if (opts.timeout) throw new SupervisedChildExitTimeoutError(ms);
+          if (opts.timeout || (opts.elapsedMs !== undefined && ms < opts.elapsedMs)) throw new SupervisedChildExitTimeoutError(ms);
           await held;
           return { event: "child_exit", code: 0 };
         },
@@ -5733,12 +5735,11 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
       });
     }
     it("quiet redirected eligible command stays active past ordinary injected wall", async () => {
-      const f = fixture();
+      const f = fixture({ elapsedMs: 2 });
       let settled = false;
       const running = f.spawn(1, 100)(["/bin/sh", "-c", "echo fixture > progress.txt"], { long_running: true });
       void running.then(() => { settled = true; });
       await waitFor(() => f.state.waitMs > 0, "quiet command");
-      await new Promise<void>(resolve => setTimeout(resolve, 10));
       assert.equal(f.state.waitMs, 100);
       assert.equal(settled, false);
       assert.equal(f.registry.hasLiveCommandRoot(), true);
