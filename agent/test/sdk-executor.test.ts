@@ -4927,6 +4927,8 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     /** Runs inside the retried gate wait, after the persisted callback is invoked once. */
     duringRetry?: (done: Promise<void>, ctl: { lifecycle: AbortController }) => Promise<void>;
     callbackTwice?: boolean;
+    /** Runs inside the switch attempt, after the close and before the outcome returns. */
+    duringSwitch?: (ctl: { lifecycle: AbortController }) => void;
     /** False when the flight never settles (abandoned), so the retry must not wait on it. */
     awaitRetry?: boolean;
     ctx?: Partial<RunContext>;
@@ -4943,6 +4945,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     let retryDone: Promise<void> | undefined;
     let hookError: unknown;
     let gates = 0;
+    let switches = 0;
     const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
     const probe = makeCtx({
       agents: [lead, coder], summaryIntentPresent: true,
@@ -4953,6 +4956,8 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
         executor.killAgentTree();
         await executor.reapAttributedProcesses();
         switchAbort.abort(new CredentialSwitchSignal());
+        switches++;
+        opts.duringSwitch?.(ctl);
         return opts.outcome ?? "gave_up";
       },
       gatePlan: async (md, _m, persisted) => {
@@ -4978,7 +4983,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     });
     const result = await executor.run(probe.ctx).catch(() => undefined);
     if (hookError) throw hookError;
-    return { fake, probe, result, usage: probe.emits.filter(m => m.kind === "summary_usage") };
+    return { fake, probe, result, gates, switches, usage: probe.emits.filter(m => m.kind === "summary_usage") };
   }
 
   it("#2945 a plan accepted on the retry after a credential-switch give-up still gets one summary", async () => {
@@ -4996,18 +5001,31 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     assert.equal(fake.rec.planPosts.length, 1);
   });
 
-  const neverGenerated: [string, Partial<RunContext>, "gave_up" | "released"][] = [
-    ["cancelRequested", { cancelRequested: () => true }, "gave_up"],
-    ["claimFenced", { claimFenced: () => true }, "gave_up"],
-    ["terminal lifecycle aborted", { terminalLifecycleSignal: AbortSignal.abort() }, "gave_up"],
-    ["live lifecycle aborted", { lifecycleSignal: () => AbortSignal.abort() }, "gave_up"],
-    ["released outcome", {}, "released"],
+  // Each condition turns true DURING the switch attempt, so the case reaches the give-up (or the
+  // release) and proves the retried callback never generates, rather than an early exit.
+  interface Flip { on: boolean; terminal: AbortController }
+  const neverGenerated: [string, (flip: Flip) => Partial<RunContext>, "gave_up" | "released"][] = [
+    ["a cancel lands during the switch", f => ({ cancelRequested: () => f.on }), "gave_up"],
+    ["the claim is fenced during the switch", f => ({ claimFenced: () => f.on }), "gave_up"],
+    ["the terminal lifecycle aborts during the switch (claim release)", f => ({ terminalLifecycleSignal: f.terminal.signal }), "gave_up"],
+    ["the live lifecycle stays aborted after the switch", () => ({}), "gave_up"],
+    ["the switch releases the claim", () => ({}), "released"],
   ];
-  for (const [name, ctx, outcome] of neverGenerated) {
-    it(`#2945 never reopens or generates when ${name}`, async () => {
-      const { fake, result, usage } = await runSwitchGiveUp({ ctx, outcome });
+  for (const [name, ctxFor, outcome] of neverGenerated) {
+    it(`#2945 the retried callback never generates when ${name}`, async () => {
+      const flip: Flip = { on: false, terminal: new AbortController() };
+      const { fake, result, usage, gates, switches } = await runSwitchGiveUp({
+        ctx: ctxFor(flip), outcome,
+        duringSwitch: ctl => {
+          flip.on = true;
+          flip.terminal.abort();
+          if (name.startsWith("the live lifecycle")) ctl.lifecycle.abort();
+        },
+      });
+      assert.equal(switches, 1, "the case reached the switch attempt");
+      assert.ok(gates >= 1, "the gate ran before the switch");
       // A cancel legitimately ends the run with REASON_CANCELLED; every other case must return.
-      if (name !== "cancelRequested") assert.ok(result, "the run returned rather than threw");
+      if (!name.startsWith("a cancel")) assert.ok(result, "the run returned rather than threw");
       assert.equal(fake.rec.planCalls.length, 0);
       assert.equal(fake.rec.planPosts.length, 0);
       assert.equal(usage.length, 0);

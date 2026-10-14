@@ -25,7 +25,7 @@ through `[0.52.0]`.)
 ### Fixed
 
 - **Plan summary after a credential-switch give-up ([#2945](https://github.com/vtmocanu/uzi/issues/2945)).**
-  A plan accepted on the retry that follows a credential switch that could not complete (the run continued on its old token) now gets its plan summary on Claude runs, instead of silently going without one.
+  A plan accepted on the retry that follows a credential switch that could not complete (the run continued on its old token) now gets its plan summary on Claude runs, instead of silently going without one; an accepted plan summary is also no longer dropped from the run result by an earlier give-up.
 
 ## [0.86.0] - 2026-10-06
 
