@@ -795,10 +795,20 @@ UUID). Five entries is a best-effort retention target, not a disk bound. It sort
 the original candidates by their own lstat mtime, then basename, and considers
 only the original oldest excess slice. A refused excess entry stays; no newer
 entry is substituted to compensate. Parent validation and complete enumeration
-precede reclamation. A private fixed 4096-direct-entry work budget bounds this
+precede reclamation. A private fixed 4096-direct-entry budget bounds this
 enumeration, not storage; overflow skips all residue reclamation for that sweep.
 The budget is not a setting. With no excess, the helper returns without a
 redundant journal discovery.
+
+Expensive residue candidate processing is separately capped at 16 attempts per
+sweep, counting refusals. A per-clone-key in-process cursor rotates through the
+original oldest excess slice, so a persistently refused prefix cannot starve
+later excess. The cursor records ordering position only, never safety evidence;
+every attempt repeats the fresh checks below. The newest five remain outside
+the candidate slice. Cursor storage is a 128-key LRU, cleared when no excess
+remains. Process restart or LRU eviction starts that key from the oldest again.
+This is a work-count bound, not a hard elapsed-time bound: a started operation
+still settles under its existing safety/deletion deadlines before returning.
 
 Before deletion, fresh readable journal discovery protects a candidate or any
 descendant named by recovery evidence, and the live registry protects live paths.

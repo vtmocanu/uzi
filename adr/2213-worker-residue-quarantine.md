@@ -225,11 +225,18 @@ lifetime, credential protections and custody semantics are unchanged.
 The best-effort target is five exact parser-valid
 `.uzi-residue-<key>.residue-<uuid>` direct siblings of the same key. Parent
 validation and complete enumeration within a private fixed 4096-direct-entry
-work budget precede reclamation; overflow skips all residue reclamation.
+enumeration budget precede reclamation; overflow skips all residue reclamation.
 No excess returns without redundant journal discovery. Selection uses the
 original oldest excess slice by lstat mtime and basename tie-break; refusal
 keeps that entry without deleting a newer substitute. Protected or unproven
 entries can leave more than five, so this is no hard disk bound.
+
+Each sweep attempts at most 16 residue candidates from that oldest excess slice.
+A bounded 128-key LRU cursor rotates past refusals and revisits them on later
+sweeps; it caches no journal, live, process or quarantine verdict. No excess
+clears the cursor, and restart/eviction restarts from the oldest. The newest five
+are never compensating candidates. The attempt cap bounds work, not wall time;
+existing operation/deletion settlement and safety deadlines remain unchanged.
 
 Canonical retention forwards existing configured best-effort Docker handling;
 unwired workers gain no daemon obligation. Attempt retention remains

@@ -1136,6 +1136,73 @@ describe("M1 canonical residue retention through the public seed path", () => {
   }
   afterEach(() => resetResidueQuarantineForTests());
 
+  it("residue work cap attempts at most 16 candidates per canonical sweep", async () => {
+    const { b, paths } = await planted(45);
+    const attempts: string[] = [];
+    const opts = { ...noProofReseed, quiescent: async ([p]: string[]) => { attempts.push(p!); return false; } };
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.deepEqual(attempts, paths.slice(0, 16), "one sweep must not prove the entire backlog");
+    attempts.length = 0;
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.deepEqual(attempts, paths.slice(16, 32), "the next sweep starts beyond the refused prefix");
+    assert.ok(paths.every(p => fs.existsSync(p)));
+  });
+
+  it("residue work cap progresses beyond 20 persistently refused entries and keeps the newest five", async () => {
+    const { b, paths } = await planted(45);
+    const refused = new Set(paths.slice(0, 20));
+    const attempts: string[] = [];
+    const opts = { ...noProofReseed, quiescent: async ([p]: string[]) => {
+      attempts.push(p!); return !refused.has(p!);
+    } };
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.deepEqual(attempts, paths.slice(0, 16));
+    assert.ok(paths.every(p => fs.existsSync(p)), "the refused first batch cannot consume all backlog work");
+    for (let round = 0; round < 3; round++) {
+      attempts.length = 0;
+      await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+      assert.ok(attempts.length <= 16);
+      assert.ok(paths.slice(40).every(p => fs.existsSync(p)), "the original newest five are never substitutes");
+    }
+    assert.ok(paths.slice(0, 20).every(p => fs.existsSync(p)));
+    assert.ok(paths.slice(20, 40).every(p => !fs.existsSync(p)), "later safe excess is reached despite the refused prefix");
+  });
+
+  it("residue work cap revisits a refusal that later clears", async () => {
+    const { b, paths } = await planted(23);
+    let cleared = false;
+    const attempts: string[] = [];
+    const opts = { ...noProofReseed, quiescent: async ([p]: string[]) => {
+      attempts.push(p!); return cleared && p === paths[0];
+    } };
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.ok(paths.every(p => fs.existsSync(p)));
+    cleared = true;
+    attempts.length = 0;
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.ok(attempts.includes(paths[0]!), "a refusal is not cached as a permanent veto");
+    assert.ok(attempts.length <= 16);
+    assert.equal(fs.existsSync(paths[0]!), false);
+    assert.ok(paths.slice(-5).every(p => fs.existsSync(p)));
+  });
+
+  it("residue work cap clears progress when no excess remains", async () => {
+    const { b, paths } = await planted(45);
+    const attempts: string[] = [];
+    const opts = { ...noProofReseed, quiescent: async ([p]: string[]) => { attempts.push(p!); return false; } };
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    for (const p of paths.slice(0, 40)) fs.rmSync(p, { recursive: true });
+    attempts.length = 0;
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.deepEqual(attempts, []);
+    for (const p of paths.slice(0, 40)) {
+      fs.mkdirSync(p);
+      fs.utimesSync(p, 1000, 1000);
+    }
+    await git.createOrAttachRunnerClone(b, iid, opts, randomUUID());
+    assert.deepEqual(attempts, paths.slice(0, 16), "new excess starts from oldest after an empty sweep");
+  });
+
   for (const kind of ["recognized", "unrecognized", "read failure"] as const) {
     it(`bounded enumeration refuses ${kind} overflow or failure before candidate work and closes the directory`, async (t) => {
       const { b, paths } = await planted();

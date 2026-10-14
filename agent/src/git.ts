@@ -1501,6 +1501,8 @@ const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
 /** Best-effort residue retention target per clone key; protected or unproven excess stays. */
 const RETAINED_RESIDUE_PER_KEY = 5;
 const RESIDUE_ENUMERATION_BUDGET = 4096;
+const RESIDUE_SWEEP_ATTEMPT_BUDGET = 16;
+const RESIDUE_SWEEP_CURSOR_KEYS = 128;
 /** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
  *  never resolves from a runner-writable PATH), and its deadline. */
 const RETENTION_RM_BIN = "/bin/rm";
@@ -1930,6 +1932,9 @@ export class GitCache {
   readonly recoveryArchiveRoot: string;
   /** Per-bare-path serialization: git's lockfiles can't take parallel mutations. */
   private readonly locks = new Map<string, Promise<unknown>>();
+  /** Availability-only LRU progress, never a cached safety verdict. Restart/eviction
+   * restarts from the oldest excess; empty excess removes the key. */
+  private readonly residueSweepCursors = new Map<string, { mtimeMs: number; name: string }>();
   // Fresh no-child authority exists only in the GitCache invocation that created the pin.
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
@@ -3179,10 +3184,13 @@ export class GitCache {
    * canonical free and BEFORE the new seed; attempt seeds call it after seed/live registration.
    * Only exact parser-valid `.uzi-residue-<key>.residue-<uuid>` direct siblings of this key count.
    * Validate the parent and enumerate its complete direct-entry set within the private fixed
-   * 4096-entry work budget before reclamation; overflow or validation failure skips reclamation.
+   * 4096-entry enumeration budget before reclamation; overflow or validation failure skips reclamation.
    * No excess returns without another journal discovery. Sort by lstat mtime, then basename, and
-   * try only the original oldest excess slice toward {@link RETAINED_RESIDUE_PER_KEY}; refused
-   * excess stays, with no newer compensating deletes and no hard disk bound.
+   * try at most 16 candidates from the original oldest excess slice toward
+   * {@link RETAINED_RESIDUE_PER_KEY}. An in-process round-robin cursor (128-key LRU)
+   * advances even on refusal, without caching safety evidence; restart/eviction starts
+   * from the oldest again, and no excess clears the cursor. Refused excess stays, with
+   * no newer compensating deletes and no hard disk or wall-time bound.
    * Fresh readable journals (candidate or descendant), live registry and quarantine are checked
    * around an affirmative scoped seed-process proof and again before deletion. A latched or newly
    * latched unreadable-unattributed worker quarantine vetoes residue deletion. False, absent,
@@ -3230,12 +3238,29 @@ export class GitCache {
       }
     }
     this.checkRecoveryInterruption();
-    if (residue.length <= RETAINED_RESIDUE_PER_KEY) return;
+    if (residue.length <= RETAINED_RESIDUE_PER_KEY) {
+      this.residueSweepCursors.delete(canonical);
+      return;
+    }
     // Complete journal discovery is required before reclamation. Ordinary reseeds with
     // no excess avoid repeating the caller's journal discovery when nothing can be deleted.
     await this.journaledClonePaths(barePath, warningScope);
-    residue.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
-    for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
+    const compare = (a: { mtimeMs: number; name: string }, b: { mtimeMs: number; name: string }): number =>
+      a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0);
+    residue.sort(compare);
+    const excess = residue.slice(0, residue.length - RETAINED_RESIDUE_PER_KEY);
+    const cursor = this.residueSweepCursors.get(canonical);
+    // A deleted cursor entry still defines its ordering position. Wrap after the
+    // last excess entry; the newest five never enter the candidate list.
+    const next = cursor === undefined ? 0 : excess.findIndex(r => compare(r, cursor) > 0);
+    const start = next < 0 ? 0 : next;
+    for (let n = 0; n < Math.min(RESIDUE_SWEEP_ATTEMPT_BUDGET, excess.length); n++) {
+      const r = excess[(start + n) % excess.length]!;
+      this.residueSweepCursors.delete(canonical);
+      this.residueSweepCursors.set(canonical, { mtimeMs: r.mtimeMs, name: r.name });
+      if (this.residueSweepCursors.size > RESIDUE_SWEEP_CURSOR_KEYS) {
+        this.residueSweepCursors.delete(this.residueSweepCursors.keys().next().value!);
+      }
       const refuse = (reason: string): false => {
         this.log.warn("runner clone retention: refusing residue deletion; keeping it", {
           path: r.p, reason: sanitizeForLog(reason, 157),
