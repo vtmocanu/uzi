@@ -55,7 +55,6 @@ through `[0.52.0]`.)
 - **Archive-backed report retirement covers competing pending FINAL sources ([#2943](https://github.com/vtmocanu/uzi/issues/2943)).**
   Workers retain a pending report when its selected archive omits a relevant competing unacknowledged FINAL's source commit, even if that FINAL's frozen work is covered. Earlier non-FINAL aggregates keep their existing coverage rule; custody and source cleanup protections remain intact.
 
-
 ## [0.86.0] - 2026-10-06
 
 ### Changed
