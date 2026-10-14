@@ -3199,7 +3199,6 @@ export class GitCache {
       if (names.length === RESIDUE_ENUMERATION_BUDGET) throw new Error("residue enumeration exceeds 4096-entry work budget");
       names.push(entry.name);
     }
-    await this.journaledClonePaths(barePath, warningScope);
     const isOwnResidue = (n: string): boolean => {
       const art = parseRetainedArtifactName(n);
       return art?.kind === "residue" && art.key === key;
@@ -3215,6 +3214,11 @@ export class GitCache {
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
       }
     }
+    this.checkRecoveryInterruption();
+    if (residue.length <= RETAINED_RESIDUE_PER_KEY) return;
+    // Complete journal discovery is required before reclamation. Ordinary reseeds with
+    // no excess avoid repeating the caller's journal discovery when nothing can be deleted.
+    await this.journaledClonePaths(barePath, warningScope);
     residue.sort((a, b) => a.mtimeMs - b.mtimeMs || (a.name < b.name ? -1 : a.name > b.name ? 1 : 0));
     for (const r of residue.slice(0, Math.max(0, residue.length - RETAINED_RESIDUE_PER_KEY))) {
       const refuse = (reason: string): false => {
