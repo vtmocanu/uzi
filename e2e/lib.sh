@@ -58,9 +58,13 @@ storage_diagnostic_snapshot() {
       echo 'storage diagnostic: Docker allocation skipped (no timeout command)'
     fi
     if declare -p COMPOSE >/dev/null 2>&1; then
-      "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 sh -ec \
-        'df -Pk /data; du -kx -d 2 /data; if [ -d /data/recovery ]; then du -akx /data/recovery | awk '\''/\.bundle$/ { bundles += $1; bundle_count++ } /\.json$/ { journals += $1; journal_count++ } END { printf "recovery bundles_kib=%d bundle_count=%d journals_kib=%d journal_count=%d\n", bundles, bundle_count, journals, journal_count }'\''; fi' \
-        || echo 'storage diagnostic: agent allocation unavailable or timed out'
+      if [ -n "$limiter" ]; then
+        "$limiter" 20 "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 sh -ec \
+          'df -Pk /data; du -kx -d 2 /data; if [ -d /data/recovery ]; then du -akx /data/recovery | awk '\''/\.bundle$/ { bundles += $1; bundle_count++ } /\.json$/ { journals += $1; journal_count++ } END { printf "recovery bundles_kib=%d bundle_count=%d journals_kib=%d journal_count=%d\n", bundles, bundle_count, journals, journal_count }'\''; fi' \
+          || echo 'storage diagnostic: agent allocation unavailable or timed out'
+      else
+        echo 'storage diagnostic: agent allocation skipped (no timeout command)'
+      fi
     fi
     printf 'storage diagnostic elapsed_seconds=%s\n' "$((SECONDS - start))"
   } > "$dir/$label-$(date -u +%Y%m%dT%H%M%SZ)-$RANDOM.txt" 2>&1 \
