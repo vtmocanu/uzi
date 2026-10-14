@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import http from "node:http";
 import type { AddressInfo } from "node:net";
 import fs from "node:fs/promises";
+import os from "node:os";
 import path from "node:path";
 import { PassThrough } from "node:stream";
 import { WorkerClient } from "../src/client.js";
@@ -30,7 +31,7 @@ it("inventory wrapper propagates recovery cancellation instead of returning unkn
 
 for (const lane of ["archive", "ordinary"] as const) {
   it(`worker preserves the admission fence after ${lane} finalize unlink`, async t => {
-    const root = await fs.mkdtemp(path.resolve(import.meta.dirname, "../../.uzi/scratch/worker-fence-"));
+    const root = await fs.mkdtemp(path.join(os.tmpdir(), "worker-fence-"));
     t.after(() => fs.rm(root, { recursive: true, force: true }));
     const outbox = new Outbox({ root, log: nullLogger(), runMaxBytes: 1024 * 1024,
       maxBytes: 16 * 1024 * 1024, retentionMs: 86400000 });

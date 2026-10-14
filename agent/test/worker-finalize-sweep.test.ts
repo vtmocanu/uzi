@@ -100,7 +100,7 @@ for (const fence of ["running", "older", "admission", "registry", "execution", "
       },
       isExecuting: () => executing,
       recoveryInventoryPending: async () => false,
-      retireRecoveryReport: async () => false,
+      retireRecoveryReport: async () => ({ retired: false as const }),
     }, registry, fence === "running" ? running : fence === "older" ?
       async () => ({ status: "completed", claim_generation: 0 }) : terminal);
     await w.sweepPendingFinalizes(controller.signal);
