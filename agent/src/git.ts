@@ -9767,7 +9767,7 @@ export class GitCache {
         .split("\n").filter((line) => line !== "");
       if (bases.length === 0 || bases.some((base) => !SHA40_RE.test(base))) return null;
       const seen = new Set<string>();
-      for (const base of [...new Set(bases)]) {
+      for (const base of new Set(bases)) {
         const out = await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", base, ref]);
         for (const entry of out.split("\0")) if (entry !== "") seen.add(entry);
       }
