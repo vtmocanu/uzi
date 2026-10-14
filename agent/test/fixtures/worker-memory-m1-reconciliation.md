@@ -6,7 +6,7 @@ The approved default merge is committed at `dddc535b84eabe690dd00525c3d117ec993b
 
 Comment-only commit `974d49921b253c03b0310e2ec374d66883bfc5ba` replaces the obsolete claim that runner reconciliation is a future seam. A tracked search for that runner-reconciliation claim found only this site; the runner already reconciles captured receipts before release. Reviewer independently confirmed the minimal correction with no findings. No executable guard behavior changed in that commit.
 
-This section is the current-state record. The earlier sections below are historical records at their own named revisions. **M1 is not complete:** the full agent gate was interrupted, two observed failures remain unclassified, and the unchanged LiveDB sweep plus real command-only subprocess proof have not executed in this resumed integration. M4 and M5 remain unstarted.
+This section is the current-state record. The earlier sections below are historical records at their own named revisions. **M1 is not complete:** the full agent gate was interrupted, two observed failures remain unclassified, the unchanged LiveDB sweep ran and failed at the workersvc cumulative timeout, and the real command-only subprocess proof has not executed in this resumed integration. M4 and M5 remain unstarted.
 
 ### Follow-up live sweep — M1 remains incomplete
 
