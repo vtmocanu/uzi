@@ -349,7 +349,7 @@ func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
 
 var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
 
-var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding"}
+var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
 
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
@@ -366,13 +366,26 @@ func workersScene(dark bool, name string) tuiModel {
 			}
 		}
 	}
-	target := map[string]string{"worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
+	target := map[string]string{"worker-capacity-blocked": "forge-small", "worker-provisioning": "forge-small", "worker-provisioning-failed": "forge-small", "worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
 	if target != "" {
 		// Scene-local samples keep the demo fleet's state and attention counts intact.
 		for i := range fake.Workers {
 			w := &fake.Workers[i]
 			if w.Name != target {
 				continue
+			}
+			switch name {
+			case "worker-capacity-blocked":
+				w.UpgradeStatus = "capacity_blocked"
+				w.UpgradeBlockingKind = strPtrT("scheduler_capacity")
+				w.UpgradeBlockingContainer = nil
+				w.UpgradeBlockingReason = strPtrT("scheduler capacity: insufficient memory")
+				w.UpgradeDetail = w.UpgradeBlockingReason
+			case "worker-provisioning", "worker-provisioning-failed":
+				w.UpgradeStatus = strings.TrimPrefix(name, "worker-")
+				w.UpgradeStatus = strings.ReplaceAll(w.UpgradeStatus, "-", "_")
+				w.Version = nil
+				w.UpgradeDetail = strPtrT("provisioning: not ready")
 			}
 			if w.StatsDiskDataBytes != nil {
 				w.StatsDiskDataBytes = i64(*w.StatsDiskDataBytes << 30)

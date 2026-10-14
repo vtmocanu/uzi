@@ -100,7 +100,7 @@ func newWorkerCmd(env Env, gf *globalFlags) *cobra.Command {
 			// LARGEST RUN is PRD #1809 M6 (D8): the HOME size of the worker's largest run, so one
 			// run growing toward filling the data volume is visible before it does. "-" when the
 			// worker reports no run sizes; also before OUTBOX.
-			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "UPGRADE", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
+			return p.Table([]string{"ID", "NAME", "STATUS", "UPTIME", "VERSION", "ROLL", "TOKEN", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 
@@ -375,11 +375,13 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 		return "up to date"
 	case "upgrade_failed":
 		return "FAILED"
+	case "capacity_blocked", "provisioning", "provisioning_failed":
+		return workerRollLabel(w.UpgradeStatus)
 	default:
 		// outdated | upgrading, and any state a newer api adds. Passing an unrecognized
 		// value through is deliberate: a newer server's new state should read as itself,
 		// not as "-" hiding a state this build has no opinion about.
-		return strings.ReplaceAll(w.UpgradeStatus, "_", " ")
+		return cellText(strings.ReplaceAll(w.UpgradeStatus, "_", " "))
 	}
 }
 
@@ -397,6 +399,9 @@ func upgradeCell(w apitypes.WorkerDTO) string {
 func blockingCell(w apitypes.WorkerDTO) string {
 	container := strOr(w.UpgradeBlockingContainer, "")
 	reason := strOr(w.UpgradeBlockingReason, "")
+	if remedy := workerCapacityRemedy(w); remedy != "" {
+		return cellText(reason + " · " + remedy)
+	}
 	switch {
 	case container != "" && reason != "":
 		return cellText(container + ": " + reason)
