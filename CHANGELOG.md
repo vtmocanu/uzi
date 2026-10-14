@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Idle cross-check counts no longer crowd TUI board and split titles ([#2894](https://github.com/vtmocanu/uzi/issues/2894)).**
+  Shared fleet titles omit cross-check capacity while online workers have no active cross-checks, recovering board space; active counts and the full Workers capacity readout remain visible.
+
 - **Read Codex gate logs during commands ([#2903](https://github.com/vtmocanu/uzi/issues/2903)).**
   Codex can read gate logs while a shell command runs; other effects/checkpoints remain ordered.
 

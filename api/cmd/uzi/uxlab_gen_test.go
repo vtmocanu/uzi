@@ -206,6 +206,31 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
+	for _, split := range []bool{false, true} {
+		for _, width := range []int{200, 80} {
+			for _, active := range []int{0, 1} {
+				surface := "board"
+				if split {
+					surface = "split"
+				}
+				state := "idle"
+				if active != 0 {
+					state = "active"
+				}
+				name := surface + "-cross-checks-" + state + "-" + itoa(width)
+				scenes[name] = func(dark bool) string {
+					m := crossCheckFleetScene(dark, split, width, active)
+					m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: boardRuns(now)})
+					if split {
+						m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo()}})
+						m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+					}
+					return m.View().Content
+				}
+			}
+		}
+	}
+
 	for _, scene := range uxAnswerScenes() {
 		scenes[scene.name] = func(dark bool) string { return scene.build(dark, now).model.View().Content }
 	}
@@ -303,6 +328,23 @@ func splitScene(dark bool, now time.Time, scene string) string {
 		m = key(m, "u")
 	}
 	return m.View().Content
+}
+
+// crossCheckFleetScene shares the shipped render path with the regression fixtures.
+// The offline worker's activity and capacity must not contribute to the title.
+func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	height := 16
+	if split {
+		height = 60
+	}
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m.workers.rows = []workerRow{
+		{w: apitypes.WorkerDTO{ID: "online-a", Name: "online-a", Status: "online", MaxConcurrentRuns: ip32(2), MaxCrossCheckSlots: ip32(2), ActiveCrossChecks: active}},
+		{w: apitypes.WorkerDTO{ID: "online-b", Name: "online-b", Status: "online", MaxConcurrentRuns: ip32(2), MaxCrossCheckSlots: ip32(2)}},
+		{w: apitypes.WorkerDTO{ID: "offline", Name: "offline", Status: "offline", MaxConcurrentRuns: ip32(9), MaxCrossCheckSlots: ip32(9), ActiveCrossChecks: 7}},
+	}
+	return m
 }
 
 var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}

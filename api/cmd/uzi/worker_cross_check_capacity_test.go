@@ -53,7 +53,7 @@ func TestWorkerCrossCheckCapacityDisplays(t *testing.T) {
 				t.Fatalf("cross-check mislabeled as chat: %s", detail)
 			}
 			for _, width := range []int{40, 80, 120, 200} {
-				summary := stripANSI(m.workersSummary(width))
+				summary := stripANSI(m.workersSummary(width, false))
 				var capacity string
 				for _, part := range strings.Split(summary, " · ") {
 					if strings.Contains(part, "cross-checks") || strings.Contains(part, "checks") {

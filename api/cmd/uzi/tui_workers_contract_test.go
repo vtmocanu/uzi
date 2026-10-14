@@ -42,7 +42,7 @@ func TestWorkersApprovedFleetTitle(t *testing.T) {
 					}
 					m.setListView(view)
 					lines := strings.Split(stripANSI(m.View().Content), "\n")
-					inline := split || width >= 120
+					inline := split || width >= 120 || view == viewBoard
 					if strings.Contains(lines[0], "need attention") != inline {
 						t.Fatalf("fleet placement inline=%t: %q", inline, lines[:min(3, len(lines))])
 					}
