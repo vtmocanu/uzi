@@ -73,7 +73,8 @@ LIMIT=8
 SEED_IDENT="e2e-72-custody-seed"
 
 # Sample once per boundary; busy includes chats as well as active runs. Every
-# worker must be idle, and the first must be online. Do not wait for a busy worker:
+# worker must be idle, and at least one must be online. Row ordering is not a
+# readiness signal. Do not wait for a busy worker:
 # that would hide a broken phase-isolation precondition.
 assert_custody_worker_idle() {
   local context="$1" snapshot observed
@@ -84,12 +85,13 @@ assert_custody_worker_idle() {
     else .[0] |
       if (.workers | type) == "array" and (.workers | length) > 0 then
         {status: .workers[0].status, busy: .workers[0].busy,
+         online_count: ([.workers[] | select(.status == "online")] | length),
          busy_count: ([.workers[] | select(.busy == true)] | length),
          all_idle: all(.workers[]; .busy == false)}
       else error("expected a nonempty worker array") end
     end' 2>/dev/null)" \
     || fail "$context: invalid worker snapshot; status=unknown busy=unknown"
-  printf '%s' "$observed" | jq -e '.status == "online" and .busy == false and .all_idle == true' >/dev/null \
+  printf '%s' "$observed" | jq -e '.online_count > 0 and .all_idle == true' >/dev/null \
     || fail "$context: needs online idle worker; observed $observed"
 }
 
