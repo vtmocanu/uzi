@@ -63,8 +63,8 @@ func TestMergedPredecessorPanicIsolationLiveDB(t *testing.T) {
 				t.Fatalf("panic audit disagrees with commit boundary: %s", audit)
 			}
 			reads, calls := a.forge.reads, hooks
-			a.engine.PollOnce(a.ctx)
 			if postCommit {
+				a.engine.PollOnce(a.ctx)
 				var after []byte
 				if err := a.pool.QueryRow(a.ctx, "SELECT merged_predecessor_discard_binding FROM recovery_custody_holds WHERE id=$1", a.hold).Scan(&after); err != nil {
 					t.Fatal(err)

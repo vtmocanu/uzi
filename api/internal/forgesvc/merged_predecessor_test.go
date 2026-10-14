@@ -338,7 +338,13 @@ func TestMergedPredecessorCandidatePanicIsolation(t *testing.T) {
 	calls := 0
 	s.SetMergedPredecessorRecovery(q, mergedRecoveryFunc(func(context.Context, recovery.VerifiedMergeSnapshot) (int64, error) {
 		calls++
-		cancel() // End after the successful sibling, before exhaustion resets cursors.
+		if calls == 1 {
+			// Check before parent cancellation, so removing the observation defer fails.
+			if ctx.Err() != nil || panickedContext == nil || panickedContext.Err() != context.Canceled {
+				t.Error("panic failed to cancel its child while the parent remained live")
+			}
+			cancel() // End after the successful sibling, before exhaustion resets cursors.
+		}
 		return 1, nil
 	}))
 	s.ReconcileMergedPredecessors(ctx, []uuid.UUID{a, b})
