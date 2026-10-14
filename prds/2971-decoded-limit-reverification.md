@@ -276,8 +276,10 @@ This is where the investigation stops. Nothing below is built. The human chooses
 - A `decoded_history_limit` block ends the run terminal `failed` with
   `keepCustody`. ADR-1197 (#2512 amendment): “it neither auto-reclaims nor exposes
   failed-run Resume”. `docs/run-recovery.md` (“Retained-source failure and local
-  proof”) says the same. A blocked journal is never reclaimed, so no ordinary claim
-  ever reaches the blocked short-circuit to retry it (M1).
+  proof”) says the same. The server never re-claims a terminal failed run (and
+  `uzi run resume` accepts only paused or `recovery_wait` runs), so in production
+  nothing reaches the blocked short-circuit; M1 drives it directly in a fixture,
+  where every reclaim still fails without re-verifying.
 - The published checkpoint ref `refs/uzi-checkpoints/<branch>` (or
   `refs/uzi-recovery/<run-id>` after supersession) is kept only while some
   custody hold on the run is open. `docs/run-recovery.md` (“Published checkpoint
@@ -295,19 +297,34 @@ Steps, in this order:
 1. `uzi run recovery <run-id>` lists the holds, checkpoint ref and capture state.
 2. Copy the checkpoint or recovery ref into a named local branch
    (`git fetch origin refs/uzi-checkpoints/<branch>:refs/heads/recovered/<run-id>`).
-   Use the held ref `refs/uzi-held/<run-id>/<generation>` or a salvage copy if
-   one exists, and an available archive via `uzi run export`.
-   - Whether held publication or salvage fires for a `decoded_history_limit`
-     failure was **not verified** in this run.
-3. Inspect the retained worker source read-only through the worker-local
-   `retained-source` inspect channel (`agent/src/ops/retained-source.mjs`) to
-   compare latest local bytes against the copied ref.
+   A salvage copy `refs/uzi-salvage/<run-id>` has its own bounded expiry,
+   independent of hold discard, so where present it survives the checkpoint-ref
+   deletion. An archive is available via `uzi run export` only if one was
+   captured. Code reading (not exercised) for a `decoded_history_limit` failure:
+   - The report maps to fail origin `agent_failure`.
+   - **Held publication does not fire.** The retained-recovery flight sets
+     `retainedLocalCustody`, and `prepareTerminalInventory`, the only starter of
+     the held step, returns early on it. With `keepCustody` the flight is not
+     reaped, so no settlement or archive capture runs either. So no
+     `refs/uzi-held/...` ref is created.
+   - **Salvage can fire, conditionally.** The salvage candidate query has no
+     blocker or custody filter. It needs all of:
+     - a failed issue or self-improvement run with a published checkpoint tip;
+     - a forge listed in `UZI_SALVAGE_FORGES` (empty by default);
+     - a finish within the retention window.
+
+     It copies only the last checkpoint tip.
+3. Locate the retained clone and its hold disposition through the worker-local
+   `retained-source` inspect channel (`agent/src/ops/retained-source.mjs`). That
+   channel is content-free: path, presence, size, digest, holds; no HEAD or diff.
+   Then compare the clone's latest bytes against the copied ref with read-only
+   `git` run on the worker via exec.
 4. Land the work through a new run or by hand. Only then discard the holds.
 
 | | Option (a) |
 | --- | --- |
 | Pros | No new authority, endpoint, migration or ADR change. Works today for every blocker, not only this one. Every custody invariant is untouched. |
-| Cons | Manual and operator-heavy. Latest dirty or untracked bytes on the worker need worker access (hosted k8s: `kubectl exec` with the uid-drop recipe) and can be lost if the holds are discarded first. The run cannot simply continue; the work is re-landed by a new run. This is what was done by hand for 21a4d826 and 38b52617, per the issue's report. |
+| Cons | Manual and operator-heavy. Latest dirty or untracked bytes on the worker need worker access (hosted k8s: `kubectl exec`, with the uid-drop recipe only on split-UID workers) and can be lost if the holds are discarded first. The run cannot simply continue; the work is re-landed by a new run. For 21a4d826 and 38b52617 the issue reports only that holds were discarded by hand; whether a copy was made first is not recorded. |
 
 ### Option (b): owner-authorized one-shot re-verification
 
@@ -413,8 +430,9 @@ live mutation, hold discard, limit increase or redispatch was performed.
 
 ## Validation status (earlier run, historical)
 
-This section records the earlier run b8016a14 at `0b3afc33`. It is superseded by
-the current validation section below for this run's candidate.
+This section records the earlier run b8016a14 at `0b3afc33`. Its “M2/M3 not yet
+performed” status is superseded by the M2 and M3 sections above. This run's
+validation is recorded in “Validation status (this run)” at the end.
 
 Focused characterization passed as recorded above. Coder and researcher
 delegations returned transport failures, not review results. Reviewer, tester
@@ -499,3 +517,14 @@ The eventual acceptance remains outstanding: owner-authorized recovery-positive
 red/green, blocker/current-cap controls, one pass per consent, every custody and
 integrity check, actual blocking-cap storage with explicit legacy unknown,
 episode-policy ADR amendment if semantics change, and required serial gates.
+
+## Validation status (this run)
+
+- Focused characterization after the M0 merge and the M1 assertion: exit 0,
+  1 passed, 0 failed/cancelled/skipped. Independently re-run by the reviewer and the
+  fact-checker with the same result.
+- `task check-docs:web`: pass after each record commit.
+- Read-only validation per commit: M0 by a reviewer; M1, M2 and M3 by a fact-checker.
+  Every blocking finding was fixed and re-checked.
+- Required gates `task gate:agent`, then `task gate:repo`: recorded below once run.
+
