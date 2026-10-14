@@ -27,7 +27,7 @@ mode == "validate" {
     } else if (FNR == 2) {
         if ($0 != "") fail("expected blank line after category")
     } else if (FNR == 3) {
-        if ($0 !~ /^- \*\*[^[:space:]].*\.\*\*$/) fail("expected a bold outcome title ending in a period")
+        if ($0 !~ /^- \*\*[^[:space:]].*\.\*\*$/ || index(substr($0, 5, length($0) - 6), "**")) fail("expected a bold outcome title ending in a period")
     } else if (FNR == 4) {
         if ($0 !~ /^  [^[:space:]].*$/) fail("expected one nonempty description line indented two spaces")
         if ($0 ~ /^  ([-*+] |[0-9]+[.)] |#+ )/) fail("description cannot be another bullet or heading")
@@ -46,6 +46,10 @@ FILENAME != legacy {
         flush()
         if (marker != "" || category != "") fail("misplaced or duplicate release-title marker")
         marker = $0
+        next
+    }
+    if ($0 ~ /^[[:space:]]*<!--[[:space:]]*release-title/) {
+        fail("malformed or misplaced release-title marker")
         next
     }
     if ($0 ~ /^#/) {

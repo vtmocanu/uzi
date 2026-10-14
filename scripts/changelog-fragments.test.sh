@@ -38,7 +38,7 @@ echo 'arbitrary README prose' > "$W/changelog.d/README.md"
 expect 0 "README excluded" validate
 expect 1 "README is not an explicit fragment" validate changelog.d/README.md
 
-for malformed in empty unknown leading no-blank plain-title no-period no-description blank-description one-space three-space nested-bullet nested-heading numbered-bullet wrapped prose extra-bullet extra-heading crlf; do
+for malformed in empty unknown leading no-blank plain-title split-bold-title no-period no-description blank-description one-space three-space nested-bullet nested-heading numbered-bullet wrapped prose extra-bullet extra-heading crlf; do
   valid Fixed Outcome "$A"
   case "$malformed" in
     empty) : > "$W/$A" ;;
@@ -46,6 +46,7 @@ for malformed in empty unknown leading no-blank plain-title no-period no-descrip
     leading) printf '\n### Fixed\n\n- **Outcome.**\n  Description.\n' > "$W/$A" ;;
     no-blank) printf '### Fixed\n- **Outcome.**\n  Description.\n' > "$W/$A" ;;
     plain-title) printf '### Fixed\n\n- Outcome.\n  Description.\n' > "$W/$A" ;;
+    split-bold-title) printf '### Fixed\n\n- **Outcome.** unbold prose **Other.**\n  Description.\n' > "$W/$A" ;;
     no-period) printf '### Fixed\n\n- **Outcome**\n  Description.\n' > "$W/$A" ;;
     no-description) printf '### Fixed\n\n- **Outcome.**\n' > "$W/$A" ;;
     blank-description) printf '### Fixed\n\n- **Outcome.**\n  \n' > "$W/$A" ;;
@@ -61,6 +62,30 @@ for malformed in empty unknown leading no-blank plain-title no-period no-descrip
     crlf) printf '### Fixed\r\n\r\n- **Outcome.**\r\n  Description.\r\n' > "$W/$A" ;;
   esac
   expect 1 "malformed $malformed" validate
+done
+# Exercise the raw-byte guard with both the host awk and BusyBox record splitting.
+mkdir -p "$TMP/busybox-bin"
+printf '#!/usr/bin/env bash\nexec busybox awk "$@"\n' > "$TMP/busybox-bin/awk"
+chmod +x "$TMP/busybox-bin/awk"
+host_path=$PATH
+implementations=(host)
+if command -v busybox > /dev/null; then implementations+=(busybox); fi
+for implementation in "${implementations[@]}"; do
+  if [ "$implementation" = busybox ]; then export PATH="$TMP/busybox-bin:$host_path"; fi
+  printf '### Fixed\0\0- **Outcome.**\0  Description.\0' > "$W/$A"
+  expect 1 "$implementation rejects NUL fragment" validate "$A"
+  equal /dev/null "$TMP/out" "$implementation NUL validation has empty stdout"
+  : > "$W/body-nul"
+  expect 1 "$implementation NUL fragment cannot render" render-body body-nul
+  equal /dev/null "$TMP/out" "$implementation NUL fragment render has empty stdout"
+  valid Fixed Outcome "$A"
+  printf '### Fixed\0\0- existing\0  Description.\0' > "$W/body-nul"
+  expect 1 "$implementation rejects NUL legacy body" render-body body-nul
+  equal /dev/null "$TMP/out" "$implementation NUL body has empty stdout"
+  printf '## [Unreleased]\n\n### Fixed\0\0- existing\0  Description.\0\n## [1.0.0]\n\n- released\n' > "$W/full-nul"
+  expect 1 "$implementation rejects NUL before extraction" render-unreleased full-nul
+  equal /dev/null "$TMP/out" "$implementation NUL fullfile has empty stdout"
+  export PATH=$host_path
 done
 valid Fixed Outcome "$A"
 for name in bad.md 11111111-1111-3111-8111-111111111111.md 11111111-1111-4111-c111-111111111111.md A1111111-1111-4111-8111-111111111111.md .hidden.md $'bad\nname.md'; do
@@ -150,10 +175,18 @@ expect 0 "full changelog interface" render-unreleased CHANGELOG.md
 equal "$TMP/expected" "$TMP/out" "full changelog and body agree"
 expect 0 "absolute legacy input" render-unreleased "$W/CHANGELOG.md"
 equal "$TMP/expected" "$TMP/out" "absolute file operand"
-for malformed in unknown orphan misplaced-marker duplicate-marker out-of-category missing-unreleased duplicate-unreleased; do
+for malformed in unknown orphan malformed-marker malformed-marker-continuation indented-marker-continuation canonical-marker-continuation malformed-marker-fullfile unexpected-heading-fullfile nul-body nul-fullfile misplaced-marker duplicate-marker out-of-category missing-unreleased duplicate-unreleased; do
   case "$malformed" in
     unknown) printf '### Other\n\n- old\n' > "$W/bad" ;;
     orphan) printf '### Fixed\n\nprose\n' > "$W/bad" ;;
+    malformed-marker) printf '<!-- release-title: Missing close\n' > "$W/bad" ;;
+    malformed-marker-continuation) printf '### Fixed\n\n- existing\n<!-- release-title: Missing close\n' > "$W/bad" ;;
+    indented-marker-continuation) printf '### Fixed\n\n- existing\n  <!-- release-title: Missing close\n' > "$W/bad" ;;
+    canonical-marker-continuation) printf '### Fixed\n\n- existing\n<!-- release-title: misplaced -->\n' > "$W/bad" ;;
+    malformed-marker-fullfile) printf '## [Unreleased]\n\n### Fixed\n\n- existing\n<!-- release-title: Missing close\n\n## [1.0.0]\n\n- released\n' > "$W/bad" ;;
+    unexpected-heading-fullfile) printf '## [Unreleased]\n\n### Fixed\n\n- keep\n\n## unexpected\n\n- lost\n\n## [1.0.0]\n\n- released\n' > "$W/bad" ;;
+    nul-body) printf '### Fixed\0\0- existing\0  Description.\0' > "$W/bad" ;;
+    nul-fullfile) printf '## [Unreleased]\n\n### Fixed\0\0- existing\0  Description.\0\n## [1.0.0]\n\n- released\n' > "$W/bad" ;;
     misplaced-marker) printf '### Fixed\n\n<!-- release-title: misplaced -->\n' > "$W/bad" ;;
     duplicate-marker) printf '<!-- release-title: one -->\n<!-- release-title: two -->\n' > "$W/bad" ;;
     out-of-category) printf -- '- old\n' > "$W/bad" ;;
@@ -161,7 +194,7 @@ for malformed in unknown orphan misplaced-marker duplicate-marker out-of-categor
     duplicate-unreleased) printf '## [Unreleased]\n\n## [Unreleased]\n' > "$W/bad" ;;
   esac
   mode=render-body
-  case "$malformed" in *unreleased) mode=render-unreleased ;; esac
+  case "$malformed" in *unreleased|*fullfile) mode=render-unreleased ;; esac
   expect 1 "fail closed on $malformed" "$mode" bad
   cases=$((cases + 1))
   if [ ! -s "$TMP/out" ]; then passed=$((passed + 1)); else echo "FAIL: partial output on $malformed" >&2; fi
@@ -260,4 +293,4 @@ git -C "$W" show main:CHANGELOG.md > "$TMP/original"
 equal "$TMP/original" "$W/CHANGELOG.md" "render never mutates actual changelog"
 
 echo "changelog-fragments.test.sh: cases=$cases passed=$passed"
-[ "$cases" -eq "$passed" ] && [ "$cases" -ge 72 ]
+[ "$cases" -eq "$passed" ] && [ "$cases" -ge 97 ]

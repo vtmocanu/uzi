@@ -9,15 +9,27 @@ changelog_fragment_directory() {
   fi
 }
 
+changelog_fragment_path() {
+  if [[ ! $1 =~ ^changelog\.d/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$ ]]; then
+    changelog_fragment_error "invalid fragment path: $1"; return 1
+  fi
+}
+
+# Check bytes before awk can interpret NUL as a record separator.
+changelog_fragment_no_nul() {
+  if ! tr -d '\000' < "$1" | cmp -s -- "$1" -; then
+    changelog_fragment_error "NUL byte or unreadable input: $1"; return 1
+  fi
+}
+
 changelog_fragment_validate() {
   local path=$1
   changelog_fragment_directory || return 1
-  if [[ ! $path =~ ^changelog\.d/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md$ ]]; then
-    changelog_fragment_error "invalid fragment path: $path"; return 1
-  fi
+  changelog_fragment_path "$path" || return 1
   if [ -L "$path" ] || [ ! -f "$path" ]; then
     changelog_fragment_error "fragment must be a regular file: $path"; return 1
   fi
+  changelog_fragment_no_nul "$path" || return 1
   awk -v mode=validate -f "$CHANGELOG_FRAGMENT_PARSER" "./$path"
 }
 
@@ -31,6 +43,7 @@ changelog_fragment_safe_entries() {
     if [ -L "$path" ] || [ ! -f "$path" ]; then
       changelog_fragment_error "unsafe entry: $path"; return 1
     fi
+    [ "$path" = changelog.d/README.md ] || changelog_fragment_path "$path" || return 1
   done
 }
 
