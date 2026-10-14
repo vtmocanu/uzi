@@ -1178,7 +1178,9 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 	h.heldListLimiter = proposalLimiter
 	// RecoveryService may already have initialized the shared instance for polling.
-	h.recovery().SetHeldListAllow(heldListAllowFor(proposalLimiter))
+	if h.recoverySvc != nil {
+		h.recoverySvc.SetHeldListAllow(heldListAllowFor(proposalLimiter))
+	}
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))
 		// PRD #1906 M5 (D-D): an isolated-lane worker reaches only the lifecycle routes its
