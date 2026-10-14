@@ -5043,7 +5043,9 @@ describe("CodexExecutor: an api_key run meters the root model end-to-end (execut
 // never manufactured from accountant output. Strip only elapsed duration from the actual
 // result payload; JSON serialization omits undefined wire fields exactly as persistence does.
 describe("#2878 M2 worker emitted fixture", () => {
-  const fixture = JSON.parse(readFileSync(
+  // Lazy: the worker-UID lane registers this suite without a /fixtures mount.
+  let fixtureCache: Record<string, unknown> | undefined;
+  const fixture = () => fixtureCache ??= JSON.parse(readFileSync(
     new URL("../../fixtures/run-usage/codex-incomplete-claim.json", import.meta.url), "utf8",
   )) as Record<string, unknown>;
   const accountingPayload = (emitted: EmittedMessage[]) => {
@@ -5060,7 +5062,7 @@ describe("#2878 M2 worker emitted fixture", () => {
       .push(signalDone()).push(turnCompleted()).end();
     const { ctx, emitted } = makeCtx();
     await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "earlier metered fixture");
-    assert.deepEqual(accountingPayload(emitted), fixture.earlierMetered);
+    assert.deepEqual(accountingPayload(emitted), fixture().earlierMetered);
   });
 
   for (const childModel of ["gpt-6.1-sol", "gpt-6-astra"]) {
@@ -5094,7 +5096,7 @@ describe("#2878 M2 worker emitted fixture", () => {
       await withTimeout(running, 3000, "retained child incomplete fixture");
       assert.equal(emitted.filter(m => m.payload.event === "codex_token_usage_incomplete").length, 1);
       assert.deepEqual(accountingPayload(emitted), childModel === "gpt-6-astra"
-        ? fixture.incompleteRootSameModelChild : fixture.incompleteRootDistinctChild,
+        ? fixture().incompleteRootSameModelChild : fixture().incompleteRootDistinctChild,
       "worker must emit proved child counters after root becomes incomplete");
     });
   }
@@ -5108,7 +5110,7 @@ describe("#2878 M2 worker emitted fixture", () => {
     })]);
     const { ctx, emitted } = makeCtx({ sessionId: "th-1" });
     await withTimeout(makeExecutor(rig, bindingOf(API_KEY)).run(ctx), 3000, "zero incomplete fixture");
-    assert.deepEqual(accountingPayload(emitted), fixture.zeroIncomplete,
+    assert.deepEqual(accountingPayload(emitted), fixture().zeroIncomplete,
       "explicit zero unreported root is necessary to downgrade prior same-key metered usage");
   });
 });
