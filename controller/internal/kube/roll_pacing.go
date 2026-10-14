@@ -269,7 +269,9 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			continue
 		}
 		for _, peer := range pool {
-			if !peer.w.CustodyHeld && peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.promoted(t, peer) {
+			// Current-incarnation proof retires completed pacing metadata only;
+			// this does not release source custody or mutate protected storage.
+			if peer.blocked == "" && peer.marker != nil && !peer.marker.Canary && m.promoted(t, peer) {
 				if err := m.reserveRoll(ctx, peer, nil); err != nil {
 					peer.blocked = "completion cleanup unconfirmed"
 				}
@@ -593,6 +595,10 @@ func (m *Materializer) planPool(ctx context.Context, t *rollTick, pool []*rollEn
 			id, predicate := canary, "promotion_unconfirmed"
 			if promotedCanary {
 				for _, peer := range pool {
+					if peer.admitted && peer.drift && peer.marker == nil {
+						id, predicate = peer.w.ID, "replacement_admitted"
+						break
+					}
 					if peer.marker != nil && !peer.marker.Completed && !m.promoted(t, peer) {
 						id, predicate = peer.w.ID, "replacement_in_flight"
 						break
@@ -1140,7 +1146,8 @@ func maintenanceActive(w protocol.DesiredWorker) bool {
 }
 
 // promoted proves the current serving incarnation. It grants no authority to
-// discard protected sources, clear a custody-held drain or retire its reservation.
+// discard protected sources or clear a custody-held drain. A protected provider
+// still under a cordon cannot supply claimable coverage.
 func (m *Materializer) promoted(t *rollTick, e *rollEntry) bool {
 	r, p := e.marker, e.w.RollEvidence
 	if e.o.Roll.Phase == protocol.PhaseStuck || r == nil || p == nil || !p.Registered || p.Version != 1 || e.dep == nil || e.dep.UID == "" || e.dep.DeletionTimestamp != nil ||
@@ -1148,7 +1155,8 @@ func (m *Materializer) promoted(t *rollTick, e *rollEntry) bool {
 		p.RegisteredVersion == nil || *p.RegisteredVersion != r.TargetVersion || p.RegisterNonce == nil || *p.RegisterNonce == "" || *p.RegisterNonce == r.Nonce ||
 		p.PodUID == nil || *p.PodUID == "" || p.HeartbeatAt == nil || p.HeartbeatAt.IsZero() || p.HeartbeatAt.After(p.EvaluatedAt) ||
 		!freshUntil(m.now(), t.start, p.EvaluatedAt, p.ValidUntil) || !covers(e.w, r.Coverage) ||
-		e.w.DiskPressure || maintenanceActive(e.w) || (e.w.DrainingSince != nil && !imageRollDrain(e.w)) {
+		e.w.DiskPressure || maintenanceActive(e.w) || (e.w.CustodyHeld && e.w.DrainingSince != nil) ||
+		(e.w.DrainingSince != nil && !imageRollDrain(e.w)) {
 		return false
 	}
 	current := 0

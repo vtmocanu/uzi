@@ -45,8 +45,8 @@ func TestRollCustodyBusyPoolProgresses(t *testing.T) {
 	removeOldPod(t, c, "w1")
 	currentProof(t, c, &workers[0], m5Now)
 	rollTickTest(t, m, workers)
-	if len(f.calls) != 2 || f.calls[1] != "w2" {
-		t.Fatalf("custody on proven current canary blocked next admission: %v", f.calls)
+	if len(f.calls) != 1 {
+		t.Fatalf("custody-held cordoned canary allowed both providers to drain: %v", f.calls)
 	}
 	if len(f.clearCalls) != 0 {
 		t.Fatalf("serving coverage released a custody-protected drain: %v", f.clearCalls)
@@ -54,6 +54,12 @@ func TestRollCustodyBusyPoolProgresses(t *testing.T) {
 	retained, err := c.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVCName("w1"), metav1.GetOptions{})
 	if err != nil || retained.UID != data.UID {
 		t.Fatalf("custody-protected data claim changed: %v", err)
+	}
+	// Once custody settles, existing drain release restores claimable coverage.
+	workers[0].CustodyHeld = false
+	rollTickTest(t, m, workers)
+	if len(f.clearCalls) != 1 || f.clearCalls[0] != "w1" || len(f.calls) != 2 || f.calls[1] != "w2" {
+		t.Fatalf("settled custody did not release w1 before cordoning w2: clears=%v cordons=%v", f.clearCalls, f.calls)
 	}
 }
 
@@ -140,7 +146,7 @@ func TestRollCustodySingletonPolicy(t *testing.T) {
 	}
 }
 
-func TestRollCustodyCompletedReservationProtected(t *testing.T) {
+func TestRollCustodyCompletedReservationCleanup(t *testing.T) {
 	for _, custody := range []bool{false, true} {
 		t.Run(map[bool]string{false: "released", true: "held"}[custody], func(t *testing.T) {
 			canary, peer := evidence(desired("w1"), m5Now), evidence(desired("w2"), m5Now)
@@ -164,8 +170,27 @@ func TestRollCustodyCompletedReservationProtected(t *testing.T) {
 			if err != nil {
 				t.Fatal(err)
 			}
-			if (got.Annotations[annotationRoll] != "") != custody {
+			if got.Annotations[annotationRoll] != "" {
 				t.Fatalf("custody=%t completed-peer reservation=%q", custody, got.Annotations[annotationRoll])
+			}
+			data, err := c.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVCName(peer.ID), metav1.GetOptions{})
+			if err != nil {
+				t.Fatal(err)
+			}
+			// A completed pacing marker is not source custody. Retiring it must
+			// permit the next desired generation while keeping the same data PVC.
+			canary.Generation++
+			peer.Generation++
+			before := len(templatePatches(c))
+			for i := 0; i < 3; i++ {
+				rollTickTest(t, m, []protocol.DesiredWorker{canary, peer})
+			}
+			if len(templatePatches(c)) <= before {
+				t.Fatal("completed peer custody starved the next generation")
+			}
+			retained, err := c.CoreV1().PersistentVolumeClaims(testConfig().Namespace).Get(context.Background(), dataPVCName(peer.ID), metav1.GetOptions{})
+			if err != nil || retained.UID != data.UID {
+				t.Fatalf("completed pacing cleanup changed protected data: %v", err)
 			}
 		})
 	}
@@ -186,17 +211,39 @@ func TestRollCustodyBlockingReason(t *testing.T) {
 			f := &fakeCordoner{}
 			m, _ := newMatWithDrain(t, f, DrainPolicy{Deadline: time.Hour}, objects...)
 			rollTickTest(t, m, workers)
-			id, term := "w1", "coverage"
+			id, prefix, other, blocker := "w1", "no usable coverage: ", "roll slot", "w2"
 			if slot {
-				id, term = "w2", "roll slot"
+				id, prefix, other, blocker = "w2", "no roll slot: ", "coverage", "w1"
 			}
 			p := m.PacingOutcomes()[id]
-			if p.BlockingReason == nil || !strings.Contains(*p.BlockingReason, term) || p.BlockingWorkerID == nil {
-				t.Fatalf("missing %s blocker identity/predicate: %+v", term, p)
+			if p.BlockingReason == nil || !strings.HasPrefix(*p.BlockingReason, prefix) || strings.Contains(*p.BlockingReason, other) || p.BlockingWorkerID == nil || *p.BlockingWorkerID != blocker {
+				t.Fatalf("missing exact %q reason and blocker %s: %+v", prefix, blocker, p)
 			}
 			if !slot && (!strings.Contains(*p.BlockingReason, "liveness") || *p.BlockingWorkerID != "w2") {
 				t.Fatalf("coverage reason does not identify missing liveness of w2: %+v", p)
 			}
 		})
+	}
+}
+
+func TestRollCustodySameTickSlotBlocker(t *testing.T) {
+	canary := evidence(desired("w1"), m5Now)
+	workers := []protocol.DesiredWorker{canary, evidence(desired("w2"), m5Now), evidence(desired("w3"), m5Now)}
+	objects := []runtime.Object{markedDeployment(t, testConfig(), canary, false)}
+	for i := 1; i < len(workers); i++ {
+		workers[i].Busy, workers[i].CustodyHeld = true, true
+		objects = append(objects, physicalOld(t, deployedWorker(workers[i].ID, 0, "old"))...)
+	}
+	f := &fakeCordoner{}
+	m, c := newMatWithDrain(t, f, DrainPolicy{Deadline: time.Hour}, objects...)
+	m.cfg.RollConcurrency = 1
+	currentProof(t, c, &workers[0], m5Now)
+	rollTickTest(t, m, workers)
+	if len(f.calls) != 1 || f.calls[0] != "w2" {
+		t.Fatalf("same-tick admission: %v", f.calls)
+	}
+	p := m.PacingOutcomes()["w3"]
+	if p.BlockingWorkerID == nil || *p.BlockingWorkerID != "w2" || p.BlockingReason == nil || *p.BlockingReason != "no roll slot: w2 replacement_admitted" {
+		t.Fatalf("same-tick slot incorrectly blamed promoted canary: %+v", p)
 	}
 }

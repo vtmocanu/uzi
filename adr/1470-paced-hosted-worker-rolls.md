@@ -100,9 +100,12 @@ The promotion boundary in `controller/internal/kube/roll_pacing.go` requires:
   fence and no stuck roll observation.
 
 Custody protects sources rather than negating positive serving evidence (#2959).
-Old and current providers can supply coverage while holding custody; no free-slot
-guarantee is added. Custody still independently fences data-PVC destruction,
-drain release and duplicate/completed-peer reservation cleanup.
+Old and current providers can supply coverage while holding custody only when
+uncordoned; no free-slot guarantee is added. Custody still independently fences
+data-PVC destruction, drain release and duplicate-canary cancellation. A promoted
+peer's completed Deployment pacing annotation can be retired while custody stays
+held: this metadata-only cleanup neither releases source custody nor changes its
+data PVC, and must not prevent the next desired generation from rolling.
 
 Ready alone is insufficient. A registration nonce identifies a registration,
 not a pod: an old process can re-register at the same version and change nonce.
