@@ -261,6 +261,7 @@ Tracked as GitLab issue vtmocanu/uzi#22; PRD at `prds/done/22-prdless-label.md`.
 - A `prds/*.md` link is OPTIONAL — still auto-detected, implemented when present, and shown as a PRD-presence badge, but never required to start a run. (AI-synced 2026-08-29)
 - Also removed with `PRDLESS`: the `eligible_label_waives_prd_link` waiver, the `run_eligible_labels`/`board_extra_labels` sets, and the `prd_label` special-casing. `Planned`/`bug` stay sweep selectors that fire only when the issue also carries `uzi`; `autopilot` is unchanged. (AI-synced 2026-08-29)
 - (AI-synced 2026-08-29) An issue is ALSO runnable when assigned to the uzi-bot account (matched on the connection's numeric bot user id, rename-safe) — a second, equivalent expression of the same single eligibility concept, additive to the `uzi` label (PRD #767). Assignment grants eligibility ONLY; it never auto-runs (unattended execution still needs `autopilot` or an enabled sweep). uzi only reads assignees, never auto-assigns. New `assigned-sweep` default schedule fires the oldest few bot-assigned issues (auto-approve ON, like the other default sweeps).
+  - Exception: the `ci-repair` default (Feature #2865) is created with auto-approve OFF; the catalog sweeps' auto-approve-ON pattern does not apply to it. (AI-synced 2026-10-14)
 - (AI-synced 2026-09-24) A label sweep reaches eligible issues (`uzi`-labelled or bot-assigned) no matter how many ineligible selector matches precede them: ineligible matches never consume the per-fire scan window, and the fire reports them as one aggregate count rather than per-issue skips (#1543).
 
 ## Feature #23 — Web UX polish: live dashboard, collapsible sidebar, hide empty board columns
@@ -547,6 +548,7 @@ Tracked as GitLab issue vtmocanu/uzi#71; PRD at `prds/done/71-ci-autofix.md`.
 
 - Automatic CI-fix is ON by default for every user (per-user tri-state opt-out, NULL=inherit=on), behind an admin instance-wide kill-switch (default on); admin can force-toggle any user. [user, PRD #914 — supersedes the earlier default-off from #71]
 - Fires only on agent-owned MR-branch pipelines (`agent/issue-N`); `main`/protected branches are never auto-touched — a fix still lands on the MR branch and a human still merges (primary directive). [user 2026-07-17]
+- Scope: this is the `ci_fix` lane only. Failures on the default branch are the `ci-repair` scheduled lane (Feature #2865), not auto-fixed here. (AI-synced 2026-10-14)
 - Loop-guarded: max 2 automatic attempts per branch + an early stop when the failure hasn't changed; on giving up, uzi comments + notifies and stops (the manual Fix CI button remains). [user 2026-07-17]
 - "Usually we fix the code, not CI itself, but if CI is really at fault we can add a CI fix in the MR" — code fixes push automatically; a fix that edits the CI config passes the approval gate (human-approved before it pushes). [user 2026-07-17]
 
@@ -1310,6 +1312,15 @@ PRD at `prds/1786-preserve-worker-only-work.md`.
 - Board titles use all remaining terminal columns before the reserved judge marker and worker column, with no fixed title cap. This supersedes the board-title cap recorded in frozen `specs/ai.md` §559. (AI-synced 2026-10-14, #2922)
 
 - The Dashboard Active runs tile counts every non-terminal run and lists non-zero state counts in order: running; owner action ("1 needs you" or "N need you" for approval, input or follow-up); queued (queued or claimed); waiting to resume (usage, pool, recovery holds or owner pause). An empty active set reads "nothing in flight". (AI-synced 2026-10-14, #2922)
+
+## Feature #2865 — Default-branch CI repair (`ci_watch` / `ci-repair`)
+
+Tracked as issue vtmocanu/uzi#2865; PRD at `prds/2865-default-branch-ci-repair.md`.
+
+- A red workflow on a repo's default branch is repaired by a scheduled `ci_watch` target, enabled as the `ci-repair` catalog default. It watches the default branch only; agent MR branches stay the `ci_fix` lane (PRD D3). (AI-synced 2026-10-14)
+- A fire inspects the newest completed execution of each watched workflow: green starts nothing; red starts one ordinary run that fixes on a new `uzi/prompt-<id>` branch and opens a PR, or finishes report-only. `main` is never touched and a human merges (D4). A loop guard (same failure signature after an attempt, or `CI_AUTOFIX_MAX_ATTEMPTS`) stops a persistently red workflow from looping. (AI-synced 2026-10-14)
+- CI-config changes are never pushed in this lane: the worker refuses unconditionally, human-approved runs included and also when the diff cannot be computed, and the claim is gated by the `ci_config_guard_v1` worker capability so older workers cannot claim a guarded run (D9). (AI-synced 2026-10-14)
+- `ci-repair` is created with auto-approve OFF, with the reason shown in the UI; the owner may turn it on. [user, 2026-10-13] (D10) This is an explicit exception to the catalog sweeps' auto-approve-ON pattern. (AI-synced 2026-10-14)
 
 ## Deferred (user, "later stuff")
 
