@@ -13761,7 +13761,7 @@ export class RunRunner {
    * Guarded runs only: the raw-path CI-config check over the EXACT candidate `sha`, run in the worker
    * before any checkpoint or held upload. The server broker compares trees but must skip subtrees
    * absent from the pack, so a merge whose second parent carries an older workflow tree could slip
-   * a protected tree through; the merge-base diff here lists it. Returns true when the publication
+   * a protected tree through; the merge-base diff here, taken over EVERY merge base, lists it. Returns true when the publication
    * must be skipped (a protected path matched, or the diff could not be computed: fail closed).
    * Never fails the run; the early and final push guards do that.
    */

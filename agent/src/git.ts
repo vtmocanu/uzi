@@ -9590,18 +9590,30 @@ export class GitCache {
   }
 
   /**
-   * Guarded-run variant of {@link changedFiles}: the same trusted `defaultBranchRef` three-dot
-   * merge-base diff, but with `--no-renames`, so a rename lists BOTH raw paths (moving a file out
-   * of a protected directory matches on its old path) and a deletion is listed. `-z` disables path
-   * quoting; the output is split only on NUL and never trimmed, so a path with a leading or
-   * trailing space or an embedded newline arrives byte-exact. `ref` may be a ref or a 40-hex SHA.
-   * Returns null (NOT []) when the diff cannot be computed, so the caller fails CLOSED.
+   * Guarded-run variant of {@link changedFiles}: the trusted `defaultBranchRef` merge-base diff,
+   * but with `--no-renames`, so a rename lists BOTH raw paths (moving a file out of a protected
+   * directory matches on its old path) and a deletion is listed. A plain three-dot diff uses only
+   * the first merge base ("warning: multiple merge bases"), so a criss-cross history could hide a
+   * protected-path change that exists relative to the other base. This therefore lists EVERY merge
+   * base (`merge-base --all`), diffs `ref` against each, and returns the de-duplicated union in
+   * first-seen order. `-z` disables path quoting; the output is split only on NUL and never
+   * trimmed, so a path with a leading or trailing space or an embedded newline arrives
+   * byte-exact. `ref` may be a ref or a 40-hex SHA.
+   * Returns null (NOT []) when the diff cannot be computed (git failure, a merge base that is not
+   * a 40-hex id, or NO merge base, e.g. unrelated histories), so the caller fails CLOSED.
    */
   async changedFilesNoRenames(barePath: string, ref: string): Promise<string[] | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const out = await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", `${baseRef}...${ref}`]);
-      return out.split("\0").filter((entry) => entry !== "");
+      const bases = (await this.runGit(barePath, ["merge-base", "--all", baseRef, ref]))
+        .split("\n").filter((line) => line !== "");
+      if (bases.length === 0 || bases.some((base) => !SHA40_RE.test(base))) return null;
+      const seen = new Set<string>();
+      for (const base of [...new Set(bases)]) {
+        const out = await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", base, ref]);
+        for (const entry of out.split("\0")) if (entry !== "") seen.add(entry);
+      }
+      return [...seen];
     } catch {
       return null;
     }
