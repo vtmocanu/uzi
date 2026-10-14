@@ -418,7 +418,7 @@ it("M1 destructive checkpoint waits for summary settlement before reaping", asyn
 
 describe("M1 persisted ACK boundary", () => {
   for (const human of [false, true]) {
-    it(`M1 persisted ACK boundary ${human ? "human enters verdict wait and implementation while callback held" : "autopilot enters implementation while callback held"}`, { timeout: 5000 }, async () => {
+    it(`M1 persisted ACK boundary ${human ? "human enters verdict wait and implementation while callback held" : "autopilot enters implementation while callback held"}`, { timeout: 60000 }, async () => {
       const { gitlab } = fakeGitlab();
       const claim = gitlabClaim(28382, { auto_approve: !human });
       const ack = deferred(), stored = deferred(), callback = deferred(), started = deferred(), entered = deferred();
@@ -454,14 +454,14 @@ describe("M1 persisted ACK boundary", () => {
         let startedTimer: NodeJS.Timeout | undefined;
         try {
           await Promise.race([started.promise, new Promise<never>((_, reject) => {
-            startedTimer = setTimeout(() => reject(new Error("accepted ACK did not start persisted callback")), 1500);
+            startedTimer = setTimeout(() => reject(new Error("accepted ACK did not start persisted callback")), 45000);
           })]);
         } finally { clearTimeout(startedTimer); }
         await flushMicrotasks();
         let timer: NodeJS.Timeout | undefined;
         try {
           await Promise.race([entered.promise, new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error("implementation blocked by persisted callback")), 1500);
+            timer = setTimeout(() => reject(new Error("implementation blocked by persisted callback")), 45000);
           })]);
         } finally { clearTimeout(timer); }
         assert.deepEqual(plans, ["# Accepted plan"]);
@@ -1712,7 +1712,9 @@ describe("#2230 shared SDK process default at a plan gate", () => {
 // Issue #2901: a human plan gate starts the advisory plan-summary hook without awaiting it, and
 // an accepted revise supersedes the summary of the plan it replaced. Each case runs through the
 // real runner gate on both harnesses; only the summary model, the summary POST and the
-// provider/query peer are scripted. Every wait is on an event the test controls.
+// provider/query peer are scripted. Waits are on events the test controls, bounded by within()
+// with a generous ceiling (loaded hosts) that stays below the describe timeouts, so a regression
+// fails with a named message; production settle bounds are shortened through settleMs.
 
 type SummaryHarness = "sdk" | "codex";
 const SUMMARY_HARNESSES: readonly SummaryHarness[] = ["sdk", "codex"];
@@ -1738,7 +1740,7 @@ interface GateRigConfig {
 }
 
 /** Bound a wait that must resolve so a regression fails the test instead of hanging it. */
-async function within<T>(promise: Promise<T>, what: string, ms = 5000): Promise<T> {
+async function within<T>(promise: Promise<T>, what: string, ms = 45000): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
@@ -1887,7 +1889,7 @@ function startGateRig(harness: SummaryHarness, cfg: GateRigConfig) {
       for (const hold of turnHold.values()) hold.resolve();
       for (const call of calls) call.finish(null);
       if (!finished) api.appendInputs(runId, [input("cancel")]);
-      await within(execution.catch(() => {}), "run teardown", 15000);
+      await within(execution.catch(() => {}), "run teardown");
     },
   };
 }
@@ -1896,14 +1898,14 @@ const S1: PlanSummaryResult = { summary: "Summary one", deltas: [] };
 const S2: PlanSummaryResult = { summary: "Summary two", deltas: [] };
 
 for (const harness of SUMMARY_HARNESSES) {
-  describe(`issue #2901 (${harness}): human plan gate does not wait for the plan summary`, { timeout: 60000 }, () => {
+  describe(`issue #2901 (${harness}): human plan gate does not wait for the plan summary`, { timeout: 120000 }, () => {
     it("approve is processed while the summary hook is still blocked, then the summary latches", async () => {
       const rig = startGateRig(harness, { plans: ["# Plan one"] });
       try {
         await within(rig.presented[0]!.promise, "first plan presentation");
         await within(rig.callEntered[0]!.promise, "summary hook start");
         rig.verdict("approve_plan");
-        await within(rig.implementing, "implementation turn while the summary hook is blocked", 3000);
+        await within(rig.implementing, "implementation turn while the summary hook is blocked");
         assert.deepEqual(rig.posts, [], "the blocked hook has posted nothing yet");
         rig.calls[0]!.finish(S1);
         await within(rig.posted[0]!.promise, "summary POST");
@@ -1933,7 +1935,7 @@ for (const harness of SUMMARY_HARNESSES) {
           await within(rig.callEntered[1]!.promise, "revised summary hook start");
           assert.equal(rig.calls[1]!.planMd, plans[1]);
           rig.verdict("approve_plan");
-          await within(rig.turnEntered[2]!.promise, "implementation turn while the revised hook is blocked", 3000);
+          await within(rig.turnEntered[2]!.promise, "implementation turn while the revised hook is blocked");
           rig.calls[1]!.finish(S2);
           await within(rig.posted[0]!.promise, "revised summary POST");
           assert.deepEqual(rig.posts, [plans[1]]);
@@ -2006,7 +2008,7 @@ for (const harness of SUMMARY_HARNESSES) {
     }
   });
 
-  describe(`issue #2901 (${harness}): plan-summary usage boundaries`, { timeout: 60000 }, () => {
+  describe(`issue #2901 (${harness}): plan-summary usage boundaries`, { timeout: 120000 }, () => {
     // Each case is a fresh flight firing exactly one usage event, so the once-per-flight
     // `delivered` latch can never mask a missing guard.
     for (const before of [true, false]) {

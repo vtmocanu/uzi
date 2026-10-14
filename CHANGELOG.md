@@ -31,7 +31,7 @@ through `[0.52.0]`.)
   Workers now try to reclaim the oldest excess residue toward a best-effort target of five entries per clone key during normal canonical reseeding as well as attempt seeding. Each sweep attempts at most 16 candidates, with bounded in-process round-robin progress past refusals and fresh safety checks on every revisit. Recovery-protected, live or unproven entries stay, and worker quarantine vetoes deletion, so safety can leave more than five; this is not a hard disk or wall-time bound (#1859).
 
 - **Human plan gates no longer wait for the plan summary ([#2901](https://github.com/vtmocanu/uzi/issues/2901)).**
-  The worker now starts the advisory plan summary after the plan is stored without awaiting it, so approving, revising or rejecting a plan is no longer delayed by up to the summary timeout, and a summary of a plan you revised is discarded instead of being posted late.
+  The worker now starts the advisory plan summary after the plan is stored without awaiting it, so approving, revising or rejecting a plan is no longer delayed by up to the summary timeout, and a summary of a plan you revised is no longer kept for the run or generated after the revise.
 
 ## [0.86.0] - 2026-10-06
 
