@@ -61,6 +61,19 @@ const SKIP_REASON_TONES: Record<ScheduleSkipReason, BadgeTone> = {
   // PRD #1732 (D2): the schedule's pinned credential is disabled, or its pinned harness has no
   // enabled credential. Actionable — the owner enables it in Settings — so it reads amber.
   credential_disabled: "warning",
+  // PRD #2865 (ci_watch): self-resolving outcomes of a CI-repair fire read neutral; a halted
+  // episode or a repo without a default branch needs the owner, so it reads amber.
+  ci_green: "neutral",
+  ci_already_handled: "neutral",
+  ci_not_failed: "neutral",
+  ci_watched_not_seen: "neutral",
+  ci_unsupported: "neutral",
+  ci_evidence_limited: "neutral",
+  ci_capacity: "neutral",
+  ci_config_changed: "neutral",
+  ci_halted_no_progress: "warning",
+  ci_halted_attempt_cap: "warning",
+  no_default_branch: "warning",
 };
 
 // LastRunOutcome is the enriched "Last run" cell for a schedule that has a

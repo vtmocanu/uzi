@@ -50,13 +50,10 @@ import (
 	"strings"
 )
 
-// AutoApprove is a temporary migration seam for existing production readers.
-// U3 switches those readers to DefaultJob.AutoApprove before M1 ships.
-// WaitOnLimit remains true so default jobs wait through usage limits.
-const (
-	AutoApprove = true
-	WaitOnLimit = true
-)
+// WaitOnLimit is the fixed wait-on-limit flag every default job is seeded with, so a
+// default job waits through a usage limit rather than failing. Auto-approve is per job
+// (DefaultJob.AutoApprove, frontmatter auto_approve, default true).
+const WaitOnLimit = true
 
 // DefaultTimezone is applied to a catalog entry whose frontmatter omits the
 // timezone key.
