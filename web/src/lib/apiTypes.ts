@@ -2366,17 +2366,19 @@ export interface Worker {
   // row it describes. upgrade_detail is the sentence behind the badge ("running 0.11.0,
   // target 0.11.7"), null in the steady up_to_date case where there is nothing to say.
   //
-  // Five states, but the api derives only three from a version comparison:
+  // The api derives only three states from a version comparison:
   // up_to_date / outdated / unknown. "upgrading" and "upgrade_failed" require the
   // controller's roll report, because `version` is written ONLY at register — a worker
   // stuck offline mid-roll keeps reporting its OLD version and cannot self-report that
-  // it is stuck. Both arrive with the roll-health fold.
+  // it is stuck. The roll-health fold also distinguishes capacity blocks and initial
+  // provisioning / provisioning_failed from an upgrade of an existing worker.
   //
   // "unknown" is the honest answer, not an error: an unstamped image, an unparseable
   // report, or a "dev" control plane all land here, and none of them should raise an
   // alert.
   upgrade_status:
-    "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
+    "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed" |
+    "capacity_blocked" | "provisioning" | "provisioning_failed";
   upgrade_detail: string | null;
   // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
   // hosted worker with a fresh report, otherwise the control plane's own version. "" when
@@ -2395,16 +2397,17 @@ export interface Worker {
   // by reporting the fleet's own stale version as the target. The api cannot tell them
   // apart, so the UI states it rather than judging it.
   upgrade_target: string;
-  // The blocking container and the k8s waiting REASON behind an upgrade_failed. Null for
-  // every other status, and null on responses that carry no roll-health join (register,
+  // The blocking container and validated reason behind a failed roll, provisioning,
+  // or scheduler capacity block. Null on responses with no roll-health join (register,
   // heartbeat, create). The reason only — `message` is never sent, being free text that
   // carries paths and Secret names.
+  // Absent on older APIs; null when the current report has no validated cause.
+  upgrade_blocking_kind?: string | null;
   upgrade_blocking_container: string | null;
   upgrade_blocking_reason: string | null;
   // The blocking container's last exit code, null when it never terminated (a different
-  // fact from "exited 0"). It DISCRIMINATES causes the reason alone conflates — a
-  // seed-nix CrashLoopBackOff comes both from a permissions error unpacking the nix store
-  // and from that volume filling up.
+  // fact from "exited 0"). A seed-nix failure can result from permissions or a full
+  // volume; the exit code alone does not distinguish those causes.
   upgrade_last_exit_code: number | null;
   last_heartbeat_at: string | null;
   // api-owned anchor of when the worker became online (null offline); uptime = now − this, derived client-side.
@@ -2496,6 +2499,10 @@ export interface Worker {
   outbox_pending_terminal?: number | null;
   outbox_stale_retired?: number | null;
   outbox_blocked?: string | null;
+  // The worker's own self-reported run id for the oldest blocked outcome (the entry
+  // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
+  // joined to a run's title or status.
+  outbox_blocked_run_id?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.

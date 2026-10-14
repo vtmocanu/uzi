@@ -863,6 +863,7 @@ for (const setupDelay of [0, 5_000]) {
     const { claim, bare, clone, key } = await seed();
     await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
     const before = readJournal(bare, clone.branch);
+    before.recovery.claimGeneration = claim.claim_generation;
     before.recovery.startedAt = Date.now() - 60_000;
     before.recovery.deadline = before.recovery.startedAt + 300_000;
     command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
@@ -1553,6 +1554,7 @@ for (const setupDelay of [0, 5_000]) {
     await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
     const old = readJournal(bare, clone.branch);
     const startedAt = Date.now() - 60_000;
+    old.recovery.claimGeneration = claim.claim_generation;
     old.recovery.startedAt = startedAt;
     old.recovery.deadline = startedAt + 300_000;
     command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(old));
@@ -1914,7 +1916,7 @@ it("issue 2971 unique-content exhaustion stays blocked after a larger-cap restar
     dirtyLiteral: "only local dirty work\n", independentLargerCapProof: true }));
 });
 
-it("configured repeated real closure reads exhaust cumulatively, retain pins, and changed-cap restart stays blocked", async () => {
+it("configured unique real closure reads exhaust cumulatively, retain pins, and changed-cap restart stays blocked", async () => {
   const limit = 4096;
   const cache = configuredCache(limit);
   const { claim, bare, clone } = await seed(2512, false, cache);
@@ -1934,13 +1936,18 @@ it("configured repeated real closure reads exhaust cumulatively, retain pins, an
     assert.ok(sizes.reduce((sum, size) => sum + size, 0) < limit, "individual closure is below cap");
     await record(...args);
     pinnedTip = tip;
-    // At most limit+1 reads: each successful nonempty closure charges at least one byte.
-    // The first refusal propagates and prevents successor admission.
+    // Independent root closures contribute unique content; the first refusal propagates
+    // and prevents successor admission. Each successful closure charges at least one byte.
     for (let i = 0; i <= limit; i++) {
       reads++;
       await cache.withRecoveryOperation(scope.signal, scope.deadline, async () => {
         assert.equal((cache as any).recoveryOperations.getStore().closureBudget, beforeBudget);
-        assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
+        const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+          { input: `unique content ${i}\n`, encoding: "utf8" }).trim();
+        const tree = execFileSync("git", ["-C", bare, "mktree"],
+          { input: `100644 blob ${blob}\tunique.txt\n`, encoding: "utf8" }).trim();
+        const uniqueTip = command(bare, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", `unique root ${i}`);
+        assert.equal(await cache.verifyRecoveryClosure(bare, uniqueTip), true);
       });
     }
     throw new Error("fixture failed to exhaust cumulative budget");
@@ -1952,7 +1959,7 @@ it("configured repeated real closure reads exhaust cumulatively, retain pins, an
   assert.equal(models, 0);
   assert.equal(successors, 0);
   assert.equal(releases, 0);
-  assert.ok(reads > 1, "individually admissible repeated reads consumed the cumulative budget");
+  assert.ok(reads > 1, "individually admissible unique reads consumed the cumulative budget");
   assert.ok(beforeBudget.delivered > 0 && beforeBudget.delivered <= limit);
   const blocked = readJournal(bare, clone.branch);
   assert.equal(blocked.recovery.stage, "blocked");
@@ -2013,6 +2020,7 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
       if (failure === "timeout") {
         await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
         const before = readJournal(bare, clone.branch);
+        before.recovery.claimGeneration = claim.claim_generation;
         before.recovery.startedAt = Date.now() - 60_000;
         before.recovery.deadline = before.recovery.startedAt + 300_000;
         command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
@@ -2056,4 +2064,31 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
       }
     });
   }
+}
+
+for (const binding of ["bound predecessor", "legacy"] as const) {
+  it(`#2958: fresh fenced claim recovers expired ${binding} work and starts a model`, { skip: process.platform !== "linux" }, async () => {
+    const { claim, bare, clone, key } = await seed();
+    await git.reserveRecoveryIteration(bare, clone.branch, key,
+      { runId: claim.run_id, clonePath: clone.path }, 1, binding === "legacy" ? undefined : 1);
+    const before = readJournal(bare, clone.branch);
+    before.recovery.startedAt = Date.now() - 300_001;
+    before.recovery.deadline = before.recovery.startedAt + 300_000;
+    command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
+    let models = 0;
+    await runnerWith(factory(async ctx => {
+      models++;
+      assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
+      const admitted = readJournal(bare, clone.branch).recovery;
+      assert.equal(admitted.claimGeneration, 2);
+      assert.equal(admitted.attempts, 2);
+      assert.ok(admitted.deadline > before.recovery.deadline);
+      // No settled-turn callback: the count and source custody must survive this interruption.
+      throw new Error("fixture interrupted long turn");
+    }), fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+    assert.equal(models, 1);
+    assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2);
+    assert.equal(fs.existsSync(clone.path), true);
+    assert.equal(api.states.some(s => /budget exhausted/.test(s.body.failure_reason ?? "")), false);
+  });
 }

@@ -283,7 +283,7 @@ test("an authenticated alias wins before a competing canonical outcome is instal
 test("accepted boundary journals stay readable across every blocked-state update and restart", async () => {
   const { root, box, log } = await fixture(1024);
   const cap = 1024 + OUTBOX_RANGE_RESERVE_BYTES;
-  const reasons = ["gap_unrecoverable", "reserve_exhausted", "completion_permit_mismatch"] as const;
+  const reasons = ["gap_unrecoverable", "reserve_exhausted", "completion_permit_mismatch", "run_not_owned"] as const;
   // Search the admission boundary with distinct generations: an installed winner is immutable.
   let low = cap - 1024;
   let high = cap;

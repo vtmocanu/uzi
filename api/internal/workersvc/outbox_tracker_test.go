@@ -22,7 +22,7 @@ func TestOutboxTrackerRecordAndAggregate(t *testing.T) {
 		{RunID: r2, PendingMessages: 5, PendingTerminal: 2, StaleRetired: 0, BlockedReason: "reserve_exhausted", Since: now.Add(-time.Minute)},
 	}, now)
 
-	pm, pt, sr, blocked := tr.workerAggregate(w)
+	pm, pt, sr, blocked, _ := tr.workerAggregate(w)
 	if pm != 8 || pt != 2 || sr != 1 {
 		t.Fatalf("aggregate = (%d,%d,%d), want (8,2,1)", pm, pt, sr)
 	}
@@ -35,19 +35,23 @@ func TestOutboxTrackerAggregateReportsOldestBlocked(t *testing.T) {
 	tr := newOutboxTracker()
 	w := uuid.New()
 	now := time.Unix(2000, 0)
+	newer, older := uuid.New(), uuid.New()
 	tr.record(w, []OutboxEntry{
-		{RunID: uuid.New(), PendingMessages: 1, BlockedReason: "newer_block", Since: now.Add(-time.Minute)},
-		{RunID: uuid.New(), PendingMessages: 1, BlockedReason: "older_block", Since: now.Add(-10 * time.Minute)},
+		{RunID: newer, PendingMessages: 1, BlockedReason: "newer_block", Since: now.Add(-time.Minute)},
+		{RunID: older, PendingMessages: 1, BlockedReason: "older_block", Since: now.Add(-10 * time.Minute)},
 	}, now)
-	_, _, _, blocked := tr.workerAggregate(w)
+	_, _, _, blocked, blockedRun := tr.workerAggregate(w)
 	if blocked == nil || *blocked != "older_block" {
 		t.Fatalf("blocked = %v, want older_block (oldest Since wins)", blocked)
+	}
+	if blockedRun == nil || *blockedRun != older.String() {
+		t.Fatalf("blockedRunID = %v, want the oldest blocked entry's run %s", blockedRun, older)
 	}
 }
 
 func TestOutboxTrackerAggregateUntrackedWorkerIsAllNull(t *testing.T) {
 	tr := newOutboxTracker()
-	pm, pt, sr, blocked := tr.workerAggregate(uuid.New())
+	pm, pt, sr, blocked, _ := tr.workerAggregate(uuid.New())
 	if pm != 0 || pt != 0 || sr != 0 || blocked != nil {
 		t.Fatalf("untracked worker aggregate = (%d,%d,%d,%v), want all zero/nil", pm, pt, sr, blocked)
 	}
@@ -84,7 +88,7 @@ func TestOutboxTrackerClearsOnEmptyReport(t *testing.T) {
 	if _, _, ok := tr.runDepth(r); ok {
 		t.Fatal("runDepth present after an empty report; the set must clear on the next empty report")
 	}
-	if pm, _, _, blocked := tr.workerAggregate(w); pm != 0 || blocked != nil {
+	if pm, _, _, blocked, _ := tr.workerAggregate(w); pm != 0 || blocked != nil {
 		t.Fatalf("aggregate = (%d,%v) after clear, want (0,nil)", pm, blocked)
 	}
 }
@@ -106,7 +110,7 @@ func TestOutboxTrackerRecordReplacesWholeSet(t *testing.T) {
 	if e, _, ok := tr.runDepth(r2); !ok || e.PendingMessages != 9 {
 		t.Fatalf("r2 = (%+v,%v), want pending 9", e, ok)
 	}
-	if pm, _, _, _ := tr.workerAggregate(w); pm != 9 {
+	if pm, _, _, _, _ := tr.workerAggregate(w); pm != 9 {
 		t.Fatalf("aggregate pm = %d, want 9 (only r2 remains)", pm)
 	}
 }
@@ -121,7 +125,7 @@ func TestOutboxTrackerEvict(t *testing.T) {
 	if _, _, ok := tr.runDepth(r); ok {
 		t.Fatal("runDepth present after evict")
 	}
-	if pm, _, _, _ := tr.workerAggregate(w); pm != 0 {
+	if pm, _, _, _, _ := tr.workerAggregate(w); pm != 0 {
 		t.Fatalf("aggregate after evict = %d, want 0", pm)
 	}
 }

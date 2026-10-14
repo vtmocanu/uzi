@@ -96,8 +96,9 @@ you to confirm first: unlike deleting a worker you run yourself (which only
 revokes its token — the container keeps running until you stop it), deleting
 a hosted worker **permanently destroys its disks**, including its tools
 cache, so a replacement re-downloads everything from scratch. There's no
-restart in this version — if a hosted worker seems stuck, delete and
-re-provision it.
+owner restart action in this version. Read the blocking diagnosis before deciding
+whether deletion/re-provisioning is appropriate: it destroys the existing disks
+and does not repair a shortage of node CPU or memory.
 
 ## Status
 
@@ -106,9 +107,11 @@ worker's — a heartbeat, nothing pod-level. If one never comes online, that's
 one of the checks an admin can now see cross-user in **Admin → Health**
 (`fleet.roll`, see [Admin health](admin-health.md)) — it names the blocking
 container and reason for a stuck roll, across every owner's fleet, without
-anyone needing to check the pod by hand. (A worker that came online once and
-then failed an upgrade also shows in your own **Settings → Workers** — see
-[Worker versions and upgrades](worker-upgrades.md).)
+anyone needing to check the pod by hand. Your own **Settings → Workers** also
+shows roll failures, first-provision progress/failure, and **waiting for capacity**
+when the scheduler reports a verified CPU/memory shortage. Capacity blockage
+requires waiting, a smaller worker, or added capacity; Pending claims alone do
+not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
 ## Draining and cordoned
 
@@ -346,6 +349,30 @@ mechanics and the same-uid caveat, which applies to a journaled outcome
 exactly as it does to the message feed.
 
 A restart in the narrower window before that journal exists is also covered, once in the initial recovery episode (issue #1742). Right after the agent's final result, and before the worker starts finalizing (fetching the branch back, pushing, opening the MR), the worker writes a small authenticated finalize-pending record; it is not an outcome. If the worker container restarts while finalizing, it reports that record on register, and the api re-queues the run once even when that episode's re-queue budget is already spent, provided `RUN_MAX_REQUEUES > 0` and the lifetime finalize-resume marker is unused. Owner-started worker-death recovery episodes get no extra allowance. The run resumes through the ordinary claim path and completes only through the normal completion path at a later claim generation (the next claim, or the one after it when that claim first captures retained work and parks) (the claim-generation fences, plus the completion permit where the run is interlocked). A crash before that record is durable, or a slow restart without timely attested proof, uses ordinary disposition: requeue under the episode cap; at exhaustion, hold for the owner when recorded recovery evidence or uncertainty exists, otherwise fail `worker_lost` (not proof that no unrecorded worker work survives). The extra resume is once per run, never renewed by owner Resume, and off at `RUN_MAX_REQUEUES=0`, and `uzi run recovery` reports a source it could not archive as retained `source_only` custody rather than offering an export. See [ADR-1742](../adr/1742-finalize-resume-allowance.md).
+
+### run_not_owned: an outcome this reporting worker cannot replay
+
+If the api answers a worker's report for a run with `run_not_owned` (the run is attributed to another worker or to none, or no longer exists), this reporting worker cannot replay that outcome at its recorded claim generation; another worker may own the run. It keeps the journal, marks it **blocked** with reason `run_not_owned`, and stops sending it; it never deletes or retries it, and the block survives a restart. Only that exact structured answer does this: any other 404 keeps the ordinary retry. The worker logs once: `outbox: terminal journal blocked...` with the run id, claim generation and `terminal-<G>.json`.
+
+The blocked journal no longer pauses claims or appears in the worker's active snapshot lease, since the api cannot lease a run it does not attribute to that worker. Its local files are still protected. It shows as `outbox_blocked` (the reason) and `outbox_blocked_run_id` on the worker: in the TUI worker detail, `uzi worker list --json` and the admin workers JSON; the table cell shows only `blocked`. It does not appear on the run page.
+
+This is an **operator-assisted interim path**. Hosted-worker owners normally have no pod or volume access and should contact their operator; self-hosted owners with volume access are their own operator. A server-mediated owner discard is planned follow-up work. Every step below is a gate: stop on any mismatch or missing evidence.
+
+1. **Quiescence.** Stop the worker (scale the workload to 0, or stop the container). Verify with the platform's process listing that no worker process and no process using the run's checkout remains (pod gone, or `fuser`/`lsof` from a debug pod mounting the volume shows nothing). Confirm with `uzi run get <run>` that the run is not attributed to this worker, and that it is absent from the worker's last active snapshot. If the operator's token cannot read the run (404 or permission error), that is not evidence: get the attribution from the run's owner (their `uzi run get <run>`) or an admin-scoped read. Never operate on a running worker.
+2. **Exact attribution.** Open `outbox/<run>/terminal-<G>.json` (plaintext JSON with a MAC). Require `run_id` equal to the reported `outbox_blocked_run_id` and to the directory name, `claim_generation` equal to `G` from the filename, `blocked` true and `blocked_reason` `run_not_owned`. Unreadable or mismatched: stop.
+3. **Siblings.** List `outbox/<run>/` (`finalize-<G>.json`, other generations), the run's clone and recovery-store directories, and the database holds via `uzi run recovery <run>` (or have the owner or an admin list them). Leave them all in place; never delete a finalize record or recovery data.
+4. **Evidence, or an informed decision.** Copy the journal off the volume and capture commits from the stopped checkout with `git bundle create <run>.bundle --all`. Preserve uncommitted work as follows:
+   - Require **GNU tar** for the command below (`tar --version` must identify GNU tar; use an already installed `gtar` where that is its name). Do not substitute a newline-delimited file list.
+   - Save `git status --porcelain=v1 -z --untracked-files=all` as a binary status record outside the checkout. Parse its NUL-delimited records with a byte-oriented parser: each record starts with two status bytes and one space, followed by the literal path. A rename or copy has a second NUL-delimited path (the original path); preserve both names and the status in a separate metadata record. Do not feed the status record directly to tar, split paths on whitespace/newlines, use shell command substitution for them, or interpret them as shell commands.
+   - Capture every dirty tracked path regardless of directory name, including under `dist/`, `target/` and `node_modules/`. Record deletions and renames in the metadata record. Produce a separate binary `existing-paths.nul` containing only existing paths to archive, one literal repository-relative path followed by NUL; missing/deleted paths belong only in metadata. Preserve symlinks as links, including dangling links. Reject absolute paths or paths outside the stopped checkout.
+   - Include every untracked path unless it is a build or dependency artifact verified to hold no unique work: wholly regenerable from committed inputs (for example a committed lockfile or build definition), with no hand-edited or downloaded-only content. If that cannot be shown, include it. Record each exclusion and its reason separately.
+   - From the stopped checkout, use `tar --create --file <run>-uncommitted.tar --null --verbatim-files-from --files-from existing-paths.nul`. Both file-list options precede `--files-from`, so spaces, newlines and leading hyphens are literal filename bytes, never tar options. Quote the archive/list arguments if their paths require it. Keep the binary status record, deletion/rename metadata, exclusion record and a path-safe checksum manifest alongside the archive; process manifest paths as literal arguments, never space-joined shell text.
+   - Verify before deleting anything: `git bundle verify`, then a clone from the bundle into a fresh directory succeeds with the expected refs and tips; extract the tar into a fresh directory and compare each path from `existing-paths.nul` with the stopped checkout, including file contents and symlink targets. Check the separate deletion/rename metadata too. Any missing or differing path stops the procedure. A matching checksum manifest can verify regular-file contents, but `tar -tf` alone is not enough. The copied journal must parse with matching `run_id` and `claim_generation`.
+
+   Alternatively, the run's owner records an explicit informed decision to discard, naming what is lost: the outcome body's status, branch and MR fields, unbundled commits, and every listed uncommitted path. Without verified evidence or that decision, stop.
+5. **Delete and restart.** Delete only `terminal-<G>.json`, restart the worker, and confirm `outbox_blocked_run_id` no longer names the run.
+
+Deleting the journal releases only its own local physical protection. It does not release database custody or recovery holds: those release only through a server-side disposition, such as settlement on publication or archive evidence, the worker's release and settle endpoints, or the owner's `uzi run discard` / **Discard held work** (see [run-recovery.md](./run-recovery.md)). The worker's other local retention is unaffected. Design rationale: [ADR-1393](../adr/1393-worker-outbox-outcomes.md).
 
 ## How this differs from running your own worker
 

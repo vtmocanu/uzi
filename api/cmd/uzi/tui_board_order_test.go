@@ -1,11 +1,16 @@
 package main
 
 import (
+	"bytes"
+	"fmt"
 	"slices"
+	"strings"
 	"testing"
 	"time"
 
+	"github.com/charmbracelet/colorprofile"
 	"github.com/vtmocanu/uzi/api/internal/apitypes"
+	"github.com/vtmocanu/uzi/api/internal/uzicli"
 )
 
 // Issue #2098: the DONE band shares the web archive's finish-time ordering.
@@ -103,4 +108,79 @@ func TestCompareDoneRunsUnknownStatusLast(t *testing.T) {
 	if compareDoneRuns(unknown, unknown) != 0 {
 		t.Error("equal unknown statuses must retain server order")
 	}
+}
+
+// Issue #2965: DONE order and the rendered AGE cell must use the same anchor.
+func TestBoardDoneAgeMatchesFinishOrder(t *testing.T) {
+	now := time.Now()
+	// Future dates pin the newer age to 0s; the older ages sit midway through
+	// their hour/day buckets, avoiding a clock-boundary flake.
+	newer := now.Add(time.Hour)
+	older := now.Add(-6*time.Hour - 30*time.Minute)
+	for _, status := range []string{"completed", "failed", "cancelled"} {
+		for _, fallback := range []bool{false, true} {
+			t.Run(status+fmt.Sprintf("/fallback=%t", fallback), func(t *testing.T) {
+				runs := []apitypes.RunListItemDTO{
+					{RunDTO: apitypes.RunDTO{ID: "oldfinish-1", Status: status,
+						CreatedAt: now.Add(-12*time.Hour - 30*time.Minute), UpdatedAt: older, FinishedAt: &older}},
+					{RunDTO: apitypes.RunDTO{ID: "newfinish-2", Status: status,
+						CreatedAt: now.Add(-48*time.Hour - 30*time.Minute), UpdatedAt: newer}},
+				}
+				if !fallback {
+					runs[1].FinishedAt = &newer
+					// A later metadata update must not override a recorded finish.
+					runs[0].UpdatedAt = newer.Add(time.Hour)
+				}
+				ordered := bandOrder(runs)
+				if ordered[0].ID != "newfinish-2" {
+					t.Fatalf("newest finish must sort first: %v", ordered)
+				}
+				m := tuiTestModel(t, &uzicli.FakeClient{Runs: runs}, "")
+				m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+				var buf bytes.Buffer
+				writer := colorprofile.NewWriter(&buf, nil)
+				writer.Profile = colorprofile.Ascii
+				if _, err := writer.Write([]byte(m.View().Content)); err != nil {
+					t.Fatal(err)
+				}
+				if strings.Contains(buf.String(), "38;") || strings.Contains(buf.String(), "48;") {
+					t.Fatal("Ascii writer retained colors")
+				}
+				out := stripANSI(buf.String())
+				for id, age := range map[string]string{"newfinish-2": "0s", "oldfinish-1": "6h"} {
+					line := boardAgeTestRow(t, out, id)
+					if !strings.Contains(line, " "+age+" ") {
+						t.Errorf("DONE row %s must show finish-anchor age %s: %s", id, age, line)
+					}
+				}
+			})
+		}
+	}
+}
+
+func TestBoardLiveAgeKeepsCreationTime(t *testing.T) {
+	now := time.Now()
+	for _, status := range []string{"queued", "running", "awaiting_approval"} {
+		t.Run(status, func(t *testing.T) {
+			r := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{ID: "liveage-3", Status: status,
+				CreatedAt: now.Add(-48*time.Hour - 30*time.Minute), UpdatedAt: now.Add(time.Hour)}}
+			m := tuiTestModel(t, &uzicli.FakeClient{Runs: []apitypes.RunListItemDTO{r}}, "")
+			m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: []apitypes.RunListItemDTO{r}})
+			line := boardAgeTestRow(t, stripANSI(m.View().Content), r.ID)
+			if !strings.Contains(line, " 2d ") {
+				t.Errorf("live row must keep its creation age: %s", line)
+			}
+		})
+	}
+}
+
+func boardAgeTestRow(t *testing.T, out, id string) string {
+	t.Helper()
+	for _, line := range strings.Split(out, "\n") {
+		if strings.Contains(line, shortRunID(id)) {
+			return line
+		}
+	}
+	t.Fatalf("row %s missing from rendered board:\n%s", id, out)
+	return ""
 }

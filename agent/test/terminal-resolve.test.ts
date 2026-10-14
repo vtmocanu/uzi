@@ -1,4 +1,4 @@
-import { afterEach, describe, it } from "node:test";
+import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
 import { existsSync } from "node:fs";
@@ -14,7 +14,8 @@ import {
   makeTerminalOutboxDeps,
   type TerminalOutboxDeps,
 } from "../src/terminal-resolve.js";
-import { RequestError } from "../src/client.js";
+import { RequestError, WorkerClient } from "../src/client.js";
+import { FakeApi } from "./fake-api.js";
 import type { MessageGapsResponse, OutgoingMessage, StateAck, StateRequest } from "../src/protocol.js";
 import { nullLogger, recordingLogger } from "./helpers.js";
 
@@ -731,5 +732,151 @@ describe("resolvePendingTerminal single-flight (issue #1512)", () => {
     const later = scriptedSend([{ applied: true, status: "failed" }]);
     await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: later.send, ifBusy: "skip" });
     assert.equal(later.bodies.length, 0, "the journal is retired, so nothing to send (not skipped-forever)");
+  });
+});
+
+// Issue #2950: a structured not-owned 404 on the run's /state report is permanent for the claim
+// generation, so the journal is BLOCKED (kept byte-intact, never resent), never retired.
+describe("run_not_owned /state refusal (issue #2950)", () => {
+  const NOT_OWNED_BODY = '{"error":"run not found for this worker","reason":"run_not_owned"}';
+  const statePath = (run: string): string => `/api/worker/runs/${run}/state`;
+  const complete = (body: string): { complete: boolean; bytes: number } => ({ complete: true, bytes: Buffer.byteLength(body) });
+  const notOwned = (): RequestError => new RequestError("POST", statePath("r1"), 404, NOT_OWNED_BODY, undefined, complete(NOT_OWNED_BODY));
+
+  it("first-send 404 blocks the journal with run_not_owned; a second resolve sends nothing; body bytes unchanged", async () => {
+    const { outbox } = await mkOutbox();
+    const deps = depsFor(outbox, new FakeClient());
+    await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    const before = await outbox.readTerminalJournal("r1", GEN);
+    const scripted = scriptedSend([notOwned()]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 1);
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1, "kept, not retired");
+    assert.equal(outbox.depthFor("r1")?.blockedReason, "run_not_owned");
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 1, "a blocked journal is never resent");
+    const after = await outbox.readTerminalJournal("r1", GEN);
+    assert.equal(after?.blocked, true);
+    assert.equal(after?.blockedReason, "run_not_owned");
+    assert.deepEqual(after?.body, before?.body);
+    assert.equal(JSON.stringify(after?.body), JSON.stringify(before?.body));
+    assert.equal(after?.messagesThroughSeq, before?.messagesThroughSeq);
+  });
+
+  it("a 404 on the gap-fill re-send also blocks the journal", async () => {
+    const { outbox } = await mkOutbox();
+    const client = new FakeClient();
+    const deps = depsFor(outbox, client);
+    client.gapsResponder = () => ({ gaps: [{ first: 2, last: 2 }] });
+    await outbox.journalTerminal("r1", GEN, "running", 3, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    const scripted = scriptedSend([{ applied: false, status: "running", reason: "messages_pending" }, notOwned()]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 2);
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1);
+    assert.equal(outbox.depthFor("r1")?.blockedReason, "run_not_owned");
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 2, "no further sends");
+  });
+
+  // All shape/route/status controls carry complete wire evidence, so their own predicate must
+  // refuse them. Missing/incomplete evidence has separate controls below.
+  const controlError = (method: string, path: string, status: number, body: string): RequestError =>
+    new RequestError(method, path, status, body, undefined, complete(body));
+  const controls: Array<[string, RequestError]> = [
+    ["plain 404 without reason", controlError("POST", statePath("r1"), 404, '{"error":"run not found for this worker"}')],
+    ["HTML 404", controlError("POST", statePath("r1"), 404, "<html><body>404 page not found</body></html>")],
+    ["wrong key (code instead of reason)", controlError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","code":"run_not_owned"}')],
+    ["extra key", controlError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","reason":"run_not_owned","x":1}')],
+    ["another run's path", controlError("POST", statePath("r2"), 404, NOT_OWNED_BODY)],
+    ["GET method", controlError("GET", statePath("r1"), 404, NOT_OWNED_BODY)],
+    ["409 with the same body", controlError("POST", statePath("r1"), 409, NOT_OWNED_BODY)],
+    ["array body", controlError("POST", statePath("r1"), 404, "[]")],
+    ["wrong error text", controlError("POST", statePath("r1"), 404, '{"error":"nope","reason":"run_not_owned"}')],
+  ];
+  controls.push(["exact body but no completeness evidence", new RequestError("POST", statePath("r1"), 404, NOT_OWNED_BODY)]);
+  controls.push(["exact body but evidence says incomplete", new RequestError("POST", statePath("r1"), 404, NOT_OWNED_BODY, undefined, { complete: false, bytes: 0 })]);
+  for (const [name, err] of controls) {
+    it(`control: ${name} stays unblocked and resendable`, async () => {
+      const { outbox } = await mkOutbox();
+      const deps = depsFor(outbox, new FakeClient());
+      await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+      const scripted = scriptedSend([err, { applied: true, status: "failed" }]);
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+      assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1);
+      assert.equal(outbox.depthFor("r1")?.blockedReason, undefined, "not blocked");
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+      assert.equal(scripted.bodies.length, 2, "resent");
+      assert.equal(outbox.depthFor("r1")?.pendingTerminal, 0, "then retired on the 200");
+    });
+  }
+});
+
+// Issue #2950: through the REAL WorkerClient, so the completeness evidence comes from toError's
+// actual read of the wire body, not from a constructed RequestError.
+describe("run_not_owned via the real client (issue #2950)", () => {
+  const TOKEN = "worker-join-token-0123456789";
+  const JSON_BODY = '{"error":"run not found for this worker","reason":"run_not_owned"}';
+  let api: FakeApi;
+  let baseUrl: string;
+  beforeEach(async () => {
+    api = new FakeApi(TOKEN);
+    baseUrl = await api.listen();
+  });
+  afterEach(async () => {
+    await api.close();
+  });
+
+  async function blockedAfter(client: WorkerClient): Promise<string | undefined> {
+    const { outbox } = await mkOutbox();
+    const deps = depsFor(outbox, new FakeClient());
+    await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    await resolvePendingTerminal(deps, {
+      runId: "r1",
+      claimGeneration: GEN,
+      send: (b) => client.reportState("r1", b),
+    });
+    return outbox.depthFor("r1")?.blockedReason;
+  }
+  const newClient = (fetchImpl?: typeof fetch): WorkerClient =>
+    new WorkerClient(baseUrl, TOKEN, "0.1.0-test", nullLogger(), {
+      sleep: async () => {},
+      terminalRetrySchedule: [1],
+      ...(fetchImpl ? { fetch: fetchImpl } : {}),
+    });
+
+  it("the api's exact body (JSON plus trailing newline) blocks the journal", async () => {
+    api.sendRawState("r1", 404, JSON_BODY + "\n");
+    assert.equal(await blockedAfter(newClient()), "run_not_owned");
+  });
+
+  it("valid JSON padded with whitespace past 1024 raw bytes (under the read cap) does not block", async () => {
+    api.sendRawState("r1", 404, JSON_BODY + " ".repeat(2000));
+    assert.equal(await blockedAfter(newClient()), undefined);
+  });
+
+  it("valid JSON, whitespace to the read cap, then garbage does not block", async () => {
+    api.sendRawState("r1", 404, JSON_BODY + " ".repeat(4096 - JSON_BODY.length) + "garbage");
+    assert.equal(await blockedAfter(newClient()), undefined);
+  });
+
+  it("a body whose stream fails mid-read does not block", async () => {
+    const failing: typeof fetch = async () => {
+      const enc = new TextEncoder();
+      const body = new ReadableStream<Uint8Array>({
+        start(c) { c.enqueue(enc.encode(JSON_BODY)); },
+        pull() { throw new Error("connection reset"); },
+      });
+      return new Response(body, { status: 404 });
+    };
+    assert.equal(await blockedAfter(newClient(failing)), undefined);
+  });
+
+  it("toError keeps body text unchanged for an oversized body: first 4096 chars, trimmed", async () => {
+    const big = "  " + "x".repeat(6000);
+    api.sendRawState("r1", 404, big);
+    const err = await newClient().reportState("r1", { status: "failed" }).then(() => undefined, (e: unknown) => e);
+    assert.ok(err instanceof RequestError);
+    assert.equal(err.body, "x".repeat(4094));
+    assert.equal(err.bodyEvidence?.complete, false);
   });
 });

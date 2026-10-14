@@ -178,8 +178,15 @@ interface ManifestData {
  *  message-gap fill hit `WORKER_GAP_FILL_MAX` and the api still refuses; `reserve_exhausted`
  *  — the terminal-sized reserve could not admit the journal, so it was sent unjournaled. The
  *  worker surfaces the reason on the heartbeat outbox entry, and the owner resolves it (never a
- *  timer). Exported so M3b's send path names exactly these three. */
-export type TerminalBlockedReason = "completion_permit_mismatch" | "gap_unrecoverable" | "reserve_exhausted";
+ *  timer). Exported so M3b's send path names exactly these. Issue #2950 adds `run_not_owned` —
+ *  the api answered the structured not-owned 404 (`run_not_owned`) to the /state report, which is
+ *  permanent for that claim generation; the journal is kept byte-intact, never resent and never
+ *  auto-retired, and the owner/operator resolves it. */
+export type TerminalBlockedReason =
+  | "completion_permit_mismatch"
+  | "gap_unrecoverable"
+  | "reserve_exhausted"
+  | "run_not_owned";
 
 /** PRD #1391 M3 (Run B): the outcome of {@link Outbox.journalTerminal}. A discriminated union so a
  *  caller (M3b's send path) never confuses "installed durably" with "sent unjournaled": on success
@@ -2913,6 +2920,7 @@ const TERMINAL_BLOCKED_REASONS: ReadonlySet<string> = new Set<TerminalBlockedRea
   "completion_permit_mismatch",
   "gap_unrecoverable",
   "reserve_exhausted",
+  "run_not_owned",
 ]);
 
 /** Validate an authenticated terminal-journal object into in-memory metadata (shape only; the MAC

@@ -9,6 +9,7 @@ import (
 	"slices"
 	"strings"
 	"time"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5"
@@ -95,7 +96,15 @@ func sincePtr(t time.Time) *string {
 // terminal escapes / bidi overrides; SanitizeBounded then caps the length. The result
 // carries no control characters and is at most maxEvidenceBytes long.
 func safe(v string) string {
-	return termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
+	clean := termsafe.SanitizeBounded(termsafe.CellText(v), maxEvidenceBytes)
+	if len(clean) > maxEvidenceBytes {
+		end := maxEvidenceBytes
+		for end > 0 && !utf8.RuneStart(clean[end]) {
+			end--
+		}
+		clean = clean[:end]
+	}
+	return clean
 }
 
 // humanDur renders a duration for a summary: whole minutes under an hour, else Hh Mm.
@@ -134,10 +143,9 @@ func (s *Service) hostedConfigured(workers []store.ListAllWorkersRow) bool {
 	return false
 }
 
-// checkFleetRoll classifies the hosted fleet's roll health. A worker is upgrade_failed
-// exactly when it has a FRESH controller signal whose phase is `stuck` (R1 of the upgrade
-// classifier, the only path to upgrade_failed — deliberately not version-dependent, so it
-// needs no CPVersion). warn when some hosted workers are stuck, danger when every one is.
+// checkFleetRoll counts every fresh hosted stuck signal, including capacity blocks
+// and first-provision failures, independent of history or the upgrading ceiling.
+// warn when some hosted workers are stuck, danger when every one is.
 // `na` when hosted workers are not configured — HostedWorkerVersion=="" AND no kind='hosted'
 // worker exists (the predicate confirmed against config.go:641).
 //
@@ -174,15 +182,17 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 
 	var (
 		failed          int
+		capacityBlocked int
+		provisionFailed int
 		anyFreshSignal  bool
 		stuckSince      time.Time
 		haveStuckSince  bool
-		blockingReason  string
 		blockingCont    string
 		targetTag       string
 		firstStuckName  string
 		haveStuckWorker bool
 	)
+	causes := map[string]int{}
 	for _, w := range hosted {
 		signalFresh := w.RollPhase.Valid && w.RollPhase.String != "" &&
 			w.RollObservedAt.Valid && now.Sub(w.RollObservedAt.Time) <= rollSignalTTL
@@ -191,10 +201,33 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		}
 		if signalFresh && w.RollPhase.String == workersvc.PhaseStuck {
 			failed++
+			sig := &workersvc.RollSignal{
+				BlockingKind: w.RollBlockingKind.String, Phase: w.RollPhase.String,
+				PodPhase: w.RollPodPhase.String, BlockingReason: w.RollBlockingReason.String,
+				BlockingContainer: w.RollBlockingContainer.String,
+			}
+			if w.RollRestartCount.Valid {
+				sig.RestartCount = w.RollRestartCount.Int32
+			}
+			if w.RollLastExitCode.Valid {
+				code := w.RollLastExitCode.Int32
+				sig.LastExitCode = &code
+			}
+			if workersvc.EffectiveBlockingKind(sig) == workersvc.BlockingKindSchedulerCapacity {
+				capacityBlocked++
+			} else if workersvc.NeverRegistered(w.Worker.Status, w.Worker.LastHeartbeatAt.Valid,
+				w.Worker.Version.Valid, w.Worker.SnapshotRegisterNonce.Valid,
+				w.Worker.RegisteredPodUid.Valid, w.Worker.RollHeartbeatAt.Valid) {
+				provisionFailed++
+			}
+			reason := safe(w.RollBlockingReason.String)
+			if reason == "" {
+				reason = "unknown reason"
+			}
+			causes[reason]++
 			if !haveStuckWorker {
 				haveStuckWorker = true
 				firstStuckName = w.Worker.Name
-				blockingReason = w.RollBlockingReason.String
 				blockingCont = w.RollBlockingContainer.String
 				targetTag = w.RollWorkerImageTag.String
 			}
@@ -204,6 +237,50 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 				stuckSince = w.RollPhaseSince.Time
 				haveStuckSince = true
 			}
+		}
+	}
+
+	// Each reason is sanitized and counted; one worker's cause cannot conceal siblings.
+	reasons := make([]string, 0, len(causes))
+	for reason := range causes {
+		reasons = append(reasons, reason)
+	}
+	slices.Sort(reasons)
+	causeCounts := make([]string, 0, len(reasons))
+	for _, reason := range reasons {
+		causeCounts = append(causeCounts, fmt.Sprintf("%s (%d)", reason, causes[reason]))
+	}
+	failureCounts := fmt.Sprintf("%d of %d hosted workers stuck", failed, len(hosted))
+	if capacityBlocked > 0 {
+		failureCounts += fmt.Sprintf("; %d capacity blocked", capacityBlocked)
+	}
+	if provisionFailed > 0 {
+		failureCounts += fmt.Sprintf("; %d first-provision failures", provisionFailed)
+	}
+	addFailures := func(paced bool) {
+		if failed == 0 {
+			return
+		}
+		if paced {
+			c.Summary += " " + failureCounts + ": " + strings.Join(causeCounts, "; ") + "."
+		} else if capacityBlocked > 0 || provisionFailed > 0 {
+			c.Summary += ". " + failureCounts + "."
+		}
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Failure causes", Value: safe(strings.Join(causeCounts, "; "))})
+		if paced {
+			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))})
+		}
+		actions := []string{}
+		if capacityBlocked > 0 {
+			actions = append(actions, "Wait for available capacity, choose a smaller worker, or ask an operator to add capacity.")
+		}
+		if failed > capacityBlocked {
+			actions = append(actions, "Inspect the blocking diagnostics for failed workers; resolve storage or runtime faults, or publish the image or a chart naming a published tag for image failures.")
+		}
+		c.Action = strPtr(strings.Join(actions, " "))
+		c.Command = strPtr("kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=<id>")
+		if haveStuckSince {
+			c.Since = sincePtr(stuckSince)
 		}
 	}
 
@@ -285,6 +362,7 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 			{Label: "Blocking reason", Value: cause},
 			{Label: "Retained image / version coverage", Value: safe(strings.Join(coverage, "; "))},
 		}
+		addFailures(true)
 		return c
 	}
 
@@ -314,7 +392,7 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	if t := safe(targetTag); t != "" {
 		tagLabel = t
 	}
-	reasonLabel := safe(blockingReason)
+	reasonLabel := strings.Join(reasons, "; ")
 	if reasonLabel == "" {
 		reasonLabel = "unknown reason"
 	}
@@ -322,15 +400,11 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 	c.Evidence = []apitypes.HealthEvidenceDTO{
 		{Label: "Target tag", Value: tagLabel},
 		{Label: "Blocking container", Value: orDash(safe(blockingCont))},
-		{Label: "Blocking reason", Value: reasonLabel},
+		{Label: "Blocking reason", Value: safe(reasonLabel)},
 		{Label: "Worker", Value: orDash(safe(firstStuckName))},
 		{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))},
 	}
-	c.Action = strPtr("Publish the image, or release a chart whose workers.image.tag names a published tag.")
-	c.Command = strPtr("kubectl -n <worker-namespace> describe pod -l uzi.dev/hosted-worker-id=<id>")
-	if haveStuckSince {
-		c.Since = sincePtr(stuckSince)
-	}
+	addFailures(false)
 	if failed == len(hosted) {
 		c.Severity = sevDanger
 	} else {

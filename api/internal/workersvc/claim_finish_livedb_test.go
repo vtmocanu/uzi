@@ -9,6 +9,7 @@ import (
 	"time"
 
 	"github.com/google/uuid"
+	"github.com/jackc/pgx/v5"
 	"github.com/jackc/pgx/v5/pgtype"
 
 	"github.com/vtmocanu/uzi/api/internal/capability"
@@ -177,6 +178,32 @@ func TestClaimObservedCaseReplayParksLiveDB(t *testing.T) {
 		t.Fatal("the gen-2 hold B's claim opened is missing")
 	}
 	assertClaimRecoveryHold(t, env, gen2, "released", true)
+
+	// Issue #2950 invariant: a worker that got run_not_owned for (run, g) never again owns the
+	// run at g. The worker blocks (does not retire) its terminal journal on that reason, which is
+	// only sound if ownership cannot return at the same generation. After the park above:
+	one, two := int64(1), int64(2)
+	// (1) B claimed generation 2 but the park moved the run to A, so B is not the owner.
+	if _, applied, err := fx.svc.SetState(env.ctx, wkrRow(t, env, fx.workerB), fx.runID, StateRequest{State: "failed", ClaimGeneration: &two}); applied || !errors.Is(err, ErrRunNotOwned) {
+		t.Fatalf("B gen-2 terminal report: applied=%v err=%v, want not applied + ErrRunNotOwned", applied, err)
+	}
+	// (2) A owns the row but at generation 2: its gen-1 report is stale and changes nothing.
+	if _, applied, err := fx.svc.SetState(env.ctx, wkrRow(t, env, fx.workerA), fx.runID, StateRequest{State: "failed", ClaimGeneration: &one}); applied || !errors.Is(err, ErrStaleClaim) {
+		t.Fatalf("A gen-1 terminal report: applied=%v err=%v, want not applied + ErrStaleClaim", applied, err)
+	}
+	after := mustRun(t, env, fx.runID)
+	if after.Status != "recovery_wait" || after.ClaimGeneration != 2 || !after.WorkerID.Valid || uuid.UUID(after.WorkerID.Bytes) != fx.workerA {
+		t.Fatalf("run after rejected reports = status %s gen %d worker %v, want recovery_wait gen 2 worker A", after.Status, after.ClaimGeneration, after.WorkerID)
+	}
+	// (3) The park itself cannot run a second time at the same generation, for either worker.
+	for name, w := range map[string]uuid.UUID{"B": fx.workerB, "A": fx.workerA} {
+		_, err := env.q.ParkRunCodexAccountUnavailable(env.ctx, store.ParkRunCodexAccountUnavailableParams{
+			ID: fx.runID, WorkerID: pgtype.UUID{Bytes: w, Valid: true}, ClaimGeneration: 2,
+		})
+		if !errors.Is(err, pgx.ErrNoRows) {
+			t.Fatalf("second ParkRunCodexAccountUnavailable as %s at gen 2: err=%v, want pgx.ErrNoRows", name, err)
+		}
+	}
 }
 
 // TestClaimPreMintQuarantineUsesSnapshotIdentityLiveDB (e): a quarantine that lands before the

@@ -1603,4 +1603,6 @@ type WorkerUpgradeReport struct {
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	Pacing               []byte             `json:"pacing"`
 	PacingObservedAt     pgtype.Timestamptz `json:"pacing_observed_at"`
+	// Display-only roll blocking classification; does not control scheduling.
+	BlockingKind pgtype.Text `json:"blocking_kind"`
 }

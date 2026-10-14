@@ -43,6 +43,27 @@ const externalWorker = { kind: "external", upgrade_status: "unknown" } as unknow
 const line = () => screen.queryByRole("status", { name: "Your hosted workers" });
 
 describe("HealthPlatformLine", () => {
+  it("includes capacity and storage causes in either mixed-fleet ordering", () => {
+    const capacity = { ...failedHosted, upgrade_status: "capacity_blocked",
+      upgrade_blocking_kind: "scheduler_capacity",
+      upgrade_blocking_reason: "scheduler capacity: insufficient cpu and memory" } as Worker;
+    const provisioning = { ...seedNixHosted, upgrade_status: "provisioning_failed" } as Worker;
+    for (const workers of [[capacity, provisioning], [provisioning, capacity]]) {
+      const { unmount } = render(<HealthPlatformLine isAdmin={false} runs={[queuedRun]} workers={workers} />);
+      expect(line()?.textContent).toContain("insufficient CPU and memory");
+      expect(line()?.textContent).toContain("choose a smaller worker");
+      expect(line()?.textContent).toContain("Provisioning failed.");
+      expect(line()?.textContent).toContain("/nix volume running out of space");
+      unmount();
+    }
+  });
+
+  it.each(["provisioning", "future_status"])("hides the line for a %s hosted worker", (status) => {
+    render(<HealthPlatformLine isAdmin={false} runs={[queuedRun]}
+      workers={[failedHosted, { ...failedHosted, upgrade_status: status } as Worker]} />);
+    expect(line()).toBeNull();
+  });
+
   it("appears with the IMAGE-PULL cause when the fleet is stuck on ImagePullBackOff", () => {
     render(<HealthPlatformLine isAdmin={false} runs={[queuedRun]} workers={[failedHosted]} />);
     expect(line()).not.toBeNull();

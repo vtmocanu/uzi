@@ -282,8 +282,12 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		row += paintSeg(m.pal.faintC, bg, false, padCell(m.renderer.Plain(strOr(r.OwnerEmail, ""), boardOwnerWidth), boardOwnerWidth)) + gap
 	}
 
+	ageAt := r.CreatedAt
+	if terminal {
+		ageAt = doneAnchor(r)
+	}
 	row += paintSeg(stateC, bg, false, padCell(tok.word, boardStatusWordWidth)) + gap +
-		paintSeg(m.pal.faintC, bg, false, padCell(relAge(r.CreatedAt), boardAgeWidth)) + gap
+		paintSeg(m.pal.faintC, bg, false, padCell(relAge(ageAt), boardAgeWidth)) + gap
 
 	if m.boardShowMile() {
 		row += m.boardProgressCell(r, terminal, bg, tok.word) + gap

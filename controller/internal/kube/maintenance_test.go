@@ -2,6 +2,7 @@ package kube
 
 import (
 	"context"
+	"encoding/json"
 	"errors"
 	"slices"
 	"testing"
@@ -38,6 +39,22 @@ func (f *maintenanceFake) ClearDrain(context.Context, string) error {
 	return nil
 }
 func (f *maintenanceFake) ReportReadiness(ctx context.Context, r protocol.StatusReport) error {
+	for _, worker := range r.Workers {
+		encoded, err := json.Marshal(worker)
+		if err != nil {
+			return err
+		}
+		var row map[string]any
+		if err := json.Unmarshal(encoded, &row); err != nil {
+			return err
+		}
+		if row["phase"] != "settled" {
+			return errors.New("readiness must serialize settled")
+		}
+		if _, present := row["blocking_kind"]; present {
+			return errors.New("readiness must omit blocking kind")
+		}
+	}
 	return f.Report(ctx, r)
 }
 func (f *maintenanceFake) Report(_ context.Context, r protocol.StatusReport) error {

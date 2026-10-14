@@ -20,6 +20,94 @@ import {
 
 afterEach(cleanup);
 
+describe("scheduler capacity and provisioning", () => {
+  it.each([
+    ["capacity_blocked", "waiting for capacity", true],
+    ["provisioning", "provisioning", false],
+    ["provisioning_failed", "provisioning failed", true],
+  ] as const)("presents %s consistently across badge, strip and fleet", (status, label, attention) => {
+    const worker = aWorker({ upgrade_status: status, upgrade_detail: null });
+    render(<><WorkerUpgradeBadge worker={worker} /><WorkerUpgradeDetail worker={worker} />
+      <FleetUpgradePanel workers={[worker]} cpVersion="0.11.7" /></>);
+    expect(screen.getByText(label)).toBeTruthy();
+    expect(screen.getByText(label[0].toUpperCase() + label.slice(1))).toBeTruthy();
+    expect(screen.getByText(`1 ${label}`)).toBeTruthy();
+    expect(needsAttention(worker)).toBe(attention);
+    expect(fleetSummary([worker], "").attention).toBe(attention ? 1 : 0);
+    expect(screen.queryByText("Upgrade failed")).toBeNull();
+  });
+
+  it.each([
+    ["cpu", "CPU"],
+    ["memory", "memory"],
+    ["cpu and memory", "CPU and memory"],
+  ])("shows fixed %s guidance without storage claims", (reason, resource) => {
+    render(<WorkerUpgradeDetail worker={aWorker({
+      upgrade_status: "capacity_blocked", upgrade_detail: null,
+      upgrade_blocking_kind: "scheduler_capacity",
+      upgrade_blocking_reason: `scheduler capacity: insufficient ${reason}`,
+      upgrade_blocking_container: "seed-nix", upgrade_last_exit_code: 2,
+    })} />);
+    expect(screen.getByText(`The scheduler has insufficient ${resource} for this worker. Wait for capacity, choose a smaller worker, or ask an operator to add capacity.`)).toBeTruthy();
+    expect(screen.getByRole("button", { name: "Copy kubectl command" })).toBeTruthy();
+    expect(screen.queryByText(/nix store|volume|rollback|Upgrade failed/i)).toBeNull();
+  });
+
+  it("preserves a real storage failure during provisioning", () => {
+    render(<WorkerUpgradeDetail worker={aWorker({
+      upgrade_status: "provisioning_failed", upgrade_detail: null,
+      upgrade_blocking_container: "seed-nix", upgrade_blocking_reason: "CrashLoopBackOff",
+      upgrade_last_exit_code: 2,
+    })} />);
+    expect(screen.getByText("Provisioning failed")).toBeTruthy();
+    expect(screen.getByText(/\/nix volume running out of space/)).toBeTruthy();
+  });
+
+  it("handles future status and cause fields safely in a mixed fleet", () => {
+    const unknown = aWorker({ upgrade_status: "toString" as Worker["upgrade_status"] });
+    const workers = [
+      aWorker({ upgrade_status: "capacity_blocked" }),
+      aWorker({ upgrade_status: "provisioning" }),
+      aWorker({ upgrade_status: "provisioning_failed" }),
+      unknown,
+    ];
+    const summary = fleetSummary(workers, "");
+    expect(summary.counts.unknown).toBe(1);
+    expect(summary.counts.capacity_blocked).toBe(1);
+    expect(summary.counts.provisioning).toBe(1);
+    expect(summary.counts.provisioning_failed).toBe(1);
+    expect(summary.attention).toBe(2);
+    expect(upgradePresentation(unknown.upgrade_status)).toBeNull();
+    render(<FleetUpgradePanel workers={workers} cpVersion="" />);
+    expect(screen.getByText("1 waiting for capacity")).toBeTruthy();
+    expect(screen.getByText("1 provisioning")).toBeTruthy();
+    expect(screen.getByText("1 provisioning failed")).toBeTruthy();
+    expect(screen.getByText("1 not reporting a version")).toBeTruthy();
+    expect(screen.getByText("2 workers need attention.")).toBeTruthy();
+    const bar = screen.getByRole("presentation");
+    expect(bar.children).toHaveLength(3);
+    for (const segment of bar.children) {
+      expect(parseFloat((segment as HTMLElement).style.width)).toBeCloseTo(33.3333, 3);
+    }
+  });
+
+  it.each([undefined, "future_kind", "scheduler_capacity"])("keeps unknown capacity diagnostics generic and sanitized (%s)", (kind) => {
+    const bad = String.fromCharCode(0x202e);
+    const { container } = render(<><WorkerUpgradeBadge worker={aWorker({
+      upgrade_status: "capacity_blocked", upgrade_detail: `waiting${bad}`,
+    })} /><WorkerUpgradeDetail worker={aWorker({
+      upgrade_status: "capacity_blocked", upgrade_detail: `waiting${bad}`,
+      upgrade_blocking_kind: kind, upgrade_blocking_container: "seed-nix",
+      upgrade_blocking_reason: kind === "scheduler_capacity" ? "toString" : "CrashLoopBackOff",
+    })} /></>);
+    expect(screen.getByText(/This worker is waiting for scheduler capacity/)).toBeTruthy();
+    expect(screen.getByText("waiting for capacity").getAttribute("title")).toBe("waiting");
+    expect(container.textContent).not.toContain(bad);
+    expect(screen.queryByText(/nix store/)).toBeNull();
+  });
+});
+
+
 function aWorker(over: Partial<Worker> = {}): Worker {
   return {
     id: "w1",
@@ -332,7 +420,7 @@ describe("likelyCause", () => {
     expect(likelyCause("worker", "CreateContainerConfigError")).toBeNull();
   });
 
-  it("names BOTH causes of a seed-nix crash-loop and uses the exit code to separate them", () => {
+  it("names BOTH causes of a seed-nix crash-loop and reports the exit code without distinguishing them", () => {
     const withCode = likelyCause("seed-nix", "CrashLoopBackOff", 2);
     expect(withCode).toMatch(/permissions error/);
     // The generalisation this replaced was false: under `set -eu -o pipefail` the tar

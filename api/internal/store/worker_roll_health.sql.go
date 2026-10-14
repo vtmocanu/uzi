@@ -17,6 +17,12 @@ SELECT
     w.id AS worker_id,
     w.kind,
     w.version,
+    w.status,
+    w.last_heartbeat_at,
+    w.snapshot_register_nonce,
+    w.registered_pod_uid,
+    w.roll_heartbeat_at,
+    r.blocking_kind,
     r.phase,
     r.phase_since,
     r.target_image,
@@ -43,21 +49,27 @@ ORDER BY w.created_at
 `
 
 type GetWorkerUpgradeSummaryForUserRow struct {
-	WorkerID          uuid.UUID          `json:"worker_id"`
-	Kind              string             `json:"kind"`
-	Version           pgtype.Text        `json:"version"`
-	Phase             pgtype.Text        `json:"phase"`
-	PhaseSince        pgtype.Timestamptz `json:"phase_since"`
-	TargetImage       pgtype.Text        `json:"target_image"`
-	PodPhase          pgtype.Text        `json:"pod_phase"`
-	BlockingContainer pgtype.Text        `json:"blocking_container"`
-	BlockingReason    pgtype.Text        `json:"blocking_reason"`
-	RestartCount      pgtype.Int4        `json:"restart_count"`
-	LastExitCode      pgtype.Int4        `json:"last_exit_code"`
-	ObservedAt        pgtype.Timestamptz `json:"observed_at"`
-	UpgradingSince    pgtype.Timestamptz `json:"upgrading_since"`
-	WorkerImageTag    pgtype.Text        `json:"worker_image_tag"`
-	Muted             bool               `json:"muted"`
+	WorkerID              uuid.UUID          `json:"worker_id"`
+	Kind                  string             `json:"kind"`
+	Version               pgtype.Text        `json:"version"`
+	Status                string             `json:"status"`
+	LastHeartbeatAt       pgtype.Timestamptz `json:"last_heartbeat_at"`
+	SnapshotRegisterNonce pgtype.Text        `json:"snapshot_register_nonce"`
+	RegisteredPodUid      pgtype.UUID        `json:"registered_pod_uid"`
+	RollHeartbeatAt       pgtype.Timestamptz `json:"roll_heartbeat_at"`
+	BlockingKind          pgtype.Text        `json:"blocking_kind"`
+	Phase                 pgtype.Text        `json:"phase"`
+	PhaseSince            pgtype.Timestamptz `json:"phase_since"`
+	TargetImage           pgtype.Text        `json:"target_image"`
+	PodPhase              pgtype.Text        `json:"pod_phase"`
+	BlockingContainer     pgtype.Text        `json:"blocking_container"`
+	BlockingReason        pgtype.Text        `json:"blocking_reason"`
+	RestartCount          pgtype.Int4        `json:"restart_count"`
+	LastExitCode          pgtype.Int4        `json:"last_exit_code"`
+	ObservedAt            pgtype.Timestamptz `json:"observed_at"`
+	UpgradingSince        pgtype.Timestamptz `json:"upgrading_since"`
+	WorkerImageTag        pgtype.Text        `json:"worker_image_tag"`
+	Muted                 bool               `json:"muted"`
 }
 
 // Roll health for ONE user's workers. Named for the scoping so a caller cannot
@@ -97,6 +109,12 @@ func (q *Queries) GetWorkerUpgradeSummaryForUser(ctx context.Context, userID uui
 			&i.WorkerID,
 			&i.Kind,
 			&i.Version,
+			&i.Status,
+			&i.LastHeartbeatAt,
+			&i.SnapshotRegisterNonce,
+			&i.RegisteredPodUid,
+			&i.RollHeartbeatAt,
+			&i.BlockingKind,
 			&i.Phase,
 			&i.PhaseSince,
 			&i.TargetImage,
@@ -166,14 +184,14 @@ const upsertWorkerRollHealth = `-- name: UpsertWorkerRollHealth :execrows
 
 INSERT INTO worker_upgrade_reports (
     worker_id, phase, phase_since, target_image, pod_phase,
-    blocking_container, blocking_reason, restart_count, last_exit_code,
+    blocking_container, blocking_reason, restart_count, last_exit_code, blocking_kind,
     controller_reported_at, observed_at, upgrading_since,
     poll_interval_seconds, worker_image_tag, pacing, pacing_observed_at
 )
 SELECT
     w.id, $1, $2, $3, $4,
-    $5, $6, $7, $8,
-    $9, $10,
+    $5, $6, $7, $8, $9,
+    $10, $11,
     -- First report of a non-terminal roll stamps the ceiling's anchor. A ` + "`" + `settled` + "`" + `
     -- report stamps nothing: settled is not a roll in progress.
     --
@@ -209,19 +227,19 @@ SELECT
     -- classifier's. The parentheses around the OR are load-bearing: AND binds tighter, so
     -- without them the phase check would attach to only the first disjunct.
     CASE WHEN $1::text IN ('rolling', 'stuck')
-              AND (NOT $11::boolean
-                   OR split_part($12::text, '+', 1)
+              AND (NOT $12::boolean
+                   OR split_part($13::text, '+', 1)
                       IS DISTINCT FROM split_part(w.version, '+', 1))
-         THEN $10::timestamptz ELSE NULL END,
-    $13, $12,
-    CASE WHEN $14::boolean THEN $15::jsonb ELSE NULL END,
-    CASE WHEN $14::boolean AND $15::jsonb IS NOT NULL
-         THEN $10::timestamptz ELSE NULL END
+         THEN $11::timestamptz ELSE NULL END,
+    $14, $13,
+    CASE WHEN $15::boolean THEN $16::jsonb ELSE NULL END,
+    CASE WHEN $15::boolean AND $16::jsonb IS NOT NULL
+         THEN $11::timestamptz ELSE NULL END
 FROM workers w
-WHERE w.id = $16 AND w.kind = 'hosted'
+WHERE w.id = $17 AND w.kind = 'hosted'
 ON CONFLICT (worker_id) DO UPDATE SET
-    pacing = CASE WHEN $14::boolean THEN EXCLUDED.pacing ELSE worker_upgrade_reports.pacing END,
-    pacing_observed_at = CASE WHEN $14::boolean THEN EXCLUDED.pacing_observed_at ELSE worker_upgrade_reports.pacing_observed_at END,
+    pacing = CASE WHEN $15::boolean THEN EXCLUDED.pacing ELSE worker_upgrade_reports.pacing END,
+    pacing_observed_at = CASE WHEN $15::boolean THEN EXCLUDED.pacing_observed_at ELSE worker_upgrade_reports.pacing_observed_at END,
     phase                  = EXCLUDED.phase,
     phase_since            = EXCLUDED.phase_since,
     target_image           = EXCLUDED.target_image,
@@ -354,6 +372,8 @@ ON CONFLICT (worker_id) DO UPDATE SET
     last_exit_code         = CASE WHEN EXCLUDED.phase IN ('rolling', 'stuck')
                                   THEN EXCLUDED.last_exit_code
                                   ELSE worker_upgrade_reports.last_exit_code END,
+    -- Classification is a current observation, including absence on settled reports.
+    blocking_kind          = EXCLUDED.blocking_kind,
     controller_reported_at = EXCLUDED.controller_reported_at,
     observed_at            = EXCLUDED.observed_at,
     poll_interval_seconds  = EXCLUDED.poll_interval_seconds,
@@ -391,6 +411,7 @@ type UpsertWorkerRollHealthParams struct {
 	BlockingReason       pgtype.Text        `json:"blocking_reason"`
 	RestartCount         int32              `json:"restart_count"`
 	LastExitCode         pgtype.Int4        `json:"last_exit_code"`
+	BlockingKind         pgtype.Text        `json:"blocking_kind"`
 	ControllerReportedAt pgtype.Timestamptz `json:"controller_reported_at"`
 	ObservedAt           pgtype.Timestamptz `json:"observed_at"`
 	TagValid             bool               `json:"tag_valid"`
@@ -432,6 +453,7 @@ func (q *Queries) UpsertWorkerRollHealth(ctx context.Context, arg UpsertWorkerRo
 		arg.BlockingReason,
 		arg.RestartCount,
 		arg.LastExitCode,
+		arg.BlockingKind,
 		arg.ControllerReportedAt,
 		arg.ObservedAt,
 		arg.TagValid,

@@ -2320,7 +2320,10 @@ reason means.
 | `up to date` | the worker runs the release it is targeted at, or a newer one |
 | `outdated` | it runs an older release, and nothing is currently rolling it |
 | `upgrading` | a roll is in progress; expected and transient |
-| `FAILED` | it tried to take a new release and could not — this is the one to act on |
+| `FAILED` | a previously registered hosted worker has a fresh stuck rollout signal |
+| `capacity blocked` | a fresh verified scheduler CPU/memory blocker; wait, choose a smaller worker, or add capacity |
+| `provisioning` | first provision is progressing, based on positive API-owned no-registration history |
+| `provisioning failed` | first provision is stuck; investigate the blocking reason |
 | `-` | no usable version to compare (an unstamped local image, or a `dev` control plane) |
 
 Two things worth knowing before acting on it. A worker's version is recorded **at
@@ -2330,8 +2333,11 @@ than from the worker itself. And a **hosted** worker is compared against the tag
 controller is rolling to, which `values.yaml` may pin below the api's own release; the
 Workers page states that divergence when it exists.
 
-`-` is not a problem to fix. It is what a locally built image and an unstamped control
-plane both look like, which is most of a development setup.
+`-` normally means there is no usable version comparison, as with a locally built
+image or an unstamped control plane. It is not proof that an offline hosted worker
+is healthy. Confirmed first-provision and capacity failures have their own labels.
+These diagnostics also appear in `uzi admin workers` and worker TUI details;
+capacity remains in the attention set without claiming that storage is healthy.
 
 ### Worker lane capacity
 
