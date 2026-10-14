@@ -72,17 +72,24 @@ trap 'if [ "$?" -ne 0 ]; then cat "$RUNROOT/custody-window.jsonl" 2>/dev/null ||
 LIMIT=8
 SEED_IDENT="e2e-72-custody-seed"
 
-# Sample once per boundary; busy includes chats as well as active runs. Do not wait
-# for a busy worker: that would hide a broken phase-isolation precondition.
+# Sample once per boundary; busy includes chats as well as active runs. Every
+# worker must be idle, and the first must be online. Do not wait for a busy worker:
+# that would hide a broken phase-isolation precondition.
 assert_custody_worker_idle() {
   local context="$1" snapshot observed
   snapshot="$(apiget /api/workers)" \
     || fail "$context: worker snapshot API error; status=unknown busy=unknown"
   observed="$(printf '%s' "$snapshot" | jq -cse '
-    if length == 1 then .[0] | {status: .workers[0].status, busy: .workers[0].busy}
-    else error("expected one worker snapshot") end' 2>/dev/null)" \
+    if length != 1 then error("expected one worker snapshot")
+    else .[0] |
+      if (.workers | type) == "array" and (.workers | length) > 0 then
+        {status: .workers[0].status, busy: .workers[0].busy,
+         busy_count: ([.workers[] | select(.busy == true)] | length),
+         all_idle: all(.workers[]; .busy == false)}
+      else error("expected a nonempty worker array") end
+    end' 2>/dev/null)" \
     || fail "$context: invalid worker snapshot; status=unknown busy=unknown"
-  printf '%s' "$observed" | jq -e '.status == "online" and .busy == false' >/dev/null \
+  printf '%s' "$observed" | jq -e '.status == "online" and .busy == false and .all_idle == true' >/dev/null \
     || fail "$context: needs online idle worker; observed $observed"
 }
 

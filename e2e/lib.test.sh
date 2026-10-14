@@ -914,6 +914,8 @@ idle_snapshot_case() {
   echo 'worker idle accepted'
 }
 custody_case "custody worker accepts online and Boolean idle" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"online","busy":false}]}'
+custody_case "custody worker accepts two online idle workers" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"online","busy":false},{"status":"online","busy":false}]}'
+custody_case "custody worker accepts an offline idle second worker" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"online","busy":false},{"status":"offline","busy":false}]}'
 for fixture in \
   '{"workers":[{"status":"online","busy":true}]}' \
   '{"workers":[{"status":"offline","busy":false}]}' \
@@ -923,6 +925,8 @@ for fixture in \
   '{"workers":[{"status":"online","busy":0}]}' \
   '{"workers":[{"status":"online","busy":null}]}' \
   '{"workers":[{"status":"online","busy":true},{"status":"online","busy":false}]}' \
+  '{"workers":[{"status":"online","busy":false},{"status":"online","busy":true}]}' \
+  '{"workers":[{"status":"online","busy":false},{"status":"offline"}]}' \
   'invalid JSON' '' 'api-error'; do
   custody_case "custody worker refuses [$fixture]" fail 'snapshot test:' idle_snapshot_case "$fixture"
   cases=$((cases + 1))
@@ -1035,6 +1039,6 @@ done
 
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has at least 179 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has at least 185 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 179 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 185 ] && [ "$cases" -eq "$passed" ]
