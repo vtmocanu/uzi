@@ -113,7 +113,7 @@ exhaustive reader inventory (the M2 audit below is the inventory):
   rewritten by a later block).
 - `agent/src/runner.ts:17417`:
   `if (error instanceof RecoveryClosureLimitError) { blocker = "decoded_history_limit"; await fail(); }`
-- `agent/src/runner.ts:17258-17259`: the blocked-journal report detail
+- `agent/src/runner.ts:17258-17260`: the blocked-journal report detail
   (“previous decoded verification exhaustion; current cap …; prior cap not recorded”).
 - `adr/1197-transient-recovery-park.md` (#2743 amendment, “Configuration and failure
   boundary”) says an already blocked decoded-history journal stays blocked across
@@ -130,7 +130,7 @@ both PRs were `opened`. Both merges are in base `84d365ed` as `2b84c993` (#2976)
 | Issue | What it fixes | Does it change the #2971 outcome? | Evidence |
 | --- | --- | --- | --- |
 | #2971 | Nothing yet. An episode blocked at `decoded_history_limit` under an older cap stays blocked after the cap is raised; restart, reclaim and newer claim generations all fail without re-verifying. | — | Characterization test, three executions (cap 4096; cap 1048576 same generation; cap 1048576 generation 3). |
-| #2958 / PR #2976 | An unblocked episode whose five-minute deadline expired during a park or long turn gets one fresh deadline window per positively fenced claim. | **No.** Both blocked short-circuits (`runner.ts:17270`, `git.ts:5907`) precede the window computations (`runner.ts:17276`, `git.ts:5911`). #2958 itself scoped this: “Episodes already blocked stay blocked with their original reasons, including `decoded_history_limit`.” | Generation-3 restart in the characterization test: zero proofs, zero successors, journal byte-identical. The reviewer's mutation (making both guards generation-scoped) turned that assertion red while the same-generation restart stayed green. |
+| #2958 / PR #2976 | An unblocked episode whose five-minute deadline expired during a park or long turn gets one fresh deadline window per positively fenced claim. | **No.** Both blocked short-circuits (`runner.ts:17270`, `git.ts:5907`) precede the window computations (`runner.ts:17276`, `git.ts:5911`). #2958 itself scoped this: “Episodes already blocked stay blocked with their original reasons, including `decoded_history_limit`.” | Generation-3 restart in the characterization test: zero proofs, zero successors, journal byte-identical. The test pins only the runner guard: making it generation-scoped turns the generation-3 assertions red while the same-generation restart stays green. Making only the `git.ts:5907` guard generation-scoped leaves the test green, because the runner guard stops the claim first; that precedence is read from code, not pinned by this test. |
 | #2979 / PR #2981 | Repeated closure checks within one recovery operation no longer re-hash and re-charge the same objects (an operation-scoped verified-object cache, `git.ts` `closureCache`), so a fresh episode with a large shared history stops exhausting 8 GiB by repetition. | **No.** It lowers the chance that a *new* episode blocks; it never revisits a journal already at `stage: "blocked"`, which never reaches a closure check. Genuinely unique content over the cap still blocks (the #2971 fixture uses unique 64 KiB content, and its single first closure check exhausts the 4096-byte cap). | #2979's description: “It is distinct from #2971, which covers an episode already blocked by an older limit.” Characterization test unchanged in outcome after the merge. |
 
 Practical consequence: after #2976 and #2981 fewer *new* episodes should block, but
@@ -138,6 +138,109 @@ every journal already at `blocked / decoded_history_limit` — whatever cap bloc
 (1 GiB before #2743, 8 GiB for run `1ab9349c`) — stays permanently blocked. The only
 ways forward remain the existing salvage paths or a new authorized re-verification
 (M3).
+
+## M2: cap-recording audit — NOT CLEAN, proposed work only
+
+Proposal audited: persist the actual `RecoveryClosureLimitError.limit` when a
+*fresh* episode blocks on `decoded_history_limit`, keep legacy blocked journals as
+explicitly “prior cap not recorded”, change no blocked behaviour and grant no retry
+authority. The approved rule allows the change only after a complete, clean
+reader/writer and downgrade audit. Audit at `94594b12` (researcher, 2026-10-14):
+**not clean**, so no code changed. The audit is recorded here as proposed work.
+
+### Blocking sites
+
+- **B1 — closed progress key set, and downgrade.** `agent/src/recovery-progress.ts`
+  `recoveryProgress` rejects any key not in
+  `keys(o, ["version", "source", "attempts", "startedAt", "deadline", "claimGeneration", "backoffMs", "stage", "restoreTip", "successor", "blocker"])`.
+  A current worker would need an allowlist entry. Every released worker, including
+  the chart's pinned worker image, rejects the new key instead of dropping it, and
+  fails closed at each journal reader below. Those readers are
+  `readRecoveryCapture` (seed paths and `terminalRetainedSnapshot`),
+  `journaledClonePaths` (canonical reuse and sweeps for the whole bare), and ACK
+  retirement in `readAcknowledgedReportSourcesUnderLock`. Operator inspect in
+  `gatherRetainedUnderLock` degrades to `unreadable_journal`. ADR-1197 already calls
+  downgrade during pending recovery unsupported, but this adds a new failure on a
+  terminal blocked journal.
+- **B2 — backup validator.** In `.agents/skills/uzi-watcher/scripts/backup-runs.sh`,
+  the protected-descriptor validator's
+  `def progress: type == "object" and fields(["version","source","attempts","startedAt","deadline","backoffMs","stage","restoreTip","successor","blocker"])`
+  rejects any extra key. The audit confirmed it **already rejects base's
+  `claimGeneration`**, which #2976 writes on every positively fenced reservation.
+  The script's own jq program was run against constructed blocked
+  `decoded_history_limit` descriptors:
+
+  | Descriptor | Output | Exit code |
+  | --- | --- | --- |
+  | base shape without `claimGeneration` | accepted | 0 |
+  | with `claimGeneration` | `invalid protected descriptor` | 5 |
+  | with `claimGeneration` plus a cap key | `invalid protected descriptor` | 5 |
+
+  The script maps that rejection to `probe_inconclusive` and then FAIL. A new key
+  would hit the same rejection. The open-key active-journal validator further down
+  the same script accepts extra keys. `backup-runs.test.sh` has no fixture carrying
+  `claimGeneration`, so its tests do not catch this. The `claimGeneration` defect
+  is pre-existing, from #2976. It was reported as an incidental issue and is not
+  fixed here.
+
+### Neutral sites (no change needed beyond B1)
+
+- `parseRecoveryJournal`: top-level allowlist; a key nested under `recovery` is fine.
+- `writeRecovery`: re-parses before writing.
+- The spread writers in `reserveRecoveryIteration`, `recoveryClockCurrent`,
+  `recordRecoveryCapture` and `prepareRecoverySuccessor` carry the key forward.
+- `blockRecoveryEpisode` would set the key in its single blocking write. An
+  already-blocked journal returns early, so a first recorded value is never renewed.
+- `completeRecoveryEpisode` strips `recovery` and never applies to blocked journals.
+- The protected-descriptor `JSON.stringify` equality checks in
+  `detachTerminalRetained` and `protectedRecoveries` compare parsed values with a
+  stable key order.
+- The ops channel (`agent/src/ops/retained-source.mjs`, `retained-source-server.ts`)
+  never reads journal fields.
+- No reader was found in `e2e/`, `scripts/`, `deploy/`, `.claude/` or `Taskfile.yml`.
+
+### Server and web sweep (tracked, verified rather than assumed)
+
+Each command was `git grep -n -F -- "<needle>" -- <dir>`:
+
+| Needle | `api/` | `web/src` | `controller/` | Classification |
+| --- | --- | --- | --- | --- |
+| `decoded_history_limit` | 0 | 0 | 0 | — |
+| `Retained recovery blocked` | 1 | 0 | 0 | embedded doc |
+| `prior cap not recorded` | 1 | 0 | 0 | embedded doc (`configuration.md` mirror) |
+| `failure_reason` | 386 | 112 | 0 | store/sqlc, DTOs, display and tests; no text parser found |
+| `blocker` | 141 | 23 | 19 | tests, embedded docs, unrelated identifiers |
+
+A further grep for the other `RecoveryBlocker` names over non-test server code
+returned nothing. Conclusion: the server treats `failure_reason` as opaque text. The
+`blocker` hits were spot-checked, not read exhaustively.
+
+### Proposed work, if the human chooses it later
+
+1. Fix B2 first and independently: add `claimGeneration` to the protected
+   `progress` field list and add a `backup-runs.test.sh` fixture carrying it. This
+   is a pre-existing #2976 defect.
+2. Cap recording itself, choosing between:
+   - (a) a nested optional `recovery` key: allowlist and type check in
+     `recoveryProgress`, set only in `blockRecoveryEpisode` for a fresh
+     `RecoveryClosureLimitError`, plus the B2 field, with downgrade documented as
+     failing closed;
+   - (b) a separate `uzi-recovery.<branch>.<name>` config key: older workers ignore
+     it, but it needs its own clear/retire lifecycle at every journal-blanking site
+     and is not carried into the protected descriptor.
+3. Reword the prose that would become false for newly blocked journals: ADR-1197
+   (#2743 amendment), `docs/configuration.md`, `docs/run-recovery-wait.md` and the
+   embedded mirrors via `task docs:sync`. Update the two tests that pin the
+   “prior cap not recorded” text. Add a CHANGELOG entry.
+4. Required test: red/green on persistence, with these controls:
+   - other blockers write no cap;
+   - legacy journals stay unknown;
+   - an already-blocked journal never renews its recorded cap;
+   - the older-format parser's rejection is pinned.
+
+Separate documentation inaccuracy found by the audit: ADR-1197, ADR-1783 and
+`docs/run-recovery.md` say older workers “may drop the durable recovery fields”, but
+older workers reject unknown keys and fail closed. Reported as an incidental issue.
 
 Recorded decisions read at `specs/human.md:877,886,1004,1303` retain custody,
 require exact disposal authority and qualify checkpoint coverage. No conflict
