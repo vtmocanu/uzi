@@ -44,9 +44,11 @@ not to replace that read.
 If summary generation fails, is refused or times out, it's simply skipped:
 the card falls back to the run title and the run proceeds. After autopilot
 persists an approved plan, its summary runs alongside implementation without
-waiting for the summary. At a human gate, the worker awaits the plan summary
-attempt before waiting for your verdict, so that attempt can add a delay;
-its failure does not prevent approval or implementation.
+waiting for the summary. At a human gate, the worker starts the plan summary
+attempt without delaying the wait for your verdict; its failure does not
+prevent approval or implementation. A summary still in flight at the first
+implementation checkpoint or at run end is not kept for the result, as for
+autopilot.
 
 Planning and seeded or pre-approved runs of all three kinds are eligible for
 an intent summary on both harnesses, unless an intent summary already exists.

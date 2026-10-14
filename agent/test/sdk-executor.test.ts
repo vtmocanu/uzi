@@ -277,12 +277,13 @@ function makeCtx(
     config: null,
     sessionId: null,
     onSessionId: (s) => sessionIds.push(s),
-    // PRD #362 M3c: model the real gate's ordering — persist plan_md (the awaiting_approval
-    // report) THEN invoke the onPlanPersisted hook (which posts the plan summary) BEFORE
-    // returning the verdict. The plan-summary POST's stale-write guard reads runs.plan_md,
-    // so it can only match once plan_md is persisted; this fake reproduces that ordering so
-    // the summary tests exercise the same sequence production does. The hook is swallowed
-    // here exactly as the real gate swallows it, so a throwing hook never fails the gate.
+    // PRD #362 M3c: persist plan_md (the awaiting_approval report) THEN invoke the
+    // onPlanPersisted hook (which posts the plan summary). The plan-summary POST's stale-write
+    // guard reads runs.plan_md, so it can only match once plan_md is persisted. This fake
+    // AWAITS the hook before returning the verdict, which is a deterministic simplification:
+    // the production gate (runner.ts) starts the hook without awaiting it (issue #2901), and
+    // the runner-level tests in runner-plan-gate.test.ts cover that ordering. A throwing hook
+    // is swallowed so it never fails the gate.
     gatePlan: async (planMd, _milestones, onPlanPersisted) => {
       gated.push(planMd);
       persisted.planMd = planMd;

@@ -2420,10 +2420,16 @@ export class CodexExecutor implements Executor {
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
       issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
     });
-    const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
+    // Invalidate the current plan-summary flight and latched result. Does not reopen
+    // summaryLifecycleClosed; returns the new generation.
+    const supersedePlanSummary = (): number => {
       const generation = ++planGeneration;
       if (this.planFlight) { this.planFlight.closed = true; this.planFlight.ctrl.abort(); }
       latestPlanSummary = undefined;
+      return generation;
+    };
+    const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
+      const generation = supersedePlanSummary();
       // A later accepted candidate may start fresh after a refused capture/switch.
       this.summaryLifecycleClosed = false;
       let flight: CodexExecutor["planFlight"];
@@ -2903,6 +2909,9 @@ export class CodexExecutor implements Executor {
             }
             revisions++;
           }
+          // Accepted revise: the plan being summarised is superseded; the revised plan's summary
+          // starts from the next gatePlan's onPlanPersisted.
+          supersedePlanSummary();
           ctx.emit({ kind: "plan_revising", agent: "worker",
             payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions } });
           // The revise turn resumes the plan thread, which holds the plan being revised.

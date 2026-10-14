@@ -368,8 +368,8 @@ export interface RunContext {
    * report so the human approves the breakdown too. Omitted/empty ⇒ no milestones on
    * the report (additive-optional; a run with no milestones is unchanged).
    *
-   * Advisory hook after accepted plan persistence. Human gates await it before their
-   * verdict wait; autopilot starts it without waiting before implementation. The
+   * Advisory hook after accepted plan persistence. Both human gates and autopilot
+   * start it without awaiting it, so it never delays the verdict wait or implementation. The
    * callback receives the actual stored candidate, including a checked canonical plan.
    * `settles` identifies the revise input this plan answers: it is finalized only
    * after the revised plan's awaiting_approval report is applied; refusal or failure

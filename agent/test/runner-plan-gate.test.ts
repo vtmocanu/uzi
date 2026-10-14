@@ -19,6 +19,8 @@ import { StubExecutor, PlanRejectedError, STUB_FAIL_SENTINEL, STUB_ASK_SENTINEL,
 import { AUTOPILOT_SENTINEL_ANSWER } from "../src/runner.js";
 import { CI_CONFIG_MARKER } from "../src/prompt.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
+import type { PlanSummaryResult, SummaryRunner } from "../src/summary-runner.js";
+import type { Logger } from "../src/log.js";
 import type { StateRequest } from "../src/protocol.js";
 import { SteeringChannel } from "../src/steering.js";
 import {
@@ -201,16 +203,21 @@ describe("approval waiter", () => {
 
 // Script only the external app-server peer; the real transport, Codex hooks and runner
 // gate own framing, revision, persistence and callback ordering.
-function summaryPlanProvider(plans: string[]): NonNullable<CodexExecutorDeps["launchProviderRoot"]> {
+function summaryPlanProvider(
+  plans: string[],
+  // Awaited when the provider is asked to start turn N (0-based): plans first, then the implementation turn.
+  onTurn?: (index: number) => Promise<void>,
+): NonNullable<CodexExecutorDeps["launchProviderRoot"]> {
   let turns = 0;
   return async () => {
     const inbound = new PassThrough();
     const outbound = new PassThrough();
     const lines = createInterface({ input: outbound });
     const frame = (value: unknown) => inbound.write(JSON.stringify(value) + "\n");
-    lines.on("line", line => {
+    lines.on("line", async line => {
       const request = JSON.parse(line);
       if (!request.method || request.id === undefined) return;
+      if (request.method === "turn/start") await onTurn?.(turns);
       let result: unknown = {};
       if (request.method === "initialize")
         result = { userAgent: "codex/test", codexHome: "/owned/codex", platformFamily: "unix", platformOs: "linux" };
@@ -241,6 +248,31 @@ function summaryPlanProvider(plans: string[]): NonNullable<CodexExecutorDeps["la
   };
 }
 
+function codexSummaryDeps(plans: string[], onTurn?: (index: number) => Promise<void>): CodexExecutorDeps {
+  return {
+    launchProviderRoot: summaryPlanProvider(plans, onTurn),
+    launchEffectRoot: async () => ({
+      started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
+        nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 200,
+      transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      waitChild: async () => ({ event: "child_exit", code: 0 }),
+      dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
+      failed: undefined, whenFailed: new Promise<Error>(() => {}),
+    }),
+    wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
+    sessionStore: {
+      adopt: async () => ({ files: 0 }), inspect: async () => "absent",
+      remove: async () => {}, persist: async () => ({ files: 0, bytes: 0 }),
+    },
+    spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
+    provisionRunTools: async () => ({ toolEnv: {} }),
+    installDeps: async () => ({ results: [], truncated: false }),
+    idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
+    };
+}
+
 describe("2833 M3 runner Codex summary persistence", () => {
   for (const mode of ["initial", "revised", "replacement-failed", "replacement-409", "autopilot"] as const) {
     it(`2833 M3 ${mode}: summaries follow durable human gates and only accepted replacement reaches result`, async () => {
@@ -257,11 +289,17 @@ describe("2833 M3 runner Codex summary persistence", () => {
       if (selected.kind !== "codex") throw new Error("invalid fixture binding");
       api.codexAuthModes.set(claim.run_id, "api_key");
       let presentations = 0;
+      // The runner no longer awaits the summary hook (issue #2901), so each verdict is appended only
+      // after that presentation's summary attempt has settled; the assertions below then keep
+      // meaning "the attempt for presentation N ran against plan N".
+      const attemptSettled = [deferred(), deferred()];
       api.onState(claim.run_id, body => {
         if (body.status !== "awaiting_approval") return;
-        presentations++;
-        api.appendInputs(claim.run_id, [input(revised && presentations === 1 ? "revise_plan" : "approve_plan",
-          revised && presentations === 1 ? "Revise the plan" : undefined)]);
+        const index = presentations++;
+        void attemptSettled[index]!.promise.then(() => {
+          api.appendInputs(claim.run_id, [input(revised && index === 0 ? "revise_plan" : "approve_plan",
+            revised && index === 0 ? "Revise the plan" : undefined)]);
+        });
       });
       const observations: { generated: string; persisted: string | undefined; status: string | undefined }[] = [];
       const attempts: { guard: string; persisted: string | undefined; status: string | undefined }[] = [];
@@ -279,28 +317,7 @@ describe("2833 M3 runner Codex summary persistence", () => {
           throw new RequestError("POST", "/summary/plan", 500, "summary persistence failed");
         accepted.push(body.summary);
       };
-      const deps: CodexExecutorDeps = {
-        launchProviderRoot: summaryPlanProvider(plans),
-        launchEffectRoot: async () => ({
-          started: { event: "started", supervisorPid: 200, childPid: 201, subreaper: true,
-            nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
-          supervisorPid: 200,
-          transport: { stdin: new PassThrough(), stdout: new PassThrough(), stderr: new PassThrough() },
-          snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
-          waitChild: async () => ({ event: "child_exit", code: 0 }),
-          dispose: async () => ({ clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } }),
-          failed: undefined, whenFailed: new Promise<Error>(() => {}),
-        }),
-        wireFileop: () => ({ client: { op: async () => ({ ok: true }) }, dispose: async () => {} }),
-        sessionStore: {
-          adopt: async () => ({ files: 0 }), inspect: async () => "absent",
-          remove: async () => {}, persist: async () => ({ files: 0, bytes: 0 }),
-        },
-        spawnCommand: async () => ({ code: 0, stdout: "", stderr: "" }),
-        provisionRunTools: async () => ({ toolEnv: {} }),
-        installDeps: async () => ({ results: [], truncated: false }),
-        idleMs: 5000, wallMs: 5000, childTurnDeadlineMs: 5000,
-      };
+      const deps = codexSummaryDeps(plans);
       await runnerWith(() => {
         const executor = new CodexExecutor(nullLogger(), homeDir, {
           binding: selected.binding, client,
@@ -319,7 +336,11 @@ describe("2833 M3 runner Codex summary persistence", () => {
           result = await executor.run({ ...ctx, gatePlan: (md, milestones, callback, settles) =>
             gate(md, milestones, callback && (async persisted => {
               callbacks.push(persisted);
-              await callback(persisted);
+              try {
+                await callback(persisted);
+              } finally {
+                attemptSettled[callbacks.length - 1]!.resolve();
+              }
             }), settles),
           });
           return result;
@@ -397,7 +418,7 @@ it("M1 destructive checkpoint waits for summary settlement before reaping", asyn
 
 describe("M1 persisted ACK boundary", () => {
   for (const human of [false, true]) {
-    it(`M1 persisted ACK boundary ${human ? "human awaits callback before verdict wait" : "autopilot enters implementation while callback held"}`, { timeout: 5000 }, async () => {
+    it(`M1 persisted ACK boundary ${human ? "human enters verdict wait and implementation while callback held" : "autopilot enters implementation while callback held"}`, { timeout: 5000 }, async () => {
       const { gitlab } = fakeGitlab();
       const claim = gitlabClaim(28382, { auto_approve: !human });
       const ack = deferred(), stored = deferred(), callback = deferred(), started = deferred(), entered = deferred();
@@ -437,10 +458,6 @@ describe("M1 persisted ACK boundary", () => {
           })]);
         } finally { clearTimeout(startedTimer); }
         await flushMicrotasks();
-        if (human) {
-          assert.equal(verdictWaits, 0, "human verdict wait cannot begin during callback");
-          callback.resolve();
-        }
         let timer: NodeJS.Timeout | undefined;
         try {
           await Promise.race([entered.promise, new Promise<never>((_, reject) => {
@@ -1691,3 +1708,391 @@ describe("#2230 shared SDK process default at a plan gate", () => {
     assert.equal(helper.calls, 0, "the shared preload covers this suite without per-executor injection");
   });
 });
+
+// Issue #2901: a human plan gate starts the advisory plan-summary hook without awaiting it, and
+// an accepted revise supersedes the summary of the plan it replaced. Each case runs through the
+// real runner gate on both harnesses; only the summary model, the summary POST and the
+// provider/query peer are scripted. Every wait is on an event the test controls.
+
+type SummaryHarness = "sdk" | "codex";
+const SUMMARY_HARNESSES: readonly SummaryHarness[] = ["sdk", "codex"];
+const PLAN_USAGE = { "claude-haiku-4-5-20251001": { inputTokens: 3, outputTokens: 1 } } as never;
+
+interface SummaryCall {
+  readonly planMd: string;
+  /** Report one usage snapshot through the executor's onUsage seam. */
+  fireUsage(): void;
+  /** Settle the scripted summary model's turn. */
+  finish(result?: PlanSummaryResult | null): void;
+}
+
+interface GateRigConfig {
+  plans: string[];
+  generate?: "blocked" | "throws";
+  post?: "ok" | "rejects";
+  /** The executor's bounded settlement (intentSettleBoundMs / summarySettleMs). */
+  settleMs?: number;
+  /** Turn indexes (plans first, then the implementation turn) held until released. Default: the implementation turn. */
+  holdTurns?: number[];
+  config?: Record<string, unknown>;
+}
+
+/** Bound a wait that must resolve so a regression fails the test instead of hanging it. */
+async function within<T>(promise: Promise<T>, what: string, ms = 5000): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([promise, new Promise<never>((_, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for: ${what}`)), ms);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+/** Let already-resolved promise chains and one macrotask turn run. */
+async function settleTurns(): Promise<void> {
+  await flushMicrotasks();
+  await new Promise<void>(resolve => setImmediate(resolve));
+  await flushMicrotasks();
+}
+
+function gatedSdkQuery(plans: string[], onTurn: (index: number) => Promise<void>): SdkQueryFn {
+  let next = 0;
+  return params => {
+    const index = next++;
+    return (async function* () {
+      for await (const _ of params.prompt) { /* drain */ }
+      await onTurn(index);
+      if (index < plans.length) {
+        yield assistant([{ type: "tool_use", id: `p${index}`, name: "mcp__uzi__submit_plan", input: { plan_md: plans[index] } }]);
+      } else {
+        yield assistant([
+          { type: "text", text: "done implementing" },
+          { type: "tool_use", id: "d", name: "mcp__uzi__signal_done", input: {} },
+        ]);
+      }
+      yield resultOk();
+    })();
+  };
+}
+
+function startGateRig(harness: SummaryHarness, cfg: GateRigConfig) {
+  const { gitlab } = fakeGitlab();
+  const codex = { auth_mode: "api_key", access_token: "fixture-codex-access", capability: "fixture-codex-capability" };
+  const claim = gitlabClaim(2901, {
+    summary_intent: "Existing intent",
+    ...(cfg.config ? { config: cfg.config } : {}),
+    ...(harness === "codex" ? { secrets: { forge_pat: "fixture-forge-pat-000000", codex } } : {}),
+  });
+  const runId = claim.run_id;
+  const settleMs = cfg.settleMs ?? 2000;
+  const warns: string[] = [];
+  const log: Logger = { ...nullLogger(), warn: msg => { warns.push(msg); }, child: () => log };
+
+  const presented = Array.from({ length: 4 }, deferred);
+  let presentations = 0;
+  api.onState(runId, body => {
+    if (body.status === "awaiting_approval") presented[presentations++]?.resolve();
+  });
+
+  const callEntered = Array.from({ length: 4 }, deferred);
+  const calls: SummaryCall[] = [];
+  const summaryRunner = {
+    generateIntentSummary: async () => null,
+    generatePlanSummary: async ({ planMd, onUsage }: { planMd: string; onUsage?: (u: never) => void }) => {
+      const index = calls.length;
+      let done!: (r: PlanSummaryResult | null) => void;
+      const finished = new Promise<PlanSummaryResult | null>(resolve => { done = resolve; });
+      calls.push({
+        planMd,
+        fireUsage: () => onUsage?.(PLAN_USAGE),
+        finish: (result = null) => done(result),
+      });
+      callEntered[index]!.resolve();
+      if (cfg.generate === "throws") throw new Error("summary model failed");
+      return finished;
+    },
+  };
+
+  const posts: string[] = [];
+  const posted = Array.from({ length: 4 }, deferred);
+  client.postPlanSummary = async (_runId, body: Parameters<WorkerClient["postPlanSummary"]>[1]) => {
+    posts.push(body.plan_md);
+    posted[posts.length - 1]!.resolve();
+    if (cfg.post === "rejects") throw new RequestError("POST", "/summary/plan", 500, "summary persistence failed");
+  };
+
+  const implementTurn = cfg.plans.length;
+  const turnEntered = Array.from({ length: 6 }, deferred);
+  const turnHold = new Map<number, ReturnType<typeof deferred>>();
+  for (const index of cfg.holdTurns ?? [implementTurn]) turnHold.set(index, deferred());
+  const onTurn = async (index: number): Promise<void> => {
+    turnEntered[index]?.resolve();
+    await turnHold.get(index)?.promise;
+  };
+
+  let executor: SdkExecutor | CodexExecutor;
+  if (harness === "sdk") {
+    executor = new SdkExecutor(log, homeDir, {
+      queryFn: gatedSdkQuery(cfg.plans, onTurn), client,
+      summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: settleMs,
+    });
+  } else {
+    const selected = selectCodexBinding({ codex });
+    if (selected.kind !== "codex") throw new Error("invalid fixture binding");
+    api.codexAuthModes.set(runId, "api_key");
+    executor = new CodexExecutor(log, homeDir, {
+      binding: selected.binding, client,
+      provider: { name: "openai", baseUrl: "http://127.0.0.1:9/v1", envKey: "OPENAI_API_KEY", model: "gpt-6-astra" },
+      summaryRunner: summaryRunner as unknown as SummaryRunner, summarySettleMs: settleMs,
+    }, codexSummaryDeps(cfg.plans, onTurn));
+  }
+
+  let result: ExecutorResult | undefined;
+  const run = executor.run.bind(executor);
+  executor.run = async ctx => (result = await run(ctx));
+
+  // Hooks around the executor's bounded summary settlement: `during` runs right after admission
+  // closes and flights are aborted, before any flight settles or is abandoned; `after` runs once
+  // the settlement returned (flights settled or abandoned), before the runner closes its batcher.
+  const settle: { during?: () => void; after?: () => void } = {};
+  const closeAndSettle = executor.closeAndSettlePlanSummary.bind(executor);
+  executor.closeAndSettlePlanSummary = async deadlineMs => {
+    const during = settle.during;
+    settle.during = undefined;
+    const settling = closeAndSettle(deadlineMs);
+    during?.();
+    await settling;
+    const after = settle.after;
+    settle.after = undefined;
+    after?.();
+  };
+
+  const runner = runnerWith(() => ({ executor }), gitlab);
+  let finished = false;
+  const execution = runner.execute(claim).finally(() => { finished = true; });
+
+  return {
+    claim, calls, posts, posted, warns, settle, presented, callEntered, turnEntered, turnHold,
+    implementing: turnEntered[implementTurn]!.promise,
+    execution,
+    result: () => result,
+    verdict: (kind: "approve_plan" | "revise_plan" | "reject_plan" | "cancel", body?: string) =>
+      api.appendInputs(runId, [input(kind, body)]),
+    /** The real claim-release path: the receipt fence ends the flight and aborts its lifecycle. */
+    fence: () => (runner as unknown as {
+      activeRuns: Map<string, { steering: { endFencedFlight(reason: string): void } }>;
+    }).activeRuns.get(runId)!.steering.endFencedFlight("released"),
+    planUsage: () => api.messages(runId).filter(
+      m => m.kind === "summary_usage" && (m.payload as { pass?: string }).pass === "plan").length,
+    async cleanup(): Promise<void> {
+      for (const hold of turnHold.values()) hold.resolve();
+      for (const call of calls) call.finish(null);
+      if (!finished) api.appendInputs(runId, [input("cancel")]);
+      await within(execution.catch(() => {}), "run teardown", 15000);
+    },
+  };
+}
+
+const S1: PlanSummaryResult = { summary: "Summary one", deltas: [] };
+const S2: PlanSummaryResult = { summary: "Summary two", deltas: [] };
+
+for (const harness of SUMMARY_HARNESSES) {
+  describe(`issue #2901 (${harness}): human plan gate does not wait for the plan summary`, { timeout: 60000 }, () => {
+    it("approve is processed while the summary hook is still blocked, then the summary latches", async () => {
+      const rig = startGateRig(harness, { plans: ["# Plan one"] });
+      try {
+        await within(rig.presented[0]!.promise, "first plan presentation");
+        await within(rig.callEntered[0]!.promise, "summary hook start");
+        rig.verdict("approve_plan");
+        await within(rig.implementing, "implementation turn while the summary hook is blocked", 3000);
+        assert.deepEqual(rig.posts, [], "the blocked hook has posted nothing yet");
+        rig.calls[0]!.finish(S1);
+        await within(rig.posted[0]!.promise, "summary POST");
+        assert.deepEqual(rig.posts, ["# Plan one"]);
+        rig.turnHold.get(1)!.resolve();
+        await within(rig.execution, "run completion");
+        assert.equal(rig.result()?.summaryPlan, "Summary one");
+      } finally { await rig.cleanup(); }
+    });
+
+    for (const identical of [false, true]) {
+      it(`revise (${identical ? "identical" : "different"} revised text): the superseded flight neither POSTs nor latches`, async () => {
+        const plans = ["# Plan one", identical ? "# Plan one" : "# Plan two"];
+        // Hold the revision turn so the superseded flight is released between the accepted revise
+        // and the revised plan's presentation.
+        const rig = startGateRig(harness, { plans, holdTurns: [1, 2] });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "first summary hook start");
+          rig.verdict("revise_plan", "Revise the plan");
+          await within(rig.turnEntered[1]!.promise, "revision turn after the accepted revise");
+          rig.calls[0]!.finish(S1);
+          await settleTurns();
+          assert.deepEqual(rig.posts, [], "a superseded flight admits no POST");
+          rig.turnHold.get(1)!.resolve();
+          await within(rig.presented[1]!.promise, "revised plan presentation");
+          await within(rig.callEntered[1]!.promise, "revised summary hook start");
+          assert.equal(rig.calls[1]!.planMd, plans[1]);
+          rig.verdict("approve_plan");
+          await within(rig.turnEntered[2]!.promise, "implementation turn while the revised hook is blocked", 3000);
+          rig.calls[1]!.finish(S2);
+          await within(rig.posted[0]!.promise, "revised summary POST");
+          assert.deepEqual(rig.posts, [plans[1]]);
+          rig.turnHold.get(2)!.resolve();
+          await within(rig.execution, "run completion");
+          assert.equal(rig.result()?.summaryPlan, "Summary two");
+        } finally { await rig.cleanup(); }
+      });
+    }
+
+    for (const verdict of ["reject", "cancel", "fence"] as const) {
+      it(`${verdict}: teardown completes within the settle bound and nothing is posted or latched`, async () => {
+        const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 20 });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "summary hook start");
+          if (verdict === "reject") rig.verdict("reject_plan", "no");
+          else if (verdict === "cancel") rig.verdict("cancel");
+          else rig.fence();
+          // The scripted model ignores the abort, so only the bound ends the settlement.
+          await within(rig.execution, "bounded teardown");
+          assert.ok(rig.warns.includes("plan summary did not settle within the bound"));
+          rig.calls[0]!.finish(S1);
+          await settleTurns();
+          assert.deepEqual(rig.posts, [], "no POST is admitted after close");
+          assert.equal(rig.result()?.summaryPlan, undefined);
+        } finally { await rig.cleanup(); }
+      });
+    }
+
+    for (const failure of ["generate", "post"] as const) {
+      it(`failing hook (${failure}): the failure is logged and the run proceeds`, async () => {
+        const rig = startGateRig(harness, {
+          plans: ["# Plan one"], holdTurns: [],
+          generate: failure === "generate" ? "throws" : "blocked",
+          post: failure === "post" ? "rejects" : "ok",
+        });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "summary hook start");
+          if (failure === "post") {
+            rig.calls[0]!.finish(S1);
+            await within(rig.posted[0]!.promise, "rejected summary POST");
+          }
+          rig.verdict("approve_plan");
+          await within(rig.execution, "run completion");
+          assert.ok(rig.warns.includes("plan summary hook failed"));
+          assert.equal(rig.result()?.summaryPlan, undefined);
+        } finally { await rig.cleanup(); }
+      });
+    }
+
+    if (harness === "sdk") {
+      it("revision budget exhausted: the re-presented same plan keeps its latched summary", async () => {
+        const rig = startGateRig(harness, { plans: ["# Plan one"], holdTurns: [], config: { plan_max_revisions: 0 } });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "summary hook start");
+          rig.calls[0]!.finish(S1);
+          await within(rig.posted[0]!.promise, "summary POST");
+          rig.verdict("revise_plan", "Revise the plan");
+          await within(rig.presented[1]!.promise, "same plan re-presented");
+          rig.verdict("approve_plan");
+          await within(rig.execution, "run completion");
+          assert.equal(rig.calls.length, 1, "the re-presented same plan is not summarised again");
+          assert.deepEqual(rig.posts, ["# Plan one"]);
+          assert.equal(rig.result()?.summaryPlan, "Summary one");
+        } finally { await rig.cleanup(); }
+      });
+    }
+  });
+
+  describe(`issue #2901 (${harness}): plan-summary usage boundaries`, { timeout: 60000 }, () => {
+    // Each case is a fresh flight firing exactly one usage event, so the once-per-flight
+    // `delivered` latch can never mask a missing guard.
+    for (const before of [true, false]) {
+      it(`supersession (${before ? "+" : "-"}): usage ${before ? "before" : "only after"} the accepted revise is ${before ? "reported" : "not reported"}`, async () => {
+        const plans = ["# Plan one", "# Plan two"];
+        const rig = startGateRig(harness, { plans, holdTurns: [1], settleMs: 20 });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "summary hook start");
+          if (before) rig.calls[0]!.fireUsage();
+          rig.verdict("revise_plan", "Revise the plan");
+          await within(rig.turnEntered[1]!.promise, "revision turn after the accepted revise");
+          if (!before) rig.calls[0]!.fireUsage();
+          rig.turnHold.get(1)!.resolve();
+          await within(rig.presented[1]!.promise, "revised plan presentation");
+          rig.verdict("approve_plan");
+          rig.turnHold.get(2)?.resolve();
+          await within(rig.execution, "run completion");
+          assert.equal(rig.planUsage(), before ? 1 : 0);
+        } finally { await rig.cleanup(); }
+      });
+    }
+
+    for (const before of [true, false]) {
+      it(`fencing (${before ? "+" : "-"}): usage ${before ? "before" : "after"} the claim is fenced is ${before ? "reported" : "not reported"}`, async () => {
+        const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 2000 });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "summary hook start");
+          if (before) rig.calls[0]!.fireUsage();
+          // Within the settle bound: the flight is still pending when the fenced teardown starts.
+          rig.settle.during = () => {
+            if (!before) rig.calls[0]!.fireUsage();
+            rig.calls[0]!.finish(null);
+          };
+          rig.fence();
+          await within(rig.execution, "fenced teardown");
+          assert.equal(rig.planUsage(), before ? 1 : 0);
+        } finally { await rig.cleanup(); }
+      });
+    }
+
+    it("bounded settlement (+): usage from a flight settling within the bound is reported", async () => {
+      const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 2000 });
+      try {
+        await within(rig.presented[0]!.promise, "first plan presentation");
+        await within(rig.callEntered[0]!.promise, "summary hook start");
+        rig.settle.during = () => { rig.calls[0]!.fireUsage(); rig.calls[0]!.finish(null); };
+        rig.verdict("reject_plan", "no");
+        await within(rig.execution, "rejected teardown");
+        assert.equal(rig.planUsage(), 1);
+      } finally { await rig.cleanup(); }
+    });
+
+    it("bounded settlement (-): usage after the bound expired and the flight was abandoned is not reported", async () => {
+      const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 20 });
+      try {
+        await within(rig.presented[0]!.promise, "first plan presentation");
+        await within(rig.callEntered[0]!.promise, "summary hook start");
+        // The settlement returned with the flight abandoned; the runner has not closed its batcher yet.
+        rig.settle.after = () => rig.calls[0]!.fireUsage();
+        rig.verdict("reject_plan", "no");
+        await within(rig.execution, "rejected teardown");
+        assert.ok(rig.warns.includes("plan summary did not settle within the bound"));
+        assert.equal(rig.planUsage(), 0);
+      } finally { await rig.cleanup(); }
+    });
+
+    for (const how of ["superseded", "fenced"] as const) {
+      it(`combined: usage during settlement of an already ${how} flight is not reported`, async () => {
+        const plans = how === "superseded" ? ["# Plan one", "# Plan two"] : ["# Plan one"];
+        const rig = startGateRig(harness, { plans, holdTurns: [], settleMs: 50 });
+        try {
+          await within(rig.presented[0]!.promise, "first plan presentation");
+          await within(rig.callEntered[0]!.promise, "summary hook start");
+          if (how === "superseded") {
+            rig.verdict("revise_plan", "Revise the plan");
+            await within(rig.presented[1]!.promise, "revised plan presentation");
+          }
+          rig.settle.during = () => { rig.calls[0]!.fireUsage(); rig.calls[0]!.finish(null); };
+          if (how === "superseded") rig.verdict("reject_plan", "no");
+          else rig.fence();
+          await within(rig.execution, "teardown");
+          assert.equal(rig.planUsage(), 0);
+        } finally { await rig.cleanup(); }
+      });
+    }
+  });
+}

@@ -17788,8 +17788,8 @@ export class RunRunner {
     // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
     // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
     publishedTip: string | undefined,
-    // Advisory hook after accepted storage; awaited for human gates and unawaited
-    // for autopilot. Receives the plan carried by the accepted report.
+    // Advisory hook after accepted storage; started without being awaited at both human
+    // gates and autopilot. Receives the plan carried by the accepted report.
     onPlanPersisted?: (planMd: string) => Promise<void>,
     // Issue #1604 (D2): the input id of the revise this plan revises. Settled (made due its
     // APPLIED) only once the awaiting_approval report below is applied, i.e. the revised plan is
@@ -18041,10 +18041,13 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
-    // Human gates await advisory work only after a positive storage acknowledgement.
+    // Human gates start advisory work only after a positive storage acknowledgement, and do
+    // not await it: the verdict wait must not be delayed by the summary model or its POST.
     if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {
       try {
-        await onPlanPersisted(planMd);
+        void Promise.resolve(onPlanPersisted(planMd)).catch(error => {
+          runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
+        });
       } catch (e) {
         runLog.warn("plan summary hook failed", {
           run_id: runId,

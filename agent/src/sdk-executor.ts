@@ -1086,14 +1086,22 @@ export class SdkExecutor implements Executor {
     }
   }
 
-  /** Prepare once per candidate, before persistence; retries share the owned callback flight. */
-  private beginPlanSummary(ctx: RunContext, prdInputP: Promise<PrdInput> | undefined): (planMd: string) => Promise<void> {
+  /** Invalidate the current plan-summary flight and latched result (bumping the generation, which
+   *  the flight's `allowed()` and `onUsage` guards read). Does not reopen {@link summaryLifecycle}.
+   *  Returns the new generation. */
+  private supersedePlanSummary(): number {
     const generation = ++this.planGeneration;
     if (this.planFlight) {
       this.planFlight.closed = true;
       this.planFlight.ctrl.abort();
     }
     this.latestPlanSummary = undefined;
+    return generation;
+  }
+
+  /** Prepare once per candidate, before persistence; retries share the owned callback flight. */
+  private beginPlanSummary(ctx: RunContext, prdInputP: Promise<PrdInput> | undefined): (planMd: string) => Promise<void> {
+    const generation = this.supersedePlanSummary();
     const lifecycle = this.summaryLifecycle;
     lifecycle.closed = false;
     const candidate: NonNullable<typeof this.planCandidate> = { generation, lifecycle, generated: false };
@@ -2285,6 +2293,10 @@ export class SdkExecutor implements Executor {
             verdict = gExhausted.value;
             continue;
           }
+          // Accepted revise: the plan being summarised is superseded (the budget-exhausted branch
+          // above re-presents the SAME plan and so keeps its summary). The summary of the revised
+          // plan starts from the next gatePlan's onPlanPersisted.
+          this.supersedePlanSummary();
           if (!automatic) revisions++;
           ctx.emit({
             kind: "plan_revising",
