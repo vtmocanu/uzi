@@ -408,14 +408,11 @@ func TestMergedPredecessorConcurrentUploadLiveDB(t *testing.T) {
 			var upload <-chan reconcileOperation[apitypes.RecoveryCaptureStatusResponse]
 			var merged <-chan reconcileOperation[int64]
 			if uploadFirst {
-				// Admit before blocking stream, so the held capture lock belongs to the upload
-				// that can commit AVAILABLE while discard waits behind it.
-				if _, ready, err := e.svc.admit(e.ctx, e.w, e.run, id, m); err != nil || ready {
-					t.Fatalf("admit=%v %v", ready, err)
-				}
+				// Upload reaches the reader after admission and stream locks the capture,
+				// so it can commit available while discard waits behind it.
 				reader := newMergedBlockingReader(t, body)
 				upload = startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryCaptureStatusResponse, error) {
-					return e.svc.stream(ctx, e.w, e.run, id, m, reader)
+					return e.svc.Upload(ctx, e.w, e.run, id, m, reader)
 				})
 				reader.await(t)
 				merged = startReconcileOperation(t, func(ctx context.Context) (int64, error) {
@@ -451,8 +448,15 @@ func TestMergedPredecessorConcurrentUploadLiveDB(t *testing.T) {
 					t.Fatalf("upload=%+v", uploadResult)
 				}
 				e.bytes(id, body)
-			} else if !errors.Is(uploadResult.err, ErrNotAuthorized) && !errors.Is(uploadResult.err, ErrNotAvailable) {
-				t.Fatalf("late upload=%+v", uploadResult)
+			} else {
+				if !errors.Is(uploadResult.err, ErrNotAuthorized) && !errors.Is(uploadResult.err, ErrNotAvailable) {
+					t.Fatalf("late upload=%+v", uploadResult)
+				}
+				capture, err := mergedCapture(t, e, id)
+				chunks, chunkErr := e.q.ListCaptureChunks(e.ctx, id)
+				if err != nil || capture.State != "discarded" || chunkErr != nil || len(chunks) != 0 {
+					t.Fatalf("discard-first capture=%+v chunks=%+v errors=%v/%v", capture, chunks, err, chunkErr)
+				}
 			}
 			assertMergedHoldState(t, e, e.hold, "discarded")
 		})
