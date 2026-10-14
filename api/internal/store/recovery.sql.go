@@ -658,7 +658,7 @@ func (q *Queries) GetCustodyAggregateForOwner(ctx context.Context, arg GetCustod
 }
 
 const getCustodyHoldForSettle = `-- name: GetCustodyHoldForSettle :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds
 WHERE id = $1 AND run_id = $2
 `
 
@@ -707,6 +707,7 @@ func (q *Queries) GetCustodyHoldForSettle(ctx context.Context, arg GetCustodyHol
 		&i.CompletedPublicationReceipt,
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
+		&i.MergedPredecessorDiscardBinding,
 	)
 	return i, err
 }
@@ -768,7 +769,7 @@ func (q *Queries) GetFinalInventoryCapture(ctx context.Context, arg GetFinalInve
 }
 
 const getFinalInventoryHold = `-- name: GetFinalInventoryHold :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds
 WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3::uuid
   AND generation = $4
 ORDER BY id LIMIT 1 FOR NO KEY UPDATE
@@ -823,6 +824,7 @@ func (q *Queries) GetFinalInventoryHold(ctx context.Context, arg GetFinalInvento
 		&i.CompletedPublicationReceipt,
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
+		&i.MergedPredecessorDiscardBinding,
 	)
 	return i, err
 }
@@ -1484,7 +1486,7 @@ func (q *Queries) ListOwnersWithClearedCustodyEpisode(ctx context.Context, arg L
 }
 
 const listReleasableCustodyHolds = `-- name: ListReleasableCustodyHolds :many
-SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection, h.inventory_guarded, h.final_disposition, h.final_capture_id, h.final_source_sha, h.final_coverage_digest, h.completion_identity, h.completed_publication_receipt, h.completed_publication_reason, h.final_publication_id,
+SELECT h.id, h.user_id, h.repo_id, h.run_id, h.generation, h.state, h.original_worker_id, h.original_worker_identity, h.live_worker_id, h.live_run_id, h.created_at, h.updated_at, h.released_at, h.release_evidence, h.release_pushed_sha, h.release_source_sha, h.release_adopted_sha, h.release_final_head_sha, h.release_successor_generation, h.release_branch, h.release_target, h.terminal_record_rejection, h.inventory_guarded, h.final_disposition, h.final_capture_id, h.final_source_sha, h.final_coverage_digest, h.completion_identity, h.completed_publication_receipt, h.completed_publication_reason, h.final_publication_id, h.merged_predecessor_discard_binding,
     CASE
         WHEN EXISTS (SELECT 1 FROM runs r
                        WHERE r.id = h.run_id
@@ -1513,38 +1515,39 @@ ORDER BY h.created_at ASC
 `
 
 type ListReleasableCustodyHoldsRow struct {
-	ID                          uuid.UUID          `json:"id"`
-	UserID                      uuid.UUID          `json:"user_id"`
-	RepoID                      pgtype.UUID        `json:"repo_id"`
-	RunID                       uuid.UUID          `json:"run_id"`
-	Generation                  int64              `json:"generation"`
-	State                       string             `json:"state"`
-	OriginalWorkerID            uuid.UUID          `json:"original_worker_id"`
-	OriginalWorkerIdentity      string             `json:"original_worker_identity"`
-	LiveWorkerID                pgtype.UUID        `json:"live_worker_id"`
-	LiveRunID                   pgtype.UUID        `json:"live_run_id"`
-	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt                  pgtype.Timestamptz `json:"released_at"`
-	ReleaseEvidence             pgtype.Text        `json:"release_evidence"`
-	ReleasePushedSha            pgtype.Text        `json:"release_pushed_sha"`
-	ReleaseSourceSha            pgtype.Text        `json:"release_source_sha"`
-	ReleaseAdoptedSha           pgtype.Text        `json:"release_adopted_sha"`
-	ReleaseFinalHeadSha         pgtype.Text        `json:"release_final_head_sha"`
-	ReleaseSuccessorGeneration  pgtype.Int8        `json:"release_successor_generation"`
-	ReleaseBranch               pgtype.Text        `json:"release_branch"`
-	ReleaseTarget               pgtype.Text        `json:"release_target"`
-	TerminalRecordRejection     pgtype.Text        `json:"terminal_record_rejection"`
-	InventoryGuarded            bool               `json:"inventory_guarded"`
-	FinalDisposition            pgtype.Text        `json:"final_disposition"`
-	FinalCaptureID              pgtype.UUID        `json:"final_capture_id"`
-	FinalSourceSha              pgtype.Text        `json:"final_source_sha"`
-	FinalCoverageDigest         pgtype.Text        `json:"final_coverage_digest"`
-	CompletionIdentity          []byte             `json:"completion_identity"`
-	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
-	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
-	FinalPublicationID          pgtype.UUID        `json:"final_publication_id"`
-	Reason                      string             `json:"reason"`
+	ID                              uuid.UUID          `json:"id"`
+	UserID                          uuid.UUID          `json:"user_id"`
+	RepoID                          pgtype.UUID        `json:"repo_id"`
+	RunID                           uuid.UUID          `json:"run_id"`
+	Generation                      int64              `json:"generation"`
+	State                           string             `json:"state"`
+	OriginalWorkerID                uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity          string             `json:"original_worker_identity"`
+	LiveWorkerID                    pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID                       pgtype.UUID        `json:"live_run_id"`
+	CreatedAt                       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                       pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt                      pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence                 pgtype.Text        `json:"release_evidence"`
+	ReleasePushedSha                pgtype.Text        `json:"release_pushed_sha"`
+	ReleaseSourceSha                pgtype.Text        `json:"release_source_sha"`
+	ReleaseAdoptedSha               pgtype.Text        `json:"release_adopted_sha"`
+	ReleaseFinalHeadSha             pgtype.Text        `json:"release_final_head_sha"`
+	ReleaseSuccessorGeneration      pgtype.Int8        `json:"release_successor_generation"`
+	ReleaseBranch                   pgtype.Text        `json:"release_branch"`
+	ReleaseTarget                   pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection         pgtype.Text        `json:"terminal_record_rejection"`
+	InventoryGuarded                bool               `json:"inventory_guarded"`
+	FinalDisposition                pgtype.Text        `json:"final_disposition"`
+	FinalCaptureID                  pgtype.UUID        `json:"final_capture_id"`
+	FinalSourceSha                  pgtype.Text        `json:"final_source_sha"`
+	FinalCoverageDigest             pgtype.Text        `json:"final_coverage_digest"`
+	CompletionIdentity              []byte             `json:"completion_identity"`
+	CompletedPublicationReceipt     []byte             `json:"completed_publication_receipt"`
+	CompletedPublicationReason      pgtype.Text        `json:"completed_publication_reason"`
+	FinalPublicationID              pgtype.UUID        `json:"final_publication_id"`
+	MergedPredecessorDiscardBinding []byte             `json:"merged_predecessor_discard_binding"`
+	Reason                          string             `json:"reason"`
 }
 
 // PRD #1296 M4 (D3): the custody-release RECONCILER's candidate set — OPEN holds whose
@@ -1624,6 +1627,7 @@ func (q *Queries) ListReleasableCustodyHolds(ctx context.Context) ([]ListReleasa
 			&i.CompletedPublicationReceipt,
 			&i.CompletedPublicationReason,
 			&i.FinalPublicationID,
+			&i.MergedPredecessorDiscardBinding,
 			&i.Reason,
 		); err != nil {
 			return nil, err

@@ -232,7 +232,7 @@ func (q *Queries) GetHeldPublicationByRunGeneration(ctx context.Context, arg Get
 }
 
 const getHeldPublicationHold = `-- name: GetHeldPublicationHold :one
-SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id FROM recovery_custody_holds
+SELECT id, user_id, repo_id, run_id, generation, state, original_worker_id, original_worker_identity, live_worker_id, live_run_id, created_at, updated_at, released_at, release_evidence, release_pushed_sha, release_source_sha, release_adopted_sha, release_final_head_sha, release_successor_generation, release_branch, release_target, terminal_record_rejection, inventory_guarded, final_disposition, final_capture_id, final_source_sha, final_coverage_digest, completion_identity, completed_publication_receipt, completed_publication_reason, final_publication_id, merged_predecessor_discard_binding FROM recovery_custody_holds
 WHERE run_id = $1 AND user_id = $2 AND original_worker_id = $3::uuid
   AND generation = $4 AND inventory_guarded
 ORDER BY id LIMIT 1
@@ -287,6 +287,7 @@ func (q *Queries) GetHeldPublicationHold(ctx context.Context, arg GetHeldPublica
 		&i.CompletedPublicationReceipt,
 		&i.CompletedPublicationReason,
 		&i.FinalPublicationID,
+		&i.MergedPredecessorDiscardBinding,
 	)
 	return i, err
 }
