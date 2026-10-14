@@ -37,12 +37,12 @@ func TestVerifiedMergeSnapshot(t *testing.T) {
 	} {
 		invalid := b
 		edit(&invalid)
-		if _, err := NewVerifiedMergeSnapshot(invalid, at, nil); !errors.Is(err, ErrBadRequest) {
+		if _, err := NewVerifiedMergeSnapshot(invalid, at, &MergeObservation{IID: invalid.MRIID, State: "merged"}); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("invalid binding %+v: %v", invalid, err)
 		}
 	}
 	for _, at := range []time.Time{{}, time.Now().Add(time.Hour)} {
-		if _, err := NewVerifiedMergeSnapshot(b, at, nil); !errors.Is(err, ErrBadRequest) {
+		if _, err := NewVerifiedMergeSnapshot(b, at, &MergeObservation{IID: b.MRIID, State: "merged"}); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("invalid time %v: %v", at, err)
 		}
 	}
