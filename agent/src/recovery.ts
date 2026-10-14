@@ -408,8 +408,8 @@ export interface RecoveryCoordinatorOptions {
     /** Awaited by {@link RecoveryCoordinator.pin} between its unlocked record observation and
      *  its locked re-read, so a test can interleave a capture there. */
     afterPinObserve?: () => Promise<void>;
-    /** Overrides {@link REDUNDANCY_DEADLINE_MS}, the one deadline for all redundancy claims of a cleanup. */
-    redundancyDeadlineMs?: number;
+    /** Schedules the redundancy abort; tests fire it at an observed boundary and return a disposer. */
+    redundancyTimer?: (fire: () => void, ms: number) => () => void;
   };
 }
 
@@ -3087,19 +3087,23 @@ export class RecoveryCoordinator {
     return out;
   }
 
-  /** Sequential, best effort, never throws, and returns by the one deadline (30 s, plus any caller
-   *  abort) even when a request hangs. Answers are logged; only final ones are remembered. */
   /** Starts the one cleanup deadline (30 s, plus any caller abort). The timer is unref'd and
    *  cleared by {@link submitRedundancyClaims}, which every path reaching the lock body calls. */
   private startRedundancyBudget(signal?: AbortSignal): RedundancyBudget {
-    const ms = this.testHooks?.redundancyDeadlineMs ?? REDUNDANCY_DEADLINE_MS;
+    const ms = REDUNDANCY_DEADLINE_MS;
     const controller = new AbortController();
-    const timer = setTimeout(() => controller.abort(), ms);
-    timer.unref?.();
+    let dispose: () => void;
+    if (this.testHooks?.redundancyTimer) {
+      dispose = this.testHooks.redundancyTimer(() => controller.abort(), ms);
+    } else {
+      const timer = setTimeout(() => controller.abort(), ms);
+      timer.unref?.();
+      dispose = () => clearTimeout(timer);
+    }
     return {
       signal: signal ? AbortSignal.any([signal, controller.signal]) : controller.signal,
       deadline: Date.now() + ms,
-      dispose: () => clearTimeout(timer),
+      dispose,
     };
   }
 
