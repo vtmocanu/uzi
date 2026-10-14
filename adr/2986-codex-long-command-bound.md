@@ -40,18 +40,18 @@ two hours are unsupported by this command bound.
 ## Rollout and safe downgrade
 
 Request `long_running: true` only on an upgraded worker that advertises it;
-that upgraded worker is required for the two-hour command bound. Rejection
-with bad_args is the required safe-downgrade rollout contract for a worker
-that does not advertise the option. This is a requirement, not an established
-guarantee that older runtimes enforce it. An ordinary request without the
-flag retains the older worker's 60-minute command bound.
+that upgraded worker is required for the two-hour command bound. A legacy
+worker that does not advertise the option may ignore the flag and keep its
+60-minute command bound; rejection must not be assumed. An ordinary request
+without the flag retains the older worker's 60-minute command bound.
 
 At pre-fix base 2b84c993, dynamic-tools.ts advertised
 `objectSchema({command:STRING,cwd:STRING},["command"],false)` with no
 long_running property. The legacy schema does not advertise the flag, but
 schema alone does not prove enforcement: routeToolCall passes raw arguments
 to the broker, and no worker schema validation was found. No guaranteed
-older-worker bad_args rejection was observed, and no live rollout validation
+older-worker bad_args rejection was observed (base `dispatchShell` reads only
+command and cwd, so it ignores the flag), and no live rollout validation
 is claimed here.
 
 ## Ownership and interruption
