@@ -731,10 +731,6 @@ settle_runs_terminal() {
   return 0
 }
 
-# wait_runs_terminal_off_worker TIMEOUT RUN...: cancellation is enqueued, not
-# acknowledged. Before starting the next case or recreating its worker, require
-# terminal outcomes AND absence from the worker snapshot for these exact fixtures.
-# Never changes custody. One shared deadline bounds the whole batch.
 dump_fixture_settlement() {
   # The storage collector lands separately; settlement remains usable without it.
   if declare -F storage_diagnostic_snapshot >/dev/null; then
@@ -763,6 +759,10 @@ wait_worker_heartbeat_after() {
     sleep 0.5
   done
 }
+# wait_runs_terminal_off_worker TIMEOUT RUN...: cancellation is enqueued, not
+# acknowledged. Before starting the next case or recreating its worker, require
+# terminal outcomes AND absence from the worker snapshot for these exact fixtures.
+# Never changes custody. One shared deadline bounds the whole batch.
 wait_runs_terminal_off_worker() {
   local timeout="$1" run status active start=$SECONDS deadline pending settled; shift
   [[ "$timeout" =~ ^[1-9][0-9]*$ ]] || fail "invalid fixture settlement timeout: $timeout"
