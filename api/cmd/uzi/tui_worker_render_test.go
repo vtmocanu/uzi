@@ -156,7 +156,7 @@ func TestWorkerRenderBoardWorkerCell(t *testing.T) {
 				verdict := "pass"
 				r.JudgeVerdict = &verdict
 				for _, sel := range []bool{true, false} {
-					out := m.boardRow(r, sel, boardMarkerCols{fullW: 4, verdictW: 1, countW: 1})
+					out := m.boardRow(r, sel, boardMarkerCols{fullW: 4, verdictW: 1, countW: 1}, m.boardAccountCols([]apitypes.RunListItemDTO{r}))
 					assertNoRawControls(t, "board worker", out)
 					out = stripANSI(out)
 					if visualWidth(out) > width {

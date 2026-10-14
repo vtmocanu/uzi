@@ -135,10 +135,10 @@ describe("RunRunner — recovery_wait park (issue #1197 D-RC2c)", () => {
         sha,
         "the tracking ref covers the committed tip after a verified recovery capture",
       );
-      // The two resume dirs survive the park (flight.parked carve-out); the clone is removed.
+      // The two resume dirs survive the park (flight.parked carve-out); the clone is retained for recapture.
       assert.strictEqual(fs.existsSync(p.pluginDir), true, "plugin dir survives a park");
       assert.strictEqual(fs.existsSync(p.runHome), true, "run HOME survives a park");
-      assert.strictEqual(fs.existsSync(p.worktree), false, "the clone is removed on a park");
+      assert.strictEqual(fs.existsSync(p.worktree), true, "the clone is retained for recapture on a park");
       // A truthful, auto-resume park notice — the FULL-DURABILITY line (a verified local
       // restore point), distinct from the degraded "last durable checkpoint" wording the
       // capture-shortfall path emits.

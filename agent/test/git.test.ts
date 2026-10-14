@@ -2031,7 +2031,7 @@ describe("bounded bare cache names (issue #2886)", () => {
     assert.equal(hashed, `uzi-sha256-${createHash("sha256").update(longIn).digest("hex")}.git`);
   });
 
-  it("measures bytes, not characters, and is deterministic and injective on long inputs", () => {
+  it("measures bytes, not characters, and is deterministic and distinct for sampled long inputs", () => {
     const multibyte = "/" + "é".repeat(130);
     assert.ok(multibyte.length < 255 && Buffer.byteLength(multibyte + ".git") > 255);
     assert.match(bareDirName(multibyte), HASHED);

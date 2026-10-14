@@ -247,11 +247,26 @@ readings are missing or unusable, to get back to an ordinary pick.
 A run whose token you later delete still names it, with **(deleted)** — the
 name is a snapshot taken when the run was claimed, so history stays readable.
 
-Once you hold **more than one token**, the **Runs** list also shows a compact
-version of this beside each run's status — the token's label, a small dot when
-the state is worth a look (info or amber), and the mode and reason on hover — so
-you can see which account paid across a batch of runs without opening each one.
-A single-token user's runs all billed the one token, so the list stays as it was.
+Once you hold **more than one credential across Claude and Codex**, the **Runs**
+list shows a compact badge for each run's account label (see `default` below).
+Claude badges also show a small dot when the selection state is worth a look
+(info or amber), with the mode and reason on hover; Codex badges are neutral.
+The list refreshes credential counts with its normal visible-tab poll, so adding
+or removing a credential updates the badges without reloading. A failed refresh
+keeps the last-good counts. With just one credential in total, personal lists
+hide the badge.
+
+The personal web list and TUI board display `claude` or `codex` in place of the
+exact label `default` when you hold exactly one credential for that run's harness
+and the recorded credential has not been deleted. Other labels, deleted snapshots,
+admin views and run details keep the recorded label. Disabled credentials count;
+Codex subscription logins and OpenAI API keys count together.
+
+The TUI board keeps the account before its cost, with shared cell widths fitted
+to the rows currently on screen (up to 10 columns for accounts and 6 for costs).
+The title column can move when that set changes. Visibility still reserves the
+maximum widths to preserve title room: on the personal board with the account
+column enabled, cost appears at 95 columns and milestones at 111.
 
 ## Pointing the judge at a token
 

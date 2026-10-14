@@ -20,6 +20,7 @@ import { AUTOPILOT_SENTINEL_ANSWER } from "../src/runner.js";
 import { CI_CONFIG_MARKER } from "../src/prompt.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import type { StateRequest } from "../src/protocol.js";
+import { SteeringChannel } from "../src/steering.js";
 import {
   api,
   assistant,
@@ -329,11 +330,10 @@ describe("2833 M3 runner Codex summary persistence", () => {
       assert.equal(api.states.at(-1)?.body.status, "completed");
       const durable = plans.map(plan => plan.replaceAll("\u0000", ""));
       if (mode === "autopilot") {
-        assert.deepEqual(callbacks, []);
-        assert.deepEqual(observations, []);
-        assert.deepEqual(attempts, []);
-        assert.deepEqual(accepted, []);
-        assert.equal(result.summaryPlan, undefined);
+        assert.deepEqual(callbacks, [plans[0]]);
+        assert.deepEqual(observations, [{ generated: plans[0], persisted: durable[0], status: "running" }]);
+        assert.deepEqual(attempts, [{ guard: durable[0], persisted: durable[0], status: "running" }]);
+        assert.deepEqual(accepted, ["Summary 1"]);
         assert.ok(api.states.some(s => s.body.status === "running" && s.body.plan_md === durable[0]));
         assert.equal(presentations, 0);
       } else {
@@ -349,6 +349,168 @@ describe("2833 M3 runner Codex summary persistence", () => {
       }
     });
   }
+});
+
+it("M1 destructive checkpoint waits for summary settlement before reaping", async () => {
+  const { gitlab } = fakeGitlab();
+  const claim = gitlabClaim(28385, { auto_approve: true });
+  const settling = deferred(), drained = deferred();
+  let active = false, settled = false, prematureReap = false, reaps = 0;
+  const executor: Executor = {
+    async closeAndSettlePlanSummary() {
+      if (!active) return;
+      settling.resolve();
+      await drained.promise;
+      settled = true;
+    },
+    killAgentTree() {
+      if (!active) return;
+      if (!settled) prematureReap = true;
+      assert.equal(settled, true, "summary drain precedes the destructive action");
+      reaps++;
+    },
+    async run(ctx) {
+      await ctx.gatePlan!("# Plan");
+      active = true;
+      await ctx.checkpoint!({ reap: true });
+      active = false;
+      return { branch: ctx.branch };
+    },
+  };
+  const execution = runner(executor, gitlab).execute(claim);
+  try {
+    const reachedSettlement = await Promise.race([
+      settling.promise.then(() => true),
+      execution.then(() => false),
+    ]);
+    assert.equal(reachedSettlement, true, "checkpoint must reach settlement before execution ends");
+    await flushMicrotasks();
+    assert.equal(prematureReap, false, "a blocked drain cannot permit a reap attempt");
+    assert.equal(reaps, 0, "a blocked drain cannot permit a reap");
+  } finally {
+    drained.resolve();
+    await execution;
+  }
+  assert.equal(prematureReap, false, "summary drain precedes every destructive action");
+  assert.ok(reaps > 0, "the checkpoint reaps after summary settlement");
+});
+
+describe("M1 persisted ACK boundary", () => {
+  for (const human of [false, true]) {
+    it(`M1 persisted ACK boundary ${human ? "human awaits callback before verdict wait" : "autopilot enters implementation while callback held"}`, { timeout: 5000 }, async () => {
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(28382, { auto_approve: !human });
+      const ack = deferred(), stored = deferred(), callback = deferred(), started = deferred(), entered = deferred();
+      const implementation = deferred();
+      const plans: string[] = [];
+      let verdictWaits = 0;
+      const wait = SteeringChannel.prototype.awaitGateEvent;
+      SteeringChannel.prototype.awaitGateEvent = function (...args) {
+        verdictWaits++;
+        return wait.apply(this, args);
+      };
+      api.afterPersistState(claim.run_id, body => {
+        if (body.plan_md !== "# Accepted plan") return false;
+        stored.resolve();
+        return true;
+      }, ack.promise);
+      api.setInputs(claim.run_id, [input("approve_plan")]);
+      const execution = runner({ run: async ctx => {
+        const verdict = await ctx.gatePlan!("# Accepted plan", undefined, async md => {
+          plans.push(md);
+          started.resolve();
+          await callback.promise;
+        });
+        assert.equal(verdict.kind, "approve");
+        entered.resolve();
+        await implementation.promise;
+        return { branch: ctx.branch };
+      } }, gitlab).execute(claim);
+      try {
+        await stored.promise;
+        assert.deepEqual(plans, [], "server storage alone cannot admit summary generation");
+        ack.resolve();
+        let startedTimer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([started.promise, new Promise<never>((_, reject) => {
+            startedTimer = setTimeout(() => reject(new Error("accepted ACK did not start persisted callback")), 1500);
+          })]);
+        } finally { clearTimeout(startedTimer); }
+        await flushMicrotasks();
+        if (human) {
+          assert.equal(verdictWaits, 0, "human verdict wait cannot begin during callback");
+          callback.resolve();
+        }
+        let timer: NodeJS.Timeout | undefined;
+        try {
+          await Promise.race([entered.promise, new Promise<never>((_, reject) => {
+            timer = setTimeout(() => reject(new Error("implementation blocked by persisted callback")), 1500);
+          })]);
+        } finally { clearTimeout(timer); }
+        assert.deepEqual(plans, ["# Accepted plan"]);
+        assert.equal(verdictWaits, human ? 1 : 0);
+      } finally {
+        ack.resolve();
+        callback.resolve();
+        implementation.resolve();
+        await execution;
+        SteeringChannel.prototype.awaitGateEvent = wait;
+      }
+    });
+  }
+
+  it("M1 persisted ACK boundary advisory throw still auto-approves", async () => {
+    const { gitlab } = fakeGitlab();
+    const claim = gitlabClaim(28383, { auto_approve: true });
+    let generated = 0, entered = false;
+    await runner({ run: async ctx => {
+      const verdict = await ctx.gatePlan!("# Plan", undefined, async () => {
+        generated++;
+        throw new Error("advisory failure");
+      });
+      entered = verdict.kind === "approve";
+      return { branch: ctx.branch };
+    } }, gitlab).execute(claim);
+    assert.equal(generated, 1);
+    assert.equal(entered, true);
+  });
+
+  for (const failure of ["transport", "unapplied"] as const) {
+    it(`M1 persisted ACK boundary ${failure} refuses generation`, async () => {
+      const { gitlab } = fakeGitlab();
+      const claim = gitlabClaim(28384, { auto_approve: true });
+      let generated = 0, entered = false;
+      const report = client.reportState.bind(client);
+      client.reportState = async (...args) => {
+        if (args[1].plan_md !== "# Refused plan") return report(...args);
+        if (failure === "transport") throw new RequestError("POST", "/state", 400, "refused");
+        return { applied: false, status: "cancelled" };
+      };
+      await runner({ run: async ctx => {
+        await ctx.gatePlan!("# Refused plan", undefined, async () => { generated++; });
+        entered = true;
+        return { branch: ctx.branch };
+      } }, gitlab).execute(claim);
+      assert.equal(generated, 0);
+      assert.equal(entered, false);
+    });
+  }
+});
+
+it("M1 ordinary reasonless human refusal does not invoke persisted hook", async () => {
+  const { gitlab } = fakeGitlab();
+  const claim = gitlabClaim(28381);
+  let callbacks = 0;
+  const report = client.reportState.bind(client);
+  client.reportState = async (...args) => args[1].status === "awaiting_approval"
+    ? { applied: false, status: "cancelled" }
+    : report(...args);
+  api.setInputs(claim.run_id, [input("reject_plan")]);
+  await runner({ run: async ctx => {
+    await ctx.gatePlan!("# Refused", undefined, async () => { callbacks++; });
+    return { branch: ctx.branch };
+  } }, gitlab).execute(claim);
+  assert.equal(callbacks, 0);
 });
 
 describe("RunRunner — plan gate + steering end to end", () => {

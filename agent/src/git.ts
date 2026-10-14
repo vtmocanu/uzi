@@ -6563,7 +6563,7 @@ export class GitCache {
    * local ref (branches, tags, remotes, any other namespace) is reachable from `capturedHead` or
    * from a ref of the worker bare, and no stash exists; and `capturedHead` is durably anchored right now, by `refs/uzi-runner/<branch>` resolving to it
    * under committed tracking ownership that still names `owner.runId` and `owner.generation`, or
-   * by an owed pin of the run, or by being an ancestor of the bare's default-branch ref; `quiesce` answered true both before (`"before"`) and after (`"after"`) the reads. The caller's "after" answer must also be false when that scan found and reaped a writer, because the byte checks ran before it. Residual: a writer that writes and exits between the status read and the "after" proof is invisible to both, so on a stopped exit (`RunRunner.retainStoppedSource`) the verdict is a diagnostic and never authority to discard; only a park or terminal exit uses it to release the clone. Anything
+   * by an owed pin of the run, or by being an ancestor of the bare's default-branch ref; `quiesce` answered true both before (`"before"`) and after (`"after"`) the reads. The caller's "after" answer must also be false when that scan found and reaped a writer, because the byte checks ran before it. Residual: a writer that writes and exits between the status read and the "after" proof is invisible to both, so on stopped and park exits (`RunRunner.retainStoppedSource`) the verdict is diagnostic and never authority to discard; only terminal coverage authorizes release, with the late-writer snapshot residual still open under #2852. Anything
    * else, a thrown error included, is `not_covered` and the caller retains the source.
    */
   async verifyStoppedSourceCovered(

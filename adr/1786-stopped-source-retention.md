@@ -19,9 +19,10 @@ unfetched or uncommitted bytes, so that convention deleted the last copy.
 ### Invariant
 
 A stopped generation's exact local source is kept until an operator explicitly disposes of it. For
-stopped-source exits the coverage check is diagnostic only and never authorizes release. Park and
-terminal exits may still release a source when the existing snapshot-based coverage check passes,
-subject to the remaining writer-exclusion limitation documented below.
+stopped-source exits the coverage check is diagnostic only and never authorizes release. Park
+release paths also keep the exact clone and existing journal even when covered. Terminal exits
+retain the existing snapshot-based covered release, subject to the remaining writer-exclusion
+limitation tracked in [#2852](https://github.com/vtmocanu/uzi/issues/2852).
 
 None of the following is proof: a successor's claim, a released hold (including a successor's
 release of a predecessor hold), a terminal run status, or a capture result remembered from
@@ -65,7 +66,7 @@ The artifact is the existing clone; nothing is copied.
   records retention whatever the proof returned. `preserveSession` is not newly set, so
   existing HOME cleanup still runs.
 
-### Coverage: a diagnostic on stopped exits, the release gate on park and terminal exits
+### Coverage: a diagnostic on stopped and park exits, the release gate on terminal exits
 
 `GitCache.verifyStoppedSourceCovered` runs under the bare lock, with the flight's execution
 tail excluding same-run successors, and is evaluated at the exit's cleanup, not when a
@@ -95,8 +96,8 @@ Recovery-handler exits below). It returns `covered` only if all of these hold:
 
 The verdict is a snapshot, and its final process scan cannot see a writer that writes and
 exits between the status read and the scan; the cleanup's retire (`discard: true`) would then
-delete that writer's bytes. So the verdict gates release only where the exit can still be
-resumed or recaptured:
+delete that writer's bytes. Park exits therefore keep the source regardless of this verdict;
+the remaining snapshot-based terminal release is an open limitation under #2852:
 
 - **Stopped-source exits** (no handler: the generic `stale_claim`, `claim_fence`,
   `running_ack_terminal` arms and a `terminal_disk_precheck` where the generation moved; or a
@@ -106,8 +107,13 @@ resumed or recaptured:
   clone is kept until explicit operator discard") and the retention log lines carry
   `coverage: covered|not_covered|skipped`. The preserve latch stays and the retention record
   is written as for any other stopped source; the clone waits for explicit operator discard.
-- **Park and terminal exits** (`record: "none"`) are unchanged: they release a clone proven
-  covered at the handler's exit.
+- **Park release paths** (recovery, provider outage, credential-switch, disk and live
+  non-terminal final parks) keep the exact clone and existing journal even when covered.
+  Coverage is diagnostic when checked; shutdown still skips the check. No stopped-source
+  marker or `reclaimed` entry is added by the park.
+- **Terminal exits** (`completed`, `failed`, `cancelled`, with `record: "none"`) retain the
+  existing covered release at the handler's exit. The late-writer snapshot residual remains
+  open under #2852; retaining parks is a partial fix, not closure of that issue.
 
 Status reads on a kept clone run with `GIT_OPTIONAL_LOCKS=0`, so they never rewrite its
 index stat cache.
@@ -219,41 +225,59 @@ positive server evidence that its run is terminal; an absent or released hold is
 ### Recovery-handler exits (M2)
 
 `handleRecoveryExhausted` no longer clears `preserveRecoveryClone` at a capture or at an exit
-site. A site only marks release as eligible (`markReleaseEligible`) or keeps the clone
-(`keepClone`); the handler's `finally` runs `settleCloneRelease` once, after the last
-possible writer on every return path, and that is the only place the clone can be released.
-It calls `retainStoppedSource` with the capture's `capturedHead`. On a park or terminal
-exit the clone goes only when `verifyStoppedSourceCovered` returns `covered` then; on an exit
-that stops the generation the verdict is diagnostic and the clone is kept either way (see
-Coverage above). A remembered capture result, a
-memo without a `capturedHead` (including the degraded `{ verified: false }` stub) and a
+site. A site marks terminal release as eligible (`markReleaseEligible`), marks a park to
+keep (`markParkKeep`, reason `recovery_park_keep`), or keeps the clone outright (`keepClone`).
+The handler's `finally` runs `settleCloneRelease` once after the return-path work; this
+orders the snapshot after that work but does not exclude an independent late writer.
+It calls `retainStoppedSource` with the capture's `capturedHead`. A terminal exit can
+release the clone when `verifyStoppedSourceCovered` returns `covered`; on a park or an exit
+that stops the generation the verdict is diagnostic and the clone stays (see Coverage above).
+A remembered capture result, a memo without a `capturedHead` (including the degraded `{ verified: false }` stub) and a
 check that throws are all `not_covered`: the clone is kept.
 
-The exit decides the representation of a source that is not covered:
+The exit decides the representation of a kept source:
 
 - **Stops this generation** (kept even when covered; a `stop` confirm, an ownership read showing another
   generation, the terminal-disk recheck or the pre-handler precheck showing another
   generation, a stale park report, plus the M1 stale and fenced arms): the stopped-source
   record, as in M1 (attempt ledger `reclaimed` and the journal cleared; canonical
   `uzi-stopped` marker).
-- **Park exits** (`recovery_wait`, a live non-terminal status, shutdown) and **terminal
-  exits** (a terminal status or a terminal-disk recheck showing a terminal status): the
-  existing ADR-1197 plain-journal posture. The clone and journal are kept and no marker or
-  `reclaimed` entry is written, so a same-worker resume recaptures bytes written after the
-  capture, and a later run's existing terminal-orphan handling applies.
+- **Park exits** (`recovery_wait`, provider outage, credential-switch, disk or live
+  non-terminal final park, shutdown): the existing ADR-1197 plain-journal posture, even
+  when covered. The exact clone and existing journal stay, with no marker or `reclaimed`
+  entry. A successful direct credential switch also preserves the clone flag.
+- **Terminal exits** (a terminal status or a terminal-disk recheck showing one): covered
+  release is unchanged; otherwise the clone and plain journal stay, and a later run's
+  existing terminal-orphan handling applies.
+
+On the same worker, the next claim follows `recoverRetainedClaim` to recapture the kept
+source onto a fresh attempt path and model session. Failed or unknown recapture keeps the
+source. Successful recapture and completion also leave the predecessor retained: neither
+recapture nor a new claim is deletion authority. Existing verified-successor retirement
+applies only within its exact-source boundary; the authenticated covering FINAL path retires
+its exact successor and reanchors the journal to retained predecessors without deleting them. Otherwise disposal requires explicit operator discard. Stopped and fenced
+sources retain their operator-only policy.
+
+The cost is storage for the old parked source, including after resume and completion. On an
+unwired worker this also replaces ordinary same-path/session continuity with a fresh attempt
+and model session; Docker-wired resumes already use fresh attempts and sessions. Capacity
+pressure is not deletion authority. No new rename, state, TTL, exclusion or disposal
+mechanism is introduced.
 
 Two exits keep their earlier shape. An owner-authorized cancel (a non-credential cancel
 ACK) keeps its normal cleanup, since the owner chose to discard; only the
-credential-deferred captured cancel is revalidated. A `predecessorCapture` flight is
-released in place (ledger abandoned, journal cleared; no filesystem operation on the
-clone), so it is not revalidated; the clone is removed later by the retention sweep.
+credential-deferred captured cancel is revalidated. The existing terminal release-eligible
+`predecessorCapture` exception releases in place (ledger abandoned, journal cleared; no
+filesystem operation on the clone), without coverage revalidation; its later retention-sweep
+handling is unchanged. A predecessor-capture park instead latches keep and retains custody.
 
 Park and terminal exits that keep the clone outright (`credentialHeld`, an unverified
 credential terminal, `receipt_failed`, `ServerWallParkedError`, a confirm `gone` without
 a capture) run no own-mode proof beyond the existing entry kill, as before; only exits
-that become release-eligible run the `stopped_source` proof, once, at the handler's
-cleanup. An interruption propagating out of the handler (shutdown, pause, limit, a codex
-deferral, any throw) skips that cleanup check; the preserve flag stays as the
+that become terminal release-eligible or mark a park keep run the `stopped_source` proof,
+once, at the handler's cleanup (an existing retained-custody flight skips coverage).
+An interruption propagating out of the handler (shutdown, pause, limit, a codex deferral,
+any throw) skips that cleanup check; the preserve flag stays as the
 interrupting arm set it (shutdown, pause and limit keep the clone; an owner cancel takes
 its normal cancel cleanup; a claim fence or stale claim goes to the caller's stopped-source
 arm; a codex deferral or any other throw keeps the clone as latched), and the caller handles the interruption.
@@ -383,8 +407,10 @@ Every case keeps the source. What a later run sees depends on where the failure 
   attempt paths and fresh model sessions. Stopped markers count toward the per-run cap of 64;
   past it the record is `unknown` and the clone stays under its plain journal.
 - **Deferred (not shipped):** writer exclusion spanning the final byte checks through retirement
-  disposal, which would let a covered stopped clone be released again. The same snapshot
-  residual remains on park and terminal exits. Persisting the coverage verdict into inspect
+  disposal, which would let a covered stopped clone be released again. Park retention avoids
+  snapshot-authorized park deletion, but the residual remains on completed, failed and
+  cancelled terminal release (#2852), pending real writer exclusion and safe reclaim in the
+  Docker lane. Persisting the coverage verdict into inspect
   output is also not done; today it is in the worker log only. Decision: PRD
   `prds/1786-preserve-worker-only-work.md`, Decision 6 (lander and reviewer).
 - **Not shipped:** teardown of attributed containers is not proven by tests or hosted

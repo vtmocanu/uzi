@@ -1,5 +1,6 @@
 import { afterEach, beforeEach, describe, it } from "node:test";
 import assert from "node:assert/strict";
+import { getEventListeners } from "node:events";
 import { execFileSync } from "node:child_process";
 import fs from "node:fs";
 import os from "node:os";
@@ -277,17 +278,17 @@ function makeCtx(
     sessionId: null,
     onSessionId: (s) => sessionIds.push(s),
     // PRD #362 M3c: model the real gate's ordering — persist plan_md (the awaiting_approval
-    // report) THEN invoke the onAwaitingApproval hook (which posts the plan summary) BEFORE
+    // report) THEN invoke the onPlanPersisted hook (which posts the plan summary) BEFORE
     // returning the verdict. The plan-summary POST's stale-write guard reads runs.plan_md,
     // so it can only match once plan_md is persisted; this fake reproduces that ordering so
     // the summary tests exercise the same sequence production does. The hook is swallowed
     // here exactly as the real gate swallows it, so a throwing hook never fails the gate.
-    gatePlan: async (planMd, _milestones, onAwaitingApproval) => {
+    gatePlan: async (planMd, _milestones, onPlanPersisted) => {
       gated.push(planMd);
       persisted.planMd = planMd;
-      if (onAwaitingApproval) {
+      if (onPlanPersisted) {
         try {
-          await onAwaitingApproval(planMd);
+          await onPlanPersisted(planMd);
         } catch {
           /* advisory — a summary failure never blocks the gate */
         }
@@ -4757,6 +4758,225 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     return { runner, client, rec, intentPosted };
   }
 
+  function m1Barrier() {
+    let resolve!: () => void;
+    const promise = new Promise<void>(r => { resolve = r; });
+    return { promise, resolve };
+  }
+  for (const signalKind of ["terminal", "context"] as const) {
+    it(`B2 Claude ${signalKind} abort releases plan generator before executor finally`, async () => {
+      const entered = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+      const abort = new AbortController();
+      let input: PlanSummaryInput | undefined;
+      let released = false, callbackDone: Promise<void> | undefined;
+      const fake = summaryFakes();
+      const summaryRunner = {
+        generateIntentSummary: async () => null,
+        generatePlanSummary: async (i: PlanSummaryInput) => {
+          input = i;
+          await new Promise<void>(resolve => {
+            i.signal!.addEventListener("abort", () => { released = true; resolve(); }, { once: true });
+            entered.resolve();
+          });
+          i.onUsage?.({});
+          return { summary: "Cancelled advice", deltas: [] };
+        },
+      };
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()],
+        async function* () { implementation.resolve(); await finish.promise; yield signalDone(); yield resultSuccess(); },
+      ]);
+      const { ctx, emits } = makeCtx({
+        agents: [lead, coder], summaryIntentPresent: true,
+        ...(signalKind === "terminal" ? { terminalLifecycleSignal: abort.signal } : { signal: abort.signal }),
+        gatePlan: async (md, _milestones, persisted) => {
+          callbackDone = persisted!(md);
+          return { kind: "approve", selection: { status: "absent" } };
+        },
+      });
+      const executor = new SdkExecutor(nullLogger(), homeDir, {
+        queryFn, client: fake.client, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+      });
+      const execution = executor.run(ctx).catch(() => undefined);
+      try {
+        await Promise.all([entered.promise, implementation.promise]);
+        abort.abort();
+        assert.equal(input!.signal!.aborted, true, "generator sees abort while implementation is held open");
+        assert.equal(released, true, "signal-aware generator released before executor finally");
+        await callbackDone;
+        assert.equal(fake.rec.planPosts.length, 0);
+        // The released pass still reports the spend it observed; only its text is dropped (#2942).
+        assert.equal(emits.filter(m => m.kind === "summary_usage").length, 1);
+      } finally {
+        finish.resolve();
+        const result = await execution;
+        assert.equal(result?.summaryPlan, undefined);
+        assert.equal(result?.summaryDeltas, undefined);
+      }
+    });
+  }
+
+  for (const kind of ["issue", "self_improve", "prompt"] as const) {
+    for (const phase of ["generation", "post"] as const) {
+      for (const invalidation of ["live", "close", "fence", "cancel"] as const) {
+        it(`M1 Claude owned ${kind} ${phase} ${invalidation} permits implementation and drops obsolete advice`, async () => {
+          const entered = m1Barrier(), generate = m1Barrier(), postEntered = m1Barrier();
+          const postAck = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+          let calls = 0, posts = 0, fenced = false, cancelled = false;
+          let input: PlanSummaryInput | undefined;
+          let callbackDone: Promise<void> | undefined;
+          const summaryRunner = {
+            generateIntentSummary: async () => null,
+            generatePlanSummary: async (i: PlanSummaryInput) => {
+              input = i; calls++; entered.resolve();
+              await generate.promise;
+              i.onUsage?.({}); i.onUsage?.({});
+              return { summary: "Accepted advice", deltas: [] };
+            },
+          };
+          const post = async () => { posts++; postEntered.resolve(); await postAck.promise; };
+          const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+            callbackDone = persisted!(md);
+            assert.equal(persisted!(md), callbackDone, "storage retry joins the same flight");
+            if (phase === "post") await postEntered.promise;
+            return { kind: "approve", selection: { status: "absent" } };
+          };
+          const { queryFn } = fakeTurns([
+            [submitPlan("# Plan"), resultSuccess()],
+            async function* () { implementation.resolve(); await finish.promise; yield signalDone(); yield resultSuccess(); },
+          ]);
+          const fake = summaryFakes({ postPlan: post });
+          const probe = makeCtx({ kind, agents: [lead, coder], summaryIntentPresent: true, gatePlan,
+            claimFenced: () => fenced, cancelRequested: () => cancelled });
+          const ctx = probe.ctx, emitted = probe.emits;
+          const executor = new SdkExecutor(nullLogger(), homeDir, {
+            queryFn, client: fake.client, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+          });
+          if (phase === "post") generate.resolve();
+          const execution = executor.run(ctx);
+          try {
+            await Promise.all([entered.promise, implementation.promise]);
+            assert.equal(calls, 1, "one generation despite repeated callback");
+            if (invalidation === "close") await executor.closeAndSettlePlanSummary(1);
+            if (invalidation === "fence") fenced = true;
+            if (invalidation === "cancel") cancelled = true;
+            generate.resolve();
+            if (invalidation === "live" || phase === "post") await postEntered.promise;
+            postAck.resolve();
+            await callbackDone;
+            assert.equal(posts, phase === "post" || invalidation === "live" ? 1 : 0);
+            // Spend is counted unless the pass is abandoned, fenced or superseded (#2942).
+            assert.equal(emitted.filter(m => m.kind === "summary_usage").length,
+              phase === "post" || invalidation === "live" || invalidation === "cancel" ? 1 : 0);
+            if (invalidation === "close") assert.equal(input!.signal!.aborted, true);
+          } finally {
+            generate.resolve(); postAck.resolve(); finish.resolve();
+          }
+          const result = await execution;
+          assert.equal(result.summaryPlan, invalidation === "live" ? "Accepted advice" : undefined);
+        });
+      }
+    }
+  }
+
+  it("M1 Claude close counts usage the aborted plan pass reports within the settle bound", async () => {
+    const entered = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+    let posts = 0, callbackDone: Promise<void> | undefined;
+    const summaryRunner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (i: PlanSummaryInput) => {
+        await new Promise<void>(resolve => {
+          i.signal!.addEventListener("abort", () => resolve(), { once: true });
+          entered.resolve();
+        });
+        i.onUsage?.({}); i.onUsage?.({});
+        return { summary: "Closed advice", deltas: [] };
+      },
+    };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      async function* () { implementation.resolve(); await finish.promise; yield signalDone(); yield resultSuccess(); },
+    ]);
+    const fake = summaryFakes({ postPlan: async () => { posts++; } });
+    const probe = makeCtx({ agents: [lead, coder], summaryIntentPresent: true,
+      gatePlan: async (md, _milestones, persisted) => {
+        callbackDone = persisted!(md);
+        return { kind: "approve", selection: { status: "absent" } };
+      } });
+    const executor = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn, client: fake.client, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+    });
+    const execution = executor.run(probe.ctx);
+    try {
+      await Promise.all([entered.promise, implementation.promise]);
+      await executor.closeAndSettlePlanSummary(5_000);
+      await callbackDone;
+      assert.equal(posts, 0, "a closed flight posts no summary text");
+      assert.equal(probe.emits.filter(m => m.kind === "summary_usage").length, 1,
+        "spend observed during settlement is counted once");
+    } finally { finish.resolve(); }
+    assert.equal((await execution).summaryPlan, undefined);
+  });
+
+  for (const phase of ["generation", "post"] as const) {
+    it(`M1 Claude supersedes ${phase} before a failing replacement and suppresses late usage`, async () => {
+      const oldEntry = m1Barrier(), release = m1Barrier();
+      let calls = 0, posts = 0;
+      let oldDone: Promise<void> | undefined;
+      const summaryRunner = {
+        generateIntentSummary: async () => null,
+        generatePlanSummary: async (input: PlanSummaryInput) => {
+          calls++;
+          if (calls === 2) return null;
+          if (phase === "generation") { oldEntry.resolve(); await release.promise; }
+          input.onUsage?.({});
+          return { summary: "Obsolete", deltas: [] };
+        },
+      };
+      const post = async () => { posts++; oldEntry.resolve(); await release.promise; };
+      let gates = 0;
+      const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+        if (++gates === 1) {
+          oldDone = persisted!(md); await oldEntry.promise;
+          return { kind: "revise", feedback: "Replace it" };
+        }
+        await persisted!(md);
+        release.resolve(); await oldDone;
+        return { kind: "approve", selection: { status: "absent" } };
+      };
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Old"), resultSuccess()], [submitPlan("# Replacement"), resultSuccess()],
+        [signalDone(), resultSuccess()],
+      ]);
+      const fake = summaryFakes({ postPlan: post });
+      const probe = makeCtx({ agents: [lead, coder], summaryIntentPresent: true, gatePlan });
+      const ctx = probe.ctx, emitted = probe.emits;
+      const executor = new SdkExecutor(nullLogger(), homeDir, {
+        queryFn, client: fake.client, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+      });
+      const result = await executor.run(ctx);
+      assert.equal(calls, 2);
+      assert.equal(posts, phase === "post" ? 1 : 0);
+      assert.equal(result.summaryPlan, undefined);
+      assert.equal(emitted.filter(m => m.kind === "summary_usage").length, phase === "post" ? 1 : 0);
+    });
+  }
+
+  for (const kind of ["issue", "self_improve", "prompt"] as const) {
+    for (const present of [false, true]) it(`M1 Claude ${kind} intent and human plan summaries present=${present}`, async () => {
+      const { queryFn } = fakeTurns([
+        [submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()],
+      ]);
+      const { runner, client, rec } = summaryFakes();
+      const probe = makeCtx({ agents: [lead, coder], kind, summaryIntentPresent: present, summaryModel: "fixture-summary-model" });
+      await new SdkExecutor(nullLogger(), homeDir, { queryFn, client, summaryRunner: runner }).run(probe.ctx);
+      assert.equal(rec.intentCalls.length, present ? 0 : 1);
+      assert.equal(rec.planCalls.length, 1);
+      if (!present) assert.equal(rec.intentCalls[0]?.model, "fixture-summary-model");
+      assert.equal(rec.planCalls[0]?.model, "fixture-summary-model");
+    });
+  }
+
   // ── Failure isolation (Decision, criterion 4) — the load-bearing test ─────────
   // A throwing generator / throwing (or 409/400) post on the BLOCKING plan path must
   // NOT propagate: the run still reaches implement and reports the branch.
@@ -4912,7 +5132,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
   // matched 0 rows (plan_md still NULL / the previous plan) → 409 → the whole plan-summary
   // half of the feature was silently dropped, invisibly to CI. This models the guard: the
   // fake client rejects a post whose plan_md is not the currently-persisted one. It passes
-  // only because the summary now fires from the gate's onAwaitingApproval callback, after
+  // only because the summary now fires from the gate's onPlanPersisted callback, after
   // persist. Move the POST back before the gate and this test 409s and fails.
   it("posts the plan summary only AFTER plan_md is persisted, so a guard-enforcing server accepts it", async () => {
     const { queryFn } = fakeTurns([
@@ -4977,8 +5197,8 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     assert.deepStrictEqual(rec.planPosts, [], "and therefore no plan post");
   });
 
-  // ── Issue-only (never on ci_fix / self_improve) ──────────────────────────────
-  for (const kind of ["ci_fix", "self_improve"] as const) {
+  // ── Summary-eligible kinds only (never on these excluded kinds) ──────────────
+  for (const kind of ["ci_fix", "judge", "chat", "job", "task", "mr_rework", "cross_check"] as const) {
     it(`a ${kind} run posts NEITHER an intent nor a plan summary`, async () => {
       const { queryFn } = fakeTurns([
         [submitPlan("# Plan"), resultSuccess()],
@@ -6655,8 +6875,51 @@ describe("M1 expired wall physical Claude runner", () => {
   }
 });
 
+describe("M4 dependency wait cancellation", () => {
+  for (const alreadyAborted of [false, true]) {
+    it(`rejects caller cancellation and completes cleanup alreadyAborted=${alreadyAborted}`, async (t) => {
+      const controller = new AbortController();
+      const signal = AbortSignal.any([controller.signal, t.signal]);
+      const reason = new Error("caller cancelled dependency wait");
+      const directories = t.mock.method(fs, "mkdtempSync");
+      let enter!: () => void;
+      let release!: () => void;
+      const entered = new Promise<void>(resolve => { enter = resolve; });
+      const barrier = new Promise<void>(resolve => { release = resolve; });
+      let executorExited = false;
+      if (alreadyAborted) controller.abort(reason);
+      const outcome = exerciseDependencyWaitRunner(() => ({
+        run: async () => {
+          enter();
+          await barrier;
+          executorExited = true;
+          throw new Error("fixture executor released");
+        },
+      }), signal).then(
+        () => ({ error: undefined }),
+        error => ({ error }),
+      );
+      let listeners = 0;
+      if (!alreadyAborted) {
+        await entered;
+        listeners = getEventListeners(signal, "abort").length;
+        controller.abort(reason);
+        release();
+      }
+      const result = await outcome;
+      assert.equal(result.error, reason, "the caller's exact abort reason is propagated");
+      assert.equal(executorExited, !alreadyAborted, "cleanup joins the released executor");
+      if (!alreadyAborted) assert.equal(listeners, 1, "readiness observes caller cancellation");
+      assert.equal(getEventListeners(signal, "abort").length, 0);
+      assert.ok(directories.mock.calls.length >= 3);
+      for (const call of directories.mock.calls.slice(0, 3))
+        assert.equal(fs.existsSync(call.result!), false, "helper finally removes its fixture directories");
+    });
+  }
+});
+
 describe("M4 dependency wait physical Claude runner", () => {
-  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async () => {
+  it("real executor parks pushed M1, releases worker custody, and owner resumes like ordinary pauses", async (t) => {
     let calls = 0;
     const custody = await exerciseDependencyWaitRunner((ctx, home) => {
       const script = scriptedDependencyWait("reworded", ({ continuation, advertisedTools }) => {
@@ -6689,10 +6952,10 @@ describe("M4 dependency wait physical Claude runner", () => {
         yield resultSuccess();
       })();
       return new SdkExecutor(nullLogger(), home, { queryFn, installDeps: async () => ({ results: [], truncated: false }) });
-    });
+    }, t.signal);
     assert.equal(calls, 3);
     for (const mode of ["now", "after_milestone"] as const) {
-      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, mode);
+      const ordinary = await exerciseDependencyWaitRunner(() => { throw new Error("ordinary fixture must use owner pause"); }, t.signal, mode);
       assert.deepEqual(custody, ordinary, `dependency wait custody equals ordinary owner pause ${mode}`);
     }
   });

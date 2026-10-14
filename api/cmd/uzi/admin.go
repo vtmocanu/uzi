@@ -50,7 +50,8 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 
 	runs := &cobra.Command{
 		Use:   "runs",
-		Short: "List all runs across the factory",
+		Short: "List active runs across the factory (newest 500)",
+		Long:  "List the newest 500 non-terminal runs across all users, excluding chat, judge, and cross-check runs.",
 		Args:  cobra.NoArgs,
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)

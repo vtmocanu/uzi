@@ -772,8 +772,9 @@ WHERE run_id = @run_id::uuid
   AND payload->>'tool_use_id' IS NOT NULL;
 
 -- name: ListActiveRunsAll :many
--- Admin Agents-status: every non-terminal run across all users, with repo path,
--- worker name, and owner email for the admin overview.
+-- Admin Agents-status: the newest 500 non-terminal runs across all users, excluding
+-- chat, judge, and cross-check runs, with repo path, worker name, and owner email
+-- for the admin overview.
 SELECT sqlc.embed(r), rp.path_with_namespace AS repo_path, w.name AS worker_name, u.email AS owner_email,
        c.forge_type,
        i.web_url                 AS issue_web_url,   -- PRD #411: the forge issue's web URL for the run's clickable #<iid> link

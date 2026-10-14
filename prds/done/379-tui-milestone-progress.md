@@ -88,10 +88,10 @@ primitives (`api/cmd/uzi/tui_render.go`), and the D7 untrusted-text discipline
    boards. Faint styling: milestones are informational, unlike the own-board judge
    marker or a stalled row.
 
-4. **Board title trim** (`tui_board.go`): titles cap at `boardTitleMax = 60` (was:
-   the whole remaining terminal width) and pad to that width, so a long title is
-   trimmed to `…` and the trailing judge marker lines up in a column instead of
-   floating after each ragged title end.
+4. **Board title trim** (`tui_board_rows.go`): titles use the remaining terminal
+   width after reserving judge and worker columns, trimming to `…` only at that
+   boundary. PR #2922 supersedes the original 60-column cap; judge markers still
+   align at the right edge.
 
 5. **Guardrails + demo** (`tui_d7_guard_test.go`, `demo.go`): `"Title"` added to
    `d7UntrustedFields`; a milestone-structured run seeded into `uzi tui --demo`.
@@ -157,7 +157,7 @@ list DTO already carried everything the badge needs.
 3. A run that has reported nothing shows `–/N`, never `0/N`.
 4. Untrusted milestone titles cannot inject control bytes into a frame (D7 guard +
    hostile-value render test).
-5. Long board titles are trimmed to a fixed column; the judge marker aligns.
+5. Long board titles fill the remaining title budget and trim at its boundary; the judge marker aligns (updated by PR #2922).
 6. The run viewer fills the terminal height: the two-pane body and pane divider reach the
    footer with no dead space below the content, at any terminal height
    (`TestTUIDetailFillsHeight`).
@@ -189,9 +189,9 @@ list DTO already carried everything the badge needs.
    as a per-rune SGR run (frame bloat, and it breaks substring assertions) and the ✓
    glyph already carries completion. In-progress uses plain terminal fg (the web's
    `text-fg`); the glyph colour is the signal.
-6. **Title trim + pad** (`boardTitleMax = 60`): trimming answers the "titles are very
-   long" ask; padding to the cap turns the trailing judge marker from a ragged float
-   into an aligned column.
+6. **Original title trim + pad** (`boardTitleMax = 60`): this capped titles to
+   align the judge marker. Superseded on 2026-10-14 by PR #2922: titles fill the
+   remaining budget and markers retain their reserved right-edge column.
 7. **D7**: milestone titles are repo/agent-authored untrusted text, so they route
    through `renderer.Plain` and `"Title"` joins `d7UntrustedFields`; the hostile-value
    render test is extended (the clean-fixture screenshots cannot catch a raw draw).
@@ -219,9 +219,9 @@ list DTO already carried everything the badge needs.
   the crew rail; on a short terminal the tail clips. Bounded and visible; M6's review
   checks it. Not gating — the block is informational and the transcript viewport is
   computed independently of rail height.
-- **`boardTitleMax` is a guess.** 60 is a judgement call; too low truncates useful
-  titles, too high defeats the trim. Exposed as a single named const, tunable after
-  the visual review.
+- **Original title-cap risk, retired by PR #2922.** The 60-column guess truncated
+  useful titles on wide terminals. The fixed cap is removed; title truncation now
+  follows the space left by the other columns.
 - **Nil-vs-empty relies on the server emitting `null`.** If a future server change
   emitted `[]` for an unreported run, `reported` would flip to true and show `0/N`.
   The web already depends on this exact contract, so the two move together.

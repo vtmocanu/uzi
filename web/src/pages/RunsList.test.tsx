@@ -1333,7 +1333,7 @@ describe("RunsHistory — the Failed filter (PRD #1650 D7)", () => {
 });
 
 // PRD #295: the compact credential badge on the Runs list, gated on the viewer
-// holding more than one Anthropic token.
+// holding more than one credential across both harnesses.
 function aSecret(over: Partial<SecretMeta> = {}): SecretMeta {
   return {
     id: "sec-1",
@@ -1393,7 +1393,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     }
   });
 
-  it.each(["/runs", "/runs/history"])("gates each harness independently on %s", async (path) => {
+  it.each(["/runs", "/runs/history"])("shows both harnesses once the total credential count exceeds one on %s", async (path) => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [
       aSecret({ id: "claude-1" }),
       aSecret({ kind: "codex_auth", id: "codex-1" }),
@@ -1408,10 +1408,10 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     renderRuns(path);
     await waitFor(() => expect(screen.getByText("Codex row")).toBeTruthy());
     expect(screen.getByText("codex-seat")).toBeTruthy();
-    expect(screen.queryByText("console-key")).toBeNull();
+    expect(screen.getByText("console-key")).toBeTruthy();
   });
 
-  it("does not let two Anthropic tokens reveal a single Codex credential", async () => {
+  it("shows a sole Codex credential alongside two Anthropic tokens", async () => {
     mockApi.listSecrets.mockResolvedValue({ secrets: [
       aSecret({ id: "claude-1" }), aSecret({ id: "claude-2", is_default: false }),
       aSecret({ kind: "codex_auth", id: "codex-1" }),
@@ -1420,8 +1420,45 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       codex_secret_id: "codex-1", codex_secret_label: "codex-seat" })] });
     renderRuns();
     await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
-    expect(screen.queryByText("codex-seat")).toBeNull();
+    expect(screen.getByText("codex-seat")).toBeTruthy();
     expect(screen.queryByText("console-key")).toBeNull();
+  });
+
+  it.each(["/runs", "/runs/history"])("names lone default accounts on %s", async (path) => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret(), aSecret({ kind: "codex_auth", id: "codex-1" })] });
+    const status = path === "/runs" ? "running" : "completed";
+    mockApi.listRuns.mockResolvedValue({ runs: [
+      aCredentialedRun({ id: "claude", issue_title: "Claude row", status, anthropic_secret_label: "default" }),
+      aCredentialedRun({ id: "codex", issue_title: "Codex row", status, harness: "codex", codex_secret_id: "codex-1", codex_secret_label: "default" }),
+    ] });
+    renderRuns(path);
+    await waitFor(() => expect(screen.getByText("Codex row")).toBeTruthy());
+    expect(screen.getByText("claude")).toBeTruthy();
+    expect(screen.getByText("codex")).toBeTruthy();
+    expect(screen.queryByText("default")).toBeNull();
+  });
+
+  it.each([
+    ["default", null, "default"],
+    ["Default", "sec-x", "Default"],
+    ["default\u202e", "sec-x", "default"],
+    ["acct-a", "sec-x", "acct-a"],
+  ])("preserves recorded %s label with id %s", async (label, id, shown) => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret(), aSecret({ kind: "codex_auth", id: "codex-1" })] });
+    mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun({ anthropic_secret_id: id, anthropic_secret_label: label })] });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
+    expect(screen.getByText(shown)).toBeTruthy();
+    if (id === null) expect(screen.getByText(shown).parentElement?.textContent).toContain("(deleted)");
+  });
+
+  it("does not substitute default among multiple credentials of the same harness", async () => {
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret(), aSecret({ id: "sec-2" })] });
+    mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun({ anthropic_secret_label: "default" })] });
+    renderRuns();
+    await waitFor(() => expect(screen.getByText("Billed run")).toBeTruthy());
+    expect(screen.getByText("default")).toBeTruthy();
+    expect(screen.queryByText("claude")).toBeNull();
   });
 
   // A run with no recorded credential label renders no badge, at any token count. The
@@ -1482,7 +1519,7 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
       user: { is_admin: true, email: "me@uzi.test" },
       vaultUnlocked: true,
     } as unknown as ReturnType<typeof useAuth>);
-    mockApi.listSecrets.mockResolvedValue({ secrets: [] });
+    mockApi.listSecrets.mockResolvedValue({ secrets: [aSecret(), aSecret({ kind: "codex_auth", id: "viewer-codex" })] });
     mockApi.listRuns.mockResolvedValue({ runs: [] });
     mockApi.adminListWorkers.mockResolvedValue({ workers: [] });
     mockApi.adminListRuns.mockResolvedValue({
@@ -1497,6 +1534,10 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
           anthropic_headroom_pct: null,
         }),
         aCredentialedRun({
+          id: "other-default", issue_title: "Other default run", owner_email: "other@uzi.test",
+          harness: "codex", codex_secret_id: "other-seat", codex_secret_label: "default",
+        }),
+        aCredentialedRun({
           id: "other-codex", issue_title: "Other's Codex run", owner_email: "other@uzi.test",
           harness: "codex", codex_secret_id: null, codex_secret_label: "retired-seat",
         }),
@@ -1506,8 +1547,10 @@ describe("RunsList — credential badge gate (PRD #295)", () => {
     const { container } = renderRuns();
 
     await waitFor(() => expect(screen.getByText("Other's run")).toBeTruthy());
-    // The badge renders (admin still sees provenance despite holding zero tokens).
+    // Admin provenance is independent of the viewer's own one-per-harness counts.
     expect(screen.getByText("their-key")).toBeTruthy();
+    expect(screen.getByText("default")).toBeTruthy();
+    expect(screen.queryByText("codex")).toBeNull();
     expect(screen.getByText("retired-seat")).toBeTruthy();
     expect(screen.getByText("(deleted)")).toBeTruthy();
     // …but its /settings link is stripped. The row's own /runs/:id link is unaffected.
@@ -1668,9 +1711,75 @@ describe("RunsList — live poll (PRD #518)", () => {
     expect(mockApi.listRuns).toHaveBeenCalledTimes(2);
     expect(screen.getByText("Second title")).toBeTruthy();
     expect(screen.getByText("running")).toBeTruthy();
-    // The mount-only credential secrets fetch does NOT re-fire on a poll (design
-    // invariant 2: poll only the volatile endpoint).
-    expect(mockApi.listSecrets).toHaveBeenCalledTimes(1);
+    // Credential counts refresh on the same cadence as rows.
+    expect(mockApi.listSecrets).toHaveBeenCalledTimes(2);
+  });
+
+  it.each(["/runs", "/runs/history"])("refreshes badge visibility and default names on %s", async (path) => {
+    vi.useFakeTimers();
+    const first = [aSecret()];
+    const mixed = [...first, aSecret({ kind: "codex_auth", id: "codex-1" })];
+    const several = [...mixed, aSecret({ id: "claude-2" })];
+    mockApi.listSecrets.mockResolvedValueOnce({ secrets: first })
+      .mockResolvedValueOnce({ secrets: mixed }).mockResolvedValueOnce({ secrets: several })
+      .mockResolvedValue({ secrets: first });
+    mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun({ anthropic_secret_label: "default",
+      status: path === "/runs" ? "running" : "completed" })] });
+    renderRuns(path);
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.queryByText("claude")).toBeNull();
+    expect(screen.queryByText("default")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByText("claude")).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByText("default")).toBeTruthy();
+    expect(screen.queryByText("claude")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.queryByText("default")).toBeNull();
+  });
+
+  it("starts with no badges when secrets fail and recovers on the next poll", async () => {
+    vi.useFakeTimers();
+    mockApi.listSecrets.mockRejectedValueOnce(new Error("secrets unavailable"))
+      .mockResolvedValue({ secrets: [aSecret(), aSecret({ id: "second" })] });
+    mockApi.listRuns.mockResolvedValue({ runs: [aCredentialedRun()] });
+    renderRuns();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText("Billed run")).toBeTruthy();
+    expect(screen.queryByText("console-key")).toBeNull();
+    expect(screen.queryByText("secrets unavailable")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByText("console-key")).toBeTruthy();
+  });
+
+  it("keeps last-good counts when secrets fail while runs refresh", async () => {
+    vi.useFakeTimers();
+    mockApi.listSecrets.mockResolvedValueOnce({ secrets: [aSecret(), aSecret({ id: "second" })] })
+      .mockRejectedValue(new Error("secrets unavailable"));
+    mockApi.listRuns.mockResolvedValueOnce({ runs: [aCredentialedRun()] })
+      .mockResolvedValue({ runs: [aCredentialedRun({ issue_title: "Refreshed row" })] });
+    renderRuns();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.getByText("console-key")).toBeTruthy();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByText("Refreshed row")).toBeTruthy();
+    expect(screen.getByText("console-key")).toBeTruthy();
+    expect(screen.queryByText("secrets unavailable")).toBeNull();
+  });
+
+  it("refreshes counts when runs fail while keeping last-good rows", async () => {
+    vi.useFakeTimers();
+    mockApi.listSecrets.mockResolvedValueOnce({ secrets: [aSecret()] })
+      .mockResolvedValue({ secrets: [aSecret(), aSecret({ id: "second" })] });
+    mockApi.listRuns.mockResolvedValueOnce({ runs: [aCredentialedRun()] })
+      .mockRejectedValue(new Error("runs unavailable"));
+    renderRuns();
+    await act(async () => { await vi.advanceTimersByTimeAsync(0); });
+    expect(screen.queryByText("console-key")).toBeNull();
+    await act(async () => { await vi.advanceTimersByTimeAsync(10000); });
+    expect(screen.getByText("Billed run")).toBeTruthy();
+    expect(screen.getByText("console-key")).toBeTruthy();
+    expect(screen.queryByText("runs unavailable")).toBeNull();
   });
 
   it("keeps the last-good list when a poll fails — no skeleton re-flash, no error banner", async () => {

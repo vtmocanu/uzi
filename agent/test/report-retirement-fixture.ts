@@ -289,8 +289,10 @@ export async function reportRetirementFixture(t: TestContext, options: {
   const assertPending = async () => {
     assert.ok(await outbox.readTerminalJournal(claim.run_id, generation), "unsafe report must remain pending");
     assert.deepEqual(outbox.listPendingTerminals().map(p => [p.run_id, p.claim_generation]), [[claim.run_id, generation]]);
-    assert.ok(registry.build().active.some(e => e.run_id === claim.run_id &&
-      e.claim_generation === generation && e.terminal_pending));
+    const settled = outbox.listPendingTerminals().find(e => e.claim_generation === generation)?.server_settled === true;
+    assert.equal(registry.build().active.some(e => e.run_id === claim.run_id &&
+      e.claim_generation === generation && e.terminal_pending), !settled,
+    "retained custody evidence advertises only an unresolved server outcome");
     await assertCustody();
   };
   // Positive stages lend the three production wall-clock bounds headroom so a slow runner cannot

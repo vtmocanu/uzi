@@ -92,6 +92,12 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"detail-human-stop-reject":          func(d bool) string { return humanStopDetailScene(d, "reject") },
 		"detail-human-stop-stop":            func(d bool) string { return humanStopDetailScene(d, "stop") },
 		"detail-human-stop-failure":         func(d bool) string { return humanStopDetailScene(d, "failure") },
+		"board-wide-title-120":              func(d bool) string { return boardWideTitleScene(d, now, 120) },
+		"board-wide-title-200":              func(d bool) string { return boardWideTitleScene(d, now, 200) },
+		"board-accounts-one-each-100":       func(d bool) string { return boardAccountScene(d, now, 1, 100) },
+		"board-accounts-two-plus-one-100":   func(d bool) string { return boardAccountScene(d, now, 2, 100) },
+		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
+		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
 		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                       boardEmpty,
@@ -200,6 +206,31 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		scenes[name] = func(dark bool) string { return workersScene(dark, name).View().Content }
 	}
 
+	for _, split := range []bool{false, true} {
+		for _, width := range []int{200, 80} {
+			for _, active := range []int{0, 1} {
+				surface := "board"
+				if split {
+					surface = "split"
+				}
+				state := "idle"
+				if active != 0 {
+					state = "active"
+				}
+				name := surface + "-cross-checks-" + state + "-" + itoa(width)
+				scenes[name] = func(dark bool) string {
+					m := crossCheckFleetScene(dark, split, width, active)
+					m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: boardRuns(now)})
+					if split {
+						m = step(m, reposMsg{repos: []apitypes.RepoDTO{oneRepo()}})
+						m = step(m, ciMsg{reqID: m.ci.waitID, runs: sampleCIRuns(now)})
+					}
+					return m.View().Content
+				}
+			}
+		}
+	}
+
 	for _, scene := range uxAnswerScenes() {
 		scenes[scene.name] = func(dark bool) string { return scene.build(dark, now).model.View().Content }
 	}
@@ -297,6 +328,23 @@ func splitScene(dark bool, now time.Time, scene string) string {
 		m = key(m, "u")
 	}
 	return m.View().Content
+}
+
+// crossCheckFleetScene shares the shipped render path with the regression fixtures.
+// The offline worker's activity and capacity must not contribute to the title.
+func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
+	m := uxModel(&uzicli.FakeClient{}, "", dark)
+	height := 16
+	if split {
+		height = 60
+	}
+	m = step(m, tea.WindowSizeMsg{Width: width, Height: height})
+	m.workers.rows = []workerRow{
+		{w: apitypes.WorkerDTO{ID: "online-a", Name: "online-a", Status: "online", MaxConcurrentRuns: ip32(2), MaxCrossCheckSlots: ip32(2), ActiveCrossChecks: active}},
+		{w: apitypes.WorkerDTO{ID: "online-b", Name: "online-b", Status: "online", MaxConcurrentRuns: ip32(2), MaxCrossCheckSlots: ip32(2)}},
+		{w: apitypes.WorkerDTO{ID: "offline", Name: "offline", Status: "offline", MaxConcurrentRuns: ip32(9), MaxCrossCheckSlots: ip32(9), ActiveCrossChecks: 7}},
+	}
+	return m
 }
 
 var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
@@ -1434,5 +1482,44 @@ func humanStopDetailScene(dark bool, id string) string {
 			break
 		}
 	}
+	return m.View().Content
+}
+
+// Mixed credentials share measured cells across the needs-you, floor and done bands.
+func boardAccountScene(dark bool, now time.Time, claudeCount, width int) string {
+	runs := boardRuns(now)[:4]
+	for i := range runs {
+		runs[i].AnthropicSecretID, runs[i].AnthropicSecretLabel = sp("claude-id"), sp("default")
+	}
+	runs[0].Harness = "codex"
+	runs[0].CodexSecretID, runs[0].CodexSecretLabel = sp("codex-id"), sp("default")
+	runs[0].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 3}
+	if claudeCount > 1 {
+		runs[2].AnthropicSecretLabel = sp("acct-a")
+	}
+	runs[2].Usage = &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 10}
+	runs[3].Status = "completed"
+	runs[3].AnthropicSecretLabel, runs[3].AnthropicSecretID = nil, nil
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m.width = width
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	m = step(m, secretsMsg{count: claudeCount, codexCount: 1})
+	return m.View().Content
+}
+
+// Wide titles consume the space before the reserved judge and worker columns.
+func boardWideTitleScene(dark bool, now time.Time, width int) string {
+	runs := boardRuns(now)[:4]
+	runs[0].IssueTitle = strings.Repeat("Keep account labels readable while aligning costs and judge markers across the board. ", 5)
+	runs[0].JudgeVerdict, runs[0].JudgeTodoCount = sp("issues"), 2
+	for i := range runs {
+		runs[i].WorkerName = sp("worker-a")
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m.width = width
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	m = step(m, secretsMsg{count: 2, codexCount: 1})
 	return m.View().Content
 }

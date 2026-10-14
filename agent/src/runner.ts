@@ -88,7 +88,7 @@ import type {
 import { resolveAgentSelection, RUN_KINDS } from "./protocol.js";
 import type { ActiveRunRegistry } from "./active-run-registry.js";
 import { deriveCloneKey, resolveRunKind, RUN_KIND_PROFILES } from "./run-kind.js";
-import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord } from "./recovery.js";
+import { RecoveryCoordinator, isCodePublishingKind, inventoryReadCause, inventorySourceReporter, type InventorySourceBoundaryContext, type CompletionSource, type RecoveryRecord, type RecoveryCoordinatorOptions } from "./recovery.js";
 import {
   PUSHED_HEAD_UNRECORDED,
   PredecessorSettler,
@@ -2163,6 +2163,8 @@ export interface CheckpointTestHooks {
 
 /** Tuning the runner needs beyond the collaborators (defaults keep M2/M3 tests terse). */
 export interface RunnerOptions {
+  /** Stub-only E2E redrive spacing; omitted for production and all other phases. */
+  recoveryLiveTiming?: Pick<RecoveryCoordinatorOptions, "liveBackoffBaseMs" | "liveBackoffCapMs">;
   /** Test-only timing overrides; production uses the approved bounded retry/poll policy. */
   planCrossCheckTiming?: PlanCrossCheckTiming;
   /** Test-only teardown seams; production uses the pinned walk with one 120 s deadline. */
@@ -2547,6 +2549,7 @@ export class RunRunner {
         onAuthoritativeGenerationReleased: opts.queueTerminalRejectionReconciliation,
         workerToken: this.joinToken,
         now: opts.now,
+        ...opts.recoveryLiveTiming,
       });
     // issue #1582 M2 — the settlement journal is a SIBLING of recovery/ (never inside it), keyed
     // from the join token under its own domain-separation label.
@@ -3912,7 +3915,7 @@ export class RunRunner {
         }
         const outcome = await this.enterCredentialSwitch(claim, flight, runLog);
         if (outcome === "released") {
-          // The flight ends: the finally retires the clone and preserves the HOME; the server
+          // The flight ends: the finally keeps the clone for recapture and preserves HOME; the server
           // requeued the run; a reclaim resumes at resume_phase on the newly-chosen token. No
           // terminal report — enterCredentialSwitch already reported credential_switch.
           runLog.info("credential switch released this claim; leaving the run for a reclaim on the new token");
@@ -4081,6 +4084,7 @@ export class RunRunner {
       let terminalDisposeUnproven = false;
       if (executor.safety) {
         try {
+          await executor.closeAndSettlePlanSummary?.(this.codexBoundaryDeadlineMs);
           const disposal = await executor.safety.dispose({ boundary: "terminal", deadlineMs: this.codexBoundaryDeadlineMs });
           if (disposal.kind === "incomplete") {
             terminalDisposeUnproven = true;
@@ -6107,6 +6111,7 @@ export class RunRunner {
         // Issue #1742 retirement site (c): the api accepted the completion-hold park for this generation.
         if (flight.completionHoldOutcome === "confirmed")
           await this.retireFinalizeRecord(flight, "completion_hold_accepted");
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("completion hold retained; skipping finalization", {
@@ -6187,6 +6192,7 @@ export class RunRunner {
         // hold/wall park below); the runner's terminal
         // safety.dispose tears the registry down. This line is a no-op for Codex (its executor
         // implements no killAgentTree); for Claude it is the literal legacy reap, byte-unchanged.
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run parked on an owner-requested pause; skipping finalization", {
@@ -6201,6 +6207,7 @@ export class RunRunner {
       // the finally preserves HOME and clone. Every completionHeld result reaches here via
       // executeClaim's finalize-boundary bypass, including an ambiguous hold delivery.
       if (result.completionHeld) {
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("completion hold retained; skipping finalization", {
@@ -6220,6 +6227,7 @@ export class RunRunner {
       // an undeliverable park still arrives inside the boundary. Keyed on the executor's result so no
       // non-wall path can reach this branch.
       if (result.walled) {
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run parked at its wall-clock limit; skipping finalization", {
@@ -6230,14 +6238,15 @@ export class RunRunner {
       }
       // PRD #1247 M5b (data-integrity fix): a held-state credential switch RELEASED the claim IN PLACE
       // (ctx.attemptCredentialSwitch → "released"). enterCredentialSwitch already drained the batcher,
-      // reported credential_switch (queued ack), cleared preserveRecoveryClone + set parked, and the
+      // reported credential_switch (queued ack), kept preserveRecoveryClone + set parked, and the
       // server requeued the run for a reclaim at resume_phase on the newly-chosen token. Like the pause
       // park and the completion hold above, the run is non-terminal and already handled, so there is
       // NOTHING to finalize (no push, no MR, no completion report). Reap + close the batcher
-      // (idempotent — the release already drained it) and return; the finally retires the clone
-      // (preserveRecoveryClone cleared) and preserves the HOME (parked) for the same-worker resume.
+      // (idempotent — the release already drained it) and return; the finally keeps the clone
+      // and HOME (parked) so the next same-worker claim recaptures the source.
       // Keyed on the executor's result so no non-release path can reach this branch.
       if (result.switchReleased) {
+        await executor.closeAndSettlePlanSummary?.();
         executor.killAgentTree?.();
         await closeBatcher().catch(() => undefined);
         runLog.info("run released for a credential switch in place; skipping finalization", {
@@ -6276,6 +6285,7 @@ export class RunRunner {
       // PRD #1171 m4: needs NO own permit — for a Codex run this runs INSIDE the finalize
       // withBoundary that wraps phasePublish, and this line is a no-op for Codex; for Claude it
       // is the literal legacy reap, byte-unchanged.
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       batcher.emit({
         kind: "status",
@@ -8023,6 +8033,7 @@ export class RunRunner {
       reason: string,
       failureReason: string = COMPLETION_INTERLOCK_UNHELD_REASON,
     ): Promise<void> => {
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       await closeBatcher().catch(() => undefined);
       // PRD #1391 Run B M3 (N1): journal write-ahead so the fail-closed completion-interlock outcome
@@ -10693,7 +10704,7 @@ export class RunRunner {
         ? new NowSummaryController({
             steering,
             claim: {
-              issueRun: resolveRunKind(claim.kind) === "issue",
+              kind: resolveRunKind(claim.kind),
               claude: !claim.secrets.codex && !!claim.secrets.anthropic_oauth_token,
               ...nowSummaryCodexClaim(runId, claim.secrets.codex, this.nowSummaryOpts.codexAdviceHarnessFactory),
             },
@@ -10894,7 +10905,7 @@ export class RunRunner {
       // old token in place, so CLEAR the preserve flags enterCredentialSwitch set up front (its
       // step 2) — a later NORMAL completion must clean up the clone + HOME as usual, not preserve
       // them (D3/D14). On a RELEASE they are already correct (parked=true, preserveRecoveryClone=
-      // false) so the finally retires the clone and keeps the HOME for resume. The clear lives HERE,
+      // true) so the finally keeps the clone for recapture and HOME for resume. The clear lives HERE,
       // not inside enterCredentialSwitch, because the outer-catch safety net cannot continue in
       // place and must KEEP the flags to leave the run non-terminal for a requeue.
       // issue #1597 M2: gated end to end — from the wip marker captureRecoveryRestorePoint commits to
@@ -10954,7 +10965,7 @@ export class RunRunner {
       ...(claim.plan_approved !== true
         ? { takeResumedGateEvent: (signal?: AbortSignal) => this.takeResumedGateEvent(runId, steering, batcher, runLog, signal) }
         : {}),
-      gatePlan: async (planMd, milestones, onAwaitingApproval, settles) => {
+      gatePlan: async (planMd, milestones, onPlanPersisted, settles) => {
         // PRD #71 M5: a CI-config-classified ci_fix plan must NOT take the auto-approve
         // short-circuit — it parks for human review even on an auto-triggered run. We
         // force the gate by passing autoApprove=false for that case; gatePlan is otherwise
@@ -11100,7 +11111,7 @@ export class RunRunner {
           runnerClone.path,
           // PRD #1416 M5: the published floor P for the warn-only plan-gate nudge.
           flight.publishedTip,
-          onAwaitingApproval,
+          onPlanPersisted,
           settles,
           checkedHuman,
           checkedFields,
@@ -11798,6 +11809,7 @@ export class RunRunner {
     // incomplete reap or a survivor blocks the push instead of being logged and ignored. A
     // process that has dropped both (another HOME and a working directory outside the run) is
     // beyond either reap.
+    await executor.closeAndSettlePlanSummary?.();
     executor.killAgentTree?.();
     flight.result = result;
     return result;
@@ -11885,6 +11897,9 @@ export class RunRunner {
     // handled by the caller like a blocked Codex boundary: nothing published or settled, the park
     // stands) and keeps the clone.
     const quiesceSink = flight !== undefined;
+    const deadlineAt = Date.now() + Math.max(0, req.deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(req.deadlineMs);
+    req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
@@ -11899,6 +11914,7 @@ export class RunRunner {
       await this.quiesceOrBlockSink(flight, executor, req.boundary, sinkOpts);
       await action(undefined);
     } else {
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       await action(undefined);
     }
@@ -11994,6 +12010,7 @@ export class RunRunner {
     opts: { mode: QuiesceMode; site: string; targetPaths?: string[]; processOnly?: boolean; clonePath?: string; propagateControl?: boolean; forceProcessScan?: boolean },
   ): Promise<{ outcome: QuiesceRunOutcome; blocked: boolean }> {
     return flight.sinkGate.run(async () => {
+      await executor.closeAndSettlePlanSummary?.();
       executor.killAgentTree?.();
       // issue #1783 M2: a flight capturing a PREDECESSOR attempt's clone never quiesces it as its
       // own: every proof there (the capture, its re-proofs, the pre-settle reap) is a
@@ -12112,6 +12129,9 @@ export class RunRunner {
     req: BoundaryRequest,
     action: (permit?: BoundaryPermit) => Promise<void>,
   ): Promise<void> {
+    const deadlineAt = Date.now() + Math.max(0, req.deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(req.deadlineMs);
+    req = { ...req, deadlineMs: Math.max(0, deadlineAt - Date.now()) };
     const safety = executor.safety;
     if (safety) {
       await safety.withBoundary(req, async (permit) => {
@@ -14963,6 +14983,9 @@ export class RunRunner {
    *  reaped by the handler's `killAgentTree`; a `safety`-bearing executor without the method fails
    *  closed. Never throws. */
   private async settleForCredentialCapture(executor: Executor, deadlineMs = this.codexBoundaryDeadlineMs): Promise<CredentialFreeSettleOutcome> {
+    const deadlineAt = Date.now() + Math.max(0, deadlineMs);
+    await executor.closeAndSettlePlanSummary?.(deadlineMs);
+    deadlineMs = Math.max(0, deadlineAt - Date.now());
     if (executor.settleForCredentialFreeCapture) {
       try {
         return await executor.settleForCredentialFreeCapture(deadlineMs);
@@ -15008,8 +15031,8 @@ export class RunRunner {
    *     terminal ack or ownership read, a given-up input receipt, a live non-running ack or
    *     ownership read) first run the credential-free exit capture: settle, WIP commit, fetch-back
    *     and verify, with a best-effort credential-free publish (skipped when the run is already
-   *     known terminal). Only a VERIFIED capture whose coverage still holds at the exit clears the
-   *     preserve flags; otherwise the clone and session are kept, so executeClaim's finally never
+   *     known terminal). A terminal exit releases the clone only when verified coverage still holds;
+   *     a park keeps the clone even when covered. Otherwise the clone and session are kept, so executeClaim's finally never
    *     discards the only copy of unfetched commits or uncommitted edits;
    *   - the STOP arms deliberately do NOT capture: a `stop` confirm (a stale_claim ack or another
    *     generation on the probe), the park loop's claim_generation mismatch, and a StaleClaimError
@@ -15017,9 +15040,9 @@ export class RunRunner {
    *     #1247 convention for the clone: the new claim has its own clone but cannot see this
    *     worker's bytes, so a stopped exit (`record: "stopped"`) keeps and records the clone for the
    *     operator channel whatever `retainStoppedSource` revalidates (a `covered` verdict there is
-   *     diagnostic only); a park or terminal exit (`record: "none"`) releases the clone only when
-   *     `retainStoppedSource` revalidates coverage at that exit for this exact source (a cached
-   *     capture, `capture.verified` or the degraded stub is never enough);
+   *     diagnostic only); a park (`record: "none"`) also keeps the clone with diagnostic coverage,
+   *     while a terminal exit releases it only when `retainStoppedSource` revalidates coverage
+   *     for this exact source (a cached capture, `capture.verified` or the degraded stub is never enough);
    *   - a terminal status then ends the flight, a live non-running status posts a feed line and
    *     keeps the clone and session without parking (even after a verified capture), and a given-up
    *     input receipt reports the generic failure without the credentialed pre-report reap or any
@@ -15058,6 +15081,7 @@ export class RunRunner {
     // the custody hold KEPT (no post-park settle): a clone exists, and the api keeps custody for a
     // data_volume_full park.
     const disk = cause.kind === "data_volume_full" ? cause : undefined;
+    await executor.closeAndSettlePlanSummary?.();
     executor.killAgentTree?.();
     if (disk) {
       // The group reap above misses what the agent backgrounded: the pinned CLI runs every Bash
@@ -15158,8 +15182,8 @@ export class RunRunner {
     };
     // issue #1786: every exit below that used to clear `preserveRecoveryClone` on a cached verdict (a
     // captured/verified memo, a stale claim, a terminal status) hands the clone to executeClaim's
-    // finally only when a park or terminal exit's `retainStoppedSource` revalidates coverage NOW for
-    // this exact source (a stopped exit keeps the clone whatever the verdict): the
+    // finally only when a terminal exit's `retainStoppedSource` revalidates coverage NOW for
+    // this exact source (park and stopped exits keep it whatever the verdict): the
     // memoized capture's head (a memo without one, the degraded stub included, is never covered), or
     // the clone's current head when nothing was captured. Anything else keeps the source and records
     // it for the operator channel. Local-only: no report, publish or credential call, no new wait. A
@@ -15168,8 +15192,8 @@ export class RunRunner {
     //
     // B2 (issue #1786): an exit never revalidates in place. It records that release is ELIGIBLE
     // (`markReleaseEligible`, flag stays latched), and `settleCloneRelease` runs the one coverage
-    // revalidation in this handler's finally, after the last writer could have acted on every return
-    // path. `record` selects the representation: `stopped` only where this generation is stopped by
+    // revalidation in this handler's finally, after its return-path work. The verdict is a snapshot,
+    // diagnostic only for a park or stopped exit. `record` selects the representation: `stopped` only where this generation is stopped by
     // staleness or superseded; park and terminal exits keep the plain journal (`none`).
     let pendingRelease: { reason: string; stale: boolean; record: "stopped" | "none" } | undefined;
     const markReleaseEligible = (reason: string, opts: { stale?: boolean; record?: "stopped" | "none" } = {}): void => {
@@ -15181,7 +15205,13 @@ export class RunRunner {
       flight.preserveRecoveryClone = true;
       pendingRelease = { reason, stale: opts.stale ?? false, record: opts.record ?? "none" };
     };
-    const releaseEligible = (): boolean => pendingRelease !== undefined;
+    // Park coverage is diagnostic: latch custody before asynchronous disposition,
+    // including when this flight captured a predecessor.
+    const markParkKeep = (): void => {
+      flight.preserveRecoveryClone = true;
+      flight.stoppedSourceKept = true;
+      pendingRelease = { reason: "recovery_park_keep", stale: false, record: "none" };
+    };
     // An explicit keep: no later cleanup-time check may release it.
     const keepClone = (): void => {
       pendingRelease = undefined;
@@ -15202,8 +15232,8 @@ export class RunRunner {
         runLog.warn("cleanup-time coverage check failed; the clone is kept", { error: errMessage(settleError) });
       }
     };
-    // Only a verified capture may release the clone and session to executeClaim's finally, and the
-    // clone only when its coverage still holds at the exit's cleanup.
+    // A terminal exit may release a verified clone only when coverage still holds at cleanup.
+    // Park exits keep the clone; session preservation follows the existing capture policy.
     const keepUnlessCaptured = (captured: boolean, reason: string): void => {
       flight.preserveSession = !captured;
       if (captured) markReleaseEligible(reason);
@@ -15323,6 +15353,7 @@ export class RunRunner {
           // PRD #1733: the typed provider park landed and only its ack was lost.
           if (providerTypedSent && !credentialDeferred &&
               (status === "recovery_wait" || (status === "paused" && holdReason === PROVIDER_HOLD_REASON))) {
+            markParkKeep();
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, status)) keepClone();
             return true;
           }
@@ -15344,6 +15375,7 @@ export class RunRunner {
             // that earlier reap earned. No reap here: the run is no longer actively-claimed.
             if (cancelReap) await this.settleRecoveryGeneration(claim, flight, runLog);
           }
+          if (!terminal.has(status)) markParkKeep();
           return status === "recovery_wait";
         }
         if (flight.steering.isCancelled()) {
@@ -15637,6 +15669,7 @@ export class RunRunner {
             });
             // issue #1786: a held or unproven-reap park keeps the clone explicitly, so the handler's
             // cleanup-time coverage check cannot release it.
+            markParkKeep();
             if (await this.dispositionProviderPark(claim, flight, runLog, providerReap, ack.status)) keepClone();
             return true;
           }
@@ -15660,16 +15693,13 @@ export class RunRunner {
               },
             });
             // No reapThenSettleRecoveryGeneration: the custody hold is kept (see `disk` above).
-            if (releaseEligible()) markReleaseEligible("recovery_park_ack");
+            markParkKeep();
             return true;
           }
           if (ack.status === "recovery_wait") {
             if (credentialDeferred) {
-              // Verified fetch-back plus the park ACK ends the retained-clone hold. The
-              // tracking ref and session remain recovery sources; normal retirement still
-              // requires its independent quiescence proof before removing the clone. issue #1786: the
-              // clone is released only when coverage is revalidated at this ACK; otherwise it stays.
-              markReleaseEligible("recovery_park_ack");
+              // A verified capture is diagnostic at a park; a resume recaptures the retained clone.
+              markParkKeep();
               // Issue #1766: NO reapThenSettleRecoveryGeneration — its credentialed reap would
               // retry the deferred credential operation and could release custody. The hold is kept.
               runLog.info("run parked for credential recovery", {
@@ -15684,7 +15714,7 @@ export class RunRunner {
               });
               return true;
             }
-            if (releaseEligible()) markReleaseEligible("recovery_park_ack");
+            markParkKeep();
             runLog.info("run parked for transient recovery", { detail: err.message });
             batcher.emit({
               kind: "status",
@@ -15714,9 +15744,10 @@ export class RunRunner {
               return false;
             }
             // Issue #1766: a live non-running park ack (paused, awaiting_approval, ...) is the held
-            // posture: the feed says so, and the clone and session are kept (the in-loop capture
-            // above had already released the clone) for whoever resumes the run.
+            // posture: the feed says so, and the clone and session are kept for whoever resumes
+            // the run (the in-loop capture was only provisional release eligibility).
             if (credentialDeferred) return await credentialHeld();
+            markParkKeep();
             return false;
           }
           // A statusless ACK (including HTTP204) proves neither a park nor a
@@ -15760,7 +15791,7 @@ export class RunRunner {
       pendingRelease = undefined;
       throw error;
     } finally {
-      // B2: the one cleanup-time coverage check, after the last possible writer on every return.
+      // B2: the one cleanup-time snapshot, after the handler's return-path work.
       // A shutdown exit does no cleanup-time work inside the termination grace (own-mode quiesce, Docker
       // teardown, bare lock): the pending release is dropped and the latched preserve flag keeps the clone.
       if (!propagating && (flight.active?.shuttingDown || this.shuttingDownGlobal)) pendingRelease = undefined;
@@ -15777,8 +15808,8 @@ export class RunRunner {
    * cache drop is skipped, while the park itself still stands. A held (paused) run keeps its clone
    * for the owner's resume, and settles only a guarded claim: the guarded path is credential-free,
    * the legacy path fetches with the forge PAT and so keeps custody without settling.
-   * Returns true when the clone must be kept (held, or an unproven reap), so the caller can make
-   * that an explicit keep rather than a release-eligible exit (issue #1786).
+   * The caller keeps every park clone. Returns true for held or unproven-reap parks, which
+   * also skip cleanup coverage; other parks run that check as a diagnostic (issue #2852).
    */
   private async dispositionProviderPark(
     claim: ClaimResponse,
@@ -16291,6 +16322,7 @@ export class RunRunner {
   ): Promise<boolean> {
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), exactly like
     //    handleRecoveryExhausted. Idempotent — phasePublish's completionHeld branch reaps again.
+    await flight.executor.closeAndSettlePlanSummary?.();
     flight.executor.killAgentTree?.();
     // Retain clone and session throughout capture and ambiguous delivery.
     flight.preserveRecoveryClone = true;
@@ -16453,6 +16485,7 @@ export class RunRunner {
     const { batcher } = flight;
     // 1. Reap the agent tree BEFORE any credentialed capture git (REAP-BEFORE-GIT), like the
     //    completion hold. Idempotent — phasePublish's walled branch reaps again.
+    await flight.executor.closeAndSettlePlanSummary?.();
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front (D4/D17): the wall park NEVER fails, so — unlike the completion
     //    hold, which clears the flags when it gives up — these STAY set through a degraded park and a
@@ -16632,10 +16665,10 @@ export class RunRunner {
    *      idempotent release after a reclaim (applied, status 'running'); the positive-ack contract,
    *      as enterCompletionHold requires "paused". An unconfirmed release or a throw (incl. a
    *      stale_claim) keeps the flags and returns "retained_stop" — never assume released.
-   *   7. Only after the confirmed release: preserveRecoveryClone=false (the finally RETIRES the
-   *      clone — a cross-worker reclaim re-clones and recovers from the durable tracking ref +
-   *      best-effort origin; work is safe) and parked=true (preserve HOME + plugin dir for a
-   *      same-worker resume); return "released".
+   *   7. After the confirmed release, preserveRecoveryClone stays true: capture verification
+   *      does not exclude late writers. Set parked=true to preserve HOME + plugin dir, and
+   *      return "released". A same-worker resume recaptures the retained source; a cross-worker
+   *      reclaim uses the durable tracking ref + best-effort origin.
    *
    * Callers. The in-place ctx.attemptCredentialSwitch (the executor's turn catch and idle held-state
    * waiters) CONTINUES the run on the old token on "gave_up" (it clears both preserve flags and
@@ -16668,6 +16701,7 @@ export class RunRunner {
     const generation = flight.steering.pendingCredentialSwitch();
     flight.keepGuardedInventoryOpen = true;
     // 1. Reap BEFORE any credentialed capture git (idempotent — run()'s finally reaps again).
+    await flight.executor.closeAndSettlePlanSummary?.();
     flight.executor.killAgentTree?.();
     // 2. Retain EVERYTHING up front so an uncertain capture cannot strand the only copy of work.
     flight.preserveRecoveryClone = true;
@@ -16755,12 +16789,12 @@ export class RunRunner {
       });
     }
     if (!released) return "retained_stop"; // flags stay SET; STOP — never continue on a possibly-released claim
-    // 7. Released. The work is durable on the worker tracking ref (+ best-effort origin), so RETIRE
-    // the clone (a cross-worker reclaim re-clones); KEEP the HOME (parked) for a same-worker resume.
-    flight.preserveRecoveryClone = false;
+    // 7. Released. Capture verification is diagnostic; keep the clone for fresh recapture
+    // and the HOME for a same-worker resume.
+    flight.preserveRecoveryClone = true;
     flight.parked = true;
     runLog.info(
-      "run released for a credential switch; retiring the clone, preserving HOME for resume",
+      "run released for a credential switch; verified capture is diagnostic, clone kept for recapture and HOME preserved",
       { run_id: flight.runId, generation },
     );
     return "released";
@@ -16975,9 +17009,9 @@ export class RunRunner {
    * already holds (this run's committed tracking tip, an owed pin, or the default branch)
    * (`GitCache.verifyStoppedSourceCovered`, re-checked under the bare lock; it also requires every
    * local ref, in every namespace, to be reachable from that head or from a ref of the worker bare,
-   * and the absence of a stash): on `covered`, only a park or terminal exit (`handler.record ===
-   * "none"`) hands teardown back its normal retire; a stopped exit (no handler, or `record:
-   * "stopped"`) logs the verdict as a diagnostic and keeps the clone; and (4) record
+   * and the absence of a stash): on `covered`, only a terminal exit (`handler.record ===
+   * "none"`) hands teardown back its normal retire. Park and stopped exits log diagnostic
+   * coverage and keep the clone; and (4) record
    * the retention in the bare: the attempt ledger `reclaimed` for an attempt clone (exactly the
    * attempt id journaled at the seed, never a fallback), the stopped-source marker for a canonical
    * clone (which also persists the key's attempt mode and clears the then-bound plain journal, so a
@@ -16989,8 +17023,8 @@ export class RunRunner {
    * clone and its journal stay.
    *
    * `no_source`: there was no clone (ordinary teardown proceeds). `covered`: the covered case above,
-   * returned only for a park or terminal exit (ordinary teardown proceeds and retires the clone); a
-   * stopped exit logs the verdict and goes on to the record. A flight already held by retained-recovery
+   * returned only for a terminal exit (ordinary teardown proceeds and retires the clone); a
+   * park keeps its plain journal and a stopped exit goes on to the retention record. A flight already held by retained-recovery
    * custody latches `preserveRecoveryClone`, `stoppedSourceKept` and `keepGuardedInventoryOpen` like
    * any other and runs the quiescence proof, but skips the coverage check and the record: it
    * answers `retained_local` (`unknown` when the proof was blocked), and `stoppedSourceKept` stays
@@ -17003,7 +17037,7 @@ export class RunRunner {
     flight: RunFlight, executor: Executor, reason: string,
     /** issue #1786 M2: set by a `handleRecoveryExhausted` exit. The handler latches the preserve flag
      *  itself, so a prior latch is not a reason to skip the coverage check; for `record: "none"`,
-     *  `covered` then clears it (a `stopped` exit only logs the verdict and keeps the latch).
+     *  `covered` clears it only at a terminal exit. Park and stopped exits log the verdict and keep it.
      *  `memo`: the handler holds a capture memo, whose `capturedHead` (when it has one) is the head to
      *  revalidate; a memo without one (the degraded stub) is never covered. No memo: the clone's
      *  current head, as at the generic arms. `stale`: the exit is a stale-claim or other-generation
@@ -17011,8 +17045,8 @@ export class RunRunner {
      *  `record`: `stopped` writes the stopped-source representation (attempt ledger `reclaimed`,
      *  canonical `uzi-stopped` marker) whatever the coverage verdict: only for an exit where this
      *  generation is stopped by staleness or superseded. `none` keeps the ADR-1197 posture of a park
-     *  or terminal exit instead: unless covered, the preserve flag stays latched and the plain journal is untouched,
-     *  so a resume recaptures the bytes and a later run's terminal-orphan handling applies. */
+     *  or terminal exit instead: parks always keep the latch and plain journal; terminals keep them
+     *  unless covered. A resume recaptures the bytes and later terminal-orphan handling still applies. */
     handler?: { memo: boolean; capturedHead?: string; stale: boolean; record: "stopped" | "none" },
   ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
     const clonePath = flight.worktreePath;
@@ -17079,7 +17113,7 @@ export class RunRunner {
           );
           coverage = covered === "covered" ? "covered" : "not_covered";
           if (covered === "covered") {
-            if (handler === undefined || handler.record === "stopped") {
+            if (handler === undefined || handler.record === "stopped" || reason === "recovery_park_keep") {
               // A stopped exit never trusts the verdict to discard: a writer that wrote and exited between
               // the status read and the "after" scan is invisible to it, and the successor claim cannot see
               // this clone. The latches stay and the retention record below is written.
@@ -17477,6 +17511,7 @@ export class RunRunner {
           // model admission; the predecessor executor never runs the resumed model.
           if (claim.secrets.codex || flight.executor.safety || flight.executor.settleForCredentialFreeCapture) {
             blocker = "quiescence_failed";
+            await flight.executor.closeAndSettlePlanSummary?.(Math.max(0, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())));
             const disposal = await flight.executor.safety?.dispose({ boundary: "shutdown", deadlineMs: Math.max(1, Math.min(this.codexBoundaryDeadlineMs, iteration.deadline - Date.now())) });
             await check();
             if (flight.executor.safety && disposal?.kind !== "disposed") throw finalize;
@@ -17726,12 +17761,9 @@ export class RunRunner {
     // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
     // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
     publishedTip: string | undefined,
-    // PRD #362 M3c: advisory hook fired AFTER the awaiting_approval report persists
-    // plan_md, BEFORE the verdict wait (see the RunContext.gatePlan doc). Never invoked
-    // on the autopilot branch: that branch DOES persist plan_md durably (RC1 #1197, via
-    // its running report / SetRunAutopilotPlan) but never invokes onAwaitingApproval, so
-    // it still generates no plan summary.
-    onAwaitingApproval?: (planMd: string) => Promise<void>,
+    // Advisory hook after accepted storage; awaited for human gates and unawaited
+    // for autopilot. Receives the plan carried by the accepted report.
+    onPlanPersisted?: (planMd: string) => Promise<void>,
     // Issue #1604 (D2): the input id of the revise this plan revises. Settled (made due its
     // APPLIED) only once the awaiting_approval report below is applied, i.e. the revised plan is
     // persisted; a declined or failed report leaves the revise unapplied, so an interruption
@@ -17831,6 +17863,17 @@ export class RunRunner {
           throw new TrustedExecutionRefusal(
             `autopilot plan not durably stored — the run is ${ack.status ?? "no longer running"}`,
           );
+        }
+        // Admission belongs to the accepted storage ACK. Autopilot implementation
+        // proceeds independently of the advisory model and its POST.
+        if (onPlanPersisted && autopilotState.plan_md !== undefined) {
+          try {
+            void Promise.resolve(onPlanPersisted(autopilotState.plan_md)).catch(error => {
+              runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
+            });
+          } catch (error) {
+            runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
+          }
         }
         batcher.emit({
           kind: "status",
@@ -17971,17 +18014,10 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
-    // PRD #362 M3c: plan_md is now persisted (the awaiting_approval report above), so the
-    // plan-summary POST's stale-write guard (`plan_md = @expected`) can match. Fire the
-    // hook HERE — after persist, before the verdict wait — never on the autopilot branch,
-    // which returned above. That branch DOES persist plan_md durably (RC1 #1197, via
-    // SetRunAutopilotPlan) but never invokes this hook, so it generates no plan summary.
-    // ADVISORY: swallow any throw so a
-    // summary failure can never wedge the gate or change the run's outcome (the hook
-    // itself also swallows internally; this is belt-and-suspenders).
-    if (onAwaitingApproval) {
+    // Human gates await advisory work only after a positive storage acknowledgement.
+    if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {
       try {
-        await onAwaitingApproval(planMd);
+        await onPlanPersisted(planMd);
       } catch (e) {
         runLog.warn("plan summary hook failed", {
           run_id: runId,

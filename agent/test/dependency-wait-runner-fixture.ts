@@ -112,11 +112,13 @@ function gitRead(tree: string, ...args: string[]): string {
 
 /**
  * Both real executors run through the same physical runner/worker seams as owner pauses.
- * Two executions and two ten-second observation deadlines bound this fixture; failures
- * abort and await the worker before cleanup, so no sibling fixture is left running.
+ * Two executions are capped by the caller's test timeout; owner-resume observation
+ * has thirty-second headroom with diagnostics. Failures abort and await the worker
+ * before cleanup. Initial readiness is event-driven and observes caller cancellation.
  */
 export async function exerciseDependencyWaitRunner(
   build: (ctx: RunContext, home: string) => Executor,
+  signal: AbortSignal,
   ownerMode?: "now" | "after_milestone",
 ) {
   const token = "fixture-worker-token";
@@ -127,6 +129,7 @@ export async function exerciseDependencyWaitRunner(
   let worker: ReturnType<typeof startSweepWorker> | undefined;
   try {
     const client = new WorkerClient(await api.listen(), token, "test", nullLogger(), { sleep: async () => {} });
+    signal.throwIfAborted();
     const git = new GitCache(fx.dataDir, nullLogger(), undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     const active = new ActiveRunRegistry();
     const { gitlab, calls: forgeWrites } = fakeGitlab();
@@ -163,12 +166,25 @@ export async function exerciseDependencyWaitRunner(
       return { ok: true, body: { published: true, ref: checkpointRef } };
     };
     let executions = 0;
+    let releases = 0;
+    let idleClaims = 0;
+    let resolveFirstReady!: () => void;
+    let rejectFirstReady!: (reason: unknown) => void;
+    const firstReady = new Promise<void>((resolve, reject) => {
+      resolveFirstReady = resolve;
+      rejectFirstReady = reject;
+    });
+    const abortReady = () => rejectFirstReady(signal.reason);
+    const observeReady = () => {
+      if (executions === 1 && releases === 1 && idleClaims > 0) resolveFirstReady();
+    };
     let tree = "";
     let resumed = false;
     const factory: ExecutorFactory = runId => ({
       homeDir: path.join(home, runId),
       executor: { run: async ctx => {
         executions++;
+        observeReady();
         tree = ctx.worktreePath;
         fs.mkdirSync(path.join(home, runId), { recursive: true });
         const sessionMarker = path.join(home, runId, "session.marker");
@@ -198,25 +214,42 @@ export async function exerciseDependencyWaitRunner(
     const coordinator = new TerminalRejectionCoordinator(sweep.outbox, client, nullLogger());
     let protectedExecutions = 0;
     let protections = 0;
-    let releases = 0;
     const protect = coordinator.protectExecution.bind(coordinator);
     coordinator.protectExecution = runId => {
       protections++;
       protectedExecutions++;
       const release = protect(runId);
-      return () => { release(); releases++; protectedExecutions--; };
+      return () => { release(); releases++; protectedExecutions--; observeReady(); };
     };
     let queued: typeof claim | undefined = claim;
-    let idleClaims = 0;
     client.claimRun = async () => {
-      if (!queued) { idleClaims++; return null; }
+      if (!queued) { idleClaims++; observeReady(); return null; }
       const next = queued;
       queued = undefined;
       return next;
     };
     // RunRunner + real HTTP remain intact; only the worker's claim source is scripted.
-    worker = startSweepWorker({ outbox: sweep.outbox, client, runner: { execute: claim => runner.execute(claim), isExecuting: runId => runner.isExecuting(runId), resumePendingRecoveries: () => runner.resumePendingRecoveries() }, activeRuns: active, terminalRejections: coordinator });
-    await pollUntil(() => executions === 1 && releases === 1 && idleClaims > 0, 10_000, "first park and worker slot release");
+    // Physical clone, Git, checkpoint and HTTP work need headroom on a contended host.
+    const waitForEvent = async (pred: () => boolean, label: string): Promise<void> => {
+      try {
+        await pollUntil(() => { signal.throwIfAborted(); return pred(); }, 30_000, label);
+      } catch (cause) {
+        throw new Error(`${label} did not settle within 30000ms: ${JSON.stringify({
+          ownerMode: ownerMode ?? "dependency_wait", executions, releases, idleClaims, resumed,
+          protections, protectedExecutions, published: published.length, questions,
+          active: active.has(claim.run_id), executing: runner.isExecuting(claim.run_id),
+          states: api.states.filter(s => s.runId === claim.run_id).map(s => s.body.status),
+        })}`, { cause });
+      }
+    };
+    signal.throwIfAborted();
+    signal.addEventListener("abort", abortReady, { once: true });
+    try {
+      worker = startSweepWorker({ outbox: sweep.outbox, client, runner: { execute: claim => runner.execute(claim), isExecuting: runId => runner.isExecuting(runId), resumePendingRecoveries: () => runner.resumePendingRecoveries() }, activeRuns: active, terminalRejections: coordinator });
+      await firstReady;
+    } finally {
+      signal.removeEventListener("abort", abortReady);
+    }
     const firstStates = api.states.filter(s => s.runId === claim.run_id).map(s => s.body);
     const paused = firstStates.find(s => s.status === "paused");
     assert.ok(paused, JSON.stringify(firstStates));
@@ -270,7 +303,7 @@ export async function exerciseDependencyWaitRunner(
       testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
     runner = new RunRunner(client, resumeGit, factory, nullLogger(), 20, undefined, options);
     queued = { ...claim, claim_generation: 2, checkpoint_tip: published[0], branch: "agent/issue-2657", pause_pending: true, pause_mode: "now" };
-    await pollUntil(() => resumed && releases === 2, 10_000, "owner resume and second park");
+    await waitForEvent(() => resumed && releases === 2, "owner resume and second park");
     assert.equal(executions, 2, "released admission allows the same run to be claimed again");
     assert.equal(protections, 2);
     assert.equal(protectedExecutions, 0);
