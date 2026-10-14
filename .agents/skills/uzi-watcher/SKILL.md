@@ -636,7 +636,8 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
    If that branch already exists, or moves, stop and reconcile; never overwrite it.
    Verify the remote tip with `git ls-remote`.
 4. **Create the successor gated** with `scripts/create-run.sh`. Omit `--harness` and
-   `--token` unless the switch is the reason for the successor or the work is on one
+   `--token` unless the switch is the reason for the successor (e.g. `claude` after a Codex
+   provider safety-policy refusal, `fail_origin` `provider_policy_refusal`) or the work is on one
    harness's SDK integration (AGENTS.md, *Two harnesses*); never pin an excluded
    credential. Verify `harness`, `credential_override.label` and `auto_approve=false`
    from `uzi run get`. At the gate, require the plan to build on the existing
