@@ -55,6 +55,9 @@ through `[0.52.0]`.)
 - **Idle cross-check counts no longer crowd TUI board and split titles ([#2894](https://github.com/vtmocanu/uzi/issues/2894)).**
   Shared fleet titles omit cross-check capacity while online workers have no active cross-checks, recovering board space; active counts and the full Workers capacity readout remain visible.
 
+- **Workers stop retrying forever a finished outcome the api says belongs to no run they own ([#2950](https://github.com/vtmocanu/uzi/issues/2950)).**
+  When the api answers a terminal report with the structured `run_not_owned` 404, the worker keeps the journal, marks it blocked with that reason, never resends or retires it, and names the run on the worker as `outbox_blocked_run_id` (TUI worker detail, `uzi worker list --json`, admin workers JSON). Such a journal no longer counts toward the active snapshot lease or the pending-overflow claim pause, while its local physical protection stays. Any other 404 keeps the old keep-and-retry behaviour. Resolution is an operator-assisted runbook in the hosted-workers docs; a server-mediated owner discard is planned follow-up work.
+
 - **Read Codex gate logs during commands ([#2903](https://github.com/vtmocanu/uzi/issues/2903)).**
   Codex can read gate logs while a shell command runs; other effects/checkpoints remain ordered.
 
