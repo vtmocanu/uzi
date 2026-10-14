@@ -2792,8 +2792,8 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		updated, err = qtx.RefreshWorkerProtocol(ctx, store.RefreshWorkerProtocolParams{
 			ID: updated.ID, RegisterNonce: refresh.RegisterNonce,
 			ProtocolCapabilities: capability.FilterProtocol(refresh.ProtocolCapabilities),
-			MaxConcurrentRuns:    int32(*cap),
-			MaxCrossCheckSlots:   int32(refresh.MaxCrossCheckSlots),
+			MaxConcurrentRuns:    int32(*cap),                       //nolint:gosec // G115: shared validation bounds the input to 1..256; ephemeral clamp only lowers it.
+			MaxCrossCheckSlots:   int32(refresh.MaxCrossCheckSlots), //nolint:gosec // G115: shared validation bounds the input to 0..16.
 		})
 		if err != nil {
 			return store.Worker{}, err

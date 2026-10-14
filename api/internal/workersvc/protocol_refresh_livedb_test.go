@@ -155,7 +155,7 @@ func TestHeartbeatProtocolRefreshEphemeralAndSnapshotLiveDB(t *testing.T) {
 	if err != nil || countActiveRuns(t, env, id) != 5 {
 		t.Fatalf("snapshot validated before refresh: %v", err)
 	}
-	env.exec("UPDATE workers SET is_ephemeral=true WHERE id=$1", id)
+	env.exec("UPDATE workers SET ephemeral=true WHERE id=$1", id)
 	current, err = svc.Heartbeat(env.ctx, current, nil, nil, nil, &ProtocolRefresh{
 		RegisterNonce: nonce, MaxConcurrentRuns: 256, MaxCrossCheckSlots: 0,
 	})
