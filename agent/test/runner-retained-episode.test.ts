@@ -1907,6 +1907,21 @@ it("issue 2971 unique-content exhaustion stays blocked after a larger-cap restar
   assert.equal(failures[1]!.body.failure_reason,
     "Retained recovery blocked: previous decoded verification exhaustion; current cap 1048576 bytes; prior cap not recorded; local work and custody retained");
   assert.equal(api.states.some(s => s.body.status === "recovery_wait"), false);
+
+  // A newer fenced claim opens a fresh #2958 deadline window only for unblocked episodes.
+  const newer = { ...claim, claim_generation: 3 };
+  api.setOwnershipStatus(claim.run_id, "running", 3);
+  const newerLog = recordingLogger();
+  await configuredRunner(restarted, factory(async () => { models++; throw new Error("must not model"); }), newerLog.logger).execute(newer);
+  assert.deepEqual({ restartedProofs, restartedSuccessors, models, successors, releases },
+    { restartedProofs: 0, restartedSuccessors: 0, models: 0, successors: 0, releases: 0 });
+  assert.equal(command(bare, "config", `uzi-recovery.${clone.branch}.clone`), rawBlocked);
+  assert.deepEqual(readJournal(bare, clone.branch), blocked);
+  assert.equal(command(bare, "rev-parse", pin), sourceTip);
+  assert.equal(fs.readFileSync(path.join(clone.path, "retained.txt"), "utf8"), "only local dirty work\n");
+  const newerFailures = api.states.filter(s => s.body.status === "failed");
+  assert.equal(newerFailures.length, 3);
+  assert.equal(newerFailures[2]!.body.failure_reason, failures[1]!.body.failure_reason);
   t.diagnostic(JSON.stringify({ originalCap, currentCap, closureBytes, exception: caught.message,
     initialReport: initialFailures[0]!.body.failure_reason, restartReport: failures[1]!.body.failure_reason,
     attempts: blocked.recovery.attempts, startedAt: blocked.recovery.startedAt,

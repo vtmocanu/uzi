@@ -1,10 +1,35 @@
-# Issue #2971 investigation checkpoint
+# PRD #2971: re-verifying a recovery episode blocked at an old decoded-history limit (investigation checkpoint)
 
-Refs #2971. Investigation in progress; the issue remains open. This document
-records observed evidence, not authority to retry, release custody or delete a
-source. M1 characterization is recorded below; M2 audit and M3 decision
-comparison are pending. No consent implementation or production salvage is
-authorized by this investigation.
+**Issue**: [#2971](https://github.com/vtmocanu/uzi/issues/2971) (Refs only; the issue stays open)
+**Status**: Investigation checkpoint, 2026-10-14. No re-verification, consent endpoint, requeue, claim predicate, CLI authorization or migration is built. Ends at the M3 decision checkpoint for the human.
+**Related**: [ADR-1197](../adr/1197-transient-recovery-park.md) (#2512 and #2743 amendments), #2743 (limit raised), #2958 / PR #2976, #2979 / PR #2981.
+
+This record holds observed evidence, not authority to retry, release custody or delete a source. It moved here from the `docs/` tree on 2026-10-14 because it is a working record, not a shipped doc page.
+
+## M0: base integration and newer-generation restart (2026-10-14)
+
+The branch merged base `84d365ed5aafa3642872e92e3efd0ee556bcd604` (merge commit
+`3a60aa3b`), which carries #2958 (PR #2976, `2b84c993`, one deadline window per
+fenced claim) and #2979 (PR #2981, `0be10c57`, verified-object reuse within an
+operation). The only conflict was adjacency in the characterization test file; the
+resolution adds exactly the #2971 test relative to base.
+
+The characterization now also restarts a third time with a newer claim generation
+(`claim_generation: 3`, ownership fenced at 3), the path on which #2976 opens a fresh
+deadline window for an unblocked episode. The blocked journal is still not revived:
+zero closure proofs, successor preparations, model calls and custody releases; the
+journal is byte-for-byte unchanged; pin and dirty literal retained; the third terminal
+report repeats “previous decoded verification exhaustion; current cap 1048576 bytes;
+prior cap not recorded”. Focused run after the merge, from `agent/`:
+
+```sh
+umask 022; TMPDIR=<worktree>/.uzi/scratch node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=120000 --test-name-pattern='issue 2971 unique-content' test/runner-retained-episode.test.ts
+```
+
+Result: exit 0, 1 passed, 0 failed/cancelled/skipped (session-local log
+`.uzi/scratch/gate-log.Z0JBd1`). The test's fake API does not enable the
+`claim_generation_fence` feature, so the terminal report body carries no
+generation field; the reason text, not a body field, shows the blocked branch ran.
 
 ## M1: permanent-block reproduction
 
