@@ -11,7 +11,7 @@ vi.mock("../../lib/api", async (importOriginal) => {
 });
 const mockApi = vi.mocked(api);
 const settings = (value: string): AppSettings => ({ hosted_worker_quota: value }) as AppSettings;
-const response = (value: string): SettingsResponse => ({ settings: settings(value), secrets: {}, sources: {} });
+const response = (value: string): SettingsResponse => ({ settings: settings(value), secrets: {}, sources: {}, slack_status: "disabled" });
 function Harness({ initial = "2" }: { initial?: string }) {
   const [saved, setSaved] = useState(settings(initial));
   return <HostedWorkerQuotaCard settings={saved} onSaved={(resp) => setSaved(resp.settings)} />;
