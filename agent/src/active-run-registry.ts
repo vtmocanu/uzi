@@ -157,9 +157,20 @@ export class ActiveRunRegistry {
    * whenever anything is pending).
    */
   claimsPausedByPendingOverflow(): boolean {
-    const count = this.pendingOutcomes().length;
+    const count = this.leasable(this.pendingOutcomes()).length;
     if (count === 0) return false;
     return count > this.effectiveCap();
+  }
+
+  /** Issue #2950: the pending terminals a snapshot can usefully lease. A `run_not_owned` journal is
+   *  excluded: the api cannot lease a run it no longer attributes to this worker
+   *  (UpsertFrozenWorkerActiveRun drops it and logs per snapshot), and its `pending_overflow`
+   *  closure only covers runs it attributes to this worker, so listing or counting the entry
+   *  protects nothing; counting it would turn an endless resend into an endless claim pause at
+   *  cap 0. Physical protection and custody still keep it via the outbox's listPendingTerminals /
+   *  hasPendingTerminal, which are unchanged. */
+  private leasable(pending: PendingTerminal[]): PendingTerminal[] {
+    return pending.filter((p) => p.blocked_reason !== "run_not_owned");
   }
 
   /** The server cap clamped to a non-negative integer, with undefined/negative/0 collapsing to 0 —
@@ -179,6 +190,8 @@ export class ActiveRunRegistry {
    * to re-claim) every pending run this worker owns BEFORE its register-time orphan pass — regardless
    * of the cap, even cap 0, where a non-empty subset would be rejected whole when cap < count. Draws
    * the shared epoch so ordering stays monotonic with the post-register heartbeat/claim snapshots.
+   * Deliberately NOT filtered through {@link leasable} (issue #2950): the boot lease stays
+   * conservative and sets `pending_overflow` whenever ANY journal is pending, `run_not_owned` included.
    * Issue #1742: `finalizeResume` (the caller's once-captured offered set) rides it as
    * `finalize_resume`, on this register snapshot only.
    */
@@ -205,7 +218,7 @@ export class ActiveRunRegistry {
    */
   build(): ActiveSnapshot {
     this.epoch += 1;
-    const pending = this.pendingOutcomes();
+    const pending = this.leasable(this.pendingOutcomes());
     const pendingByRun = new Map(pending.map((p) => [p.run_id, p]));
 
     const active: ActiveSnapshotEntry[] = [];

@@ -733,3 +733,72 @@ describe("resolvePendingTerminal single-flight (issue #1512)", () => {
     assert.equal(later.bodies.length, 0, "the journal is retired, so nothing to send (not skipped-forever)");
   });
 });
+
+// Issue #2950: a structured not-owned 404 on the run's /state report is permanent for the claim
+// generation, so the journal is BLOCKED (kept byte-intact, never resent), never retired.
+describe("run_not_owned /state refusal (issue #2950)", () => {
+  const NOT_OWNED_BODY = '{"error":"run not found for this worker","reason":"run_not_owned"}';
+  const statePath = (run: string): string => `/api/worker/runs/${run}/state`;
+  const notOwned = (): RequestError => new RequestError("POST", statePath("r1"), 404, NOT_OWNED_BODY);
+
+  it("first-send 404 blocks the journal with run_not_owned; a second resolve sends nothing; body bytes unchanged", async () => {
+    const { outbox } = await mkOutbox();
+    const deps = depsFor(outbox, new FakeClient());
+    await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    const before = await outbox.readTerminalJournal("r1", GEN);
+    const scripted = scriptedSend([notOwned()]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 1);
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1, "kept, not retired");
+    assert.equal(outbox.depthFor("r1")?.blockedReason, "run_not_owned");
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 1, "a blocked journal is never resent");
+    const after = await outbox.readTerminalJournal("r1", GEN);
+    assert.equal(after?.blocked, true);
+    assert.equal(after?.blockedReason, "run_not_owned");
+    assert.deepEqual(after?.body, before?.body);
+    assert.equal(JSON.stringify(after?.body), JSON.stringify(before?.body));
+    assert.equal(after?.messagesThroughSeq, before?.messagesThroughSeq);
+  });
+
+  it("a 404 on the gap-fill re-send also blocks the journal", async () => {
+    const { outbox } = await mkOutbox();
+    const client = new FakeClient();
+    const deps = depsFor(outbox, client);
+    client.gapsResponder = () => ({ gaps: [{ first: 2, last: 2 }] });
+    await outbox.journalTerminal("r1", GEN, "running", 3, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+    const scripted = scriptedSend([{ applied: false, status: "running", reason: "messages_pending" }, notOwned()]);
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 2);
+    assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1);
+    assert.equal(outbox.depthFor("r1")?.blockedReason, "run_not_owned");
+    await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+    assert.equal(scripted.bodies.length, 2, "no further sends");
+  });
+
+  const controls: Array<[string, RequestError]> = [
+    ["plain 404 without reason", new RequestError("POST", statePath("r1"), 404, '{"error":"run not found for this worker"}')],
+    ["HTML 404", new RequestError("POST", statePath("r1"), 404, "<html><body>404 page not found</body></html>")],
+    ["wrong key (code instead of reason)", new RequestError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","code":"run_not_owned"}')],
+    ["extra key", new RequestError("POST", statePath("r1"), 404, '{"error":"run not found for this worker","reason":"run_not_owned","x":1}')],
+    ["another run's path", new RequestError("POST", statePath("r2"), 404, NOT_OWNED_BODY)],
+    ["GET method", new RequestError("GET", statePath("r1"), 404, NOT_OWNED_BODY)],
+    ["409 with the same body", new RequestError("POST", statePath("r1"), 409, NOT_OWNED_BODY)],
+    ["array body", new RequestError("POST", statePath("r1"), 404, "[]")],
+    ["wrong error text", new RequestError("POST", statePath("r1"), 404, '{"error":"nope","reason":"run_not_owned"}')],
+  ];
+  for (const [name, err] of controls) {
+    it(`control: ${name} stays unblocked and resendable`, async () => {
+      const { outbox } = await mkOutbox();
+      const deps = depsFor(outbox, new FakeClient());
+      await outbox.journalTerminal("r1", GEN, "running", 0, canonicalizeTerminalBody({ status: "failed" }, 1 << 20));
+      const scripted = scriptedSend([err, { applied: true, status: "failed" }]);
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+      assert.equal(outbox.depthFor("r1")?.pendingTerminal, 1);
+      assert.equal(outbox.depthFor("r1")?.blockedReason, undefined, "not blocked");
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: scripted.send });
+      assert.equal(scripted.bodies.length, 2, "resent");
+      assert.equal(outbox.depthFor("r1")?.pendingTerminal, 0, "then retired on the 200");
+    });
+  }
+});
