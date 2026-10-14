@@ -886,7 +886,7 @@ test("M3 delayed feedback beyond deadline retains original send and sink receipt
   }
 });
 
-test("M3 deferred outcome ACK cannot rearm pressure after its response budget expires", async () => {
+test("M3 late mocked historical outcome resolves only the original ticket after expired wait", async () => {
   const f = await setup();
   const monitoring = f.memory.run();
   const release = releaseGate();
@@ -894,7 +894,7 @@ test("M3 deferred outcome ACK cannot rearm pressure after its response budget ex
   let proof = false, executorError: unknown;
   const report = client.reportMemoryInterventionOutcome.bind(client);
   client.reportMemoryInterventionOutcome = (...args) => {
-    reportSignal = args[1];
+    reportSignal ??= args[1];
     reportWork = (async () => {
       const ack = await report(...args);
       await release.promise; // Deliberately ignore abort; this exact promise is joined below.
@@ -912,13 +912,16 @@ test("M3 deferred outcome ACK cannot rearm pressure after its response budget ex
       await until(() => reportSignal !== undefined);
       await until(() => reportSignal!.aborted);
       assert.equal(command.captured.commands.pressureHeld(command.captured.context), true);
+      assert.equal(command.captured.commands.admitsCommands(command.captured.context), false,
+        "expired wait alone supplies no authority");
+      assert.equal(f.reservations.length, 1);
       release.resolve(); await reportWork;
       f.pressure(100);
       await ctx.reportIteration!(1);
       await new Promise(resolve => setTimeout(resolve, 30)); // Three configured rearm windows, after the late ACK.
-      assert.equal(command.captured.commands.pressureHeld(command.captured.context), true,
-        "expired outcome ACK cannot resolve the held pressure ticket");
-      assert.equal(command.captured.commands.admitsCommands(command.captured.context), false);
+      assert.equal(command.captured.commands.pressureHeld(command.captured.context), false,
+        "mocked exact historical proof plus fresh sustained Q resolves the original ticket");
+      assert.equal(command.captured.commands.admitsCommands(command.captured.context), true);
       assert.equal(command.captured.commands.remaining(command.captured.context), 1);
       assert.equal(f.reservations.length, 1, "deferred outcome never spends another intervention");
       proof = true;

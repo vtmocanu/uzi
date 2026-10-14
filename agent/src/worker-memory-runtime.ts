@@ -34,22 +34,23 @@ export class WorkerMemoryRuntime {
     return () => { this.invalidationListeners.delete(callback); };
   }
 
-  private readonly receipts = new Set<Readonly<{ context: Context; kind: "feedback" | "preserve"; completion: Promise<void> }>>();
+  private readonly receipts = new Set<Readonly<{ context: Context; kind: "feedback" | "preserve" | "report"; completion: Promise<void> }>>();
 
   /** Unsettled owner operations, including callbacks that ignored deadline/abort.
    * The bound runner must reconcile these before releasing its clone/session.
    */
   get sinkReceipts() { return Object.freeze([...this.receipts]); }
 
-  private ownedSink(context: Context, kind: "feedback" | "preserve", work: () => Promise<void>): Promise<void> {
-    let completion: Promise<void>;
-    try { completion = work(); }
-    catch (error) { completion = Promise.reject(error); }
+  private ownedSink<T>(context: Context, kind: "feedback" | "preserve" | "report", work: () => Promise<T>): Promise<T> {
+    let producer: Promise<T>;
+    try { producer = work(); }
+    catch (error) { producer = Promise.reject(error); }
+    const completion = producer.then(() => {});
     const receipt = Object.freeze({ context, kind, completion });
     this.receipts.add(receipt);
     // Exactly one completion observer per invocation; no retry or new operation.
     void completion.then(() => this.receipts.delete(receipt), () => this.receipts.delete(receipt));
-    return completion;
+    return producer;
   }
 
   constructor(
@@ -81,7 +82,8 @@ export class WorkerMemoryRuntime {
         for (const listener of this.invalidationListeners) listener();
       }),
       reserve: (request, signal, ms) => client.reserveMemoryIntervention(request, signal, ms),
-      report: (request, signal, ms) => client.reportMemoryInterventionOutcome(request, signal, ms),
+      report: (request, signal, ms, context) => this.ownedSink(context, "report",
+        () => client.reportMemoryInterventionOutcome(request, signal, ms)),
       feedback: (result, context, signal, ms) => {
         const bound = sink(context);
         return this.ownedSink(context, "feedback", () => bound.feedback(result, context, signal, ms));
