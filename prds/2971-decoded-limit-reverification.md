@@ -15,8 +15,11 @@ operation). The only conflict was adjacency in the characterization test file; t
 resolution adds exactly the #2971 test relative to base.
 
 The characterization now also restarts a third time with a newer claim generation
-(`claim_generation: 3`, ownership fenced at 3), the path on which #2976 opens a fresh
-deadline window for an unblocked episode. The blocked journal is still not revived:
+(`claim_generation: 3`, ownership fenced at 3), the input on which #2976 opens a fresh
+deadline window for an unblocked episode. The blocked short-circuit in
+`recoverRetainedClaim` runs before that window computation, so the generation-3 claim
+never reaches `reserveRecoveryIteration`; the test pins that precedence. The blocked
+journal (which records `claimGeneration: 2`, asserted) is still not revived:
 zero closure proofs, successor preparations, model calls and custody releases; the
 journal is byte-for-byte unchanged; pin and dirty literal retained; the third terminal
 report repeats “previous decoded verification exhaustion; current cap 1048576 bytes;
@@ -26,8 +29,7 @@ prior cap not recorded”. Focused run after the merge, from `agent/`:
 umask 022; TMPDIR=<worktree>/.uzi/scratch node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-timeout=120000 --test-name-pattern='issue 2971 unique-content' test/runner-retained-episode.test.ts
 ```
 
-Result: exit 0, 1 passed, 0 failed/cancelled/skipped (session-local log
-`.uzi/scratch/gate-log.Z0JBd1`). The test's fake API does not enable the
+Result: exit 0, 1 passed, 0 failed/cancelled/skipped. The test's fake API does not enable the
 `claim_generation_fence` feature, so the terminal report body carries no
 generation field; the reason text, not a body field, shows the blocked branch ran.
 
@@ -95,28 +97,47 @@ a live worker, forge upload, owner consent or production custody.
 
 ### Code evidence and related work
 
-Starting points verified in the baseline, not an exhaustive reader inventory:
+Starting points re-verified after the M0 merge (tree of `820d53a2`), not an
+exhaustive reader inventory (the M2 audit below is the inventory):
 
-- `agent/src/runner.ts:17269`:
-  `if (source.recovery?.stage === "blocked") await fail();`
-- `agent/src/git.ts:5900`:
-  `if (old?.stage === "blocked") throw new Error("recovery episode is blocked");`
-- `agent/src/git.ts:6048`:
-  `if (journal.recovery?.stage === "blocked") return;`
-- `agent/src/runner.ts:17396`:
+- `agent/src/runner.ts:17270`:
+  `if (source.recovery?.stage === "blocked") await fail();` — runs before the
+  #2976 window computation at `runner.ts:17276`
+  (`const newWindow = episode?.claimGeneration !== flight.claimGeneration;`).
+- `agent/src/git.ts:5907`:
+  `if (old?.stage === "blocked") throw new Error("recovery episode is blocked");` —
+  runs before `git.ts:5911`
+  (`const newWindow = claimGeneration !== undefined && old?.claimGeneration !== claimGeneration;`).
+- `agent/src/git.ts:6095`:
+  `if (journal.recovery?.stage === "blocked") return;` (a blocked record is never
+  rewritten by a later block).
+- `agent/src/runner.ts:17417`:
   `if (error instanceof RecoveryClosureLimitError) { blocker = "decoded_history_limit"; await fail(); }`
-- `adr/1197-transient-recovery-park.md:308–312` says an already blocked
-  decoded-history journal stays blocked across restart/cap increase and reports
-  “prior cap not recorded”.
+- `agent/src/runner.ts:17258-17259`: the blocked-journal report detail
+  (“previous decoded verification exhaustion; current cap …; prior cap not recorded”).
+- `adr/1197-transient-recovery-park.md` (#2743 amendment, “Configuration and failure
+  boundary”) says an already blocked decoded-history journal stays blocked across
+  restart or a cap increase and reports “prior cap not recorded”.
 
-PR #2976 and PR #2981 were both read through the authorized forge reader on
-2026-10-14, approximately 12:18 UTC, and returned `state: opened`. The grant
-returned no diff, head SHA or merge evidence. Checked-out
-`GitCache.reserveRecoveryIteration` still uses the original startedAt +
-300000 deadline and refuses blocked records; the existing cumulative
-repeated-read test remains. The investigation preserves that code and
-implements neither external change. Future resumes must re-read related status
-and checked-out code before relying on these observations.
+## M1: relationship to #2958 and #2979
+
+Forge reads on 2026-10-14 (after 14:18 UTC): PR #2976 `state: merged`, PR #2981
+`state: merged`; issue #2958 `closed`; issue #2979 `closed`; issue #2971 `opened`
+with no comments. This corrects the earlier observation at about 12:18 UTC that
+both PRs were `opened`. Both merges are in base `84d365ed` as `2b84c993` (#2976) and
+`0be10c57` (#2981), which this branch merged in M0.
+
+| Issue | What it fixes | Does it change the #2971 outcome? | Evidence |
+| --- | --- | --- | --- |
+| #2971 | Nothing yet. An episode blocked at `decoded_history_limit` under an older cap stays blocked after the cap is raised; restart, reclaim and newer claim generations all fail without re-verifying. | — | Characterization test, three executions (cap 4096; cap 1048576 same generation; cap 1048576 generation 3). |
+| #2958 / PR #2976 | An unblocked episode whose five-minute deadline expired during a park or long turn gets one fresh deadline window per positively fenced claim. | **No.** Both blocked short-circuits (`runner.ts:17270`, `git.ts:5907`) precede the window computations (`runner.ts:17276`, `git.ts:5911`). #2958 itself scoped this: “Episodes already blocked stay blocked with their original reasons, including `decoded_history_limit`.” | Generation-3 restart in the characterization test: zero proofs, zero successors, journal byte-identical. The reviewer's mutation (making both guards generation-scoped) turned that assertion red while the same-generation restart stayed green. |
+| #2979 / PR #2981 | Repeated closure checks within one recovery operation no longer re-hash and re-charge the same objects (an operation-scoped verified-object cache, `git.ts` `closureCache`), so a fresh episode with a large shared history stops exhausting 8 GiB by repetition. | **No.** It lowers the chance that a *new* episode blocks; it never revisits a journal already at `stage: "blocked"`, which never reaches a closure check. Genuinely unique content over the cap still blocks (the #2971 fixture uses unique 64 KiB content, and its single first closure check exhausts the 4096-byte cap). | #2979's description: “It is distinct from #2971, which covers an episode already blocked by an older limit.” Characterization test unchanged in outcome after the merge. |
+
+Practical consequence: after #2976 and #2981 fewer *new* episodes should block, but
+every journal already at `blocked / decoded_history_limit` — whatever cap blocked it
+(1 GiB before #2743, 8 GiB for run `1ab9349c`) — stays permanently blocked. The only
+ways forward remain the existing salvage paths or a new authorized re-verification
+(M3).
 
 Recorded decisions read at `specs/human.md:877,886,1004,1303` retain custody,
 require exact disposal authority and qualify checkpoint coverage. No conflict
@@ -152,7 +173,22 @@ likewise supplied no incident journal.
 | 0d5a0f7c / #2958 | Reported expired episode clock, budget_exhausted, attempts 1; start 07:31:17.572Z, deadline 07:36:17.572Z Oct 14. Decoded cap not applicable to reported cause. | Codex ephemeral rc.14 reported; exact identities unknown. | Three holds reportedly left; current status/source/pins unknown. Later capture is reported but preservation not independently established. |
 | 84ed3050 / #2958 | Reported expired clock, budget_exhausted, attempts 1; start 01:57:47.572Z, deadline 02:02:47.572Z Oct 14. | Claude persistent rc.11 reported; exact identities unknown. | Current hold/source/pin/checkpoint availability and latest-edit coverage unknown. |
 | 63ea43d9 / #2958 comment | Reported stale deadline on new claim after OOM, failed Oct 14 10:56:06Z; start 10:46:41Z, deadline 10:51:41Z. Not old-cap exhaustion. | Codex ephemeral rc.14 reported; new claim asserted, exact fence/attempt unknown. | Comment asserts retained checkpoint/custody and “No work was lost”; this run has not verified complete latest-work preservation. |
-| Local issue-2971 fixture | Independently reproduced 4096-byte exhaustion; recreated runner at 1048576 bytes remains blocked. | Synthetic claim generation 2, same retained run/source attribution asserted; no live worker. | Source, literal, existing pin and journal retained within isolated fixture; no production hold or checkpoint inference. |
+| Local issue-2971 fixture | Independently reproduced 4096-byte exhaustion; recreated runner at 1048576 bytes remains blocked, at the same claim generation and at generation 3. | Synthetic claim generation 2, same retained run/source attribution asserted; no live worker. | Source, literal, existing pin and journal retained within isolated fixture; no production hold or checkpoint inference. |
+
+Evidence classes, kept separate (observation date 2026-10-14; forge reads
+refreshed after 14:18 UTC with no new #2971 comments):
+
+| Class | What it contains | Coverage | Strength |
+| --- | --- | --- | --- |
+| Reported incidents | 21a4d826 (failed 2026-10-11 08:58Z, holds discarded 09:13Z) and 38b52617 (failed 2026-10-12 07:29Z), both from the #2971 description; 1ab9349c (fresh 8 GiB block, #2979); 0d5a0f7c, 84ed3050, 63ea43d9 (deadline, #2958) | Issue texts #2971, #2958, #2979 only; the earlier bounded `area::recovery` query above | Reports only, not re-verified |
+| Independently inspected journals | **None** | No worker, PVC, journal, hold listing or checkpoint was read by this run | — |
+| Fixture results | The characterization test: 4096-byte block, larger-cap restart at the same generation, restart at generation 3 | One isolated local fixture, fake API, real Git | Observed, local only |
+
+Of the reported incidents, only 21a4d826 and 38b52617 are old-limit (#2971) cases,
+and both holds are reported discarded, so neither is a known surviving source.
+1ab9349c is a fresh 8 GiB block; by the same code path it is now also a permanently
+blocked journal, which #2981 does not revisit (see the M1 relationship table).
+Current frequency and the set of surviving blocked sources are **UNVERIFIED**.
 
 The **current live configured cap is unknown for every incident**. The code
 default is 8 GiB; it cannot establish an individual worker's configuration.

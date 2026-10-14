@@ -1876,6 +1876,7 @@ it("issue 2971 unique-content exhaustion stays blocked after a larger-cap restar
   assert.equal(blocked.recovery.stage, "blocked");
   assert.equal(blocked.recovery.blocker, "decoded_history_limit");
   assert.equal(blocked.recovery.attempts, 1);
+  assert.equal(blocked.recovery.claimGeneration, 2, "the blocked episode is bound to the generation-2 claim");
   assert.equal(blocked.recovery.deadline, blocked.recovery.startedAt + 300_000);
   assert.ok(Date.now() < blocked.recovery.deadline, "decoded limit, not deadline, caused the block");
   assert.equal(blocked.recovery.backoffMs, 1);
