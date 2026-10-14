@@ -96,8 +96,9 @@ you to confirm first: unlike deleting a worker you run yourself (which only
 revokes its token — the container keeps running until you stop it), deleting
 a hosted worker **permanently destroys its disks**, including its tools
 cache, so a replacement re-downloads everything from scratch. There's no
-restart in this version — if a hosted worker seems stuck, delete and
-re-provision it.
+owner restart action in this version. Read the blocking diagnosis before deciding
+whether deletion/re-provisioning is appropriate: it destroys the existing disks
+and does not repair a shortage of node CPU or memory.
 
 ## Status
 
@@ -106,9 +107,11 @@ worker's — a heartbeat, nothing pod-level. If one never comes online, that's
 one of the checks an admin can now see cross-user in **Admin → Health**
 (`fleet.roll`, see [Admin health](admin-health.md)) — it names the blocking
 container and reason for a stuck roll, across every owner's fleet, without
-anyone needing to check the pod by hand. (A worker that came online once and
-then failed an upgrade also shows in your own **Settings → Workers** — see
-[Worker versions and upgrades](worker-upgrades.md).)
+anyone needing to check the pod by hand. Your own **Settings → Workers** also
+shows roll failures, first-provision progress/failure, and **waiting for capacity**
+when the scheduler reports a verified CPU/memory shortage. Capacity blockage
+requires waiting, a smaller worker, or added capacity; Pending claims alone do
+not establish storage health. See [Worker versions and upgrades](worker-upgrades.md).
 
 ## Draining and cordoned
 

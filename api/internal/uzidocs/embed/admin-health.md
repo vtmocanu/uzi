@@ -123,6 +123,16 @@ or `na`.
 - **`fleet.roll` does not alarm for an orderly roll in progress.** It reports
   stuck pods (`CrashLoopBackOff`, `ImagePullBackOff`, `ErrImagePull`,
   `CreateContainerConfigError`, `CreateContainerError`, `InvalidImageName`).
+  Confirmed CPU/memory scheduling blockers remain fresh `stuck` roll signals,
+  but worker views distinguish them as **waiting for capacity** instead of a
+  failed upgrade. First provisioning also has its own progress/failure labels.
+  Both capacity and provisioning failures retain attention and the same
+  some-stuck warning/all-stuck danger escalation, including during paced rolls.
+  Capacity diagnosis stays visible beyond the upgrading progress window;
+  stale controller reports follow the existing unknown/freshness rules.
+  Mixed fleets retain storage and other failure evidence beside capacity causes.
+  Wait for capacity, choose a smaller worker, or ask an operator to add capacity;
+  the capacity label does not prove that Pending storage is healthy.
   `fleet.capacity` separately reports overdue confirmed upgrade waits at
   24 hours, as described [below](#workers).
 

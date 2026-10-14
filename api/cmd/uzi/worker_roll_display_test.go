@@ -71,7 +71,7 @@ func TestWorkerRollAttentionRankingFilterAndSummary(t *testing.T) {
 		t.Fatal("filter leaked excluded worker", out)
 	}
 	// The summary is fleet-wide even while the list is filtered.
-	if got := stripANSI(m.workersSummary(200)); !strings.Contains(got, "6") || !strings.Contains(got, "4 need attention") {
+	if got := stripANSI(m.workersSummary(200, false)); !strings.Contains(got, "6") || !strings.Contains(got, "4 need attention") {
 		t.Fatal("summary counted provisioning or excluded a filtered-out failure", got)
 	}
 }
