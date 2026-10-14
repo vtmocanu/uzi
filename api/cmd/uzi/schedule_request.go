@@ -127,7 +127,7 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 	}
 	if targets != 1 {
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage,
-			"specify exactly one target: --issue <iid>, --sweep, or --prompt <text>")
+			"specify exactly one target: --issue <iid>, --sweep, --prompt <text>, or --ci-watch")
 	}
 	if len(labels) > 0 && !sweep {
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--label is only valid with --sweep")
@@ -584,7 +584,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	// guidance edit), so reject it here.
 	guidanceSet := f.Changed("guidance")
 	clearGuidance := f.Changed("clear-guidance")
-	if (guidanceSet || clearGuidance) && s.Target != schedTargetPrompt && s.Target != schedTargetSweep {
+	if (guidanceSet || clearGuidance) && s.Target != schedTargetPrompt && s.Target != schedTargetSweep && s.Target != schedTargetCIWatch {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
 			"--guidance/--clear-guidance are catalog-owned on this default schedule; clone it first with `uzi schedule clone`")
 	}
@@ -638,7 +638,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	if s.Target == schedTargetSweep {
 		req.MaxIssues = s.MaxIssues
 	}
-	// Guidance on a PROMPT-target (issue #662) or SWEEP-target (issue #675) default is
+	// Guidance on a PROMPT-target (issue #662), SWEEP-target (issue #675) or CI_WATCH-target default is
 	// owner-editable and uses replace-semantics on the server, so RESTATE the fetched value —
 	// otherwise a partial edit (e.g. --cron alone) would send a nil guidance and wipe the
 	// stored value. For a sweep default s.Guidance is the OVERLAY (nil when no overlay is set;
@@ -646,7 +646,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	// echoes the baked value back into the column. The server guard accepts a nil guidance
 	// (keeps NULL, no wipe). Issue/self_improve defaults never reach here with a guidance flag,
 	// so they still send no guidance.
-	if s.Target == schedTargetPrompt || s.Target == schedTargetSweep {
+	if s.Target == schedTargetPrompt || s.Target == schedTargetSweep || s.Target == schedTargetCIWatch {
 		req.Guidance = s.Guidance
 	}
 

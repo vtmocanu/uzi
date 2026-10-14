@@ -104,7 +104,13 @@ func ciEpisodeStatus(e apitypes.CIEpisodeDTO) string {
 	if e.HaltedReason != nil && *e.HaltedReason != "" {
 		return "halted: " + *e.HaltedReason
 	}
-	return "watching"
+	if e.Attempts > 0 {
+		return fmt.Sprintf("repair attempted (%d)", e.Attempts)
+	}
+	if e.LastSignature == nil || *e.LastSignature == "" {
+		return "passing again"
+	}
+	return "red observed"
 }
 
 func ciInt64(v *int64) string { return int64Or(v, "-") }

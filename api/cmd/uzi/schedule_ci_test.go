@@ -235,3 +235,43 @@ func TestScheduleGetCIWatchWorkflowsListed(t *testing.T) {
 		t.Fatalf("note missing: %s", out)
 	}
 }
+
+// TestScheduleGetCIEpisodeStates: the STATE column reflects the server's episode lifecycle
+// (a row exists only after a red observation; a repair start bumps attempts; a fresh green
+// resets attempts and the signature; a halt sets the reason).
+func TestScheduleGetCIEpisodeStates(t *testing.T) {
+	now := time.Now()
+	halted := "same failure twice"
+	page := apitypes.CIEpisodePage{Episodes: []apitypes.CIEpisodeDTO{
+		{WorkflowKey: "wf-halted", Attempts: 2, HaltedReason: &halted, UpdatedAt: now},
+		{WorkflowKey: "wf-attempted", Attempts: 1, LastSignature: sptr("sig"), UpdatedAt: now},
+		{WorkflowKey: "wf-green", Attempts: 0, UpdatedAt: now},
+		{WorkflowKey: "wf-red", Attempts: 0, LastSignature: sptr("sig"), UpdatedAt: now},
+	}}
+	fc := &uzicli.FakeClient{ScheduleByID: map[string]apitypes.ScheduleDTO{
+		"s": {ID: "s", Target: "ci_watch", Timing: "recurring", CronExpr: "0 * * * *", CIEpisodes: &page},
+	}}
+	out, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "get", "s")
+	if code != 0 {
+		t.Fatalf("exit=%d err=%s", code, errOut)
+	}
+	for wf, want := range map[string]string{
+		"wf-halted":    "halted: same failure twice",
+		"wf-attempted": "repair attempted (1)",
+		"wf-green":     "passing again",
+		"wf-red":       "red observed",
+	} {
+		var line string
+		for _, l := range strings.Split(out, "\n") {
+			if strings.Contains(l, wf) {
+				line = l
+			}
+		}
+		if !strings.Contains(line, want) {
+			t.Errorf("%s row = %q, want state %q", wf, line, want)
+		}
+	}
+	if strings.Contains(out, "watching") {
+		t.Errorf("stale generic 'watching' state in:\n%s", out)
+	}
+}

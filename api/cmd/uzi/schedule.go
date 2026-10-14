@@ -266,9 +266,9 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	create.Flags().StringArray("repo", nil, "repo id to schedule against (see 'uzi repo list'); repeatable to create the schedule on N repos at once")
-	create.Flags().Int64("issue", 0, "pinned issue IID target (one of --issue/--sweep/--prompt)")
-	create.Flags().Bool("sweep", false, "label-sweep target: every eligible matching issue (one of --issue/--sweep/--prompt)")
-	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt)")
+	create.Flags().Int64("issue", 0, "pinned issue IID target (one of --issue/--sweep/--prompt/--ci-watch)")
+	create.Flags().Bool("sweep", false, "label-sweep target: every eligible matching issue (one of --issue/--sweep/--prompt/--ci-watch)")
+	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt/--ci-watch)")
 	create.Flags().Bool("ci-watch", false, "default-branch CI repair target: watch workflows and plan a fix for a red run; --prompt optionally overrides the instruction")
 	create.Flags().StringArray("workflow", nil, "a workflow key or name to watch with --ci-watch (repeatable; none watches every workflow in the listed window)")
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the uzi label)")
