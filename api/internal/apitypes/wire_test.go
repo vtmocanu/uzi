@@ -892,7 +892,7 @@ var workerDTOKeys = []string{
 	// the control-plane release. Derived rather than stored, so nothing in the store
 	// layer pins it — this tag set is the only wire contract these two fields have.
 	"upgrade_status", "upgrade_detail", "upgrade_target",
-	"upgrade_blocking_container", "upgrade_blocking_reason", "upgrade_last_exit_code",
+	"upgrade_blocking_container", "upgrade_blocking_kind", "upgrade_blocking_reason", "upgrade_last_exit_code",
 	"last_heartbeat_at",
 	// PRD #251: api-owned anchor of when the worker became online; null when offline or
 	// never online. Uptime is derived client-side as now − online_since; display-only.

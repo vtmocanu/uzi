@@ -257,7 +257,7 @@ func (s *Service) checkFleetRoll(now time.Time, workers []store.ListAllWorkersRo
 		} else if capacityBlocked > 0 || provisionFailed > 0 {
 			c.Summary += ". " + failureCounts + "."
 		}
-		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Failure causes", Value: strings.Join(causeCounts, "; ")})
+		c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Failure causes", Value: safe(strings.Join(causeCounts, "; "))})
 		if paced {
 			c.Evidence = append(c.Evidence, apitypes.HealthEvidenceDTO{Label: "Stuck workers", Value: fmt.Sprintf("%d of %d", failed, len(hosted))})
 		}
