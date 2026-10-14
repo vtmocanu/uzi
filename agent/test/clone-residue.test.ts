@@ -17,7 +17,8 @@ import {
   type CanonicalReseedOptions,
   type GitCacheOptions,
 } from "../src/git.js";
-import { failOriginForReason, RunRunner, type ExecutorFactory } from "../src/runner.js";
+import { failOriginForReason, RunRunner, StaleClaimError, type ExecutorFactory } from "../src/runner.js";
+import { PauseNowSignal } from "../src/steering.js";
 import { formatResidueName, parseRetainedArtifactName } from "../src/attempt-path.js";
 import {
   LiveAttemptRegistry,
@@ -1135,6 +1136,80 @@ describe("M1 canonical residue retention through the public seed path", () => {
   }
   afterEach(() => resetResidueQuarantineForTests());
 
+  for (const kind of ["recognized", "unrecognized", "read failure"] as const) {
+    it(`bounded enumeration refuses ${kind} overflow or failure before candidate work and closes the directory`, async (t) => {
+      const { b, paths } = await planted();
+      if (kind !== "read failure") {
+        for (let i = 7; i < 4097; i++) {
+          const name = kind === "recognized"
+            ? formatResidueName(`issue-${iid}`, `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`)
+            : `unrecognized-${i}`;
+          fs.writeFileSync(path.join(runnerRepoDir(), name), "keep");
+        }
+      }
+      const before = fs.readdirSync(runnerRepoDir()).sort();
+      const rec = recordingLogger();
+      let proofs = 0;
+      const deletes: string[] = [];
+      const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({
+        gitleaksBin: defaultGitleaksShim(), retentionDelete: {
+          split: true, run: async (_command, args) => { deletes.push(args.at(-1)!); },
+        },
+      }));
+      const originalOpen = fs.promises.opendir.bind(fs.promises);
+      let opened: fs.Dir | undefined;
+      let enumerated = 0;
+      t.mock.method(fs.promises, "opendir", async (...args: Parameters<typeof fs.promises.opendir>) => {
+        const dir = await originalOpen(...args);
+        if (args[0] !== runnerRepoDir()) return dir;
+        opened = dir;
+        return {
+          async *[Symbol.asyncIterator]() {
+            for await (const entry of dir) {
+              enumerated++;
+              if (kind === "read failure" && enumerated === 3) throw new Error("EACCES directory read");
+              yield entry;
+            }
+          },
+        } as unknown as fs.Dir;
+      });
+      const originalStat = fs.promises.lstat.bind(fs.promises);
+      let candidateStats = 0;
+      t.mock.method(fs.promises, "lstat", async (...args: Parameters<typeof fs.promises.lstat>) => {
+        if (typeof args[0] === "string" && before.includes(path.basename(args[0]))
+          && path.dirname(args[0]) === runnerRepoDir()) candidateStats++;
+        return originalStat(...args);
+      });
+      const clone = await g.createOrAttachRunnerClone(b, iid, {
+        ...noProofReseed, quiescent: async () => { proofs++; return true; },
+      }, randomUUID());
+      assert.equal(clone.path, canonicalFor(iid), "ordinary seed still succeeds");
+      assert.equal(enumerated, kind === "read failure" ? 3 : 4097, "stop at the first entry over the fixed budget");
+      assert.ok(opened);
+      await assert.rejects(opened.read(), { code: "ERR_DIR_CLOSED" });
+      assert.equal(candidateStats, 0);
+      assert.equal(proofs, 0);
+      assert.deepEqual(deletes, []);
+      assert.deepEqual(fs.readdirSync(runnerRepoDir()).filter(n => n !== `issue-${iid}`).sort(), before);
+      assert.ok(paths.every(p => fs.readFileSync(path.join(p, "kept.txt"), "utf8") === "residue"));
+      const warn = rec.lines.find(l => /retention sweep failed/.test(String((l as { msg?: string }).msg))) as { error: string };
+      assert.match(warn.error, kind === "read failure" ? /EACCES directory read/ : /4096-entry work budget/);
+      assert.ok(warn.error.length <= 160);
+    });
+  }
+
+  it("exactly 4096 siblings still sweep recognized excess down to five", async () => {
+    const { b, paths } = await planted();
+    for (let i = 7; i < 4096; i++) fs.writeFileSync(path.join(runnerRepoDir(), `unrecognized-${i}`), "keep");
+    const proofs: string[][] = [];
+    await git.createOrAttachRunnerClone(b, iid, {
+      ...noProofReseed, quiescent: async ps => { proofs.push(ps); return true; },
+    }, randomUUID());
+    assert.deepEqual(proofs, paths.slice(0, 2).map(p => [p]));
+    assert.deepEqual(paths.map(p => fs.existsSync(p)), [false, false, true, true, true, true, true]);
+    assert.equal(fs.readFileSync(path.join(runnerRepoDir(), "unrecognized-4095"), "utf8"), "keep");
+  });
+
   it("ordinary canonical reseeds cap tied-mtime siblings at five, including repeated replenishment", async () => {
     const { b, paths } = await planted();
     const protectedNames = [formatResidueName("issue-3902", randomUUID()),
@@ -1223,7 +1298,7 @@ describe("M1 canonical residue retention through the public seed path", () => {
       const g = new GitCache(fx.dataDir, rec.logger, undefined, testGitCacheOptions({ gitleaksBin: defaultGitleaksShim() }));
       let guarded = false;
       let injected = false;
-      const originalRead = fs.promises.readdir.bind(fs.promises);
+      const originalRead = fs.promises.opendir.bind(fs.promises);
       const originalStat = fs.promises.lstat.bind(fs.promises);
       const gitSeam = g as unknown as { runGit: (cwd: string, args: string[]) => Promise<string> };
       const originalGit = gitSeam.runGit.bind(g);
@@ -1234,7 +1309,7 @@ describe("M1 canonical residue retention through the public seed path", () => {
         }
         return originalGit(cwd, args);
       });
-      t.mock.method(fs.promises, "readdir", async (...args: Parameters<typeof fs.promises.readdir>) => {
+      t.mock.method(fs.promises, "opendir", async (...args: Parameters<typeof fs.promises.opendir>) => {
         if (guarded && !injected && failure === "parent enumeration" && args[0] === runnerRepoDir()) {
           injected = true;
           throw new Error("EACCES parent enumeration");
@@ -1406,6 +1481,42 @@ describe("M1 canonical residue retention through the public seed path", () => {
       canonical: creators.canonicalReseedOptions(flight),
       attempt: creators.attemptSeedOptions(claim, flight),
     };
+  }
+
+  for (const kind of ["canonical", "attempt"] as const) {
+    for (const Control of [StaleClaimError, PauseNowSignal]) {
+      it(`real ${kind} retention propagates the same ${Control.name} through the public seed path`, async () => {
+        const { b, paths } = await planted();
+        const stop = new Control();
+        let proofs = 0;
+        const opts = retentionOptions({ quiesceRun: async req => {
+          if (req.site === "attempt_seed") return quiescentOutcome();
+          proofs++;
+          throw stop;
+        } });
+        await assert.rejects(opts[kind].quiescent([paths[0]!], canonicalFor(iid)), err => err === stop);
+        await assert.rejects(git.createOrAttachRunnerClone(b, iid, opts.canonical, randomUUID(),
+          false, undefined, kind === "attempt" ? opts.attempt : undefined), err => err === stop);
+        assert.equal(proofs, 2, "public seed stops after the first interrupted retention proof");
+        assert.equal(fs.existsSync(canonicalFor(iid)), false);
+        assert.ok(paths.every(p => fs.existsSync(p)), "no residues removed");
+      });
+    }
+
+    it(`real ${kind} retention treats generic errors as best-effort refusal`, async () => {
+      const { b, paths } = await planted();
+      let proofs = 0;
+      const opts = retentionOptions({ quiesceRun: async req => {
+        if (req.site === "attempt_seed") return quiescentOutcome();
+        proofs++;
+        throw new Error("ordinary proof failure");
+      } });
+      const clone = await git.createOrAttachRunnerClone(b, iid, opts.canonical, randomUUID(),
+        false, undefined, kind === "attempt" ? opts.attempt : undefined);
+      assert.ok(fs.existsSync(clone.path));
+      assert.equal(proofs, 2, "both original excess entries were refused");
+      assert.ok(paths.every(p => fs.existsSync(p)));
+    });
   }
 
   for (const kind of ["empty", "live", "unattributed", "unreadable"] as const) {

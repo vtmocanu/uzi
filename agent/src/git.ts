@@ -1497,6 +1497,7 @@ const RETAINED_ABANDONED_PER_KEY = 3;
 const LEDGER_COMPACT_TMP_PREFIX = "config.uzi-compact-";
 /** How many `.uzi-residue-*` entries the retention sweep keeps per clone key. */
 const RETAINED_RESIDUE_PER_KEY = 5;
+const RESIDUE_ENUMERATION_BUDGET = 4096;
 /** The retention sweep's runner-uid delete: the image's root-owned busybox rm (absolute, so it
  *  never resolves from a runner-writable PATH), and its deadline. */
 const RETENTION_RM_BIN = "/bin/rm";
@@ -1538,6 +1539,8 @@ export interface CanonicalReseedOptions {
   /** Retention predicates, with the same contract as AttemptSeedOptions. */
   isLive: AttemptSeedOptions["isLive"];
   quiescent: AttemptSeedOptions["quiescent"];
+  /** Internal control errors must escape best-effort retention. */
+  isInterruption?: (error: unknown) => boolean;
 }
 
 /**
@@ -1562,6 +1565,8 @@ export interface AttemptSeedOptions {
   /** The retention sweep's quiescence predicate: true when the scoped process scan over `paths`
    *  finds nothing in scope. A false (or a throw) keeps the entry. */
   quiescent: (paths: string[], canonicalPath: string) => Promise<boolean>;
+  /** Internal control errors must escape best-effort retention. */
+  isInterruption?: (error: unknown) => boolean;
 }
 
 // issue #909 — the PRE-#887 flattened owner-key form. Kept ONLY so a resume can still READ a
@@ -2743,6 +2748,7 @@ export class GitCache {
       if ((await this.journaledClonePaths(barePath)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
       await this.sweepResidue(barePath, clonePath, reseed).catch((err: unknown) => {
+        if (reseed.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
           key, error: sanitizeForLog(gitErrorMessage(err), 157),
@@ -3003,6 +3009,7 @@ export class GitCache {
       }
       attempt.onSeeded?.(clonePath);
       await this.sweepRetainedArtifacts(barePath, canonical, clonePath, attempt).catch((err: unknown) => {
+        if (attempt.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
           key,
@@ -3099,7 +3106,9 @@ export class GitCache {
     const quiescent = async (paths: string[]): Promise<boolean> => {
       try {
         return await attempt.quiescent(paths, canonical);
-      } catch {
+      } catch (err) {
+        if (attempt.isInterruption?.(err)) throw err;
+        this.checkRecoveryInterruption();
         return false;
       }
     };
@@ -3167,7 +3176,7 @@ export class GitCache {
   private async sweepResidue(
     barePath: string,
     canonical: string,
-    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent">,
+    predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent" | "isInterruption">,
   ): Promise<void> {
     const parent = path.dirname(canonical);
     const key = path.basename(canonical);
@@ -3177,7 +3186,13 @@ export class GitCache {
       if (st.isSymbolicLink() || !st.isDirectory()) throw new Error("runner repo dir is not a real directory");
     };
     await validateParent();
-    const names = await fs.readdir(parent);
+    const names: string[] = [];
+    // Bound all direct siblings before any candidate stat, proof or deletion. The async
+    // iterator closes the directory on completion, overflow and read failure.
+    for await (const entry of await fs.opendir(parent)) {
+      if (names.length === RESIDUE_ENUMERATION_BUDGET) throw new Error("residue enumeration exceeds 4096-entry work budget");
+      names.push(entry.name);
+    }
     await this.journaledClonePaths(barePath);
     const isOwnResidue = (n: string): boolean => {
       const art = parseRetainedArtifactName(n);
@@ -3219,6 +3234,7 @@ export class GitCache {
       try {
         proven = await predicates.quiescent([r.p], canonical);
       } catch (err) {
+        if (predicates.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         refuse(gitErrorMessage(err));
         continue;

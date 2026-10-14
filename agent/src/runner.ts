@@ -9112,6 +9112,7 @@ export class RunRunner {
     let retentionVetoed = false;
     return {
       attemptId,
+      isInterruption: canonicalRecoveryInterruption,
       isLive: (p) => this.liveAttempts.isLivePath(p),
       beforeSeed: async (nonLivePaths, canonical) => {
         // issue #1783 M2 (seed-time sweep): the process scan (mode `seed`: a terminal attempt's
@@ -9166,6 +9167,7 @@ export class RunRunner {
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
           site: "attempt_retention",
+          propagateControl: true,
           targetPaths: paths,
           clonePath: canonical,
           processOnly: true,
@@ -9192,6 +9194,7 @@ export class RunRunner {
    */
   private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
     return {
+      isInterruption: canonicalRecoveryInterruption,
       isLive: (p) => this.liveAttempts.isLivePath(p),
       quiescent: async (paths, canonical) => {
         if (residueQuarantine() !== undefined) return false;
