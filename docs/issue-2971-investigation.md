@@ -152,10 +152,79 @@ delegations returned transport failures, not review results. Reviewer, tester
 and auditor independently ran the focused characterization successfully on
 `70bb9a4af0c26438bb819bb67c3849942c14241a`. Each reported the same
 restart-successor-counter coverage gap; the repair instruments the recreated
-cache separately. Scoped repair review and the required serial
-agent/repository gates remain pending. M1 is not declared complete until those
-requirements are satisfied. M2 cap audit and M3 salvage/design checkpoint are
-not yet performed.
+cache separately. Reviewer and auditor then reported clean scoped static
+repair review at `0b3afc33253b73fd77390cf7cdc19ba4eada9936`; tester's first
+repair dispatch was cancelled with no result, then its retry independently
+passed the named test on that SHA (1 pass, no failures/cancellations/skips).
+The lead's repaired focused run also passed, scratch log
+`.uzi/scratch/gate-log.jmw6oZ`; the tester retained
+`.uzi/scratch/gate-log.jDRWUA`. No deferred review defect remains.
+
+### Blocking broad-validation result
+
+After every validator returned, the candidate was frozen at
+`0b3afc33253b73fd77390cf7cdc19ba4eada9936` and the lead ran
+`task gate:agent` alone in the foreground with a unique scratch log.
+The runtime stopped it at its **60-minute deadline** and reaped its process
+tree on 2026-10-14, approximately 13:49 UTC. It is **not a pass**.
+The shell wrapper was interrupted before writing its numeric exit status;
+status is runtime deadline termination, numeric exit unavailable. Log:
+`.uzi/scratch/gate-log.2bvT9T` (session-local, not published).
+
+The log reached deps-check, lint, dead code, typecheck and the unit suite.
+Lint reported zero errors/warnings; no preceding task failure was reported.
+The unit suite had not finished; no final unit summary or Codex M4 completion
+was reached, and the new characterization was not shown in this partial log.
+Its independent focused passes remain the evidence for that test.
+Two named failures appeared:
+
+- `runner-acknowledged-final-restart.test.ts`: “new report proof transport
+  failure preserves existing physical archive authority within the same budget”.
+- `runner-plan-cross-check.test.ts`: “forces the supported human disposition
+  on submit checker_unavailable”.
+
+There was no broad-suite final diagnostic block before termination. To avoid
+attributing either failure to baseline without evidence, the lead selected the
+two named tests on candidate and base, then the two whole files on candidate
+and base. Commands used the same wrappers, Node imports, timeout and
+concurrency, with matching-lockfile installed dependencies in the immutable
+base scratch export. No Git-dependent gate ran inside an export.
+
+From the respective `agent` directory:
+
+```sh
+../scripts/real-procfs-skip-check.sh ../scripts/tmpdir-leak-guard.sh node --import tsx --import ./test/setup/hermetic-proc.ts --test --test-concurrency=3 --test-timeout=120000 --test-name-pattern='new report proof transport failure|forces the supported human disposition on submit checker_unavailable' test/runner-acknowledged-final-restart.test.ts test/runner-plan-cross-check.test.ts
+```
+
+The whole-file command was identical with `--test-name-pattern` omitted.
+
+| Selection / revision | Recorded outcome | Session-local scratch log |
+| --- | --- | --- |
+| Named two / candidate 0b3afc33 | exit 0, 2 passed, zero failed/cancelled/skipped | gate-log.zOgDZR |
+| Named two / base a86fb127 | exit 0, 2 passed, zero failed/cancelled/skipped | gate-log.5cAmOH |
+| Whole two files / candidate 0b3afc33 | exit 0, 105 passed, zero failed/cancelled/skipped | gate-log.i5i7GD |
+| Whole two files / base a86fb127 | exit 1, 104 passed, 1 failed, zero cancelled/skipped | gate-log.gIO2Cu |
+
+The base export was resolved to
+`a86fb127d4cea4dfa8ea42b8f7f4331b3b1f9436` and has the original baseline
+tree. Base failure reproduces the report-retirement assertion at line 866:
+actual `{ retired: false }`, expected
+`{ retired: true, authority: "existing_archive" }`. This is an observed
+baseline test instability; its production root cause is not established.
+It was reported as an off-task finding without a code fix.
+The checker-unavailable failure passed all narrowed comparisons and remains
+**inconclusive**, not attributed to baseline. Neither result converts the
+stopped broad gate to green.
+
+`task gate:repo` remains **unrun** because the required first gate did not
+pass. No Go changes, gate:api, live E2E, LiveDB or production inspection occurred.
+No full gate was repeated on an unchanged tree to retrieve output. Broad
+validation still blocks M1 completion and any shipping claim. A successful
+required gate execution is needed before M1 can be declared complete; no
+baseline waiver or alternate gate equivalence is claimed.
+
+M1 remains in progress with committed passing characterization and evidence.
+M2 cap audit and M3 salvage/design checkpoint are not yet performed.
 
 The eventual acceptance remains outstanding: owner-authorized recovery-positive
 red/green, blocker/current-cap controls, one pass per consent, every custody and
