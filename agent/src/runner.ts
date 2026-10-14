@@ -6897,9 +6897,10 @@ export class RunRunner {
 
     // Default-branch CI repair lane (claim.config.ci_config_guard): the worker backstop. Unlike the
     // ci_fix guard below, a human approval does NOT exempt it: CI-config changes in this lane are
-    // reported, not pushed. It runs at two check points (here, and again on the exact owned SHA
-    // immediately before every final push attempt) with the raw-path matcher and the
-    // rename-aware diff; an uncomputable diff refuses too.
+    // reported, not pushed. Two check points fail the run (here, and again on the exact owned SHA
+    // immediately before every final push attempt); checkpoint and held publication are checked
+    // too (ciConfigGuardBlocksPublication), where a match skips the upload. All use the raw-path
+    // matcher and the --no-renames diff; an uncomputable diff refuses too.
     const ciConfigGuarded = claim.config?.ci_config_guard === true;
     const ciConfigGuardGlobs = [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
     let ciConfigGuardReported = false;
