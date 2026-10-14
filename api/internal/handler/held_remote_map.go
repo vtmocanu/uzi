@@ -22,5 +22,8 @@ func heldRemoteForRecovery(err error) error {
 // heldListAllowFor is step B's per-worker forge-listing gate: one limiter bucket per worker,
 // keyed apart from every route-pattern bucket the same limiter serves.
 func heldListAllowFor(lim *mw.Limiter) func(workerID uuid.UUID) bool {
+	if lim == nil {
+		return nil
+	}
 	return func(workerID uuid.UUID) bool { return lim.Allow("held-final-list|" + workerID.String()) }
 }
