@@ -111,6 +111,9 @@ fs.writeFileSync(path.join(epoch, "sessions", "rollout-" + session + ".jsonl"),
 let flight = 0;
 let committedHead = "";
 let sourceBranch = "";
+let predecessorPath = "";
+let predecessorHead = "";
+let resumedPath = "";
 let resumeObserved = false;
 let successfulBoundaries = 0;
 const runner = new RunRunner(client, cache, (_runId, codex) => {
@@ -159,6 +162,7 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
     run: async (ctx: RunContext): Promise<ExecutorResult> => {
       if (flight === 1) {
         sourceBranch = ctx.branch;
+        predecessorPath = ctx.worktreePath;
         ctx.onSessionId?.(session);
         await CodexSessionStore.persist(epoch, path.join(home, "codex-session-store"));
         fs.writeFileSync(path.join(ctx.worktreePath, "COMMITTED.txt"), "committed before refresh\n");
@@ -167,7 +171,10 @@ const runner = new RunRunner(client, cache, (_runId, codex) => {
         committedHead = gitAt(ctx.worktreePath, ["rev-parse", "HEAD"]);
         fs.writeFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "dirty before refresh\n");
       } else {
-        assert.equal(ctx.sessionId, session, "real reclaim preserved the session");
+        resumedPath = ctx.worktreePath;
+        assert.notEqual(resumedPath, predecessorPath, "retained-source reclaim uses a fresh attempt path");
+        assert.match(path.basename(resumedPath), /\.attempt-/);
+        assert.ok(ctx.sessionId == null, "fresh-attempt reclaim inherits no model session");
         assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "COMMITTED.txt"), "utf8"), "committed before refresh\n");
         assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "DIRTY.txt"), "utf8"), "dirty before refresh\n");
         assert.equal(gitAt(ctx.worktreePath, ["merge-base", "--is-ancestor", committedHead, "HEAD"]), "");
@@ -239,6 +246,11 @@ try {
   assert.equal(parked.permit_requests, 0);
   assert.ok(parked.holds > 0);
   assert.equal(mrCreates, 0);
+  assert.ok(predecessorPath && fs.existsSync(path.join(predecessorPath, ".git")),
+    "the refresh park retains its exact predecessor clone");
+  predecessorHead = gitAt(predecessorPath, ["rev-parse", "HEAD"]);
+  assert.equal(fs.readFileSync(path.join(predecessorPath, "COMMITTED.txt"), "utf8"), "committed before refresh\n");
+  assert.equal(fs.readFileSync(path.join(predecessorPath, "DIRTY.txt"), "utf8"), "dirty before refresh\n");
   assert.equal(successfulBoundaries, 0, "blocked reconcile minted no action authority");
   assert.equal(await CodexSessionStore.inspectSession(path.join(home, "codex-session-store"), session), "present");
   const recovered = await control("recover");
@@ -280,6 +292,13 @@ try {
   assert.equal(gitAt(cfg.origin, ["show", finalHead + ":COMMITTED.txt"]), "committed before refresh");
   assert.equal(gitAt(cfg.origin, ["show", finalHead + ":DIRTY.txt"]), "dirty before refresh");
   assert.equal(gitAt(cfg.origin, ["merge-base", "--is-ancestor", committedHead, finalHead]), "", "published head includes the recovered source");
+  assert.ok(resumedPath && resumedPath !== predecessorPath);
+  assert.ok(fs.existsSync(path.join(predecessorPath, ".git")),
+    "recapture and completion do not delete the parked predecessor");
+  assert.equal(gitAt(predecessorPath, ["rev-parse", "HEAD"]), predecessorHead,
+    "the successor never rewrites its predecessor head");
+  assert.equal(fs.readFileSync(path.join(predecessorPath, "COMMITTED.txt"), "utf8"), "committed before refresh\n");
+  assert.equal(fs.readFileSync(path.join(predecessorPath, "DIRTY.txt"), "utf8"), "dirty before refresh\n");
   const logs = lines.join("\n");
   for (const canary of ["access-canary-", "refresh-canary-", cfg.token, first.secrets.codex?.capability ?? "", resumed.secrets.codex.capability]) {
     if (canary) assert.ok(!logs.includes(canary), "no credential canary in worker logs");
