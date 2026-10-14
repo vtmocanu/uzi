@@ -38,6 +38,13 @@ type VerifiedMergeSnapshot struct {
 
 var ErrMergeSnapshotMismatch = errors.New("recovery: completed merge snapshot no longer matches")
 
+var ErrMergedPredecessorWorkLimit = errors.New("recovery: merged predecessor transaction exceeds 1000 holds or 1000 non-ready captures")
+
+const (
+	maxMergedPredecessorHolds    = 1000
+	maxMergedPredecessorCaptures = 1000
+)
+
 func validateMergeBinding(binding MergeBinding, verifiedAt time.Time) error {
 	if binding.RunID == uuid.Nil || binding.OwnerID == uuid.Nil || binding.RepoID == uuid.Nil ||
 		binding.ConnectionID == uuid.Nil || binding.ProjectID <= 0 || binding.MRIID <= 0 ||
@@ -61,8 +68,9 @@ func NewVerifiedMergeSnapshot(binding MergeBinding, verifiedAt time.Time, observ
 
 // DiscardMergedPredecessorHolds settles only earlier OPEN holds in one transaction.
 // Run, repo and connection locks fence binding drift, then holds are locked in generation/id
-// order before captures. Work is bounded by the selected holds/captures and ctx's deadline;
-// there are no retries. Any refusal aborts all siblings. Available archives are untouched.
+// order before captures. Each transaction permits at most 1000 holds and 1000 non-ready
+// captures across siblings, with one extra row read to detect overflow. Calls use ctx's
+// deadline and have no retries. Any refusal aborts all siblings. Available archives are untouched.
 func (s *Service) DiscardMergedPredecessorHolds(ctx context.Context, snapshot VerifiedMergeSnapshot) (int64, error) {
 	b := snapshot.binding
 	if err := validateMergeBinding(b, snapshot.verifiedAt); err != nil {
@@ -104,6 +112,10 @@ func (s *Service) DiscardMergedPredecessorHolds(ctx context.Context, snapshot Ve
 	if err != nil || len(holds) == 0 {
 		return 0, err
 	}
+	if len(holds) > maxMergedPredecessorHolds {
+		return 0, ErrMergedPredecessorWorkLimit
+	}
+	remainingCaptures := maxMergedPredecessorCaptures
 	for _, hold := range holds {
 		audit, err := json.Marshal(struct {
 			HoldID              uuid.UUID `json:"hold_id"`
@@ -133,10 +145,16 @@ func (s *Service) DiscardMergedPredecessorHolds(ctx context.Context, snapshot Ve
 		if n != 1 {
 			return 0, fmt.Errorf("recovery: merged predecessor hold %s refused discard", hold.ID)
 		}
-		captures, err := qtx.LockMergedPredecessorNonReadyCaptures(ctx, hold.ID)
+		captures, err := qtx.LockMergedPredecessorNonReadyCaptures(ctx, store.LockMergedPredecessorNonReadyCapturesParams{
+			HoldID: hold.ID, CaptureLimit: int32(remainingCaptures + 1),
+		})
 		if err != nil {
 			return 0, err
 		}
+		if len(captures) > remainingCaptures {
+			return 0, ErrMergedPredecessorWorkLimit
+		}
+		remainingCaptures -= len(captures)
 		n, err = qtx.DiscardNonReadyCapturesForHold(ctx, hold.ID)
 		if err != nil {
 			return 0, err

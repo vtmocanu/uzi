@@ -35,12 +35,12 @@ FOR SHARE OF p, c;
 SELECT id, generation FROM recovery_custody_holds
 WHERE run_id = @run_id AND user_id = @owner_id AND repo_id = @repo_id
     AND state = 'open' AND generation < @completed_generation
-ORDER BY generation, id FOR NO KEY UPDATE;
+ORDER BY generation, id LIMIT 1001 FOR NO KEY UPDATE;
 
 -- name: LockMergedPredecessorNonReadyCaptures :many
 SELECT id FROM recovery_captures
 WHERE hold_id = @hold_id AND state IN ('preparing', 'uploading', 'needs_action')
-ORDER BY id FOR UPDATE;
+ORDER BY id LIMIT @capture_limit::int FOR UPDATE;
 
 -- name: DiscardMergedPredecessorHold :execrows
 UPDATE recovery_custody_holds SET

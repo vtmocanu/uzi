@@ -153,7 +153,7 @@ const lockMergedPredecessorHolds = `-- name: LockMergedPredecessorHolds :many
 SELECT id, generation FROM recovery_custody_holds
 WHERE run_id = $1 AND user_id = $2 AND repo_id = $3
     AND state = 'open' AND generation < $4
-ORDER BY generation, id FOR NO KEY UPDATE
+ORDER BY generation, id LIMIT 1001 FOR NO KEY UPDATE
 `
 
 type LockMergedPredecessorHoldsParams struct {
@@ -198,11 +198,16 @@ func (q *Queries) LockMergedPredecessorHolds(ctx context.Context, arg LockMerged
 const lockMergedPredecessorNonReadyCaptures = `-- name: LockMergedPredecessorNonReadyCaptures :many
 SELECT id FROM recovery_captures
 WHERE hold_id = $1 AND state IN ('preparing', 'uploading', 'needs_action')
-ORDER BY id FOR UPDATE
+ORDER BY id LIMIT $2::int FOR UPDATE
 `
 
-func (q *Queries) LockMergedPredecessorNonReadyCaptures(ctx context.Context, holdID uuid.UUID) ([]uuid.UUID, error) {
-	rows, err := q.db.Query(ctx, lockMergedPredecessorNonReadyCaptures, holdID)
+type LockMergedPredecessorNonReadyCapturesParams struct {
+	HoldID       uuid.UUID `json:"hold_id"`
+	CaptureLimit int32     `json:"capture_limit"`
+}
+
+func (q *Queries) LockMergedPredecessorNonReadyCaptures(ctx context.Context, arg LockMergedPredecessorNonReadyCapturesParams) ([]uuid.UUID, error) {
+	rows, err := q.db.Query(ctx, lockMergedPredecessorNonReadyCaptures, arg.HoldID, arg.CaptureLimit)
 	if err != nil {
 		return nil, err
 	}
