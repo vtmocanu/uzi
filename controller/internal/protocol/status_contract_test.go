@@ -38,6 +38,8 @@ func sampleStatusReport() StatusReport {
 	canary := "11111111-1111-1111-1111-111111111111"
 	blockingReason := "waiting_for_registration"
 	retained := "0.11.6"
+	capacityKind := "scheduler_capacity"
+	capacityReason := "scheduler capacity: insufficient cpu"
 	return StatusReport{
 		Kind: "fleet", ReportedAt: time.Date(2026, 7, 26, 10, 0, 0, 0, time.UTC),
 		PollIntervalSeconds: 10,
@@ -70,6 +72,15 @@ func sampleStatusReport() StatusReport {
 				BlockingReason:    nil,
 				RestartCount:      0,
 				LastExitCode:      nil,
+			},
+			{
+				ID:             "33333333-3333-3333-3333-333333333333",
+				Phase:          PhaseStuck,
+				PhaseSince:     &phaseSince,
+				TargetImage:    "harbor.example.com/uzi/agent-base:0.11.7",
+				PodPhase:       "Pending",
+				BlockingKind:   &capacityKind,
+				BlockingReason: &capacityReason,
 			},
 		},
 	}

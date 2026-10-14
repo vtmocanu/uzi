@@ -155,8 +155,9 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 	if m.cfg.IsolatedNamespace != "" {
 		namespaces = append(namespaces, m.cfg.IsolatedNamespace)
 	}
+	deploymentCounts := map[string]int{}
 	for _, ns := range namespaces {
-		if err := m.observeNamespace(ctx, ns, byID); err != nil {
+		if err := m.observeNamespace(ctx, ns, byID, deploymentCounts); err != nil {
 			return nil, err
 		}
 	}
@@ -192,7 +193,7 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 			{dataPVCName(w.ID), w.DataPVCPhase, w.DataPVCCreatedAt},
 			{dindDataPVCName(w.ID), w.DinDPVCPhase, w.DinDPVCCreatedAt},
 		}
-		var flagged bool
+		var timedOut []target
 		for _, t := range targets {
 			if t.phase != string(corev1.ClaimPending) || t.created == nil {
 				continue
@@ -202,29 +203,37 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 				continue
 			}
 			m.log.Warn(fmt.Sprintf("pvc-bind-timeout worker=%s pvc=%s pending_for=%s", w.ID, t.name, age))
-			if !flagged {
-				flagged = true
-				since := *t.created
-				w.Roll = reconcile.RollHealth{
-					Phase:             protocol.PhaseStuck,
-					PhaseSince:        since,
-					PodPhase:          string(corev1.ClaimPending),
-					BlockingContainer: t.name,
-					// Kept within the api's 64-byte self-reported display cap
-					// (handler.maxSelfReportedBytes) so the failed-worker strip renders the
-					// cause in full rather than truncating it mid-word. The PVC name rides
-					// BlockingContainer; "no auto-rollback" is the operator's cue that manual
-					// intervention (not a controller retry) is the remedy (ADR-0837 D6/D7).
-					BlockingReason: fmt.Sprintf("stranded Pending past %s bind-timeout; no auto-rollback", pvcBindTimeout),
-				}
+			timedOut = append(timedOut, t)
+		}
+		if len(timedOut) == 0 {
+			continue
+		}
+		capacity := w.SchedulerCapacityReason != ""
+		for _, t := range timedOut {
+			if !w.SchedulerMountedClaims[t.name] {
+				capacity = false
 			}
+		}
+		// Preserve image and container failure evidence while choosing a cause only
+		// after every timed-out claim has been checked. Targets keep /nix first.
+		w.Roll.Phase = protocol.PhaseStuck
+		w.Roll.PhaseSince = *timedOut[0].created
+		if capacity {
+			w.Roll.BlockingKind = "scheduler_capacity"
+			w.Roll.BlockingContainer = ""
+			w.Roll.BlockingReason = w.SchedulerCapacityReason
+		} else {
+			w.Roll.BlockingKind = ""
+			w.Roll.PodPhase = string(corev1.ClaimPending)
+			w.Roll.BlockingContainer = timedOut[0].name
+			w.Roll.BlockingReason = fmt.Sprintf("stranded Pending past %s bind-timeout; no auto-rollback", pvcBindTimeout)
 		}
 	}
 }
 
 // observeNamespace folds one namespace's stamped Deployments and PVCs into byID,
 // recording the namespace each worker was seen in so teardown can target it.
-func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker) error {
+func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker, deploymentCounts map[string]int) error {
 	get := func(id string) *reconcile.ObservedWorker {
 		if o, ok := byID[id]; ok {
 			return o
@@ -234,9 +243,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		return o
 	}
 	// The image each worker's Deployment currently asks for, collected in the
-	// deployment pass and handed to the pod pass below. Kept in a local rather than
-	// written straight onto ObservedWorker.Roll because the pod pass REPLACES Roll
-	// wholesale, which would drop anything stashed there first.
+	// deployment pass and handed to the pod pass below, which replaces Roll.
+	// Also retain it on Roll so a failed pod list followed by PVC timeout detection
+	// still reports the image the Deployment asks for.
 	targetImages := map[string]string{}
 	// The reason on each worker Deployment's ReplicaFailure condition when it is True —
 	// the Deployment controller saying a pod create FAILED, as opposed to a pod merely
@@ -249,6 +258,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// which PRD #113 declined to grant (`events: list` was refused) and which this does
 	// not reopen.
 	replicaFailures := map[string]string{}
+	hasReplicaFailure := map[string]bool{}
 
 	deployments, err := m.client.AppsV1().Deployments(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
@@ -262,12 +272,29 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			continue
 		}
 		o := get(id)
+		deploymentCounts[id]++
+		if deploymentCounts[id] > 1 {
+			// A second Deployment makes the desired hash ambiguous, including across
+			// namespace folds. Retire any capacity evidence from the earlier fold.
+			o.SchedulerCapacityReason = ""
+			o.SchedulerMountedClaims = nil
+			if o.Roll.BlockingKind == "scheduler_capacity" {
+				o.Roll.BlockingKind = ""
+				o.Roll.BlockingReason = ""
+			}
+		}
 		o.HasDeployment = true
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
+		for _, c := range d.Status.Conditions {
+			if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
+				hasReplicaFailure[id] = true
+			}
+		}
 		if img := workerImage(d); img != "" {
 			targetImages[id] = img
+			o.Roll.TargetImage = img
 		}
 		if reason := replicaFailureReason(d); reason != "" {
 			replicaFailures[id] = reason
@@ -404,6 +431,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// pod readiness rather than deployment drift — see rollhealth.go's header.
 		o.Roll = deriveRollHealth(byWorker[o.ID], o.SpecHash, replicaFailures[o.ID], now)
 		o.Roll.TargetImage = targetImages[o.ID]
+		recordSchedulerCapacity(o, byWorker[o.ID], hasReplicaFailure[o.ID] || deploymentCounts[o.ID] != 1)
 	}
 	// A worker seen ONLY as pods (its Deployment already gone, its pods still
 	// terminating) gets roll health too — teardown is in flight and the row is honest
