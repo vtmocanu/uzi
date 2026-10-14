@@ -41,6 +41,18 @@ func (c *HTTPClient) GetSchedule(ctx context.Context, id string) (apitypes.Sched
 	return out, nil
 }
 
+func (c *HTTPClient) ListScheduleCIEpisodes(ctx context.Context, id, cursor string) (apitypes.CIEpisodePage, error) {
+	path := "/api/schedules/" + url.PathEscape(id) + "/ci-episodes"
+	if cursor != "" {
+		path += "?cursor=" + url.QueryEscape(cursor)
+	}
+	var out apitypes.CIEpisodePage
+	if err := c.get(ctx, path, &out); err != nil {
+		return apitypes.CIEpisodePage{}, err
+	}
+	return out, nil
+}
+
 func (c *HTTPClient) SetScheduleEnabled(ctx context.Context, id string, enabled bool) (apitypes.ScheduleDTO, error) {
 	// A struct carrying ONLY `enabled`, so the handler's onlyEnabled() pause/resume path
 	// fires: the config is left untouched and just the flag flips. A full ScheduleRequest

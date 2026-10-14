@@ -64,7 +64,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	if s.Timing == schedTimingRecurring {
 		rows = append(rows, []string{"TIMEZONE", s.Timezone})
 	}
-	if s.Target == schedTargetPrompt && s.Prompt != "" {
+	if (s.Target == schedTargetPrompt || s.Target == schedTargetCIWatch) && s.Prompt != "" {
 		rows = append(rows, []string{"PROMPT", s.Prompt})
 	}
 	if s.Target == schedTargetSweep {
@@ -109,6 +109,9 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	renderLastFire(p, s.LastFire)
 	renderRecentFires(p, s.RecentFires)
+	if s.Target == schedTargetCIWatch {
+		renderCIWatchDetail(p, s)
+	}
 	return nil
 }
 

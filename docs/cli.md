@@ -113,14 +113,15 @@ uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi run held <id> [--json]
 uzi run held expire <id> [--yes]
-uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
+uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>
+                    | --ci-watch [--workflow <key|name> ...] [--prompt <text>])
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
                     [--max-issues <n>] [--guidance <text>]
                     [--output mr|issues]
                     [--model <alias|id>] [--apply-model-to-agents[=false]]
                     [--harness claude|codex]
-uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
+uzi schedule list | get <id> [--episodes-cursor <c>] | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi schedule pause-all --until <when> | resume-all | pause-status
 uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--prompt <text> | --label <l> ... [--create-missing-labels]]
@@ -130,6 +131,7 @@ uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--output mr|issues|""]
                    [--model <alias|id>] [--apply-model-to-agents[=false]] [--repo <id>]
                    [--harness claude|codex|""]
+                   [--workflow <key|name> ... | --clear-workflows]   # ci_watch only
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
 uzi schedule reset <id>
@@ -452,6 +454,20 @@ A few worth knowing:
   is standalone (no group). An **`--issue` target cannot span repos** (the issue
   number is repo-relative), so `--repo A --repo B ... --issue N` is a usage error
   (exit 2) before any create; `--sweep` and `--prompt` targets group freely.
+  **`--ci-watch`** is a fourth target, default-branch CI repair: it watches the repo's
+  workflows (repeat `--workflow <key|name>` to select some; none watches every
+  workflow in the listed window, the newest 100 executions, 50 on Forgejo) and `--prompt`
+  optionally overrides the instruction (default: the `ci-repair` catalog body, also
+  available as `schedule catalog enable ci-repair`). `--auto-approve` stays **off**
+  unless passed, since CI logs can contain text from dependencies, tests or outside
+  contributors. `--workflow` is rejected on other targets, and `--issue`, `--sweep`,
+  `--label`, `--max-issues`, `--output` and `--guidance` are rejected with `--ci-watch`
+  (exit 2). `schedule edit` takes `--workflow` (replace) or `--clear-workflows` (back to
+  all), mutually exclusive; omitting both keeps the stored selector. `schedule get`
+  shows the watched workflows, each workflow's episode state (state or halted reason,
+  attempts, run ids), the auto-approve note, and `next cursor: <c>` when more
+  pages exist; `schedule get <id> --episodes-cursor <c>` prints the next page
+  (`--json` prints it with `next_cursor`).
   `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
   gate); pass `--auto-approve=false` to keep the gate. **To start an
   auto-approved run on one issue now**, use a disabled one-shot schedule:
