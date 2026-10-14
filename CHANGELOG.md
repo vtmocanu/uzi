@@ -24,6 +24,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **Runs admin worker badges stay visible on narrow screens ([#2862](https://github.com/vtmocanu/uzi/issues/2862)).**
+  The Factory status worker badge row wraps at phone widths so the last badge is not clipped.
+
 - **Checkpoint publication acknowledgments are capped at 64 KiB ([#2888](https://github.com/vtmocanu/uzi/issues/2888)).**
   The worker now reads the checkpoint publish response through a streamed-byte cap instead of buffering it whole, so an oversized or endless acknowledgment is cancelled and treated as an ambiguous publish failure (the attempted tip is kept, nothing is confirmed) without echoing any of the body.
 

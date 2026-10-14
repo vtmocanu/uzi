@@ -739,7 +739,7 @@ export function RunsList() {
                         <span className="ml-2 text-xs text-faint">up {formatUptimeSince(w.online_since)}</span>
                       )}
                     </div>
-                    <div className="flex items-center gap-1.5">
+                    <div className="flex flex-wrap items-center gap-1.5">
                       {hasTemplateDrift(w.template_declared, w.template_reported) && (
                         <Badge
                           tone="warning"
