@@ -431,7 +431,11 @@ live mutation, hold discard, limit increase or redispatch was performed.
 ## Validation status (earlier run, historical)
 
 This section records the earlier run b8016a14 at `0b3afc33`. Its “M2/M3 not yet
-performed” status is superseded by the M2 and M3 sections above. This run's
+performed”, “M1 remains in progress” and “broad validation still blocks M1”
+statements are superseded. M1–M3 are recorded above. Completion of this
+checkpoint rests on this run's required gates (see “Validation status (this
+run)”). Scratch log names in that section are from the earlier run and are not
+published. This run's
 validation is recorded in “Validation status (this run)” at the end.
 
 Focused characterization passed as recorded above. Coder and researcher
@@ -520,6 +524,11 @@ episode-policy ADR amendment if semantics change, and required serial gates.
 
 ## Validation status (this run)
 
+- **Focused characterization, one red run.** One lead run between the M0 merge
+  and `820d53a2` failed (exit 1). The cause was an assertion the lead wrote and
+  then dropped, which expected a generation field in the failure-report body. The
+  fake API does not send that field without `claim_generation_fence` (see M0). It
+  was not a product defect.
 - **Focused characterization run.** Run on this run's merged tree, from `agent/`,
   with the command in the M0 section: exit 0, 1 passed, 0 failed/cancelled/skipped.
   Runs:
@@ -529,13 +538,16 @@ episode-policy ADR amendment if semantics change, and required serial gates.
   - the M1 fact-checker, independently, at `94594b12`.
 
   The M2 and M3 fact-checks ran no tests; those ranges change only this record.
-- **`task check-docs:web`.** The lead ran it on the final record candidate: exit 0,
-  log kept. Earlier interim runs printed OK but were not logged.
+- **`task check-docs:web`.** The lead ran it on the final record candidate: exit 0.
+  The log is run-local and unpublished. Some earlier interim runs were not logged;
+  every run exited 0.
 - **Read-only validation per commit.** M0 by a reviewer; M1, M2 and M3 by a
   fact-checker. Each blocking finding was fixed in a follow-up commit, and the M2 fix
-  range was re-checked. The M3 fix range was re-checked at `1c7a6ac2`, and its
-  follow-up wording fix was re-checked too.
+  range was re-checked. The M3 fix range was re-checked at `1c7a6ac2`, its follow-up
+  `763a264a` was re-checked, and the final wording commits were reviewed by a
+  reviewer.
 - **Required gates.** `task gate:agent`, then `task gate:repo`, are run in the
   foreground on the frozen candidate that contains this record, after validation.
-  Their recorded results are reported in the pull request for that candidate, not
-  here, so the record does not change after the gates have run.
+  Their recorded results are reported in the run's final validation report (the
+  verification list of the pull request summary), not here, so the record does not
+  change after the gates have run.
