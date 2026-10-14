@@ -4,6 +4,9 @@ import (
 	"bytes"
 	"encoding/json"
 	"fmt"
+	"net/http"
+	"net/http/httptest"
+	"reflect"
 	"strings"
 	"testing"
 	"time"
@@ -151,6 +154,127 @@ func TestMemoryHoldCLIFollow(t *testing.T) {
 	for _, line := range strings.Split(errout, "\n") {
 		if strings.Contains(line, "worker memory pressure") && strings.Contains(line, "still following") {
 			t.Error(line)
+		}
+	}
+}
+
+// The worker persists its last message after the initial log drain but before
+// GetRun observes an owner hold. Follow must drain that message before exiting.
+func TestOwnerHoldCLIFollowFinalDrain(t *testing.T) {
+	for _, hold := range []struct {
+		name, notice string
+		run          apitypes.RunDTO
+	}{
+		{"memory", "worker memory pressure", memoryHeldRun()},
+		{"worker exhaustion", "worker recovery exhausted", workerExhaustionRun(3)},
+	} {
+		for _, format := range []string{"text", "NDJSON"} {
+			for _, failDrain := range []bool{false, true} {
+				t.Run(fmt.Sprintf("%s/%s/error=%v", hold.name, format, failDrain), func(t *testing.T) {
+					first := apitypes.MessageDTO{Seq: 1, Kind: "text", Payload: json.RawMessage(`{"text":"initial message"}`)}
+					final := apitypes.MessageDTO{Seq: 2, Kind: "text", Payload: json.RawMessage(`{"text":"last message before owner hold"}`)}
+					polls, resume, visible := 0, false, false
+					var afters []string
+					srv := httptest.NewServer(http.HandlerFunc(func(w http.ResponseWriter, r *http.Request) {
+						w.Header().Set("Content-Type", "application/json")
+						switch {
+						case r.Method == http.MethodPost:
+							resume = true
+							t.Errorf("unexpected mutation: %s", r.URL.Path)
+							http.Error(w, "read-only follow", http.StatusBadRequest)
+						case r.URL.Path == "/api/runs/r1/messages":
+							after := r.URL.Query().Get("after")
+							afters = append(afters, after)
+							var messages []apitypes.MessageDTO
+							switch after {
+							case "0":
+								messages = []apitypes.MessageDTO{first}
+							case "1":
+								if visible {
+									if failDrain {
+										w.WriteHeader(http.StatusBadRequest)
+										_, _ = w.Write([]byte(`{"error":"final drain failed"}`))
+										return
+									}
+									messages = []apitypes.MessageDTO{final}
+								}
+							case "2":
+							default:
+								t.Errorf("unexpected cursor %q", after)
+							}
+							_ = json.NewEncoder(w).Encode(map[string]any{"messages": messages})
+						case r.URL.Path == "/api/runs/r1":
+							polls++
+							if !reflect.DeepEqual(afters, []string{"0", "1"}) {
+								t.Errorf("GetRun before initial drain completed: %v", afters)
+							}
+							// Publish seq 2 only now, just before returning the hold.
+							visible = true
+							_ = json.NewEncoder(w).Encode(map[string]any{"run": hold.run})
+						default:
+							t.Errorf("unexpected request: %s", r.URL.Path)
+							http.NotFound(w, r)
+						}
+					}))
+					defer srv.Close()
+					args := []string{"run", "logs", "r1", "--follow"}
+					if format == "NDJSON" {
+						args = append(args, "--json")
+					}
+					out, errout, code := runCLI(t, httpEnv(srv), args...)
+					if failDrain {
+						if code == 0 || !strings.Contains(errout, "final drain failed") {
+							t.Errorf("final drain error not propagated: exit %d stderr %s", code, errout)
+						}
+					} else {
+						if code != 0 {
+							t.Errorf("exit %d: %s", code, errout)
+						}
+						if strings.Count(out, "last message before owner hold") != 1 {
+							t.Errorf("missing or duplicated final message seq 2: %s", out)
+						}
+					}
+					if strings.Count(out, "initial message") != 1 {
+						t.Errorf("initial message replayed or missing: %s", out)
+					}
+					if format == "text" && !failDrain && strings.Count(out, "#2") != 1 {
+						t.Errorf("final text message seq changed: %s", out)
+					}
+					if format == "NDJSON" {
+						lines := strings.Split(strings.TrimSpace(out), "\n")
+						want := []apitypes.MessageDTO{first}
+						if !failDrain {
+							want = append(want, final)
+						}
+						var got []apitypes.MessageDTO
+						for _, line := range lines {
+							var m apitypes.MessageDTO
+							if err := json.Unmarshal([]byte(line), &m); err != nil {
+								t.Fatalf("invalid NDJSON %q: %v", line, err)
+							}
+							got = append(got, m)
+						}
+						if !reflect.DeepEqual(got, want) {
+							t.Errorf("NDJSON messages/seq changed: got %+v want %+v", got, want)
+						}
+					}
+					wantAfters := []string{"0", "1", "1", "2"}
+					if failDrain {
+						wantAfters = wantAfters[:3]
+					}
+					if !reflect.DeepEqual(afters, wantAfters) {
+						t.Errorf("drain cursors %v want %v", afters, wantAfters)
+					}
+					if polls != 1 || resume {
+						t.Errorf("GetRun polls %d want 1, mutation %v", polls, resume)
+					}
+					requireWorkerCopy(t, errout, hold.notice, "uzi run resume r1", "uzi run cancel r1", "no automatic resume")
+					if strings.Count(errout, hold.notice) != 1 || strings.Contains(errout, "still following") ||
+						strings.Contains(errout, "resumes on its own") {
+						t.Errorf("owner hold notice changed: %s", errout)
+					}
+				})
+			}
 		}
 	}
 }

@@ -224,7 +224,7 @@ func newRunLogsCmd(env Env, gf *globalFlags) *cobra.Command {
 								for _, evidence := range workerExhaustionEvidence(run) {
 									_, _ = fmt.Fprintln(env.Stderr, evidence)
 								}
-								return nil
+								return drain()
 							} else if line := codexAccountActionLine(run); line != "" {
 								// PRD #1590: a Codex account hold has no retry clock; it
 								// says what the account needs and does not promise a resume.
