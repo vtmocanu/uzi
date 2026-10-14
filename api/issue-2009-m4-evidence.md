@@ -10,7 +10,7 @@ The literal UUID and generation-zero/int64-maximum assertion suggested by the M2
 
 Matched worker baseline runtime and genuine assertion failures are recorded in `agent/issue-2009-m4-evidence.md`. Full canonical gates and generated-SQL behavioral mutation controls remain required before M4 completion; this acceptance record alone does not assert they ran.
 
-## Lead continuation on 2026-10-14: committed repairs and validation still incomplete
+## Earlier lead continuation on 2026-10-14: repairs committed before canonical validation
 
 M4 remains in progress. No delivery signal has been sent. The primary tree is committed through `c9c8dcb2`; production code was not changed in this continuation. Scratch artifacts are local and may be absent after a fresh worker reseed; the observations below preserve commands, revisions, outcomes and limitations rather than asserting that an old log is still present.
 
@@ -75,7 +75,7 @@ Pinned exits are expected pre-fix assertion failures, not compilation/setup fail
 
 An earlier release delegation was cancelled before reporting a result; its partial `gate-log.Qgg5In` has no final exit status and is unverified.
 
-Lead `task gate:agent` at `f48e1157` returned **201**, wall **3358.688908193s** (55m58.689s), log `gate-log.pWGAio`. It did **not** reach the 60-minute command deadline, so the conditional shard-composition fallback has not been invoked. Unit summary: 14,384 tests, 14,231 pass, 138 fail, 0 cancelled, 15 skipped; the wrapper recorded unit 3337s/exit 1 and zero real-procfs skips. Codex M4 was not reached. Failed files: issue-1742-restart, issue-2021-recovery-pin-cleanup, issue-2263-recovery-pin-cleanup, recovery-inventory-clone, recovery-inventory and terminal-rejection-retention.
+Lead `task gate:agent` at `f48e1157` returned **201**, wall **3358.688908193s** (55m58.689s), log `gate-log.pWGAio`. It did **not** reach the 60-minute command deadline, so the conditional shard-composition fallback had not yet been invoked at that point. Unit summary: 14,384 tests, 14,231 pass, 138 fail, 0 cancelled, 15 skipped; the wrapper recorded unit 3337s/exit 1 and zero real-procfs skips. Codex M4 was not reached. Failed files: issue-1742-restart, issue-2021-recovery-pin-cleanup, issue-2263-recovery-pin-cleanup, recovery-inventory-clone, recovery-inventory and terminal-rejection-retention.
 
 TMPDIR was initially the provisioned scratch root (mode 2770, different group from command processes). Git recovery fixtures inherit that setgid group; `agent/src/git.ts`'s ownership checks reject unsafe group-writable bare directories. Narrow candidate/base command:
 ~~~sh
@@ -123,4 +123,4 @@ A scratch-only executable wrapper, selected through the existing UZI_WEB_BROWSER
 
 The API gate passed including pinned sqlc drift validation and API tests. The repository gate and changelog entry check passed. The integration script provisioned its throwaway Docker Postgres (`uzi-store-it-143445`) and ran the seven-package LiveDB sweep with race/p1/count1: store, handler, forgesvc, schedsvc, workersvc, recovery and poller. Script summary: **2,810 top-level LiveDB tests passed, zero skipped**. Independently counted verbose output: 7,306 RUN/PASS cases including subtests, zero SKIP and zero FAIL. Thus this is executed LiveDB evidence, not merely exit zero.
 
-Local runtimes do not establish CI timing or execution; green required PR CI remains a merge prerequisite. No linked PRD exists. Final delivery retains the accepted rejected-enclosing-snapshot/fleet/ceiling limits from ADR 2009 and the deferred CI timing note from the reviewer of 6ddf16e0. All implementation and repair ranges were reviewed as recorded above; this final evidence-only range still requires its own review before completion/checkpoint.
+Local runtimes do not establish CI timing or execution; green required PR CI remains a merge prerequisite. No linked PRD exists. Final delivery retains the accepted rejected-enclosing-snapshot/fleet/ceiling limits from ADR 2009 and the deferred CI timing note from the reviewer of 6ddf16e0. All implementation and repair ranges were reviewed as recorded above; reviewer returned no blocking findings on the evidence-only range `e749ba45..a48ecf63` after checking retained logs and reports. Its one historical-tense note is addressed in the subsequent documentation-only repair, which receives its own scoped review before completion/checkpoint.
