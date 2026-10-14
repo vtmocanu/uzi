@@ -4,7 +4,69 @@ import (
 	"encoding/json"
 	"testing"
 	"time"
+
+	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/pgconv"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+// Exercise the query's own owner fence separately from recovery capture, which
+// already excludes foreign-owned rows in route-level tests. A valid frozen ledger
+// for one worker must not authorize inserting evidence for a different worker.
+func TestIssue2009M4IdentitySQLWorkerContextLiveDB(t *testing.T) {
+	e := setupCodexLiveDB(t)
+	user, _, repo := e.seedCodexInfra(t)
+	owner := seedSnapshotWorker(t, e, user, "n1")
+	reporter := seedSnapshotWorker(t, e, user, "n2")
+	run := seedOutageRun(t, e, user, repo, owner, "running", "issue", 2, 0)
+	tx, err := e.pool.Begin(e.ctx)
+	if err != nil {
+		t.Fatal(err)
+	}
+	defer func() { _ = tx.Rollback(e.ctx) }()
+	qtx := e.q.WithTx(tx)
+	workers := [2]uuid.UUID{owner, reporter}
+	if workers[0].String() > workers[1].String() {
+		workers[0], workers[1] = workers[1], workers[0]
+	}
+	// Hold both worker contexts before capturing ordered parents and targets.
+	for _, worker := range workers {
+		if _, err := qtx.GetWorkerForUpdate(e.ctx, worker); err != nil {
+			t.Fatal(err)
+		}
+	}
+	locks, err := captureWorkerRecoveryLocks(e.ctx, qtx, owner, nil, validatedFinalizeResume{}, []uuid.UUID{run})
+	if err != nil {
+		t.Fatal(err)
+	}
+	frozen, parents, err := locks.parameters()
+	if err != nil {
+		t.Fatal(err)
+	}
+	if _, err := qtx.LockFrozenWorkerSnapshotRuns(e.ctx, store.LockFrozenWorkerSnapshotRunsParams{
+		WorkerID: pgconv.UUID(owner), RunIds: []uuid.UUID{run}, FrozenTargets: frozen, LockedParentIds: parents,
+	}); err != nil {
+		t.Fatal(err)
+	}
+	params := store.UpsertFrozenWorkerPendingOutcomeIdentityParams{
+		WorkerID: owner, RunID: run, ClaimGeneration: 2, LeaseSeconds: 120,
+		FrozenTargets: frozen, LockedParentIds: parents,
+	}
+	if rows, err := qtx.UpsertFrozenWorkerPendingOutcomeIdentity(e.ctx, params); err != nil || rows != 1 {
+		t.Fatalf("matching-owner positive control: rows=%d err=%v", rows, err)
+	}
+	params.WorkerID = reporter
+	if rows, err := qtx.UpsertFrozenWorkerPendingOutcomeIdentity(e.ctx, params); err != nil || rows != 0 {
+		t.Fatalf("foreign frozen owner accepted in reporter context: rows=%d err=%v", rows, err)
+	}
+	var count int
+	if err := tx.QueryRow(e.ctx, "SELECT count(*) FROM worker_pending_outcome_identities WHERE worker_id=$1", reporter).Scan(&count); err != nil {
+		t.Fatal(err)
+	}
+	if count != 0 {
+		t.Fatal("SQL owner fence inserted reporter evidence for a foreign-owned run")
+	}
+}
 
 func TestIssue2009M4ReportedGenerationWriteFenceLiveDB(t *testing.T) {
 	e := setupCodexLiveDB(t)
