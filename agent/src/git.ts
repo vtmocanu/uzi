@@ -61,6 +61,9 @@ const CODE_UUID = codePattern(/^[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-
 const CODE_READER_KEY = codePattern(/^cross-check-[A-Za-z0-9_-]{1,128}-[a-f0-9]{8}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{4}-[a-f0-9]{12}(?![\s\S])/);
 const CODE_MAX_READERS = 128;
 type LocalMetadataDirectory = "uzi-owed" | "uzi-code-snapshots";
+interface RecoveryPhysicalWarningScope {
+  emitted: boolean;
+}
 const codeGeneration = (value: number): boolean => Number.isSafeInteger(value) && value >= 0;
 const codeTerminal = (value: string): boolean => ["completed", "failed", "cancelled"].includes(value);
 
@@ -2745,9 +2748,10 @@ export class GitCache {
       if (await this.readRecoveryAttemptMode(barePath, key)) {
         throw new Error("recovered key requires a fresh attempt path");
       }
-      if ((await this.journaledClonePaths(barePath)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
+      const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
+      if ((await this.journaledClonePaths(barePath, warningScope)).has(clonePath)) throw new Error("retained predecessor blocks canonical reuse");
       await this.freeCanonicalClonePath(clonePath, key, reseed);
-      await this.sweepResidue(barePath, clonePath, reseed).catch((err: unknown) => {
+      await this.sweepResidue(barePath, clonePath, reseed, warningScope).catch((err: unknown) => {
         if (reseed.isInterruption?.(err)) throw err;
         this.checkRecoveryInterruption();
         this.log.warn("runner clone retention sweep failed; nothing further removed", {
@@ -3096,7 +3100,8 @@ export class GitCache {
   ): Promise<void> {
     const parent = path.dirname(canonical);
     const names = await fs.readdir(parent);
-    const journaled = [...(await this.journaledClonePaths(barePath))];
+    const warningScope: RecoveryPhysicalWarningScope = { emitted: false };
+    const journaled = [...(await this.journaledClonePaths(barePath, warningScope))];
     const ledgers = await this.readAllAttemptLedgers(barePath);
     const namedByJournal = (p: string): boolean => journaled.some((j) => isWithinPath(j, p));
     const entryFor = (attemptId: string, p: string): (AttemptLedgerEntry & { branch: string }) | undefined => {
@@ -3168,7 +3173,7 @@ export class GitCache {
       }
     }
 
-    await this.sweepResidue(barePath, canonical, attempt);
+    await this.sweepResidue(barePath, canonical, attempt, warningScope);
   }
 
   /** Residue-only retention under the bare lock. Enumerate and validate the complete original
@@ -3177,6 +3182,7 @@ export class GitCache {
     barePath: string,
     canonical: string,
     predicates: Pick<AttemptSeedOptions, "isLive" | "quiescent" | "isInterruption">,
+    warningScope: RecoveryPhysicalWarningScope,
   ): Promise<void> {
     const parent = path.dirname(canonical);
     const key = path.basename(canonical);
@@ -3193,7 +3199,7 @@ export class GitCache {
       if (names.length === RESIDUE_ENUMERATION_BUDGET) throw new Error("residue enumeration exceeds 4096-entry work budget");
       names.push(entry.name);
     }
-    await this.journaledClonePaths(barePath);
+    await this.journaledClonePaths(barePath, warningScope);
     const isOwnResidue = (n: string): boolean => {
       const art = parseRetainedArtifactName(n);
       return art?.kind === "residue" && art.key === key;
@@ -3225,7 +3231,7 @@ export class GitCache {
       };
       const validate = async (): Promise<boolean> => {
         await validateParent();
-        const journaled = await this.journaledClonePaths(barePath);
+        const journaled = await this.journaledClonePaths(barePath, warningScope);
         if ([...journaled].some((j) => isWithinPath(j, r.p))) return refuse("named by recovery journal");
         return open();
       };
@@ -8078,7 +8084,7 @@ export class GitCache {
 
   /** Every clone path any branch's recovery journal names (issue #1783 M2: the retention sweep
    *  never deletes a journaled path). Throws on an unreadable config or a malformed journal. */
-  private async journaledClonePaths(barePath: string): Promise<Set<string>> {
+  private async journaledClonePaths(barePath: string, warningScope?: RecoveryPhysicalWarningScope): Promise<Set<string>> {
     const out = new Set<string>();
     let physicalFailure = false;
     try {
@@ -8106,7 +8112,10 @@ export class GitCache {
       return out;
     } finally {
       this.checkRecoveryInterruption();
-      if (physicalFailure) this.warnRecoveryPhysicalFailure();
+      if (physicalFailure && !warningScope?.emitted) {
+        if (warningScope) warningScope.emitted = true;
+        this.warnRecoveryPhysicalFailure();
+      }
     }
   }
 
