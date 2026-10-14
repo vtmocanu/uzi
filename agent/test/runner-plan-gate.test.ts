@@ -418,7 +418,7 @@ it("M1 destructive checkpoint waits for summary settlement before reaping", asyn
 
 describe("M1 persisted ACK boundary", () => {
   for (const human of [false, true]) {
-    it(`M1 persisted ACK boundary ${human ? "human enters verdict wait and implementation while callback held" : "autopilot enters implementation while callback held"}`, { timeout: 60000 }, async () => {
+    it(`M1 persisted ACK boundary ${human ? "human enters verdict wait and implementation while callback held" : "autopilot enters implementation while callback held"}`, { timeout: 120000 }, async () => {
       const { gitlab } = fakeGitlab();
       const claim = gitlabClaim(28382, { auto_approve: !human });
       const ack = deferred(), stored = deferred(), callback = deferred(), started = deferred(), entered = deferred();
@@ -430,13 +430,14 @@ describe("M1 persisted ACK boundary", () => {
         verdictWaits++;
         return wait.apply(this, args);
       };
+      let execution: Promise<unknown> = Promise.resolve();
       api.afterPersistState(claim.run_id, body => {
         if (body.plan_md !== "# Accepted plan") return false;
         stored.resolve();
         return true;
       }, ack.promise);
       api.setInputs(claim.run_id, [input("approve_plan")]);
-      const execution = runner({ run: async ctx => {
+      execution = runner({ run: async ctx => {
         const verdict = await ctx.gatePlan!("# Accepted plan", undefined, async md => {
           plans.push(md);
           started.resolve();
@@ -454,14 +455,14 @@ describe("M1 persisted ACK boundary", () => {
         let startedTimer: NodeJS.Timeout | undefined;
         try {
           await Promise.race([started.promise, new Promise<never>((_, reject) => {
-            startedTimer = setTimeout(() => reject(new Error("accepted ACK did not start persisted callback")), 45000);
+            startedTimer = setTimeout(() => reject(new Error("accepted ACK did not start persisted callback")), 30000);
           })]);
         } finally { clearTimeout(startedTimer); }
         await flushMicrotasks();
         let timer: NodeJS.Timeout | undefined;
         try {
           await Promise.race([entered.promise, new Promise<never>((_, reject) => {
-            timer = setTimeout(() => reject(new Error("implementation blocked by persisted callback")), 45000);
+            timer = setTimeout(() => reject(new Error("implementation blocked by persisted callback")), 30000);
           })]);
         } finally { clearTimeout(timer); }
         assert.deepEqual(plans, ["# Accepted plan"]);
@@ -470,8 +471,7 @@ describe("M1 persisted ACK boundary", () => {
         ack.resolve();
         callback.resolve();
         implementation.resolve();
-        await execution;
-        SteeringChannel.prototype.awaitGateEvent = wait;
+        try { await execution; } finally { SteeringChannel.prototype.awaitGateEvent = wait; }
       }
     });
   }
@@ -1713,8 +1713,15 @@ describe("#2230 shared SDK process default at a plan gate", () => {
 // an accepted revise supersedes the summary of the plan it replaced. Each case runs through the
 // real runner gate on both harnesses; only the summary model, the summary POST and the
 // provider/query peer are scripted. Waits are on events the test controls, bounded by within()
-// with a generous ceiling (loaded hosts) that stays below the describe timeouts, so a regression
-// fails with a named message; production settle bounds are shortened through settleMs.
+// with a generous ceiling (loaded hosts), so a regression fails with a named message; production
+// settle bounds are shortened through settleMs. Timeouts are per test (PER_TEST_MS), never a
+// describe-level budget: node:test shares a suite timeout across its tests, so one exhausted
+// suite cancels the rest unnamed and skips their cleanup. A failing test spends at most one
+// within() wait plus the bounded teardown in cleanup(), which also releases every held summary
+// call and turn so nothing is left running after a failure.
+
+/** One test's budget: comfortably above a failing test's first within() wait plus teardown. */
+const PER_TEST_MS = 120000;
 
 type SummaryHarness = "sdk" | "codex";
 const SUMMARY_HARNESSES: readonly SummaryHarness[] = ["sdk", "codex"];
@@ -1740,7 +1747,7 @@ interface GateRigConfig {
 }
 
 /** Bound a wait that must resolve so a regression fails the test instead of hanging it. */
-async function within<T>(promise: Promise<T>, what: string, ms = 45000): Promise<T> {
+async function within<T>(promise: Promise<T>, what: string, ms = 30000): Promise<T> {
   let timer: NodeJS.Timeout | undefined;
   try {
     return await Promise.race([promise, new Promise<never>((_, reject) => {
@@ -1797,10 +1804,12 @@ function startGateRig(harness: SummaryHarness, cfg: GateRigConfig) {
 
   const callEntered = Array.from({ length: 4 }, deferred);
   const calls: SummaryCall[] = [];
+  let released = false;
   const summaryRunner = {
     generateIntentSummary: async () => null,
     generatePlanSummary: async ({ planMd, onUsage }: { planMd: string; onUsage?: (u: never) => void }) => {
       const index = calls.length;
+      if (released) { callEntered[index]?.resolve(); return null; }
       let done!: (r: PlanSummaryResult | null) => void;
       const finished = new Promise<PlanSummaryResult | null>(resolve => { done = resolve; });
       calls.push({
@@ -1886,10 +1895,16 @@ function startGateRig(harness: SummaryHarness, cfg: GateRigConfig) {
     planUsage: () => api.messages(runId).filter(
       m => m.kind === "summary_usage" && (m.payload as { pass?: string }).pass === "plan").length,
     async cleanup(): Promise<void> {
+      released = true;
       for (const hold of turnHold.values()) hold.resolve();
       for (const call of calls) call.finish(null);
       if (!finished) api.appendInputs(runId, [input("cancel")]);
-      await within(execution.catch(() => {}), "run teardown");
+      try {
+        await within(execution.catch(() => {}), "run teardown");
+      } catch (err) {
+        // Keep the test's own named failure; a stuck teardown is reported on stderr instead.
+        console.error(String(err));
+      }
     },
   };
 }
@@ -1898,8 +1913,8 @@ const S1: PlanSummaryResult = { summary: "Summary one", deltas: [] };
 const S2: PlanSummaryResult = { summary: "Summary two", deltas: [] };
 
 for (const harness of SUMMARY_HARNESSES) {
-  describe(`issue #2901 (${harness}): human plan gate does not wait for the plan summary`, { timeout: 120000 }, () => {
-    it("approve is processed while the summary hook is still blocked, then the summary latches", async () => {
+  describe(`issue #2901 (${harness}): human plan gate does not wait for the plan summary`, () => {
+    it("approve is processed while the summary hook is still blocked, then the summary latches", { timeout: PER_TEST_MS }, async () => {
       const rig = startGateRig(harness, { plans: ["# Plan one"] });
       try {
         await within(rig.presented[0]!.promise, "first plan presentation");
@@ -1917,7 +1932,7 @@ for (const harness of SUMMARY_HARNESSES) {
     });
 
     for (const identical of [false, true]) {
-      it(`revise (${identical ? "identical" : "different"} revised text): the superseded flight neither POSTs nor latches`, async () => {
+      it(`revise (${identical ? "identical" : "different"} revised text): the superseded flight neither POSTs nor latches`, { timeout: PER_TEST_MS }, async () => {
         const plans = ["# Plan one", identical ? "# Plan one" : "# Plan two"];
         // Hold the revision turn so the superseded flight is released between the accepted revise
         // and the revised plan's presentation.
@@ -1947,7 +1962,7 @@ for (const harness of SUMMARY_HARNESSES) {
     }
 
     for (const verdict of ["reject", "cancel", "fence"] as const) {
-      it(`${verdict}: teardown completes within the settle bound and nothing is posted or latched`, async () => {
+      it(`${verdict}: teardown completes within the settle bound and nothing is posted or latched`, { timeout: PER_TEST_MS }, async () => {
         const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 20 });
         try {
           await within(rig.presented[0]!.promise, "first plan presentation");
@@ -1967,7 +1982,7 @@ for (const harness of SUMMARY_HARNESSES) {
     }
 
     for (const failure of ["generate", "post"] as const) {
-      it(`failing hook (${failure}): the failure is logged and the run proceeds`, async () => {
+      it(`failing hook (${failure}): the failure is logged and the run proceeds`, { timeout: PER_TEST_MS }, async () => {
         const rig = startGateRig(harness, {
           plans: ["# Plan one"], holdTurns: [],
           generate: failure === "generate" ? "throws" : "blocked",
@@ -1989,7 +2004,7 @@ for (const harness of SUMMARY_HARNESSES) {
     }
 
     if (harness === "sdk") {
-      it("revision budget exhausted: the re-presented same plan keeps its latched summary", async () => {
+      it("revision budget exhausted: the re-presented same plan keeps its latched summary", { timeout: PER_TEST_MS }, async () => {
         const rig = startGateRig(harness, { plans: ["# Plan one"], holdTurns: [], config: { plan_max_revisions: 0 } });
         try {
           await within(rig.presented[0]!.promise, "first plan presentation");
@@ -2008,11 +2023,11 @@ for (const harness of SUMMARY_HARNESSES) {
     }
   });
 
-  describe(`issue #2901 (${harness}): plan-summary usage boundaries`, { timeout: 120000 }, () => {
+  describe(`issue #2901 (${harness}): plan-summary usage boundaries`, () => {
     // Each case is a fresh flight firing exactly one usage event, so the once-per-flight
     // `delivered` latch can never mask a missing guard.
     for (const before of [true, false]) {
-      it(`supersession (${before ? "+" : "-"}): usage ${before ? "before" : "only after"} the accepted revise is ${before ? "reported" : "not reported"}`, async () => {
+      it(`supersession (${before ? "+" : "-"}): usage ${before ? "before" : "only after"} the accepted revise is ${before ? "reported" : "not reported"}`, { timeout: PER_TEST_MS }, async () => {
         const plans = ["# Plan one", "# Plan two"];
         const rig = startGateRig(harness, { plans, holdTurns: [1], settleMs: 20 });
         try {
@@ -2033,7 +2048,7 @@ for (const harness of SUMMARY_HARNESSES) {
     }
 
     for (const before of [true, false]) {
-      it(`fencing (${before ? "+" : "-"}): usage ${before ? "before" : "after"} the claim is fenced is ${before ? "reported" : "not reported"}`, async () => {
+      it(`fencing (${before ? "+" : "-"}): usage ${before ? "before" : "after"} the claim is fenced is ${before ? "reported" : "not reported"}`, { timeout: PER_TEST_MS }, async () => {
         const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 2000 });
         try {
           await within(rig.presented[0]!.promise, "first plan presentation");
@@ -2051,7 +2066,7 @@ for (const harness of SUMMARY_HARNESSES) {
       });
     }
 
-    it("bounded settlement (+): usage from a flight settling within the bound is reported", async () => {
+    it("bounded settlement (+): usage from a flight settling within the bound is reported", { timeout: PER_TEST_MS }, async () => {
       const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 2000 });
       try {
         await within(rig.presented[0]!.promise, "first plan presentation");
@@ -2063,7 +2078,7 @@ for (const harness of SUMMARY_HARNESSES) {
       } finally { await rig.cleanup(); }
     });
 
-    it("bounded settlement (-): usage after the bound expired and the flight was abandoned is not reported", async () => {
+    it("bounded settlement (-): usage after the bound expired and the flight was abandoned is not reported", { timeout: PER_TEST_MS }, async () => {
       const rig = startGateRig(harness, { plans: ["# Plan one"], settleMs: 20 });
       try {
         await within(rig.presented[0]!.promise, "first plan presentation");
@@ -2078,7 +2093,7 @@ for (const harness of SUMMARY_HARNESSES) {
     });
 
     for (const how of ["superseded", "fenced"] as const) {
-      it(`combined: usage during settlement of an already ${how} flight is not reported`, async () => {
+      it(`combined: usage during settlement of an already ${how} flight is not reported`, { timeout: PER_TEST_MS }, async () => {
         const plans = how === "superseded" ? ["# Plan one", "# Plan two"] : ["# Plan one"];
         const rig = startGateRig(harness, { plans, holdTurns: [], settleMs: 50 });
         try {
