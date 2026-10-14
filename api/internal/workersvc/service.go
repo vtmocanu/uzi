@@ -457,6 +457,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error)
 	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
 	// Workers.
@@ -2551,7 +2552,11 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if finalizeOK {
 		attested = finalize
 	}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested)
+	pending := validatedPendingAll{}
+	if snapshotValid {
+		pending = s.validatePendingAll(store.Worker(row), snapshot)
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested, pending.ids)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2561,7 +2566,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	snapshotApplied := false
 	if snapshotValid {
-		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks)
+		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks, pending)
 		if err != nil {
 			return store.Worker{}, "", err
 		}
@@ -2811,11 +2816,12 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	applied := false
 	if valid {
 		// Include omitted owned leads before any snapshot child or FK write.
-		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{})
+		pending := s.validatePendingAll(updated, snapshot)
+		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{}, pending.ids)
 		if err != nil {
 			return store.Worker{}, err
 		}
-		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks)
+		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks, pending)
 		if err != nil {
 			return store.Worker{}, err
 		}
@@ -3337,11 +3343,12 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	if !valid {
 		return nil, ErrActiveSnapshotInvalid
 	}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{})
+	pending := s.validatePendingAll(locked, snapshot)
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks); err != nil {
+	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending); err != nil {
 		return nil, err
 	}
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared

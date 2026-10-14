@@ -303,8 +303,8 @@ describe("ActiveRunRegistry — run_not_owned journals are not leasable (issue #
   });
 });
 
-describe("issue 2009 M1 — uncapped pending_all wire coverage (enabled until M2)", () => {
-  // JSON observes the additive wire field without importing a future protocol type.
+describe("issue 2009 — complete pending_all wire coverage regressions", () => {
+  // JSON observes the additive wire field as serialized for the API.
   function wire(snapshot: ReturnType<ActiveRunRegistry["build"]>) {
     return JSON.parse(JSON.stringify(snapshot)) as {
       pending_all?: { run_id: string; claim_generation: number }[];
@@ -325,7 +325,8 @@ describe("issue 2009 M1 — uncapped pending_all wire coverage (enabled until M2
         assert.deepStrictEqual(snap.active, []);
         assert.strictEqual(snap.pending_overflow, true);
       } else {
-        // Characterize the existing duplicate-run active behavior; API rejection belongs to M2.
+        // Preserve the accepted duplicate-run construction limit: the API rejects this enclosing
+        // snapshot, so its pending_all list provides no coverage despite carrying both generations.
         assert.deepStrictEqual(snap.active.map((e) => [e.run_id, e.claim_generation]),
           [[RUN_A, 2], [RUN_A, 3], [RUN_B, 7]]);
         assert.strictEqual(snap.pending_overflow, false);

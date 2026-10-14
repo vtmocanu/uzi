@@ -548,6 +548,13 @@ export interface ActiveSnapshot {
   register_nonce?: string;
   active: ActiveSnapshotEntry[];
   pending_overflow: boolean;
+  /** Issue #2009: complete terminal-pending identities, independent of active rotation/caps.
+   *  Only run_id/claim_generation; excludes finalize-pending records. Empty means complete empty
+   *  coverage; omission means unavailable on older workers. Requires an accepted enclosing
+   *  snapshot: duplicate active run IDs still reject it and provide no pending_all coverage.
+   *  The worker sends the full list even over the API identity-count limit; the API drops the
+   *  entire pending_all list when over that limit, never truncates it. No lifecycle authority. */
+  pending_all?: { run_id: string; claim_generation: number }[];
   /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
    *  named exact claim generation and whose authenticated finalize-pending record survived a
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the

@@ -45,9 +45,13 @@ func validatedSnapshotIDs(entries []validatedEntry) []uuid.UUID {
 	return ids
 }
 
-func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume) (workerRecoveryLockSet, error) {
+func captureWorkerRecoveryLocks(ctx context.Context, qtx *store.Queries, workerID uuid.UUID, entries []validatedEntry, attested validatedFinalizeResume, pendingIDs ...[]uuid.UUID) (workerRecoveryLockSet, error) {
+	ids := validatedSnapshotIDs(entries)
+	for _, pending := range pendingIDs {
+		ids = append(ids, pending...)
+	}
 	rows, err := qtx.LockWorkerRecoveryParents(ctx, store.LockWorkerRecoveryParentsParams{
-		WorkerID: pgconv.UUID(workerID), SnapshotRunIds: validatedSnapshotIDs(entries),
+		WorkerID: pgconv.UUID(workerID), SnapshotRunIds: ids,
 		AttestedRunIds: attested.ids, AttestedClaimGenerations: attested.generations,
 	})
 	if err != nil {

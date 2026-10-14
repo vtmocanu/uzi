@@ -9433,10 +9433,16 @@ SELECT id, user_id, status, auto_approve,
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
-       (SELECT a.terminal_pending_since FROM worker_active_runs a
-         WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
-           AND a.claim_generation = runs.claim_generation
-           AND a.terminal_pending AND a.terminal_pending_until > now())::timestamptz AS terminal_pending_since,
+       (SELECT MIN(evidence.since) FROM (
+           SELECT a.terminal_pending_since AS since FROM worker_active_runs a
+           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
+             AND a.claim_generation = runs.claim_generation
+             AND a.terminal_pending AND a.terminal_pending_until > now()
+           UNION ALL
+           SELECT p.first_seen_at AS since FROM worker_pending_outcome_identities p
+           WHERE p.run_id = runs.id AND p.worker_id = runs.worker_id
+             AND p.claim_generation = runs.claim_generation AND p.reported_until > now()
+         ) evidence WHERE runs.claim_released_at IS NULL)::timestamptz AS terminal_pending_since,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL

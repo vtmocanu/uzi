@@ -16,7 +16,7 @@ func TestWorkerRecoveryLedgerEvaluation(t *testing.T) {
 		t.Fatalf("absent snapshot queried or applied: %v %v", applied, err)
 	}
 	// Refusal precedes any query, including with otherwise empty input.
-	if _, err := svc.applyWorkerActiveSnapshot(context.Background(), nil, store.Worker{}, &ActiveSnapshot{}, snapshotModeHeartbeat, nil, workerRecoveryLockSet{}); err == nil {
+	if _, err := svc.applyWorkerActiveSnapshot(context.Background(), nil, store.Worker{}, &ActiveSnapshot{}, snapshotModeHeartbeat, nil, workerRecoveryLockSet{}, validatedPendingAll{}); err == nil {
 		t.Fatal("unevaluated snapshot ledger accepted")
 	}
 	if _, _, _, err := svc.runFrozenAttested(context.Background(), nil, uuid.Nil, 0, store.FrozenFailWorkerRunsOverCapParams{}, validatedFinalizeResume{}, false, workerRecoveryLockSet{}); err == nil {

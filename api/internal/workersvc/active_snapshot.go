@@ -50,18 +50,21 @@ type ActiveSnapshot struct {
 	// leniently).
 	FinalizeResume []FinalizeResumeEntry `json:"finalize_resume,omitempty"`
 
+	// PendingAll is complete pending-outcome coverage independent of active rotation.
+	// nil means unavailable; a nonnil empty slice means complete empty coverage.
+	PendingAll          []PendingOutcomeIdentity `json:"pending_all"`
+	pendingAllMalformed bool
+
 	// finalizeResumeMalformed is set by UnmarshalJSON when finalize_resume had a wrong wire type
 	// and was dropped. Only the register path (validateFinalizeResume) logs it, with the worker id;
 	// heartbeat and claim snapshots stay silent about the field.
 	finalizeResumeMalformed bool
 }
 
-// UnmarshalJSON decodes an ActiveSnapshot with FinalizeResume decoded as a SEPARATE lenient step
-// (issue #1742): a finalize_resume value of the wrong wire type (a string claim_generation, a
-// float, a non-string run_id, a non-array) drops only the finalize list, with a warning, and never
-// fails the decode of the rest of the snapshot, so a malformed attestation cannot discard valid
-// Active terminal_pending leases or pending_overflow (#1391). Every other field keeps the strict
-// typed decode it had before the finalize list existed.
+// UnmarshalJSON decodes finalize_resume and pending_all independently from the
+// strict enclosing active snapshot. Malformed optional evidence drops only its
+// own list. Service validation logs pending_all only after enclosing acceptance;
+// finalize_resume retains its register-only validation policy.
 func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	// json.Unmarshaler convention: a JSON null is a no-op.
 	if string(bytes.TrimSpace(data)) == "null" {
@@ -71,9 +74,31 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	aux := struct {
 		*plain
 		FinalizeResume json.RawMessage `json:"finalize_resume"`
+		PendingAll     json.RawMessage `json:"pending_all"`
 	}{plain: (*plain)(s)}
 	if err := json.Unmarshal(data, &aux); err != nil {
 		return err
+	}
+	s.PendingAll = nil
+	s.pendingAllMalformed = false
+	if raw := bytes.TrimSpace(aux.PendingAll); len(raw) > 0 && !bytes.Equal(raw, []byte("null")) {
+		var wire []struct {
+			RunID           *string `json:"run_id"`
+			ClaimGeneration *int64  `json:"claim_generation"`
+		}
+		if err := json.Unmarshal(raw, &wire); err != nil {
+			s.pendingAllMalformed = true
+		} else {
+			s.PendingAll = make([]PendingOutcomeIdentity, 0, len(wire))
+			for _, e := range wire {
+				if e.RunID == nil || e.ClaimGeneration == nil {
+					s.pendingAllMalformed = true
+					s.PendingAll = nil
+					break
+				}
+				s.PendingAll = append(s.PendingAll, PendingOutcomeIdentity{RunID: *e.RunID, ClaimGeneration: *e.ClaimGeneration})
+			}
+		}
 	}
 	s.FinalizeResume = nil
 	s.finalizeResumeMalformed = false
@@ -87,6 +112,63 @@ func (s *ActiveSnapshot) UnmarshalJSON(data []byte) error {
 	}
 	s.FinalizeResume = list
 	return nil
+}
+
+// PendingOutcomeIdentity identifies one pending outcome without lifecycle authority.
+type PendingOutcomeIdentity struct {
+	RunID           string `json:"run_id"`
+	ClaimGeneration int64  `json:"claim_generation"`
+}
+
+type pendingOutcomeTuple struct {
+	runID      uuid.UUID
+	generation int64
+}
+
+type validatedPendingAll struct {
+	ids         []uuid.UUID
+	generations []int64
+	available   bool
+}
+
+// validatePendingAll is called only after the enclosing snapshot is accepted.
+func (s *Service) validatePendingAll(wkr store.Worker, snap *ActiveSnapshot) validatedPendingAll {
+	reject := func() validatedPendingAll {
+		slog.Warn("pending_all rejected; ignoring complete coverage", "worker_id", wkr.ID.String())
+		return validatedPendingAll{}
+	}
+	if snap == nil {
+		return validatedPendingAll{}
+	}
+	if snap.pendingAllMalformed {
+		return reject()
+	}
+	if snap.PendingAll == nil {
+		return validatedPendingAll{}
+	}
+	ceiling := s.p.ActiveSnapshotMaxEntries
+	if ceiling <= 0 {
+		ceiling = 256
+	}
+	if len(snap.PendingAll) > ceiling {
+		return reject()
+	}
+	out := validatedPendingAll{available: true, ids: make([]uuid.UUID, 0, len(snap.PendingAll)), generations: make([]int64, 0, len(snap.PendingAll))}
+	seen := make(map[pendingOutcomeTuple]bool, len(snap.PendingAll))
+	for _, e := range snap.PendingAll {
+		id, err := uuid.Parse(e.RunID)
+		if err != nil || e.ClaimGeneration < 0 {
+			return reject()
+		}
+		tuple := pendingOutcomeTuple{id, e.ClaimGeneration}
+		if seen[tuple] {
+			return reject()
+		}
+		seen[tuple] = true
+		out.ids = append(out.ids, id)
+		out.generations = append(out.generations, e.ClaimGeneration)
+	}
+	return out
 }
 
 // FinalizeResumeEntry is one finalize-pending attempt a restarting worker attests on its register
@@ -319,20 +401,21 @@ func (s *Service) ReplaceWorkerActiveRuns(ctx context.Context, qtx *store.Querie
 	if err != nil || !valid {
 		return false, err
 	}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{})
+	pending := s.validatePendingAll(locked, snap)
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
 	if err != nil {
 		return false, err
 	}
-	return s.applyWorkerActiveSnapshot(ctx, qtx, locked, snap, mode, entries, locks)
+	return s.applyWorkerActiveSnapshot(ctx, qtx, locked, snap, mode, entries, locks, pending)
 }
 
-func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode, entries []validatedEntry, locks workerRecoveryLockSet) (bool, error) {
+func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Queries, wkr store.Worker, snap *ActiveSnapshot, mode snapshotMode, entries []validatedEntry, locks workerRecoveryLockSet, pending validatedPendingAll) (bool, error) {
 	frozen, parents, err := locks.parameters()
 	if err != nil {
 		return false, err
 	}
 	if _, err := qtx.LockFrozenWorkerSnapshotRuns(ctx, store.LockFrozenWorkerSnapshotRunsParams{
-		WorkerID: pgconv.UUID(wkr.ID), RunIds: validatedSnapshotIDs(entries), FrozenTargets: frozen, LockedParentIds: parents,
+		WorkerID: pgconv.UUID(wkr.ID), RunIds: append(validatedSnapshotIDs(entries), pending.ids...), FrozenTargets: frozen, LockedParentIds: parents,
 	}); err != nil {
 		return false, err
 	}
@@ -349,12 +432,9 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 	// and reset when the entry clears, is omitted, or the generation changes. All three callers
 	// lock the worker row first, so this read-then-write cannot race a sibling snapshot.
 	//
-	// KNOWN LIMIT: under pending_overflow the worker (agent/src/active-run-registry.ts,
-	// selectPendingForBuild) lists blocked-first fixed slots plus ONE slot that round-robins over
-	// the omitted pending entries. In heartbeat/claim mode an omitted entry's row is deleted by
-	// DeleteWorkerActiveRuns below, so its since resets each time it rotates back in and those
-	// runs never reach the outcome-undelivered health threshold. The worker-level pending_overflow lease still
-	// protects them from claim and reconcile.
+	// Active rotation still resets omitted legacy rows. Accepted explicit pending_all
+	// coverage independently preserves fresh exact-tuple health age across rotation;
+	// the worker-level overflow lease retains its existing claim/reconcile authority.
 	type priorPending struct {
 		gen   int64
 		since pgtype.Timestamptz
@@ -366,6 +446,19 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 	prior := make(map[uuid.UUID]priorPending, len(priorRows))
 	for _, r := range priorRows {
 		prior[r.RunID] = priorPending{gen: r.ClaimGeneration, since: r.TerminalPendingSince}
+	}
+
+	// Capture fresh eligible continuity before active replacement, including upgrade
+	// age from a legacy snapshot. Invalid/unavailable coverage performs no reads or renewal.
+	fresh := make(map[pendingOutcomeTuple]pgtype.Timestamptz)
+	if pending.available {
+		rows, err := qtx.ListFreshWorkerPendingOutcomeSince(ctx, wkr.ID)
+		if err != nil {
+			return false, err
+		}
+		for _, row := range rows {
+			fresh[pendingOutcomeTuple{row.RunID, row.ClaimGeneration}] = row.FirstSeenAt
+		}
 	}
 
 	if mode == snapshotModeRegister {
@@ -408,6 +501,26 @@ func (s *Service) applyWorkerActiveSnapshot(ctx context.Context, qtx *store.Quer
 			// The entry is not persisted or leased; log without further discovery.
 			slog.Warn("active snapshot entry dropped: ownership or frozen identity changed",
 				"worker_id", wkr.ID.String(), "run_id", e.runID.String())
+		}
+	}
+
+	if pending.available {
+		if _, err := qtx.PruneWorkerPendingOutcomeIdentities(ctx, wkr.ID); err != nil {
+			return false, err
+		}
+		if _, err := qtx.DeleteWorkerPendingOutcomeIdentitiesNotIn(ctx, store.DeleteWorkerPendingOutcomeIdentitiesNotInParams{
+			WorkerID: wkr.ID, RunIds: pending.ids, ClaimGenerations: pending.generations,
+		}); err != nil {
+			return false, err
+		}
+		for i, id := range pending.ids {
+			if _, err := qtx.UpsertFrozenWorkerPendingOutcomeIdentity(ctx, store.UpsertFrozenWorkerPendingOutcomeIdentityParams{
+				WorkerID: wkr.ID, RunID: id, ClaimGeneration: pending.generations[i],
+				FirstSeenAt:  fresh[pendingOutcomeTuple{id, pending.generations[i]}],
+				LeaseSeconds: leaseSeconds, FrozenTargets: frozen, LockedParentIds: parents,
+			}); err != nil {
+				return false, err
+			}
 		}
 	}
 

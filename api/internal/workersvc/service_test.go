@@ -813,6 +813,10 @@ func (f *fakeStore) GetChatRunClaimContext(context.Context, uuid.UUID) (pgtype.T
 func (f *fakeStore) CountChatFollowUps(context.Context, uuid.UUID) (int64, error) {
 	return f.followUpCount, nil
 }
+func (f *fakeStore) PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error) {
+	return 0, nil
+}
+
 func (f *fakeStore) SweepIdleChatRuns(context.Context, pgtype.Timestamptz) ([]store.SweepIdleChatRunsRow, error) {
 	return f.sweptIdleChats, nil
 }

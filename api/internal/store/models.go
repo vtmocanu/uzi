@@ -1583,6 +1583,14 @@ type WorkerActiveRun struct {
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
 }
 
+type WorkerPendingOutcomeIdentity struct {
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	FirstSeenAt     pgtype.Timestamptz `json:"first_seen_at"`
+	ReportedUntil   pgtype.Timestamptz `json:"reported_until"`
+}
+
 type WorkerRunDisk struct {
 	WorkerID   uuid.UUID          `json:"worker_id"`
 	RunID      uuid.UUID          `json:"run_id"`
