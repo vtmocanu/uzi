@@ -1372,7 +1372,7 @@ function WorkerDecisionPanel({ run, ownerProof, busy, onResume, onCancel }: {
         {memoryHeld
           ? "Memory interventions have stopped. Resume starts a fresh memory episode. Cancel ends this run."
           : "Automatic worker recovery has stopped. Only the run owner can resume or cancel this run. Resume requests one explicit attempt, even when the automatic recovery limit is zero."}
-        {memoryHeld && " Only the run owner can resume or cancel this run."}
+        {memoryHeld && " Only the run owner can resume or cancel this run."}{" "}
         This hold has no scheduled retry. Credential changes, messages and capture expiry do not release it.
       </p>
       <p className="mt-1.5 text-xs text-muted">
