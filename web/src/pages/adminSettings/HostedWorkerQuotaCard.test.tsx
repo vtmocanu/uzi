@@ -33,6 +33,29 @@ describe("HostedWorkerQuotaCard", () => {
     expect(mockApi.updateSettings).not.toHaveBeenCalled();
   });
 
+  it.each(["+3", " 3 ", "3"])("normalizes saved quota %j for display and dirty comparison", (initial) => {
+    render(<Harness initial={initial} />);
+    expect(input().value).toBe("3");
+    expect(button().disabled).toBe(true);
+    fireEvent.change(input(), { target: { value: "4" } });
+    expect(button().disabled).toBe(false);
+    fireEvent.change(input(), { target: { value: "3" } });
+    expect(button().disabled).toBe(true);
+    fireEvent.submit(button().closest("form")!);
+    expect(mockApi.updateSettings).not.toHaveBeenCalled();
+  });
+
+  it.each(["+3", " 3 "])("normalizes save-response quota %j", async (saved) => {
+    mockApi.updateSettings.mockResolvedValue(response(saved));
+    render(<Harness />);
+    fireEvent.change(input(), { target: { value: "3" } });
+    fireEvent.click(button());
+    expect(await screen.findByText("Hosted worker quota saved.")).toBeTruthy();
+    expect(mockApi.updateSettings).toHaveBeenCalledWith({ hosted_worker_quota: "3" });
+    expect(input().value).toBe("3");
+    expect(button().disabled).toBe(true);
+  });
+
   it.each(["0", "3", "20"])("saves %s independently and becomes clean", async (value) => {
     mockApi.updateSettings.mockResolvedValue(response(value));
     render(<Harness />);

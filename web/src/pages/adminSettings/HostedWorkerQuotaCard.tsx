@@ -10,15 +10,22 @@ function quotaError(value: string): string | null {
   return n < 0 || n > 20 ? "Must be 0 (self-service disabled) or between 1 and 20 workers" : null;
 }
 
+// The server stores accepted strings verbatim, but numeric inputs cannot display
+// a leading plus or surrounding whitespace. Normalize valid saved values only.
+function displayQuota(value: string): string {
+  return quotaError(value) === null ? String(Number(value.trim())) : value;
+}
+
 export function HostedWorkerQuotaCard({ settings, onSaved }: {
   settings: AppSettings;
   onSaved: (resp: SettingsResponse) => void;
 }) {
-  const [value, setValue] = useState(settings.hosted_worker_quota);
+  const savedValue = displayQuota(settings.hosted_worker_quota);
+  const [value, setValue] = useState(savedValue);
   const [busy, setBusy] = useState(false);
   const [error, setError] = useState("");
   const [notice, setNotice] = useState("");
-  const dirty = value !== settings.hosted_worker_quota;
+  const dirty = value !== savedValue;
   const invalid = quotaError(value);
 
   const save = async (e: FormEvent) => {
@@ -30,7 +37,7 @@ export function HostedWorkerQuotaCard({ settings, onSaved }: {
     try {
       const resp = await api.updateSettings({ hosted_worker_quota: value });
       onSaved(resp);
-      setValue(resp.settings.hosted_worker_quota);
+      setValue(displayQuota(resp.settings.hosted_worker_quota));
       setNotice("Hosted worker quota saved.");
     } catch (err) {
       setError(errorMessage(err, "Failed to save hosted worker quota"));
