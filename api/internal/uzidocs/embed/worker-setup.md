@@ -569,6 +569,37 @@ paired with an older api may show an MR cancellation reason implying the
 candidate was not applied; that older wording does not establish whether an
 earlier push applied.
 
+## Proactive memory guard
+
+Operators can opt into a worker-wide memory guard with
+`WORKER_MEMORY_GUARD_ENABLED`; it is **off by default** and needs six explicit
+numeric settings. See [configuration](./configuration.md#worker-memory-guard)
+for Compose, standalone and hosted wiring, validation and sizing inputs.
+There are no calibrated production thresholds.
+
+One monitor shares the worker's cgroup budget across its configured
+concurrency. It can intervene in enrolled **Codex model shell commands**,
+using the exact registered supervisor and process start ticks; approximate
+tree RSS ranks candidates while total cgroup usage determines pressure.
+It does not subtract file memory. Claude commands (#2471), internal probes,
+provider/credential processes, boundary operations and cross-checker
+authority are outside the delivered adapter's scope.
+
+A confirmed command drain, resolved outcome and fresh low-usage dwell are
+required before another intervention/retry. The per-run memory-episode
+allowance survives ordinary redispatch. Exhaustion, uncertain drainage or
+unconfirmed outcome reporting takes the capture/owner-hold path; see
+[Memory-pressure holds](./run-recovery.md#memory-pressure-holds).
+Capture can fail, leaving local custody retained without a downloadable
+archive or a latest-work guarantee.
+
+This is proactive mitigation, not OOM prevention: allocation bursts,
+stalled sampling and node pressure can still kill the worker. A separate
+Docker-in-Docker cgroup needs its own sizing. Keep concurrency configured
+for the shared run, chat and checker workload; enabling the guard does not
+force it to one. An actual worker OOM still follows the worker-death requeue
+path described below.
+
 ## Concurrent runs
 
 By default a worker executes one run-lane run at a time, alongside its separate
@@ -595,7 +626,7 @@ Raising the cap is an informed trade-off, not a free speedup:
   credential-reading commands but not writes outside a run's own worktree, so a
   prompt-injected run could shell-write into a sibling's worktree or the shared
   bare-repo cache.
-- **One container, one memory budget.** A runaway run can OOM the whole container,
+- **One container, one memory budget.** An actual OOM can kill the whole container,
   requeuing eligible in-flight runs together; raise the API's `RUN_MAX_REQUEUES`
   alongside `workers.maxConcurrentRuns > 1` to give affected runs more automatic
   worker-death retries per episode. Registration cannot attribute the memory consumer, so

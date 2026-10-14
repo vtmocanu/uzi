@@ -24,8 +24,8 @@ through `[0.52.0]`.)
 
 ### Changed
 
-- **Memory-pressure holds preserve owner decisions across recovery and automatic cross-check rounds ([#2396](https://github.com/vtmocanu/uzi/issues/2396)).**
-  An available recovery archive does not automatically release a memory-pressure hold's retained custody. Memory intervention and owner-resume checks follow the current automatic cross-check round while preserving ownership, claim-generation and deadline fences.
+- **An opt-in worker memory guard interrupts eligible Codex shell commands and holds uncertain recovery for the owner ([#2396](https://github.com/vtmocanu/uzi/issues/2396)).**
+  One worker-wide monitor uses total cgroup usage and ranks enrolled model command trees by approximate RSS, acting through their exact registered supervisors. Compose and hosted workers relay the enable flag and six required numeric settings; the guard remains off by default, with no calibrated production thresholds. Intervention allowance persists per memory episode across ordinary redispatch; exhaustion, uncertain drainage or unconfirmed outcome reporting invokes capture and an owner-held memory-pressure park attempt. Owner Resume starts a fresh memory episode under existing budget, custody and lifecycle fences; an available historical archive does not release retained custody or prove latest-work capture. Unknown capture retains local source without an archive guarantee. Claude enrollment (#2471), internal probes, provider/credential processes, boundary operations and cross-checker authority remain outside the delivered adapter's scope; allocation bursts, sampling stalls and node pressure can still cause OOM.
 
 ## [0.86.0] - 2026-10-06
 

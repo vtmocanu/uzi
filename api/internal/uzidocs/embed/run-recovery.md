@@ -43,6 +43,50 @@ For operators investigating checkpoint acknowledgement failures, see
 HTTP evidence boundary and a deployment comparison procedure. An unknown
 acknowledgement does not prove that origin rejected the update.
 
+## Memory-pressure holds
+
+With the [proactive memory guard](./worker-setup.md#proactive-memory-guard)
+enabled, allowance exhaustion, uncertain drainage or unconfirmed outcome
+reporting invokes capture and attempts to park the affected run at `recovery_wait` with cause
+`worker_memory_pressure`. An accepted park is **owner-held**, with no automatic
+retry time. An unconfirmed capture or park retains local custody. It is separate
+from recovery after an actual OOM kills a worker.
+
+1. Check the run's intervention outcome and current recovery archive status.
+   A historical **Available** report may be outdated: an archive can expire or
+   be discarded. Verify availability by exporting it. Neither that report nor
+   an export proves that the latest work was captured, that the command drained,
+   or that the memory hold's custody may be released.
+2. Resolve the memory/custody problem, then use owner **Resume** to queue a
+   fresh memory episode. The previous episode's persisted maximum and spent
+   allowance survive ordinary redispatch; Resume renews the memory episode
+   subject to remaining run budget, custody, claim and cross-check lifecycle
+   fences. Unknown drain evidence remains retained across Resume.
+3. Use **Cancel** to end the run instead. Cancel is terminal; it does not
+   prove retained work has been archived or authorize deleting uncertain
+   local source.
+
+Credential changes, Codex account changes, budget extension, approval,
+follow-up and pause do not release a held memory episode. Extending a timed
+run can supply budget for a subsequent owner Resume, but does not itself
+queue the run. An available archive does not automatically release this
+hold's retained custody.
+
+The worker attempts preservation using its existing recovery path. Failed
+or uncertain capture keeps local source custody; there is no archive or
+latest-work guarantee, and loss of that worker's retained storage can lose
+uncaptured work. Confirmed drain, a resolved outcome and fresh usage below
+the quiet threshold for the configured dwell are required before another
+intervention/retry. Transport retries do not provide an exactly-once
+delivery guarantee.
+
+Source boundaries: [captured-context reconciliation](../agent/src/runner.ts),
+[memory reservation and outcomes](../api/internal/workersvc/memory.go),
+[owner Resume](../api/internal/store/queries/memory.sql) and
+[custody release](../api/internal/store/queries/recovery.sql). Automatic and
+credential-driven promotion exclude this cause in the
+[runtime queries](../api/internal/store/queries/runtime.sql).
+
 ## What you'll see
 
 The run page shows a **Recovery archives** section on any run that failed to
