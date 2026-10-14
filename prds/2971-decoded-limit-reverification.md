@@ -222,8 +222,8 @@ Each command was `git grep -n -F -- "<needle>" -- <dir>`:
 | `failure_reason` | 386 | 112 | 0 | store/sqlc, DTOs, display and tests; no text parser found |
 | `blocker` | 141 | 23 | 19 | tests, embedded docs, unrelated identifiers |
 
-A further grep for the other `RecoveryBlocker` names over non-test server code
-found only unrelated identifiers with the same names: the run hold reason
+A further grep for the other `RecoveryBlocker` names over `api/`, `web/src` and
+`controller/` (non-test, excluding embedded docs) found only unrelated identifiers with the same names: the run hold reason
 `budget_exhausted` (270 lines) and `oversize`/“oversized” (91 lines). The other
 seven names returned nothing. The parser search was line-oriented. Conclusion: the server treats `failure_reason` as opaque text. The
 `blocker` hits were spot-checked, not read exhaustively.
@@ -266,6 +266,90 @@ was found with this characterization; this is not an exhaustive compatibility
 claim. In particular, line 1004 states:
 
 > The server recorded checkpoint <tip> before this hold. Current availability and the latest local edits are not verified.
+
+## M3: decision checkpoint — salvage versus authorized re-verification
+
+This is where the investigation stops. Nothing below is built. The human chooses.
+
+### Facts the decision rests on
+
+- A `decoded_history_limit` block ends the run terminal `failed` with
+  `keepCustody`. ADR-1197 (#2512 amendment): “it neither auto-reclaims nor exposes
+  failed-run Resume”. `docs/run-recovery.md` (“Retained-source failure and local
+  proof”) says the same. A blocked journal is never reclaimed, so no ordinary claim
+  ever reaches the blocked short-circuit to retry it (M1).
+- The published checkpoint ref `refs/uzi-checkpoints/<branch>` (or
+  `refs/uzi-recovery/<run-id>` after supersession) is kept only while some
+  custody hold on the run is open. `docs/run-recovery.md` (“Published checkpoint
+  refs”): “Once every hold on the run is released or discarded, uzi removes the
+  ref.” **Discarding the last open hold deletes the retained checkpoint ref.** Any
+  salvage must first make an independent copy, for example a fetched local branch
+  or an exported archive. Destructive salvage is never tested on incident holds.
+- The checkpoint ref holds only what was last published. It may lag dirty or
+  untracked bytes in the retained source.
+
+### Option (a): the smallest existing salvage path (no code change)
+
+Steps, in this order:
+
+1. `uzi run recovery <run-id>` lists the holds, checkpoint ref and capture state.
+2. Copy the checkpoint or recovery ref into a named local branch
+   (`git fetch origin refs/uzi-checkpoints/<branch>:refs/heads/recovered/<run-id>`).
+   Use the held ref `refs/uzi-held/<run-id>/<generation>` or a salvage copy if
+   one exists, and an available archive via `uzi run export`.
+   - Whether held publication or salvage fires for a `decoded_history_limit`
+     failure was **not verified** in this run.
+3. Inspect the retained worker source read-only through the worker-local
+   `retained-source` inspect channel (`agent/src/ops/retained-source.mjs`) to
+   compare latest local bytes against the copied ref.
+4. Land the work through a new run or by hand. Only then discard the holds.
+
+| | Option (a) |
+| --- | --- |
+| Pros | No new authority, endpoint, migration or ADR change. Works today for every blocker, not only this one. Every custody invariant is untouched. |
+| Cons | Manual and operator-heavy. Latest dirty or untracked bytes on the worker need worker access (hosted k8s: `kubectl exec` with the uid-drop recipe) and can be lost if the holds are discarded first. The run cannot simply continue; the work is re-landed by a new run. This is what was done by hand for 21a4d826 and 38b52617, per the issue's report. |
+
+### Option (b): owner-authorized one-shot re-verification
+
+What it would add:
+
+- **Owner action:** an owner-only API action, plus a `uzi run` CLI verb, for a
+  `failed` run with an open guarded hold and a recorded `decoded_history_limit`
+  blocker.
+- **Grant:** the action creates a one-shot grant (a DB migration) bound to:
+  - the run and the hold's claim generation;
+  - the blocked episode identity (`startedAt`, `attempts`, `source.clonePath` and
+    `attemptId`);
+  - the requesting owner.
+- **Requeue:** the action requeues the run.
+- **Claim:** the claim carries the grant.
+- **Worker:**
+  1. verifies the grant matches the journal exactly;
+  2. durably records the grant as consumed in the journal *before* any closure
+     check, so a crash or replay cannot renew it;
+  3. re-verifies under the current cap with every existing hold, pin, generation
+     fence and integrity check;
+  4. on success, proceeds through the normal successor handoff; on failure,
+     re-blocks with the grant spent.
+- **Not covered:** other blockers, and episodes blocked at the current cap.
+- **Legacy journals:** they have no recorded cap, so they need explicit
+  authorization; no increase is inferred.
+
+| | Option (b) |
+| --- | --- |
+| Pros | Recovers the exact retained source in place, with fresh verification and no hand-built copy. Bounded: at most one pass per grant. Also covers new 8 GiB blocks such as 1ab9349c, if the cap is raised further. |
+| Cons | It **is a failed-run Resume for this blocker** and amends ADR-1197 (#2512 amendment: “neither auto-reclaims nor exposes failed-run Resume”) and `docs/run-recovery.md`. It touches four components (API with a migration, worker, CLI, docs) and a trust boundary (a new owner-authorized state transition). Cap recording (M2) is a prerequisite to telling a block at the current cap from an old-cap block, and M2 is not clean today (B1, B2). Frequency is UNVERIFIED: two reported old-limit cases, both already discarded by hand. |
+
+### Lead's reading (advisory, not a decision)
+
+Given unverified frequency, no known surviving old-limit source, and the B1/B2
+prerequisites, the evidence favours:
+
+1. documenting option (a) as the supported path for blocked decoded-limit runs;
+2. fixing B2 (`claimGeneration` in the backup validator) on its own;
+3. deferring option (b) until a surviving source makes it worth amending ADR-1197.
+
+The human decides. #2971 stays open.
 
 ## Bounded incident and surviving-source ledger
 
@@ -327,7 +411,10 @@ current source/pin/hold availability, and independent checkpoint availability
 with a comparison against dirty/untracked latest bytes. No credential request,
 live mutation, hold discard, limit increase or redispatch was performed.
 
-## Validation status
+## Validation status (earlier run, historical)
+
+This section records the earlier run b8016a14 at `0b3afc33`. It is superseded by
+the current validation section below for this run's candidate.
 
 Focused characterization passed as recorded above. Coder and researcher
 delegations returned transport failures, not review results. Reviewer, tester
