@@ -23,6 +23,7 @@ describe("PublishResponse wire contract (PRD #122 M8)", () => {
       "not_descendant",
       "unsupported",
       "workflow_scope",
+      "ci_config_guard",
       "superseded",
       "tip_missing",
       "pack_too_large",

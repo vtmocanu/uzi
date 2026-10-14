@@ -164,6 +164,19 @@ type CiAutofixAttempt struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CiWatchEpisode struct {
+	ScheduleID        uuid.UUID          `json:"schedule_id"`
+	WorkflowKey       string             `json:"workflow_key"`
+	LastHandledRunID  pgtype.Int8        `json:"last_handled_run_id"`
+	ObservedCreatedAt pgtype.Timestamptz `json:"observed_created_at"`
+	ObservedUpdatedAt pgtype.Timestamptz `json:"observed_updated_at"`
+	ObservedRunID     pgtype.Int8        `json:"observed_run_id"`
+	LastSignature     pgtype.Text        `json:"last_signature"`
+	Attempts          int32              `json:"attempts"`
+	HaltedReason      pgtype.Text        `json:"halted_reason"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CliAuthRequest struct {
 	ID            uuid.UUID          `json:"id"`
 	CodeChallenge string             `json:"code_challenge"`
@@ -1046,6 +1059,7 @@ type Run struct {
 	CodeCrossCheckRequired      bool               `json:"code_cross_check_required"`
 	ProviderParkCount           int32              `json:"provider_park_count"`
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
+	CiConfigGuard               bool               `json:"ci_config_guard"`
 }
 
 type RunCompletionAttempt struct {
@@ -1246,6 +1260,7 @@ type RunSchedule struct {
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	RecentFires                []byte             `json:"recent_fires"`
+	CiWorkflows                []byte             `json:"ci_workflows"`
 }
 
 type RunUsage struct {

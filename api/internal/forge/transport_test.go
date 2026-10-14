@@ -10,7 +10,7 @@ import (
 func TestForgeHTTPTransportDefaults(t *testing.T) {
 	first := timeoutClient(time.Second)
 	second := timeoutClient(2 * time.Second)
-	if first.Transport != second.Transport || first.Transport != ancestryClient(time.Second).Transport {
+	if first.Transport != second.Transport || ancestryClient(time.Second).Transport != forgeHTTPTransport {
 		t.Fatal("rebuilt clients must share the forge pool")
 	}
 
@@ -39,7 +39,7 @@ func TestForgeTransportIndependentOfDefaultReplacement(t *testing.T) {
 	if forgeTransport() != forgeHTTPTransport {
 		t.Fatal("replacing the process default disabled forge health pings")
 	}
-	if timeoutClient(time.Second).Transport != forgeHTTPTransport {
+	if timeoutClient(time.Second).Transport != forgeBudgetTransport() {
 		t.Fatal("a rebuilt client lost the forge pool after default replacement")
 	}
 }

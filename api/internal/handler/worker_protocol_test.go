@@ -967,11 +967,13 @@ func TestWorkerHeartbeatRetainingUnpublishedWork(t *testing.T) {
 			if rec.Code != http.StatusOK {
 				t.Fatalf("status = %d, want 200 (a custody lookup error must not fail liveness), body %q", rec.Code, rec.Body.String())
 			}
-			var raw map[string]map[string]json.RawMessage
+			var raw struct {
+				Worker map[string]json.RawMessage `json:"worker"`
+			}
 			if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
 				t.Fatal(err)
 			}
-			if _, present := raw["worker"]["custody_decisions_needed"]; present {
+			if _, present := raw.Worker["custody_decisions_needed"]; present {
 				t.Fatal("heartbeat sent list-only decision count")
 			}
 			if !st.custodyCalled {

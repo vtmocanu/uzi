@@ -218,12 +218,12 @@ func renderOwnerRecovery(env Env, gf *globalFlags, dto apitypes.RecoveryCustodyH
 		}
 		rows = append(rows, []string{
 			cellText(h.RunID), cellText(h.ID), strconv.FormatInt(h.Generation, 10),
-			cellText(h.Attention), strconv.FormatBool(h.HasAvailableCapture),
+			cellText(h.Attention), admissionCell(h), strconv.FormatBool(h.HasAvailableCapture),
 			cellText(recoveryWorkerLabel(h)), relAge(h.CreatedAt),
 		})
 	}
 	if len(rows) > 0 {
-		if err := p.Table([]string{"RUN ID", "HOLD ID", "GEN", "DISPOSITION", "ARCHIVE", "WORKER", "AGE"}, rows); err != nil {
+		if err := p.Table([]string{"RUN ID", "HOLD ID", "GEN", "DISPOSITION", "ADMISSION", "ARCHIVE", "WORKER", "AGE"}, rows); err != nil {
 			return err
 		}
 	} else if !gf.quiet {
@@ -437,12 +437,13 @@ func renderRunRecovery(env Env, gf *globalFlags, runID string, holds []apitypes.
 			h.ID,
 			fmt.Sprintf("%d", h.Generation),
 			sanitizeTTY(h.Attention),
+			admissionCell(h),
 			sanitizeTTY(h.State),
 			captureCell(h.CaptureState),
 			cellText(recoveryWorkerLabel(h)),
 		})
 	}
-	if err := p.Table([]string{"HOLD ID", "GEN", "DISPOSITION", "STATE", "CAPTURE", "WORKER"}, rows); err != nil {
+	if err := p.Table([]string{"HOLD ID", "GEN", "DISPOSITION", "ADMISSION", "STATE", "CAPTURE", "WORKER"}, rows); err != nil {
 		return err
 	}
 	for _, h := range holds {
@@ -599,4 +600,20 @@ func confirmDiscardHold(env Env, runID, holdID string) (bool, error) {
 	}
 	ans := strings.ToLower(strings.TrimSpace(line))
 	return ans == "y" || ans == "yes", nil
+}
+
+// admissionCell renders the server-derived custody admission membership of a hold (issue #2970):
+// "counted (<reason>)" or "counted", "not counted", or "-" when the server sent none (a non-open
+// hold, or an older server), which is unknown and never "not counted".
+func admissionCell(h apitypes.RecoveryCustodyHoldDTO) string {
+	switch {
+	case h.CountsTowardAdmission == nil:
+		return "-"
+	case !*h.CountsTowardAdmission:
+		return "not counted"
+	case h.AdmissionReason == "":
+		return "counted"
+	default:
+		return "counted (" + cellText(h.AdmissionReason) + ")"
+	}
 }

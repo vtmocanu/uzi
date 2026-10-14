@@ -11,6 +11,8 @@ import type {
   AdminDockerAllowlistRepos,
   RunMessage,
   Schedule,
+  CIEpisodeDTO,
+  CIEpisodePage,
   ScheduleInput,
   RunNowResponse,
   LastFireStarted,
@@ -98,6 +100,10 @@ import messageZero from "../../../fixtures/api-contract/message.zero.json";
 import messageFull from "../../../fixtures/api-contract/message.full.json";
 import scheduleZero from "../../../fixtures/api-contract/schedule.zero.json";
 import scheduleFull from "../../../fixtures/api-contract/schedule.full.json";
+import ciEpisodeZero from "../../../fixtures/api-contract/ci_episode.zero.json";
+import ciEpisodeFull from "../../../fixtures/api-contract/ci_episode.full.json";
+import ciEpisodePageZero from "../../../fixtures/api-contract/ci_episode_page.zero.json";
+import ciEpisodePageFull from "../../../fixtures/api-contract/ci_episode_page.full.json";
 import scheduleRunNowZero from "../../../fixtures/api-contract/schedule_run_now.zero.json";
 import scheduleRunNowFull from "../../../fixtures/api-contract/schedule_run_now.full.json";
 import scheduleInputZero from "../../../fixtures/api-contract/schedule_input.zero.json";
@@ -535,6 +541,22 @@ void _releaseCheckStatusFull;
   void _scheduleExtra;
   void _scheduleZero;
   void _scheduleFull;
+}
+
+{
+  const missing: never = null as unknown as Exclude<keyof CIEpisodeDTO, keyof typeof ciEpisodeFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof ciEpisodeFull, keyof CIEpisodeDTO>;
+  const zero: ZeroOf<CIEpisodeDTO> = ciEpisodeZero;
+  const full: Widen<CIEpisodeDTO> = ciEpisodeFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof CIEpisodePage, keyof typeof ciEpisodePageFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof ciEpisodePageFull, keyof CIEpisodePage>;
+  // The page endpoint normalizes episodes to []; the Go zero fixture has a nil slice.
+  const zero: ZeroOf<CIEpisodePage, "episodes"> = ciEpisodePageZero;
+  const full: Widen<CIEpisodePage> = ciEpisodePageFull;
+  void missing; void extra; void zero; void full;
 }
 
 // runNowResponse in api/internal/handler/schedules.go allocates run_ids, started,

@@ -9793,6 +9793,51 @@ export class GitCache {
   }
 
   /**
+   * Guarded-run variant of {@link changedFiles}: the trusted `defaultBranchRef` merge-base diff,
+   * but with `--no-renames`, so a rename lists BOTH raw paths (moving a file out of a protected
+   * directory matches on its old path) and a deletion is listed. A plain three-dot diff uses only
+   * the first merge base ("warning: multiple merge bases"), so a criss-cross history could hide a
+   * protected-path change that exists relative to the other base. This therefore lists EVERY merge
+   * base (`merge-base --all`), diffs `ref` against each, and returns the de-duplicated union in
+   * first-seen order. `-z` disables path quoting; the output is split only on NUL and never
+   * trimmed, so a path with a leading or trailing space or an embedded newline arrives
+   * byte-exact. `ref` may be a ref or a 40-hex SHA.
+   * Returns null (NOT []) when the diff cannot be computed (git failure, a merge base that is not
+   * a 40-hex id, or NO merge base, e.g. unrelated histories), so the caller fails CLOSED.
+   * A non-SHA-1 repository (e.g. SHA-256 object format) yields 64-hex merge bases, which are not
+   * 40-hex ids, so it also returns null (fail closed) rather than a possibly partial list.
+   * A path is kept only if it ALSO differs between the default tip and `ref` (a direct
+   * `--no-renames` tree diff against the same pinned default SHA). A path the branch merely took
+   * from the default (the finalize workflow-subtree overlay copies the refreshed default's
+   * workflows in a single-parent commit, so the merge base stays at the fork point) equals the
+   * tip and drops out; a run-made addition, edit, deletion and both sides of a rename still
+   * differ from it. Either diff failing returns null.
+   */
+  async changedFilesNoRenames(barePath: string, ref: string): Promise<string[] | null> {
+    try {
+      const baseRef = await this.defaultBranchRef(barePath);
+      // Pin the default once so both comparisons read the same tip.
+      const defaultSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+      if (!SHA40_RE.test(defaultSha)) return null;
+      const bases = (await this.runGit(barePath, ["merge-base", "--all", defaultSha, ref]))
+        .split("\n").filter((line) => line !== "");
+      if (bases.length === 0 || bases.some((base) => !SHA40_RE.test(base))) return null;
+      const seen = new Set<string>();
+      for (const base of new Set(bases)) {
+        const out = await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", base, ref]);
+        for (const entry of out.split("\0")) if (entry !== "") seen.add(entry);
+      }
+      const fromTip = new Set(
+        (await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", defaultSha, ref]))
+          .split("\0").filter((entry) => entry !== ""),
+      );
+      return [...seen].filter((entry) => fromTip.has(entry));
+    } catch {
+      return null;
+    }
+  }
+
+  /**
    * The commit messages a push of `tip` would publish: every commit reachable from `tip` and not
    * from the worker's default ref (the same base as changedFiles), merge commits included. `tip`
    * must be a 40-hex object id. An empty range is a legitimate `[]`. Returns null (NEVER []) on

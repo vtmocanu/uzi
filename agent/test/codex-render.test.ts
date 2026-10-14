@@ -520,6 +520,10 @@ describe("renderCodexRun — prompts", () => {
     assert.ok(prompt.indexOf(CODEX_LONG_COMMAND_APPEND) < prompt.indexOf(SUBAGENT_SAFETY_APPEND));
     assert.ok(!prompt.includes(CLAUDE_LONG_COMMAND_APPEND));
     assert.ok(!prompt.includes("run_in_background"));
+    assert.match(prompt, /Only the root lead may set/);
+    assert.match(prompt, /Child agents cannot/);
+    assert.match(prompt, /child-turn limits remain unchanged/);
+    assert.equal(run.perRoleGrants.get("a")?.isRoot, false);
   });
 });
 

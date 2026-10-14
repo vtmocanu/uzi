@@ -547,4 +547,86 @@ describe("RecoveryHoldsSurface", () => {
       expect(group.getAttribute("aria-describedby")).toBe("discard-warning-h-bare");
     });
   });
+  describe("admission information at the custody limit", () => {
+    const atLimit = { custody_hold_limit: 2, admission_counted_holds: 2 };
+    const counted = (id: string, reason: string, over: Partial<RecoveryCustodyHold> = {}) =>
+      hold({ id, run_id: `run-${id}`, worker_id: `w-${id}`, worker_name: `worker-${id}`, generation: 3, counts_toward_admission: true, admission_reason: reason, ...over });
+
+    it("lists counted non-decision holds with reason, run link, gen and worker", async () => {
+      await renderSurface(listing([counted("a", "terminal_run"), counted("b", "run_not_live")], atLimit));
+      const section = screen.getByRole("region", { name: "Counting toward the limit" });
+      expect(within(section).getByText(/consume admission capacity without requiring an owner decision/)).toBeTruthy();
+      expect(within(section).getByText("Run has finished")).toBeTruthy();
+      expect(within(section).getByText("Run is not running (queued, paused or waiting)")).toBeTruthy();
+      expect(within(section).getAllByText("gen 3")).toHaveLength(2);
+      expect(within(section).getByText("worker-a")).toBeTruthy();
+      const hrefs = within(section).getAllByRole("link", { name: /View run/ }).map((l) => l.getAttribute("href"));
+      expect(hrefs).toEqual(["/runs/run-a", "/runs/run-b"]);
+      expect(screen.queryByText(/These are the holds only you can resolve/)).toBeNull();
+    });
+
+    it("renders nothing below the limit", async () => {
+      const { container } = await renderSurface(
+        listing([counted("a", "terminal_run")], { custody_hold_limit: 8, admission_counted_holds: 1 }),
+      );
+      expect(container.textContent).toBe("");
+    });
+
+    it("lists holds without the field only under 'not reported'", async () => {
+      await renderSurface(listing([hold({ id: "o1", run_id: "run-o1", worker_name: "old-worker" })], atLimit));
+      const section = screen.getByRole("region", { name: "Admission membership not reported" });
+      expect(within(section).getByText(/did not report whether these holds count/)).toBeTruthy();
+      expect(within(section).getByText("old-worker")).toBeTruthy();
+      expect(within(section).getByRole("link", { name: /View run/ }).getAttribute("href")).toBe("/runs/run-o1");
+      expect(within(section).queryByText(/Counted by the server/)).toBeNull();
+      expect(screen.queryByRole("region", { name: "Counting toward the limit" })).toBeNull();
+    });
+
+    it("keeps counted and unreported holds in their own groups", async () => {
+      await renderSurface(
+        listing([counted("a", "terminal_run", { worker_name: "worker-counted" }), hold({ id: "o1", run_id: "run-o1", worker_name: "worker-old" })], atLimit),
+      );
+      const c = screen.getByRole("region", { name: "Counting toward the limit" });
+      const u = screen.getByRole("region", { name: "Admission membership not reported" });
+      expect(within(c).getByText("worker-counted")).toBeTruthy();
+      expect(within(c).queryByText("worker-old")).toBeNull();
+      expect(within(u).getByText("worker-old")).toBeTruthy();
+      expect(within(u).queryByText("worker-counted")).toBeNull();
+    });
+
+    it("omits holds reported as not counting", async () => {
+      await renderSurface(
+        listing([counted("a", "terminal_run"), counted("n", "live_claim", { counts_toward_admission: false, worker_name: "worker-not" })], atLimit),
+      );
+      const section = screen.getByRole("region", { name: "Counting toward the limit" });
+      expect(within(section).getAllByRole("listitem")).toHaveLength(1);
+      expect(screen.queryByText("worker-not")).toBeNull();
+    });
+
+    it("gives info rows no discard button or export link", async () => {
+      await renderSurface(listing([counted("a", "terminal_run", { attention: "archive_ready", has_available_capture: true, capture_state: "available" })], atLimit));
+      const section = screen.getByRole("region", { name: "Counting toward the limit" });
+      expect(within(section).getAllByRole("listitem")).toHaveLength(1);
+      expect(within(section).queryByRole("button", { name: /Discard held work/ })).toBeNull();
+      expect(within(section).queryByRole("link", { name: /Export archive/ })).toBeNull();
+    });
+
+    it("renders a generic label for an unknown reason, never the raw string", async () => {
+      await renderSurface(listing([counted("a", "brand_new_reason_xyz")], atLimit));
+      const section = screen.getByRole("region", { name: "Counting toward the limit" });
+      expect(within(section).getByText("Counted by the server")).toBeTruthy();
+      expect(document.body.textContent).not.toContain("brand_new_reason_xyz");
+    });
+
+    it("keeps decision rows alongside the info rows", async () => {
+      await renderSurface(
+        listing([hold({ id: "d1", attention: "source_only", worker_name: "decision-worker" }), counted("a", "terminal_run", { attention: "archive_ready", has_available_capture: true })], { custody_hold_limit: 2, admission_counted_holds: 2 }),
+      );
+      expect(screen.getByText(/These are the holds only you can resolve/)).toBeTruthy();
+      expect(screen.getByRole("button", { name: /Discard held work/ })).toBeTruthy();
+      const section = screen.getByRole("region", { name: "Counting toward the limit" });
+      expect(within(section).getAllByRole("listitem")).toHaveLength(1);
+      expect(within(section).queryByRole("button", { name: /Discard held work/ })).toBeNull();
+    });
+  });
 });

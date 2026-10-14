@@ -108,6 +108,35 @@ const (
 	// credentials; that candidate skip does not hold a one-time sweep or stop its siblings.
 	// A disabled stored credential override retains the schedule-wide hold/stop semantics.
 	SkipCredentialDisabled SkipReason = "credential_disabled" //nolint:gosec // G101: a schedule-skip-reason VOCABULARY value, not a credential (see SkipNoUsableCredential).
+
+	// The ci_watch fire path (PRD #2865). Each is benign: the schedule advances and the
+	// next cadence tries again. ci_green: every watched workflow's newest completed
+	// execution succeeded. ci_already_handled: this execution was already handled, and a
+	// stale observation (an older execution, or a superseded revision) maps here too.
+	SkipCIGreen          SkipReason = "ci_green"
+	SkipCIAlreadyHandled SkipReason = "ci_already_handled"
+	// ci_halted_no_progress / ci_halted_attempt_cap: the loop guard halted the episode
+	// (same failure signature as the last attempt, or the attempt cap reached).
+	SkipCIHaltedNoProgress SkipReason = "ci_halted_no_progress"
+	SkipCIHaltedAttemptCap SkipReason = "ci_halted_attempt_cap"
+	// ci_watched_not_seen: a watched workflow had no completed execution in the listed
+	// window. Never reported as ci_green.
+	SkipCIWatchedNotSeen SkipReason = "ci_watched_not_seen"
+	// ci_unsupported ← forge.ErrForgeVersionUnsupported (a Forgejo without the Actions API).
+	SkipCIUnsupported SkipReason = "ci_unsupported"
+	// no_default_branch: the repo row carries no default branch.
+	SkipNoDefaultBranch SkipReason = "no_default_branch"
+	// ci_capacity ← ErrCIWatchCapacity: the lifetime 1024-key admission limit is reached.
+	SkipCICapacity SkipReason = "ci_capacity"
+	// ci_evidence_limited ← forge.ErrCIReadBudget: a discovery or evidence read budget was
+	// exceeded; no episode write and no run, and the next fire tries again.
+	SkipCIEvidenceLimited SkipReason = "ci_evidence_limited"
+	// ci_not_failed: the newest completed execution is neither red nor green (cancelled,
+	// skipped, neutral, action_required): no start and no reset.
+	SkipCINotFailed SkipReason = "ci_not_failed"
+	// ci_config_changed ← ErrCIWatchConfigChanged: the lock-time recheck found the
+	// schedule or repo configuration differs from what the fire read, or the schedule is gone.
+	SkipCIConfigChanged SkipReason = "ci_config_changed"
 )
 
 // AllSkipReasons lists every SkipReason in the closed set. The cross-language contract
@@ -127,6 +156,17 @@ var AllSkipReasons = []SkipReason{
 	SkipSchedulesPaused,
 	SkipNoUsableCredential,
 	SkipCredentialDisabled,
+	SkipCIGreen,
+	SkipCIAlreadyHandled,
+	SkipCIHaltedNoProgress,
+	SkipCIHaltedAttemptCap,
+	SkipCIWatchedNotSeen,
+	SkipCIUnsupported,
+	SkipNoDefaultBranch,
+	SkipCICapacity,
+	SkipCIEvidenceLimited,
+	SkipCINotFailed,
+	SkipCIConfigChanged,
 }
 
 // skipReasonForErr maps the benign run-creation seam sentinels to their SkipReason.

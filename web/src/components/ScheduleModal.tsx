@@ -1,7 +1,7 @@
 // ScheduleModal — the create/edit modal for scheduled runs (PRD #241 M5, mock §2).
 //
-// One modal serves both timing modes (Once / Recurring) and all three targets
-// (Issue / Label sweep / Prompt); the two segmented pickers swap the fields below
+// One modal serves both timing modes (Once / Recurring) and all four user targets
+// (Issue / Label sweep / Prompt / CI repair); the two segmented pickers swap the fields below
 // them. A live "Next fires" preview calls POST /api/schedules/preview (debounced)
 // so it always matches server truth. The cron STRING is canonical (Decision 6):
 // presets translate to it, editing the raw cron flips the preset to "Custom", and
@@ -20,6 +20,7 @@ import {
   type SecretMeta,
 } from "../lib/api";
 import { capacityCadence } from "../lib/scheduleCapacity";
+import { CI_WATCH_APPROVE_NOTE, CI_WATCH_TARGET_NAME } from "../lib/scheduleList";
 import { errorMessage } from "../lib/apiError";
 import {
   scheduleCredentialPatch,
@@ -82,7 +83,34 @@ const TARGET_OPTIONS: { value: ScheduleTarget; title: string; desc: string }[] =
   { value: "issue", title: "Issue", desc: "Pin one issue" },
   { value: "sweep", title: "Label sweep", desc: "Issues matching a label" },
   { value: "prompt", title: "Prompt", desc: "No issue → opens an MR" },
+  { value: "ci_watch", title: "CI repair", desc: "Fix failed default-branch CI" },
 ];
+
+// The server's bounds on a ci_watch workflow list (PRD #2865, normalizeCIWorkflows):
+// at most 20 entries, each 1..200 UTF-8 bytes after trimming, unique, no control chars.
+const MAX_CI_WORKFLOWS = 20;
+const MAX_CI_WORKFLOW_BYTES = 200;
+
+// parseCIWorkflows reads the one-per-line workflow textarea into the request list
+// (trimmed, blank lines dropped) plus the first rule it breaks, "" when it is valid.
+// An empty list is valid: it watches every workflow in the listed window.
+function parseCIWorkflows(text: string): { workflows: string[]; error: string } {
+  const workflows = text
+    .split("\n")
+    .map((line) => line.trim())
+    .filter((line) => line !== "");
+  let error = "";
+  if (workflows.length > MAX_CI_WORKFLOWS) {
+    error = `Watch at most ${MAX_CI_WORKFLOWS} workflows.`;
+  } else if (workflows.some((w) => new TextEncoder().encode(w).length > MAX_CI_WORKFLOW_BYTES)) {
+    error = `Each workflow name must be at most ${MAX_CI_WORKFLOW_BYTES} bytes.`;
+  } else if (workflows.some((w) => /\p{Cc}/u.test(w))) {
+    error = "Workflow names can't contain control characters.";
+  } else if (new Set(workflows).size !== workflows.length) {
+    error = "Each workflow can be listed only once.";
+  }
+  return { workflows, error };
+}
 
 const TIMING_OPTIONS: { value: ScheduleTiming; title: string; desc: string }[] = [
   { value: "once", title: "Once", desc: "A single future moment" },
@@ -126,7 +154,7 @@ function SegmentedControl<T extends string>({
   return (
     <div className="space-y-2" role="radiogroup" aria-label={label}>
       <span className="text-xs font-semibold uppercase tracking-wide text-muted">{label}</span>
-      <div className="grid grid-flow-col auto-cols-fr gap-1.5">
+      <div className="grid grid-cols-2 gap-1.5 sm:grid-flow-col sm:grid-cols-none sm:auto-cols-fr">
         {options.map((o) => {
           const on = o.value === value;
           return (
@@ -237,7 +265,19 @@ export function ScheduleModal({
   // override. Sent as an explicit `mr_rework_enabled` on both create and update so
   // inherit stays a real null and never collapses into false.
   const [mrRework, setMrRework] = useState<boolean | null>(editing?.mr_rework_enabled ?? null);
+  // PRD #2865 D10: a new ci_watch schedule starts with auto-approve OFF (it reads CI logs,
+  // which carry outside text); every other target keeps today's ON default. An edit shows
+  // the stored value. Until the owner touches the toggle, switching target re-applies the
+  // target's default, so the choice is never silently carried from another target.
   const [autoApprove, setAutoApprove] = useState<boolean>(editing?.auto_approve ?? true);
+  const [autoApproveTouched, setAutoApproveTouched] = useState(false);
+  const onAutoApproveChange = (on: boolean) => {
+    setAutoApproveTouched(true);
+    setAutoApprove(on);
+  };
+  // ci_watch workflow selector, one per line; blank = every workflow in the listed window.
+  const [ciWorkflowsText, setCiWorkflowsText] = useState<string>((editing?.ci_workflows ?? []).join("\n"));
+  const ciWorkflows = parseCIWorkflows(ciWorkflowsText);
   // Create-only enabled/disabled toggle (PRD #344 Feature B): lets a schedule be created
   // already paused. Edit-mode enable/disable stays the job of pause/resume, so this state
   // seeds from editing but is only ever SENT on create (see buildInput).
@@ -276,6 +316,14 @@ export function ScheduleModal({
   const clearCapacity = () => { setCapacityLimit(null); setCapacityRoom(null); };
   const changeTarget = (value: ScheduleTarget) => {
     if (value !== "sweep") clearCapacity();
+    // ci_watch defaults auto-approve off (D10); an edit converting INTO ci_watch does not
+    // inherit the previous target's setting, and converting back restores the stored one.
+    if (!autoApproveTouched) {
+      if (!isEdit) setAutoApprove(value !== "ci_watch");
+      else if (editing.target !== "ci_watch") {
+        setAutoApprove(value === "ci_watch" ? false : editing.auto_approve);
+      }
+    }
     setTarget(value);
   };
   const changeTiming = (value: ScheduleTiming) => {
@@ -571,6 +619,7 @@ export function ScheduleModal({
     if (isEdit ? !repoId : selectedRepoIds.length === 0) return false;
     // A catalog default is always recurring: only its cron and model gate submit; the
     // catalog-owned target fields are read-only and always valid.
+    if (target === "ci_watch" && ciWorkflows.error !== "") return false;
     if (isDefault) {
       if (cron.trim() === "") return false;
       if (modelWarning !== "") return false;
@@ -580,6 +629,8 @@ export function ScheduleModal({
     }
     if (target === "issue" && !(Number(issueIid) > 0)) return false;
     if (target === "prompt" && prompt.trim() === "") return false;
+    // ci_watch's prompt is optional (the server defaults it); its workflow list was
+    // checked above.
     // Blank max_issues (null) = unlimited and is valid; a set value must be a
     // positive integer. The server validates too.
     if (target === "sweep" && maxIssues != null && !(Number.isInteger(maxIssues) && maxIssues > 0 && maxIssues <= 10000))
@@ -633,12 +684,15 @@ export function ScheduleModal({
     // PRD #1429 M4a: OMIT when untouched (seed-and-keep), null on explicit clear, the bare
     // harness string on a pick. Allowed on every lane including self_improve.
     harness: harnessPatch(),
+    // A ci_watch default's guidance is an owner overlay too (PRD #2865), as is its
+    // workflow selector: always sent, [] clears it back to every workflow.
     guidance:
-      target === "prompt" || target === "sweep"
+      target === "prompt" || target === "sweep" || target === "ci_watch"
         ? guidance.trim() === ""
           ? null
           : guidance
         : undefined,
+    ci_workflows: target === "ci_watch" ? ciWorkflows.workflows : undefined,
   });
 
   const buildInput = (): ScheduleInput => ({
@@ -659,7 +713,12 @@ export function ScheduleModal({
           ? null
           : guidance
         : undefined,
-    prompt: target === "prompt" ? prompt : undefined,
+    // A ci_watch prompt is optional: blank lets the server use the CI repair catalog
+    // instructions (PRD #2865).
+    prompt: target === "prompt" || target === "ci_watch" ? prompt : undefined,
+    // PRD #2865: the ci_watch workflow selector, replace-semantics ([] = all workflows).
+    // Omitted on every other target, which the server rejects it on.
+    ci_workflows: target === "ci_watch" ? ciWorkflows.workflows : undefined,
     timing,
     cron_expr: timing === "recurring" ? cron.trim() : undefined,
     run_at: timing === "once" ? fromLocalInput(runAtLocal) : undefined,
@@ -790,6 +849,27 @@ export function ScheduleModal({
     </Field>
   );
 
+  // The ci_watch workflow selector (PRD #2865), shared by a user ci_watch schedule and a
+  // ci_watch catalog default (whose selector is owner-editable, not catalog-owned).
+  const ciWorkflowsField = (
+    <Field label="Workflows to watch (optional)" htmlFor="sched-ci-workflows">
+      <Textarea
+        id="sched-ci-workflows"
+        rows={3}
+        className="font-mono"
+        value={ciWorkflowsText}
+        onChange={(e) => setCiWorkflowsText(e.target.value)}
+        placeholder={"ci.yml\nrelease.yml"}
+        aria-invalid={ciWorkflows.error !== "" || undefined}
+        aria-describedby="sched-ci-workflows-help"
+      />
+      <p id="sched-ci-workflows-help" className={cx("mt-1 text-[11px]", ciWorkflows.error ? "text-danger" : "text-faint")}>
+        {ciWorkflows.error ||
+          "One workflow name or file per line, up to 20. Leave blank to watch all workflows in the listed window (newest 100 executions; 50 on Forgejo)."}
+      </p>
+    </Field>
+  );
+
   const footerSummarySegments = [
     timing === "once" ? "One time" : "Recurring",
     target === "sweep"
@@ -798,7 +878,9 @@ export function ScheduleModal({
         ? "prompt"
         : target === "self_improve"
           ? "self-improve"
-          : "issue",
+          : target === "ci_watch"
+            ? "CI repair"
+            : "issue",
   ];
   // A self_improve run is always auto-approved (the server forces it), so drop the
   // approve segment entirely there — it is a fixed value, not a user choice.
@@ -935,7 +1017,8 @@ export function ScheduleModal({
                   (issue #675) are owner-editable: the baked prompt/guidance stays read-only
                   above, but this OVERLAY is appended to it at fire time. issue/self_improve
                   defaults keep their guidance catalog-owned (baked, shown read-only). */}
-              {(target === "prompt" || target === "sweep") && guidanceField}
+              {target === "ci_watch" && ciWorkflowsField}
+              {(target === "prompt" || target === "sweep" || target === "ci_watch") && guidanceField}
             </>
           ) : (
             <>
@@ -1053,6 +1136,29 @@ export function ScheduleModal({
                     </Select>
                     <p className="mt-1 text-[11px] text-faint">
                       How a prompt run delivers: MR opens a merge request from an idea file; Issues files a labeled <code className="rounded bg-raised px-1">proposal::&lt;slug&gt;</code> issue (not sweep-eligible until promoted). Leave as job default to inherit.
+                    </p>
+                  </Field>
+                </>
+              )}
+
+              {target === "ci_watch" && (
+                <>
+                  <p className="-mt-2 text-[12px] text-muted">
+                    Each fire checks the repo&rsquo;s default branch. When a watched workflow&rsquo;s
+                    latest run failed, it starts a run that reproduces the failure and proposes the
+                    smallest fix. No issue is needed.
+                  </p>
+                  {ciWorkflowsField}
+                  <Field label="Prompt (optional)" htmlFor="sched-prompt">
+                    <Textarea
+                      id="sched-prompt"
+                      rows={3}
+                      value={prompt}
+                      onChange={(e) => setPrompt(e.target.value)}
+                      placeholder="Leave blank to use the CI repair instructions"
+                    />
+                    <p className="mt-1 text-[11px] text-faint">
+                      Leave blank to use the shipped CI repair instructions.
                     </p>
                   </Field>
                 </>
@@ -1341,7 +1447,7 @@ export function ScheduleModal({
                 so hide the toggle rather than misrepresent a fixed value as a user choice. */}
             {target !== "self_improve" && (
               <div className="flex items-start gap-3">
-                <Toggle checked={autoApprove} onChange={setAutoApprove} label="Auto-approve the plan" />
+                <Toggle checked={autoApprove} onChange={onAutoApproveChange} label="Auto-approve the plan" />
                 <span className="text-[13px] text-fg">
                   Auto-approve the plan
                   <span className="block text-[11px] text-faint">
@@ -1350,6 +1456,7 @@ export function ScheduleModal({
                 </span>
               </div>
             )}
+            {target === "ci_watch" && <CIWatchApproveNote />}
             {!isEdit && (
               <div className="flex items-start gap-3">
                 <Toggle checked={enabled} onChange={setEnabled} label="Enabled" />
@@ -1451,7 +1558,9 @@ function BakedTargetDetail({
               ? "Prompt"
               : target === "self_improve"
                 ? "Self-improvement"
-                : "Issue"}
+                : target === "ci_watch"
+                  ? CI_WATCH_TARGET_NAME
+                  : "Issue"}
           <span className="text-[11px] font-normal text-faint">· baked into the default</span>
         </span>
       </div>
@@ -1488,7 +1597,7 @@ function BakedTargetDetail({
 
       {target !== "self_improve" && (
         <BakedBlock
-          label={target === "sweep" ? "Baked guidance" : "Baked prompt"}
+          label={target === "sweep" ? "Baked guidance" : target === "ci_watch" ? "Baked instructions" : "Baked prompt"}
           text={target === "sweep" ? bakedGuidance : prompt}
         />
       )}
@@ -1514,6 +1623,16 @@ function BakedBlock({ label, text }: { label: string; text: string }) {
         This wording ships with the default. To change it, clone the default to an editable copy.
       </p>
     </div>
+  );
+}
+
+// CIWatchApproveNote explains why a ci_watch schedule's auto-approve starts off (PRD
+// #2865 D10). The schedule's CI detail panel shows the same note.
+export function CIWatchApproveNote() {
+  return (
+    <p className="rounded-lg border border-info/40 bg-info/10 px-3 py-2 text-[12px] leading-relaxed text-info">
+      {CI_WATCH_APPROVE_NOTE}
+    </p>
   );
 }
 

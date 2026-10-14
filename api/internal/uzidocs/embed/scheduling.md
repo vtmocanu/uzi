@@ -30,6 +30,11 @@ Every schedule fires against exactly one target:
 - **Ad-hoc prompt** — no issue at all. A stored prompt runs against the repo
   and opens a merge request directly, for standing "hunt for X and open an
   MR" work with no throwaway tracking issue.
+- **CI watch** (`ci_watch`) — no issue and no prompt of your own. At fire
+  time it looks at the repo's **default-branch** CI and, when a workflow is
+  red, starts one repair run. It is the target behind the `ci-repair`
+  [default job](#default-branch-ci-repair); see that section for what a fire
+  does and which limits apply.
 
 A pinned issue or label sweep can also carry optional **guidance** — see
 [Guidance](#guidance) below. A user-authored prompt target carries its own
@@ -554,6 +559,13 @@ exceed `max_issues` once backfill walks past a skip), which ones
   selector changed to multiple labels). The fire starts nothing; an invalid
   selector is rejected before listing candidates.
 
+- `ci_green`, `ci_already_handled`, `ci_halted_no_progress`,
+  `ci_halted_attempt_cap`, `ci_watched_not_seen`, `ci_not_failed`,
+  `ci_unsupported`, `ci_capacity`, `ci_evidence_limited`, `ci_config_changed`
+  and `no_default_branch` — the outcomes of a [CI-watch
+  fire](#default-branch-ci-repair); each is defined in [its skip
+  reasons](#ci-watch-skip-reasons).
+
 Started entries can also carry **label-removal outcomes**; these are not
 skip reasons, since the run already exists:
 
@@ -670,7 +682,7 @@ get` prints a **Recent fires** block after **Last fire**
 
 ## Default jobs
 
-uzi ships a small **catalog of built-in default jobs** — ten generic,
+uzi ships a small **catalog of built-in default jobs** — eleven generic,
 repo-agnostic schedules covering the standing automations most projects want
 from day one: a weekly test-improvement pass, a weekly docs-hygiene sweep, a
 deep bug-hunt audit, a feature-brainstorm prompt, a biweekly propose-only
@@ -679,7 +691,9 @@ proposal issue by default (never implementing it, `refactor-scout`), daily
 sweeps over the `bug` and `Planned` labels and over issues **assigned to the uzi-bot
 account** (`assigned-sweep`), an On-deck backlog drain every 10 minutes
 (`ondeck-sweep`), and self-improvement — an autonomous audit of
-the enabled repo's own codebase that picks one top improvement. Each has a
+the enabled repo's own codebase that picks one top improvement, and a
+default-branch CI repair job (`ci-repair`, hourly, covered in
+[Default-branch CI repair](#default-branch-ci-repair)). Each has a
 baked cron cadence and, for the five prompt
 jobs, a baked prompt; three of the four sweeps instead carry a baked label
 selector, and the fourth (`assigned-sweep`) carries the non-label "assigned"
@@ -722,9 +736,12 @@ the catalog — its entry is cadence and model only (see
   guidance into the new row's editable guidance, without carrying over any
   owner guidance overlay you had added. Cloning into a different repo than
   the source is how you replicate a schedule across repos.
-- **Auto-approve, on by default.** Like any new schedule, a default is
-  created with auto-approve and wait-on-limit both on — the point of a
-  default is that it runs unattended off-hours. Issue-target defaults,
+- **Auto-approve, on by default (except `ci-repair`).** Like any new
+  schedule, a default is created with auto-approve and wait-on-limit both on
+  — the point of a default is that it runs unattended off-hours. The one
+  exception is `ci-repair`, which is created with auto-approve **off** (see
+  [Default-branch CI repair](#default-branch-ci-repair)); every other default
+  keeps it on. Issue-target defaults,
   including assigned-sweep, still apply the [issue-input approval
   gate](#issue-input-and-the-approval-gate) per run; prompt defaults keep
   their existing approval behavior. Nothing a default job does merges on
@@ -868,6 +885,303 @@ forge on the spot. The schedule is created or saved either way — the check
 never blocks it, including when the check itself can't reach the forge (an
 expired token, a rate limit, an outage) — it just means the sweep won't match
 anything until the label exists.
+
+## Default-branch CI repair
+
+The `ci-repair` [default job](#default-jobs) watches a repo's **default
+branch** CI and, when a workflow goes red, starts one run that diagnoses the
+failure and opens a merge request with the fix (or finishes with a report
+when it can't fix it). It spends nothing while CI is green. It is the lane
+for the default branch: [automatic CI fixes](./ci-autofix.md) only touch
+your agent MR branches and never the default branch.
+
+Under the hood `ci-repair` is a schedule with the **`ci_watch`** target. Its
+catalog entry runs hourly (`0 * * * *`, UTC). Enable it like any default
+(`uzi schedule catalog enable ci-repair --repo <id>`), or create your own
+with `uzi schedule create --ci-watch` — see [the CLI
+reference](./cli.md#commands) for the flags. A custom `ci_watch` schedule
+stores its instruction in its prompt, which defaults to a copy of the
+`ci-repair` body made at create time; `guidance` isn't offered there. The
+default's instruction is read-only and resolved from the catalog at fire
+time, like any prompt default, and takes an owner **guidance** overlay.
+
+### Auto-approve is off by default
+
+Unlike every other default, `ci-repair` is created with **auto-approve
+off**, so each repair run stops at the plan gate for your approval. The
+run's only input is CI output — workflow and job names, log text — and that
+text can come from dependencies, tests or outside contributors, so an
+instruction-shaped line in a log could otherwise steer an unattended run.
+The run treats the evidence as untrusted (it sits inside a fenced block
+under a heading that says so), but a fence marks the boundary and doesn't
+neutralise the text; the plan gate is what puts a human in the loop. The web
+create and edit dialog and the schedule detail say so ("Off by default: this
+job reads CI logs, which can contain text from dependencies, tests or outside
+contributors. Review the plan before the run changes code. You can turn it
+on."), and `uzi schedule get` prints the same reason in its own words for
+every CI-watch schedule. You can turn auto-approve on for a
+schedule; **Reset** puts it back to off, and a clone of a default keeps the
+value the source has at the time. Every other default still enables with
+auto-approve on.
+
+### What a fire does
+
+Each fire looks at the **newest completed execution of each watched
+workflow** on the default branch:
+
+- **Nothing red: nothing starts.** The fire records `ci_green` and starts no
+  run.
+- **A red workflow that isn't handled and isn't halted: one `prompt` run.**
+  At most one run starts per fire. The run is titled `CI repair: <workflow>
+  #<number>` and its description holds the instruction, any guidance, then
+  the failure evidence (workflow, execution URL, head SHA, failed jobs with
+  bounded log tails) inside a fenced untrusted block. It works on a new
+  `uzi/prompt-<id>` branch and opens an MR, or finishes report-only. The
+  default branch is never written; a human merges. The fix MR's own CI is
+  covered by [automatic CI fixes](./ci-autofix.md) like any scheduled-run MR.
+- **Several red workflows:** the one whose newest red execution is oldest
+  goes first (ties by workflow key). The fire builds failure evidence for at
+  most 3 candidates and stops at the first run it starts.
+- **A run of this schedule is still active:** no second run; the red
+  workflows that aren't halted record `already_running`. Once that run ends, an execution that
+  is still the newest records `ci_already_handled`.
+
+A scheduled (cron) fire stores its outcome in `last_fire` (and
+`recent_fires`) like any other target, so an all-green fire shows `started 0`
+and `ci_green`. `uzi schedule run-now` returns the same outcome in its
+response only and never writes `last_fire`.
+
+**Which executions count.** Only completed executions on the default branch
+are considered. Pull-request and merge-request events are dropped (a fork PR
+from a branch named like the default branch reports that branch on some
+forges), and so are executions triggered by another workflow (GitHub
+`workflow_run`), so workflows that only run that way aren't watched.
+Failure and timeout (`failure`, `failed`, `error`, `timed_out`,
+`startup_failure`) are red; `success` is green; anything else completed
+(cancelled, skipped, neutral, action required) is neither, records
+`ci_not_failed`, and neither starts a run nor resets history.
+
+**The window is one page.** A fire reads one page of default-branch
+executions, newest first: **100** on GitHub and GitLab, **50** on Forgejo
+(the Forgejo driver's fixed page size). It does not page further, so a
+workflow whose latest execution is older than that window isn't seen.
+
+**Choosing what to watch.** The watched selector is a list of up to 20
+entries (1 to 200 bytes each, unique, no control characters). An entry
+matches a workflow's key **or** its display name exactly, so a name shared by
+two GitHub workflows watches both; use the key to pick one. With no selector
+(`NULL`, the default) every workflow seen in the window is watched. Set it
+with the `--workflow` flag on `schedule create`/`edit` (or in the web
+dialog); `--clear-workflows` goes back to all.
+
+**Coverage is never reported as green.** A watched entry with no completed
+execution in the window records `ci_watched_not_seen` for that entry and the
+fire is never reported as `ci_green`. With no selector, "green" means every
+workflow seen in the window (100 executions, 50 on Forgejo) is green, and a
+window with no completed execution at all records `ci_watched_not_seen`,
+not green.
+
+**Workflow identity depends on the forge.** Episodes (below) key on it:
+
+| Forge | Workflow key | Display name |
+|---|---|---|
+| GitHub | the numeric workflow id | the workflow's name |
+| Forgejo | the workflow file path | the same path |
+| GitLab | the pipeline name when set, else the ref | the same value |
+
+GitLab exposes no stable workflow id, so **renaming a GitLab pipeline starts
+a new episode** (the old one stays in the history). On GitHub two workflows
+with the same display name stay distinct.
+
+### CI-watch skip reasons
+
+Every one is benign: the schedule advances and tries again at the next
+cadence. Each is recorded with the workflow it concerns where there is one.
+
+- `ci_green` — every watched workflow's newest completed execution
+  succeeded.
+- `ci_already_handled` — that execution was already acted on (a run started
+  for it, or the episode halted on it), or a concurrent fire or a newer
+  state recorded since this fire read it made the observation stale.
+- `ci_halted_no_progress` — the [loop guard](#loop-guard-and-episode-state)
+  stopped the workflow: it failed again with the same failure signature as
+  the last attempt.
+- `ci_halted_attempt_cap` — the loop guard stopped the workflow at
+  `CI_AUTOFIX_MAX_ATTEMPTS` attempts (2 by default).
+- `ci_watched_not_seen` — a watched workflow had no completed execution in
+  the window (see above).
+- `ci_not_failed` — the newest completed execution was neither red nor
+  green (cancelled, skipped, neutral, action required).
+- `ci_unsupported` — the forge has no Actions API (a Forgejo version
+  without it).
+- `ci_capacity` — the schedule already tracks 1024 workflows and this one is
+  new (see [admission](#loop-guard-and-episode-state)).
+- `ci_evidence_limited` — a discovery or evidence read hit one of the
+  [evidence limits](#evidence-limits), or the workflow listing was malformed
+  (for example a workflow key over 200 bytes). No run starts and the limited
+  workflow's episode is not written, but resets or halts already written
+  earlier in the same fire stand; the next fire tries again.
+- `ci_config_changed` — the schedule or repo was edited (or deleted) while
+  the fire ran. The episode write that detected the change was not made, but
+  resets or halts already written earlier in the same fire stand, and the
+  fire records only this reason; the next fire uses the new configuration.
+- `no_default_branch` — the repo has no recorded default branch.
+
+A CI-watch fire can also record the existing `already_running`,
+`credential_disabled`, `no_usable_credential`,
+`description_too_large` (the instruction and guidance leave no room for even
+the smallest evidence block; the instruction is never shortened to make room)
+and `codex_override_conflict`. Other forge errors are transient: the fire
+retries on the next tick.
+
+### Loop guard and episode state
+
+Per watched workflow the schedule keeps an **episode**: the last execution it
+handled, how many repair attempts it has started, the failure signature of
+the last attempt, and whether the workflow is halted. The signature
+fingerprints the failed jobs' names and stages plus the last lines of their
+log tails, so a re-run of the identical failure matches and a different
+failure doesn't.
+
+- **No progress.** If the workflow fails again after an attempt with the
+  **same signature**, the episode halts as `no_progress` and no run starts.
+  A different signature is a new attempt.
+- **Attempt cap.** At `CI_AUTOFIX_MAX_ATTEMPTS` attempts (2 by default,
+  shared with [automatic CI fixes](./ci-autofix.md)) the episode halts as
+  `attempt_cap`. The cap is checked first, so a workflow at the cap reports
+  the cap.
+- **A halted workflow stays halted** and skips with its halt reason until its
+  newest completed execution is **green**, which resets attempts, signature
+  and halt. A stale or repeated green observation doesn't clear a newer
+  halt.
+- **Re-runs.** A GitHub re-run reuses the execution id with a later update
+  time. A re-run that turns green resets the episode; one that stays red
+  with a new signature counts as a new attempt; with the same signature
+  after an attempt it halts as `no_progress`. An older execution that
+  finishes late never outranks a newer one (GitHub and GitLab order by
+  creation time then id; Forgejo by execution id alone).
+- **Atomic and serialized.** The run and its attempt are written in one
+  transaction under the schedule's lock, rechecking the episode state, so two
+  concurrent fires on the same red execution start one run, and a fire that
+  read stale state can't start an attempt past the cap.
+
+**Admission and paging.** A schedule tracks at most **1024 workflow keys over
+its lifetime**. There is no eviction: at capacity, workflows already tracked
+keep working and a new one is refused with `ci_capacity`. A green workflow
+never takes a slot (history is only created when a run starts or a halt is
+recorded). State is read in pages of up to 100 (the default and the
+maximum), ordered by workflow key bytes with an exclusive cursor;
+`uzi schedule get` and the schedule detail show the first page and a next
+cursor, and `GET /api/schedules/{id}/ci-episodes?cursor=&limit=` reads
+further pages (see [the CLI reference](./cli.md#commands)).
+
+**History survives edits.** Editing the watched selector or converting a
+schedule's target does not delete episodes, and they are dropped only when
+the schedule is deleted. Because the keys belong to one repo's workflows,
+**repointing a schedule to another repo is refused (HTTP 409) while it has
+episode history**; delete and recreate it against the new repo.
+
+### Evidence limits
+
+The evidence a fire reads is bounded, and everything read from the forge is
+treated as untrusted:
+
+- **Per job and per execution:** at most `CI_FIX_MAX_JOBS` failed jobs
+  (10 by default) and the last `CI_FIX_LOG_TAIL_BYTES` bytes of each log
+  (32 KiB by default) — the same settings [automatic CI
+  fixes](./ci-autofix.md) use, see [Configuration](./configuration.md).
+  The composed description is further shortened to fit the run description
+  limit (log tails first, then whole jobs from the last one), always with an
+  explicit omission marker.
+- **Per fire:** at most 3 failure snapshots, and one list call of 100 rows
+  (50 on Forgejo).
+- **Bytes:** each CI JSON response is limited to **4 MiB** and all of one
+  fire's responses to **16 MiB**. Both the compressed bytes on the wire and
+  the decompressed bytes are counted, each against those limits. Log tails
+  and other forge reads don't draw on this budget (their own tail size
+  bounds apply).
+- **Job discovery** reads at most 10 pages and 1000 jobs per execution.
+
+Exceeding a byte or job-discovery limit records `ci_evidence_limited`.
+
+### The CI-config guard
+
+A repair run **never pushes a change to CI configuration**. The guard is
+unconditional for this lane: it applies to every `ci-repair` run, including
+one whose plan you approved (unlike automatic CI fixes, which exempt
+human-approved runs). Approving a plan doesn't give the worker's token
+permission to rewrite CI, so a needed CI-config change is reported for you
+to make, not pushed.
+
+Protected paths are `.gitlab-ci.yml`, `.gitlab/**`, `**/*.gitlab-ci.yml`,
+`.github/workflows/**`, `.forgejo/workflows/**` and `.gitea/workflows/**`,
+plus anything in `CI_AUTOFIX_CONFIG_PATHS` and the project's own configured
+CI config path. If that project path can't be looked up, the fire creates no
+run and retries.
+
+The worker refuses at four points:
+
+- an **early check** on the finished branch, which fails the run;
+- **every checkpoint publish**, which is skipped (the work stays local);
+- **every held-work publication**, also skipped;
+- the **final push**, rechecked on the exact commit immediately before every
+  push attempt, which fails the run.
+
+It **fails closed**: if the diff can't be computed, it refuses. It matches the
+**raw git paths** (no trimming or normalising), lists both sides of a rename,
+and diffs against **every merge base** with the default branch, so a merge
+can't carry a protected file in through a second parent. A path that matches the
+current default branch tip (for example a workflow copied in from the default
+branch when the branch is brought up to date) doesn't count as the run's change.
+
+The server repeats the check on checkpoint and held-work publications by
+comparing the candidate's tree with the fetched default branch tip, and
+refuses (the publication is skipped, never passed) when a protected path
+differs or when it can't prove it doesn't: an invalid glob, an unknown or
+unfetched default branch, a tree walk that reaches **100,000** entries, a
+single name or path over 4096 bytes, or more than 64 MiB of path bytes in one
+walk, or a differing subtree the worker's pack omits (the server can't prove
+it unchanged). So once the default branch has moved under a directory since
+the run started, the run's checkpoint and held-work publications are skipped
+(held work falls back to the recovery archive); the worker's own check still
+decides the final branch push.
+
+A refusal fails the run with a reason such as `CI-config guard: this run
+changes CI configuration: <up to 5 paths, and N more>. CI-config changes in
+this lane are reported, not pushed.` (or, when the diff couldn't be computed,
+`could not compute the diff to verify it does not change CI configuration
+(failing closed)`). The run's diff is attached as the **preserved patch**
+only when its secret scan is trusted and clean, after redacting the run's own
+secrets; otherwise the patch is withheld, the reason says so, and points at
+`uzi run export`.
+
+### Rolling it out
+
+The guard needs a worker that enforces it, so a guarded run is gated by a
+worker capability, `ci_config_guard_v1`:
+
+- **Upgrade the api first.** Workers that predate the guard don't report the
+  capability, so they can't claim a repair run. The run stays `queued`, and
+  its [health reason](./run-health.md) says no online worker enforces the
+  CI-config push guard (`ci_config_guard_v1`). With
+  [auto-provisioning](#auto-provisioning-a-worker-for-an-unmet-capability) on,
+  such a queued run counts as unmet demand. Roll the workers and it claims.
+- **Workers first also works:** a new worker reports the capability, an older
+  api ignores it, and nothing changes until the api ships.
+
+### Not covered
+
+- Only job **log tails** are used as evidence; CI artifacts are not read.
+- A fire reads one page; a workflow outside the window is reported, not
+  paged to.
+- One red execution is enough to start a repair, and the attempt cap is the
+  instance-wide `CI_AUTOFIX_MAX_ATTEMPTS`, not a per-schedule setting.
+- Detection runs on the schedule's cadence only, not on a CI event.
+- A halt isn't announced by Slack or an issue comment; it shows in the
+  schedule's last fire and its episode state.
+- Workflows triggered only by another workflow aren't watched.
+- Live acceptance on a real repo (a red nightly yielding one run at the plan
+  gate and one MR once approved) follows the release and hasn't happened yet.
 
 ## Automatic fixes on scheduled-run MRs
 

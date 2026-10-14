@@ -71,6 +71,13 @@ doesn't fire while the [instance-wide kill-switch](#1-opt-out) is off,
 regardless of anyone's own setting — and, fail-closed, a settings-read
 hiccup on that admin gate is treated the same as off.
 
+**The default branch is a different lane.** A failure on the repo's default
+branch (a nightly end-to-end suite, say) is never fixed by this feature. It
+is the job of the opt-in `ci-repair` scheduled job, which watches the default
+branch's workflows, starts one repair run on a new branch and opens an MR, and
+stops at the plan gate for your approval unless you turn auto-approve on. See
+[Default-branch CI repair](./scheduling.md#default-branch-ci-repair).
+
 ## The loop guard
 
 A persistently red pipeline can't loop forever:

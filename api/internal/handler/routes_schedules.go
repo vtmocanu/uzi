@@ -29,6 +29,9 @@ func (h *Handler) mountSchedulesRoutes(r chi.Router, forgeLimiter *mw.Limiter) {
 		r.Put("/pause", h.PutSchedulePause)
 		r.Delete("/pause", h.DeleteSchedulePause)
 		r.Get("/{id}", h.GetSchedule)
+		// A ci_watch schedule's per-workflow episode state, paged by an opaque cursor
+		// (PRD #2865). RequireUser + owner-scoped inside the handler.
+		r.Get("/{id}/ci-episodes", h.ListScheduleCIEpisodes)
 		r.Patch("/{id}", h.PatchSchedule)
 		r.Delete("/{id}", h.DeleteSchedule)
 		r.With(forgeLimiter.PerUserMiddleware).Post("/{id}/run-now", h.RunScheduleNow)

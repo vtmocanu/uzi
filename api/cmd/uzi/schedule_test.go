@@ -2257,3 +2257,32 @@ func TestScheduleListDegradesWhenPauseReadFails(t *testing.T) {
 		t.Errorf("stderr = %q, want a WARNING about the pause-all read", errOut)
 	}
 }
+
+// TestScheduleEditDefaultCIWatchGuidance: the server accepts guidance on a ci_watch default
+// (guidanceEditable), so --guidance is sent and an untouched edit restates the stored value.
+func TestScheduleEditDefaultCIWatchGuidance(t *testing.T) {
+	mk := func() *uzicli.FakeClient {
+		return &uzicli.FakeClient{
+			ScheduleByID: map[string]apitypes.ScheduleDTO{
+				"sch_ci": {ID: "sch_ci", Origin: "default", Target: "ci_watch", Timing: "recurring", CronExpr: "0 9 * * 1", Timezone: "UTC", Enabled: true, Status: "active", Guidance: sptr("keep me")},
+			},
+			PatchedSchedule: apitypes.ScheduleDTO{ID: "sch_ci", Origin: "default", Target: "ci_watch", Timing: "recurring", CronExpr: "0 9 * * 1", Enabled: true},
+		}
+	}
+	fc := mk()
+	_, errOut, code := runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_ci", "--guidance", "new steer")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d; stderr=%q", code, errOut)
+	}
+	if g := fc.LastPatchSchedReq.Guidance; g == nil || *g != "new steer" {
+		t.Errorf("guidance = %v, want \"new steer\"", g)
+	}
+	fc = mk()
+	_, errOut, code = runCLI(t, fakeEnv(fc), "schedule", "edit", "sch_ci", "--cron", "0 10 * * 1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d; stderr=%q", code, errOut)
+	}
+	if g := fc.LastPatchSchedReq.Guidance; g == nil || *g != "keep me" {
+		t.Errorf("guidance = %v, want the stored value restated", g)
+	}
+}

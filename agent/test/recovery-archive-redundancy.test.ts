@@ -264,7 +264,46 @@ const receipt = (generation: number): CompletedPublicationReceipt => ({
   base_url: "https://example.invalid", branch: "task", mr_iid: 3, observed_branch_head: FINAL_HEAD,
 });
 
-async function harness(opts: { features?: string[]; redundancyDeadlineMs?: number } = {}) {
+function controlledRedundancyTimer() {
+  let fire: (() => void) | undefined;
+  let disposed = false;
+  let fired = false;
+  return {
+    schedule(callback: () => void, ms: number) {
+      assert.equal(ms, 30_000, "the production deadline value is unchanged");
+      fire = callback;
+      disposed = false;
+      fired = false;
+      return () => { disposed = true; };
+    },
+    fire() {
+      assert.ok(fire, "cleanup scheduled its deadline");
+      assert.equal(disposed, false, "the deadline is still armed");
+      fired = true;
+      fire();
+    },
+    get disposed() { return disposed; },
+    get fired() { return fired; },
+  };
+}
+
+function observedEvent() {
+  let resolve!: () => void;
+  const promise = new Promise<void>(done => { resolve = done; });
+  return { promise, resolve };
+}
+
+/** Failure watchdog only; successful tests advance through observed events, never elapsed time. */
+async function bounded<T>(work: Promise<T>, event: string): Promise<T> {
+  let timer: NodeJS.Timeout | undefined;
+  try {
+    return await Promise.race([work, new Promise<never>((_resolve, reject) => {
+      timer = setTimeout(() => reject(new Error(`timed out waiting for ${event}`)), 3_000);
+    })]);
+  } finally { clearTimeout(timer); }
+}
+
+async function harness(opts: { features?: string[]; redundancyTimer?: (fire: () => void, ms: number) => () => void } = {}) {
   const root = await fsp.mkdtemp(path.join(os.tmpdir(), "redundancy-"));
   await fsp.chmod(root, 0o700);
   const runId = "22222222-2222-4222-8222-222222222222";
@@ -278,6 +317,7 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     cleanupCalls: 0,
     claimResult: "ok" as "ok" | "none" | "throw" | "hang",
     claimReads: [] as Array<Record<string, unknown>>,
+    claimStarted: undefined as (() => void) | undefined,
     // when set, the claim read takes this long (a slow repo read)
     claimDelayMs: undefined as number | undefined,
     // behaviour of the redundancy RPC
@@ -355,6 +395,7 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
     },
     readRecoveryCoverageClaim: async (_b: string, o: Record<string, unknown>) => {
       state.claimReads.push(o);
+      state.claimStarted?.();
       if (state.claimDelayMs) await new Promise(r => setTimeout(r, state.claimDelayMs));
       if (state.claimResult === "throw") throw new Error("read failed");
       if (state.claimResult === "hang") return new Promise<RecoveryCoverageClaim | undefined>(() => undefined);
@@ -364,7 +405,7 @@ async function harness(opts: { features?: string[]; redundancyDeadlineMs?: numbe
   const make = () => new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: TOKEN, log: nullLogger(), client: client as never, git: git as never,
     withCompletionSourceBoundary: async (_s, action) => { await action(() => true); return "passed"; },
-    ...(opts.redundancyDeadlineMs === undefined ? {} : { testHooks: { redundancyDeadlineMs: opts.redundancyDeadlineMs } }),
+    ...(opts.redundancyTimer === undefined ? {} : { testHooks: { redundancyTimer: opts.redundancyTimer } }),
   });
   const coordinator = make();
   /** The cleanup journal lock is free iff an unrelated call that takes it finishes at once. */
@@ -550,17 +591,24 @@ describe("RecoveryCoordinator redundancy claims", () => {
     }
 
     it("a hanging request returns control at the deadline and cleanup is already complete", async () => {
-      const h = await harness({ redundancyDeadlineMs: 80 });
+      const clock = controlledRedundancyTimer();
+      const h = await harness({ redundancyTimer: clock.schedule });
       try {
         await h.uploaded(true);
-        h.state.prove = () => new Promise<RecoveryArchiveRedundancyResponse>(() => undefined);
-        const started = Date.now();
-        await h.coordinator.forgetGeneration(h.runId, 7);
-        const elapsed = Date.now() - started;
+        const entered = observedEvent();
+        h.state.prove = () => { entered.resolve(); return new Promise<RecoveryArchiveRedundancyResponse>(() => undefined); };
+        let returned = false;
+        const running = h.coordinator.forgetGeneration(h.runId, 7).then(() => { returned = true; });
+        await bounded(entered.promise, "prove entry");
         assert.equal(h.state.proveCalls.length, 1);
-        assert.ok(elapsed >= 70, `returned only after the deadline, took ${elapsed}ms`);
-        assert.ok(elapsed < 5_000, `returned at the deadline, not after a hang, took ${elapsed}ms`);
+        assert.equal(returned, false, "a never-settling request waits until the deadline is fired");
+        assert.deepEqual(await h.coordinator.inspect(h.runId), [], "cleanup was complete before the deadline");
+        clock.fire();
+        await bounded(running, "cleanup return after deadline");
+        assert.equal(returned, true);
+        assert.equal(h.state.proveCalls.length, 1);
         assert.equal(h.state.proveCalls[0]!.signal?.aborted, true, "the request was given the deadline signal and aborted");
+        assert.equal(clock.disposed, true, "the deadline is disposed after return");
         assert.deepEqual(await h.coordinator.inspect(h.runId), []);
       } finally { await h.close(); }
     });
@@ -594,33 +642,60 @@ describe("RecoveryCoordinator redundancy claims", () => {
       }
     });
     it("a claim read that hangs under the journal lock is cut off by the same deadline and cleanup completes", async () => {
-      const h = await harness({ redundancyDeadlineMs: 60 });
+      const clock = controlledRedundancyTimer();
+      const h = await harness({ redundancyTimer: clock.schedule });
       try {
         await h.uploaded(true);
         h.state.claimResult = "hang";
-        const guard = new Promise<"hung">(resolve => setTimeout(() => resolve("hung"), 3_000).unref());
-        const started = Date.now();
-        const outcome = await Promise.race([h.coordinator.forgetGeneration(h.runId, 7).then(() => "returned" as const), guard]);
-        assert.equal(outcome, "returned", `cleanup stalled behind a hung claim read (${Date.now() - started}ms)`);
+        const entered = observedEvent();
+        h.state.claimStarted = entered.resolve;
+        let returned = false;
+        const running = h.coordinator.forgetGeneration(h.runId, 7).then(() => { returned = true; });
+        await bounded(entered.promise, "claim read entry");
+        assert.equal(returned, false, "the hung read is still under the journal lock");
+        assert.equal(h.state.claimReads.length, 1, "the read was attempted before firing the deadline");
+        clock.fire();
+        await bounded(running, "cleanup after the hung read's deadline");
+        assert.equal(returned, true);
         assert.equal(h.state.claimReads.length, 1, "the read was attempted");
         assert.equal(h.state.proveCalls.length, 0, "no claim is sent when its read did not finish");
+        assert.equal(clock.disposed, true);
         assert.deepEqual(await h.coordinator.inspect(h.runId), [], "cleanup is unchanged");
       } finally { await h.close(); }
     });
 
     it("a client that aborts the caller synchronously and never settles still returns by the deadline", async () => {
-      const h = await harness({ redundancyDeadlineMs: 40 });
+      const clock = controlledRedundancyTimer();
+      const h = await harness({ redundancyTimer: clock.schedule });
       try {
         const rec = await h.uploaded(false);
         const abort = new AbortController();
-        h.state.syncProve = () => { abort.abort(); return new Promise<RecoveryArchiveRedundancyResponse>(() => undefined); };
+        let observed: { proveCallsAtEntry: number; signalAbortedAfterCallerAbort: boolean | undefined } | undefined;
+        h.state.syncProve = signal => {
+          abort.abort();
+          observed = { proveCallsAtEntry: h.state.proveCalls.length, signalAbortedAfterCallerAbort: signal?.aborted };
+          return new Promise<RecoveryArchiveRedundancyResponse>(() => undefined);
+        };
         const withReceipt = await h.receipted(rec);
-        const started = Date.now();
-        const guard = new Promise<"hung">(resolve => setTimeout(() => resolve("hung"), 3_000).unref());
-        const outcome = await Promise.race([h.coordinator.resumePending(abort.signal, [withReceipt]).then(() => "returned" as const), guard]);
-        assert.equal(outcome, "returned", `submission hung after a synchronous caller abort (${Date.now() - started}ms)`);
+        await bounded(h.coordinator.resumePending(abort.signal, [withReceipt]), "return after synchronous caller abort");
+        assert.ok(observed, "the client was entered");
+        assert.equal(observed.proveCallsAtEntry, 1);
+        assert.equal(observed.signalAbortedAfterCallerAbort, true, "the caller abort reaches the request synchronously");
         assert.equal(h.state.proveCalls.length, 1);
         assert.equal(h.state.proveCalls[0]!.signal?.aborted, true);
+        assert.equal(clock.fired, false, "returned on the caller abort, not the deadline");
+        assert.equal(clock.disposed, true);
+      } finally { await h.close(); }
+    });
+
+    it("a deadline fired before client entry still cleans without reading or proving", async () => {
+      const h = await harness({ redundancyTimer: fire => { fire(); return () => undefined; } });
+      try {
+        await h.uploaded(true);
+        await h.coordinator.forgetGeneration(h.runId, 7);
+        assert.equal(h.state.proveCalls.length, 0, "an early deadline skips the client, reproducing the old race");
+        assert.equal(h.state.claimReads.length, 0);
+        assert.deepEqual(await h.coordinator.inspect(h.runId), [], "deadline never gates cleanup");
       } finally { await h.close(); }
     });
   });

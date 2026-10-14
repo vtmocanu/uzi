@@ -89,7 +89,9 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		prompt = pgtype.Text{}
 		guidance = pgtype.Text{}
 		switch cur.Target {
-		case "prompt":
+		case "prompt", "ci_watch":
+			// A ci_watch row stores its instruction in prompt like a prompt schedule
+			// (PRD #2865); the clone bakes the catalog body in and discards the owner overlay.
 			prompt = pgtype.Text{String: job.Prompt, Valid: true}
 		case "sweep":
 			labels = marshalLabels(job.Labels)
@@ -132,6 +134,7 @@ func (h *Handler) CloneSchedule(w http.ResponseWriter, r *http.Request) {
 		IssueIid:              issueIID,
 		Labels:                labels,
 		Prompt:                prompt,
+		CiWorkflows:           cur.CiWorkflows,
 		Timing:                cur.Timing,
 		CronExpr:              cur.CronExpr,
 		RunAt:                 cur.RunAt,
@@ -269,6 +272,7 @@ func (h *Handler) AddScheduleRepo(w http.ResponseWriter, r *http.Request) {
 		IssueIid:              cur.IssueIid,
 		Labels:                cur.Labels,
 		Prompt:                cur.Prompt,
+		CiWorkflows:           cur.CiWorkflows,
 		Timing:                cur.Timing,
 		CronExpr:              cur.CronExpr,
 		RunAt:                 cur.RunAt,

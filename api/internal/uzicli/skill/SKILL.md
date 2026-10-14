@@ -197,10 +197,10 @@ uzi run discard <run-id> --hold <hold-id> [--yes]
 uzi run held <run-id> [--json]
 uzi run held expire <run-id> [--yes]
 uzi run fetches <run-id> [--json]
-uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text>) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--remove-label-on-dispatch[=false]] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
+uzi schedule create --repo <repo-id> [--repo <repo-id>]... (--issue <iid> | --sweep [--label <l>]... [--create-missing-labels] | --prompt <text> | --ci-watch [--workflow <key|name>]... [--prompt <text>]) (--at <rfc3339> | --cron <expr>) [--tz <iana>] [--enabled[=false]] [--auto-approve[=false]] [--wait-on-limit] [--remove-label-on-dispatch[=false]] [--mr-rework[=false]] [--output mr|issues] [--token <label>|auto|default|inherit] [--harness claude|codex]
 uzi schedule list
-uzi schedule get <schedule-id>
-uzi schedule edit <schedule-id> [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--remove-label-on-dispatch[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit] [--harness claude|codex|""]
+uzi schedule get <schedule-id> [--episodes-cursor <cursor>]
+uzi schedule edit <schedule-id> [--workflow <key|name>... | --clear-workflows] [--repo <repo-id>] [--cron <expr> | --at <rfc3339>] [--tz <iana>] [--prompt <text>] [--label <l>]... [--create-missing-labels] [--guidance <text> | --clear-guidance] [--max-issues <n> | --clear-max-issues] [--output mr|issues|""] [--auto-approve[=false]] [--wait-on-limit[=false]] [--remove-label-on-dispatch[=false]] [--mr-rework[=false] | --clear-mr-rework] [--model <alias|id>] [--apply-model-to-agents[=false]] [--token <label>|auto|default|inherit] [--harness claude|codex|""]
 uzi schedule pause <schedule-id>
 uzi schedule resume <schedule-id>
 uzi schedule pause-all --until <when>
@@ -721,7 +721,7 @@ uzi version
 - `uzi run recovery [<run-id>] [--json]` — start without a run id to find what held work
   you have before export or discard. The human view lists only open custody holds across
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
-  `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
+  `ADMISSION` (`counted (<reason>)`, `not counted`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
   `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
   `blocked_runs` aggregate. Capacity uses admission count against the fixed limit 8;
   `open_holds` remains total custody. At most one hold per run is excluded when it backs
@@ -739,7 +739,7 @@ uzi version
   explicit zero. The human view also prints
   a recover-or-discard hint when an open hold needs a decision. With no run id, `--json`
   returns the endpoint's `aggregate` and `holds`, including settled holds, without captures.
-  Supply a run id to list that run's retained holds (owner-only): each hold's exact id,
+  Supply a run id to list that run's retained holds (owner-only, with the same `ADMISSION` column): each hold's exact id,
   claim generation, server-derived **disposition** and latest capture state.
   A `source_only` or `needs_action` disposition awaits your decision;
   `archive_ready` can release after its required evidence is accepted; `active` labels
@@ -934,6 +934,17 @@ nothing a manual start cannot.
   only the first element) that the whole array is one kind. Inspect one full
   element's keys (`jq '.[0]|keys'`) before writing a filter.
 - `uzi schedule get <schedule-id>` — one schedule's config plus its computed next fires.
+  A `ci_watch` schedule (default-branch CI repair; create with `--ci-watch`, optional
+  repeatable `--workflow <key|name>`, optional `--prompt` override; `edit --workflow ...`
+  or `--clear-workflows` to change the selector; these flags are rejected on other targets,
+  and `--issue/--sweep/--label/--max-issues/--output/--guidance` are rejected with
+  `--ci-watch`) also prints the watched workflows (none = all workflows in the listed
+  window: newest 100 executions, 50 on Forgejo), the first page of per-workflow episode
+  state (state or halted reason, attempts, run ids) with a `next cursor: <c>` line, and the
+  auto-approve note: auto-approve is off by default for CI repair because CI logs can carry
+  text from dependencies, tests or outside contributors. `get <id> --episodes-cursor <c>`
+  prints the next page (`--json` prints the page incl. `next_cursor`). Enable the
+  catalog default with `uzi schedule catalog enable ci-repair --repo <id>`.
   When the schedule has fired at least once it also prints a **Last fire** block: a
   summary line (`fired <time> · examined N · started M · skipped K`), one line per started
   run (`#<iid> → run <run-id>  <title>`, or a `prompt` marker for a prompt schedule), one

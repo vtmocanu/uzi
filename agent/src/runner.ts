@@ -189,7 +189,7 @@ import {
 import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
-import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
+import { flagCIConfigPaths, flagCIConfigPathsRaw, DEFAULT_CI_CONFIG_PATHS, DEFAULT_CI_REPAIR_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSize } from "./pr-size.js";
 import { buildDeliveryContext } from "./pr-description-context.js";
 import { resolvePrdInputFromBare } from "./prd-link.js";
@@ -635,6 +635,7 @@ const PUBLISH_SKIP_LABELS = [
   "no_ref",
   "not_descendant",
   "workflow_scope",
+  "ci_config_guard",
   "superseded",
   "tip_missing",
   "pack_too_large",
@@ -845,6 +846,15 @@ class WorkflowScopeBlockedSignal extends PublicationRefusedSignal {
   constructor() {
     super("workflow scope blocked");
     this.name = "WorkflowScopeBlockedSignal";
+  }
+}
+
+/** The default-branch CI repair guard refused a candidate; failCIConfigGuard already terminally
+ *  reported, so unwind without pushing (permanent for withForgeRetry, like every refusal signal). */
+class CIConfigGuardRefusedSignal extends PublicationRefusedSignal {
+  constructor() {
+    super("ci config guard refused");
+    this.name = "CIConfigGuardRefusedSignal";
   }
 }
 
@@ -1280,6 +1290,37 @@ export function composeWorkflowScopeReason(paths: string[], patchPreserved = tru
     }
   }
   return prefix + list + suffix;
+}
+
+/** Display-only form of a git path for a refusal message: control characters (including newlines
+ *  and the C1 range) escaped, quoted, truncated. Matching never sees this form. */
+function displayGuardPath(path: string): string {
+  const quoted = JSON.stringify(path).replace(/[\u007f-\u009f\u2028\u2029]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return quoted.length > 80 ? `${quoted.slice(0, 79)}…` : quoted;
+}
+
+/** Failure reason for a default-branch CI repair run refused by the CI-config guard. `paths` null
+ *  means the diff could not be computed (fail closed). The path list is display-sanitised and
+ *  budgeted so the fixed tail always fits MAX_FAILURE_REASON_LEN. */
+export function composeCIConfigGuardReason(paths: string[] | null, patchPreserved = true): string {
+  const tail = " CI-config changes in this lane are reported, not pushed." +
+    (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
+  if (paths === null) {
+    return "CI-config guard: could not compute the diff to verify it does not change CI configuration (failing closed)." + tail;
+  }
+  const prefix = "CI-config guard: this run changes CI configuration: ";
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - tail.length - 1;
+  const shownPaths = paths.map(displayGuardPath);
+  let shown = Math.min(shownPaths.length, 5);
+  let list = "";
+  for (; shown > 0; shown--) {
+    const more = shownPaths.length - shown;
+    list = shownPaths.slice(0, shown).join(", ") + (more > 0 ? `, and ${more} more` : "");
+    if (list.length <= budget) break;
+  }
+  if (shown === 0) list = `${shownPaths.length} path(s)`;
+  return `${prefix}${list}.${tail}`;
 }
 
 /**
@@ -1922,6 +1963,10 @@ interface RunFlight {
    *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
    *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
   checkpointChainForge?: boolean;
+  /** Guarded default-branch CI repair runs (claim.config.ci_config_guard): the protected-path globs
+   *  every checkpoint and held publication is checked against, over the exact candidate SHA, before
+   *  any upload. Absent for unguarded runs (no check, no extra git calls). */
+  ciConfigGuardGlobs?: string[];
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -6813,6 +6858,58 @@ export class RunRunner {
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
     };
+    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
+    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
+    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
+    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
+    // is not enough on its own: it can be trustworthy AND carry findings.
+    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
+      if (rawPatch === null) return undefined;
+      const patch = redactText(rawPatch);
+      const scan = await this.git.scanPatchForSecrets(patch);
+      if (scan.trusted && scan.findings.length === 0) return patch;
+      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
+        run_id: runId,
+        site,
+        trusted: scan.trusted,
+        findings: scan.findings.length,
+      });
+      return undefined;
+    };
+
+    // Default-branch CI repair lane (claim.config.ci_config_guard): the worker backstop. Unlike the
+    // ci_fix guard below, a human approval does NOT exempt it: CI-config changes in this lane are
+    // reported, not pushed. Two check points fail the run (here, and again on the exact owned SHA
+    // immediately before every final push attempt); checkpoint and held publication are checked
+    // too (ciConfigGuardBlocksPublication), where a match skips the upload. All use the raw-path
+    // matcher and the --no-renames diff; an uncomputable diff refuses too.
+    const ciConfigGuarded = claim.config?.ci_config_guard === true;
+    const ciConfigGuardGlobs = [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+    let ciConfigGuardReported = false;
+    const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
+      if (ciConfigGuardReported) return;
+      ciConfigGuardReported = true;
+      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
+      const reason = composeCIConfigGuardReason(paths, patch !== undefined);
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
+      runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
+      await closeBatcher();
+      await journalTerminalReport({ status: "failed", failure_reason: reason, preserved_patch: patch });
+    };
+    // Returns true when publication of `ref` must be refused (a protected path changed, or the
+    // diff could not be computed) after the terminal failure was reported.
+    const refuseOnCIConfigGuard = async (guardBarePath: string, ref: string): Promise<boolean> => {
+      const changed = await this.git.changedFilesNoRenames(guardBarePath, ref);
+      const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, ciConfigGuardGlobs);
+      if (flagged !== null && flagged.length === 0) return false;
+      await failCIConfigGuard(guardBarePath, ref, flagged);
+      return true;
+    };
+    if (ciConfigGuarded) {
+      const earlyGuardBarePath = barePath;
+      if (await refuseOnCIConfigGuard(earlyGuardBarePath, trackingRef)) return;
+    }
+
     // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
     // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
     // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
@@ -6853,24 +6950,6 @@ export class RunRunner {
     // Serves every forge-pushing kind (the failed path is not issue-gated).
     // The precheck compares tip blobs per path; the overlay keeps its separate conservative
     // changedFiles guard below.
-    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
-    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
-    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
-    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
-    // is not enough on its own: it can be trustworthy AND carry findings.
-    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
-      if (rawPatch === null) return undefined;
-      const patch = redactText(rawPatch);
-      const scan = await this.git.scanPatchForSecrets(patch);
-      if (scan.trusted && scan.findings.length === 0) return patch;
-      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
-        run_id: runId,
-        site,
-        trusted: scan.trusted,
-        findings: scan.findings.length,
-      });
-      return undefined;
-    };
     const workflowBarePath = barePath;
     const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
     const rethrowWorkflowAbort = (error: unknown) => {
@@ -7062,6 +7141,12 @@ export class RunRunner {
               await failClosingCommits(closing);
               throw new ClosingCommitRefusedSignal();
             }
+          }
+          // Default-branch CI repair lane: the authoritative CI-config check on the exact owned
+          // candidate about to be pushed, re-run on every attempt (a retry, an alignment or a bridge
+          // can change the candidate after the early check). Last gate before the push.
+          if (ciConfigGuarded && await refuseOnCIConfigGuard(finalizeBarePath, sourceSha)) {
+            throw new CIConfigGuardRefusedSignal();
           }
           await this.git.pushBranch(
             finalizeBarePath,
@@ -8800,6 +8885,9 @@ export class RunRunner {
       lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
       lastAttemptedCheckpointRefTip: undefined,
       checkpointChainForge: claim.repo.forge_type === "github",
+      ...(claim.config?.ci_config_guard === true
+        ? { ciConfigGuardGlobs: [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
+        : {}),
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -12406,6 +12494,8 @@ export class RunRunner {
       // (d) The stored credential may lack workflow scope: a range that authors a workflow change archives.
       const workflows = await this.git.rangeTouchesWorkflows(barePath, range, { deadlineMs: this.scanDeadlineMs() });
       if (workflows !== "clean") return skip(workflows === "touches" ? "workflow_change" : "workflow_check_unknown");
+      // (d2) Guarded runs: the raw-path CI-config check over the exact candidate, before any upload.
+      if (await this.ciConfigGuardBlocksPublication(flight, barePath, record.sourceSha, "held publication")) return skip("ci_config_guard");
       // (e) The pack, over the same range object the scan judged.
       const packed = await this.git.checkpointPack(barePath, branch, undefined, range, undefined, record.sourceSha);
       if (!packed || packed.tipOid !== record.sourceSha) {
@@ -13697,6 +13787,27 @@ export class RunRunner {
     return false;
   }
 
+  /**
+   * Guarded runs only: the raw-path CI-config check over the EXACT candidate `sha`, run in the worker
+   * before any checkpoint or held upload. The server broker compares trees but must skip subtrees
+   * absent from the pack, so a merge whose second parent carries an older workflow tree could slip
+   * a protected tree through; the merge-base diff here, taken over EVERY merge base, lists it. Returns true when the publication
+   * must be skipped (a protected path matched, or the diff could not be computed: fail closed).
+   * Never fails the run; the early and final push guards do that.
+   */
+  private async ciConfigGuardBlocksPublication(flight: RunFlight, barePath: string, sha: string, what: string): Promise<boolean> {
+    const globs = flight.ciConfigGuardGlobs;
+    if (!globs) return false;
+    const changed = await this.git.changedFilesNoRenames(barePath, sha);
+    const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
+    if (flagged !== null && flagged.length === 0) return false;
+    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
+      (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
+    this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
+      `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });
+    return true;
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
@@ -13756,6 +13867,10 @@ export class RunRunner {
     try {
       signal?.throwIfAborted();
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      signal?.throwIfAborted();
+      if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
+        return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
+      }
       signal?.throwIfAborted();
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
         throw new SecretRemediationPendingError();

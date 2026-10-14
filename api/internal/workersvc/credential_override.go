@@ -141,17 +141,24 @@ func (s *Service) ScheduleCredentialDisabled(ctx context.Context, userID uuid.UU
 	return nil
 }
 
-// ResolveCredentialOverride is the EXPORTED entry point every override write outside this
-// package runs through (PRD #1247 M2): the handler (a different package) has no access to
-// the unexported validateCredentialOverride, so this thin wrapper is its door. It performs
+// ResolveCredentialOverride is the pool-bound exported entry to override validation
+// (PRD #1247 M2). Callers with explicit queries use ResolveCredentialOverrideOn instead.
+// Both delegate to the same validator. This wrapper performs
 // no work of its own beyond delegating — the validation, the D9/D10 refusals and the
 // column resolution all live in the one validator — and returns the same resolved
 // *CredentialOverride (nil = inherit) or one of the exported typed refusals the handler
-// maps to HTTP statuses (404/409/422/400). Wired by schedule create/edit (M6); run set-token
+// maps to HTTP statuses (404/409/422/400). Schedule create/edit use the explicit-query
+// ResolveCredentialOverrideOn wrapper (M6); run set-token
 // calls validateCredentialOverride in-package, and createRun calls validateCredentialOverrideOn
 // with its transaction's queries.
 func (s *Service) ResolveCredentialOverride(ctx context.Context, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
 	return s.validateCredentialOverride(ctx, userID, kind, harness, mode, secretID)
+}
+
+// ResolveCredentialOverrideOn keeps credential metadata reads on the caller's query
+// surface, including a schedule edit's transaction, rather than borrowing from the pool.
+func (s *Service) ResolveCredentialOverrideOn(ctx context.Context, q *store.Queries, userID uuid.UUID, kind, harness, mode string, secretID *uuid.UUID) (*CredentialOverride, error) {
+	return validateCredentialOverrideOn(ctx, q, userID, kind, harness, mode, secretID)
 }
 
 // validateCredentialOverride is the pool-bound entry to the ONE validator every override

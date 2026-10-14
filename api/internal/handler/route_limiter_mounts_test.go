@@ -473,6 +473,7 @@ var wantRouteMounts = []routeMount{
 	// Schedule list/get (PRD #241 M4): owner-scoped reads, no forge → noLimiter.
 	{"GET", "/api/me/schedules/", noLimiter},
 	{"GET", "/api/schedules/{id}", noLimiter},
+	{"GET", "/api/schedules/{id}/ci-episodes", noLimiter},
 	// Pause-all singleton (PRD #1093 M2, D7): the user-level kill switch. All three are
 	// owner-scoped writes/reads on the caller's own users row — a boolean + nullable
 	// timestamp, no forge call, no token spend, mints nothing → noLimiter, matching the

@@ -22,6 +22,8 @@ func TestDefaultEditableDivergesOutputMode(t *testing.T) {
 		Cron:     "0 9 * * 1",
 		Timezone: schedtmpl.DefaultTimezone,
 		Output:   schedtmpl.OutputModeIssues,
+		// Absent frontmatter parses to true; a literal job must say so itself.
+		AutoApprove: true,
 	}
 	if job.OutputMode() != schedtmpl.OutputModeIssues {
 		t.Fatalf("baseline OutputMode() = %q, want %q", job.OutputMode(), schedtmpl.OutputModeIssues)
@@ -34,7 +36,7 @@ func TestDefaultEditableDivergesOutputMode(t *testing.T) {
 			job.Cron,
 			job.Timezone,
 			pgtype.Text{}, // model: inherit (== job.Model "")
-			schedtmpl.AutoApprove,
+			job.AutoApprove,
 			schedtmpl.WaitOnLimit,
 			pgtype.Bool{}, // mr_rework: inherit
 			pgtype.Int4{}, // max_issues: unset (prompt has no cap)

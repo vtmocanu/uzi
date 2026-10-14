@@ -1,0 +1,11 @@
+{
+  "workflow_key": "",
+  "last_handled_run_id": null,
+  "observed_created_at": null,
+  "observed_updated_at": null,
+  "observed_run_id": null,
+  "last_signature": null,
+  "attempts": 0,
+  "halted_reason": null,
+  "updated_at": "0001-01-01T00:00:00Z"
+}

@@ -23,6 +23,17 @@ export const SCHEDULE_SKIP_REASON_LABELS: Record<ScheduleSkipReason, string> = {
   schedules_paused: "all schedules paused",
   no_usable_credential: "no usable credential",
   credential_disabled: "pinned credential is disabled",
+  ci_green: "CI is green",
+  ci_already_handled: "failure already handled",
+  ci_halted_no_progress: "halted: same failure after a repair attempt",
+  ci_halted_attempt_cap: "halted: repair attempt limit reached",
+  ci_watched_not_seen: "watched workflow not seen",
+  ci_unsupported: "forge has no CI API",
+  no_default_branch: "repo has no default branch",
+  ci_capacity: "watched workflow limit reached",
+  ci_evidence_limited: "CI evidence too large to read",
+  ci_not_failed: "newest execution neither failed nor passed",
+  ci_config_changed: "schedule changed during the fire",
 };
 
 export function scheduleSkipReasonLabel(reason: ScheduleSkipReason): string {

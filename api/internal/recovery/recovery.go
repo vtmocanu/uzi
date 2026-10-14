@@ -73,6 +73,8 @@ type Store interface {
 	// maps these to the RecoveryCustodyHoldsDTO and derives each hold's server-side Attention.
 	ListCustodyHoldsForOwner(ctx context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error)
 	GetCustodyAggregateForOwner(ctx context.Context, arg store.GetCustodyAggregateForOwnerParams) (store.GetCustodyAggregateForOwnerRow, error)
+	// Issue #2970: per-hold admission membership (counted + reason) for the owner hold list.
+	ListCustodyAdmissionMembersForOwner(ctx context.Context, arg store.ListCustodyAdmissionMembersForOwnerParams) ([]store.ListCustodyAdmissionMembersForOwnerRow, error)
 }
 
 // DB is the pgx pool surface the service needs for the streaming download cursor and the

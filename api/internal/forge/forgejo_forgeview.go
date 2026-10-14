@@ -11,6 +11,7 @@ package forge
 import (
 	"context"
 	"encoding/json"
+	"errors"
 	"fmt"
 	"net/http"
 	"strings"
@@ -482,6 +483,11 @@ func (f *forgejo) ListWorkflowRuns(ctx context.Context, projectID int64, opts Li
 	if err != nil {
 		return nil, err
 	}
+	ctx = markCIJSON(ctx)
+	c, err = f.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	pageSize := forgejoPerPage
 	if opts.Limit > 0 && opts.Limit < pageSize {
 		pageSize = opts.Limit
@@ -493,16 +499,23 @@ func (f *forgejo) ListWorkflowRuns(ctx context.Context, projectID int64, opts Li
 		Status:      opts.Status,
 	}
 	runs, resp, err := c.ListRepoActionRuns(slug.owner, slug.repo, opt)
+	err = ciReadError(ctx, err)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound {
+		if !errors.Is(err, ErrCIReadBudget) && resp != nil && resp.StatusCode == http.StatusNotFound {
 			return nil, fmt.Errorf("forgejo: list workflow runs: actions API not available on this server version: %w", ErrForgeVersionUnsupported)
 		}
 		return nil, f.wrapErr("list workflow runs", err)
 	}
 	out := []WorkflowRun{}
 	if runs != nil {
+		if b := ciBudget(ctx); b != nil && len(runs.WorkflowRuns) > pageSize {
+			return nil, b.fail("oversized workflow page")
+		}
 		for _, r := range runs.WorkflowRuns {
 			if r == nil {
+				if b := ciBudget(ctx); b != nil {
+					return nil, b.fail("invalid workflow identity")
+				}
 				continue
 			}
 			out = append(out, toForgejoWorkflowRun(r))
@@ -511,7 +524,7 @@ func (f *forgejo) ListWorkflowRuns(ctx context.Context, projectID int64, opts Li
 			}
 		}
 	}
-	return out, nil
+	return validateCIWorkflows(ctx, out)
 }
 
 // GetWorkflowRun returns one Actions run's header (the neutral WorkflowRun) by its
@@ -533,17 +546,30 @@ func (f *forgejo) GetWorkflowRun(ctx context.Context, projectID, runID int64) (W
 	if err != nil {
 		return WorkflowRun{}, err
 	}
-	run, resp, err := c.GetRepoActionRun(slug.owner, slug.repo, runID)
+	ctx = markCIJSON(ctx)
+	c, err = f.newClient(ctx)
 	if err != nil {
-		if resp != nil && resp.StatusCode == http.StatusNotFound && forgejoActionsAPIAbsent(c, slug) {
+		return WorkflowRun{}, err
+	}
+	run, resp, err := c.GetRepoActionRun(slug.owner, slug.repo, runID)
+	err = ciReadError(ctx, err)
+	if err != nil {
+		if !errors.Is(err, ErrCIReadBudget) && resp != nil && resp.StatusCode == http.StatusNotFound && forgejoActionsAPIAbsent(c, slug) {
+			if budgetErr := ciReadError(ctx, nil); budgetErr != nil {
+				return WorkflowRun{}, budgetErr
+			}
 			return WorkflowRun{}, fmt.Errorf("forgejo: get workflow run: actions API not available on this server version: %w", ErrForgeVersionUnsupported)
 		}
-		return WorkflowRun{}, f.wrapErr("get workflow run", err)
+		return WorkflowRun{}, f.wrapErr("get workflow run", ciReadError(ctx, err))
 	}
 	if run == nil {
-		return WorkflowRun{}, nil
+		return WorkflowRun{}, validateCIWorkflow(ctx, WorkflowRun{})
 	}
-	return toForgejoWorkflowRun(run), nil
+	mapped := toForgejoWorkflowRun(run)
+	if err := validateCIWorkflow(ctx, mapped); err != nil {
+		return WorkflowRun{}, err
+	}
+	return mapped, nil
 }
 
 // forgejoActionsAPIAbsent reports whether the repo's Actions runs list 404s, the
@@ -563,19 +589,20 @@ func forgejoActionsAPIAbsent(c *gitea.Client, slug repoSlug) bool {
 // "completed"), so a consumer collapses Status/Conclusion exactly as for Check.
 func toForgejoWorkflowRun(r *gitea.ActionWorkflowRun) WorkflowRun {
 	wr := WorkflowRun{
-		ID:         r.ID,
-		Name:       r.Path,
-		Number:     r.RunNumber,
-		Event:      r.Event,
-		Branch:     r.HeadBranch,
-		SHA:        r.HeadSha,
-		Status:     r.Status,
-		Conclusion: r.Conclusion,
-		Title:      r.DisplayTitle,
-		WebURL:     r.HTMLURL,
-		CreatedAt:  r.StartedAt,
-		UpdatedAt:  r.CompletedAt,
-		StartedAt:  r.StartedAt,
+		ID:          r.ID,
+		WorkflowKey: r.Path,
+		Name:        r.Path,
+		Number:      r.RunNumber,
+		Event:       r.Event,
+		Branch:      r.HeadBranch,
+		SHA:         r.HeadSha,
+		Status:      r.Status,
+		Conclusion:  r.Conclusion,
+		Title:       r.DisplayTitle,
+		WebURL:      r.HTMLURL,
+		CreatedAt:   r.StartedAt,
+		UpdatedAt:   r.CompletedAt,
+		StartedAt:   r.StartedAt,
 	}
 	switch {
 	case r.Actor != nil:

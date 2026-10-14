@@ -29,6 +29,9 @@ type cappedTransport struct {
 }
 
 func (t cappedTransport) RoundTrip(req *http.Request) (*http.Response, error) {
+	if isCIJSON(req.Context()) {
+		return t.base.RoundTrip(req)
+	}
 	resp, err := t.base.RoundTrip(req)
 	if err != nil || resp == nil || resp.Body == nil {
 		return resp, err

@@ -34,6 +34,18 @@ func TestSkipReasonEnumIsHonest(t *testing.T) {
 		SkipSchedulesPaused:         true,
 		SkipNoUsableCredential:      true,
 		SkipCredentialDisabled:      true,
+		// PRD #2865: the ci_watch fire path.
+		SkipCIGreen:            true,
+		SkipCIAlreadyHandled:   true,
+		SkipCIHaltedNoProgress: true,
+		SkipCIHaltedAttemptCap: true,
+		SkipCIWatchedNotSeen:   true,
+		SkipCIUnsupported:      true,
+		SkipNoDefaultBranch:    true,
+		SkipCICapacity:         true,
+		SkipCIEvidenceLimited:  true,
+		SkipCINotFailed:        true,
+		SkipCIConfigChanged:    true,
 	}
 
 	if len(AllSkipReasons) != len(want) {

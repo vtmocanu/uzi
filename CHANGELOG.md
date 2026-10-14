@@ -22,6 +22,27 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Added
+
+- **A red default-branch workflow now starts one guarded repair run, via the `ci-repair` default job ([#2865](https://github.com/vtmocanu/uzi/issues/2865)).**
+  A new `ci_watch` schedule target (`uzi schedule create --ci-watch`, or `uzi schedule catalog enable ci-repair`, hourly by default) reads the newest completed default-branch execution of each watched workflow: green starts nothing, red starts one `prompt` run on a new `uzi/prompt-<id>` branch that opens an MR with the fix or finishes report-only, and the default branch is never written. **Auto-approve is off by default for this job** (every other default stays on) because the run reads CI text that can come from dependencies, tests or outside contributors, so the run stops at the plan gate; the web UI and `schedule get` say why, and you can turn it on. A fire reads one page of executions (100 on GitHub and GitLab, 50 on Forgejo) and a watched workflow missing from it is reported as `ci_watched_not_seen`, never as green; PR events and in-progress executions are ignored. A per-workflow loop guard halts on the same failure signature after an attempt (`ci_halted_no_progress`) or at `CI_AUTOFIX_MAX_ATTEMPTS` (`ci_halted_attempt_cap`) and resets on green; a schedule tracks at most 1024 workflows for its lifetime, its history survives edits, and repointing it to another repo is refused while history exists. Evidence is bounded by `CI_FIX_MAX_JOBS` and `CI_FIX_LOG_TAIL_BYTES`, at most 3 snapshots per fire, 4 MiB per CI JSON response and 16 MiB per fire (compressed and decompressed bytes both counted). These runs can never push a CI-config change: the worker refuses before checkpoint and held-work publication and at the final push, human-approved runs included and also when the diff cannot be computed, and the server refuses conservatively (tree walk capped at 100,000 entries, oversized paths and invalid globs refuse); a refused run fails with the paths named and a preserved patch when its secret scan is clean. **Roll the api out before the workers:** guarded runs require the new `ci_config_guard_v1` worker capability, so workers that predate it cannot claim a repair run, which stays queued with a run-health reason naming the missing capability until a new worker is online; a new worker against an older api reports the capability and nothing else changes. Not included: CI artifacts as evidence, paging past one page, a failure threshold or per-schedule attempt cap, and event-triggered detection. See [Scheduling](docs/scheduling.md#default-branch-ci-repair).
+
+### Changed
+
+- **Owners at the custody admission limit can see which holds the server counts and why ([#2970](https://github.com/vtmocanu/uzi/issues/2970)).**
+  The owner hold listing gains `counts_toward_admission` and `admission_reason` per open hold, read from a read-only per-hold projection in the same repeatable-read snapshot as the list and aggregate, so the three agree; `uzi run recovery` shows an `ADMISSION` column and the Workers page lists counted non-decision holds under "Admission information". A server that does not report membership leaves the fields absent, which clients treat as unknown rather than not counted. This is visibility only: the canonical `fn_custody_admission_count` accounting, hold classification and release/discard authority are unchanged.
+
+- **Codex root leads can opt foreground Bash commands into a 120-minute bound ([#2986](https://github.com/vtmocanu/uzi/issues/2986)).**
+  Authorized commands use the fixed extended bound with `long_running: true`; the default remains 60 minutes. Run-wall parking remains authoritative, and cancellation arriving during deadline cleanup beats the command deadline without replacing an already-selected exit, output cap or nondeadline error.
+
+### Fixed
+
+- **Backups accept recovery claim deadline windows.**
+  Retained-source backups accept the optional claim generation written by workers and reject malformed claim fences in protected descriptors and ordinary recovery journals (Refs #2958).
+
+- **Refresh worker protocol negotiation without restarting ([#1419](https://github.com/vtmocanu/uzi/issues/1419)).**
+  Regular heartbeats refresh API-supported features and outbox quotas, and re-advertise the worker's implemented protocols so an API upgrade can restore claim eligibility within two successful regular heartbeats with complete responses no larger than 1 MiB. Refresh preserves worker identity, registration nonce, running work and custody; server capabilities and capacity limits only grow until ordinary registration.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

@@ -80,6 +80,8 @@ func contractCases() []contractCase {
 		newContractCase[AdminDockerAllowlistReposDTO]("admin_docker_allowlist_repos"),
 		newContractCase[MessageDTO]("message"),
 		newContractCase[ScheduleDTO]("schedule"),
+		newContractCase[CIEpisodeDTO]("ci_episode"),
+		newContractCase[CIEpisodePage]("ci_episode_page"),
 		newContractCase[RunNowResponse]("schedule_run_now"),
 		// ScheduleRequest is a REQUEST body: its full.json round-trips through
 		// DisallowUnknownFields (the runtime-400 class the PRD names) like every other row.

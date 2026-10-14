@@ -30,6 +30,22 @@ func (f *FakeClient) CreateSchedule(_ context.Context, repoID string, req apityp
 	return f.CreatedSchedule, nil
 }
 
+// ListScheduleCIEpisodes serves the embedded first page of a stored schedule; a non-empty
+// cursor is answered with an empty, exhausted page.
+func (f *FakeClient) ListScheduleCIEpisodes(_ context.Context, id, cursor string) (apitypes.CIEpisodePage, error) {
+	if f.Err != nil {
+		return apitypes.CIEpisodePage{}, f.Err
+	}
+	s, ok := f.ScheduleByID[id]
+	if !ok {
+		return apitypes.CIEpisodePage{}, Exitf(ExitNotFound, "schedule %s not found", id)
+	}
+	if cursor != "" || s.CIEpisodes == nil {
+		return apitypes.CIEpisodePage{Episodes: []apitypes.CIEpisodeDTO{}}, nil
+	}
+	return *s.CIEpisodes, nil
+}
+
 // GetSchedule mirrors the owner-scoped endpoint: a key present in ScheduleByID is the
 // caller's own schedule; a key absent is a foreign/unknown id → ExitNotFound (exit 4).
 func (f *FakeClient) GetSchedule(_ context.Context, id string) (apitypes.ScheduleDTO, error) {

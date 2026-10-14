@@ -95,15 +95,39 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 	// is still rejected below (positive-IID check) rather than read as "unset".
 	issueSet := cmd.Flags().Changed("issue")
 	promptSet := cmd.Flags().Changed("prompt")
+	ciWatch, _ := cmd.Flags().GetBool("ci-watch")
+	workflowSet := cmd.Flags().Changed("workflow")
+	if workflowSet && !ciWatch {
+		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--workflow is only valid with --ci-watch")
+	}
+	if ciWatch {
+		// --prompt is the optional instruction override here, not a separate target.
+		if issueSet || sweep {
+			return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage,
+				"--ci-watch cannot be combined with --issue or --sweep")
+		}
+		for _, flag := range []string{"label", "max-issues", "output", "guidance"} {
+			if cmd.Flags().Changed(flag) {
+				return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage,
+					"--%s is not valid with --ci-watch", flag)
+			}
+		}
+		if promptSet && strings.TrimSpace(prompt) == "" {
+			return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--prompt needs task text")
+		}
+	}
 	targets := 0
 	for _, on := range []bool{issueSet, sweep, promptSet} {
 		if on {
 			targets++
 		}
 	}
+	if ciWatch {
+		targets = 1
+	}
 	if targets != 1 {
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage,
-			"specify exactly one target: --issue <iid>, --sweep, or --prompt <text>")
+			"specify exactly one target: --issue <iid>, --sweep, --prompt <text>, or --ci-watch")
 	}
 	if len(labels) > 0 && !sweep {
 		return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--label is only valid with --sweep")
@@ -128,6 +152,16 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 
 	req := apitypes.ScheduleRequest{RemoveLabelOnDispatch: scheduleRemoveLabelFlag(cmd)}
 	switch {
+	case ciWatch:
+		workflows, werr := ciWorkflowFlags(cmd)
+		if werr != nil {
+			return apitypes.ScheduleRequest{}, nil, werr
+		}
+		req.Target = schedTargetCIWatch
+		req.Prompt = prompt // blank: the server defaults it to the ci-repair catalog body
+		if len(workflows) > 0 {
+			req.CIWorkflows = apitypes.OptionalCIWorkflows{Present: true, Value: workflows}
+		}
 	case issueSet:
 		if issue <= 0 {
 			return apitypes.ScheduleRequest{}, nil, uzicli.Exitf(uzicli.ExitUsage, "--issue must be a positive issue IID")
@@ -206,7 +240,11 @@ func buildScheduleRequest(cmd *cobra.Command, c uzicli.Client) (apitypes.Schedul
 	// always sent as pointers rather than omitted — the flag value IS the statement.
 	autoApprove, _ := cmd.Flags().GetBool("auto-approve")
 	waitOnLimit, _ := cmd.Flags().GetBool("wait-on-limit")
-	req.AutoApprove = &autoApprove
+	// A ci_watch schedule reads attacker-influenceable CI logs, so auto-approve stays off
+	// unless explicitly passed (the server defaults an omitted value to false).
+	if !ciWatch || cmd.Flags().Changed("auto-approve") {
+		req.AutoApprove = &autoApprove
+	}
 	req.WaitOnLimit = &waitOnLimit
 
 	// mr_rework is tri-state and its schedule default is INHERIT (nil), not on (PRD #841
@@ -337,8 +375,8 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 			"specify at most one timing: --cron <expr> (recurring) or --at <RFC3339> (once)")
 	}
 	// Target-scoped flags: reject an EXPLICIT set on the wrong target (mirrors create).
-	if promptSet && s.Target != schedTargetPrompt {
-		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--prompt is only valid on a prompt-target schedule")
+	if promptSet && s.Target != schedTargetPrompt && s.Target != schedTargetCIWatch {
+		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--prompt is only valid on a prompt or ci_watch schedule")
 	}
 	if f.Changed("output") && s.Target != schedTargetPrompt {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage, "--output is only valid on a prompt-target schedule")
@@ -392,6 +430,11 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 		req.Prompt, _ = f.GetString("prompt")
 		changed = true
 	}
+	ciChanged, ciErr := applyCIWorkflowEditFlags(cmd, s.Target, &req)
+	if ciErr != nil {
+		return apitypes.ScheduleRequest{}, ciErr
+	}
+	changed = changed || ciChanged
 	if labelSet {
 		req.Labels, _ = f.GetStringArray("label")
 		changed = true
@@ -514,8 +557,8 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 // restated from the fetched row (replace-semantics) so a partial edit does not drop them,
 // and an explicit flag overrides the restated value.
 //
-// Guidance is owner-editable on a PROMPT-target default (PRD #662 M1) and a SWEEP-target
-// default (issue #675, where it is an overlay composed onto the baked catalog guidance at
+// Guidance is owner-editable on a PROMPT-target default (PRD #662 M1), a CI_WATCH-target
+// default (PRD #2865) and a SWEEP-target default (issue #675, where it is an overlay composed onto the baked catalog guidance at
 // fire time): --guidance sets it and --clear-guidance blanks it, and the fetched value is
 // RESTATED so a partial edit does not wipe it under the server's replace-semantics (for a
 // sweep default the restated value is the OVERLAY, never the baked catalog value). On an
@@ -535,13 +578,14 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 				"--%s is catalog-owned on a default schedule; clone it first with `uzi schedule clone`", flag)
 		}
 	}
-	// Guidance is owner-editable on a prompt-target default (issue #662) and on a sweep-target
+	// Guidance is owner-editable on a prompt-target default (issue #662), on a ci_watch-target
+	// default (PRD #2865) and on a sweep-target
 	// default (issue #675: an owner overlay composed onto the baked catalog guidance at fire
 	// time). On an issue/self_improve default it stays catalog-owned (the server still 400s a
 	// guidance edit), so reject it here.
 	guidanceSet := f.Changed("guidance")
 	clearGuidance := f.Changed("clear-guidance")
-	if (guidanceSet || clearGuidance) && s.Target != schedTargetPrompt && s.Target != schedTargetSweep {
+	if (guidanceSet || clearGuidance) && s.Target != schedTargetPrompt && s.Target != schedTargetSweep && s.Target != schedTargetCIWatch {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
 			"--guidance/--clear-guidance are catalog-owned on this default schedule; clone it first with `uzi schedule clone`")
 	}
@@ -595,7 +639,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	if s.Target == schedTargetSweep {
 		req.MaxIssues = s.MaxIssues
 	}
-	// Guidance on a PROMPT-target (issue #662) or SWEEP-target (issue #675) default is
+	// Guidance on a PROMPT-target (issue #662), SWEEP-target (issue #675) or CI_WATCH-target default is
 	// owner-editable and uses replace-semantics on the server, so RESTATE the fetched value —
 	// otherwise a partial edit (e.g. --cron alone) would send a nil guidance and wipe the
 	// stored value. For a sweep default s.Guidance is the OVERLAY (nil when no overlay is set;
@@ -603,7 +647,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	// echoes the baked value back into the column. The server guard accepts a nil guidance
 	// (keeps NULL, no wipe). Issue/self_improve defaults never reach here with a guidance flag,
 	// so they still send no guidance.
-	if s.Target == schedTargetPrompt || s.Target == schedTargetSweep {
+	if s.Target == schedTargetPrompt || s.Target == schedTargetSweep || s.Target == schedTargetCIWatch {
 		req.Guidance = s.Guidance
 	}
 
@@ -709,6 +753,11 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 		req.Harness = harness
 		changed = true
 	}
+	ciChanged, ciErr := applyCIWorkflowEditFlags(cmd, s.Target, &req)
+	if ciErr != nil {
+		return apitypes.ScheduleRequest{}, ciErr
+	}
+	changed = changed || ciChanged
 	capacityChanged, capacityErr := applyScheduleCapacityFlags(cmd, &req)
 	if capacityErr != nil {
 		return apitypes.ScheduleRequest{}, capacityErr
@@ -716,7 +765,7 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 	changed = changed || capacityChanged
 	if !changed {
 		return apitypes.ScheduleRequest{}, uzicli.Exitf(uzicli.ExitUsage,
-			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token, --harness, --remove-label-on-dispatch)")
+			"nothing to edit (pass at least one editable field: --cron, --tz, --auto-approve, --wait-on-limit, --mr-rework, --max-issues, --guidance, --model, --output, --apply-model-to-agents, --token, --harness, --workflow, --clear-workflows, --remove-label-on-dispatch)")
 	}
 	return req, nil
 }

@@ -65,6 +65,12 @@ type HeldPackOptions struct {
 	Tip string
 	// Pack is the raw (non-thin) packfile the worker shipped.
 	Pack []byte
+	// CIConfigGuard marks a guarded run (runs.ci_config_guard). When set, PrepareHeldPack
+	// refuses with ErrCIConfigGuard if the tip differs from the fetched default branch at any
+	// path matching CIConfigPaths. False leaves the preparation unchanged.
+	CIConfigGuard bool
+	// CIConfigPaths are the protected globs (runs.ci_config_paths), server-derived.
+	CIConfigPaths []string
 }
 
 // PreparedHeldPack is a pack that passed PrepareHeldPack. It holds the credential and the pack
@@ -176,11 +182,17 @@ func PrepareHeldPack(ctx context.Context, o HeldPackOptions) (*PreparedHeldPack,
 		return nil, fmt.Errorf("pushbroker: apply pack: %w", err)
 	}
 	tip := plumbing.NewHash(o.Tip)
-	if _, err := object.GetCommit(repo.Storer, tip); err != nil {
+	tipCommit, err := object.GetCommit(repo.Storer, tip)
+	if err != nil {
 		if errors.Is(err, plumbing.ErrObjectNotFound) {
 			return nil, ErrTipMissing
 		}
 		return nil, fmt.Errorf("pushbroker: read declared tip: %w", err)
+	}
+	if o.CIConfigGuard {
+		if err := ciConfigGuard(ctx, repo, tipCommit, o.DefaultBranch, o.CIConfigPaths); err != nil {
+			return nil, err
+		}
 	}
 	// The send needs only the URL, so it gets a fresh remote rather than one that pins the
 	// storer holding every fetched base object.

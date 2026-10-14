@@ -1904,7 +1904,7 @@ export interface Memory {
 // owner-scoped intent to create run(s) at future time(s). Mirrors the Go
 // apitypes.ScheduleDTO — snake_case, byte-for-byte.
 
-export type ScheduleTarget = "issue" | "sweep" | "prompt" | "self_improve";
+export type ScheduleTarget = "issue" | "sweep" | "prompt" | "self_improve" | "ci_watch";
 export type ScheduleTiming = "once" | "recurring";
 // active — armed; fired — a `once` schedule that has already fired (terminal);
 // error — parked because its owner/token/repo is gone (surfaced, not dropped).
@@ -1927,7 +1927,18 @@ export type ScheduleSkipReason =
   | "harness_label_invalid"
   | "schedules_paused"
   | "no_usable_credential"
-  | "credential_disabled";
+  | "credential_disabled"
+  | "ci_green"
+  | "ci_already_handled"
+  | "ci_halted_no_progress"
+  | "ci_halted_attempt_cap"
+  | "ci_watched_not_seen"
+  | "ci_unsupported"
+  | "no_default_branch"
+  | "ci_capacity"
+  | "ci_evidence_limited"
+  | "ci_not_failed"
+  | "ci_config_changed";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -1991,7 +2002,26 @@ export type RunNowResponse = {
   skips: LastFireSkip[];
 };
 
+export interface CIEpisodeDTO {
+  workflow_key: string;
+  last_handled_run_id: number | null;
+  observed_created_at: string | null;
+  observed_updated_at: string | null;
+  observed_run_id: number | null;
+  last_signature: string | null;
+  attempts: number;
+  halted_reason: "no_progress" | "attempt_cap" | null;
+  updated_at: string;
+}
+
+export interface CIEpisodePage {
+  episodes: CIEpisodeDTO[];
+  next_cursor: string | null;
+}
+
 export interface Schedule {
+  ci_workflows?: string[];
+  ci_episodes?: CIEpisodePage;
   remove_label_on_dispatch: boolean;
  capacity_limit: number | null;
  capacity_room_needed: number | null;
@@ -2173,6 +2203,8 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
+  // Omitted preserves PATCH selectors; null or [] clears to all workflows.
+  ci_workflows?: string[] | null;
   remove_label_on_dispatch?: boolean;
  capacity_limit?: number | null;
  capacity_room_needed?: number | null;
@@ -4974,6 +5006,12 @@ export interface RecoveryCustodyHold {
   // Issue #2545: a hold released by held publication names its publication and forge ref.
   final_publication_id?: string;
   held_ref?: string;
+  // Server-derived admission membership of an OPEN hold (issue #2970). Absent means the
+  // server did not report it (older server, or a non-open hold); absent is never false.
+  counts_toward_admission?: boolean;
+  // Why the server counts or excludes the hold; a closed vocabulary rendered through
+  // admissionReasonLabel, never raw.
+  admission_reason?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the

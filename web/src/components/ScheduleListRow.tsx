@@ -22,6 +22,7 @@ import { nextFireOf } from "../lib/scheduleList";
 import { relativeFromNow } from "./ScheduleModal";
 import { LastRunOutcome, LastFireDetail, RecentFiresPanel, formatStamp } from "./LastRun";
 import { AddAnotherRepo } from "./AddAnotherRepo";
+import { CIWatchDetail } from "./CIWatchDetail";
 import { MoreActionsMenu, type MoreActionsItem } from "./MoreActionsMenu";
 import { Badge, Button, Toggle, cx } from "./ui";
 import { LockIcon, PencilIcon, PlayIcon, RotateCcwIcon } from "./icons";
@@ -123,6 +124,10 @@ export function ScheduleListRow({
   // what the cell shows, and its own badge already reads "Waiting for room".
   const waitingSince = recent.length > 0 && s.last_fire?.capacity?.blocked ? s.last_fire.fired_at : undefined;
   const [expanded, setExpanded] = useState(false);
+  // PRD #2865: a ci_watch row's detail panel (watched workflows + episode state).
+  const ciWatch = s.target === "ci_watch";
+  const [ciOpen, setCiOpen] = useState(false);
+  const ciPanelId = `ci-watch-${s.id}`;
   const [addingRepo, setAddingRepo] = useState(false);
   const addPanelRef = useRef<HTMLTableCellElement>(null);
   const menuButtonRef = useRef<HTMLButtonElement>(null);
@@ -242,6 +247,18 @@ export function ScheduleListRow({
                   {repoLabel}
                   {s.target === "prompt" && " · no issue"}
                 </span>
+                {ciWatch && (
+                  <button
+                    type="button"
+                    aria-expanded={ciOpen}
+                    aria-controls={ciOpen ? ciPanelId : undefined}
+                    aria-label={`CI state: ${on}`}
+                    onClick={() => setCiOpen((v) => !v)}
+                    className="rounded text-brand underline-offset-2 hover:underline"
+                  >
+                    CI state
+                  </button>
+                )}
                 {isDefault && onShowInCatalog && (
                   <button
                     type="button"
@@ -391,6 +408,13 @@ export function ScheduleListRow({
           </td>
         </tr>
       )}
+      {ciWatch && ciOpen && (
+        <tr className="block border-t border-edge md:table-row">
+          <td id={ciPanelId} colSpan={SCHEDULE_COLS} className="block bg-raised/30 px-4 pb-4 pt-2 md:table-cell">
+            <CIWatchDetail s={s} panelId={ciPanelId} />
+          </td>
+        </tr>
+      )}
       {shown && expanded && (
         <tr className="block border-t border-edge md:table-row">
           {/* The id pairs with the disclosure's aria-controls; rendered only while expanded. */}
@@ -428,6 +452,12 @@ function KindPill({ s }: { s: Schedule }) {
     return (
       <Badge tone="ok" dot>
         self-improve
+      </Badge>
+    );
+  if (s.target === "ci_watch")
+    return (
+      <Badge tone="plan" dot>
+        CI repair
       </Badge>
     );
   return null;

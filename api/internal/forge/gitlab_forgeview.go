@@ -340,6 +340,7 @@ func gitlabStatusToCheck(raw string) (status, conclusion string) {
 // "run": its IID is the run Number, its Source the event; there is no separate
 // conclusion, so Status carries the terminal state and Conclusion stays empty.
 func (g *gitLab) ListWorkflowRuns(ctx context.Context, projectID int64, opts ListWorkflowRunsOptions) ([]WorkflowRun, error) {
+	ctx = markCIJSON(ctx)
 	opt := &gitlab.ListProjectPipelinesOptions{
 		ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage},
 		OrderBy:     new("id"),
@@ -358,12 +359,19 @@ func (g *gitLab) ListWorkflowRuns(ctx context.Context, projectID int64, opts Lis
 		opt.Status = new(gitlab.BuildStateValue(opts.Status))
 	}
 	pipelines, _, err := g.client.Pipelines.ListProjectPipelines(projectID, opt, gitlab.WithContext(ctx))
+	err = ciReadError(ctx, err)
 	if err != nil {
 		return nil, g.wrapErr("list workflow runs", err)
 	}
 	out := []WorkflowRun{}
+	if b := ciBudget(ctx); b != nil && len(pipelines) > int(opt.PerPage) {
+		return nil, b.fail("oversized workflow page")
+	}
 	for _, p := range pipelines {
 		if p == nil {
+			if b := ciBudget(ctx); b != nil {
+				return nil, b.fail("invalid workflow identity")
+			}
 			continue
 		}
 		out = append(out, toGitLabWorkflowRun(p))
@@ -371,12 +379,13 @@ func (g *gitLab) ListWorkflowRuns(ctx context.Context, projectID int64, opts Lis
 			break
 		}
 	}
-	return out, nil
+	return validateCIWorkflows(ctx, out)
 }
 
 // toGitLabWorkflowRun maps a PipelineInfo to the neutral WorkflowRun. Name is the
-// pipeline's Name when set, else its ref (a pipeline often has no name). GitLab has
-// no separate conclusion, so Status carries everything and StartedAt mirrors
+// pipeline's Name when set, else its ref (a pipeline often has no name).
+// Renaming a pipeline changes WorkflowKey; GitLab exposes no stable workflow ID.
+// GitLab has no separate conclusion, so Status carries everything and StartedAt mirrors
 // CreatedAt (a pipeline has no distinct start timestamp on the list row).
 func toGitLabWorkflowRun(p *gitlab.PipelineInfo) WorkflowRun {
 	name := p.Name
@@ -384,14 +393,15 @@ func toGitLabWorkflowRun(p *gitlab.PipelineInfo) WorkflowRun {
 		name = p.Ref
 	}
 	wr := WorkflowRun{
-		ID:     p.ID,
-		Name:   name,
-		Number: p.IID,
-		Event:  p.Source,
-		Branch: p.Ref,
-		SHA:    p.SHA,
-		Status: p.Status,
-		WebURL: p.WebURL,
+		ID:          p.ID,
+		WorkflowKey: name,
+		Name:        name,
+		Number:      p.IID,
+		Event:       p.Source,
+		Branch:      p.Ref,
+		SHA:         p.SHA,
+		Status:      p.Status,
+		WebURL:      p.WebURL,
 	}
 	if p.CreatedAt != nil {
 		wr.CreatedAt = *p.CreatedAt
@@ -417,14 +427,15 @@ func toGitLabWorkflowRunFromPipeline(p *gitlab.Pipeline) WorkflowRun {
 		name = p.Ref
 	}
 	wr := WorkflowRun{
-		ID:     p.ID,
-		Name:   name,
-		Number: p.IID,
-		Event:  string(p.Source),
-		Branch: p.Ref,
-		SHA:    p.SHA,
-		Status: p.Status,
-		WebURL: p.WebURL,
+		ID:          p.ID,
+		WorkflowKey: name,
+		Name:        name,
+		Number:      p.IID,
+		Event:       string(p.Source),
+		Branch:      p.Ref,
+		SHA:         p.SHA,
+		Status:      p.Status,
+		WebURL:      p.WebURL,
 	}
 	if p.CreatedAt != nil {
 		wr.CreatedAt = *p.CreatedAt
@@ -446,12 +457,18 @@ func toGitLabWorkflowRunFromPipeline(p *gitlab.Pipeline) WorkflowRun {
 // GitLab pipeline id, for the `ci` drill-in. The single GET returns the richer
 // *gitlab.Pipeline, so it maps through toGitLabWorkflowRunFromPipeline.
 func (g *gitLab) GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error) {
+	ctx = markCIJSON(ctx)
 	pipeline, _, err := g.client.Pipelines.GetPipeline(projectID, runID, gitlab.WithContext(ctx))
+	err = ciReadError(ctx, err)
 	if err != nil {
 		return WorkflowRun{}, g.wrapErr("get workflow run", err)
 	}
 	if pipeline == nil {
-		return WorkflowRun{}, nil
+		return WorkflowRun{}, validateCIWorkflow(ctx, WorkflowRun{})
 	}
-	return toGitLabWorkflowRunFromPipeline(pipeline), nil
+	mapped := toGitLabWorkflowRunFromPipeline(pipeline)
+	if err := validateCIWorkflow(ctx, mapped); err != nil {
+		return WorkflowRun{}, err
+	}
+	return mapped, nil
 }

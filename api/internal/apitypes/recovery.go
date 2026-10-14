@@ -326,6 +326,16 @@ type RecoveryCustodyHoldDTO struct {
 	// held publication: the publication row and the forge ref its work lives on.
 	FinalPublicationID string `json:"final_publication_id,omitempty"`
 	HeldRef            string `json:"held_ref,omitempty"`
+
+	// CountsTowardAdmission and AdmissionReason (issue #2970) are the server-derived custody
+	// admission membership of an OPEN hold, computed in SQL (fn_custody_admission_members) and
+	// never re-derived by a client. nil / empty means unknown or not applicable (a non-open hold,
+	// or no membership row), never false. AdmissionReason is a closed vocabulary: live_claim,
+	// duplicate_hold, decision_needed, terminal_run, run_not_live, claim_released,
+	// earlier_generation, other_generation, unknown_evidence, identity_mismatch, stale_heartbeat.
+	// CountsTowardAdmission is true exactly when the hold counts toward AdmissionCountedHolds.
+	CountsTowardAdmission *bool  `json:"counts_toward_admission,omitempty"`
+	AdmissionReason       string `json:"admission_reason,omitempty"`
 }
 
 // RecoveryCustodyAggregateDTO is the owner-level custody summary the board alert and the

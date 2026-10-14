@@ -546,6 +546,50 @@ expect_pick() {
     || fail "$1: expected WIP marker $3 missing"
 }
 
+# #2958: detached protected descriptors and ordinary journals carry an optional
+# positive safe-integer claim fence. Missing fences remain valid legacy progress.
+for kind in protected ordinary; do
+  reset_layout
+  rid=completed-1
+  [ "$kind" = protected ] || rid=run-4242
+  predecessor="$RB/issue-4242"
+  make_clone "$predecessor" agent/issue-4242 claim-generation-dirty
+  progress_journal="$(jq -cn --arg rid "$rid" --arg pred "$predecessor" '
+    {runId:$rid,clonePath:$pred} as $source
+    | $source + {recovery:{version:1,source:$source,attempts:2,
+        startedAt:1000,deadline:301000,backoffMs:10,stage:"blocked",blocker:"budget_exhausted"}}')"
+  dest="$WORK/out.claim-generation-$kind"
+  for generation in legacy 1 9007199254740991; do
+    value="$progress_journal"
+    [ "$generation" = legacy ] || value="$(printf '%s' "$value" | jq --argjson gen "$generation" '.recovery.claimGeneration=$gen')"
+    if [ "$kind" = protected ]; then
+      value="$(printf '%s' "$value" | jq '{version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    else
+      git --git-dir="$BARE" config "$JKEY" "$value"
+    fi
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -eq 0 ] || fail "claimGeneration $kind/$generation: exit $rc; log: $(cat "$dest/latest-attempt/backup.log")"
+    tar -xOzf "$dest/latest/issue-4242.tgz" ./issue-4242.uncommitted.patch | grep -qxF '+claim-generation-dirty' \
+      || fail "claimGeneration $kind/$generation: retained dirty bytes missing"
+    echo "PASS claimGeneration $kind/$generation"
+  done
+  for generation in 0 -1 1.5 9007199254740992 '"1"' null true; do
+    value="$(printf '%s' "$progress_journal" | jq --argjson gen "$generation" '.recovery.claimGeneration=$gen')"
+    if [ "$kind" = protected ]; then
+      value="$(printf '%s' "$value" | jq '{version:1,branch:"agent/issue-4242",key:"issue-4242",journal:.}')"
+      git --git-dir="$BARE" config "uzi-retained.$rid.journal" "$value"
+    else
+      git --git-dir="$BARE" config "$JKEY" "$value"
+    fi
+    rc="$(backup_rc "$dest" "$rid")"
+    [ "$rc" -ne 0 ] || fail "claimGeneration $kind/$generation: malformed fence accepted"
+    [ ! -e "$dest/latest-attempt/issue-4242.tgz" ] || fail "claimGeneration $kind/$generation: invalid journal attributed source"
+    echo "PASS claimGeneration $kind/$generation refused"
+  done
+  [ "$kind" != protected ] || git --git-dir="$BARE" config --unset-all "uzi-retained.$rid.journal"
+done
+
 # case 9: canonical only (unwired worker; legacy journal without attemptId).
 reset_layout
 make_clone "$RB/issue-4242" agent/issue-4242 canon

@@ -114,6 +114,11 @@ type fakeStore struct {
 	schedulePauseErr      error
 	getSchedulePauseCalls int
 	getSchedulePauseUsers []uuid.UUID
+
+	// ci_watch fire path (PRD #2865): the unlocked per-key episode read.
+	ciEpisodes      map[string]store.CiWatchEpisode
+	ciEpisodeErr    error
+	ciEpisodeLookup []string
 }
 
 func (f *fakeStore) ListUsersNeedingVaultLockNotice(context.Context) ([]store.ListUsersNeedingVaultLockNoticeRow, error) {
@@ -362,6 +367,27 @@ type fakeRuns struct {
 	// one-time row's stored pin and pinned harness; credDisabledCalls counts the checks.
 	credDisabledErr   error
 	credDisabledCalls int
+
+	// ci_watch fire path (PRD #2865): the recorded repair-run creates and episode transitions.
+	// ciCreateErr / ciCreateErrs (consumed in order) and ciTransitionErr script the seam's
+	// answers; a zero value succeeds.
+	ciRepairs       []workersvc.CIRepairRunParams
+	ciTransitions   []workersvc.CIWatchTransition
+	ciCreateErr     error
+	ciTransitionErr error
+}
+
+func (f *fakeRuns) CreateCIRepairRun(_ context.Context, p workersvc.CIRepairRunParams) (store.Run, error) {
+	f.ciRepairs = append(f.ciRepairs, p)
+	if f.ciCreateErr != nil {
+		return store.Run{}, f.ciCreateErr
+	}
+	return store.Run{ID: uuid.New()}, nil
+}
+
+func (f *fakeRuns) TransitionCIWatchEpisode(_ context.Context, tr workersvc.CIWatchTransition) error {
+	f.ciTransitions = append(f.ciTransitions, tr)
+	return f.ciTransitionErr
 }
 
 func (f *fakeRuns) CheckStoredCredentialOverrideEnabled(context.Context, uuid.UUID, *workersvc.CredentialOverride) error {
@@ -1498,8 +1524,9 @@ func TestSkipReasonForErr(t *testing.T) {
 	// issue #856 added open_mr_exists; PRD #1093 M1 added schedules_paused; PRD #1429 M2 added
 	// codex_override_conflict; a PRD #1429 review fix added no_usable_credential; PRD #1732 added
 	// credential_disabled; issue #2853 added harness_label_conflict and harness_label_invalid).
-	if len(AllSkipReasons) != 14 {
-		t.Fatalf("AllSkipReasons has %d reasons, want 14", len(AllSkipReasons))
+	// PRD #2865 added the eleven ci_watch reasons (ci_green .. ci_config_changed).
+	if len(AllSkipReasons) != 25 {
+		t.Fatalf("AllSkipReasons has %d reasons, want 25", len(AllSkipReasons))
 	}
 }
 
@@ -2302,6 +2329,34 @@ func TestTickBenignSkipPersistsLastFire(t *testing.T) {
 	}
 	if rec.Skips[0].Reason != string(SkipAlreadyRunning) {
 		t.Fatalf("last_fire skip reason = %q, want %q", rec.Skips[0].Reason, SkipAlreadyRunning)
+	}
+}
+
+// TestTickCIWatchGreenPersistsLastFire is acceptance example 1 on the cron path: a tick
+// fire (not run-now) of a ci_watch schedule whose watched workflows are all green starts
+// nothing, still advances, and persists last_fire with started 0 and one ci_green skip.
+func TestTickCIWatchGreenPersistsLastFire(t *testing.T) {
+	h := newCIHarness(t, ciGreenRun("1", 100, 0), ciGreenRun("2", 101, 1))
+	h.st.due = []store.RunSchedule{h.schedule()}
+
+	h.sched.Boot(context.Background())
+
+	if len(h.st.advanceCalls) != 1 {
+		t.Fatalf("advance calls = %d, want 1", len(h.st.advanceCalls))
+	}
+	raw := h.st.advanceCalls[0].LastFire
+	if raw == nil {
+		t.Fatalf("green ci_watch fire must persist a last_fire, got nil")
+	}
+	var rec lastFireRecord
+	if err := json.Unmarshal(raw, &rec); err != nil {
+		t.Fatalf("last_fire is not valid JSON: %v (%s)", err, raw)
+	}
+	if len(rec.Started) != 0 || len(rec.Skips) != 1 || rec.Skips[0].Reason != string(SkipCIGreen) {
+		t.Fatalf("last_fire = %+v, want started:0 and one %q skip", rec, SkipCIGreen)
+	}
+	if h.runsCreated() != 0 || len(h.runs.ciRepairs) != 0 {
+		t.Fatalf("green fire started a run")
 	}
 }
 

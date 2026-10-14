@@ -1021,6 +1021,7 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
+		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths})
 		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
 		// Registered ONLY inside this started-block, so a not-started scheduler
 		// (SCHEDULER_CHECK_INTERVAL=0) is left OUT of the loops evidence entirely rather than

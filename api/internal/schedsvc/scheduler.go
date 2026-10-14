@@ -114,6 +114,9 @@ type Store interface {
 	// RecordScheduleHeldFire writes only last_fire on a still-active one-time row (PRD #1732
 	// D2): the credential_disabled hold records why the row waits without advancing it.
 	RecordScheduleHeldFire(ctx context.Context, arg store.RecordScheduleHeldFireParams) (int64, error)
+	// GetCIWatchEpisode is the ci_watch fire's UNLOCKED read of one workflow's episode (PRD
+	// #2865). Every write is rechecked under locks by the RunCreator seam below.
+	GetCIWatchEpisode(ctx context.Context, arg store.GetCIWatchEpisodeParams) (store.CiWatchEpisode, error)
 }
 
 // RunCreator is the shared run-creation seam the scheduler fires through — the SAME
@@ -133,6 +136,12 @@ type RunCreator interface {
 	// CreateAutopilotRun inherits owner defaults (see workersvc.CreateScheduledAutopilotRun).
 	CreateScheduledAutopilotRun(ctx context.Context, userID, repoID uuid.UUID, issueIID int64, description string, waitOnLimit *bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
 	CreatePromptRun(ctx context.Context, userID, repoID, scheduleID uuid.UUID, title, prompt string, autoApprove, waitOnLimit bool, mrReworkEnabled *bool, model *string, overrideSubagentModel bool, credOverride *workersvc.CredentialOverride, explicit *workersvc.Harness) (store.Run, error)
+	// CreateCIRepairRun is the ci_watch fire's guarded prompt-run insert (PRD #2865): the repo,
+	// schedule and episode locks, the configuration and episode rechecks, the run INSERT and the
+	// episode write all commit in one transaction. TransitionCIWatchEpisode records a halt or a
+	// green reset in its own locked transaction.
+	CreateCIRepairRun(ctx context.Context, p workersvc.CIRepairRunParams) (store.Run, error)
+	TransitionCIWatchEpisode(ctx context.Context, tr workersvc.CIWatchTransition) error
 	// ResolveHarnessForUser resolves the harness a user's next run WOULD get under D11 (PRD #1429
 	// M2), reads-only. The scheduler uses it for the fire-time codex+override conflict gate (D5).
 	ResolveHarnessForUser(ctx context.Context, userID uuid.UUID, explicit *workersvc.Harness) (workersvc.Harness, error)
@@ -221,6 +230,8 @@ type Scheduler struct {
 	// origin='default'.
 	catalog func(slug string) (schedtmpl.DefaultJob, bool)
 	logger  *slog.Logger
+	// ciRepair holds the ci_watch fire's bounds (SetCIRepair); zero fields take defaults.
+	ciRepair CIRepairConfig
 	// beat is the admin-health loop-beat callback (PRD #1484 M2): main.go injects a
 	// func(){ registry.Beat("scheduler") } ONLY when the scheduler is started
 	// (SchedulerCheckInterval > 0), so a not-started scheduler is left out of the loops
@@ -516,6 +527,8 @@ func (e *Scheduler) fireOne(ctx context.Context, sched store.RunSchedule) (FireO
 		return e.firePrompt(ctx, sched)
 	case "self_improve":
 		return e.fireSelfImprove(ctx, sched)
+	case "ci_watch":
+		return e.fireCIWatch(ctx, sched)
 	default:
 		// A target the DB CHECK should have rejected. Park it rather than retry forever.
 		e.logger.Error("scheduler: unknown target", "schedule", sched.ID.String(), "target", sched.Target)
