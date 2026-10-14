@@ -21,7 +21,7 @@ The `uzi` TUI never shows what a run cost. The data is already fetched: `Usage.C
 - `formatTokens(n)`: adaptive ladder — `<1000` bare int; `<1e6` → `"NN.Nk"` (one decimal); `<1e9` → `"N.NNM"`; `<1e12` → `"N.NNB"`; else `"N.NNT"` (two decimals). Reference values: `999→"999"`, `48200→"48.2k"`, `188000→"188.0k"`, `1280000→"1.28M"`, `5.4e9→"5.40B"`, `2.3e12→"2.30T"`.
 
 **Board render (`api/cmd/uzi/tui_board.go`):**
-- Column consts `~412-425` (`boardIDWidth`, `boardStatusWordWidth`, `boardAgeWidth`, `boardMileWidth`, `boardCredWidth`, `boardTitleMax`, `boardMileMinWidth`).
+- Column consts `~412-425` (`boardIDWidth`, `boardStatusWordWidth`, `boardAgeWidth`, `boardMileWidth`, `boardCredWidth`, `boardMileMinWidth`).
 - `boardRow` (`~760`) draws the row; `boardRowPrefixWidth(admin, mile, cred)` (`~883`) is the width of every column before TITLE, used to size the title.
 - `boardShowMile()` (`~430`) gates the milestone micro-bar on terminal width, dropping it before the title is squeezed (issue #379 discipline); `boardShowCred()` (`~444`) gates the credential column.
 - `boardSummary()` (`~515`) is the top-right glyph cluster (`⚑ N · ✎ N · … · N runs`), computed over `m.board.runs` (the whole board, stable under the `/` filter). `boardCredSeg` (`~871`) shows the empty-cell convention to copy for a no-usage run.

@@ -297,7 +297,7 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 		row += m.boardCostSeg(r, bg, cols.costW) + gap
 	}
 
-	// Title: capped to the remaining width AND to boardTitleMax. The marker column allowance is
+	// Title: fills the remaining width before the judge and worker columns. Marker room is
 	// reserved for every row so the title keeps one width down the board; markers then align by
 	// flushing the whole row to width-fullW below.
 	markerAllow := 0
@@ -314,9 +314,6 @@ func (m tuiModel) boardRow(r apitypes.RunListItemDTO, sel bool, mc boardMarkerCo
 	workerWidth := m.boardWorkerWidth()
 	contentWidth := m.width - workerWidth
 	avail := max(0, contentWidth-visualWidth(row)-markerAllow)
-	if avail > boardTitleMax {
-		avail = boardTitleMax
-	}
 	// Clickable #<iid> immediately before the title (issue-less runs render nothing).
 	// Its visual width comes off the title budget; the OSC-8 escape is zero-width to
 	// lipgloss so padding stays correct. Variable-width, so it is deliberately NOT in

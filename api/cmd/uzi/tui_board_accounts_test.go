@@ -201,3 +201,45 @@ func TestBoardAccountWidthsFollowRenderedWindow(t *testing.T) {
 		t.Fatalf("title did not move with wider visible values: %d <= %d", got, firstOffset)
 	}
 }
+
+func TestBoardLongTitleFillsJudgeAndWorkerBudget(t *testing.T) {
+	m := tuiTestModel(t, &uzicli.FakeClient{}, "")
+	m.tokenCount, m.codexCredentialCount = 1, 1
+	iid := int64(777)
+	r := apitypes.RunListItemDTO{RunDTO: apitypes.RunDTO{
+		ID: "aaaaaaaa", Harness: "claude", Status: "running", IssueIID: &iid,
+		IssueTitle: strings.Repeat("X", 400), AnthropicSecretLabel: sp("default"), AnthropicSecretID: sp("claude-id"),
+		Usage: &apitypes.UsageDTO{CostStatus: "metered", CostUSD: 3},
+	}, WorkerName: sp("worker-a"), JudgeVerdict: sp("issues"), JudgeTodoCount: 2}
+	rows := []apitypes.RunListItemDTO{r}
+	mc := m.boardMarkerCols(rows)
+	marker := stripANSI(m.verdictMarker("issues", 2, mc.verdictW, mc.countW, nil))
+	for _, width := range []int{120, 200} {
+		m.width = width
+		row := stripANSI(m.boardRow(r, false, mc, m.boardAccountCols(rows)))
+		markerAt := strings.Index(row, marker)
+		titleAt := strings.Index(row, "XXXX")
+		if markerAt < 0 || titleAt < 0 {
+			t.Fatalf("width %d: missing title or judge marker: %q", width, row)
+		}
+		titleEnd := visualWidth(strings.TrimRight(row[:markerAt], " "))
+		wantEnd := width - 18 - mc.fullW - 2
+		if titleEnd != wantEnd {
+			t.Errorf("width %d: title ends at %d, want marker budget boundary %d", width, titleEnd, wantEnd)
+		}
+		titleWidth := titleEnd - visualWidth(row[:titleAt])
+		if width == 200 && titleWidth <= 60 {
+			t.Errorf("wide title still capped: rendered %d columns", titleWidth)
+		}
+		if visualWidth(row[:markerAt]) != width-18-mc.fullW {
+			t.Errorf("width %d: judge marker moved", width)
+		}
+		workerAt := strings.Index(row, "worker-a")
+		if workerAt < 0 || visualWidth(row[:workerAt]) != width-16 {
+			t.Errorf("width %d: worker column moved: %q", width, row)
+		}
+		if visualWidth(row) != width {
+			t.Errorf("width %d: row overflowed or underfilled: %d", width, visualWidth(row))
+		}
+	}
+}

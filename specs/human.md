@@ -1307,6 +1307,8 @@ PRD at `prds/1786-preserve-worker-only-work.md`.
 - Personal run lists show each run's recorded account when the viewer holds more than one credential across Claude and Codex, including one of each. Exact `default` displays as the harness name only for a live credential and exactly one credential of that harness; deleted snapshots, admin views and run details retain recorded labels. Disabled credentials count. (AI-synced 2026-10-13)
 - The TUI keeps account before cost, fits shared cell widths to visible rows (caps 10/6), and permits title movement between frames while retaining maximum-width visibility reservations. Web lists refresh credential counts on their existing visible-tab poll; runs and counts preserve last-good state independently on failures. (AI-synced 2026-10-13)
 
+- Board titles use all remaining terminal columns before the reserved judge marker and worker column, with no fixed title cap. This supersedes the board-title cap recorded in frozen `specs/ai.md` §559. (AI-synced 2026-10-14, #2922)
+
 ## Deferred (user, "later stuff")
 
 - On-demand worker spawning: on compose the worker simply runs always-on (idle is
