@@ -1,11 +1,10 @@
 // PRD #1332 (M5A, C4a) — Codex per-thread/per-model token accounting.
 //
-// The production Codex registry retains NO model identity and drops the app-server's
-// `thread/tokenUsage/updated` notifications as generic activity, so a Codex run emits no
-// per-model usage. This module is the missing accounting spine: an IMMUTABLE
-// `threadId -> configured model` map plus a per-thread cumulative-snapshot reconciler that
-// the {@link CodexHarness} feeds every typed usage notification (root AND demuxed child) and
-// reads at each turn terminal to build the result-frame `modelUsage`.
+// The accounting spine for Codex runs: an IMMUTABLE `threadId -> configured model` map plus a
+// per-thread cumulative-snapshot reconciler. The {@link CodexHarness} feeds it every typed
+// `thread/tokenUsage/updated` notification (root AND demuxed child) and reads it at each turn
+// terminal to project the result frame's per-model `modelUsage`, metered or unreported per
+// model as COST below describes.
 //
 // RECONCILIATION (D5), stated as invariants the tests pin:
 //   - `total` is the thread's CUMULATIVE usage; `last` is the single most-recent response.

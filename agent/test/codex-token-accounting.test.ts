@@ -8,8 +8,9 @@ import type { CodexThreadTokenUsage, CodexUsageBreakdown } from "../src/codex/tr
 // harness, no transport). These are the reconciliation proofs D5 demands: a duplicate, stale
 // resume replay or out-of-order note cannot increase usage; a missed update is recovered from
 // the cumulative; an unknown thread is never attributed to the root; a mixed-model child
-// aggregates per actual model; redelivery is idempotent. Every emitted entry is `unreported`
-// (C4a prices nothing) and carries NO costUSD.
+// aggregates per actual model; redelivery is idempotent. Token-only cases (no pricing
+// context) emit `unreported` entries with NO costUSD; the pricing-aware controls also assert
+// metered entries.
 
 const MODEL_ROOT = "gpt-6-astra";
 const MODEL_CHILD = "gpt-5.6-sol";
