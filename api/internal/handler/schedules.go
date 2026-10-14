@@ -98,7 +98,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	// this request's pin if one was just resolved, else the user's default_harness else claude),
 	// then persist the resolved columns. A self_improve schedule with an explicit override 409s
 	// here (scheduleLaneKind → SelfImprove).
-	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(store.RunSchedule{UserID: user.ID}, harnessCols), m.Target, req)
+	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), h.q, user.ID, scheduleWithHarness(store.RunSchedule{UserID: user.ID}, harnessCols), m.Target, req)
 	if !ok {
 		return
 	}
@@ -248,7 +248,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		if repoint {
 			// Ownership mirror (create parity, PRD #344 D3): 404 on a foreign/absent repo.
 			// No enabled/guardrail/blocked gate is added here — those run at fire time.
-			if _, rerr := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
+			if _, rerr := qw.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
 				httpx.Error(w, http.StatusNotFound, "repo not found")
 				return
 			}
@@ -300,7 +300,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		// write the resolved columns.
 		credMode := cur.CredentialOverrideMode
 		credSecret := cur.CredentialOverrideSecretID
-		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(cur, harnessCols), m.Target, req)
+		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), qw, user.ID, scheduleWithHarness(cur, harnessCols), m.Target, req)
 		if !ok {
 			return
 		}
@@ -629,14 +629,15 @@ func scheduleLaneKind(target string) string {
 // no longer wrongly refuses an Anthropic override. Neither harness usable ⇒ treat as claude, the
 // safe direction: the override is allowed and the AUTHORITATIVE fire-time gate re-checks and fails
 // closed if the schedule later resolves to codex.
-func (h *Handler) scheduleEffectiveHarness(ctx context.Context, sched store.RunSchedule) (string, error) {
+// All resolver reads use q, which is transaction-bound during a locked config edit.
+func (h *Handler) scheduleEffectiveHarness(ctx context.Context, q *store.Queries, sched store.RunSchedule) (string, error) {
 	if sched.Harness.Valid && sched.Harness.String != "" {
 		if sched.Harness.String == string(workersvc.HarnessCodex) {
 			return string(workersvc.HarnessCodex), nil
 		}
 		return string(workersvc.HarnessClaude), nil
 	}
-	harness, err := h.wsvc.ResolveHarnessForUser(ctx, sched.UserID, nil)
+	harness, err := h.wsvc.ResolveHarnessForUserOn(ctx, q, sched.UserID, nil)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrNoUsableCredential) {
 			return string(workersvc.HarnessClaude), nil
@@ -666,7 +667,8 @@ type scheduleCredentialColumns struct {
 // switch (D10) — and returns the resolved columns (both NULL for a switchable-lane inherit
 // clear). It writes the HTTP error itself (400 malformed uuid, 404/409/422/400 via
 // writeCredentialOverrideError) and returns ok=false on any refusal.
-func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx context.Context, userID uuid.UUID, sched store.RunSchedule, target string, req apitypes.ScheduleRequest) (scheduleCredentialColumns, bool) {
+// Harness and credential reads use q so a locked edit needs no second pool connection.
+func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx context.Context, q *store.Queries, userID uuid.UUID, sched store.RunSchedule, target string, req apitypes.ScheduleRequest) (scheduleCredentialColumns, bool) {
 	if !req.CredentialOverride.Present {
 		return scheduleCredentialColumns{keep: true}, true
 	}
@@ -683,13 +685,13 @@ func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx c
 			secretID = &id
 		}
 	}
-	harness, herr := h.scheduleEffectiveHarness(ctx, sched)
+	harness, herr := h.scheduleEffectiveHarness(ctx, q, sched)
 	if herr != nil {
 		slog.Error("resolve schedule harness", "error", herr)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return scheduleCredentialColumns{}, false
 	}
-	resolved, verr := h.wsvc.ResolveCredentialOverride(ctx, userID, scheduleLaneKind(target), harness, mode, secretID)
+	resolved, verr := h.wsvc.ResolveCredentialOverrideOn(ctx, q, userID, scheduleLaneKind(target), harness, mode, secretID)
 	if verr != nil {
 		h.writeCredentialOverrideError(w, verr)
 		return scheduleCredentialColumns{}, false

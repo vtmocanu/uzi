@@ -781,7 +781,7 @@ func TestScheduleEffectiveHarnessExplicit(t *testing.T) {
 	}
 	for _, tc := range cases {
 		t.Run(tc.name, func(t *testing.T) {
-			got, err := (&Handler{}).scheduleEffectiveHarness(context.Background(), store.RunSchedule{Harness: tc.harness})
+			got, err := (&Handler{}).scheduleEffectiveHarness(context.Background(), nil, store.RunSchedule{Harness: tc.harness})
 			if err != nil {
 				t.Fatalf("scheduleEffectiveHarness returned err=%v, want nil", err)
 			}

@@ -455,7 +455,7 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// the catalog-owned reject block above.
 	credMode := cur.CredentialOverrideMode
 	credSecret := cur.CredentialOverrideSecretID
-	credCols, credOK := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(cur, harnessCols), cur.Target, req)
+	credCols, credOK := h.resolveScheduleCredentialOverride(w, r.Context(), qw, user.ID, scheduleWithHarness(cur, harnessCols), cur.Target, req)
 	if !credOK {
 		return store.RunSchedule{}, false
 	}
