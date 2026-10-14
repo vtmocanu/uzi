@@ -29,6 +29,7 @@
 # --identity-only [oracle-path] runs identity fixtures, optionally against a frozen oracle.
 # --ghcr-only [baseline-verifier] runs #1464 M1 publication fixtures only.
 # --frozen-rc-only runs the #1389 block-guard regressions without the full fixture suite.
+# --fold-order-only runs canonical pending/open-RC ordering fixtures.
 #
 # Wired as `task test:release-scripts` (its own gate member, not gate:repo's
 # sub-second band: it builds a multi-commit repo). Watch it fail on the
@@ -439,7 +440,7 @@ if [ "${1:-}" = "--identity-only" ]; then
   exit $?
 fi
 
-if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ]; then
+if [ "${1:-}" != "--shipping-paths-only" ] && [ "${1:-}" != "--ghcr-only" ] && [ "${1:-}" != "--fold-order-only" ]; then
 identity_regressions
 echo "=== building fixture in $REPO ==="
 build_fixture
@@ -635,6 +636,69 @@ add_origin() {
   git -C "$d" push -q origin main --tags
 }
 push_tag_to_origin() { git -C "$1" push -q origin "refs/tags/$2"; }
+
+# Real cuts preserve published blocks while grouping newly pending categories.
+fold_order_regressions() {
+  local d mode inventory version base before oldblock oldaddition section expected
+  # Four finite, independent fixtures: assertion failures do not block sibling cases.
+  for mode in next skip; do
+    for inventory in legacy mixed; do
+      d="$(mktemp -d)"; seed_repo "$d"; add_feature "$d" 201
+      printf '# Changelog\n\n## [Unreleased]\n### Changed\n- **Published change** (#201)\n  Published continuation bytes.\n' > "$d/.git/notes"
+      if [ "$mode" = skip ]; then
+        printf '### Added\n- **Published addition** (#201)\n  Addition continuation bytes.\n' >> "$d/.git/notes"
+      fi
+      printf '\n## [0.1.0] - 2026-09-01\n### Added\n- **Initial** (#100)\n' >> "$d/.git/notes"
+      put_changelog "$d" < "$d/.git/notes"
+      run_rc "$d" 0.2.0
+      assert_eq "$mode $inventory ordering fixture first cut" 0 "$RC_RC"
+      git -C "$d" tag v0.2.0-rc.1
+      before="$(awk '/^## \[0.1.0\]/{p=1} p&&/^\[Unreleased\]:/{exit} p' "$d/CHANGELOG.md")"
+      oldblock="$(awk '/^- \*\*Published change/{p=1} p && NF==0{exit} p' "$d/CHANGELOG.md")"
+      oldaddition="$(awk '/^- \*\*Published addition/{p=1} p && NF==0{exit} p' "$d/CHANGELOG.md")"
+      awk '
+        {print}
+        /^## \[Unreleased\]$/ {
+          print "### Fixed"; print "- **Pending fix** (#202)"; print "  Fix continuation bytes."
+          print "### Added"; print "- **Pending addition** (#202)"; print "  Pending continuation bytes."
+        }
+      ' "$d/CHANGELOG.md" > "$d/.git/pending-notes"
+      put_changelog "$d" < "$d/.git/pending-notes"
+      if [ "$inventory" = mixed ]; then
+        mkdir -p "$d/changelog.d"
+        printf '### Added\n\n- **Pending fragment (#202).**\n  Fragment continuation bytes.\n' > "$d/changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"
+        git -C "$d" add -- changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md
+        gcommit "$d" 'docs: ordering fragment'
+      fi
+      add_feature "$d" 202
+      version=0.2.0; base=0.2.0
+      if [ "$mode" = skip ]; then version=0.3.0; base=0.3.0; fi
+      if [ "$mode" = skip ]; then run_rc "$d" "$version" --skip-promote; else run_rc "$d" "$version"; fi
+      assert_eq "$mode $inventory ordered cut succeeds" 0 "$RC_RC"
+      section="$(awk -v base="$base" 'index($0, "## [" base "]")==1{s=1;next} s&&/^## \[/{exit} s' "$d/CHANGELOG.md")"
+      expected=$'### Changed\n### Added\n### Fixed'
+      if [ "$mode" = skip ]; then expected=$'### Added\n### Changed\n### Fixed'; fi
+      assert_eq "$mode $inventory one heading per category in published/pending order" "$expected" "$(printf '%s\n' "$section" | awk '/^### /')"
+      expected=$'- **Published change**\n- **Pending addition**\n- **Pending fix**'
+      if [ "$mode" = skip ]; then expected=$'- **Published addition**\n- **Pending addition**\n- **Published change**\n- **Pending fix**'; fi
+      if [ "$inventory" = mixed ]; then
+        if [ "$mode" = skip ]; then expected=$'- **Published addition**\n- **Pending addition**\n- **Pending fragment\n- **Published change**\n- **Pending fix**'
+        else expected=$'- **Published change**\n- **Pending addition**\n- **Pending fragment\n- **Pending fix**'; fi
+      fi
+      assert_eq "$mode $inventory new blocks append to matching categories" "$expected" "$(printf '%s\n' "$section" | awk '/^- /{sub(/ \(.*/, ""); print}')"
+      assert_contains "$mode $inventory published block bytes survive" "$oldblock" "$section"
+      if [ "$mode" = skip ]; then assert_contains "$mode $inventory published addition bytes survive" "$oldaddition" "$section"; fi
+      assert_contains "$mode $inventory pending continuation survives" '  Pending continuation bytes.' "$section"
+      assert_eq "$mode $inventory released section bytes unchanged" "$before" "$(awk '/^## \[0.1.0\]/{p=1} p&&/^\[Unreleased\]:/{exit} p' "$d/CHANGELOG.md")"
+      rm -rf "$d"
+    done
+  done
+}
+if [ "$#" -eq 0 ] || [ "${1:-}" = "--fold-order-only" ]; then fold_order_regressions; fi
+if [ "${1:-}" = "--fold-order-only" ]; then
+  printf '=== fold ordering: %s passed, %s failed ===\n' "$PASSES" "$FAILS"
+  [ "$FAILS" -eq 0 ]; exit $?
+fi
 
 # #1466: public release seams, with independent fixtures for each runtime surface.
 shipping_path_regressions() {
@@ -1308,7 +1372,7 @@ next_rc_fixture "$S3R" <<'MD'
 MD
 run_rc "$S3R" 0.2.0
 assert_eq "repeated ### in [Unreleased] folds (exit 0)" "0" "$RC_RC"
-assert_contains "the collapse is reported, not silent" "[Unreleased] repeats ### Added" "$RC_OUT"
+assert_eq "canonical pending view leaves one Added heading" 1 "$(open_section "$S3R" | awk '/^### Added$/{n++} END{print n+0}')"
 assert_eq "both repeats land under the one ### Added, in order" "### Added|- **Feature 201**|- **Late one**|- **Late two**|### Fixed|- **Late fix**" \
   "$(open_section "$S3R" | grep -v '^[[:space:]]*$' | sed 's/^\(- \*\*[^*]*\*\*\).*/\1/' | paste -sd'|' -)"
 
@@ -2320,6 +2384,17 @@ for mode in rc stable no-commit commit-failure oracle-failure; do
       assert_eq "$mode clean tracked tree" "" "$(git -C "$MF" status --porcelain --untracked-files=no)"
       assert_eq "$mode deletion committed" D "$(git -C "$MF" diff HEAD~1 HEAD --name-status -- "$fragment_path" | awk '{print $1}')"
       if [ "$mode" = rc ]; then
+        repeat_start="$(git -C "$MF" rev-parse HEAD)"
+        repeat_notes="$(awk 'NF' "$MF/CHANGELOG.md")"
+        run_rc "$MF" 0.2.0
+        assert_eq "repeat first RC before tagging refuses empty pending" 3 "$RC_RC"
+        assert_eq "repeat before tag retains HEAD" "$repeat_start" "$(git -C "$MF" rev-parse HEAD)"
+        assert_eq "repeat before tag retains all nonblank note bytes" "$repeat_notes" "$(awk 'NF' "$MF/CHANGELOG.md")"
+        assert_eq "repeat before tag never replays consumed fragment" 1 "$(fragment_count "$MF" 201)"
+        assert_eq "repeat before tag fragment stays absent" no "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
+        # Precommit preparation may normalize blank lines; restore only this repeat's
+        # metadata from its current start, never resurrect the consumed fragment.
+        git -C "$MF" restore --source="$repeat_start" --staged --worktree -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh
         git -C "$MF" tag v0.2.0-rc.1
         run_rc "$MF" 0.2.0
         assert_eq "empty RC respin succeeds" 0 "$RC_RC"
