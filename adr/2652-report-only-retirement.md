@@ -54,7 +54,10 @@ Under the journal and bare locks, the worker authenticates the physical recovery
 journals and enumerates owed roots and their contexts. Relevant journal heads
 and owed roots must be ancestors of the selected aggregate; owed contexts must
 match the authenticated frozen roots. Frozen original/current heads remain
-requirements even after pins disappear. Earlier generations with their own
+requirements even after pins disappear. As qualified by
+[ADR-2943](2943-retirement-proof-source-coverage.md), a relevant competing
+unacknowledged FINAL also requires coverage of its own source SHA; non-FINAL
+aggregate tips remain checked through frozen heads and roots. Earlier generations with their own
 covering acknowledgment are settled for this check; positively attributed
 later-generation sources are outside G's report scope. Unknown attribution
 retains the report.

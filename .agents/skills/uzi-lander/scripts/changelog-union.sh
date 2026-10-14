@@ -2,7 +2,8 @@
 # changelog-union.sh — resolve a CHANGELOG.md rebase conflict by keeping BOTH sides, the
 # answer for a shared append-only list where every PR adds a bullet under the same heading.
 #
-# Usage: changelog-union.sh [--collapse] [FILE]      (default: CHANGELOG.md)
+# Usage: changelog-union.sh [--collapse] [--base FILE] [FILE] (default: CHANGELOG.md)
+# --base: preserve that base's headings and ordered content; collapse only added subsections.
 #
 # Every conflict block keeps its first side, then its second; a diff3 base section
 # (`|||||||` .. `=======`) is dropped. FAIL-CLOSED: when a bullet, a continuation line or a
@@ -50,10 +51,20 @@
 set -uo pipefail
 
 MODE=union
-if [ "${1:-}" = --collapse ]; then MODE=collapse; shift; fi
+BASE_FILE=""
+while [ $# -gt 0 ]; do
+  case "$1" in
+    --collapse) MODE=collapse; shift ;;
+    --base) BASE_FILE="${2:?--base needs a file}"; shift 2 ;;
+    *) break ;;
+  esac
+done
 FILE="${1:-CHANGELOG.md}"
-[ $# -le 1 ] || { echo "usage: changelog-union.sh [--collapse] [FILE]" >&2; exit 2; }
+[ $# -le 1 ] || { echo "usage: changelog-union.sh [--collapse] [--base FILE] [FILE]" >&2; exit 2; }
 [ -f "$FILE" ] && [ -r "$FILE" ] || { echo "changelog-union: cannot read $FILE" >&2; exit 2; }
+[ -z "$BASE_FILE" ] || { [ -f "$BASE_FILE" ] && [ -r "$BASE_FILE" ]; } \
+  || { echo "changelog-union: cannot read base $BASE_FILE" >&2; exit 2; }
+HERE="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 
 MARKER_RE='^(<<<<<<<( |$)|>>>>>>>( |$)|[|]{7}( |$)|=======$)'
 if [ "$MODE" = collapse ]; then
@@ -305,6 +316,9 @@ fold_resolve() {
 
 if [ "$MODE" = collapse ]; then
 cp "$FILE" "$tmpd/before" || exit 2
+if [ -n "$BASE_FILE" ]; then
+  python3 "$HERE/changelog-collapse.py" "$BASE_FILE" "$FILE" > "$tmpd/out" || exit 2
+else
 awk "$SEP_AWK"'
   function blank(s) { return s ~ /^[ \t]*$/ }
   # lastpair(s): the kind of the newest item pair inside section s (1 blank, 0 touching, "").
@@ -362,8 +376,9 @@ awk "$SEP_AWK"'
     for (i = e; i <= n; i++) print L[i]
   }
 ' "$FILE" > "$tmpd/out" || { echo "changelog-union: collapse failed; $FILE left untouched" >&2; exit 1; }
+fi
 if cmp -s "$FILE" "$tmpd/out"; then
-  echo "changelog-union: no duplicate headings under [Unreleased] in $FILE; nothing to do"
+  echo "changelog-union: no safe heading collapse in $FILE; nothing to do"
   exit 0
 fi
 else
@@ -435,7 +450,7 @@ fi
 # either side of the join become one run: a JOIN keeps the longer of the two, so no side
 # loses a separator it had; a join with no blank line on either side, and every folded
 # repeat, gets joinstyle()'s gap.
-awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
+awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" -v scoped="$BASE_FILE" "$SEP_AWK"'
   function isblank(s) { return s ~ /^[ \t]*$/ }
   function emit_body(h,   i, lo, hi, k, pend, a, injoin, jkind, jid, n, prevc) {
     lo = 1; hi = cnt[h]
@@ -480,7 +495,7 @@ awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
     for (i = u + 1; i < e; i++) {
       if (L[i] ~ /^### /) {
         key = L[i]; sub(/[ \t]+$/, "", key)
-        if (!(key in idx)) { idx[key] = ++nh; hd[nh] = L[i]; cnt[nh] = 0 }
+        if (scoped != "" || !(key in idx)) { idx[key] = ++nh; hd[nh] = L[i]; cnt[nh] = 0 }
         else { B[idx[key], ++cnt[idx[key]]] = sentinel " C" }  # a folded repeat: a join
         cur = idx[key]; continue
       }
@@ -495,6 +510,10 @@ awk -v sepfile="$tmpd/sep" -v sentinel="$SENTINEL" "$SEP_AWK"'
     for (i = e; i <= n; i++) print L[i]
   }
 ' "$tmpd/union" > "$tmpd/out" || { echo "changelog-union: collapse failed; $FILE left untouched" >&2; exit 1; }
+if [ -n "$BASE_FILE" ]; then
+  python3 "$HERE/changelog-collapse.py" "$BASE_FILE" "$tmpd/out" > "$tmpd/scoped" || exit 2
+  mv "$tmpd/scoped" "$tmpd/out" || exit 2
+fi
 fi
 
 # ---- verification ---------------------------------------------------------------------------

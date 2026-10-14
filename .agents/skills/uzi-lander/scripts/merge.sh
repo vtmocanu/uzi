@@ -4,7 +4,8 @@
 # post-merge watch. The decision to merge is the caller's; this is only the mechanics.
 #
 # Usage: merge.sh OWNER/REPO PR [--expect-head SHA] [--expect-closes N[,N...]|none] [--method squash|merge] [--no-admin] [--no-delete-branch] [--no-rework-check] [--confirm-only]
-#   --expect-head   the head you reviewed/watched; a different current head refuses (exit 8)
+#   --expect-head   reviewed full SHA or unique hex prefix (7+); resolve prefixes on the forge
+#                   before comparing; a different current head refuses (exit 8)
 #                   so a push that landed after your last look is never merged unseen. The
 #                   merge itself passes --match-head-commit, so a push in the window between
 #                   the preflight and the merge is refused by GitHub as well.
@@ -135,8 +136,22 @@ if [ "$CONFIRM_ONLY" -eq 1 ]; then
 fi
 
 [ "$state" = "OPEN" ] || { echo "PR #$PR is $state"; exit 3; }
-if [ -n "$EXPECT" ] && ! printf '%s' "$head" | grep -q "^$EXPECT"; then
-  echo "HEAD MISMATCH: current ${head:0:8}, expected ${EXPECT:0:8} — a push landed after your last look; re-review"; exit 8
+if [ -n "$EXPECT" ]; then
+  if ! [[ "$EXPECT" =~ ^[[:xdigit:]]{7,40}$ ]]; then
+    echo "bad --expect-head: require a full SHA or hex prefix of at least 7 characters" >&2; exit 2
+  fi
+  EXPECT=$(printf '%s' "$EXPECT" | tr 'ABCDEF' 'abcdef')
+  if [ "${#EXPECT}" -lt 40 ]; then
+    prefix=$EXPECT
+    EXPECT=$(gh api "repos/$REPO/commits/$prefix" --jq .sha 2>/dev/null) \
+      || { echo "cannot resolve --expect-head prefix $prefix uniquely; current $head; not merging" >&2; exit 3; }
+    if ! [[ "$EXPECT" =~ ^[0-9a-f]{40}$ ]] || [[ "$EXPECT" != "$prefix"* ]]; then
+      echo "invalid resolved --expect-head for $prefix; current $head; not merging" >&2; exit 3
+    fi
+  fi
+  if [ "$head" != "$EXPECT" ]; then
+    echo "HEAD MISMATCH: current $head, expected $EXPECT; a push landed after your last look; re-review"; exit 8
+  fi
 fi
 echo "head=${head:0:8} mergeable=$mg mergeStateStatus=$ms"
 

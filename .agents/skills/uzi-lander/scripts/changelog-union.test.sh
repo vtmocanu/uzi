@@ -711,4 +711,35 @@ printf '## [Unreleased]\n\n### Changed\n\n- **m**\n- **b**\n\n## Notes\n\n- **x*
 bash "$SCRIPT" "$WORK/tie.md" > "$WORK/tie.out" 2>&1 || fail "tie union failed: $(cat "$WORK/tie.out")"
 diff -u "$WORK/tie.want" "$WORK/tie.md" || fail "non-release sections or a tie changed the join"
 
-echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept, and a fresh [Unreleased] joining with the file's blank-line convention"
+# Base-aware mode folds only this PR's heading, never pre-existing duplicates.
+cat > "$WORK/scoped-base.md" <<'EOF'
+## [Unreleased]
+
+### Added
+
+- main first
+
+### Fixed
+
+- main fix
+
+### Added
+
+- main last
+
+## [1.0.0]
+
+- released
+EOF
+awk '{print} /^## \[Unreleased\]/{print ""; print "### Added"; print ""; print "- branch own"}' "$WORK/scoped-base.md" > "$WORK/scoped.md"
+bash "$SCRIPT" --collapse --base "$WORK/scoped-base.md" "$WORK/scoped.md" > "$WORK/scoped.out" 2>&1 || fail "base-aware collapse failed: $(cat "$WORK/scoped.out")"
+awk 'NF && $0 != "- branch own"' "$WORK/scoped.md" > "$WORK/scoped.actual"
+awk 'NF' "$WORK/scoped-base.md" > "$WORK/scoped.want"
+diff -u "$WORK/scoped.want" "$WORK/scoped.actual" || fail "collapse moved main's headings or bullets"
+[ "$(grep -c '^### Added$' "$WORK/scoped.md")" -eq 2 ] || fail "base-aware mode did not remove only the added heading"
+awk '{print} /^- main fix$/{print "<<<<<<< HEAD"; print "||||||| parent"; print "======="; print "### Fixed"; print ""; print "- branch own"; print ">>>>>>> branch"}' "$WORK/scoped-base.md" > "$WORK/scoped-union.md"
+bash "$SCRIPT" --base "$WORK/scoped-base.md" "$WORK/scoped-union.md" > "$WORK/scoped-union.out" 2>&1 || fail "base-aware union failed: $(cat "$WORK/scoped-union.out")"
+awk 'NF && $0 != "- branch own"' "$WORK/scoped-union.md" > "$WORK/scoped-union.actual"
+diff -u "$WORK/scoped.want" "$WORK/scoped-union.actual" || fail "union moved main's headings or bullets"
+
+echo "PASS changelog-union: union, duplicate-heading collapse, lossy refusal, both-sides and repeated-version refusals, shared ### subsections, reword, no-base and version-heading refusals, no-op, --collapse, blank-separated entries, sparse/mixed/no-vote gaps kept, and base-aware preservation"

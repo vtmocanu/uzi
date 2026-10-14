@@ -6,6 +6,7 @@ import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import type { OutboxHeartbeatEntry, StateAck, StateRequest } from "../src/protocol.js";
 import { mkSweepOutbox, pollUntil, recordingLogger, startSweepWorker, sweepClient } from "./worker-sweep-rig.js";
 import { sleep } from "../src/util.js";
+import { RequestError } from "../src/client.js";
 
 // Issue #1512: the heartbeat-driven terminal sweep. A journaled run terminal whose send failed and
 // whose run has NO message-outbox records used to strand until boot or re-claim, because the only
@@ -222,6 +223,57 @@ describe("Worker heartbeat terminal sweep (issue #1512)", () => {
     const entry = latest!.find((e) => e.run_id === RUN)!;
     assert.equal(entry.pending_terminal, 1);
     assert.equal(entry.blocked_reason, "gap_unrecoverable");
+  });
+
+  it("5b2. issue #2950: a structured not-owned 404 blocks the journal once; later sweeps and a restarted worker send nothing", async () => {
+    const outbox = await rig();
+    let sends = 0;
+    let latest: OutboxHeartbeatEntry[] | undefined;
+    const notOwned = new RequestError(
+      "POST", `/api/worker/runs/${RUN}/state`, 404,
+      '{"error":"run not found for this worker","reason":"run_not_owned"}',
+      undefined, { complete: true, bytes: 67 },
+    );
+    const mk = () => sweepClient({
+      heartbeat: async (entries) => { latest = entries; },
+      reportState: async () => { sends += 1; throw notOwned; },
+    });
+    await outbox.journalTerminal(RUN, 2, "running", 0, { status: "failed" });
+    const before = await outbox.readTerminalJournal(RUN, 2);
+    const w = startSweepWorker({ outbox, client: mk() });
+    try {
+      await pollUntil(
+        () => (latest ?? []).some((e) => e.run_id === RUN && e.blocked_reason === "run_not_owned"),
+        3000,
+        "journal blocked and reported with run_not_owned",
+      );
+      const seen = sends;
+      await sleep(40);
+      assert.equal(sends, seen, "later sweeps send nothing");
+    } finally {
+      await w.stop();
+    }
+    assert.equal(sends, 1, "exactly one send before it was blocked");
+    assert.equal(latest!.find((e) => e.run_id === RUN)!.pending_terminal, 1);
+
+    // Restart: a new worker over the same outbox dir keeps it blocked and sends nothing at boot.
+    const sendsBefore = sends;
+    latest = undefined;
+    const w2 = startSweepWorker({ outbox, client: mk() });
+    try {
+      await pollUntil(
+        () => (latest ?? []).some((e) => e.run_id === RUN && e.blocked_reason === "run_not_owned"),
+        3000,
+        "still blocked after restart",
+      );
+      await sleep(40);
+    } finally {
+      await w2.stop();
+    }
+    assert.equal(sends, sendsBefore, "restart resends nothing");
+    const after = await outbox.readTerminalJournal(RUN, 2);
+    assert.deepEqual(after?.body, before?.body);
+    assert.equal(after?.blockedReason, "run_not_owned");
   });
 
   it("5c. a run with undrained message segments is left to the drainer, not the sweep", async () => {

@@ -4,6 +4,7 @@ import fs from "node:fs/promises";
 import { existsSync, statSync } from "node:fs";
 import os from "node:os";
 import path from "node:path";
+import { createHmac } from "node:crypto";
 
 import {
   Outbox,
@@ -1794,6 +1795,44 @@ describe("Outbox M3 terminal-journal store (PRD #1391 Run B)", () => {
     await b.init();
     assert.equal(b.depthFor("r1")?.blockedReason, reason, "blocked state survives restart");
     assert.equal(b.listPendingTerminals()[0]?.blocked, true);
+  });
+
+  it("T6c. issue #2950: run_not_owned and its body survive restart; an unknown raw blocked_reason stays blocked with no reason", async () => {
+    const root = await mkRoot();
+    const o = makeOutbox(root);
+    await o.init();
+    const body = canonicalizeTerminalBody({ status: "failed", failure_reason: "boom" }, 1 << 20);
+    await o.journalTerminal("r1", 8, "running", 9, body);
+    await o.journalTerminal("r2", 8, "running", 9, body);
+    await o.markTerminalBlocked("r1", 8, "run_not_owned");
+    const before = await o.readTerminalJournal("r1", 8);
+
+    // Forge a validly-sealed journal whose blocked_reason is outside the closed vocabulary.
+    const file = path.join(root, "r2", "terminal-8.json");
+    const rec = JSON.parse(await fs.readFile(file, "utf8")) as Record<string, unknown>;
+    delete rec.mac;
+    rec.blocked = true;
+    rec.blocked_reason = "from_the_future";
+    const canon = (v: unknown): string => {
+      if (v === null || typeof v !== "object") return JSON.stringify(v) ?? "null";
+      if (Array.isArray(v)) return `[${v.map(canon).join(",")}]`;
+      const obj = v as Record<string, unknown>;
+      return `{${Object.keys(obj).sort().filter((k) => obj[k] !== undefined).map((k) => `${JSON.stringify(k)}:${canon(obj[k])}`).join(",")}}`;
+    };
+    const key = await fs.readFile(path.join(root, ".key"));
+    const mac = createHmac("sha256", key).update("uzi.outbox.terminal.v1").update(canon(rec)).digest("hex");
+    await fs.writeFile(file, JSON.stringify({ ...rec, mac }));
+
+    const b = makeOutbox(root);
+    await b.init();
+    const pending = new Map(b.listPendingTerminals().map((p) => [p.run_id, p]));
+    assert.equal(pending.get("r1")?.blocked, true);
+    assert.equal(pending.get("r1")?.blocked_reason, "run_not_owned");
+    const after = await b.readTerminalJournal("r1", 8);
+    assert.equal(after?.blockedReason, "run_not_owned");
+    assert.deepEqual(after?.body, before?.body, "the outcome body survives intact");
+    assert.equal(pending.get("r2")?.blocked, true, "an unknown reason still blocks");
+    assert.equal(pending.get("r2")?.blocked_reason, undefined, "but carries no reason");
   });
 
   it("T6b. marking a terminal blocked releases the reserve on ENOSPC and persists across restart", async () => {

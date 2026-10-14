@@ -71,6 +71,7 @@
   "outbox_pending_terminal": 1,
   "outbox_stale_retired": 1,
   "outbox_blocked": "x",
+  "outbox_blocked_run_id": "x",
   "residue_quarantined_at": "2020-01-02T03:04:05Z",
   "residue_quarantine_cause": "x",
   "owner_email": "x",

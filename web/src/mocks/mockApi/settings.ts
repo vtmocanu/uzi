@@ -143,6 +143,7 @@ const SEED_APP_SETTINGS: AppSettings = {
   now_summary_enabled: "true",
   // PRD #529 / #649 M1: ephemeral worker auto-provisioning instance kill-switch, default OFF.
   ephemeral_workers_enabled: "false",
+  hosted_worker_quota: "2",
   // PRD #836: upstream release-check toggles, both default ON (the master air-gap
   // switch and the escalation-banner switch). The Updates card reads the live values
   // off getReleaseCheck and writes them back here through updateSettings.
@@ -289,6 +290,8 @@ function isPersistedSettings(p: unknown): p is PersistedSettings {
     typeof a.default_light_theme === "string" &&
     typeof a.default_dark_theme === "string" &&
     typeof a.default_typeface === "string" &&
+    // Legacy demo settings inherit the quota seed; reject malformed non-string values.
+    (a.hosted_worker_quota === undefined || typeof a.hosted_worker_quota === "string") &&
     // PRD #649: accept legacy blobs that predate this field (undefined), but reject a
     // malformed non-string so a bad localStorage blob can't violate the AppSettings contract.
     (a.ephemeral_workers_enabled === undefined || typeof a.ephemeral_workers_enabled === "string") &&
@@ -830,6 +833,17 @@ export const settingsApi = {
           throw new ApiError(400, `${key}: must be "true" or "false"`);
         }
         (nonSecret as Record<string, string>)[key] = value;
+        continue;
+      }
+      if (key === "hosted_worker_quota") {
+        if (!/^[+-]?\d+$/.test(value.trim())) {
+          throw new ApiError(400, "hosted_worker_quota: must be a whole number of workers");
+        }
+        const n = Number(value.trim());
+        if (n < 0 || n > 20) {
+          throw new ApiError(400, "hosted_worker_quota: must be 0 (self-service disabled) or between 1 and 20 workers");
+        }
+        nonSecret.hosted_worker_quota = value;
         continue;
       }
       // judge_cooldown_seconds: 0 (off) or 60..86400 seconds; judge_daily_budget: 0

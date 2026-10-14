@@ -243,3 +243,62 @@ describe("ActiveRunRegistry — deterministic overflow rotation (PRD #1391 Run B
     assert.deepStrictEqual(picks, [X, Y, Z], "oldest-first over every pending entry");
   });
 });
+
+describe("ActiveRunRegistry — run_not_owned journals are not leasable (issue #2950)", () => {
+  const notOwned = (run: string, since = 1): PendingTerminal => ({ ...pt(run, 5, { blocked: true, since }), blocked_reason: "run_not_owned" });
+  const gap = (run: string, since = 1): PendingTerminal => ({ ...pt(run, 6, { blocked: true, since }), blocked_reason: "gap_unrecoverable" });
+  const RUN_C = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+
+  it("cap 0: a lone run_not_owned entry is neither listed, nor overflow, nor a claim pause", () => {
+    const reg = new ActiveRunRegistry(() => [notOwned(RUN_A)], () => 0);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), false);
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.active, []);
+    assert.strictEqual(snap.pending_overflow, false);
+  });
+
+  it("cap 0: another blocked reason still overflows and pauses the claim loop", () => {
+    const reg = new ActiveRunRegistry(() => [gap(RUN_A), notOwned(RUN_B)], () => 0);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    assert.strictEqual(reg.build().pending_overflow, true);
+  });
+
+  it("cap N: build omits it and it does not displace leasable entries from fixed slots", () => {
+    // Cap 2, three pending. With the not-owned entry counted it would take a fixed slot (blocked,
+    // oldest) and overflow; filtered, the two leasable entries fit exactly.
+    const pending = [notOwned(RUN_A, 1), gap(RUN_B, 2), pt(RUN_C, 1, { since: 3 })];
+    const reg = new ActiveRunRegistry(() => pending, () => 2);
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.active.map((e) => e.run_id), [RUN_B, RUN_C]);
+    assert.strictEqual(snap.pending_overflow, false);
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), false);
+  });
+
+  it("cap N: a real overflow among leasable entries still rotates without ever listing the not-owned run", () => {
+    const pending = [notOwned(RUN_A, 1), gap(RUN_B, 2), pt(RUN_C, 1, { since: 3 })];
+    const reg = new ActiveRunRegistry(() => pending, () => 1);
+    for (let i = 0; i < 4; i++) {
+      const snap = reg.build();
+      assert.strictEqual(snap.pending_overflow, true);
+      assert.ok(snap.active.every((e) => e.run_id !== RUN_A));
+      assert.strictEqual(snap.active.filter((e) => e.terminal_pending).length, 1);
+    }
+  });
+
+  it("a live run sharing an id with a run_not_owned journal is listed once, live, at its own generation", () => {
+    const reg = new ActiveRunRegistry(() => [notOwned(RUN_A)], () => 4);
+    reg.add(RUN_A, 9);
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.active, [
+      { run_id: RUN_A, claim_generation: 9, phase: "running", terminal_pending: false },
+    ]);
+    assert.strictEqual(snap.pending_overflow, false);
+  });
+
+  it("the register snapshot stays conservative: pending_overflow with only a run_not_owned entry", () => {
+    const reg = new ActiveRunRegistry(() => [notOwned(RUN_A)], () => 32);
+    const snap = reg.buildRegisterSnapshot();
+    assert.deepStrictEqual(snap.active, []);
+    assert.strictEqual(snap.pending_overflow, true);
+  });
+});

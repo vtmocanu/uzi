@@ -15,7 +15,10 @@ retirement proof without resolving that remaining recovery obligation.
 path still requires exact discard. [ADR-2652](2652-report-only-retirement.md)'s
 physical archive path still requires strict actual clean content and refuses
 missing clones. This additive decision preserves both contracts; missing
-physical sources qualify only through the separate proof below.
+physical sources qualify only through the separate proof below. The later
+[ADR-2943](2943-retirement-proof-source-coverage.md) narrowly corrects physical
+coverage of a competing pending FINAL's own source; this decision itself did
+not change the physical proof.
 
 ## Decision
 
