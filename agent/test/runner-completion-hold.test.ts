@@ -464,10 +464,15 @@ describe("completion hold streamed ownership bounds", () => {
       let readDuration = 0;
       let readError: unknown;
       let abortedAtRejection: boolean | undefined;
+      let liveAtStall: boolean | undefined;
       t.mock.method(globalThis, "fetch", async (...args: Parameters<typeof fetch>) => {
-        const response = await fetchReal(...args);
-        if (!String(args[0]).endsWith("/ownership")) return response;
+        const ownership = /\/runs\/([^/]+)\/ownership$/.exec(String(args[0]));
+        if (!ownership) return fetchReal(...args);
+        // Answer without a real round trip: awaiting the fake API first let a loaded host spend
+        // the whole budget before the stalled body existed, so there was nothing to cancel.
+        api.ownershipRequests.push(ownership[1]!);
         signal = args[1]?.signal ?? undefined;
+        liveAtStall = signal !== undefined && !signal.aborted;
         signal?.addEventListener("abort", () => { events.push("abort"); }, { once: true });
         readStarted = performance.now();
         return new Response(new ReadableStream<Uint8Array>({
@@ -493,16 +498,18 @@ describe("completion hold streamed ownership bounds", () => {
       await reconcileCase(t, (runId) => {
         api.setCompletionHoldResponse("", 200);
         api.committedHoldOwnership.set(runId, exactHeld);
-      }, true, overflow ? 5_000 : 40);
+      }, true, overflow ? 5_000 : 1_000);
+      assert.equal(liveAtStall, true, "the stalled body exists while the deadline is live");
       assert.ok(events.includes("cancel"));
-      assert.ok(events.indexOf("cancel") < events.indexOf("reject"), "cancel settles before rejection");
+      assert.ok(events.indexOf("cancel") < events.indexOf("reject"), "cancel is requested before rejection");
       if (overflow) {
         assert.match(String(readError), /exceeds 16384 bytes/);
         assert.equal(abortedAtRejection, false, "overflow rejection precedes deadline");
         assert.ok(!events.slice(0, events.indexOf("reject")).includes("abort"));
       }
       else assert.ok(events.indexOf("abort") < events.indexOf("reject"));
-      assert.ok(readDuration < 1000, `bounded read took ${readDuration}ms`);
+      // Scheduling margin over the 1 s stall budget; overflow rejects long before its deadline.
+      assert.ok(readDuration < (overflow ? 1_000 : 5_000), `bounded read took ${readDuration}ms`);
       t.diagnostic(`ownership ${overflow ? "overflow" : "stall"} duration_ms=${readDuration.toFixed(2)} events=${events.join(",")}`);
     });
   }
