@@ -697,6 +697,17 @@ SELECT
      END)::bigint AS blocked_runs
 FROM admission;
 
+-- name: ListCustodyAdmissionMembersForOwner :many
+-- Issue #2970: per-hold custody admission membership for the owner hold list, one row per
+-- state='open' hold. counted mirrors fn_custody_admission_count membership and reason names the
+-- first matching cause (closed vocabulary, see migration 00334). Read-only visibility only:
+-- admission accounting stays on fn_custody_admission_count. Callers pass the SAME
+-- @heartbeat_cutoff as GetCustodyAggregateForOwner so both read one cutoff. Explicit casts type
+-- the columns as uuid/bool/string, never interface{}.
+SELECT m.hold_id::uuid AS hold_id, m.counted::boolean AS counted, m.reason::text AS reason
+FROM fn_custody_admission_members(@user_id::uuid, @heartbeat_cutoff::timestamptz) m
+ORDER BY m.hold_id;
+
 -- name: DiscardCustodyHoldForOwner :execrows
 -- PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold
 -- 'discarded' and nulls its live worker/run FKs (dropping the ON DELETE RESTRICT so ordinary

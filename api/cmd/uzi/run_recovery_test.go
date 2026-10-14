@@ -41,13 +41,13 @@ func ownerRecoveryFixture() apitypes.RecoveryCustodyHoldsDTO {
 		Aggregate: apitypes.RecoveryCustodyAggregateDTO{OpenHolds: 3, AdmissionCountedHolds: 2, CustodyHoldLimit: 8, DecisionNeeded: 2, BlockedRuns: 1},
 		Holds: []apitypes.RecoveryCustodyHoldDTO{
 			{ID: "hold-z", RunID: "run-z", Generation: 3, State: "open", Attention: "active",
-				WorkerID: "worker-z", CreatedAt: newer},
+				WorkerID: "worker-z", CreatedAt: newer, CountsTowardAdmission: boolPtr(false), AdmissionReason: "live_claim"},
 			{ID: "hold-released", RunID: "run-r", Generation: 1, State: "released", Attention: "settled",
 				WorkerID: "worker-r", CreatedAt: old.Add(-time.Hour)},
 			{ID: "hold-discarded", RunID: "run-d", Generation: 1, State: "discarded", Attention: "settled",
 				WorkerID: "worker-d", CreatedAt: old.Add(-2 * time.Hour)},
 			{ID: "hold-b", RunID: "run-b", Generation: 2, State: "open", Attention: "needs_action",
-				WorkerID: "worker-b", WorkerName: "beta", CreatedAt: old},
+				WorkerID: "worker-b", WorkerName: "beta", CreatedAt: old, CountsTowardAdmission: boolPtr(true), AdmissionReason: "decision_needed"},
 			{ID: "hold-a", RunID: "run-a", Generation: 1, State: "open", Attention: "source_only",
 				WorkerID: "worker-a", CreatedAt: old},
 		},
@@ -140,16 +140,17 @@ func TestOwnerRecoveryHuman(t *testing.T) {
 		t.Fatalf("calls: holds=%d archives=%d; want 1, 0", client.holdsCalls, client.archivesCalls)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if got := strings.Fields(lines[0]); !reflect.DeepEqual(got, []string{"RUN", "ID", "HOLD", "ID", "GEN", "DISPOSITION", "ARCHIVE", "WORKER", "AGE"}) {
+	if got := strings.Fields(lines[0]); !reflect.DeepEqual(got, []string{"RUN", "ID", "HOLD", "ID", "GEN", "DISPOSITION", "ADMISSION", "ARCHIVE", "WORKER", "AGE"}) {
 		t.Fatalf("headers = %q", lines[0])
 	}
 	for i, want := range [][]string{
-		{"run-a", "hold-a", "1", "source_only", "false", "worker-a"},
-		{"run-b", "hold-b", "2", "needs_action", "false", "beta"},
-		{"run-z", "hold-z", "3", "active", "false", "worker-z"},
+		{"run-a", "hold-a", "1", "source_only", "-", "false", "worker-a"},
+		{"run-b", "hold-b", "2", "needs_action", "counted", "(decision_needed)", "false", "beta"},
+		{"run-z", "hold-z", "3", "active", "not", "counted", "false", "worker-z"},
 	} {
 		got := strings.Fields(lines[i+1])
-		if len(got) != 7 || !reflect.DeepEqual(got[:6], want) || got[6] == "-" {
+		n := len(want)
+		if len(got) != n+1 || !reflect.DeepEqual(got[:n], want) || got[n] == "-" {
 			t.Errorf("row %d = %q, want %v plus age", i, lines[i+1], want)
 		}
 	}
@@ -976,5 +977,31 @@ func TestSourceOnlyArchiveAndCaptureIndependent(t *testing.T) {
 				}
 			}
 		})
+	}
+}
+
+func TestRunRecoveryHumanAdmissionColumn(t *testing.T) {
+	dto := ownerRecoveryFixture()
+	for i := range dto.Holds {
+		dto.Holds[i].RunID = "run1"
+	}
+	fc := &uzicli.FakeClient{RecoveryHoldsResult: dto}
+	out, errb, code := runCLI(t, fakeEnv(fc), "run", "recovery", "run1")
+	if code != uzicli.ExitOK {
+		t.Fatalf("exit = %d, stderr=%q", code, errb)
+	}
+	lines := strings.Split(strings.TrimSpace(out), "\n")
+	if got := strings.Fields(lines[0]); len(got) < 5 || got[4] != "ADMISSION" {
+		t.Fatalf("headers = %q", lines[0])
+	}
+	for _, want := range []string{"counted (decision_needed)", "not counted"} {
+		if !strings.Contains(out, want) {
+			t.Errorf("run table lacks %q: %q", want, out)
+		}
+	}
+	for _, line := range lines {
+		if strings.HasPrefix(strings.TrimSpace(line), "hold-a") && !strings.Contains(line, " - ") {
+			t.Errorf("absent membership must render -: %q", line)
+		}
 	}
 }

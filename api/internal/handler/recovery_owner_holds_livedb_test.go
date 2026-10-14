@@ -510,3 +510,118 @@ func TestRecoveryOwnerHoldsInvalidStateFilterLiveDB(t *testing.T) {
 		t.Fatalf("GET ?state=released = %d, want 400", rec.Code)
 	}
 }
+
+// TestRecoveryOwnerHoldsAdmissionMembershipLiveDB (issue #2970) proves GET /api/recovery/holds,
+// unfiltered and ?state=open, stamps every OPEN hold with its server-derived admission membership
+// (counts_toward_admission + admission_reason), that the true flags sum to
+// aggregate.admission_counted_holds, and that a non-open hold carries neither field.
+func TestRecoveryOwnerHoldsAdmissionMembershipLiveDB(t *testing.T) {
+	_, router, pool := cliLiveDB(t)
+	owner := cliSeedUser(t, pool, false)
+	uzc := cliMintToken(t, pool, owner, clitoken.ScopeUser)
+	conn := rmSeedConn(t, pool, owner)
+	fresh := custodySeedWorker(t, pool, owner)
+	stale := custodySeedWorker(t, pool, owner)
+	// The test handler config leaves WorkerHeartbeatStale at zero, so the cutoff is "now": a fresh
+	// heartbeat must therefore sit in the future to be at or after it.
+	cliMustExec(t, pool, `UPDATE workers SET last_heartbeat_at = now() + interval '1 day' WHERE id = $1`, fresh)
+	cliMustExec(t, pool, `UPDATE workers SET last_heartbeat_at = now() - interval '365 days' WHERE id = $1`, stale)
+
+	// liveRun seeds a run + gen-1 hold and binds the run to a worker at the given claim generation.
+	liveRun := func(projectID int64, status string, worker uuid.UUID, claimGen int64) (uuid.UUID, uuid.UUID) {
+		run, hold := custodySeedRunHold(t, pool, owner, conn, worker, projectID, status, 1)
+		cliMustExec(t, pool, `UPDATE runs SET worker_id = $2, claim_generation = $3 WHERE id = $1`, run, worker, claimGen)
+		return run, hold
+	}
+	type want struct {
+		counted bool
+		reason  string
+	}
+	wants := map[string]want{}
+	add := func(id uuid.UUID, counted bool, reason string) { wants[id.String()] = want{counted, reason} }
+
+	runA, hLive := liveRun(4300, "running", fresh, 1)
+	add(hLive, false, "live_claim")
+	hDup := custodySeedHoldOnRun(t, pool, owner, runA, fresh, 1)
+	add(hDup, true, "duplicate_hold")
+
+	runB, hEarlier := liveRun(4301, "running", fresh, 2)
+	add(hEarlier, true, "earlier_generation")
+	hCurrent := custodySeedHoldOnRun(t, pool, owner, runB, fresh, 2)
+	add(hCurrent, false, "live_claim")
+
+	_, hQueued := liveRun(4302, "queued", fresh, 1)
+	add(hQueued, true, "run_not_live")
+
+	runD, hTerminal := liveRun(4303, "failed", fresh, 1)
+	custodySeedCapture(t, pool, owner, runD, fresh, hTerminal, "kTerm", "available", 1)
+	add(hTerminal, true, "terminal_run")
+
+	_, hStale := liveRun(4304, "running", stale, 1)
+	add(hStale, true, "stale_heartbeat")
+
+	_, hMismatch := liveRun(4305, "running", fresh, 1)
+	cliMustExec(t, pool, `UPDATE recovery_custody_holds SET live_run_id = $2 WHERE id = $1`, hMismatch, runA)
+	add(hMismatch, true, "identity_mismatch")
+
+	_, hUnknown := liveRun(4306, "running", fresh, 1)
+	cliMustExec(t, pool, `UPDATE recovery_custody_holds SET live_worker_id = NULL WHERE id = $1`, hUnknown)
+	add(hUnknown, true, "unknown_evidence")
+
+	runI, hReleasedClaim := liveRun(4307, "running", fresh, 1)
+	cliMustExec(t, pool, `UPDATE runs SET claim_released_at = now() WHERE id = $1`, runI)
+	add(hReleasedClaim, true, "claim_released")
+
+	_, hClosed := custodySeedTerminalHold(t, pool, owner, conn, fresh, 4308, "released", 1)
+
+	for _, path := range []string{"/api/recovery/holds", "/api/recovery/holds?state=open"} {
+		rec := bearerReq(router, http.MethodGet, path, uzc)
+		if rec.Code != http.StatusOK {
+			t.Fatalf("GET %s = %d\nbody: %s", path, rec.Code, rec.Body.String())
+		}
+		var got apitypes.RecoveryCustodyHoldsDTO
+		if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
+			t.Fatalf("decode %s: %v", path, err)
+		}
+		var raw struct {
+			Holds []map[string]any `json:"holds"`
+		}
+		if err := json.Unmarshal(rec.Body.Bytes(), &raw); err != nil {
+			t.Fatalf("decode raw %s: %v", path, err)
+		}
+		counted, seenOpen := 0, 0
+		for i, h := range got.Holds {
+			if h.ID == hClosed.String() {
+				if path != "/api/recovery/holds" {
+					t.Errorf("%s leaked the released hold", path)
+				}
+				if _, ok := raw.Holds[i]["counts_toward_admission"]; ok || h.CountsTowardAdmission != nil {
+					t.Errorf("released hold carries counts_toward_admission: %+v", raw.Holds[i])
+				}
+				if _, ok := raw.Holds[i]["admission_reason"]; ok {
+					t.Errorf("released hold carries admission_reason: %+v", raw.Holds[i])
+				}
+				continue
+			}
+			w, ok := wants[h.ID]
+			if !ok {
+				t.Errorf("%s: unexpected hold %s", path, h.ID)
+				continue
+			}
+			seenOpen++
+			if h.CountsTowardAdmission == nil || *h.CountsTowardAdmission != w.counted || h.AdmissionReason != w.reason {
+				t.Errorf("%s hold %s = counted %v reason %q, want counted %v reason %q",
+					path, h.ID, h.CountsTowardAdmission, h.AdmissionReason, w.counted, w.reason)
+			}
+			if h.CountsTowardAdmission != nil && *h.CountsTowardAdmission {
+				counted++
+			}
+		}
+		if seenOpen != len(wants) {
+			t.Errorf("%s: saw %d open holds, want %d", path, seenOpen, len(wants))
+		}
+		if counted != got.Aggregate.AdmissionCountedHolds {
+			t.Errorf("%s: counted flags = %d, aggregate.admission_counted_holds = %d", path, counted, got.Aggregate.AdmissionCountedHolds)
+		}
+	}
+}

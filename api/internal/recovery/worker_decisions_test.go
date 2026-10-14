@@ -55,6 +55,14 @@ type ownerCustodyStore struct {
 	listParams            store.ListCustodyHoldsForOwnerParams
 	aggregateParams       store.GetCustodyAggregateForOwnerParams
 	listErr, aggregateErr error
+	members               []store.ListCustodyAdmissionMembersForOwnerRow
+	memberParams          store.ListCustodyAdmissionMembersForOwnerParams
+	membersErr            error
+}
+
+func (s *ownerCustodyStore) ListCustodyAdmissionMembersForOwner(_ context.Context, arg store.ListCustodyAdmissionMembersForOwnerParams) ([]store.ListCustodyAdmissionMembersForOwnerRow, error) {
+	s.memberParams = arg
+	return s.members, s.membersErr
 }
 
 func (s *ownerCustodyStore) ListCustodyHoldsForOwner(_ context.Context, arg store.ListCustodyHoldsForOwnerParams) ([]store.ListCustodyHoldsForOwnerRow, error) {
@@ -103,5 +111,54 @@ func TestOwnerCustodyConfiguredCutoffAndSQLFields(t *testing.T) {
 		if !errors.Is(err, st.listErr) {
 			t.Fatalf("list error=%v", err)
 		}
+	}
+}
+
+func TestOwnerCustodyAdmissionMembershipMerge(t *testing.T) {
+	owner := uuid.New()
+	idA, idB, idC, idClosed := uuid.New(), uuid.New(), uuid.New(), uuid.New()
+	st := &ownerCustodyStore{
+		rows: []store.ListCustodyHoldsForOwnerRow{
+			{ID: idA, State: "open"},
+			{ID: idB, State: "open"},
+			{ID: idC, State: "open"}, // no member row: unknown, never false
+			{ID: idClosed, State: "released"},
+		},
+		members: []store.ListCustodyAdmissionMembersForOwnerRow{
+			{HoldID: idA, Counted: false, Reason: "live_claim"},
+			{HoldID: idB, Counted: true, Reason: "stale_heartbeat"},
+			{HoldID: idClosed, Counted: true, Reason: "terminal_run"},
+		},
+	}
+	calls := 0
+	svc := New(st, nil, nil, Limits{CustodyHoldLimit: 8, WorkerHeartbeatStale: time.Minute}, func() time.Time {
+		calls++
+		return time.Date(2026, 10, 7, 12, 0, 0, 0, time.UTC)
+	})
+	got, err := svc.ListHoldsForOwner(context.Background(), owner, false)
+	if err != nil || calls != 1 {
+		t.Fatalf("err=%v clock calls=%d", err, calls)
+	}
+	if st.memberParams.UserID != owner || !st.memberParams.HeartbeatCutoff.Valid ||
+		st.memberParams.HeartbeatCutoff != st.aggregateParams.HeartbeatCutoff {
+		t.Fatalf("members params=%+v aggregate params=%+v", st.memberParams, st.aggregateParams)
+	}
+	h := got.Holds
+	if h[0].CountsTowardAdmission == nil || *h[0].CountsTowardAdmission || h[0].AdmissionReason != "live_claim" {
+		t.Errorf("hold A = %+v", h[0])
+	}
+	if h[1].CountsTowardAdmission == nil || !*h[1].CountsTowardAdmission || h[1].AdmissionReason != "stale_heartbeat" {
+		t.Errorf("hold B = %+v", h[1])
+	}
+	if h[2].CountsTowardAdmission != nil || h[2].AdmissionReason != "" {
+		t.Errorf("absent member must stay unknown: %+v", h[2])
+	}
+	if h[3].CountsTowardAdmission != nil || h[3].AdmissionReason != "" {
+		t.Errorf("non-open hold must carry no membership: %+v", h[3])
+	}
+	st.membersErr = errors.New("members failed")
+	got, err = svc.ListHoldsForOwner(context.Background(), owner, false)
+	if !errors.Is(err, st.membersErr) || got.Holds != nil || got.Aggregate != (apitypes.RecoveryCustodyAggregateDTO{}) {
+		t.Fatalf("partial members leaked: %+v %v", got, err)
 	}
 }
