@@ -241,7 +241,10 @@ export async function reportRetirementFixture(t: TestContext, options: {
       const bytes = Buffer.concat(chunks);
       assert.ok(bytes.length);
       // Broker consumes the actual producer pack and updates the local forge before ACK.
-      execFileSync("git", ["-C", fx.originPath, "index-pack", "--stdin"], { input: bytes });
+      execFileSync("git", ["-C", fx.originPath, "index-pack", "--stdin"], {
+        input: bytes, timeout: 10_000,
+        env: Object.fromEntries(Object.entries(process.env).filter(([k]) => !k.startsWith("GIT_"))),
+      });
       const branch = cmd(predecessorClone!, ["branch", "--show-current"]);
       const ref = `refs/uzi-checkpoints/${branch}`;
       cmd(fx.originPath, ["update-ref", ref, tip]);
