@@ -123,10 +123,10 @@ it("finalize-pending protects its FINAL evidence and later permits exact cleanup
   await f.assertFinalizePending();
   const restore = f.useHeadroom();
   try {
-    assert.equal(await f.r.retireRecoveryReport(f.claim.run_id, 2, {
+    assert.equal((await f.r.retireRecoveryReport(f.claim.run_id, 2, {
       expectedIdentity: f.outbox.finalizeRecordIdentity(f.claim.run_id, 2)!,
       signal: new AbortController().signal, deadline: Date.now() + f.headroomMs,
-    }, "finalize"), true);
+    }, "finalize")).retired, true);
   } finally { restore(); }
   await f.r.resumePendingRecoveries(undefined, await f.coordinator.inspect(f.claim.run_id));
   assert.deepEqual(await f.coordinator.inspect(f.claim.run_id), []);

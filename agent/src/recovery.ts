@@ -25,7 +25,7 @@ import path from "node:path";
 import type { Readable } from "node:stream";
 
 import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, type HeldFinalRetainedReason } from "./protocol.js";
-import { RequestError, isRunOwnershipLost } from "./client.js";
+import { RequestError, isRunOwnershipLost, type WorkerClient } from "./client.js";
 import type { Logger } from "./log.js";
 import { residueQuarantine } from "./residue-quarantine.js";
 import { RunDiskLocks } from "./run-disk-locks.js";
@@ -213,6 +213,7 @@ export interface RecoveryOutcome {
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
  *  structurally; a test supplies a fake. */
 export interface RecoveryArchiveClient {
+  withAcknowledgedFinalReportCustody?: WorkerClient["withAcknowledgedFinalReportCustody"];
   hasFeature?(feature: string): boolean;
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
@@ -247,6 +248,7 @@ export interface RecoveryArchiveClient {
 export interface RecoveryBundleProducer {
   withReportProofBudget?: GitCache["withReportProofBudget"];
   withBareLock?: GitCache["withBareLock"];
+  readAcknowledgedReportSourcesUnderLock?: GitCache["readAcknowledgedReportSourcesUnderLock"];
   readInventoryCloneHeadsUnderLock?: GitCache["readInventoryCloneHeadsUnderLock"];
   enumerateOwedUnderLock?: GitCache["enumerateOwedUnderLock"];
   cleanupRecoveryGeneration?: GitCache["cleanupRecoveryGeneration"];
@@ -1192,6 +1194,119 @@ export class RecoveryCoordinator {
    * the callback performs the conditional exact unlink before any boundary releases.
    * At most 256 journals and their captures are considered; a bad candidate retains
    * its report, without granting FINAL, capture or cleanup authority. */
+  /** ACK-only report retirement never settles or rewrites recovery evidence. */
+  async retireAcknowledgedFinalReport(
+    runId: string, generation: number,
+    budget: { signal: AbortSignal; deadline: number },
+    reserve: (action: (ownTailEligible: () => boolean) => Promise<void>) => Promise<void>,
+    inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
+      laterHead: (head: string) => boolean) => Promise<boolean>,
+    remove: (ownTailEligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
+        !this.git.withBareLock || !this.git.withReportProofBudget ||
+        !this.git.enumerateOwedUnderLock || !this.git.readInventoryCloneHeads ||
+        !this.git.ancestry || !this.client.getRunOwnership || !this.client.withAcknowledgedFinalReportCustody) return;
+    const check = () => {
+      budget.signal.throwIfAborted();
+      if (Date.now() >= budget.deadline || residueQuarantine() !== undefined) throw new Error("report proof unavailable");
+    };
+    await runCaptureCycle(path.resolve(this.runDir(runId), `generation-${generation}`), "skip",
+      () => reserve(ownTailEligible => this.withJournalLock(runId, async () => {
+        check();
+        const sources = await this.checkedRecords(runId, budget);
+        const ackRecords = sources.filter(r => r.generation === generation && r.inventoryGuarded === true &&
+          r.finalAcknowledged === true && r.finalRequest?.disposition.kind === "archive");
+        if (ackRecords.length !== 1) return;
+        const records = ackRecords.filter(r => r.generation === generation && r.inventoryGuarded === true &&
+          r.state === "uploaded" && r.serverCaptureId && r.coverageDigest && r.coverageContext &&
+          r.originalSourceSha && r.inventoryCurrentSha && Array.isArray(r.originalRoots) &&
+          /^[0-9a-f]{40}$/.test(r.sourceSha) && /^[0-9a-f]{64}$/.test(r.checksum ?? "") &&
+          Number.isSafeInteger(r.byteSize) && r.byteSize! > 0 &&
+          r.reason !== "inventory_snapshot_changed" && r.reason !== "inventory_quiescence_breach");
+        if (records.length !== 1) return;
+        const archive = records[0]!;
+        const unresolved = sources.filter(r => r.finalRequest && r.finalAcknowledged !== true);
+        if (unresolved.length !== 1 || unresolved.some(r => r.generation !== generation || r.inventoryGuarded !== true ||
+            r.finalRequest?.disposition.kind !== "settled" || r.finalRequest.evidence !== "publication" ||
+            r.coverageDigest !== EMPTY_INVENTORY_DIGEST || r.originalRoots?.length !== 0 ||
+            canonicalJson(r.coverageContext) !== canonicalJson(archive.coverageContext) ||
+            !r.originalSourceSha || !r.inventoryCurrentSha ||
+            r.reason === "inventory_snapshot_changed" || r.reason === "inventory_quiescence_breach")) return;
+        for (const record of records) {
+          check();
+          const bare = record.bareDir && await this.git.withReportProofBudget!(budget,
+            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined));
+          if (!bare || bare !== record.coverageContext!.barePath) continue;
+          const removed = await this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
+            check();
+            const ownership = await this.client.getRunOwnership!(runId, budget);
+            if (!ownership || ownership.status !== "completed" ||
+                !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
+                ownership.inventory_guarded !== true) return false;
+            const status = await this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget);
+            if (!healthyInventoryStatus(status, record, this.now())) return false;
+            check();
+            const owed = await this.git.enumerateOwedUnderLock!(bare, runId);
+            const settledEarlier = await this.settledEarlierGenerations(sources, generation);
+            const laterContext = (c: OwedCandidate["contexts"][number]) =>
+              Number.isSafeInteger(c.generation) && c.generation! > generation;
+            const laterHead = (sha: string) => {
+              const journals = sources.filter(r => !r.coverageDigest && r.sourceSha === sha);
+              const producers = owed.filter(c => c.sha === sha).flatMap(c => c.contexts);
+              return journals.length + producers.length > 0 &&
+                journals.every(r => Number.isSafeInteger(r.generation) && r.generation! > generation) &&
+                producers.every(laterContext);
+            };
+            const covered = async (head: string) => {
+              check();
+              return /^[0-9a-f]{40}$/.test(head) &&
+                await this.git.ancestry!(bare, head, record.sourceSha) === "ancestor";
+            };
+            for (const source of sources) {
+              if (source.captureId === record.captureId ||
+                  (Number.isSafeInteger(source.generation) &&
+                    (source.generation! > generation || settledEarlier.has(source.generation!)))) continue;
+              if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha ||
+                  !Array.isArray(source.originalRoots))) return false;
+              if (source.coverageDigest && canonicalJson(source.coverageContext) !== canonicalJson(record.coverageContext)) return false;
+              // Earlier aggregates' synthetic tips need not be archive ancestors; only a competing
+              // unacknowledged FINAL's own source must be covered (its frozen heads alone are not).
+              const heads = source.coverageDigest
+                ? [...(source.finalRequest && !source.finalAcknowledged ? [source.sourceSha] : []), source.originalSourceSha!, source.inventoryCurrentSha!, ...source.originalRoots!.map(r => r.sha)]
+                : [source.sourceSha];
+              for (const head of heads) if (!await covered(head)) return false;
+            }
+            for (const root of owed) {
+              const contexts = root.contexts.filter(c => !laterContext(c) &&
+                !(Number.isSafeInteger(c.generation) && settledEarlier.has(c.generation!)));
+              if (!contexts.length) continue;
+              if (!record.originalRoots!.some(frozen => root.sha === frozen.sha &&
+                  contexts.every(c => frozen.contexts.some(p => canonicalJson(p) === canonicalJson(c)))) ||
+                  !await covered(root.sha)) return false;
+            }
+            // Frozen original/current heads remain requirements even if their pins disappeared.
+            for (const head of [record.originalSourceSha!, record.inventoryCurrentSha!,
+                ...record.originalRoots!.map(r => r.sha)]) if (!await covered(head)) return false;
+            if (!await inspectSources(bare, covered, laterHead)) return false;
+            check();
+            if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
+                canonicalJson(await this.git.enumerateOwedUnderLock!(bare, runId)) !== canonicalJson(owed)) return false;
+            if (!ownTailEligible() || !healthyInventoryStatus(status, record, this.now())) return false;
+            await this.client.withAcknowledgedFinalReportCustody!(runId, generation, budget, async custodyEligible => {
+              const eligible = () => ownTailEligible() && custodyEligible() && !budget.signal.aborted &&
+                Date.now() < budget.deadline && residueQuarantine() === undefined &&
+                healthyInventoryStatus(status, record, this.now());
+              if (eligible()) await remove(eligible);
+            });
+            return true;
+          }));
+          if (removed) return;
+        }
+      }, budget.signal)));
+  }
+
+
   async retireArchivedReport(
     runId: string, generation: number,
     budget: { signal: AbortSignal; deadline: number },

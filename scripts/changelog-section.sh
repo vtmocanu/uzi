@@ -1,6 +1,7 @@
 #!/usr/bin/env bash
 # Extract one version's section from CHANGELOG.md, for the GitHub Release that
 # release.yml's `publish-release` job creates from a `v*` tag.
+# check-rc-bullets <version|HEAD> rejects edits/removals of already-shipped blocks.
 #
 #   changelog-section.sh body  <version>   -> section content (Added/Changed/...)
 #                                             heading + release-title marker stripped;
@@ -35,8 +36,9 @@
 # previous RC's section, so an APPENDED bullet and an AMENDED one (a citation or a
 # clause added to an existing bullet) both surface, and an untouched bullet is
 # dropped. If the previous RC's content cannot be resolved (offline, tag absent,
-# not a git tree) the body FALLS BACK to the full section rather than fail a
-# release: the worst case is today's over-inclusive body, never a broken publish.
+# not a git tree) rendering keeps its legacy fallback to the full section.
+# The separate check-rc-bullets
+# guard fails closed on missing required evidence before a cut or publication.
 #
 # The one authored extra per release is an OPTIONAL terse title marker placed on
 # the line under the heading, e.g.
@@ -53,13 +55,23 @@
 set -euo pipefail
 
 usage() {
-  echo "usage: $0 <body|title> <version>" >&2
+  echo "usage: $0 <body|title|check-rc-bullets> <version|HEAD>" >&2
   exit 2
 }
 
 [ $# -eq 2 ] || usage
 mode="$1"
-version="$2"
+version="${2#v}"
+branch_check=false
+if [ "$mode" = check-rc-bullets ] && [ "$version" = HEAD ]; then
+  branch_check=true
+  if [ "$(git rev-parse --is-shallow-repository)" != false ]; then
+    echo "changelog-section: frozen RC check requires full history and tags" >&2; exit 2
+  fi
+  version="$(awk '/^version:/{gsub(/"/, "", $2); print $2; exit}' deploy/chart/Chart.yaml)"
+  [ -n "$version" ] || { echo "changelog-section: no chart version" >&2; exit 2; }
+fi
+parser="$(cd "$(dirname "$0")" && pwd)/lib/changelog-bullets.awk"
 # A tag may be vX.Y.Z-rc.N (PRD 1265): the CHANGELOG section is keyed by the STABLE
 # base X.Y.Z, but the Release TITLE keeps the full tag. base strips any -suffix.
 base="${version%%-*}"
@@ -75,13 +87,41 @@ section="$work/section.md"
 # this base's heading and the next `## [` heading. Same extraction
 # assert-changelog-covers-release.sh uses, so the two agree on what a "section" is.
 extract_section() {
-  awk -v v="$1" '
-    $0 ~ "^## \\[" v "\\]" { inside = 1; next }
+  awk -v h="## [$1]" '
+    index($0, h) == 1 { inside = 1; next }
     inside && /^## \[/     { exit }
     inside                 { print }
   ' "$2" > "$3"
 }
 
+# Tag discovery is local; release checkouts and PR CI fetch full history/tags.
+prev_tag=""
+if [ "$mode" = check-rc-bullets ]; then
+  if ! "$branch_check" && [[ "$version" =~ ^[0-9]+\.[0-9]+\.[0-9]+-rc\.([1-9][0-9]*)$ ]]; then
+    rcn="${BASH_REMATCH[1]}"
+    [ "$rcn" != 1 ] || exit 0
+    if [ "${#rcn}" -gt 9 ]; then
+      echo "changelog-section: RC index exceeds safe arithmetic bound" >&2; exit 2
+    fi
+    prev_tag="v$base-rc.$((rcn - 1))"
+  else
+    tags="$(git tag -l "v$base-rc.*" --sort=-version:refname)" || {
+      echo "changelog-section: cannot enumerate RC tags" >&2; exit 2;
+    }
+    while IFS= read -r tag; do
+      suffix="${tag#"v$base-rc."}"
+      case "$suffix" in ''|*[!0-9]*) continue ;; esac
+      if "$branch_check"; then
+        ancestry=0
+        git merge-base --is-ancestor "$tag" HEAD || ancestry=$?
+        [ "$ancestry" -ne 1 ] || continue
+        [ "$ancestry" -eq 0 ] || { echo "changelog-section: cannot resolve RC ancestry" >&2; exit 2; }
+      fi
+      prev_tag="$tag"; break
+    done <<< "$tags"
+    [ -n "$prev_tag" ] || exit 0
+  fi
+fi
 extract_section "$base" "$file" "$section"
 
 # Reject an absent or blank-only section (a release must describe itself). awk
@@ -155,47 +195,17 @@ resolve_prev_rc_section() {
 # BSD awk on macOS and gawk on the runner; no \xNN escape, no regex dialect).
 emit_delta() {
   local prev="$1" cur="$2"
-  awk '
-    BEGIN { SEP = sprintf("%c", 30) }        # 0x1E, cannot appear in CHANGELOG text
-    function block_key(   k, i) {
-      if (n == 0) return ""
-      k = b[1]
-      for (i = 2; i <= n; i++) k = k SEP b[i]
-      return k
-    }
-    # pass 1: previous RC section -> record every bullet block in seen[]
-    FNR == NR {
-      if ($0 ~ /^- /)                       { kk = block_key(); if (kk != "") seen[kk] = 1; n = 1; b[1] = $0 }
-      else if ($0 ~ /^### / || $0 ~ /^## /) { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
-      else if ($0 ~ /^[[:space:]]*$/)       { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
-      else if (n > 0)            { b[++n] = $0 }
-      next
-    }
-    # boundary into the second file: flush the last prev block
-    FNR == 1 { kk = block_key(); if (kk != "") seen[kk] = 1; n = 0 }
-    # pass 2: current section -> emit surviving bullets under lazy headers
-    function flush_cur(   kk, i) {
-      if (n == 0) return
-      kk = block_key()
-      if (!(kk in seen)) {
-        # Blank before the header when it is not the first output, and a blank
-        # AFTER it, so an emitted subsection reads as the authored loose list
-        # (`### X` / blank / bullets), matching the full-section body exactly.
-        if (pending != "") { if (emitted) print ""; print pending; print ""; pending = ""; emitted = 1 }
-        for (i = 1; i <= n; i++) { print b[i]; emitted = 1 }
-      }
-      n = 0
-    }
-    /^### / { flush_cur(); pending = $0; next }
-    /^## /  { flush_cur(); pending = ""; next }
-    /^- /   { flush_cur(); n = 1; b[1] = $0; next }
-    /^[[:space:]]*$/ { flush_cur(); next }
-    { if (n > 0) b[++n] = $0 }
-    END { flush_cur() }
-  ' "$prev" "$cur"
+  awk -v mode=delta -f "$parser" "$prev" "$cur"
 }
 
 case "$mode" in
+  check-rc-bullets)
+    if ! resolve_prev_rc_section "$prev_tag" "$base" "$work/prev.md"; then
+      echo "changelog-section: could not resolve required predecessor $prev_tag section [$base]; fetch the tag and restore its changelog evidence" >&2
+      exit 1
+    fi
+    awk -v mode=check -f "$parser" "$work/prev.md" "$section"
+    ;;
   title)
     if [ -n "$marker" ]; then
       printf 'v%s: %s\n' "$version" "$marker"

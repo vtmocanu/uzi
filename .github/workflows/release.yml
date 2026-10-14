@@ -192,7 +192,9 @@ jobs:
           GH_TOKEN: ${{ github.token }}
           GH_REPO: ${{ github.repository }}
         run: bash scripts/assert-changelog-covers-release.sh "${GITHUB_REF_NAME}"
-      # The Release notes are the CHANGELOG section verbatim, so the section's
+      - name: Shipped RC changelog bullets remain frozen
+        run: bash scripts/changelog-section.sh check-rc-bullets "${GITHUB_REF_NAME}"
+      # Release notes use the CHANGELOG section (an RC emits its bullet delta), so the section's
       # inline #N links and the compare-link footers must already be committed --
       # publish-release does not generate them. A tag whose CHANGELOG links are
       # stale is rejected here, the same way a missing section is.

@@ -956,18 +956,10 @@ for bad in 'not json' '{"version":1}' \
 done
 echo "PASS marker-c: a value that is not an exact-shape marker -> inconclusive"
 
-# case M-d: the journal names a live attempt A2; the detached kept canonical (valid
-# marker) is a second attributed source, captured as issue-4242.source-2.tgz.
-reset_layout
-make_clone "$CANON" agent/issue-4242 kept-canon
-make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
-journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
-ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
-stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
 # source_check <tag> <primary-clone> <primary-marker> <extra-clone> <extra-marker>: exit 0,
 # the primary holds only its own bytes, source-2 holds the extra's bytes and clone path.
 source_check() {
-  local d="$WORK/out.$1" rc p x
+  local d="$WORK/out.$1" rc p x clone_ere
   rc="$(backup_rc "$d" run-4242)"
   [ "$rc" -eq 0 ] || fail "$1: exit $rc, want 0; log: $(cat "$d/latest-attempt/backup.log")"
   p="$d/latest/issue-4242.tgz"; x="$d/latest/issue-4242.source-2.tgz"
@@ -977,9 +969,36 @@ source_check() {
   tar -xOzf "$p" ./issue-4242.uncommitted.patch | grep -qxF "+$5" && fail "$1: extra bytes leaked into the primary"
   tar -xOzf "$x" ./issue-4242.source-2.meta.txt | grep -qxF "clone=$4" || fail "$1: source-2 is not $4"
   tar -xOzf "$x" ./issue-4242.source-2.uncommitted.patch | grep -qxF "+$5" || fail "$1: source-2 lacks +$5"
-  grep -qE "(OK|PART) .*pod=[^ ]+ clone=$4[: ].*issue-4242[.]source-2[.]tgz" "$d/latest-attempt/backup.log" \
+  clone_ere="$(printf '%s' "$4" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
+  grep -qE "(OK|PART) .*pod=[^ ]+ clone=${clone_ere}[: ].*issue-4242[.]source-2[.]tgz" "$d/latest-attempt/backup.log" \
     || fail "$1: missing its own OK/PART line for source-2 naming pod and clone; log: $(cat "$d/latest-attempt/backup.log")"
 }
+# Exercise the real backup with an explicit '+' in the clone path on every host.
+# Run before marker-d so a '+' checkout reaches this regression first.
+(
+  mkdir -p "$WORK/plus+path"
+  cp "$WORK/uzi" "$WORK/plus+path/uzi"
+  WORK="$WORK/plus+path"
+  RB="$WORK/runner"
+  CANON="$RB/issue-4242"
+  reset_layout
+  make_clone "$CANON" agent/issue-4242 plus-kept-canon
+  make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 plus-live-attempt
+  journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+  ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+  stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
+  source_check marker-plus-path "$RB/issue-4242.attempt-$A2" plus-live-attempt "$CANON" plus-kept-canon
+) || fail "marker-plus-path: regression failed"
+echo "PASS marker-plus-path: literal '+' clone path retains source-2 log and archive evidence"
+
+# case M-d: the journal names a live attempt A2; the detached kept canonical (valid
+# marker) is a second attributed source, captured as issue-4242.source-2.tgz.
+reset_layout
+make_clone "$CANON" agent/issue-4242 kept-canon
+make_clone "$RB/issue-4242.attempt-$A2" agent/issue-4242 live-attempt
+journal run-4242 "$RB/issue-4242.attempt-$A2" "$A2"
+ledger "$A2" run-4242 "$RB/issue-4242.attempt-$A2" live
+stopped_marker run-4242 agent/issue-4242 issue-4242 "$CANON"
 source_check marker-d "$RB/issue-4242.attempt-$A2" live-attempt "$CANON" kept-canon
 echo "PASS marker-d: journal-current attempt is primary; the kept canonical is captured as source-2"
 

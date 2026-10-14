@@ -4526,62 +4526,86 @@ export class RunRunner {
 
   /** Proof and unlink share C/S/J/B/O; no reusable archive proof escapes this call. */
   async retireRecoveryReport(runId: string, generation: number, context: ReportRetirementContext,
-    kind: "terminal" | "finalize" = "terminal", outbox = this.outbox): Promise<boolean> {
-    if (!outbox || !context.expectedIdentity || context.signal?.aborted || context.eligible?.() === false) return false;
+    kind: "terminal" | "finalize" = "terminal", outbox = this.outbox): Promise<{ retired: false } | { retired: true; authority: "acknowledged_final_report_only" | "existing_archive" }> {
+    if (!outbox || !context.expectedIdentity || context.signal?.aborted || context.eligible?.() === false) return { retired: false };
     const deadline = Math.min(Date.now() + reportProofTiming.proofBudgetMs(), context.deadline ?? Infinity);
-    if (deadline <= Date.now()) return false;
+    if (deadline <= Date.now()) return { retired: false };
     const abort = new AbortController();
     const cancel = () => abort.abort(context.signal?.reason);
     context.signal?.addEventListener("abort", cancel, { once: true });
     const timer = setTimeout(() => abort.abort(new Error("report proof deadline")), Math.max(1, deadline - Date.now()));
     const budget = { signal: abort.signal, deadline };
     let retired = false;
+    let authority: "acknowledged_final_report_only" | "existing_archive" = "existing_archive";
     try {
-      await this.recovery.retireArchivedReport(runId, generation, budget,
-        action => this.withReportSourceReservation(runId, action),
-        async (bare, covered, laterHead) => {
-          const first = await this.git.readInventoryCloneHeads(bare, runId, true);
-          if (first.kind !== "verified" || process.platform !== "linux") return false;
-          const identity = JSON.stringify(first);
-          for (const head of first.heads) if (!laterHead(head) && !await covered(head)) return false;
-          // Each complete content inspection is bracketed by process observations.
-          // Report observations refuse writers without killing them.
-          for (let pass = 0; pass < 2; pass++) {
-            for (const clone of first.clones) {
-              budget.signal.throwIfAborted();
-              if (this.liveAttempts.isLivePath(clone.clonePath)) return false;
-              if (!clone.head || !clone.identity) return false;
-              if (laterHead(clone.head)) continue;
-              const observe = () => this.quiesceImpl({
-                mode: "capture", attempt: undefined, cloneKey: cloneKeyOf(clone.clonePath).cloneKey,
-                targetPaths: [clone.clonePath], processes: true, dockerHost: undefined, registry: this.liveAttempts,
-                otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
-                site: "report_retirement", reportBudget: budget,
-              });
-              const before = await observe();
-              if (before.process?.state !== "quiescent" || before.process.killed.length !== 0) return false;
-              if (await this.git.credentialFreeCancelCleanHead(clone.clonePath, bare, clone.head) !== clone.head) return false;
-              const after = await observe();
-              if (after.process?.state !== "quiescent" || after.process.killed.length !== 0) return false;
-            }
-            if (JSON.stringify(await this.git.readInventoryCloneHeads(bare, runId, true)) !== identity) return false;
-          }
-          return true;
-        },
-        async ownTailEligible => {
-          const eligible = () => ownTailEligible() && context.eligible?.() !== false &&
-            !outbox.hasUndrainedMessages(runId) && !outbox.isTerminalResolveHeld(runId, generation);
-          if (kind === "terminal") retired = await outbox.retireTerminalIfEligible(runId, generation,
-            { ...context, ...budget, eligible });
-          else retired = await outbox.retireFinalizeIfEligible(runId, generation, eligible, budget.signal, context.expectedIdentity!, true, budget);
-        });
-    } catch (err) {
-      this.log.debug("recovery: report retained", { run_id: runId, generation, error: errMessage(err) });
+      for (const mode of ["acknowledged_final_report_only", "existing_archive"] as const) {
+        const readSources = () => mode === "acknowledged_final_report_only"
+          ? this.git.readAcknowledgedReportSourcesUnderLock(bareForRead, runId)
+          : this.git.readInventoryCloneHeads(bareForRead, runId, true);
+        let bareForRead = "";
+        let sourceIdentity: string | undefined;
+        const prove = mode === "acknowledged_final_report_only"
+          ? this.recovery.retireAcknowledgedFinalReport.bind(this.recovery)
+          : this.recovery.retireArchivedReport.bind(this.recovery);
+        try {
+          await prove(runId, generation, budget,
+            action => this.withReportSourceReservation(runId, action),
+            async (bare, covered, laterHead) => {
+              bareForRead = bare;
+              const first = await readSources();
+              if (first.kind !== "verified" || process.platform !== "linux") return false;
+              const identity = JSON.stringify(first);
+              for (const head of first.heads) if (!laterHead(head) && !await covered(head)) return false;
+              // Each complete content inspection is bracketed by process observations.
+              // Report observations refuse writers without killing them.
+              for (let pass = 0; pass < 2; pass++) {
+                for (const clone of first.clones) {
+                  budget.signal.throwIfAborted();
+                  if (this.liveAttempts.isLivePath(clone.clonePath)) return false;
+                  if (!clone.head || !clone.identity) return false;
+                  if (laterHead(clone.head)) continue;
+                  const observe = () => this.quiesceImpl({
+                    mode: "capture", attempt: undefined, cloneKey: cloneKeyOf(clone.clonePath).cloneKey,
+                    targetPaths: [clone.clonePath], processes: true, dockerHost: undefined, registry: this.liveAttempts,
+                    otherClaimInFlight: [...this.executionTails.keys()].some(id => id !== runId),
+                    site: "report_retirement", reportBudget: budget,
+                  });
+                  const before = await observe();
+                  if (before.process?.state !== "quiescent" || before.process.killed.length !== 0) return false;
+                  if (await this.git.credentialFreeCancelCleanHead(clone.clonePath, bare, clone.head) !== clone.head) return false;
+                  const after = await observe();
+                  if (after.process?.state !== "quiescent" || after.process.killed.length !== 0) return false;
+                }
+                if (JSON.stringify(await readSources()) !== identity) return false;
+              }
+              sourceIdentity ??= identity;
+              return true;
+            },
+            async ownTailEligible => {
+              // Fresh custody HTTP follows inspectSources; compare its successful observation
+              // again under the same bare lock, deadline and cumulative metadata budget.
+              if (mode === "acknowledged_final_report_only" &&
+                  (!sourceIdentity || JSON.stringify(await readSources()) !== sourceIdentity)) return;
+              const eligible = () => ownTailEligible() && context.eligible?.() !== false &&
+                !outbox.hasUndrainedMessages(runId) && !outbox.isTerminalResolveHeld(runId, generation);
+              if (kind === "terminal") retired = await outbox.retireTerminalIfEligible(runId, generation,
+                { ...context, ...budget, eligible });
+              else retired = await outbox.retireFinalizeIfEligible(runId, generation, eligible, budget.signal, context.expectedIdentity!, true, budget);
+              if (retired) authority = mode;
+            });
+        } catch (err) {
+          this.log.debug(retired ? "recovery: report retired before proof settlement failed" : "recovery: report retained",
+            { run_id: runId, generation, error: errMessage(err) });
+          if (retired || budget.signal.aborted || Date.now() >= deadline || isAbortLikeError(err) ||
+              (err instanceof Error && err.name === "TimeoutError")) break;
+        }
+        if (retired || budget.signal.aborted || Date.now() >= deadline) break;
+      }
     } finally {
       clearTimeout(timer);
       context.signal?.removeEventListener("abort", cancel);
     }
-    return retired;
+    return retired ? { retired: true, authority } : { retired: false };
   }
 
   protectRecoveryTerminalDeps(deps: TerminalOutboxDeps): TerminalOutboxDeps {
@@ -4595,8 +4619,11 @@ export class RunRunner {
           const original = receipt && this.persistedReceiptProofs.has(receipt)
             ? await target.readTerminalJournal(runId, generation) : undefined;
           let retired = false;
-          if (context?.expectedIdentity)
-            retired = await this.retireRecoveryReport(runId, generation, context, "terminal", target);
+          if (context?.expectedIdentity) {
+            const result = await this.retireRecoveryReport(runId, generation, context, "terminal", target);
+            if (result.retired && result.authority === "acknowledged_final_report_only") return true;
+            retired = result.retired;
+          }
           if (!retired) {
             if (await this.recoveryInventoryPending(runId, generation)) return false;
             retired = await target.retireTerminal(runId, generation);

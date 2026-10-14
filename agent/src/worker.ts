@@ -317,7 +317,8 @@ export class Worker {
           const retired = await this.runner.retireRecoveryReport(entry.run_id, entry.claim_generation, {
             expectedIdentity: identity, signal: authorityWait.signal, deadline, eligible: reportEligible,
           }, "finalize", outbox);
-          if (retired === true) {
+          if (retired.retired) {
+            if (retired.authority === "acknowledged_final_report_only") return true;
             if (incarnation && reportEligible() && !this.isFinalizeRunLive(entry.run_id)) await this.runner.notifyPublicationCompletionRetired(
               entry.run_id, entry.claim_generation, incarnation);
             return true;

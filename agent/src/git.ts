@@ -1921,7 +1921,7 @@ export class GitCache {
   // At capacity, pinning still works but returns no retirement receipt (retention).
   private readonly codeSnapshotFreshReceipts = new Set<string>();
   private readonly boundaryProcesses = new AsyncLocalStorage<BoundaryProcessScope>();
-  private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number }>();
+  private readonly reportProofs = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; owedBytes: number; configBytes: number }>();
 
   /** Optional observational budget, isolated from concurrent capture/cleanup operations. */
   async withReportProofBudget<T>(budget: { signal: AbortSignal; deadline: number }, action: () => Promise<T>): Promise<T> {
@@ -1932,7 +1932,7 @@ export class GitCache {
     const timer = setTimeout(() => timeout.abort(new Error("report proof deadline")), Math.max(0, deadline - Date.now()));
     try {
       if (Date.now() >= deadline) timeout.abort(new Error("report proof deadline"));
-      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0 }, action);
+      return await this.reportProofs.run({ signal, deadline, owedBytes: parent?.owedBytes ?? 0, configBytes: parent?.configBytes ?? 0 }, action);
     } finally { clearTimeout(timer); }
   }
 
@@ -7710,41 +7710,7 @@ export class GitCache {
             throw err;
           }
           if (!st.isDirectory() || st.isSymbolicLink()) refuse("clone_path_invalid", "unsafe clone");
-          const head = await atFailure("clone_head_unreadable", async () => {
-            const gitdir = path.join(clone, ".git");
-            const gs = await fs.lstat(gitdir);
-            if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
-            const readRef = async (relative: string): Promise<string> => {
-              const parts = relative.split("/");
-              for (let i = 1; i < parts.length; i++) {
-                const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
-                if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
-              }
-              const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
-              try {
-                const stat = await file.stat();
-                if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
-                const bytes = Buffer.alloc(1024 * 1024 + 1);
-                const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
-                if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
-                return bytes.subarray(0, bytesRead).toString("utf8").trim();
-              } finally { await file.close(); }
-            };
-            let head = await readRef("HEAD");
-            if (head.startsWith("ref: ")) {
-              const ref = head.slice(5);
-              if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
-                  ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
-              try { head = await readRef(ref); }
-              catch (err) {
-                if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
-                const packed = await readRef("packed-refs");
-                head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
-              }
-            }
-            if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
-            return head;
-          });
+          const head = await atFailure("clone_head_unreadable", () => this.readReportCloneHead(clone));
           heads.add(head);
           clones.push({ clonePath: clone, ...owner,
             ...(this.reportProofs.getStore() ? { head, identity: `${st.dev}:${st.ino}` } : {}) });
@@ -7759,6 +7725,196 @@ export class GitCache {
       this.checkRecoveryInterruption();
       if (physicalFailure) this.warnRecoveryPhysicalFailure();
     }
+  }
+
+  /** Metadata-only ACK observer. One bounded snapshot drives every parser and
+   * relationship; at most 256 paths are probed once, and any ambiguity refuses all. */
+  async readAcknowledgedReportSourcesUnderLock(barePath: string, runId: string): Promise<
+    { kind: "verified"; heads: string[]; clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }>;
+      snapshot: string } | { kind: "unknown"; cause?: string }
+  > {
+    try {
+      this.checkReportProof();
+      const budget = this.reportProofs.getStore();
+      if (!budget || !OWED_RUN_ID.test(runId) ||
+          await this.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return { kind: "unknown" };
+      const configPath = path.join(barePath, "config");
+      const file = await fs.open(configPath, fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      let raw: Buffer, identity: string;
+      try {
+        const before = await file.stat({ bigint: true });
+        if (!before.isFile() || before.uid !== BigInt(process.getuid!()) ||
+            (before.mode & 0o002n) !== 0n ||
+            ((before.mode & 0o020n) !== 0n && (before.gid !== BigInt(process.getgid!()) ||
+              (uidSplitActive() && before.gid === BigInt(RUNNER_UID)))) || before.size > 1048576n) throw new Error("unsafe ACK config");
+        const bytes = Buffer.alloc(1048577);
+        let length = 0;
+        while (length < bytes.length) {
+          this.checkReportProof();
+          const read = await file.read(bytes, length, bytes.length - length, null);
+          if (!read.bytesRead) break;
+          length += read.bytesRead;
+        }
+        if (length > 1048576) throw new Error("oversized ACK config");
+        raw = bytes.subarray(0, length);
+        const after = await file.stat({ bigint: true });
+        const named = await fs.lstat(configPath, { bigint: true });
+        identity = `${before.dev}:${before.ino}:${before.size}:${before.mtimeNs}:${before.ctimeNs}`;
+        for (const stat of [after, named]) {
+          if (stat.isSymbolicLink() || identity !== `${stat.dev}:${stat.ino}:${stat.size}:${stat.mtimeNs}:${stat.ctimeNs}`)
+            throw new Error("ACK config changed");
+        }
+      } finally { await file.close(); }
+      const parsed = await this.execScoped("git", ["config", "--file", "-", "--no-includes", "--null", "--list"],
+        { env: gitEnv(), input: raw, maxBuffer: 1048576, timeout: GIT_TIMEOUT_MS });
+      if ((budget.configBytes += raw.length + Buffer.byteLength(parsed.stdout) + Buffer.byteLength(parsed.stderr)) > 4194304)
+        throw new Error("ACK config cumulative bound");
+      const entries = parsed.stdout.split("\0").filter(Boolean);
+      if (entries.length > 1024) throw new Error("ACK config value count");
+      const journals = new Map<string, RecoveryJournalEntry>();
+      const protectedRecords: Array<{ branch: string; key: string; journal: RecoveryJournalEntry }> = [];
+      const ledgers = new Map<string, AttemptLedgerEntry & { branch: string }>();
+      const paths = new Map<string, { branch: string; runId: string; attemptId?: string }>();
+      const add = (branch: string, source: RecoverySource, key?: string) => {
+        recoverySource({ runId: source.runId, clonePath: source.clonePath,
+          ...(source.attemptId === undefined ? {} : { attemptId: source.attemptId }) });
+        const attempt = parseAttemptPath(source.clonePath, path.resolve(this.runnerRoot));
+        const cloneKey = key ?? attempt?.key ?? path.basename(source.clonePath);
+        if (!/^[A-Za-z0-9_-]+$/.test(cloneKey)) throw new Error("ACK clone key");
+        const shape = this.clonePathShape(source.clonePath, this.runnerClonePath(barePath, cloneKey));
+        if (!shape || shape.attemptId !== source.attemptId) throw new Error("ACK source path attribution");
+        const prior = paths.get(source.clonePath);
+        if (prior && (prior.branch !== branch || prior.runId !== source.runId || prior.attemptId !== source.attemptId))
+          throw new Error("ACK conflicting path");
+        paths.set(source.clonePath, { branch, runId: source.runId, attemptId: source.attemptId });
+        if (paths.size > 256) throw new Error("ACK path bound");
+      };
+      const seenProtected = new Set<string>();
+      for (const item of entries) {
+        this.checkReportProof();
+        const nl = item.indexOf("\n");
+        const name = nl < 0 ? item : item.slice(0, nl);
+        const value = nl < 0 ? "" : item.slice(nl + 1);
+        if (/^(include\.|includeif\.|core\.worktree$|core\.hookspath$|core\.sshcommand$)/i.test(name) ||
+            Buffer.byteLength(value) > 65536) throw new Error("ACK unsafe config value");
+        if (name.startsWith("uzi-retained.")) {
+          const match = /^uzi-retained\.([^.]+)\.journal$/.exec(name);
+          if (!match || seenProtected.has(name)) throw new Error("ACK protected identity");
+          seenProtected.add(name);
+          const descriptor = JSON.parse(value);
+          if (!descriptor || descriptor.version !== 1 ||
+              Object.keys(descriptor).sort().join(",") !== "branch,journal,key,version" ||
+              typeof descriptor.branch !== "string" || !descriptor.branch ||
+              typeof descriptor.key !== "string" || !/^[A-Za-z0-9_-]+$/.test(descriptor.key)) throw new Error("ACK protected schema");
+          const journal = parseRecoveryJournal(JSON.stringify(descriptor.journal));
+          if (journal.runId !== match[1] || (!journal.recovery && !journal.retainedSources?.length)) throw new Error("ACK protected run");
+          protectedRecords.push({ branch: descriptor.branch, key: descriptor.key, journal });
+        }
+        const recovery = /^uzi-recovery\.(.+)\.clone$/.exec(name);
+        if (recovery) {
+          if (value) journals.set(recovery[1]!, parseRecoveryJournal(value));
+          else journals.delete(recovery[1]!);
+        }
+        const ledger = /^uzi-attempts\.(.+)\.entry$/.exec(name);
+        if (ledger) {
+          const entry = parseAttemptLedgerEntry(value);
+          if (!entry || !OWED_RUN_ID.test(entry.runId)) throw new Error("ACK ledger schema");
+          const prior = ledgers.get(entry.attemptId);
+          if (prior && (prior.branch !== ledger[1] || prior.runId !== entry.runId || prior.clonePath !== entry.clonePath))
+            throw new Error("ACK ledger identity conflict");
+          ledgers.set(entry.attemptId, { ...entry, branch: ledger[1]! });
+        }
+      }
+      for (const [branch, journal] of journals) for (const source of this.recoverySources(journal)) add(branch, source);
+      for (const record of protectedRecords) {
+        const active = journals.get(record.branch);
+        if (active?.runId === record.journal.runId && JSON.stringify(active) !== JSON.stringify(record.journal))
+          throw new Error("ACK protected conflict");
+        for (const source of this.recoverySources(record.journal)) add(record.branch, source, record.key);
+      }
+      for (const entry of ledgers.values()) add(entry.branch, entry);
+      const markers = await this.readStoppedMarkers(barePath, entries);
+      if (markers.malformed.length || markers.overflow.size) throw new Error("ACK malformed stopped marker");
+      for (const { marker } of markers.valid) add(marker.branch, marker, marker.key);
+      for (const [clonePath, source] of paths.entries()) {
+        if (source.attemptId) {
+          const ledger = ledgers.get(source.attemptId);
+          if (!ledger || ledger.branch !== source.branch || ledger.runId !== source.runId ||
+              ledger.clonePath !== clonePath) throw new Error("ACK missing producer");
+        }
+      }
+      const observations: unknown[] = [];
+      const clones: Array<{ clonePath: string; branch: string; runId: string; head: string; identity: string }> = [];
+      for (const [clonePath, owner] of paths) {
+        if (owner.runId !== runId) continue;
+        const root = path.resolve(this.runnerRoot);
+        if (path.resolve(clonePath) !== clonePath || path.dirname(path.dirname(clonePath)) !== root) throw new Error("ACK unsafe path");
+        // Probe from the existing worker-owned data directory, including a missing runner root.
+        const chain = [path.dirname(root), root, path.dirname(clonePath), clonePath];
+        let missing = false;
+        for (const dir of chain) {
+          this.checkReportProof();
+          try {
+            const stat = await fs.lstat(dir, { bigint: true });
+            if (!stat.isDirectory() || stat.isSymbolicLink()) throw new Error("ACK unsafe ancestor");
+            observations.push([dir, "present", String(stat.dev), String(stat.ino), String(stat.uid), String(stat.mode)]);
+          } catch (err) {
+            if ((err as NodeJS.ErrnoException).code !== "ENOENT" || dir === chain[0]) throw err;
+            observations.push([dir, "missing"]);
+            missing = true;
+            break;
+          }
+        }
+        if (missing) continue;
+        const stat = await fs.lstat(clonePath);
+        const head = await this.readReportCloneHead(clonePath);
+        clones.push({ clonePath, branch: owner.branch, runId, head, identity: `${stat.dev}:${stat.ino}` });
+      }
+      this.checkReportProof();
+      return { kind: "verified", heads: [...new Set(clones.map(c => c.head))], clones,
+        snapshot: JSON.stringify([identity, raw.toString("base64"), observations, clones]) };
+    } catch (err) {
+      this.checkReportProof();
+      return { kind: "unknown", cause: gitErrorMessage(err) };
+    }
+  }
+
+  /** Shared strict HEAD observer; a present clone never substitutes missing content. */
+  private async readReportCloneHead(clone: string): Promise<string> {
+    const gitdir = path.join(clone, ".git");
+    const gs = await fs.lstat(gitdir);
+    if (!gs.isDirectory() || gs.isSymbolicLink()) throw new Error("unsafe clone git directory");
+    const readRef = async (relative: string): Promise<string> => {
+      const parts = relative.split("/");
+      for (let i = 1; i < parts.length; i++) {
+        const ds = await fs.lstat(path.join(gitdir, ...parts.slice(0, i)));
+        if (!ds.isDirectory() || ds.isSymbolicLink()) throw new Error("unsafe ref parent");
+      }
+      const file = await fs.open(path.join(gitdir, relative), fsConstants.O_RDONLY | fsConstants.O_NOFOLLOW | fsConstants.O_NONBLOCK);
+      try {
+        const stat = await file.stat();
+        if (!stat.isFile() || stat.size > 1024 * 1024) throw new Error("unsafe ref file");
+        const bytes = Buffer.alloc(1024 * 1024 + 1);
+        const { bytesRead } = await file.read(bytes, 0, bytes.length, 0);
+        if (bytesRead > 1024 * 1024) throw new Error("ref exceeds verification bound");
+        return bytes.subarray(0, bytesRead).toString("utf8").trim();
+      } finally { await file.close(); }
+    };
+    let head = await readRef("HEAD");
+    if (head.startsWith("ref: ")) {
+      const ref = head.slice(5);
+      if (ref.length > 256 || !/^refs\/heads\/[A-Za-z0-9_./-]+$/.test(ref) ||
+          ref.split("/").some(p => !p || p === "." || p === "..")) throw new Error("unsafe HEAD ref");
+      try { head = await readRef(ref); }
+      catch (err) {
+        if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
+        const packed = await readRef("packed-refs");
+        head = packed.split("\n").find(line => line.slice(41) === ref)?.slice(0, 40) ?? "";
+      }
+    }
+    if (!SHA40_RE.test(head)) throw new Error("unreadable retained HEAD");
+    return head;
+
   }
 
   /** The EXACT stored value of one branch's recovery journal (undefined when absent or cleared). */
