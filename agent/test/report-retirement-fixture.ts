@@ -8,6 +8,7 @@ import type { TestContext } from "node:test";
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
 import { Outbox } from "../src/outbox.js";
 import { RecoveryCoordinator } from "../src/recovery.js";
+import type { RecoveryRecord } from "../src/recovery.js";
 import { reportProofTiming } from "../src/report-proof-timing.js";
 import type { PositiveOwedCandidateContext } from "../src/git.js";
 import type { RecoveryUploadManifest } from "../src/protocol.js";
@@ -15,7 +16,7 @@ import { makeTerminalOutboxDeps, resolvePendingTerminal } from "../src/terminal-
 import { nullLogger } from "./helpers.js";
 import { api, baseUrl, client, deferred, fakeGitlab, fx, git, gitlabClaim, runner } from "./runner-harness.js";
 
-/** Real git, MAC journals, archive bytes, Outbox and runner; only server responses are fixtures.
+/** Real git, MAC journals, archive bytes, Outbox and runner; server responses and process observations are fixtures.
  * By default no FINAL or cleanup authority is supplied. acknowledgeArchive drives real FINAL
  * and generation cleanup for the producer-ordering regression. */
 export async function reportRetirementFixture(t: TestContext, options: {
@@ -27,6 +28,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
   olderOpenHold?: boolean;
   currentArchiveReleased?: boolean;
   olderSource?: boolean;
+  priorPendingHeldFinal?: boolean;
 } = {}) {
   const generation = 2, archiveGeneration = options.archiveGeneration ?? generation;
   const claim = gitlabClaim(2652, { claim_generation: generation, inventory_guarded: true });
@@ -36,12 +38,13 @@ export async function reportRetirementFixture(t: TestContext, options: {
   let status = "running";
   let manifest: RecoveryUploadManifest | undefined;
   let uploadedBytes: Buffer | undefined;
-  const calls = { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0, sends: 0, cancelledAcks: 0 };
+  const calls = { final: 0, cloneCleanup: 0, sourceDelete: 0, pinDelete: 0, sends: 0, cancelledAcks: 0, heldFinal: 0 };
   const ownership = { mode: "healthy" as "healthy" | "unknown" | "throw", generation };
   const capture = { mode: "healthy" as "healthy" | "throw" | "expired" | "unbound" | "checksum" };
   const originalFetch = globalThis.fetch;
   let workerId = "";
-  api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report"]);
+  api.setRegisterProtocolFeatures(["recovery_inventory_v1", "terminal_rejection_report",
+    ...(options.priorPendingHeldFinal ? ["recovery_held_publication_v1"] : [])]);
   t.mock.method(globalThis, "fetch", async (input: string | URL | Request, init?: RequestInit) => {
     const url = new URL(input instanceof Request ? input.url : String(input));
     if (url.origin !== new URL(baseUrl).origin ||
@@ -101,7 +104,14 @@ export async function reportRetirementFixture(t: TestContext, options: {
       byte_size: manifest?.byte_size,
       expires_at: capture.mode === "expired" ? "2000-01-01T00:00:00Z" : "2099-01-01T00:00:00Z" };
   };
-  client.releaseRecoveryCustody = async () => {
+  client.releaseRecoveryCustody = async (runId, gen, _evidence, disposition) => {
+    if (options.priorPendingHeldFinal && gen === 1) {
+      assert.equal(runId, claim.run_id);
+      assert.equal(disposition?.kind, "held_publication");
+      calls.heldFinal++;
+      return { run_id: runId, generation: gen, released: false, holds_released: 0,
+        retained: true, reason: "held_publication_unavailable" };
+    }
     calls.final++;
     return { run_id: claim.run_id, generation, released: false, holds_released: 0 };
   };
@@ -169,6 +179,7 @@ export async function reportRetirementFixture(t: TestContext, options: {
     await leave.promise;
     throw new Error("cancelled unpublished SDK error");
   } }, fakeGitlab().gitlab, token, { outbox, activeRuns: registry, checkpointIntervalMs: 1,
+    // SYNTHETIC PROCESS PROOF: fixture observation only; Git source/content proof stays real.
     // The foreground error retains its source. Later replay gets healthy physical quiescence.
     quiesceRun: async () => {
       processObservation.calls++;
@@ -206,9 +217,31 @@ export async function reportRetirementFixture(t: TestContext, options: {
     barePath: bare, runId: claim.run_id, generation: archiveGeneration, kind: "issue", branch,
     defaultIdentity: { ref: "refs/remotes/origin/main", sha: cmd(bare, ["rev-parse", "refs/remotes/origin/main"]) },
   };
-  await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
   const coordinator = new RecoveryCoordinator({ client, git, log: nullLogger(),
     recoveryRoot: git.recoveryRoot, workerToken: token });
+  let priorFinal: RecoveryRecord | undefined;
+  if (options.priorPendingHeldFinal) {
+    assert.equal(options.olderOpenHold, true, "historical FINAL needs its real exact-generation hold");
+    const earlierContext = { ...context, generation: 1 };
+    await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context: earlierContext });
+    assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
+      inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
+    const earlier = await coordinator.freezeInventory({
+      context: earlierContext, currentSha: head, defaultBranch: "main",
+    });
+    assert.ok(earlier, "public freeze mints the historical coverage wrapper");
+    const physicalCoordinator = (r as unknown as { recovery: RecoveryCoordinator }).recovery;
+    assert.equal(await physicalCoordinator.releaseHeldPublication(earlier,
+      "55555555-5555-4555-8555-555555555555"), "kept");
+    priorFinal = (await coordinator.inspect(claim.run_id)).find(row => row.captureId === earlier.captureId);
+    assert.ok(priorFinal?.finalRequest, "public held-publication writer persists FINAL");
+    assert.equal(priorFinal.finalAcknowledged === true, false, "public writer leaves historical FINAL unacknowledged");
+    assert.equal(calls.heldFinal, 1, "real runner boundary permits FINAL; server retains it");
+    // Ordinary successor work changes the aggregate inputs; the historical synthetic wrapper
+    // is a coverage ref, so owed discovery retains its work roots without adopting the wrapper.
+    head = commit("successor.txt");
+  }
+  await git.fetchAgentBranch(bare, clone, branch, claim.run_id, { context });
   if (options.olderOpenHold && options.olderSource !== false) assert.ok(await coordinator.pin({ runId: claim.run_id, generation: 1,
     inventoryGuarded: true, kind: "issue", branch, sourceSha: head }));
   assert.ok(await coordinator.pin({ runId: claim.run_id, generation: archiveGeneration,
@@ -405,14 +438,19 @@ export async function reportRetirementFixture(t: TestContext, options: {
   const restartedRunner = async (opts: { root?: string; brokenRoot?: boolean } = {}) => {
     const root = opts.root ?? path.join(fx.dataDir, "outbox");
     if (opts.brokenRoot) fs.writeFileSync(root, "outbox init failure");
+    const observations = { calls: 0 };
     const restarted = new Outbox({ root, log: nullLogger(),
       runMaxBytes: 64 * 1024 * 1024, maxBytes: 512 * 1024 * 1024, retentionMs: 7 * 86_400_000 });
     await restarted.init();
-    return { root, outbox: restarted, r: runner({ run: async () => { throw new Error("no execution on restart"); } },
+    return { root, observations, outbox: restarted, r: runner({ run: async () => { throw new Error("no execution on restart"); } },
       fakeGitlab().gitlab, token, { outbox: restarted,
-        quiesceRun: async () => ({ process: { state: "quiescent", processes: [], killed: [], detail: "" },
-          docker: { state: "not_wired", removed: [], detail: "" } }) }) };
+        // SYNTHETIC PROCESS PROOF; physical source and content inspection remain production code.
+        quiesceRun: async () => {
+          observations.calls++;
+          return { process: { state: "quiescent", processes: [], killed: [], detail: "" },
+            docker: { state: "not_wired", removed: [], detail: "" } };
+        } }) };
   };
-  return { recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
+  return { priorFinal, recoveryOf, acknowledgeArchive, restartedRunner, headroomMs, headroom, useHeadroom, captureTimers, claim, generation, archive, outbox, registry, r, coordinator, replay, expireNextProof, replayPositive, positiveStage, assertFinalizePending, assertPending,
     assertCustody, ownership, capture, clone, bare, head, cmd, commit, context, calls, liveFlight, processObservation };
 }
