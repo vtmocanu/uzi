@@ -327,8 +327,12 @@ deferred; this amendment does not claim to solve it.
 A retained-recovery episode may outlive a park or an interrupted long model turn.
 Its cumulative reservation count stays bounded at three, but the five-minute
 window now belongs to a positively verified claim generation, rather than the
-whole episode. The runner proves current `running` ownership and the exact
-positive claim generation before establishing a new window. The journal persists
+whole episode. The acquired server claim's positive generation fences the first
+window; its reservation is durably charged before ownership probes, preserving
+#2512's outage and cancellation accounting. Renewing an existing episode instead
+requires a current `running` ownership proof with the exact positive generation
+before rebasing its window. A lost claim stops that renewal without changing or
+blocking the predecessor episode. The journal persists
 `claimGeneration` beside `startedAt` and `deadline` (`startedAt + 300000`), under
 the existing source binding and bare lock. A higher verified generation rebases
 those timestamps once. Same-generation retry and process recreation do not renew

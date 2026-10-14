@@ -17276,17 +17276,16 @@ export class RunRunner {
         const newWindow = episode?.claimGeneration !== flight.claimGeneration;
         const deadline = newWindow ? now + 300_000 : episode!.deadline;
         reservation = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), deadline, async signal => {
-          // Only the authenticated current claim may bind/rebase a legacy or predecessor window.
-          // Do not install the predecessor's expired deadline before this proof can run.
-          if (newWindow) {
-            if (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1) throw new RetainedRecoveryStop();
-            await this.requireRetainedOwnership(flight, deadline, signal);
-          }
+          if (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1) throw new RetainedRecoveryStop();
+          // The acquired claim positively fences a first window; precharge it before probes
+          // as #2512 requires. Only rebasing an existing episode needs an extra ownership
+          // proof, before applying its predecessor deadline or changing that episode.
+          if (newWindow && episode) await this.requireRetainedOwnership(flight, deadline, signal);
           return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration);
         });
       } catch (error) {
         this.retainedLifecycleGuard(flight);
-        if (error instanceof CredentialSwitchSignal) throw error;
+        if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";
         flight.runLog.warn("retained recovery reservation failed", { error: sanitizeForLog(message), blocker });

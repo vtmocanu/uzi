@@ -179,6 +179,7 @@ test("runner cannot rebase without positive matching claim ownership", async t =
   const f = fixture(t);
   const first = await f.reserve(1);
   f.advance(300_001);
+  const before = f.read();
   let proof = false;
   const runner = Object.assign(Object.create(RunRunner.prototype), {
     git: f.recreate(), recoveryRetryMs: 1000, codexBoundaryDeadlineMs: 1000,
@@ -193,8 +194,37 @@ test("runner cannot rebase without positive matching claim ownership", async t =
   await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
     barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2, runLog: nullLogger(),
   }, "key", f.read()));
+  assert.deepEqual(f.read(), before, "a lost claim must not block or mutate its predecessor episode");
   assert.equal(f.read().recovery?.claimGeneration, 1);
   assert.equal(f.read().recovery?.deadline, first.deadline);
   assert.equal(f.read().recovery?.attempts, 1);
   assert.equal(proof, false);
+});
+
+test("first recovery window durably charges before ownership probes and preserves outage retries", async t => {
+  const f = fixture(t);
+  const observed: number[] = [];
+  let report = "";
+  const runner = Object.assign(Object.create(RunRunner.prototype), {
+    git: f.recreate(), recoveryRetryMs: 1, codexBoundaryDeadlineMs: 1000,
+    shutdownSignal: new AbortController(),
+    waitRecoveryRetry: async () => {},
+    client: { getRunOwnership: async () => {
+      observed.push(f.read().recovery?.attempts ?? 0);
+      throw new Error("ownership unavailable");
+    } },
+    cloneCoordinates: () => ({ branch: "branch" }),
+    retainedLifecycleGuard: () => {},
+    retainedLifecycleSignal: () => new AbortController().signal,
+    reportGenericFailure: async (_claim: unknown, _flight: unknown, error: Error) => { report = error.message; },
+  });
+  await assert.rejects(runner.recoverRetainedClaim({ run_id: f.source.runId }, {
+    barePath: "/tmp/bare", runId: f.source.runId, claimGeneration: 2,
+    runLog: nullLogger(), batcher: { emit: () => {} },
+  }, "key", f.read()));
+  assert.deepEqual([...new Set(observed)], [1, 2, 3]);
+  assert.ok(observed.every(attempt => attempt > 0), "every ownership probe follows its durable charge");
+  assert.equal(f.read().recovery?.attempts, 3);
+  assert.equal(f.read().recovery?.blocker, "budget_exhausted");
+  assert.match(report, /budget exhausted/);
 });
