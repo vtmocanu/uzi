@@ -1942,7 +1942,10 @@ export class GitCache {
     if (budget && Date.now() >= budget.deadline) throw new Error("report proof deadline");
   }
   readonly recoveryDecodedLimitBytes: number;
-  private readonly recoveryOperations = new AsyncLocalStorage<{ signal: AbortSignal; deadline: number; closureBudget: ClosureBudget }>();
+  private readonly recoveryOperations = new AsyncLocalStorage<{
+    signal: AbortSignal; deadline: number; closureBudget: ClosureBudget;
+    closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
+  }>();
 
   /** Local recovery clock, including queued locks and actual child settlement. */
   async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
@@ -1954,7 +1957,9 @@ export class GitCache {
     if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
     try {
       combined.throwIfAborted();
-      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes } }, () => action(combined));
+      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
+        closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
+      }, () => action(combined));
     } finally { clearTimeout(timer); }
   }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
@@ -5966,6 +5971,21 @@ export class GitCache {
     operation?.signal.throwIfAborted();
     if (!SHA40_RE.test(tip)) return false;
     const budget = operation?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes };
+    const cache = operation?.closureCache ?? { identities: new Map<string, Map<string, ClosureObject>>(), entries: 0 };
+    // Operation-wide bound, including every bare identity. At capacity misses still hash/charge.
+    const maxEntries = Math.floor(GIT_MAX_BUFFER / 41);
+    const identity = async (): Promise<string> => {
+      const bare = await fs.lstat(barePath, { bigint: true });
+      const objects = await fs.lstat(path.join(barePath, "objects"), { bigint: true });
+      if (!bare.isDirectory() || bare.isSymbolicLink() || !objects.isDirectory() || objects.isSymbolicLink()) {
+        throw new Error("unsafe recovery object directory");
+      }
+      return JSON.stringify([barePath, `${bare.dev}:${bare.ino}`, `${objects.dev}:${objects.ino}`]);
+    };
+    // Reuse assumes immutable worker-owned object storage and disabled bare repack/prune.
+    // User decision 2026-10-14 (#2979) accepts that corruption, loose/pack replacement
+    // or added alternates within this operation can escape re-hashing when directory
+    // identities and cached type/size metadata match.
     // Ignore replacement, shallow and graft views, and forbid promisor lazy fetch.
     const env = { ...gitEnv(), GIT_NO_REPLACE_OBJECTS: "1", GIT_SHALLOW_FILE: "/dev/null",
       GIT_GRAFT_FILE: "/dev/null", GIT_NO_LAZY_FETCH: "1", GIT_ALLOW_PROTOCOL: "none" };
@@ -5974,6 +5994,8 @@ export class GitCache {
         { env, timeout: GIT_TIMEOUT_MS, maxBuffer: GIT_MAX_BUFFER, ...(input === undefined ? {} : { input }) })).stdout;
     let producer: Awaited<ReturnType<GitCache["spawnGit"]>> | undefined;
     try {
+      const beforeIdentity = await identity();
+      const verified = cache.identities.get(beforeIdentity);
       if ((await read(["rev-parse", "--verify", `${tip}^{commit}`])).trim() !== tip) return false;
       const listing = await read(["rev-list", "--objects", "--no-object-names", "--missing=error", tip]);
       if (!listing.endsWith("\n")) return false;
@@ -5991,18 +6013,35 @@ export class GitCache {
         const match = /^([0-9a-f]{40}) (blob|tree|commit|tag) (0|[1-9][0-9]*)$/.exec(rows[i]!);
         if (!match || match[1] !== oids[i]) return false;
         const size = Number(match[3]);
-        if (!Number.isSafeInteger(size) || size > budget.limit - budget.delivered - declared) {
-          throw new RecoveryClosureLimitError(budget.limit);
+        if (!Number.isSafeInteger(size)) throw new RecoveryClosureLimitError(budget.limit);
+        const hit = verified?.get(match[1]!);
+        if (hit) {
+          if (hit.type !== match[2] || hit.size !== size) return false;
+          continue;
         }
+        if (size > budget.limit - budget.delivered - declared) throw new RecoveryClosureLimitError(budget.limit);
         declared += size;
         objects.push({ oid: match[1]!, type: match[2]!, size });
       }
       operation?.signal.throwIfAborted();
-      producer = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"], input,
-        { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true });
-      await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
-      if (await producer.exited !== 0) return false;
+      if (objects.length > 0) {
+        producer = await this.spawnGit(barePath, ["--no-replace-objects", "cat-file", "--batch"],
+          objects.map(object => object.oid).join("\n") + "\n",
+          { env, timeoutMs: GIT_TIMEOUT_MS, stderrMaxBytes: 4096, cancelOnAbandon: true });
+        await verifyClosureFrames(producer.stdout, objects, budget, operation?.signal);
+        if (await producer.exited !== 0) return false;
+      }
       operation?.signal.throwIfAborted();
+      if (await identity() !== beforeIdentity) return false;
+      operation?.signal.throwIfAborted();
+      // Publish only the complete successful batch after clean child settlement and identity proof.
+      // Failed/partial batches never seed trust, even for frames already hashed successfully.
+      for (const object of objects) {
+        if (cache.entries >= maxEntries) break;
+        let entries = cache.identities.get(beforeIdentity);
+        if (!entries) { entries = new Map(); cache.identities.set(beforeIdentity, entries); }
+        if (!entries.has(object.oid)) { entries.set(object.oid, object); cache.entries++; }
+      }
       return true;
     } catch (error) {
       // Abandoning the pipe cancels the exact owned producer; settlement precedes lock release.

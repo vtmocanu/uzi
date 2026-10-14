@@ -213,8 +213,9 @@ and hashes under the existing deadline; unrelated cache objects do not
 participate in that proof. Overflow, timeout, corruption and interruption
 never authorize custody release or source cleanup.
 
-The 1 GiB budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads. The delivered-byte
+The decoded budget (limit amended by #2743) counts delivered object contents
+cumulatively within a recovery operation. The 2026-10-14 cache amendment below
+supersedes the original repeated-verification-read accounting. The delivered-byte
 cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
 does not isolate this verifier from sibling runs. The resulting residual
 resource-exhaustion risk is deferred scope, as authorized by the human
@@ -297,9 +298,10 @@ This issue changes neither deployment manifest. See
 
 Outer recovery operations and closure checks without an operation context use
 the configured cap; nested recovery operations share their parent's cumulative
-delivered-byte counter. Verification continues to hash the **full reachable
-history**, including prerequisites, with no deduplication across repeated
-reads or history exclusion. Missing or corrupt objects are refused.
+delivered-byte counter. Every verification still walks the **full reachable
+history**, including prerequisites, without history exclusion. The 2026-10-14
+cache amendment below supersedes the original repeated-read accounting and
+states the explicitly accepted change to corruption detection.
 Cancellation and existing deadlines remain in force. Cap exhaustion fails
 closed, preserving local work and custody; encoded archive limits and storage
 quotas are unchanged. Local proof still grants neither remote durability nor
@@ -360,3 +362,50 @@ a reclaim nor a deployment upgrade revives them. Source protection, custody,
 publication proof, closure verification limits and retry backoff are unchanged.
 No claim fence, timer renewal or successful local verification authorizes deletion
 or release of retained work.
+
+## Amendment 2026-10-14: #2979, per-operation verified-object reuse
+
+**User decision, 2026-10-14: option A.** Retained recovery and retained credential
+switches may reuse successfully hashed objects within the same recovery
+operation instead of repeatedly spending the decoded budget on shared history.
+The independent reviewer dissented, preferring refusal of reuse when
+`objects/info/alternates` exists plus per-pack identity checks. That alternative
+would still not catch in-place corruption or replacement of a loose object.
+The user chose option A with the broader risk wording below. This supersedes
+#2512's repeated-verification-read charging and #2743's explicit no-deduplication
+deferral. Nested operations share both the counter and cache by
+reference; standalone calls have a private cache, and new operations start empty.
+
+Every call still performs the complete `rev-list --objects --missing=error` walk
+and batch metadata checks. Cache hits must retain their verified type and size.
+Only misses contribute to the declared-size precheck, content hashing and decoded
+charges. Entries publish only after all requested frames and hashes verify, the
+producer exits cleanly, and the bare identity is unchanged. A failed or partial
+batch publishes no entries; its already-delivered bytes remain charged.
+
+Identity is `barePath` plus `lstat dev:ino` for the bare and its `objects/`
+directory, checked before the walk and after producer settlement (also on an
+all-hit check). The total cache entry count across the whole operation is capped
+at `floor(GIT_MAX_BUFFER / 41)`. At capacity, new objects remain uncached and are
+still hashed and charged. No cache state persists to disk or crosses operations.
+
+Validity relies on immutable Git object storage owned by the worker. Automatic
+bare maintenance is disabled; the worker does not repack or prune its bare, and
+clone materialization's repack is separate. Deletion is still refused by the full
+missing-object walk. Cache reuse adds a distinct risk: loose objects or packs
+modified in place or renamed over, or an added alternate object store, can evade
+later content verification when the bare and object-directory inodes and cached
+type/size metadata remain unchanged. Previously, each later closure check hashed
+those bytes again. **This is not today's guarantee and is not a technical
+equivalence to the existing verification-to-consumer race.** The user explicitly
+accepts this additional risk within one operation. Directory replacement, missing
+objects and cached type/size disagreement still refuse. A fresh operation hashes
+objects again. Cache reuse never grants custody release or source deletion.
+
+The finite 8 GiB default and configurable ceiling remain unchanged. Deduplication
+removes repeated shared-history charging, not the single-pass growth risk: a
+closure whose unique decoded content exceeds the cap still fails closed. History
+was measured at roughly 1.5 GiB in October 2026; continued growth can eventually
+require another policy decision. Deadline, cancellation, archive and storage
+quota boundaries remain unchanged. The decoded cap still does not bound
+Git-internal decompression memory.

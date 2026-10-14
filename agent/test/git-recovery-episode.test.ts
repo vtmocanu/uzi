@@ -1290,11 +1290,20 @@ test("explicit owner discard keeps paths intact and per-key attempt mode outlive
   assert.ok(clone.path.endsWith(".attempt-" + aid(3)));
 });
 
-test("configured nested recovery verification shares a cumulative budget and fallback uses the same cap", async () => {
+test("configured nested recovery verification charges unique content cumulatively and fallback uses the same cap", async () => {
   const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
   const oids = git(bare, ["rev-list", "--objects", "--no-object-names", tip]).split("\n");
   const decoded = oids.reduce((total, oid) => total + Number(git(bare, ["cat-file", "-s", oid])), 0);
-  const limit = decoded * 2 - 1;
+  const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+    { input: "independent unique content\n".repeat(20), encoding: "utf8" }).trim();
+  const tree = execFileSync("git", ["-C", bare, "mktree"],
+    { input: `100644 blob ${blob}\tunique.txt\n`, encoding: "utf8" }).trim();
+  const uniqueTip = git(bare, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", "unique root"]);
+  const uniqueOids = git(bare, ["rev-list", "--objects", "--no-object-names", uniqueTip]).split("\n");
+  assert.ok(uniqueOids.every(oid => !oids.includes(oid)));
+  const uniqueDecoded = uniqueOids.reduce((total, oid) => total + Number(git(bare, ["cat-file", "-s", oid])), 0);
+  const limit = decoded + uniqueDecoded - 1;
+  assert.ok(decoded < limit && uniqueDecoded < limit);
   const config = loadConfig({ UZI_API_URL: "http://api:8080", UZI_WORKER_TOKEN: "fixture-token",
     UZI_RECOVERY_DECODED_LIMIT_BYTES: String(limit) });
   cache = new GitCache(fx.dataDir, nullLogger(), undefined,
@@ -1308,7 +1317,7 @@ test("configured nested recovery verification shares a cumulative budget and fal
     assert.equal(budget.delivered, decoded);
     await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000, async () => {
       assert.equal((cache as any).recoveryOperations.getStore().closureBudget, budget, "nested budget identity");
-      return cache.verifyRecoveryClosure(bare, tip);
+      return cache.verifyRecoveryClosure(bare, uniqueTip);
     }), { message: `reachable recovery history exceeds the ${limit} bytes decoded verification limit` });
     assert.equal(budget.delivered, decoded, "metadata refusal does not refund or charge unread bytes");
   });

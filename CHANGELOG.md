@@ -47,6 +47,9 @@ through `[0.52.0]`.)
 - **Hosted worker CPU/memory capacity blockers no longer appear as failed upgrades (#2419).**
   Verified scheduler-only resource shortages have distinct web, CLI and TUI diagnostics, while first provisioning gets its own progress/failure labels. Storage and unknown faults retain failure visibility; typed cause validation survives mixed-version API writes. Live Kubernetes capacity/storage-control verification and fresh light/dark TUI PNG review remain maintainer-owned and incomplete.
 
+- **Retained recovery avoids charging verified shared history repeatedly ([#2979](https://github.com/vtmocanu/uzi/issues/2979)).**
+  Recovery and retained credential switches reuse verified objects within one operation, preserving complete closure walks, missing-object checks and the finite decoded-content limit. New operations start with an empty cache; the documented object-storage assumptions and accepted corruption risk apply.
+
 - **Retained recovery gets one deadline window per verified claim ([#2958](https://github.com/vtmocanu/uzi/issues/2958)).**
   A fresh claim can recover work after a long turn or park without inheriting an expired predecessor deadline. Same-claim retries retain their deadline, reservation counts remain cumulative, and already-blocked episodes keep their original reason and custody.
 

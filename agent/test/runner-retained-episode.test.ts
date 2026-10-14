@@ -1832,7 +1832,7 @@ it("real production configured overflow blocks runner with decoded_history_limit
   assert.ok(log.lines.some(line => JSON.stringify(line).includes("1 bytes decoded verification limit")));
 });
 
-it("configured repeated real closure reads exhaust cumulatively, retain pins, and changed-cap restart stays blocked", async () => {
+it("configured unique real closure reads exhaust cumulatively, retain pins, and changed-cap restart stays blocked", async () => {
   const limit = 4096;
   const cache = configuredCache(limit);
   const { claim, bare, clone } = await seed(2512, false, cache);
@@ -1852,13 +1852,18 @@ it("configured repeated real closure reads exhaust cumulatively, retain pins, an
     assert.ok(sizes.reduce((sum, size) => sum + size, 0) < limit, "individual closure is below cap");
     await record(...args);
     pinnedTip = tip;
-    // At most limit+1 reads: each successful nonempty closure charges at least one byte.
-    // The first refusal propagates and prevents successor admission.
+    // Independent root closures contribute unique content; the first refusal propagates
+    // and prevents successor admission. Each successful closure charges at least one byte.
     for (let i = 0; i <= limit; i++) {
       reads++;
       await cache.withRecoveryOperation(scope.signal, scope.deadline, async () => {
         assert.equal((cache as any).recoveryOperations.getStore().closureBudget, beforeBudget);
-        assert.equal(await cache.verifyRecoveryClosure(bare, tip), true);
+        const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+          { input: `unique content ${i}\n`, encoding: "utf8" }).trim();
+        const tree = execFileSync("git", ["-C", bare, "mktree"],
+          { input: `100644 blob ${blob}\tunique.txt\n`, encoding: "utf8" }).trim();
+        const uniqueTip = command(bare, "-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", `unique root ${i}`);
+        assert.equal(await cache.verifyRecoveryClosure(bare, uniqueTip), true);
       });
     }
     throw new Error("fixture failed to exhaust cumulative budget");
@@ -1870,7 +1875,7 @@ it("configured repeated real closure reads exhaust cumulatively, retain pins, an
   assert.equal(models, 0);
   assert.equal(successors, 0);
   assert.equal(releases, 0);
-  assert.ok(reads > 1, "individually admissible repeated reads consumed the cumulative budget");
+  assert.ok(reads > 1, "individually admissible unique reads consumed the cumulative budget");
   assert.ok(beforeBudget.delivered > 0 && beforeBudget.delivered <= limit);
   const blocked = readJournal(bare, clone.branch);
   assert.equal(blocked.recovery.stage, "blocked");
