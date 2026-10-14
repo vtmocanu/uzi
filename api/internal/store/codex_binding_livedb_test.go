@@ -348,8 +348,8 @@ func TestFreezeRunCodexBindingLiveDB(t *testing.T) {
 }
 
 // TestSetRunCodexClaimCapabilityLiveDB pins the capability mint (owning-worker only,
-// bumps the epoch) and the requeue revocation across all THREE requeue queries,
-// including the regression that a non-codex run's other columns survive a requeue.
+// bumps the epoch), explicit requeue revocation, and provisional stale-requeue
+// preservation, including non-codex epoch and unrelated-column regression pins.
 func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	repo, worker := codexRunFixture(ctx, t, pool, user)
@@ -462,7 +462,7 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 		t.Fatalf("non-codex run after requeue: cap_hash=%q epoch=%d, want (NULL, 1)", ctrlAfter.CodexCapHash, ctrlAfter.CodexClaimEpoch)
 	}
 
-	// --- RequeueRunsOfStaleWorkers revokes too. ---
+	// --- RequeueRunsOfStaleWorkers preserves the same flight's capability. ---
 	// Make the worker stale (old heartbeat) and put the codex run back to running.
 	mustExec(ctx, t, pool, `UPDATE runs SET status='running', requeue_count=0 WHERE id=$1`, runID)
 	if _, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
@@ -470,6 +470,7 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	}); err != nil {
 		t.Fatalf("re-mint before stale requeue: %v", err)
 	}
+	mustExec(ctx, t, pool, `UPDATE runs SET status='running', requeue_count=0 WHERE id=$1`, ctrlID)
 	mustExec(ctx, t, pool, `UPDATE workers SET last_heartbeat_at = now() - interval '1 hour' WHERE id=$1`, worker)
 	epochBefore, err := q.GetRunByID(ctx, runID)
 	if err != nil {
@@ -484,9 +485,17 @@ func TestSetRunCodexClaimCapabilityLiveDB(t *testing.T) {
 	if err != nil {
 		t.Fatalf("GetRunByID after stale requeue: %v", err)
 	}
-	if staleAfter.CodexCapHash != nil || staleAfter.CodexClaimEpoch != epochBefore.CodexClaimEpoch+1 {
-		t.Fatalf("after RequeueRunsOfStaleWorkers: cap_hash=%q epoch=%d, want (NULL, %d)",
-			staleAfter.CodexCapHash, staleAfter.CodexClaimEpoch, epochBefore.CodexClaimEpoch+1)
+	if staleAfter.Status != "queued" || string(staleAfter.CodexCapHash) != "cap3" || staleAfter.CodexClaimEpoch != epochBefore.CodexClaimEpoch {
+		t.Fatalf("after RequeueRunsOfStaleWorkers: status=%q cap_hash=%q epoch=%d, want (queued, cap3, %d)",
+			staleAfter.Status, staleAfter.CodexCapHash, staleAfter.CodexClaimEpoch, epochBefore.CodexClaimEpoch)
+	}
+	ctrlStale, err := q.GetRunByID(ctx, ctrlID)
+	if err != nil {
+		t.Fatalf("GetRunByID(control after stale): %v", err)
+	}
+	if ctrlStale.Status != "queued" || ctrlStale.CodexCapHash != nil || ctrlStale.CodexClaimEpoch != 1 ||
+		ctrlStale.IssueDescription != ctrlBefore.IssueDescription || ctrlStale.CodexSecretID.Valid {
+		t.Fatalf("non-codex run after stale requeue: %+v, want queued with NULL hash, unchanged epoch 1 and unrelated columns", ctrlStale)
 	}
 }
 
@@ -669,13 +678,10 @@ func TestCodexRefreshIntentLiveDB(t *testing.T) {
 	}
 }
 
-// TestSweepClaimedNeverStartedCodexRevocationLiveDB pins the sweeper's claimed→queued
-// path (PRD #1147 M2): sweeping a claimed run back to queued must ALSO revoke its
-// per-claim Codex capability — clear codex_cap_hash and bump codex_claim_epoch — so a
-// run swept off a lost claim cannot replay a live cap on its next claim. A non-codex
-// claimed run swept in the same pass keeps its unrelated columns (regression) and its
-// already-NULL cap_hash, with only the harmless epoch bump.
-func TestSweepClaimedNeverStartedCodexRevocationLiveDB(t *testing.T) {
+// TestSweepClaimedNeverStartedCodexPreservationLiveDB pins provisional capability
+// preservation (#2988), including non-codex epochs and unrelated columns. A successful
+// fresh same-worker ClaimRun then supersedes the old capability before any new mint.
+func TestSweepClaimedNeverStartedCodexPreservationLiveDB(t *testing.T) {
 	ctx, pool, q, user := codexLiveDB(t)
 	repo, worker := codexRunFixture(ctx, t, pool, user)
 
@@ -694,7 +700,7 @@ func TestSweepClaimedNeverStartedCodexRevocationLiveDB(t *testing.T) {
 	// A non-codex claimed run in the SAME sweep: no cap_hash, a marker to prove its
 	// unrelated columns survive.
 	plainRun := insertCodexRun(ctx, t, pool, user, repo, worker, 302, "claimed", "plain-marker")
-	mustExec(ctx, t, pool, `UPDATE runs SET claimed_at = $1 WHERE id = $2`, old, plainRun)
+	mustExec(ctx, t, pool, `UPDATE runs SET claimed_at = $1, codex_claim_epoch = 7 WHERE id = $2`, old, plainRun)
 	plainBefore, err := q.GetRunByID(ctx, plainRun)
 	if err != nil {
 		t.Fatalf("GetRunByID(plain before): %v", err)
@@ -704,7 +710,7 @@ func TestSweepClaimedNeverStartedCodexRevocationLiveDB(t *testing.T) {
 		t.Fatalf("SweepClaimedNeverStarted: %v", err)
 	}
 
-	// Codex run: queued, cap_hash revoked (NULL), epoch bumped 5 -> 6.
+	// Provisional requeue: queued, cap_hash and epoch retained for re-adoption.
 	codexAfter, err := q.GetRunByID(ctx, codexRun)
 	if err != nil {
 		t.Fatalf("GetRunByID(codex after): %v", err)
@@ -712,15 +718,14 @@ func TestSweepClaimedNeverStartedCodexRevocationLiveDB(t *testing.T) {
 	if codexAfter.Status != "queued" {
 		t.Fatalf("codex run status = %q after sweep, want \"queued\"", codexAfter.Status)
 	}
-	if codexAfter.CodexCapHash != nil {
-		t.Fatalf("codex run cap_hash = %q after sweep, want NULL (revoked)", codexAfter.CodexCapHash)
+	if string(codexAfter.CodexCapHash) != "live-cap" {
+		t.Fatalf("codex run cap_hash = %q after sweep, want live-cap", codexAfter.CodexCapHash)
 	}
-	if codexAfter.CodexClaimEpoch != 6 {
-		t.Fatalf("codex run epoch = %d after sweep, want 6 (5 -> 6)", codexAfter.CodexClaimEpoch)
+	if codexAfter.CodexClaimEpoch != 5 {
+		t.Fatalf("codex run epoch = %d after sweep, want unchanged 5", codexAfter.CodexClaimEpoch)
 	}
 
-	// Non-codex run: queued, unrelated columns untouched, cap_hash stays NULL, epoch
-	// bumps harmlessly 0 -> 1 (the no-op revocation).
+	// Non-codex run: queued, unrelated columns untouched, NULL hash and epoch retained.
 	plainAfter, err := q.GetRunByID(ctx, plainRun)
 	if err != nil {
 		t.Fatalf("GetRunByID(plain after): %v", err)
@@ -731,8 +736,44 @@ func TestSweepClaimedNeverStartedCodexRevocationLiveDB(t *testing.T) {
 	if plainAfter.IssueDescription != plainBefore.IssueDescription || plainAfter.CodexSecretID.Valid {
 		t.Fatalf("non-codex run mutated by sweep: desc=%q secret_valid=%v", plainAfter.IssueDescription, plainAfter.CodexSecretID.Valid)
 	}
-	if plainAfter.CodexCapHash != nil || plainAfter.CodexClaimEpoch != 1 {
-		t.Fatalf("non-codex run after sweep: cap_hash=%q epoch=%d, want (NULL, 1)", plainAfter.CodexCapHash, plainAfter.CodexClaimEpoch)
+	if plainAfter.CodexCapHash != nil || plainAfter.CodexClaimEpoch != 7 {
+		t.Fatalf("non-codex run after sweep: cap_hash=%q epoch=%d, want (NULL, 7)", plainAfter.CodexCapHash, plainAfter.CodexClaimEpoch)
+	}
+
+	// Claim both swept rows through the public store seam. The same owner must fence
+	// the preserved capability too; the non-codex row must advance its epoch as well.
+	remaining := map[uuid.UUID]int64{codexRun: 6, plainRun: 8}
+	for range 2 {
+		claimed, err := q.ClaimRun(ctx, store.ClaimRunParams{
+			WorkerID: pgtype.UUID{Bytes: worker, Valid: true}, UserID: user,
+			HeartbeatCutoff: pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+			AffinityCutoff:  pgtype.Timestamptz{Time: time.Now().Add(-time.Hour), Valid: true},
+			SpreadCutoff:    pgtype.Timestamptz{Time: time.Now().Add(-time.Minute), Valid: true},
+		})
+		if err != nil {
+			t.Fatalf("ClaimRun after sweep: %v", err)
+		}
+		wantEpoch, ok := remaining[claimed.ID]
+		if !ok {
+			t.Fatalf("ClaimRun returned unexpected run %s", claimed.ID)
+		}
+		delete(remaining, claimed.ID)
+		if claimed.Status != "claimed" || claimed.CodexCapHash != nil || claimed.CodexClaimEpoch != wantEpoch || claimed.ClaimGeneration != 1 {
+			t.Fatalf("fresh claim: status=%q hash=%q epoch=%d generation=%d, want (claimed, NULL, %d, 1)",
+				claimed.Status, claimed.CodexCapHash, claimed.CodexClaimEpoch, claimed.ClaimGeneration, wantEpoch)
+		}
+		if claimed.ID == codexRun {
+			epoch, err := q.SetRunCodexClaimCapability(ctx, store.SetRunCodexClaimCapabilityParams{
+				ID: codexRun, WorkerID: claimed.WorkerID, ClaimGeneration: claimed.ClaimGeneration, Hash: []byte("new-cap"),
+			})
+			if err != nil || epoch != 7 {
+				t.Fatalf("mint after fresh claim = (%d, %v), want (7, nil)", epoch, err)
+			}
+			persisted, err := q.GetRunByID(ctx, codexRun)
+			if err != nil || persisted.CodexClaimEpoch != epoch || string(persisted.CodexCapHash) != "new-cap" {
+				t.Fatalf("persisted fresh mint: hash=%q epoch=%d err=%v, want (new-cap, 7, nil)", persisted.CodexCapHash, persisted.CodexClaimEpoch, err)
+			}
+		}
 	}
 }
 

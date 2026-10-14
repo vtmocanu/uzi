@@ -36,6 +36,9 @@ through `[0.52.0]`.)
 - **Pending outcomes keep their API age across worker snapshot rotation (#2009).**
   Updated workers report complete pending identities so health warnings and worker counts survive active-list caps; fresh overflow is shown as “N confirmed pending; more may be pending” without inventing per-run ages. Coverage requires a worker fleet roll and a complete list within the ceiling in an accepted snapshot; rejected enclosing snapshots provide no pending identity coverage ([design and limits](adr/2009-pending-outcome-identities.md)).
 
+- **Codex capabilities survive provisional outage requeues ([#2988](https://github.com/vtmocanu/uzi/issues/2988)).**
+  Stale-worker and claimed-never-started requeues preserve the capability for same-generation re-adoption while queued suspends credential use. Every successful fresh claim revokes the old capability atomically before assembly; flights already revoked before rollout are not repaired.
+
 ### Security
 
 - **The automatic CI-fix guard is hardened against CI-configuration changes (f6d4168a2).**

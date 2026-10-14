@@ -1513,6 +1513,9 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
+    -- #2988 reverses PRD #1147's provisional-requeue revocation: every successful
+    -- fresh claim supersedes the old capability atomically, even for the same worker.
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     -- PRD #1247 M5 (D3): CLOSE the released-claim fence window. A held-state credential
     -- switch requeues the run with claim_released_at set (ReleaseCredentialSwitch), which
     -- makes the generation fence reject every report from the OLD flight. Reclaiming the
@@ -16525,10 +16528,9 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
         + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
-    -- Codex claim-capability revocation (PRD #1147 M2): a stale worker losing its runs
-    -- revokes their per-claim capabilities immediately — clear the hash and bump the
-    -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
-    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    -- #2988: preserve the capability for provisional same-generation re-adoption.
+    -- Queued suspends credential use; a successful ClaimRun supersedes the old
+    -- capability atomically even when the same worker claims again.
     updated_at = now()
 FROM eligible_candidates candidate
 WHERE runs.id = candidate.run_id
@@ -21332,12 +21334,9 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
-    -- Codex claim-capability revocation (PRD #1147 M2): this is the sweeper's
-    -- claimed→queued path (RequeueClaimedRunToQueued mirrors it) — losing the claim
-    -- must revoke the per-claim capability here too, or a run swept back to queued
-    -- would keep a live cap_hash replayable on its next claim. Clear the hash and
-    -- bump the epoch; a harmless no-op for non-codex runs (cap_hash already NULL).
-    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    -- #2988: this provisional same-generation requeue preserves the capability.
+    -- Queued suspends credential use; re-adoption may restore the same flight,
+    -- while a successful ClaimRun atomically supersedes it before claim assembly.
     updated_at = now()
 WHERE runs.status = 'claimed' AND runs.claimed_at < $1
   -- PRD #1390 D11: a ` + "`" + `claimed` + "`" + ` run whose initial ` + "`" + `running` + "`" + ` report never landed while its worker

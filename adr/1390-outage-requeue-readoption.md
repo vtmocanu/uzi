@@ -195,6 +195,27 @@ guard), and makes every D11 transition skip every run that worker owns; it is cl
 a valid unflagged snapshot or by expiry. The lease and overflow expiries share one clock and
 are the single backstop, so a worker that never returns still frees its runs.
 
+## Amendment — 2026-10-14 (#2988, PRD #1147 reversal)
+
+The API-only owner decision reverses PRD #1147's capability revocation on exactly two
+provisional paths: `RequeueRunsOfStaleWorkers` and `SweepClaimedNeverStarted`. Both keep
+`codex_cap_hash` and `codex_claim_epoch` unchanged within the same claim generation, so
+`ReadoptRunsFromSnapshot` can restore that flight without minting a replacement capability.
+While `queued`, every credential scope is suspended by the existing status guard.
+
+Every successful `ClaimRun` atomically clears `codex_cap_hash` and increments
+`codex_claim_epoch` alongside `claim_generation`, including same-worker and non-Codex
+claims. This supersedes the old flight before claim assembly; mint increments the epoch
+again and returns its persisted value. Mint's worker, status and generation guards and
+the credential prelude's worker, epoch, hash and release guards remain unchanged.
+
+All other revocations remain unchanged, including explicit release, register requeue,
+missing-snapshot requeue, parks, promotions and terminal transitions. This amendment adds
+no schema, protocol, worker, lease, custody, eligibility or outage subsystem change. It
+does not repair flights whose capabilities were already revoked before rollout. #1595
+remains unchanged; #1419 and #2986 are outside scope, and #2747's hosted follow-up belongs
+to the maintainer rather than this unit's gate.
+
 ## Operational seams
 
 - **`UZI_ACTIVE_SNAPSHOT_DISABLED` — the rollback lever.** An api started with this set omits
