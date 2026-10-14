@@ -54,9 +54,12 @@ function ClientIDRow({ id }: { id: string }) {
       <dt className="text-muted">Client ID</dt>
       <dd className="flex flex-wrap items-center gap-2">
         <code className="break-all font-mono text-xs text-fg">{id}</code>
-        <Button variant="secondary" size="sm" aria-label="Copy client ID" onClick={copy}>
+        <Button variant="secondary" size="sm" onClick={copy}>
           {copied ? "Copied" : "Copy client ID"}
         </Button>
+        <span role="status" aria-live="polite" className="sr-only">
+          {copied ? "Client ID copied" : ""}
+        </span>
       </dd>
     </div>
   );
@@ -191,9 +194,6 @@ export function ProductOAuthPanel({
               className="space-y-3 rounded-xl border border-ok/40 bg-surface p-4 outline-hidden"
             >
               <p className="text-sm font-medium text-ok">New client secret for {product.name}</p>
-              <dl className="text-sm">
-                <ClientIDRow id={product.id} />
-              </dl>
               <p className="text-sm text-muted">
                 Copy it into {product.name} now. It is shown{" "}
                 <strong className="text-fg">once and never again</strong> (only its hash is stored). The
@@ -207,6 +207,9 @@ export function ProductOAuthPanel({
                   {copied ? "Copied" : "Copy"}
                 </Button>
               </div>
+              <dl className="text-sm">
+                <ClientIDRow key={secret} id={product.id} />
+              </dl>
               <Button
                 variant="ghost"
                 onClick={() => {

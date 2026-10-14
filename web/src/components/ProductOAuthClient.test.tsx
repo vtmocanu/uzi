@@ -78,6 +78,8 @@ describe("ProductOAuthPanel", () => {
     expect(screen.getByText(clientID, { selector: "code" })).toBeTruthy();
     fireEvent.click(screen.getByRole("button", { name: "Copy client ID" }));
     await waitFor(() => expect(writeText).toHaveBeenCalledExactlyOnceWith(clientID));
+    expect(screen.getByRole("button", { name: "Copied" })).toBeTruthy();
+    expect(screen.getByRole("status").textContent).toBe("Client ID copied");
   });
 
   it.each([false, true])("reveals the client ID and keeps ID and secret copies separate (rotation=%s)", async (rotating) => {
@@ -90,7 +92,7 @@ describe("ProductOAuthPanel", () => {
     fireEvent.click(screen.getByRole("button", { name: rotating ? "Rotate secret" : "Create client secret" }));
     if (rotating) fireEvent.click(screen.getAllByRole("button", { name: "Rotate secret" })[0]);
     await screen.findByText(secret);
-    const reveal = within(screen.getByRole("status"));
+    const reveal = within(screen.getByText("New client secret for Helpdesk assistant").closest('[role="status"]') as HTMLElement);
     expect(reveal.getByText(clientID)).toBeTruthy();
     fireEvent.click(reveal.getByRole("button", { name: "Copy client ID" }));
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(clientID));
@@ -98,6 +100,31 @@ describe("ProductOAuthPanel", () => {
     fireEvent.click(reveal.getByRole("button", { name: "Copy" }));
     await waitFor(() => expect(writeText).toHaveBeenLastCalledWith(secret));
     expect(writeText.mock.calls).toEqual([[clientID], [secret]]);
+  });
+
+  it("resets the reveal's copied ID state after another secret rotation", async () => {
+    const firstSecret = "uzs_" + "D".repeat(43);
+    const nextSecret = "uzs_" + "E".repeat(43);
+    const writeText = vi.fn().mockResolvedValue(undefined);
+    Object.defineProperty(navigator, "clipboard", { configurable: true, value: { writeText } });
+    const p = product(fullClient, { id: clientID });
+    mockApi.adminRotateProductClientSecret
+      .mockResolvedValueOnce({ client_secret: firstSecret, product: p })
+      .mockResolvedValueOnce({ client_secret: nextSecret, product: p });
+    renderPanel(p);
+    const rotate = () => {
+      fireEvent.click(screen.getByRole("button", { name: "Rotate secret" }));
+      fireEvent.click(screen.getAllByRole("button", { name: "Rotate secret" })[0]);
+    };
+    rotate();
+    await screen.findByText(firstSecret);
+    const reveal = within(screen.getByText("New client secret for Helpdesk assistant").closest('[role="status"]') as HTMLElement);
+    const copyID = reveal.getByRole("button", { name: "Copy client ID" });
+    fireEvent.click(copyID);
+    await waitFor(() => expect(copyID.textContent).toBe("Copied"));
+    rotate();
+    await screen.findByText(nextSecret);
+    expect(reveal.getByRole("button", { name: "Copy client ID" }).textContent).toBe("Copy client ID");
   });
 
   it("shows a registered client's status, URIs, scopes and secret prefix", () => {
