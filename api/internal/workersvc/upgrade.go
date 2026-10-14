@@ -27,11 +27,14 @@ import (
 // here (the enum is the wire contract the web and CLI switch on) and produced by M4's
 // fold, not by version comparison. A version compare alone can never see a stuck pod.
 const (
-	UpgradeStatusUpToDate      = "up_to_date"
-	UpgradeStatusOutdated      = "outdated"
-	UpgradeStatusUnknown       = "unknown"
-	UpgradeStatusUpgrading     = "upgrading"      // M4 (controller roll-health)
-	UpgradeStatusUpgradeFailed = "upgrade_failed" // M4 (controller roll-health)
+	UpgradeStatusCapacityBlocked    = "capacity_blocked"
+	UpgradeStatusProvisioning       = "provisioning"
+	UpgradeStatusProvisioningFailed = "provisioning_failed"
+	UpgradeStatusUpToDate           = "up_to_date"
+	UpgradeStatusOutdated           = "outdated"
+	UpgradeStatusUnknown            = "unknown"
+	UpgradeStatusUpgrading          = "upgrading"      // M4 (controller roll-health)
+	UpgradeStatusUpgradeFailed      = "upgrade_failed" // M4 (controller roll-health)
 )
 
 // The controller's roll phases, re-declared on this side (PRD #113 M4).
@@ -182,7 +185,8 @@ type RollSignal struct {
 	// RolledTag is the tag the controller actually rolls to. For a HOSTED worker this
 	// is the authoritative target (Decision 9), because values.yaml may pin the worker
 	// image independently of the api's own release.
-	RolledTag string
+	RolledTag    string
+	BlockingKind string
 	// Display fields for the failed-worker strip. Already sanitized at ingest.
 	PodPhase          string
 	BlockingContainer string
@@ -193,6 +197,8 @@ type RollSignal struct {
 
 // UpgradeInput is everything the decision table reads.
 type UpgradeInput struct {
+	// NeverRegistered is positive API-owned evidence; false also covers unknown history.
+	NeverRegistered bool
 	// Reported is workers.version — written only at register, so a worker offline
 	// mid-roll still carries its OLD version. That single fact is why roll health
 	// cannot be derived from this field and has to come from the controller.
@@ -422,10 +428,19 @@ func classifyWithTarget(in UpgradeInput, p UpgradeParams) (status string, detail
 	}
 
 	// R1 is NOT ceiling-gated — see the ceilingOK comment above (issue #151).
+	if hosted && signalFresh && EffectiveBlockingKind(s) == BlockingKindSchedulerCapacity {
+		return UpgradeStatusCapacityBlocked, stuckDetail(s), target
+	}
 	if hosted && signalFresh && s.Phase == PhaseStuck {
+		if in.NeverRegistered {
+			return UpgradeStatusProvisioningFailed, stuckDetail(s), target
+		}
 		return UpgradeStatusUpgradeFailed, stuckDetail(s), target // R1
 	}
 	if hosted && signalFresh && ceilingOK && s.Phase == PhaseRolling {
+		if in.NeverRegistered {
+			return UpgradeStatusProvisioning, rollingDetail(s), target
+		}
 		return UpgradeStatusUpgrading, rollingDetail(s), target // R2
 	}
 
@@ -596,11 +611,12 @@ func ParseFreshPacingReport(data []byte, receipt pgtype.Timestamptz, now time.Ti
 // to persist. The handler does the decoding, enum validation and sanitizing; this
 // layer also validates pacing for callers that do not use the handler.
 type RollHealthReport struct {
-	Kind       string
-	Pacing     *PacingReport
-	WorkerID   uuid.UUID
-	Phase      string
-	PhaseSince *time.Time
+	BlockingKind string
+	Kind         string
+	Pacing       *PacingReport
+	WorkerID     uuid.UUID
+	Phase        string
+	PhaseSince   *time.Time
 	// TargetImage / PodPhase / Blocking* are controller-supplied display strings,
 	// already passed through the 64-byte control-character-stripping sanitizer.
 	TargetImage       string
@@ -656,6 +672,7 @@ func (s *Service) RecordRollHealth(ctx context.Context, rep RollHealthReport) (i
 		PhaseSince:           pgconv.TimePtr(rep.PhaseSince),
 		TargetImage:          pgconv.TextOrNull(rep.TargetImage),
 		PodPhase:             pgconv.TextOrNull(rep.PodPhase),
+		BlockingKind:         pgconv.TextOrNull(normalizedReportBlockingKind(rep)),
 		BlockingContainer:    pgconv.TextPtrOrNull(rep.BlockingContainer),
 		BlockingReason:       pgconv.TextPtrOrNull(rep.BlockingReason),
 		RestartCount:         rep.RestartCount,
@@ -720,6 +737,7 @@ func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, c
 		var sig *RollSignal
 		if row.Phase.Valid && row.ObservedAt.Valid {
 			sig = &RollSignal{
+				BlockingKind:      row.BlockingKind.String,
 				Phase:             row.Phase.String,
 				ObservedAt:        row.ObservedAt.Time,
 				PodPhase:          row.PodPhase.String,
@@ -744,6 +762,7 @@ func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, c
 			}
 		}
 		status, _ := ClassifyUpgrade(UpgradeInput{
+			NeverRegistered:     NeverRegistered(row.Status, row.LastHeartbeatAt.Valid, row.Version.Valid, row.SnapshotRegisterNonce.Valid, row.RegisteredPodUid.Valid, row.RollHeartbeatAt.Valid),
 			Reported:            row.Version.String,
 			Kind:                row.Kind,
 			CPVersion:           cpVersion,
@@ -772,5 +791,5 @@ func (s *Service) UpgradeSummaryForUser(ctx context.Context, userID uuid.UUID, c
 // (Decision 1): failed or behind. Exported so the nav badge's count and any other
 // consumer cannot drift into two answers.
 func InUpgradeAttentionSet(status string) bool {
-	return status == UpgradeStatusUpgradeFailed || status == UpgradeStatusOutdated
+	return IsUpgradeFailure(status) || status == UpgradeStatusOutdated
 }

@@ -70,11 +70,23 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	// set DisallowUnknownFields (drift is caught at the gate), and the production
 	// decoder deliberately does not. Two decoders, opposite policies, one wire.
 	var req hostedsvc.StatusReport
+	var raw json.RawMessage
 	dec := json.NewDecoder(http.MaxBytesReader(w, r.Body, maxStatusBodyBytes))
-	if err := dec.Decode(&req); err != nil && !errors.Is(err, io.EOF) {
+	if err := dec.Decode(&raw); err != nil && !errors.Is(err, io.EOF) {
 		httpx.Error(w, http.StatusBadRequest, "invalid request body")
 		return
 	}
+	if len(raw) != 0 {
+		if err := json.Unmarshal(raw, &req); err != nil {
+			httpx.Error(w, http.StatusBadRequest, "invalid request body")
+			return
+		}
+	}
+	var wire struct {
+		Workers []json.RawMessage `json:"workers"`
+	}
+	// The typed decode above already validated the ordinary report envelope.
+	_ = json.Unmarshal(raw, &wire)
 	if req.Kind != "" && req.Kind != "fleet" && req.Kind != "readiness" {
 		httpx.Error(w, http.StatusBadRequest, "invalid report kind")
 		return
@@ -109,7 +121,7 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var accepted, dropped int
-	for _, ws := range req.Workers {
+	for i, ws := range req.Workers {
 		id, err := uuid.Parse(ws.ID)
 		if err != nil {
 			dropped++
@@ -130,6 +142,7 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		n, err := h.wsvc.RecordRollHealth(r.Context(), workersvc.RollHealthReport{
+			BlockingKind:         rawBlockingKind(ws, wire.Workers[i]),
 			Kind:                 req.Kind,
 			Pacing:               pacing,
 			WorkerID:             id,

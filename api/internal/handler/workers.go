@@ -99,6 +99,7 @@ func bindingForMode(mode string, secretID pgtype.UUID, label string) (*string, *
 // is exactly what it carries. The per-user LIST path has the join and folds it.
 func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		NeverRegistered:     workersvc.NeverRegistered(w.Status, w.LastHeartbeatAt.Valid, w.Version.Valid, w.SnapshotRegisterNonce.Valid, w.RegisteredPodUid.Valid, w.RollHeartbeatAt.Valid),
 		Reported:            w.Version.String,
 		Kind:                w.Kind,
 		CPVersion:           cpVersion,
@@ -161,12 +162,14 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+	sig := rollSignalFromRow(w)
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		NeverRegistered:     workersvc.NeverRegistered(w.Status, w.LastHeartbeatAt.Valid, w.Version.Valid, w.SnapshotRegisterNonce.Valid, w.RegisteredPodUid.Valid, w.RollHeartbeatAt.Valid),
 		Reported:            w.Version.String,
 		Kind:                w.Kind,
 		CPVersion:           cpVersion,
 		PinnedWorkerVersion: pinnedWorkerVersion,
-		Signal:              rollSignalFromRow(w),
+		Signal:              sig,
 		Now:                 now,
 		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
@@ -177,11 +180,12 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		UpgradeStatus: upgradeStatus,
 		UpgradeDetail: textPtrValue(upgradeDetail != "", upgradeDetail),
 		UpgradeTarget: upgradeTarget,
-		// Only meaningful for a failed upgrade, and only the list path has the join that
+		// Blocking diagnostics are meaningful for failed statuses; this list path has the join that
 		// carries them at all.
-		UpgradeBlockingContainer: textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
-		UpgradeBlockingReason:    textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
-		UpgradeLastExitCode:      int32PtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
+		UpgradeBlockingKind:      textPtrValue(upgradeStatus == workersvc.UpgradeStatusCapacityBlocked, workersvc.EffectiveBlockingKind(sig)),
+		UpgradeBlockingContainer: textPtrValue(workersvc.IsUpgradeFailure(upgradeStatus) && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
+		UpgradeBlockingReason:    textPtrValue(workersvc.IsUpgradeFailure(upgradeStatus) && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
+		UpgradeLastExitCode:      int32PtrValue(workersvc.IsUpgradeFailure(upgradeStatus) && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
 		AnthropicSecretID:        rowBindingID,
 		AnthropicSecretLabel:     rowBindingLabel,
 		AnthropicBindMode:        effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
@@ -265,6 +269,7 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		return nil
 	}
 	sig := &workersvc.RollSignal{
+		BlockingKind:      w.RollBlockingKind.String,
 		Phase:             w.RollPhase.String,
 		ObservedAt:        w.RollObservedAt.Time,
 		PodPhase:          w.RollPodPhase.String,
@@ -287,6 +292,7 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		t := w.RollUpgradingSince.Time
 		sig.UpgradingSince = &t
 	}
+	sig.BlockingKind = workersvc.EffectiveBlockingKind(sig)
 	return sig
 }
 
@@ -302,6 +308,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 		return nil
 	}
 	sig := &workersvc.RollSignal{
+		BlockingKind:      w.RollBlockingKind.String,
 		Phase:             w.RollPhase.String,
 		ObservedAt:        w.RollObservedAt.Time,
 		PodPhase:          w.RollPodPhase.String,
@@ -324,6 +331,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 		t := w.RollUpgradingSince.Time
 		sig.UpgradingSince = &t
 	}
+	sig.BlockingKind = workersvc.EffectiveBlockingKind(sig)
 	return sig
 }
 
@@ -350,6 +358,7 @@ func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 		return dto
 	}
 	status, detail, target := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		NeverRegistered:     workersvc.NeverRegistered(row.Worker.Status, row.Worker.LastHeartbeatAt.Valid, row.Worker.Version.Valid, row.Worker.SnapshotRegisterNonce.Valid, row.Worker.RegisteredPodUid.Valid, row.Worker.RollHeartbeatAt.Valid),
 		Reported:            row.Worker.Version.String,
 		Kind:                row.Worker.Kind,
 		CPVersion:           cpVersion,
@@ -361,11 +370,12 @@ func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 	dto.UpgradeStatus = status
 	dto.UpgradeDetail = textPtrValue(detail != "", detail)
 	dto.UpgradeTarget = target
-	// The three blocking fields are meaningful only for a failed upgrade, gated identically to
+	// Blocking diagnostics are meaningful only for a failed status, gated identically to
 	// workerDTOFromRow so the admin list matches GET /api/workers for the same roll data.
-	dto.UpgradeBlockingContainer = textPtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollBlockingContainer.Valid, row.RollBlockingContainer.String)
-	dto.UpgradeBlockingReason = textPtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollBlockingReason.Valid, row.RollBlockingReason.String)
-	dto.UpgradeLastExitCode = int32PtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollLastExitCode.Valid, row.RollLastExitCode.Int32)
+	dto.UpgradeBlockingKind = textPtrValue(status == workersvc.UpgradeStatusCapacityBlocked, workersvc.EffectiveBlockingKind(sig))
+	dto.UpgradeBlockingContainer = textPtrValue(workersvc.IsUpgradeFailure(status) && row.RollBlockingContainer.Valid, row.RollBlockingContainer.String)
+	dto.UpgradeBlockingReason = textPtrValue(workersvc.IsUpgradeFailure(status) && row.RollBlockingReason.Valid, row.RollBlockingReason.String)
+	dto.UpgradeLastExitCode = int32PtrValue(workersvc.IsUpgradeFailure(status) && row.RollLastExitCode.Valid, row.RollLastExitCode.Int32)
 	return dto
 }
 

@@ -125,6 +125,7 @@ SELECT w.*,
        rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
+       rh.blocking_kind      AS roll_blocking_kind,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        -- observed_at is the API's own receipt time and the ONLY input to freshness.
@@ -267,6 +268,7 @@ WITH prev AS (
        SET upgrading_since    = NULL,
            blocking_container = NULL,
            blocking_reason    = NULL,
+           blocking_kind      = NULL,
            restart_count      = 0,
            last_exit_code     = NULL,
            updated_at         = now()
@@ -285,6 +287,7 @@ WITH prev AS (
        AND (r.upgrading_since IS NOT NULL
             OR r.blocking_container IS NOT NULL
             OR r.blocking_reason IS NOT NULL
+            OR r.blocking_kind IS NOT NULL
             OR r.restart_count <> 0
             OR r.last_exit_code IS NOT NULL)
        -- COMPARE THE RELEASE, NOT THE STRING. Both sides are stripped of SemVer
@@ -840,6 +843,7 @@ SELECT sqlc.embed(w),
        rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
+       rh.blocking_kind      AS roll_blocking_kind,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        rh.observed_at        AS roll_observed_at,

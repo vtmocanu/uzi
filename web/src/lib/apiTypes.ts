@@ -2399,6 +2399,8 @@ export interface Worker {
   // every other status, and null on responses that carry no roll-health join (register,
   // heartbeat, create). The reason only — `message` is never sent, being free text that
   // carries paths and Secret names.
+  // Absent on older APIs; null when the current report has no validated cause.
+  upgrade_blocking_kind?: string | null;
   upgrade_blocking_container: string | null;
   upgrade_blocking_reason: string | null;
   // The blocking container's last exit code, null when it never terminated (a different

@@ -38,6 +38,7 @@
   "upgrade_status": "x",
   "upgrade_detail": "x",
   "upgrade_target": "x",
+  "upgrade_blocking_kind": "x",
   "upgrade_blocking_container": "x",
   "upgrade_blocking_reason": "x",
   "upgrade_last_exit_code": 1,

@@ -101,7 +101,8 @@ type WorkerDTO struct {
 	DrainingSince *time.Time `json:"draining_since"`
 	CreatedAt     time.Time  `json:"created_at"`
 	// Derived upgrade health (PRD #113): "up_to_date" | "outdated" | "unknown" |
-	// "upgrading" | "upgrade_failed". Computed at read time from Version against the
+	// "upgrading" | "upgrade_failed" | "capacity_blocked" | "provisioning" |
+	// "provisioning_failed". Computed at read time from Version against the
 	// control plane's release — never stored, so it cannot go stale against the row
 	// it describes. UpgradeDetail is the human sentence behind the badge ("running
 	// 0.11.0, target 0.11.7"), null in the steady up_to_date case where there is
@@ -125,12 +126,15 @@ type WorkerDTO struct {
 	UpgradeTarget string `json:"upgrade_target"`
 	// The blocking container and the k8s waiting REASON behind an upgrade_failed, split
 	// out from UpgradeDetail so the UI can key a lookup on them rather than parsing a
-	// sentence. Null for every other status.
+	// sentence. Exposed for upgrade_failed, provisioning_failed and capacity_blocked.
 	//
 	// The reason ONLY — `state.waiting.message` is deliberately never sent. Reason is a
 	// short k8s enum; message is free text that routinely carries filesystem paths,
 	// image references and Secret names, and this field reaches a browser badge and a
 	// terminal via the CLI.
+	// UpgradeBlockingKind is scheduler_capacity only for a fresh, fully validated
+	// hosted capacity_blocked report; otherwise null.
+	UpgradeBlockingKind      *string `json:"upgrade_blocking_kind"`
 	UpgradeBlockingContainer *string `json:"upgrade_blocking_container"`
 	UpgradeBlockingReason    *string `json:"upgrade_blocking_reason"`
 	// The blocking container's last exit code, when it has one. Null for "never
