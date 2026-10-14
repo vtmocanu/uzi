@@ -970,7 +970,7 @@ source_check() {
   tar -xOzf "$x" ./issue-4242.source-2.meta.txt | grep -qxF "clone=$4" || fail "$1: source-2 is not $4"
   tar -xOzf "$x" ./issue-4242.source-2.uncommitted.patch | grep -qxF "+$5" || fail "$1: source-2 lacks +$5"
   clone_ere="$(printf '%s' "$4" | sed 's/[][\\.^$*+?(){}|]/\\&/g')"
-  grep -qE "(OK|PART) .*pod=[^ ]+ clone=$clone_ere[: ].*issue-4242[.]source-2[.]tgz" "$d/latest-attempt/backup.log" \
+  grep -qE "(OK|PART) .*pod=[^ ]+ clone=${clone_ere}[: ].*issue-4242[.]source-2[.]tgz" "$d/latest-attempt/backup.log" \
     || fail "$1: missing its own OK/PART line for source-2 naming pod and clone; log: $(cat "$d/latest-attempt/backup.log")"
 }
 # Exercise the real backup with an explicit '+' in the clone path on every host.
