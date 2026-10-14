@@ -895,10 +895,12 @@ A few worth knowing:
   these tokens. Read-only: there's no admin revoke here, the same write/read
   split as every other `admin` verb.
 - **`admin products` lists the external products registered for product
-  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
-  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (manual product
+  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `ID`,
+  `STATE` (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS`, `CONNECTIONS`,
+  `JOB_TYPES`, `CLIENT`, `SCOPES`, `CREATED` and `DESCRIPTION`.
+  `ID` is the product's OAuth `client_id`. `ACTIVE_TOKENS` counts manual product
   tokens neither revoked nor expired; the access tokens of OAuth connections
-  are not counted), `CONNECTIONS` (live OAuth connections) and `DESCRIPTION`.
+  are not counted. `CONNECTIONS` counts live OAuth connections.
   A disabled or deleted product's tokens and connections are refused on `/api/v1`, and a deleted product can never be
   re-enabled. Read-only: registering, editing, deleting a product and
   revoking one of its tokens are browser-only admin actions.

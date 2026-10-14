@@ -87,7 +87,8 @@ All steps are browser actions under **Admin → Products**, on the product's car
 
 1. Open the section and enter the **redirect URIs**, one per line.
 2. Tick the **scopes** the product may request, then **Save OAuth settings**. The two lists are saved together.
-3. Click **Create client secret**. Copy it into the product now: it is shown once and only its SHA-256 hash is stored.
+3. Copy the **Client ID** shown in the section into the product's configuration as its `client_id` (it is the product's id). It is available even before registration is complete.
+4. Click **Create client secret**. Copy it into the product now: it is shown once and only its SHA-256 hash is stored. The reveal panel also shows the **Client ID**, with a separate copy button.
 
 The section then shows **Client** once all three parts exist, and says what is still missing until then.
 
@@ -113,7 +114,7 @@ A secret is `uzs_` plus 256 bits of randomness. Like uzi's other bearer credenti
 
 ## From the CLI
 
-`uzi admin products` shows a `CLIENT` column (`yes` when the product is a full client) and a `SCOPES` column. `--json` carries the `oauth_client` object (redirect URIs, scopes, `has_secret`, `secret_prefix`, `rotated_at`, `is_client`) and never the secret or its hash. Registration itself is browser-only. See [CLI](./cli.md#managing-tokens).
+`uzi admin products` shows an `ID` column (the product's OAuth `client_id`), a `CLIENT` column (`yes` when the product is a full client) and a `SCOPES` column. `--json` carries the `oauth_client` object (redirect URIs, scopes, `has_secret`, `secret_prefix`, `rotated_at`, `is_client`) and never the secret or its hash. Registration itself is browser-only. See [CLI](./cli.md#managing-tokens).
 
 ## API
 

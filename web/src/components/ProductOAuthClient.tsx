@@ -39,6 +39,29 @@ function missingParts(c: ProductOAuthClient): string[] {
   return out;
 }
 
+function ClientIDRow({ id }: { id: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable (insecure context); the ID stays visible.
+    }
+  };
+  return (
+    <div>
+      <dt className="text-muted">Client ID</dt>
+      <dd className="flex flex-wrap items-center gap-2">
+        <code className="break-all font-mono text-xs text-fg">{id}</code>
+        <Button variant="secondary" size="sm" aria-label="Copy client ID" onClick={copy}>
+          {copied ? "Copied" : "Copy client ID"}
+        </Button>
+      </dd>
+    </div>
+  );
+}
+
 export function ProductOAuthPanel({
   product,
   onChanged,
@@ -168,6 +191,9 @@ export function ProductOAuthPanel({
               className="space-y-3 rounded-xl border border-ok/40 bg-surface p-4 outline-hidden"
             >
               <p className="text-sm font-medium text-ok">New client secret for {product.name}</p>
+              <dl className="text-sm">
+                <ClientIDRow id={product.id} />
+              </dl>
               <p className="text-sm text-muted">
                 Copy it into {product.name} now. It is shown{" "}
                 <strong className="text-fg">once and never again</strong> (only its hash is stored). The
@@ -200,6 +226,7 @@ export function ProductOAuthPanel({
           </p>
 
           <dl className="space-y-2 text-sm">
+            <ClientIDRow id={product.id} />
             <div>
               <dt className="text-muted">Redirect URIs</dt>
               <dd>
