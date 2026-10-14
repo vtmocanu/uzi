@@ -1271,7 +1271,7 @@ export class RecoveryCoordinator {
                   !Array.isArray(source.originalRoots))) return false;
               if (source.coverageDigest && canonicalJson(source.coverageContext) !== canonicalJson(record.coverageContext)) return false;
               const heads = source.coverageDigest
-                ? [source.originalSourceSha!, source.inventoryCurrentSha!, ...source.originalRoots!.map(r => r.sha)]
+                ? [source.sourceSha, source.originalSourceSha!, source.inventoryCurrentSha!, ...source.originalRoots!.map(r => r.sha)]
                 : [source.sourceSha];
               for (const head of heads) if (!await covered(head)) return false;
             }
