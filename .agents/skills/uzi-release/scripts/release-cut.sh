@@ -412,27 +412,16 @@ fold_or_insert() { # writes the [BASE] section into CHANGELOG (fold [Unreleased]
   mv "$tmp" CHANGELOG.md
 }
 
-rename_and_fold() { # skiprc: rename `## [IB]`->`## [NEW]` (date today), move [Unreleased] body under it
-  local from="$1" to="$2" tmp bodyf; tmp="$(mktemp)"; bodyf="$(mktemp)"
-  # The [Unreleased] body goes through a FILE, never `awk -v`: BSD awk rejects a newline
-  # in a -v value ("newline in string"). getline reads it when the renamed heading lands.
-  changelog_unreleased_body > "$bodyf"
-  awk -v from="$from" -v to="$to" -v d="$TODAY" -v bodyf="$bodyf" '
-    /^## \[Unreleased\]/ && !u { print "## [Unreleased]"; print ""; u=1; skipu=1; next }
-    skipu && /^## \[/ { skipu=0 }
-    skipu { next }
-    $0 ~ "^## \\[" from "\\]" && !r {
-      print "## [" to "] - " d
-      nb = 0; hasbody = 0
-      while ((getline line < bodyf) > 0) { buf[++nb] = line; if (line ~ /[^[:space:]]/) hasbody = 1 }
-      close(bodyf)
-      while (nb > 0 && buf[nb] ~ /^[[:space:]]*$/) nb--   # trim trailing blanks
-      if (hasbody) { print ""; for (i = 1; i <= nb; i++) print buf[i] }
-      r = 1; next
+rename_and_fold() { # skiprc: rename the open heading, then use the guarded category fold
+  local from="$1" to="$2" tmp; tmp="$(mktemp)"
+  awk -v from="$from" -v to="$to" -v d="$TODAY" '
+    index($0, "## [" from "]") == 1 && !r {
+      print "## [" to "] - " d; r = 1; next
     }
     { print }
-  ' CHANGELOG.md > "$tmp" || { rm -f "$tmp" "$bodyf"; echo "release-cut: skip-promote rename/fold failed" >&2; exit 1; }
-  mv "$tmp" CHANGELOG.md; rm -f "$bodyf"
+  ' "$CHANGELOG_VIEW" > "$tmp" || { rm -f "$tmp"; echo "release-cut: skip-promote rename failed" >&2; exit 1; }
+  fold_into_open "$to" "$tmp"
+  rm -f "$tmp"
 }
 
 # fold_line_tags <base> <file>: sorted `section<TAB>subsection<TAB>line` for every non-blank,
@@ -446,8 +435,10 @@ fold_line_tags() {
   ' "$2" | LC_ALL=C sort
 }
 
-# fold_into_open <base>: nextrc: move the [Unreleased] body into the open `## [base]`
-# section, subsection by subsection (D3, amended): each `### X` bucket is appended to the
+# fold_into_open <base> [writer-input] [pending-view]: move canonical [Unreleased]
+# into the open `## [base]` section, subsection by subsection (D3, amended).
+# The pending view supplies buckets and guard input; the writer preserves published order.
+# Each `### X` bucket is appended to the
 # end of the section's own `### X`, or opens that subsection at the section's end. PRs
 # land their entries in [Unreleased], so a re-spin nearly always has some. Guarded, because
 # a malformed merge is invisible to the oracle and changelog-links --check: refuses (exit 3,
@@ -455,7 +446,7 @@ fold_line_tags() {
 # Changelog's six, a duplicate `###` in the result, or any line lost, invented or moved to
 # another subsection. A `### X` repeated inside [Unreleased] is collapsed, with a NOTE.
 fold_into_open() {
-  local base="$1" tmp; tmp="$(mktemp)"
+  local base="$1" input="${2:-CHANGELOG.md}" pending="${3:-${2:-CHANGELOG.md}}" tmp; tmp="$(mktemp)"
   awk -v base="$base" '
     function flush(   n, i, lines) {   # append the bucket for the current subsection
       if (sub_ != "" && (sub_ in bucket)) {
@@ -510,7 +501,7 @@ fold_into_open() {
         for (i = 1; i <= no; i++) if ((order[i] in bucket) && !(order[i] in used)) { print ""; print "### " order[i]; n = split(bucket[order[i]], L, "\n"); print ""; for (j = 1; j < n; j++) print L[j] }
       }
     }
-  ' CHANGELOG.md CHANGELOG.md > "$tmp" || { rm -f "$tmp"; echo "release-cut: [Unreleased] fold into [$base] refused; CHANGELOG untouched" >&2; exit 3; }
+  ' "$pending" "$input" > "$tmp" || { rm -f "$tmp"; echo "release-cut: [Unreleased] fold into [$base] refused; CHANGELOG untouched" >&2; exit 3; }
 
   # Guard 1: no subsection appears twice in the open section.
   local dups
@@ -520,7 +511,7 @@ fold_into_open() {
   # Headings are excluded as lines: folding a bucket into an existing subsection, or
   # collapsing a repeated one, drops a heading by design.
   local before after
-  before="$(fold_line_tags "$base" CHANGELOG.md)"
+  before="$(fold_line_tags "$base" "$pending")"
   after="$(fold_line_tags "$base" "$tmp")"
   if [ -n "$dups" ] || [ "$before" != "$after" ] || [ -n "$(awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f' "$tmp" | tr -d '[:space:]')" ]; then
     echo "release-cut: [Unreleased] fold into [$base] failed its guard (duplicate subsection in [$base]: ${dups:-none}; a line lost, invented or moved: $([ "$before" = "$after" ] && echo no || echo yes)); CHANGELOG untouched" >&2
@@ -859,10 +850,10 @@ if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
 fi
 
 # --- CHANGELOG (main half) ----------------------------------------------------
-# Render to a separate file before replacing; fold guards then compare the assembled view.
-# The legacy next-RC fold already groups pending categories and reports collapses;
-# retain its unchanged-input refusal guards when there are no fragment inputs.
-if [ -z "$CL_FILE" ] && { [ "${#INCORPORATED[@]}" -gt 0 ] || [ "$OP" != nextrc ]; }; then
+# Every fold reads canonical pending categories. Keep the original writer input for
+# next RCs until fold_into_open has checked the assembled view, so refusal preserves bytes.
+CHANGELOG_VIEW=CHANGELOG.md
+if [ -z "$CL_FILE" ]; then
   mkdir -p .uzi/scratch || exit 1
   assembled="$(mktemp .uzi/scratch/release-notes.XXXXXX)" || exit 1
   pending="$(mktemp .uzi/scratch/release-body.XXXXXX)" || { rm -f "$assembled"; exit 1; }
@@ -875,7 +866,11 @@ if [ -z "$CL_FILE" ] && { [ "${#INCORPORATED[@]}" -gt 0 ] || [ "$OP" != nextrc ]
     rm -f "$assembled" "$pending"; exit 1
   fi
   rm -f "$pending"
-  mv "$assembled" CHANGELOG.md || exit 1
+  CHANGELOG_VIEW="$assembled"
+  case "$OP" in
+    nextrc|skiprc) ;; # guarded folds publish only after validation
+    *) mv "$assembled" CHANGELOG.md || exit 1; CHANGELOG_VIEW=CHANGELOG.md ;;
+  esac
 fi
 case "$OP" in
   rc1|stable)
@@ -885,7 +880,7 @@ case "$OP" in
       echo "release-cut: no open '## [$BASE]' section for the next candidate; expected it from the first RC." >&2; exit 3
     fi
     if [ -n "$(changelog_unreleased_body | tr -d '[:space:]')" ]; then
-      fold_into_open "$BASE"
+      fold_into_open "$BASE" CHANGELOG.md "$CHANGELOG_VIEW"
       echo "  CHANGELOG: [Unreleased] folded into the open [$BASE] section"
     fi ;;
   skiprc)
@@ -894,6 +889,7 @@ case "$OP" in
     refresh_section_date "$IB"
     fold_or_insert "$BASE" ;;
 esac
+[ "$CHANGELOG_VIEW" = CHANGELOG.md ] || rm -f "$CHANGELOG_VIEW"
 echo "  CHANGELOG: [$BASE] section applied ($OP)"
 autocite_dependency_merges "$BASE"
 # A cut of a NEW base also reconciles the previous stable's heading date (a no-op unless that
