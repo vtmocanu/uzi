@@ -52,3 +52,7 @@ The SQL function is `STABLE` and the claim gate observes its statement snapshot.
 The SQL/API/CLI/health/Slack contract and web rendering share the capacity/total split. No-action UX copy and tone belong to issue #2444 and are outside this decision's scope. The accounting tests establish admission behavior; full-stack acceptance remains the responsibility of the existing lifecycle phase.
 
 Phase 72's seeded holds have null `live_run_id` and `live_worker_id`, so none of those seeds qualifies for the discount. Its aggregate assertions distinguish total and admission counts at the wedge and after a healthy claim. The phase remains a wedge/disposition lifecycle check, not coverage of the full classifier matrix, concurrent admission or late heartbeat staleness.
+
+## Addendum: per-hold admission membership (#2970)
+
+`fn_custody_admission_members` is a read-only per-hold projection that lets an owner see which holds admission counts and why. `fn_custody_admission_count` remains the canonical accounting function and was not changed. Agreement between the two is guarded by parity tests (the mirrors in `custody_admission_livedb_test.go` plus a per-reason test). The owner listing reads the hold list, membership and aggregate in one repeatable-read read-only snapshot with one heartbeat cutoff. Clients never infer membership and treat an absent `counts_toward_admission` as unknown, never as not counted. The policy remains SQL-only; this adds visibility, not authority or a change to accounting.

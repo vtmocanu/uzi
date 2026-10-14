@@ -1142,8 +1142,11 @@ uzi run recovery [--json]
 ```
 
 - The human view shows only open holds across your runs, oldest first by `created_at`.
-  Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ARCHIVE` (whether an
-  available capture exists), `WORKER`, and `AGE`. Run and hold ids are shown in full.
+  Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION`, `ARCHIVE` (whether an
+  available capture exists), `WORKER`, and `AGE`. `ADMISSION` is the server's per-hold
+  custody admission membership: `counted (<reason>)`, `not counted`, or `-` when the
+  server did not report it (a non-open hold or an older server), which is unknown, never
+  `not counted`. Run and hold ids are shown in full.
   Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
   `admission_counted_holds` against the limit for capacity, and `open_holds` for total
@@ -1168,7 +1171,8 @@ uzi run recovery [--json]
 uzi run recovery <run-id> [--json]
 ```
 
-- The per-run view shows each hold's exact id, claim generation, and its attention state — active
+- The per-run view lists `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION` (same values as above), `STATE`,
+  `CAPTURE` and `WORKER` columns. It shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow exhaustion exception is an OPEN hold for `recovery_wait` /

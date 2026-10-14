@@ -721,7 +721,7 @@ uzi version
 - `uzi run recovery [<run-id>] [--json]` — start without a run id to find what held work
   you have before export or discard. The human view lists only open custody holds across
   your runs in `created_at` order, with full `RUN ID` and `HOLD ID`, `GEN`, `DISPOSITION`,
-  `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
+  `ADMISSION` (`counted (<reason>)`, `not counted`, or `-` when the server did not report it: unknown, never `not counted`), `ARCHIVE` (available capture), `WORKER`, and `AGE` columns. It prints the owner-wide
   `open_holds`, `admission_counted_holds`, `custody_hold_limit`, `decision_needed`, and
   `blocked_runs` aggregate. Capacity uses admission count against the fixed limit 8;
   `open_holds` remains total custody. At most one hold per run is excluded when it backs
@@ -739,7 +739,7 @@ uzi version
   explicit zero. The human view also prints
   a recover-or-discard hint when an open hold needs a decision. With no run id, `--json`
   returns the endpoint's `aggregate` and `holds`, including settled holds, without captures.
-  Supply a run id to list that run's retained holds (owner-only): each hold's exact id,
+  Supply a run id to list that run's retained holds (owner-only, with the same `ADMISSION` column): each hold's exact id,
   claim generation, server-derived **disposition** and latest capture state.
   A `source_only` or `needs_action` disposition awaits your decision;
   `archive_ready` can release after its required evidence is accepted; `active` labels

@@ -851,10 +851,10 @@ per run) carrying your open-hold and blocked-run counts, a link to the surface,
 and the exact discard command. The per-worker **retaining work** pills stay as
 row context.
 
-The **Workers** settings page is where you resolve them: every retained hold
-is grouped by worker with the run it came from, its claim generation, and a
-state that separates normal active protection from holds that actually need
-you. Each row offers the right action for its state:
+The **Workers** settings page is where you resolve them: the holds that need a
+decision (and MAC-rejected terminal records) are grouped by worker with the run
+it came from, its claim generation, and a state that separates them from normal
+active protection. Each row offers the right action for its state:
 
 - **Export archive** — download a ready archive (same bundle as `uzi run
   export`). Downloading does not itself release custody. Legacy holds can
@@ -874,6 +874,16 @@ is deliberately distinct from discarding a held source. Deleting an archive
 while its hold is still open does not resolve custody; left untouched, a
 non-final or legacy archive expires after its retention window. A selected
 final guarded archive follows the worker-deletion retention rule above.
+
+At or over the limit, the surface also shows an **Admission information**
+section so you can see what is consuming capacity without needing a decision.
+**Counting toward the limit** lists the non-decision holds the server confirms
+it counts, each with its run link, claim generation, worker, and the reason it
+counts (for example, no live claim backs it). These rows are read-only: this is
+visibility only, and adds no new way to release or discard custody and changes
+no accounting. **Admission membership not reported** lists holds from an older
+server that does not report membership; uzi never infers it, so an unreported
+hold is unknown rather than uncounted.
 
 From the CLI, list a run's holds and captures with `uzi run recovery
 <run-id>`, then discard one exact held source:
