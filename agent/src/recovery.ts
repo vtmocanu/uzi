@@ -1270,7 +1270,7 @@ export class RecoveryCoordinator {
               if (source.coverageDigest && (!source.originalSourceSha || !source.inventoryCurrentSha ||
                   !Array.isArray(source.originalRoots))) return false;
               if (source.coverageDigest && canonicalJson(source.coverageContext) !== canonicalJson(record.coverageContext)) return false;
-              // Earlier aggregates' synthetic tips are never archive ancestors; only a competing
+              // Earlier aggregates' synthetic tips need not be archive ancestors; only a competing
               // unacknowledged FINAL's own source must be covered (its frozen heads alone are not).
               const heads = source.coverageDigest
                 ? [...(source.finalRequest && !source.finalAcknowledged ? [source.sourceSha] : []), source.originalSourceSha!, source.inventoryCurrentSha!, ...source.originalRoots!.map(r => r.sha)]
