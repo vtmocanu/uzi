@@ -1007,6 +1007,7 @@ custody_idle_phase() {
   }
   # Include actual setup, guards, polling, CLI and wait statements, stopping before
   # post-claim custody accounting (covered by the live full-stack phase).
+  # shellcheck disable=SC1090  # extracted real phase under test, optionally replaced for mutation checks
   source <(awk '{print} /^wait_status "\$WEDGE_RUN" awaiting_approval 60$/ {exit}' "$CUSTODY_PHASE_TEST_SOURCE")
 }
 for mode in entry window discard idle; do
