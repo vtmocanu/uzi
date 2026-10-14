@@ -29,7 +29,8 @@ through `[0.52.0]`.)
 
 ### Changed
 
-- **Self-improvement and prompt runs receive inline summaries ([#2838](https://github.com/vtmocanu/uzi/issues/2838)).** Accepted autopilot plans are summarized alongside implementation, with owned plan-summary cleanup before claim release or resource teardown.
+- **Self-improvement and prompt runs receive inline summaries ([#2838](https://github.com/vtmocanu/uzi/issues/2838)).**
+  Accepted autopilot plans are summarized alongside implementation, with owned plan-summary cleanup before claim release or resource teardown.
 
 ## [0.86.0] - 2026-10-06
 

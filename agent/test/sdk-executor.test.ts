@@ -5156,7 +5156,7 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     assert.deepStrictEqual(rec.planPosts, [], "and therefore no plan post");
   });
 
-  // ── Issue-only (never on ci_fix / self_improve) ──────────────────────────────
+  // ── Summary-eligible kinds only (never on these excluded kinds) ──────────────
   for (const kind of ["ci_fix", "judge", "chat", "job", "task", "mr_rework", "cross_check"] as const) {
     it(`a ${kind} run posts NEITHER an intent nor a plan summary`, async () => {
       const { queryFn } = fakeTurns([
