@@ -87,6 +87,9 @@ for implementation in "${implementations[@]}"; do
   equal /dev/null "$TMP/out" "$implementation NUL fullfile has empty stdout"
   export PATH=$host_path
 done
+printf '\0' > "$W/-"
+expect 1 "NUL-only literal dash file" render-body -
+equal /dev/null "$TMP/out" "literal dash NUL rejection has empty stdout"
 valid Fixed Outcome "$A"
 for name in bad.md 11111111-1111-3111-8111-111111111111.md 11111111-1111-4111-c111-111111111111.md A1111111-1111-4111-8111-111111111111.md .hidden.md $'bad\nname.md'; do
   cp "$W/$A" "$W/changelog.d/$name"
@@ -167,6 +170,9 @@ for fixture in "$W/body" "$TMP/expected"; do
 done
 expect 0 "render legacy and fragments" render-body body
 equal "$TMP/expected" "$TMP/out" "canonical grouping and exact legacy block bytes"
+cp "$W/body" "$W/-"
+expect 0 "literal dash legacy file" render-body -
+equal "$TMP/expected" "$TMP/out" "literal dash input preserves legacy bytes"
 printf '%s\n%s\n' "$A" "$B" > "$TMP/list"
 expect 0 "list" list
 equal "$TMP/list" "$TMP/out" "deterministic incorporated paths"
@@ -293,4 +299,4 @@ git -C "$W" show main:CHANGELOG.md > "$TMP/original"
 equal "$TMP/original" "$W/CHANGELOG.md" "render never mutates actual changelog"
 
 echo "changelog-fragments.test.sh: cases=$cases passed=$passed"
-[ "$cases" -eq "$passed" ] && [ "$cases" -ge 97 ]
+[ "$cases" -eq "$passed" ] && [ "$cases" -ge 101 ]

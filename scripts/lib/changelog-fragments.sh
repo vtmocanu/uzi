@@ -17,7 +17,10 @@ changelog_fragment_path() {
 
 # Check bytes before awk can interpret NUL as a record separator.
 changelog_fragment_no_nul() {
-  if ! tr -d '\000' < "$1" | cmp -s -- "$1" -; then
+  local input=$1
+  # cmp reserves '-' for stdin even after --; make relative operands literal files.
+  case "$input" in /*) ;; *) input="./$input" ;; esac
+  if ! tr -d '\000' < "$input" | cmp -s -- "$input" -; then
     changelog_fragment_error "NUL byte or unreadable input: $1"; return 1
   fi
 }
