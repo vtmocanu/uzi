@@ -20,7 +20,31 @@ const client = new WorkerClient(primary, token, "m3", nullLogger(), {
     const body = String(init?.body ?? "{}");
     const start = performance.now();
     const response = await fetch(endpoint + path, init);
-    const responseBytes = Buffer.byteLength(await response.clone().text());
+    // Count actual bytes without decoding or retaining text. EOF is required even
+    // at the limit; headers and a valid JSON prefix cannot establish completeness.
+    let responseBytes = 0;
+    let reader: ReadableStreamDefaultReader<Uint8Array> | undefined;
+    try {
+      reader = response.clone().body?.getReader();
+      if (reader) {
+        for (;;) {
+          const { done, value } = await reader.read();
+          if (done) break;
+          responseBytes += value.byteLength;
+          if (responseBytes > 1024 * 1024) throw new Error("overflow");
+        }
+      }
+    } catch {
+      // Start both cancellations before awaiting either: a tee branch's cancel
+      // can wait for the other branch. One failure must not prevent its sibling.
+      await Promise.allSettled([
+        reader?.cancel().catch(() => {}),
+        response.body?.cancel().catch(() => {}),
+      ]);
+      assert.fail("fixture response unreadable or exceeds 1 MiB");
+    } finally {
+      reader?.releaseLock();
+    }
     requests.push({ path, body: JSON.parse(body), bytes: Buffer.byteLength(body), responseBytes, ms: performance.now() - start });
     return response;
   },

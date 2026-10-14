@@ -4,6 +4,7 @@ import (
 	"bytes"
 	"context"
 	"encoding/json"
+	"errors"
 	"net/http"
 	"net/http/httptest"
 	"os"
@@ -98,6 +99,101 @@ func refreshRouter(t *testing.T, pool *pgxpool.Pool, counter *refreshQueryCounte
 	})
 }
 
+// refreshWriteReady confines the environment-provided name to the parent's scratch.
+// Exported children derive the checkout from their known refreshExport layout,
+// rather than trusting TMPDIR (their runtime.Caller source is the export).
+func refreshWriteReady(sourceRoot, ready, address string) error {
+	checkout := sourceRoot
+	if strings.HasPrefix(filepath.Base(sourceRoot), "refresh-export-") &&
+		filepath.Base(filepath.Dir(sourceRoot)) == "scratch" &&
+		filepath.Base(filepath.Dir(filepath.Dir(sourceRoot))) == ".uzi" {
+		checkout = filepath.Dir(filepath.Dir(filepath.Dir(sourceRoot)))
+	}
+	scratch := filepath.Join(checkout, ".uzi/scratch")
+	realScratch, err := filepath.EvalSymlinks(scratch)
+	if err != nil {
+		return err
+	}
+	ready = filepath.Clean(ready)
+	rel, err := filepath.Rel(realScratch, ready)
+	if err != nil {
+		return err
+	}
+	parts := strings.Split(rel, string(filepath.Separator))
+	if !filepath.IsAbs(ready) || len(parts) != 2 || !strings.HasPrefix(parts[0], "refresh-e2e-") ||
+		!strings.HasPrefix(parts[1], "ready-") {
+		return errors.New("invalid fixture ready path")
+	}
+	id := strings.TrimPrefix(parts[1], "ready-")
+	if parsed, err := uuid.Parse(id); err != nil || parsed.String() != id {
+		return errors.New("invalid fixture ready basename")
+	}
+	parent, err := filepath.EvalSymlinks(filepath.Dir(ready))
+	if err != nil || parent != filepath.Dir(ready) {
+		return errors.New("invalid fixture ready parent")
+	}
+	// OpenRoot enforces containment during open, including a parent symlink swap.
+	// Exclusive creation rejects an existing ready file or leaf symlink.
+	root, err := os.OpenRoot(realScratch)
+	if err != nil {
+		return err
+	}
+	defer func() { _ = root.Close() }()
+	file, err := root.OpenFile(rel, os.O_WRONLY|os.O_CREATE|os.O_EXCL, 0600)
+	if err != nil {
+		return err
+	}
+	_, writeErr := file.WriteString(address)
+	return errors.Join(writeErr, file.Close())
+}
+
+func TestHeartbeatProtocolRefreshReadyGuard(t *testing.T) {
+	checkout := refreshRoot(t)
+	if err := os.MkdirAll(filepath.Join(checkout, ".uzi/scratch"), 0700); err != nil {
+		t.Fatal(err)
+	}
+	scratch, err := os.MkdirTemp(filepath.Join(checkout, ".uzi/scratch"), "refresh-e2e-")
+	if err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.RemoveAll(scratch) })
+	valid := filepath.Join(scratch, "ready-"+uuid.NewString())
+	if err := refreshWriteReady(checkout, valid, "http://127.0.0.1:1234"); err != nil {
+		t.Fatal(err)
+	}
+	if err := refreshWriteReady(checkout, valid, "overwrite"); err == nil {
+		t.Fatal("existing ready file accepted")
+	}
+	export := filepath.Join(checkout, ".uzi/scratch/refresh-export-fixture")
+	if err := refreshWriteReady(export, filepath.Join(scratch, "ready-"+uuid.NewString()), "export child"); err != nil {
+		t.Fatal(err)
+	}
+	for _, path := range []string{
+		filepath.Join(scratch, "ready-invalid"),
+		filepath.Join(checkout, "ready-"+uuid.NewString()),
+		filepath.Join(checkout, ".uzi/scratch", "ready-"+uuid.NewString()),
+	} {
+		if err := refreshWriteReady(checkout, path, "invalid"); err == nil {
+			t.Fatalf("invalid ready path accepted: %s", path)
+		}
+	}
+	link := filepath.Join(scratch, "ready-"+uuid.NewString())
+	if err := os.Symlink(valid, link); err != nil {
+		t.Fatal(err)
+	}
+	if err := refreshWriteReady(checkout, link, "symlink"); err == nil {
+		t.Fatal("leaf symlink accepted")
+	}
+	parentLink := scratch + "-link"
+	if err := os.Symlink(checkout, parentLink); err != nil {
+		t.Fatal(err)
+	}
+	t.Cleanup(func() { _ = os.Remove(parentLink) })
+	if err := refreshWriteReady(checkout, filepath.Join(parentLink, "ready-"+uuid.NewString()), "escape"); err == nil {
+		t.Fatal("parent symlink escape accepted")
+	}
+}
+
 // This child is compiled from unmodified pinned or explicitly calibrated scratch source.
 // It shares only the parent's throwaway DSN; no capabilities are seeded in workers.
 func TestHeartbeatProtocolRefreshServer(t *testing.T) {
@@ -120,7 +216,7 @@ func TestHeartbeatProtocolRefreshServer(t *testing.T) {
 		router.ServeHTTP(w, r)
 	}))
 	defer server.Close()
-	if err := os.WriteFile(ready, []byte(server.URL), 0600); err != nil {
+	if err := refreshWriteReady(refreshRoot(t), ready, server.URL); err != nil {
 		t.Fatal(err)
 	}
 	select {
@@ -132,7 +228,10 @@ func TestHeartbeatProtocolRefreshServer(t *testing.T) {
 
 func refreshExport(t *testing.T, ctx context.Context, root, ref string) string {
 	t.Helper()
-	resolved, err := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", ref+"^{commit}").Output()
+	if ref != refreshPinned && ref != "HEAD" {
+		t.Fatal("invalid export ref")
+	}
+	resolved, err := exec.CommandContext(ctx, "git", "-C", root, "rev-parse", ref+"^{commit}").Output() // #nosec G204 -- fixed git command, runtime.Caller checkout root, only pinned hash or HEAD above; no shell
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -149,8 +248,8 @@ func refreshExport(t *testing.T, ctx context.Context, root, ref string) string {
 			t.Error(err)
 		}
 	})
-	archive := exec.CommandContext(ctx, "git", "-C", root, "archive", sha)
-	tar := exec.CommandContext(ctx, "tar", "-x", "-C", dir)
+	archive := exec.CommandContext(ctx, "git", "-C", root, "archive", sha) // #nosec G204 -- fixed git command, runtime.Caller checkout root, validated 40-hex commit above; no shell
+	tar := exec.CommandContext(ctx, "tar", "-x", "-C", dir)                // #nosec G204 -- fixed tar command extracts the validated repository commit into this function’s owned MkdirTemp export; no shell
 	reader, err := archive.StdoutPipe()
 	if err != nil {
 		t.Fatal(err)
@@ -164,11 +263,11 @@ func refreshExport(t *testing.T, ctx context.Context, root, ref string) string {
 	if tarErr != nil || archiveErr != nil {
 		t.Fatalf("export: tar=%v archive=%v", tarErr, archiveErr)
 	}
-	lock, err := os.ReadFile(filepath.Join(dir, "agent/package-lock.json"))
+	lock, err := os.ReadFile(filepath.Join(dir, "agent/package-lock.json")) // #nosec G304 -- constant lockfile path in this function’s owned MkdirTemp export
 	if err != nil {
 		t.Fatal(err)
 	}
-	current, err := os.ReadFile(filepath.Join(root, "agent/package-lock.json"))
+	current, err := os.ReadFile(filepath.Join(root, "agent/package-lock.json")) // #nosec G304 -- constant lockfile path under runtime.Caller checkout root
 	if err != nil {
 		t.Fatal(err)
 	}
@@ -179,14 +278,14 @@ func refreshExport(t *testing.T, ctx context.Context, root, ref string) string {
 		t.Fatal(err)
 	}
 	for _, path := range []string{"api/internal/handler/heartbeat_protocol_refresh_e2e_test.go", "agent/test/fixtures/heartbeat-protocol-refresh-e2e.ts"} {
-		data, err := os.ReadFile(filepath.Join(root, path))
+		data, err := os.ReadFile(filepath.Join(root, path)) // #nosec G304 -- only the two constant fixture paths above under runtime.Caller checkout root
 		if err != nil {
 			t.Fatal(err)
 		}
 		if err := os.MkdirAll(filepath.Dir(filepath.Join(dir, path)), 0700); err != nil {
 			t.Fatal(err)
 		}
-		if err := os.WriteFile(filepath.Join(dir, path), data, 0600); err != nil {
+		if err := os.WriteFile(filepath.Join(dir, path), data, 0600); err != nil { // #nosec G703 -- only the two constant fixture paths above in this function’s owned MkdirTemp export
 			t.Fatal(err)
 		}
 	}
@@ -198,7 +297,7 @@ func refreshBinary(t *testing.T, ctx context.Context, dir string, calibrate bool
 	t.Helper()
 	if calibrate {
 		path := filepath.Join(dir, "api/internal/capability/capability.go")
-		data, err := os.ReadFile(path)
+		data, err := os.ReadFile(path) // #nosec G304 -- constant capability.go path in refreshExport-owned scratch export
 		if err != nil {
 			t.Fatal(err)
 		}
@@ -207,13 +306,13 @@ func refreshBinary(t *testing.T, ctx context.Context, dir string, calibrate bool
 			t.Fatal("vocabulary calibration anchor drifted")
 		}
 		data = bytes.Replace(data, []byte(needle), []byte(""), 1)
-		if err := os.WriteFile(path, data, 0600); err != nil {
+		if err := os.WriteFile(path, data, 0600); err != nil { // #nosec G703 -- constant capability.go path in refreshExport’s owned scratch export, never the checkout
 			t.Fatal(err)
 		}
 		t.Log("variant=vocabulary-calibration omits completion_interlock_v1 from actual protocolVocabulary; protocolOrder unchanged")
 	}
 	binary := filepath.Join(dir, "refresh-server.test")
-	cmd := exec.CommandContext(ctx, "go", "test", "-buildvcs=false", "-c", "-o", binary, "./internal/handler")
+	cmd := exec.CommandContext(ctx, "go", "test", "-buildvcs=false", "-c", "-o", binary, "./internal/handler") // #nosec G204 -- fixed go test command; binary is a constant filename in refreshExport-owned scratch export; no shell
 	cmd.Dir = filepath.Join(dir, "api")
 	cmd.Env = append(os.Environ(), "GOFLAGS=-buildvcs=false")
 	out, err := cmd.CombinedOutput()
@@ -227,7 +326,7 @@ func refreshChild(t *testing.T, ctx context.Context, binary, scratch, label stri
 	t.Helper()
 	ready := filepath.Join(scratch, "ready-"+uuid.NewString())
 	cmd := exec.CommandContext(ctx, binary, "-test.v", "-test.run=^TestHeartbeatProtocolRefreshServer$")
-	cmd.Env = append(os.Environ(), "UZI_REFRESH_SERVER_READY="+ready, "UZI_REFRESH_LABEL="+label)
+	cmd.Env = append(os.Environ(), "TMPDIR="+scratch, "UZI_REFRESH_SERVER_READY="+ready, "UZI_REFRESH_LABEL="+label)
 	var output bytes.Buffer
 	cmd.Stdout, cmd.Stderr = &output, &output
 	if err := cmd.Start(); err != nil {
@@ -264,7 +363,7 @@ func refreshChild(t *testing.T, ctx context.Context, binary, scratch, label stri
 	})
 	// Bounded readiness: 600 attempts at 100ms. A failed child cannot block sibling cases forever.
 	for n := 0; n < 600; n++ {
-		data, err := os.ReadFile(ready)
+		data, err := os.ReadFile(ready) // #nosec G304 -- parent-generated ready-UUID in its owned MkdirTemp scratch, not the child environment value
 		if err == nil {
 			address = string(data)
 			break
@@ -368,7 +467,7 @@ func TestHeartbeatProtocolRefreshE2E(t *testing.T) {
 			if !strings.Contains(output, "\n# tests 1\n") || !strings.Contains(output, "\n# skipped 0\n") || !strings.Contains(output, "\n# cancelled 0\n") || !strings.Contains(output, tc.name) {
 				t.Fatal("missing named zero-skip/cancel control")
 			}
-			stateBytes, err := os.ReadFile(statePath)
+			stateBytes, err := os.ReadFile(statePath) // #nosec G304 -- parent-generated state-UUID.json in its owned MkdirTemp scratch
 			if err != nil {
 				t.Fatalf("read Node registration state: %v", err)
 			}
