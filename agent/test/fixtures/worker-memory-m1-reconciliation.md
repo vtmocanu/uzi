@@ -1,12 +1,35 @@
 # Worker memory foundation reconciliation — issue #2396
 
-## Resumed reconciliation — 2026-10-14, validation pending
+## Resumed reconciliation — 2026-10-14, scoped M1 validation complete
 
 This run preserves published floor `0bc24b959f85d8ef5adcf322f4c3240a6bf2eec3` and merges default `ebbe088d01959ec74e0826a0887af3e3e49ce3b5` without rewriting either history. The earlier sections below remain historical evidence for their named revisions, not acceptance of this merge.
 
 Conflict resolutions combine the captured memory capability with upstream summary settlement, Read scheduling, retained-source admission and shutdown. Worker construction keeps upstream's gate/channel arguments and adds the memory runtime afterward; the lifecycle fixture now verifies that the memory-enabled worker starts and joins the retained-source channel once. Runner failure/release paths keep both unresolved-completion and memory-custody protections. The credential-free settlement helper retains the memory cancellation purpose while settling upstream plan summaries under the same remaining deadline. Test doubles supply the bounded supervisor observation interface.
 
-The implementation delegation ended without a report; retained edits were inspected by the lead. A completed SQL generation run used `go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate` (log `gate-log.ZFFLat`, EXIT=0); no additional generated drift resulted. A combined retained test log (`gate-log.MiFJfB`, EXIT=1) failed the late native park successor-admission case; its isolated rerun (`gate-log.2hn1fy`, EXIT=0) does not establish a baseline failure or close the combined-run concern. Current committed-range review and integration checks remain pending.
+The implementation delegation ended without a report; retained edits were inspected by the lead. A completed SQL generation run used `go run github.com/sqlc-dev/sqlc/cmd/sqlc@v1.31.1 generate` (log `gate-log.ZFFLat`, EXIT=0); no additional generated drift resulted. A combined retained test log (`gate-log.MiFJfB`, EXIT=1) failed the late native park successor-admission case; its isolated rerun (`gate-log.2hn1fy`, EXIT=0) does not establish a baseline failure or close the combined-run concern. That earlier failed result remains recorded; the resumed checks and repair below supersede its pending-validation state.
+
+### Resumed checks and deadline-fixture repair
+
+Merge commit `564bf2332000041c628b1709055cdc6ad169584a` preserves both parents. Reviewer, tester and auditor reviewed the reconciliation against both published floor and default with no demonstrated mandatory finding. The first implementation delegation was cancelled; two auditor attempts and one tester attempt returned transport failures and provide no review. Completed retry reports and observed log results supply the evidence.
+
+The lead's seven-file combined selection at `564bf233` failed three elapsed-bound assertions (`gate-log.V9ZfKb`, EXIT=1). The equivalent command against a published-floor export passed 202 tests, zero skips (`gate-log.glCnh0`, EXIT=0), so these candidate failures are not classified as base failures. The isolated late-park case also passed on both floor and candidate (`gate-log.xpJkYV` / `gate-log.6gZD4b`, EXIT=0); that comparison alone was inconclusive for the combined failure.
+
+Repair `7d3532a9e275472d312ec2c2c2ca3ca0e1a31314` changes only the runner memory fixture. Elapsed clocks now start at the trusted accessor or pressure trigger, after runner preflight; the owner budgets remain 200 ms and all three elapsed bounds remain 1500 ms. Blocked-port rescues start when those ports enter, not before preflight. The successor's readiness wait uses its existing 5000 ms capture window; the park rescue allows a bounded 10 seconds for the original stop plus successor capture. Controlled-release, unsettled-operation, custody and successor-fencing assertions remain. No production code, gate flags or concurrency setting changed in this repair.
+
+Reviewer, tester and auditor reviewed `564bf233..7d3532a9` with no mandatory finding. The tester typechecked an isolated control making the effective 200 ms production owner deadline 5000 ms, then observed all three intended elapsed assertions fail. This establishes sensitivity to an overlong deadline, not independent sensitivity to every custody or successor-corruption defect.
+
+| Revision | Executed check | Observed result | Run-local log |
+|---|---|---|---|
+| `564bf233` | `task check:migration-numbering check:migration-additive typecheck:agent typecheck:web test:codex-supervisor` | PASS; EXIT=0 | `gate-log.wNsGuh` |
+| `564bf233` | Scratch-only narrowed copy of `e2e/run-store-it.sh`: handler owner-only release plus workersvc reservation cases, unchanged race/count/package-serial flags | PASS; 10 top-level tests, zero skips; applied schema through 334; EXIT=0 | `gate-log.AZdaPy` |
+| `564bf233` | `GOFLAGS=-buildvcs=false go test -race -count=1 ./cmd/uzi -run '^TestMemoryHold' -v` | PASS; six top-level tests; EXIT=0 | `gate-log.BipKh3` |
+| `7d3532a9` | Named repaired exhaustion/late-park/delayed-feedback cases | PASS; three tests, zero skips; EXIT=0 | `gate-log.hmsZUe` |
+| `7d3532a9` | Seven-file Node selection: guard, reader, commands, lifecycle, runner memory, Codex memory command and runner plan-gate | PASS; 214 tests, zero skips/cancellations; EXIT=0; process 114.24 seconds | `gate-log.6R9jEw` |
+| `564bf233` | Auditor `task scan:secrets`, inspected by lead | PASS; canaries detected, zero tracked findings; EXIT=0 | `gate-log.3Aff6N` |
+
+The scratch-only live-DB diagnostic selected `TestMemoryReservation.*LiveDB` and `TestMemoryHoldOwnerOnlyReleaseLiveDB`; it is contract-seam proof, not the final unchanged full live-DB sweep. The source/supervisor/API checks remain usable after the test-only repair because their production inputs are unchanged. Reviewer/tester focused export checks also passed; their counts do not substitute for the lead's integration checks.
+
+Both tester reports (`564bf233` and `7d3532a9`) ran `task gate:agent` despite the focused dispatch; both failed at the known dependency preflight (EXIT=201). These remain failed checks, not passing gates or demonstrated merge regressions. Their optional c8 coverage-threshold suggestions, one in each report, are deferred without changing repository gate recipes. Matched-lockfile acceptance and full final component gates remain M4 work.
 
 A read-only current-worker sample returned `available: false, reason: absent`; no load, usable headroom or sizing recommendation follows. The provisioned agent SDK/knip and web knip still match the pre-merge manifests, not upstream's updated versions. They were not reinstalled. Tests in that dependency environment cannot establish final matched-lockfile acceptance. M2 required real-process lane enrollment, M3 documentation/surfaces and M4 real-cgroup/CI calibration remain unfinished. Production enablement stays disabled.
 
