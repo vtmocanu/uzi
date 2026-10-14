@@ -58,6 +58,13 @@
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
+  - Each round inspect this repo's `failed` delivery runs in the Patrol scope via
+    `uzi run list --json` and known IDs; retain owner/newest-200 coverage limits.
+    Exclude user cancellations, superseded runs, provider-limit parks and
+    budget/time-limit stops unless the run died where it should have parked.
+    Route to its owning pair, else an enrolled pair with capacity and spare buddy
+    allowance, for read-only root cause. Report unassigned findings when none is
+    available. Track every failed run ID to a verdict; skipper reads no code.
   - Read `uzi run recovery --json` (owner-scoped, includes settled holds); inspect
     open custody on runs ended long ago (`completed`, `failed`, `cancelled`),
     which active-run inventories omit. Route only decision-bearing dispositions
@@ -83,3 +90,21 @@
   - Read `uzi schedule list --json`; flag fired one-shot schedules that linger.
     Verify their single-fire state from schedule timing/history; do not delete
     schedules or classify cron schedules as spent one-shots.
+
+## Failed-run follow-through and RC proposal
+
+- Before filing, check duplicates and fixes already on main or in the deployed
+  worker version; link existing issues/fixes instead of duplicating them.
+- Have the pair file a buddy-approved issue for a uzi defect. Default to
+  `priority::high` when it crashed or lost a run; otherwise use the taxonomy.
+  High/urgent filing or dispatch still requires AGENTS.md's independent opus/xhigh review.
+- Have the pair dispatch the fix as a run, or fix locally when faster; steer its
+  plan gate via `uzi-watcher` and land via `uzi-lander`. Respect dispatches barriers and grants.
+- Require a live landing owner claim for every failed run retaining open custody,
+  a pushed branch, preserved patch or recovery capture. Flag unowned held work.
+  Let the owning pair finish locally or resume/re-dispatch in uzi; never discard,
+  release or clean holds without the owner.
+- Decide when to propose an RC, for example after crash fixes land and main CI
+  plus KinD smoke are green on the exact tip. Give the user the fix list and
+  evidence. The user invokes `uzi-release`; skipper never cuts or tags.
+  Apply the release barriers and coverage rules above.
