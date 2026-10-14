@@ -148,6 +148,12 @@ authority. The approved rule allows the change only after a complete, clean
 reader/writer and downgrade audit. Audit at `94594b12` (researcher, 2026-10-14):
 **not clean**, so no code changed. The audit is recorded here as proposed work.
 
+Post-#2995 reassessment on 2026-10-14, at merged tree `5d42cfe9`: M2 remains
+**NOT CLEAN**. B1's worker key allowlist and downgrade exposure remain, and B2's
+protected backup validator still rejects an additional cap key. The separate
+`claimGeneration` backup defect was fixed by PR #2995 (`7a0481d7`); it is no
+longer a prerequisite left to implement. No M2 cap-recording code is built here.
+
 ### Blocking sites
 
 - **B1 — closed progress key set, and downgrade.** `agent/src/recovery-progress.ts`
@@ -172,26 +178,51 @@ reader/writer and downgrade audit. Audit at `94594b12` (researcher, 2026-10-14):
   `claimGeneration` when downgrading from rc.15; this is pre-existing, from #2976. ADR-1197 already calls
   downgrade during pending recovery unsupported, but this adds a new failure on a
   terminal blocked journal.
-- **B2 — backup validator.** In `.agents/skills/uzi-watcher/scripts/backup-runs.sh`,
-  the protected-descriptor validator's
-  `def progress: type == "object" and fields(["version","source","attempts","startedAt","deadline","backoffMs","stage","restoreTip","successor","blocker"])`
-  rejects any extra key. The audit confirmed it **already rejects base's
-  `claimGeneration`**, which #2976 writes on every positively fenced reservation.
-  The script's own jq program was run against constructed blocked
-  `decoded_history_limit` descriptors:
+- **B2: backup validator, historical observation and post-#2995 measurement.**
+  Original observation dated 2026-10-14, audit at `94594b12` against base
+  `84d365ed`: the protected-descriptor validator in
+  `.agents/skills/uzi-watcher/scripts/backup-runs.sh` had a closed progress key
+  set without `claimGeneration`. The script's own jq program rejected that
+  extra key, which #2976 writes on positively fenced reservations. The run
+  recorded these constructed blocked `decoded_history_limit` descriptors:
 
-  | Descriptor | Output | Exit code |
+  | Original descriptor class (base `84d365ed`, 2026-10-14) | Output | Exit code |
   | --- | --- | --- |
   | base shape without `claimGeneration` | accepted | 0 |
   | with `claimGeneration` | `invalid protected descriptor` | 5 |
   | with `claimGeneration` plus a cap key | `invalid protected descriptor` | 5 |
 
-  The script maps that rejection to `probe_inconclusive` and then FAIL. A new key
-  would hit the same rejection. The open-key active-journal validator further down
-  the same script accepts extra keys. `backup-runs.test.sh` has no fixture carrying
-  `claimGeneration`, so its tests do not catch this. The `claimGeneration` defect
-  is pre-existing, from #2976. It was reported as an incidental issue and is not
-  fixed here.
+  At that base, the active-journal validator accepted extra keys and
+  `backup-runs.test.sh` had no `claimGeneration` fixture. This pre-existing
+  #2976 defect was reported as an incidental issue and **was fixed separately
+  by PR #2995**, merged as `7a0481d7`.
+
+  Reconstructed descriptors, same shape classes, measured at `5d42cfe9`
+  (post-#2995) on 2026-10-14: the original fixture files were not retained, so
+  these are reconstructed inputs, not byte-identical originals. The full jq
+  program was extracted from the merged script and run with its `-ers` flags,
+  matching run/branch/key/root arguments, and empty ledger/active-journal
+  arguments. Each descriptor has a canonical source, attempts 1, startedAt
+  1000, deadline 301000, backoffMs 1, and stage `blocked` with blocker
+  `decoded_history_limit`. The second adds `claimGeneration: 2`; the third also
+  adds `closureLimit: 4096`. **`closureLimit` is an illustrative cap-key name,
+  not a decided field name.**
+
+  | Reconstructed descriptor class (merged `5d42cfe9`, 2026-10-14) | Output | Exit code |
+  | --- | --- | --- |
+  | base shape without `claimGeneration` | accepted | 0 |
+  | with `claimGeneration` | accepted | 0 |
+  | with `claimGeneration` plus illustrative `closureLimit` | `invalid protected descriptor` | 5 |
+
+  Both merged validators now accept an optional positive safe-integer
+  `claimGeneration` (1 through 9007199254740991), and the backup tests cover
+  legacy absence, valid boundaries and malformed values in both formats.
+  The ordinary active-journal jq also accepted all three reconstructed journal
+  shapes (exit 0 with source output); its progress key set remains open beyond
+  the validated claim fence. The protected validator still maps an unknown cap
+  key to `probe_inconclusive` and FAIL. Adding a nested cap field would therefore
+  still require a protected-progress allowlist and type/range validation change,
+  independently of B1's worker parser and downgrade requirements.
 
 ### Neutral sites (no change needed beyond B1)
 
@@ -230,13 +261,13 @@ seven names returned nothing. The parser search was line-oriented. Conclusion: t
 
 ### Proposed work, if the human chooses it later
 
-1. Fix B2 first and independently: add `claimGeneration` to the protected
-   `progress` field list and add a `backup-runs.test.sh` fixture carrying it. This
-   is a pre-existing #2976 defect.
+1. The independent `claimGeneration` backup fix is complete in PR #2995
+   (`7a0481d7`). B2 still requires validator support for any proposed nested cap
+   field; the existing claim-fence support does not admit other progress keys.
 2. Cap recording itself, choosing between:
    - (a) a nested optional `recovery` key: allowlist and type check in
      `recoveryProgress`, set only in `blockRecoveryEpisode` for a fresh
-     `RecoveryClosureLimitError`, plus the B2 field, with downgrade documented as
+     `RecoveryClosureLimitError`, plus B2 validator support for that cap field, with downgrade documented as
      failing closed;
    - (b) a separate `uzi-recovery.<branch>.<name>` config key: older workers ignore
      it, but it needs its own clear/retire lifecycle at every journal-blanking site
@@ -355,15 +386,16 @@ What it would add:
 | | Option (b) |
 | --- | --- |
 | Pros | Recovers the exact retained source in place, with fresh verification and no hand-built copy. Bounded: at most one pass per grant. Also covers new 8 GiB blocks such as 1ab9349c, if the cap is raised further. |
-| Cons | It **is a failed-run Resume for this blocker** and amends ADR-1197 (#2512 amendment: “neither auto-reclaims nor exposes failed-run Resume”) and `docs/run-recovery.md`. It touches four components (API with a migration, worker, CLI, docs) and a trust boundary (a new owner-authorized state transition). Cap recording (M2) is a prerequisite to telling a block at the current cap from an old-cap block, and M2 is not clean today (B1, B2). Frequency is UNVERIFIED: two reported old-limit cases, both already discarded by hand. |
+| Cons | It **is a failed-run Resume for this blocker** and amends ADR-1197 (#2512 amendment: “neither auto-reclaims nor exposes failed-run Resume”) and `docs/run-recovery.md`. It touches four components (API with a migration, worker, CLI, docs) and a trust boundary (a new owner-authorized state transition). Cap recording (M2) is a prerequisite to telling a block at the current cap from an old-cap block, and M2 remains not clean after #2995: B1's worker parser/downgrade requirements and B2's additional cap-key validation remain. Frequency is UNVERIFIED: two reported old-limit cases, both already discarded by hand. |
 
 ### Lead's reading (advisory, not a decision)
 
-Given unverified frequency, no known surviving old-limit source, and the B1/B2
-prerequisites, the evidence favours:
+Given unverified frequency, no known surviving old-limit source, and the remaining
+B1 worker/downgrade and B2 cap-key prerequisites, the evidence favours:
 
 1. documenting option (a) as the supported path for blocked decoded-limit runs;
-2. fixing B2 (`claimGeneration` in the backup validator) on its own;
+2. retaining the independent `claimGeneration` backup fix completed by #2995;
+   any later nested cap field still needs B2 validator support;
 3. deferring option (b) until a surviving source makes it worth amending ADR-1197.
 
 The human decides. #2971 stays open.
