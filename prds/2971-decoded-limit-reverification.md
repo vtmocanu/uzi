@@ -307,8 +307,8 @@ This is where the investigation stops. Nothing below is built. The human chooses
 - A `decoded_history_limit` block ends the run terminal `failed` with
   `keepCustody`. ADR-1197 (#2512 amendment): “it neither auto-reclaims nor exposes
   failed-run Resume”. `docs/run-recovery.md` (“Retained-source failure and local
-  proof”) says the same. The server never re-claims a terminal failed run (and
-  `uzi run resume` accepts only paused or `recovery_wait` runs), so in production
+  proof”) says the same. The server never re-claims a terminal failed run.
+  Generic resume does not accept a terminal failed run. Thus in production
   nothing reaches the blocked short-circuit; M1 drives it directly in a fixture,
   where every reclaim still fails without re-verifying.
 - The published checkpoint ref `refs/uzi-checkpoints/<branch>` (or
@@ -354,10 +354,18 @@ Steps, in this order:
 
 | | Option (a) |
 | --- | --- |
-| Pros | No new authority, endpoint, migration or ADR change. Works today for every blocker, not only this one. Every custody invariant is untouched. |
+| Pros | No new authority, endpoint, migration or ADR change. Does not depend on blocker type, but requires recoverable source/checkpoint/archive evidence and appropriate operator access. Every custody invariant is untouched. |
 | Cons | Manual and operator-heavy. Latest dirty or untracked bytes on the worker need worker access (hosted k8s: `kubectl exec`, with the uid-drop recipe only on split-UID workers) and can be lost if the holds are discarded first. The run cannot simply continue; the work is re-landed by a new run. For 21a4d826 and 38b52617 the issue reports only that holds were discarded by hand; whether a copy was made first is not recorded. |
 
 ### Option (b): owner-authorized one-shot re-verification
+
+The one-pass-per-grant bound is a proposed requirement, not an established
+property of this outline. It requires a separately reviewed server-consumption
+design with exact source, worker/incarnation, generation and cap bindings, plus
+replay controls. Local journal consumption alone does not establish that bound:
+a restored journal or another worker could present the grant again. The server
+consumption and replay design must be reviewed before this option can authorize
+any re-verification.
 
 What it would add:
 
@@ -373,8 +381,9 @@ What it would add:
 - **Claim:** the claim carries the grant.
 - **Worker:**
   1. verifies the grant matches the journal exactly;
-  2. durably records the grant as consumed in the journal *before* any closure
-     check, so a crash or replay cannot renew it;
+  2. requires server-consumption authority under the separately reviewed design
+     and durably records local consumption *before* any closure check; the local
+     journal is a crash marker, not sufficient replay prevention;
   3. re-verifies under the current cap with every existing hold, pin, generation
      fence and integrity check;
   4. on success, proceeds through the normal successor handoff; on failure,
@@ -385,7 +394,7 @@ What it would add:
 
 | | Option (b) |
 | --- | --- |
-| Pros | Recovers the exact retained source in place, with fresh verification and no hand-built copy. Bounded: at most one pass per grant. Also covers new 8 GiB blocks such as 1ab9349c, if the cap is raised further. |
+| Pros | Recovers the exact retained source in place, with fresh verification and no hand-built copy. The intended at-most-one-pass bound requires the separately reviewed server-consumption design and replay controls above. Also covers new 8 GiB blocks such as 1ab9349c, if the cap is raised further. |
 | Cons | It **is a failed-run Resume for this blocker** and amends ADR-1197 (#2512 amendment: “neither auto-reclaims nor exposes failed-run Resume”) and `docs/run-recovery.md`. It touches four components (API with a migration, worker, CLI, docs) and a trust boundary (a new owner-authorized state transition). Cap recording (M2) is a prerequisite to telling a block at the current cap from an old-cap block, and M2 remains not clean after #2995: B1's worker parser/downgrade requirements and B2's additional cap-key validation remain. Frequency is UNVERIFIED: two reported old-limit cases, both already discarded by hand. |
 
 ### Lead's reading (advisory, not a decision)
