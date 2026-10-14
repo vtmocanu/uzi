@@ -17,6 +17,11 @@
 - Hold triggers: the release lead requests a merges barrier while cutting an RC;
   request a separate pushes-ci barrier when the cut tip's CI is queued. Account
   CI capacity is shared across repositories; include other affected sessions.
+- Dispatches holds include scheduled automation. Have each schedule owner's session,
+  with its buddy's check, run `uzi schedule pause-all --until never` before activation;
+  record `uzi schedule pause-status` before/after as evidence. At release, run
+  `uzi schedule resume-all` only for pauses this hold created and after the last
+  applicable dispatches hold; preserve pre-existing pauses and report unheld automation.
 - Coverage: include every merging lead and outstanding operation, and identify
   unenrolled actors and automation. Require quiescent acknowledgments before
   activating a barrier. Hold through the release lead's explicit release. Follow
@@ -55,6 +60,13 @@
   - Compare active runs by repository and issue against board claims and the
     skipper ledger. Flag a second run for an issue another session owns; route
     to both owners. Missing issue identity or incomplete visibility is unknown.
+  - Check owner admission via `uzi run recovery --json`: compare
+    `.aggregate.admission_counted_holds` with `.aggregate.custody_hold_limit`,
+    not `open_holds`; live current generations are excluded from the counted signal.
+    New runs need counted < limit; missing fields mean unknown, not spare admission.
+  - A parked `awaiting_approval` plan gate holds a worker slot. Route long-parked
+    gates to their owner to approve or steer promptly; in-flight runs keep going
+    under a dispatches hold, which blocks new dispatch rather than ongoing work.
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
