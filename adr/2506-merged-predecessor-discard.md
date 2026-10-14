@@ -1,6 +1,6 @@
 # ADR-2506: server discard of merged-run predecessor custody
 
-**Status**: Implemented narrow server scope at `9d77c962`; partial, nonclosing #2506. Physical disposal remains deferred to #2823 and #1373.
+**Status**: Implemented narrow server scope; partial, nonclosing #2506. Physical disposal remains deferred to #2823 and #1373.
 **Date**: 2026-10-14
 **Issue**: [#2506](https://github.com/vtmocanu/uzi/issues/2506)
 
@@ -23,6 +23,8 @@ A discarded hold grants **no new worker source-deletion authority**. Operator-on
 ## Polling and resource boundary
 
 After ordinary polling finishes, a separate reconciliation phase uses the original parent context, with a 30-second budget and at most 100 repository visits and 100 candidate attempts. Repository rotation and per-repository run-ID keysets select one candidate per visit. Attempted candidates advance even on verification/settlement refusal; enumeration failures retain the run cursor. Exhaustion resets it for a later phase, without repeating an attempted candidate in that phase. Cursors are in memory, restart from the beginning after process restart, and are pruned for disabled repositories. Each observation has a five-second child deadline plus the client's existing timeout. Parent cancellation stops progress. Synchronous ticks may coalesce; immediate backlog convergence is not promised.
+
+Each run's discard transaction is bounded by `maxMergedPredecessorHolds = 1000` and `maxMergedPredecessorCaptures = 1000` in `api/internal/recovery/merged_predecessor.go`. The capture budget covers non-ready captures (`preparing`, `uploading`, `needs_action`) across the selected sibling holds, not per hold. In `api/internal/store/queries/merged_predecessor.sql`, hold selection uses `LIMIT 1001` as an overflow probe; capture selection uses the remaining capture budget plus one (initially 1001). Exceeding either budget returns `ErrMergedPredecessorWorkLimit` and rolls back the entire transaction, including any earlier sibling hold updates and capture cleanup; no partial batch commits. Oversized run worksets remain OPEN. Polling advances the attempted run cursor and may revisit the run after a later wrap, but retries alone do not reduce the workset or establish automatic convergence. Settlement requires owner action to reduce the workset within these limits or a separate follow-up; this operation performs no internal retry.
 
 Failure logs contain identifiers and fixed refusal reasons rather than raw forge errors or credentials. The reused `GetMergeRequest` response decoding is not newly byte-bounded: the approved plan accepts this inherited risk. Candidate and time bounds are not response-byte bounds. No forge transport rewrite, routes, protocol, capabilities, flags, workflows or new worker cleanup obligations are part of this scope.
 
