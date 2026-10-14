@@ -109,6 +109,41 @@ describe("GitCache.changedFilesNoRenames", () => {
     assert.deepStrictEqual(await git.changedFilesNoRenames(bare, tip), ["src/a.ts", WF].sort());
   });
 
+  it("a workflow copied from the moved default (single-parent overlay) drops out; run changes stay", async () => {
+    const w = newRepo();
+    commit(w, "code", "0\n", "A");
+    g(w, ["checkout", "-q", "-b", "agent"]);
+    commit(w, "src/a.ts", "a\n", "run");
+    g(w, ["checkout", "-q", "main"]);
+    commit(w, WF, "v1\n", "default adds a workflow");
+    g(w, ["checkout", "-q", "agent"]);
+    g(w, ["checkout", "main", "--", ".github/workflows"]);
+    g(w, ["commit", "-q", "-m", "overlay"]);
+    const overlay = g(w, ["rev-parse", "HEAD"]);
+    const edited = commit(w, WF, "evil\n", "run edits the workflow");
+    g(w, ["checkout", "-q", "main"]);
+    const bare = toBare(w);
+    const threeDot = g(bare, ["diff", "--name-only", "-z", "--no-renames", `main...${overlay}`]).split("\0").filter(Boolean);
+    assert.ok(threeDot.includes(WF), "premise: the merge-base diff lists the overlaid workflow");
+
+    assert.deepStrictEqual(await git.changedFilesNoRenames(bare, overlay), ["src/a.ts"]);
+    assert.deepStrictEqual((await git.changedFilesNoRenames(bare, edited))?.sort(), [WF, "src/a.ts"].sort());
+  });
+
+  it("a deletion and both sides of a rename-out still differ from the default tip", async () => {
+    const w = newRepo();
+    commit(w, WF, "v1\n", "A");
+    commit(w, ".github/workflows/b.yml", "b\n", "B");
+    g(w, ["checkout", "-q", "-b", "agent"]);
+    g(w, ["rm", "-q", WF]);
+    g(w, ["mv", ".github/workflows/b.yml", "moved.yml"]);
+    g(w, ["commit", "-q", "-m", "delete and rename out"]);
+    const tip = g(w, ["rev-parse", "HEAD"]);
+    g(w, ["checkout", "-q", "main"]);
+    const bare = toBare(w);
+    assert.deepStrictEqual((await git.changedFilesNoRenames(bare, tip))?.sort(), [".github/workflows/b.yml", WF, "moved.yml"].sort());
+  });
+
   it("unrelated histories: null (fail closed)", async () => {
     const w = newRepo();
     commit(w, "code", "0\n", "A");

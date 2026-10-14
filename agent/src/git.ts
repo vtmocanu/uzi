@@ -9759,11 +9759,20 @@ export class GitCache {
    * a 40-hex id, or NO merge base, e.g. unrelated histories), so the caller fails CLOSED.
    * A non-SHA-1 repository (e.g. SHA-256 object format) yields 64-hex merge bases, which are not
    * 40-hex ids, so it also returns null (fail closed) rather than a possibly partial list.
+   * A path is kept only if it ALSO differs between the default tip and `ref` (a direct
+   * `--no-renames` tree diff against the same pinned default SHA). A path the branch merely took
+   * from the default (the finalize workflow-subtree overlay copies the refreshed default's
+   * workflows in a single-parent commit, so the merge base stays at the fork point) equals the
+   * tip and drops out; a run-made addition, edit, deletion and both sides of a rename still
+   * differ from it. Either diff failing returns null.
    */
   async changedFilesNoRenames(barePath: string, ref: string): Promise<string[] | null> {
     try {
       const baseRef = await this.defaultBranchRef(barePath);
-      const bases = (await this.runGit(barePath, ["merge-base", "--all", baseRef, ref]))
+      // Pin the default once so both comparisons read the same tip.
+      const defaultSha = (await this.runGit(barePath, ["rev-parse", "--verify", `${baseRef}^{commit}`])).trim();
+      if (!SHA40_RE.test(defaultSha)) return null;
+      const bases = (await this.runGit(barePath, ["merge-base", "--all", defaultSha, ref]))
         .split("\n").filter((line) => line !== "");
       if (bases.length === 0 || bases.some((base) => !SHA40_RE.test(base))) return null;
       const seen = new Set<string>();
@@ -9771,7 +9780,11 @@ export class GitCache {
         const out = await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", base, ref]);
         for (const entry of out.split("\0")) if (entry !== "") seen.add(entry);
       }
-      return [...seen];
+      const fromTip = new Set(
+        (await this.runGit(barePath, ["diff", "--name-only", "-z", "--no-renames", defaultSha, ref]))
+          .split("\0").filter((entry) => entry !== ""),
+      );
+      return [...seen].filter((entry) => fromTip.has(entry));
     } catch {
       return null;
     }
