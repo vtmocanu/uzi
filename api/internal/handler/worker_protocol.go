@@ -1420,7 +1420,11 @@ func (h *Handler) WorkerRunState(w http.ResponseWriter, r *http.Request) {
 				"disposition": "stale_claim",
 			})
 		case errors.Is(err, workersvc.ErrRunNotOwned):
-			httpx.Error(w, http.StatusNotFound, "run not found for this worker")
+			// Issue #2950: a machine-readable reason so the worker can BLOCK (not retire) its
+			// write-ahead terminal journal instead of retrying a 404 forever. Body is exactly
+			// {error, reason}: no run body, no ownership change, and deliberately not the
+			// stale_claim disposition (the worker never held this claim generation).
+			httpx.ErrorReason(w, http.StatusNotFound, "run not found for this worker", "run_not_owned")
 		case errors.Is(err, workersvc.ErrRunWallExpired):
 			ack := h.workerStateAck(r, run)
 			ack["applied"] = false

@@ -23,7 +23,7 @@ type workerRowText struct {
 	workerName, workerVersion, templateDeclared, templateReported          string
 	upgradeDetail, upgradeTarget, blockingContainer, blockingReason        string
 	outboxBlockedText, tokenLabel, hostedSize, capabilityText, workerOwner string
-	quarantineText                                                         string
+	quarantineText, outboxBlockedRunText                                   string
 	pressureText                                                           []string
 }
 
@@ -34,7 +34,7 @@ func workerTextOf(r workerRow) workerRowText {
 		templateDeclared: workerString(w.TemplateDeclared), templateReported: workerString(w.TemplateReported),
 		upgradeDetail: workerString(w.UpgradeDetail), upgradeTarget: w.UpgradeTarget,
 		blockingContainer: workerString(w.UpgradeBlockingContainer), blockingReason: workerString(w.UpgradeBlockingReason),
-		outboxBlockedText: workerString(w.OutboxBlocked), quarantineText: workerString(w.ResidueQuarantineCause), tokenLabel: workerString(w.AnthropicSecretLabel),
+		outboxBlockedText: workerString(w.OutboxBlocked), outboxBlockedRunText: workerString(w.OutboxBlockedRunID), quarantineText: workerString(w.ResidueQuarantineCause), tokenLabel: workerString(w.AnthropicSecretLabel),
 		hostedSize: workerString(w.HostedSize), capabilityText: strings.Join(w.Capabilities, " "),
 		workerOwner: r.workerOwner, pressureText: r.pressureText,
 	}
@@ -295,7 +295,12 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 		add(0, "✕ upgrade failed", detail)
 	}
 	if w.OutboxBlocked != nil {
-		add(0, "✕ outbox blocked", "✕ outbox blocked: "+renderer.Plain(t.outboxBlockedText, 200))
+		detail := "✕ outbox blocked: " + renderer.Plain(t.outboxBlockedText, 200)
+		if w.OutboxBlockedRunID != nil {
+			// The worker's own self-reported run id (issue #2950): untrusted text, never joined to a run.
+			detail += " · run " + renderer.Plain(t.outboxBlockedRunText, 200)
+		}
+		add(0, "✕ outbox blocked", detail)
 	}
 	// Residue quarantine (issue #2213): the worker found an unreadable, unattributed
 	// runner-uid process and claims nothing until its container restarts. The cause is the

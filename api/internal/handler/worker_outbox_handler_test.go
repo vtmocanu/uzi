@@ -90,6 +90,35 @@ func TestWorkerHeartbeatOverlaysOutboxOntoDTO(t *testing.T) {
 	}
 }
 
+// TestWorkerHeartbeatOverlaysBlockedRunID pins issue #2950: the oldest blocked entry's
+// reason AND its run id reach the DTO, so the worker's owner can see which run is held.
+func TestWorkerHeartbeatOverlaysBlockedRunID(t *testing.T) {
+	h := newProtocolHandler(t, &protocolStore{})
+	rec := httptest.NewRecorder()
+	runID := uuid.New()
+	body := `{"version":"1","outbox":[{"run_id":"` + runID.String() +
+		`","pending_messages":0,"pending_terminal":1,"stale_retired":0,"blocked_reason":"run_not_owned","since":1}]}`
+	h.WorkerHeartbeat(rec, workerReq(http.MethodPost, body, uuid.Nil))
+	if rec.Code != http.StatusOK {
+		t.Fatalf("status = %d, want 200, body %q", rec.Code, rec.Body.String())
+	}
+	var resp struct {
+		Worker struct {
+			OutboxBlocked      *string `json:"outbox_blocked"`
+			OutboxBlockedRunID *string `json:"outbox_blocked_run_id"`
+		} `json:"worker"`
+	}
+	if err := json.Unmarshal(rec.Body.Bytes(), &resp); err != nil {
+		t.Fatalf("decode heartbeat response: %v (body %q)", err, rec.Body.String())
+	}
+	if resp.Worker.OutboxBlocked == nil || *resp.Worker.OutboxBlocked != "run_not_owned" {
+		t.Fatalf("outbox_blocked = %v, want run_not_owned", resp.Worker.OutboxBlocked)
+	}
+	if resp.Worker.OutboxBlockedRunID == nil || *resp.Worker.OutboxBlockedRunID != runID.String() {
+		t.Fatalf("outbox_blocked_run_id = %v, want %s", resp.Worker.OutboxBlockedRunID, runID)
+	}
+}
+
 // TestWorkerHeartbeatWithoutOutboxLeavesDTONull is the control: a heartbeat with no
 // outbox report leaves the DTO's outbox_* fields null, so the overlay test above proves
 // the overlay, not an always-set field.

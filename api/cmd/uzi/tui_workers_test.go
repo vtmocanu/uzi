@@ -155,7 +155,7 @@ func TestWorkerAttentionFacts(t *testing.T) {
 		wants []string
 	}{
 		{5, []string{"upgrade failed", "seed-nix", "ImagePullBackOff", "offline", "cordoned"}},
-		{7, []string{"outbox blocked", "outdated", "template drift", "chat active"}},
+		{7, []string{"outbox blocked", "run 6f0c2d4e-8a51-4b7e-9c3a-1d2e3f4a5b6c", "outdated", "template drift", "chat active"}},
 		{1, []string{"outcome pending 12m", "not yet delivered/acknowledged", "14 queued", "dind ino 97% (display-only)"}},
 	} {
 		items := workerAttention(workerRow{w: f.Workers[tc.index]}, now)
@@ -693,7 +693,7 @@ func TestWorkerSortSeverityNameAndIDTies(t *testing.T) {
 func TestWorkersHostileReadoutAndASCII(t *testing.T) {
 	m := workersScene(true, "workers-factory")
 	hostile := "safe\n\r\t" + "\x1b[31m" + "hostile" + "\x1b]0;title\x07"
-	w := apitypes.WorkerDTO{ID: "hostile", Name: hostile, Status: "offline", Version: sp(hostile), UpgradeStatus: "upgrade_failed", UpgradeBlockingReason: sp(hostile), UpgradeBlockingContainer: sp(hostile), UpgradeDetail: sp(hostile), UpgradeTarget: hostile, OutboxBlocked: sp(hostile), AnthropicSecretLabel: sp(hostile), TemplateDeclared: sp(hostile), TemplateReported: sp("other")}
+	w := apitypes.WorkerDTO{ID: "hostile", Name: hostile, Status: "offline", Version: sp(hostile), UpgradeStatus: "upgrade_failed", UpgradeBlockingReason: sp(hostile), UpgradeBlockingContainer: sp(hostile), UpgradeDetail: sp(hostile), UpgradeTarget: hostile, OutboxBlocked: sp(hostile), OutboxBlockedRunID: sp(hostile), AnthropicSecretLabel: sp(hostile), TemplateDeclared: sp(hostile), TemplateReported: sp("other")}
 	r := workerRow{w: w, workerOwner: hostile, pressureText: []string{hostile}}
 	m.workers.rows = []workerRow{r}
 	m.workers.cursor = 0

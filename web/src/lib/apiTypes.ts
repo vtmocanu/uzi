@@ -2496,6 +2496,10 @@ export interface Worker {
   outbox_pending_terminal?: number | null;
   outbox_stale_retired?: number | null;
   outbox_blocked?: string | null;
+  // The worker's own self-reported run id for the oldest blocked outcome (the entry
+  // outbox_blocked describes), shown to the worker's owner. Untrusted worker text: never
+  // joined to a run's title or status.
+  outbox_blocked_run_id?: string | null;
   // The worker's residue-quarantine latch (issue #2213): it found an unreadable,
   // unattributed process running as its own uid, so it claims nothing and starts no
   // forge-credentialed git and no new Claude/Codex turn until its container restarts.
