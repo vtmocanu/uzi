@@ -520,11 +520,19 @@ episode-policy ADR amendment if semantics change, and required serial gates.
 
 ## Validation status (this run)
 
-- Focused characterization after the M0 merge and the M1 assertion: exit 0,
-  1 passed, 0 failed/cancelled/skipped. Independently re-run by the reviewer and the
-  fact-checker with the same result.
-- `task check-docs:web`: pass after each record commit.
-- Read-only validation per commit: M0 by a reviewer; M1, M2 and M3 by a fact-checker.
-  Every blocking finding was fixed and re-checked.
-- Required gates `task gate:agent`, then `task gate:repo`: recorded below once run.
+- **Focused characterization run.** Run on this run's merged tree, from `agent/`,
+  with the command in the M0 section: exit 0, 1 passed, 0 failed/cancelled/skipped.
+  Runs:
+  - lead after the M0 merge;
+  - lead after the M1 assertion;
+  - the M0 reviewer, independently, at `820d53a2`;
+  - the M1 fact-checker, independently, at `94594b12`.
 
+  The M2 and M3 fact-checks ran no tests; those ranges change only this record.
+- **`task check-docs:web`.** The lead ran it before each record commit: exit 0.
+- **Read-only validation per commit.** M0 by a reviewer; M1, M2 and M3 by a
+  fact-checker. Each blocking finding was fixed in a follow-up commit, and the M2 fix
+  range was re-checked. The M3 fix range is re-checked by the commit that adds this
+  wording.
+- **Required gates.** `task gate:agent`, then `task gate:repo`: pending, run in the
+  foreground after validation. Results are added below when recorded.
