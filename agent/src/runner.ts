@@ -10828,6 +10828,7 @@ export class RunRunner {
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
+      lifecycleSignal: () => steering.lifecycleSignal(),
       onModelTurnSettled: async (processedEvents) => {
         // PRD #1733: counted before the retained-episode early return below; a failed turn never
         // reaches this hook (both executors fire it on a success outcome only).

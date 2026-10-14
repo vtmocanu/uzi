@@ -4918,6 +4918,163 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
     assert.equal((await execution).summaryPlan, undefined);
   });
 
+  // Issue #2945: a plan accepted on the storage retry after a credential-switch give-up must still
+  // get its summary. The fake hook models the runner's give-up: it closes the plan summary, kills
+  // the tree, and leaves ctx.signal aborted with a CredentialSwitchSignal (steering never un-aborts it).
+  interface SwitchOptions {
+    outcome?: "gave_up" | "released";
+    startBeforeSwitch?: boolean;
+    /** Runs inside the retried gate wait, after the persisted callback is invoked once. */
+    duringRetry?: (done: Promise<void>, ctl: { lifecycle: AbortController }) => Promise<void>;
+    callbackTwice?: boolean;
+    /** False when the flight never settles (abandoned), so the retry must not wait on it. */
+    awaitRetry?: boolean;
+    ctx?: Partial<RunContext>;
+    summary?: SummaryBehavior;
+    runner?: SummaryRunner;
+    bound?: number;
+  }
+  async function runSwitchGiveUp(opts: SwitchOptions = {}) {
+    const fake = summaryFakes(opts.summary);
+    const switchAbort = new AbortController();
+    const ctl = { lifecycle: new AbortController() };
+    let executor!: SdkExecutor;
+    let stash: { md: string; persisted: (md: string) => Promise<void> } | undefined;
+    let retryDone: Promise<void> | undefined;
+    let hookError: unknown;
+    let gates = 0;
+    const { queryFn } = fakeTurns([[submitPlan("# Plan"), resultSuccess()], [signalDone(), resultSuccess()]]);
+    const probe = makeCtx({
+      agents: [lead, coder], summaryIntentPresent: true,
+      signal: switchAbort.signal,
+      lifecycleSignal: () => ctl.lifecycle.signal,
+      attemptCredentialSwitch: async () => {
+        await executor.closeAndSettlePlanSummary();
+        executor.killAgentTree();
+        await executor.reapAttributedProcesses();
+        switchAbort.abort(new CredentialSwitchSignal());
+        return opts.outcome ?? "gave_up";
+      },
+      gatePlan: async (md, _m, persisted) => {
+        stash = { md, persisted: persisted! };
+        if (++gates === 1) {
+          if (opts.startBeforeSwitch) void persisted!(md);
+          throw new CredentialSwitchSignal();
+        }
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+      continueExistingPlanGate: async () => {
+        const first = stash!.persisted(stash!.md);
+        retryDone = opts.callbackTwice ? (await first, stash!.persisted(stash!.md)) : first;
+        // run() failures are swallowed below, so surface an assertion thrown by the retry hook.
+        if (opts.duringRetry) await opts.duringRetry(retryDone, ctl).catch(e => { hookError = e; });
+        if (opts.awaitRetry !== false) await retryDone;
+        return { kind: "approve", selection: { status: "absent" } };
+      },
+      ...opts.ctx,
+    });
+    executor = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn, client: fake.client, summaryRunner: opts.runner ?? fake.runner, intentSettleBoundMs: opts.bound ?? 50,
+    });
+    const result = await executor.run(probe.ctx).catch(() => undefined);
+    if (hookError) throw hookError;
+    return { fake, probe, result, usage: probe.emits.filter(m => m.kind === "summary_usage") };
+  }
+
+  it("#2945 a plan accepted on the retry after a credential-switch give-up still gets one summary", async () => {
+    const { fake, result, usage } = await runSwitchGiveUp();
+    assert.equal(fake.rec.planCalls.length, 1);
+    assert.equal(fake.rec.planPosts.length, 1);
+    assert.equal(fake.rec.planPosts[0]!.plan_md, "# Plan");
+    assert.equal(result?.summaryPlan, "PLAN SUMMARY", "the accepted summary still rides the result");
+    assert.ok(usage.length <= 1);
+  });
+
+  it("#2945 a repeated persisted callback after the give-up shares one flight", async () => {
+    const { fake } = await runSwitchGiveUp({ callbackTwice: true });
+    assert.equal(fake.rec.planCalls.length, 1);
+    assert.equal(fake.rec.planPosts.length, 1);
+  });
+
+  const neverGenerated: [string, Partial<RunContext>, "gave_up" | "released"][] = [
+    ["cancelRequested", { cancelRequested: () => true }, "gave_up"],
+    ["claimFenced", { claimFenced: () => true }, "gave_up"],
+    ["terminal lifecycle aborted", { terminalLifecycleSignal: AbortSignal.abort() }, "gave_up"],
+    ["live lifecycle aborted", { lifecycleSignal: () => AbortSignal.abort() }, "gave_up"],
+    ["released outcome", {}, "released"],
+  ];
+  for (const [name, ctx, outcome] of neverGenerated) {
+    it(`#2945 never reopens or generates when ${name}`, async () => {
+      const { fake, result, usage } = await runSwitchGiveUp({ ctx, outcome });
+      // A cancel legitimately ends the run with REASON_CANCELLED; every other case must return.
+      if (name !== "cancelRequested") assert.ok(result, "the run returned rather than threw");
+      assert.equal(fake.rec.planCalls.length, 0);
+      assert.equal(fake.rec.planPosts.length, 0);
+      assert.equal(usage.length, 0);
+      assert.equal(result?.summaryPlan, undefined);
+    });
+  }
+
+  it("#2945 a flight already generating when the switch closed it is not revived by the retry", async () => {
+    const release = m1Barrier();
+    const runner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (i: PlanSummaryInput) => {
+        await new Promise<void>(resolve => i.signal!.addEventListener("abort", () => resolve(), { once: true }));
+        i.onUsage?.({});
+        release.resolve();
+        return { summary: "Closed advice", deltas: [] };
+      },
+    } as unknown as SummaryRunner;
+    let calls = 0;
+    const counted = { ...runner, generatePlanSummary: (i: PlanSummaryInput) => { calls++; return (runner as any).generatePlanSummary(i); } } as unknown as SummaryRunner;
+    const { fake, result, usage } = await runSwitchGiveUp({ startBeforeSwitch: true, runner: counted });
+    assert.equal(calls, 1);
+    assert.equal(fake.rec.planPosts.length, 0);
+    assert.equal(result?.summaryPlan, undefined);
+    assert.equal(usage.length, 1, "spend reported within the settle bound counts exactly once");
+  });
+
+  it("#2945 usage after abandonment of a switch-closed flight emits nothing", async () => {
+    let late: PlanSummaryInput | undefined;
+    const runner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (i: PlanSummaryInput) => { late = i; await new Promise<void>(() => {}); return null; },
+    } as unknown as SummaryRunner;
+    const { fake, usage } = await runSwitchGiveUp({ startBeforeSwitch: true, runner, bound: 1, awaitRetry: false });
+    late!.onUsage?.({});
+    assert.equal(fake.rec.planPosts.length, 0);
+    assert.equal(usage.length, 0);
+  });
+
+  it("#2945 a reopened flight is aborted promptly by the re-armed lifecycle, with no post or usage", async () => {
+    const entered = m1Barrier();
+    let released = false;
+    const runner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (i: PlanSummaryInput) => {
+        await new Promise<void>(resolve => {
+          i.signal!.addEventListener("abort", () => { released = true; resolve(); }, { once: true });
+          entered.resolve();
+        });
+        return { summary: "Late", deltas: [] };
+      },
+    } as unknown as SummaryRunner;
+    const { fake, result, usage } = await runSwitchGiveUp({
+      runner,
+      duringRetry: async (_done, ctl) => {
+        await entered.promise;
+        assert.equal(released, false);
+        ctl.lifecycle.abort(new CredentialSwitchSignal());
+        await new Promise(r => setImmediate(r));
+        assert.equal(released, true, "generator signal aborts promptly");
+      },
+    });
+    assert.equal(fake.rec.planPosts.length, 0);
+    assert.equal(usage.length, 0);
+    assert.equal(result?.summaryPlan, undefined);
+  });
+
   for (const phase of ["generation", "post"] as const) {
     it(`M1 Claude supersedes ${phase} before a failing replacement and suppresses late usage`, async () => {
       const oldEntry = m1Barrier(), release = m1Barrier();

@@ -354,6 +354,8 @@ export interface RunContext {
   signal?: AbortSignal;
   /** Stable terminal cancellation, independent of rearmed pause lifecycles. */
   terminalLifecycleSignal?: AbortSignal;
+  /** Issue #2945: the re-armable steering lifecycle signal; replaced after a confirmed credential-switch give-up. */
+  lifecycleSignal?(): AbortSignal;
   /** Worker-local evidence after successful terminal, stream settlement and turn cleanup.
    * Async handlers must check live ownership before writing; handler failures propagate. */
   onModelTurnSettled?(processedEvents: number): Promise<void>;
