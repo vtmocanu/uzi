@@ -915,10 +915,11 @@ instruction-shaped line in a log could otherwise steer an unattended run.
 The run treats the evidence as untrusted (it sits inside a fenced block
 under a heading that says so), but a fence marks the boundary and doesn't
 neutralise the text; the plan gate is what puts a human in the loop. The web
-create and edit dialog, the schedule detail and `uzi schedule get` show the
-same reason ("Off by default: this job reads CI logs, which can contain text
-from dependencies, tests or outside contributors. Review the plan before the
-run changes code. You can turn it on."). You can turn auto-approve on for a
+create and edit dialog and the schedule detail say so ("Off by default: this
+job reads CI logs, which can contain text from dependencies, tests or outside
+contributors. Review the plan before the run changes code. You can turn it
+on."), and `uzi schedule get` prints the same reason in its own words for
+every CI-watch schedule. You can turn auto-approve on for a
 schedule; **Reset** puts it back to off, and a clone of a default keeps the
 value the source has at the time. Every other default still enables with
 auto-approve on.
@@ -1016,14 +1017,17 @@ cadence. Each is recorded with the workflow it concerns where there is one.
 - `ci_capacity` — the schedule already tracks 1024 workflows and this one is
   new (see [admission](#loop-guard-and-episode-state)).
 - `ci_evidence_limited` — a discovery or evidence read hit one of the
-  [evidence limits](#evidence-limits); no run and no episode write, and the
-  next fire tries again.
+  [evidence limits](#evidence-limits), or the workflow listing was malformed
+  (for example a workflow key over 200 bytes); no run and no episode write,
+  and the next fire tries again.
 - `ci_config_changed` — the schedule or repo was edited (or deleted) while
-  the fire ran, so the fire wrote nothing; the next fire uses the new
-  configuration.
+  the fire ran. The episode write that detected the change was not made, but
+  resets or halts already written earlier in the same fire stand, and the
+  fire records only this reason; the next fire uses the new configuration.
 - `no_default_branch` — the repo has no recorded default branch.
 
 A CI-watch fire can also record the existing `already_running`,
+`credential_disabled`, `no_usable_credential`,
 `description_too_large` (the instruction and guidance leave no room for even
 the smallest evidence block; the instruction is never shortened to make room)
 and `codex_override_conflict`. Other forge errors are transient: the fire
