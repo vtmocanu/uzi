@@ -285,6 +285,16 @@ describe("ActiveRunRegistry — run_not_owned journals are not leasable (issue #
     }
   });
 
+  it("a live run sharing an id with a run_not_owned journal is listed once, live, at its own generation", () => {
+    const reg = new ActiveRunRegistry(() => [notOwned(RUN_A)], () => 4);
+    reg.add(RUN_A, 9);
+    const snap = reg.build();
+    assert.deepStrictEqual(snap.active, [
+      { run_id: RUN_A, claim_generation: 9, phase: "running", terminal_pending: false },
+    ]);
+    assert.strictEqual(snap.pending_overflow, false);
+  });
+
   it("the register snapshot stays conservative: pending_overflow with only a run_not_owned entry", () => {
     const reg = new ActiveRunRegistry(() => [notOwned(RUN_A)], () => 32);
     const snap = reg.buildRegisterSnapshot();

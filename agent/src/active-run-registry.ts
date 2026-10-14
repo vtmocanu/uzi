@@ -222,9 +222,11 @@ export class ActiveRunRegistry {
     const pendingByRun = new Map(pending.map((p) => [p.run_id, p]));
 
     const active: ActiveSnapshotEntry[] = [];
-    // Live executions this worker is running, EXCEPT any that also carry a pending terminal (those
-    // are listed below as terminal_pending, and the cap governs them). In practice a run leaves the
-    // live registry as it journals its terminal, so an overlap is a brief corner case.
+    // Live executions this worker is running, EXCEPT any that also carry a LEASABLE pending terminal
+    // (those are listed below as terminal_pending, and the cap governs them). In practice a run leaves
+    // the live registry as it journals its terminal, so an overlap is a brief corner case. A
+    // run_not_owned journal is not leasable (filtered above), so a live run sharing its id is listed
+    // live at its own generation: the api drops it unless it attributes the run to this worker.
     for (const [runId, entry] of this.runs) {
       if (pendingByRun.has(runId)) continue;
       active.push({

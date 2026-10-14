@@ -415,7 +415,7 @@ func (h *Handler) overlayOutbox(dto *apitypes.WorkerDTO, workerID uuid.UUID) {
 	}
 	pm, pt, sr, blocked, blockedRunID := h.wsvc.OutboxAggregate(workerID)
 	if pm == 0 && pt == 0 && sr == 0 && blocked == nil {
-		return // no tracked depth → leave the four fields null
+		return // no tracked depth → leave the five fields null
 	}
 	dto.OutboxPendingMessages = &pm
 	dto.OutboxPendingTerminal = &pt
