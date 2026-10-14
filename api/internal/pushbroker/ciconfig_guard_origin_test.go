@@ -14,7 +14,7 @@ import (
 // CI-config path before anything is sent. The origin is a local bare repo over file://; a refusal
 // is proven by the checkpoint or held ref staying absent on it.
 
-var ciFloor = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**"}
+var ciFloor = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**", ".gitea/workflows/**"}
 
 // ciTip builds an origin whose main holds a.txt and a tip one commit ahead that adds path.
 func ciTip(t *testing.T, path string) (f *gitFixture, url, tip string, pack []byte) {
@@ -138,6 +138,78 @@ func TestHeldPrepareCIConfigGuard(t *testing.T) {
 		o.CIConfigPaths = ciFloor // paths without the flag change nothing
 		if _, err := pushbroker.PrepareHeldPack(ctx, o); err != nil {
 			t.Fatalf("PrepareHeldPack: %v", err)
+		}
+	})
+}
+
+// ciMovedDefault builds the shape the worker ships: the base holds docs/a.md and a.txt, the run
+// adds path on top, and the pack is `tip ^base` (trees shared with the base are NOT in it). The
+// default branch then moves, changing docs/a.md.
+func ciMovedDefault(t *testing.T, path string) (f *gitFixture, url, tip string, pack []byte) {
+	t.Helper()
+	f = newGitFixture(t)
+	if err := os.MkdirAll(filepath.Join(f.work, "docs"), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	f.commit("docs/a.md", "doc\n", "docs")
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(f.work, path)), 0o750); err != nil {
+		t.Fatal(err)
+	}
+	tip = f.commit(path, "changed\n", "tip")
+	pack = f.pack(tip, base)
+	f.git("checkout", "-q", "-b", "moved", base)
+	f.commit("docs/a.md", "doc moved\n", "default moves")
+	f.git("push", "origin", "moved:main")
+	return f, f.cloneURL(), tip, pack
+}
+
+// runBranchOpts publishes on a run branch (not the default branch the origin moved on).
+func runBranchOpts(url, tip string, pack []byte) pushbroker.Options {
+	o := publishOpts(url, tip, pack, true, ciFloor)
+	o.Branch = "agent/issue-1"
+	return o
+}
+
+func TestCIConfigGuardDefaultMovedSinceBase(t *testing.T) {
+	ctx := context.Background()
+
+	t.Run("clean tip publishes although the default branch moved", func(t *testing.T) {
+		f, url, tip, pack := ciMovedDefault(t, "b.txt")
+		if _, err := pushbroker.Publish(ctx, runBranchOpts(url, tip, pack)); err != nil {
+			t.Fatalf("Publish: %v", err)
+		}
+		if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != tip {
+			t.Fatalf("checkpoint = %q, want %s", got, tip)
+		}
+	})
+
+	t.Run("clean pack is prepared although the default branch moved", func(t *testing.T) {
+		_, url, tip, pack := ciMovedDefault(t, "b.txt")
+		p, err := pushbroker.PrepareHeldPack(ctx, func() pushbroker.HeldPackOptions {
+			o := heldOpts(url, tip, pack)
+			o.CIConfigGuard, o.CIConfigPaths = true, ciFloor
+			return o
+		}())
+		if err != nil || p.Tip() != tip {
+			t.Fatalf("PrepareHeldPack = %v, %v; want prepared at %s", p, err, tip)
+		}
+	})
+
+	t.Run("a workflow the run added is still refused", func(t *testing.T) {
+		f, url, tip, pack := ciMovedDefault(t, ".github/workflows/x.yml")
+		_, err := pushbroker.Publish(ctx, runBranchOpts(url, tip, pack))
+		if !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+			t.Fatalf("Publish err = %v, want ErrCIConfigGuard", err)
+		}
+		if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != "" {
+			t.Fatalf("checkpoint ref created at %s", got)
+		}
+		o := heldOpts(url, tip, pack)
+		o.CIConfigGuard, o.CIConfigPaths = true, ciFloor
+		if _, err := pushbroker.PrepareHeldPack(ctx, o); !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+			t.Fatalf("PrepareHeldPack err = %v, want ErrCIConfigGuard", err)
 		}
 	})
 }

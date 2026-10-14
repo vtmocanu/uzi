@@ -29,8 +29,13 @@ const (
 	// ciConfigMaxDepth bounds directory nesting so a hostile chain of one-entry trees cannot make
 	// the path building quadratic. Real git paths are bounded by PATH_MAX, far below this.
 	ciConfigMaxDepth = 4096
-	// ciConfigCtxEvery is how many entries are visited between context checks.
-	ciConfigCtxEvery = 256
+	// ciConfigMaxPathBytes bounds one tree entry name and one joined path. A walk bounded only by
+	// entry count still runs for minutes on a single entry with a huge name (path concatenation
+	// and glob matching are linear in its length), so an oversized name or path is a refusal.
+	ciConfigMaxPathBytes = 4096
+	// ciConfigMaxPathBytesTotal bounds the path bytes processed across the whole walk, the byte
+	// analogue of ciConfigWalkCap.
+	ciConfigMaxPathBytesTotal = 64 << 20
 )
 
 // ciConfigGlobRegex ports ciConfigGuardRegex of agent/src/ci-config-guard.ts: `**/` is an
@@ -98,10 +103,20 @@ func newCIConfigMatcher(globs []string) (match func(string) bool, ok bool, err e
 // of the fetched default branch (refs/remotes/origin/<defaultBranch>) at any protected path.
 //
 // It is depth-1 safe: the broker fetches the default branch at depth 1, so there is no history
-// to walk and no merge base. It compares the two root trees directly. A protected file changed
-// only on the default branch after the run's base therefore also counts as a difference. That
-// strictness is accepted: a spurious refusal of a server-side checkpoint or held publication is
-// non-fatal, and the worker's own merge-base check decides the final branch push.
+// to walk and no merge base. It compares the two root trees directly.
+//
+// The guard checks the trees the run wrote. The worker's pack is `tip ^floor` (floor = the
+// merge-base with the default branch, or origin/<branch>), so a subtree the candidate shares with
+// that trusted floor is not in the pack and not in the broker's object store. When both sides
+// hold a directory with differing hashes and the candidate-side tree object is absent
+// (plumbing.ErrObjectNotFound), the run did not write it and it is skipped: inherited trees
+// compare as unchanged, consistent with the worker's merge-base diff. Still fail closed: a
+// missing candidate ROOT tree, any missing default-side object, a candidate-only directory whose
+// tree is missing, and any other error. Residual strictness, accepted: a protected file inside a
+// tree the run did write (for example a root-level .gitlab-ci.yml when the run added a root
+// file) that also changed on the default branch after the run's base still counts as a
+// difference; a spurious refusal of a server-side checkpoint or held publication is non-fatal,
+// and the worker's own merge-base check decides the final branch push.
 func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.Commit, defaultBranch string, globs []string) error {
 	match, ok, err := newCIConfigMatcher(globs)
 	if err != nil {
@@ -127,7 +142,7 @@ func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.
 // ciConfigTreeGuard compares two root trees and refuses on a differing protected path. A path
 // differs when it is on one side only, its mode differs, or its blob hash differs.
 func ciConfigTreeGuard(ctx context.Context, s storer.EncodedObjectStorer, cand, def plumbing.Hash, match func(string) bool, limit int) error {
-	w := &ciConfigWalk{ctx: ctx, s: s, match: match, limit: limit}
+	w := &ciConfigWalk{ctx: ctx, s: s, match: match, limit: limit, maxBytes: ciConfigMaxPathBytesTotal}
 	if err := w.diff(cand, def, "", 0); err != nil {
 		if errors.Is(err, ErrCIConfigGuard) {
 			return err
@@ -143,18 +158,27 @@ type ciConfigWalk struct {
 	match func(string) bool
 	limit int
 	seen  int
+	bytes int
+	// maxBytes is the total path-byte cap (ciConfigMaxPathBytesTotal; a field so tests can lower it).
+	maxBytes int
 }
 
-// visit counts one tree entry and enforces the cap and the context.
-func (w *ciConfigWalk) visit() error {
+// visit counts one tree entry (name under the directory path prefix) and enforces the entry cap,
+// the per-name and per-path byte caps, the total byte cap and the context.
+func (w *ciConfigWalk) visit(prefix, name string) error {
 	w.seen++
 	if w.seen >= w.limit {
 		return fmt.Errorf("%w: tree walk reached %d entries", ErrCIConfigGuard, w.limit)
 	}
-	if w.seen%ciConfigCtxEvery == 0 {
-		if err := w.ctx.Err(); err != nil {
-			return fmt.Errorf("%w: %v", ErrCIConfigGuard, err)
-		}
+	if err := w.ctx.Err(); err != nil {
+		return fmt.Errorf("%w: %v", ErrCIConfigGuard, err)
+	}
+	if len(name) > ciConfigMaxPathBytes || len(prefix)+len(name) > ciConfigMaxPathBytes {
+		return fmt.Errorf("%w: tree entry path longer than %d bytes", ErrCIConfigGuard, ciConfigMaxPathBytes)
+	}
+	w.bytes += len(prefix) + len(name)
+	if w.bytes > w.maxBytes {
+		return fmt.Errorf("%w: tree walk processed more than %d path bytes", ErrCIConfigGuard, w.maxBytes)
 	}
 	return nil
 }
@@ -200,7 +224,7 @@ func (w *ciConfigWalk) diff(a, b plumbing.Hash, prefix string, depth int) error 
 			return fmt.Errorf("%w: duplicate tree entry name", ErrCIConfigGuard)
 		}
 		inA[ea.Name] = struct{}{}
-		if err := w.visit(); err != nil {
+		if err := w.visit(prefix, ea.Name); err != nil {
 			return err
 		}
 		eb, both := byName[ea.Name]
@@ -210,7 +234,7 @@ func (w *ciConfigWalk) diff(a, b plumbing.Hash, prefix string, depth int) error 
 			}
 			continue
 		}
-		if err := w.visit(); err != nil {
+		if err := w.visit(prefix, ea.Name); err != nil {
 			return err
 		}
 		if err := w.pair(ea, eb, prefix, depth); err != nil {
@@ -221,7 +245,7 @@ func (w *ciConfigWalk) diff(a, b plumbing.Hash, prefix string, depth int) error 
 		if _, dup := inA[eb.Name]; dup {
 			continue
 		}
-		if err := w.visit(); err != nil {
+		if err := w.visit(prefix, eb.Name); err != nil {
 			return err
 		}
 		if err := w.whole(eb, prefix, depth); err != nil {
@@ -239,6 +263,11 @@ func (w *ciConfigWalk) pair(ea, eb object.TreeEntry, prefix string, depth int) e
 	path := prefix + ea.Name
 	switch {
 	case isDirEntry(ea) && isDirEntry(eb):
+		// The worker's pack omits trees reachable from its trusted floor; the run did not write
+		// a candidate subtree the store lacks. See ciConfigGuard.
+		if _, err := w.s.EncodedObject(plumbing.TreeObject, ea.Hash); errors.Is(err, plumbing.ErrObjectNotFound) {
+			return nil
+		}
 		return w.diff(ea.Hash, eb.Hash, path+"/", depth+1)
 	case isDirEntry(ea) != isDirEntry(eb):
 		// A file replaced a directory or the reverse: the file path differs on its own and
@@ -266,7 +295,7 @@ func (w *ciConfigWalk) whole(e object.TreeEntry, prefix string, depth int) error
 		return err
 	}
 	for _, c := range t.Entries {
-		if err := w.visit(); err != nil {
+		if err := w.visit(path+"/", c.Name); err != nil {
 			return err
 		}
 		if err := w.whole(c, path+"/", depth+1); err != nil {

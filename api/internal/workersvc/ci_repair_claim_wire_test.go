@@ -36,7 +36,7 @@ func ciRepairClaimPayload(t *testing.T, guarded bool) ClaimPayload {
 	}
 	if guarded {
 		run.CiConfigGuard = true
-		run.CiConfigPaths = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**"}
+		run.CiConfigPaths = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**", ".gitea/workflows/**"}
 	}
 	fs := &fakeStore{
 		claimRun:           run,
@@ -59,7 +59,7 @@ func ciRepairClaimPayload(t *testing.T, guarded bool) ClaimPayload {
 // TestCIRepairClaimWireContract pins the guarded-prompt claim shape against the golden.
 func TestCIRepairClaimWireContract(t *testing.T) {
 	payload := ciRepairClaimPayload(t, true)
-	if !payload.Config.CIConfigGuard || len(payload.Config.CIConfigPaths) != 5 {
+	if !payload.Config.CIConfigGuard || len(payload.Config.CIConfigPaths) != len(CIRepairConfigFloor) {
 		t.Fatalf("a guarded run must carry the guard flag and the floor paths, got guard=%v paths=%v", payload.Config.CIConfigGuard, payload.Config.CIConfigPaths)
 	}
 	got, err := json.MarshalIndent(payload, "", "  ")

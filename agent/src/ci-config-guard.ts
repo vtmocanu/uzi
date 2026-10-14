@@ -24,9 +24,13 @@ export const DEFAULT_CI_CONFIG_PATHS = [
 ];
 
 // DEFAULT_CI_REPAIR_CONFIG_PATHS is the worker-side floor for a GUARDED run (a default-branch
-// CI repair run, claim.config.ci_config_guard): the ci_fix floor plus the Forgejo workflow
-// directory. Guarded runs always union it with claim.config.ci_config_paths.
-export const DEFAULT_CI_REPAIR_CONFIG_PATHS = [...DEFAULT_CI_CONFIG_PATHS, ".forgejo/workflows/**"];
+// CI repair run, claim.config.ci_config_guard): the ci_fix floor plus the Forgejo/Gitea workflow
+// directories. Guarded runs always union it with claim.config.ci_config_paths.
+export const DEFAULT_CI_REPAIR_CONFIG_PATHS = [
+  ...DEFAULT_CI_CONFIG_PATHS,
+  ".forgejo/workflows/**",
+  ".gitea/workflows/**",
+];
 
 // ciConfigPathToRegex converts one server-supplied CI-config path/glob to an
 // anchored, dotfile-safe RegExp. Supports: `**` (any path segments, incl. none),

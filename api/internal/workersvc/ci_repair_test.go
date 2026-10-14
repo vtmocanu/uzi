@@ -151,7 +151,7 @@ func TestCIWatchFingerprintCoversEveryField(t *testing.T) {
 	if CIWatchFingerprint(base, branch, "other body") == want {
 		t.Error("changing the resolved body did not change the fingerprint")
 	}
-	if !reflect.DeepEqual(CIRepairConfigFloor, []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**"}) {
+	if !reflect.DeepEqual(CIRepairConfigFloor, []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**", ".gitea/workflows/**"}) {
 		t.Fatalf("repair floor = %v", CIRepairConfigFloor)
 	}
 }

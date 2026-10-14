@@ -97,6 +97,7 @@ function assertRefused(runId: string, label: string, expectInReason: RegExp): St
 describe("CI-config guard: early check (a human approval does not exempt it)", () => {
   const cases: Array<[string, string[], Step[], RegExp]> = [
     ["a floor path outside the claim paths", [], [{ write: ".forgejo/workflows/x.yml" }], /forgejo\/workflows\/x\.yml/],
+    ["a gitea floor path outside the claim paths", [], [{ write: ".gitea/workflows/evil.yml" }], /gitea\/workflows\/evil\.yml/],
     ["a path only the claim lists", [], [{ write: "deploy/ci.yml" }], /deploy\/ci\.yml/],
     ["a deleted protected file", [".github/workflows/ci.yml"], [{ remove: ".github/workflows/ci.yml" }], /workflows\/ci\.yml/],
     ["a rename OUT of a protected directory", [".github/workflows/a.yml"], [{ move: [".github/workflows/a.yml", "moved.yml"] }], /workflows\/a\.yml/],

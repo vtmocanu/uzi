@@ -19,7 +19,7 @@ import (
 )
 
 // floorGlobs mirrors the repair floor the guarded runs carry (see the parity fixture).
-var floorGlobs = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**"}
+var floorGlobs = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**", ".gitea/workflows/**"}
 
 // blobHash fabricates a blob id for content without storing the blob: the guard compares ids and
 // never reads blobs.
@@ -373,4 +373,70 @@ func TestCIConfigGlobParityFixture(t *testing.T) {
 			t.Errorf("changeSet %q: flagged %q, want %q", c.Name, flagged, c.Flagged)
 		}
 	}
+}
+
+func TestCIConfigTreeGuardByteCaps(t *testing.T) {
+	protected := []string{"**/ci.yml"}
+
+	t.Run("oversized entry name is refused", func(t *testing.T) {
+		b := newTB(t)
+		long := strings.Repeat("n", ciConfigMaxPathBytes+1)
+		cand := b.tree(file(long, "1"), file("z", "1"))
+		def := b.tree(file("z", "2"))
+		start := time.Now()
+		err := guard(t, b, cand, def, protected...)
+		if !errors.Is(err, ErrCIConfigGuard) || !strings.Contains(err.Error(), "longer than") {
+			t.Fatalf("err = %v, want path-length refusal", err)
+		}
+		if d := time.Since(start); d > 5*time.Second {
+			t.Fatalf("refusal took %v", d)
+		}
+	})
+
+	t.Run("oversized default-side name is refused", func(t *testing.T) {
+		b := newTB(t)
+		long := strings.Repeat("n", ciConfigMaxPathBytes+1)
+		cand := b.tree(file("z", "1"))
+		def := b.tree(file(long, "1"), file("z", "2"))
+		if err := guard(t, b, cand, def, protected...); !errors.Is(err, ErrCIConfigGuard) {
+			t.Fatalf("err = %v, want ErrCIConfigGuard", err)
+		}
+	})
+
+	t.Run("joined path over the cap is refused", func(t *testing.T) {
+		b := newTB(t)
+		half := strings.Repeat("d", ciConfigMaxPathBytes/2+10)
+		inner := func(c string) plumbing.Hash { return b.tree(file(half, c)) }
+		mid := func(c string) plumbing.Hash {
+			return b.tree(object.TreeEntry{Name: half, Mode: filemode.Dir, Hash: inner(c)})
+		}
+		cand := b.tree(object.TreeEntry{Name: "top", Mode: filemode.Dir, Hash: mid("1")})
+		def := b.tree(object.TreeEntry{Name: "top", Mode: filemode.Dir, Hash: mid("2")})
+		if err := guard(t, b, cand, def, protected...); !errors.Is(err, ErrCIConfigGuard) {
+			t.Fatalf("err = %v, want ErrCIConfigGuard", err)
+		}
+	})
+
+	t.Run("total path bytes over the cap are refused", func(t *testing.T) {
+		b := newTB(t)
+		cand := b.tree(append(filesTree(b, 50, "x"), file("z", "1"))...)
+		def := b.tree(append(filesTree(b, 50, "x"), file("z", "2"))...)
+		m, _, _ := newCIConfigMatcher(protected)
+		w := &ciConfigWalk{ctx: context.Background(), s: b.s, match: m, limit: ciConfigWalkCap, maxBytes: 100}
+		if err := w.diff(cand, def, "", 0); !errors.Is(err, ErrCIConfigGuard) || !strings.Contains(err.Error(), "path bytes") {
+			t.Fatalf("err = %v, want total-bytes refusal", err)
+		}
+	})
+
+	t.Run("cancelled context is refused on a tiny tree", func(t *testing.T) {
+		b := newTB(t)
+		cand := b.tree(file("a", "1"))
+		def := b.tree(file("a", "2"))
+		m, _, _ := newCIConfigMatcher(protected)
+		ctx, cancel := context.WithCancel(context.Background())
+		cancel()
+		if err := ciConfigTreeGuard(ctx, b.s, cand, def, m, ciConfigWalkCap); !errors.Is(err, ErrCIConfigGuard) {
+			t.Fatalf("err = %v, want ErrCIConfigGuard", err)
+		}
+	})
 }

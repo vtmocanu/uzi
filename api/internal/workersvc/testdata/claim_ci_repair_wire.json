@@ -79,7 +79,8 @@
       ".gitlab/**",
       "**/*.gitlab-ci.yml",
       ".github/workflows/**",
-      ".forgejo/workflows/**"
+      ".forgejo/workflows/**",
+      ".gitea/workflows/**"
     ],
     "ci_config_guard": true
   },

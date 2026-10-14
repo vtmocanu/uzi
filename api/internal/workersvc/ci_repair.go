@@ -73,6 +73,7 @@ var CIRepairConfigFloor = []string{
 	"**/*.gitlab-ci.yml",
 	".github/workflows/**",
 	".forgejo/workflows/**",
+	".gitea/workflows/**",
 }
 
 // CIObservation is the identity of one workflow execution as a fire saw it.

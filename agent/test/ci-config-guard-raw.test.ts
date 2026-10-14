@@ -39,8 +39,13 @@ describe("guarded CI-config matcher: shared parity fixture", () => {
 
 describe("guarded CI-config matcher: contract", () => {
   test("the repair floor is the ci_fix floor plus the forgejo workflow directory", () => {
-    assert.deepEqual(DEFAULT_CI_REPAIR_CONFIG_PATHS, [...DEFAULT_CI_CONFIG_PATHS, ".forgejo/workflows/**"]);
+    assert.deepEqual(DEFAULT_CI_REPAIR_CONFIG_PATHS, [
+      ...DEFAULT_CI_CONFIG_PATHS,
+      ".forgejo/workflows/**",
+      ".gitea/workflows/**",
+    ]);
     assert.ok(!DEFAULT_CI_CONFIG_PATHS.includes(".forgejo/workflows/**"), "the ci_fix floor is unchanged");
+    assert.ok(!DEFAULT_CI_CONFIG_PATHS.includes(".gitea/workflows/**"), "the ci_fix floor is unchanged");
   });
 
   test("the guarded regex is anchored without the multiline flag", () => {

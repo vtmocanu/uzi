@@ -16,7 +16,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".gitlab-ci.yml",
    "match": true
@@ -28,7 +29,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "sub/.gitlab-ci.yml",
    "match": true
@@ -40,7 +42,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "a.gitlab-ci.yml",
    "match": true
@@ -52,7 +55,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "x/y/a.gitlab-ci.yml",
    "match": true
@@ -64,7 +68,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".gitlab/ci/a.yml",
    "match": true
@@ -76,7 +81,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/ci.yml",
    "match": true
@@ -88,7 +94,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/nested/deep/ci.yml",
    "match": true
@@ -100,7 +107,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/",
    "match": true
@@ -112,10 +120,37 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".forgejo/workflows/x.yml",
    "match": true
+  },
+  {
+   "name": "floor: gitea workflow",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
+   ],
+   "path": ".gitea/workflows/evil.yml",
+   "match": true
+  },
+  {
+   "name": "floor: gitea workflows lookalike dir",
+   "globs": [
+    ".gitlab-ci.yml",
+    ".gitlab/**",
+    "**/*.gitlab-ci.yml",
+    ".github/workflows/**",
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
+   ],
+   "path": ".gitea/workflowsx/a.yml",
+   "match": false
   },
   {
    "name": "floor: workflows dir without trailing slash",
@@ -124,7 +159,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows",
    "match": false
@@ -136,7 +172,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflowsx/a.yml",
    "match": false
@@ -148,7 +185,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "docs/.github/workflows/a.yml",
    "match": false
@@ -160,7 +198,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "src/main.go",
    "match": false
@@ -172,7 +211,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".GITHUB/workflows/a.yml",
    "match": false
@@ -184,7 +224,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": " .github/workflows/a.yml",
    "match": false
@@ -196,7 +237,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a.yml ",
    "match": true
@@ -208,7 +250,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a\n.yml",
    "match": true
@@ -220,7 +263,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a.yml\n",
    "match": true
@@ -232,7 +276,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "\n.github/workflows/a.yml",
    "match": false
@@ -244,7 +289,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/work\nflows/x",
    "match": false
@@ -264,7 +310,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a\t.yml",
    "match": true
@@ -276,7 +323,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a\u0001b\u007fc.yml",
    "match": true
@@ -288,7 +336,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a\r.yml",
    "match": true
@@ -300,7 +349,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/a\u2028.yml",
    "match": true
@@ -312,7 +362,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "caf\u00e9/.gitlab-ci.yml",
    "match": true
@@ -324,7 +375,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": "cafe\u0301/.gitlab-ci.yml",
    "match": true
@@ -352,7 +404,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "path": ".github/workflows/\ud83d\ude00.yml",
    "match": true
@@ -663,7 +716,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     ".github/workflows/a.yml",
@@ -680,7 +734,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     ".github/workflows/ci.yml"
@@ -696,7 +751,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     "b/.gitlab-ci.yml",
@@ -716,7 +772,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     "",
@@ -733,7 +790,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     " .github/workflows/a.yml",
@@ -750,7 +808,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     ".github/workflows/a\n.yml",
@@ -767,7 +826,8 @@
     ".gitlab/**",
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
-    ".forgejo/workflows/**"
+    ".forgejo/workflows/**",
+    ".gitea/workflows/**"
    ],
    "changed": [
     "src/a.go",
@@ -783,6 +843,7 @@
     "**/*.gitlab-ci.yml",
     ".github/workflows/**",
     ".forgejo/workflows/**",
+    ".gitea/workflows/**",
     "deploy/ci.yml"
    ],
    "changed": [
