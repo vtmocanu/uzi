@@ -29,6 +29,9 @@ through `[0.52.0]`.)
 
 ### Fixed
 
+- **GitHub pipeline discovery prefers the newest Actions suite.**
+  When workflow discovery falls back to checks, a newer Actions suite now takes priority over an older suite already represented by check runs. If the preferred suite returns no workflow, discovery still recovers the older native workflow before synthesizing a status, preserving job and log access.
+
 - `uzi admin runs` help now says it lists the newest 500 active runs.
 
 - **Idle cross-check counts no longer crowd TUI board and split titles ([#2894](https://github.com/vtmocanu/uzi/issues/2894)).**
