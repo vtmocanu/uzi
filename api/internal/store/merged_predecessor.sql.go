@@ -48,6 +48,76 @@ func (q *Queries) DiscardMergedPredecessorHold(ctx context.Context, arg DiscardM
 	return result.RowsAffected(), nil
 }
 
+const listMergedPredecessorCandidates = `-- name: ListMergedPredecessorCandidates :many
+SELECT r.id AS run_id, r.user_id AS owner_id, p.id AS repo_id,
+    p.connection_id, p.forge_project_id AS project_id, r.mr_iid::bigint AS mr_iid,
+    r.claim_generation AS completed_generation, c.forge_type, c.base_url,
+    c.token_ciphertext
+FROM runs r
+JOIN repos p ON p.id = r.repo_id
+JOIN forge_connections c ON c.id = p.connection_id AND c.user_id = r.user_id
+WHERE p.id = $1 AND p.enabled
+    AND r.status = 'completed' AND r.mr_iid > 0 AND r.claim_generation > 0
+    AND r.id > $2
+    AND EXISTS (
+        SELECT 1 FROM recovery_custody_holds h
+        WHERE h.run_id = r.id AND h.user_id = r.user_id AND h.repo_id = p.id
+            AND h.state = 'open' AND h.generation < r.claim_generation
+    )
+ORDER BY r.id LIMIT 1
+`
+
+type ListMergedPredecessorCandidatesParams struct {
+	RepoID     uuid.UUID `json:"repo_id"`
+	AfterRunID uuid.UUID `json:"after_run_id"`
+}
+
+type ListMergedPredecessorCandidatesRow struct {
+	RunID               uuid.UUID `json:"run_id"`
+	OwnerID             uuid.UUID `json:"owner_id"`
+	RepoID              uuid.UUID `json:"repo_id"`
+	ConnectionID        uuid.UUID `json:"connection_id"`
+	ProjectID           int64     `json:"project_id"`
+	MrIid               int64     `json:"mr_iid"`
+	CompletedGeneration int64     `json:"completed_generation"`
+	ForgeType           string    `json:"forge_type"`
+	BaseUrl             string    `json:"base_url"`
+	TokenCiphertext     []byte    `json:"token_ciphertext"`
+}
+
+// OPEN exact-identity predecessor holds are the durable workset, including
+// historical merged caches and issue-less runs. One row per repository visit.
+func (q *Queries) ListMergedPredecessorCandidates(ctx context.Context, arg ListMergedPredecessorCandidatesParams) ([]ListMergedPredecessorCandidatesRow, error) {
+	rows, err := q.db.Query(ctx, listMergedPredecessorCandidates, arg.RepoID, arg.AfterRunID)
+	if err != nil {
+		return nil, err
+	}
+	defer rows.Close()
+	items := []ListMergedPredecessorCandidatesRow{}
+	for rows.Next() {
+		var i ListMergedPredecessorCandidatesRow
+		if err := rows.Scan(
+			&i.RunID,
+			&i.OwnerID,
+			&i.RepoID,
+			&i.ConnectionID,
+			&i.ProjectID,
+			&i.MrIid,
+			&i.CompletedGeneration,
+			&i.ForgeType,
+			&i.BaseUrl,
+			&i.TokenCiphertext,
+		); err != nil {
+			return nil, err
+		}
+		items = append(items, i)
+	}
+	if err := rows.Err(); err != nil {
+		return nil, err
+	}
+	return items, nil
+}
+
 const lockMergedPredecessorBinding = `-- name: LockMergedPredecessorBinding :one
 SELECT p.id AS repo_id, p.connection_id, p.forge_project_id AS project_id,
     c.user_id AS owner_id, c.forge_type, c.base_url

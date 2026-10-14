@@ -510,12 +510,15 @@ func (h *Handler) budget() *forgeBudget {
 // recovery returns the durable-recovery archive service (PRD #1296 M2), lazily built from
 // h.q (the M1 recovery.sql store), h.pool (streaming + bounded upload transactions), h.box
 // (chunk encryption) and the cfg limits. Constructed under recoveryOnce so a struct-literal
-// test handler is race-safe; this accessor is the ONLY production construction site (New does
-// not set recoverySvc). Mirrors budget().
+// test handler is race-safe. RecoveryService shares this instance with the poller.
+// Mirrors budget().
 //
 // PRD #1810 D3: when the worker service is wired, the service's custody-settlement hook is
 // workersvc.SettleRetainedCheckpoint, so a release or discard through this service triggers
 // the run's retained-checkpoint delete check after its transaction commits.
+// RecoveryService initializes the shared recovery service before background polling starts.
+func (h *Handler) RecoveryService() *recovery.Service { return h.recovery() }
+
 func (h *Handler) recovery() *recovery.Service {
 	h.recoveryOnce.Do(func() {
 		if h.recoverySvc == nil {
@@ -1173,8 +1176,9 @@ func (h *Handler) WorkerRoutes(proposalLimiter *mw.Limiter) http.Handler {
 // token (sha256 lookup), not a session cookie. No CSRF step — the credential is a
 // held bearer secret, not an ambient cookie.
 func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
-	// Read once by recovery() when it builds the recovery service, after routes are mounted.
 	h.heldListLimiter = proposalLimiter
+	// RecoveryService may already have initialized the shared instance for polling.
+	h.recovery().SetHeldListAllow(heldListAllowFor(proposalLimiter))
 	r.Route("/worker", func(r chi.Router) {
 		r.Use(mw.RequireWorker(h.q))
 		// PRD #1906 M5 (D-D): an isolated-lane worker reaches only the lifecycle routes its

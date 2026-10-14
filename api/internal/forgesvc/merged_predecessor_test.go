@@ -1,0 +1,326 @@
+package forgesvc
+
+import (
+	"context"
+	"errors"
+	"fmt"
+	"slices"
+	"sync"
+	"testing"
+	"time"
+
+	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/forge"
+	"github.com/vtmocanu/uzi/api/internal/forge/forgetest"
+	"github.com/vtmocanu/uzi/api/internal/recovery"
+	"github.com/vtmocanu/uzi/api/internal/secretbox"
+	"github.com/vtmocanu/uzi/api/internal/store"
+)
+
+type mergeCandidates struct {
+	rows           map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow
+	fail           map[uuid.UUID]bool
+	visits         []store.ListMergedPredecessorCandidatesParams
+	afterEnumerate func()
+}
+
+func (q *mergeCandidates) ListMergedPredecessorCandidates(ctx context.Context, p store.ListMergedPredecessorCandidatesParams) ([]store.ListMergedPredecessorCandidatesRow, error) {
+	q.visits = append(q.visits, p)
+	if q.afterEnumerate != nil {
+		q.afterEnumerate()
+	}
+	if q.fail[p.RepoID] {
+		return nil, errors.New("enumeration")
+	}
+	for _, row := range q.rows[p.RepoID] {
+		if slices.Compare(row.RunID[:], p.AfterRunID[:]) > 0 {
+			return []store.ListMergedPredecessorCandidatesRow{row}, nil
+		}
+	}
+	return nil, nil
+}
+
+type mergeSink struct {
+	calls int
+	err   error
+}
+
+func (r *mergeSink) DiscardMergedPredecessorHolds(context.Context, recovery.VerifiedMergeSnapshot) (int64, error) {
+	r.calls++
+	return 1, r.err
+}
+
+type mergeForge struct {
+	forgetest.BaseFake
+	read func(context.Context, int64, int64) (forge.MergeRequest, error)
+}
+
+func (f *mergeForge) GetMergeRequest(ctx context.Context, project, iid int64) (forge.MergeRequest, error) {
+	return f.read(ctx, project, iid)
+}
+func mergeID(n int) uuid.UUID { return uuid.MustParse(fmt.Sprintf("00000000-0000-0000-0000-%012d", n)) }
+func mergeTestService(t *testing.T, f forge.Forge) (*Service, []byte) {
+	t.Helper()
+	box, err := secretbox.New([]byte("0123456789abcdefghijklmnopqrstuv"))
+	if err != nil {
+		t.Fatal(err)
+	}
+	s := NewWithForgeBuilder(nil, box, time.Second, nil, func(forge.Type, string, string, time.Duration) (forge.Forge, error) { return f, nil })
+	token, err := s.EncryptToken("fixture")
+	if err != nil {
+		t.Fatal(err)
+	}
+	return s, token
+}
+func mergeRow(repo uuid.UUID, n int, token []byte) store.ListMergedPredecessorCandidatesRow {
+	return store.ListMergedPredecessorCandidatesRow{RunID: mergeID(n), OwnerID: mergeID(9000), RepoID: repo, ConnectionID: mergeID(9001), ProjectID: 42, MrIid: int64(n), CompletedGeneration: 2, ForgeType: "gitlab", BaseUrl: "https://forge.test", TokenCiphertext: token}
+}
+
+func TestMergedPredecessorFairnessAndRestart(t *testing.T) {
+	var reads []int64
+	f := &mergeForge{read: func(ctx context.Context, p, i int64) (forge.MergeRequest, error) {
+		if p != 42 {
+			t.Errorf("project=%d", p)
+		}
+		deadline, ok := ctx.Deadline()
+		if !ok || time.Until(deadline) > 5*time.Second {
+			t.Error("observation budget")
+		}
+		reads = append(reads, i)
+		return forge.MergeRequest{IID: i, State: forge.MRStateOpened}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	a, b := mergeID(1), mergeID(2)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{}}
+	for n := 101; n <= 250; n++ {
+		q.rows[a] = append(q.rows[a], mergeRow(a, n, token))
+		q.rows[b] = append(q.rows[b], mergeRow(b, n+1000, token))
+	}
+	s.SetMergedPredecessorRecovery(q, &mergeSink{})
+	// Concurrent callers serialize the phase and cursor updates.
+	var wg sync.WaitGroup
+	for i := 0; i < 3; i++ {
+		wg.Add(1)
+		go func() { defer wg.Done(); s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{b, a}) }()
+	}
+	wg.Wait()
+	if len(reads) != 300 {
+		t.Fatalf("reads=%d", len(reads))
+	}
+	for i := 0; i < 300; i += 2 {
+		if reads[i] != int64(101+i/2) || reads[i+1] != int64(1101+i/2) {
+			t.Fatalf("fair sequence at %d: %v", i, reads[i:i+2])
+		}
+	}
+	// Exhausted cursors wrap for a later phase, with no duplicates in that phase.
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a, b})
+	if len(reads) != 300 {
+		t.Fatal("exhaustion repeated a candidate")
+	}
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a, b})
+	if len(reads) != 400 || reads[300] != 101 {
+		t.Fatal("wrapped cursor did not retry refusals")
+	}
+	restarted, _ := mergeTestService(t, f)
+	restarted.SetMergedPredecessorRecovery(q, &mergeSink{})
+	restarted.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{a})
+	if reads[400] != 101 {
+		t.Fatal("restart lost durable OPEN workset")
+	}
+}
+
+func TestMergedPredecessorRefusals(t *testing.T) {
+	for _, kind := range []string{"", "unknown", "opened", "closed", "locked", "wrong_iid", "unreadable", "bad_token", "discard_error", "merged"} {
+		t.Run(kind, func(t *testing.T) {
+			f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				if kind == "unreadable" {
+					return forge.MergeRequest{}, errors.New("secret must not be logged")
+				}
+				if kind == "wrong_iid" {
+					return forge.MergeRequest{IID: iid + 1, State: forge.MRStateMerged}, nil
+				}
+				state := kind
+				if kind == "bad_token" || kind == "discard_error" {
+					state = forge.MRStateMerged
+				}
+				return forge.MergeRequest{IID: iid, State: state}, nil
+			}}
+			s, token := mergeTestService(t, f)
+			if kind == "bad_token" {
+				token = []byte("invalid")
+			}
+			repo := mergeID(1)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {mergeRow(repo, 100, token)}}}
+			sink := &mergeSink{}
+			if kind == "discard_error" {
+				sink.err = errors.New("binding changed")
+			}
+			s.SetMergedPredecessorRecovery(q, sink)
+			s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+			want := 0
+			if kind == "merged" || kind == "discard_error" {
+				want = 1
+			}
+			if sink.calls != want {
+				t.Fatalf("discard calls=%d want=%d", sink.calls, want)
+			}
+			if s.merged.cursors[repo] != uuid.Nil {
+				t.Fatal("exhausted cursor should wrap")
+			}
+		})
+	}
+}
+
+func TestMergedPredecessorVisitsCancellationAndPruning(t *testing.T) {
+	ctx, cancel := context.WithCancel(context.Background())
+	reads := 0
+	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		cancel()
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	var repos []uuid.UUID
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{}, fail: map[uuid.UUID]bool{}}
+	for n := 1; n <= 120; n++ {
+		repo := mergeID(n)
+		repos = append(repos, repo)
+		q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{mergeRow(repo, n+200, token)}
+		q.fail[repo] = true
+	}
+	sink := &mergeSink{}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), repos)
+	if len(q.visits) != 100 || s.merged.nextRepo != mergeID(101) {
+		t.Fatal("repository visit budget/position")
+	}
+	q.fail = map[uuid.UUID]bool{}
+	s.ReconcileMergedPredecessors(ctx, repos)
+	if reads != 1 || sink.calls != 0 || s.merged.nextRepo != mergeID(102) {
+		t.Fatal("cancellation did not preserve next repository")
+	}
+	if s.merged.cursors[mergeID(101)] != mergeID(301) {
+		t.Fatal("attempted cursor not saved")
+	}
+	s.ReconcileMergedPredecessors(context.Background(), nil)
+	if len(s.merged.cursors) != 0 || s.merged.nextRepo != uuid.Nil {
+		t.Fatal("disabled repositories not pruned")
+	}
+}
+
+func TestMergedPredecessorIndependentDeadlines(t *testing.T) {
+	for _, phase := range []bool{true, false} {
+		t.Run(fmt.Sprintf("phase_%v", phase), func(t *testing.T) {
+			parent := context.Background()
+			reads := 0
+			f := &mergeForge{read: func(ctx context.Context, _, iid int64) (forge.MergeRequest, error) {
+				reads++
+				if !errors.Is(ctx.Err(), context.DeadlineExceeded) {
+					t.Fatal("observation child not exhausted")
+				}
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}}
+			s, token := mergeTestService(t, f)
+			repo := mergeID(1)
+			q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {mergeRow(repo, 100, token)}}}
+			sink := &mergeSink{}
+			s.SetMergedPredecessorRecovery(q, sink)
+			var budgets []time.Duration
+			s.merged.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+				budgets = append(budgets, d)
+				if (phase && d == 30*time.Second) || (!phase && d == 5*time.Second) {
+					return context.WithDeadline(ctx, time.Now().Add(-time.Hour))
+				}
+				return context.WithTimeout(ctx, d)
+			}
+			s.ReconcileMergedPredecessors(parent, []uuid.UUID{repo})
+			if parent.Err() != nil || sink.calls != 0 {
+				t.Fatal("deadline escaped child or accepted late merged response")
+			}
+			wantReads := 1
+			wantBudgets := []time.Duration{30 * time.Second, 5 * time.Second}
+			if phase {
+				wantReads = 0
+				wantBudgets = wantBudgets[:1]
+			}
+			if reads != wantReads || !slices.Equal(budgets, wantBudgets) {
+				t.Fatalf("reads=%d budgets=%v", reads, budgets)
+			}
+			s.merged.withTimeout = nil
+			f.read = func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}
+			// The exhausted phase did not consume work; late observation wraps for retry.
+			if !phase {
+				s.ReconcileMergedPredecessors(parent, []uuid.UUID{repo})
+			}
+			s.ReconcileMergedPredecessors(parent, []uuid.UUID{repo})
+			if sink.calls == 0 {
+				t.Fatal("deadline refusal lost retry")
+			}
+		})
+	}
+}
+
+type mergeDeadlineContext struct{ context.Context }
+
+func TestMergedPredecessorEnumerationExpiresWithoutConsumingCandidate(t *testing.T) {
+	reads := 0
+	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	repo := mergeID(1)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {mergeRow(repo, 100, token)}}}
+	sink := &mergeSink{}
+	s.SetMergedPredecessorRecovery(q, sink)
+	var phase *mergeDeadlineContext
+	s.merged.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+		if d != 30*time.Second {
+			t.Fatalf("phase budget=%v", d)
+		}
+		phase = &mergeDeadlineContext{Context: ctx}
+		return phase, func() {}
+	}
+	q.afterEnumerate = func() {
+		expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+		t.Cleanup(stop)
+		phase.Context = expired
+		if !errors.Is(phase.Err(), context.DeadlineExceeded) {
+			t.Fatal("phase did not expire during enumeration")
+		}
+	}
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	if reads != 0 || sink.calls != 0 {
+		t.Fatal("enumeration returned after cancellation was consumed")
+	}
+	q.afterEnumerate = nil
+	s.merged.withTimeout = nil
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
+	if reads != 1 || sink.calls != 1 {
+		t.Fatalf("candidate skipped after expired enumeration: reads=%d discards=%d", reads, sink.calls)
+	}
+}
+
+func TestMergedPredecessorEnumerationRetryAndEmptyRepo(t *testing.T) {
+	reads := 0
+	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+		reads++
+		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+	}}
+	s, token := mergeTestService(t, f)
+	repo, empty := mergeID(1), mergeID(2)
+	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {mergeRow(repo, 100, token)}}, fail: map[uuid.UUID]bool{repo: true}}
+	sink := &mergeSink{}
+	s.SetMergedPredecessorRecovery(q, sink)
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo, empty})
+	if reads != 0 || sink.calls != 0 {
+		t.Fatal("failed or empty enumeration contacted forge")
+	}
+	q.fail[repo] = false
+	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo, empty})
+	if reads != 1 || sink.calls != 1 {
+		t.Fatal("enumeration failure lost candidate")
+	}
+}
