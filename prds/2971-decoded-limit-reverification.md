@@ -153,13 +153,23 @@ reader/writer and downgrade audit. Audit at `94594b12` (researcher, 2026-10-14):
 - **B1 — closed progress key set, and downgrade.** `agent/src/recovery-progress.ts`
   `recoveryProgress` rejects any key not in
   `keys(o, ["version", "source", "attempts", "startedAt", "deadline", "claimGeneration", "backoffMs", "stage", "restoreTip", "successor", "blocker"])`.
-  A current worker would need an allowlist entry. Every released worker, including
-  the chart's pinned worker image, rejects the new key instead of dropping it, and
-  fails closed at each journal reader below. Those readers are
-  `readRecoveryCapture` (seed paths and `terminalRetainedSnapshot`),
-  `journaledClonePaths` (canonical reuse and sweeps for the whole bare), and ACK
-  retirement in `readAcknowledgedReportSourcesUnderLock`. Operator inspect in
-  `gatherRetainedUnderLock` degrades to `unreadable_journal`. ADR-1197 already calls
+  A current worker would need an allowlist entry. Every worker from
+  `v0.86.0-rc.8` on (when `recovery-progress.ts` first shipped), including the
+  chart's pinned `0.86.0-rc.15` image, rejects the new key and fails closed. Older
+  workers (for example `v0.85.2`, `v0.86.0-rc.7`) ignore `recovery` and may rewrite
+  or blank the journal, dropping it. Fail-closed parse sites on an rc.8+ worker
+  include the following; this is a starting point, not exhaustive:
+  - `readRecoveryCapture` (seed paths and `terminalRetainedSnapshot`)
+  - `readRecoveryCaptureWithRaw`
+  - `journaledClonePaths` (canonical reuse and sweeps for the whole bare)
+  - `protectedRecoveries` and `detachTerminalRetained`
+  - `discardRetainedSource`, so a protected discard through the ops channel would
+    fail
+  - ACK retirement in `readAcknowledgedReportSourcesUnderLock`
+
+  Operator inspect in `gatherRetainedUnderLock` degrades to `unreadable_journal`.
+  The same rc.8–rc.14 fail-closed exposure already applies to base's
+  `claimGeneration` when downgrading from rc.15; this is pre-existing, from #2976. ADR-1197 already calls
   downgrade during pending recovery unsupported, but this adds a new failure on a
   terminal blocked journal.
 - **B2 — backup validator.** In `.agents/skills/uzi-watcher/scripts/backup-runs.sh`,
@@ -195,8 +205,9 @@ reader/writer and downgrade audit. Audit at `94594b12` (researcher, 2026-10-14):
 - The protected-descriptor `JSON.stringify` equality checks in
   `detachTerminalRetained` and `protectedRecoveries` compare parsed values with a
   stable key order.
-- The ops channel (`agent/src/ops/retained-source.mjs`, `retained-source-server.ts`)
-  never reads journal fields.
+- The ops channel files (`agent/src/ops/retained-source.mjs`,
+  `retained-source-server.ts`) never read journal fields themselves. Their inspect
+  and protected-discard operations do reach journal parsing in `git.ts` (B1).
 - No reader was found in `e2e/`, `scripts/`, `deploy/`, `.claude/` or `Taskfile.yml`.
 
 ### Server and web sweep (tracked, verified rather than assumed)
@@ -212,7 +223,9 @@ Each command was `git grep -n -F -- "<needle>" -- <dir>`:
 | `blocker` | 141 | 23 | 19 | tests, embedded docs, unrelated identifiers |
 
 A further grep for the other `RecoveryBlocker` names over non-test server code
-returned nothing. Conclusion: the server treats `failure_reason` as opaque text. The
+found only unrelated identifiers with the same names: the run hold reason
+`budget_exhausted` (270 lines) and `oversize`/“oversized” (91 lines). The other
+seven names returned nothing. The parser search was line-oriented. Conclusion: the server treats `failure_reason` as opaque text. The
 `blocker` hits were spot-checked, not read exhaustively.
 
 ### Proposed work, if the human chooses it later
@@ -238,9 +251,14 @@ returned nothing. Conclusion: the server treats `failure_reason` as opaque text.
    - an already-blocked journal never renews its recorded cap;
    - the older-format parser's rejection is pinned.
 
-Separate documentation inaccuracy found by the audit: ADR-1197, ADR-1783 and
-`docs/run-recovery.md` say older workers “may drop the durable recovery fields”, but
-older workers reject unknown keys and fail closed. Reported as an incidental issue.
+Separate documentation gap found by the audit:
+
+- ADR-1197 (“may drop the durable recovery fields”), ADR-1783, `docs/run-recovery.md`
+  and `docs/run-recovery-wait.md` describe the downgrade risk as dropping recovery
+  fields. That is accurate only for workers before `v0.86.0-rc.8`.
+- They omit that rc.8+ workers reject unknown keys and fail closed.
+- Reported as an incidental issue; the first report overstated it as “wrong” and was
+  corrected.
 
 Recorded decisions read at `specs/human.md:877,886,1004,1303` retain custody,
 require exact disposal authority and qualify checkpoint coverage. No conflict
