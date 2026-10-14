@@ -1130,7 +1130,9 @@ The worker refuses at four points:
 It **fails closed**: if the diff can't be computed, it refuses. It matches the
 **raw git paths** (no trimming or normalising), lists both sides of a rename,
 and diffs against **every merge base** with the default branch, so a merge
-can't carry a protected file in through a second parent.
+can't carry a protected file in through a second parent. A path that matches the
+current default branch tip (for example a workflow copied in from the default
+branch when the branch is brought up to date) doesn't count as the run's change.
 
 The server repeats the check on checkpoint and held-work publications by
 comparing the candidate's tree with the fetched default branch tip, and
