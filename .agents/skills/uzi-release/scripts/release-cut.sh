@@ -163,7 +163,7 @@ prev_stable_below() {
 }
 # changelog_unreleased_body -> the body between `## [Unreleased]` and the next `## [`.
 changelog_unreleased_body() {
-  awk '/^## \[Unreleased\]/{f=1;next} f&&/^## \[/{exit} f{print}' CHANGELOG.md
+  printf '%s\n' "$PENDING_BODY"
 }
 # shipping_commits_since <ref> -> one SHA per first-parent commit in <ref>..HEAD that touched
 # a SHIPPING path (is_shipping, shared with the oracle). This is what promote-only keys on:
@@ -236,6 +236,26 @@ fi
 if [ -n "$PREV_OVERRIDE" ] && ! git rev-parse -q --verify "refs/tags/$PREV_OVERRIDE" >/dev/null; then
   echo "release-cut: --prev-tag '$PREV_OVERRIDE' does not exist" >&2; exit 3
 fi
+# Validate and capture the complete pending inventory before any release mutation.
+# Clean tracked inputs plus an exact HEAD mode check exclude local/untracked notes.
+STARTING_SHA="$(git rev-parse HEAD)" || exit 3
+FRAGMENT_CLI="$ROOT/scripts/changelog-fragments.sh"
+if ! FRAGMENT_LIST="$(bash "$FRAGMENT_CLI" list)"; then exit 3; fi
+INCORPORATED=()
+while IFS= read -r fragment; do
+  [ -n "$fragment" ] || continue
+  if [ "$(git ls-tree "$STARTING_SHA" -- "$fragment" | awk '{print $1}')" != 100644 ]; then
+    echo "release-cut: pending fragment must be committed as a regular non-executable file in HEAD: $fragment" >&2
+    exit 3
+  fi
+  INCORPORATED+=("$fragment")
+done <<< "$FRAGMENT_LIST"
+if [ -n "$CL_FILE" ] && [ "${#INCORPORATED[@]}" -gt 0 ]; then
+  echo "release-cut: --changelog-file is refused with pending fragments" >&2; exit 3
+fi
+if ! PENDING_BODY="$(bash "$FRAGMENT_CLI" render-unreleased CHANGELOG.md)"; then exit 3; fi
+OWNED_PATHS=(CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh "${INCORPORATED[@]}")
+
 # Best-effort tag refresh so discovery sees pushed tags; harmless (and skipped) with no
 # reachable origin, e.g. an offline fixture repo.
 git fetch --tags --quiet origin >/dev/null 2>&1 || true
@@ -708,10 +728,11 @@ verify_fail() {
   echo "release-cut: VERIFY FAILED — $1" >&2
   echo "  undoing the release commit (git reset --soft HEAD~1); your edits are kept staged." >&2
   git reset --soft HEAD~1
+  print_recovery verify-failure
   exit 1
 }
 commit_and_verify() { # $1 tag  $2 prev  $3 base
-  git commit -q -m "chore(release): $1" || { echo "release-cut: commit failed" >&2; exit 1; }
+  git commit -q -m "chore(release): $1" || { echo "release-cut: commit failed; preparation kept staged" >&2; print_recovery staged; exit 1; }
   if ! bash scripts/assert-changelog-covers-release.sh HEAD "$2" "$3"; then
     verify_fail "changelog coverage oracle rejected the release commit"
   fi
@@ -721,6 +742,19 @@ commit_and_verify() { # $1 tag  $2 prev  $3 base
 }
 
 echo "=== release-cut $TAG (op=$OP) on $DEFBRANCH ==="
+
+# Print before mutation: interruption cannot rely on a later error handler.
+print_recovery() {
+  echo "Recovery ($1): starting SHA $STARTING_SHA"
+  echo "  Inspect worktree/index: git status --short; git diff; git diff --cached"
+  echo "  Before commit, finish deliberate preparation and verify; or restore owned paths:"
+  printf '  git restore --source=%s --staged --worktree --' "$STARTING_SHA"
+  printf ' %q' "${OWNED_PATHS[@]}"; printf '\n'
+  echo "  After commit (possibly clean), inspect and verify; to undo deliberately first:"
+  echo "  git reset --soft $STARTING_SHA"
+  echo "  Then run the explicit restore above. Inspect/remove any leftover provisional stable tag deliberately after interruption."
+}
+print_recovery precommit
 
 # --- promote half (before touching main) --------------------------------------
 PROMOTED_TAG=""; PROMOTE_FINALIZED=0
@@ -825,6 +859,24 @@ if ! DEP_REFS="$(dependency_merge_refs "$PREV")"; then
 fi
 
 # --- CHANGELOG (main half) ----------------------------------------------------
+# Render to a separate file before replacing; fold guards then compare the assembled view.
+# The legacy next-RC fold already groups pending categories and reports collapses;
+# retain its unchanged-input refusal guards when there are no fragment inputs.
+if [ -z "$CL_FILE" ] && { [ "${#INCORPORATED[@]}" -gt 0 ] || [ "$OP" != nextrc ]; }; then
+  mkdir -p .uzi/scratch || exit 1
+  assembled="$(mktemp .uzi/scratch/release-notes.XXXXXX)" || exit 1
+  pending="$(mktemp .uzi/scratch/release-body.XXXXXX)" || { rm -f "$assembled"; exit 1; }
+  printf '%s\n' "$PENDING_BODY" > "$pending" || exit 1
+  if ! awk -v body="$pending" '
+    /^## \[Unreleased\]$/ { print; print ""; while ((getline line < body) > 0) print line; close(body); print ""; skip=1; next }
+    skip && /^## \[/ { skip=0 }
+    !skip { print }
+  ' CHANGELOG.md > "$assembled"; then
+    rm -f "$assembled" "$pending"; exit 1
+  fi
+  rm -f "$pending"
+  mv "$assembled" CHANGELOG.md || exit 1
+fi
 case "$OP" in
   rc1|stable)
     fold_or_insert "$BASE" ;;
@@ -863,7 +915,12 @@ bash scripts/changelog-section.sh check-rc-bullets "$TAG" || {
   exit 3
 }
 
-git add -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh 2>/dev/null || true
+# Only the captured HEAD inputs are consumed; subsequent RCs cannot replay them.
+for fragment in "${INCORPORATED[@]}"; do
+  rm -- "$fragment" || exit 1
+done
+git add -- "${OWNED_PATHS[@]}" || { echo "release-cut: staging failed" >&2; exit 1; }
+print_recovery staged
 
 if [ "$DO_COMMIT" -eq 0 ]; then
   echo
@@ -876,12 +933,13 @@ fi
 
 if [ -z "$PREV" ]; then
   # First release ever: the oracle self-skips with no previous tag. Commit without it.
-  git commit -q -m "chore(release): $TAG" || { echo "release-cut: commit failed" >&2; exit 1; }
+  git commit -q -m "chore(release): $TAG" || { echo "release-cut: commit failed; preparation kept staged" >&2; print_recovery staged; exit 1; }
   if ! bash scripts/changelog-links.sh --check; then verify_fail "changelog-links --check found stale links"; fi
 else
   commit_and_verify "$TAG" "$PREV" "$BASE"
 fi
 
+print_recovery aftercommit
 PROMOTE_FINALIZED=1   # the RC cut committed and verified; the promote tag (if any) stands
 echo
 echo "=== $TAG cut and verified on main (NOT pushed) ==="

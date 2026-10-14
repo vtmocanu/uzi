@@ -88,6 +88,10 @@ def metadata(parent, sha):
         for change in changes:
             header, path = change.split('\t')
             oldmode, newmode, _, _, status = header.split()
+            # Release note inputs only: consuming canonical regular fragments is metadata.
+            if (status == 'D' and oldmode[1:] == '100644' and newmode == '000000'
+                    and re.fullmatch(r'changelog\.d/[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}\.md', path)):
+                continue
             if status != 'M' or oldmode[1:] != newmode or newmode not in ('100644', '100755'):
                 return False
             if path == 'CHANGELOG.md':

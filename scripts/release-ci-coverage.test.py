@@ -148,6 +148,116 @@ class Metadata(RepoFixture, unittest.TestCase):
         self.assertFalse(policy.metadata(self.parent, self.parent))
 
 
+class FragmentMetadata(RepoFixture, unittest.TestCase):
+    canonical = 'changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md'
+
+    def test_classifier_matrix(self):
+        cases = [
+            (self.canonical, 'D', 0o644, True),
+            (self.canonical.replace('-8fab-', '-bfab-'), 'D', 0o644, True),
+            ('changelog.d/README.md', 'D', 0o644, False),
+            (self.canonical.upper(), 'D', 0o644, False),
+            ('changelog.d/' + Path(self.canonical).name.upper().replace('.MD', '.md'), 'D', 0o644, False),
+            (self.canonical.replace('-4cde-', '-3cde-'), 'D', 0o644, False),
+            (self.canonical.replace('-8fab-', '-7fab-'), 'D', 0o644, False),
+            (self.canonical + '.bak', 'D', 0o644, False),
+            (self.canonical.replace('01234567-', '0123456-'), 'D', 0o644, False),
+            (self.canonical.replace('01234567-', '012345678-'), 'D', 0o644, False),
+            (self.canonical.replace('01234567-', 'g1234567-'), 'D', 0o644, False),
+            (self.canonical.removesuffix('.md'), 'D', 0o644, False),
+            (self.canonical.replace('.md', '.txt'), 'D', 0o644, False),
+            (self.canonical.replace('changelog.d/', 'changelog.dx/'), 'D', 0o644, False),
+            (self.canonical.replace('changelog.d/', 'changelog.d/nested/'), 'D', 0o644, False),
+            ('nested/' + self.canonical, 'D', 0o644, False),
+            ('other.md', 'D', 0o644, False),
+            (self.canonical, 'D', 0o755, False),
+            (self.canonical, 'symlink', 0o644, False),
+            (self.canonical, 'A', 0o644, False),
+            (self.canonical, 'M', 0o644, False),
+            (self.canonical, 'rename', 0o644, False),
+        ]
+        for name, operation, mode, expected in cases:
+            with self.subTest(name=name, operation=operation, mode=mode):
+                self.git('reset', '--hard', self.parent)
+                path = Path(name)
+                path.parent.mkdir(parents=True, exist_ok=True)
+                if operation != 'A':
+                    if operation == 'symlink':
+                        path.symlink_to('../CHANGELOG.md')
+                    else:
+                        path.write_text('release note input\n')
+                        path.chmod(mode)
+                    parent = self.commit()
+                else:
+                    parent = self.parent
+                if operation in ('D', 'symlink'):
+                    path.unlink()
+                elif operation == 'rename':
+                    self.git('mv', name, name + '.renamed')
+                else:
+                    path.write_text('new note\n')
+                self.assertEqual(policy.metadata(parent, self.commit()), expected)
+
+    def test_consumption_with_existing_metadata(self):
+        self.write(self.canonical, 'note\n')
+        parent = self.commit()
+        Path(self.canonical).unlink()
+        self.write('CHANGELOG.md', self.files['CHANGELOG.md'] + '- consumed\n')
+        self.write('deploy/chart/Chart.yaml',
+                   self.files['deploy/chart/Chart.yaml'].replace('0.1.0', '0.2.0'))
+        self.assertTrue(policy.metadata(parent, self.commit()))
+
+    def test_valid_consumption_does_not_mask_refused_changes(self):
+        # Each sibling case starts afresh; no failed assertion skips another case.
+        for operation in ('D', 'A', 'M', 'symlink', 'mode', 'rename', 'worker-pin'):
+            with self.subTest(operation=operation):
+                self.git('reset', '--hard', self.parent)
+                self.write(self.canonical, 'note\n')
+                self.write('api/other.go', 'package main\n')
+                parent = self.commit()
+                Path(self.canonical).unlink()
+                if operation == 'D':
+                    Path('api/other.go').unlink()
+                elif operation == 'A':
+                    self.write('api/added.go', 'package main\n')
+                elif operation == 'M':
+                    self.write('api/other.go', 'package changed\n')
+                elif operation == 'symlink':
+                    Path('api/link.go').symlink_to('other.go')
+                elif operation == 'mode':
+                    Path('CHANGELOG.md').chmod(0o755)
+                elif operation == 'rename':
+                    self.git('mv', 'api/other.go', 'api/renamed.go')
+                else:
+                    self.write('deploy/chart/values.yaml',
+                               self.files['deploy/chart/values.yaml'].replace('tag: "0.1.0"', 'tag: "0.2.0"'))
+                self.assertFalse(policy.metadata(parent, self.commit()))
+
+
+class FragmentChain(RepoFixture, unittest.TestCase):
+    def test_fragment_consumption_chain(self):
+        paths = [f'changelog.d/{n:08x}-89ab-4cde-8fab-0123456789ab.md' for n in range(3)]
+        for path in paths:
+            self.write(path, 'note\n')
+        anchor = self.commit()
+        nodes = [anchor]
+        for path in paths:
+            Path(path).unlink()
+            self.write('CHANGELOG.md', Path('CHANGELOG.md').read_text() + '- consumed\n')
+            nodes.append(self.commit())
+        api = unittest.mock.Mock()
+        api.run.side_effect = lambda w, sha, b: run(w, sha) if sha == anchor else None
+        with contextlib.redirect_stdout(io.StringIO()):
+            policy.coverage(api, nodes[2], None, False, 0, 1, chain=policy.metadata_chain(nodes[2]))
+        self.assertEqual({call.args[0] for call in api.run.call_args_list}, {'ci.yml', 'kind-smoke.yml'})
+        for target, failure in ((nodes[3], None), (nodes[2], 'ci.yml'), (nodes[2], 'kind-smoke.yml')):
+            with self.subTest(target=target, failure=failure):
+                api.run.side_effect = lambda w, sha, b: (run(w, sha, conclusion='failure')
+                    if sha == nodes[1] and w == failure else (run(w, sha) if sha == anchor else None))
+                with contextlib.redirect_stdout(io.StringIO()), self.assertRaises(policy.Refusal):
+                    policy.coverage(api, target, None, False, 0, 1, chain=policy.metadata_chain(target))
+
+
 class Chain(RepoFixture, unittest.TestCase):
     def setUp(self):
         super().setUp()
@@ -203,8 +313,9 @@ class Cutter(RepoFixture, unittest.TestCase):
         super().setUp()
         root = Path(__file__).resolve().parent.parent
         self.cutter = Path(os.environ.get('UZI_CUTTER_SCRIPT', root / '.agents/skills/uzi-release/scripts/release-cut.sh'))
-        for name in ('shipping-paths.sh', 'dependency-bump.sh'):
+        for name in ('shipping-paths.sh', 'dependency-bump.sh', 'changelog-fragments.sh', 'changelog-fragments.awk'):
             self.write('scripts/lib/' + name, (root / 'scripts/lib' / name).read_text())
+        self.write('scripts/changelog-fragments.sh', (root / 'scripts/changelog-fragments.sh').read_text())
         self.write('scripts/release-ci-coverage.py', "import sys\nfrom pathlib import Path\nwith Path('coverage-calls').open('a') as f: f.write(' '.join(sys.argv[1:]) + '\\n')\nraise SystemExit(1)\n")
         self.commit()
         self.git('tag', 'v0.1.0')

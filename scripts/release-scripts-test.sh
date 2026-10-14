@@ -563,12 +563,14 @@ seed_repo() {
   local d="$1"
   mkdir -p "$d/scripts/lib" "$d/deploy/chart" "$d/api"
   local s
-  for s in worker-tag-autobump changelog-links assert-changelog-covers-release changelog-section assert-worker-tag-decoupled; do
+  for s in changelog-fragments worker-tag-autobump changelog-links assert-changelog-covers-release changelog-section assert-worker-tag-decoupled; do
     [ -f "$SCRIPTS_DIR/$s.sh" ] && { cp "$SCRIPTS_DIR/$s.sh" "$d/scripts/$s.sh"; chmod +x "$d/scripts/$s.sh"; }
   done
   # The shared shipping-path lib used by the oracle, release-cut and autobump.
   cp "$SCRIPTS_DIR/lib/shipping-paths.sh" "$d/scripts/lib/shipping-paths.sh"
   cp "$SCRIPTS_DIR/lib/dependency-bump.sh" "$d/scripts/lib/dependency-bump.sh"
+  cp "$SCRIPTS_DIR/lib/changelog-fragments.sh" "$d/scripts/lib/changelog-fragments.sh"
+  cp "$SCRIPTS_DIR/lib/changelog-fragments.awk" "$d/scripts/lib/changelog-fragments.awk"
   cp "$SCRIPTS_DIR/lib/release-mode.sh" "$d/scripts/lib/release-mode.sh"
   cp "$SCRIPTS_DIR/lib/changelog-bullets.awk" "$d/scripts/lib/changelog-bullets.awk"
   [ ! -f "$SCRIPTS_DIR/lib/ghcr.sh" ] || cp "$SCRIPTS_DIR/lib/ghcr.sh" "$d/scripts/lib/ghcr.sh"
@@ -1235,7 +1237,7 @@ MD
 cl_before="$(cat "$S3U/CHANGELOG.md")"
 run_rc "$S3U" 0.2.0
 assert_eq "fold refuses an unknown subsection (exit 3)" "3" "$RC_RC"
-assert_contains "refusal names the unknown subsection" "unknown subsection: ### Improvements" "$RC_OUT"
+assert_contains "refusal names the unknown subsection" "unknown heading" "$RC_OUT"
 assert_eq "refused fold leaves CHANGELOG untouched" "$cl_before" "$(cat "$S3U/CHANGELOG.md")"
 S3T="$(mktemp -d)"
 next_rc_fixture "$S3T" <<'MD'
@@ -1254,7 +1256,7 @@ next_rc_fixture "$S3T" <<'MD'
 MD
 run_rc "$S3T" 0.2.0
 assert_eq "fold refuses text before the first ### (exit 3)" "3" "$RC_RC"
-assert_contains "refusal quotes the stray line" "text before its first ### subsection" "$RC_OUT"
+assert_contains "refusal quotes the stray line" "bullet outside a category" "$RC_OUT"
 S3D="$(mktemp -d)"
 next_rc_fixture "$S3D" <<'MD'
 # Changelog
@@ -2265,8 +2267,274 @@ printf '# Changelog\n\n## [Unreleased]\n### Added\n- Unicode (#1468)\n\n## [0.2.
 run_rc "$LN" 0.3.0 --promote
 assert_eq "Unicode work with entries promotes and cuts main" 0 "$RC_RC"
 assert_eq "Unicode work advances main chart" 0.3.0-rc.1 "$(chart_ver "$LN")"
+export PATH="${PATH#"$LIST_SHIM:"}"
 rm -rf "$LN" "$LN.origin.git" "$LIST_SHIM"
 unset LIST_SHA LIST_MODE LIST_LOG LIST_REAL_GIT
+
+echo "=== M2 fragments: consumption, isolation and recovery ==="
+fragment_path=changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md
+fragment_second=changelog.d/11234567-89ab-4cde-8fab-0123456789ab.md
+fragment_owned=(CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh "$fragment_path")
+write_fragment() {
+  mkdir -p "$1/changelog.d"
+  printf '### Added\n\n- **Fragment %s (#%s).**\n  Preserved description.\n' "$2" "$2" > "$1/$fragment_path"
+}
+commit_fragment() {
+  write_fragment "$1" "$2"
+  git -C "$1" add -- "$fragment_path"
+  gcommit "$1" "docs: fragment $2"
+}
+fragment_count() { awk -v n="$2" 'index($0, "- **Fragment " n " (") == 1 { nlines++ } END { print nlines+0 }' "$1/CHANGELOG.md"; }
+assert_fragment_staged() {
+  local d="$1" label="$2"
+  assert_eq "$label deletion staged" "D" "$(git -C "$d" diff --cached --name-status -- "$fragment_path" | awk '{print $1}')"
+  assert_eq "$label no unstaged edits" "" "$(git -C "$d" diff --name-only)"
+  assert_eq "$label only owned paths staged" "" "$(git -C "$d" diff --cached --name-only | awk '$0 != "CHANGELOG.md" && $0 != "deploy/chart/Chart.yaml" && $0 != "deploy/chart/values.yaml" && $0 != "scripts/assert-worker-tag-decoupled.sh" && $0 != "changelog.d/01234567-89ab-4cde-8fab-0123456789ab.md"')"
+}
+# Every case owns an isolated repository; failures are tallied without blocking siblings.
+for mode in rc stable no-commit commit-failure oracle-failure; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; add_feature "$MF" 201; commit_fragment "$MF" 201
+  case "$mode" in
+    commit-failure)
+      printf '#!/bin/sh\nexit 1\n' > "$MF/.git/hooks/pre-commit"; chmod +x "$MF/.git/hooks/pre-commit" ;;
+    oracle-failure)
+      # A valid fragment touch in the shipping first-parent commit is no exemption.
+      write_fragment "$MF" 999
+      echo 'package main // shipping fragment with wrong identity' > "$MF/api/fragment.go"
+      git -C "$MF" add -- "$fragment_path" api/fragment.go; gcommit "$MF" 'Feature (#202)' ;;
+  esac
+  start="$(git -C "$MF" rev-parse HEAD)"
+  args=(); [ "$mode" != stable ] || args=(--stable)
+  [ "$mode" != no-commit ] || args=(--no-commit)
+  run_rc "$MF" 0.2.0 "${args[@]}"
+  assert_contains "$mode prints starting SHA" "$start" "$RC_OUT"
+  assert_contains "$mode explicit restore" "git restore --source=$start --staged --worktree -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh $fragment_path" "$RC_OUT"
+  assert_contains "$mode explicit postcommit reset" "git reset --soft $start" "$RC_OUT"
+  assert_contains "$mode provisional recovery warning" "Inspect/remove any leftover provisional stable tag deliberately" "$RC_OUT"
+  case "$mode" in
+    rc|stable)
+      assert_eq "$mode success" 0 "$RC_RC"
+      assert_eq "$mode fragment once" 1 "$(fragment_count "$MF" 201)"
+      assert_contains "$mode fragment citation identity" '- **Fragment 201 ([#201](https://github.com/vtmocanu/uzi/pull/201)).**' "$(cat "$MF/CHANGELOG.md")"
+      assert_eq "$mode fragment consumed" no "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
+      assert_eq "$mode clean tracked tree" "" "$(git -C "$MF" status --porcelain --untracked-files=no)"
+      assert_eq "$mode deletion committed" D "$(git -C "$MF" diff HEAD~1 HEAD --name-status -- "$fragment_path" | awk '{print $1}')"
+      if [ "$mode" = rc ]; then
+        git -C "$MF" tag v0.2.0-rc.1
+        run_rc "$MF" 0.2.0
+        assert_eq "empty RC respin succeeds" 0 "$RC_RC"
+        assert_eq "empty respin never replays" 1 "$(fragment_count "$MF" 201)"
+        git -C "$MF" tag v0.2.0-rc.2
+        commit_fragment "$MF" 202; add_feature "$MF" 202
+        run_rc "$MF" 0.2.0
+        assert_eq "later RC fresh fragment succeeds" 0 "$RC_RC"
+        assert_eq "later RC retains old once" 1 "$(fragment_count "$MF" 201)"
+        assert_eq "later RC adds fresh once" 1 "$(fragment_count "$MF" 202)"
+      fi ;;
+    *)
+      expected=1; [ "$mode" != no-commit ] || expected=0
+      assert_eq "$mode status" "$expected" "$RC_RC"
+      assert_eq "$mode HEAD retained" "$start" "$(git -C "$MF" rev-parse HEAD)"
+      assert_fragment_staged "$MF" "$mode"
+      if [ "$mode" = no-commit ]; then assert_contains "no-commit explicit successful prep" 'oracle not run' "$RC_OUT"; fi
+      run_rc "$MF" 0.2.0
+      assert_eq "$mode dirty retry refused" 3 "$RC_RC"
+      git -C "$MF" restore --source="$start" --staged --worktree -- "${fragment_owned[@]}"
+      assert_eq "$mode deliberate restore clean" "" "$(git -C "$MF" status --porcelain --untracked-files=no)"
+      rm -f "$MF/.git/hooks/pre-commit"
+      if [ "$mode" = oracle-failure ]; then
+        commit_fragment "$MF" 201
+        sed 's/(#201)/(#201, #202)/' "$MF/$fragment_path" > "$MF/.git/note"
+        mv "$MF/.git/note" "$MF/$fragment_path"
+        git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: correct identities'
+      fi
+      run_rc "$MF" 0.2.0
+      assert_eq "$mode restored retry succeeds" 0 "$RC_RC"
+      assert_eq "$mode restored retry consumes once" 1 "$(fragment_count "$MF" 201)"
+      if [ "$mode" = oracle-failure ]; then
+        assert_contains "corrected retry retains both citation identities" '- **Fragment 201 ([#201](https://github.com/vtmocanu/uzi/pull/201), [#202](https://github.com/vtmocanu/uzi/pull/202)).**' "$(cat "$MF/CHANGELOG.md")"
+      fi ;;
+  esac
+  rm -rf "$MF"
+done
+
+# Refusals preserve HEAD, files, index and tag set, including combined promotion.
+for mode in malformed untracked draft promote-draft; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"
+  if [ "$mode" = promote-draft ]; then published_rc "$MF"; else seed_repo "$MF"; fi
+  commit_fragment "$MF" 201
+  case "$mode" in
+    malformed) printf 'invalid\n' > "$MF/$fragment_path"; git -C "$MF" add -- "$fragment_path"; gcommit "$MF" 'docs: malformed' ;;
+    untracked) git -C "$MF" rm -q --cached -- "$fragment_path"; gcommit "$MF" 'docs: untrack' ;;
+  esac
+  start="$(git -C "$MF" rev-parse HEAD)"; before="$(git -C "$MF" status --porcelain)"; tags="$(git -C "$MF" tag)"
+  cp "$MF/CHANGELOG.md" "$MF/.git/before-notes"
+  cp "$MF/$fragment_path" "$MF/.git/before-fragment"
+  printf '## [0.3.0]\n### Added\n- Draft (#201)\n' > "$MF/.git/draft"
+  args=(); version=0.2.0
+  case "$mode" in draft) args=(--changelog-file "$MF/.git/draft");; promote-draft) args=(--promote --changelog-file "$MF/.git/draft"); version=0.3.0;; esac
+  run_rc "$MF" "$version" "${args[@]}"
+  assert_eq "$mode refuses" 3 "$RC_RC"
+  assert_eq "$mode HEAD untouched" "$start" "$(git -C "$MF" rev-parse HEAD)"
+  assert_eq "$mode index/worktree untouched" "$before" "$(git -C "$MF" status --porcelain)"
+  assert_eq "$mode tags untouched" "$tags" "$(git -C "$MF" tag)"
+  if cmp -s "$MF/CHANGELOG.md" "$MF/.git/before-notes" && cmp -s "$MF/$fragment_path" "$MF/.git/before-fragment"; then pass "$mode bytes untouched"; else fail "$mode bytes untouched"; fi
+  rm -rf "$MF" "$MF.origin.git"
+done
+
+for mode in promote-only promote skip; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; published_rc "$MF"; commit_fragment "$MF" 202
+  start="$(git -C "$MF" rev-parse HEAD)"
+  if [ "$mode" = promote-only ]; then run_rc "$MF" 0.2.0 --promote-only; else run_rc "$MF" 0.3.0 "--$([ "$mode" = skip ] && echo skip-promote || echo promote)"; fi
+  assert_eq "$mode pending fragment success" 0 "$RC_RC"
+  if [ "$mode" = promote-only ]; then
+    assert_eq "explicit promotion main unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
+    assert_eq "explicit promotion fragment unchanged" yes "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
+    assert_eq "explicit promotion notes not on main" 0 "$(fragment_count "$MF" 202)"
+  else
+    assert_eq "$mode fragment folded once" 1 "$(fragment_count "$MF" 202)"
+    assert_eq "$mode candidate advanced despite notes-only work" 0.3.0-rc.1 "$(chart_ver "$MF")"
+  fi
+  if [ "$mode" != skip ]; then
+    assert_eq "$mode stable isolates pending main fragment" "" "$(git -C "$MF" ls-tree v0.2.0 -- "$fragment_path")"
+    assert_eq "$mode stable excludes pending note" 0 "$(git -C "$MF" show v0.2.0:CHANGELOG.md | awk '/Fragment 202/{n++} END{print n+0}')"
+  fi
+  rm -rf "$MF" "$MF.origin.git"
+done
+
+# Duplicate physical blocks remain distinct, including legacy duplicate categories.
+MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; commit_fragment "$MF" 201
+cp "$MF/$fragment_path" "$MF/$fragment_second"
+printf '# Changelog\n\n## [Unreleased]\n### Added\n- Legacy one (#201)\n### Added\n- **Legacy two (#201).**\n  Legacy continuation bytes.\n\n## [0.1.0]\n- Initial (#100)\n' | put_changelog "$MF"
+git -C "$MF" add -- "$fragment_second"; gcommit "$MF" 'docs: duplicate fragment'
+printf 'module example\n' > "$MF/api/go.mod"; git -C "$MF" add -- api/go.mod; gcommit "$MF" 'chore(deps): bump (#203)'
+run_rc "$MF" 0.2.0
+assert_eq "legacy plus duplicate fragments succeeds" 0 "$RC_RC"
+assert_eq "identical fragment blocks remain duplicate" 2 "$(fragment_count "$MF" 201)"
+assert_eq "one grouped Added section" 1 "$(awk '/^### Added$/{n++} END{print n+0}' "$MF/CHANGELOG.md")"
+assert_contains "legacy one-line preserved" '- Legacy one ([#201](https://github.com/vtmocanu/uzi/pull/201))' "$(cat "$MF/CHANGELOG.md")"
+assert_contains "legacy continuation preserved" '  Legacy continuation bytes.' "$(cat "$MF/CHANGELOG.md")"
+assert_contains "fragment cut dependency autocitation" '- **Routine dependency updates ([#203](https://github.com/vtmocanu/uzi/pull/203)).**' "$(cat "$MF/CHANGELOG.md")"
+assert_eq "duplicate inputs both consumed" "" "$(git -C "$MF" ls-files -- changelog.d)"
+rm -rf "$MF"
+
+# Canonical category order applies to legacy-only and mixed pending notes.
+for inventory in legacy mixed; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"
+  printf '# Changelog\n\n## [Unreleased]\n### Fixed\n- Fixed legacy (#201)\n### Added\n- Added legacy (#201)\n### Fixed\n- Fixed duplicate (#201)\n\n## [0.1.0]\n- Initial (#100)\n' | put_changelog "$MF"
+  if [ "$inventory" = mixed ]; then
+    write_fragment "$MF" 201
+    mkdir -p "$MF/changelog.d"
+    printf '### Changed\n\n- **Changed fragment (#201).**\n  Changed fragment description.\n' > "$MF/$fragment_second"
+    git -C "$MF" add -- "$fragment_path" "$fragment_second"
+    gcommit "$MF" 'docs: mixed pending notes'
+  fi
+  run_rc "$MF" 0.2.0
+  assert_eq "$inventory canonical cut succeeds" 0 "$RC_RC"
+  expected=$'### Added\n### Fixed'
+  [ "$inventory" != mixed ] || expected=$'### Added\n### Changed\n### Fixed'
+  assert_eq "$inventory canonical grouped categories" "$expected" "$(awk '/^### /{print}' "$MF/CHANGELOG.md")"
+  expected=$'- Added legacy\n- Fixed legacy\n- Fixed duplicate'
+  [ "$inventory" != mixed ] || expected=$'- Added legacy\n- **Fragment 201\n- **Changed fragment\n- Fixed legacy\n- Fixed duplicate'
+  assert_eq "$inventory deterministic block order and multiplicity" "$expected" "$(awk '/^- / && !/Initial/ {sub(/ \(.*/, ""); print}' "$MF/CHANGELOG.md")"
+  assert_eq "$inventory released section stays at original version" $'## [0.1.0] - 2026-09-01\n- Initial ([#100](https://github.com/vtmocanu/uzi/pull/100))' "$(awk '/^## \[0.1.0\]/{p=1} p && /^\[Unreleased\]:/{exit} p && NF{print}' "$MF/CHANGELOG.md")"
+  rm -rf "$MF"
+done
+
+# A fragment-touch shipping commit needs the right identity in the assembled section.
+for identity in missing wrong correct; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; write_fragment "$MF" 999
+  case "$identity" in
+    missing) sed 's/ (#999)//' "$MF/$fragment_path" > "$MF/.git/note"; mv "$MF/.git/note" "$MF/$fragment_path" ;;
+    correct) write_fragment "$MF" 201 ;;
+  esac
+  echo 'package main // ships' > "$MF/api/feature.go"
+  git -C "$MF" add -- api/feature.go "$fragment_path"; gcommit "$MF" 'Feature (#201)'
+  run_rc "$MF" 0.2.0
+  expected=1; [ "$identity" != correct ] || expected=0
+  assert_eq "shipping fragment $identity identity" "$expected" "$RC_RC"
+  if [ "$identity" != correct ]; then
+    assert_contains "$identity identity oracle refusal" 'VERIFY FAILED' "$RC_OUT"
+    assert_fragment_staged "$MF" "$identity identity"
+  else
+    assert_eq "correct identity rendered once" 1 "$(fragment_count "$MF" 201)"
+    assert_contains "correct identity citation retained" '- **Fragment 201 ([#201](https://github.com/vtmocanu/uzi/pull/201)).**' "$(cat "$MF/CHANGELOG.md")"
+  fi
+  rm -rf "$MF"
+done
+
+# Deterministic interruption at git commit: the fixture wrapper stops its known
+# parent, reports readiness over a pipe, then exits. The owner kills only Popen.pid.
+for phase in before after; do
+  MF="$(mktemp -d "$REPO_ROOT/.uzi/scratch/m2.XXXXXX")"; seed_repo "$MF"; commit_fragment "$MF" 201
+  start="$(git -C "$MF" rev-parse HEAD)"
+  mkdir "$MF/.git/bin"
+  real_git="$(command -v git)"
+  cat > "$MF/.git/bin/git" <<'STUB'
+#!/usr/bin/env python3
+import os
+import signal
+import subprocess
+import sys
+if sys.argv[1:2] == ['commit']:
+    if os.environ['INTERRUPT_PHASE'] == 'after':
+        result = subprocess.run([os.environ['FIXTURE_GIT'], *sys.argv[1:]], check=False)
+        if result.returncode:
+            raise SystemExit(result.returncode)
+    os.kill(os.getppid(), signal.SIGSTOP)
+    os.write(int(os.environ['READY_FD']), b'R')
+    raise SystemExit(1)
+os.execv(os.environ['FIXTURE_GIT'], [os.environ['FIXTURE_GIT'], *sys.argv[1:]])
+STUB
+  chmod +x "$MF/.git/bin/git"
+  python3 - "$MF" "$RC" "$phase" "$real_git" <<'PY'
+import os
+from pathlib import Path
+import select
+import subprocess
+import sys
+repo, cutter, phase, git = sys.argv[1:]
+reader, writer = os.pipe()
+env = {**os.environ, 'PATH': str(Path(repo) / '.git/bin') + ':' + os.environ['PATH'],
+       'READY_FD': str(writer), 'INTERRUPT_PHASE': phase, 'FIXTURE_GIT': git,
+       'UZI_RELEASE_OFFLINE_FIXTURE': '1', 'UZI_CHANGELOG_REPO_URL': 'https://github.com/vtmocanu/uzi'}
+with (Path(repo) / '.git/interruption.log').open('w') as log:
+    process = subprocess.Popen(['bash', cutter, '0.2.0'], cwd=repo, env=env,
+                               stdout=log, stderr=subprocess.STDOUT, pass_fds=(writer,))
+    os.close(writer)
+    try:
+        if not select.select([reader], [], [], 15)[0] or os.read(reader, 1) != b'R':
+            raise RuntimeError('fixture did not reach commit boundary')
+    finally:
+        process.kill()
+        process.wait(timeout=5)
+        os.close(reader)
+PY
+  interrupt_rc=$?
+  assert_eq "$phase interruption reached deterministic boundary" 0 "$interrupt_rc"
+  RC_OUT="$(cat "$MF/.git/interruption.log")"
+  assert_contains "$phase interruption printed starting SHA" "$start" "$RC_OUT"
+  assert_contains "$phase interruption printed owned restore" "git restore --source=$start --staged --worktree -- CHANGELOG.md deploy/chart/Chart.yaml deploy/chart/values.yaml scripts/assert-worker-tag-decoupled.sh $fragment_path" "$RC_OUT"
+  assert_eq "$phase interrupted notes exactly once" 1 "$(fragment_count "$MF" 201)"
+  if [ "$phase" = before ]; then
+    assert_eq "before interruption HEAD unchanged" "$start" "$(git -C "$MF" rev-parse HEAD)"
+    assert_fragment_staged "$MF" "before interruption"
+    run_rc "$MF" 0.2.0
+    assert_eq "interrupted dirty retry refuses" 3 "$RC_RC"
+  else
+    assert_eq "after interruption release committed" 'chore(release): v0.2.0-rc.1' "$(head_msg "$MF")"
+    assert_eq "after interruption may be clean" "" "$(git -C "$MF" status --porcelain --untracked-files=no)"
+    git -C "$MF" reset --soft "$start"
+    assert_fragment_staged "$MF" "after deliberate soft reset"
+  fi
+  git -C "$MF" restore --source="$start" --staged --worktree -- "${fragment_owned[@]}"
+  assert_eq "$phase interrupted restore clean" "" "$(git -C "$MF" status --porcelain --untracked-files=no)"
+  assert_eq "$phase interrupted fragment restored" yes "$([ -f "$MF/$fragment_path" ] && echo yes || echo no)"
+  run_rc "$MF" 0.2.0
+  assert_eq "$phase interrupted restore retry succeeds" 0 "$RC_RC"
+  assert_eq "$phase interrupted retry exactly once" 1 "$(fragment_count "$MF" 201)"
+  rm -rf "$MF"
+done
 
 echo "=== M3: release-mode lib (shared by watch + verify) ==="
 # shellcheck source=scripts/lib/release-mode.sh
