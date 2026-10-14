@@ -69,6 +69,15 @@ func TestIssue2009M4SixRenewalsPreserveExactAgeLiveDB(t *testing.T) {
 			if nonce == "" || nonce == "n1" || workerEpoch(t, e, o.workerID) != 0 {
 				t.Fatal("register did not rotate transport fence")
 			}
+			if pendingIdentityCount(t, e, o.workerID) != len(ids) {
+				t.Fatal("boot register did not insert complete identity coverage")
+			}
+			for _, id := range ids {
+				_, until := pendingIdentityTimes(t, e, o.workerID, id)
+				if !until.After(time.Now()) {
+					t.Fatal("boot register inserted expired identity evidence")
+				}
+			}
 			m4Heartbeat(t, e, svc, o.workerID, &ActiveSnapshot{PendingAll: identities, PendingOverflow: true})
 			// Age beyond four heartbeat intervals through the production threshold,
 			// without sleeps or any worker-supplied timestamp.
@@ -79,6 +88,13 @@ func TestIssue2009M4SixRenewalsPreserveExactAgeLiveDB(t *testing.T) {
 				old[id], _ = pendingIdentityTimes(t, e, o.workerID, id)
 			}
 			for cycle := 0; cycle < 6; cycle++ {
+				// Keep prior evidence fresh but deliberately short so skipped renewal
+				// cannot pass merely because the original lease remains in the future.
+				e.exec("UPDATE worker_pending_outcome_identities SET reported_until=now()+interval '30 seconds' WHERE worker_id=$1", o.workerID)
+				priorUntil := make(map[uuid.UUID]time.Time)
+				for _, id := range ids {
+					_, priorUntil[id] = pendingIdentityTimes(t, e, o.workerID, id)
+				}
 				active := make([]ActiveRunEntry, 0, cap)
 				for j := 0; j < cap; j++ {
 					active = append(active, entry(ids[(cycle*2+j)%6], 5, "running", true))
@@ -106,8 +122,8 @@ func TestIssue2009M4SixRenewalsPreserveExactAgeLiveDB(t *testing.T) {
 				svc.detectRunHealth(e.ctx, time.Now())
 				for _, id := range ids {
 					since, until := pendingIdentityTimes(t, e, o.workerID, id)
-					if !since.Equal(old[id]) || !until.After(time.Now()) {
-						t.Errorf("cycle=%d tuple=%s first_seen=%v want=%v until=%v", cycle, id, since, old[id], until)
+					if !since.Equal(old[id]) || !until.After(priorUntil[id]) || !until.After(time.Now()) {
+						t.Errorf("cycle=%d tuple=%s first_seen=%v want=%v until=%v prior=%v", cycle, id, since, old[id], until, priorUntil[id])
 					}
 					if health, reason := runHealthOf(t, e, id); health != healthStalled || reason != reasonOutcomeUndelivered {
 						t.Errorf("cycle=%d run=%s health=%s reason=%s", cycle, id, health, reason)
@@ -127,14 +143,19 @@ func TestIssue2009M4SixRenewalsPreserveExactAgeLiveDB(t *testing.T) {
 				}
 			}
 			// Same-generation register renews exact ages while rotating its nonce.
+			e.exec("UPDATE worker_pending_outcome_identities SET reported_until=now()+interval '30 seconds' WHERE worker_id=$1", o.workerID)
+			registerUntil := make(map[uuid.UUID]time.Time)
+			for _, id := range ids {
+				_, registerUntil[id] = pendingIdentityTimes(t, e, o.workerID, id)
+			}
 			w = hbWorker(t, e, o.workerID)
 			if _, _, err = svc.Register(e.ctx, w, "v1", "base", nil, nil, nil, &ActiveSnapshot{RegisterNonce: w.SnapshotRegisterNonce.String, PendingAll: identities, PendingOverflow: true}); err != nil {
 				t.Fatal(err)
 			}
 			for _, id := range ids {
-				since, _ := pendingIdentityTimes(t, e, o.workerID, id)
-				if !since.Equal(old[id]) {
-					t.Fatal("register erased continuity")
+				since, until := pendingIdentityTimes(t, e, o.workerID, id)
+				if !since.Equal(old[id]) || !until.After(registerUntil[id]) {
+					t.Fatal("register erased continuity or failed to renew")
 				}
 			}
 			m4Heartbeat(t, e, svc, o.workerID, &ActiveSnapshot{PendingAll: identities})
