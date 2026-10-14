@@ -671,8 +671,12 @@ const seededDefaults: Schedule[] = [
 ];
 
 // PRD #2865: per-schedule CI-watch episode state, keyed by schedule id and ordered by
-// workflow key (UTF-8 bytes, as the server orders it). The server pages 100 at a time;
-// the mock pages CI_EPISODE_PAGE_SIZE so the seeded five rows span two pages.
+// workflow key (UTF-8 bytes, as the server orders it). Every row is a shape the server
+// writes: a red observation creates it inside a repair start (attempts+1, watermark = the
+// failed run) or a halt (halted_reason set, signature and attempts kept); a later fresh
+// green resets it (attempts 0, signature and halt cleared, watermark = the green run).
+// The server pages 100 at a time; the mock pages CI_EPISODE_PAGE_SIZE so the seeded five
+// rows span two pages.
 const CI_EPISODE_PAGE_SIZE = 3;
 const ciEpisode = (over: Partial<CIEpisodeDTO> & { workflow_key: string }): CIEpisodeDTO => ({
   last_handled_run_id: null,
@@ -690,14 +694,18 @@ const ciEpisodesBySchedule: Record<string, CIEpisodeDTO[]> = {
     ciEpisode({ workflow_key: "ci.yml", observed_run_id: 18342001, observed_created_at: minsAgo(52),
       observed_updated_at: minsAgo(41), last_handled_run_id: 18342001, attempts: 1,
       last_signature: "test-api: TestScheduleFire/ci_watch timed out after 10m" }),
+    // Started twice, the second time on a new signature; a repeat of it halts as no_progress.
     ciEpisode({ workflow_key: "codeql.yml", observed_run_id: 18341877, observed_created_at: minsAgo(170),
-      observed_updated_at: minsAgo(160), updated_at: minsAgo(158) }),
+      observed_updated_at: minsAgo(160), last_handled_run_id: 18341877, attempts: 2,
+      last_signature: "analyze (go): extraction failed for api/internal/forge", updated_at: minsAgo(158) }),
     ciEpisode({ workflow_key: "docs.yml", observed_run_id: 18340410, observed_created_at: minsAgo(400),
       observed_updated_at: minsAgo(395), last_handled_run_id: 18340410, attempts: 3,
       last_signature: "check-docs: README.md links to a removed page", halted_reason: "no_progress",
       updated_at: minsAgo(390) }),
+    // Reset by the fresh green the last fire skipped as ci_green: the watermark moved to the
+    // green run and the loop history cleared.
     ciEpisode({ workflow_key: "kind-smoke.yml", observed_run_id: 18342010, observed_created_at: minsAgo(50),
-      observed_updated_at: minsAgo(39) }),
+      observed_updated_at: minsAgo(39), last_handled_run_id: 18342010, updated_at: minsAgo(38) }),
     ciEpisode({ workflow_key: "release.yml", observed_run_id: 18338002, observed_created_at: minsAgo(1500),
       observed_updated_at: minsAgo(1490), last_handled_run_id: 18338002, attempts: 5,
       last_signature: "publish: chart version mismatch", halted_reason: "attempt_cap", updated_at: minsAgo(1480) }),

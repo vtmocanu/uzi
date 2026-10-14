@@ -30,6 +30,26 @@ describe("mock ci_watch schedules (PRD #2865)", () => {
     expect(second.next_cursor).toBeNull();
   });
 
+  it("seeds only episode shapes the server writes", async () => {
+    const first = (await mockApi.getSchedule("sch-def-ci-uzi")).ci_episodes!;
+    const rest = await mockApi.listScheduleCIEpisodes("sch-def-ci-uzi", first.next_cursor!);
+    const rows = [...first.episodes, ...rest.episodes];
+    for (const e of rows) {
+      // Start, halt and reset all set the watermark to the observed run.
+      expect(e.observed_run_id).not.toBeNull();
+      expect(e.last_handled_run_id).toBe(e.observed_run_id);
+      const isReset = e.attempts === 0 && e.last_signature === null && e.halted_reason === null;
+      const isStartOrHalt = e.last_signature !== null && (e.attempts > 0 || e.halted_reason !== null);
+      expect(isReset || isStartOrHalt, e.workflow_key).toBe(true);
+    }
+    // kind-smoke.yml is reset-shaped, matching the last fire's ci_green skip.
+    expect(rows.find((e) => e.workflow_key === "kind-smoke.yml")).toMatchObject({
+      attempts: 0, last_signature: null, halted_reason: null,
+    });
+    const detail = await mockApi.getSchedule("sch-def-ci-uzi");
+    expect(detail.last_fire?.skips).toContainEqual(expect.objectContaining({ title: "kind-smoke.yml", reason: "ci_green" }));
+  });
+
   it("rejects a malformed cursor with a 400", async () => {
     await expect(mockApi.listScheduleCIEpisodes("sch-def-ci-uzi", "%%%")).rejects.toMatchObject({ status: 400 });
   });

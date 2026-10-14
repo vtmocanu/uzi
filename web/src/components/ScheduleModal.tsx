@@ -858,7 +858,7 @@ export function ScheduleModal({
       />
       <p id="sched-ci-workflows-help" className={cx("mt-1 text-[11px]", ciWorkflows.error ? "text-danger" : "text-faint")}>
         {ciWorkflows.error ||
-          "One workflow name or file per line, up to 20. Leave blank to watch all workflows in the listed window."}
+          "One workflow name or file per line, up to 20. Leave blank to watch all workflows in the listed window (newest 100 executions; 50 on Forgejo)."}
       </p>
     </Field>
   );

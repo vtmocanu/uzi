@@ -22,12 +22,13 @@ const mockApi = vi.mocked(api);
 const NOTE =
   "Off by default: this job reads CI logs, which can contain text from dependencies, tests or outside contributors. Review the plan before the run changes code. You can turn it on.";
 
+// Defaults to the reset shape (handled == observed, no attempts, no signature).
 const episode = (workflow_key: string, over: Partial<CIEpisodeDTO> = {}): CIEpisodeDTO => ({
   workflow_key,
-  last_handled_run_id: null,
-  observed_created_at: null,
-  observed_updated_at: null,
-  observed_run_id: null,
+  last_handled_run_id: 1,
+  observed_created_at: "2026-10-01T09:50:00Z",
+  observed_updated_at: "2026-10-01T09:58:00Z",
+  observed_run_id: 1,
   last_signature: null,
   attempts: 0,
   halted_reason: null,
@@ -55,7 +56,60 @@ const rowKeys = () =>
     .slice(1)
     .map((r) => r.querySelector("td .font-mono")?.textContent);
 
+const rowStates = () =>
+  within(screen.getByRole("table"))
+    .getAllByRole("row")
+    .slice(1)
+    .map((r) => r.querySelectorAll("td")[1]?.querySelector("span")?.textContent?.trim());
+
+// The three row shapes the server commits (api/internal/store/queries/ci_watch.sql): a
+// red observation creates the row inside Start or a halt; a fresh green Resets it.
+const started = episode("start.yml", {
+  observed_run_id: 41, last_handled_run_id: 41, attempts: 1, last_signature: "test: TestX failed",
+});
+const reset = episode("reset.yml", {
+  observed_run_id: 52, last_handled_run_id: 52, attempts: 0, last_signature: null,
+});
+const haltedCap = episode("cap.yml", {
+  observed_run_id: 63, last_handled_run_id: 63, attempts: 5, last_signature: "publish failed", halted_reason: "attempt_cap",
+});
+const haltedStuck = episode("stuck.yml", {
+  observed_run_id: 74, last_handled_run_id: 74, attempts: 2, last_signature: "lint failed", halted_reason: "no_progress",
+});
+
 describe("CIWatchDetail", () => {
+  it("labels each server-written episode shape", async () => {
+    mockApi.getSchedule.mockResolvedValue({
+      ...base,
+      ci_episodes: { episodes: [started, reset, haltedCap, haltedStuck], next_cursor: null },
+    });
+    renderDetail(base);
+    await waitFor(() => expect(rowKeys()).toEqual(["start.yml", "reset.yml", "cap.yml", "stuck.yml"]));
+    expect(rowStates()).toEqual([
+      "Repair attempted",
+      "Passing again",
+      "Stopped: attempt limit reached",
+      "Stopped: no progress",
+    ]);
+  });
+
+  it("counts repeated repair attempts and falls back to a neutral label on an unknown shape", async () => {
+    mockApi.getSchedule.mockResolvedValue({
+      ...base,
+      ci_episodes: {
+        episodes: [
+          { ...started, workflow_key: "again.yml", attempts: 3 },
+          // Not a shape the server writes (no attempts, but a signature): stay neutral.
+          episode("odd.yml", { observed_run_id: 9, last_handled_run_id: 9, last_signature: "x" }),
+        ],
+        next_cursor: null,
+      },
+    });
+    renderDetail(base);
+    await waitFor(() => expect(rowKeys()).toEqual(["again.yml", "odd.yml"]));
+    expect(rowStates()).toEqual(["Repair attempted (3 times)", "Failure seen"]);
+  });
+
   it("shows the target, the approval note and the watched workflows", async () => {
     mockApi.getSchedule.mockResolvedValue({ ...base, ci_episodes: { episodes: [], next_cursor: null } });
     renderDetail(base);
@@ -63,14 +117,18 @@ describe("CIWatchDetail", () => {
     expect(screen.getByText(NOTE)).toBeTruthy();
     const list = screen.getByRole("list", { name: "Watched workflows" });
     expect(within(list).getAllByRole("listitem").map((li) => li.textContent)).toEqual(["ci.yml", "kind-smoke.yml"]);
-    expect(await screen.findByText(/No failed run seen yet/)).toBeTruthy();
+    expect(
+      await screen.findByText(
+        "No failed run seen yet. A workflow appears here the first time it fails on the watched branch.",
+      ),
+    ).toBeTruthy();
   });
 
   it("says all workflows in the listed window when no selector is set", async () => {
     const s = { ...base, ci_workflows: undefined };
     mockApi.getSchedule.mockResolvedValue({ ...s, ci_episodes: { episodes: [], next_cursor: null } });
     renderDetail(s);
-    expect(screen.getByText("All workflows in the listed window")).toBeTruthy();
+    expect(screen.getByText("All workflows in the listed window (newest 100 executions; 50 on Forgejo)")).toBeTruthy();
     expect(screen.queryByRole("list", { name: "Watched workflows" })).toBeNull();
   });
 
@@ -108,9 +166,13 @@ describe("CIWatchDetail", () => {
       expect(rowKeys()).toEqual(["ci.yml", "codeql.yml", "docs.yml", "kind-smoke.yml", "release.yml"]),
     );
     expect(screen.queryByRole("button", { name: "Load more" })).toBeNull();
-    expect(screen.getByText("Stopped: no progress")).toBeTruthy();
-    expect(screen.getByText("Stopped: attempt limit reached")).toBeTruthy();
-    expect(screen.getByText("Repair started")).toBeTruthy();
+    expect(rowStates()).toEqual([
+      "Repair attempted",
+      "Repair attempted (2 times)",
+      "Stopped: no progress",
+      "Passing again",
+      "Stopped: attempt limit reached",
+    ]);
   });
 
   it("keeps the loaded rows and offers the control again when a page fails", async () => {
@@ -133,7 +195,7 @@ describe("CIWatchDetail", () => {
     mockApi.getSchedule.mockResolvedValue({
       ...s,
       ci_episodes: {
-        episodes: [episode(hostile, { last_signature: "<b>boom</b>", observed_run_id: 7 })],
+        episodes: [episode(hostile, { last_signature: "<b>boom</b>", attempts: 1 })],
         next_cursor: null,
       },
     });

@@ -2,10 +2,10 @@
 // the Schedules tab.
 //
 // It answers the three questions an owner has about a CI repair job: what it watches
-// (the workflow selector, or every workflow in the listed window), why it waits for
-// plan approval (the auto-approve note), and where each watched workflow stands (the
-// per-workflow episode state). The list DTO carries no episodes, so the panel reads the
-// schedule's detail GET for the first page and follows next_cursor on "Load more".
+// (the workflow selector, or every workflow in the listed window of newest executions), why
+// it waits for plan approval (the auto-approve note), and where each watched workflow
+// stands (the per-workflow episode state). The list DTO carries no episodes, so the panel
+// reads the schedule's detail GET for the first page and follows next_cursor on "Load more".
 //
 // Every workflow key and failure signature is forge-derived text: it is rendered as React
 // text children only, never as markup and never into an attribute.
@@ -17,6 +17,9 @@ import { CI_WATCH_TARGET_NAME } from "../lib/scheduleList";
 import { CIWatchApproveNote } from "./ScheduleModal";
 import { formatStamp } from "./LastRun";
 import { Alert, Badge, Button, type BadgeTone } from "./ui";
+
+// The window is the one bounded page a fire reads (schedsvc ciListLimit; Forgejo caps at 50).
+const CI_ALL_WORKFLOWS = "All workflows in the listed window (newest 100 executions; 50 on Forgejo)";
 
 type Loaded = { episodes: CIEpisodeDTO[]; cursor: string | null };
 
@@ -83,7 +86,7 @@ export function CIWatchDetail({ s, panelId }: { s: Schedule; panelId: string }) 
       <div>
         <h4 className="text-[12px] font-medium text-muted">Watched workflows</h4>
         {workflows.length === 0 ? (
-          <p className="mt-1 text-[13px] text-fg">All workflows in the listed window</p>
+          <p className="mt-1 text-[13px] text-fg">{CI_ALL_WORKFLOWS}</p>
         ) : (
           <ul className="mt-1.5 flex flex-wrap gap-1.5" aria-label="Watched workflows">
             {workflows.map((w) => (
@@ -113,7 +116,7 @@ export function CIWatchDetail({ s, panelId }: { s: Schedule; panelId: string }) 
           </p>
         ) : loaded.episodes.length === 0 ? (
           <p className="mt-1 text-[13px] text-faint">
-            No failed run seen yet. A workflow appears here the first time this job checks it.
+            No failed run seen yet. A workflow appears here the first time it fails on the watched branch.
           </p>
         ) : (
           <EpisodeTable episodes={loaded.episodes} />
@@ -176,13 +179,16 @@ function EpisodeTable({ episodes }: { episodes: CIEpisodeDTO[] }) {
   );
 }
 
-// episodeState names where one workflow stands, most decisive fact first: a halted loop
-// needs the owner, a handled failure is waiting on its run, a newer failure is next.
+// episodeState names where one workflow stands. The server creates a row only on a red
+// observation, inside a repair start (attempts+1, watermark = the failed run) or a halt
+// (halted_reason set, signature and attempts kept); a later fresh green resets it
+// (attempts 0, signature and halt cleared). Any other shape gets a neutral fallback. A halt needs the owner, so it reads first.
 function episodeState(e: CIEpisodeDTO): { label: string; tone: BadgeTone } {
   if (e.halted_reason === "attempt_cap") return { label: "Stopped: attempt limit reached", tone: "warning" };
   if (e.halted_reason === "no_progress") return { label: "Stopped: no progress", tone: "warning" };
-  if (e.observed_run_id == null) return { label: "Not seen yet", tone: "neutral" };
-  if (e.last_handled_run_id != null && e.last_handled_run_id === e.observed_run_id)
-    return { label: "Repair started", tone: "ok" };
-  return { label: "Watching", tone: "info" };
+  if (e.halted_reason) return { label: "Stopped", tone: "warning" };
+  if (e.attempts > 0)
+    return { label: e.attempts === 1 ? "Repair attempted" : `Repair attempted (${e.attempts} times)`, tone: "info" };
+  if (e.last_signature == null) return { label: "Passing again", tone: "ok" };
+  return { label: "Failure seen", tone: "neutral" };
 }
