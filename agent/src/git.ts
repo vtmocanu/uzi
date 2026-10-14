@@ -5887,23 +5887,29 @@ export class GitCache {
   }
 
   /** Precharge one of three total iterations before capture. Legacy journals start at zero.
-   * Recreated workers and fresh successors use the original five-minute episode deadline.
+   * A positively fenced new claim gets one five-minute window; same-claim recreation keeps it.
+   * Callers without a positive fence retain the legacy deadline and cannot rebase it.
    * recoveryRetryMs is the existing base (1..30000ms). Returned backoff is base times
    * 2^(charged attempts - 1), capped at 16x base; caller sleeps outside lock/deadline. */
   async reserveRecoveryIteration(
-    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000,
+    barePath: string, branch: string, key: string, expected: RecoverySource, recoveryRetryMs = 1_000, claimGeneration?: number,
   ): Promise<RecoveryProgress> {
+    if (claimGeneration !== undefined && (!Number.isSafeInteger(claimGeneration) || claimGeneration < 1)) throw new Error("invalid recovery claim fence");
     if (!Number.isSafeInteger(recoveryRetryMs) || recoveryRetryMs < 1 || recoveryRetryMs > 30_000) throw new Error("invalid recovery backoff");
     return this.withLock(barePath, async () => {
       const journal = await this.checkedRecovery(barePath, branch, key, expected);
       const old = journal.recovery;
       if (old?.stage === "blocked") throw new Error("recovery episode is blocked");
+      if (old?.claimGeneration !== undefined && (claimGeneration === undefined || claimGeneration < old.claimGeneration)) {
+        throw new Error("stale recovery claim fence");
+      }
+      const newWindow = claimGeneration !== undefined && old?.claimGeneration !== claimGeneration;
       const now = Date.now();
       if (!Number.isSafeInteger(now) || now < 0 || !Number.isSafeInteger(now + 300_000) || (old && now < old.startedAt)) {
         if (old) await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "clock_invalid" } });
         throw new Error("invalid recovery clock");
       }
-      if (old && (old.attempts >= 3 || now >= old.deadline)) {
+      if (old && (old.attempts >= 3 || (!newWindow && now >= old.deadline))) {
         await this.writeRecovery(barePath, branch, { ...journal, recovery: { ...old, stage: "blocked", blocker: "budget_exhausted" } });
         throw new Error("recovery budget exhausted");
       }
@@ -5911,7 +5917,9 @@ export class GitCache {
         ...(journal.attemptId ? { attemptId: journal.attemptId } : {}) });
       const recovery: RecoveryProgress = {
         ...old, version: 1, source, attempts: (old?.attempts ?? 0) + 1,
-        startedAt: old?.startedAt ?? now, deadline: old?.deadline ?? now + 300_000,
+        startedAt: newWindow ? now : old?.startedAt ?? now,
+        deadline: newWindow ? now + 300_000 : old?.deadline ?? now + 300_000,
+        ...(claimGeneration === undefined ? {} : { claimGeneration }),
         backoffMs: recoveryRetryMs * 2 ** Math.min(old?.attempts ?? 0, 4), stage: "capturing",
       };
       await this.runGit(barePath, ["config", "--local", `uzi-attemptmode.${key}.enabled`, "true"]);

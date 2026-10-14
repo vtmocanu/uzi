@@ -52,6 +52,9 @@ through `[0.52.0]`.)
 - **Hosted worker CPU/memory capacity blockers no longer appear as failed upgrades (#2419).**
   Verified scheduler-only resource shortages have distinct web, CLI and TUI diagnostics, while first provisioning gets its own progress/failure labels. Storage and unknown faults retain failure visibility; typed cause validation survives mixed-version API writes. Live Kubernetes capacity/storage-control verification and fresh light/dark TUI PNG review remain maintainer-owned and incomplete.
 
+- **Retained recovery gets one deadline window per verified claim ([#2958](https://github.com/vtmocanu/uzi/issues/2958)).**
+  A fresh claim can recover work after a long turn or park without inheriting an expired predecessor deadline. Same-claim retries retain their deadline, reservation counts remain cumulative, and already-blocked episodes keep their original reason and custody.
+
 - **Admin Settings exposes the hosted worker quota ([#2960](https://github.com/vtmocanu/uzi/issues/2960)).**
   The Hosted worker quota card lets admins set the per-user persistent worker cap from 0 to 20, validates edits before saving, and shows server errors. Zero disables self-service provisioning without changing existing workers.
 

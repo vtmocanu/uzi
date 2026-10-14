@@ -863,6 +863,7 @@ for (const setupDelay of [0, 5_000]) {
     const { claim, bare, clone, key } = await seed();
     await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
     const before = readJournal(bare, clone.branch);
+    before.recovery.claimGeneration = claim.claim_generation;
     before.recovery.startedAt = Date.now() - 60_000;
     before.recovery.deadline = before.recovery.startedAt + 300_000;
     command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
@@ -1553,6 +1554,7 @@ for (const setupDelay of [0, 5_000]) {
     await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
     const old = readJournal(bare, clone.branch);
     const startedAt = Date.now() - 60_000;
+    old.recovery.claimGeneration = claim.claim_generation;
     old.recovery.startedAt = startedAt;
     old.recovery.deadline = startedAt + 300_000;
     command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(old));
@@ -1929,6 +1931,7 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
       if (failure === "timeout") {
         await git.reserveRecoveryIteration(bare, clone.branch, key, { runId: claim.run_id, clonePath: clone.path }, 1);
         const before = readJournal(bare, clone.branch);
+        before.recovery.claimGeneration = claim.claim_generation;
         before.recovery.startedAt = Date.now() - 60_000;
         before.recovery.deadline = before.recovery.startedAt + 300_000;
         command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
@@ -1972,4 +1975,31 @@ for (const failure of ["cap", "timeout", "interruption"] as const) {
       }
     });
   }
+}
+
+for (const binding of ["bound predecessor", "legacy"] as const) {
+  it(`#2958: fresh fenced claim recovers expired ${binding} work and starts a model`, { skip: process.platform !== "linux" }, async () => {
+    const { claim, bare, clone, key } = await seed();
+    await git.reserveRecoveryIteration(bare, clone.branch, key,
+      { runId: claim.run_id, clonePath: clone.path }, 1, binding === "legacy" ? undefined : 1);
+    const before = readJournal(bare, clone.branch);
+    before.recovery.startedAt = Date.now() - 300_001;
+    before.recovery.deadline = before.recovery.startedAt + 300_000;
+    command(bare, "config", `uzi-recovery.${clone.branch}.clone`, JSON.stringify(before));
+    let models = 0;
+    await runnerWith(factory(async ctx => {
+      models++;
+      assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "retained.txt"), "utf8"), "only local dirty work\n");
+      const admitted = readJournal(bare, clone.branch).recovery;
+      assert.equal(admitted.claimGeneration, 2);
+      assert.equal(admitted.attempts, 2);
+      assert.ok(admitted.deadline > before.recovery.deadline);
+      // No settled-turn callback: the count and source custody must survive this interruption.
+      throw new Error("fixture interrupted long turn");
+    }), fakeGitlab().gitlab, undefined, nullLogger(), { recoveryRetryMs: 1 }).execute(claim);
+    assert.equal(models, 1);
+    assert.equal(readJournal(bare, clone.branch).recovery.attempts, 2);
+    assert.equal(fs.existsSync(clone.path), true);
+    assert.equal(api.states.some(s => /budget exhausted/.test(s.body.failure_reason ?? "")), false);
+  });
 }
