@@ -11,8 +11,8 @@ import type { PendingTerminal } from "./outbox.js";
  *  an installed, un-retired terminal journal. */
 export type PendingTerminalLister = () => PendingTerminal[];
 
-/** PRD #1391 Run B M4: the server-side terminal-pending outbox cap getter — the register-returned
- *  `WORKER_OUTBOX_MAX_PENDING` off the client. Undefined when an older api did not return it, in
+/** PRD #1391 Run B M4: the server-side terminal-pending outbox cap getter — the latest valid
+ *  `WORKER_OUTBOX_MAX_PENDING` advertisement from register or an ordinary heartbeat. Undefined when an older api did not return it, in
  *  which case the registry treats the cap as 0 (protect every pending outcome via `pending_overflow`,
  *  the cap-independent floor). */
 export type OutboxCapGetter = () => number | undefined;

@@ -40,6 +40,9 @@ through `[0.52.0]`.)
 - **Backups accept recovery claim deadline windows.**
   Retained-source backups accept the optional claim generation written by workers and reject malformed claim fences in protected descriptors and ordinary recovery journals (Refs #2958).
 
+- **Refresh worker protocol negotiation without restarting ([#1419](https://github.com/vtmocanu/uzi/issues/1419)).**
+  Regular heartbeats refresh API-supported features and outbox quotas, and re-advertise the worker's implemented protocols so an API upgrade can restore claim eligibility within two successful regular heartbeats with complete responses no larger than 1 MiB. Refresh preserves worker identity, registration nonce, running work and custody; server capabilities and capacity limits only grow until ordinary registration.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed
