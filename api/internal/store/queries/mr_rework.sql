@@ -241,12 +241,23 @@ WHERE ledger.repo_id = @repo_id::uuid
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), @trigger_source, @harness,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id),
+    -- PRD #2865: a rework of a GUARDED run (runs.ci_config_guard, a default-branch CI repair)
+    -- inherits the guard and that run's ci_config_paths, read in this same statement. The
+    -- owner is the target run, or any guarded run owning the branch (recorded branch or the
+    -- deterministic uzi/prompt-<id> name). Unguarded sources keep false / NULL. Keep in sync
+    -- between the two INSERT bodies.
+    EXISTS (SELECT 1 FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+          AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)),
+    (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
+        SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+          AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
+    ) x)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid
@@ -301,14 +312,25 @@ WITH led AS (
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths)
 SELECT
     @user_id, @repo_id::uuid, 'mr_rework', @issue_title, @issue_description,
     @pipeline_ref, @mr_iid, @target_run_id, sqlc.narg('review_comments')::jsonb, true, @wait_on_limit,
     -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
     -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'manual', @harness,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id),
+    -- PRD #2865: a rework of a GUARDED run (runs.ci_config_guard, a default-branch CI repair)
+    -- inherits the guard and that run's ci_config_paths, read in this same statement. The
+    -- owner is the target run, or any guarded run owning the branch (recorded branch or the
+    -- deterministic uzi/prompt-<id> name). Unguarded sources keep false / NULL. Keep in sync
+    -- between the two INSERT bodies.
+    EXISTS (SELECT 1 FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+          AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)),
+    (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
+        SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+          AND (g.id = @target_run_id OR g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
+    ) x)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = @repo_id::uuid

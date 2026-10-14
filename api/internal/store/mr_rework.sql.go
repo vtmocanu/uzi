@@ -62,12 +62,23 @@ const createAutoMRReworkRun = `-- name: CreateAutoMRReworkRun :one
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), $10, $11,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = $1)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = $1),
+    -- PRD #2865: a rework of a GUARDED run (runs.ci_config_guard, a default-branch CI repair)
+    -- inherits the guard and that run's ci_config_paths, read in this same statement. The
+    -- owner is the target run, or any guarded run owning the branch (recorded branch or the
+    -- deterministic uzi/prompt-<id> name). Unguarded sources keep false / NULL. Keep in sync
+    -- between the two INSERT bodies.
+    EXISTS (SELECT 1 FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
+          AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)),
+    (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
+        SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
+          AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)
+    ) x)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
@@ -350,14 +361,25 @@ WITH led AS (
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_ref, mr_iid, target_run_id, review_comments, auto_approve, wait_on_limit, required_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required)
+, code_cross_check_required, ci_config_guard, ci_config_paths)
 SELECT
     $1, $2::uuid, 'mr_rework', $3, $4,
     $5, $6, $7, $8::jsonb, true, $9,
     -- harness (PRD #1429 M1, was #1332 M5A / D2): the @harness PARAMETER, mirroring
     -- CreateAutoMRReworkRun. The caller passes the D11-resolved, source-run-inherited harness.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = $2::uuid), '{}'), 'manual', $10,
-    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = $1)
+    (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = $1), (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = $1),
+    -- PRD #2865: a rework of a GUARDED run (runs.ci_config_guard, a default-branch CI repair)
+    -- inherits the guard and that run's ci_config_paths, read in this same statement. The
+    -- owner is the target run, or any guarded run owning the branch (recorded branch or the
+    -- deterministic uzi/prompt-<id> name). Unguarded sources keep false / NULL. Keep in sync
+    -- between the two INSERT bodies.
+    EXISTS (SELECT 1 FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
+          AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)),
+    (SELECT array_agg(DISTINCT x.p ORDER BY x.p) FROM (
+        SELECT unnest(g.ci_config_paths) AS p FROM runs g WHERE g.repo_id = $2::uuid AND g.ci_config_guard
+          AND (g.id = $7 OR g.branch = $5 OR 'uzi/prompt-' || g.id::text = $5)
+    ) x)
 WHERE NOT EXISTS (
     SELECT 1 FROM runs
     WHERE repo_id = $2::uuid
