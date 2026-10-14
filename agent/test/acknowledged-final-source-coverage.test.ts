@@ -7,7 +7,11 @@ import { execFileSync } from 'node:child_process';
 import { RecoveryCoordinator } from '../src/recovery.js';
 import { nullLogger } from './helpers.js';
 
-for (const covered of [false, true]) it(`acknowledged-FINAL report retirement ${covered ? 'retires with a covered' : 'refuses an uncovered'} competing FINAL source SHA (#2883)`, async () => {
+for (const [covered, earlierSynthetic, name] of [
+  [false, false, 'refuses an uncovered competing FINAL source SHA'],
+  [true, false, 'retires with a covered competing FINAL source SHA'],
+  [true, true, 'retires despite an earlier aggregate whose synthetic tip is not an archive ancestor'],
+] as const) it(`acknowledged-FINAL report retirement ${name} (#2883)`, async () => {
   const root = await fs.mkdtemp(path.join(os.tmpdir(), 'ack-final-source-'));
   try {
     const bare = path.join(root, 'repo.git');
@@ -42,7 +46,11 @@ for (const covered of [false, true]) it(`acknowledged-FINAL report retirement ${
     const pending = {...common,captureId:'33333333-3333-4333-8333-333333333333',sourceSha:covered ? base : uncovered,state:'needs_action',reason:'inventory_source_not_quiescent:execution_tail_present',finalRequest:{disposition:{kind:'settled',coverage_digest:digest},evidence:'publication'}};
     await (recovery as any).writeRecordUnlocked(archive);
     await (recovery as any).writeRecordUnlocked(pending);
-    assert.equal((await recovery.inspect(runId)).length,2,'both journals must authenticate and parse');
+    if (earlierSynthetic) {
+      const synthetic = cmd(['commit-tree', tree, '-p', base], 'earlier recovery aggregate\n');
+      await (recovery as any).writeRecordUnlocked({...common,captureId:'44444444-4444-4444-8444-444444444444',sourceSha:synthetic,state:'uploaded',serverCaptureId:'44444444-4444-4444-8444-444444444444',checksum,byteSize:1});
+    }
+    assert.equal((await recovery.inspect(runId)).length, earlierSynthetic ? 3 : 2,'every journal must authenticate and parse');
     let removed=0;
     await recovery.retireAcknowledgedFinalReport(runId,generation,{signal:new AbortController().signal,deadline:Date.now()+10_000},action=>action(()=>true),async()=>true,async()=>{removed++;});
     assert.equal(removed, covered ? 1 : 0, covered ? 'covered competing source retires the report' : 'uncovered competing sourceSha must refuse report retirement');
