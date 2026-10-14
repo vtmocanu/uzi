@@ -4805,7 +4805,8 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
         assert.equal(released, true, "signal-aware generator released before executor finally");
         await callbackDone;
         assert.equal(fake.rec.planPosts.length, 0);
-        assert.equal(emits.filter(m => m.kind === "summary_usage").length, 0);
+        // The released pass still reports the spend it observed; only its text is dropped (#2942).
+        assert.equal(emits.filter(m => m.kind === "summary_usage").length, 1);
       } finally {
         finish.resolve();
         const result = await execution;
@@ -4864,8 +4865,9 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
             postAck.resolve();
             await callbackDone;
             assert.equal(posts, phase === "post" || invalidation === "live" ? 1 : 0);
+            // Spend is counted unless the pass is abandoned, fenced or superseded (#2942).
             assert.equal(emitted.filter(m => m.kind === "summary_usage").length,
-              phase === "post" || invalidation === "live" ? 1 : 0);
+              phase === "post" || invalidation === "live" || invalidation === "cancel" ? 1 : 0);
             if (invalidation === "close") assert.equal(input!.signal!.aborted, true);
           } finally {
             generate.resolve(); postAck.resolve(); finish.resolve();
@@ -4876,6 +4878,45 @@ describe("SdkExecutor inline run summaries (PRD #362 M3c)", () => {
       }
     }
   }
+
+  it("M1 Claude close counts usage the aborted plan pass reports within the settle bound", async () => {
+    const entered = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+    let posts = 0, callbackDone: Promise<void> | undefined;
+    const summaryRunner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (i: PlanSummaryInput) => {
+        await new Promise<void>(resolve => {
+          i.signal!.addEventListener("abort", () => resolve(), { once: true });
+          entered.resolve();
+        });
+        i.onUsage?.({}); i.onUsage?.({});
+        return { summary: "Closed advice", deltas: [] };
+      },
+    };
+    const { queryFn } = fakeTurns([
+      [submitPlan("# Plan"), resultSuccess()],
+      async function* () { implementation.resolve(); await finish.promise; yield signalDone(); yield resultSuccess(); },
+    ]);
+    const fake = summaryFakes({ postPlan: async () => { posts++; } });
+    const probe = makeCtx({ agents: [lead, coder], summaryIntentPresent: true,
+      gatePlan: async (md, _milestones, persisted) => {
+        callbackDone = persisted!(md);
+        return { kind: "approve", selection: { status: "absent" } };
+      } });
+    const executor = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn, client: fake.client, summaryRunner: summaryRunner as unknown as SummaryRunner, intentSettleBoundMs: 1,
+    });
+    const execution = executor.run(probe.ctx);
+    try {
+      await Promise.all([entered.promise, implementation.promise]);
+      await executor.closeAndSettlePlanSummary(5_000);
+      await callbackDone;
+      assert.equal(posts, 0, "a closed flight posts no summary text");
+      assert.equal(probe.emits.filter(m => m.kind === "summary_usage").length, 1,
+        "spend observed during settlement is counted once");
+    } finally { finish.resolve(); }
+    assert.equal((await execution).summaryPlan, undefined);
+  });
 
   for (const phase of ["generation", "post"] as const) {
     it(`M1 Claude supersedes ${phase} before a failing replacement and suppresses late usage`, async () => {

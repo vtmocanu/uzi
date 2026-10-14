@@ -1114,8 +1114,11 @@ export class SdkExecutor implements Executor {
             signal: AbortSignal.any([owned.ctrl.signal,
               ...(ctx.signal ? [ctx.signal] : []),
               ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : [])]),
+            // Spend observed during bounded settlement counts even after close/abort; only
+            // abandonment, a fence or a superseding flight drops it (as for the intent pass).
             onUsage: usage => {
-              if (owned.delivered || !allowed()) return;
+              if (owned.delivered || owned.abandoned || this.planFlight !== owned
+                || generation !== this.planGeneration || ctx.claimFenced?.()) return;
               owned.delivered = true;
               ctx.emit({ kind: "summary_usage", agent: "worker", payload: { pass: "plan", model_usage: usage } });
             },

@@ -17321,8 +17321,9 @@ describe("2833 Codex inline summaries", () => {
             postAck.resolve();
             await callbackDone;
             assert.equal(posts, phase === "post" || invalidation === "live" ? 1 : 0);
+            // Spend is counted unless the pass is abandoned, fenced or superseded (#2942).
             assert.equal(emitted.filter(m => m.kind === "summary_usage").length,
-              phase === "post" || invalidation === "live" ? 1 : 0);
+              phase === "post" || invalidation === "live" || invalidation === "cancel" ? 1 : 0);
             if (invalidation === "close") assert.equal(input!.signal!.aborted, true);
           } finally {
             generate.resolve(); postAck.resolve(); finish.resolve();
@@ -17336,6 +17337,55 @@ describe("2833 Codex inline summaries", () => {
       }
     }
   }
+
+  it("M1 Codex close counts usage the aborted plan pass reports within the settle bound", async () => {
+    const entered = m1Barrier(), implementation = m1Barrier(), finish = m1Barrier();
+    let posts = 0, callbackDone: Promise<void> | undefined;
+    const summaryRunner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (i: PlanSummaryInput) => {
+        await new Promise<void>(resolve => {
+          i.signal!.addEventListener("abort", () => resolve(), { once: true });
+          entered.resolve();
+        });
+        i.onUsage?.({}); i.onUsage?.({});
+        return { summary: "Closed advice", deltas: [] };
+      },
+    };
+    const gatePlan: NonNullable<RunContext["gatePlan"]> = async (md, _milestones, persisted) => {
+      callbackDone = persisted!(md);
+      return { kind: "approve", selection: { status: "absent" } };
+    };
+    const planResponder = epochResponder("th-plan", "tn-plan", (t, th, tn) =>
+      t.push(toolCall(98, "submit_plan", { plan_md: "# Plan" }, th, tn, "plan"))
+        .push(turnCompleted("completed", th, tn)));
+    const implementResponder: Responder = c => {
+      if (c.method === "thread/start" || c.method === "thread/resume") return { thread: { id: "th-impl" } };
+      if (c.method !== "turn/start") return {};
+      implementation.resolve();
+      void finish.promise.then(() => c.transport
+        .push(toolCall(99, "signal_done", {}, "th-impl", "tn-impl", "done"))
+        .push(turnCompleted("completed", "th-impl", "tn-impl")));
+      return { turn: { id: "tn-impl" } };
+    };
+    const rig = makeMultiEpochRig([planResponder, implementResponder]);
+    Object.assign(rig.client, { postIntentSummary: async () => {}, postPlanSummary: async () => { posts++; } });
+    const { ctx, emitted } = makeCtx({ kind: "issue", planApproved: false, approvedPlan: undefined,
+      summaryIntentPresent: true, gatePlan });
+    const executor = makeExecutor(rig, bindingOf(API_KEY), noopLog, undefined, provider, {
+      summaryRunner, summarySettleMs: 1,
+    });
+    const execution = executor.run(ctx);
+    try {
+      await Promise.all([entered.promise, implementation.promise]);
+      await executor.closeAndSettlePlanSummary(5_000);
+      await callbackDone;
+      assert.equal(posts, 0, "a closed flight posts no summary text");
+      assert.equal(emitted.filter(m => m.kind === "summary_usage").length, 1,
+        "spend observed during settlement is counted once");
+    } finally { finish.resolve(); }
+    assert.equal((await execution).summaryPlan, undefined);
+  });
 
   for (const phase of ["generation", "post"] as const) {
     it(`M1 Codex supersedes ${phase} before a failing replacement and suppresses late usage`, async () => {
