@@ -28,6 +28,30 @@ supports short eligible-bound fixtures. The selected bound goes to waitChild
 and CommandDeadlineError, whose broker reply names the actual bound (120 min
 in production). Child command and child-turn deadlines are unchanged.
 
+## Bound rationale
+
+The 120-minute bound provides headroom over reported 44–76-minute unit gate
+stages. Those reports are the decision's evidence, not new measurements made
+for this clarification. Run-wall limits remain unchanged and take precedence.
+We explicitly accept that a hung opted-in command may occupy the lead for up
+to two hours, subject to existing interruption limits. Gates needing more than
+two hours are unsupported by this command bound.
+
+## Rollout and safe downgrade
+
+Request `long_running: true` only on an upgraded worker that advertises it.
+On the supported advertised-tool argument/schema path, older workers reject
+this unknown argument as bad_args; treat that rejection as a safe downgrade,
+not acceptance of the flag or a promise of two-hour execution. An ordinary
+request without the flag retains the older worker's 60-minute command bound.
+
+At pre-fix base 2b84c993, dynamic-tools.ts advertised
+`objectSchema({command:STRING,cwd:STRING},["command"],false)` with no
+long_running property. This downgrade claim is scoped to that supported
+schema boundary: the legacy dispatchShell broker ignored unknown properties
+on a direct bypass and did not have the new runtime validation. No live
+rollout validation is claimed here.
+
 ## Ownership and interruption
 
 The command stays in the foreground and owns its root until primary exit,
