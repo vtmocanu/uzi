@@ -557,8 +557,8 @@ func buildScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apitypes.Sc
 // restated from the fetched row (replace-semantics) so a partial edit does not drop them,
 // and an explicit flag overrides the restated value.
 //
-// Guidance is owner-editable on a PROMPT-target default (PRD #662 M1) and a SWEEP-target
-// default (issue #675, where it is an overlay composed onto the baked catalog guidance at
+// Guidance is owner-editable on a PROMPT-target default (PRD #662 M1), a CI_WATCH-target
+// default (PRD #2865) and a SWEEP-target default (issue #675, where it is an overlay composed onto the baked catalog guidance at
 // fire time): --guidance sets it and --clear-guidance blanks it, and the fetched value is
 // RESTATED so a partial edit does not wipe it under the server's replace-semantics (for a
 // sweep default the restated value is the OVERLAY, never the baked catalog value). On an
@@ -578,7 +578,8 @@ func buildDefaultScheduleEditRequest(cmd *cobra.Command, c uzicli.Client, s apit
 				"--%s is catalog-owned on a default schedule; clone it first with `uzi schedule clone`", flag)
 		}
 	}
-	// Guidance is owner-editable on a prompt-target default (issue #662) and on a sweep-target
+	// Guidance is owner-editable on a prompt-target default (issue #662), on a ci_watch-target
+	// default (PRD #2865) and on a sweep-target
 	// default (issue #675: an owner overlay composed onto the baked catalog guidance at fire
 	// time). On an issue/self_improve default it stays catalog-owned (the server still 400s a
 	// guidance edit), so reject it here.

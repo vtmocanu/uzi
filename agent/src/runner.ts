@@ -1964,6 +1964,10 @@ interface RunFlight {
    *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
    *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
   checkpointChainForge?: boolean;
+  /** Guarded default-branch CI repair runs (claim.config.ci_config_guard): the protected-path globs
+   *  every checkpoint and held publication is checked against, over the exact candidate SHA, before
+   *  any upload. Absent for unguarded runs (no check, no extra git calls). */
+  ciConfigGuardGlobs?: string[];
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -8860,6 +8864,9 @@ export class RunRunner {
       lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
       lastAttemptedCheckpointRefTip: undefined,
       checkpointChainForge: claim.repo.forge_type === "github",
+      ...(claim.config?.ci_config_guard === true
+        ? { ciConfigGuardGlobs: [...DEFAULT_CI_REPAIR_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
+        : {}),
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -12457,6 +12464,8 @@ export class RunRunner {
       // (d) The stored credential may lack workflow scope: a range that authors a workflow change archives.
       const workflows = await this.git.rangeTouchesWorkflows(barePath, range, { deadlineMs: this.scanDeadlineMs() });
       if (workflows !== "clean") return skip(workflows === "touches" ? "workflow_change" : "workflow_check_unknown");
+      // (d2) Guarded runs: the raw-path CI-config check over the exact candidate, before any upload.
+      if (await this.ciConfigGuardBlocksPublication(flight, barePath, record.sourceSha, "held publication")) return skip("ci_config_guard");
       // (e) The pack, over the same range object the scan judged.
       const packed = await this.git.checkpointPack(barePath, branch, undefined, range, undefined, record.sourceSha);
       if (!packed || packed.tipOid !== record.sourceSha) {
@@ -13748,6 +13757,27 @@ export class RunRunner {
     return false;
   }
 
+  /**
+   * Guarded runs only: the raw-path CI-config check over the EXACT candidate `sha`, run in the worker
+   * before any checkpoint or held upload. The server broker compares trees but must skip subtrees
+   * absent from the pack, so a merge whose second parent carries an older workflow tree could slip
+   * a protected tree through; the merge-base diff here lists it. Returns true when the publication
+   * must be skipped (a protected path matched, or the diff could not be computed: fail closed).
+   * Never fails the run; the early and final push guards do that.
+   */
+  private async ciConfigGuardBlocksPublication(flight: RunFlight, barePath: string, sha: string, what: string): Promise<boolean> {
+    const globs = flight.ciConfigGuardGlobs;
+    if (!globs) return false;
+    const changed = await this.git.changedFilesNoRenames(barePath, sha);
+    const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
+    if (flagged !== null && flagged.length === 0) return false;
+    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
+      (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
+    this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
+      `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });
+    return true;
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
@@ -13807,6 +13837,10 @@ export class RunRunner {
     try {
       signal?.throwIfAborted();
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      signal?.throwIfAborted();
+      if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
+        return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
+      }
       signal?.throwIfAborted();
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
         throw new SecretRemediationPendingError();

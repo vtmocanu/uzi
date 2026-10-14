@@ -456,13 +456,13 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	// PRD #1429 M5: an unset flag leaves the stored pin unchanged (retain-on-omission, the
 	// server's presence-aware seed-and-keep); pass "" to explicitly clear it back to implicit.
 	edit.Flags().String("harness", "", "change the pinned harness for runs this schedule fires: claude or codex; pass \"\" to clear back to implicit; an unset flag leaves the stored pin unchanged")
-	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
+	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target, sweep-target or ci_watch-target default)")
 	edit.Flags().Int("max-issues", 10, "issues to send at a time, oldest-first (sweep only)")
 	edit.Flags().Bool("remove-label-on-dispatch", false, "set whether the selector label is removed after a run starts")
 	edit.Flags().Int("capacity-limit", 0, "unfinished runs limit (1..50; requires --room-needed)")
 	edit.Flags().Int("room-needed", 0, "room required before sending issues (requires --capacity-limit)")
 	edit.Flags().Bool("clear-capacity", false, "turn off the capacity gate")
-	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")
+	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target, sweep-target or ci_watch-target default)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
 	edit.Flags().Bool("clear-mr-rework", false, "clear the stored MR-rework override back to inherit (the account default)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")
