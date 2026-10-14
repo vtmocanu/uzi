@@ -20,8 +20,8 @@ func TestCIRepairCatalogApproval(t *testing.T) {
 			t.Errorf("legacy job %s no longer auto-approves", job.Slug)
 		}
 	}
-	if !AutoApprove || !WaitOnLimit {
-		t.Fatal("migration constants changed")
+	if !WaitOnLimit {
+		t.Fatal("WaitOnLimit constant changed")
 	}
 }
 

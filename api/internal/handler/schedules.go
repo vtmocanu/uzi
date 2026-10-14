@@ -110,6 +110,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		IssueIid:                   issueIID,
 		Labels:                     labels,
 		Prompt:                     prompt,
+		CiWorkflows:                ciWorkflowsColumn(m),
 		Timing:                     m.Timing,
 		CronExpr:                   cronExpr,
 		RunAt:                      runAt,
@@ -174,7 +175,19 @@ func (h *Handler) GetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "schedule not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
+	dto := h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s))
+	if s.Target == "ci_watch" {
+		// Detail carries the first episode page (PRD #2865); further pages come from
+		// GET /api/schedules/{id}/ci-episodes.
+		page, perr := h.ciEpisodePage(r.Context(), user.ID, id, nil, ciEpisodePageMax)
+		if perr != nil {
+			slog.Error("get schedule ci episodes", "schedule", id.String(), "error", perr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		dto.CIEpisodes = &page
+	}
+	httpx.JSON(w, http.StatusOK, dto)
 }
 
 // PatchSchedule merges the provided fields over the current schedule (pointer/empty =
@@ -198,11 +211,29 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	final := cur
+	// Every config-changing PATCH that touches a ci_watch schedule (it is one, or the
+	// request converts it into one) runs in ONE transaction that first takes the
+	// schedule row lock every fire transition takes (PRD #2865), so a fire's start,
+	// halt or reset is fully ordered before or after this edit. The locked row replaces
+	// the unlocked pre-read so the merge below sees the state the fire left. A non-
+	// ci_watch edit keeps the plain pool path.
+	qw := h.q
+	var lock *scheduleConfigLock
+	if !onlyEnabled(req) && (cur.Target == "ci_watch" || req.Target == "ci_watch") {
+		var locked store.RunSchedule
+		var ok bool
+		lock, locked, ok = h.lockScheduleForConfig(w, r.Context(), user.ID, id)
+		if !ok {
+			return
+		}
+		defer lock.rollback()
+		qw, cur, final = lock.q, locked, locked
+	}
 	if cur.Origin == "default" && !onlyEnabled(req) {
 		// A default-origin row (PRD #589 M2) is editable ONLY in its catalog-inherited
 		// editable fields; its prompt/labels/guidance/target/repo/timing are catalog-owned.
 		// A distinct branch keeps the user-row path below byte-for-byte unchanged.
-		updated, done := h.patchDefaultScheduleConfig(w, r, user, id, cur, req)
+		updated, done := h.patchDefaultScheduleConfig(w, r, qw, user, id, cur, req)
 		if !done {
 			return
 		}
@@ -219,6 +250,14 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			// No enabled/guardrail/blocked gate is added here — those run at fire time.
 			if _, rerr := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
 				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			// A schedule with CI-watch episode history keeps it only against the repo whose
+			// workflow keys it recorded, so repointing it is refused (PRD #2865). Checked
+			// on qw: for a ci_watch schedule that is the locked transaction, so a fire that
+			// recorded its first episode is ordered before this check.
+			if refused, status, msg := h.ciEpisodesBlockRepoint(r.Context(), qw, user.ID, id); refused {
+				httpx.Error(w, status, msg)
 				return
 			}
 		}
@@ -270,12 +309,13 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			credSecret = credCols.secretID
 		}
 		issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
-		final, err = h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
+		final, err = qw.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 			Target:                     m.Target,
 			RepoID:                     repoID,
 			IssueIid:                   issueIID,
 			Labels:                     labels,
 			Prompt:                     prompt,
+			CiWorkflows:                ciWorkflowsColumn(m),
 			Timing:                     m.Timing,
 			CronExpr:                   cronExpr,
 			RunAt:                      runAt,
@@ -310,6 +350,14 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			slog.Error("update run schedule", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if lock != nil {
+		if err := lock.commit(r.Context()); err != nil {
+			slog.Error("commit schedule config patch", "schedule", id.String(), "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}

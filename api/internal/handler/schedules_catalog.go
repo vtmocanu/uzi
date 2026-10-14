@@ -136,7 +136,7 @@ func (h *Handler) EnableCatalogSchedule(w http.ResponseWriter, r *http.Request) 
 		CronExpr:              pgtype.Text{String: job.Cron, Valid: true},
 		Timezone:              tz,
 		NextFireAt:            pgtype.Timestamptz{Time: next, Valid: true},
-		AutoApprove:           schedtmpl.AutoApprove,
+		AutoApprove:           job.AutoApprove,
 		WaitOnLimit:           schedtmpl.WaitOnLimit,
 		MaxIssues:             catalogMaxIssues(job),
 		RemoveLabelOnDispatch: job.RemoveLabelOnDispatch,
@@ -192,6 +192,23 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusUnprocessableEntity, "this schedule's catalog entry no longer exists")
 		return
 	}
+	// A reset of a ci_watch default rewrites its selectors and run flags, so it takes the
+	// same schedule row lock every fire transition takes, in one transaction (PRD #2865).
+	qw := h.q
+	var lock *scheduleConfigLock
+	if cur.Target == "ci_watch" || job.Target == "ci_watch" {
+		var locked store.RunSchedule
+		lock, locked, ok = h.lockScheduleForConfig(w, r.Context(), user.ID, id)
+		if !ok {
+			return
+		}
+		defer lock.rollback()
+		qw = lock.q
+		if locked.Origin != "default" || locked.CatalogSlug != cur.CatalogSlug {
+			httpx.Error(w, http.StatusConflict, "the schedule changed; retry the reset")
+			return
+		}
+	}
 	if status, msg := h.validateScheduleRemoval(r.Context(), apitypes.ScheduleRequest{Target: job.Target, Timing: "recurring", Labels: job.Labels, RemoveLabelOnDispatch: &job.RemoveLabelOnDispatch}, job.SelectorKind); status != 0 {
 		httpx.Error(w, status, msg)
 		return
@@ -203,11 +220,11 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "could not compute the next fire time")
 		return
 	}
-	s, err := h.q.ResetDefaultSchedule(r.Context(), store.ResetDefaultScheduleParams{
+	s, err := qw.ResetDefaultSchedule(r.Context(), store.ResetDefaultScheduleParams{
 		CronExpr:              pgtype.Text{String: job.Cron, Valid: true},
 		Timezone:              tz,
 		Model:                 catalogModel(job),
-		AutoApprove:           schedtmpl.AutoApprove,
+		AutoApprove:           job.AutoApprove,
 		WaitOnLimit:           schedtmpl.WaitOnLimit,
 		MaxIssues:             catalogMaxIssues(job),
 		RemoveLabelOnDispatch: job.RemoveLabelOnDispatch,
@@ -227,6 +244,13 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return
 	}
+	if lock != nil {
+		if err := lock.commit(r.Context()); err != nil {
+			slog.Error("commit schedule reset", "schedule", id.String(), "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
 	httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
 }
 
@@ -242,14 +266,14 @@ func (h *Handler) ResetSchedule(w http.ResponseWriter, r *http.Request) {
 // diverging from the catalog default OR the row was already customized), and persists via
 // UpdateRunSchedule keeping the catalog-owned columns NULL. It writes the HTTP error itself
 // and returns done=false on any failure; on success it returns the updated row and done=true.
-func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Request, user store.User, id uuid.UUID, cur store.RunSchedule, req apitypes.ScheduleRequest) (store.RunSchedule, bool) {
+func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Request, qw *store.Queries, user store.User, id uuid.UUID, cur store.RunSchedule, req apitypes.ScheduleRequest) (store.RunSchedule, bool) {
 	// Owner-guidance overlay (issue #662, extended by issue #675): a DEFAULT PROMPT job
 	// carries owner-editable guidance appended to the catalog-resolved prompt at fire time,
 	// and a DEFAULT SWEEP job carries an owner OVERLAY composed onto the baked catalog
 	// guidance at fire time — so guidance is NOT catalog-owned for a prompt or sweep default.
 	// Issue/self_improve defaults keep guidance catalog-owned (locked). All the other fields
 	// stay catalog-owned for every target.
-	guidanceEditable := cur.Target == "prompt" || cur.Target == "sweep"
+	guidanceEditable := cur.Target == "prompt" || cur.Target == "sweep" || cur.Target == "ci_watch"
 	if req.Prompt != "" || req.Labels != nil || (!guidanceEditable && req.Guidance != nil) || req.Target != "" ||
 		req.RepoID != "" || req.IssueIID != nil || req.Timing != "" || req.RunAt != nil {
 		locked := "prompt, labels, guidance, target, timing and repo"
@@ -262,6 +286,23 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	if guidanceEditable && req.Guidance != nil && len(*req.Guidance) > MaxGuidanceBytes {
 		httpx.Error(w, http.StatusUnprocessableEntity, "guidance is too large")
 		return store.RunSchedule{}, false
+	}
+
+	// ci_workflows (PRD #2865) is an owner-editable selector list on a ci_watch default,
+	// not catalog-owned. Absent keeps the stored list; null or [] clears it to "all
+	// workflows"; any other target rejects a non-empty list.
+	ciWorkflows := cur.CiWorkflows
+	if req.CIWorkflows.Present {
+		clean, status, msg := normalizeCIWorkflows(req.CIWorkflows.Value)
+		if status != 0 {
+			httpx.Error(w, status, msg)
+			return store.RunSchedule{}, false
+		}
+		if cur.Target != "ci_watch" && len(clean) > 0 {
+			httpx.Error(w, http.StatusBadRequest, "ci_workflows is only valid for a ci_watch schedule")
+			return store.RunSchedule{}, false
+		}
+		ciWorkflows = ciWorkflowsColumn(apitypes.ScheduleRequest{Target: cur.Target, CIWorkflows: apitypes.OptionalCIWorkflows{Present: true, Value: clean}})
 	}
 
 	capacityReq := req
@@ -475,8 +516,12 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 	// baseline is no pin (NULL), so any stored pin diverges = customized. A cleared pin does
 	// not, so an exact-restore un-customizes. Mirrors credential_override's precedent above.
 	customized = customized || harness.Valid
+	// ci_workflows (PRD #2865): the catalog baseline is "watch every workflow" (NULL), so any
+	// stored selector list diverges; clearing it un-customizes.
+	customized = customized || len(ciWorkflowsFromColumn(ciWorkflows)) > 0
 
-	final, err := h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
+	final, err := qw.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
+		CiWorkflows:                ciWorkflows,
 		Target:                     cur.Target,
 		RepoID:                     cur.RepoID,
 		IssueIid:                   pgtype.Int8{},
@@ -514,7 +559,8 @@ func (h *Handler) patchDefaultScheduleConfig(w http.ResponseWriter, r *http.Requ
 }
 
 // catalogEntryDTO maps a builtin default job to its wire view (PRD #589 M2). auto_approve
-// and wait_on_limit are the fixed schedtmpl run flags, not per-entry.
+// is the job's own default (absent frontmatter means true); wait_on_limit is the fixed
+// schedtmpl run flag.
 func catalogEntryDTO(j schedtmpl.DefaultJob) apitypes.CatalogEntryDTO {
 	return apitypes.CatalogEntryDTO{
 		Slug:                  j.Slug,
@@ -533,7 +579,7 @@ func catalogEntryDTO(j schedtmpl.DefaultJob) apitypes.CatalogEntryDTO {
 		RemoveLabelOnDispatch: j.RemoveLabelOnDispatch,
 		CapacityLimit:         catalogCapacityDTO(j.CapacityLimit),
 		CapacityRoomNeeded:    catalogCapacityDTO(j.CapacityRoomNeeded),
-		AutoApprove:           schedtmpl.AutoApprove,
+		AutoApprove:           j.AutoApprove,
 		WaitOnLimit:           schedtmpl.WaitOnLimit,
 	}
 }
@@ -634,7 +680,7 @@ func defaultEditableDiverges(job schedtmpl.DefaultJob, cron, tz string, model pg
 	if strings.TrimSpace(rModel) != strings.TrimSpace(job.Model) {
 		return true
 	}
-	if autoApprove != schedtmpl.AutoApprove || waitOnLimit != schedtmpl.WaitOnLimit {
+	if autoApprove != job.AutoApprove || waitOnLimit != schedtmpl.WaitOnLimit {
 		return true
 	}
 	// mr_rework_enabled (PRD #841 M2, D5): the schedtmpl/catalog baseline is inherit

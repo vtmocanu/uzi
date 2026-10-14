@@ -151,7 +151,7 @@ func (o OptionalInteger) MarshalJSON() ([]byte, error) {
 func (o OptionalInteger) IsZero() bool { return !o.Present }
 
 // OptionalCIWorkflows preserves PATCH presence: absent keeps selectors, null or
-// [] clears to all workflows. U3 validates at most 20 entries of 1..200 bytes.
+// [] clears to all workflows. The handler validates at most 20 entries of 1..200 bytes.
 type OptionalCIWorkflows struct {
 	Present bool
 	Value   []string
@@ -166,7 +166,7 @@ func (o OptionalCIWorkflows) MarshalJSON() ([]byte, error) { return json.Marshal
 func (o OptionalCIWorkflows) IsZero() bool                 { return !o.Present }
 
 // CIEpisodeCursor is an opaque base64 encoding of an exclusive workflow key,
-// ordered by UTF-8 bytes. U3 validates the decoded key is 1..200 bytes.
+// ordered by UTF-8 bytes. The handler validates the decoded key is 1..200 bytes.
 type CIEpisodeCursor string
 
 // CIEpisodeDTO exposes durable loop history; run IDs are forge execution IDs.
@@ -192,7 +192,8 @@ type CIEpisodePage struct {
 // ScheduleRequest is the create/patch input for a run schedule (PRD #241 M4).
 //
 // On CREATE, omitted pointer fields take their documented defaults (auto_approve=true
-// per Decision 4, wait_on_limit=true, enabled=true). On PATCH the pointers carry
+// per Decision 4 except for a ci_watch schedule, which defaults to false because it reads
+// attacker-influenceable CI logs (PRD #2865 D10), wait_on_limit=true, enabled=true). On PATCH the pointers carry
 // "omitted = keep the current value" semantics: a nil AutoApprove/WaitOnLimit/Enabled
 // leaves that flag untouched, so a caller can toggle one field without restating the
 // rest. Timing/target-specific fields (CronExpr, RunAt, Timezone, IssueIID, Labels,
@@ -458,8 +459,9 @@ type LastFire struct {
 
 // CatalogEntryDTO is the wire view of one builtin default scheduled job (PRD #589). It
 // surfaces the catalog entry's shipped, read-only shape so the web can render the
-// enable-a-default UI. auto_approve/wait_on_limit are the fixed run flags every default is
-// seeded with (schedtmpl.AutoApprove / WaitOnLimit), not per-entry. For a prompt entry
+// enable-a-default UI. auto_approve is the job's own default (the catalog file's
+// auto_approve frontmatter key, true when absent, schedtmpl.DefaultJob.AutoApprove) and
+// wait_on_limit is the fixed run flag every default is seeded with (schedtmpl.WaitOnLimit). For a prompt entry
 // Guidance/Labels/MaxIssues are empty; for a sweep entry Prompt is empty.
 type CatalogEntryDTO struct {
 	RemoveLabelOnDispatch bool   `json:"remove_label_on_dispatch"`
