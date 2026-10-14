@@ -106,10 +106,10 @@ type Handler struct {
 	// heldListLimiter is the proposal limiter, stored by mountWorkerRoutes for step B's
 	// per-worker forge-listing bucket (recovery()); nil permits every listing.
 	heldListLimiter *mw.Limiter
-	// recoverySvc is the durable-recovery archive service (PRD #1296 M2). Accessed only
-	// through recovery(), which lazily constructs it under recoveryOnce from h.q/h.pool/
-	// h.box + the cfg limits (production and struct-literal test Handlers alike, so the
-	// latter are race-safe without every construction site wiring it). A test may pin its own
+	// recoverySvc is the durable-recovery archive service (PRD #1296 M2). recovery()
+	// constructs it lazily under recoveryOnce from h.q/h.pool/h.box and the cfg limits,
+	// for production and struct-literal test Handlers. During startup, mountWorkerRoutes
+	// also configures an existing instance before listeners serve. A test may pin its own
 	// service here before the first recovery() call.
 	recoverySvc  *recovery.Service
 	recoveryOnce sync.Once
