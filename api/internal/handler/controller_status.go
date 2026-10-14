@@ -121,7 +121,14 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 	}
 
 	var accepted, dropped int
-	for i, ws := range req.Workers {
+	for _, row := range wire.Workers {
+		// Decode independently: repeated workers arrays may reuse struct elements
+		// during the envelope decode, retaining an earlier row's identity or fields.
+		var ws hostedsvc.WorkerStatus
+		if err := json.Unmarshal(row, &ws); err != nil {
+			dropped++
+			continue
+		}
 		id, err := uuid.Parse(ws.ID)
 		if err != nil {
 			dropped++
@@ -142,7 +149,7 @@ func (h *Handler) ControllerStatus(w http.ResponseWriter, r *http.Request) {
 			continue
 		}
 		n, err := h.wsvc.RecordRollHealth(r.Context(), workersvc.RollHealthReport{
-			BlockingKind:         rawBlockingKind(ws, wire.Workers[i]),
+			BlockingKind:         rawBlockingKind(ws, row),
 			Kind:                 req.Kind,
 			Pacing:               pacing,
 			WorkerID:             id,

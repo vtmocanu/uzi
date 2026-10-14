@@ -104,7 +104,8 @@ func (f *capacityLiveHarness) dto(t *testing.T, id uuid.UUID, admin bool) apityp
 	t.Helper()
 	path, token := "/api/workers", f.ownerToken
 	if admin {
-		path, token = "/api/admin/workers", f.adminToken
+		path = "/api/admin/workers"
+		token = f.adminToken
 	}
 	rec := bearerReq(f.router, http.MethodGet, path, token)
 	var dto apitypes.WorkerDTO

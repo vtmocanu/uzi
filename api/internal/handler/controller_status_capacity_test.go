@@ -48,6 +48,16 @@ func TestCapacityDuplicateWorkerArraysCurrentRow(t *testing.T) {
 			body := `{"workers":[` + first + `],"workers":[` + later + "," + sibling + "]}"
 			rec := httptest.NewRecorder()
 			h.ControllerStatus(rec, httptest.NewRequest(http.MethodPost, "/api/controller/status", strings.NewReader(body)))
+			var current hostedsvc.WorkerStatus
+			if err := json.Unmarshal([]byte(later), &current); err != nil {
+				t.Fatal(err)
+			}
+			if current.ID == "" {
+				if rec.Code != 204 || len(st.upserts) != 1 || st.upserts[0].WorkerID.String() != "22222222-2222-2222-2222-222222222222" || !st.upserts[0].BlockingKind.Valid {
+					t.Fatalf("invalid identity affected valid sibling: status=%d rows=%+v", rec.Code, st.upserts)
+				}
+				return
+			}
 			if rec.Code != 204 || len(st.upserts) != 2 {
 				t.Fatalf("status=%d rows=%d", rec.Code, len(st.upserts))
 			}
