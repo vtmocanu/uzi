@@ -44,7 +44,15 @@ for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "u
     let releaseLate: (() => void) | undefined;
     const server = createServer(async (req, res) => {
       const chunks: Buffer[] = [];
-      for await (const chunk of req) chunks.push(Buffer.from(chunk));
+      let receivedBytes = 0;
+      for await (const chunk of req) {
+        receivedBytes += typeof chunk === "string" ? Buffer.byteLength(chunk) : chunk.byteLength;
+        if (receivedBytes > 16 * 1024) {
+          req.destroy();
+          return;
+        }
+        chunks.push(Buffer.from(chunk));
+      }
       const body = JSON.parse(Buffer.concat(chunks).toString()) as MemoryReservationRequest & MemoryOutcomeRequest;
       res.setHeader("content-type", "application/json");
       if (req.url?.endsWith("/register")) {
