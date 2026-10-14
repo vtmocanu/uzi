@@ -1018,8 +1018,9 @@ cadence. Each is recorded with the workflow it concerns where there is one.
   new (see [admission](#loop-guard-and-episode-state)).
 - `ci_evidence_limited` — a discovery or evidence read hit one of the
   [evidence limits](#evidence-limits), or the workflow listing was malformed
-  (for example a workflow key over 200 bytes); no run and no episode write,
-  and the next fire tries again.
+  (for example a workflow key over 200 bytes). No run starts and the limited
+  workflow's episode is not written, but resets or halts already written
+  earlier in the same fire stand; the next fire tries again.
 - `ci_config_changed` — the schedule or repo was edited (or deleted) while
   the fire ran. The episode write that detected the change was not made, but
   resets or halts already written earlier in the same fire stand, and the
