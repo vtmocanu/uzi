@@ -275,6 +275,18 @@ const StoredFilesLockClass int32 = 0x757A7366 // "uzsf"
 // runs' usage writes for a moment.
 const RunUsageLockClass int32 = 0x757A7573 // "uzus"
 
+// WorkerOutcomeDiscardLockClass is the class half of the two-int advisory lock that serializes
+// every writer of ONE worker's blocked-outcome reports and discard directives (issue #2984): the
+// worker's report PUT, the owner's authorize and cancel, and the worker's /begin, /complete and
+// /reconcile. Taken in SQL by LockWorkerOutcomeDiscards (queries/worker_outcome_discards.sql),
+// which carries this value as the literal 1970958180 with the objid derived there from the worker
+// id; TestWorkerOutcomeDiscardLockClassMatchesSQL fails if the two disagree and
+// lockClassesFromSource-based collision checking covers it like every other *LockClass. It is the
+// SECOND lock of every transaction that takes it, after the worker row FOR KEY SHARE (L0) and
+// before any report or directive row (L2, L3). XACT-scoped. An objid collision only serializes two
+// unrelated workers' discard traffic for a moment.
+const WorkerOutcomeDiscardLockClass int32 = 0x757A6F64 // "uzod"
+
 // Migrate runs all pending goose migrations against the database at dsn. It
 // retries the initial connection so the API can start slightly ahead of
 // Postgres becoming ready.

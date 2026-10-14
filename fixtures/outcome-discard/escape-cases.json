@@ -1,0 +1,12 @@
+[
+  {"hex": "", "escaped": ""},
+  {"hex": "6162632f646566", "escaped": "abc/def"},
+  {"hex": "5c", "escaped": "\\\\"},
+  {"hex": "615c62", "escaped": "a\\\\b"},
+  {"hex": "c3a9", "escaped": "\\xc3\\xa9"},
+  {"hex": "e282ac", "escaped": "\\xe2\\x82\\xac"},
+  {"hex": "00011f", "escaped": "\\x00\\x01\\x1f"},
+  {"hex": "097f0a", "escaped": "\\x09\\x7f\\x0a"},
+  {"hex": "20227e", "escaped": " \"~"},
+  {"hex": "ff", "escaped": "\\xff"}
+]

@@ -1398,6 +1398,14 @@ func (h *Handler) mountWorkerRoutes(r chi.Router, proposalLimiter *mw.Limiter) {
 		// same capture id. The two static paths (reserve/release) are registered before the
 		// {captureID} wildcard so chi routes them by their static segment.
 		r.Post("/terminal-rejections", h.WorkerTerminalRejections)
+		// Issue #2984 (capability outcome_discard_v1): the holding worker reports its blocked
+		// journals and executes an owner-confirmed discard. Every route is bound to the
+		// authenticated worker; a directive of another worker is a 404.
+		r.Put("/blocked-outcomes", h.WorkerBlockedOutcomesPut)
+		r.Get("/outcome-discards", h.WorkerOutcomeDiscardsList)
+		r.Post("/outcome-discards/{id}/begin", h.WorkerOutcomeDiscardBegin)
+		r.Post("/outcome-discards/{id}/complete", h.WorkerOutcomeDiscardComplete)
+		r.Post("/outcome-discards/{id}/reconcile", h.WorkerOutcomeDiscardReconcile)
 		r.Get("/runs/{id}/terminal-rejection-custody", h.WorkerTerminalRejectionCustody)
 		r.Post("/runs/{id}/archives/reserve", h.WorkerRecoveryReserve)
 		r.Post("/runs/{id}/archives/release", h.WorkerRecoveryRelease)

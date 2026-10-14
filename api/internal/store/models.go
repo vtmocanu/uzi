@@ -1583,6 +1583,36 @@ type WorkerActiveRun struct {
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
 }
 
+type WorkerBlockedOutcome struct {
+	WorkerID         uuid.UUID          `json:"worker_id"`
+	RunID            uuid.UUID          `json:"run_id"`
+	ClaimGeneration  int64              `json:"claim_generation"`
+	JournalSha256    string             `json:"journal_sha256"`
+	BlockedReason    string             `json:"blocked_reason"`
+	LossComplete     bool               `json:"loss_complete"`
+	LossSha256       string             `json:"loss_sha256"`
+	IncompleteReason string             `json:"incomplete_reason"`
+	Loss             []byte             `json:"loss"`
+	ReportedAt       pgtype.Timestamptz `json:"reported_at"`
+}
+
+type WorkerOutcomeDiscard struct {
+	ID              uuid.UUID          `json:"id"`
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	JournalSha256   string             `json:"journal_sha256"`
+	LossSha256      string             `json:"loss_sha256"`
+	ConfirmedBy     uuid.UUID          `json:"confirmed_by"`
+	Evidence        string             `json:"evidence"`
+	State           string             `json:"state"`
+	LeaseUntil      pgtype.Timestamptz `json:"lease_until"`
+	ExpiresAt       pgtype.Timestamptz `json:"expires_at"`
+	ResultReason    pgtype.Text        `json:"result_reason"`
+	CreatedAt       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt       pgtype.Timestamptz `json:"updated_at"`
+}
+
 type WorkerRunDisk struct {
 	WorkerID   uuid.UUID          `json:"worker_id"`
 	RunID      uuid.UUID          `json:"run_id"`

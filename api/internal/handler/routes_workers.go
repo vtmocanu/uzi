@@ -33,6 +33,15 @@ func (h *Handler) mountWorkersRoutes(r chi.Router, hostedLimiter *mw.Limiter) {
 			// loss is the owner's own. hostedLimiter runs AFTER RequireUser (B.4) and
 			// covers BOTH worker kinds (the middleware cannot see the row's kind).
 			r.With(hostedLimiter.PerUserMiddleware).Delete("/{id}", h.DeleteWorker)
+			// Issue #2984: the owner's view and confirmation of a worker-held run_not_owned
+			// outcome. RequireUser so a uzc_ CLI token reaches it without CSRF; the service
+			// requires the caller to own BOTH the run and the worker, so no admin masking
+			// matters here. The static discard path is a distinct segment from the status
+			// path, so chi needs no ordering between them.
+			r.Get("/{id}/blocked-outcomes", h.ListWorkerBlockedOutcomes)
+			r.Post("/{id}/blocked-outcomes/discard", h.DiscardWorkerBlockedOutcome)
+			r.Get("/{id}/outcome-discards/{discardID}", h.GetWorkerOutcomeDiscard)
+			r.Post("/{id}/outcome-discards/{discardID}/cancel", h.CancelWorkerOutcomeDiscard)
 		})
 		r.Group(func(r chi.Router) {
 			r.Use(mw.RequireAuth(h.q, h.cfg))

@@ -1381,6 +1381,18 @@ func (f *fakeStore) HeartbeatWorker(_ context.Context, arg store.HeartbeatWorker
 	f.heartbeatArg = &arg
 	return f.heartbeat, nil
 }
+
+// Issue #2984: Sweep's outcome-discard retention reaches the store; this fake holds none.
+func (f *fakeStore) SweepExpireOutcomeDiscards(context.Context, store.SweepExpireOutcomeDiscardsParams) (int64, error) {
+	return 0, nil
+}
+func (f *fakeStore) SweepDeleteFinalOutcomeDiscards(context.Context, pgtype.Timestamptz) (int64, error) {
+	return 0, nil
+}
+func (f *fakeStore) SweepDeleteStaleBlockedOutcomes(context.Context, pgtype.Timestamptz) (int64, error) {
+	return 0, nil
+}
+
 func (f *fakeStore) MarkStaleWorkersOffline(_ context.Context, cutoff pgtype.Timestamptz) (int64, error) {
 	f.staleCutoff = cutoff
 	f.callOrder = append(f.callOrder, "mark_stale")

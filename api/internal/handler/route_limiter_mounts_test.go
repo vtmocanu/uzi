@@ -586,6 +586,18 @@ var wantRouteMounts = []routeMount{
 	{"GET", "/api/worker/runs/{id}/ownership", noLimiter},
 	{"GET", "/api/worker/runs/{id}/recovery-holds", noLimiter},
 	{"POST", "/api/worker/terminal-rejections", noLimiter},
+	// Issue #2984: owner-confirmed outcome discard. Local DB reads and writes under a per-worker
+	// advisory lock, no forge call and no token spend; the worker routes are keyed by worker
+	// identity, the owner routes mutate one directive of the caller's own worker.
+	{"PUT", "/api/worker/blocked-outcomes", noLimiter},
+	{"GET", "/api/worker/outcome-discards", noLimiter},
+	{"POST", "/api/worker/outcome-discards/{id}/begin", noLimiter},
+	{"POST", "/api/worker/outcome-discards/{id}/complete", noLimiter},
+	{"POST", "/api/worker/outcome-discards/{id}/reconcile", noLimiter},
+	{"GET", "/api/workers/{id}/blocked-outcomes", noLimiter},
+	{"POST", "/api/workers/{id}/blocked-outcomes/discard", noLimiter},
+	{"GET", "/api/workers/{id}/outcome-discards/{discardID}", noLimiter},
+	{"POST", "/api/workers/{id}/outcome-discards/{discardID}/cancel", noLimiter},
 	{"GET", "/api/worker/runs/{id}/terminal-rejection-custody", noLimiter},
 	{"GET", "/api/worker/runs/{id}/trace", noLimiter},
 	{"GET", "/api/workers/", noLimiter},

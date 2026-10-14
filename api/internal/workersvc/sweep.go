@@ -503,6 +503,11 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 		slog.Error("sweeper: promote codex account available failed", "error", perr)
 	}
 
+	// Issue #2984: retention of owner-confirmed outcome discards (expiry of stale directives, and
+	// deletion of final directives and unreported outcome rows past 30 days). Best-effort: each
+	// statement logs and stops on its own error, and nothing else shares its transactions.
+	s.sweepOutcomeDiscards(ctx, now)
+
 	return res, nil
 }
 

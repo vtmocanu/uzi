@@ -1035,6 +1035,17 @@ type autoStopSweepStore struct {
 func (f *autoStopSweepStore) MarkStaleWorkersOffline(context.Context, pgtype.Timestamptz) (int64, error) {
 	return 0, nil
 }
+
+// Issue #2984: Sweep's outcome-discard retention reaches the store; this fake holds none.
+func (f *autoStopSweepStore) SweepExpireOutcomeDiscards(context.Context, store.SweepExpireOutcomeDiscardsParams) (int64, error) {
+	return 0, nil
+}
+func (f *autoStopSweepStore) SweepDeleteFinalOutcomeDiscards(context.Context, pgtype.Timestamptz) (int64, error) {
+	return 0, nil
+}
+func (f *autoStopSweepStore) SweepDeleteStaleBlockedOutcomes(context.Context, pgtype.Timestamptz) (int64, error) {
+	return 0, nil
+}
 func (f *autoStopSweepStore) SweepClaimedNeverStarted(context.Context, pgtype.Timestamptz) ([]store.SweepClaimedNeverStartedRow, error) {
 	return f.claimed, nil
 }

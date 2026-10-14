@@ -452,6 +452,11 @@ func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []stri
 		// unknown field, so a worker sends it only after seeing this token.
 		{"repo_agent_folder"},
 		{"terminal_rejection_report"}, // Issue #1974 M1; independent of active snapshots.
+		// Issue #2984: this api accepts the worker's blocked-outcome report and serves the
+		// owner-confirmed discard directives (PUT /blocked-outcomes, GET /outcome-discards and the
+		// begin, complete and reconcile routes). Advertised UNCONDITIONALLY: a worker sends the
+		// report only after seeing this token, because an older api 404s the routes.
+		{"outcome_discard_v1"},
 	}
 	if activeSnapshotEnabled {
 		groups = append(groups, []string{"active_run_snapshot"}) // PRD #1390 M2a

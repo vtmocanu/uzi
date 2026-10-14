@@ -459,6 +459,11 @@ const (
 type Store interface {
 	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
+	// Issue #2984: Sweep's retention of owner-confirmed outcome discards. Every other query of the
+	// feature runs on a transaction-bound store.Queries inside outcomeDiscardTx, never through here.
+	SweepExpireOutcomeDiscards(context.Context, store.SweepExpireOutcomeDiscardsParams) (int64, error)
+	SweepDeleteFinalOutcomeDiscards(context.Context, pgtype.Timestamptz) (int64, error)
+	SweepDeleteStaleBlockedOutcomes(context.Context, pgtype.Timestamptz) (int64, error)
 	// Workers.
 	CreateWorker(ctx context.Context, arg store.CreateWorkerParams) (store.Worker, error)
 	GetWorkerByID(ctx context.Context, id uuid.UUID) (store.Worker, error)
