@@ -38,6 +38,9 @@ through `[0.52.0]`.)
 - **Admin Settings exposes the hosted worker quota ([#2960](https://github.com/vtmocanu/uzi/issues/2960)).**
   The Hosted worker quota card lets admins set the per-user persistent worker cap from 0 to 20, validates edits before saving, and shows server errors. Zero disables self-service provisioning without changing existing workers.
 
+- **Large hosted workers have more build-cache headroom ([#2013](https://github.com/vtmocanu/uzi/issues/2013)).**
+  New persistent L workers request 50Gi of data storage. Both worker tiers admit 50Gi PVCs, and default storage quotas cover 20 restricted or 10 Docker workers at their largest preset. Existing data PVCs retain their capacity; operators can expand them in place on a compatible StorageClass using the deployment runbook. Cluster overrides must raise their PVC ceilings and recalculate storage quotas. Post-release long-run acceptance remains outstanding.
+
 - **GitHub pipeline discovery prefers the newest Actions suite.**
   When workflow discovery falls back to checks, a newer Actions suite now takes priority over an older suite already represented by check runs. If the preferred suite returns no workflow, discovery still recovers the older native workflow before synthesizing a status, preserving job and log access.
 

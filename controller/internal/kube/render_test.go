@@ -351,7 +351,7 @@ func TestRenderedPriorityClassName(t *testing.T) {
 }
 
 func TestPVCsSizeFromThePresetAndNixIsFlat(t *testing.T) {
-	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "25Gi"}, {"l", "25Gi"}} {
+	for _, tc := range []struct{ size, data string }{{"s", "5Gi"}, {"m", "25Gi"}, {"l", "50Gi"}} {
 		pvcs := RenderPVCs(testConfig(), desired("abc"), testSpec(t, "base", tc.size))
 		if len(pvcs) != 2 {
 			t.Fatalf("%d pvcs, want 2", len(pvcs))

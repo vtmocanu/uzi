@@ -22,7 +22,7 @@
       "cpu_limit": "4",
       "memory_request": "14Gi",
       "memory_limit": "20Gi",
-      "data": "25Gi"
+      "data": "50Gi"
     }
   ],
   "nix": "20Gi"

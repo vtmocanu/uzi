@@ -59,9 +59,11 @@ New ephemeral hosted workers default to **M** (1 CPU / 8Gi memory
 requested, 4 CPU / 12Gi memory limits), saving 6Gi of memory reservation per
 worker compared with **L**. New persistent workers still preselect **L**
 (1 CPU / 14Gi requested, 4 CPU / 20Gi limits) for more memory headroom.
-Both **M** and **L** now allocate 25Gi of persistent `/data`; ephemeral data
-retains its independent 20Gi default. Existing persistent **M** data volumes
-stay at 10Gi until reprovisioned: the controller does not resize existing PVCs.
+New persistent **M** workers allocate 25Gi of `/data`, and **L** workers allocate
+50Gi. Ephemeral data retains its independent 20Gi default. Existing data volumes
+keep their current capacity: the controller does not resize existing PVCs.
+Operators can [expand them in place](https://github.com/vtmocanu/uzi/blob/main/deploy/README.md#expanding-existing-worker-data-volumes)
+on a StorageClass that supports volume expansion.
 Existing workers keep their stored size; existing **M** workers receive the
 1-CPU request and 4-CPU limit when the controller next rolls their pod spec.
 Operators set `workers.ephemeralDefaultSize` in the chart (`s`, `m`, or `l`);

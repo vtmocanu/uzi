@@ -697,7 +697,7 @@ func RenderPVCs(cfg RenderConfig, w protocol.DesiredWorker, spec preset.Spec) []
 // the preset table is shared with persistent workers whose /data must not move. It
 // REPLACES Size.DataSize for such a worker (not max(DataSize, this)).
 //
-// It must fit BOTH tiers' LimitRange maxPVCStorage (25Gi today) —
+// It must fit BOTH tiers' LimitRange maxPVCStorage (50Gi today) —
 // TestEphemeralDataDefaultFitsTheChartsLimitRangeMax reads them out of values.yaml —
 // and the tiers' quota.requestsStorage budget, which the fleet-storage test checks.
 // ValidatePVCCeilings checks an override against the live ceilings at boot.
