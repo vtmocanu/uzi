@@ -76,8 +76,10 @@ a consistent multi-file view. The Read dynamic-tool description says so.
 ## Cancellation and command ownership
 
 Native orchestration-cell termination or promise abandonment is **not worker
-cancellation**. An owned command runs until exit, its unchanged command deadline
-or output cap, or explicit harness/run stop cleanup. There is no per-command
+cancellation**. An owned command runs until exit, its selected command deadline
+or output cap, or explicit harness/run stop cleanup. ADR-2986 adds an explicit
+root-lead opt-in to a fixed 120-minute command bound; absent/false and child
+commands retain the 60-minute bound. Read observation changes neither bound. There is no per-command
 cancel API in this design.
 
 `CodexHarness.requestStop` requests best-effort `turn/interrupt` and wakes/ends

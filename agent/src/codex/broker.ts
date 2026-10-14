@@ -287,6 +287,7 @@ export interface SpawnCommandResult {
  *  seam records the exact env command spawns use; the default seam falls back to its
  *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
+  readonly long_running?: boolean;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly signal?: AbortSignal;
@@ -688,7 +689,7 @@ export class CodexCallbackBroker {
 
     switch (cap) {
       case "shell":
-        return this.dispatchShell(args);
+        return this.dispatchShell(args, origin);
       case "file_write":
         return this.dispatchFileWrite(args);
       case "file_read":
@@ -707,7 +708,7 @@ export class CodexCallbackBroker {
 
   // --- shell ------------------------------------------------------------------
 
-  private async dispatchShell(args: unknown): Promise<CallbackResult> {
+  private async dispatchShell(args: unknown, origin: CallbackOrigin): Promise<CallbackResult> {
     const command = strField(args, "command");
     if (command === undefined) {
       return deny("bad_args", "Bash requires a non-empty string 'command'");
@@ -729,9 +730,18 @@ export class CodexCallbackBroker {
     }
     if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
 
+    const hasLongRunning = typeof args === "object" && args !== null && Object.hasOwn(args, "long_running");
+    const longRunning = hasLongRunning ? (args as Record<string, unknown>)["long_running"] : undefined;
+    if (hasLongRunning && typeof longRunning !== "boolean") {
+      return deny("bad_args", "Bash 'long_running' must be a boolean");
+    }
+    if (longRunning === true && (origin !== "root" || !this.grants.isRoot)) {
+      return deny("denied_tool", "Bash long_running:true is available only to the root lead");
+    }
+
     let spawned: SpawnCommandResult;
     try {
-      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal });
+      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
     } catch (err) {
       if (err instanceof CommandDeadlineError) return deny("command_deadline", commandDeadlineMessage(err.deadlineMs));
       throw err;

@@ -3203,8 +3203,9 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     });
   }
 
+  for (const longRunning of [false, true]) {
   for (const readBehindEffects of [false, true]) {
-  it(`#2903 M2: real broker observes read ${readBehindEffects ? "behind" : "before"} queued pwd checkpoint during held Bash`, async () => {
+  it(`#2903 M2: real broker observes read ${readBehindEffects ? "behind" : "before"} queued pwd checkpoint during held Bash (long_running=${longRunning})`, async () => {
     const ac = new AbortController();
     const request = makeRequest({ signal: ac.signal });
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
@@ -3212,7 +3213,7 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     let markEntered!: () => void;
     const held = new Promise<void>(resolve => { release = resolve; });
     const entered = new Promise<void>(resolve => { markEntered = resolve; });
-    const raw = "gate progress fixture\n";
+    let raw = "gate progress fixture\n";
     const order: string[] = [];
     let fileops = 0;
     const broker = new CodexCallbackBroker({
@@ -3222,6 +3223,7 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
         assert.equal(opts.cwd, WORKSPACE);
         order.push(`spawn:${argv[2]}`);
         if (argv[2] === "echo held-2903") {
+          assert.equal(opts.long_running, longRunning);
           markEntered();
           await held;
           return { code: 0, stdout: "held effect complete\n", stderr: "" };
@@ -3242,13 +3244,14 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     });
     const { harness, transport } = makeHarness({ registry, broker });
     transport.onRespond = id => { order.push(`reply:${id}`); };
-    transport.push(toolCall(29030, "uzi_bash", { command: "echo held-2903" }, "th-1", "tn-1", "held-2903"));
+    transport.push(toolCall(29030, "uzi_bash", { command: "echo held-2903", long_running: longRunning }, "th-1", "tn-1", "held-2903"));
     const iter = harness.startTurn(request).events[Symbol.asyncIterator]();
     const events: HarnessEvent[] = [];
     try {
       events.push((await iter.next()).value!);
       events.push(...await pullUntil(iter, "started"));
       await withTimeout(entered, 1000, "held command entry");
+      if (longRunning) raw += "gate progress grew\n";
       if (!readBehindEffects) transport.push(toolCall(29031, "uzi_read", { path: "progress.txt" }, "th-1", "tn-1", "read-2903"));
       transport.push(toolCall(29032, "uzi_bash", { command: "pwd" }, "th-1", "tn-1", "pwd-2903"))
         .push(toolCall(29033, "checkpoint", {}, "th-1", "tn-1", "checkpoint-2903"));
@@ -3281,8 +3284,8 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
         return rec(JSON.parse(items[0]!.text));
       });
       assert.deepEqual(outputs[0], {
-        size: Buffer.byteLength(raw), content: "gate progress fixture\n", offset: 1,
-        linesReturned: 1, partialLastLine: false, truncated: false,
+        size: Buffer.byteLength(raw), content: raw, offset: 1,
+        linesReturned: longRunning ? 2 : 1, partialLastLine: false, truncated: false,
       });
       assert.deepEqual(outputs[2], { code: 0, stdout: WORKSPACE + "\n", stderr: "" });
       assert.deepEqual(outputs[3], { checkpoint: true });
@@ -3304,6 +3307,7 @@ describe("CodexHarness: commentary during callbacks (issue #2283)", () => {
     }
   });
 
+  }
   }
 
   it("A blocked, B queued, C commentary: effects stay serial and terminal waits without reading beyond it", async () => {

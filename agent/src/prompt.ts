@@ -394,10 +394,21 @@ export const CODEX_LONG_COMMAND_APPEND = [
   "then reaps the command root, terminating background descendants before returning; abort,",
   "output-cap and wall-deadline paths reap it too.",
   "So do not background a gate and expect to poll it later or rely on its result.",
+  "Commands have a finite 60-minute bound by default. Only the root lead may set",
+  "`long_running: true` on Bash/uzi_bash to select a fixed 120-minute bound for any",
+  "otherwise-authorized command; false or absent keeps 60 minutes. Child agents cannot",
+  "opt in, and their command and child-turn limits remain unchanged.",
+  "For a long repository gate, the root lead should set `long_running: true`.",
   "Run one long gate in the foreground:",
   "`log=$(mktemp .uzi/scratch/gate-log.XXXXXX); rc=0; <gate command> > \"$log\" 2>&1 || rc=$?; echo \"EXIT=$rc\" >> \"$log\"; printf 'LOG=%s\\n' \"$log\"; test \"$rc\" -eq 0`",
   "After that command call exits, read the printed log path in a separate call and report",
   "its recorded exit status.",
+  "For live observation, choose a known .uzi/scratch log path before invoking Bash.",
+  "While that command is pending, use Read on its known log path to observe progress;",
+  "quiet or redirected output does not extend or shorten its finite bound. There is no",
+  "automatic extension or per-command cancel API. A suspected hang still has a finite",
+  "deadline; owner cancellation, pause-now, turn abort and the run wall stop owned work.",
+  "The run wall parks the run even when a command has opted into 120 minutes.",
 ].join("\n");
 
 /**
