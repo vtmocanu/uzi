@@ -49,4 +49,18 @@ apipost() { return 1; }
 cancel_run failed-fixture
 tail -1 "$SCRATCH/artifacts/fixture-settlement/cancel.jsonl" | jq -e '.request_failed == true and .server_side == null' >/dev/null
 echo 'PASS: failed cancellation also leaves diagnostic evidence'
-echo 'cases=4 passed=4'
+# Exercise the real dump with and without the separately shipped collector.
+eval "$(awk '/^dump_fixture_settlement\(\) \{/,/^\}/' "$LIB")"
+# shellcheck disable=SC2034  # extracted dump consumes this array
+COMPOSE=(settlement_compose)
+settlement_compose() { echo '{}'; }
+db_psql() { echo '{}'; }
+storage_diagnostic_snapshot() { [ "$1" = fixture-settlement ]; echo called > "$SCRATCH/storage-calls"; }
+dump_fixture_settlement >/dev/null
+[ -f "$SCRATCH/storage-calls" ] || fail 'settlement failed to collect storage evidence'
+[ "$(cat "$SCRATCH/storage-calls")" = called ] || fail 'settlement failed to collect storage evidence'
+echo 'PASS: real fixture settlement dump invokes the storage collector'
+unset -f storage_diagnostic_snapshot
+dump_fixture_settlement >/dev/null
+echo 'PASS: settlement remains usable before the separate collector lands'
+echo 'cases=6 passed=6'

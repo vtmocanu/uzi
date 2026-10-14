@@ -736,6 +736,10 @@ settle_runs_terminal() {
 # terminal outcomes AND absence from the worker snapshot for these exact fixtures.
 # Never changes custody. One shared deadline bounds the whole batch.
 dump_fixture_settlement() {
+  # The storage collector lands separately; settlement remains usable without it.
+  if declare -F storage_diagnostic_snapshot >/dev/null; then
+    storage_diagnostic_snapshot fixture-settlement
+  fi
   local dir="$RUNROOT/artifacts/fixture-settlement"
   mkdir -p "$dir"
   "${COMPOSE[@]}" exec -T -u 0 agent timeout 15 node --input-type=module - /data \
