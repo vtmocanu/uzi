@@ -9,6 +9,7 @@ import (
 	"context"
 	"encoding/json"
 	"reflect"
+	"regexp"
 	"strings"
 	"testing"
 	"time"
@@ -991,17 +992,34 @@ func TestRunRecoveryHumanAdmissionColumn(t *testing.T) {
 		t.Fatalf("exit = %d, stderr=%q", code, errb)
 	}
 	lines := strings.Split(strings.TrimSpace(out), "\n")
-	if got := strings.Fields(lines[0]); len(got) < 5 || got[4] != "ADMISSION" {
+	// The printer separates cells with at least two spaces; spaces inside an
+	// admission value belong to that cell, and CAPTURE may independently be "-".
+	columns := regexp.MustCompile(` {2,}`)
+	headers := []string{"HOLD ID", "GEN", "DISPOSITION", "ADMISSION", "STATE", "CAPTURE", "WORKER"}
+	if got := columns.Split(strings.TrimSpace(lines[0]), -1); !reflect.DeepEqual(got, headers) {
 		t.Fatalf("headers = %q", lines[0])
 	}
-	for _, want := range []string{"counted (decision_needed)", "not counted"} {
-		if !strings.Contains(out, want) {
-			t.Errorf("run table lacks %q: %q", want, out)
+	for hold, want := range map[string]string{
+		"hold-a": "-",
+		"hold-b": "counted (decision_needed)",
+		"hold-z": "not counted",
+	} {
+		var row []string
+		for _, line := range lines[1:] {
+			cells := columns.Split(strings.TrimSpace(line), -1)
+			if cells[0] == hold {
+				row = cells
+				break
+			}
 		}
-	}
-	for _, line := range lines {
-		if strings.HasPrefix(strings.TrimSpace(line), "hold-a") && !strings.Contains(line, " - ") {
-			t.Errorf("absent membership must render -: %q", line)
+		if row == nil {
+			t.Fatalf("missing %s row: %q", hold, out)
+		}
+		if len(row) != len(headers) {
+			t.Fatalf("%s cells = %q, want %d", hold, row, len(headers))
+		}
+		if got := row[3]; got != want {
+			t.Errorf("%s ADMISSION = %q, want %q", hold, got, want)
 		}
 	}
 }

@@ -700,7 +700,7 @@ FROM admission;
 -- name: ListCustodyAdmissionMembersForOwner :many
 -- Issue #2970: per-hold custody admission membership for the owner hold list, one row per
 -- state='open' hold. counted mirrors fn_custody_admission_count membership and reason names the
--- first matching cause (closed vocabulary, see migration 00335). Read-only visibility only:
+-- first matching cause (closed vocabulary, see migration 00336). Read-only visibility only:
 -- admission accounting stays on fn_custody_admission_count. Callers pass the SAME
 -- @heartbeat_cutoff as GetCustodyAggregateForOwner so both read one cutoff. Explicit casts type
 -- the columns as uuid/bool/string, never interface{}.
