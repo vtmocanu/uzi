@@ -1472,8 +1472,27 @@ chain in the diagram above, with no intervening `running`.
   exact old-journal clearing, while lost proof retains remaining artifacts.
   See [ADR-1296](adr/1296-durable-run-recovery.md) and
   [ADR-2417](adr/2417-guarded-local-retention.md) for the dated amendments.
-  Older/successor holds and unstamped older completions gain no authority;
+  Older/successor holds and unstamped older completions gain no completed-publication authority;
   failed/cancelled/parked runs and other kinds keep their existing policy.
+  A separate server-discard phase (#2506, maintainer decision 2026-10-14)
+  follows ordinary polling using the original parent context: 30 seconds,
+  at most 100 repository visits/attempts, one run-keyset candidate per visit,
+  and a five-second fresh exact recorded-MR observation. Historical cached-merged
+  and issue-less completed runs qualify without trusting cached state. Recovery
+  shares the handler's service (wired before polling), rechecks the exact
+  owner/repo/connection/project/forge/base URL/MR/run/completed-generation binding
+  under locks, then discards earlier OPEN holds with immutable
+  `merged_predecessor_discard` audit evidence. This includes nonancestor aggregates;
+  it supplies no ancestry, archive FINAL or completed-publication receipt.
+  Non-ready captures are cleaned up atomically; available bytes, prerequisites,
+  TTL and export survive. Existing discard semantics reduce counts/hotlists.
+  This grants no new worker source-deletion authority or worker/PVC fence/retention
+  guarantee beyond existing owner-discard lifecycle consequences. Operator-only
+  #1786 physical disposal and guards remain; Option D's local-source and
+  available-archive disposal is deferred to #2823/#1373. #2506 is partial,
+  nonclosing. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for cursors,
+  accepted tick coalescing, inherited response-byte risk, migration CHECK scans
+  under ACCESS EXCLUSIVE and rollback refusal to erase audit evidence.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and

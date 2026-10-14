@@ -39,6 +39,9 @@ through `[0.52.0]`.)
 - **Codex capabilities survive provisional outage requeues ([#2988](https://github.com/vtmocanu/uzi/issues/2988)).**
   Stale-worker and claimed-never-started requeues preserve the capability for same-generation re-adoption while queued suspends credential use. Every successful fresh claim revokes the old capability atomically before assembly; flights already revoked before rollout are not repaired.
 
+- **Merged runs automatically discard earlier custody holds after fresh verification of their recorded PR ([#2506](https://github.com/vtmocanu/uzi/issues/2506), partial, nonclosing).**
+  Earlier open holds stop occupying custody slots after the server freshly verifies the completed run's own recorded PR has merged and rechecks its exact binding. Available archives remain downloadable until their normal expiry; this discard policy does not prove earlier work was included in the merge and grants no worker source-deletion authority. Physical local-source and available-archive disposal remain deferred to #2823 and #1373. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for safeguards and rollout limits.
+
 ### Security
 
 - **The automatic CI-fix guard is hardened against CI-configuration changes (f6d4168a2).**

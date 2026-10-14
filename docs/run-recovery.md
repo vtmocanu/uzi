@@ -789,9 +789,35 @@ The ref disappears once the run's last hold is released (automatically, by
 settlement) or discarded (`uzi run discard`) — the same custody lifecycle
 that governs the recovery archives above.
 
+## Automatic discard after the recorded PR merges
+
+For a completed run at generation G, uzi can automatically discard earlier OPEN
+custody holds (generation < G) after freshly verifying that the run's own recorded
+PR/MR is merged. The server rechecks the exact owner, repository, connection,
+project, forge, base URL, MR, run and G under locks. Open, closed-unmerged,
+unknown, unreadable, wrong-IID or drifting evidence leaves custody retained.
+Historical cached-merged and issue-less runs can qualify, but cached state alone
+is insufficient. This policy includes prior recovery aggregates that are not
+ancestors of the merged work; it does not prove their work was published.
+
+The discarded holds leave the existing custody count and decision hotlist.
+Preparing, uploading and needs-action captures are discarded with partial-byte
+cleanup. **Available archives survive** with their prerequisites, expiry policy
+and export eligibility. The audit records `merged_predecessor_discard`, not
+ancestry proof, archive FINAL coverage or a publication receipt.
+
+Hold discard grants no new worker source-deletion authority. Existing retention
+guards and the [worker-local operator procedure](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
+remain; clearing custody has existing owner-discard lifecycle consequences and
+adds no worker/PVC fence or retention guarantee. Physical local-source and
+available-archive disposal previously promised by Option D remains **deferred**
+to #2823 and #1373. This is partial, nonclosing #2506; see
+[ADR-2506](../adr/2506-merged-predecessor-discard.md) for polling and rollout limits.
+
 ## Automatic settlement of an older held generation
 
-The ancestry settlement below applies to legacy, unguarded holds. Guarded
+The ancestry settlement below applies to legacy, unguarded holds. Outside the
+[merged-PR server-discard exception](#automatic-discard-after-the-recorded-pr-merges), guarded
 holds use the [final inventory disposition](#guarded-inventory-and-final-custody-transfer)
 above; the completed-publication exception settles only the completing generation,
 not an older adopted generation. Publishing one adopted head does not settle
