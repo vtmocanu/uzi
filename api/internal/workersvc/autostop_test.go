@@ -1032,6 +1032,11 @@ type autoStopSweepStore struct {
 	claimed      []store.SweepClaimedNeverStartedRow
 }
 
+// This fixture has no pending outcome identities; Sweep still runs their cleanup pass.
+func (f *autoStopSweepStore) PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error) {
+	return 0, nil
+}
+
 func (f *autoStopSweepStore) MarkStaleWorkersOffline(context.Context, pgtype.Timestamptz) (int64, error) {
 	return 0, nil
 }
