@@ -4,7 +4,9 @@ import (
 	"context"
 	"errors"
 	"os"
+	"os/exec"
 	"path/filepath"
+	"strings"
 	"testing"
 
 	"github.com/vtmocanu/uzi/api/internal/pushbroker"
@@ -212,4 +214,80 @@ func TestCIConfigGuardDefaultMovedSinceBase(t *testing.T) {
 			t.Fatalf("PrepareHeldPack err = %v, want ErrCIConfigGuard", err)
 		}
 	})
+}
+
+// commitIn writes a file (creating its directory) and commits it.
+func (f *gitFixture) commitIn(path, content, msg string) string {
+	f.t.Helper()
+	if err := os.MkdirAll(filepath.Dir(filepath.Join(f.work, path)), 0o750); err != nil {
+		f.t.Fatal(err)
+	}
+	return f.commit(path, content, msg)
+}
+
+// A second publication refuses once a protected path changed on the default branch after the run's
+// base: the first checkpoint puts the run's tree (inherited subtrees included) on origin, and the
+// next publication fetches it at depth 1, so the inherited .gitlab tree is present and compared.
+// Accepted strictness: a non-fatal checkpoint skip; the worker's merge-base check decides the
+// final branch push.
+func TestCIConfigGuardSecondPublicationAfterProtectedChangeOnDefault(t *testing.T) {
+	ctx := context.Background()
+	f := newGitFixture(t)
+	f.commitIn(".gitlab/ci.yml", "v1\n", "ci v1")
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	c1 := f.commit("b.txt", "one\n", "c1")
+	pack1 := f.pack(c1, base)
+	c2 := f.commit("c.txt", "two\n", "c2")
+	pack2 := f.pack(c2, base)
+	f.git("checkout", "-q", "-b", "moved", base)
+	f.commitIn(".gitlab/ci.yml", "v2\n", "default changes ci")
+	f.git("push", "origin", "moved:main")
+	url := f.cloneURL()
+
+	if _, err := pushbroker.Publish(ctx, runBranchOpts(url, c1, pack1)); err != nil {
+		t.Fatalf("Publish C1: %v", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != c1 {
+		t.Fatalf("checkpoint = %q, want %s", got, c1)
+	}
+	_, err := pushbroker.Publish(ctx, runBranchOpts(url, c2, pack2))
+	if !errors.Is(err, pushbroker.ErrCIConfigGuard) {
+		t.Fatalf("Publish C2 err = %v, want ErrCIConfigGuard", err)
+	}
+	if got := f.originRef("refs/uzi-checkpoints/agent/issue-1"); got != c1 {
+		t.Fatalf("checkpoint advanced to %q despite the refusal", got)
+	}
+}
+
+// KNOWN GAP, covered by the worker's merge-base guard and NOT by the broker: when the pack omits
+// the tree of a protected path the run changed (an agent-authored merge whose extra parent is
+// outside the pack), the broker skips that subtree as inherited and accepts the tip. This test
+// pins that the broker alone does not catch it; the worker runs its own merge-base guard over every
+// guarded checkpoint and held candidate before upload (agent/src/runner.ts), and that layer is the
+// authority for this case.
+func TestCIConfigGuardBrokerAloneMissesMergeParentOutsidePack(t *testing.T) {
+	ctx := context.Background()
+	f := newGitFixture(t)
+	f.commitIn(".gitlab/ci.yml", "v1\n", "ci v1")
+	base := f.commit("a.txt", "base\n", "base")
+	f.pushMain()
+	f.git("checkout", "-q", "-b", "side", base)
+	side := f.commitIn(".gitlab/ci.yml", "evil\n", "side changes ci")
+	f.git("push", "origin", "side:side") // the extra parent lives on origin, but the broker never fetches it
+	f.git("checkout", "-q", "main")
+	f.commit("b.txt", "one\n", "c1")
+	f.git("merge", "--no-ff", "-m", "merge side", "side")
+	tip := strings.TrimSpace(f.git("rev-parse", "HEAD"))
+	// The pack excludes the side parent's objects, so the evil .gitlab tree is not in it.
+	revs := f.git("rev-list", tip, "^"+base, "^"+side, "--objects")
+	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout") //nolint:gosec // G204: test helper against a test-owned temp repo.
+	cmd.Stdin = strings.NewReader(revs)
+	pack, err := cmd.Output()
+	if err != nil {
+		t.Fatalf("pack-objects: %v", err)
+	}
+	if _, err := pushbroker.Publish(ctx, runBranchOpts(f.cloneURL(), tip, pack)); err != nil {
+		t.Fatalf("Publish = %v; the broker alone is expected to accept this (the worker guard is the layer for it)", err)
+	}
 }

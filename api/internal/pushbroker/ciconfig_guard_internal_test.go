@@ -70,7 +70,7 @@ func guard(t *testing.T, b treeBuilder, cand, def plumbing.Hash, globs ...string
 	if err != nil || !ok {
 		t.Fatalf("matcher: ok=%v err=%v", ok, err)
 	}
-	return ciConfigTreeGuard(context.Background(), b.s, cand, def, m, ciConfigWalkCap)
+	return ciConfigTreeGuard(context.Background(), b.s, cand, def, m)
 }
 
 func TestCIConfigTreeGuardPathCases(t *testing.T) {
@@ -216,7 +216,7 @@ func TestCIConfigTreeGuardFailClosed(t *testing.T) {
 		m, _, _ := newCIConfigMatcher([]string{"**/ci.yml"})
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := ciConfigTreeGuard(ctx, big.s, cand, d, m, ciConfigWalkCap); !errors.Is(err, ErrCIConfigGuard) {
+		if err := ciConfigTreeGuard(ctx, big.s, cand, d, m); !errors.Is(err, ErrCIConfigGuard) {
 			t.Fatalf("err = %v, want ErrCIConfigGuard", err)
 		}
 	})
@@ -233,7 +233,7 @@ func TestCIConfigTreeGuardFailClosed(t *testing.T) {
 			cur2 = nb.tree(object.TreeEntry{Name: "d", Mode: filemode.Dir, Hash: cur2})
 		}
 		m, _, _ := newCIConfigMatcher([]string{"**/ci.yml"})
-		if err := ciConfigTreeGuard(context.Background(), nb.s, cur, cur2, m, ciConfigWalkCap); !errors.Is(err, ErrCIConfigGuard) {
+		if err := ciConfigTreeGuard(context.Background(), nb.s, cur, cur2, m); !errors.Is(err, ErrCIConfigGuard) {
 			t.Fatalf("err = %v, want ErrCIConfigGuard", err)
 		}
 	})
@@ -435,7 +435,7 @@ func TestCIConfigTreeGuardByteCaps(t *testing.T) {
 		m, _, _ := newCIConfigMatcher(protected)
 		ctx, cancel := context.WithCancel(context.Background())
 		cancel()
-		if err := ciConfigTreeGuard(ctx, b.s, cand, def, m, ciConfigWalkCap); !errors.Is(err, ErrCIConfigGuard) {
+		if err := ciConfigTreeGuard(ctx, b.s, cand, def, m); !errors.Is(err, ErrCIConfigGuard) {
 			t.Fatalf("err = %v, want ErrCIConfigGuard", err)
 		}
 	})

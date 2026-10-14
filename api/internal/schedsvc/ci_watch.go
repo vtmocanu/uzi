@@ -56,11 +56,18 @@ func (c CIRepairConfig) withDefaults() CIRepairConfig {
 	return c
 }
 
-// ciPullRequestEvents are the executions a default-branch watch ignores: a fork pull request
-// from a branch that happens to be named like the default branch reports that branch name.
-var ciPullRequestEvents = map[string]struct{}{
-	"pull_request": {}, "pull_request_target": {},
-	"merge_request_event": {}, "external_pull_request_event": {},
+// ciIgnoredEvent reports whether a default-branch watch ignores an execution by its trigger
+// event. A fork pull request from a branch named like the default branch reports that branch
+// name, and so do GitHub's pull_request_review and pull_request_review_comment runs, so every
+// pull_request* event is dropped, as are the GitLab merge-request events. A workflow_run
+// execution reports the triggering run's head branch, so it is dropped too: workflow_run-chained
+// executions are therefore not watched (accepted).
+func ciIgnoredEvent(event string) bool {
+	switch event {
+	case "workflow_run", "merge_request_event", "external_pull_request_event":
+		return true
+	}
+	return strings.HasPrefix(event, "pull_request")
 }
 
 // ciCompleted reports whether a workflow execution has finished. GitHub splits phase from
@@ -321,7 +328,7 @@ func ciTargetFor(base workersvc.CIWatchTarget, k *ciKey) workersvc.CIWatchTarget
 func ciNewestPerKey(forgeType, branch string, runs []forge.WorkflowRun) []*ciKey {
 	best := map[string]*ciKey{}
 	for _, r := range runs {
-		if _, pr := ciPullRequestEvents[r.Event]; pr || !ciCompleted(r) || r.WorkflowKey == "" {
+		if ciIgnoredEvent(r.Event) || !ciCompleted(r) || r.WorkflowKey == "" {
 			continue
 		}
 		if r.Branch != "" && r.Branch != branch {
@@ -432,8 +439,11 @@ func (e *Scheduler) ciStartOne(ctx context.Context, sched store.RunSchedule, rep
 		}
 		projectPath, perr := f.ProjectCIConfigPath(ctx, repo.ForgeProjectID)
 		if perr != nil {
-			e.logger.Warn("scheduler: ci_watch ci_config_path, using the configured defaults", "schedule", sched.ID.String(), "error", perr)
-			projectPath = ""
+			// Fail closed: without the project's own ci_config_path the guard would leave a
+			// custom CI file unprotected for this run, so no run is created and the fire retries.
+			// The drivers answer ("", nil) for a forge without the concept.
+			e.logger.Warn("scheduler: ci_watch ci_config_path lookup failed, creating no run", "schedule", sched.ID.String(), "error", perr)
+			return res, fmt.Errorf("project ci_config_path: %w", perr)
 		}
 		title := ciRepairTitle(k.run.Name, k.run.Number)
 		run, cerr := e.runs.CreateCIRepairRun(ctx, workersvc.CIRepairRunParams{

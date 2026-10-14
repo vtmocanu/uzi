@@ -30,6 +30,7 @@ type ciForge struct {
 	tails     map[int64]string
 	listOpts  []forge.ListWorkflowRunsOptions
 	jobCalls  []int64
+	pathErr   error    // ProjectCIConfigPath failure
 	unlimited []string // reads that ran without the per-fire read limits
 	// onList, when set, runs inside ListWorkflowRuns: a live test uses it to change the
 	// schedule or repo between discovery and the locked start.
@@ -66,7 +67,9 @@ func (f *ciForge) JobLogTail(_ context.Context, _, jobID int64, _ int) (string, 
 	return f.tails[jobID], nil
 }
 
-func (f *ciForge) ProjectCIConfigPath(context.Context, int64) (string, error) { return "", nil }
+func (f *ciForge) ProjectCIConfigPath(context.Context, int64) (string, error) {
+	return "", f.pathErr
+}
 
 type ciBuilder struct{ f forge.Forge }
 
@@ -263,10 +266,35 @@ func TestCIWatchIgnoresPullRequestEvents(t *testing.T) {
 	pr.Event = "pull_request"
 	h := newCIHarness(t, pr, ciGreenRun("1", 100, 0))
 	wantOnlySkip(t, h.fire(t, h.schedule()), SkipCIGreen)
-	for _, ev := range []string{"pull_request_target", "merge_request_event", "external_pull_request_event"} {
+	for _, ev := range []string{"pull_request_target", "pull_request_review", "pull_request_review_comment", "merge_request_event", "external_pull_request_event", "workflow_run"} {
 		pr.Event = ev
 		h = newCIHarness(t, pr, ciGreenRun("1", 100, 0))
 		wantOnlySkip(t, h.fire(t, h.schedule()), SkipCIGreen)
+	}
+}
+
+// Push, schedule and manual executions of the default branch still count.
+func TestCIWatchKeepsDefaultBranchEvents(t *testing.T) {
+	for _, ev := range []string{"push", "schedule", "workflow_dispatch"} {
+		r := ciRed("1", 100, 0)
+		r.Event = ev
+		h := newCIHarness(t, r)
+		if out := h.fire(t, h.schedule()); len(out.Started) != 1 {
+			t.Fatalf("event %q: started %d, want 1", ev, len(out.Started))
+		}
+	}
+}
+
+// A failed ci_config_path lookup is transient: no run is created, so a custom CI file is never
+// left unguarded.
+func TestCIWatchCIConfigPathLookupFailureCreatesNoRun(t *testing.T) {
+	h := newCIHarness(t, ciRed("1", 100, 0))
+	h.cf.pathErr = errors.New("gitlab 503")
+	if _, err := h.sched.fireOne(context.Background(), h.schedule()); err == nil {
+		t.Fatal("a ci_config_path lookup failure must be returned as a transient fire error")
+	}
+	if len(h.runs.ciRepairs) != 0 {
+		t.Fatalf("repair creates = %d, want 0", len(h.runs.ciRepairs))
 	}
 }
 

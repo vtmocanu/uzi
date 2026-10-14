@@ -105,18 +105,19 @@ func newCIConfigMatcher(globs []string) (match func(string) bool, ok bool, err e
 // It is depth-1 safe: the broker fetches the default branch at depth 1, so there is no history
 // to walk and no merge base. It compares the two root trees directly.
 //
-// The guard checks the trees the run wrote. The worker's pack is `tip ^floor` (floor = the
-// merge-base with the default branch, or origin/<branch>), so a subtree the candidate shares with
-// that trusted floor is not in the pack and not in the broker's object store. When both sides
-// hold a directory with differing hashes and the candidate-side tree object is absent
-// (plumbing.ErrObjectNotFound), the run did not write it and it is skipped: inherited trees
-// compare as unchanged, consistent with the worker's merge-base diff. Still fail closed: a
-// missing candidate ROOT tree, any missing default-side object, a candidate-only directory whose
-// tree is missing, and any other error. Residual strictness, accepted: a protected file inside a
-// tree the run did write (for example a root-level .gitlab-ci.yml when the run added a root
-// file) that also changed on the default branch after the run's base still counts as a
-// difference; a spurious refusal of a server-side checkpoint or held publication is non-fatal,
-// and the worker's own merge-base check decides the final branch push.
+// This is a backstop for the trees present in the pack and the fetched refs, not the authority.
+// The worker's pack is `tip ^floor`, so a subtree the candidate shares with the floor is usually
+// absent from the broker's object store. When both sides hold a directory with differing hashes
+// and the candidate-side tree object is absent (plumbing.ErrObjectNotFound), that subtree is
+// skipped. The skip is NOT proof the run did not write it: an agent-authored merge whose extra
+// parent is outside the pack also leaves trees out. The worker's own merge-base guard over every
+// guarded checkpoint and held candidate (agent/src/runner.ts) is the layer that covers that case.
+// Once a checkpoint or branch ref exists on origin, fetchBaseRefs fetches it at depth 1, so its
+// inherited subtrees ARE present and compared: a later publication is refused when the default
+// branch changed a protected path after the run's base. That strictness is accepted (a non-fatal
+// checkpoint skip or held refusal; the worker's merge-base check decides the final branch push).
+// Still fail closed: a missing candidate ROOT tree, any missing default-side object, a
+// candidate-only directory whose tree is missing, and any other error.
 func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.Commit, defaultBranch string, globs []string) error {
 	match, ok, err := newCIConfigMatcher(globs)
 	if err != nil {
@@ -136,13 +137,13 @@ func ciConfigGuard(ctx context.Context, repo *git.Repository, candidate *object.
 	if err != nil {
 		return fmt.Errorf("%w: default tip unreadable: %v", ErrCIConfigGuard, err)
 	}
-	return ciConfigTreeGuard(ctx, repo.Storer, candidate.TreeHash, def.TreeHash, match, ciConfigWalkCap)
+	return ciConfigTreeGuard(ctx, repo.Storer, candidate.TreeHash, def.TreeHash, match)
 }
 
 // ciConfigTreeGuard compares two root trees and refuses on a differing protected path. A path
 // differs when it is on one side only, its mode differs, or its blob hash differs.
-func ciConfigTreeGuard(ctx context.Context, s storer.EncodedObjectStorer, cand, def plumbing.Hash, match func(string) bool, limit int) error {
-	w := &ciConfigWalk{ctx: ctx, s: s, match: match, limit: limit, maxBytes: ciConfigMaxPathBytesTotal}
+func ciConfigTreeGuard(ctx context.Context, s storer.EncodedObjectStorer, cand, def plumbing.Hash, match func(string) bool) error {
+	w := &ciConfigWalk{ctx: ctx, s: s, match: match, limit: ciConfigWalkCap, maxBytes: ciConfigMaxPathBytesTotal}
 	if err := w.diff(cand, def, "", 0); err != nil {
 		if errors.Is(err, ErrCIConfigGuard) {
 			return err
