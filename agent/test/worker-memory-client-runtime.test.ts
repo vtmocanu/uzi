@@ -20,6 +20,20 @@ async function until(predicate: () => boolean) {
   }
 }
 
+async function boundedCleanup(name: string, work: () => Promise<unknown>) {
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await Promise.race([
+      Promise.resolve().then(work),
+      new Promise<never>((_resolve, reject) => {
+        timer = setTimeout(() => reject(new Error(`unresolved fixture cleanup: ${name}`)), 4000);
+      }),
+    ]);
+  } finally {
+    clearTimeout(timer);
+  }
+}
+
 for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "unconfirmed", "retired-late", "ignored-abort"] as const) {
   test(`native client/runtime: ${mode}, exact historical fixture replay with one charge`, async () => {
     let nonce = "original-nonce";
@@ -61,65 +75,80 @@ for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "u
       if (mode === "retired-late" && reports.length === 1) { releaseLate = reply; return; }
       reply();
     });
-    await new Promise<void>(resolve => server.listen(0, "127.0.0.1", resolve));
-    const address = server.address();
-    assert.ok(address && typeof address !== "string");
-    const client = new WorkerClient(`http://127.0.0.1:${address.port}`, "fixture", "test", nullLogger());
-    await client.register("fixture");
     let releaseProducer: (() => void) | undefined;
     let producerDone: Promise<unknown> | undefined;
-    if (mode === "ignored-abort") {
-      // This adapter deliberately holds a real HTTP ACK past abort. It models an
-      // uncooperative reporting port; the other cases use the native client unchanged.
-      const nativeReport = client.reportMemoryInterventionOutcome.bind(client);
-      const held = new Promise<void>(resolve => { releaseProducer = resolve; });
-      client.reportMemoryInterventionOutcome = (...args) => {
-        const producer = nativeReport(...args).then(async ack => { await held; return ack; });
-        producerDone = producer;
-        return producer;
-      };
-    }
-    let sampleId = 0, usage = 0, signals = 0, prepared = 0, preserved = 0, feedback = 0;
-    let originalResult: WorkerMemoryPressureResult | undefined;
-    const runtime = new WorkerMemoryRuntime(settings, client, nullLogger(), {
-      reader: { sample: () => {
-        const now = performance.now();
-        return { available: true, sampleId: ++sampleId, startedAtMs: now, completedAtMs: now,
-          currentBytes: usage, limitBytes: 1000,
-          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
-          pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
-            full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
-      } },
-    });
-    const input = { run_id: run, worker_id: worker, register_nonce: nonce,
-      claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1,
-      memory_policy: { version: 1 as const, max_interventions: 2 }, memory_intervention_count: 0 };
-    const context = runtime.begin(input, {
-      prepareFeedback: (_ctx, result) => { originalResult = result; },
-      feedback: async result => { assert.equal(result, originalResult); feedback++; },
-      preparePreservation: (ctx, result) => {
-        assert.equal(ctx, context);
-        assert.equal(result, originalResult);
-        prepared++;
-        // Regression: preparation can retire admission, but original preservation is owed.
-        runtime.commands.retire(ctx);
-      },
-      preserve: async ctx => { assert.equal(ctx, context); preserved++; },
-      preservationBudgetMs: 200,
-    });
-    const entry = runtime.commands.register(context, {
-      source: "codex-model-command", toolId: "tool", attemptId: "attempt",
-      command: "inert fixture", root: { pid: 10, startTime: "10" },
-      observe: async () => {
-        const now = performance.now();
-        return { available: true, complete: true, startedAtMs: now, completedAtMs: now,
-          rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
-      },
-      cancel: async authority => { assert.equal(authority.authorized(), true); signals++; },
-      drain: async () => ({ confirmed: mode !== "unconfirmed" }),
-    });
-    const running = runtime.run();
+    let nativeAckHeld = false;
+    let runtimeOwner: WorkerMemoryRuntime | undefined;
+    let running: Promise<void> | undefined;
+    const failures: unknown[] = [];
     try {
+      await new Promise<void>((resolve, reject) => {
+        server.once("error", reject);
+        server.listen(0, "127.0.0.1", resolve);
+      });
+      const address = server.address();
+      assert.ok(address && typeof address !== "string");
+      const client = new WorkerClient(`http://127.0.0.1:${address.port}`, "fixture", "test", nullLogger());
+      await client.register("fixture");
+      if (mode === "ignored-abort") {
+        // This adapter deliberately holds a real HTTP ACK past abort. It models an
+        // uncooperative reporting port; the other cases use the native client unchanged.
+        const nativeReport = client.reportMemoryInterventionOutcome.bind(client);
+        const held = new Promise<void>(resolve => { releaseProducer = resolve; });
+        client.reportMemoryInterventionOutcome = (...args) => {
+          const producer = nativeReport(...args).then(async ack => {
+            nativeAckHeld = true;
+            await held;
+            return ack;
+          });
+          // Observe rejection immediately; body/cleanup still await the original promise.
+          void producer.catch(() => {});
+          producerDone = producer;
+          return producer;
+        };
+      }
+      let sampleId = 0, usage = 0, signals = 0, prepared = 0, preserved = 0, feedback = 0;
+      let originalResult: WorkerMemoryPressureResult | undefined;
+      const runtime = new WorkerMemoryRuntime(settings, client, nullLogger(), {
+        reader: { sample: () => {
+          const now = performance.now();
+          return { available: true, sampleId: ++sampleId, startedAtMs: now, completedAtMs: now,
+            currentBytes: usage, limitBytes: 1000,
+            stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+            pressure: { some: { avg10: 0, avg60: 0, avg300: 0, total: 0 },
+              full: { avg10: 0, avg60: 0, avg300: 0, total: 0 } } };
+        } },
+      });
+      runtimeOwner = runtime;
+      const input = { run_id: run, worker_id: worker, register_nonce: nonce,
+        claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1,
+        memory_policy: { version: 1 as const, max_interventions: 2 }, memory_intervention_count: 0 };
+      const context = runtime.begin(input, {
+        prepareFeedback: (_ctx, result) => { originalResult = result; },
+        feedback: async result => { assert.equal(result, originalResult); feedback++; },
+        preparePreservation: (ctx, result) => {
+          assert.equal(ctx, context);
+          assert.equal(result, originalResult);
+          prepared++;
+          // Regression: preparation can retire admission, but original preservation is owed.
+          runtime.commands.retire(ctx);
+        },
+        preserve: async ctx => { assert.equal(ctx, context); preserved++; },
+        preservationBudgetMs: 200,
+      });
+      const entry = runtime.commands.register(context, {
+        source: "codex-model-command", toolId: "tool", attemptId: "attempt",
+        command: "inert fixture", root: { pid: 10, startTime: "10" },
+        observe: async () => {
+          const now = performance.now();
+          return { available: true, complete: true, startedAtMs: now, completedAtMs: now,
+            rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+        },
+        cancel: async authority => { assert.equal(authority.authorized(), true); signals++; },
+        drain: async () => ({ confirmed: mode !== "unconfirmed" }),
+      });
+      running = runtime.run();
+      void running.catch(() => {});
       usage = 950;
       const result = await runtime.commands.watchOutcome(entry);
       assert.deepEqual(result, originalResult);
@@ -127,16 +156,16 @@ for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "u
       assert.equal(result.cancellation_confirmed, mode !== "unconfirmed");
       await until(() => reports.length >= 1);
       if (mode === "ignored-abort") {
-        await until(() => runtime.sinkReceipts.some(receipt => receipt.kind === "report"));
+        await until(() => nativeAckHeld);
         const start = performance.now();
-        await runtime.stop();
+        await boundedCleanup("ignored-abort stop", () => runtime.stop());
         assert.ok(performance.now() - start < 1000, "stop does not join an uncooperative producer");
         const receipts = runtime.sinkReceipts.filter(receipt => receipt.kind === "report");
         assert.equal(receipts.length, 1);
         assert.equal(receipts[0]!.context, context);
         assert.ok(Object.isFrozen(receipts[0]));
         releaseProducer!();
-        await producerDone;
+        await boundedCleanup("released producer", async () => { await producerDone; });
         await until(() => runtime.sinkReceipts.length === 0);
       } else if (mode === "retired-late") {
         await until(() => releaseLate !== undefined);
@@ -188,14 +217,33 @@ for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "u
       assert.equal(stored.size, 1);
       assert.equal(signals, 1);
       assert.equal(feedback, 1);
+    } catch (error) {
+      failures.push(error);
     } finally {
       releaseLate?.();
       releaseProducer?.();
-      await producerDone;
-      await runtime.stop();
-      await running;
-      server.closeAllConnections();
-      await new Promise<void>((resolve, reject) => server.close(error => error ? reject(error) : resolve()));
+      try {
+        // Each owner gets one bounded attempt; a failed owner does not block siblings.
+        const cleanup = await Promise.allSettled([
+          boundedCleanup("producer", async () => { await producerDone; }),
+          boundedCleanup("runtime.stop", async () => { await runtimeOwner?.stop(); }),
+          boundedCleanup("runtime.run", async () => { await running; }),
+        ]);
+        for (const result of cleanup) {
+          if (result.status === "rejected") failures.push(result.reason);
+        }
+      } finally {
+        server.closeAllConnections();
+        try {
+          await boundedCleanup("server.close", () => new Promise<void>((resolve, reject) =>
+            server.close(error => error ? reject(error) : resolve())));
+          assert.equal(runtimeOwner?.sinkReceipts.length ?? 0, 0, "unresolved fixture sink receipts");
+        } catch (error) {
+          failures.push(error);
+        }
+      }
     }
+    if (failures.length === 1) throw failures[0];
+    if (failures.length > 1) throw new AggregateError(failures, "native fixture and cleanup failed");
   });
 }
