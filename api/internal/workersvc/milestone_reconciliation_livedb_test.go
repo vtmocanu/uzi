@@ -16,9 +16,8 @@ import (
 const reconciliationOldList = `[{"id":"M1","title":"Old one"},{"id":"M2","title":"Old two"},{"id":"M3","title":"Old three"},{"id":"M4","title":"Old four"}]`
 const reconciliationNewList = `[{"id":"M1","title":"Replacement one"},{"id":"M2","title":"Replacement two"}]`
 
-// This fixture publishes the replacement through SetStateReport, including the
-// canonical H/P witness. Only the forge ref read is fake; all authority uses SQL.
-func newMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*gateFix, uuid.UUID, SubmitInputOptions) {
+// Seed predecessor authority; only the forge ref read is fake.
+func seedMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*gateFix, uuid.UUID) {
 	t.Helper()
 	f := newGateFix(t, 8)
 	f.wkr.ProtocolCapabilities = append(f.wkr.ProtocolCapabilities, capability.CompletionInterlockV1, capability.CredentialSwitchV1)
@@ -46,6 +45,13 @@ func newMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*gat
 	if len(historicalStop) > 0 {
 		f.exec("UPDATE runs SET stop_kind=$2, stop_reason='historical decision' WHERE id=$1", id, historicalStop[0])
 	}
+	return f, id
+}
+
+// Publish the replacement through SetStateReport, including the canonical H/P witness.
+func newMilestoneReconciliationFix(t *testing.T, historicalStop ...string) (*gateFix, uuid.UUID, SubmitInputOptions) {
+	t.Helper()
+	f, id := seedMilestoneReconciliationFix(t, historicalStop...)
 	req := gateReq(i64(1), uid())
 	req.Milestones = &[]Milestone{{ID: "M1", Title: "Replacement one"}, {ID: "M2", Title: "Replacement two"}}
 	req.GateCheckpointWitness = &apitypes.GateCheckpointWitness{SourceHead: "1111111111111111111111111111111111111111", PublishedCheckpoint: retentionTestTip}

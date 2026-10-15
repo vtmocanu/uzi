@@ -83,7 +83,8 @@ see [Named contexts](#named-contexts) below.
 ```
 uzi login | logout | auth token [--with-token] | auth status [--all] | whoami
 uzi context list | current | use <name> | set <name> --url <url> | rm <name>
-uzi run list | get <id> [--field <name> ...] | logs <id> [--follow] [--after <seq>]
+uzi run list | get <id> [--field <name> ...] [--reconciliation-before-gate-revision <n>]
+uzi run logs <id> [--follow] [--after <seq>]
 uzi run plan <run-id> [--version N] [--diff] [--json]
 uzi run wait <id> [--until <status,...>] [--interval <dur>] [--timeout <dur>] [--min-plan-seq <n>]
 uzi run create --repo <id> --issue <iid> [--plan-file <path>]
@@ -92,6 +93,8 @@ uzi run create --repo <id> --issue <iid> [--plan-file <path>]
                 [--harness claude|codex]
 uzi run approve <id> [--agent-source own|repo] [--exclude-agents a,b]
                 [--expected-gate-revision <n>]
+                [--reset-milestones --reason <text> --expected-reset-state-digest <digest>
+                 --expected-completion-revision <N|null>]
 uzi run reject <id> [--message <text>] [--expected-gate-revision <n>]
 uzi run revise <id> [--message <text>] [--expected-gate-revision <n>]
 uzi run cancel <id> [--discard-pending-outcome]
@@ -289,8 +292,8 @@ A few worth knowing:
   (readable with `uzi run get <id> --field gate_revision`). Pass
   `--expected-gate-revision <n>` to make a verdict conditional on that exact
   revision still being current — the way to say "this is the plan I read."
-  Without the flag, the CLI reads the run once, right before sending the
-  verdict, and sends whatever revision it finds while the run is
+  For an ordinary verdict without the flag, the CLI reads the run once,
+  right before sending the verdict, and sends whatever revision it finds while the run is
   `awaiting_approval`; that only proves the verdict targets the gate current
   *at that moment*, not a plan you read earlier in a separate `run get` or in
   the web UI. A mismatch — the run has since shown a newer plan, or is no
@@ -300,6 +303,64 @@ A few worth knowing:
   refuses the approve, the token switch is NOT rolled back, and the error
   says so, so you know a bare re-run of `run approve` (no `--token`) is what's
   left to do.
+- **`run approve <id> --reset-milestones`** approves a changed milestone
+  plan with explicit owner consent to replace the frozen milestones. Unchanged
+  milestone approval preserves progress and scope. Review `uzi run get <id>`
+  first: it shows frozen and candidate IDs/titles (including an explicit empty
+  replacement), completed and in-progress milestones, agent attribution,
+  scope/stop decisions, accepted/deferred criteria, and reset bindings.
+  Use `--json` for details omitted or shortened in the human display.
+
+  Copy the reviewed `gate_revision`, `reset_state_digest` (SHA-256 hex),
+  and `completion_revision` into the required flags below. `N` is a positive
+  completion revision; use literal lowercase `null` when the reviewed value
+  is null. Supply a nonblank reason:
+
+  ```sh
+  uzi run get <id> --json
+  uzi run approve <id> --reset-milestones --reason "Replace the milestone scope" \
+    --expected-gate-revision <reviewed-gate-revision> \
+    --expected-reset-state-digest <reviewed-reset-state-digest> \
+    --expected-completion-revision <N|null>
+  ```
+
+  Reset does not fetch or refresh bindings for you, and cannot be combined
+  with `--token`. It clears completed/in-progress milestones and agent
+  attribution, scope ceiling and stop decisions, and the authority of prior
+  accepted/deferred completion decisions; prior completion permits are
+  invalidated. Reused milestone IDs retain no completion credit. History
+  remains available, including before/after reset snapshots and the reason.
+
+  In the web plan gate, approval of changed milestones opens a separate
+  **Reset progress and approve plan** confirmation with the effects, a reason
+  and an acknowledgement. Changes to the displayed snapshot invalidate the
+  confirmation. Reset approval does not write a token selection. A stale
+  consent refusal (409, CLI exit 5) requires reviewing the refreshed run and
+  making a new explicit decision; refresh does not grant consent or retry approval.
+
+  A `milestone_reconciliation_not_ready` refusal means request a plan revision
+  so the worker can attempt a fresh published checkpoint. If revisions are
+  exhausted, cancel and start a new run; retrying approval cannot create the
+  missing witness. An ordinary `awaiting_input` question is not a
+  completion-decision state; see `run answer` and `run decide` below.
+
+  Deploy the API and migration `00339` before upgraded workers. The API
+  advertises `milestone_reconciliation_v1`; upgraded workers attempt the gate
+  checkpoint when that feature is advertised and the milestone list changes.
+  An older worker cannot supply the required witness. After reset, claiming
+  requires the existing worker protocol capability `credential_switch_v1`
+  for generation fencing, even with capability scheduling disabled or an
+  owner capability override; a completion contract also requires
+  `completion_interlock_v1`.
+
+  `run get` returns a bounded reset-history page. Follow the
+  `RECONCILIATIONS_NEXT` hint with
+  `uzi run get <id> --reconciliation-before-gate-revision <n>` for entries
+  strictly older than that positive revision. JSON exposes the records as
+  `milestone_reconciliations` and the next cursor as
+  `milestone_reconciliations_next_before_gate_revision`; omitted cursor means
+  no further page. Server-shortened reasons or omitted oversized snapshots
+  are marked `reason_truncated` / `details_omitted`.
 - **`run stop <id>`** gracefully winds down a run. On an **interactive**
   task run (one created with `uzi handoff --interactive`; see [Interactive
   mode](./handoff.md#interactive-mode)) the current turn
