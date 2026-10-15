@@ -2,7 +2,7 @@
 
 **Issue:** [#1228](https://github.com/vtmocanu/uzi/issues/1228)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Consumers:** Completion holds in #1229 and retained PR sessions in #1214.
+**Consumers:** Retained PR sessions in #1214. Completion holds in #1229 were a consumer until #1229 was closed as not planned (2026-10-15).
 **Status:** Planned, blocked on the one-at-a-time sequence after #1227.
 **Priority:** High.
 **Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1227 merges and main CI is green.
