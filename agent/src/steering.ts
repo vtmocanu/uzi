@@ -328,9 +328,9 @@ const ACTIVE_APPLY_ATTEMPTS = 30;
  *  a full HTTP timeout, so the attempt count alone could hold a report for many minutes. */
 const ACTIVE_APPLY_DEADLINE_MS = 60_000;
 
-/** Issue #1673: the applied receipt for a routed batch could not be confirmed. Thrown to every
- *  state report still waiting on it and to the parked waiters, so the run fails instead of
- *  reporting a resume the server's applied-only guards would not recognise. */
+/** Issue #1673: the applied receipt for a routed batch could not be confirmed. State reports
+ *  waiting on it reject with this error; parked gates receive ClaimFencedSignal instead.
+ *  The source rows stay unapplied for a later claim to replay. */
 class InputReceiptError extends Error {
   constructor(message: string) {
     super(message);
@@ -339,8 +339,8 @@ class InputReceiptError extends Error {
 }
 
 /** Issue #1673: a receipt said this claim was released or superseded (or the run is terminal).
- *  The old flight's GETs would never see its inputs again, so it ends; its reports are refused
- *  by the server's claim fence. */
+ *  The old flight ends; runner state reports check the local fence on entry and after waiting
+ *  for receipt settlement. */
 class ClaimFencedSignal extends Error {
   constructor(readonly reason: string) {
     super(`input claim is no longer active (${reason})`);
@@ -648,8 +648,8 @@ export class SteeringChannel {
     for (const w of this.receiptWaiters.splice(0)) w.reject(err);
   }
 
-  /** Give up the applied receipt of a routed batch on an active claim: stop polling, fail every
-   *  report waiting on it and every parked waiter. The rows stay unapplied for a later claim. */
+  /** Give up the applied receipt of a routed batch on an active claim: reject waiting reports
+   *  with InputReceiptError, then fence parked gates. The rows stay unapplied for a later claim. */
   private failReceipts(err: InputReceiptError): void {
     this.log.error("steering: giving up the applied receipt; stopping this flight", { run_id: this.runId, error: err.message });
     this.receiptFailure = err;
@@ -658,8 +658,8 @@ export class SteeringChannel {
     this.endFencedFlight("input_receipt_unconfirmed");
   }
 
-  /** The claim is released or superseded: route nothing more and end the old flight. A waiting
-   *  report is let go; the server refuses it as a stale claim. */
+  /** End a fenced flight and route nothing more. Receipt waiters are released; runner state
+   *  reports check the local fence on entry and again after receipt settlement. */
   private endFencedFlight(reason: string): void {
     this.log.warn("steering: input receipt claim is fenced; ending this flight", { run_id: this.runId, reason });
     const signal = new ClaimFencedSignal(reason);
