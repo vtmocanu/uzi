@@ -29,7 +29,7 @@ The final product rejects an incomplete completion attempt without failing the r
 | 5 | [#1230 Semantic completion contract and plan coverage review](1230-semantic-completion-contract.md) | Source-backed criteria, independent plan coverage and autopilot fallback | #1226 |
 | 6 | [#1231 Independent completion auditor and semantic permit](1231-completion-auditor.md) | Exact-head full audit (tool-less, two-pass cap, fixed token/wall budget), captured gate evidence, semantic permit, per-repo semantic opt-in and bounded recovery | #1226 + #1230 |
 | 7 | [#1233 Structured completion blockers and governed MR rework](1233-structured-blockers-mr-rework.md) | Server-owned blocker dispositions and contract-governed automatic/manual rework | #1227 + #1230 + #1231 |
-| 8 | [#1232 Completion interlock integration, rollout and epic close-out](1232-completion-interlock-integration.md) | End-to-end/race proof, default enablement, consolidated docs and epic close | #1226-#1231 + #1233 |
+| 8 | [#1232 Completion interlock integration, rollout and epic close-out](1232-completion-interlock-integration.md) | End-to-end/race proof, default enablement, consolidated docs and epic close | #1226-#1228, #1230, #1231 + #1233 (#1229 not planned) |
 
 Queue policy: remove `uzi` from the current child after its PR merges and main CI is green, then add `uzi` to the next child. The scheduled sweep's `max_issues=3` is not a serialization guarantee; the single eligibility label is.
 
@@ -40,19 +40,19 @@ These seams are fixed here so each merged child extends rather than replaces its
 1. **Contract identity.** `completion_contract_version` is nullable for legacy rows. Schema v1 has `profile=structural|semantic` and a separate monotonically increasing contract revision. #1226 creates structural contracts; #1230 fills semantic criteria; #1231 activates semantic enforcement.
 2. **Hard worker protocol.** Interlocked claims have dedicated positive clauses outside `required_capabilities`, owner override and the capability kill-switch. Structural contracts require `completion_interlock_v1`; semantic contracts additionally require `completion_audit_v1`.
 3. **Permit wire.** The request reserves optional audit and finding fields from #1226. Structural permits accept null/empty fields; semantic permits require them after #1231.
-4. **Completion transaction.** Permit consumption and `SetRunCompleted` are one service transaction with a generation-activation hook so #1229/#1214 do not replace the terminal seam.
+4. **Completion transaction.** Permit consumption and `SetRunCompleted` are one service transaction with a generation-activation hook so #1214 (and any reopened #1229) does not replace the terminal seam.
 5. **Hold writer.** `SetRunCompletionHold` positively admits owned `running|awaiting_input` attempts. It is distinct from owner-requested `SetRunPaused`.
-6. **Capture hook.** Park ordering is Git capture/ACK, `captureHoldContext`, hold transition/ACK, then release. #1226 returns `same_worker_only`; #1229 supplies durable context without reordering the fence.
+6. **Capture hook.** Park ordering is Git capture/ACK, `captureHoldContext`, hold transition/ACK, then release. #1226 returns `same_worker_only`; #1229 (not planned) would have supplied durable context without reordering the fence.
 7. **Claim handoff.** Completion contract/attempt/hold metadata is one additive object. Provider context uses a distinct server handoff, never `session_id` as authority.
 8. **Owner decision path.** One `completion_decision` input/endpoint begins with continue in #1226 and gains partial/accept in #1227.
 9. **No-progress routing.** After attempt one, no-progress and budget exhaustion call one completion-hold function; before attempt one, legacy behavior remains.
 10. **Alignment.** Keep ADR-456 alignment in `phasePublish`. Structural permits rebind to its final head. Semantic evidence invalidated by a changed head recovers/requeues for new gates and audit rather than moving the large finalizer into the lead loop.
-11. **Context owner kinds.** #1228 defines `run_hold|pr_session`; #1229 implements run-hold policy; #1214 later implements PR-session policy. Their authorization, consent and lifetimes never cross.
+11. **Context owner kinds.** #1228 defines `run_hold|pr_session`; run-hold policy (#1229) is not planned; #1214 later implements PR-session policy. Their authorization, consent and lifetimes never cross.
 12. **MR rework.** It stays legacy until #1233 copies/activates the source contract and current structured findings. #1214 context is optional continuity, never completion evidence.
 
 ## Issue relationships and queue order
 
-#1214 currently retains `Planned` but not `uzi`. Re-add `uzi` only after #1228 has merged and its PRD has been amended to consume the shared primitive, and never on a night when a #1225 child also carries `uzi`. The preferred completion-first order is #1226, #1227, #1228, #1229, #1230, #1231, #1233, #1232, then #1214. A maintainer may choose #1214 after #1228, but it and #1229/#1231/#1233 share runner/resume seams and must still execute one at a time.
+#1214 currently retains `Planned` but not `uzi`. Re-add `uzi` only after #1228 has merged and its PRD has been amended to consume the shared primitive, and never on a night when a #1225 child also carries `uzi`. The preferred completion-first order is #1226, #1227, #1228, #1230, #1231, #1233, #1232, then #1214. A maintainer may choose #1214 after #1228, but it and #1231/#1233 share runner/resume seams and must still execute one at a time.
 
 #1088 provider-outage recovery is related but not a prerequisite. #1202 already provides on-demand post-PR rework. #1171 may later supply a verified Codex codec; an unmerged/provisional branch is not production support.
 
@@ -73,7 +73,7 @@ These seams are fixed here so each merged child extends rather than replaces its
 These are release checks, not worker-frozen child milestones:
 
 - [ ] Same-worker completion rework retains the original provider session on hosted k8s.
-- [ ] Worker deletion followed by another worker restores exact Git and provider context.
+- [ ] Worker deletion followed by another worker restores exact Git; provider context reports `same_worker_only` (#1229 not planned).
 - [ ] Mixed old/new worker rollout leaves contracted runs visibly waiting and never misclaims them.
 - [ ] API restart between permit and terminal report recovers idempotently.
 - [ ] Full, reduced-scope and accepted-criteria PR bodies have correct closing behavior on the live forge.
