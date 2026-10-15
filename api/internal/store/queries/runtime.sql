@@ -1044,7 +1044,10 @@ WITH claimant AS MATERIALIZED (
       -- same exemption expression is mirrored by GetCustodyAdmissionForRun (health reason) and
       -- GetCustodyAggregateForOwner.blocked_runs, so the pill, the aggregate and the claim
       -- agree.
+      -- Report-only checkers open no custody hold; their exemption is independent
+      -- of the bounded continuation exemption for code-publishing runs above.
       AND (@custody_hold_limit::int <= 0
+           OR r.kind = 'cross_check'
            OR (r.claim_generation >= 1
                AND EXISTS (SELECT 1 FROM recovery_custody_holds oh
                              WHERE oh.user_id = r.user_id AND oh.run_id = r.id AND oh.state = 'open')
@@ -1576,7 +1579,9 @@ RETURNING runs.*;
 -- the same expression: the run was claimed before (claim_generation >= 1) AND its OWN open
 -- custody-hold count (owner-scoped) is at least 1 and below @custody_hold_limit. The upper bound
 -- stops a run that the never-started sweep keeps requeueing from opening holds forever (see
--- ClaimRun). An exempt run is never blocked by the custody cap. A run that does not exist (or
+-- ClaimRun). A continuation-exempt run is never blocked by the custody cap. The separate
+-- kind='cross_check' exemption is handled before this health read; hold-free children do not
+-- become continuation-exempt. A run that does not exist (or
 -- belongs to another owner), or a non-positive limit, yields continuation_exempt = false.
 SELECT
     fn_custody_admission_count(@user_id::uuid, @heartbeat_cutoff::timestamptz)::bigint AS admission_counted_holds,

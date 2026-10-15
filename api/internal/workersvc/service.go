@@ -3270,6 +3270,8 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 		// PRD #1296 M1 (D2/D3/D4): the durable-recovery claim/custody contract.
 		//   - CustodyHoldLimit gates admission: a claim is blocked once the owner holds
 		//     >= this many admission-counted open holds (ADR-2445; owner-scoped, never global).
+		//     Hold-free cross-check children are exempt. Code-publishing continuations
+		//     are exempt only with a prior claim and 1..limit-1 own open holds.
 		//   - RecoveryCapable derives from the worker's advertised recovery_archive_v1,
 		//     recovery_archive_v2 or recovery_inventory_v1 protocol capability (D9 additive
 		//     versioned contract; any one of the three suffices): the custody hold is
