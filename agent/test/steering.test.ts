@@ -51,6 +51,35 @@ function makeChannel(batches: UserInput[][], cancel = new AbortController()): { 
   return { ch, cancel };
 }
 
+describe("D2b cancellation observation", () => {
+  it("first observer runs after sticky cancel before abort listeners", async () => {
+    const cancel = new AbortController();
+    const events: string[] = [];
+    const ch = new SteeringChannel(fakeClient([[inp("cancel")]]), "run-1", 1, nullLogger(), cancel, {
+      onCancel: () => { assert.equal(ch.isCancelled(), true); events.push("observe"); },
+    });
+    cancel.signal.addEventListener("abort", () => events.push("model"));
+    ch.lifecycleSignal().addEventListener("abort", () => events.push("lifecycle"));
+    ch.start();
+    await ch.awaitVerdict();
+    assert.deepEqual(events, ["observe", "model", "lifecycle"]);
+    await ch.stop();
+  });
+
+  it("throwing cancellation observer still stops model and lifecycle", async () => {
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([[inp("cancel")]]), "run-1", 1, nullLogger(), cancel, {
+      onCancel: () => { throw new Error("observer fixture"); },
+    });
+    ch.start();
+    for (let n = 0; n < 100 && !cancel.signal.aborted; n++) await tick(1);
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(cancel.signal.aborted, true);
+    assert.equal(ch.lifecycleSignal().aborted, true);
+    await ch.stop();
+  });
+});
+
 describe("#2493 terminal lifecycle", () => {
   it("identity survives pause rearm and recoverable switch; terminal abort keeps first reason", () => {
     const { ch } = makeChannel([[]]);

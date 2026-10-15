@@ -84,6 +84,8 @@ export type AnswerVerdict =
   { kind: "answer"; answers: string[] } | { kind: "cancel" };
 
 export interface SteeringOptions {
+  /** Observe sticky cancellation before synchronous model/lifecycle abort listeners. */
+  onCancel?: () => void;
   /** Injectable sleep so tests can drive the poll loop deterministically. */
   sleep?: (ms: number, signal?: AbortSignal) => Promise<void>;
   /** PRD #41: emit a short feed notice (as a worker `status` message) when a verdict
@@ -1446,6 +1448,7 @@ export class SteeringChannel {
     | undefined;
   private readonly sleepFn: (ms: number, signal?: AbortSignal) => Promise<void>;
   private readonly notify: ((text: string) => void) | undefined;
+  private readonly onCancel: (() => void) | undefined;
   /** PRD #517 M3: clock the follow-up park's idle window measures against. */
   private readonly now: () => number;
   /** PRD #1247 M5b: the claim-lane generation this channel guards a credential switch against. */
@@ -1464,6 +1467,7 @@ export class SteeringChannel {
   ) {
     this.sleepFn = opts.sleep ?? sleep;
     this.notify = opts.notify;
+    this.onCancel = opts.onCancel;
     this.now = opts.now ?? Date.now;
     this.claimGeneration = opts.claimGeneration ?? 0;
     this.inclusions = new InclusionReporter(client, runId, this.claimGeneration, log);
@@ -2258,8 +2262,11 @@ export class SteeringChannel {
         // Sticky BEFORE the abort: the abort's listeners run synchronously and read it (a parked
         // delivery waiter resolves on a cancel instead of rejecting with the AbortError).
         this.cancelled = true;
-        if (!this.cancel.signal.aborted) this.cancel.abort();
-        this.abortLifecycle();
+        try { this.onCancel?.(); }
+        finally {
+          try { if (!this.cancel.signal.aborted) this.cancel.abort(); }
+          finally { this.abortLifecycle(); }
+        }
         break;
       case "stop":
         // PRD #517 M4: a graceful wind-down of an interactive task. Sticky, like cancel, but
