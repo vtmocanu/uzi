@@ -47,6 +47,25 @@ func TestRecoveryServiceSharedBeforeWorkerRoutes(t *testing.T) {
 	}
 }
 
+func TestRecoveryServiceLazyAfterWorkerRoutes(t *testing.T) {
+	h := &Handler{}
+	limiter := mw.NewLimiter(1, time.Minute, nil)
+	h.WorkerRoutes(limiter)
+	if h.recoverySvc != nil {
+		t.Fatal("worker routes must leave recovery service uninitialized")
+	}
+	if h.heldListLimiter != limiter {
+		t.Fatal("worker routes must retain the supplied limiter")
+	}
+	shared := h.RecoveryService()
+	if shared == nil || h.recoverySvc != shared {
+		t.Fatal("first recovery service access must initialize the shared instance")
+	}
+	if h.RecoveryService() != shared {
+		t.Fatal("repeated recovery service access must return the shared instance")
+	}
+}
+
 func TestHeldListAllowForIsPerWorker(t *testing.T) {
 	allow := heldListAllowFor(mw.NewLimiter(1, time.Minute, nil))
 	a, b := uuid.New(), uuid.New()
