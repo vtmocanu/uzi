@@ -2103,13 +2103,15 @@ func TestNonRootlessDindBindsOnlyLoopbackTCPViaExplicitCommand(t *testing.T) {
 		t.Fatal("non-rootless dind MUST override the command to bind loopback explicitly — without the " +
 			"override docker:dind's entrypoint restores the 0.0.0.0:2375 listener, exposing the root daemon on the pod IP")
 	}
-	if dind.Command[0] != "dockerd" {
-		t.Errorf("dind command[0] = %q, want dockerd", dind.Command[0])
+	netDir := dindMTUFixture(t, []dindMTUInterface{{name: "ens5", value: "1400\n"}})
+	launch, stderr, err := runRenderedDind(t, dind, netDir)
+	if err != nil {
+		t.Fatalf("dind launch failed: %v, stderr: %s", err, stderr)
 	}
 
 	var hosts []string
 	tlsOff := false
-	for _, arg := range dind.Command[1:] {
+	for _, arg := range launch.argv {
 		if strings.HasPrefix(arg, "--host=") {
 			hosts = append(hosts, strings.TrimPrefix(arg, "--host="))
 		}
@@ -2144,7 +2146,7 @@ func TestNonRootlessDindBindsOnlyLoopbackTCPViaExplicitCommand(t *testing.T) {
 	// container avoids.
 	rootless := RenderDeployment(dockerTestConfig(), desiredDocker("abc"), testSpec(t, "base", "m"))
 	rl := containerByName(t, rootless.Spec.Template.Spec.InitContainers, dindContainerName)
-	if len(rl.Command) != 0 {
+	if rl.Command != nil {
 		t.Errorf("rootless dind must inherit its image entrypoint, got command=%v", rl.Command)
 	}
 }

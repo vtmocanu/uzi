@@ -182,6 +182,47 @@ var (
 	}
 )
 
+// rootfulDindCommand passes netDir as a positional argument, keeping the production
+// sysfs path fixed at the call site while allowing isolated filesystem fixtures.
+// MTUs must be canonical decimal integers in 1..65535 (the maximum IPv4 packet
+// size, including jumbo frames). Validate syntax and length before any numeric
+// comparison so shell integer width and octal parsing cannot affect the result.
+// Docker 29 accepts default-network-opts only in daemon JSON, so keep that
+// setting in a private sidecar-local file and the listener/bridge MTU in argv.
+func rootfulDindCommand(netDir string) []string {
+	return []string{"/bin/sh", "-c", `fail() {
+    printf 'dind MTU: %s\n' "$1" >&2
+    exit 1
+}
+[ -d "$1" ] || fail "network interface directory unavailable: $1"
+min=
+# One startup snapshot, one read per interface; any failure stops daemon launch.
+for iface in "$1"/*; do
+    [ "${iface##*/}" != lo ] || continue
+    file="$iface/mtu"
+    # The sentinel preserves trailing newlines through command substitution.
+    mtu=$(cat "$file" && printf '.') || fail "cannot read MTU: $file"
+    mtu=${mtu%.}
+    # Accept the kernel's single terminating newline, but no extra lines.
+    mtu=${mtu%"
+"}
+    case "$mtu" in
+        ''|0*|*[!0-9]*) fail "invalid MTU (expected decimal 1..65535): $file" ;;
+    esac
+    [ "${#mtu}" -le 5 ] || fail "MTU exceeds 65535: $file"
+    [ "$mtu" -le 65535 ] || fail "MTU exceeds 65535: $file"
+    if [ -z "$min" ] || [ "$mtu" -lt "$min" ]; then
+        min=$mtu
+    fi
+done
+[ -n "$min" ] || fail "no non-loopback interface MTU in $1"
+umask 077
+config=$(mktemp /tmp/uzi-dind-daemon.XXXXXX) || fail "cannot create daemon config in /tmp"
+printf '{"default-network-opts":{"bridge":{"com.docker.network.driver.mtu":"%s"}}}\n' "$min" > "$config" || fail "cannot write daemon config: $config"
+exec dockerd --host=tcp://127.0.0.1:2375 --tls=false "--mtu=$min" "--config-file=$config"
+`, "dind-mtu", netDir}
+}
+
 // dindContainer is the Docker-in-Docker daemon, modelled as a NATIVE SIDECAR (an
 // initContainer with restartPolicy: Always) so k8s starts it before the worker and
 // holds the worker container until its startupProbe (`docker info`) passes — the k8s
@@ -259,7 +300,7 @@ func dindContainer(cfg RenderConfig) corev1.Container {
 		// socket ...: bind: no such file or directory") — live-proven on dev-cluster in
 		// 0.8.0 and fixed here (0.8.1). Nothing needs the socket: the worker's DOCKER_HOST
 		// is dindLoopbackTCP and the probe is `docker -H tcp://127.0.0.1:2375 info`.
-		command = []string{"dockerd", "--host=" + dindLoopbackTCP, "--tls=false"}
+		command = rootfulDindCommand("/sys/class/net")
 		// `docker info` over the loopback endpoint: the daemon answering there is the real
 		// readiness signal (the socket existing is not the daemon being up).
 		probeCmd = "docker -H " + dindLoopbackTCP + " info >/dev/null 2>&1"
