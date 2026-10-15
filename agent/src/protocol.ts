@@ -1473,10 +1473,10 @@ export interface ClaimResponse {
   plan_md?: string | null;
   /** The FROZEN milestone list for this run (PRD #122 M1, Decision 11), carried so a
    *  future resume's planning prompt can name what is already committed. Null/absent
-   *  when the approved plan had no milestones. Additive + optional; nothing consumes
-   *  it in M1 — the field is declared now so the wire contract is complete.
-   *  Issue #1626: on a `resume_phase: "awaiting_approval"` claim (nothing frozen yet) it
-   *  carries the unapproved CANDIDATE list instead, so the re-presented gate re-sends it. */
+   *  means none supplied; [] is an explicitly empty list and must survive decoding.
+   *  On a `resume_phase: "awaiting_approval"` claim it carries the unapproved CANDIDATE
+   *  instead, even if an older contract is frozen, so the recovered gate checkpoints
+   *  an empty replacement and re-sends the same proposed definitions. */
   milestones?: Milestone[] | null;
   /** Frozen execution definitions, distinct from a presented candidate. An explicit []
    *  is a frozen empty plan; absence means no execution definitions were supplied. */

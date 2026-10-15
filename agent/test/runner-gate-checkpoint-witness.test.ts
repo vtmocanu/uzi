@@ -17,19 +17,21 @@ const ID = "aaaaaaaa-aaaa-4aaa-8aaa-aaaaaaaaaaaa";
 
 describe("M1 gate checkpoint witness", () => {
   for (const mode of ["published", "failed", "unrelated", "moved", "legacy", "initial", "unchanged",
-    "unchanged-empty", "absent-candidate", "removed", "frozen-empty", "reordered", "resumed", "held-approve", "revise", "revise-unconfirmed"] as const) {
+    "unchanged-empty", "absent-candidate", "removed", "frozen-empty", "reordered", "resumed", "resumed-empty", "held-approve", "revise", "revise-unconfirmed"] as const) {
     it(`${mode}: only a confirmed recoverable publish presents a witness`, async () => {
       const order: string[] = [];
       const old = [{ id: "m1", title: "Original" }, { id: "m2", title: "Second" }];
       const candidate = mode === "absent-candidate" ? undefined :
-        mode === "removed" || mode === "unchanged-empty" ? [] :
+        mode === "removed" || mode === "unchanged-empty" || mode === "resumed-empty" ? [] :
         mode === "unchanged" ? old.map((m) => ({ title: m.title, id: m.id })) :
         mode === "reordered" ? [...old].reverse() : [{ id: "m1", title: "Replacement" }];
       const ordinary = ["legacy", "initial", "unchanged", "unchanged-empty", "absent-candidate"].includes(mode);
+      const resumed = mode === "resumed" || mode === "resumed-empty";
       const claim = gitlabClaim(2944, {
         claim_generation: 7,
         ...(mode === "initial" ? {} : { execution_milestones: mode === "frozen-empty" || mode === "unchanged-empty" ? [] : old }),
-        ...(mode === "resumed" ? {
+        ...(resumed ? {
+          ...(mode === "resumed-empty" ? { milestones: [] } : {}),
           plan_md: "Plan", resume_phase: "awaiting_approval",
           resume_plan_at: "2000-01-01T00:00:00.000000Z",
           resume_gate_revision: 2, resume_gate_presentation_id: ID,
@@ -49,7 +51,7 @@ describe("M1 gate checkpoint witness", () => {
       let returned = false;
       const { gitlab } = fakeGitlab();
       const executor: Executor = {
-        resumesAtGate: mode === "resumed",
+        resumesAtGate: resumed,
         killAgentTree() { order.push("quiesce"); },
         async run(ctx) {
           sourcePath = ctx.worktreePath;
@@ -79,7 +81,7 @@ describe("M1 gate checkpoint witness", () => {
               { ok: true, body: { published: true, ref: "refs/uzi-checkpoints/agent/issue-2944" } };
           };
           try {
-            const verdict = await ctx.gatePlan!("Plan", candidate);
+            const verdict = await ctx.gatePlan!("Plan", mode === "resumed-empty" ? ctx.frozenMilestones ?? undefined : candidate);
             returned = true;
             assert.equal(verdict.kind, mode === "revise" ? "revise" : "reject");
             if (mode === "revise") assert.ok(order.includes("running"), "revision settles running before another provider turn");
@@ -103,7 +105,17 @@ describe("M1 gate checkpoint witness", () => {
         }
         api.setInputs(claim.run_id, [input(mode === "held-approve" ? "approve_plan" : mode.startsWith("revise") ? "revise_plan" : "reject_plan", mode.startsWith("revise") ? "Revise the replacement" : undefined)]);
       });
-      await run.execute(claim);
+      let recoveredClaim = claim;
+      if (mode === "resumed-empty") {
+        // Exercise the real HTTP JSON decoder, rather than passing the candidate
+        // directly to gatePlan. Go's claim-wire regression pins the server half.
+        api.enqueueClaim(JSON.parse(JSON.stringify(claim)));
+        const decoded = await client.claimRun();
+        assert.ok(decoded);
+        assert.deepEqual(decoded.milestones, []);
+        recoveredClaim = decoded;
+      }
+      await run.execute(recoveredClaim);
       const gates = api.states.filter((s) => s.runId === claim.run_id && s.body.status === "awaiting_approval");
       if (!ordinary && mode !== "failed" && mode !== "unrelated" && mode !== "moved") {
         assert.equal(gates.length, 1);
@@ -114,7 +126,7 @@ describe("M1 gate checkpoint witness", () => {
         assert.ok(order.indexOf("publish") < order.indexOf("ancestry"));
         assert.ok(order.indexOf("ancestry") < order.indexOf("gate"));
         assert.deepEqual(gates[0]!.body.milestones, candidate);
-        if (mode === "resumed") {
+        if (resumed) {
           assert.ok(gates[0]!.body.presentation_id);
           assert.notEqual(gates[0]!.body.presentation_id, ID, "new capture cannot reuse the previous immutable presentation");
           assert.equal(gates[0]!.body.adopt_gate_revision, undefined);
