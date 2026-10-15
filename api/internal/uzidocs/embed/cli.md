@@ -284,6 +284,13 @@ A few worth knowing:
   (`-m`/`--message`, or piped on stdin). Revisions are capped by the run's
   revision limit, and an exhausted limit — or a run that has already finished —
   is a 409 (exit 5).
+- **When plan-revision provider retries expire**, the original plan stays at
+  the gate and feedback remains pending. Use ordinary `run revise` bound with
+  `--expected-gate-revision` for a new, normally charged revision if the cap
+  permits. At the cap, use `run cancel` or source-bound `run reject`, then
+  dispatch a new run for further changes. Approval and follow-up cannot resume
+  the expired wait. See [plan-revision recovery](./run-recovery.md#when-plan-revision-retries-expire)
+  for retry and reclaim limits.
 - **`run approve|reject|revise` bind to a plan-gate revision.** Every plan
   presented at the gate has a revision number, exposed as `gate_revision`
   (readable with `uzi run get <id> --field gate_revision`). Pass
