@@ -19,6 +19,30 @@ PASS = ('<testsuites><testsuite name="suite"><testcase name="leaf" '
         'file="/app/test/example.test.ts"/></testsuite></testsuites>')
 
 
+class CaptureTest(unittest.TestCase):
+    def test_complete_output_and_inherited_pipe_deadline(self):
+        from bounded import capture
+        import time
+        SCRATCH.mkdir(parents=True, exist_ok=True)
+        with tempfile.TemporaryDirectory(dir=SCRATCH) as directory:
+            report = Path(directory) / "report"
+            rc = capture([sys.executable, "-c", "import sys; sys.stdout.buffer.write(b'x' * 1024)"],
+                         report, 10, 1024)
+            self.assertEqual(rc, 0)
+            self.assertEqual(report.read_bytes(), b"x" * 1024)
+            # The direct producer exits, but its child holds stdout and ignores TERM.
+            # Completion must use the deadline rather than wait indefinitely for EOF.
+            child = ("import signal,time; signal.signal(signal.SIGTERM, signal.SIG_IGN); "
+                     "print('ready', flush=True); time.sleep(60)")
+            parent = ("import subprocess,sys; "
+                      f"subprocess.Popen([sys.executable, '-c', {child!r}])")
+            start = time.monotonic()
+            rc = capture([sys.executable, "-c", parent], report, 7, 1024)
+            self.assertEqual(rc, 124)
+            self.assertLess(time.monotonic() - start, 8)
+            self.assertIn(b"ready", report.read_bytes())
+
+
 class RunnerTest(unittest.TestCase):
     def setUp(self):
         SCRATCH.mkdir(parents=True, exist_ok=True)
@@ -27,7 +51,7 @@ class RunnerTest(unittest.TestCase):
         self.repo = Path(self.temp.name)
         harness = self.repo / "e2e/worker-uid"
         harness.mkdir(parents=True)
-        for name in ("run.sh", "check.py", "check_test.py"):
+        for name in ("run.sh", "bounded.py", "check.py", "check_test.py"):
             shutil.copyfile(HARNESS / name, harness / name)
         self.bin = self.repo / "bin"
         self.bin.mkdir()
@@ -44,8 +68,21 @@ else:
     raise AssertionError(args)
 """)
         self.stub("docker", """
-if args[0] == "run":
-    name = args[args.index("--name") + 1]
+state_path = Path("resources.json")
+state = json.loads(state_path.read_text()) if state_path.exists() else {}
+if args[0] == "run" or args[:2] == ["volume", "create"]:
+    volume = args[0] == "volume"
+    name = args[-1] if volume else args[args.index("--name") + 1]
+    token = args[args.index("--label") + 1].split("=", 1)[1]
+    state[name] = {"Name": name, "Id": __import__("hashlib").sha256(name.encode()).hexdigest(),
+                   "Labels": {"io.uzi.worker-uid.invocation": token},
+                   "Config": {"Labels": {"io.uzi.worker-uid.invocation": token}}}
+    if os.environ["OWNERSHIP_MISMATCH"] and name.endswith(os.environ["OWNERSHIP_MISMATCH"]):
+        state[name]["Labels"] = state[name]["Config"]["Labels"] = {}
+    state_path.write_text(json.dumps(state))
+    if volume:
+        print(name)
+        sys.exit(int(os.environ["VOLUME_RC"]))
     if name.endswith("-provision"):
         sys.exit(int(os.environ["PROVISION_RC"]))
     command = name.endswith("-command")
@@ -54,11 +91,20 @@ if args[0] == "run":
     if os.environ[prefix + "XML_MODE"] == "missing":
         filename = "command-results.xml" if command else "results.xml"
         reports = list(Path(".uzi/scratch").glob("worker-uid.*/" + filename))
-        assert len(reports) == 1
-        reports[0].unlink()
+        max(reports, key=lambda path: path.stat().st_mtime_ns).unlink()
     else:
-        print(os.environ[prefix + "XML"])
+        print(os.environ[prefix + "XML"], flush=True)
+    if os.environ[prefix + "XML_MODE"] == "overflow":
+        import signal, time
+        signal.signal(signal.SIGTERM, lambda *_: (Path(name + ".terminated").touch(), sys.exit(143)))
+        # Stream indefinitely: the collector must stop this producer before its watchdog.
+        while True:
+            sys.stdout.write(" " * 65536)
+            sys.stdout.flush()
     sys.exit(int(os.environ[prefix + "CONTAINER_RC"]))
+if args[0] == "inspect" or args[:2] == ["volume", "inspect"]:
+    print(json.dumps([state[args[-1]]]))
+    sys.exit(0)
 assert args[0] in ("build", "rm", "image", "volume"), args
 if args[0] == "image":
     sys.exit(int(os.environ["METADATA_RC"]))
@@ -69,18 +115,23 @@ if args[0] == "rm":
 """)
         self.stub("timeout", """
 assert args[2] == "docker", args
-normal = args[:2] == ["--kill-after=30s", "7"]
-assert normal or args[:2] in (["--kill-after=5s", "10s"], ["--kill-after=5s", "30s"],
-                             ["--kill-after=5s", "60s"], ["--kill-after=5s", "115s"]), args
+assert args[0] == "--kill-after=5s", args
+seconds = float(args[1].removesuffix("s"))
 operation = args[3]
 if operation == "run":
     name = args[args.index("--name") + 1]
-    expected = ["--kill-after=5s", "30s"] if name.endswith("-provision") else (\n        ["--kill-after=5s", "115s"] if name.endswith("-command") else ["--kill-after=30s", "7"])
+    expected = 20 if name.endswith("-provision") else 115 if name.endswith("-command") else 7
+    assert seconds == expected, args
+elif operation == "build":
+    assert seconds == 60, args
 else:
-    expected = ["--kill-after=5s", "60s" if operation == "build" else "10s"]
-assert args[:2] == expected, args
-rc = subprocess.run(args[2:], check=False, timeout=5).returncode
-key = "TIMEOUT_RC" if normal else "COMMAND_TIMEOUT_RC" if args[1] == "115s" else ""
+    assert 0 < seconds <= 5, args
+import signal
+proc = subprocess.Popen(args[2:])
+signal.signal(signal.SIGTERM, lambda *_: proc.terminate())
+rc = proc.wait(timeout=5)
+key = "TIMEOUT_RC" if operation == "run" and seconds == 7 else (
+    "COMMAND_TIMEOUT_RC" if operation == "run" and seconds == 115 else "")
 if key and os.environ[key]:
     print("watchdog stderr fixture", file=sys.stderr)
     rc = int(os.environ[key])
@@ -101,7 +152,9 @@ sys.exit(rc)
 
     def run_lane(self, xml=PASS, container_rc=0, timeout_rc="", xml_mode="", skip_build="1",
                  command_xml=COMMAND_PASS, command_rc=0, command_timeout="", command_mode="",
-                 metadata_rc=0, provision_rc=0, build_rc=0, cleanup_rc=0):
+                 metadata_rc=0, provision_rc=0, build_rc=0, cleanup_rc=0,
+                 volume_rc=0, ownership_mismatch=""):
+        (self.repo / "resources.json").unlink(missing_ok=True)
         env = {
             "PATH": str(self.bin) + os.pathsep + os.defpath,
             "CALLS": str(self.calls), "EXPECTED": json.dumps(EXPECTED),
@@ -109,14 +162,15 @@ sys.exit(rc)
             "COMMAND_XML": command_xml, "COMMAND_XML_MODE": command_mode,
             "COMMAND_CONTAINER_RC": str(command_rc), "COMMAND_TIMEOUT_RC": str(command_timeout),
             "METADATA_RC": str(metadata_rc), "PROVISION_RC": str(provision_rc), "BUILD_RC": str(build_rc),
-            "CLEANUP_RC": str(cleanup_rc),
+            "CLEANUP_RC": str(cleanup_rc), "VOLUME_RC": str(volume_rc),
+            "OWNERSHIP_MISMATCH": ownership_mismatch,
             "XML": xml, "XML_MODE": xml_mode, "CONTAINER_RC": str(container_rc),
             "TIMEOUT_RC": str(timeout_rc), "WORKER_UID_TIMEOUT": "7",
             "WORKER_UID_SKIP_BUILD": skip_build, "WORKER_UID_IMAGE": "fixture-image",
             "PYTHONDONTWRITEBYTECODE": "1",
         }
         result = subprocess.run(["bash", str(self.repo / "e2e/worker-uid/run.sh")],
-                                env=env, capture_output=True, text=True, timeout=10, check=False)
+                                env=env, capture_output=True, text=True, timeout=20, check=False)
         calls = [json.loads(line) for line in self.calls.read_text().splitlines()]
         runs = [call for call in calls if call[:2] == ["docker", "run"]]
         # Every Docker operation, including failures before either lane, is bounded.
@@ -124,16 +178,27 @@ sys.exit(rc)
             if call[0] == "docker":
                 self.assertEqual(calls[index - 1][0], "timeout", call)
                 self.assertEqual(calls[index - 1][3:], call)
-        if metadata_rc or provision_rc or build_rc:
+        if metadata_rc or provision_rc or build_rc or volume_rc or ownership_mismatch:
             self.assertNotEqual(result.returncode, 0, result.stderr)
-            self.assertTrue(any(call[:2] == ["docker", "rm"] for call in calls))
+            removals = [call for call in calls if call[:2] == ["docker", "rm"] or call[:3] == ["docker", "volume", "rm"]]
+            if metadata_rc or build_rc:
+                self.assertEqual(removals, [])
+            elif ownership_mismatch == "-deps":
+                self.assertEqual(removals, [])
+            else:
+                self.assertTrue(removals)
             return result, calls
         self.assertEqual(len(runs), 3, result.stderr)
         provision, run, command = runs
         name = run[run.index("--name") + 1]
         self.assertTrue(name.startswith("wuid-2134-"), name)
+        state = json.loads((self.repo / "resources.json").read_text())
         self.assertEqual([call for call in calls if call[:2] == ["docker", "rm"]],
-                         [["docker", "rm", "-f", name, name + "-command", name + "-provision"]])
+                         [["docker", "rm", "-f", state[n]["Id"]]
+                          for n in (name + "-command", name, name + "-provision")])
+        self.assertRegex(name, r"^wuid-2134-[0-9a-f]{32}$")
+        for n in (name, name + "-command", name + "-provision", name + "-deps"):
+            self.assertEqual(state[n]["Labels"]["io.uzi.worker-uid.invocation"], name.removeprefix("wuid-2134-"))
         self.assertEqual([call for call in calls if call[:3] == ["docker", "volume", "rm"]],
                          [["docker", "volume", "rm", name + "-deps"]])
         self.assertEqual(command[command.index("--name") + 1], name + "-command")
@@ -190,6 +255,43 @@ sys.exit(rc)
         ])
         return result, calls
 
+    def test_ownership_failure_and_ambiguous_create(self):
+        for options in ({"volume_rc": 23}, {"ownership_mismatch": "-deps"},
+                        {"ownership_mismatch": "-command"}, {"provision_rc": 23}):
+            with self.subTest(options=options):
+                self.calls.unlink(missing_ok=True)
+                result, calls = self.run_lane(**options)
+                self.assertNotEqual(result.returncode, 0)
+                state = json.loads((self.repo / "resources.json").read_text())
+                removed = [call[-1] for call in calls if call[:2] == ["docker", "rm"]
+                           or call[:3] == ["docker", "volume", "rm"]]
+                for name, item in state.items():
+                    mismatch = options.get("ownership_mismatch", "")
+                    if mismatch and name.endswith(mismatch):
+                        self.assertNotIn(item["Id"], removed)
+                        self.assertNotIn(name, removed)
+                        self.assertIn("ownership mismatch", result.stderr)
+                    else:
+                        self.assertIn(name if name.endswith("-deps") else item["Id"], removed)
+
+    def test_capture_overflow_in_both_lanes(self):
+        from bounded import REPORT_BYTES
+        for command in (False, True):
+            with self.subTest(command=command):
+                self.calls.unlink(missing_ok=True)
+                options = {"command_mode": "overflow"} if command else {"xml_mode": "overflow"}
+                result, _ = self.run_lane(**options)
+                self.assertNotEqual(result.returncode, 0)
+                self.assertIn("report overflow", result.stderr)
+                prefix = "command-" if command else ""
+                directory = next(line.removeprefix("worker UID reports: ") for line in result.stdout.splitlines()
+                                 if line.startswith("worker UID reports: "))
+                report = Path(directory) / (prefix + "results.xml")
+                self.assertEqual(report.stat().st_size, REPORT_BYTES)
+                self.assertEqual(Path(str(report) + ".status").read_text(), "EXIT=125\n")
+                self.assertTrue(list(self.repo.glob("*.terminated")))
+                self.assertIn(("command " if command else "") + "node/container exit: 125", result.stderr)
+
     def test_success_and_build(self):
         result, calls = self.run_lane(skip_build="")
         self.assertEqual(result.returncode, 0, result.stderr)
@@ -235,7 +337,7 @@ sys.exit(rc)
     def test_cleanup_failure_still_attempts_volume(self):
         result, _ = self.run_lane(cleanup_rc=124)
         self.assertNotEqual(result.returncode, 0)
-        self.assertIn("worker UID cleanup exit: 124", result.stderr)
+        self.assertIn("Docker rm -f exit: 124", result.stderr)
 
     def test_worker_skip(self):
         result, _ = self.run_lane(xml=PASS.replace("/>", '><skipped/></testcase>'))

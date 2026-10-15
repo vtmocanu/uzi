@@ -17,6 +17,37 @@ class CheckerTest(unittest.TestCase):
     def case(self, body=""):
         return f'<testcase name="leaf" file="/app/test/example.test.ts">{body}</testcase>'
 
+    def test_report_bounds_before_parsing(self):
+        from check import MAX_REPORT_BYTES, MAX_XML_ITEMS, MAX_XML_CASES, MAX_XML_DEPTH, parse_report
+        scratch = Path(__file__).resolve().parents[2] / ".uzi/scratch"
+        scratch.mkdir(parents=True, exist_ok=True)
+        passing = '<testsuites><testsuite name="suite">' + self.case() + '</testsuite></testsuites>'
+        fixtures = {
+            "auditor oversized valid XML": passing + " " * (8388748 - len(passing)),
+            "truncated": passing[:-10],
+            "items": "<testsuites>" + "<x/>" * MAX_XML_ITEMS + "</testsuites>",
+            "cases": "<testsuites>" + "<testcase/>" * (MAX_XML_CASES + 1) + "</testsuites>",
+            "depth": "<x>" * (MAX_XML_DEPTH + 1) + "</x>" * (MAX_XML_DEPTH + 1),
+            "text": "<x>" + "x" * (256 * 1024 + 1) + "</x>",
+            "entity": '<!DOCTYPE x [<!ENTITY a "expanded">]><x>&a;</x>',
+        }
+        with tempfile.TemporaryDirectory(dir=scratch) as directory:
+            report = Path(directory) / "report.xml"
+            expected = Path(directory) / "expected.json"
+            expected.write_text(__import__("json").dumps(self.expected))
+            for label, xml in fixtures.items():
+                with self.subTest(label=label):
+                    report.write_text(xml)
+                    with self.assertRaises((ValueError, ET.ParseError)):
+                        parse_report(report)
+                    result = subprocess.run([sys.executable, str(Path(__file__).with_name("check.py")),
+                                             str(expected), str(report)], capture_output=True, text=True, timeout=5)
+                    self.assertNotEqual(result.returncode, 0, result.stdout)
+                    self.assertIn("worker UID lane FAIL", result.stderr)
+            # A complete report at the explicit byte cap is preserved and accepted.
+            report.write_text(passing + " " * (MAX_REPORT_BYTES - len(passing)))
+            self.assertEqual(check(self.expected, parse_report(report)), [])
+
     def test_pass(self):
         self.assertEqual(check(self.expected, self.report(self.case())), [])
 

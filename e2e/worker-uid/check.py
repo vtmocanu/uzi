@@ -8,6 +8,63 @@ import xml.etree.ElementTree as ET
 DIAGNOSTIC_PREFIX = "advice-teardown-diagnostic "
 MAX_DIAGNOSTIC_LINES = 8
 MAX_DIAGNOSTIC_BYTES = 16384
+MAX_REPORT_BYTES = 8 * 1024 * 1024
+MAX_XML_ITEMS = 20000
+MAX_XML_CASES = 4096
+MAX_XML_DEPTH = 32
+MAX_ITEM_BYTES = 256 * 1024
+
+
+class BoundedTree(ET.TreeBuilder):
+    def __init__(self):
+        super().__init__(insert_comments=True)
+        self.items = self.cases = 0
+        self.sizes = []
+
+    def start(self, tag, attrs):
+        self.items += 1
+        self.cases += tag == "testcase"
+        if (self.items > MAX_XML_ITEMS or self.cases > MAX_XML_CASES
+                or len(self.sizes) >= MAX_XML_DEPTH or len(attrs) > 64
+                or sum(len(k.encode()) + len(v.encode()) for k, v in attrs.items()) > MAX_ITEM_BYTES):
+            raise ValueError("XML item/case/depth limit exceeded")
+        self.sizes.append(0)
+        return super().start(tag, attrs)
+
+    def end(self, tag):
+        self.sizes.pop()
+        return super().end(tag)
+
+    def data(self, data):
+        if self.sizes:
+            self.sizes[-1] += len(data.encode())
+            if self.sizes[-1] > MAX_ITEM_BYTES:
+                raise ValueError("XML item text limit exceeded")
+        return super().data(data)
+
+    def comment(self, text):
+        self.items += 1
+        if self.items > MAX_XML_ITEMS or len(text.encode()) > MAX_ITEM_BYTES:
+            raise ValueError("XML comment/item limit exceeded")
+        return super().comment(text)
+
+    def doctype(self, *_):
+        raise ValueError("XML DTD forbidden")
+
+
+def read_bounded(path, limit):
+    with open(path, "rb") as source:
+        data = source.read(limit + 1)
+    if len(data) > limit:
+        raise ValueError(f"report byte limit exceeded: {limit}")
+    return data
+
+
+def parse_report(path):
+    # Bound bytes before XML parsing, including files grown/replaced by a caller.
+    data = read_bounded(path, MAX_REPORT_BYTES)
+    return ET.fromstring(data, parser=ET.XMLParser(target=BoundedTree()))
+
 
 
 def diagnostic_lines(texts, budget):
@@ -103,10 +160,10 @@ def check(expected, root):
 
 if __name__ == "__main__":
     try:
-        with open(sys.argv[1], encoding="utf-8") as source:
-            expected = json.load(source)
-        parser = ET.XMLParser(target=ET.TreeBuilder(insert_comments=True))
-        errors = check(expected, ET.parse(sys.argv[2], parser=parser).getroot())
+        expected = json.loads(read_bounded(sys.argv[1], 1024 * 1024))
+        if len(expected) > MAX_XML_CASES:
+            raise ValueError("inventory case limit exceeded")
+        errors = check(expected, parse_report(sys.argv[2]))
         if errors:
             raise ValueError("\n".join(errors))
         print(f"worker UID lane: {len(expected)} required leaves passed")

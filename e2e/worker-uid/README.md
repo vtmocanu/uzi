@@ -8,13 +8,24 @@ disposable data and Nix mounts, and removes only its own named container.
 To reuse an image, set `WORKER_UID_SKIP_BUILD=1` and `WORKER_UID_IMAGE=<image>`.
 `WORKER_UID_TIMEOUT` controls the outer watchdog (default 600 seconds).
 The separate command proof has a 115-second watchdog plus five-second kill grace
-(120 seconds total). All Docker operations use GNU timeout: image metadata gets
-10 seconds, the local build fallback 60 seconds, and dependency provisioning 30
-seconds, each with five-second kill grace (115 seconds total including the optional
-build). Cleanup attempts only the three owned container names and dependency volume
-in two calls of 10 seconds plus five-second kill grace (30 seconds total). Cleanup
-tries both calls even on failure and propagates nonzero status. Containers are
-retained until the trap so successful invocations leave exact owned names to remove.
+(120 seconds total). All Docker operations use GNU timeout. Image metadata, volume
+creation and ownership inspection each get five seconds plus five-second kill grace.
+The optional local build gets 60 seconds plus five-second grace; dependency
+provisioning gets 20 seconds plus five-second grace (120 seconds total including
+metadata and the optional build). Cleanup has a shared 30-second budget including
+kill grace and reaping; each metadata/removal request gets at most 10 seconds,
+including at most five-second grace. It tries each recorded resource once, continues
+after failures while budget remains, and propagates failure or exhausted budget.
+
+Every invocation uses an unpredictable 128-bit token in its names and ownership
+labels. Creation requests are journaled before sending, so an ambiguous Docker
+failure or lost acknowledgement still triggers ownership inspection. The volume
+is explicitly created and its label checked before mounting it. Cleanup inspects
+only attempted resources, verifies the invocation label, and removes containers
+by their returned immutable IDs and the volume by its verified name. Missing,
+malformed or mismatching ownership metadata fails closed: planned names alone
+never authorize removal. Metadata/build failure before creation performs no
+resource cleanup. Containers remain until the trap.
 `WORKER_UID_SKIP_BUILD=1` requires the hosted image to exist locally; the harness
 never pulls an image or installs runtime dependencies.
 
@@ -62,7 +73,20 @@ checker requires each leaf exactly once and
 rejects skip, failure, error and missing results. Node and container failures,
 including exit 77 and watchdog timeouts, also fail the target even when the checker
 fails too. Container stderr stays visible. Reports remain in a unique directory
-under `.uzi/scratch/`, printed for diagnosis.
+under `.uzi/scratch/`, printed for diagnosis. Both JUnit stdout streams are captured
+by the foreground bounded collector: each complete report may occupy at most
+8 MiB (8,388,608 bytes), including diagnostics. The collector never writes past
+that cap. Overflow terminates its own watchdog, retains the capped report and an
+`EXIT=125` status sidecar, and fails the lane even if the retained XML parses.
+TERM gets at most five seconds before the private producer group is killed;
+inherited pipes cannot extend the capture deadline. The EXIT trap then performs
+the bounded, ownership-verified container cleanup.
+
+The standalone checker reads at most the same cap plus one sentinel byte before
+parsing. XML is limited to 20,000 items (including comments), 4,096 testcases,
+32 levels, 64 attributes per element and 256 KiB per element's text, comment or
+attribute set; DTDs are rejected. These limits bound ingestion independently of
+the printed diagnostic budget. Oversized or truncated reports fail closed.
 
 Failures identify the leaf file and full suite/leaf names, and report each local
 or inherited skip, failure or error with its originating suite or testcase.
