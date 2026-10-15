@@ -21,8 +21,8 @@ const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
 // V2 records retain original generation and preparation policy across worker drift.
-async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue") {
-  const f = await fixture(true);
+async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue", receiptModel = false) {
+  const f = await fixture(true, os.tmpdir(), receiptModel, receiptModel ? "00000000-0000-4000-8000-000000000001" : "run-1");
   const order: string[] = [];
   const holdId = "00000000-0000-4000-8000-000000000007";
   const repoId = "00000000-0000-4000-8000-000000000008";
@@ -30,19 +30,19 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
   let hold: "open" | "discarded" | "unknown" = "open";
   Object.assign(f.client, {
     hasHeldPublicationV2: () => true,
-    listRecoveryHolds: async () => ({ run_id: "run-1", holds: [{
+    listRecoveryHolds: async () => ({ run_id: f.context.runId, holds: [{
       hold_id: holdId, generation: 7, inventory_guarded: true, has_available_capture: false,
     }] }),
     getExactRecoveryHold: async () => hold === "unknown" ? undefined : ({
-      run_id: "run-1", hold_id: holdId, repo_id: repoId, generation: 7, state: hold,
+      run_id: f.context.runId, hold_id: holdId, repo_id: repoId, generation: 7, state: hold,
       original_worker_id: "original", original_worker_identity: "original", inventory_guarded: true,
       run_status: f.state.status, current_claim_generation: f.state.ownGeneration, claim_released: true,
-      ...(hold === "open" ? { live_worker_id: "original", live_run_id: "run-1" } : { release_evidence: "owner_discard" }),
+      ...(hold === "open" ? { live_worker_id: "original", live_run_id: f.context.runId } : { release_evidence: "owner_discard" }),
     }),
     publishHeld: async (run: string, gen: number, tip: string, digest: string) => {
       order.push("held");
       assert.equal(gen, 7);
-      const saved = (await f.coordinator.inspect(run))[0]!;
+      const saved = (await f.coordinator.inspect(run)).find(r => r.generation === gen)!;
       assert.equal(tip, saved.sourceSha);
       assert.equal(digest, saved.coverageDigest);
       return { ok: true, body: { publication_id: publicationId, ref: `refs/uzi-held/${run}/${gen}`, tip, state: "created" } };
@@ -516,6 +516,146 @@ it("B throwing pack stream waits for controlled child exit", async () => {
     assert.equal(stopRequested, 1, "abandonment requests cancellation before waiting for close");
   } finally { await f.close(); }
 });
+
+
+for (const mode of ["boot", "live"] as const) {
+  for (const refusal of ["none", "source proof", "unknown create", "FINAL refusal"] as const) {
+    it(`M4 completed ISSUE current receipt earlier available thin NO receipt ${mode}/${refusal}`, async () => {
+      const f = await v2FrozenFixture("issue", true);
+      try {
+        const runId = f.context.runId;
+        f.state.status = "completed";
+        f.state.thin = true;
+        await f.capture(f.record);
+        const earlier = (await f.coordinator.inspect(runId)).find(r => r.generation === 7)!;
+        assert.equal(earlier.state, "uploaded");
+        assert.equal(earlier.selfContained, false);
+        assert.equal(earlier.completionReceipt, undefined);
+        assert.equal(earlier.finalRequest, undefined);
+        assert.equal(f.committedReceipts.size, 0);
+        const captureBefore = structuredClone([...f.captures]);
+        const bytes = await fs.readFile(earlier.bundlePath!);
+        const listHolds = f.client.listRecoveryHolds;
+        f.client.listRecoveryHolds = async () => ({ run_id: runId, holds: [
+          { hold_id: "hold-8", generation: 8, inventory_guarded: true, has_available_capture: false },
+          ...(await listHolds()).holds,
+        ] });
+        await f.coordinator.pin({ runId, generation: 8, kind: "issue", branch: "task",
+          sourceSha: H2, inventoryGuarded: true });
+        const uuid = "00000000-0000-4000-8000-000000000002";
+        assert.equal(await f.coordinator.persistCompletionReceipt({
+          hold_id: uuid, run_id: runId, owner_id: uuid, worker_id: uuid, generation: 8,
+          final_head: H2, repo_id: f.record.exactHoldBinding!.repoId, connection_id: uuid,
+          project_id: 1, forge_type: "github", base_url: "https://example.com",
+          branch: "task", mr_iid: 1, observed_branch_head: H2,
+        }), true);
+        const current = (await f.coordinator.inspect(runId)).find(r => r.generation === 8)!;
+        if (refusal === "source proof") f.state.sourceProofRefused = true;
+        if (refusal === "unknown create") Object.assign(f.client, {
+          publishHeld: async () => { f.order.push("held"); throw new Error("unknown create"); },
+        });
+        if (refusal === "FINAL refusal") f.state.finalError = new Error("FINAL unavailable");
+        // Keep discovery focused on the existing immutable snapshot, as a boot journal replay does.
+        Object.assign(f.git, { discoverOwedCandidates: async () => [] });
+        const restarted = f.make(true);
+        if (mode === "boot") await restarted.resumePending();
+        else await restarted.resumeLive({ authenticatedAtMs: f.state.now, isExecuting: () => false });
+        const records = await restarted.inspect(runId);
+        assert.deepEqual(records.find(r => r.generation === 8), current, "current receipt remains byte-for-byte authority");
+        const saved = records.find(r => r.captureId === earlier.captureId)!;
+        assert.ok(saved);
+        assert.equal(saved.sourceSha, earlier.sourceSha);
+        assert.equal(saved.coverageDigest, earlier.coverageDigest);
+        assert.equal(saved.completionReceipt, undefined, "current receipt never covers earlier generation");
+        assert.deepEqual([...f.captures], captureBefore, "available thin manifest is frozen on the same record");
+        assert.deepEqual(await fs.readFile(earlier.bundlePath!), bytes);
+        assert.equal(f.reserves(), 1, "no replacement capture");
+        assert.equal(f.state.produced, 1, "no extra archive");
+        assert.equal(f.state.uploads, 1);
+        if (refusal === "none") {
+          assert.ok(f.order.includes("held"), "earlier generation must publish held despite current receipt");
+          assert.equal(f.finals.length, 1);
+          assert.equal(f.finals[0]![0], runId);
+          assert.equal(f.finals[0]![1], 7, "FINAL targets exact earlier generation");
+          assert.deepEqual(f.committedReceipts.get(7), {
+            kind: "held_publication", publication_id: "00000000-0000-4000-8000-000000000009",
+            source_sha: earlier.sourceSha, coverage_digest: earlier.coverageDigest,
+          });
+          assert.equal(saved.finalAcknowledged, true);
+          assert.equal(f.state.open, false);
+        } else {
+          assert.equal(saved.finalAcknowledged, undefined, "refusal never fabricates ACK");
+          assert.equal(f.committedReceipts.size, 0);
+          assert.equal(f.state.open, true, "refusal keeps earlier custody");
+          assert.equal(f.state.pinDeletes, 0);
+          assert.equal(f.finals.length, refusal === "FINAL refusal" ? 1 : 0);
+        }
+      } finally { await f.close(); }
+    });
+  }
+}
+
+for (const kind of ["ci_fix", "prompt", "task"] as const) {
+  it(`M4 completed independent ${kind} self-contained archive FINAL`, async () => {
+    const f = await v2FrozenFixture(kind, true);
+    try {
+      f.state.status = "completed";
+      await f.make(true).resumePending();
+      assert.deepEqual(f.order, ["archive"]);
+      assert.equal(f.finals.length, 1);
+      assert.equal(f.finals[0]![1], 7);
+      assert.equal(f.committedReceipts.get(7)?.kind, "archive");
+      assert.equal(f.state.open, false);
+    } finally { await f.close(); }
+  });
+}
+
+
+for (const [kind, refusal] of [["ci_fix", "quota"], ["prompt", "oversize"], ["task", "thin"]] as const) {
+  it(`M4 completed independent ${kind} ${refusal} falls back to exact held FINAL`, async () => {
+    const f = await v2FrozenFixture(kind, true);
+    try {
+      f.state.status = "completed";
+      if (refusal === "thin") f.state.thin = true;
+      else f.state.reserveError = new RequestError("POST", "/reserve",
+        refusal === "quota" ? 429 : 413, JSON.stringify({ reason: refusal }));
+      await f.make(true).resumePending();
+      assert.ok(f.order.indexOf("archive") < f.order.indexOf("held"));
+      assert.equal(f.finals.length, 1);
+      assert.equal(f.finals[0]![1], 7);
+      assert.deepEqual(f.committedReceipts.get(7), {
+        kind: "held_publication", publication_id: "00000000-0000-4000-8000-000000000009",
+        source_sha: f.record.sourceSha, coverage_digest: f.record.coverageDigest,
+      });
+      assert.equal(f.state.open, false);
+    } finally { await f.close(); }
+  });
+}
+
+for (const refusal of ["empty roots without source proof", "unverified head"] as const) {
+  it(`M4 completed earlier thin ${refusal} cannot manufacture empty proof or ACK`, async () => {
+    const f = await v2FrozenFixture("issue", true);
+    try {
+      f.state.status = "completed";
+      f.state.thin = true;
+      await f.capture(f.record);
+      const before = (await f.coordinator.inspect(f.context.runId))[0]!;
+      if (refusal === "empty roots without source proof") {
+        f.state.candidates = [];
+        f.state.sourceProofRefused = true;
+      } else f.state.cloneReadable = false;
+      await f.make(true).resumePending();
+      const saved = (await f.coordinator.inspect(f.context.runId))[0]!;
+      assert.equal(saved.captureId, before.captureId);
+      assert.equal(saved.finalAcknowledged, undefined);
+      assert.equal(f.finals.length, 0);
+      assert.equal(f.order.includes("held"), false);
+      assert.equal(f.state.open, true);
+      assert.equal(f.state.pinDeletes, 0);
+      assert.equal(f.state.produced, 1);
+    } finally { await f.close(); }
+  });
+}
 
 for (const status of ["failed", "cancelled", "completed"]) {
   for (const kind of ["issue", "ci_fix", "prompt", "task"] as const) {
@@ -1400,10 +1540,10 @@ for (const kind of ["issue", "mr_rework"] as const) for (const cause of sourceDi
     });
   }
 
-async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false) {
+async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = os.tmpdir(), receiptModel = false, runId = "run-1") {
   const root = await fs.mkdtemp(path.join(rootParent, "inventory-"));
   const context: PositiveOwedCandidateContext = {
-    runId: "run-1", generation: 7, kind: "issue", branch: "task",
+    runId, generation: 7, kind: "issue", branch: "task",
     barePath: path.join(root, "repo.git"),
     defaultIdentity: { ref: "refs/remotes/origin/main", sha: "d".repeat(40) },
   };
@@ -1506,6 +1646,13 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
         const committed = committedReceipts.get(generation);
         if (committed) {
           assert.deepEqual(disposition, committed, "committed FINAL receipts cannot be replaced");
+        } else if (disposition.kind === "held_publication") {
+          const record = (await coordinator.inspect(runId)).find(r => r.generation === generation)!;
+          assert.equal(disposition.source_sha, record.sourceSha);
+          assert.equal(disposition.coverage_digest, record.coverageDigest);
+          assert.equal(disposition.publication_id, "00000000-0000-4000-8000-000000000009");
+          committedReceipts.set(generation, Object.freeze(structuredClone(disposition)));
+          state.open = false;
         } else {
           assert.equal(disposition.kind, "archive");
           const capture = [...captures.values()].find(c => c.id === disposition.capture_id);
