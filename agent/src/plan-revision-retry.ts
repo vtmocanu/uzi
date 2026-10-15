@@ -1,5 +1,5 @@
 import { setTimeout as delay } from "node:timers/promises";
-import { RequestError } from "./client.js";
+import { RequestError, RevisionSourceFenceUnavailableError } from "./client.js";
 import { PlanRejectedError, PlanRevisionReplacedError } from "./executor.js";
 import type { RunOwnershipResponse, StateAck, StateRequest } from "./protocol.js";
 import type { PlanVerdict, SteeringChannel } from "./steering.js";
@@ -62,7 +62,7 @@ export class PlanRevisionRecovery {
    * immutable current presentation. This seeds identity only, never old retry state.
    */
   seed(request: StateRequest, revision: number, report: Report): void {
-    if (positive(revision) && request.presentation_id && positive(this.deps.generation))
+    if (positive(revision) && positive(this.deps.generation))
       this.source = { request: structuredClone(request), revision, report };
   }
 
@@ -113,6 +113,9 @@ export class PlanRevisionRecovery {
     const a = this.active;
     if (!a) throw cause; // missing source/older API keeps existing compatibility behavior
     await this.confirmSource(a);
+    // An id-less legacy presentation still has a source ownership fence, but
+    // cannot use the exact-presentation expiry restore. Keep its existing recovery path.
+    if (!a.source.request.presentation_id) throw cause;
     if (a.used < this.limit) {
       const random = this.deps.policy?.random?.() ?? Math.random();
       const jitter = Number.isFinite(random) ? Math.max(0, Math.min(1, random)) : 0;
@@ -123,7 +126,7 @@ export class PlanRevisionRecovery {
       return;
     }
 
-    const owned = await this.confirmSource(a);
+    const restoreSourceGate = async (owned: RunOwnershipResponse): Promise<void> => {
     if (owned.status !== "awaiting_approval") {
       // No plan frame, fresh presentation, epoch or receipt settlement on restoration.
       const restore = { ...a.source.request, status: "awaiting_approval" as const,
@@ -133,6 +136,8 @@ export class PlanRevisionRecovery {
       delete restore.superseded_revision_input_ids;
       await this.publish(restore, a.source.report);
     }
+    };
+    await restoreSourceGate(await this.confirmSource(a));
     this.deps.steering.setGateRevision(a.source.revision);
     const capped = this.humanRounds >= this.deps.maxRevisions;
     await this.deps.notice(
@@ -142,7 +147,9 @@ export class PlanRevisionRecovery {
       "Cancel and source-bound reject remain available. Approval and follow-up cannot resume this wait. For further changes after the cap, cancel/reject and dispatch a new run. This live gate remains busy and can defer a worker image roll until it ends or existing drain/shutdown policy acts.",
     );
     for (;;) {
-      await this.confirmSource(a);
+      // Same-flight readoption or a delayed running report must not hide the
+      // expired gate again. Retain only the captured source under the same fence.
+      await restoreSourceGate(await this.confirmSource(a));
       const abort = new AbortController();
       const signal = AbortSignal.any([this.deps.signal(), abort.signal]);
       let verdict: PlanVerdict | undefined;
@@ -182,6 +189,8 @@ export class PlanRevisionRecovery {
       catch (err) {
         this.control(a);
         if (err instanceof PlanRevisionRecoveryStoppedError) throw err;
+        if (err instanceof RevisionSourceFenceUnavailableError)
+          throw new PlanRevisionRecoveryStoppedError("plan revision source-fence support is unavailable");
         if (err instanceof RequestError && err.status >= 400 && err.status < 500 && err.status !== 429)
           throw new PlanRevisionRecoveryStoppedError("source-fenced plan revision publication was refused");
         await this.wait(250);

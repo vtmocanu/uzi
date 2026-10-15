@@ -1888,6 +1888,8 @@ interface RunFlight {
   permanentFailureReapSafety?: unknown;
   preserveSession: boolean;
   recoveryRetentionCause?: string;
+  /** Captured support, not permission to downgrade a later source-bearing write. */
+  planRevisionRetryNegotiated?: boolean;
   /** PRD #1392 M2: this run parked on a PRE-CLONE forge-unreachable transient error, so it
    *  captured no clone and no model session. Unlike a limit_wait/recovery park, it preserves its
    *  HOME + plugin dir ONLY when a resume transcript is resolvable on this worker
@@ -5156,7 +5158,9 @@ export class RunRunner {
     // resolve it (D3): on reserve_exhausted it degrades to today's direct send, whose throw the
     // .catch below still logs; on the journaled path journalAndSendTerminal never throws (a send that
     // fails now leaves the durable journal for a later resolve).
+    const requiresRevisionSourceFence = flight.planRevisionRetryNegotiated === true && err instanceof PlanRejectedError && err.sourceGateRevision !== undefined;
     let staleRevisionRejection = false;
+    let revisionRejectionConfirmed = false;
     await this.journalAndSendTerminal(
       flight,
       TERMINAL_JOURNAL_PHASE,
@@ -5164,12 +5168,14 @@ export class RunRunner {
         status: "failed",
         failure_reason: reportedReason,
         fail_origin: failOrigin,
-        ...(err instanceof PlanRejectedError && err.sourceGateRevision !== undefined && this.client.protocolFeatures.includes(PLAN_REVISION_RETRY_FEATURE)
+        ...(requiresRevisionSourceFence && err instanceof PlanRejectedError
           ? { expected_gate_revision: err.sourceGateRevision } : {}),
       },
       async (b, sig) => {
         const ack = await flight.reportState(b, sig);
         if (ack.staleRevisionSource) staleRevisionRejection = true;
+        if (ack.applied && ack.status !== undefined && TERMINAL_RUN_STATUSES.has(ack.status) && !ack.staleRevisionSource && !ack.staleClaim)
+          revisionRejectionConfirmed = true;
         return ack;
       },
     ).catch((e) =>
@@ -5177,9 +5183,11 @@ export class RunRunner {
         error: errMessage(e),
       }),
     );
-    if (staleRevisionRejection) {
+    if (requiresRevisionSourceFence && !revisionRejectionConfirmed) {
       flight.preserveSession = true;
-      flight.recoveryRetentionCause = "recovered rejection refused because its source gate changed";
+      flight.recoveryRetentionCause = staleRevisionRejection
+        ? "recovered rejection refused because its source gate changed"
+        : "source-fenced rejection outcome is unconfirmed";
       await this.retainStoppedSource(flight, flight.executor, "stale_revision_rejection", { memo: false, stale: true, record: "none" });
       return; // refusal grants neither terminal authority nor custody settlement
     }
@@ -8740,6 +8748,7 @@ export class RunRunner {
       cancel,
       steering,
       claimGeneration,
+      planRevisionRetryNegotiated: this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE) && Number.isSafeInteger(claimGeneration) && claimGeneration > 0,
       owedDefaultBranch: claim.repo.default_branch?.trim() || undefined,
       owedContext: undefined,
       owedFeedClosed: false,
@@ -10700,7 +10709,7 @@ export class RunRunner {
       this.liveAttempts.add(attempt);
     }
     const revisionCap = claim.config?.plan_max_revisions;
-    const revisionRecovery = this.client.protocolFeatures.includes(PLAN_REVISION_RETRY_FEATURE) &&
+    const revisionRecovery = flight.planRevisionRetryNegotiated === true &&
       Number.isSafeInteger(flight.claimGeneration) && flight.claimGeneration > 0
       ? new PlanRevisionRecovery({
         generation: flight.claimGeneration,
@@ -10714,7 +10723,10 @@ export class RunRunner {
         checkControl: () => {
           if (steering.isCancelled()) throw new Error("run cancelled");
           if (flight.active?.shuttingDown || this.shuttingDownGlobal) throw new Error("worker shutdown during plan revision recovery");
-          if (steering.getPauseMode() !== null) throw new PauseNowSignal();
+          const pause = steering.getPauseMode();
+          if (pause === "now" || pause === "wall" || pause === "disk") throw new PauseNowSignal();
+          if (!this.client.hasFeature(PLAN_REVISION_RETRY_FEATURE))
+            throw new PlanRevisionRecoveryStoppedError("plan revision source-fence support is unavailable");
           steering.lifecycleSignal().throwIfAborted();
         },
         notice: async (text) => {
@@ -10724,7 +10736,7 @@ export class RunRunner {
         policy: this.planRevisionRetryPolicy,
       }) : undefined;
     const resumedSource = this.gateResumes.get(runId);
-    if (revisionRecovery && resumedSource?.presentationId) {
+    if (revisionRecovery && resumedSource) {
       // Existing same-gate identity only; omitted fields retain the server snapshot.
       // No old allowance or predecessor chain is reconstructed.
       revisionRecovery.seed({ status: "awaiting_approval", presentation_id: resumedSource.presentationId,

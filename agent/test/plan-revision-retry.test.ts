@@ -1,16 +1,18 @@
 import { describe, it } from "node:test";
+import { RevisionSourceFenceUnavailableError } from "../src/client.js";
 import assert from "node:assert/strict";
 import { PlanRevisionRecovery, PlanRevisionRecoveryStoppedError, type PlanRevisionRetryPolicy } from "../src/plan-revision-retry.js";
 import { PlanRejectedError, PlanRevisionReplacedError } from "../src/executor.js";
 import type { PlanVerdict } from "../src/steering.js";
 import type { RunOwnershipResponse, StateAck, StateRequest } from "../src/protocol.js";
 
-function fixture(maxRevisions = 3, redrives = 0) {
+function fixture(maxRevisions = 3, redrives = 0, hasPresentation = true) {
   let owner: RunOwnershipResponse = { status: "awaiting_approval", claim_generation: 7, gate_revision: 11, claim_released: false };
   let control: Error | undefined;
   let event: PlanVerdict = { kind: "reject", reason: "stop", sourceGateRevision: 11 };
   let onSleep: (() => void) | undefined;
   let onOwner: (() => void) | undefined;
+  let onEvent: ((signal?: AbortSignal) => Promise<PlanVerdict>) | undefined;
   const sleeps: number[] = [], notices: string[] = [], waits: number[] = [];
   const writes: StateRequest[] = [];
   const retired: { id: number; predecessors: readonly number[] }[] = [];
@@ -20,13 +22,14 @@ function fixture(maxRevisions = 3, redrives = 0) {
   } };
   const report = async (body: StateRequest): Promise<StateAck> => {
     writes.push(structuredClone(body));
+    owner = { ...owner, status: body.status };
     return { applied: true, status: "awaiting_approval", gateRevision: 11 };
   };
   const recovery = new PlanRevisionRecovery({
     generation: 7, maxRevisions, policy,
     steering: {
       takeRevisionRecoveryControl: () => undefined,
-      awaitRevisionRecoveryEvent: async (_source, after) => { waits.push(after); return event; },
+      awaitRevisionRecoveryEvent: (_source, after, signal) => { waits.push(after); return onEvent ? onEvent(signal) : Promise.resolve(event); },
       setGateRevision: (r) => assert.equal(r, 11),
       retirePersistedRevision: (id, predecessors) => { retired.push({ id, predecessors }); },
     },
@@ -37,6 +40,7 @@ function fixture(maxRevisions = 3, redrives = 0) {
   });
   const source: StateRequest = { status: "awaiting_approval", presentation_id: "00000000-0000-4000-8000-000000000001",
     plan_md: "# Source", milestones: [{ id: "one", title: "Original" }], plan_changed_files: [] };
+  if (!hasPresentation) delete source.presentation_id;
   recovery.seed(source, 11, report);
   recovery.accept({ kind: "revise", inputId: 101, sourceGateRevision: 11, feedback: "I" });
   return { recovery, source, writes, notices, sleeps, waits, retired, report,
@@ -44,6 +48,7 @@ function fixture(maxRevisions = 3, redrives = 0) {
     setEvent: (v: PlanVerdict) => { event = v; },
     onSleep: (fn: () => void) => { onSleep = fn; },
     onOwner: (fn: () => void) => { onOwner = fn; },
+    onEvent: (fn: (signal?: AbortSignal) => Promise<PlanVerdict>) => { onEvent = fn; },
     cancel: () => { control = new Error("run cancelled"); },
     abort: () => { controllerAbort.abort(new Error("worker shutdown")); },
   };
@@ -85,6 +90,47 @@ describe("live-flight plan revision recovery", () => {
     f.recovery.published(request, ack, f.report);
     assert.deepEqual(f.retired, [{ id: 102, predecessors: [101] }]);
     assert.match(f.notices.at(-1)!, /superseded, not successfully answered/);
+  });
+
+  it("an id-less source still fences ownership before the original provider turn", async () => {
+    const f = fixture(3, 3, false);
+    f.setOwner({ status: "paused", claim_generation: 7, gate_revision: 11, claim_released: false });
+    await assert.rejects(f.recovery.beforeTurn(), PlanRevisionRecoveryStoppedError);
+    assert.deepEqual(f.writes, []);
+  });
+
+  it("id-less source exhaustion keeps compatibility without an unfenced restore or re-drive", async () => {
+    const f = fixture(3, 3, false);
+    await f.recovery.beforeTurn();
+    const cause = new Error("provider exhausted");
+    await assert.rejects(f.recovery.retry(cause), error => error === cause);
+    assert.deepEqual(f.writes, []);
+    assert.deepEqual(f.sleeps, []);
+    assert.deepEqual(f.retired, []);
+  });
+
+  it("an expired gate is restored again if same-flight status returns to running", async () => {
+    const f = fixture();
+    let events = 0;
+    f.onEvent(signal => {
+      if (++events === 1) {
+        f.setOwner({ status: "running", claim_generation: 7, gate_revision: 11, claim_released: false });
+        return new Promise((_resolve, reject) => signal?.addEventListener("abort", () => reject(signal.reason), { once: true }));
+      }
+      return Promise.resolve({ kind: "reject", reason: "stop", sourceGateRevision: 11 });
+    });
+    await assert.rejects(f.recovery.retry(new Error("429")), PlanRejectedError);
+    assert.deepEqual(f.writes, [{ ...f.source, expected_gate_revision: 11 }]);
+    assert.deepEqual(f.retired, []);
+  });
+
+  it("lost source-fence support stops publication without an unfenced send", async () => {
+    const f = fixture();
+    const request = { ...f.source, ...f.recovery.fields(101) };
+    await assert.rejects(f.recovery.publish(request, async () => { throw new RevisionSourceFenceUnavailableError(); }),
+      PlanRevisionRecoveryStoppedError);
+    assert.deepEqual(f.sleeps, []);
+    assert.deepEqual(f.retired, []);
   });
 
   it("holds an I-to-J-to-K chain pending and refuses duplicate driver acceptance", async () => {

@@ -185,7 +185,8 @@ for (const control of ["cancel", "reject", "paused", "generation", "source"] as 
   });
 }
 
-it("a recovered rejection refused at a newer source preserves the clone and HOME", async t => {
+for (const outcome of ["stale source", "unknown", "capability loss"] as const) {
+it(`a recovered rejection with ${outcome} preserves the clone and HOME`, async t => {
   enable();
   const claim = freshClaim();
   const id = claim.run_id;
@@ -204,7 +205,9 @@ it("a recovered rejection refused at a newer source preserves the clone and HOME
     } catch (error) {
       assert.ok(error instanceof PlanRejectedError);
       assert.equal(error.sourceGateRevision, 1);
-      api.seedGate(id, { revision: 2, presentationId: "newer-presentation", payload: { plan_md: "# newer" } });
+      if (outcome === "unknown") api.sendRawState(id, 409, JSON.stringify({ run: { status: "awaiting_approval" } }));
+      else api.seedGate(id, { revision: 2, presentationId: "newer-presentation", payload: { plan_md: "# newer" } });
+      if (outcome === "capability loss") client.clearFeatures();
       throw error;
     }
     throw new Error("expiry must not return for another provider turn");
@@ -218,15 +221,69 @@ it("a recovered rejection refused at a newer source preserves the clone and HOME
     assert.ok(await until(() => feed(id).some(text => text.includes("retry allowance exhausted"))));
     const [reject] = send(id, row("reject_plan", "owner rejection of source 1"));
     await done;
-    assert.equal(api.gateOf(id).revision, 2);
+    assert.equal(api.gateOf(id).revision, outcome === "unknown" ? 1 : 2);
     assert.equal(statuses(id).includes("failed"), false);
     assert.equal(api.isApplied(id, i!.id), false);
     assert.equal(api.isApplied(id, reject!.id), false);
     assert.equal(remove.mock.callCount(), 0, "source refusal grants no clone disposal authority");
     assert.equal(fs.existsSync(breadcrumb), true);
-    assert.match(JSON.stringify(lines), /recovered rejection refused because its source gate changed/);
+    assert.match(JSON.stringify(lines), outcome === "stale source"
+      ? /recovered rejection refused because its source gate changed/
+      : /source-fenced rejection outcome is unconfirmed/);
   } finally {
     r.shutdown();
     await done;
+  }
+});
+}
+
+it("an id-less resumed gate still refuses a human provider start on paused ownership", async () => {
+  enable();
+  const at = new Date(Date.now() - 1000).toISOString();
+  const claim = freshClaim(2, { resume_phase: "awaiting_approval", plan_md: SOURCE, resume_plan_at: at,
+    resume_gate_revision: 2, resume_gate_presentation_id: undefined });
+  const id = claim.run_id;
+  api.seedGate(id, { revision: 2, presentationId: null, payload: { plan_md: SOURCE } });
+  let starts = 0;
+  const executor: Executor = { resumesAtGate: true, run: async ctx => {
+    const verdict = await ctx.takeResumedGateEvent!();
+    assert.equal(verdict?.kind, "revise");
+    api.setOwnershipStatus(id, "paused", 2);
+    await ctx.beforePlanRevisionTurn!();
+    starts++;
+    return { branch: ctx.branch };
+  } };
+  const [i] = send(id, row("revise_plan", "I", { gate_binding: "bound", gate_revision: 2 }));
+  await runner(executor, fakeGitlab().gitlab).execute(claim);
+  assert.equal(starts, 0);
+  assert.equal(statuses(id).includes("failed"), false);
+  assert.equal(api.isApplied(id, i!.id), false);
+});
+
+it("a milestone pause during backoff remains a milestone pause", async () => {
+  enable();
+  const claim = freshClaim();
+  const id = claim.run_id;
+  const driver = new RevisionDriver();
+  const sleeping = barrier();
+  const release = barrier();
+  const r = runner(driver, fakeGitlab().gitlab, undefined, { planRevisionRetryPolicy: {
+    redrives: 1, random: () => 0, sleep: async () => { sleeping.release(); await release.promise; },
+  } });
+  const done = r.execute(claim);
+  try {
+    assert.ok(await until(() => gates(id).length === 1));
+    send(id, row("revise_plan", "I"));
+    await sleeping.promise;
+    const [pause] = send(id, row("pause", JSON.stringify({ mode: "milestone" })));
+    assert.ok(await until(() => api.isAcked(id, pause!.id)));
+    release.release();
+    assert.ok(await until(() => driver.turns.length === 2), "the next human provider turn remains allowed");
+    assert.equal(statuses(id).includes("paused"), false);
+    send(id, row("cancel"));
+    driver.publish.release();
+    await done;
+  } finally {
+    release.release(); driver.publish.release(); r.shutdown(); await done;
   }
 });

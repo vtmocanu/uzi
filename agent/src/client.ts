@@ -354,6 +354,19 @@ export class StateReportUnappliedError extends RequestError {
   }
 }
 
+/** A source-bearing request must never degrade into an ordinary unfenced write. */
+export class RevisionSourceFenceUnavailableError extends Error {
+  constructor() {
+    super("plan revision source fence requires negotiated support and positive claim generation");
+    this.name = "RevisionSourceFenceUnavailableError";
+  }
+}
+
+function hasRevisionSourceFields(body: StateRequest): boolean {
+  return body.expected_gate_revision !== undefined || body.revision_input_id !== undefined ||
+    body.superseded_revision_input_ids !== undefined;
+}
+
 // Internal per-attempt evidence, minted only after reading the authenticated response through EOF.
 class StateDecodeRefusalError extends RequestError {}
 interface StateAttemptEvidence { ambiguous: boolean; refusals: number }
@@ -1783,8 +1796,7 @@ export class WorkerClient {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
     // Once a source fence is negotiated, never retry its write without that fence
     // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
-    if (body.expected_gate_revision !== undefined && this.hasFeature("plan_revision_retry_v1") &&
-        this.includeClaimGeneration(body.claim_generation))
+    if (hasRevisionSourceFields(body))
       return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     if (body.require_running === true) {
       if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
@@ -1926,14 +1938,12 @@ export class WorkerClient {
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
   private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
-    // Apply the negotiation gate to ordinary, checked-plan and guarded-question writes alike.
-    if (!this.hasFeature("plan_revision_retry_v1") ||
-        !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0) {
-      body = { ...body };
-      delete body.expected_gate_revision;
-      delete body.revision_input_id;
-      delete body.superseded_revision_input_ids;
-    }
+    // Field presence carries the source-fence intent through feature shrink and
+    // durable terminal replay. Absence of support cannot authorize an ordinary write.
+    if (hasRevisionSourceFields(body) && (!this.hasFeature("plan_revision_retry_v1") ||
+        !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0 ||
+        !this.includeClaimGeneration(body.claim_generation)))
+      throw new RevisionSourceFenceUnavailableError();
     const incarnation = this.completionIncarnation;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();

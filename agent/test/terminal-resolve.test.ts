@@ -392,6 +392,37 @@ describe("resolvePendingTerminal / journalAndResolveTerminal (PRD #1391 Run B M3
     }
   });
 
+  it("a source-fenced rejection journal stays pending without negotiated support", async t => {
+    const { outbox } = await mkOutbox();
+    const api = new FakeApi("source-rollback-fixture");
+    const url = await api.listen();
+    api.planRevisionRetries = true;
+    api.seedGate("r1", { revision: 2, presentationId: "current", payload: { plan_md: "# current" } });
+    const client = new WorkerClient(url, "source-rollback-fixture", "test", nullLogger());
+    const deps = makeTerminalOutboxDeps(outbox, client, {
+      gapFillMax: 10_000, terminalMaxBytes: 1 << 20, log: nullLogger(),
+    })!;
+    const settled = t.mock.method(outbox, "markTerminalServerSettled");
+    try {
+      await journalAndResolveTerminal(deps, {
+        runId: "r1", claimGeneration: GEN, phase: "awaiting_approval", messagesThroughSeq: 0,
+        body: { status: "failed", expected_gate_revision: 1, claim_generation: GEN },
+        send: body => client.reportState("r1", body),
+      });
+      assert.equal(api.stateAttempts, 0, "no unfenced terminal POST");
+      assert.equal(outbox.hasPendingTerminal("r1", GEN), true);
+      assert.equal((await outbox.readTerminalJournal("r1", GEN))?.body.expected_gate_revision, 1);
+      assert.equal(settled.mock.callCount(), 0);
+      client.protocolFeatures = ["claim_generation_fence", "plan_revision_retry_v1"];
+      await resolvePendingTerminal(deps, { runId: "r1", claimGeneration: GEN, send: body => client.reportState("r1", body) });
+      assert.equal(api.stateAttempts, 1);
+      assert.equal(outbox.hasPendingTerminal("r1", GEN), false);
+      assert.equal(outbox.depthFor("r1")?.staleRetired, 1);
+      assert.equal(settled.mock.callCount(), 0, "source-stale disposal is not successful terminal settlement");
+      assert.equal(api.states.length, 0);
+    } finally { await api.close(); }
+  });
+
   it("messages_pending triggers the GAP-FILL loop: missing seqs get per-seq tombstones (carrying the gen), then the terminal applies", async () => {
     const { outbox } = await mkOutbox();
     const client = new FakeClient();

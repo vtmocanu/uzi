@@ -73,7 +73,7 @@ describe("B1: a verdict routed after persistence but before the ACK is taken (PR
         assert.deepStrictEqual(kinds, ["revise", "approve"], "the approve of plan 2 was taken");
         assert.ok(statuses(runId).includes("completed"));
       } else if (kind === "reject") {
-        assert.deepStrictEqual(exec.verdicts.at(-1), { kind: "reject", reason: "not like this" });
+        assert.deepStrictEqual(exec.verdicts.at(-1), { kind: "reject", reason: "not like this", sourceGateRevision: 2 });
         assert.ok(statuses(runId).includes("failed"));
       } else {
         assert.deepStrictEqual(kinds, ["revise", "revise", "approve"], "the revise of plan 2 was taken, then plan 3 approved");
