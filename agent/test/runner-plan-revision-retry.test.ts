@@ -3,6 +3,7 @@ import assert from "node:assert/strict";
 import { it } from "node:test";
 import fs from "node:fs";
 import path from "node:path";
+import { RequestError } from "../src/client.js";
 import { recordingLogger } from "./helpers.js";
 import { PlanRejectedError, PlanRevisionReplacedError, type Executor, type RunContext } from "../src/executor.js";
 import { TransientRecoveryError } from "../src/sdk-executor.js";
@@ -140,8 +141,8 @@ it("at cap one expiry offers cancel/reject and a new run; one queued cancel ends
   }
 });
 
-for (const control of ["cancel", "reject", "paused", "generation", "source"] as const) {
-  it(`backoff suppresses redrive after ${control}`, async () => {
+for (const control of ["cancel", "reject", "paused", "generation", "source", "released", "worker"] as const) {
+  it(`backoff suppresses redrive after ${control}`, async t => {
     enable();
     const claim = freshClaim();
     const id = claim.run_id;
@@ -165,7 +166,11 @@ for (const control of ["cancel", "reject", "paused", "generation", "source"] as 
         assert.ok(await until(() => api.isAcked(id, cancel!.id)));
       } else if (control === "paused") api.setOwnershipStatus(id, "paused", 1);
       else if (control === "generation") api.setInputClaimGeneration(id, 2);
-      else api.seedGate(id, { revision: 2, presentationId: "external", payload: { plan_md: "# external" } });
+      else if (control === "source") api.seedGate(id, { revision: 2, presentationId: "external", payload: { plan_md: "# external" } });
+      else if (control === "released") t.mock.method(client, "getRunOwnership", async () => ({
+        status: "awaiting_approval", claim_generation: 1, gate_revision: 1, claim_released: true,
+      }));
+      else t.mock.method(client, "getRunOwnership", async () => { throw new RequestError("GET", "/ownership", 404, "worker no longer owns run"); });
       release.release();
       await done;
       assert.equal(driver.turns.length, 1);
