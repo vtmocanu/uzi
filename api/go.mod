@@ -28,7 +28,7 @@ require (
 	github.com/pressly/goose/v3 v3.28.0
 	github.com/robfig/cron/v3 v3.0.1
 	github.com/sergi/go-diff v1.3.2-0.20230802210424-5b0b94c5c0d3
-	github.com/slack-go/slack v0.29.0
+	github.com/slack-go/slack v0.30.1
 	github.com/spf13/cobra v1.10.2
 	github.com/yuin/goldmark v1.8.6
 	gitlab.com/gitlab-org/api/client-go/v3 v3.15.0
