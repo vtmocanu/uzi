@@ -2015,12 +2015,15 @@ export class GitCache {
   }
   /** An awaited supervisor may hand back a root after the deadline. Stop and
    * join it before giving any caller its streams or delivering stdin. */
-  private async checkRecoverySpawn(process: BoundaryProcessHandle): Promise<void> {
+  private checkRecoverySpawn(process: BoundaryProcessHandle): Promise<never> | undefined {
     try { this.checkRecoveryInterruption(); }
     catch (error) {
-      await Promise.allSettled([Promise.resolve().then(() => process.cancel()), process.completed]);
-      throw error;
+      return Promise.allSettled([Promise.resolve().then(() => process.cancel()), process.completed])
+        .then(() => { throw error; });
     }
+    // Success is synchronous: awaiting a resolved helper would admit another
+    // microtask between the deadline check and stdin delivery or handle exposure.
+    return undefined;
   }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
@@ -12219,7 +12222,8 @@ export class GitCache {
     } catch (cause) {
       throw this.boundaryAbortError(cause) ?? cause;
     }
-    await this.checkRecoverySpawn(process);
+    const expired = this.checkRecoverySpawn(process);
+    if (expired) await expired;
     let cancellation: Promise<unknown> | undefined;
     const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
@@ -12443,7 +12447,8 @@ export class GitCache {
       } catch (cause) {
         throw this.boundaryAbortError(cause) ?? cause;
       }
-      await this.checkRecoverySpawn(process);
+      const expired = this.checkRecoverySpawn(process);
+      if (expired) await expired;
       if (!process.stdout) {
         await Promise.allSettled([process.cancel(), process.completed]);
         throw new Error("supervised git process has no stdout");
@@ -12718,7 +12723,8 @@ export class GitCache {
       const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command",
         ...(recovery ? { timeoutMs: this.recoveryRemaining(recovery) } : {}),
       });
-      await this.checkRecoverySpawn(process);
+      const expired = this.checkRecoverySpawn(process);
+      if (expired) await expired;
       let cancellation: Promise<unknown> | undefined;
       const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });

@@ -55,6 +55,35 @@ for (const path of ["buffered", "streaming", "runner stdin"] as const) {
   });
 }
 
+for (const path of ["buffered", "streaming"] as const) {
+  test(`supervised ${path} input admission does not yield after checking its budget`, async t => {
+    let now = 0, armed = false, scheduled = false;
+    const inputs: number[] = [];
+    const budget = new MaintenanceBudget(600_000, () => {
+      if (armed && !scheduled) {
+        scheduled = true;
+        queueMicrotask(() => { now = 600_000; });
+      }
+      return now;
+    });
+    t.after(() => budget.dispose());
+    const stdin = new Writable({ write(_chunk, _encoding, done) { inputs.push(now); done(); } });
+    const git = cache();
+    await MaintenanceBudget.run(budget, () => git.withBoundaryProcessSpawner(async () => {
+      armed = true;
+      return { stdin, stdout: Readable.from([]), stderr: Readable.from([]),
+        completed: Promise.resolve({ code: 0 }), cancel: async () => {} };
+    }, new AbortController().signal, async () => {
+      try {
+        if (path === "buffered") await git["execScoped"]("git", ["--version"], { env: process.env, input: "input" });
+        else await git["spawnGit"]("/unused", ["version"], "input");
+      } catch { /* expiry may refuse the eventual result; it never authorizes late input */ }
+    }));
+    assert.equal(scheduled, true);
+    assert.equal(inputs.some(at => at >= 600_000), false, "stdin admission must precede expiry");
+  });
+}
+
 test("expiry during pre-release join cannot return lock result authority", async t => {
   let now = 0;
   const budget = new MaintenanceBudget(600_000, () => now);

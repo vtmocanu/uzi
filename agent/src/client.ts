@@ -1,5 +1,6 @@
 import { createHash } from "node:crypto";
 import { Readable } from "node:stream";
+import { MaintenanceBudget } from "./maintenance-budget.js";
 import { readPlanCrossCheckReconciliation } from "./cross-check-reconciliation.js";
 import type { DindMeterSample } from "./dind-meter.js";
 import type { Logger } from "./log.js";
@@ -1081,6 +1082,7 @@ export class WorkerClient {
 
   /** Record that this exact guarded generation's hold was confirmed released (empty settle). */
   markInventoryGuardedClaimSettled(runId: string, generation: number): void {
+    MaintenanceBudget.current()?.check();
     const key = `${runId}:${generation}`;
     if (this.inventoryGuardedClaims.has(key)) this.settledInventoryGuardedClaims.add(key);
   }
@@ -1425,6 +1427,7 @@ export class WorkerClient {
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
     if (!res.ok) throw await this.toError("POST", path, res);
+    MaintenanceBudget.current()?.check();
     if (res.status === 204) return undefined;
     let text: string;
     try {
@@ -1931,6 +1934,7 @@ export class WorkerClient {
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
   private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
     const incarnation = this.completionIncarnation;
+    if (MaintenanceBudget.current()) signal = AbortSignal.any([MaintenanceBudget.current()!.signal, ...(signal ? [signal] : [])]);
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
       try {
@@ -1944,6 +1948,7 @@ export class WorkerClient {
           // already issued — learns its scaled cap here (a resume gets it on the claim
           // config instead). Absent/non-numeric ⇒ left undefined = "no budget update".
           const fields = await readRunAck(res, maxAckBytes);
+          MaintenanceBudget.current()?.check();
           const ack: StateAck = {
             applied: res.status === 200,
             status: fields.status,
@@ -2040,6 +2045,7 @@ export class WorkerClient {
         // but no status came back. Undefined reads as "not parked", which is safe.
         return { applied: true, status: undefined };
       } catch (err) {
+        MaintenanceBudget.current()?.check();
         if (evidence) {
           if (err instanceof StateDecodeRefusalError) evidence.refusals++;
           else evidence.ambiguous = true;
@@ -2089,8 +2095,8 @@ export class WorkerClient {
   ): Promise<PublishResult> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
     const signal = boundarySignal
-      ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
-      : AbortSignal.timeout(this.httpTimeoutMs);
+      ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
+      : maintenanceSignal(this.httpTimeoutMs);
     const init: RequestInit = {
       method: "POST",
       headers: {
@@ -2105,10 +2111,12 @@ export class WorkerClient {
       duplex: "half",
       signal,
     };
-    const res = await fetch(this.baseUrl + path, init);
+    const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
     if (res.status < 200 || res.status >= 300) {
       // Discard remote content without exposing it or changing the HTTP outcome.
-      await res.body?.cancel().catch(() => undefined);
+      if (MaintenanceBudget.current()) void res.body?.cancel().catch(() => undefined);
+      else await res.body?.cancel().catch(() => undefined);
+      MaintenanceBudget.current()?.check();
       return { ok: false, httpStatus: res.status };
     }
     // Bounded by streamed bytes: an overflow, a read failure or an abort throws, so the caller
@@ -2142,7 +2150,7 @@ export class WorkerClient {
   ): Promise<HeldPublishResult> {
     if (!this.hasFeature(HELD_PUBLICATION_FEATURE) && !this.hasHeldPublicationV2()) return { ok: false, reason: "unsupported_feature" };
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/held-publication`;
-    const timeout = AbortSignal.timeout(HELD_PUBLICATION_TIMEOUT_MS);
+    const timeout = maintenanceSignal(HELD_PUBLICATION_TIMEOUT_MS);
     const init: RequestInit = {
       method: "POST",
       headers: {
@@ -2158,8 +2166,9 @@ export class WorkerClient {
       duplex: "half",
       signal: signal ? AbortSignal.any([signal, timeout]) : timeout,
     };
-    const res = await fetch(this.baseUrl + path, init);
-    const text = await res.text().catch(() => "");
+    const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
+    const text = await readResponseText(res).catch(() => "");
+    MaintenanceBudget.current()?.check();
     if (res.status < 200 || res.status >= 300) {
       let reason = `http_${res.status}`;
       try {
@@ -2288,12 +2297,12 @@ export class WorkerClient {
       body: bundle,
       duplex: "half",
       signal: boundarySignal
-        ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
-        : AbortSignal.timeout(this.httpTimeoutMs),
+        ? AbortSignal.any([boundarySignal, maintenanceSignal(this.httpTimeoutMs)])
+        : maintenanceSignal(this.httpTimeoutMs),
     };
-    const res = await fetch(this.baseUrl + path, init);
+    const res = await maintenanceFetch(fetch, this.baseUrl + path, init);
     if (res.status >= 400) throw await this.toError("POST", path, res);
-    const text = await res.text();
+    const text = await readResponseText(res);
     return (text ? JSON.parse(text) : {}) as RecoveryCaptureStatusResponse;
   }
 
@@ -2305,6 +2314,7 @@ export class WorkerClient {
     generation?: number,
     releaseEvidence?: string,
     finalDisposition?: RecoveryReleaseRequest["final_disposition"],
+    signal?: AbortSignal,
   ): Promise<RecoveryReleaseResponse> {
     // Backward-compatible: an omitted generation posts an empty body (the v1 settle-by-
     // run+worker path); a v2 caller names the exact generation (PRD #1349 M1, D1/D2).
@@ -2331,13 +2341,14 @@ export class WorkerClient {
       `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/archives/release`,
       body,
       this.httpTimeoutMs,
-      undefined,
+      signal,
       RECOVERY_RELEASE_RESPONSE_MAX_BYTES,
     )) as RecoveryReleaseResponse;
   }
 
   /** New attempts need headroom; original terminal recognition is independent of admission. */
   canStartPublicationCompletion(runId: string, generation: number): boolean {
+    MaintenanceBudget.current()?.check();
     const key = `${runId}:${generation}`;
     const claim = this.completionClaims.get(key);
     const hold = this.completionHolds.get(key);
@@ -2349,6 +2360,7 @@ export class WorkerClient {
 
   /** Called only with persisted receipt proof after actual terminal resolution/removal. */
   releasePublicationCompletion(receipt: CompletedPublicationReceipt, incarnation?: Readonly<object>): void {
+    MaintenanceBudget.current()?.check();
     if (incarnation !== undefined && incarnation !== this.completionRetirementIncarnation) return;
     if (this.completionInventoryUnreadable || this.receiptIncarnations.get(receipt) !== this.completionIncarnation) return;
     const key = `${receipt.run_id}:${receipt.generation}`;
@@ -2369,6 +2381,7 @@ export class WorkerClient {
 
   /** Runner notification after authorized deletion and positive absence of both original reports. */
   releaseRetiredPublicationCompletion(runId: string, generation: number, incarnation: Readonly<object>): void {
+    MaintenanceBudget.current()?.check();
     if (incarnation !== this.completionRetirementIncarnation || this.completionInventoryUnreadable) return;
     const key = `${runId}:${generation}`;
     const claim = this.completionClaims.get(key);
@@ -2446,8 +2459,9 @@ export class WorkerClient {
     const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
     if (res.status >= 400) throw await this.toError("GET", path, res);
     let body: unknown;
-    try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true)); }
-    catch { return undefined; }
+    try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true, signal)); }
+    catch { MaintenanceBudget.current()?.check(); return undefined; }
+    MaintenanceBudget.current()?.check();
     if (incarnation !== this.completionIncarnation || worker !== this.registeredWorkerId ||
         !this.hasExactHoldCapability ||
         !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
@@ -2472,6 +2486,7 @@ export class WorkerClient {
    *  post-clone generation-exact inventory (PRD #1349 M1, D3). holds is always an array. */
   async listRecoveryHolds(runId: string): Promise<RecoveryHoldsResponse> {
     const incarnation = this.completionIncarnation;
+    MaintenanceBudget.current()?.check();
     const ticket = this.beginCompletionObservation(runId);
     try {
       const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds`;
@@ -2482,9 +2497,11 @@ export class WorkerClient {
         const text = await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true);
         response = (text ? JSON.parse(text) : undefined) as RecoveryHoldsResponse;
       } catch (err) {
+        MaintenanceBudget.current()?.check();
         if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
         throw err;
       }
+      MaintenanceBudget.current()?.check();
       if (Array.isArray(response?.holds) && response.holds.length > COMPLETION_HOLDS_MAX_ITEMS) {
         if (incarnation === this.completionIncarnation) this.completionInventoryUnreadable = true;
         throw new Error("recovery hold inventory exceeds item limit");
@@ -3306,7 +3323,7 @@ export class WorkerClient {
     }
     let parsed: unknown;
     try {
-      parsed = JSON.parse(await res.text());
+      parsed = JSON.parse(await readResponseText(res));
     } catch {
       parsed = undefined;
     }
@@ -3542,8 +3559,10 @@ export class WorkerClient {
   ): Promise<unknown> {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
+    MaintenanceBudget.current()?.check();
     if (res.status === 204) return undefined;
-    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true);
+    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readBoundedText(res, maxResponseBytes, true, callerSignal);
+    MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -3704,7 +3723,7 @@ export class WorkerClient {
 
   private async terminalRejectionJSON(method: "GET" | "POST", path: string, body: unknown, callerSignal: AbortSignal | undefined, timeoutMs: number): Promise<unknown> {
     const abort = new AbortController();
-    const signal = AbortSignal.any([abort.signal, AbortSignal.timeout(timeoutMs), ...(callerSignal ? [callerSignal] : [])]);
+    const signal = AbortSignal.any([abort.signal, maintenanceSignal(timeoutMs), ...(callerSignal ? [callerSignal] : [])]);
     // This is the last operation before every actual transport, including a shared-client clear.
     if (!this.hasFeature("terminal_rejection_report")) return undefined;
     const res = await this.fetchRaw(method, path, body, timeoutMs, signal);
@@ -3727,7 +3746,8 @@ export class WorkerClient {
       const text = await readBoundedText(res, maxResponseBytes ?? ERROR_BODY_MAX_BYTES, true, signal);
       throw new RequestError("GET", path, res.status, text.slice(0, 4096), retryAfterMsOf(res.headers.get("Retry-After")));
     }
-    const text = maxResponseBytes === undefined ? await res.text() : await readBoundedText(res, maxResponseBytes, true, signal);
+    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readBoundedText(res, maxResponseBytes, true, signal);
+    MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }
 
@@ -3755,11 +3775,11 @@ export class WorkerClient {
       method,
       headers,
       signal: callerSignal
-        ? AbortSignal.any([callerSignal, AbortSignal.timeout(timeoutMs)])
-        : AbortSignal.timeout(timeoutMs),
+        ? AbortSignal.any([callerSignal, maintenanceSignal(timeoutMs)])
+        : maintenanceSignal(timeoutMs),
     };
     if (body !== undefined) init.body = JSON.stringify(body);
-    return (this.transport ?? fetch)(this.baseUrl + path, init);
+    return maintenanceFetch(this.transport ?? fetch, this.baseUrl + path, init);
   }
 
   private async toError(method: string, path: string, res: Response): Promise<RequestError> {
@@ -3774,8 +3794,49 @@ export class WorkerClient {
     } catch {
       // ignore body read failures — the status is the signal that matters.
     }
+    MaintenanceBudget.current()?.check();
     return new RequestError(method, path, res.status, text, retryAfterMsOf(res.headers.get("Retry-After")), evidence);
   }
+}
+
+// Signals live as long as the response body, so headers do not renew an operation's cap.
+const responseSignals = new WeakMap<Response, AbortSignal>();
+
+function maintenanceSignal(timeoutMs: number): AbortSignal {
+  const budget = MaintenanceBudget.current();
+  if (!budget) return AbortSignal.timeout(timeoutMs);
+  budget.check();
+  const duration = Math.floor(Math.min(timeoutMs, budget.remainingMs()));
+  if (duration <= 0) throw new Error("maintenance deadline exhausted");
+  return AbortSignal.any([budget.signal, AbortSignal.timeout(duration)]);
+}
+
+async function maintenanceFetch(transport: typeof fetch, url: string, init: RequestInit): Promise<Response> {
+  const budget = MaintenanceBudget.current();
+  if (!budget) return transport(url, init);
+  budget.check();
+  const signal = AbortSignal.any([budget.signal, ...(init.signal ? [init.signal] : [])]);
+  const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
+    // One detached cancellation attempt; an uncooperative body cannot block the caller.
+    void late.body?.cancel().catch(() => undefined);
+  });
+  budget.check();
+  if (signal.aborted) {
+    void res.body?.cancel().catch(() => undefined);
+    signal.throwIfAborted();
+  }
+  responseSignals.set(res, signal);
+  return res;
+}
+
+async function readResponseText(res: Response): Promise<string> {
+  const budget = MaintenanceBudget.current();
+  if (!budget) return res.text();
+  budget.check();
+  const text = await readBoundedText(res, Number.POSITIVE_INFINITY, true);
+  budget.check();
+  responseSignals.get(res)?.throwIfAborted();
+  return text;
 }
 
 /** A `Retry-After` header of whole seconds as milliseconds (capped at one hour); anything else
@@ -3845,6 +3906,10 @@ async function readBoundedText(res: Response, maxBytes: number, rejectOverflow =
 
 /** The raw-byte core of {@link readBoundedText}; same bounds and failure behaviour. */
 async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow = false, signal?: AbortSignal): Promise<Buffer> {
+  const budget = MaintenanceBudget.current();
+  budget?.check();
+  const responseSignal = responseSignals.get(res);
+  if (budget) signal = AbortSignal.any([budget.signal, ...(signal ? [signal] : []), ...(responseSignal ? [responseSignal] : [])]);
   if (!res.body) return Buffer.alloc(0);
   const reader = res.body.getReader();
   const parts: Uint8Array[] = [];
@@ -3855,7 +3920,8 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     signal?.throwIfAborted();
     while (total < maxBytes || rejectOverflow) {
       signal?.throwIfAborted();
-      const { done, value } = await reader.read();
+      const { done, value } = await (budget ? budget.raceIO(() => reader.read()) : reader.read());
+      budget?.check();
       signal?.throwIfAborted();
       if (done) break;
       if (rejectOverflow && value.byteLength > maxBytes - total) {
@@ -3871,6 +3937,7 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     // result or error from propagating (#2888).
     void reader.cancel().catch(() => undefined);
   }
+  budget?.check();
   return Buffer.concat(parts);
 }
 
@@ -3922,7 +3989,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
 }> {
   const boundedText = maxAckBytes === undefined ? undefined : await readBoundedText(res, maxAckBytes, true);
   try {
-    const text = boundedText ?? await res.text();
+    const text = boundedText ?? await readResponseText(res);
+    MaintenanceBudget.current()?.check();
     if (!text) return {};
     const parsed = JSON.parse(text) as {
       applied?: unknown;
@@ -4076,8 +4144,10 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     if (res.status === 200 && reconciliation !== undefined &&
         (out.status !== "awaiting_approval" || reconciliation.gateRevision > 0))
       out.reconciliation = reconciliation;
+    MaintenanceBudget.current()?.check();
     return out;
   } catch {
+    MaintenanceBudget.current()?.check();
     return {};
   }
 }

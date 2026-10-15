@@ -1866,7 +1866,11 @@ export class RecoveryCoordinator {
       if (latest.kind === "gone") return final ?? outcome("acked");
       if (latest.kind !== "ok") return outcome("kept");
       record = latest.record;
-      if (record.finalRequest || record.finalAcknowledged || selfContainedArchive) return final ?? outcome("kept");
+      // Reconciliation may have invalidated the old capture and moved this same
+      // record back to bundled. Judge the fresh state before deciding to stop.
+      const stillArchived = record.state === "uploaded" && record.selfContained === true &&
+        record.prerequisiteShas?.length === 0;
+      if (record.finalRequest || record.finalAcknowledged || stillArchived) return final ?? outcome("kept");
       if (replayedHeld) {
         const hold = await this.heldOperationState(record, input.signal);
         if (hold !== "open") return this.heldStopped(record, hold);

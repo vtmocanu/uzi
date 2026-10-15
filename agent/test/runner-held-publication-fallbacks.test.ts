@@ -59,14 +59,27 @@ async function assertArchived(s: Scenario, label: string, expectedHeldCalls: num
     assert.equal(server.holdOpen(), true, `${label}: the hold is open until the archive FINAL is ACKed`);
     assert.equal(server.acked(), 0);
     assert.equal(command(bare(), ["rev-parse", "--verify", pinRef(claim)]), record.inventoryCurrentSha);
-    assert.equal(call.disposition!.source_sha, record.sourceSha, `${label}: FINAL uses the frozen source`);
-    assert.equal(call.disposition!.coverage_digest, record.coverageDigest, `${label}: FINAL uses the frozen coverage`);
+    // V1 boot discovery can freeze a new aggregate; FINAL still needs a complete
+    // uploaded record of this exact generation. V2 identity is tested separately.
     const frozen = await frozenRecords(claim);
-    assert.ok(frozen.some(f => f.captureId === record.captureId && f.sourceSha === record.sourceSha &&
-      f.coverageDigest === record.coverageDigest));
+    const finalRecord = frozen.find(f => f.sourceSha === call.disposition!.source_sha &&
+      f.coverageDigest === call.disposition!.coverage_digest);
+    assert.ok(finalRecord, `${label}: FINAL matches a frozen source and coverage`);
+    assert.equal(finalRecord.generation, claim.claim_generation);
+    assert.equal(finalRecord.serverCaptureId, call.disposition!.capture_id);
+    assert.equal(finalRecord.state, "uploaded");
+    assert.equal(finalRecord.selfContained, true);
+    assert.deepEqual(finalRecord.prerequisiteShas, []);
   };
-  server.onFinal = sendFinal;
+  const callbackFailures: unknown[] = [];
+  server.onFinal = async call => {
+    try { await sendFinal(call); }
+    catch (error) { callbackFailures.push(error); throw error; }
+  };
   await redrive(r);
+  // The coordinator keeps custody when its RPC throws. Surface a fixture assertion
+  // here so it cannot be hidden behind the later missing-ACK symptom.
+  if (callbackFailures.length) throw callbackFailures[0];
   assert.equal(server.finals.length, 1, `${label}: exactly one FINAL`);
   assert.equal(server.finals[0]!.disposition?.kind, "archive");
   assert.equal(server.finals[0]!.disposition?.capture_id, SERVER_CAPTURE_ID);

@@ -1,0 +1,166 @@
+import assert from "node:assert/strict";
+import test from "node:test";
+import { WorkerClient, readRunAck } from "../src/client.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { nullLogger } from "./helpers.js";
+
+const tick = () => new Promise<void>(resolve => setImmediate(resolve));
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  const promise = new Promise<T>(r => { resolve = r; });
+  return { promise, resolve };
+}
+
+for (const wall of [-9_000_000, 9_000_000_000]) {
+  test(`cumulative headers and body reject at 600k despite wall ${wall}`, async t => {
+    let now = 0, calls = 0;
+    const budget = new MaintenanceBudget(600_000, () => now);
+    t.after(() => budget.dispose());
+    t.mock.method(Date, "now", () => wall);
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+      fetch: async () => {
+        calls++;
+        now = 300_000;
+        return new Response(new ReadableStream<Uint8Array>({
+          pull(controller) {
+            now = 600_000;
+            controller.enqueue(new TextEncoder().encode('{"holds_released":1}'));
+            controller.close();
+          },
+        }, { highWaterMark: 0 }));
+      },
+    });
+    await MaintenanceBudget.run(budget, async () => {
+      await assert.rejects(client.releaseRecoveryCustody("run", 1, "publication", undefined), /maintenance deadline/);
+      assert.equal(calls, 1);
+    });
+  });
+}
+
+test("late headers ignoring abort reject and detach a never-settling cancellation", async t => {
+  let now = 0, calls = 0, cancelled = 0;
+  const budget = new MaintenanceBudget(600_000, () => now);
+  t.after(() => budget.dispose());
+  const headers = deferred<Response>();
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async () => { calls++; return headers.promise; },
+  });
+  await MaintenanceBudget.run(budget, async () => {
+    const waiting = client.releaseRecoveryCustody("run");
+    await tick();
+    now = 600_000;
+    assert.throws(() => budget.check(), /maintenance deadline/);
+    await assert.rejects(waiting, /maintenance deadline/);
+    headers.resolve(new Response(new ReadableStream({
+      cancel() { cancelled++; return new Promise(() => {}); },
+    })));
+    await tick();
+    assert.equal(cancelled, 1);
+    await assert.rejects(client.releaseRecoveryCustody("run"), /maintenance deadline/);
+    assert.equal(calls, 1);
+  });
+});
+
+for (const operation of ["release", "holds", "ack"] as const) {
+  test(`stalled ${operation} body and cancellation cannot hold the budget open`, async t => {
+    let now = 0, cancelled = 0;
+    const budget = new MaintenanceBudget(600_000, () => now);
+    t.after(() => budget.dispose());
+    const res = new Response(new ReadableStream({
+      pull() { return new Promise(() => {}); },
+      cancel() { cancelled++; return new Promise(() => {}); },
+    }));
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), { fetch: async () => res });
+    await MaintenanceBudget.run(budget, async () => {
+      const pending = operation === "release" ? client.releaseRecoveryCustody("run") :
+        operation === "holds" ? client.listRecoveryHolds("run") : readRunAck(res);
+      await tick();
+      now = 600_000;
+      assert.throws(() => budget.check(), /maintenance deadline/);
+      await assert.rejects(pending, /maintenance deadline/);
+      assert.equal(cancelled, 1);
+    });
+  });
+}
+
+for (const operation of ["release", "holds", "ack"] as const) {
+  test(`late valid ${operation} body grants no authority`, async t => {
+    let now = 0;
+    const budget = new MaintenanceBudget(600_000, () => now);
+    t.after(() => budget.dispose());
+    const read = deferred<{ done: false; value: Uint8Array }>();
+    const res = new Response();
+    Object.defineProperty(res, "body", { value: {
+      getReader: () => ({ read: () => read.promise, cancel: () => new Promise(() => {}) }),
+    } });
+    let registered = false;
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+      fetch: async () => {
+        if (!registered) { registered = true; return Response.json({ worker_id: "worker", protocol_features: [] }); }
+        return res;
+      },
+    });
+    await client.register("worker");
+    await MaintenanceBudget.run(budget, async () => {
+      const pending = operation === "release" ? client.releaseRecoveryCustody("run") :
+        operation === "holds" ? client.listRecoveryHolds("run") : readRunAck(res);
+      await tick();
+      now = 600_000;
+      assert.throws(() => budget.check(), /maintenance deadline/);
+      await assert.rejects(pending, /maintenance deadline/);
+      read.resolve({ done: false, value: new TextEncoder().encode(JSON.stringify({
+        run_id: "run", released: true, holds_released: 1,
+        run: { status: "completed" }, holds: [{ generation: 1, hold_id: "invalid", inventory_guarded: true }],
+      })) });
+      await tick();
+    });
+    assert.equal(client.canStartPublicationCompletion("run", 1), true, "late inventory must not poison provenance");
+  });
+}
+
+test("expired maintenance cannot mark a guarded claim settled synchronously", async t => {
+  let now = 0;
+  const budget = new MaintenanceBudget(600_000, () => now);
+  t.after(() => budget.dispose());
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger());
+  client["inventoryGuardedClaims"].add("run:1");
+  await MaintenanceBudget.run(budget, async () => {
+    now = 600_000;
+    assert.throws(() => client.markInventoryGuardedClaimSettled("run", 1), /maintenance deadline/);
+  });
+  assert.equal(client.knowsInventoryGuardedClaim("run", 1), true);
+});
+
+test("a caller-aborted late 204 cannot pass the maintenance header fence", async t => {
+  const budget = new MaintenanceBudget();
+  t.after(() => budget.dispose());
+  const abort = new AbortController();
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async () => { abort.abort(new Error("operation stopped")); return new Response(null, { status: 204 }); },
+  });
+  await MaintenanceBudget.run(budget, () => assert.rejects(
+    client.releaseRecoveryCustody("run", 1, undefined, undefined, abort.signal), /operation stopped/));
+});
+
+test("explicit release signal also fences the bounded response body without an ambient budget", async () => {
+  const abort = new AbortController();
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async () => new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        abort.abort(new Error("explicit release stopped"));
+        controller.enqueue(new TextEncoder().encode('{"holds_released":1}'));
+        controller.close();
+      },
+    }, { highWaterMark: 0 })),
+  });
+  await assert.rejects(client.releaseRecoveryCustody("run", 7, undefined, undefined, abort.signal), /explicit release stopped/);
+});
+
+test("legacy four-argument release remains compatible without an ambient budget", async () => {
+  let sent: unknown;
+  const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+    fetch: async (_url, init) => { sent = JSON.parse(String(init?.body)); return Response.json({ holds_released: 1 }); },
+  });
+  assert.deepEqual(await client.releaseRecoveryCustody("run", 7, "publication", undefined), { holds_released: 1 });
+  assert.deepEqual(sent, { generation: 7, release_evidence: "publication" });
+});
