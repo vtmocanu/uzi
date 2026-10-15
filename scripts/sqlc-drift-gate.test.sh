@@ -1,5 +1,6 @@
 #!/bin/sh
 # Hermetic gate contracts; --case NAME selects an independent scenario.
+# Set UZI_SQLC_KEEP_TEST_ARTIFACTS=1 to preserve this run's artifacts for debugging.
 set -eu
 
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
@@ -10,6 +11,7 @@ TMPDIR="$ROOT/.uzi/scratch"
 mkdir -p "$TMPDIR"
 export TMPDIR
 TMP="$(mktemp -d "$TMPDIR/sqlc-drift-tests.XXXXXX")"
+trap 'if [ "${UZI_SQLC_KEEP_TEST_ARTIFACTS:-0}" != 1 ]; then rm -rf "$TMP"; fi' 0
 printf 'ARTIFACTS=%s\n' "$TMP"
 mkdir -p "$TMP/scripts"
 GATE="$TMP/scripts/sqlc-drift-gate.sh"

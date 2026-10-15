@@ -187,8 +187,8 @@ fi
 binary_bytes="$(wc -c < "$BIN" | tr -d ' ')"
 [ "$binary_bytes" -gt 0 ] && [ "$binary_bytes" -le "$MAX_TAR_BYTES" ] \
   || { echo "sqlc.sh: extracted binary has invalid size $binary_bytes" >&2; exit 2; }
-# Cache only after the fully bounded structure has validated. `mv` replaces a
-# hostile destination symlink rather than following it.
+# Populate the cache only after validation. This invocation uses the private
+# verified snapshot; later invocations reverify the cached bytes.
 if [ "$downloaded" -eq 1 ]; then
   STAGE="$(mktemp -d "$DIR/.stage.XXXXXX")" || { echo "sqlc.sh: cache staging failed" >&2; exit 2; }
   if ! (ulimit -f "$MAX_ARCHIVE_BLOCKS" && cp "$CANDIDATE" "$STAGE/archive") \

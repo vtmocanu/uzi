@@ -1,5 +1,6 @@
 #!/bin/sh
 # Select cases with --case NAME; --mutations proves each assertion independently.
+# Set UZI_SQLC_KEEP_TEST_ARTIFACTS=1 to preserve this run's artifacts for debugging.
 set -eu
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMPDIR="$ROOT/.uzi/scratch"
@@ -7,6 +8,7 @@ mkdir -p "$TMPDIR"
 export TMPDIR
 exec python3 - "$ROOT" "$@" <<'PY'
 import argparse
+import atexit
 import gzip
 import hashlib
 import io
@@ -29,6 +31,8 @@ parser.add_argument("--script", type=Path, default=root / "scripts/sqlc.sh")
 args = parser.parse_args(sys.argv[2:])
 source = args.script.read_text()
 artifacts = Path(tempfile.mkdtemp(prefix="sqlc-tests.", dir=root / ".uzi/scratch"))
+atexit.register(lambda: shutil.rmtree(artifacts) if os.environ.get("UZI_SQLC_KEEP_TEST_ARTIFACTS") != "1" else None)
+signal.signal(signal.SIGTERM, lambda signum, frame: sys.exit(128 + signum))
 print("ARTIFACTS=" + str(artifacts), flush=True)
 pins = re.findall(r'SQLC_\w+_SHA256="([a-f0-9]+)"', source)
 payload = b"""#!/bin/sh
@@ -141,6 +145,9 @@ def skip_failure(fragment):
     pos = source.index("exit 2", start)
     return (source[start:pos + 6], source[start:pos] + "exit 0")
 
+class SkipCase(Exception):
+    pass
+
 cases = {}
 def case(name, mutation):
     def add(fn):
@@ -189,7 +196,7 @@ def warm(r):
 
 @case("darwin-shasum", ('shasum -a 256 -c - >/dev/null', 'true'))
 def darwin(r):
-    (r.bin / "sha256sum").unlink()
+    (r.bin / "sha256sum").unlink(missing_ok=True)
     r.env.update(FAKE_OS="Darwin", FAKE_ARCH="arm64")
     r.run()
     assert "sqlc_1.31.1_darwin_arm64.tar.gz" in (r.dir / "transport").read_text()
@@ -318,6 +325,9 @@ def decompress_limit(r):
 @case("sparse-logical-bound", ('ulimit -f "$MAX_TAR_BLOCKS" && tar', ': && tar'))
 def sparse(r):
     # GNU sparse tar is physically small but expands beyond the extraction cap.
+    version = subprocess.run(["tar", "--version"], capture_output=True, text=True)
+    if version.returncode != 0 or "GNU tar" not in version.stdout:
+        raise SkipCase("GNU tar --format=gnu --sparse fixture capabilities unavailable")
     sparse_file = r.dir / "sqlc"
     with sparse_file.open("wb") as f:
         f.write(payload)
@@ -366,7 +376,11 @@ for name, sig, status in [("interrupt", signal.SIGINT, 130), ("terminate", signa
 selected = [args.case] if args.case else list(cases)
 for name in selected:
     fn, mutation = cases[name]
-    fn(Run(name))
+    try:
+        fn(Run(name))
+    except SkipCase as error:
+        print("SKIP " + name + ": " + str(error), flush=True)
+        continue
     print("PASS " + name, flush=True)
     if args.mutations:
         try:
