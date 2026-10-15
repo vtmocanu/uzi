@@ -3,6 +3,7 @@
 set -eu
 ROOT="$(CDPATH='' cd -- "$(dirname -- "$0")/.." && pwd)"
 TMPDIR="$ROOT/.uzi/scratch"
+mkdir -p "$TMPDIR"
 export TMPDIR
 exec python3 - "$ROOT" "$@" <<'PY'
 import argparse

@@ -7,6 +7,7 @@ SOURCE_GATE="${UZI_SQLC_DRIFT_GATE:-$ROOT/scripts/sqlc-drift-gate.sh}"
 CASE="${2:-all}"
 [ "${1:---case}" = --case ] || exit 2
 TMPDIR="$ROOT/.uzi/scratch"
+mkdir -p "$TMPDIR"
 export TMPDIR
 TMP="$(mktemp -d "$TMPDIR/sqlc-drift-tests.XXXXXX")"
 printf 'ARTIFACTS=%s\n' "$TMP"
