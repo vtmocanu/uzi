@@ -1005,6 +1005,34 @@ describe("Worker — job dispatch and capability (PRD #1908 M4)", () => {
 // (resolveCodexHarnessAvailability / probeLandlockAvailability) is unit-tested in
 // codex-runtime-probe.test.ts.
 describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / #1493 M3)", () => {
+  // The always-present protocol caps, in advertisement order. One token per line keeps the
+  // expectation readable and off gitleaks' generic-api-key heuristic, which flagged the
+  // single-line form.
+  const ALWAYS_PRESENT_PROTOCOL_CAPS = [
+    "completion_interlock_v1",
+    "recovery_archive_v1",
+    "recovery_archive_v2",
+    "recovery_inventory_v1",
+    "recovery_completed_publication_v1",
+    "recovery_held_publication_v1",
+    "credential_switch_v1",
+    "milestone_reconciliation_claim_v1",
+    "codex_refresh_recovery_v1",
+    "codex_account_park_v1",
+    "wall_park_v1",
+    "park_run_v1",
+    "input_receipts_v1",
+    "input_inclusion_v1",
+    "gate_revision_v1",
+    "advice_claim_fence_v1",
+    "job_runner_v1",
+    "job_files_v1",
+    "cross_check_v1",
+    "cross_check_rounds_v1",
+    "cross_check_pins_v1",
+    "cross_check_codex_lead_v1",
+    "ci_config_guard_v1",
+  ];
   // A client whose register() captures the protocol-capabilities argument (5th param) so a
   // test can assert exactly what the worker advertised, then idles both claim lanes.
   function capturingClient(): { client: WorkerClient; captured: () => string[] | undefined } {
@@ -1054,7 +1082,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_held_publication_v1", "credential_switch_v1", "milestone_reconciliation_claim_v1", "codex_refresh_recovery_v1", "codex_account_park_v1", "wall_park_v1", "park_run_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", "cross_check_v1", "cross_check_rounds_v1", "cross_check_pins_v1", "cross_check_codex_lead_v1", "ci_config_guard_v1", CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
+      [...ALWAYS_PRESENT_PROTOCOL_CAPS, CODEX_HARNESS_CAPABILITY, CODEX_RUNTIME_V2_CAPABILITY, CODEX_COMPLETION_INTERLOCK_CAPABILITY, CODEX_CUSTOM_MODEL_CAPABILITY],
       "an advertising result appends codex_harness_v1 then codex_custom_model_v1 (PRD #1551 D6) after the always-present protocol caps (v2 by PRD #1349 M1, credential_switch_v1 by PRD #1247 M5b, wall_park_v1 by PRD #1497 M2)",
     );
   });
@@ -1075,7 +1103,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     );
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_held_publication_v1", "credential_switch_v1", "milestone_reconciliation_claim_v1", "codex_refresh_recovery_v1", "codex_account_park_v1", "wall_park_v1", "park_run_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", "cross_check_v1", "cross_check_rounds_v1", "cross_check_pins_v1", "cross_check_codex_lead_v1", "ci_config_guard_v1"],
+      ALWAYS_PRESENT_PROTOCOL_CAPS,
       "a non-advertising result leaves the always-present protocol caps unchanged (Claude service intact)",
     );
     assert.ok(!caps?.includes(CODEX_HARNESS_CAPABILITY), "codex_harness_v1 is absent when not advertising");
@@ -1088,7 +1116,7 @@ describe("Worker — codex_harness_v1 conditional advertisement (PRD #1332 D3 / 
     const caps = await advertisedCapabilities(fakeConfig());
     assert.deepStrictEqual(
       caps,
-      ["completion_interlock_v1", "recovery_archive_v1", "recovery_archive_v2", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_held_publication_v1", "credential_switch_v1", "milestone_reconciliation_claim_v1", "codex_refresh_recovery_v1", "codex_account_park_v1", "wall_park_v1", "park_run_v1", "input_receipts_v1", "input_inclusion_v1", "gate_revision_v1", "advice_claim_fence_v1", "job_runner_v1", "job_files_v1", "cross_check_v1", "cross_check_rounds_v1", "cross_check_pins_v1", "cross_check_codex_lead_v1", "ci_config_guard_v1"],
+      ALWAYS_PRESENT_PROTOCOL_CAPS,
       "an absent availability result advertises only the always-present protocol caps",
     );
   });
