@@ -349,7 +349,8 @@ A few worth knowing:
   checkpoint when that feature is advertised and the milestone list changes.
   An older worker cannot supply the required witness. After reset, claiming
   requires the worker protocol capability `milestone_reconciliation_claim_v1`
-  for generation-stamped checkpoint, input and memory requests. This worker
+  for generation-stamped checkpoint, input and memory requests, and checkpoint
+  restoration when reset starts a fresh transcript. This worker
   capability is distinct from the API feature above; older workers advertising
   only `credential_switch_v1` cannot claim reset runs, even with capability
   scheduling disabled or an owner capability override; a completion contract also requires

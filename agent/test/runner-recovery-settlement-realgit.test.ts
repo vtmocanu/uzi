@@ -901,9 +901,12 @@ describe("M2 fresh replacement checkpoint recovery", () => {
       } }), nullLogger(), 20, undefined, {
         pollMs: 5, checkpointIntervalMs: 0, recovery: nextStores.coord, settlement: nextStores.settlement,
       });
+      // A real reclaim advances the API's ownership generation before the
+      // retained-source recovery probes it. runGen1 left the fake at generation 7.
+      api.setOwnershipStatus(replacement.run_id, "running", replacement.claim_generation!);
       await runner.execute(replacement);
       assert.equal(executionError, undefined, "runner failure handling must not hide restoration assertions");
-      assert.equal(observed, true);
+      assert.equal(observed, true, JSON.stringify(api.states.filter(s => s.runId === replacement.run_id)));
       assert.ok(!(api.states.filter(x => x.runId === replacement.run_id).some(x => x.body.status === "awaiting_approval")));
       const retainedRecords = await oldStores.coord.inspect(predecessor.run_id);
       assert.ok(retainedRecords.some(r => r.generation === 7), "successor park cannot retire predecessor custody");

@@ -38,9 +38,10 @@ const (
 const CompletionInterlockV1 = "completion_interlock_v1"
 
 // MilestoneReconciliationClaimV1 identifies workers that stamp the captured claim
-// generation on checkpoint, input and memory requests. It fences reconciled-run
-// placement independently of the older CredentialSwitchV1 capability and of the
-// API feature milestone_reconciliation_v1, which enables gate witness publication.
+// generation on checkpoint, input and memory requests and restore the approved
+// checkpoint lineage even when reconciliation starts a fresh transcript. It fences
+// reconciled-run placement independently of CredentialSwitchV1 and of the API
+// feature milestone_reconciliation_v1, which enables gate witness publication.
 const MilestoneReconciliationClaimV1 = "milestone_reconciliation_claim_v1"
 
 // RecoveryArchiveV1 is the PROTOCOL capability a worker self-reports (PRD #1296 M1, D9)

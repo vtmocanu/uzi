@@ -738,8 +738,8 @@ export class Worker {
           // is safe to land now. An image WITHOUT this flag keeps working on legacy claims, and the
           // held-state `set-token` verb 409s naming the worker.
           "credential_switch_v1",
-          // #2944: checkpoint, input and memory requests carry the captured claim
-          // generation. Distinct from the API feature milestone_reconciliation_v1.
+          // #2944: generation-stamped checkpoint/input/memory requests and fresh-transcript
+          // checkpoint restoration. Distinct from the API feature milestone_reconciliation_v1.
           "milestone_reconciliation_claim_v1",
           // M2: this image reconciles unknown Codex refresh outcomes before recovery capture.
           "codex_refresh_recovery_v1",
