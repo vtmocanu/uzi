@@ -131,27 +131,161 @@ test("already cancelled load starts nothing and cleanup failure rejects", async 
   assert.equal(stopped, 2);
 });
 
-test("report derives monotonic growth, jitter, elapsed and strict reserve inequality; missing response remains unmeasured", () => {
-  const input = { baseline: [sample(1, 100), sample(2, 110), sample(3, 105)],
-    samples: [sample(4, 200), sample(5, 300), sample(6, 500)], spans: [],
-    reserveBytes: 400, responseBudgetMs: 10 };
-  const report = calibrationReport(input);
+function reportInput() {
+  const binding = { reportId: "report", legId: "leg", interventionId: "intervention",
+    treeId: "tree", toolId: "tool", reservationId: "reservation" };
+  const span = (startMs: number, endMs: number) => ({ binding, startMs, endMs });
+  return { baseline: [sample(1, 100), sample(2, 110), sample(3, 105)],
+    samples: [sample(4, 200), sample(5, 300), sample(6, 500)], reserveBytes: 1024 * MiB - 300,
+    response: { provenance: "synthetic" as "synthetic" | "measured", reportId: "report", legs: [{
+      binding, hardThresholdBytes: 300,
+      hardBracket: { lastBelowSampleId: 4, firstAtOrAboveSampleId: 5, lowerMs: 40, upperMs: 51 },
+      spans: { observe: span(51, 53), reservation: span(54, 57), signal: span(58, 59),
+        drain: span(60, 70), cleanup: span(70, 75) },
+      ack: { binding, atMs: 57, accepted: true as const },
+      exit: { binding, atMs: 70, confirmed: true as const },
+      cleanup: { binding, confirmed: true as const }, oomKillsBefore: 0, oomKillsAfter: 0,
+      oomBefore: 0, oomAfter: 0, oomGroupKillsBefore: 0, oomGroupKillsAfter: 0,
+    }] } };
+}
+
+test("synthetic bound response never claims real measurement; raw growth and strict reserve include bracket uncertainty once", () => {
+  const input = reportInput(), report = calibrationReport(input);
   assert.equal(report.elapsedMs, 21);
   assert.equal(report.jitterBytes, 10);
-  assert.equal(report.growthBytesPerMs, 20);
+  assert.equal(report.peakPositiveGrowthRateBytesPerMs, 20);
   assert.equal(report.maxSampleGapMs, 9);
   assert.equal(report.netGrowthBytes, 300);
   assert.equal(report.monotonicGrowth, true);
-  assert.deepEqual(report.latencies, { sample: [1, 1, 1], observe: [], reservation: [], signal: [], drain: [] });
   assert.equal(report.responseMeasured, false);
-  assert.deepEqual(report.reserveCheck, { reserveBytes: 400, requiredBytes: 390, satisfied: true });
-  assert.equal(calibrationReport({ ...input, reserveBytes: 390 }).reserveCheck.satisfied, false);
-  // Explicit supplied fake spans exercise arithmetic, never claim a real cancellation.
-  const measured = calibrationReport({ ...input, spans: [
-    { kind: "observe", startMs: 10, endMs: 12 }, { kind: "reservation", startMs: 12, endMs: 15 },
-    { kind: "signal", startMs: 15, endMs: 16 }, { kind: "drain", startMs: 16, endMs: 20 },
-  ] });
-  assert.equal(measured.responseMeasured, true);
-  assert.deepEqual(measured.latencies.drain, [4]);
-  assert.throws(() => calibrationReport({ ...input, spans: [{ kind: "drain", startMs: 20, endMs: 10 }] }));
+  assert.equal(report.accepted, false);
+  assert.equal(report.legs[0]!.observationToDrainMs, 19);
+  assert.equal(report.legs[0]!.drainMinusBracketLowerMs, 30);
+  assert.equal(report.conservativeStageSumMs, 30);
+  assert.deepEqual(report.legs[0]!.stageLatenciesMs, { crossingToObserveEnd: 13, reservation: 4, signal: 2, drain: 11 });
+  assert.equal(report.worstEndToEndLatencyMs, 30);
+  assert.deepEqual(report.reserveCheck, { reserveBytes: input.reserveBytes, requiredBytes: 610, satisfied: true });
+  const equality = reportInput();
+  equality.reserveBytes = 610;
+  const h = 1024 * MiB - equality.reserveBytes;
+  equality.response.legs[0]!.hardThresholdBytes = h;
+  equality.samples = [sample(4, h - 100), sample(5, h), sample(6, h + 200)];
+  assert.equal(calibrationReport(equality).reserveCheck.requiredBytes, 610);
+  assert.equal(calibrationReport(equality).reserveCheck.satisfied, false);
+  equality.samples[2] = sample(6, equality.samples[2]!.currentBytes - 1);
+  assert.equal(calibrationReport(equality).reserveCheck.satisfied, true);
+  input.response.provenance = "measured"; // Contract branch only; no real measurement performed by this test.
+  assert.equal(calibrationReport(input).accepted, true);
+  assert.throws(() => calibrationReport({ ...input, response: undefined! }), /invalid calibration report/);
+});
+
+test("measured response fails closed on absent, misordered or mismatched bracket/spans/ACK/exit/cleanup/OOM evidence", () => {
+  const mutations: ((input: ReturnType<typeof reportInput>) => void)[] = [
+    (i) => { i.response.legs = []; },
+    (i) => { i.response.legs[0]!.hardBracket.lowerMs = 41; },
+    (i) => { i.response.legs[0]!.hardBracket.upperMs = 50; },
+    (i) => { i.response.legs[0]!.hardBracket.lastBelowSampleId = 3; },
+    (i) => { i.response.legs[0]!.hardBracket.firstAtOrAboveSampleId = 6; },
+    (i) => { i.response.legs[0]!.hardThresholdBytes = 100; },
+    (i) => { i.response.legs[0]!.spans.observe = undefined!; },
+    (i) => { i.response.legs[0]!.spans.observe.startMs = 39; }, // early PSI cannot replace hard acceptance
+    (i) => { i.response.legs[0]!.spans.drain.startMs = 58; },
+    (i) => { i.response.legs[0]!.spans.drain.endMs = Number.NaN; },
+    (i) => { i.response.legs[0]!.spans.signal.binding = { ...i.response.legs[0]!.binding, toolId: "other" }; },
+    (i) => { i.response.reportId = "other"; },
+    (i) => { i.response.legs[0]!.ack = undefined!; },
+    (i) => { i.response.legs[0]!.ack.atMs = 60; },
+    (i) => { i.response.legs[0]!.exit = undefined!; },
+    (i) => { i.response.legs[0]!.exit.atMs = 69; },
+    (i) => { i.response.legs[0]!.cleanup = undefined!; },
+    (i) => { i.response.legs[0]!.oomKillsAfter = 1; },
+    (i) => { i.response.legs[0]!.oomAfter = 1; },
+    (i) => { i.response.legs[0]!.oomGroupKillsAfter = 1; },
+    (i) => { i.samples[1]!.limitBytes *= 2; },
+    (i) => { i.samples.reverse(); },
+  ];
+  for (const mutate of mutations) {
+    const input = reportInput(); input.response.provenance = "measured"; mutate(input);
+    assert.throws(() => calibrationReport(input));
+  }
+  for (const key of ["reportId", "legId", "interventionId", "treeId", "toolId", "reservationId"] as const) {
+    const input = reportInput();
+    input.response.legs[0]!.spans.drain.binding = { ...input.response.legs[0]!.binding, [key]: "other" };
+    assert.throws(() => calibrationReport(input), /mismatched/);
+  }
+});
+
+test("reservation ACK must end reservation before signal; signal-time ACK is invalid", () => {
+  const input = reportInput(), leg = input.response.legs[0]!;
+  assert.equal(calibrationReport(input).legs.length, 1);
+  for (const atMs of [53, 54, 56, 58, 59]) {
+    leg.ack.atMs = atMs;
+    assert.throws(() => calibrationReport(input), /ACK/);
+  }
+  leg.ack.atMs = leg.spans.reservation.endMs;
+  assert.equal(calibrationReport(input).legs.length, 1);
+});
+
+test("H is derived from a positive reserve strictly below the finite limit", () => {
+  for (const reserveBytes of [0, -1, 1024 * MiB, 1024 * MiB + 1, 611]) {
+    assert.throws(() => calibrationReport({ ...reportInput(), reserveBytes }));
+  }
+});
+
+test("all OOM counters require natural before/after values and zero event deltas", () => {
+  for (const [before, after] of [
+    ["oomBefore", "oomAfter"], ["oomKillsBefore", "oomKillsAfter"],
+    ["oomGroupKillsBefore", "oomGroupKillsAfter"],
+  ] as const) {
+    for (const [start, end] of [[0, 1], [1, 0], [-1, -1], [0.5, 0.5], [0, NaN], [0, undefined]]) {
+      const input = reportInput(), leg = input.response.legs[0]!;
+      leg[before] = start!;
+      leg[after] = end!;
+      assert.throws(() => calibrationReport(input), /OOM/);
+    }
+    const input = reportInput();
+    input.response.legs[0]![before] = 2;
+    input.response.legs[0]![after] = 2;
+    assert.equal(calibrationReport(input).legs.length, 1);
+  }
+});
+
+test("growth uses peak positive raw sample pair, including after a decrease", () => {
+  const input = reportInput();
+  input.samples = [sample(4, 200), sample(5, 300), sample(6, 250), sample(7, 650)];
+  const report = calibrationReport(input);
+  assert.equal(report.peakPositiveGrowthRateBytesPerMs, 40);
+  assert.equal(report.monotonicGrowth, false);
+  assert.equal(report.reserveCheck.requiredBytes, 1210);
+});
+
+test("early PSI is retained as context and cannot substitute for the hard crossing response", () => {
+  const input = reportInput(), leg = input.response.legs[0]!;
+  const earlyPsiObservation = { binding: leg.binding, startMs: 35, endMs: 36 };
+  const report = calibrationReport({ ...input, response: { ...input.response, legs: [{ ...leg, earlyPsiObservation }] } });
+  assert.deepEqual(report.legs[0]!.earlyPsiObservation, earlyPsiObservation);
+  assert.equal(report.worstEndToEndLatencyMs, 30);
+  assert.throws(() => calibrationReport({ ...input, response: { ...input.response,
+    legs: [{ ...leg, earlyPsiObservation, spans: { ...leg.spans, observe: earlyPsiObservation } }] } }));
+});
+
+test("two ordered legs at the same H use adjacent crossings after prior cleanup and retain stage maxima", () => {
+  const input = reportInput(), first = input.response.legs[0]!;
+  const binding = { ...first.binding, legId: "leg2", interventionId: "intervention2",
+    treeId: "tree2", toolId: "tool2", reservationId: "reservation2" };
+  const span = (startMs: number, endMs: number) => ({ binding, startMs, endMs });
+  const second = { ...first, binding,
+    hardBracket: { lastBelowSampleId: 8, firstAtOrAboveSampleId: 9, lowerMs: 80, upperMs: 91 },
+    spans: { observe: span(91, 92), reservation: span(92, 110), signal: span(110, 112),
+      drain: span(112, 115), cleanup: span(115, 116) },
+    ack: { binding, atMs: 110, accepted: true as const }, exit: { binding, atMs: 115, confirmed: true as const },
+    cleanup: { binding, confirmed: true as const } };
+  input.samples.push(sample(8, 250), sample(9, 400));
+  input.response.legs.push(second);
+  const report = calibrationReport(input);
+  assert.equal(report.worstEndToEndLatencyMs, 35);
+  assert.equal(report.conservativeStageSumMs, 44);
+  assert.equal(report.reserveCheck.requiredBytes, 710);
+  input.response.legs.reverse();
+  assert.throws(() => calibrationReport(input), /misordered|bracket/);
 });

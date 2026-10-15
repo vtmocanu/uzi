@@ -6,11 +6,11 @@ import type { WorkerMemoryReader } from "../../src/worker-memory-reader.js";
 type Sample = ReturnType<WorkerMemoryReader["sample"]>;
 type Available = Extract<Sample, { available: true }>;
 type Producer = { step: () => Promise<void>; stop: () => Promise<void> };
-type Plan = Readonly<{
+export type CalibrationPlan = Readonly<{
   limitBytes: number; ceilingBytes: number; baselineBytes: number;
   allocationBytes: number; overheadBytes: number; chunkBytes: number; rounds: number; windowMs: number;
 }>;
-type Span = Readonly<{ kind: "sample" | "observe" | "reservation" | "signal" | "drain"; startMs: number; endMs: number }>;
+type Plan = CalibrationPlan;
 const MiB = 1024 * 1024;
 function finite(value: number): boolean { return Number.isFinite(value) && value >= 0; }
 function validateSamples(samples: readonly Available[], minimum = 3): void {
@@ -56,8 +56,9 @@ export function calibrationPlan(input: {
  * The real port below terminates its owned thread; fake tests exercise the public ports.
  * Cleanup joins startup and step work after abort and handle termination; its duration
  * is not a measured cancellation span or part of the load window.
- * M6 must supply two supervised command-tree producers through this port, with real
- * cancellation/drain evidence. calibrationThreadPort is only a load fixture.
+ * Command-tree acceptance uses commandTreeCalibration in worker-memory-command-driver.ts.
+ * calibrationThreadPort is only load scaffolding; thread termination cannot
+ * establish command-tree cancellation acceptance.
  */
 export async function calibrationLoad(plan: Plan, ports: {
   now: () => number; sample: () => Sample; signal?: AbortSignal;
@@ -185,42 +186,117 @@ export async function calibrationThreadPort(dirs: { disk: string; shmem: string 
   };
 }
 
-/** Missing cancellation spans remain explicitly unmeasured until real M3/M6
- * adapters provide them. The reserve inequality uses an INPUT budget, not a
- * fabricated cancellation observation or a production tuning recommendation.
- */
-export function calibrationReport(input: {
-  baseline: readonly Available[]; samples: readonly Available[]; spans: readonly Span[];
-  reserveBytes: number; responseBudgetMs: number;
-}) {
+/** Correlated response evidence uses one monotonic clock (ms). Synthetic
+ * fixtures exercise arithmetic and never satisfy measurement acceptance. */
+export type CalibrationBinding = Readonly<{
+  reportId: string; legId: string; interventionId: string; treeId: string; toolId: string; reservationId: string;
+}>;
+export type CalibrationSpan = Readonly<{ binding: CalibrationBinding; startMs: number; endMs: number }>;
+export type CalibrationLegResponse = Readonly<{
+  binding: CalibrationBinding; hardThresholdBytes: number;
+  hardBracket: { lastBelowSampleId: number; firstAtOrAboveSampleId: number; lowerMs: number; upperMs: number };
+  spans: Record<"observe" | "reservation" | "signal" | "drain" | "cleanup", CalibrationSpan>;
+  earlyPsiObservation?: CalibrationSpan;
+  ack: { binding: CalibrationBinding; atMs: number; accepted: true };
+  exit: { binding: CalibrationBinding; atMs: number; confirmed: true };
+  cleanup: { binding: CalibrationBinding; confirmed: true };
+  oomKillsBefore: number; oomKillsAfter: number;
+  oomBefore: number; oomAfter: number;
+  oomGroupKillsBefore: number; oomGroupKillsAfter: number;
+}>;
+export type CalibrationMeasuredResponse = Readonly<{
+  provenance: "measured" | "synthetic"; reportId: string; legs: readonly CalibrationLegResponse[];
+}>;
+export type CalibrationReportInput = Readonly<{
+  baseline: readonly Available[]; samples: readonly Available[];
+  reserveBytes: number; response: CalibrationMeasuredResponse;
+}>;
+const bindingKeys = ["reportId", "legId", "interventionId", "treeId", "toolId", "reservationId"] as const;
+function sameBinding(a: CalibrationBinding, b: CalibrationBinding): boolean {
+  return !!a && !!b && bindingKeys.every((key) => typeof a[key] === "string" && a[key].length > 0 && a[key] === b[key]);
+}
+export function calibrationReport(input: CalibrationReportInput) {
   validateSamples(input.baseline); validateSamples(input.samples);
-  if (input.spans.length > 256) throw new Error("calibration latency bound exceeded");
-  if (input.samples[0]!.limitBytes !== input.baseline[0]!.limitBytes
+  const response = input.response;
+  if (!response || !["measured", "synthetic"].includes(response.provenance) || !response.reportId
+    || !response.legs?.length || response.legs.length > 32
+    || ![1024 * MiB, 2048 * MiB].includes(input.samples[0]!.limitBytes)
+    || input.samples[0]!.sampleId <= input.baseline.at(-1)!.sampleId
+    || input.samples[0]!.limitBytes !== input.baseline[0]!.limitBytes
+    || input.samples[0]!.startedAtMs < input.baseline.at(-1)!.completedAtMs
     || !Number.isSafeInteger(input.reserveBytes) || input.reserveBytes <= 0
-    || !finite(input.responseBudgetMs) || input.responseBudgetMs <= 0) throw new Error("invalid calibration report");
+    || input.reserveBytes >= input.samples[0]!.limitBytes) throw new Error("invalid calibration report");
   const baseline = input.baseline.map((sample) => sample.currentBytes);
   const jitterBytes = Math.max(...baseline) - Math.min(...baseline);
-  let growthBytesPerMs = 0, maxSampleGapMs = 0;
+  let peakPositiveGrowthRateBytesPerMs = 0, maxSampleGapMs = 0;
   for (let i = 1; i < input.samples.length; i++) {
     const previous = input.samples[i - 1]!, current = input.samples[i]!;
     const elapsed = current.completedAtMs - previous.completedAtMs;
     if (elapsed <= 0) throw new Error("nonmonotonic calibration time");
     maxSampleGapMs = Math.max(maxSampleGapMs, current.startedAtMs - previous.completedAtMs);
-    growthBytesPerMs = Math.max(growthBytesPerMs, Math.max(0, current.currentBytes - previous.currentBytes) / elapsed);
+    peakPositiveGrowthRateBytesPerMs = Math.max(peakPositiveGrowthRateBytesPerMs,
+      Math.max(0, current.currentBytes - previous.currentBytes) / elapsed);
   }
-  const latencies: Record<Span["kind"], number[]> = { sample: [], observe: [], reservation: [], signal: [], drain: [] };
-  for (const sample of input.samples) latencies.sample.push(sample.completedAtMs - sample.startedAtMs);
-  for (const span of input.spans) {
-    if (!finite(span.startMs) || !finite(span.endMs) || span.endMs < span.startMs || !Object.hasOwn(latencies, span.kind)) {
-      throw new Error("invalid calibration latency");
+  const seen = new Set<string>();
+  let previousCleanupEndMs = input.baseline.at(-1)!.completedAtMs;
+  const legs = response.legs.map((leg) => {
+    const b = leg.binding, bracket = leg.hardBracket, spans = leg.spans;
+    if (!sameBinding(b, b) || b.reportId !== response.reportId || seen.has(b.legId)
+      || !Number.isSafeInteger(leg.hardThresholdBytes) || leg.hardThresholdBytes <= 0
+      || leg.hardThresholdBytes !== input.samples[0]!.limitBytes - input.reserveBytes) throw new Error("invalid leg binding or threshold");
+    seen.add(b.legId);
+    const highIndex = input.samples.findIndex((sample) => sample.startedAtMs >= previousCleanupEndMs
+      && sample.currentBytes >= leg.hardThresholdBytes);
+    const low = input.samples[highIndex - 1], high = input.samples[highIndex];
+    if (!low || !high || !bracket || low.currentBytes >= leg.hardThresholdBytes
+      || bracket.lastBelowSampleId !== low.sampleId || bracket.firstAtOrAboveSampleId !== high.sampleId
+      || bracket.lowerMs !== low.startedAtMs || bracket.upperMs !== high.completedAtMs) {
+      throw new Error("missing or mismatched hard crossing bracket");
     }
-    latencies[span.kind].push(span.endMs - span.startMs);
-  }
-  const requiredBytes = jitterBytes + growthBytesPerMs * (maxSampleGapMs + input.responseBudgetMs);
-  return { fixtureOnly: true, elapsedMs: input.samples.at(-1)!.completedAtMs - input.samples[0]!.startedAtMs,
-    jitterBytes, growthBytesPerMs, maxSampleGapMs, latencies,
+    if (bracket.lowerMs < previousCleanupEndMs) throw new Error("misordered calibration legs");
+    const earlyPsi = leg.earlyPsiObservation;
+    if (earlyPsi && (!sameBinding(b, earlyPsi.binding) || !finite(earlyPsi.startMs) || !finite(earlyPsi.endMs)
+      || earlyPsi.endMs < earlyPsi.startMs || earlyPsi.endMs > bracket.lowerMs)) throw new Error("invalid early PSI observation");
+    let end = bracket.upperMs;
+    for (const kind of ["observe", "reservation", "signal", "drain", "cleanup"] as const) {
+      const span = spans?.[kind];
+      if (!span || !sameBinding(b, span.binding) || !finite(span.startMs) || !finite(span.endMs)
+        || span.startMs < end || span.endMs < span.startMs) throw new Error("missing, misordered or mismatched response span");
+      end = span.endMs;
+    }
+    if (!leg.ack || !sameBinding(b, leg.ack.binding) || leg.ack.accepted !== true
+      || !finite(leg.ack.atMs) || leg.ack.atMs !== spans.reservation.endMs || leg.ack.atMs > spans.signal.startMs
+      || !leg.exit || !sameBinding(b, leg.exit.binding) || leg.exit.confirmed !== true
+      || !finite(leg.exit.atMs) || leg.exit.atMs < spans.drain.startMs || leg.exit.atMs !== spans.drain.endMs
+      || !leg.cleanup || !sameBinding(b, leg.cleanup.binding) || leg.cleanup.confirmed !== true
+      || [[leg.oomKillsBefore, leg.oomKillsAfter], [leg.oomBefore, leg.oomAfter],
+        [leg.oomGroupKillsBefore, leg.oomGroupKillsAfter]].some(([before, after]) =>
+        !Number.isSafeInteger(before) || before! < 0 || !Number.isSafeInteger(after) || after! < 0 || after !== before)) throw new Error("unconfirmed ACK, exit, cleanup or OOM delta");
+    previousCleanupEndMs = spans.cleanup.endMs;
+    return { binding: b, hardBracket: bracket, earlyPsiObservation: earlyPsi,
+      observationToDrainMs: spans.drain.endMs - spans.observe.startMs,
+      drainMinusBracketLowerMs: spans.drain.endMs - bracket.lowerMs,
+      stageLatenciesMs: {
+        crossingToObserveEnd: spans.observe.endMs - bracket.lowerMs,
+        reservation: spans.reservation.endMs - spans.observe.endMs,
+        signal: spans.signal.endMs - spans.reservation.endMs,
+        drain: spans.drain.endMs - spans.signal.endMs,
+      } };
+  });
+  // Bracket lower already includes sampling uncertainty; do not add the sample gap.
+  const worstEndToEndLatencyMs = Math.max(...legs.map((leg) => leg.drainMinusBracketLowerMs));
+  // Sum of per-stage maxima across legs is a separate conservative estimate;
+  // end-to-end acceptance uses the correlated worst single leg above.
+  const conservativeStageSumMs = (["crossingToObserveEnd", "reservation", "signal", "drain"] as const)
+    .reduce((sum, kind) => sum + Math.max(...legs.map((leg) => leg.stageLatenciesMs[kind])), 0);
+  const requiredBytes = peakPositiveGrowthRateBytesPerMs * worstEndToEndLatencyMs + jitterBytes;
+  const satisfied = input.reserveBytes > requiredBytes;
+  return { fixtureOnly: true, provenance: response.provenance, reportId: response.reportId, legs,
+    elapsedMs: input.samples.at(-1)!.completedAtMs - input.samples[0]!.startedAtMs,
+    jitterBytes, peakPositiveGrowthRateBytesPerMs, maxSampleGapMs, worstEndToEndLatencyMs, conservativeStageSumMs,
     netGrowthBytes: input.samples.at(-1)!.currentBytes - input.samples[0]!.currentBytes,
     monotonicGrowth: input.samples.every((sample, index) => index === 0 || sample.currentBytes >= input.samples[index - 1]!.currentBytes),
-    responseMeasured: (["observe", "reservation", "signal", "drain"] as const).every((kind) => latencies[kind].length > 0),
-    reserveCheck: { reserveBytes: input.reserveBytes, requiredBytes, satisfied: input.reserveBytes > requiredBytes } };
+    responseMeasured: response.provenance === "measured",
+    accepted: response.provenance === "measured" && satisfied,
+    reserveCheck: { reserveBytes: input.reserveBytes, requiredBytes, satisfied } };
 }
