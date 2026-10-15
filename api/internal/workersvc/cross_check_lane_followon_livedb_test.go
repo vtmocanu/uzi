@@ -168,8 +168,19 @@ func TestCrossCheckLaneInheritedFencesLiveDB(t *testing.T) {
 				if adm.ContinuationExempt {
 					t.Fatal("affinity granted prior-claim custody exemption")
 				}
-				if p := laneClaim(t, f, "cross_check", nil); p != nil {
-					t.Fatal("custody cap bypassed")
+				// Checker admission is independent of prior-claim continuation.
+				// Even this synthetic prior hold must remain unchanged by the claim.
+				custody := checkerCustodyFixture{env: f.env, owner: f.userID}
+				before := custody.snapshot(t)
+				p := laneClaim(t, f, "cross_check", nil)
+				if p == nil || p.RunID != f.runID.String() || p.Kind != "cross_check" || p.ClaimGeneration != 1 {
+					t.Fatal("expected own checker at generation one despite owner custody cap")
+				}
+				if claimed := mustRun(t, f.env, f.runID); claimed.Status != "claimed" || !claimed.CrossCheckLane {
+					t.Fatal("checker claim did not persist status and lane")
+				}
+				if after := custody.snapshot(t); after != before {
+					t.Fatal("checker admission changed existing custody")
 				}
 			case "credential-disabled":
 				f.env.exec("UPDATE user_secrets SET disabled_at=now(),enablement_rev=enablement_rev+1 WHERE id=(SELECT codex_secret_id FROM runs WHERE id=$1)", f.runID)
