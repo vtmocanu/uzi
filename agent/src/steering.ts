@@ -1553,6 +1553,12 @@ export class SteeringChannel {
     return this.cancelled;
   }
 
+  /** Record authenticated API cancellation without routing an input or notifying onCancel.
+   * The runner installs its maintenance budget before aborting model/lifecycle listeners. */
+  markCancelled(): void {
+    this.cancelled = true;
+  }
+
   /** Register the re-armable pause-now interrupt (see pauseNowInterrupt, PRD #1190 rework N2).
    *  Last-wins; the runner wires it to the executor's per-run trip so a `now` pause drops the
    *  current turn even after the shared abort controller has been spent by an earlier `now`. */

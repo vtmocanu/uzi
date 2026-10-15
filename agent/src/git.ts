@@ -9431,6 +9431,7 @@ export class GitCache {
    *  bare interaction). The warm bare and the fetched refs/objects are kept. */
   async removeRunnerClone(clonePath: string, ownerRunId?: string): Promise<void> {
     const refuseUnderQuarantine = (): void => {
+      this.checkRecoveryInterruption();
       if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
     };
     if (ownerRunId !== undefined) {
@@ -9643,6 +9644,7 @@ export class GitCache {
         }
         await checkSuccessor(anchored);
       }
+      this.checkRecoveryInterruption();
       try {
         await fs.rename(clonePath, holdingDest);
       } catch (err) {
@@ -9800,6 +9802,7 @@ export class GitCache {
     }
     if (opts.completionSource) {
       const open = (): void => {
+        this.checkRecoveryInterruption();
         if (protectedNow || residueQuarantine() !== undefined || !opts.completionSource!.canDelete())
           throw new Error("completion disposal protection changed");
       };
@@ -9891,6 +9894,7 @@ export class GitCache {
     };
     if (holding && opts.discard && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
+      this.checkRecoveryInterruption();
       await fs.rm(holding, { recursive: true, force: true }).catch((e) =>
         this.log.warn("retireRunnerClone: holding dispose failed", {
           path: holding,
@@ -9900,6 +9904,7 @@ export class GitCache {
     }
     if (scratch && !protectedNow) {
       if (opts.verifiedSuccessor) await checkDisposal();
+      this.checkRecoveryInterruption();
       await fs.rm(scratch, { recursive: true, force: true }).catch(() => undefined);
     }
     return result.disposition;
@@ -9932,6 +9937,7 @@ export class GitCache {
     }
     if (guard) await guard();
     if (residueQuarantine() !== undefined) throw new CloneRetainedByQuarantineError();
+    this.checkRecoveryInterruption();
     return this.renameCanonicalOrConfirmFree(clonePath, path.join(scratchParent, "clone"));
   }
 

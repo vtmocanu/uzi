@@ -52,6 +52,27 @@ function makeChannel(batches: UserInput[][], cancel = new AbortController()): { 
 }
 
 describe("D2b cancellation observation", () => {
+  it("API cancellation is sticky without observer recursion or input receipts", async () => {
+    let observations = 0;
+    const cancel = new AbortController();
+    const ch = new SteeringChannel(fakeClient([]), "run-1", 1, nullLogger(), cancel, {
+      onCancel: () => { observations++; },
+    });
+    cancel.abort(new PauseNowSignal());
+    ch.abortLifecycle(new PauseNowSignal());
+    ch.rearmLifecycle();
+    const lifecycle = ch.lifecycleSignal();
+    ch.markCancelled();
+    ch.markCancelled();
+    assert.equal(ch.isCancelled(), true);
+    assert.equal(observations, 0);
+    ch.abortLifecycle();
+    ch.rearmLifecycle();
+    assert.equal(ch.lifecycleSignal(), lifecycle);
+    assert.equal(lifecycle.aborted, true);
+    assert.deepEqual(await ch.awaitVerdict(), { kind: "cancel" });
+  });
+
   it("first observer runs after sticky cancel before abort listeners", async () => {
     const cancel = new AbortController();
     const events: string[] = [];
