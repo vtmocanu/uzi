@@ -68,7 +68,7 @@ it("regular Worker ticks retain 15s cadence, original report and nonce, epochs a
     }, "regular tick 2 must send the original implementation report");
     for (const [index, tick] of ticks.entries()) assert.deepEqual(tick.active_snapshot, {
       snapshot_epoch: index + 1, active: [{ run_id: "held-run", claim_generation: 7, phase: "awaiting_approval", terminal_pending: false }],
-      pending_overflow: false, register_nonce: nonce,
+      pending_overflow: false, pending_all: [], register_nonce: nonce,
     });
     assert.deepEqual(custody, [[false, 100_000], [false, 115_000]]);
     const { protocol_refresh: report, ...withoutReport } = ticks[1]!;
