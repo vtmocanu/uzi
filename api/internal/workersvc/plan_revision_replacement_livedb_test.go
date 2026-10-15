@@ -61,7 +61,7 @@ func assertReplacementPending(t *testing.T, f *gateFix, run uuid.UUID, ids []int
 	if got := replacementIDs(t, f, run); !slices.Equal(got, ids) {
 		t.Fatalf("input IDs=%v want=%v", got, ids)
 	}
-	if s := f.sideEffects(t, run); s.reviseCount != int32(len(ids)) || s.inputRows != len(ids) ||
+	if s := f.sideEffects(t, run); int(s.reviseCount) != len(ids) || s.inputRows != len(ids) ||
 		s.frozen != nil || s.contractFrozen || s.budgetIters != nil || s.stopKind != nil {
 		t.Fatalf("revision acceptance changed count or granted approval: %+v", s)
 	}
@@ -152,7 +152,7 @@ func TestPlanRevisionReplacementSubmissionLifecycleLiveDB(t *testing.T) {
  kind='revise_plan' AND gate_binding='bound' AND gate_revision=1
  AND consumed_worker_id=$2 AND consumed_claim_generation=1
  AND applied_at IS NOT NULL
- AND CASE WHEN id=$3 THEN disposition IS NULL ELSE disposition='superseded' END)
+ AND CASE WHEN id=$3 THEN disposition IS NULL ELSE disposition IS NOT DISTINCT FROM 'superseded' END)
  FROM run_user_inputs WHERE run_id=$1`, run, f.wkr.ID, ids[2]).Scan(&settled); err != nil || !settled {
 		t.Fatalf("I/J must be explicitly superseded and K normally applied: settled=%v err=%v", settled, err)
 	}
