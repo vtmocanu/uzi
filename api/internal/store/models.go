@@ -1076,10 +1076,10 @@ type Run struct {
 	CodeCrossCheckRequired      bool               `json:"code_cross_check_required"`
 	ProviderParkCount           int32              `json:"provider_park_count"`
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
+	CiConfigGuard               bool               `json:"ci_config_guard"`
 	MemoryEpisode               int64              `json:"memory_episode"`
 	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
 	MemoryPolicy                []byte             `json:"memory_policy"`
-	CiConfigGuard               bool               `json:"ci_config_guard"`
 }
 
 type RunCompletionAttempt struct {
