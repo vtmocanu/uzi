@@ -7,7 +7,7 @@ import type { WorkerMemoryReader } from "../src/worker-memory-reader.js";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
 
 function deferred<T>() {
-  let resolve!: (value: T) => void, reject!: (error: Error) => void;
+  let resolve!: (value: T) => void, reject!: (error: unknown) => void;
   const promise = new Promise<T>((yes, no) => { resolve = yes; reject = no; });
   return { promise, resolve, reject };
 }
@@ -136,8 +136,10 @@ test("completed selected step cannot substitute for selected cancellation", asyn
   await assert.rejects(done, /mismatched actual/);
 });
 
-test("load timeout halts work and proves sibling before aborting and joining both handles", async () => {
+test("load timeout halts work and proves sibling before aborting and joining both handles", async (t) => {
+  t.mock.timers.enable({ apis: ["setTimeout"] });
   const f = fixture(5), { done } = await f.start();
+  t.mock.timers.tick(5);
   await assert.rejects(done, /load window expired/);
   assert.deepEqual(f.events, ["step0", "step1", "live1", "abort0", "abort1", "stop0", "stop1"]);
 });
@@ -160,4 +162,158 @@ test("unjoined graceful stop triggers bounded forced joins on both exact handles
   t.mock.timers.tick(15000);
   await assert.rejects(done, /cleanup failed; no next leg/);
   assert.deepEqual(f.events.slice(-2), ["force0", "force1"]);
+});
+test("review: producer one selection preserves producer zero and exact feedback", async () => {
+  const f = fixture();
+  const intervention = deferred<CalibrationIntervention>();
+  const binding = { ...f.binding, treeId: "tree1", toolId: "tool1" };
+  const actual = { ...f.actual, ...f.pair[1].enrollment };
+  const done = commandTreeCalibration(f.plan, { producers: f.pair, intervention: intervention.promise });
+  void done.catch(() => {});
+  for (let i = 0; i < 20 && f.events.length < 2; i++) await Promise.resolve();
+  intervention.resolve({ binding, selected: 1, feedback: Promise.resolve(actual),
+    confirmedDrain: Promise.resolve({ binding, identity: f.pair[1].identity, confirmed: true }) });
+  f.steps[1]!.resolve({ kind: "cancelled", feedback: actual });
+  assert.equal((await done).sibling.pid, 100);
+  assert.deepEqual(f.events, ["step0", "step1", "live0", "abort0", "abort1", "stop0", "stop1"]);
+});
+
+test("review: round exhaustion at both sizes rejects without scheduling extra allocations", async () => {
+  for (const limitBytes of [1024 ** 3, 2 * 1024 ** 3]) {
+    const f = fixture();
+    const rounds = limitBytes === 1024 ** 3 ? 16 : 32;
+    const counts = [0, 0];
+    const pair = f.pair.map((p, index) => ({ ...p, step: async (): Promise<CommandStep> => {
+      counts[index]!++;
+      return { kind: "completed" };
+    } })) as unknown as [EnrolledCalibrationProducer, EnrolledCalibrationProducer];
+    const plan = { ...f.plan, limitBytes, rounds, ceilingBytes: limitBytes / 2,
+      allocationBytes: 8 * rounds * f.plan.chunkBytes };
+    await assert.rejects(commandTreeCalibration(plan, { producers: pair,
+      intervention: new Promise<CalibrationIntervention>(() => {}) }), /no selected intervention/);
+    assert.deepEqual(counts, [rounds, rounds]);
+    assert.deepEqual(f.events, ["live1", "stop0", "stop1"]);
+  }
+});
+
+test("review: caller abort during evidence and malformed intervention both clean both handles", async () => {
+  for (const mode of ["abort", "binding"] as const) {
+    const f = fixture(), controller = new AbortController();
+    const intervention = deferred<CalibrationIntervention>();
+    const done = commandTreeCalibration(f.plan, { producers: f.pair, intervention: intervention.promise,
+      signal: controller.signal });
+    void done.catch(() => {});
+    for (let i = 0; i < 20 && f.events.length < 2; i++) await Promise.resolve();
+    intervention.resolve({ binding: mode === "binding" ? { ...f.binding, toolId: "wrong" } : f.binding,
+      selected: 0, feedback: new Promise<WorkerMemoryPressureResult>(() => {}),
+      confirmedDrain: new Promise<Awaited<CalibrationIntervention["confirmedDrain"]>>(() => {}) });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    if (mode === "abort") controller.abort();
+    await assert.rejects(done, mode === "abort" ? /caller cancelled/ : /mismatched intervention/);
+    assert.deepEqual(f.events, ["step0", "step1", "live1", "abort0", "abort1", "stop0", "stop1"]);
+  }
+});
+
+test("malformed binding observes both evidence rejections while sibling proof is pending", async () => {
+  const f = fixture(), proof = deferred<EnrolledCalibrationProducer["identity"]>();
+  f.pair[1] = { ...f.pair[1], proveLive: async () => { f.events.push("proof1"); return proof.promise; } };
+  const intervention = deferred<CalibrationIntervention>();
+  const done = commandTreeCalibration(f.plan, { producers: f.pair, intervention: intervention.promise });
+  void done.catch(() => {});
+  for (let i = 0; i < 20 && f.events.length < 2; i++) await Promise.resolve();
+  intervention.resolve({ binding: { ...f.binding, toolId: "wrong" }, selected: 0,
+    feedback: f.feedback.promise, confirmedDrain: f.drain.promise });
+  for (let i = 0; i < 100 && !f.events.includes("proof1"); i++) await Promise.resolve();
+  assert.deepEqual(f.events, ["step0", "step1", "proof1"]);
+  f.feedback.reject(new Error("malformed feedback"));
+  f.drain.reject(new Error("malformed drain"));
+  // Cross a Node event-loop turn while proof is pending: node:test reports
+  // either unhandled evidence rejection as a test failure.
+  await new Promise<void>((resolve) => setImmediate(resolve));
+  assert.deepEqual(f.events, ["step0", "step1", "proof1"]);
+  proof.resolve(f.pair[1].identity);
+  await assert.rejects(done, /mismatched intervention/);
+  assert.deepEqual(f.events.slice(-4), ["abort0", "abort1", "stop0", "stop1"]);
+});
+
+test("falsy evidence, producer and intervention rejections always reject with the actual reason", async () => {
+  for (const reason of [undefined, null, false, 0, ""]) {
+    for (const mode of ["feedback", "drain", "step", "exit", "intervention"] as const) {
+      const f = fixture(), intervention = deferred<CalibrationIntervention>();
+      const done = commandTreeCalibration(f.plan, { producers: f.pair, intervention: intervention.promise });
+      const rejected = assert.rejects(done, (error: unknown) => { assert.equal(error, reason); return true; });
+      for (let i = 0; i < 20 && f.events.length < 2; i++) await Promise.resolve();
+      if (mode === "intervention") intervention.reject(reason);
+      else {
+        intervention.resolve({ binding: f.binding, selected: 0, feedback: f.feedback.promise, confirmedDrain: f.drain.promise });
+        if (mode === "feedback") f.feedback.reject(reason); else f.feedback.resolve(f.actual);
+        if (mode === "drain") f.drain.reject(reason);
+        else f.drain.resolve({ binding: f.binding, identity: f.pair[0].identity, confirmed: true });
+        if (mode === "step") f.steps[0]!.reject(reason);
+        else f.steps[0]!.resolve({ kind: "cancelled", feedback: f.actual });
+        if (mode === "exit") f.failures[1]!.reject(reason);
+      }
+      await rejected;
+      assert.ok(f.events.includes("stop0") && f.events.includes("stop1"));
+    }
+  }
+});
+
+test("falsy primary, proof and cleanup failures survive aggregation", async () => {
+  for (const reason of [undefined, null, false, 0, ""]) {
+    for (const mode of ["proof", "cleanup", "both"] as const) {
+      const f = fixture();
+      if (mode !== "cleanup") f.pair[1] = { ...f.pair[1], proveLive: async () => { throw reason; } };
+      if (mode !== "proof") f.pair[0] = { ...f.pair[0], stop: async () => {
+        f.events.push("stop0"); f.steps[0]!.resolve({ kind: "completed" }); throw reason;
+      } };
+      const { done } = await f.start();
+      f.select(); f.feedback.reject(reason);
+      await assert.rejects(done, (error: unknown) => {
+        assert.ok(error instanceof AggregateError);
+        if (mode !== "both") assert.equal(error.errors[0], reason);
+        if (mode === "both") {
+          assert.ok(error.errors[0] instanceof AggregateError);
+          assert.deepEqual(error.errors[0].errors, [reason, reason]);
+        } else if (mode === "proof") assert.deepEqual(error.errors, [reason, reason]);
+        if (mode !== "proof") {
+          const cleanup = error.errors[1];
+          assert.ok(cleanup instanceof AggregateError);
+          assert.ok(cleanup.errors.length > 0);
+          assert.ok(cleanup.errors.every((value: unknown) => value === reason));
+          assert.deepEqual(f.events.slice(-2), ["force0", "force1"]);
+        }
+        return true;
+      });
+      assert.ok(f.events.includes("stop0") && f.events.includes("stop1"));
+    }
+  }
+});
+
+test("caller abort with a falsy reason rejects while evidence is pending", async () => {
+  for (const reason of [undefined, null, false, 0, ""]) {
+    const f = fixture(), caller = new AbortController();
+    const intervention = deferred<CalibrationIntervention>();
+    const done = commandTreeCalibration(f.plan, { producers: f.pair, intervention: intervention.promise, signal: caller.signal });
+    const rejected = assert.rejects(done, /caller cancelled/);
+    for (let i = 0; i < 20 && f.events.length < 2; i++) await Promise.resolve();
+    intervention.resolve({ binding: f.binding, selected: 0, feedback: f.feedback.promise, confirmedDrain: f.drain.promise });
+    for (let i = 0; i < 20; i++) await Promise.resolve();
+    caller.abort(reason);
+    await rejected;
+    assert.ok(f.events.includes("stop0") && f.events.includes("stop1"));
+  }
+});
+
+test("selected step feedback must have the same own enumerable keys as actual feedback", async () => {
+  for (const mode of ["extra", "missing", "inherited"] as const) {
+    const f = fixture(), { done } = await f.start();
+    const feedback = { ...f.actual, ...(mode === "extra" ? { extra: true } : {}) };
+    if (mode === "missing" || mode === "inherited") Reflect.deleteProperty(feedback, "guidance");
+    if (mode === "inherited") Object.setPrototypeOf(feedback, { guidance: f.actual.guidance });
+    f.select(); f.feedback.resolve(f.actual);
+    f.drain.resolve({ binding: f.binding, identity: f.pair[0].identity, confirmed: true });
+    f.steps[0]!.resolve({ kind: "cancelled", feedback });
+    await assert.rejects(done, /mismatched actual/);
+  }
 });

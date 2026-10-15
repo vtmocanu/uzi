@@ -71,6 +71,10 @@ export async function commandTreeCalibration(plan: CalibrationPlan, ports: Comma
     halted = true; failedIndex = index; throw error;
   }));
   const selectedEvent = ports.intervention.then((event) => {
+    // Observe evidence immediately, including when event validation fails.
+    // Acceptance below still awaits the original promises and their failures.
+    void event.feedback.catch(() => {});
+    void event.confirmedDrain.catch(() => {});
     halted = true;
     selected = event;
     if (![0, 1].includes(event.selected) || !matches(event.binding, event.binding)
@@ -86,6 +90,7 @@ export async function commandTreeCalibration(plan: CalibrationPlan, ports: Comma
   void cancelled.catch(() => {});
   const onAbort = () => { halted = true; rejectCaller(new Error("calibration caller cancelled")); };
   ports.signal?.addEventListener("abort", onAbort, { once: true });
+  let hasFailure = false;
   let failure: unknown, result: { intervention: CalibrationBinding; sibling: CommandIdentity } | undefined;
   try {
     await bounded((async () => {
@@ -129,11 +134,13 @@ export async function commandTreeCalibration(plan: CalibrationPlan, ports: Comma
         || !matches(event.binding, drain.binding) || drain.confirmed !== true
         || !identityMatches(saved[event.selected]!, drain.identity)
         || step.kind !== "cancelled"
-        || Object.keys(feedback).some((key) => step.feedback[key as keyof WorkerMemoryPressureResult] !== feedback[key as keyof WorkerMemoryPressureResult])) {
+        || Object.keys(feedback).length !== Object.keys(step.feedback).length
+        || Object.keys(feedback).some((key) => !Object.prototype.propertyIsEnumerable.call(step.feedback, key)
+          || step.feedback[key as keyof WorkerMemoryPressureResult] !== feedback[key as keyof WorkerMemoryPressureResult])) {
         throw new Error("mismatched actual pressure feedback or unconfirmed drain");
       }
     })(), plan.windowMs, "calibration load window expired");
-  } catch (error) { halted = true; failure = error; }
+  } catch (error) { halted = true; hasFailure = true; failure = error; }
   finally { ports.signal?.removeEventListener("abort", onAbort); }
 
   // Prove the saved sibling identity before global cleanup. Proof failure
@@ -145,7 +152,10 @@ export async function commandTreeCalibration(plan: CalibrationPlan, ports: Comma
     const live = await bounded(pair[siblingIndex]!.proveLive(sibling), 5000, "sibling proof timeout");
     if (!identityMatches(sibling, live)) throw new Error("sibling identity not live");
     if (selected) result = { intervention: selected.binding, sibling };
-  } catch (error) { failure = new AggregateError([...(failure ? [failure] : []), error], "sibling proof failed; no next leg"); }
+  } catch (error) {
+    failure = new AggregateError([...(hasFailure ? [failure] : []), error], "sibling proof failed; no next leg");
+    hasFailure = true;
+  }
   controller.abort();
   const cleanup = async () => {
     const errors: unknown[] = [];
@@ -168,11 +178,15 @@ export async function commandTreeCalibration(plan: CalibrationPlan, ports: Comma
     if (errors.length) throw new AggregateError(errors, "calibration cleanup failed");
   };
   try { await bounded(cleanup(), cleanupDeadline - Date.now(), "calibration forced cleanup/join timeout"); }
-  catch (error) { throw new AggregateError([...(failure ? [failure] : []), error], "calibration cleanup failed; no next leg"); }
+  catch (error) { throw new AggregateError([...(hasFailure ? [failure] : []), error], "calibration cleanup failed; no next leg"); }
   // unexpected failures during evidence/proof also fail acceptance.
-  if (failedIndex !== undefined && !failure) failure = new Error("unexpected producer failure or exit");
-  if (ports.signal?.aborted && !failure) failure = new Error("calibration caller cancelled");
-  if (failure) throw failure;
+  if (failedIndex !== undefined && !hasFailure) {
+    hasFailure = true; failure = new Error("unexpected producer failure or exit");
+  }
+  if (ports.signal?.aborted && !hasFailure) {
+    hasFailure = true; failure = new Error("calibration caller cancelled");
+  }
+  if (hasFailure) throw failure;
   if (!result) throw new Error("missing intervention result");
   return result;
 }
