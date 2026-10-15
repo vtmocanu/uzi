@@ -850,18 +850,25 @@ for (const { caller, afterUnlinkFault, liveClient } of [
 
 it("new report proof transport failure preserves existing physical archive authority within the same budget", { skip: linuxReportSkip }, async t => {
   const f = await reportRetirementFixture(t);
+  // Positive physical proof walks the real clone repeatedly; keep host speed out of this assertion.
+  // Deterministic deadline expiry is covered separately in report-retirement.test.ts.
+  const proofMs = 10_000;
+  t.mock.method(reportProofTiming, "proofBudgetMs", () => proofMs);
   const recovery = Reflect.get(f.r, "recovery") as RecoveryCoordinator;
   const report = (await f.outbox.readTerminalJournalForRetirement(f.claim.run_id, f.generation))!;
   let firstBudget: { signal: AbortSignal; deadline: number } | undefined;
+  let firstDeadline: number | undefined;
   t.mock.method(recovery, "retireAcknowledgedFinalReport", async (...[_run, _generation, budget]:
     Parameters<RecoveryCoordinator["retireAcknowledgedFinalReport"]>) => {
     firstBudget = budget;
+    firstDeadline = budget.deadline;
     throw new Error("custody transport unavailable before unlink");
   });
   const oldProof = recovery.retireArchivedReport.bind(recovery);
   const old = t.mock.method(recovery, "retireArchivedReport", async (...args: Parameters<typeof oldProof>) => {
     assert.equal(args[2], firstBudget, "fallback shares the original signal and deadline");
-    assert.ok(args[2].deadline <= Date.now() + 1000, "fallback gets no extended budget");
+    assert.equal(args[2].deadline, firstDeadline, "fallback cannot renew the original absolute deadline");
+    assert.ok(args[2].deadline <= Date.now() + proofMs, "fallback gets no extended budget");
     return oldProof(...args);
   });
   const sources = t.mock.method(git, "readInventoryCloneHeads");
