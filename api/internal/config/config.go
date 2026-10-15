@@ -790,6 +790,8 @@ type Config struct {
 	// Job-file limits (PRD #1909 D1). Every knob is operator-configurable with the PRD default;
 	// byte ceilings are int64. parseInt/parseInt64/parseDuration floor at >0, so a non-positive
 	// or malformed override falls back to the default rather than disabling a ceiling.
+	CIArtifactMaxFiles     int
+	CIArtifactMaxBytes     int64
 	JobInputFileMaxBytes   int64         // UZI_JOB_INPUT_FILE_MAX_BYTES — one input file. Default 25 MiB.
 	JobInputsMaxFiles      int           // UZI_JOB_INPUTS_MAX_FILES — input files per job. Default 10.
 	JobInputsMaxBytes      int64         // UZI_JOB_INPUTS_MAX_BYTES — total input bytes per job. Default 50 MiB.
@@ -1428,6 +1430,8 @@ func Load() (Config, error) {
 	cfg.RecoveryRequestDeadline = parseDuration("UZI_RECOVERY_REQUEST_DEADLINE", 120*time.Second)
 
 	// Job-file limits (PRD #1909 D1).
+	cfg.CIArtifactMaxFiles = int(clampToWorkerCeiling("UZI_CI_ARTIFACT_MAX_FILES", int64(parseInt("UZI_CI_ARTIFACT_MAX_FILES", 50)), 50))
+	cfg.CIArtifactMaxBytes = clampToWorkerCeiling("UZI_CI_ARTIFACT_MAX_BYTES", parseInt64("UZI_CI_ARTIFACT_MAX_BYTES", 16<<20), 16<<20)
 	cfg.JobInputFileMaxBytes = clampToWorkerCeiling("UZI_JOB_INPUT_FILE_MAX_BYTES", parseInt64("UZI_JOB_INPUT_FILE_MAX_BYTES", 25<<20), WorkerJobInputFileMaxBytes)
 	cfg.JobInputsMaxFiles = int(clampToWorkerCeiling("UZI_JOB_INPUTS_MAX_FILES", int64(parseInt("UZI_JOB_INPUTS_MAX_FILES", 10)), WorkerJobInputsMaxFiles))
 	cfg.JobInputsMaxBytes = clampToWorkerCeiling("UZI_JOB_INPUTS_MAX_BYTES", parseInt64("UZI_JOB_INPUTS_MAX_BYTES", 50<<20), WorkerJobInputsMaxBytes)

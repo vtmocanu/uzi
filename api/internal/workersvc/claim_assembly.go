@@ -655,7 +655,12 @@ func (s *Service) assembleClaim(ctx context.Context, wkr store.Worker, run store
 	if err != nil {
 		return nil, err
 	}
+	ciRepair, err := s.assembleCIRepair(ctx, run)
+	if err != nil {
+		return nil, err
+	}
 	payload := &ClaimPayload{
+		CIRepair:         ciRepair,
 		InventoryGuarded: inventoryGuarded,
 		RunID:            run.ID.String(),
 		Kind:             run.Kind,

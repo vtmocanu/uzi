@@ -411,6 +411,7 @@ func run() error {
 		RequestDeadline:        cfg.RecoveryRequestDeadline,
 	}), nil)
 	wsvc.SetJobFiles(jobFiles)
+	wsvc.SetCIArtifactLimits(cfg.CIArtifactMaxFiles, cfg.CIArtifactMaxBytes)
 
 	// Plan-approval gatekeeper (PRD #25 M4): handles the Slack Approve / Reject /
 	// Reject-without-reason buttons. It rides workersvc's ownership-checked

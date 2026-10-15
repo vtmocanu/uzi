@@ -1061,6 +1061,7 @@ type Run struct {
 	ProviderParkCount           int32              `json:"provider_park_count"`
 	ProviderParkStreakStartedAt pgtype.Timestamptz `json:"provider_park_streak_started_at"`
 	CiConfigGuard               bool               `json:"ci_config_guard"`
+	CiArtifactManifest          []byte             `json:"ci_artifact_manifest"`
 }
 
 type RunCompletionAttempt struct {
@@ -1262,6 +1263,7 @@ type RunSchedule struct {
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	RecentFires                []byte             `json:"recent_fires"`
 	CiWorkflows                []byte             `json:"ci_workflows"`
+	CiArtifacts                []byte             `json:"ci_artifacts"`
 }
 
 type RunUsage struct {

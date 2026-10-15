@@ -35,6 +35,7 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/autoselect"
 	"github.com/vtmocanu/uzi/api/internal/board"
 	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/ciartifacts"
 	"github.com/vtmocanu/uzi/api/internal/config"
 	"github.com/vtmocanu/uzi/api/internal/issueinput"
 	"github.com/vtmocanu/uzi/api/internal/jointoken"
@@ -1795,7 +1796,8 @@ type Service struct {
 	p   Params
 	// jobFiles is the PRD #1909 job-file store the upload/download surfaces reach through
 	// JobFiles(). Optional (nil-safe); set via SetJobFiles.
-	jobFiles *JobFiles
+	jobFiles         *JobFiles
+	ciArtifactLimits ciartifacts.Limits
 	// genMu guards genRuns (the runs with a generated-output storage in flight, each with at most
 	// one pending behind it) and genClosed (set by DrainGeneratedOutputs); genWG tracks the detached
 	// generated-output storages (startJobResultOutputs); genTimeout, genReplyBound and genMax
