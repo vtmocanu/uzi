@@ -76,8 +76,8 @@ func TestHeldFinalTerminalCustodyControlsV2LiveDB(t *testing.T) {
 					e.exec("INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled) SELECT $1,connection_id,999,'g/other',web_url,default_branch,true FROM repos WHERE id=$2", other, e.repo)
 					rawTerminalHold(e, "UPDATE recovery_custody_holds SET repo_id=$2 WHERE id=$1", e.hold, other)
 				case "future_generation":
-					g := int64(3)
-					req.Generation = &g
+					// The exact hold exists; the run alone has not reached its generation.
+					e.exec("UPDATE runs SET claim_generation=0 WHERE id=$1", e.run)
 				case "user":
 					other := uuid.New()
 					e.exec("INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@example.com")
@@ -112,6 +112,9 @@ func TestHeldFinalTerminalCustodyControlsV2LiveDB(t *testing.T) {
 			}
 			if len(e.settled) != 0 {
 				t.Fatal("invalid FINAL settled custody")
+			}
+			if bad != "locked_drift" && e.lists() != 0 {
+				t.Fatalf("ineligible custody reached forge verification: lists=%d", e.lists())
 			}
 			if bad == "locked_drift" && e.lists() != 1 {
 				t.Fatalf("drift did not follow eligible forge precheck: lists=%d", e.lists())

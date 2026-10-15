@@ -54,7 +54,8 @@ func TestHeldTerminalCustodyControlsV2LiveDB(t *testing.T) {
 					f.e.exec(t, "INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled) SELECT $1,connection_id,999,'g/other',web_url,default_branch,true FROM repos WHERE id=$2", other, f.e.repoID)
 					f.rawHold("UPDATE recovery_custody_holds SET repo_id=$2 WHERE id=$1", f.hold, other)
 				case "future_generation":
-					req.Generation = 3
+					// Keep exact request/hold/publication identity; only the run is behind.
+					f.e.exec(t, "UPDATE runs SET claim_generation=0 WHERE id=$1", f.run)
 				case "user":
 					other := uuid.New()
 					f.e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@example.com")

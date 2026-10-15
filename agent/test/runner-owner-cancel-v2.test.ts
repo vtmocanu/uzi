@@ -14,7 +14,10 @@ import {
 installHarness();
 
 for (const scenario of ["old-generation-foreground", "late-quiescence", "identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
-  it(`V2 owner cancellation preserves frozen inventory: ${scenario}`, { skip: HELD_LINUX_ONLY }, async t => {
+  const name = scenario === "identical"
+    ? "#2901 before-model cancelled identical-tree inventory with no messages or checkpoint"
+    : `V2 owner cancellation preserves frozen inventory: ${scenario}`;
+  it(name, { skip: HELD_LINUX_ONLY }, async t => {
     const claim = gitlabClaim(30310, { claim_generation: 71, inventory_guarded: true });
     claim.secrets.codex = { auth_mode: "api_key", access_token: "fixture-key", capability: "fixture-capability" };
     const features = ["recovery_inventory_v1", "recovery_held_publication_v1", "recovery_held_publication_v2"];
@@ -53,6 +56,7 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
       return args[1].status === "failed" && scenario !== "old-generation-foreground" ? { ...ack, status: "cancelled" } : ack;
     });
     skipCheckpoints();
+    const checkpoint = mock.method(client, "publishCheckpoint");
     const freezes = watchFreezes(server);
     let models = 0, mono = 0, factories = 0;
     let budget: MaintenanceBudget | undefined, observedBudget: MaintenanceBudget | undefined;
@@ -63,7 +67,7 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
       if (scenario === "late-quiescence" && mono >= 600_000) lateReads.push(args[0]);
       return status(...args);
     });
-    let clone = "";
+    let clone = "", identicalTree = "";
     let dirtyBlob: string | undefined;
     let oldRoot: string | undefined;
     const executor: Executor = {
@@ -107,6 +111,10 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
         fs.appendFileSync(path.join(clone, "README.md"), "tracked change\n");
         fs.writeFileSync(path.join(clone, "untracked.txt"), "untracked change\n");
         dirtyBlob = command(clone, ["hash-object", "untracked.txt"]);
+      }
+      if (scenario === "identical") {
+        identicalTree = command(clone, ["rev-parse", "HEAD^{tree}"]);
+        assert.deepEqual(api.messages(claim.run_id), [], "no messages before cancellation observation");
       }
       if (scenario === "retained") flight.retainedEpisode = true;
       if (scenario !== "old-generation-foreground" && scenario !== "late-quiescence") r["observeCancellation"](flight);
@@ -152,6 +160,18 @@ for (const scenario of ["old-generation-foreground", "late-quiescence", "identic
       assert.equal(records[0]!.finalRequest?.disposition.kind, "held_publication");
       assert.equal(server.heldCalls[0]!.tip, records[0]!.sourceSha);
       const objects = packObjects(server.heldCalls[0]!.pack);
+      if (scenario === "identical") {
+        assert.equal(checkpoint.mock.callCount(), 0, "no checkpoint preceded held preservation");
+        assert.equal(command(records[0]!.coverageContext!.barePath,
+          ["rev-parse", `${records[0]!.sourceSha}^{tree}`]), identicalTree, "immutable capture has the identical pre-model tree");
+        // The executing-flight guard retains FINAL until the real execution tail closes.
+        assert.equal(server.acked(), 0);
+        await recoveryOf(r).resumePending();
+        assert.equal(server.heldCalls.length, 1, "reconciliation reuses the admitted publication");
+        assert.equal(server.archiveReserves(), 0);
+        assert.equal(server.acked(), 1, "exact held FINAL settles the cancellation");
+        assert.equal(server.finals[0]!.generation, 71);
+      }
       if (dirtyBlob) assert.ok(objects.has(dirtyBlob));
       if (oldRoot) assert.ok(objects.has(oldRoot));
     } else {
