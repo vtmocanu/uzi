@@ -1,8 +1,8 @@
 # Worker memory foundation reconciliation — issue #2396
 
-## Current integration — 2026-10-15, M1 still in progress
+## Current integration — 2026-10-15, M1 complete under approved deviations
 
-This section supersedes the current-state language in the older dated sections below; those sections remain historical evidence at their named revisions. M1 is **not complete**: the canonical agent gate is blocked by the supplied dependency environment. M4, M5a and M5b are not complete.
+This section supersedes the current-state language in the older dated sections below; those sections remain historical evidence at their named revisions. M1 implementation, review and required local checks are **complete** on tested source `164ef8b86be831489242315c762f8395f71dc20e`, under the human-approved merge-target and LiveDB deviations below. The subsequent evidence-only edit changes no gate inputs. M4, M5a and M5b are not complete.
 
 ### Integrated candidate and approved deviation
 
@@ -18,7 +18,7 @@ The new LiveDB admission parity case executes guarded/legacy memory holds with a
 
 Reviewer, tester and auditor completed immutable reviews through `fa3b99d4`, including both merge parents, retained delta against 4103fad7 and earlier evidence range 974d4992..a7f721c0. No mandatory source finding remained. Tester executed 235 focused tests with zero failures/skips/cancellations and an exported typecheck; a compiled heartbeat-revocation mutation failed the intended authority assertion. This proves that regression's sensitivity, not universal mutation coverage. Reviewer separately reviewed the three-field golden repair `fa3b99d4..eced6a26` with no findings.
 
-Reviewer deferred one lander-owned CI timing note at fa3b99d4. Tester identified absent separate coverage/pre-commit slots without proposing a patch requirement; no new gate was added. Auditor reported no graded security finding. Secrets canaries were detected with zero tracked findings; scoped Semgrep found zero findings/errors; agent/web npm audits reported zero vulnerabilities in the installed trees. These scans do not establish complete static coverage or matched-lockfile acceptance. govulncheck was unavailable and was not run.
+Reviewer deferred one lander-owned CI timing note at fa3b99d4. Tester identified absent separate coverage/pre-commit slots without proposing a patch requirement; no new gate was added. Auditor reported no graded security finding. Secrets canaries were detected with zero tracked findings; scoped Semgrep found zero findings/errors; agent/web npm audits reported zero vulnerabilities in the installed trees. These pre-reconciliation scans do not establish complete static coverage or vulnerability status of the subsequently updated installed packages. govulncheck was unavailable and was not run.
 
 ### Observed checks on this integration
 
@@ -30,7 +30,11 @@ All logs are run-local scratch artifacts, not published artifacts. Gates used pi
 | fa3b99d4 | check:migration-numbering check:migration-additive | PASS, EXIT=0; head 339 | gate-log.8vNJVe |
 | integrated source | npm run typecheck after fake observation/test narrowing repairs | PASS, EXIT=0; initial typecheck failure retained | gate-log.ssGDlX / gate-log.cRANeb |
 | fa3b99d4 | gate:agent | FAIL, EXIT=201 at dependency preflight; no complete agent gate | gate-log.dNvHT0 |
-| integrated source | deps-check:web | FAIL, EXIT=201 at dependency preflight | gate-log.4cy8xZ |
+| integrated source | deps-check:web before reconciliation | FAIL, EXIT=201 at dependency preflight | gate-log.4cy8xZ |
+| 164ef8b8 | deps-check:agent deps-check:web before reconciliation | FAIL, EXIT=201 at agent preflight; later web target not reached | gate-log.aImdx2 |
+| 164ef8b8 | approved incremental install, agent then web | PASS, EXIT=0 each; 4s / 2s; tracked manifests/locks unchanged | gate-log.oQWJvg / gate-log.PCOK5Z |
+| 164ef8b8 | deps-check:agent deps-check:web after reconciliation | PASS, EXIT=0; both lockfiles matched | gate-log.xZFd5A |
+| 164ef8b8 | gate:agent, root 120-minute command bound | PASS, EXIT=0; full unit and Codex conformance stages completed | gate-log.D0BFiu |
 | fa3b99d4 | gate:api | FAIL, EXIT=201; shared CI-repair golden omitted memory defaults | gate-log.wBCMRE |
 | fa3b99d4 / default export | narrowed CI-repair wire producer comparison | candidate FAIL, base PASS; actual merge defect repaired | gate-log.oZISri / gate-log.D0KfT8 |
 | eced6a26 | gate:api after golden repair/review | PASS, EXIT=0; fmt/vet/build/sqlc/lint/deadcode and race/count tests completed | gate-log.XifDao |
@@ -38,8 +42,17 @@ All logs are run-local scratch artifacts, not published artifacts. Gates used pi
 | integrated source | test:e2e-lib / test:forge-fake | PASS, EXIT=0 each | gate-log.2ZPOIj / gate-log.wecFCw |
 | eced6a26 | unchanged e2e/run-store-it.sh | FAIL, EXIT=1 solely at workersvc 15-minute package timeout | gate-log.JXAmc2 |
 | eced6a26 | human-authorized disposable LiveDB continuation and combined guards | PASS, EXIT=0; sweep-equivalent coverage under the deviation below | gate-log.is170A |
+| default 4103fad7 export | local workersvc-only LiveDB timing reference, identical Go flags/20m budget | PASS, EXIT=0; 1,290 passed, zero skipped | gate-log.oQs4jm |
 
-The supplied agent oxlint/native binding is 1.86.0 versus merged lockfile 1.87.0. Web additionally has @babel/parser 8.0.6 versus 8.0.7. No installed directory was deleted or reinstalled in this resumed implementation. Permission to reconcile these trees incrementally is pending; canonical matched-lockfile agent/web acceptance cannot be claimed. Focused green tests do not close the earlier interrupted full agent gate or classify the historical archive-fallback/durable-tail failures as pre-existing. Fresh complete agent validation remains required.
+### Provisioning deviation and completed agent gate
+
+Before reconciliation, the supplied agent oxlint/native binding was 1.86.0 versus merged lockfile 1.87.0; web additionally had @babel/parser 8.0.6 versus 8.0.7. The human confirmed worker provisioning had finished at run start and explicitly authorized bounded incremental reconciliation after the merge. This run had no outstanding installation command; it did not inspect the process table. Tracked package.json/package-lock.json status was clean before and after installation.
+
+Exactly once per package, serially, the lead ran `timeout --kill-after=30s 600 npm install --ignore-scripts --no-audit --no-fund` from agent/ and then web/. Agent ran 14:54:09–14:54:13 UTC (4s, EXIT=0); web ran 14:54:18–14:54:20 UTC (2s, EXIT=0). Neither node_modules directory was deleted; npm ci was not used. No tracked manifest or lockfile changed, so no installation change needed restoring. Both subsequent canonical dependency checks passed. Earlier failed dependency checks remain recorded.
+
+The unchanged canonical gate:agent then ran from 14:54:41 to 16:03:08 UTC (4,107s), EXIT=0. Lint reported zero warnings/errors; deadcode and typecheck completed. Units reported 15,154 tests, 15,139 passed, zero failures/cancellations, 15 skips, and **zero real-procfs skips**. Reported skip categories include packaged-profile/worker-UID/root prerequisites, missing ssh-agent, a live credential opt-in and non-Linux counterpart cases; they do not prove those environments. Codex conformance reported 183 passed with zero failures/cancellations/skips; its compiler and completeness checker passed (37 catalogued clauses, required claude/U, codex/U and codex/P matrix satisfied).
+
+The full unit log positively records both historical concerns passing: `new report proof transport failure preserves existing physical archive authority within the same budget` and `runner memory close preserves original feedback intent/custody with durable tail=true`. This accepts the current integrated candidate; it does not reclassify the old failed/interrupted observations as pre-existing or prove their original cause.
 
 ### LiveDB sweep-equivalent coverage: explicit deviation
 
@@ -51,11 +64,17 @@ That continuation ran locally from 14:30:22 to 14:46:20 UTC: workersvc **882.581
 
 Named live cases include memory admission parity, archive custody, owner-only Resume/Cancel/non-owner behavior, reservation concurrency/replay/identity/no-refund, allowance redispatch, checker authority, revision races, feedback deduplication and retained custody. Ordinary gate:api LiveDB skips are not the evidence for these claims; actual database execution above is.
 
-These durations are **local candidate observations**. A comparable successful default workersvc baseline and worker-UID before/after timing remain uncollected; no delta or CI timing claim follows. Final timing acceptance remains M5b work, with post-publication CI timing owned by the lander.
+### Local workersvc timing reference
+
+A default `4103fad73896f103bf7cebd743f009b0b6bde671` archive supplied the local before-change reference. A scratch-only harness copy retained its disposable database setup and skip/plain-package checks, selected workersvc only, and used the same exact Go flags and 20m package budget as the successful candidate execution. Git identity was resolved in the real checkout; Go VCS stamping was disabled for the exported benchmark. API go.mod/go.sum were byte-identical to the candidate. The default reference ran **after** the candidate, serially, from 16:04:10 to 16:17:59 UTC (829s harness wall time including setup/build); the cached postgres:17 image required no provisioning. Workersvc itself passed in **707.393s**, with 1,290 passing cases and zero skips. The candidate continuation used a fresh disposable database and cached image too, reporting **882.581s** for workersvc (958s harness wall time for workersvc plus recovery/poller/setup).
+
+The package-duration delta is **+175.188s (+24.77%)**, candidate minus default. Both successful executions used `-buildvcs=false -count=1 -v -race -p 1 -timeout 20m -run 'LiveDB$'`, equivalent tooling and the same host, one heavy job at a time. Source/test inventories differ; each is a single local observation, the baseline was collected later, and build-cache/host variation was not controlled. This does not isolate a causal runtime regression or establish hosted performance. The earlier failed 900.096s candidate run is not the successful baseline. The scratch timing reference is not another full seven-package default sweep.
+
+Worker-UID before/after timing and final M5b acceptance remain unfinished. Post-publication CI step/dependency-path timing remains lander-owned; no CI timing claim is made.
 
 ### Remaining acceptance
 
-M1 still requires a successful canonical agent gate and any necessary failure triage. A tracked literal consumer inspection found no new memory-result expectation in general e2e/phases, lib or forge-fake; existing requeue-exhaustion assertions describe their guard-off scenarios. Full Compose phases remain unrun. Real command-tree lane enrollment/execution, isolated 1Gi/2Gi calibration, complete bound stdout reports, owner-surface visuals/documentation and final serial gates remain later milestone work. Production remains default-off; no hosted sizing recommendation or real-kernel PID-recycling proof is claimed.
+M1 is complete under the approved deviations. The failed original sweep and initial API/dependency failures remain above with their actual outcomes and follow-up evidence. A tracked literal consumer inspection found no new memory-result expectation in general e2e/phases, lib or forge-fake; existing requeue-exhaustion assertions describe their guard-off scenarios. Full Compose phases remain unrun. Real command-tree lane enrollment/execution, isolated 1Gi/2Gi calibration, complete bound stdout reports, owner-surface visuals/documentation and final serial gates remain later milestone work. Production remains default-off; no hosted sizing recommendation or real-kernel PID-recycling proof is claimed.
 
 
 ## Current resumed integration — 2026-10-14, M1 still in progress
