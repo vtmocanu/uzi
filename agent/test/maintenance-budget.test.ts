@@ -66,3 +66,55 @@ test("RPC checks budget after action even before timer fires", async t => {
   await new Promise(resolve => setImmediate(resolve));
   assert.equal(cleaned, 1);
 });
+
+test("a Git-style active budget scope retains attempt identity for nested isolation", async t => {
+  const first = new MaintenanceBudget();
+  const second = new MaintenanceBudget();
+  t.after(() => { first.dispose(); second.dispose(); });
+  await MaintenanceBudget.runAttempt("first:1", () => first, async () => {
+    MaintenanceBudget.observeCancellation();
+    await MaintenanceBudget.run(first, async () => {
+      assert.equal(MaintenanceBudget.isAttempt("first:1"), true);
+      await MaintenanceBudget.runAttempt("second:1", () => second, async () => {
+        assert.equal(MaintenanceBudget.current(), undefined);
+        assert.equal(MaintenanceBudget.observeCancellation(), second);
+      });
+      assert.equal(MaintenanceBudget.current(), first);
+    });
+  });
+});
+
+test("late attempt activation reaches awaiting callers once and isolates run and generation", async t => {
+  const budget = new MaintenanceBudget();
+  t.after(() => budget.dispose());
+  let factories = 0, actions = 0;
+  await MaintenanceBudget.runAttempt("run:1", () => { factories++; return budget; }, async () => {
+    actions++;
+    assert.equal(MaintenanceBudget.current(), undefined);
+    await MaintenanceBudget.runAttempt("run:1", () => { throw new Error("renewed"); }, async () => {
+      await Promise.resolve();
+      MaintenanceBudget.observeCancellation();
+    });
+    assert.equal(MaintenanceBudget.current(), budget);
+    for (const identity of ["other:1", "run:2"]) {
+      await MaintenanceBudget.runAttempt(identity, () => { throw new Error("unused"); }, async () => {
+        assert.equal(MaintenanceBudget.current(), undefined);
+      });
+    }
+    assert.equal(MaintenanceBudget.observeCancellation(), budget);
+  });
+  assert.equal(factories, 1);
+  assert.equal(actions, 1);
+  assert.equal(MaintenanceBudget.current(), undefined);
+});
+
+test("attempt activation inherits an expired explicit cap without renewing", t => {
+  let now = 0, factories = 0;
+  const budget = new MaintenanceBudget(10, () => now);
+  t.after(() => budget.dispose());
+  MaintenanceBudget.run(budget, () => {
+    now = 10;
+    assert.throws(() => MaintenanceBudget.runAttempt("run:1", () => { factories++; return budget; }, () => {}), /maintenance deadline/);
+  });
+  assert.equal(factories, 0);
+});

@@ -333,6 +333,8 @@ export interface FrozenOperationOptions {
 }
 
 export interface CaptureInput {
+  /** Foreground attempts hand their first observed cancellation back to the flight. Never serialized. */
+  onCancellationObserved?: () => MaintenanceBudget;
   record: RecoveryRecord;
   barePath: string;
   /** The fresh-forge-tip inputs (D5). The PAT is used ONLY here, on the failure path
@@ -650,7 +652,7 @@ const captureCycleTails = new Map<string, Promise<void>>();
 
 function maintenanceSignal(signal?: AbortSignal): AbortSignal | undefined {
   const budget = MaintenanceBudget.current();
-  budget?.check();
+  MaintenanceBudget.current()?.check();
   return budget ? (signal ? AbortSignal.any([signal, budget.signal]) : budget.signal) : signal;
 }
 
@@ -663,16 +665,15 @@ function maintenanceSignalArgs(): [] | [AbortSignal] {
 async function recoveryRPC<T>(action: () => T | Promise<T>): Promise<T> {
   const budget = MaintenanceBudget.current();
   const value = await (budget ? budget.raceIO(async () => action()) : action());
-  budget?.check();
+  MaintenanceBudget.current()?.check();
   return value;
 }
 
 /** Owned operations settle before their lock or child ownership can be released. */
 async function ownedRecoveryIO<T>(action: () => T | Promise<T>): Promise<T> {
-  const budget = MaintenanceBudget.current();
-  budget?.check();
+  MaintenanceBudget.current()?.check();
   const value = await action();
-  budget?.check();
+  MaintenanceBudget.current()?.check();
   return value;
 }
 
@@ -690,7 +691,7 @@ async function runCaptureCycle<T>(
   fn: () => Promise<T>,
 ): Promise<T | { ran: true; value: T } | { ran: false }> {
   const budget = MaintenanceBudget.current();
-  budget?.check();
+  MaintenanceBudget.current()?.check();
   const previous = captureCycleTails.get(key);
   if (mode === "skip" && previous) return { ran: false };
   let release!: () => void;
@@ -704,9 +705,9 @@ async function runCaptureCycle<T>(
     // An expired waiter releases only its placeholder, behind the earlier holder.
     if (budget) await budget.raceIO(() => previous ?? Promise.resolve());
     else await previous;
-    budget?.check();
+    MaintenanceBudget.current()?.check();
     const value = await fn();
-    budget?.check();
+    MaintenanceBudget.current()?.check();
     return mode === "skip" ? { ran: true, value } : value;
   } finally {
     release();
@@ -1022,7 +1023,6 @@ export class RecoveryCoordinator {
       if (!input.locallyQuiescent && !(await this.inactiveInventory(probe))) return undefined;
       if (!(await this.openInventoryHold(probe))) return undefined;
       let exactHoldBinding: RecoveryRecord["exactHoldBinding"];
-      let observedCancelled = false;
       if (input.repoId && this.client.getExactRecoveryHold) {
         const response = await recoveryRPC(() => this.client.listRecoveryHolds(context.runId));
         const holds = response.run_id === context.runId && Array.isArray(response.holds)
@@ -1030,11 +1030,12 @@ export class RecoveryCoordinator {
         if (holds.length === 1 && HELD_PUBLICATION_ID_RE.test(holds[0]!.hold_id) && HELD_PUBLICATION_ID_RE.test(input.repoId)) {
           const binding = { holdId: holds[0]!.hold_id, repoId: input.repoId };
           const exact = await recoveryRPC(() => this.client.getExactRecoveryHold!(context.runId, context.generation, binding, ...maintenanceSignalArgs()));
-          if (exact?.state === "open") {
-            exactHoldBinding = binding;
-            if (exact.run_status === "cancelled") {
-              observedCancelled = true;
-            }
+          if (exact && exact.run_id === context.runId && exact.generation === context.generation &&
+              exact.hold_id === binding.holdId && exact.repo_id === binding.repoId && exact.inventory_guarded === true) {
+            if (exact.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
+                exact.current_claim_generation >= context.generation) MaintenanceBudget.observeCancellation();
+            if (exact.state === "released" || exact.state === "discarded") return undefined;
+            if (exact.state === "open") exactHoldBinding = binding;
           }
         }
       }
@@ -1043,6 +1044,7 @@ export class RecoveryCoordinator {
         if (input.settledEvidence === "publication") {
           try {
             const own = await recoveryRPC(() => this.client.getRunOwnership!(context.runId));
+            if (own.status === "cancelled" && own.claim_generation === context.generation && own.inventory_guarded === true) MaintenanceBudget.observeCancellation();
             if (own.status !== "completed" || own.claim_generation !== context.generation || own.inventory_guarded !== true) return undefined;
           } catch { MaintenanceBudget.current()?.check(); return undefined; }
         }
@@ -1104,10 +1106,8 @@ export class RecoveryCoordinator {
           return record;
         });
       };
-      return observedCancelled && !MaintenanceBudget.current()
-        ? this.withCancellationAttempt(probe, freezeRemaining, undefined, true, input.onCancellationObserved)
-        : freezeRemaining();
-    }), undefined, false, input.onCancellationObserved);
+      return freezeRemaining();
+    }), undefined, input.onCancellationObserved);
   }
 
   /**
@@ -1178,7 +1178,7 @@ export class RecoveryCoordinator {
     }
   }
 
-  private async inactiveInventory(record: RecoveryRecord, onCancelled?: () => void): Promise<boolean> {
+  private async inactiveInventory(record: RecoveryRecord): Promise<boolean> {
     const generation = record.generation;
     if (this.isExecuting(record.runId) || !this.client.hasFeature?.("recovery_inventory_v1") ||
         !this.client.getRunOwnership || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return false;
@@ -1190,7 +1190,9 @@ export class RecoveryCoordinator {
       return !!(record.inventoryGuarded && record.finalRequest) || await this.openInventoryHold(record);
     }
     if (!Number.isSafeInteger(own.claim_generation) || own.claim_generation! < generation) return false;
-    if (own.status === "cancelled" && own.inventory_guarded === true) onCancelled?.();
+    if (own.status === "cancelled" && own.inventory_guarded === true) {
+      MaintenanceBudget.observeCancellation();
+    }
     // A later claim ends this exact generation, even while the successor is active or unguarded.
     // The MAC-covered original guard and exact hold checks remain the custody authority.
     return own.claim_generation! > generation ||
@@ -1217,7 +1219,10 @@ export class RecoveryCoordinator {
 
   /** One read per boundary, no retries. Unknown evidence retains all sources and blocks writes.
    * A validated closed hold is settled, never a release ACK or local cleanup permission. */
-  async heldOperationState(record: RecoveryRecord, signal?: AbortSignal, onCancelled?: () => void): Promise<"open" | "settled" | "unknown"> {
+  async heldOperationState(record: RecoveryRecord, signal?: AbortSignal): Promise<"open" | "settled" | "unknown"> {
+    if (!MaintenanceBudget.isAttempt(`${record.runId}:${record.generation}`)) {
+      return this.withCancellationAttempt(record, () => this.heldOperationState(record, signal));
+    }
     try {
       const current = await this.requireRecord(record);
       if (current.holdSettlement) return "settled";
@@ -1228,11 +1233,11 @@ export class RecoveryCoordinator {
       if (!exact || exact.run_id !== current.runId || exact.generation !== current.generation ||
           exact.hold_id !== current.exactHoldBinding.holdId || exact.repo_id !== current.exactHoldBinding.repoId ||
           exact.inventory_guarded !== true) return "unknown";
-      if (exact.state === "open") {
-        if (exact.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
-            exact.current_claim_generation >= current.generation!) onCancelled?.();
-        return "open";
+      if (exact.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
+          exact.current_claim_generation >= current.generation!) {
+        MaintenanceBudget.observeCancellation();
       }
+      if (exact.state === "open") return "open";
       if (exact.state !== "released" && exact.state !== "discarded") return "unknown";
       await this.writeExistingRecord(current, cur => ({ ...cur, holdSettlement: exact }));
       return "settled";
@@ -1319,6 +1324,10 @@ export class RecoveryCoordinator {
   }
 
   private async finalizeInventory(snapshot: RecoveryRecord, reconcile = true): Promise<RecoveryOutcome | void> {
+    return this.withCancellationAttempt(snapshot, () => this.finalizeInventoryInAttempt(snapshot, reconcile));
+  }
+
+  private async finalizeInventoryInAttempt(snapshot: RecoveryRecord, reconcile = true): Promise<RecoveryOutcome | void> {
     if (!snapshot.coverageContext || typeof snapshot.generation !== "number") return;
     let outcome: RecoveryOutcome | void = undefined;
     let sourceVerified = true;
@@ -1344,6 +1353,18 @@ export class RecoveryCoordinator {
    * its report, without granting FINAL, capture or cleanup authority. */
   /** ACK-only report retirement never settles or rewrites recovery evidence. */
   async retireAcknowledgedFinalReport(
+    runId: string, generation: number,
+    budget: { signal: AbortSignal; deadline: number },
+    reserve: (action: (ownTailEligible: () => boolean) => Promise<void>) => Promise<void>,
+    inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
+      laterHead: (head: string) => boolean) => Promise<boolean>,
+    remove: (ownTailEligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
+    return this.withCancellationAttempt({ runId, generation, inventoryGuarded: true } as RecoveryRecord,
+      () => this.retireAcknowledgedFinalReportWithinAttempt(runId, generation, budget, reserve, inspectSources, remove));
+  }
+
+  private async retireAcknowledgedFinalReportWithinAttempt(
     runId: string, generation: number,
     budget: { signal: AbortSignal; deadline: number },
     reserve: (action: (ownTailEligible: () => boolean) => Promise<void>) => Promise<void>,
@@ -1389,6 +1410,7 @@ export class RecoveryCoordinator {
           const removed = await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
             check();
             const ownership = await recoveryRPC(() => this.client.getRunOwnership!(runId, budget));
+            if (ownership?.status === "cancelled" && ownership.claim_generation === generation && ownership.inventory_guarded === true) MaintenanceBudget.observeCancellation();
             if (!ownership || ownership.status !== "completed" ||
                 !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
                 ownership.inventory_guarded !== true) return false;
@@ -1465,6 +1487,18 @@ export class RecoveryCoordinator {
       laterHead: (head: string) => boolean) => Promise<boolean>,
     remove: (ownTailEligible: () => boolean) => Promise<void>,
   ): Promise<void> {
+    return this.withCancellationAttempt({ runId, generation, inventoryGuarded: true } as RecoveryRecord,
+      () => this.retireArchivedReportWithinAttempt(runId, generation, budget, reserve, inspectSources, remove));
+  }
+
+  private async retireArchivedReportWithinAttempt(
+    runId: string, generation: number,
+    budget: { signal: AbortSignal; deadline: number },
+    reserve: (action: (ownTailEligible: () => boolean) => Promise<void>) => Promise<void>,
+    inspectSources: (bare: string, covered: (head: string) => Promise<boolean>,
+      laterHead: (head: string) => boolean) => Promise<boolean>,
+    remove: (ownTailEligible: () => boolean) => Promise<void>,
+  ): Promise<void> {
     if (!this.enabled || !Number.isSafeInteger(generation) || generation <= 0 ||
         !this.git.withBareLock || !this.git.withReportProofBudget ||
         !this.git.enumerateOwedUnderLock || !this.git.readInventoryCloneHeads ||
@@ -1492,6 +1526,7 @@ export class RecoveryCoordinator {
           const removed = await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
             check();
             const ownership = await recoveryRPC(() => this.client.getRunOwnership!(runId, budget));
+            if (ownership?.status === "cancelled" && ownership.claim_generation === generation && ownership.inventory_guarded === true) MaintenanceBudget.observeCancellation();
             if (!ownership || !["completed", "failed", "cancelled"].includes(ownership.status) ||
                 !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
                 (ownership.inventory_guarded !== undefined && typeof ownership.inventory_guarded !== "boolean")) return false;
@@ -1785,7 +1820,8 @@ export class RecoveryCoordinator {
     if (!this.enabled || !HELD_PUBLICATION_ID_RE.test(publicationId)) return "fallback";
     if (residueQuarantine() !== undefined) return "kept";
     try {
-      return await runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId));
+      return await this.withCancellationAttempt(record, async () =>
+        runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId)));
     } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: held publication final not completed; custody retained", {
         run_id: record.runId, generation: record.generation, error: errText(err) });
@@ -1912,58 +1948,60 @@ export class RecoveryCoordinator {
 
   /** One probe per entry, before queueing. Unknown custody grants no new authority.
    * Nested work keeps even an expired ambient object; only its creator disposes it. */
-  private async withCancellationAttempt<T>(record: RecoveryRecord, action: () => Promise<T>, attempts?: Map<string, MaintenanceBudget>, knownCancelled = false, onCancellationObserved?: () => MaintenanceBudget): Promise<T> {
-    const inherited = MaintenanceBudget.current();
+  private async withCancellationAttempt<T>(record: RecoveryRecord, action: () => Promise<T>, attempts?: Map<string, MaintenanceBudget>, onCancellationObserved?: () => MaintenanceBudget): Promise<T> {
     const key = `${record.runId}:${record.generation}`;
-    let budget = inherited ?? attempts?.get(key);
-    if (!budget) {
-      let trusted = record;
-      if (record.captureId && !knownCancelled) {
-        try { trusted = await this.requireRecord(record); }
-        catch (error) { if (error instanceof RecordGoneError) return action(); throw error; }
-      }
-      let cancelled = knownCancelled;
-      try {
-        if (!knownCancelled && trusted.exactHoldBinding) {
-          const binding = trusted.exactHoldBinding;
-          const exact = await recoveryRPC(() => this.client.getExactRecoveryHold?.(
-            trusted.runId, trusted.generation!, binding));
-          cancelled = !!exact && exact.run_id === trusted.runId && exact.generation === trusted.generation &&
-            exact.hold_id === binding.holdId && exact.repo_id === binding.repoId &&
-            exact.inventory_guarded === true && exact.state === "open" && exact.run_status === "cancelled" &&
-            Number.isSafeInteger(exact.current_claim_generation) && exact.current_claim_generation >= trusted.generation!;
-        } else if (!knownCancelled) {
-          const own = await recoveryRPC(() => this.client.getRunOwnership?.(trusted.runId));
-          cancelled = !!own && own.status === "cancelled" && Number.isSafeInteger(own.claim_generation) &&
-            typeof trusted.generation === "number" && own.claim_generation! >= trusted.generation &&
-            (!trusted.inventoryGuarded || own.inventory_guarded === true);
-        }
-      } catch { /* An unavailable status never authorizes cancellation maintenance. */ }
-      if (cancelled) {
-        budget = onCancellationObserved?.() ?? this.testHooks?.maintenanceBudget?.() ?? new MaintenanceBudget();
-        attempts?.set(key, budget);
-      }
+    if (MaintenanceBudget.isAttempt(key)) {
+      MaintenanceBudget.current()?.check();
+      return action();
     }
-    if (!budget) return action();
-    const attempt = budget;
+    let owned: MaintenanceBudget | undefined;
+    const factory = () => {
+      const cached = attempts?.get(key);
+      if (cached) return cached;
+      const budget = onCancellationObserved?.() ?? this.testHooks?.maintenanceBudget?.() ?? new MaintenanceBudget();
+      attempts?.set(key, budget);
+      if (!attempts && !onCancellationObserved) owned = budget;
+      return budget;
+    };
     try {
-      return await MaintenanceBudget.run(attempt, async () => {
-        attempt.check();
+      return await MaintenanceBudget.runAttempt(key, factory, async () => {
+        // An expired object from this pass must stop before journal reads or the entry probe.
+        if (attempts?.has(key)) MaintenanceBudget.observeCancellation();
+        MaintenanceBudget.current()?.check();
+        let trusted = record;
+        if (record.captureId && !MaintenanceBudget.current()) {
+          try { trusted = await this.requireRecord(record); }
+          catch (error) { if (error instanceof RecordGoneError) return action(); throw error; }
+        }
+        if (!MaintenanceBudget.current()) {
+          try {
+            if (trusted.exactHoldBinding) {
+              const binding = trusted.exactHoldBinding;
+              const exact = await recoveryRPC(() => this.client.getExactRecoveryHold?.(trusted.runId, trusted.generation!, binding));
+              if (exact && exact.run_id === trusted.runId && exact.generation === trusted.generation &&
+                  exact.hold_id === binding.holdId && exact.repo_id === binding.repoId &&
+                  exact.inventory_guarded === true && ["open", "released", "discarded"].includes(exact.state) &&
+                  exact.run_status === "cancelled" && Number.isSafeInteger(exact.current_claim_generation) &&
+                  exact.current_claim_generation >= trusted.generation!) MaintenanceBudget.observeCancellation();
+            } else {
+              const own = await recoveryRPC(() => this.client.getRunOwnership?.(trusted.runId));
+              if (own && own.status === "cancelled" && Number.isSafeInteger(own.claim_generation) &&
+                  typeof trusted.generation === "number" && own.claim_generation! >= trusted.generation &&
+                  (!trusted.inventoryGuarded || own.inventory_guarded === true)) MaintenanceBudget.observeCancellation();
+            }
+          } catch { MaintenanceBudget.current()?.check(); /* Missing status grants no maintenance authority. */ }
+        }
         const run = async () => {
-          attempt.check();
+          MaintenanceBudget.current()?.check();
           const result = await action();
-          attempt.check();
+          MaintenanceBudget.current()?.check();
           return result;
         };
-        const result = this.git.withRecoveryOperation
-          ? await this.git.withRecoveryOperation(attempt.signal, Infinity, run)
-          : await run();
-        attempt.check();
-        return result;
+        const budget = MaintenanceBudget.current();
+        return budget && this.git.withRecoveryOperation
+          ? this.git.withRecoveryOperation(budget.signal, Infinity, run) : run();
       });
-    } finally {
-      if (!inherited && !attempts && !onCancellationObserved) attempt.dispose();
-    }
+    } finally { owned?.dispose(); }
   }
 
   /** Shared foreground/boot/live ordering, serialized once per frozen generation. */
@@ -1971,10 +2009,10 @@ export class RecoveryCoordinator {
     if (!this.enabled || residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
     return this.withCancellationAttempt(input.record, async () =>
       runCaptureCycle(await this.cycleKey(input.record), "wait",
-        () => this.frozenOperationCycle(input, options)));
+        () => this.frozenOperationCycle(input, options)), undefined, input.onCancellationObserved);
   }
 
-  private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}, attempts?: Map<string, MaintenanceBudget>): Promise<RecoveryOutcome> {
+  private async frozenOperationCycle(input: CaptureInput, options: FrozenOperationOptions = {}): Promise<RecoveryOutcome> {
     let record = await this.requireRecord(input.record);
     const outcome = (held: NonNullable<RecoveryOutcome["held"]>): RecoveryOutcome =>
       ({ state: record.state, captureId: record.captureId, held });
@@ -2000,11 +2038,8 @@ export class RecoveryCoordinator {
         return this.captureCycle({ ...input, record });
       }
     }
-    let cancelled = false;
-    let hold = await this.heldOperationState(record, input.signal, () => { cancelled = true; });
+    let hold = await this.heldOperationState(record, input.signal);
     if (hold !== "open") return this.heldStopped(record, hold);
-    if (cancelled && !MaintenanceBudget.current()) return this.withCancellationAttempt(record,
-      () => this.frozenOperationCycle(input, options, attempts), attempts, true);
     if (record.heldCreateUncertain) {
       if (!this.client.publishHeld || input.signal?.aborted || residueQuarantine() !== undefined) return outcome("kept");
       try {
@@ -2048,15 +2083,13 @@ export class RecoveryCoordinator {
             ["failed", "cancelled", "completed"].includes(exact.run_status)) {
           terminal = { status: exact.run_status as "failed" | "cancelled" | "completed",
             fail_origin: options.terminal?.fail_origin };
-          if (exact.run_status === "cancelled" && !MaintenanceBudget.current()) {
-            return this.withCancellationAttempt(record,
-              () => this.frozenOperationCycle(input, options, attempts), attempts, true);
-          }
+          if (exact.run_status === "cancelled") MaintenanceBudget.observeCancellation();
         }
       } catch { MaintenanceBudget.current()?.check(); /* Unknown terminal eligibility retains the archive policy. */ }
     } else if (!options.foreground) {
       try {
         const own = await recoveryRPC(() => this.client.getRunOwnership?.(record.runId));
+        if (own?.status === "cancelled" && own.inventory_guarded === true && Number.isSafeInteger(own.claim_generation) && own.claim_generation! >= record.generation!) MaintenanceBudget.observeCancellation();
         terminal = own && Number.isSafeInteger(own.claim_generation) &&
           own.claim_generation! >= record.generation! &&
           ["failed", "cancelled", "completed"].includes(own.status)
@@ -2154,7 +2187,7 @@ export class RecoveryCoordinator {
     return archived ?? this.captureCycle({ ...input, record: await this.requireRecord(record) });
   }
 
-  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting, attempts?: Map<string, MaintenanceBudget>): Promise<RecoveryOutcome | void> {
+  private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting): Promise<RecoveryOutcome | void> {
     if (record.holdSettlement && !record.finalRequest && !record.finalAcknowledged && !record.completionReceipt) return this.heldStopped(record, "settled");
     if (record.completionReceipt) {
       await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
@@ -2164,14 +2197,11 @@ export class RecoveryCoordinator {
       await this.forgetGenerationWithinCycle(record.runId, record.generation!, isExecuting, signal);
       return;
     }
-    let cancelled = false;
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged ||
-        !(await this.inactiveInventory(record, () => { cancelled = true; }))) return;
-    if (cancelled && !MaintenanceBudget.current()) return this.withCancellationAttempt(record,
-      () => this.resumeInventory(record, signal, isExecuting, attempts), attempts, true);
+        !(await this.inactiveInventory(record))) return;
     const barePath = record.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(record.bareDir!));
     if (!barePath) return;
-    return this.frozenOperationCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal }, {}, attempts);
+    return this.frozenOperationCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal });
   }
 
   /** Credential-free discovery precedes the journal snapshot; authentication is required
@@ -2211,9 +2241,7 @@ export class RecoveryCoordinator {
         const probe = existing.find(r => r.generation === ctx.generation && r.exactHoldBinding) ??
           { runId: ctx.runId, generation: ctx.generation, inventoryGuarded: true } as RecoveryRecord;
         const materialize = async (): Promise<void> => {
-        let cancelled = false;
-        if (!(await this.inactiveInventory(probe, () => { cancelled = true; }))) return;
-        if (cancelled && !MaintenanceBudget.current()) return this.withCancellationAttempt(probe, materialize, attempts, true);
+        if (!(await this.inactiveInventory(probe))) return;
         // Issue #2545: a generation with a journaled held_publication FINAL has its identity fixed by
         // that request. A second snapshot (it would differ in its original source) would only mint a
         // redundant archive beside the held release, so the pending request is replayed instead.
@@ -2289,7 +2317,8 @@ export class RecoveryCoordinator {
     if (!this.enabled) return { state: "pinned", captureId: input.record.captureId };
     // issue #2213: a latched worker captures and uploads nothing; the record and pin stay as they are.
     if (residueQuarantine() !== undefined) return quarantinedOutcome(input.record.captureId);
-    return runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input));
+    return this.withCancellationAttempt(input.record, async () =>
+      runCaptureCycle(await this.cycleKey(input.record), "wait", () => this.captureCycle(input)), undefined, input.onCancellationObserved);
   }
 
   /** The capture cycle; the caller holds the record's capture-cycle lock. */
@@ -2938,7 +2967,7 @@ export class RecoveryCoordinator {
         if (snap.state === "uploaded" && !snap.inventoryGuarded) { if (archiveProvesPin(snap)) cleanups.push(snap); continue; }
         try {
           await this.withCancellationAttempt(snap, async () =>
-            runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal, attempts)), attempts);
+            runCaptureCycle(await this.cycleKey(snap), "wait", () => this.pendingStep(snap, signal)), attempts);
         } catch (err) { MaintenanceBudget.current()?.check(); failure ??= err; }
       }
       await this.bootPinCleanups(cleanups, signal);
@@ -2981,7 +3010,7 @@ export class RecoveryCoordinator {
   }
 
   /** One boot-sweep record step; the caller holds the record's capture-cycle lock. */
-  private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal, attempts?: Map<string, MaintenanceBudget>): Promise<void> {
+  private async pendingStep(snap: RecoveryRecord, signal?: AbortSignal): Promise<void> {
     // Re-read the current, authenticated state of exactly this snapshotted record.
     const record = await this.readRecord(this.recordPath(snap));
     if (!record) return;
@@ -2995,7 +3024,7 @@ export class RecoveryCoordinator {
       });
     };
     try {
-      if (record.inventoryGuarded) { await this.resumeInventory(record, signal, this.isExecuting, attempts); return; }
+      if (record.inventoryGuarded) { await this.resumeInventory(record, signal, this.isExecuting); return; }
       if (record.state === "uploaded") return;
       if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
         // A disposition the api or the local bytes made final: never retried (issue #1995).
@@ -3230,7 +3259,7 @@ export class RecoveryCoordinator {
         let res;
         try {
           res = await this.withCancellationAttempt(snap, async () =>
-            runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts, attempts)), attempts);
+            runCaptureCycle(await this.cycleKey(snap), "skip", () => this.liveStep(snap, opts)), attempts);
         } catch (err) {
           MaintenanceBudget.current()?.check();
           transient = true;
@@ -3287,7 +3316,7 @@ export class RecoveryCoordinator {
   }
 
   /** One live record step; the caller holds the record's capture-cycle lock. */
-  private async liveStep(snap: RecoveryRecord, opts: ResumeLiveOptions, attempts?: Map<string, MaintenanceBudget>): Promise<"ok" | "transient" | "credential"> {
+  private async liveStep(snap: RecoveryRecord, opts: ResumeLiveOptions): Promise<"ok" | "transient" | "credential"> {
     const log = (outcome: string, reason?: string): void => {
       this.log.info("recovery live re-drive", {
         run_id: snap.runId,
@@ -3312,7 +3341,7 @@ export class RecoveryCoordinator {
     this.lastAttemptAt.set(record.captureId, this.now());
     try {
       const out = record.inventoryGuarded
-        ? await this.resumeInventory(record, opts.signal, opts.isExecuting, attempts)
+        ? await this.resumeInventory(record, opts.signal, opts.isExecuting)
         : await this.uploadJournaledBundle(record, opts.signal, "live");
       if (!out) return "ok";
       log(out.state, out.reason);
@@ -3822,8 +3851,7 @@ export class RecoveryCoordinator {
   }
 
   private withJournalLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    const budget = MaintenanceBudget.current();
-    budget?.check();
+    MaintenanceBudget.current()?.check();
     return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)),
       () => ownedRecoveryIO(fn), maintenanceSignal(signal));
   }

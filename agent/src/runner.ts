@@ -1774,6 +1774,8 @@ function logScratchPublicationRefused(
  */
 interface RunFlight {
   cancellationBudget?: MaintenanceBudget;
+  /** A raw cancellation response did not prove this flight's generation. Never a release authority. */
+  cancellationCustodyUnknown?: boolean;
   readonly runId: string;
   executor: Executor;
   effectiveAttemptPaths?: boolean;
@@ -3201,6 +3203,14 @@ export class RunRunner {
   }
 
   private async executeClaim(claim: ClaimResponse): Promise<void> {
+    let observedFlight: RunFlight | undefined;
+    return MaintenanceBudget.runAttempt(`${claim.run_id}:${claim.claim_generation ?? 0}`, () => {
+      if (!observedFlight) throw new Error("cancellation observed before flight initialization");
+      return this.observeCancellation(observedFlight);
+    }, () => this.executeClaimInAttempt(claim, flight => { observedFlight = flight; }));
+  }
+
+  private async executeClaimInAttempt(claim: ClaimResponse, onFlight: (flight: RunFlight) => void): Promise<void> {
     const runId = claim.run_id;
     // PRD #1171 M3 (redactor canary hoist): register the Codex access-token + capability
     // canaries with the logger BEFORE makeExecutor, so a construction error inside the
@@ -3247,6 +3257,7 @@ export class RunRunner {
       gitBasic,
       runScopedSecrets,
     );
+    onFlight(flight);
     const { runLog, batcher, reportState, steering } = flight;
     // PRD #1390 M2a: register this run in the active-run snapshot registry at `running`,
     // at the generation it was claimed at, so the worker's next ActiveSnapshot lists it.
@@ -5185,6 +5196,10 @@ export class RunRunner {
    * it never throws and never changes the run's honest report.
    */
   private async settleUnadoptedGuardedClaim(claim: ClaimResponse, flight: RunFlight, runLog: Logger): Promise<void> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return;
+    if (!MaintenanceBudget.current() && flight.cancellationBudget) {
+      return this.runCancellationMaintenance(flight, () => this.settleUnadoptedGuardedClaim(claim, flight, runLog)).catch(() => undefined);
+    }
     if (claim.inventory_guarded !== true || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind)) ||
         flight.barePath !== undefined || flight.worktreePath !== undefined || flight.runnerClone !== undefined) return;
@@ -6017,6 +6032,7 @@ export class RunRunner {
               (await this.git.defaultBranchName(capBarePath)) ||
               "main";
             const outcome = await this.recovery.captureAndUpload({
+              onCancellationObserved: () => this.observeCancellation(flight),
               record: recoveryRecord,
               barePath: capBarePath,
               defaultBranch: capDefaultBranch,
@@ -8733,6 +8749,11 @@ export class RunRunner {
           return this.runCancellationMaintenance(flight, () => flight.prepareTerminalInventory(pending)).catch(() => undefined);
         }
         if (this.completionReceipts.has(this.completionKey(runId, claimGeneration))) return;
+        if (flight.cancellationCustodyUnknown) {
+          flight.preserveRecoveryClone = true;
+          flight.preserveSession = true;
+          return;
+        }
         // Owner cancellation has one stronger producer. A refusal there must never fall
         // through to the ordinary terminal snapshot, which lacks registry drainage.
         if (this.isCredentialFreeOwnerCancel(claim, flight)) {
@@ -8827,9 +8848,12 @@ export class RunRunner {
         if (checked && stamped.claim_generation !== flight.claimGeneration)
           throw new Error("plan cross-check: state generation changed");
         const diskSeq = body.status !== undefined ? this.diskGovernor?.statusRequested(runId, body.status) : undefined;
-        const sending = checked
+        const transport = () => checked
           ? this.client.reportPlanCrossCheckGateState(runId, stamped, signal)
           : this.client.reportState(runId, stamped, signal);
+        // Preservation expiry cannot prevent the honest terminal report. FINAL stays budgeted.
+        const sending = body.status === "failed" || body.status === "completed"
+          ? MaintenanceBudget.withoutAttempt(transport) : transport();
         const senders = flight.stateSenders ??= new Set();
         senders.add(sending);
         let ack: StateAck;
@@ -12029,7 +12053,11 @@ export class RunRunner {
    */
   /** Cancellation observation changes metadata and stops the model, never grants custody authority. */
   private observeCancellation(flight: RunFlight): MaintenanceBudget {
-    try { return flight.cancellationBudget ??= MaintenanceBudget.current() ?? this.cancellationBudgetFactory(); }
+    try {
+      const budget = flight.cancellationBudget ??= MaintenanceBudget.current() ?? this.cancellationBudgetFactory();
+      MaintenanceBudget.attachObserved(`${flight.runId}:${flight.claimGeneration}`, budget);
+      return budget;
+    }
     finally {
       try { flight.steering.markCancelled(); }
       finally {
@@ -12046,6 +12074,7 @@ export class RunRunner {
     if (own.status === "cancelled") {
       // Stop observation never grants this source authority over another generation.
       if (own.claim_generation === undefined || own.claim_generation !== flight.claimGeneration) {
+        flight.cancellationCustodyUnknown = true;
         flight.keepGuardedInventoryOpen = true;
         flight.preserveRecoveryClone = true;
         flight.preserveSession = true;
@@ -12085,7 +12114,7 @@ export class RunRunner {
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       return this.runCancellationMaintenance(flight, () => this.quiesceRun(flight, executor, opts)).catch(() => ({ outcome: { process: { state: "unverified" as const, processes: [], killed: [], detail: "maintenance deadline exhausted" }, docker: { state: "not_wired" as const, removed: [], detail: "maintenance deadline exhausted" } }, blocked: true }));
     }
-    return flight.sinkGate.run(async () => {
+    try { return await flight.sinkGate.run(async () => {
       MaintenanceBudget.current()?.check();
       await executor.closeAndSettlePlanSummary?.(MaintenanceBudget.current()?.remainingMs());
       MaintenanceBudget.current()?.check();
@@ -12196,7 +12225,15 @@ export class RunRunner {
         });
       }
       return { outcome, blocked };
-    });
+    }); } catch (error) {
+      if (!this.cancellationExpired(flight) && !MaintenanceBudget.current()?.signal.aborted) throw error;
+      flight.preserveRecoveryClone = true;
+      flight.preserveSession = true;
+      return { outcome: {
+        process: { state: "unverified", processes: [], killed: [], detail: "maintenance deadline exhausted" },
+        docker: { state: "not_wired", removed: [], detail: "maintenance deadline exhausted" },
+      }, blocked: true };
+    }
   }
 
   /**
@@ -12358,6 +12395,7 @@ export class RunRunner {
      *  full strength, then stops before the archive capture and remembers the frozen record. */
     opts: { deferCapture?: boolean } = {},
   ): Promise<void> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       const budget = flight.cancellationBudget;
       return this.runCancellationMaintenance(flight, () => this.settleGuardedInventory(claim, flight, originalSourceSha, completedBody, budget.signal, locallyQuiescent, opts)).catch(() => undefined);
@@ -12373,7 +12411,7 @@ export class RunRunner {
           (opts.deferCapture !== true && flight.heldDeferredCapture === undefined)) return;
     }
     const barePath = flight.barePath, branch = flight.branch;
-    if (flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
+    if (flight.cancellationCustodyUnknown || flight.keepGuardedInventoryOpen || !barePath || !branch || !claim.claim_generation || !this.recovery.enabled ||
         !isCodePublishingKind(resolveRunKind(claim.kind))) return;
     // Issue #2545: once a record is deferred, EVERY later settle works on that exact record. It never
     // re-freezes: the post-send freeze would pin a different original source and mint a second record.
@@ -12458,6 +12496,7 @@ export class RunRunner {
   private async captureFrozenInventory(
     claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
   ): Promise<void> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       const budget = flight.cancellationBudget;
       return this.runCancellationMaintenance(flight, () => this.captureFrozenInventory(claim, flight, record, budget.signal)).catch(() => undefined);
@@ -12466,6 +12505,7 @@ export class RunRunner {
     MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
     const outcome = await this.recovery.operateFrozenInventory({
+      onCancellationObserved: () => this.observeCancellation(flight),
       record, barePath, defaultBranch: record.defaultBranch!, signal,
     }, {
       foreground: true, terminal: flight.heldTerminal,
@@ -14682,12 +14722,13 @@ export class RunRunner {
     claim: ClaimResponse,
     flight: RunFlight,
   ): Promise<"released" | "retained"> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return "retained";
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       return this.runCancellationMaintenance(flight, () => this.disposeCredentialFreeOwnerCancel(claim, flight)).catch(() => "retained" as const);
     }
     flight.preserveRecoveryClone = true;
     flight.preserveSession = true;
-    if (flight.keepGuardedInventoryOpen || flight.retainedEpisode || flight.retainedEpisodeCustody || flight.retainedLocalCustody || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
+    if (flight.cancellationCustodyUnknown || flight.retainedEpisode || flight.retainedEpisodeCustody || flight.retainedLocalCustody || flight.completedRetainedSuccessor || residueQuarantine() !== undefined) return "retained";
     const gen = claim.claim_generation;
     const guardedV2 = claim.inventory_guarded === true && this.client.hasHeldPublicationV2();
     const fenced = () => flight.steering.claimFence() !== undefined;
@@ -14794,6 +14835,7 @@ export class RunRunner {
     runLog: Logger,
     signal?: AbortSignal,
   ): Promise<void> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       const budget = flight.cancellationBudget;
       return this.runCancellationMaintenance(flight, () => this.settleRecoveryGeneration(claim, flight, runLog, budget.signal)).catch(() => undefined);
@@ -14882,6 +14924,7 @@ export class RunRunner {
         (await this.git.defaultBranchName(barePath)) ||
         "main";
       const outcome = await this.recovery.captureAndUpload({
+        onCancellationObserved: () => this.observeCancellation(flight),
         record,
         barePath,
         defaultBranch,
@@ -14931,6 +14974,7 @@ export class RunRunner {
     runLog: Logger,
     boundary: BoundaryRequest["boundary"],
   ): Promise<boolean> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return false;
     if (!MaintenanceBudget.current() && flight.cancellationBudget) {
       return this.runCancellationMaintenance(flight, () => this.reapRecoveryProviderForSettle(claim, flight, runLog, boundary)).catch(() => false);
     }
@@ -17158,6 +17202,16 @@ export class RunRunner {
      *  unless covered. A resume recaptures the bytes and later terminal-orphan handling still applies. */
     handler?: { memo: boolean; capturedHead?: string; stale: boolean; record: "stopped" | "none" },
   ): Promise<"no_source" | "covered" | "retained_local" | "unknown"> {
+    if (flight.cancellationBudget && this.cancellationExpired(flight)) return flight.worktreePath === undefined ? "no_source" : "unknown";
+    if (!MaintenanceBudget.current() && flight.cancellationBudget) {
+      return this.runCancellationMaintenance(flight, () => this.retainStoppedSource(flight, executor, reason, handler)).catch(() => {
+        if (flight.worktreePath === undefined) return "no_source" as const;
+        flight.preserveRecoveryClone = true;
+        flight.stoppedSourceKept = true;
+        if (!handler || handler.stale) flight.keepGuardedInventoryOpen = true;
+        return "unknown" as const;
+      });
+    }
     const clonePath = flight.worktreePath;
     if (clonePath === undefined) return "no_source";
     // A retained-recovery flight (its retained source journaled, an episode, a predecessor capture)
@@ -17600,6 +17654,7 @@ export class RunRunner {
             await check();
             if (!record) { blocker = "preservation_failed"; throw finalize; }
             const outcome = await this.recovery.captureAndUpload({
+              onCancellationObserved: () => this.observeCancellation(flight),
               record: record!, barePath: bare, defaultBranch: record!.defaultBranch!,
               signal,
             });

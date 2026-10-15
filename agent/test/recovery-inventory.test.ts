@@ -4,7 +4,7 @@ import { it } from "node:test";
 import { RunRunner } from "../src/runner.js";
 import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
 import { RequestError } from "../src/client.js";
-import type { RecoveryFinalDisposition, RecoveryReserveRequest } from "../src/protocol.js";
+import type { RecoveryExactHold, RecoveryFinalDisposition, RecoveryReserveRequest } from "../src/protocol.js";
 import { execFileSync } from "node:child_process";
 import assert from "node:assert/strict";
 import fs from "node:fs/promises";
@@ -75,6 +75,16 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
     record, barePath: f.context.barePath, defaultBranch: "main",
   });
   return { ...f, order, record, operate, setHold: (state: typeof hold) => { hold = state; } };
+}
+
+function closedExactFixture(record: RecoveryRecord, exact: RecoveryExactHold, state: "released" | "discarded"): RecoveryExactHold {
+  return { ...exact, state, live_worker_id: undefined, live_run_id: undefined,
+    release_evidence: state === "discarded" ? "owner_discard" : "held_publication",
+    final_receipt: state === "discarded" ? undefined : {
+      kind: "held_publication", publication_id: "00000000-0000-4000-8000-000000000009",
+      source_sha: record.sourceSha, coverage_digest: record.coverageDigest!,
+    },
+  };
 }
 
 it("first cancellation inside freeze shares the flight budget through later maintenance", async () => {
@@ -206,6 +216,13 @@ for (const mode of ["boot", "live"] as const) {
     const f = await v2FrozenFixture();
     let mono = 0, factories = 0;
     f.state.status = "cancelled";
+    // Cancellation first appears in the inactive recheck, after the entry read was running.
+    const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+    let reads = 0;
+    Object.assign(f.client, { getExactRecoveryHold: async () => {
+      const result = await exact("run-1", 7, f.record.exactHoldBinding!);
+      return ++reads === 1 ? { ...result!, run_status: "running" } : result;
+    } });
     const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
       factories++;
       return new MaintenanceBudget(600_000, () => mono);
@@ -240,11 +257,13 @@ it("cancellation transition from running entry to exact terminal starts budget b
       return exact("run-1", 7, f.record.exactHoldBinding!);
     },
   });
+  const range = (f.git as unknown as HeldGit).resolveCheckpointRange!;
   Object.assign(f.git, {
-    withRecoveryOperation: async (_signal: AbortSignal, deadline: number, action: () => Promise<unknown>) => {
-      assert.equal(deadline, Infinity);
+    resolveCheckpointRange: async (...args: Parameters<typeof range>) => {
+      assert.ok(MaintenanceBudget.current(), "the first terminal read activates the existing continuation");
+      const result = await range(...args);
       mono = 600_000;
-      return action();
+      return result;
     },
   });
   const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
@@ -3269,3 +3288,144 @@ it("maintenance late valid FINAL ACK cannot authorize cleanup and saved FINAL re
     assert.throws(() => MaintenanceBudget.run(budget, () => f.make().resumePending(undefined, [kept])), /maintenance deadline/);
   } finally { settle(); budget.dispose(); await f.close(); }
 });
+
+it("late capture cancellation after three running exact reads activates once before production", async () => {
+  const f = await v2FrozenFixture();
+  let mono = 0, factories = 0, reads = 0, produced = false;
+  let budget: MaintenanceBudget | undefined;
+  const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+  Object.assign(f.client, { getExactRecoveryHold: async () => {
+    f.state.status = ++reads <= 3 ? "running" : "cancelled";
+    return exact("run-1", 7, f.record.exactHoldBinding!);
+  } });
+  f.state.onProduce = () => {
+    produced = true;
+    assert.equal(MaintenanceBudget.current(), budget);
+    assert.ok(budget);
+    mono = 600_000;
+  };
+  const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+    factories++; return budget = new MaintenanceBudget(600_000, () => mono);
+  } });
+  try {
+    await assert.rejects(coordinator.operateFrozenInventory({ record: f.record, barePath: f.context.barePath, defaultBranch: "main" }), /maintenance deadline/);
+    assert.equal(produced, true);
+    assert.equal(factories, 1);
+    assert.equal(f.finals.length, 0);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { budget?.dispose(); await f.close(); }
+});
+
+for (const state of ["released", "discarded"] as const) it(`late closed ${state} cancellation activates before settlement journal`, async () => {
+  const f = await v2FrozenFixture();
+  let reads = 0, factories = 0, writes = 0;
+  let budget: MaintenanceBudget | undefined;
+  const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+  Object.assign(f.client, { getExactRecoveryHold: async () => {
+    const result = await exact("run-1", 7, f.record.exactHoldBinding!);
+    return { ...closedExactFixture(f.record, result!, state), run_status: ++reads === 1 ? "running" : "cancelled" };
+  } });
+  const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+    factories++; return budget = new MaintenanceBudget();
+  } });
+  const write = coordinator["writeExistingRecord"].bind(coordinator);
+  Object.assign(coordinator, { writeExistingRecord: async (...args: Parameters<typeof write>) => {
+    writes++; assert.ok(budget); assert.equal(MaintenanceBudget.current(), budget);
+    return write(...args);
+  } });
+  try {
+    await coordinator.operateFrozenInventory({ record: f.record, barePath: f.context.barePath, defaultBranch: "main" });
+    assert.equal(factories, 1); assert.ok(writes > 0);
+    assert.equal(f.finals.length, 0); assert.deepEqual(f.order, []);
+  } finally { budget?.dispose(); await f.close(); }
+});
+
+it("late cancellation during saved archive FINAL replay keeps identical bytes and rejects a late ACK", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  let reads = 0, factories = 0, mono = 0;
+  let budget: MaintenanceBudget | undefined;
+  const reserves = f.reserves(), produced = f.state.produced, uploads = f.state.uploads;
+  const release = f.client.releaseRecoveryCustody;
+  Object.assign(f.client, {
+    getRunOwnership: async () => ({
+      status: ++reads === 1 ? "running" : "cancelled", claim_generation: 7, inventory_guarded: true,
+    }),
+    releaseRecoveryCustody: async (...args: unknown[]) => {
+      assert.ok(budget);
+      assert.equal(MaintenanceBudget.current(), budget);
+      assert.equal(args[4], budget.signal);
+      assert.deepEqual(args[3], before.finalRequest!.disposition);
+      return release(...args);
+    },
+  });
+  f.state.beforeFinalAck = async () => { mono = 600_000; };
+  const coordinator = f.make(false, undefined, undefined, { maintenanceBudget: () => {
+    factories++; return budget = new MaintenanceBudget(600_000, () => mono);
+  } });
+  try {
+    await assert.rejects(coordinator.resumePending(undefined, [before]), /maintenance deadline/);
+    assert.equal(factories, 1);
+    assert.equal(f.finals.length, 2);
+    assert.deepEqual(f.finals[1]![3], before.finalRequest!.disposition);
+    const kept = (await coordinator.inspect("run-1"))[0]!;
+    assert.notEqual(kept.finalAcknowledged, true);
+    assert.deepEqual(kept.finalRequest, before.finalRequest);
+    assert.equal(f.reserves(), reserves); assert.equal(f.state.produced, produced); assert.equal(f.state.uploads, uploads);
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { budget?.dispose(); await f.close(); }
+});
+
+for (const state of ["released", "discarded"] as const) {
+  it(`freeze refuses a newly closed ${state} exact hold before coverage or replacement FINAL`, async () => {
+    const f = await v2FrozenFixture();
+    let builds = 0;
+    const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+    Object.assign(f.client, {
+      getRunOwnership: async () => ({ status: "running", claim_generation: 8, inventory_guarded: true }),
+      getExactRecoveryHold: async () => closedExactFixture(f.record, (await exact("run-1", 7, f.record.exactHoldBinding!))!, state),
+    });
+    Object.assign(f.git, { buildRecoveryCoverage: async () => { builds++; throw new Error("must not freeze settled custody"); } });
+    const before = await f.coordinator.inspect("run-1");
+    try {
+      const record = await f.coordinator.freezeInventory({
+        context: f.context, currentSha: H, defaultBranch: "main", repoId: f.record.exactHoldBinding!.repoId,
+      });
+      assert.equal(record, undefined);
+      assert.equal(builds, 0);
+      assert.deepEqual(await f.coordinator.inspect("run-1"), before);
+      assert.equal(f.finals.length, 0);
+    } finally { await f.close(); }
+  });
+}
+
+for (const entry of ["frozen", "capture"] as const) {
+  it(`late ${entry} observation uses the flight-owned budget without starting a second window`, async () => {
+    const f = await v2FrozenFixture();
+    let mono = 0, reads = 0, callbacks = 0, internalFactories = 0;
+    const budget = new MaintenanceBudget(600_000, () => mono);
+    const exact = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+    Object.assign(f.client, { getExactRecoveryHold: async () => {
+      f.state.status = ++reads <= (entry === "frozen" ? 3 : 1) ? "running" : "cancelled";
+      return exact("run-1", 7, f.record.exactHoldBinding!);
+    } });
+    f.state.onProduce = () => {
+      assert.equal(MaintenanceBudget.current(), budget);
+      mono = 600_000;
+    };
+    const coordinator = f.make(true, undefined, undefined, { maintenanceBudget: () => {
+      internalFactories++; return new MaintenanceBudget();
+    } });
+    const input = {
+      record: f.record, barePath: f.context.barePath, defaultBranch: "main",
+      onCancellationObserved: () => { callbacks++; return budget; },
+    };
+    try {
+      await assert.rejects(entry === "frozen" ? coordinator.operateFrozenInventory(input) : coordinator.captureAndUpload(input), /maintenance deadline/);
+      assert.equal(callbacks, 1); assert.equal(internalFactories, 0);
+      assert.equal(budget.remainingMs(), 0);
+      assert.throws(() => MaintenanceBudget.run(budget, () => coordinator.operateFrozenInventory(input)), /maintenance deadline/);
+      assert.equal(callbacks, 1);
+      assert.equal(f.finals.length, 0); assert.equal(f.state.uploads, 0); assert.equal(f.state.pinDeletes, 0);
+    } finally { budget.dispose(); await f.close(); }
+  });
+}

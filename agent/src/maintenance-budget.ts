@@ -1,7 +1,14 @@
 import { AsyncLocalStorage } from "node:async_hooks";
 import { performance } from "node:perf_hooks";
 
-const scope = new AsyncLocalStorage<MaintenanceBudget>();
+interface AttemptContext {
+  identity?: string;
+  budget?: MaintenanceBudget;
+  factory?: () => MaintenanceBudget;
+  activating?: boolean;
+}
+
+const scope = new AsyncLocalStorage<AttemptContext>();
 
 /** One attempt owns this object from its first cancellation observation through cleanup. */
 export class MaintenanceBudget {
@@ -40,12 +47,54 @@ export class MaintenanceBudget {
 
   /** Nested scopes retain the attempt object; separate async chains remain isolated. */
   static run<T>(budget: MaintenanceBudget, action: () => T): T {
-    const current = scope.getStore() ?? budget;
+    const context = scope.getStore();
+    const current = context?.budget ?? budget;
     current.check();
-    return scope.run(current, action);
+    if (context?.identity !== undefined) {
+      context.budget = current;
+      return scope.run(context, action);
+    }
+    return scope.run({ budget: current }, action);
   }
 
-  static current(): MaintenanceBudget | undefined { return scope.getStore(); }
+  /** Attach the flight's observation before synchronous abort listeners continue. */
+  static attachObserved(identity: string, budget: MaintenanceBudget): void {
+    const context = scope.getStore();
+    if (context?.identity === identity && !context.budget) context.budget = budget;
+  }
+
+  /** Status transport is independent of preservation; never use this for FINAL or cleanup. */
+  static withoutAttempt<T>(action: () => T): T { return scope.exit(action); }
+
+  static isAttempt(identity: string): boolean {
+    const context = scope.getStore();
+    return context?.identity === identity || (!!context?.budget && context.identity === undefined);
+  }
+
+  /** Install before any await: late observations update every continuation in this attempt. */
+  static runAttempt<T>(identity: string, factory: () => MaintenanceBudget, action: () => T): T {
+    const parent = scope.getStore();
+    if (parent?.identity === identity || (parent?.budget && parent.identity === undefined)) {
+      parent.budget?.check();
+      return action();
+    }
+    return scope.run({ identity, factory }, action);
+  }
+
+  /** Observation constrains time only; it grants no custody authority. */
+  static observeCancellation(): MaintenanceBudget | undefined {
+    const context = scope.getStore();
+    if (!context) return undefined;
+    if (!context.budget && context.factory && !context.activating) {
+      context.activating = true;
+      try { context.budget = context.factory(); }
+      finally { context.activating = false; }
+    }
+    context.budget?.check();
+    return context.budget;
+  }
+
+  static current(): MaintenanceBudget | undefined { return scope.getStore()?.budget; }
 
   /** Timer cleanup never renews the absolute deadline. */
   dispose(): void {

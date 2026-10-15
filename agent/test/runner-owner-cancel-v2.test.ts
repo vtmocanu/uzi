@@ -2,8 +2,10 @@ import { it, mock } from "node:test";
 import assert from "node:assert/strict";
 import fs from "node:fs";
 import path from "node:path";
+import { RequestError } from "../src/client.js";
 import type { Executor } from "../src/executor.js";
-import { api, client, fakeGitlab, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { api, client, fakeGitlab, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, command, commit, frozenRecords, heldServer, packObjects,
   recoveryOf, skipCheckpoints, watchFreezes,
@@ -11,7 +13,7 @@ import {
 
 installHarness();
 
-for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
+for (const scenario of ["old-generation-foreground", "late-quiescence", "identical", "dirty", "closed", "unknown", "wrong-custodian", "wrong-repo", "wrong-live-run", "malformed", "live", "retained", "registry", "late-writer"] as const) {
   it(`V2 owner cancellation preserves frozen inventory: ${scenario}`, { skip: HELD_LINUX_ONLY }, async t => {
     const claim = gitlabClaim(30310, { claim_generation: 71, inventory_guarded: true });
     claim.secrets.codex = { auth_mode: "api_key", access_token: "fixture-key", capability: "fixture-capability" };
@@ -24,6 +26,7 @@ for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custod
     client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: [{
       hold_id: holdId, generation: 71, inventory_guarded: true, has_available_capture: false,
     }] });
+    let foreground = false;
     const fetch = globalThis.fetch;
     t.mock.method(globalThis, "fetch", async (input: Parameters<typeof fetch>[0], init?: Parameters<typeof fetch>[1]) => {
       if (!String(input).endsWith(`/runs/${claim.run_id}/recovery-holds?generation=71`))
@@ -31,7 +34,7 @@ for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custod
       const closed = scenario === "closed" && server.failedAcked();
       // Exercise the real client's authentication/binding validation, including refusals.
       return new Response(JSON.stringify({ run_id: claim.run_id,
-        exact_hold: scenario === "unknown" ? undefined : {
+        exact_hold: (scenario === "unknown" || (scenario === "old-generation-foreground" && !foreground)) ? undefined : {
           run_id: claim.run_id, generation: scenario === "malformed" ? "71" : 71, hold_id: holdId,
           repo_id: scenario === "wrong-repo" ? holdId : claim.repo.id, inventory_guarded: true,
           original_worker_id: scenario === "wrong-custodian" ? holdId : registration.worker_id,
@@ -39,19 +42,27 @@ for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custod
           ...(closed ? { state: "discarded", release_evidence: "owner_discard" }
             : { state: "open", live_worker_id: registration.worker_id,
               live_run_id: scenario === "wrong-live-run" ? holdId : claim.run_id }),
-          run_status: server.failedAcked() && scenario !== "live" ? "cancelled" : "running",
-          current_claim_generation: 71, claim_released: server.failedAcked(),
+          run_status: server.failedAcked() && scenario !== "live" ? (scenario === "old-generation-foreground" ? "failed" : "cancelled") : "running",
+          current_claim_generation: foreground ? 72 : 71, ...(foreground ? { run_worker_id: holdId } : {}), claim_released: server.failedAcked(),
         },
       }), { status: 200 });
     });
     const send = client.reportState.bind(client);
     mock.method(client, "reportState", async (...args: Parameters<typeof send>) => {
       const ack = await send(...args);
-      return args[1].status === "failed" ? { ...ack, status: "cancelled" } : ack;
+      return args[1].status === "failed" && scenario !== "old-generation-foreground" ? { ...ack, status: "cancelled" } : ack;
     });
     skipCheckpoints();
     const freezes = watchFreezes(server);
-    let models = 0;
+    let models = 0, mono = 0, factories = 0;
+    let budget: MaintenanceBudget | undefined, observedBudget: MaintenanceBudget | undefined;
+    let lateTriggered = false;
+    const lateReads: string[] = [];
+    const status = git.worktreeStatus.bind(git);
+    mock.method(git, "worktreeStatus", async (...args: Parameters<typeof status>) => {
+      if (scenario === "late-quiescence" && mono >= 600_000) lateReads.push(args[0]);
+      return status(...args);
+    });
     let clone = "";
     let dirtyBlob: string | undefined;
     let oldRoot: string | undefined;
@@ -65,10 +76,22 @@ for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custod
       async settleForCredentialFreeCapture() { return scenario === "registry" ? { kind: "incomplete", errors: [] } : { kind: "observed_empty" }; },
     };
     const r = runner(executor, fakeGitlab().gitlab, JOIN_TOKEN, {
-      quiesceRun: async req => ({
-        process: { state: "quiescent", processes: [], killed: scenario === "late-writer" && req.site === "owner_cancel_after_inspection" ? [123] : [], detail: "fixture empty process registry" },
-        docker: { state: "not_wired", removed: [], detail: "fixture has no Docker" },
-      }),
+      cancellationBudgetFactory: scenario === "late-quiescence" ? () => {
+        factories++; return budget = new MaintenanceBudget(600_000, () => mono);
+      } : undefined,
+      quiesceRun: async req => {
+        if (scenario === "late-quiescence" && req.site === "terminal_retire" && !lateTriggered) {
+          lateTriggered = true;
+          r["observeCancellation"](flight);
+          observedBudget = MaintenanceBudget.current();
+          // The signal-ignoring quiescence result arrives after the same attempt expires.
+          mono = 600_001;
+        }
+        return {
+          process: { state: "quiescent", processes: [], killed: scenario === "late-writer" && req.site === "owner_cancel_after_inspection" ? [123] : [], detail: "fixture empty process registry" },
+          docker: { state: "not_wired", removed: [], detail: "fixture has no Docker" },
+        };
+      },
     });
     // Cancel after clone creation, before executor/model admission. This also exercises
     // API-only cancellation, with no fabricated steering input receipt.
@@ -86,13 +109,37 @@ for (const scenario of ["identical", "dirty", "closed", "unknown", "wrong-custod
         dirtyBlob = command(clone, ["hash-object", "untracked.txt"]);
       }
       if (scenario === "retained") flight.retainedEpisode = true;
-      r["observeCancellation"](flight);
+      if (scenario !== "old-generation-foreground" && scenario !== "late-quiescence") r["observeCancellation"](flight);
       return out;
     };
     const capture = mock.method(recoveryOf(r), "captureAndUpload");
     await r.execute(claim);
-    assert.equal(models, 0);
+    assert.equal(models, scenario === "old-generation-foreground" || scenario === "late-quiescence" ? 1 : 0);
     assert.equal(api.states.filter(s => s.body.status === "failed").length, 1);
+    if (scenario === "old-generation-foreground") {
+      assert.equal(server.heldCalls.length, 0);
+      assert.equal(server.finals.length, 0);
+      foreground = true;
+      flight!.heldDeferredCapture = undefined;
+      const reserves = server.archiveReserves();
+      client.getRunOwnership = async () => { throw new RequestError("GET", `/api/worker/runs/${claim.run_id}/ownership`, 404, JSON.stringify({ error: "run not found for this worker" })); };
+      await r["settleRecoveryGeneration"](claim, flight!, flight!.runLog);
+      assert.equal(server.heldCalls.length, 0, "persisted self-contained archive precedes new held production");
+      assert.equal(server.finals.length, 1, "original custody settles despite current g72/foreign worker and ownership404");
+      assert.equal(server.finals[0]!.generation, 71);
+      assert.equal(server.finals[0]!.disposition?.kind, "archive");
+      assert.equal(server.archiveReserves(), reserves, "reuse existing archive identity");
+      assert.equal(server.acked(), 1);
+      return;
+    }
+    if (scenario === "late-quiescence") {
+      assert.equal(lateTriggered, true);
+      assert.equal(factories, 1);
+      assert.ok(budget);
+      assert.equal(observedBudget, budget, "cancellation attaches to the already-awaiting flight continuation");
+      assert.deepEqual(lateReads, [], "late quiescence cannot start fresh source inspection");
+      assert.equal(server.failedAcked(), true, "honest terminal status transport remains independent of preservation expiry");
+    }
     const positive = scenario === "identical" || scenario === "dirty";
     assert.equal(server.heldCalls.length, positive ? 1 : 0);
     assert.equal(capture.mock.callCount(), 0, "no archive before positive exact terminal authority");
