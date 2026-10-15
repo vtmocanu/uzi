@@ -93,6 +93,7 @@ import {
   type RecoveryReleaseResponse,
   type RecoveryReleaseRequest,
   type RecoveryHoldsResponse,
+  type RecoveryExactHold,
   type RecoveryLiveSettleRequest,
   type RecoverySettleRequest,
   type RecoverySettleResponse,
@@ -1052,6 +1053,7 @@ type CompletionReservation = { live: boolean; tickets: Set<CompletionTicket> };
 /** Transport for the worker→API control plane (PRD §Worker protocol). */
 export class WorkerClient {
   private registeredWorkerId: string | undefined;
+  private hasExactHoldCapability = false;
   // Provenance survives uncertain registration; only a successful changed identity resets it.
   private completionWorkerId: string | undefined;
   private completionInventoryUnreadable = false;
@@ -1197,6 +1199,7 @@ export class WorkerClient {
     maxCrossCheckSlots?: number,
   ): Promise<RegisterResponse> {
     this.registeredWorkerId = undefined;
+    this.hasExactHoldCapability = false;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
     this.registrationReport = undefined;
@@ -1254,6 +1257,7 @@ export class WorkerClient {
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
     this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
+    this.hasExactHoldCapability = originalCapabilities?.includes("recovery_held_publication_v2") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
     // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
@@ -2416,6 +2420,45 @@ export class WorkerClient {
       reservation.tickets.delete(ticket);
       if (!reservation.live && reservation.tickets.size === 0) this.completionReservations.delete(key);
     }
+  }
+
+  /** Observe one exact hold against the caller's local identity. This never updates
+   * completion inventories, receipt incarnations, or FINAL acknowledgement state. */
+  async getExactRecoveryHold(
+    runId: string,
+    generation: number,
+    expected: { holdId: string; repoId: string },
+    signal?: AbortSignal,
+  ): Promise<RecoveryExactHold | undefined> {
+    if (!this.hasFeature("recovery_held_publication_v2") || !this.hasExactHoldCapability ||
+        !this.registeredWorkerId || !terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0 ||
+        !terminalUUID(expected.holdId) || !terminalUUID(expected.repoId)) return undefined;
+    const worker = this.registeredWorkerId;
+    const incarnation = this.completionIncarnation;
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/recovery-holds?generation=${generation}`;
+    const res = await this.fetchRaw("GET", path, undefined, this.httpTimeoutMs, signal);
+    if (res.status >= 400) throw await this.toError("GET", path, res);
+    let body: unknown;
+    try { body = JSON.parse(await readBoundedText(res, COMPLETION_HOLDS_MAX_BYTES, true)); }
+    catch { return undefined; }
+    if (incarnation !== this.completionIncarnation || worker !== this.registeredWorkerId ||
+        !this.hasExactHoldCapability || !this.hasFeature("recovery_held_publication_v2") ||
+        !isRecord(body) || body.run_id !== runId || !isRecord(body.exact_hold)) return undefined;
+    const value = body.exact_hold;
+    if (value.run_id !== runId || value.generation !== generation || value.hold_id !== expected.holdId ||
+        value.repo_id !== expected.repoId || value.original_worker_id !== worker ||
+        typeof value.original_worker_identity !== "string" || !value.original_worker_identity.trim() ||
+        value.inventory_guarded !== true || (value.run_worker_id !== undefined && !terminalUUID(value.run_worker_id)) ||
+        (value.recovery_wait_cause !== undefined && typeof value.recovery_wait_cause !== "string") || !terminalGeneration(value.current_claim_generation) ||
+        value.current_claim_generation < generation || typeof value.claim_released !== "boolean" ||
+        typeof value.run_status !== "string" || !["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait", "completed", "failed", "cancelled"].includes(value.run_status)) return undefined;
+    if (value.state === "open") {
+      if (value.live_worker_id !== worker || value.live_run_id !== runId || value.release_evidence !== undefined ||
+          value.final_receipt !== undefined || value.completed_publication_receipt !== undefined) return undefined;
+    } else if (value.state === "released" || value.state === "discarded") {
+      if (value.live_worker_id !== undefined || value.live_run_id !== undefined || !validExactClosedProof(value)) return undefined;
+    } else return undefined;
+    return value as unknown as RecoveryExactHold;
   }
 
   /** listRecoveryHolds returns this worker's own open custody holds on a run — the
@@ -4155,5 +4198,47 @@ async function readTerminalRejectionBody(res: Response, signal: AbortSignal): Pr
   } finally {
     signal.removeEventListener("abort", onAbort);
     reader.releaseLock();
+  }
+}
+
+/** Validate saved proof shape without admitting it to the state-report receipt registry. */
+function validExactClosedProof(value: Record<string, unknown>): boolean {
+  const f = value.final_receipt;
+  if (value.state === "discarded") {
+    // This typed policy outcome is issued only for an immutable server-side binding.
+    // It suppresses preservation; any retained FINAL is not admitted as a new ACK.
+    if (value.release_evidence === "merged_predecessor_discard") return f === undefined || isRecord(f);
+    return value.release_evidence === "owner_discard" && f === undefined && value.completed_publication_receipt === undefined;
+  }
+  if (!isRecord(f) || (f.kind !== "completed_publication" && value.completed_publication_receipt !== undefined)) return false;
+  const noCapture = f.capture_id === undefined;
+  const noPublication = f.publication_id === undefined;
+  const digest = typeof f.coverage_digest === "string" && /^[0-9a-f]{64}$/.test(f.coverage_digest);
+  switch (f.kind) {
+    case "held_publication":
+      return value.release_evidence === f.kind && noCapture && terminalUUID(f.publication_id) && completionSHA(f.source_sha) && digest;
+    case "archive":
+      return value.release_evidence === f.kind && noPublication && terminalUUID(f.capture_id) && typeof f.source_sha === "string" && /^[0-9a-fA-F]{4,64}$/.test(f.source_sha) && digest;
+    case "settled":
+      return ["publication", "forge_no_output"].includes(String(value.release_evidence)) && noCapture && noPublication &&
+        f.source_sha === undefined && f.coverage_digest === "e3b0c44298fc1c149afbf4c8996fb92427ae41e4649b934ca495991b7852b855";
+    case "no_adopted_source":
+      return value.release_evidence === f.kind && noCapture && noPublication && f.source_sha === undefined && f.coverage_digest === "";
+    case "completed_publication": {
+      const receipt = value.completed_publication_receipt;
+      if (value.release_evidence !== f.kind || !noCapture || !noPublication || f.source_sha !== undefined || f.coverage_digest !== "" || !isRecord(receipt) ||
+          receipt.hold_id !== value.hold_id || receipt.run_id !== value.run_id || receipt.repo_id !== value.repo_id ||
+          receipt.worker_id !== value.original_worker_id || receipt.generation !== value.generation ||
+          !completionSHA(receipt.final_head) || !completionSHA(receipt.observed_branch_head) ||
+          !terminalUUID(receipt.owner_id) || !terminalUUID(receipt.connection_id) ||
+          !completionPositiveInteger(receipt.project_id) || !completionPositiveInteger(receipt.mr_iid) ||
+          !completionForgeType(receipt.forge_type) || !completionSafeIdentifier(receipt.branch) ||
+          !completionSafeIdentifier(receipt.base_url)) return false;
+      try {
+        const url = new URL(receipt.base_url as string);
+        return url.protocol === "https:" && !url.username && !url.password && !url.search && !url.hash;
+      } catch { return false; }
+    }
+    default: return false;
   }
 }
