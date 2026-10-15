@@ -7,8 +7,10 @@ import (
 
 func TestMemoryGuardRenderAndSpecHash(t *testing.T) {
 	w, spec := desired("abc"), testSpec(t, "base", "m")
-	envOf := func(cfg RenderConfig) map[string]string {
+	envOf := func(cfg RenderConfig, ephemeral bool) map[string]string {
 		t.Helper()
+		w := w
+		w.Ephemeral = ephemeral
 		dep := RenderDeployment(cfg, w, spec)
 		worker := containerByName(t, dep.Spec.Template.Spec.Containers, workerContainerName)
 		env := map[string]string{}
@@ -18,15 +20,9 @@ func TestMemoryGuardRenderAndSpecHash(t *testing.T) {
 			}
 		}
 		if dep.Spec.Template.Annotations[AnnotationSpecHash] != SpecHashOf(cfg, w, spec) {
-			t.Fatal("deployment hash differs from SpecHashOf")
+			t.Fatalf("ephemeral=%t: deployment hash differs from SpecHashOf", ephemeral)
 		}
 		return env
-	}
-	for _, cfg := range []RenderConfig{{}, testConfig()} {
-		env := envOf(cfg)
-		if len(env) != 1 || env["WORKER_MEMORY_GUARD_ENABLED"] != "false" {
-			t.Fatalf("disabled env: %v", env)
-		}
 	}
 	cfg := testConfig()
 	cfg.MemoryGuardEnabled = true
@@ -36,7 +32,6 @@ func TestMemoryGuardRenderAndSpecHash(t *testing.T) {
 	cfg.MemoryGuardRearmMs = 14
 	cfg.MemoryGuardResponseBudgetMs = 15
 	cfg.MemoryGuardMaxInterventions = 16
-	env := envOf(cfg)
 	want := map[string]string{
 		"WORKER_MEMORY_GUARD_ENABLED":            "true",
 		"WORKER_MEMORY_GUARD_RESERVE_BYTES":      "11",
@@ -46,12 +41,21 @@ func TestMemoryGuardRenderAndSpecHash(t *testing.T) {
 		"WORKER_MEMORY_GUARD_RESPONSE_BUDGET_MS": "15",
 		"WORKER_MEMORY_GUARD_MAX_INTERVENTIONS":  "16",
 	}
-	if len(env) != len(want) {
-		t.Fatalf("env: %v", env)
-	}
-	for name, value := range want {
-		if env[name] != value {
-			t.Errorf("%s = %q, want %q", name, env[name], value)
+	for _, ephemeral := range []bool{false, true} {
+		for i, disabled := range []RenderConfig{{}, testConfig()} {
+			env := envOf(disabled, ephemeral)
+			if len(env) != 1 || env["WORKER_MEMORY_GUARD_ENABLED"] != "false" {
+				t.Fatalf("ephemeral=%t disabled config=%d env: %v", ephemeral, i, env)
+			}
+		}
+		env := envOf(cfg, ephemeral)
+		if len(env) != len(want) {
+			t.Fatalf("ephemeral=%t enabled env: %v", ephemeral, env)
+		}
+		for name, value := range want {
+			if env[name] != value {
+				t.Errorf("ephemeral=%t: %s = %q, want %q", ephemeral, name, env[name], value)
+			}
 		}
 	}
 	base := SpecHashOf(cfg, w, spec)
