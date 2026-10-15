@@ -62,6 +62,15 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 			return errors.New("artifact batch exceeds hard bound")
 		}
 	}
+	// Verify canonical inputs against their kept source rows first. An alias can
+	// resolve only to content verified here, never merely to a claimed digest.
+	canonical := map[string][]byte{}
+	for _, e := range m.Entries {
+		if in, ok := byKey[artifactKey(e.ArtifactID, e.EntryOrdinal)]; ok && e.Status == "kept" {
+			digest, _ := ciartifacts.Identity(in.Content)
+			canonical[digest] = in.Content
+		}
+	}
 	for i := range m.Entries {
 		e := &m.Entries[i]
 		in, exists := byKey[artifactKey(e.ArtifactID, e.EntryOrdinal)]
@@ -72,7 +81,11 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 			continue
 		}
 		if !exists {
-			return errors.New("kept artifact lacks input")
+			content, ok := canonical[e.SHA256]
+			if !ok || e.Size != int64(len(content)) || e.Name != e.SHA256+".txt" {
+				return errors.New("kept artifact lacks verified canonical input")
+			}
+			in.Content = content
 		}
 		e.SHA256, e.Name = ciartifacts.Identity(in.Content)
 		e.Size = int64(len(in.Content))
@@ -118,6 +131,10 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 		if m.Omitted != nil {
 			omitted = *m.Omitted
 		}
+		// A whole-batch refusal also refuses source aliases whose names were
+		// omitted during collection. Archive summaries never count as files.
+		omitted += m.OmittedKeptAliases
+		m.OmittedKeptAliases = 0
 		for _, e := range m.Entries {
 			if e.Status == "kept" {
 				e.Status = "skipped"
@@ -129,7 +146,7 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 			}
 			if len(rows) < ciartifacts.MaxSkipped {
 				rows = append(rows, e)
-			} else {
+			} else if !e.Summary {
 				omitted++
 			}
 		}
@@ -184,7 +201,8 @@ func (s *Service) admitCIArtifacts(ctx context.Context, q *store.Queries, run *s
 		return err
 	}
 	// Never crop the opaque existing description: it may contain complete fences.
-	// Rendered fields contain no literal backticks, so fence overhead is fixed.
+	// Escaped names cannot contain a triple backtick run; inline name delimiters
+	// fit inside the fixed three-backtick fence.
 	remaining := MaxIssueDescriptionBytes - len(run.IssueDescription) - 10
 	rendered, err := m.RenderWithin(remaining)
 	if errors.Is(err, ciartifacts.ErrRenderTooLarge) {

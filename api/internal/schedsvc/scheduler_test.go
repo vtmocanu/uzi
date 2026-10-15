@@ -589,6 +589,10 @@ func (b *fakeBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store.I
 	panic("unexpected label removal")
 }
 
+func (b *fakeBuilder) CIArtifactScrubber([]byte) (func(string) string, error) {
+	return func(s string) string { return s }, nil
+}
+
 func (b *fakeBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) {
 	if b.err != nil {
 		return nil, b.err

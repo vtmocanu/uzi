@@ -72,6 +72,10 @@ func (sweepGateBuilder) SetIssueLabel(context.Context, forge.Forge, int64, store
 	panic("unexpected label removal")
 }
 
+func (b sweepGateBuilder) CIArtifactScrubber([]byte) (func(string) string, error) {
+	return func(s string) string { return s }, nil
+}
+
 func (b sweepGateBuilder) ForgeForConnection(string, string, []byte) (forge.Forge, error) {
 	return b.f, nil
 }

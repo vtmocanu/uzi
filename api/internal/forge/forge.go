@@ -624,6 +624,10 @@ type Check struct {
 // route layer (no forge's runs list includes jobs), so a driver leaves them zero.
 // Name, Title, Actor, Branch are UNTRUSTED forge text.
 type WorkflowRun struct {
+	// RunAttempt is nil when the forge does not report an attempt.
+	RunAttempt       *int64
+	RepositoryID     int64
+	HeadRepositoryID int64
 	// WorkflowKey is the provider identity: GitHub workflow ID, Forgejo path, GitLab name/ref.
 	WorkflowKey string
 	ID          int64
@@ -904,6 +908,11 @@ type Forge interface {
 	// forge-native run/pipeline id, for the `ci` drill-in. ErrForgeVersionUnsupported
 	// on a forge whose Actions/pipelines API is absent (mirrors ListWorkflowRuns).
 	GetWorkflowRun(ctx context.Context, projectID, runID int64) (WorkflowRun, error)
+
+	// ListRunArtifacts returns bounded metadata for this exact run, without URL authority.
+	ListRunArtifacts(ctx context.Context, projectID, runID int64) ([]Artifact, error)
+	// DownloadArtifact fetches an ID-addressed archive, enforcing maxBytes on actual bytes.
+	DownloadArtifact(ctx context.Context, projectID, artifactID, maxBytes int64) ([]byte, error)
 	// ListMergeRequestReviews returns an open MR's per-reviewer reviews for the
 	// forge-view detail route (PRD #1255 D6), oldest-first — the same review stream the
 	// driver folds into ReviewDecision, returned verbatim (State is the raw forge value)

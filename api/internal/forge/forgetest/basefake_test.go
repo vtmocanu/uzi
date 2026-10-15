@@ -122,6 +122,14 @@ func actionMethods() []struct {
 			_, err := b.ListWorkflowRuns(ctx, 1, forge.ListWorkflowRunsOptions{})
 			return err
 		}},
+		{"ListRunArtifacts", func(b *BaseFake) error {
+			_, err := b.ListRunArtifacts(ctx, 1, 2)
+			return err
+		}},
+		{"DownloadArtifact", func(b *BaseFake) error {
+			_, err := b.DownloadArtifact(ctx, 1, 2, 3)
+			return err
+		}},
 		{"GetWorkflowRun", func(b *BaseFake) error {
 			_, err := b.GetWorkflowRun(ctx, 1, 2)
 			return err
@@ -152,8 +160,8 @@ func actionMethods() []struct {
 
 func TestBaseFakeActionMethodsNotStubbed(t *testing.T) {
 	methods := actionMethods()
-	if len(methods) != 34 {
-		t.Fatalf("expected 34 action methods, got %d", len(methods))
+	if len(methods) != 36 {
+		t.Fatalf("expected 36 action methods, got %d", len(methods))
 	}
 	b := &BaseFake{}
 	for _, m := range methods {
