@@ -96,6 +96,10 @@ func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []
 			continue
 		}
 		rows, err := m.q.ListMergedPredecessorCandidates(ctx, store.ListMergedPredecessorCandidatesParams{RepoID: repo, AfterRunID: m.cursors[repo]})
+		if ctx.Err() != nil {
+			m.nextRepo = repo
+			return
+		}
 		if err != nil {
 			slog.Warn("merged predecessor reconciliation refused", "repo_id", repo, "reason", "enumeration_failed")
 			exhausted[repo] = true
@@ -108,6 +112,7 @@ func (s *Service) ReconcileMergedPredecessors(parent context.Context, repoIDs []
 		}
 		row := rows[0]
 		if ctx.Err() != nil {
+			m.nextRepo = repo
 			return
 		}
 		if attempted[row.RunID] {

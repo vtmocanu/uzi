@@ -268,41 +268,72 @@ func TestMergedPredecessorIndependentDeadlines(t *testing.T) {
 type mergeDeadlineContext struct{ context.Context }
 
 func TestMergedPredecessorEnumerationExpiresWithoutConsumingCandidate(t *testing.T) {
-	reads := 0
-	f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
-		reads++
-		return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
-	}}
-	s, token := mergeTestService(t, f)
-	repo := mergeID(1)
-	q := &mergeCandidates{rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{repo: {mergeRow(repo, 100, token)}}}
-	sink := &mergeSink{}
-	s.SetMergedPredecessorRecovery(q, sink)
-	var phase *mergeDeadlineContext
-	s.merged.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
-		if d != 30*time.Second {
-			t.Fatalf("phase budget=%v", d)
-		}
-		phase = &mergeDeadlineContext{Context: ctx}
-		return phase, func() {}
-	}
-	q.afterEnumerate = func() {
-		expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
-		t.Cleanup(stop)
-		phase.Context = expired
-		if !errors.Is(phase.Err(), context.DeadlineExceeded) {
-			t.Fatal("phase did not expire during enumeration")
-		}
-	}
-	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
-	if reads != 0 || sink.calls != 0 {
-		t.Fatal("enumeration returned after cancellation was consumed")
-	}
-	q.afterEnumerate = nil
-	s.merged.withTimeout = nil
-	s.ReconcileMergedPredecessors(context.Background(), []uuid.UUID{repo})
-	if reads != 1 || sink.calls != 1 {
-		t.Fatalf("candidate skipped after expired enumeration: reads=%d discards=%d", reads, sink.calls)
+	for _, result := range []string{"rows", "error", "empty"} {
+		t.Run(result, func(t *testing.T) {
+			var reads []int64
+			f := &mergeForge{read: func(_ context.Context, _, iid int64) (forge.MergeRequest, error) {
+				reads = append(reads, iid)
+				return forge.MergeRequest{IID: iid, State: forge.MRStateMerged}, nil
+			}}
+			s, token := mergeTestService(t, f)
+			sibling, repo := mergeID(1), mergeID(2)
+			q := &mergeCandidates{
+				rows: map[uuid.UUID][]store.ListMergedPredecessorCandidatesRow{
+					sibling: {mergeRow(sibling, 101, token)},
+					repo:    {mergeRow(repo, 201, token)},
+				},
+				fail: map[uuid.UUID]bool{repo: result == "error"},
+			}
+			if result == "empty" {
+				q.rows[repo] = nil
+			}
+			sink := &mergeSink{}
+			s.SetMergedPredecessorRecovery(q, sink)
+			s.merged.cursors = map[uuid.UUID]uuid.UUID{sibling: mergeID(100), repo: mergeID(200)}
+			s.merged.nextRepo = repo
+			var phase *mergeDeadlineContext
+			s.merged.withTimeout = func(ctx context.Context, d time.Duration) (context.Context, context.CancelFunc) {
+				if d != 30*time.Second {
+					t.Fatalf("phase budget=%v", d)
+				}
+				phase = &mergeDeadlineContext{Context: ctx}
+				return phase, func() {}
+			}
+			q.afterEnumerate = func() {
+				expired, stop := context.WithDeadline(context.Background(), time.Now().Add(-time.Hour))
+				t.Cleanup(stop)
+				phase.Context = expired
+				if !errors.Is(phase.Err(), context.DeadlineExceeded) {
+					t.Fatal("phase did not expire during enumeration")
+				}
+			}
+			repos := []uuid.UUID{sibling, repo}
+			s.ReconcileMergedPredecessors(context.Background(), repos)
+			if len(reads) != 0 || sink.calls != 0 {
+				t.Fatal("enumeration returned after cancellation was consumed")
+			}
+			if len(q.visits) != 1 || q.visits[0].RepoID != repo || q.visits[0].AfterRunID != mergeID(200) {
+				t.Fatalf("expired phase visits=%v", q.visits)
+			}
+			if s.merged.nextRepo != repo {
+				t.Errorf("expired enumeration consumed repository turn: nextRepo=%s want=%s", s.merged.nextRepo, repo)
+			}
+			if s.merged.cursors[repo] != mergeID(200) || s.merged.cursors[sibling] != mergeID(100) {
+				t.Errorf("expired enumeration changed run cursors: %v", s.merged.cursors)
+			}
+			q.afterEnumerate = nil
+			q.fail[repo] = false
+			q.rows[repo] = []store.ListMergedPredecessorCandidatesRow{mergeRow(repo, 201, token)}
+			s.merged.withTimeout = nil
+			q.visits = nil
+			s.ReconcileMergedPredecessors(context.Background(), repos)
+			if len(q.visits) == 0 || q.visits[0].RepoID != repo || q.visits[0].AfterRunID != mergeID(200) {
+				t.Errorf("next phase did not first resume interrupted repository and run cursor: visits=%v", q.visits)
+			}
+			if !slices.Equal(reads, []int64{201, 101}) || sink.calls != 2 {
+				t.Fatalf("candidates skipped or reordered after expired enumeration: reads=%v discards=%d", reads, sink.calls)
+			}
+		})
 	}
 }
 
