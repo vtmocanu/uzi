@@ -156,7 +156,7 @@ func TestRecoveryReconcileFenceFirstOrderLiveDB(t *testing.T) {
 	upload := startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryCaptureStatusResponse, error) {
 		return e.svc.Upload(ctx, e.w, e.run, id, manifestOf(body), bytes.NewReader(body))
 	})
-	waitReconcileLock(t, e, fencePID, "WHERE c.id = $1 FOR UPDATE OF c")
+	waitReconcileLock(t, e, fencePID, "WHERE h.id=$1 FOR NO KEY UPDATE OF h")
 	if err := tx.Commit(e.ctx); err != nil {
 		t.Fatal(err)
 	}
@@ -218,7 +218,7 @@ func TestRecoveryFinalUploadFirstOrderLiveDB(t *testing.T) {
 	final := startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryReleaseResponse, error) {
 		return e.svc.Release(ctx, e.w, e.run, req)
 	})
-	waitReconcileLock(t, e, 0, "GetFinalInventoryCapture")
+	waitReconcileLock(t, e, 0, "GetFinalInventoryHold")
 	resume <- struct{}{}
 	up := awaitReconcileOperation(t, upload)
 	if up.err != nil || up.value.State != "available" || !up.value.ManifestBound ||
@@ -296,7 +296,7 @@ func TestRecoveryReconcileUploadFirstOrderLiveDB(t *testing.T) {
 	reconcile := startReconcileOperation(t, func(ctx context.Context) (apitypes.RecoveryReconcileResponse, error) {
 		return e.svc.Reconcile(ctx, e.w, e.run, id, reconcileRequest(body))
 	})
-	waitReconcileLock(t, e, 0, "GetFinalInventoryCapture")
+	waitReconcileLock(t, e, 0, "GetFinalInventoryHold")
 	resume <- struct{}{}
 	up := awaitReconcileOperation(t, upload)
 	if up.err != nil || up.value.State != "available" || !up.value.ManifestBound {
