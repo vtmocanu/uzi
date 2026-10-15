@@ -72,6 +72,19 @@ func TestPublishMergeAncestryDepth1(t *testing.T) {
 				if err != nil {
 					t.Fatal(err)
 				}
+				shallow, err := repo.Storer.Shallow()
+				if err != nil {
+					t.Fatal(err)
+				}
+				boundary := false
+				for _, h := range shallow {
+					if h == plumbing.NewHash(b) {
+						boundary = true
+					}
+				}
+				if !boundary {
+					t.Fatalf("checkpoint B %s must be a recorded shallow boundary: %v", b, shallow)
+				}
 				if err = packfile.UpdateObjectStorage(repo.Storer, bytes.NewReader(pack)); err != nil {
 					t.Fatal(err)
 				}

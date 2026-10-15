@@ -154,9 +154,58 @@ func (c *ancestryCancelContext) Err() error {
 	}
 	return nil
 }
+func TestAncestryAlreadyCanceled(t *testing.T) {
+	s := &ancestryStore{Storer: memory.NewStorage()}
+	repo, err := git.Init(s, nil)
+	if err != nil {
+		t.Fatal(err)
+	}
+	tree := storeTree(t, repo)
+	base := storeCommit(t, repo, tree, "base")
+	child := getCommit(t, repo, storeCommit(t, repo, tree, "child", base))
+	equal := getCommit(t, repo, base)
+	for _, wrapper := range []struct {
+		name string
+		run  func(context.Context, *git.Repository, plumbing.Hash, *object.Commit) (bool, error)
+	}{
+		{"strict", strictDescends},
+		{"or_equal", descendsOrEqual},
+	} {
+		for _, tc := range []struct {
+			name string
+			tip  *object.Commit
+		}{{"child", child}, {"equal", equal}} {
+			t.Run(wrapper.name+"/"+tc.name, func(t *testing.T) {
+				ctx, cancel := context.WithCancel(context.Background())
+				cancel()
+				s.reads = nil
+				if got, err := wrapper.run(ctx, repo, base, tc.tip); got || !errors.Is(err, context.Canceled) {
+					t.Fatalf("already canceled=%t,%v", got, err)
+				}
+				if len(s.reads) != 0 {
+					t.Fatalf("already canceled context read storage: %v", s.reads)
+				}
+			})
+		}
+	}
+}
+
 func TestAncestryCancellation(t *testing.T) {
-	for _, mode := range []string{"equal", "strict_equal", "missing_base", "success", "exhaustion", "node_budget", "edge_budget"} {
-		t.Run(mode, func(t *testing.T) {
+	for _, tc := range []struct {
+		mode  string
+		calls int // Includes the final check in ancestry's finish.
+		want  bool
+	}{
+		{"equal", 3, true},
+		{"strict_equal", 3, false},
+		{"missing_base", 3, false},
+		{"success", 7, true},
+		{"exhaustion", 4, false},
+		{"node_budget", 5, false},
+		{"edge_budget", 6, false},
+	} {
+		t.Run(tc.mode, func(t *testing.T) {
+			mode := tc.mode
 			s := &ancestryStore{Storer: memory.NewStorage()}
 			repo, err := git.Init(s, nil)
 			if err != nil {
@@ -186,22 +235,23 @@ func TestAncestryCancellation(t *testing.T) {
 				t.Fatalf("after base load=%t,%v", got, err)
 			}
 			s.hook = nil
-			// Sweep every context-check boundary through the normal result, including
-			// success, exhaustion and budget-refusal returns.
-			completed := false
-			for i := 1; i < 40; i++ {
+			// Verify the normal path's exact check count before targeting its
+			// final boundary. Earlier normal returns must not shorten the sweep.
+			probe := &ancestryCancelContext{Context: context.Background(), remaining: 100}
+			got, err := ancestry(probe, repo, base, declared, strict, nodes, edges)
+			calls := 100 - probe.remaining
+			if err != nil || got != tc.want || calls != tc.calls {
+				t.Errorf("normal result=%t,%v checks=%d; want %t,nil checks=%d", got, err, calls, tc.want, tc.calls)
+			}
+			t.Logf("verified terminal context check: %d", calls)
+			// Each attempt is bounded by the fixture's expected check count;
+			// failures are recorded while the remaining boundaries still run.
+			for i := 1; i <= tc.calls; i++ {
 				ctx := &ancestryCancelContext{Context: context.Background(), remaining: i}
 				got, err := ancestry(ctx, repo, base, declared, strict, nodes, edges)
-				if err == nil {
-					completed = true
-					break
-				}
 				if got || !errors.Is(err, context.Canceled) {
-					t.Fatalf("check %d: %t,%v", i, got, err)
+					t.Errorf("check %d (final=%d): %t,%v; want false,context.Canceled", i, tc.calls, got, err)
 				}
-			}
-			if !completed {
-				t.Fatal("context sweep did not reach normal return")
 			}
 		})
 	}
