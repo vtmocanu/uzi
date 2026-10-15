@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "./maintenance-budget.js";
 import { prepareFrozenHeld, validFrozenHeldPolicy, type FrozenHeldPolicy, type HeldGit } from "./frozen-held.js";
 // Durable run recovery: worker capture, authenticated journal, and model-free
 // restart-safe upload (PRD #1296 M3, decisions D1/D3/D5/D6/D9).
@@ -247,6 +248,7 @@ export interface RecoveryArchiveClient {
     generation?: number,
     releaseEvidence?: string,
     finalDisposition?: RecoveryFinalDisposition,
+    signal?: AbortSignal,
   ): Promise<RecoveryReleaseResponse>;
   /** Issue #2625: claim a completed run's archive is redundant with its published branch. Optional
    *  and gated on `recovery_archive_redundancy_v1`; the answer is only ever logged. */
@@ -380,7 +382,7 @@ export function inventorySourceReporter(context: InventorySourceBoundaryContext)
         // Promise resolution guards thenable access/setup and consumes rejection without waiting.
         const result = context.reportDiagnostic?.(diagnostic);
         void Promise.resolve(result).catch(() => {});
-      } catch { /* Diagnostics must never change the proof's decision. */ }
+      } catch { MaintenanceBudget.current()?.check(); /* Diagnostics must never change the proof's decision. */ }
     }
     return false;
   };
@@ -645,6 +647,34 @@ function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
 // purpose, like recoveryJournalLocks: one worker process owns each data dir.
 const captureCycleTails = new Map<string, Promise<void>>();
 
+function maintenanceSignal(signal?: AbortSignal): AbortSignal | undefined {
+  const budget = MaintenanceBudget.current();
+  budget?.check();
+  return budget ? (signal ? AbortSignal.any([signal, budget.signal]) : budget.signal) : signal;
+}
+
+function maintenanceSignalArgs(): [] | [AbortSignal] {
+  const signal = maintenanceSignal();
+  return signal ? [signal] : [];
+}
+
+/** RPCs can finish remotely after cancellation; their late answers grant no local authority. */
+async function recoveryRPC<T>(action: () => T | Promise<T>): Promise<T> {
+  const budget = MaintenanceBudget.current();
+  const value = await (budget ? budget.raceIO(async () => action()) : action());
+  budget?.check();
+  return value;
+}
+
+/** Owned operations settle before their lock or child ownership can be released. */
+async function ownedRecoveryIO<T>(action: () => T | Promise<T>): Promise<T> {
+  const budget = MaintenanceBudget.current();
+  budget?.check();
+  const value = await action();
+  budget?.check();
+  return value;
+}
+
 /** Run `fn` as the capture cycle of `key`. `wait` queues behind the current holder and returns
  *  `fn`'s value; `skip` returns `{ ran: false }` at once when the cycle is busy. */
 function runCaptureCycle<T>(key: string, mode: "wait", fn: () => Promise<T>): Promise<T>;
@@ -658,6 +688,8 @@ async function runCaptureCycle<T>(
   mode: "wait" | "skip",
   fn: () => Promise<T>,
 ): Promise<T | { ran: true; value: T } | { ran: false }> {
+  const budget = MaintenanceBudget.current();
+  budget?.check();
   const previous = captureCycleTails.get(key);
   if (mode === "skip" && previous) return { ran: false };
   let release!: () => void;
@@ -667,13 +699,19 @@ async function runCaptureCycle<T>(
   // Installed synchronously, so a later waiter queues behind this holder.
   const tail = (previous ?? Promise.resolve()).then(() => held);
   captureCycleTails.set(key, tail);
-  await previous;
   try {
+    // An expired waiter releases only its placeholder, behind the earlier holder.
+    if (budget) await budget.raceIO(() => previous ?? Promise.resolve());
+    else await previous;
+    budget?.check();
     const value = await fn();
+    budget?.check();
     return mode === "skip" ? { ran: true, value } : value;
   } finally {
     release();
-    if (captureCycleTails.get(key) === tail) captureCycleTails.delete(key);
+    void tail.then(() => {
+      if (captureCycleTails.get(key) === tail) captureCycleTails.delete(key);
+    });
   }
 }
 
@@ -686,6 +724,7 @@ export type UploadFailureClass =
 /** Recompute the size, SHA-256 and chunk count of the journaled bundle file and compare them with
  *  the journaled facts. False on a mismatch or an unreadable file. */
 async function verifyJournaledBytes(record: RecoveryRecord, signal?: AbortSignal): Promise<boolean> {
+  signal = maintenanceSignal(signal);
   if (!hasJournaledBundle(record)) return false;
   try {
     const hash = createHash("sha256");
@@ -701,7 +740,7 @@ async function verifyJournaledBytes(record: RecoveryRecord, signal?: AbortSignal
       hash.digest("hex") === record.checksum &&
       Math.max(1, Math.ceil(size / RECOVERY_CHUNK_BYTES)) === record.chunkCount
     );
-  } catch {
+  } catch { MaintenanceBudget.current()?.check();
     return false;
   }
 }
@@ -714,7 +753,7 @@ function errorReason(err: RequestError): string | undefined {
       const reason = (parsed as Record<string, unknown>).reason;
       if (typeof reason === "string") return reason;
     }
-  } catch {
+  } catch { MaintenanceBudget.current()?.check();
     // an untyped (or proxy) body: the status is the signal
   }
   return undefined;
@@ -950,7 +989,7 @@ export class RecoveryCoordinator {
         });
         return record;
       });
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: failed to pin source head (source stays protected by the server hold)", {
         run_id: input.runId,
         error: errText(err),
@@ -974,26 +1013,26 @@ export class RecoveryCoordinator {
     const { context } = input;
     return runCaptureCycle(await this.cycleKey({ runId: context.runId, generation: context.generation, captureId: "", inventoryGuarded: true }), "wait", async () => {
       if (!this.git.enumerateOwedCandidates || !this.git.buildRecoveryCoverage) throw new Error("inventory Git support unavailable");
-      const candidates = await this.git.enumerateOwedCandidates(context.barePath, context.runId);
+      const candidates = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(context.barePath, context.runId));
       const probe = { runId: context.runId, generation: context.generation } as RecoveryRecord;
       if (!input.locallyQuiescent && !(await this.inactiveInventory(probe))) return undefined;
       if (!(await this.openInventoryHold(probe))) return undefined;
       let exactHoldBinding: RecoveryRecord["exactHoldBinding"];
       if (input.repoId && this.client.getExactRecoveryHold) {
-        const response = await this.client.listRecoveryHolds(context.runId);
+        const response = await recoveryRPC(() => this.client.listRecoveryHolds(context.runId));
         const holds = response.run_id === context.runId && Array.isArray(response.holds)
           ? response.holds.filter(h => h.generation === context.generation && h.inventory_guarded === true) : [];
         if (holds.length === 1 && HELD_PUBLICATION_ID_RE.test(holds[0]!.hold_id) && HELD_PUBLICATION_ID_RE.test(input.repoId)) {
           const binding = { holdId: holds[0]!.hold_id, repoId: input.repoId };
-          const exact = await this.client.getExactRecoveryHold(context.runId, context.generation, binding);
+          const exact = await recoveryRPC(() => this.client.getExactRecoveryHold!(context.runId, context.generation, binding, ...maintenanceSignalArgs()));
           if (exact?.state === "open") exactHoldBinding = binding;
         }
       }
       if (input.settledEvidence === "publication") {
         try {
-          const own = await this.client.getRunOwnership!(context.runId);
+          const own = await recoveryRPC(() => this.client.getRunOwnership!(context.runId));
           if (own.status !== "completed" || own.claim_generation !== context.generation || own.inventory_guarded !== true) return undefined;
-        } catch { return undefined; }
+        } catch { MaintenanceBudget.current()?.check(); return undefined; }
       }
       if (!validInventoryContext(context, context.runId) ||
           candidates.some(c => !/^[0-9a-f]{40}$/.test(c.sha) || !c.contexts.length ||
@@ -1008,7 +1047,7 @@ export class RecoveryCoordinator {
         digest = EMPTY_INVENTORY_DIGEST;
         sourceSha = input.currentSha;
       } else {
-        const coverage = await this.git.buildRecoveryCoverage(context.barePath, context, aggregateRoots, input.currentSha);
+        const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(context.barePath, context, aggregateRoots, input.currentSha));
         sourceSha = coverage.sha;
         digest = coverage.fingerprint;
       }
@@ -1084,19 +1123,19 @@ export class RecoveryCoordinator {
       if ((await this.checkedRecords(runId)).some(r => r.generation === generation)) return "retained";
       let bareExists = true;
       try { await fs.lstat(barePath); }
-      catch (err) {
+      catch (err) { MaintenanceBudget.current()?.check();
         if ((err as NodeJS.ErrnoException).code !== "ENOENT") return "retained";
         bareExists = false;
       }
       if (bareExists) {
         if (!this.git.resolveRecoveryBareDir || !this.git.enumerateOwedCandidates || !this.git.readInventoryCloneHeads ||
-            await this.git.resolveRecoveryBareDir(path.basename(barePath)) !== barePath) return "retained";
-        const owed = await this.git.enumerateOwedCandidates(barePath, runId);
+            await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir!(path.basename(barePath))) !== barePath) return "retained";
+        const owed = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(barePath, runId));
         if (owed.some(c => c.contexts.some(x => x.runId === runId))) return "retained";
-        const clones = await this.git.readInventoryCloneHeads(barePath, runId);
+        const clones = await ownedRecoveryIO(() => this.git.readInventoryCloneHeads!(barePath, runId));
         if (clones.kind !== "verified" || clones.clones.length > 0 || clones.heads.length > 0) return "retained";
       }
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: unadopted-generation proof unavailable; custody retained", { run_id: runId, generation, error: errText(err) });
       return "retained";
     }
@@ -1105,13 +1144,14 @@ export class RecoveryCoordinator {
         const open = (await this.guardedHolds(runId)).filter(h => h.generation === generation);
         if (open.length === 0) return "settled"; // already closed (a replayed or concurrent settle)
         if (open.length !== 1) return "retained";
-        const ack = await this.client.releaseRecoveryCustody(runId, generation, "forge_no_output",
-          { kind: "settled", coverage_digest: EMPTY_INVENTORY_DIGEST });
+        const ack = await recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(runId, generation, "forge_no_output",
+          { kind: "settled", coverage_digest: EMPTY_INVENTORY_DIGEST }, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(runId, generation, "forge_no_output",
+          { kind: "settled", coverage_digest: EMPTY_INVENTORY_DIGEST })));
         if (ack.run_id === runId && ack.generation === generation && ack.released === true &&
             ack.holds_released === 1 && !ack.retained) return "settled";
         this.log.warn("recovery: unadopted-generation release not confirmed; custody retained", { run_id: runId, generation });
         return "retained";
-      } catch (err) {
+      } catch (err) { MaintenanceBudget.current()?.check();
         const delay = this.unadoptedSettleRetryDelaysMs[attempt];
         if (delay === undefined || input.signal?.aborted) {
           this.log.warn("recovery: unadopted-generation release failed; custody retained", { run_id: runId, generation, error: errText(err) });
@@ -1127,8 +1167,8 @@ export class RecoveryCoordinator {
     if (this.isExecuting(record.runId) || !this.client.hasFeature?.("recovery_inventory_v1") ||
         !this.client.getRunOwnership || typeof generation !== "number" || !Number.isSafeInteger(generation) || generation <= 0) return false;
     let own;
-    try { own = await this.client.getRunOwnership(record.runId); }
-    catch (err) {
+    try { own = await recoveryRPC(() => this.client.getRunOwnership!(record.runId)); }
+    catch (err) { MaintenanceBudget.current()?.check();
       if (!isRunOwnershipLost(err, record.runId)) return false;
       // A MAC-authenticated immutable FINAL may only replay; new work needs the exact open hold.
       return !!(record.inventoryGuarded && record.finalRequest) || await this.openInventoryHold(record);
@@ -1145,7 +1185,7 @@ export class RecoveryCoordinator {
    *  missing or non-boolean flag, a bad generation or a foreign run throws instead of reading as "no
    *  guarded hold". Callers use it where absence would release or unprotect custody. */
   private async guardedHolds(runId: string): Promise<Array<{ generation: number }>> {
-    const response = await this.client.listRecoveryHolds(runId);
+    const response = await recoveryRPC(() => this.client.listRecoveryHolds(runId));
     if (!response || response.run_id !== runId || !Array.isArray(response.holds)) throw new Error("malformed recovery holds response");
     const out: Array<{ generation: number }> = [];
     for (const h of response.holds as unknown[]) {
@@ -1166,8 +1206,8 @@ export class RecoveryCoordinator {
       if (current.holdSettlement) return "settled";
       // Legacy immutable FINALs retain their byte-identical replay authority after a lost ACK.
       if (!current.exactHoldBinding) return await this.openInventoryHold(current) ? "open" : "unknown";
-      const exact = await this.client.getExactRecoveryHold?.(current.runId, current.generation!,
-        current.exactHoldBinding, signal);
+      const exact = await recoveryRPC(() => this.client.getExactRecoveryHold?.(current.runId, current.generation!,
+        current.exactHoldBinding!, maintenanceSignal(signal)));
       if (!exact || exact.run_id !== current.runId || exact.generation !== current.generation ||
           exact.hold_id !== current.exactHoldBinding.holdId || exact.repo_id !== current.exactHoldBinding.repoId ||
           exact.inventory_guarded !== true) return "unknown";
@@ -1175,7 +1215,7 @@ export class RecoveryCoordinator {
       if (exact.state !== "released" && exact.state !== "discarded") return "unknown";
       await this.writeExistingRecord(current, cur => ({ ...cur, holdSettlement: exact }));
       return "settled";
-    } catch { return "unknown"; }
+    } catch { MaintenanceBudget.current()?.check(); return "unknown"; }
   }
 
   /** Only an existing immutable request can use replay authority. Closed observations
@@ -1199,7 +1239,7 @@ export class RecoveryCoordinator {
 
   private async openInventoryHold(record: Pick<RecoveryRecord, "runId" | "generation">): Promise<boolean> {
     if (!this.client.hasFeature?.("recovery_inventory_v1") || !Number.isSafeInteger(record.generation) || record.generation! <= 0) return false;
-    const response = await this.client.listRecoveryHolds(record.runId);
+    const response = await recoveryRPC(() => this.client.listRecoveryHolds(record.runId));
     return response.run_id === record.runId && Array.isArray(response.holds) &&
       response.holds.filter(h => h.generation === record.generation && h.inventory_guarded === true &&
         typeof h.hold_id === "string" && h.hold_id.length > 0).length === 1;
@@ -1218,7 +1258,7 @@ export class RecoveryCoordinator {
           source_boundary_reason: first?.check ?? "inventory_source_not_quiescent",
           ...(first?.check === "inventory_read_not_verified" ? { inventory_read_cause: first.cause } : {}),
         });
-      } catch { /* Logging cannot affect custody. */ }
+      } catch { MaintenanceBudget.current()?.check(); /* Logging cannot affect custody. */ }
     };
     return {
       context: { ...context, reportDiagnostic: (diagnostic: InventorySourceDiagnostic) => {
@@ -1241,7 +1281,7 @@ export class RecoveryCoordinator {
     // Only positive discovery of zero physical sources permits a callback-free producer.
     const refuse = inventorySourceReporter(context);
     const prove = async () => {
-      const inventory = await this.git.readInventoryCloneHeads?.(context.barePath, context.runId);
+      const inventory = await ownedRecoveryIO(() => this.git.readInventoryCloneHeads?.(context.barePath, context.runId));
       if (inventory?.kind !== "verified" || !Array.isArray(inventory.clones))
         return refuse({ check: "inventory_read_not_verified", cause: inventoryReadCause(inventory) });
       if (inventory.clones.length !== 0) return refuse({ check: "physical_sources_without_boundary" });
@@ -1251,7 +1291,7 @@ export class RecoveryCoordinator {
       if (!await prove()) return "retained";
       await action(prove);
       return "passed";
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       refuse({ check: "boundary_exception" });
       throw err;
     }
@@ -1322,19 +1362,19 @@ export class RecoveryCoordinator {
             r.reason === "inventory_snapshot_changed" || r.reason === "inventory_quiescence_breach")) return;
         for (const record of records) {
           check();
-          const bare = record.bareDir && await this.git.withReportProofBudget!(budget,
-            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined));
+          const bare = record.bareDir && await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget,
+            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined)));
           if (!bare || bare !== record.coverageContext!.barePath) continue;
-          const removed = await this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
+          const removed = await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
             check();
-            const ownership = await this.client.getRunOwnership!(runId, budget);
+            const ownership = await recoveryRPC(() => this.client.getRunOwnership!(runId, budget));
             if (!ownership || ownership.status !== "completed" ||
                 !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
                 ownership.inventory_guarded !== true) return false;
-            const status = await this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget);
+            const status = await recoveryRPC(() => this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget));
             if (!healthyInventoryStatus(status, record, this.now())) return false;
             check();
-            const owed = await this.git.enumerateOwedUnderLock!(bare, runId);
+            const owed = await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId));
             const settledEarlier = await this.settledEarlierGenerations(sources, generation);
             const laterContext = (c: OwedCandidate["contexts"][number]) =>
               Number.isSafeInteger(c.generation) && c.generation! > generation;
@@ -1348,7 +1388,7 @@ export class RecoveryCoordinator {
             const covered = async (head: string) => {
               check();
               return /^[0-9a-f]{40}$/.test(head) &&
-                await this.git.ancestry!(bare, head, record.sourceSha) === "ancestor";
+                await ownedRecoveryIO(() => this.git.ancestry!(bare, head, record.sourceSha)) === "ancestor";
             };
             for (const source of sources) {
               if (source.captureId === record.captureId ||
@@ -1378,16 +1418,18 @@ export class RecoveryCoordinator {
             if (!await inspectSources(bare, covered, laterHead)) return false;
             check();
             if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
-                canonicalJson(await this.git.enumerateOwedUnderLock!(bare, runId)) !== canonicalJson(owed)) return false;
+                canonicalJson(await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId))) !== canonicalJson(owed)) return false;
             if (!ownTailEligible() || !healthyInventoryStatus(status, record, this.now())) return false;
             await this.client.withAcknowledgedFinalReportCustody!(runId, generation, budget, async custodyEligible => {
+              MaintenanceBudget.current()?.check();
               const eligible = () => ownTailEligible() && custodyEligible() && !budget.signal.aborted &&
                 Date.now() < budget.deadline && residueQuarantine() === undefined &&
                 healthyInventoryStatus(status, record, this.now());
               if (eligible()) await remove(eligible);
+              MaintenanceBudget.current()?.check();
             });
             return true;
-          }));
+          })));
           if (removed) return;
         }
       }, budget.signal)));
@@ -1423,19 +1465,19 @@ export class RecoveryCoordinator {
         if (records.length !== 1) return;
         for (const record of records) {
           check();
-          const bare = record.bareDir && await this.git.withReportProofBudget!(budget,
-            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined));
+          const bare = record.bareDir && await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget,
+            () => this.git.resolveRecoveryBareDir?.(record.bareDir!) ?? Promise.resolve(undefined)));
           if (!bare || bare !== record.coverageContext!.barePath) continue;
-          const removed = await this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
+          const removed = await ownedRecoveryIO(() => this.git.withReportProofBudget!(budget, () => this.git.withBareLock!(bare, async () => {
             check();
-            const ownership = await this.client.getRunOwnership!(runId, budget);
+            const ownership = await recoveryRPC(() => this.client.getRunOwnership!(runId, budget));
             if (!ownership || !["completed", "failed", "cancelled"].includes(ownership.status) ||
                 !Number.isSafeInteger(ownership.claim_generation) || ownership.claim_generation !== generation ||
                 (ownership.inventory_guarded !== undefined && typeof ownership.inventory_guarded !== "boolean")) return false;
-            const status = await this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget);
+            const status = await recoveryRPC(() => this.client.getRecoveryCaptureStatus(runId, record.serverCaptureId!, budget));
             if (!healthyInventoryStatus(status, record, this.now())) return false;
             check();
-            const owed = await this.git.enumerateOwedUnderLock!(bare, runId);
+            const owed = await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId));
             const settledEarlier = await this.settledEarlierGenerations(sources, generation);
             const laterContext = (c: OwedCandidate["contexts"][number]) =>
               Number.isSafeInteger(c.generation) && c.generation! > generation;
@@ -1449,7 +1491,7 @@ export class RecoveryCoordinator {
             const covered = async (head: string) => {
               check();
               return /^[0-9a-f]{40}$/.test(head) &&
-                await this.git.ancestry!(bare, head, record.sourceSha) === "ancestor";
+                await ownedRecoveryIO(() => this.git.ancestry!(bare, head, record.sourceSha)) === "ancestor";
             };
             for (const source of sources) {
               if (source.captureId === record.captureId ||
@@ -1476,11 +1518,11 @@ export class RecoveryCoordinator {
             if (!await inspectSources(bare, covered, laterHead)) return false;
             check();
             if (canonicalJson(await this.checkedRecords(runId, budget)) !== canonicalJson(sources) ||
-                canonicalJson(await this.git.enumerateOwedUnderLock!(bare, runId)) !== canonicalJson(owed)) return false;
+                canonicalJson(await ownedRecoveryIO(() => this.git.enumerateOwedUnderLock!(bare, runId))) !== canonicalJson(owed)) return false;
             if (!ownTailEligible()) return false;
             await remove(ownTailEligible);
             return true;
-          }));
+          })));
           if (removed) return;
         }
       }, budget.signal)));
@@ -1489,14 +1531,14 @@ export class RecoveryCoordinator {
   private async frozenCoverageProven(record: RecoveryRecord): Promise<boolean> {
     // Every still-unresolved root must be covered; an earlier archive cannot close a later inventory.
     if (!record.coverageContext || !this.git.enumerateOwedCandidates) return false;
-    const unresolved = await this.git.enumerateOwedCandidates(record.coverageContext.barePath, record.runId);
+    const unresolved = await ownedRecoveryIO(() => this.git.enumerateOwedCandidates!(record.coverageContext!.barePath, record.runId));
     const frozenRoots = record.originalRoots ?? [];
     // Authenticate every physical source record: listRecords deliberately skips unreadable
     // files for inspection, which cannot prove that FINAL covers the run's sources.
     if (!this.git.readInventoryCloneHeads || !this.git.ancestry) return false;
     let sources: RecoveryRecord[];
-    try { sources = await this.checkedRecords(record.runId); } catch { return false; }
-    const clones = await this.git.readInventoryCloneHeads(record.coverageContext.barePath, record.runId);
+    try { sources = await this.checkedRecords(record.runId); } catch { MaintenanceBudget.current()?.check(); return false; }
+    const clones = await ownedRecoveryIO(() => this.git.readInventoryCloneHeads!(record.coverageContext!.barePath, record.runId));
     if (clones.kind !== "verified") return false;
     const laterContext = (c: OwedCandidate["contexts"][number]): boolean =>
       typeof c.generation === "number" && c.generation > record.generation!;
@@ -1514,7 +1556,7 @@ export class RecoveryCoordinator {
     // exclude a retained head; unknown attribution still needs positive ancestry.
     const heads = [...new Set([...sourceHeads, ...clones.heads.filter(h => !laterHead(h))])];
     for (const head of heads) {
-      if (await this.git.ancestry(record.coverageContext.barePath, head, record.sourceSha) !== "ancestor") {
+      if (await ownedRecoveryIO(() => this.git.ancestry!(record.coverageContext!.barePath, head, record.sourceSha)) !== "ancestor") {
         await this.writeExistingRecord(record, cur => ({ ...cur, reason: cur.finalRequest
           ? "inventory_quiescence_breach" : "inventory_snapshot_changed" }));
         return false;
@@ -1534,12 +1576,12 @@ export class RecoveryCoordinator {
     if (record.originalRoots?.length || record.finalRequest?.disposition.kind !== "settled") {
       const roots = [...new Set([...frozenRoots.map(c => c.sha), record.originalSourceSha])].sort();
       if (this.git.readRecoveryCoverageClaim) {
-        if (!await this.git.readRecoveryCoverageClaim(record.coverageContext.barePath, {
-          sourceSha: record.sourceSha, fingerprint: record.coverageDigest!, roots, currentSha: record.inventoryCurrentSha,
-        })) return false;
+        if (!await ownedRecoveryIO(() => this.git.readRecoveryCoverageClaim!(record.coverageContext!.barePath, {
+          sourceSha: record.sourceSha, fingerprint: record.coverageDigest!, roots, currentSha: record.inventoryCurrentSha!,
+        }))) return false;
       } else {
-        const coverage = await this.git.buildRecoveryCoverage(record.coverageContext.barePath, record.coverageContext,
-          roots, record.inventoryCurrentSha);
+        const coverage = await ownedRecoveryIO(() => this.git.buildRecoveryCoverage!(record.coverageContext!.barePath, record.coverageContext!,
+          roots, record.inventoryCurrentSha!));
         if (coverage.sha !== record.sourceSha || coverage.fingerprint !== record.coverageDigest) return false;
       }
     }
@@ -1566,16 +1608,16 @@ export class RecoveryCoordinator {
       try {
         const header = await readRecoveryBundleHeader(record.bundlePath, record.sourceSha);
         if (!header.selfContained || header.prerequisiteShas.length !== 0) return;
-      } catch { return; }
+      } catch { MaintenanceBudget.current()?.check(); return; }
     }
     if (!await this.frozenCoverageProven(record)) return;
     // Validate the archive before both minting and replaying FINAL. A committed receipt
     // remains authoritative when its capture has expired or its status is unusable.
     let observedStatus: RecoveryCaptureStatusResponse | undefined;
     if (record.finalRequest?.disposition.kind !== "settled" && !heldFinal) {
-      if (record.state !== "uploaded" || !record.serverCaptureId) return;
-      try { observedStatus = await this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId); }
-      catch { if (reconcile) return this.reconcileInventory(record, prove); return; }
+      if (record.state !== "uploaded" || !record.serverCaptureId!) return;
+      try { observedStatus = await recoveryRPC(() => this.client.getRecoveryCaptureStatus(record.runId, record.serverCaptureId!)); }
+      catch { MaintenanceBudget.current()?.check(); if (reconcile) return this.reconcileInventory(record, prove); return; }
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       if (!healthyInventoryStatus(observedStatus, record, this.now())) {
         if (reconcile) return this.reconcileInventory(record, prove, observedStatus);
@@ -1603,7 +1645,7 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
-      const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
+      const ack = await recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
       if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true ||
           ack.holds_released !== 1 || ack.retained) {
         return this.reconcileInventory(record, prove, observedStatus);
@@ -1616,10 +1658,11 @@ export class RecoveryCoordinator {
         return quarantinedOutcome(record.captureId);
       }
       await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
+      MaintenanceBudget.current()?.check();
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
       await this.forgetGenerationWithinCycle(record.runId, record.generation!);
       return { state: "uploaded", captureId: record.captureId };
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: final inventory ACK pending; exact request retained", { run_id: record.runId, generation: record.generation, error: errText(err) });
       const cls = await classifyUploadFailure(err, record);
       if (cls.kind === "credential") this.credentialBlockedAt = this.now();
@@ -1664,7 +1707,7 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
       if (residueQuarantine() !== undefined) return { ...quarantinedOutcome(record.captureId), held: "kept" };
-      const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
+      const ack = await recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
       if (!ack || typeof ack !== "object") return kept("held_publication_unreadable_answer");
       if (ack.retained === true) {
         const reason: HeldFinalRetainedReason | undefined = typeof ack.reason === "string" &&
@@ -1686,10 +1729,11 @@ export class RecoveryCoordinator {
         return { ...quarantinedOutcome(record.captureId), held: "kept" };
       }
       await this.writeExistingRecord(record, cur => ({ ...cur, finalAcknowledged: true }));
+      MaintenanceBudget.current()?.check();
       this.onAuthoritativeGenerationReleased?.(record.runId, record.generation!);
       await this.forgetGenerationWithinCycle(record.runId, record.generation!);
       return { state: record.state, captureId: record.captureId, held: "acked" };
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       // 400 is the strict-decode refusal of an api that rolled back past this kind. Everything else
       // (transport, timeout, 5xx, the typed client-side feature absence) proves nothing: keep.
       if (err instanceof RequestError && err.status === 400) return await clearHeld("held_publication_downgrade_400");
@@ -1721,7 +1765,7 @@ export class RecoveryCoordinator {
     if (residueQuarantine() !== undefined) return "kept";
     try {
       return await runCaptureCycle(await this.cycleKey(record), "wait", () => this.releaseHeldWithinCycle(record, publicationId));
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: held publication final not completed; custody retained", {
         run_id: record.runId, generation: record.generation, error: errText(err) });
       return "kept";
@@ -1765,13 +1809,13 @@ export class RecoveryCoordinator {
         !this.client.hasFeature?.("recovery_inventory_v1")) return;
     try {
       if (!await prove() || !await this.inactiveInventory(record) || residueQuarantine() !== undefined) return;
-      const response = await this.client.reconcileRecoveryCapture(record.runId, record.serverCaptureId, {
-        generation: record.generation, source_sha: record.sourceSha, coverage_digest: record.coverageDigest,
+      const response = await recoveryRPC(() => this.client.reconcileRecoveryCapture!(record.runId, record.serverCaptureId!, {
+        generation: record.generation!, source_sha: record.sourceSha, coverage_digest: record.coverageDigest!,
         checksum: record.checksum!, byte_size: record.byteSize!,
-      });
+      }));
       if (!response || typeof response !== "object" || Array.isArray(response) ||
           residueQuarantine() !== undefined || response.run_id !== record.runId ||
-          response.generation !== record.generation || response.capture_id !== record.serverCaptureId) return;
+          response.generation !== record.generation || response.capture_id !== record.serverCaptureId!) return;
       if (response.outcome === "accepted") {
         const receipt = response.final_receipt;
         const saved = record.finalRequest;
@@ -1794,6 +1838,7 @@ export class RecoveryCoordinator {
           residueQuarantine() === undefined && canonicalJson(cur.finalRequest) === canonicalJson(saved) &&
           cur.generation === record.generation && cur.serverCaptureId === record.serverCaptureId && !cur.finalAcknowledged
             ? { ...cur, finalAcknowledged: true } : undefined);
+        MaintenanceBudget.current()?.check();
         if (current.finalAcknowledged) this.onAuthoritativeGenerationReleased?.(record.runId, record.generation);
         return;
       }
@@ -1839,7 +1884,7 @@ export class RecoveryCoordinator {
         delete next.reason;
         return next;
       });
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: capture reconciliation pending; custody retained", { run_id: record.runId, error: errText(err) });
     }
   }
@@ -1885,8 +1930,8 @@ export class RecoveryCoordinator {
         // HeldPublishGate reconciles an existing invocation before reading the body.
         // Without a marker, the empty invalid pack fails pre-verification before heldInvoke.
         // One readback per cycle; unknown answers retain custody and never archive or resend a pack.
-        const response = await this.client.publishHeld(record.runId, record.generation!, record.sourceSha,
-          record.coverageDigest!, Buffer.alloc(0), input.signal);
+        const response = await recoveryRPC(() => this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
+          record.coverageDigest!, Buffer.alloc(0), maintenanceSignal(input.signal)));
         if (!response.ok) return outcome("kept");
         const body = response.body;
         if (body.tip !== record.sourceSha || body.ref !== `refs/uzi-held/${record.runId}/${record.generation}` ||
@@ -1903,7 +1948,7 @@ export class RecoveryCoordinator {
         hold = await this.heldOperationState(record, input.signal);
         if (hold !== "open") return this.heldStopped(record, hold);
         return this.captureCycle({ ...input, record });
-      } catch { return outcome("kept"); }
+      } catch { MaintenanceBudget.current()?.check(); return outcome("kept"); }
     }
     const v2 = this.client.hasHeldPublicationV2?.() === true;
     // Missing new held metadata cannot grant publication authority, but it must
@@ -1913,8 +1958,8 @@ export class RecoveryCoordinator {
     if (v2) {
       terminal = undefined;
       try {
-        const exact = record.exactHoldBinding && await this.client.getExactRecoveryHold?.(
-          record.runId, record.generation!, record.exactHoldBinding, input.signal);
+        const exact = record.exactHoldBinding && await recoveryRPC(() => this.client.getExactRecoveryHold?.(
+          record.runId, record.generation!, record.exactHoldBinding!, maintenanceSignal(input.signal)));
         if (exact && exact.run_id === record.runId && exact.generation === record.generation &&
             exact.hold_id === record.exactHoldBinding!.holdId && exact.repo_id === record.exactHoldBinding!.repoId &&
             exact.inventory_guarded === true && exact.state === "open" &&
@@ -1923,15 +1968,15 @@ export class RecoveryCoordinator {
           terminal = { status: exact.run_status as "failed" | "cancelled" | "completed",
             fail_origin: options.terminal?.fail_origin };
         }
-      } catch { /* Unknown terminal eligibility retains the archive policy. */ }
+      } catch { MaintenanceBudget.current()?.check(); /* Unknown terminal eligibility retains the archive policy. */ }
     } else if (!options.foreground) {
       try {
-        const own = await this.client.getRunOwnership?.(record.runId);
+        const own = await recoveryRPC(() => this.client.getRunOwnership?.(record.runId));
         terminal = own && Number.isSafeInteger(own.claim_generation) &&
           own.claim_generation! >= record.generation! &&
           ["failed", "cancelled", "completed"].includes(own.status)
           ? { status: own.status as "failed" | "cancelled" | "completed" } : undefined;
-      } catch { terminal = undefined; }
+      } catch { MaintenanceBudget.current()?.check(); terminal = undefined; }
     }
     const eligible = isCodePublishingKind(record.kind) && terminal && (v2 || (options.foreground && terminal.status === "failed" &&
       this.client.hasFeature?.("recovery_held_publication_v1"))) &&
@@ -1980,8 +2025,8 @@ export class RecoveryCoordinator {
       // archive fallback, whose FINAL supplies the generation settlement authority.
       if (v2) record = await this.writeExistingRecord(record, cur => ({ ...cur, heldCreateUncertain: true }));
       result = v2 ? "kept" : "fallback";
-      const response = await this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
-        record.coverageDigest!, prepared.pack, input.signal);
+      const response = await recoveryRPC(() => this.client.publishHeld!(record.runId, record.generation!, record.sourceSha,
+        record.coverageDigest!, prepared.pack, maintenanceSignal(input.signal)));
       if (!response.ok) {
         if (v2 && (response.reason === "malformed_response" ||
             (response.httpStatus !== undefined && (response.httpStatus < 400 || response.httpStatus >= 500)))) return;
@@ -2008,10 +2053,10 @@ export class RecoveryCoordinator {
     try {
       if (options.foreground) await publish(async () => true);
       else if (record.coverageContext && record.generation) {
-        const boundary = await this.inventorySourceBoundary({ ...record.coverageContext, generation: record.generation }, publish);
+        const boundary = await this.inventorySourceBoundary({ ...record.coverageContext!, generation: record.generation }, publish);
         if (boundary !== "passed") result = "kept";
       } else result = "kept";
-    } catch { result = v2 ? "kept" : "fallback"; }
+    } catch { MaintenanceBudget.current()?.check(); result = v2 ? "kept" : "fallback"; }
     if (publicationId) {
       const released = await this.releaseHeldWithinCycle(record, publicationId);
       if (released !== "fallback") return outcome(released);
@@ -2035,7 +2080,7 @@ export class RecoveryCoordinator {
       return;
     }
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged || !(await this.inactiveInventory(record))) return;
-    const barePath = record.bareDir && await this.git.resolveRecoveryBareDir?.(record.bareDir);
+    const barePath = record.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(record.bareDir!));
     if (!barePath) return;
     return this.frozenOperationCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal });
   }
@@ -2044,7 +2089,7 @@ export class RecoveryCoordinator {
    * before materializing anything. A failure blocks discovery, never implies empty work. */
   async snapshotOwedInventory(): Promise<void> {
     if (!this.git.discoverOwedCandidates) throw new Error("inventory discovery unavailable");
-    const discovered = await this.git.discoverOwedCandidates();
+    const discovered = await ownedRecoveryIO(() => this.git.discoverOwedCandidates!());
     const fresh = new Map(discovered.map(entry => [canonicalJson(entry.context), entry]));
     // A successful discovery is authoritative: a context it no longer returns has no pins left,
     // so it leaves the queue instead of costing a hold RPC per pass forever. Survivors keep their
@@ -2070,7 +2115,7 @@ export class RecoveryCoordinator {
       if (ctx.generation === null || !("kind" in ctx) || ctx.kind === null ||
           (this.isExecuting(ctx.runId) || isExecuting(ctx.runId)) || !this.client.hasFeature?.("recovery_inventory_v1")) continue;
       try {
-        const hold = (await this.client.listRecoveryHolds(ctx.runId)).holds.find(h =>
+        const hold = (await recoveryRPC(() => this.client.listRecoveryHolds(ctx.runId))).holds.find(h =>
           h.generation === ctx.generation && h.inventory_guarded === true);
         if (!hold || !this.client.getRunOwnership) continue; // closed/discarded never reopened
         const probe = { runId: ctx.runId, generation: ctx.generation } as RecoveryRecord;
@@ -2093,7 +2138,7 @@ export class RecoveryCoordinator {
         if (!preferred || canonicalJson(preferred) !== canonicalJson(ctx)) continue;
         const originalSourceSha = original?.sourceSha;
         let currentSha = originalSourceSha ?? entry.candidates[0]?.sha;
-        const owned = await this.git.committedTrackingOwnership?.(ctx.barePath, ctx.branch, ctx.runId, undefined, ctx.generation);
+        const owned = await ownedRecoveryIO(() => this.git.committedTrackingOwnership?.(ctx.barePath, ctx.branch, ctx.runId, undefined, ctx.generation));
         if (owned?.kind === "owned" && canonicalJson(owned.context) === canonicalJson(ctx)) currentSha = owned.sha;
         if (!currentSha) continue; // No adopted source or positive tracking proof is not an empty snapshot.
         // freezeInventory alone compares the complete source/tree/context fingerprint.
@@ -2111,7 +2156,7 @@ export class RecoveryCoordinator {
         if (boundary === "retained" && original) {
           await this.writeExistingRecord(original, cur => ({ ...cur, state: "needs_action", reason: diagnostics.reason() }));
         }
-      } catch (err) {
+      } catch (err) { MaintenanceBudget.current()?.check();
         this.log.warn("recovery: boot inventory retained; reconstruction failed", { run_id: ctx.runId, generation: ctx.generation, error: errText(err) });
       }
     }
@@ -2232,7 +2277,7 @@ export class RecoveryCoordinator {
         if (finalOutcome) return finalOutcome;
       }
       return outcome;
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       if (err instanceof RecordGoneError) return removed(err);
       this.log.warn("recovery: capture/upload failed; retaining source (needs_action)", {
         run_id: record.runId,
@@ -2241,7 +2286,7 @@ export class RecoveryCoordinator {
       });
       try {
         return await this.markFailure(record, "capture_error", true);
-      } catch (markErr) {
+      } catch (markErr) { MaintenanceBudget.current()?.check();
         if (markErr instanceof RecordGoneError) return removed(markErr);
         throw markErr;
       }
@@ -2267,30 +2312,30 @@ export class RecoveryCoordinator {
     // private origin/main and any checkpoint wrapper are NEVER consulted here.
     let forgeTip: string | undefined;
     try {
-      if (!record.inventoryGuarded) forgeTip = await this.git.fetchDefaultTip(
+      if (!record.inventoryGuarded) forgeTip = await ownedRecoveryIO(() => this.git.fetchDefaultTip!(
         input.barePath,
         input.defaultBranch,
         input.forgePat,
         input.cloneUrl,
         input.forgeUsername,
-      );
-    } catch (err) {
+      ));
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: could not fetch a fresh forge tip; producing a self-contained bundle", {
         run_id: record.runId,
         error: errText(err),
       });
     }
     const tmpPath = this.bundleTmpPath(record);
-    await fs.mkdir(path.dirname(tmpPath), { recursive: true, mode: 0o700 });
+    await ownedRecoveryIO(() => fs.mkdir(path.dirname(tmpPath), { recursive: true, mode: 0o700 }));
     let result: RecoveryBundleResult;
     try {
-      result = await this.git.produceRecoveryBundle(input.barePath, {
+      result = await ownedRecoveryIO(() => this.git.produceRecoveryBundle!(input.barePath, {
         sourceSha: record.sourceSha,
         outPath: tmpPath,
         ...(record.inventoryGuarded ? { guardedDefaultBranch: input.defaultBranch } : { forgeTip }),
-      });
-    } catch (err) {
-      await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+      }));
+    } catch (err) { MaintenanceBudget.current()?.check();
+      await ownedRecoveryIO(() => fs.rm(tmpPath, { force: true })).catch(() => undefined);
       if (err instanceof RecoveryBundleTooLargeError) {
         this.log.warn("recovery: bundle exceeds the size limit; retaining source (needs_action)", {
           run_id: record.runId,
@@ -2310,7 +2355,7 @@ export class RecoveryCoordinator {
     }
     if (result.alreadyPublished && record.inventoryGuarded) throw new Error("aggregate cannot use already-published shortcut");
     if (result.alreadyPublished) {
-      await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rm(tmpPath, { force: true })).catch(() => undefined);
       return { kind: "already_published" };
     }
     const installed = await this.installBundle(record, result, tmpPath, path.basename(input.barePath));
@@ -2351,7 +2396,7 @@ export class RecoveryCoordinator {
         if (pinFactsDiffer(snapshot, cur)) return { kind: "source_advanced" as const };
         if (hasJournaledBundle(cur)) return { kind: "bundled" as const, record: cur };
         const header = cur.inventoryGuarded ? await readRecoveryBundleHeader(tmpPath, cur.sourceSha) : undefined;
-        await fs.rename(tmpPath, finalPath);
+        await ownedRecoveryIO(() => fs.rename(tmpPath, finalPath));
         const bundled: RecoveryRecord = {
           ...cur,
           state: "bundled",
@@ -2366,14 +2411,14 @@ export class RecoveryCoordinator {
         };
         try {
           await this.writeRecordUnlocked(bundled);
-        } catch (err) {
-          await fs.rm(finalPath, { force: true }).catch(() => undefined);
+        } catch (err) { MaintenanceBudget.current()?.check();
+          await ownedRecoveryIO(() => fs.rm(finalPath, { force: true })).catch(() => undefined);
           throw err;
         }
         return { kind: "bundled" as const, record: bundled };
       });
     } finally {
-      await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rm(tmpPath, { force: true })).catch(() => undefined);
     }
   }
 
@@ -2423,7 +2468,7 @@ export class RecoveryCoordinator {
           // issue #2213: a latch that landed during the hold read stops the reserve.
           if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
         }
-        reserved = await this.client.reserveRecoveryCapture(current.runId, {
+        reserved = await recoveryRPC(() => this.client.reserveRecoveryCapture(current.runId, {
           run_id: current.runId,
           idempotency_key: current.reserveIdempotencyKey ?? current.captureId,
           source_sha: current.sourceSha,
@@ -2432,8 +2477,8 @@ export class RecoveryCoordinator {
           // Bind the reserve to the EXACT generation's hold (PRD #1349 M2, D1); a v1 record with
           // no generation omits it and the server falls back to the newest-hold reserve.
           ...(current.generation !== undefined ? { generation: current.generation } : {}),
-        });
-      } catch (err) {
+        }));
+      } catch (err) { MaintenanceBudget.current()?.check();
         return this.failUpload(current, err, signal, mode);
       }
       current = await this.writeExistingRecord(current, (cur) => ({ ...cur, serverCaptureId: reserved.capture_id }));
@@ -2457,14 +2502,14 @@ export class RecoveryCoordinator {
     if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
     let status: RecoveryCaptureStatusResponse;
     try {
-      status = await this.client.uploadRecoveryBundle(
+      status = await recoveryRPC(() => this.client.uploadRecoveryBundle(
         current.runId,
         current.serverCaptureId!,
         manifest,
-        createReadStream(current.bundlePath!),
-        signal,
-      );
-    } catch (err) {
+        createReadStream(current.bundlePath!, { signal: maintenanceSignal(signal) }),
+        maintenanceSignal(signal),
+      ));
+    } catch (err) { MaintenanceBudget.current()?.check();
       return this.failUpload(current, err, signal, mode);
     }
     // A stream already in flight when cleanup ran cannot be recalled; this guarded write then
@@ -2477,7 +2522,7 @@ export class RecoveryCoordinator {
     }
     // Bytes are durable on the server; free the local copy. The small journal record stays
     // (state=uploaded) so a restart sweep skips it.
-    if (!uploaded.inventoryGuarded) await fs.rm(current.bundlePath!, { force: true }).catch(() => undefined);
+    if (!uploaded.inventoryGuarded) await ownedRecoveryIO(() => fs.rm(current.bundlePath!, { force: true })).catch(() => undefined);
     this.log.info("recovery: bundle uploaded (durable capture)", {
       run_id: current.runId,
       capture_id: current.captureId,
@@ -2512,7 +2557,7 @@ export class RecoveryCoordinator {
         const retained = (reason: string): UploadedPinCleanupResult => ({ state: "retained", reason });
         let records: RecoveryRecord[];
         try { records = await this.checkedRecords(runId, { signal, deadline }); }
-        catch { return retained("unverified_journal"); }
+        catch { MaintenanceBudget.current()?.check(); return retained("unverified_journal"); }
         const cur = records.find((r) => r.captureId === captureId);
         if (!cur) return retained("record_gone");
         generation = cur.generation ?? 0;
@@ -2524,6 +2569,7 @@ export class RecoveryCoordinator {
         if (residueQuarantine() !== undefined) return retained("quarantined");
         if (this.isExecuting(runId)) return retained("executing");
         // Forward each authenticated directory independently: the primitive refuses a disagreement.
+        MaintenanceBudget.current()?.check();
         const out = await cleanup.call(this.git, {
           runId,
           generation,
@@ -2534,9 +2580,10 @@ export class RecoveryCoordinator {
           deadline,
           isEligible: () => residueQuarantine() === undefined && !this.isExecuting(runId) && !signal.aborted,
         });
+        MaintenanceBudget.current()?.check();
         return out.state === "retained" ? retained(out.reason) : out;
       }, signal);
-    } catch {
+    } catch { MaintenanceBudget.current()?.check();
       // Includes lock-wait aborts and any primitive failure; raw error text never leaves here.
       result = { state: "retained", reason: signal.aborted ? "deadline" : "cleanup_failed" };
     } finally {
@@ -2596,9 +2643,9 @@ export class RecoveryCoordinator {
 
   /** Drop the bundle file(s) a removed record named (and its canonical path). */
   private async dropBundleFiles(record: RecoveryRecord): Promise<void> {
-    await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+    await ownedRecoveryIO(() => fs.rm(this.bundlePath(record), { force: true })).catch(() => undefined);
     if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
-      await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rm(record.bundlePath!, { force: true })).catch(() => undefined);
     }
   }
 
@@ -2651,7 +2698,7 @@ export class RecoveryCoordinator {
     }
     if (residueQuarantine() !== undefined && opts.completedRun !== true) return;
     try {
-      const res = await this.client.releaseRecoveryCustody(runId, generation, releaseEvidence);
+      const res = await recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(runId, generation, releaseEvidence, undefined, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(runId, generation, releaseEvidence)));
       this.log.info("recovery: released custody after verified no-unpublished-output", {
         run_id: runId,
         generation,
@@ -2671,9 +2718,10 @@ export class RecoveryCoordinator {
       if (res.run_id === runId && res.released === true && !res.retained &&
           generation !== undefined && Number.isSafeInteger(generation) && generation >= 0 &&
           res.generation === generation && this.client.hasFeature?.("recovery_release_exact_echo") === true) {
+        MaintenanceBudget.current()?.check();
         this.onAuthoritativeGenerationReleased?.(runId, generation);
       }
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: custody release failed (a reconciler will retry; completion is unaffected)", {
         run_id: runId,
         error: errText(err),
@@ -2695,9 +2743,9 @@ export class RecoveryCoordinator {
   async inventoryHolds(runId: string): Promise<RecoveryHold[]> {
     if (!this.enabled) return [];
     try {
-      const res = await this.client.listRecoveryHolds(runId);
+      const res = await recoveryRPC(() => this.client.listRecoveryHolds(runId));
       return res.holds ?? [];
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: prior-hold inventory failed (custody unchanged)", {
         run_id: runId,
         error: errText(err),
@@ -2721,7 +2769,7 @@ export class RecoveryCoordinator {
     let runDirs: string[];
     try {
       runDirs = await fs.readdir(this.recoveryRoot);
-    } catch {
+    } catch { MaintenanceBudget.current()?.check();
       return [];
     }
     const out: RecoveryRecord[] = [];
@@ -2816,7 +2864,7 @@ export class RecoveryCoordinator {
             reason: res.state === "retained" ? res.reason : res.state,
           });
         });
-      } catch (err) {
+      } catch (err) { MaintenanceBudget.current()?.check();
         this.log.warn("recovery: uploaded pin cleanup step failed; continuing", { run_id: snap.runId, error: errText(err).slice(0, 512) });
       }
     }
@@ -2847,7 +2895,7 @@ export class RecoveryCoordinator {
         return;
       }
       await this.sweepRecord(record, done, signal);
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       if (!(err instanceof RecordGoneError)) {
         // One record's failure (e.g. a journal write error) must not abort the rest of the sweep.
         this.log.warn("recovery: restart sweep failed for a record; continuing", {
@@ -2864,7 +2912,7 @@ export class RecoveryCoordinator {
         done("needs_action", "record_unauthenticated");
         return;
       }
-      await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rm(this.bundlePath(record), { force: true })).catch(() => undefined);
       done("record_removed");
     }
   }
@@ -2895,7 +2943,7 @@ export class RecoveryCoordinator {
     try {
       const out = await this.uploadJournaledBundle(record, signal, "sweep");
       done(out.state, out.reason);
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       if (err instanceof RecordGoneError) throw err;
       this.log.warn("recovery: restart re-upload failed; retaining source (needs_action)", {
         run_id: record.runId,
@@ -2938,8 +2986,8 @@ export class RecoveryCoordinator {
     let resolved: Awaited<ReturnType<NonNullable<RecoveryBundleProducer["resolveRestartSource"]>>> | undefined;
     if (record.bareDir && record.defaultBranch && this.git.resolveRestartSource) {
       try {
-        resolved = await this.git.resolveRestartSource(record.bareDir, record.sourceSha, record.defaultBranch);
-      } catch (err) {
+        resolved = await ownedRecoveryIO(() => this.git.resolveRestartSource!(record.bareDir!, record.sourceSha, record.defaultBranch!));
+      } catch (err) { MaintenanceBudget.current()?.check();
         this.log.warn("recovery: restart source resolution failed", { run_id: record.runId, error: errText(err) });
       }
     }
@@ -2958,16 +3006,16 @@ export class RecoveryCoordinator {
       // Written to a private temp and installed atomically only if the record still names the same
       // source (issue #1995).
       const tmpPath = this.bundleTmpPath(record);
-      await fs.mkdir(path.dirname(tmpPath), { recursive: true, mode: 0o700 });
+      await ownedRecoveryIO(() => fs.mkdir(path.dirname(tmpPath), { recursive: true, mode: 0o700 }));
       let result: RecoveryBundleResult;
       try {
-        result = await this.git.produceRecoveryBundle(resolved.barePath, {
+        result = await ownedRecoveryIO(() => this.git.produceRecoveryBundle!(resolved.barePath!, {
           sourceSha: record.sourceSha,
           outPath: tmpPath,
           forgeTip: undefined,
-        });
-      } catch (err) {
-        await fs.rm(tmpPath, { force: true }).catch(() => undefined);
+        }));
+      } catch (err) { MaintenanceBudget.current()?.check();
+        await ownedRecoveryIO(() => fs.rm(tmpPath, { force: true })).catch(() => undefined);
         const reason = err instanceof RecoveryBundleTooLargeError ? "oversized" : "bundle_failed";
         await this.sweepMark(record, reason, done);
         return;
@@ -2979,7 +3027,7 @@ export class RecoveryCoordinator {
       }
       const out = await this.uploadJournaledBundle(installed.record, signal, "sweep");
       done(out.state, out.reason);
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       if (err instanceof RecordGoneError) throw err;
       this.log.warn("recovery: restart capture failed; retaining source (needs_action)", {
         run_id: record.runId,
@@ -3035,7 +3083,7 @@ export class RecoveryCoordinator {
       // One discovery per spaced pass. Failed discovery retains earlier entries.
       if (!credentialsBlocked && this.git.discoverOwedCandidates && this.client.hasFeature?.("recovery_inventory_v1")) {
         try { await this.snapshotOwedInventory(); }
-        catch (err) {
+        catch (err) { MaintenanceBudget.current()?.check();
           transient = true;
           this.log.warn("recovery: live inventory discovery failed; retained", { error: errText(err) });
         }
@@ -3087,7 +3135,7 @@ export class RecoveryCoordinator {
         const res = await runCaptureCycle(await this.cycleKey(snap), "skip", () => this.livePinCleanupStep(snap, opts));
         if (!res.ran) this.lastAttemptAt.set(snap.captureId, this.now());
       }
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: live re-drive pass failed", { error: errText(err) });
       transient = true;
     }
@@ -3153,7 +3201,7 @@ export class RecoveryCoordinator {
       if (out.reason === "credential_rejected") return "credential";
       if (out.reason && LIVE_RETRY_REASONS.has(out.reason)) return "transient";
       return "ok";
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       if (err instanceof RecordGoneError) {
         // Drop the bytes only for a confirmed-absent record; an unreadable one stays eligible.
         if (err.absent) await this.dropBundleFiles(record);
@@ -3207,14 +3255,14 @@ export class RecoveryCoordinator {
       const ctx = source.context;
       if (selected.some(r => !r.inventoryGuarded || r.branch !== ctx.branch || r.kind !== ctx.kind ||
           (r.completionReceipt && canonicalJson(r.completionReceipt) !== canonicalJson(authority.completionReceipt)))) return;
-      const bare = await this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath));
+      const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(path.basename(ctx.barePath)));
       if (bare !== ctx.barePath) return;
       claims = await this.buildRedundancyClaims(selected, generation, bare, budget, authority.completionReceipt!.final_head);
       const bundles = new Set<string>();
       for (const record of selected) {
         if ((record.bareDir && record.bareDir !== path.basename(bare)) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== path.basename(bare)) ||
-            (record.coverageContext && record.coverageContext.barePath !== bare) ||
+            (record.coverageContext && record.coverageContext!.barePath !== bare) ||
             (record.completionSource && canonicalJson(record.completionSource) !== canonicalJson(source))) return;
         const canonical = path.resolve(this.bundlePath(record));
         if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
@@ -3222,7 +3270,7 @@ export class RecoveryCoordinator {
         try {
           const stat = await fs.lstat(canonical);
           if (!stat.isFile() || stat.isSymbolicLink()) return;
-        } catch (err) {
+        } catch (err) { MaintenanceBudget.current()?.check();
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
         bundles.add(canonical);
@@ -3231,23 +3279,23 @@ export class RecoveryCoordinator {
       const recoverySources = [...new Set(selected.flatMap(r =>
         [r.sourceSha, r.originalSourceSha, r.inventoryCurrentSha].filter((sha): sha is string => !!sha)))];
       // Refuse malformed/unknown attribution before moving the physical completing source.
-      const preflight = await this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
+      const preflight = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
         recoverySources, authority.completionReceipt!.final_head,
-        () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check");
+        () => residueQuarantine() === undefined && !isExecuting(runId) && !this.isExecuting(runId), "completion-check"));
       if (preflight !== "verified") return;
       await this.withCompletionSourceBoundary!(source, async canDelete => {
-        const result = await this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
-          recoverySources, authority.completionReceipt!.final_head, canDelete, "completion");
+        const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ctx, source.roots, pins,
+          recoverySources, authority.completionReceipt!.final_head, canDelete, "completion"));
         if (result !== "removed") return;
         const unlink = async (file: string): Promise<void> => {
           if (!canDelete()) throw new Error("completion cleanup protection changed");
-          try { await fs.unlink(file); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+          try { await ownedRecoveryIO(() => fs.unlink(file)); }
+          catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         };
         for (const bundle of bundles) await unlink(bundle);
         for (const record of selected) if (record.captureId !== authority.captureId) await unlink(this.recordPath(record));
         await unlink(this.recordPath(authority));
-        await fs.rmdir(this.runDir(runId)).catch(() => undefined);
+        await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
       });
     });
     await this.submitRedundancyClaims(claims, budget);
@@ -3281,7 +3329,7 @@ export class RecoveryCoordinator {
       const ack = selected.find(r => r.inventoryGuarded && r.finalAcknowledged && r.finalRequest && r.coverageDigest)!;
       const open = (): boolean => residueQuarantine() === undefined && !this.isExecuting(runId) && !isExecuting(runId);
       if (!open() || !ack.coverageContext || !ack.bareDir) return;
-      const bare = await this.git.resolveRecoveryBareDir?.(ack.bareDir);
+      const bare = await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(ack.bareDir!));
       if (bare !== ack.coverageContext.barePath) return;
       const bundles = new Set<string>();
       // Positive ownership is the canonical capture filename, not an arbitrary MAC-covered path.
@@ -3289,14 +3337,14 @@ export class RecoveryCoordinator {
       for (const record of selected) {
         if ((record.bareDir && record.bareDir !== ack.bareDir) ||
             (record.recoveryPinBareDir && record.recoveryPinBareDir !== ack.bareDir) ||
-            (record.coverageContext && record.coverageContext.barePath !== bare)) return;
+            (record.coverageContext && record.coverageContext!.barePath !== bare)) return;
         const canonical = path.resolve(this.bundlePath(record));
         if (record.bundlePath && path.resolve(record.bundlePath) !== canonical) return;
         if (path.dirname(canonical) !== path.resolve(this.runDir(runId))) return;
         try {
           const st = await fs.lstat(canonical);
           if (!st.isFile() || st.isSymbolicLink()) return;
-        } catch (err) {
+        } catch (err) { MaintenanceBudget.current()?.check();
           if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err;
         }
         bundles.add(canonical);
@@ -3312,25 +3360,25 @@ export class RecoveryCoordinator {
         }
         for (const bundle of bundles) {
           if (!open()) return;
-          try { await fs.unlink(bundle); }
-          catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+          try { await ownedRecoveryIO(() => fs.unlink(bundle)); }
+          catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
         }
         return;
       }
       const cleanupOpen = (): boolean => open() && !this.pendingGenerationReport?.(runId, generation);
       this.pendingReportLogged.delete(ack.captureId);
       claims = await this.buildRedundancyClaims(selected, generation, bare, budget);
-      const result = await this.git.cleanupRecoveryGeneration(bare, ack.coverageContext,
+      const result = await ownedRecoveryIO(() => this.git.cleanupRecoveryGeneration!(bare, ack.coverageContext!,
         ack.originalRoots ?? [], selected.filter(r => r.coverageDigest).map(r => ({
           fingerprint: r.coverageDigest!, sha: r.sourceSha,
           coveredHeads: [...new Set([r.originalSourceSha!, r.inventoryCurrentSha!, ...(r.originalRoots ?? []).map(root => root.sha)])],
         })), [...new Set(selected.flatMap(r => [r.sourceSha, r.originalSourceSha].filter((s): s is string => !!s)))],
-        ack.sourceSha, cleanupOpen);
+        ack.sourceSha, cleanupOpen));
       if (result !== "removed") return;
       const unlink = async (file: string): Promise<void> => {
         if (!cleanupOpen()) throw new Error("recovery cleanup source protection changed");
-        try { await fs.unlink(file); }
-        catch (err) { if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
+        try { await ownedRecoveryIO(() => fs.unlink(file)); }
+        catch (err) { MaintenanceBudget.current()?.check(); if ((err as NodeJS.ErrnoException).code !== "ENOENT") throw err; }
       };
       for (const bundle of bundles) await unlink(bundle);
       // All other journals (including other ACKs) go first. The ACK chosen by cleanupStateOf
@@ -3338,7 +3386,7 @@ export class RecoveryCoordinator {
       for (const record of selected.filter(r => r.captureId !== ack.captureId)
         .sort((a, b) => Number(!!a.finalAcknowledged) - Number(!!b.finalAcknowledged))) await unlink(this.recordPath(record));
       await unlink(this.recordPath(ack));
-      await fs.rmdir(this.runDir(runId)).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
     });
     await this.submitRedundancyClaims(claims, budget);
   }
@@ -3371,18 +3419,18 @@ export class RecoveryCoordinator {
           };
           const read = () => this.git.readRecoveryCoverageClaim!(bare, opts);
           const claim = await withinBudget(budget.signal, () =>
-            this.git.withRecoveryOperation ? this.git.withRecoveryOperation(budget.signal, budget.deadline, read) : read());
+            this.git.withRecoveryOperation ? this.git.withRecoveryOperation!(budget.signal, budget.deadline, read) : read());
           if (!claim) continue;
           out.push({ runId: r.runId, generation, captureId: r.serverCaptureId, request: {
             generation, coverage_digest: claim.coverageDigest, roots: claim.roots, current_sha: claim.currentSha,
             tree: claim.tree, aggregate_objects: claim.aggregateObjects, current_object: claim.currentObject,
             ...(claim.witnessObject === undefined ? {} : { wip: { witness_object: claim.witnessObject } }),
           } });
-        } catch (err) {
+        } catch (err) { MaintenanceBudget.current()?.check();
           this.log.debug("recovery: archive redundancy claim not built", { run_id: r.runId, generation, error: errText(err) });
         }
       }
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.debug("recovery: archive redundancy claims not built", { generation, error: errText(err) });
     }
     return out;
@@ -3417,7 +3465,7 @@ export class RecoveryCoordinator {
         if (budget.signal.aborted) break;
         try {
           const res = await withinBudget(budget.signal, () =>
-            this.client.proveRecoveryArchiveRedundancy!(claim.runId, claim.captureId, claim.request, budget.signal));
+            recoveryRPC(() => this.client.proveRecoveryArchiveRedundancy!(claim.runId, claim.captureId, claim.request, maintenanceSignal(budget.signal))));
           if (!res) break;
           this.log.info("recovery: archive redundancy claim answered", {
             run_id: claim.runId, generation: claim.generation, capture_id: claim.captureId,
@@ -3426,7 +3474,7 @@ export class RecoveryCoordinator {
           if (res.outcome === "expired" || (res.outcome === "retained" && !TRANSIENT_REDUNDANCY_REASONS.has(res.reason ?? ""))) {
             this.redundancySettled.add(claim.captureId);
           }
-        } catch (err) {
+        } catch (err) { MaintenanceBudget.current()?.check();
           this.log.info("recovery: archive redundancy claim failed", {
             run_id: claim.runId, generation: claim.generation, capture_id: claim.captureId, error: errText(err),
           });
@@ -3475,7 +3523,7 @@ export class RecoveryCoordinator {
         }
         return true;
       });
-    } catch { return false; }
+    } catch { MaintenanceBudget.current()?.check(); return false; }
   }
 
   /** One bounded authenticated write/readback, only to an existing exact-generation record.
@@ -3494,7 +3542,7 @@ export class RecoveryCoordinator {
         const readback = await this.requireRecord(existing);
         return canonicalJson(readback.completionReceipt) === canonicalJson(receipt);
       });
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: completion receipt not persisted; source and terminal evidence retained", {
         run_id: receipt.run_id, error: errText(err),
       });
@@ -3505,7 +3553,7 @@ export class RecoveryCoordinator {
   async hasPersistedCompletionReceipt(runId: string, generation: number): Promise<boolean> {
     try {
       return (await this.checkedRecords(runId)).some(r => r.generation === generation && !!r.completionReceipt);
-    } catch { return false; }
+    } catch { MaintenanceBudget.current()?.check(); return false; }
   }
 
   /** Cleanup authority requires a complete authenticated physical journal, unlike inspect. */
@@ -3562,9 +3610,9 @@ export class RecoveryCoordinator {
         : [source.sourceSha];
       for (const head of heads) {
         if (head === ack.sourceSha) continue;
-        const bare = ack.bareDir && await this.git.resolveRecoveryBareDir?.(ack.bareDir);
+        const bare = ack.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(ack.bareDir!));
         if (!bare || bare !== ack.coverageContext?.barePath || !this.git.ancestry ||
-            await this.git.ancestry(bare, head, ack.sourceSha) !== "ancestor") return "pending";
+            await ownedRecoveryIO(() => this.git.ancestry!(bare, head, ack.sourceSha)) !== "ancestor") return "pending";
       }
     }
     return "acknowledged";
@@ -3580,7 +3628,7 @@ export class RecoveryCoordinator {
     for (const directory of [root, dir]) {
       let stat;
       try { stat = await fs.lstat(directory); }
-      catch (err) {
+      catch (err) { MaintenanceBudget.current()?.check();
         if ((err as NodeJS.ErrnoException).code === "ENOENT") return [];
         throw err;
       }
@@ -3656,7 +3704,10 @@ export class RecoveryCoordinator {
   }
 
   private withJournalLock<T>(runId: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
-    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)), fn, signal);
+    const budget = MaintenanceBudget.current();
+    budget?.check();
+    return recoveryJournalLocks.withLock(path.resolve(this.runDir(runId)),
+      () => ownedRecoveryIO(fn), maintenanceSignal(signal));
   }
 
   /** Atomic rename with a fresh MAC (0600 file, 0700 dir). The caller holds this run's journal lock. */
@@ -3664,11 +3715,11 @@ export class RecoveryCoordinator {
     if (!this.key) throw new Error("recovery: MAC key unavailable");
     const mac = this.computeMac(record);
     const dir = this.runDir(record.runId);
-    await fs.mkdir(dir, { recursive: true, mode: 0o700 });
+    await ownedRecoveryIO(() => fs.mkdir(dir, { recursive: true, mode: 0o700 }));
     const dst = this.recordPath(record);
     const tmp = `${dst}.${randomUUID()}.tmp`;
-    await fs.writeFile(tmp, JSON.stringify({ ...record, mac }), { mode: 0o600 });
-    await fs.rename(tmp, dst);
+    await ownedRecoveryIO(() => fs.writeFile(tmp, JSON.stringify({ ...record, mac }), { mode: 0o600 }));
+    await ownedRecoveryIO(() => fs.rename(tmp, dst));
   }
 
   /** Read + AUTHENTICATE one record; null on a missing/tampered/unparseable/unreadable file. */
@@ -3719,13 +3770,13 @@ export class RecoveryCoordinator {
       } else {
         raw = await fs.readFile(filePath, "utf8");
       }
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       return (err as NodeJS.ErrnoException)?.code === "ENOENT" ? { kind: "absent" } : { kind: "unreadable" };
     }
     let parsed: unknown;
     try {
       parsed = JSON.parse(raw);
-    } catch {
+    } catch { MaintenanceBudget.current()?.check();
       this.log.warn("recovery: unparseable journal record; refusing (needs_action)", { file: filePath });
       return { kind: "unreadable" };
     }
@@ -3770,7 +3821,7 @@ export class RecoveryCoordinator {
     let names: string[];
     try {
       names = await fs.readdir(this.runDir(runId));
-    } catch {
+    } catch { MaintenanceBudget.current()?.check();
       return [];
     }
     const out: RecoveryRecord[] = [];
@@ -3836,7 +3887,7 @@ export class RecoveryCoordinator {
       });
       if (alreadyUploaded) return { state: "uploaded", captureId: record.captureId };
       return { state: "needs_action", captureId: record.captureId, reason };
-    } catch (err) {
+    } catch (err) { MaintenanceBudget.current()?.check();
       if (err instanceof RecordGoneError || !swallow) throw err;
       return { state: "needs_action", captureId: record.captureId, reason };
     }
@@ -3847,14 +3898,14 @@ export class RecoveryCoordinator {
     let protectedNow = true;
     try {
       protectedNow = await this.terminalRecordProtection?.(runId) ?? false;
-    } catch {
+    } catch { MaintenanceBudget.current()?.check();
       // An unavailable protection inventory retains unknown files.
     }
     if (protectedNow) {
-      await fs.rmdir(this.runDir(runId)).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
       return;
     }
-    await fs.rm(this.runDir(runId), { recursive: true, force: true }).catch(() => undefined);
+    await ownedRecoveryIO(() => fs.rm(this.runDir(runId), { recursive: true, force: true })).catch(() => undefined);
   }
 
   /**
@@ -3892,12 +3943,12 @@ export class RecoveryCoordinator {
         remaining++;
         continue;
       }
-      await fs.rm(this.recordPath(record), { force: true }).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rm(this.recordPath(record), { force: true })).catch(() => undefined);
       // The bundle lives at the canonical <captureId>.bundle path; remove any distinct
       // journaled bundlePath too, so a released generation never leaks its bytes.
-      await fs.rm(this.bundlePath(record), { force: true }).catch(() => undefined);
+      await ownedRecoveryIO(() => fs.rm(this.bundlePath(record), { force: true })).catch(() => undefined);
       if (record.bundlePath && record.bundlePath !== this.bundlePath(record)) {
-        await fs.rm(record.bundlePath, { force: true }).catch(() => undefined);
+        await ownedRecoveryIO(() => fs.rm(record.bundlePath!, { force: true })).catch(() => undefined);
       }
     }
     if (dirMode === "sweep_if_last") {
@@ -3905,7 +3956,7 @@ export class RecoveryCoordinator {
       return;
     }
     // ENOTEMPTY / ENOENT (and any other failure) leave the dir: never a recursive removal here.
-    await fs.rmdir(this.runDir(runId)).catch(() => undefined);
+    await ownedRecoveryIO(() => fs.rmdir(this.runDir(runId))).catch(() => undefined);
   }
 }
 
@@ -3934,7 +3985,7 @@ async function fileExists(p: string): Promise<boolean> {
   try {
     await fs.access(p);
     return true;
-  } catch {
+  } catch { MaintenanceBudget.current()?.check();
     return false;
   }
 }

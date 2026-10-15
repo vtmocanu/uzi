@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "../src/maintenance-budget.js";
 import { Readable } from "node:stream";
 import { it } from "node:test";
 import { RunRunner } from "../src/runner.js";
@@ -75,6 +76,27 @@ async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "iss
   });
   return { ...f, order, record, operate, setHold: (state: typeof hold) => { hold = state; } };
 }
+
+
+it("maintenance expiry after held ACK journal completion cannot notify release or delete pins", async () => {
+  const f = await v2FrozenFixture();
+  let now = 0, released = 0;
+  const budget = new MaintenanceBudget(600_000, () => now);
+  const write = f.coordinator["writeExistingRecord"].bind(f.coordinator);
+  Object.assign(f.coordinator, {
+    onAuthoritativeGenerationReleased: () => { released++; },
+    writeExistingRecord: async (...args: Parameters<typeof write>) => {
+      const result = await write(...args);
+      if (result.finalAcknowledged) now = 600_000;
+      return result;
+    },
+  });
+  try {
+    await assert.rejects(MaintenanceBudget.run(budget, () => f.operate()), /maintenance deadline/);
+    assert.equal(released, 0, "expiry after the join cannot create a cleanup hint");
+    assert.equal(f.state.pinDeletes, 0);
+  } finally { budget.dispose(); await f.close(); }
+});
 
 it("M3 remembered held scan finding survives restart and a later clean scan", async () => {
   const f = await v2FrozenFixture();
@@ -1271,12 +1293,13 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
     if (message === "recovery: inventory source boundary retained") logs.push(fields!);
   };
   const make = (sourceBoundary: boolean | "runner" = false,
-    pendingGenerationReport?: (runId: string, generation: number) => boolean) => {
+    pendingGenerationReport?: (runId: string, generation: number) => boolean,
+    onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void) => {
     let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
       action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
     const coordinator = new RecoveryCoordinator({
     recoveryRoot: path.join(root, "journal"), workerToken: "local-worker-fixture",
-    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport,
+    log, client: client as never, git: git as never, now: () => state.now, pendingGenerationReport, onAuthoritativeGenerationReleased,
     withInventorySourceBoundary: sourceBoundary === "runner" ? (context, action) =>
       physical.withInventorySourceBoundary(context, action) : sourceBoundary ? async (context, action) => {
       if (state.sourceRefused) {
@@ -3033,3 +3056,35 @@ for (const corruption of ["missing", "source", "ref", "dependencies", "oversized
     } finally { await f.close(); }
   });
 }
+
+it("maintenance late valid FINAL ACK cannot authorize cleanup and saved FINAL retry shares ambient budget", async () => {
+  const { f, before } = await pendingReceiptFixture();
+  let now = 0, released = 0;
+  const budget = new MaintenanceBudget(600_000, () => now);
+  const original = f.client.releaseRecoveryCustody;
+  const reserves = f.reserves(), uploads = f.state.uploads;
+  let settle!: () => void, entered!: () => void;
+  const arrived = new Promise<void>(r => { entered = r; });
+  const wait = new Promise<void>(r => { settle = r; });
+  Object.assign(f.client, { releaseRecoveryCustody: async (...args: unknown[]) => {
+    assert.equal(MaintenanceBudget.current(), budget);
+    assert.equal(args[4], budget.signal);
+    entered(); await wait;
+    return original(...args.slice(0, 4));
+  } });
+  const restarted = f.make(false, undefined, () => { released++; });
+  try {
+    const pending = MaintenanceBudget.run(budget, () => restarted.resumePending(undefined, [before]));
+    await arrived;
+    now = 600_000; assert.throws(() => budget.check());
+    await assert.rejects(pending, /maintenance deadline/);
+    settle(); await new Promise<void>(r => setImmediate(r));
+    const kept = (await restarted.inspect("run-1"))[0]!;
+    assert.notEqual(kept.finalAcknowledged, true);
+    assert.deepEqual(kept.finalRequest, before.finalRequest);
+    assert.equal(released, 0);
+    assert.equal(f.state.pinDeletes, 0);
+    assert.equal(f.reserves(), reserves); assert.equal(f.state.uploads, uploads);
+    assert.throws(() => MaintenanceBudget.run(budget, () => f.make().resumePending(undefined, [kept])), /maintenance deadline/);
+  } finally { settle(); budget.dispose(); await f.close(); }
+});

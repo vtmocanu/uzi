@@ -156,6 +156,72 @@ test("explicit release signal also fences the bounded response body without an a
   await assert.rejects(client.releaseRecoveryCustody("run", 7, undefined, undefined, abort.signal), /explicit release stopped/);
 });
 
+
+for (const phase of ["headers", "body"] as const) {
+  test(`caller abort interrupts uncooperative maintenance ${phase} before the absolute deadline`, async t => {
+    let now = 0, state = "pending";
+    const budget = new MaintenanceBudget(600_000, () => now);
+    t.after(() => budget.dispose());
+    const abort = new AbortController();
+    const headers = deferred<Response>();
+    const bytes = deferred<{ done: true; value: undefined }>();
+    const res = new Response();
+    Object.defineProperty(res, "body", { value: {
+      getReader: () => ({ read: () => bytes.promise, cancel: () => new Promise(() => {}) }),
+      cancel: () => new Promise(() => {}),
+    } });
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+      fetch: async () => phase === "headers" ? headers.promise : res,
+    });
+    await MaintenanceBudget.run(budget, async () => {
+      const pending = client.releaseRecoveryCustody("run", 7, undefined, undefined, abort.signal)
+        .then(() => { state = "resolved"; }, () => { state = "rejected"; });
+      await tick();
+      abort.abort(new Error("short operation stopped"));
+      await tick();
+      const atCallerAbort = state;
+      const absoluteStillOpen = !budget.signal.aborted;
+      // Always release an unfixed waiter so a failing regression cannot hang the suite.
+      now = 600_000;
+      assert.throws(() => budget.check());
+      await pending;
+      headers.resolve(res);
+      bytes.resolve({ done: true, value: undefined });
+      await tick();
+      assert.equal(absoluteStillOpen, true);
+      assert.equal(atCallerAbort, "rejected", "caller cancellation must not wait for the ten-minute budget");
+    });
+  });
+}
+
+
+for (const contentLength of [undefined, "1"]) {
+  test(`maintenance ACK refuses oversized streamed bytes despite Content-Length ${contentLength ?? "absent"}`, async t => {
+    const budget = new MaintenanceBudget();
+    t.after(() => budget.dispose());
+    let index = 0, delivered = 0, cancelled = 0;
+    const encode = new TextEncoder();
+    const res = new Response(new ReadableStream<Uint8Array>({
+      pull(controller) {
+        let value: string;
+        if (index === 0) value = '{"run":{"status":"completed"},"padding":"';
+        else if (index <= 64) value = "x".repeat(64 * 1024);
+        else { value = '"}'; }
+        index++;
+        const bytes = encode.encode(value);
+        delivered += bytes.length;
+        controller.enqueue(bytes);
+        if (index > 65) controller.close();
+      },
+      cancel() { cancelled++; },
+    }, { highWaterMark: 0 }), { headers: contentLength ? { "Content-Length": contentLength } : {} });
+    const ack = await MaintenanceBudget.run(budget, () => readRunAck(res));
+    assert.equal(ack.status, undefined, "an oversized body cannot grant completed ACK authority");
+    assert.ok(delivered < 2 * 1024 * 1024, "the reader stops before buffering the whole oversized response");
+    assert.equal(cancelled, 1);
+  });
+}
+
 test("legacy four-argument release remains compatible without an ambient budget", async () => {
   let sent: unknown;
   const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {

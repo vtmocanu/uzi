@@ -3801,6 +3801,8 @@ export class WorkerClient {
 
 // Signals live as long as the response body, so headers do not renew an operation's cap.
 const responseSignals = new WeakMap<Response, AbortSignal>();
+// Bound actual bytes for default maintenance responses; individual RPCs may be stricter.
+const MAINTENANCE_RESPONSE_MAX_BYTES = 1024 * 1024;
 
 function maintenanceSignal(timeoutMs: number): AbortSignal {
   const budget = MaintenanceBudget.current();
@@ -3819,7 +3821,7 @@ async function maintenanceFetch(transport: typeof fetch, url: string, init: Requ
   const res = await budget.raceIO(() => transport(url, { ...init, signal }), late => {
     // One detached cancellation attempt; an uncooperative body cannot block the caller.
     void late.body?.cancel().catch(() => undefined);
-  });
+  }, signal);
   budget.check();
   if (signal.aborted) {
     void res.body?.cancel().catch(() => undefined);
@@ -3833,7 +3835,7 @@ async function readResponseText(res: Response): Promise<string> {
   const budget = MaintenanceBudget.current();
   if (!budget) return res.text();
   budget.check();
-  const text = await readBoundedText(res, Number.POSITIVE_INFINITY, true);
+  const text = await readBoundedText(res, MAINTENANCE_RESPONSE_MAX_BYTES, true);
   budget.check();
   responseSignals.get(res)?.throwIfAborted();
   return text;
@@ -3920,7 +3922,7 @@ async function readBoundedBytes(res: Response, maxBytes: number, rejectOverflow 
     signal?.throwIfAborted();
     while (total < maxBytes || rejectOverflow) {
       signal?.throwIfAborted();
-      const { done, value } = await (budget ? budget.raceIO(() => reader.read()) : reader.read());
+      const { done, value } = await (budget ? budget.raceIO(() => reader.read(), undefined, signal) : reader.read());
       budget?.check();
       signal?.throwIfAborted();
       if (done) break;

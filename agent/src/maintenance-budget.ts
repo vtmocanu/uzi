@@ -50,8 +50,10 @@ export class MaintenanceBudget {
    * One late-result cleanup attempt is detached and best effort; it cannot block siblings.
    * The caller must supply a bounded/nonblocking cleanup (for example body.cancel()).
    */
-  async raceIO<T>(action: (signal: AbortSignal) => Promise<T>, cancelLate?: (value: T) => void | Promise<void>): Promise<T> {
+  async raceIO<T>(action: (signal: AbortSignal) => Promise<T>, cancelLate?: (value: T) => void | Promise<void>, operationSignal?: AbortSignal): Promise<T> {
     this.check();
+    const signal = operationSignal ? AbortSignal.any([this.signal, operationSignal]) : this.signal;
+    signal.throwIfAborted();
     let aborted = false;
     let cleaned = false;
     const cleanup = (value: T): void => {
@@ -61,19 +63,19 @@ export class MaintenanceBudget {
     };
     let onAbort!: () => void;
     const stopped = new Promise<never>((_resolve, reject) => {
-      onAbort = () => { aborted = true; reject(this.signal.reason); };
-      this.signal.addEventListener("abort", onAbort, { once: true });
+      onAbort = () => { aborted = true; reject(signal.reason); };
+      signal.addEventListener("abort", onAbort, { once: true });
     });
-    const pending = Promise.resolve().then(() => { this.check(); return action(this.signal); });
+    const pending = Promise.resolve().then(() => { this.check(); signal.throwIfAborted(); return action(signal); });
     void pending.then(value => {
       if (aborted) cleanup(value);
     }, () => undefined);
     try {
       const value = await Promise.race([pending, stopped]);
-      try { this.check(); } catch (error) { cleanup(value); throw error; }
+      try { this.check(); signal.throwIfAborted(); } catch (error) { cleanup(value); throw error; }
       return value;
     } finally {
-      this.signal.removeEventListener("abort", onAbort);
+      signal.removeEventListener("abort", onAbort);
     }
   }
 }
