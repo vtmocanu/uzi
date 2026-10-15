@@ -42,7 +42,9 @@ func TestMergedPredecessorPanicIsolationLiveDB(t *testing.T) {
 			})
 			if postCommit {
 				// Model the existing retained checkpoint whose immediate settlement hook is lost.
-				a.exec("INSERT INTO checkpoint_retentions(run_id,user_id,repo_id,branch,tip,ref,state) VALUES($1,$2,$3,'agent/issue-1',$4,'refs/uzi-checkpoints/agent/issue-1','retained')",
+				// The public reconciler reads a bounded page from the shared DB; put this fixture
+				// before other tests' due rows so its one-pass assertion reaches its own checkpoint.
+				a.exec("INSERT INTO checkpoint_retentions(run_id,user_id,repo_id,branch,tip,ref,state,next_attempt_at) VALUES($1,$2,$3,'agent/issue-1',$4,'refs/uzi-checkpoints/agent/issue-1','retained','-infinity')",
 					a.run, a.worker.UserID, a.repo, strings.Repeat("a", 40))
 			}
 			a.svc.SetMergedPredecessorRecovery(a.q, a.recovery)
