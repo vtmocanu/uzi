@@ -2209,7 +2209,11 @@ export class CodexExecutor implements Executor {
     if (flight.abandoned) return;
     const bound = Math.min(this.opts.summarySettleMs ?? 3_000,
       remaining ? remaining() : deadlineAt === undefined ? Infinity : Math.max(0, deadlineAt - Date.now()));
-    if (bound <= 0) { flight.abandoned = true; return; }
+    if (bound <= 0) {
+      flight.abandoned = true;
+      this.log.warn("intent summary did not settle within the bound");
+      return;
+    }
     let timer: ReturnType<typeof setTimeout> | undefined;
     try {
       const settled = await Promise.race([

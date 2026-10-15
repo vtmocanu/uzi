@@ -2345,6 +2345,7 @@ export class WorkerClient {
       this.httpTimeoutMs,
       signal,
       RECOVERY_RELEASE_RESPONSE_MAX_BYTES,
+      true,
     )) as RecoveryReleaseResponse;
   }
 
@@ -3585,12 +3586,14 @@ export class WorkerClient {
     timeoutMs = this.httpTimeoutMs,
     callerSignal?: AbortSignal,
     maxResponseBytes?: number,
+    fenceResponseAbort = false,
   ): Promise<unknown> {
     const res = await this.fetchRaw("POST", path, body, timeoutMs, callerSignal);
     if (res.status >= 400) throw await this.toError("POST", path, res);
     MaintenanceBudget.current()?.check();
     if (res.status === 204) return undefined;
-    const text = maxResponseBytes === undefined ? await readResponseText(res) : await readBoundedText(res, maxResponseBytes, true, callerSignal);
+    const text = maxResponseBytes === undefined ? await readResponseText(res) :
+      await readBoundedText(res, maxResponseBytes, true, fenceResponseAbort ? callerSignal : undefined);
     MaintenanceBudget.current()?.check();
     return text ? JSON.parse(text) : undefined;
   }

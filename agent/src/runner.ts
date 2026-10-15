@@ -12507,13 +12507,18 @@ export class RunRunner {
     signal = MaintenanceBudget.current()?.signal ?? signal;
     MaintenanceBudget.current()?.check();
     const barePath = flight.barePath!;
-    const outcome = await this.recovery.operateFrozenInventory({
+    const input = {
       onCancellationObserved: () => this.observeCancellation(flight),
       record, barePath, defaultBranch: record.defaultBranch!, signal,
-    }, {
-      foreground: true, terminal: flight.heldTerminal,
-      prepare: frozen => this.heldPublicationStep(claim, flight, frozen),
-    });
+    };
+    // V1 ordinary settlement keeps its archive entry point; deferred held work
+    // and V2 share the coordinator's frozen-record ordering and reconciliation.
+    const outcome = !this.client.hasHeldPublicationV2() && flight.heldDeferredCapture === undefined
+      ? await this.recovery.captureAndUpload(input)
+      : await this.recovery.operateFrozenInventory(input, {
+        foreground: true, terminal: flight.heldTerminal,
+        prepare: frozen => this.heldPublicationStep(claim, flight, frozen),
+      });
     MaintenanceBudget.current()?.check();
     if (outcome.held === "acked") {
       flight.heldAcked = true;

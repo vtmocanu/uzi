@@ -2215,6 +2215,14 @@ export class RecoveryCoordinator {
     }
     if (this.isExecuting(record.runId) || !isLiveCandidate(record) || !record.coverageDigest || record.finalAcknowledged ||
         !(await this.inactiveInventory(record))) return;
+    // A saved FINAL replays before resolving inputs needed only for a new capture.
+    // In particular, a verified empty inventory has no bundle or bare to rebuild.
+    if (record.finalRequest) {
+      const outcome = await this.finalizeInventory(record);
+      const latest = await this.readLatest(record);
+      if (latest.kind !== "ok" || latest.record.finalRequest || latest.record.finalAcknowledged) return outcome;
+      record = latest.record;
+    }
     const barePath = record.bareDir && await ownedRecoveryIO(() => this.git.resolveRecoveryBareDir?.(record.bareDir!));
     if (!barePath) return;
     return this.frozenOperationCycle({ record, barePath, defaultBranch: record.defaultBranch ?? "main", signal });
