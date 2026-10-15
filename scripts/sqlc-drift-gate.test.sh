@@ -196,4 +196,68 @@ EOF
   assert_contains "$TMP/transport.log" 'sqlc_1.31.1_linux_amd64.tar.gz'
 fi
 
+if [ "$CASE" = all ] || [ "$CASE" = fixture-cleanup ]; then
+  # Exercise the real harnesses, not the fixture wrapper. Each child is bounded
+  # to 30 seconds; the first failure stops the matrix after its finally cleanup.
+  python3 - "$ROOT" "$TMP" <<'PY'
+import os
+from pathlib import Path
+import shutil
+import subprocess
+import sys
+
+root, diagnostics = map(Path, sys.argv[1:])
+scratch = root / ".uzi/scratch"
+for script, prefix, success_case in (
+    ("sqlc.test.sh", "sqlc-tests.", "missing-version"),
+    ("sqlc-drift-gate.test.sh", "sqlc-drift-tests.", "clean"),
+):
+    for keep in (False, True):
+        for success in (True, False):
+            mode = "opt-in" if keep else "default"
+            outcome = "success" if success else "failure"
+            name = f"fixture-cleanup/{script}/{mode}/{outcome}"
+            env = dict(os.environ)
+            env.pop("UZI_SQLC_KEEP_TEST_ARTIFACTS", None)
+            env.pop("UZI_SQLC_DRIFT_GATE", None)
+            env["UZI_SQLC_KEEP_TEST_ARTIFACTS"] = "1" if keep else "0"
+            selected = success_case
+            if not success:
+                if script == "sqlc.test.sh":
+                    selected = "__fixture_cleanup_unknown_case__"
+                else:
+                    # The parent's fresh TMP owns this guaranteed absent path.
+                    absent = diagnostics / "absent-cleanup-gate.sh"
+                    assert not absent.exists(), name + ": failure fixture must be absent"
+                    env["UZI_SQLC_DRIFT_GATE"] = str(absent)
+            result = subprocess.run(
+                ["sh", str(root / "scripts" / script), "--case", selected],
+                cwd=root / "scripts", env=env, capture_output=True, text=True,
+                timeout=30,
+            )
+            (diagnostics / f"{script}.{mode}.{outcome}.log").write_text(
+                result.stdout + result.stderr + f"\nEXIT={result.returncode}\n"
+            )
+            paths = [line.removeprefix("ARTIFACTS=")
+                     for line in result.stdout.splitlines() if line.startswith("ARTIFACTS=")]
+            assert len(paths) == 1, name + ": expected one child ARTIFACTS path"
+            owned = Path(paths[0])
+            assert owned.parent == scratch and owned.name.startswith(prefix), (
+                name + ": unexpected child ARTIFACTS path: " + str(owned)
+            )
+            try:
+                assert (result.returncode == 0) == success, name + ": unexpected child status"
+                if keep:
+                    assert owned.is_dir(), name + ": opt-in artifacts missing"
+                else:
+                    assert not owned.exists(), name + ": default artifacts retained"
+                print("PASS " + name, flush=True)
+            finally:
+                # The child is reaped; remove only its allocated tree, including
+                # a default-mode leak detected by the assertion above.
+                if owned.exists():
+                    shutil.rmtree(owned)
+PY
+fi
+
 printf 'sqlc-drift-gate tests: PASS\n'
