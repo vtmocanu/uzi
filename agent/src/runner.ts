@@ -1807,7 +1807,7 @@ interface RunFlight {
   heldDeferredCapture?: string;
   /** Issue #2545: a `failed` terminal this flight sent and the server ACKed as failed, recorded at the
    *  report choke point. The held step needs it: step A refuses a run the server has not failed. */
-  heldTerminal?: { status: "failed"; fail_origin?: string };
+  heldTerminal?: { status: "failed" | "cancelled"; fail_origin?: string };
   /** Issue #2545: the held step already ran once for this flight (it publishes at most once). */
   heldAttempted?: boolean;
   /** Issue #2545: the held FINAL was ACKed; the generation is released and cleaned up. */
@@ -12329,7 +12329,7 @@ export class RunRunner {
       currentSha ??= originalSourceSha;
       if (!currentSha) { flight.preserveRecoveryClone = true; return; }
       const record = await this.recovery.freezeInventory({
-        context: options.context, currentSha, originalSourceSha, locallyQuiescent,
+        context: options.context, currentSha, originalSourceSha, locallyQuiescent, repoId: claim.repo.id,
         defaultBranch: claim.repo.default_branch?.trim() || await this.git.defaultBranchName(barePath) || "main",
         ...(publication && retained.kind === "updated" && !flight.preserveRecoveryClone && !candidates.length
           ? { settledEvidence: "publication" as const } : {}),
@@ -12366,7 +12366,7 @@ export class RunRunner {
     // A self-contained upload may still need the terminal quiescence/FINAL pass.
     // Thin or unknown captures retain the clone; cleanup keeps its independent ACK guard.
     if (outcome.state !== "uploaded" ||
-        (await this.recovery.inventoryCleanupState(claim.run_id, claim.claim_generation!) !== "acknowledged" &&
+        (await this.recovery.inventoryCleanupState(record.runId, record.generation!) !== "acknowledged" &&
          (uploaded?.state !== "uploaded" || uploaded.selfContained !== true ||
           !Array.isArray(uploaded.prerequisiteShas) || uploaded.prerequisiteShas.length !== 0))) {
       flight.preserveRecoveryClone = true;
@@ -12388,7 +12388,7 @@ export class RunRunner {
       }
     }
     flight.runLog.info("recovery: guarded inventory disposition", {
-      generation: claim.claim_generation, capture_id: record.captureId, state: outcome.state, reason: outcome.reason,
+      generation: record.generation, capture_id: record.captureId, state: outcome.state, reason: outcome.reason,
     });
   }
 
@@ -12400,9 +12400,9 @@ export class RunRunner {
    * parked runs never reach here with `failed`, so they never defer.
    */
   private heldEligibleTerminal(pending?: PendingTerminal): boolean {
-    return pending?.status === "failed" &&
+    return (pending?.status === "failed" || (pending?.status === "cancelled" && this.client.hasHeldPublicationV2())) &&
       pending.fail_origin !== "push_secret_blocked" && pending.fail_origin !== "worker_residue_blocked" &&
-      this.client.hasFeature(HELD_PUBLICATION_FEATURE);
+      (this.client.hasFeature(HELD_PUBLICATION_FEATURE) || this.client.hasHeldPublicationV2());
   }
 
   /** A held-publication notice carries only the ref, a short sha and a reason code: never file
@@ -12433,7 +12433,7 @@ export class RunRunner {
         return;
       }
       if (record.finalAcknowledged) { flight.heldAcked = true; return; }
-      let result: "acked" | "kept" | "fallback" = "fallback";
+      let result: "acked" | "kept" | "fallback" | "settled" = "fallback";
       const journaled = record.finalRequest?.disposition;
       if (journaled?.kind === "held_publication" && journaled.publication_id) {
         result = await this.recovery.releaseHeldPublication(record, journaled.publication_id);
@@ -12448,7 +12448,7 @@ export class RunRunner {
         if (cleanup !== "acknowledged" && cleanup !== "absent") flight.preserveRecoveryClone = true;
         return;
       }
-      if (result === "kept") {
+      if (result === "kept" || result === "settled") {
         flight.preserveRecoveryClone = true;
         return;
       }
@@ -12476,21 +12476,26 @@ export class RunRunner {
    */
   private async heldPublicationStep(
     claim: ClaimResponse, flight: RunFlight, record: RecoveryRecord, signal?: AbortSignal,
-  ): Promise<"acked" | "kept" | "fallback"> {
-    const barePath = flight.barePath, branch = flight.branch, generation = claim.claim_generation;
+  ): Promise<"acked" | "kept" | "fallback" | "settled"> {
+    const barePath = flight.barePath, branch = record.branch, generation = record.generation;
     const sha12 = record.sourceSha.slice(0, 12);
     const skip = (reason: string): "fallback" => {
       this.heldNotice(flight, `Held publication of ${sha12} skipped: ${reason}; archiving instead.`);
       return "fallback";
     };
     const origin = flight.heldTerminal?.fail_origin;
-    if (!barePath || !branch || generation === undefined || flight.heldTerminal?.status !== "failed" ||
+    const v2 = this.client.hasHeldPublicationV2();
+    if (v2 && !record.exactHoldBinding) return "kept";
+    if (!barePath || !branch || generation === undefined ||
+        !(flight.heldTerminal?.status === "failed" || (v2 && flight.heldTerminal?.status === "cancelled")) ||
         origin === "push_secret_blocked" || origin === "worker_residue_blocked" ||
-        !this.client.hasFeature(HELD_PUBLICATION_FEATURE) || record.generation !== generation ||
+        (!this.client.hasFeature(HELD_PUBLICATION_FEATURE) && !v2) || (!v2 && generation !== claim.claim_generation) ||
         record.inventoryGuarded !== true || !record.coverageDigest || residueQuarantine() !== undefined) {
       return "fallback";
     }
     try {
+      const hold = await this.recovery.heldOperationState(record, signal);
+      if (hold !== "open") return hold === "settled" ? "settled" : "kept";
       // (a) The range: tip = the frozen record, floors = forge-present bases the api fetches (the
       // confirmed checkpoint ref tip, the published branch tips, the default branch). Never an
       // ambiguous attempted tip or a local-only bridge floor.
@@ -12539,9 +12544,11 @@ export class RunRunner {
       if (over) return skip("pack_too_large");
       if (exitCode !== 0) return skip("pack_failed");
       // (f) Upload. Only an answer of `created` for this exact tip and ref continues.
+      const admittedHold = await this.recovery.heldOperationState(record, signal);
+      if (admittedHold !== "open") return admittedHold === "settled" ? "settled" : "kept";
       let res;
       try {
-        res = await this.client.publishHeld(flight.runId, generation, record.sourceSha, record.coverageDigest,
+        res = await this.client.publishHeld(record.runId, generation, record.sourceSha, record.coverageDigest,
           Buffer.concat(chunks), signal);
       } catch {
         return skip("upload_failed");

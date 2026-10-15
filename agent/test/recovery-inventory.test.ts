@@ -16,6 +16,85 @@ import { buildRecoveryLiveTiming } from "../src/main.js";
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
 
+for (const closed of ["released", "discarded", "unknown"] as const) {
+  it(`exact ${closed} hold stops held fallback and new archive without acknowledging FINAL`, async () => {
+    const f = await fixture();
+    try {
+      const holdId = "00000000-0000-4000-8000-000000000007";
+      const repoId = "00000000-0000-4000-8000-000000000008";
+      let state: "open" | "released" | "discarded" | "unknown" = "open";
+      Object.assign(f.client, {
+        listRecoveryHolds: async () => ({ run_id: "run-1", holds: [{
+          hold_id: holdId, generation: 7, inventory_guarded: true, has_available_capture: false,
+        }] }),
+        getExactRecoveryHold: async (_run: string, generation: number, expected: unknown) => {
+          assert.equal(generation, 7);
+          assert.deepEqual(expected, { holdId, repoId });
+          return state === "unknown" ? undefined : {
+            run_id: "run-1", hold_id: holdId, repo_id: repoId, generation: 7, state,
+            original_worker_id: "original", original_worker_identity: "original",
+            inventory_guarded: true, run_status: "failed", current_claim_generation: 8,
+            claim_released: true,
+            ...(state === "open" ? { live_worker_id: "original", live_run_id: "run-1" } : { release_evidence: state === "released" ? "archive" : "owner_discard", ...(state === "released" ? { final_receipt: { kind: "archive", capture_id: "00000000-0000-4000-8000-000000000010", source_sha: H2, coverage_digest: "c".repeat(64) } } : {}) }),
+          };
+        },
+      });
+      const record = await f.coordinator.freezeInventory({
+        context: f.context, currentSha: H, defaultBranch: "main", repoId,
+      });
+      assert.ok(record);
+      state = closed;
+      assert.equal(await f.coordinator.releaseHeldPublication(record, "00000000-0000-4000-8000-000000000009"),
+        closed === "unknown" ? "kept" : "settled");
+      const outcome = await f.capture(record);
+      assert.equal(outcome.held, closed === "unknown" ? "kept" : "settled");
+      assert.equal(f.state.produced, 0);
+      assert.equal(f.state.uploads, 0);
+      assert.equal(f.finals.length, 0);
+      const saved = (await f.coordinator.inspect("run-1"))[0]!;
+      assert.deepEqual(saved.exactHoldBinding, { holdId, repoId });
+      assert.equal(saved.finalAcknowledged, undefined);
+      if (closed !== "unknown") assert.equal(saved.holdSettlement?.state, closed);
+    } finally { await f.close(); }
+  });
+}
+
+
+it("exact closed hold permits only the saved archive FINAL replay after ACK loss", async () => {
+  const f = await fixture(false, os.tmpdir(), true);
+  try {
+    f.client.reconcileRecoveryCapture = async () => { throw new Error("reconciliation unavailable"); };
+    const holdId = "00000000-0000-4000-8000-000000000007";
+    const repoId = "00000000-0000-4000-8000-000000000008";
+    Object.assign(f.client, {
+      listRecoveryHolds: async () => ({ run_id: "run-1", holds: f.state.open ? [{
+        hold_id: holdId, generation: 7, inventory_guarded: true, has_available_capture: false,
+      }] : [] }),
+      getExactRecoveryHold: async () => ({
+        run_id: "run-1", hold_id: holdId, repo_id: repoId, generation: 7,
+        state: f.state.open ? "open" : "released", inventory_guarded: true,
+        original_worker_id: "original", original_worker_identity: "original",
+        run_status: "failed", current_claim_generation: 7, claim_released: true,
+        ...(f.state.open ? { live_worker_id: "original", live_run_id: "run-1" } :
+          { release_evidence: "archive", final_receipt: structuredClone(f.committedReceipts.get(7)) }),
+      }),
+    });
+    const record = await f.coordinator.freezeInventory({ context: f.context, currentSha: H, defaultBranch: "main", repoId });
+    assert.ok(record);
+    f.state.loseAck = true;
+    await f.capture(record);
+    assert.equal(f.finals.length, 1);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, undefined);
+    f.state.loseAck = false;
+    await f.make().resumePending();
+    assert.equal(f.finals.length, 2);
+    assert.deepEqual(f.finals[1], f.finals[0]);
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.finalAcknowledged, true);
+    assert.equal(f.reserves(), 1);
+    assert.equal(f.state.uploads, 1);
+  } finally { await f.close(); }
+});
+
 it("stub redrive wiring recaptures stale inventory and FINALs within the receipt window", async () => {
   const f = await fixture(true);
   try {

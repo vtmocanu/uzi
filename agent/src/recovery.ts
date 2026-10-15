@@ -39,6 +39,7 @@ import type {
   RunOwnershipResponse,
   RecoveryCaptureStatusResponse,
   RecoveryHold,
+  RecoveryExactHold,
   RecoveryHoldsResponse,
   RecoveryReleaseResponse,
   RecoveryReserveRequest,
@@ -95,6 +96,12 @@ export interface RecoveryRecord {
   originalRoots?: Array<{ sha: string; contexts: OwedCandidate["contexts"] }>;
   coverageDigest?: string;
   coverageContext?: PositiveOwedCandidateContext;
+  /** Original hold identity authenticated at freeze; absent on legacy records. */
+  exactHoldBinding?: { holdId: string; repoId: string };
+  /** Validated closed-hold evidence stops publication without granting cleanup authority. */
+  holdSettlement?: RecoveryExactHold;
+  /** Typed archive refusal, never inferred from status or error prose. */
+  archiveRefusal?: "oversize" | "quota";
   finalRequest?: { disposition: RecoveryFinalDisposition; evidence?: string };
   finalAcknowledged?: boolean;
   /** Completion proof is independent of archive coverage and never covers another generation. */
@@ -207,7 +214,7 @@ export interface RecoveryOutcome {
   /** Issue #2545: set only by a held_publication FINAL attempt. `acked` = the api released the hold
    *  against the forge ref; `kept` = the journaled held FINAL stays (non-definitive); `fallback` = the
    *  held FINAL was cleared (definitive refusal or a downgrade 400) and the caller must capture. */
-  held?: "acked" | "kept" | "fallback";
+  held?: "acked" | "kept" | "fallback" | "settled";
 }
 
 /** The archive RPC subset {@link RecoveryCoordinator} needs — WorkerClient satisfies it
@@ -215,6 +222,8 @@ export interface RecoveryOutcome {
 export interface RecoveryArchiveClient {
   withAcknowledgedFinalReportCustody?: WorkerClient["withAcknowledgedFinalReportCustody"];
   hasFeature?(feature: string): boolean;
+  hasHeldPublicationV2?: WorkerClient["hasHeldPublicationV2"];
+  getExactRecoveryHold?: WorkerClient["getExactRecoveryHold"];
   reconcileRecoveryCapture?(runId: string, captureId: string, req: RecoveryReconcileRequest): Promise<RecoveryReconcileResponse>;
   reserveRecoveryCapture(runId: string, req: RecoveryReserveRequest): Promise<RecoveryReserveResponse>;
   getRecoveryCaptureStatus(runId: string, captureId: string, options?: { signal?: AbortSignal; deadline: number }): Promise<RecoveryCaptureStatusResponse>;
@@ -654,8 +663,8 @@ async function runCaptureCycle<T>(
 
 /** The typed disposition of a failed reserve/upload RPC (issue #1995). */
 export type UploadFailureClass =
-  | { kind: "transient"; reason?: "storage_quota_exceeded" }
-  | { kind: "permanent"; reason: string }
+  | { kind: "transient"; reason?: "storage_quota_exceeded"; archiveRefusal?: "quota" }
+  | { kind: "permanent"; reason: string; archiveRefusal?: "oversize" }
   | { kind: "credential"; reason: "credential_rejected" };
 
 /** Recompute the size, SHA-256 and chunk count of the journaled bundle file and compare them with
@@ -719,11 +728,11 @@ export async function classifyUploadFailure(err: unknown, record?: RecoveryRecor
     case "bad_request":
       return permanent("upload_rejected");
     case "oversize":
-      return permanent("archive_constraint");
+      return { kind: "permanent", reason: "archive_constraint", archiveRefusal: "oversize" };
     case "integrity":
       return integrity();
     case "quota":
-      return { kind: "transient", reason: "storage_quota_exceeded" };
+      return { kind: "transient", reason: "storage_quota_exceeded", archiveRefusal: "quota" };
     case "busy":
     case "internal":
       return { kind: "transient" };
@@ -939,6 +948,8 @@ export class RecoveryCoordinator {
   async freezeInventory(input: {
     context: PositiveOwedCandidateContext; currentSha: string; originalSourceSha?: string;
     defaultBranch: string; settledEvidence?: "publication" | "forge_no_output";
+    /** Trusted repo identity from the original claim, never reconstructed from Git. */
+    repoId?: string;
     /** Caller proved the local process reaped; permits freezing before the terminal RPC. */
     locallyQuiescent?: boolean;
   }): Promise<RecoveryRecord | undefined> {
@@ -950,6 +961,17 @@ export class RecoveryCoordinator {
       const probe = { runId: context.runId, generation: context.generation } as RecoveryRecord;
       if (!input.locallyQuiescent && !(await this.inactiveInventory(probe))) return undefined;
       if (!(await this.openInventoryHold(probe))) return undefined;
+      let exactHoldBinding: RecoveryRecord["exactHoldBinding"];
+      if (input.repoId && this.client.getExactRecoveryHold) {
+        const response = await this.client.listRecoveryHolds(context.runId);
+        const holds = response.run_id === context.runId && Array.isArray(response.holds)
+          ? response.holds.filter(h => h.generation === context.generation && h.inventory_guarded === true) : [];
+        if (holds.length === 1 && HELD_PUBLICATION_ID_RE.test(holds[0]!.hold_id) && HELD_PUBLICATION_ID_RE.test(input.repoId)) {
+          const binding = { holdId: holds[0]!.hold_id, repoId: input.repoId };
+          const exact = await this.client.getExactRecoveryHold(context.runId, context.generation, binding);
+          if (exact?.state === "open") exactHoldBinding = binding;
+        }
+      }
       if (input.settledEvidence === "publication") {
         try {
           const own = await this.client.getRunOwnership!(context.runId);
@@ -980,7 +1002,14 @@ export class RecoveryCoordinator {
           r.inventoryCurrentSha === input.currentSha && r.originalSourceSha === originalSourceSha &&
           canonicalJson(r.coverageContext) === canonicalJson(context) &&
           canonicalJson(r.originalRoots) === canonicalJson(roots));
-        if (matching) return matching;
+        if (matching) {
+          if (exactHoldBinding && !matching.exactHoldBinding) {
+            const bound = { ...matching, exactHoldBinding };
+            await this.writeRecordUnlocked(bound);
+            return bound;
+          }
+          return matching;
+        }
         const pending = records.find(r => r.generation === context.generation && r.inventoryGuarded &&
           r.finalRequest && !r.finalAcknowledged);
         if (pending) {
@@ -994,6 +1023,7 @@ export class RecoveryCoordinator {
           generation: context.generation, inventoryGuarded: true, sourceSha,
           originalSourceSha, originalRoots: roots, inventoryCurrentSha: input.currentSha,
           coverageDigest: digest, coverageContext: context,
+          ...(exactHoldBinding ? { exactHoldBinding } : {}),
           branch: context.branch, kind: context.kind, createdAt: this.now(), state: "pinned",
           bareDir: path.basename(context.barePath), defaultBranch: input.defaultBranch,
           finalizationPin: true,
@@ -1108,6 +1138,45 @@ export class RecoveryCoordinator {
       out.push({ generation: hold.generation });
     }
     return out;
+  }
+
+  /** One read per boundary, no retries. Unknown evidence retains all sources and blocks writes.
+   * A validated closed hold is settled, never a release ACK or local cleanup permission. */
+  async heldOperationState(record: RecoveryRecord, signal?: AbortSignal): Promise<"open" | "settled" | "unknown"> {
+    try {
+      const current = await this.requireRecord(record);
+      if (current.holdSettlement) return "settled";
+      // Legacy immutable FINALs retain their byte-identical replay authority after a lost ACK.
+      if (!current.exactHoldBinding) return await this.openInventoryHold(current) ? "open" : "unknown";
+      const exact = await this.client.getExactRecoveryHold?.(current.runId, current.generation!,
+        current.exactHoldBinding, signal);
+      if (!exact || exact.run_id !== current.runId || exact.generation !== current.generation ||
+          exact.hold_id !== current.exactHoldBinding.holdId || exact.repo_id !== current.exactHoldBinding.repoId ||
+          exact.inventory_guarded !== true) return "unknown";
+      if (exact.state === "open") return "open";
+      if (exact.state !== "released" && exact.state !== "discarded") return "unknown";
+      await this.writeExistingRecord(current, cur => ({ ...cur, holdSettlement: exact }));
+      return "settled";
+    } catch { return "unknown"; }
+  }
+
+  /** Only an existing immutable request can use replay authority. Closed observations
+   * never authorize capture, upload, clearing a request, or a replacement FINAL. */
+  private async finalHoldAllowsReplay(record: RecoveryRecord, state: "open" | "settled" | "unknown"): Promise<boolean> {
+    if (state === "open") return true;
+    const current = await this.requireRecord(record);
+    if (!current.finalRequest) return false;
+    if (state === "unknown") return !current.exactHoldBinding;
+    const settled = current.holdSettlement;
+    return !!settled?.final_receipt &&
+      canonicalJson(settled.final_receipt) === canonicalJson(current.finalRequest.disposition) &&
+      (current.finalRequest.evidence === undefined || current.finalRequest.evidence === settled.release_evidence);
+  }
+
+  private heldStopped(record: RecoveryRecord, state: "settled" | "unknown"): RecoveryOutcome {
+    return { state: record.state, captureId: record.captureId,
+      reason: state === "settled" ? "inventory_hold_settled" : "inventory_hold_unknown",
+      held: state === "settled" ? "settled" : "kept" };
   }
 
   private async openInventoryHold(record: Pick<RecoveryRecord, "runId" | "generation">): Promise<boolean> {
@@ -1499,6 +1568,9 @@ export class RecoveryCoordinator {
       if (!await prove() || !await this.inactiveInventory(record)) return;
       // issue #2213: synchronous check immediately before the release (nothing awaited in between).
       if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
+      const hold = await this.heldOperationState(record);
+      if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
+      if (residueQuarantine() !== undefined) return quarantinedOutcome(record.captureId);
       const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
       if (ack.run_id !== record.runId || ack.generation !== record.generation || ack.released !== true ||
           ack.holds_released !== 1 || ack.retained) {
@@ -1542,6 +1614,8 @@ export class RecoveryCoordinator {
     const kept = (reason?: string): RecoveryOutcome => ({ state: record.state, captureId: record.captureId,
       ...(reason ? { reason } : {}), held: "kept" });
     const clearHeld = async (why: string): Promise<RecoveryOutcome> => {
+      const hold = await this.heldOperationState(record);
+      if (hold !== "open") return this.heldStopped(record, hold);
       const cleared = await this.writeExistingRecord(record, cur =>
         !cur.finalAcknowledged && canonicalJson(cur.finalRequest) === canonicalJson(request)
           ? (() => { const next = { ...cur }; delete next.finalRequest; delete next.reason; return next; })()
@@ -1554,6 +1628,9 @@ export class RecoveryCoordinator {
     try {
       if (!this.client.hasFeature?.("recovery_inventory_v1") || !(await this.inactiveInventory(record))) return kept();
       if (!await prove() || !await this.inactiveInventory(record)) return kept();
+      if (residueQuarantine() !== undefined) return { ...quarantinedOutcome(record.captureId), held: "kept" };
+      const hold = await this.heldOperationState(record);
+      if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
       if (residueQuarantine() !== undefined) return { ...quarantinedOutcome(record.captureId), held: "kept" };
       const ack = await this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition);
       if (!ack || typeof ack !== "object") return kept("held_publication_unreadable_answer");
@@ -1607,7 +1684,7 @@ export class RecoveryCoordinator {
    *    and the request was cleared); the caller captures an archive on the SAME record.
    * Never throws.
    */
-  async releaseHeldPublication(record: RecoveryRecord, publicationId: string): Promise<"acked" | "kept" | "fallback"> {
+  async releaseHeldPublication(record: RecoveryRecord, publicationId: string): Promise<"acked" | "kept" | "fallback" | "settled"> {
     if (!this.enabled || !HELD_PUBLICATION_ID_RE.test(publicationId)) return "fallback";
     if (residueQuarantine() !== undefined) return "kept";
     try {
@@ -1616,11 +1693,15 @@ export class RecoveryCoordinator {
         if (latest.kind !== "ok") return "kept" as const;
         let cur = latest.record;
         if (cur.finalAcknowledged) return "acked" as const;
+        if (!cur.finalRequest) {
+          const hold = await this.heldOperationState(cur);
+          if (hold !== "open") return hold === "settled" ? "settled" as const : "kept" as const;
+        }
         if (!cur.inventoryGuarded || !cur.coverageDigest || cur.captureId !== record.captureId ||
             typeof cur.generation !== "number" || !this.client.hasFeature?.("recovery_inventory_v1")) return "fallback" as const;
         if (cur.finalRequest && cur.finalRequest.disposition.kind !== "held_publication") return "kept" as const;
         if (!cur.finalRequest) {
-          if (!(await this.openInventoryHold(cur)) || residueQuarantine() !== undefined) return "fallback" as const;
+          if (!(await this.openInventoryHold(cur)) || residueQuarantine() !== undefined) return "kept" as const;
           cur = await this.writeExistingRecord(cur, c => c.finalRequest || c.finalAcknowledged ? undefined : ({
             ...c, finalRequest: { disposition: { kind: "held_publication", publication_id: publicationId,
               source_sha: c.sourceSha, coverage_digest: c.coverageDigest! } },
@@ -1730,6 +1811,7 @@ export class RecoveryCoordinator {
   }
 
   private async resumeInventory(record: RecoveryRecord, signal?: AbortSignal, isExecuting = this.isExecuting): Promise<RecoveryOutcome | void> {
+    if (record.holdSettlement && !record.finalRequest && !record.finalAcknowledged && !record.completionReceipt) return this.heldStopped(record, "settled");
     if (record.completionReceipt) {
       await this.forgetCompletedGeneration(record.runId, record.generation!, isExecuting, signal);
       return;
@@ -1892,6 +1974,10 @@ export class RecoveryCoordinator {
         return { state: "needs_action", captureId: record.captureId, reason: "record_unauthenticated" };
       }
       record = latest.record;
+      if (record.inventoryGuarded && !record.finalAcknowledged && !record.finalRequest) {
+        const hold = await this.heldOperationState(record, input.signal);
+        if (hold !== "open") return this.heldStopped(record, hold);
+      }
       if (record.inventoryGuarded && (!record.coverageDigest || !this.client.hasFeature?.("recovery_inventory_v1"))) {
         return { state: "needs_action", captureId: record.captureId, reason: "inventory_not_frozen_or_feature_unavailable" };
       }
@@ -1909,6 +1995,10 @@ export class RecoveryCoordinator {
         if (!heldCleared && (record.state !== "bundled" || record.finalRequest || record.finalAcknowledged)) {
           return finalOutcome ?? { state: record.state, captureId: record.captureId };
         }
+      }
+      if (record.inventoryGuarded && !record.finalRequest && !record.finalAcknowledged) {
+        const hold = await this.heldOperationState(record, input.signal);
+        if (hold !== "open") return this.heldStopped(record, hold);
       }
       if (record.state === "needs_action" && record.reason && PERMANENT_UPLOAD_REASONS.has(record.reason)) {
         return { state: "needs_action", captureId: record.captureId, reason: record.reason };
@@ -2127,7 +2217,8 @@ export class RecoveryCoordinator {
       try {
         if (current.inventoryGuarded) {
           if (!this.client.hasFeature?.("recovery_inventory_v1")) throw new Error("inventory feature unavailable");
-          if (!(await this.openInventoryHold(current))) throw new Error("exact guarded open hold unavailable");
+          const hold = await this.heldOperationState(current, signal);
+          if (hold !== "open") return this.heldStopped(current, hold);
           // issue #2213: a latch that landed during the hold read stops the reserve.
           if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
         }
@@ -2157,6 +2248,11 @@ export class RecoveryCoordinator {
     // Last custody check before the stream opens: a record removed while the reserve ran is not uploaded.
     await this.requirePresent(current);
     // issue #2213: a latch that landed during the reserve or the check above stops the stream.
+    if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
+    if (current.inventoryGuarded) {
+      const hold = await this.heldOperationState(current, signal);
+      if (hold !== "open") return this.heldStopped(current, hold);
+    }
     if (residueQuarantine() !== undefined) return quarantinedOutcome(current.captureId);
     let status: RecoveryCaptureStatusResponse;
     try {
@@ -2275,6 +2371,10 @@ export class RecoveryCoordinator {
     );
     if (cls.kind === "credential") this.credentialBlockedAt = this.now();
     const reason = cls.kind === "transient" ? cls.reason ?? TRANSIENT_UPLOAD_REASON[mode] : cls.reason;
+    if (cls.kind !== "credential" && cls.archiveRefusal) {
+      const archiveRefusal = cls.archiveRefusal;
+      record = await this.writeExistingRecord(record, cur => ({ ...cur, archiveRefusal }));
+    }
     return this.markFailure(record, reason, mode === "capture");
   }
 
@@ -3817,6 +3917,24 @@ function coerceRecord(obj: Record<string, unknown>): RecoveryRecord | null {
     record.coverageContext = ctx;
     record.coverageDigest = obj.coverageDigest;
 
+  }
+  if (obj.exactHoldBinding !== undefined) {
+    const binding = obj.exactHoldBinding as RecoveryRecord["exactHoldBinding"];
+    if (!record.inventoryGuarded || !binding || !HELD_PUBLICATION_ID_RE.test(binding.holdId) ||
+        !HELD_PUBLICATION_ID_RE.test(binding.repoId)) return null;
+    record.exactHoldBinding = binding;
+  }
+  if (obj.holdSettlement !== undefined) {
+    const settled = obj.holdSettlement as RecoveryExactHold;
+    if (!record.exactHoldBinding || !settled ||
+        settled.run_id !== record.runId || settled.generation !== record.generation ||
+        settled.hold_id !== record.exactHoldBinding.holdId || settled.repo_id !== record.exactHoldBinding.repoId ||
+        settled.inventory_guarded !== true || !["released", "discarded"].includes(settled.state)) return null;
+    record.holdSettlement = settled;
+  }
+  if (obj.archiveRefusal !== undefined) {
+    if (obj.archiveRefusal !== "oversize" && obj.archiveRefusal !== "quota") return null;
+    record.archiveRefusal = obj.archiveRefusal;
   }
   if (obj.finalRequest !== undefined) {
     const req = obj.finalRequest as RecoveryRecord["finalRequest"];

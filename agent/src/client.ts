@@ -1293,6 +1293,11 @@ export class WorkerClient {
     return this.serverFeatures.has(f);
   }
 
+  /** V2 publication requires both this registration's capability and the server feature. */
+  hasHeldPublicationV2(): boolean {
+    return this.hasExactHoldCapability && this.hasFeature("recovery_held_publication_v2");
+  }
+
   /** Drop the whole negotiated feature set (PRD #1391 M5): after a strict-decode
    *  rollback fallback succeeds, later ordinary heartbeat adverts can repopulate it. */
   clearFeatures(): void {
@@ -2135,7 +2140,7 @@ export class WorkerClient {
     pack: Readable | Buffer,
     signal?: AbortSignal,
   ): Promise<HeldPublishResult> {
-    if (!this.hasFeature(HELD_PUBLICATION_FEATURE)) return { ok: false, reason: "unsupported_feature" };
+    if (!this.hasFeature(HELD_PUBLICATION_FEATURE) && !this.hasHeldPublicationV2()) return { ok: false, reason: "unsupported_feature" };
     const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/held-publication`;
     const timeout = AbortSignal.timeout(HELD_PUBLICATION_TIMEOUT_MS);
     const init: RequestInit = {
@@ -2316,7 +2321,7 @@ export class WorkerClient {
       if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; final release retained");
       // Issue #2545: a held_publication FINAL names a ref on the forge; without the negotiated
       // feature nothing is sent, and the typed error keeps the journaled FINAL (non-definitive).
-      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE)) {
+      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE) && !this.hasHeldPublicationV2()) {
         throw new HeldFeatureUnavailableError();
       }
       body.final_disposition = finalDisposition;

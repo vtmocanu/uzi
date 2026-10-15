@@ -40,6 +40,19 @@ test("exact observation requires both rollout directions and treats old API abse
  assert.deepEqual(e.paths, [`/api/worker/runs/${run}/recovery-holds?generation=1`]);
 });
 
+test("V2 publication is mutually negotiated and registration resets the worker capability", async () => {
+ const e = await setup([v2], [v2]);
+ assert.equal(e.client.hasHeldPublicationV2(), true);
+ await e.client.register("worker", undefined, 1, undefined, []);
+ assert.equal(e.client.hasHeldPublicationV2(), false);
+ mock.restoreAll();
+ const serverOnly = await setup([v2], []);
+ assert.equal(serverOnly.client.hasHeldPublicationV2(), false);
+ mock.restoreAll();
+ const workerOnly = await setup([], [v2]);
+ assert.equal(workerOnly.client.hasHeldPublicationV2(), false);
+});
+
 test("publication disabled advertisement does not disable exact custody observations", async () => {
  const e = await setup([], [v2]);
  assert.deepEqual(await e.client.getExactRecoveryHold(run, 1, expected), open());
