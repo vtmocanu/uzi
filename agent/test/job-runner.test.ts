@@ -10,6 +10,7 @@ import { setTimeout as realDelay } from "node:timers/promises";
 import type { HookInput, Options as SdkOptions } from "@anthropic-ai/claude-agent-sdk";
 
 import { ActiveRunRegistry } from "../src/active-run-registry.js";
+import { MessageBatcher } from "../src/batcher.js";
 import type { WorkerClient } from "../src/client.js";
 import { JobFileTimeoutError, RequestError } from "../src/client.js";
 import type { JobFileUploadMeta, JobFileUploadResponse } from "../src/protocol.js";
@@ -85,6 +86,7 @@ interface Calls {
 
 function fakeClient(opts: {
   inputs?: () => UserInput[];
+  inputReply?: () => ReturnType<WorkerClient["getInputs"]>;
   receipts?: boolean;
   postJobResult?: (id: string, body: JobResultRequest) => Promise<void>;
   /** Decide one upload attempt (default: stored, 201). May throw a RequestError. */
@@ -110,7 +112,7 @@ function fakeClient(opts: {
     postMessages: async (_id: string, messages: OutgoingMessage[], generation?: number) => {
       calls.messages.push({ messages, generation });
     },
-    getInputs: async () => ({ inputs: opts.inputs?.() ?? [], receipts: opts.receipts === true }),
+    getInputs: async () => opts.inputReply ? opts.inputReply() : ({ inputs: opts.inputs?.() ?? [], receipts: opts.receipts === true }),
     ackInputs: async (_id: string, ids: number[]) => {
       calls.acks.push(ids);
       return { active: true, inputs: [] };
@@ -195,6 +197,246 @@ function scripted(
 function newRunner(client: WorkerClient, jobsRoot: string, queryFn: SdkQueryFn, extra: Record<string, unknown> = {}): JobRunner {
   return new JobRunner(client, nullLogger(), { queryFn, jobsRoot, batchMs: 5, cancelPollMs: 10, outputRetryDelaysMs: [1, 1], ...extra });
 }
+
+function terminalBarrier(): { promise: Promise<void>; release: () => void } {
+  let release!: () => void;
+  const promise = new Promise<void>((resolve) => { release = resolve; });
+  return { promise, release };
+}
+
+function assertTerminalControlOnly(calls: Calls): void {
+  assert.deepStrictEqual(calls.states.map(({ body }) => body.status), ["running"]);
+  assert.deepStrictEqual(calls.results, []);
+  assert.deepStrictEqual(calls.acks, []);
+  assert.deepStrictEqual(calls.applied, []);
+}
+
+describe("job terminalCancelled teardown", () => {
+  it("settles an aborted input download and closes the batcher before returning", { timeout: 5000 }, async (t) => {
+    const started = terminalBarrier();
+    const aborted = terminalBarrier();
+    const cleanup = terminalBarrier();
+    const closeEntered = terminalBarrier();
+    const closeAllowed = terminalBarrier();
+    const claim = jobClaim();
+    const bytes = Buffer.from("input");
+    const sha = createHash("sha256").update(bytes).digest("hex");
+    claim.job!.files = [{ id: randomUUID(), name: `${sha}.txt`, display_name: "input.txt",
+      size: bytes.length, sha256: sha, content_type: "text/plain" }];
+    let downloadSettled = false;
+    let queryCalled = false;
+    let sessionSignal: AbortSignal | undefined;
+    const { client, calls } = fakeClient({
+      inputReply: async () => {
+        await started.promise;
+        return { inputs: [], receipts: true, terminalCancelled: { run_id: claim.run_id, generation: GEN } };
+      },
+      downloadJobFile: async (_id, _file, _generation, _sink, signal) => {
+        sessionSignal = signal;
+        const onAbort = () => aborted.release();
+        signal!.addEventListener("abort", onAbort, { once: true });
+        started.release();
+        try {
+          if (signal!.aborted) aborted.release();
+          await aborted.promise;
+          await cleanup.promise;
+          throw new Error("download aborted");
+        } finally {
+          signal!.removeEventListener("abort", onAbort);
+          downloadSettled = true;
+        }
+      },
+    });
+    const originalClose = MessageBatcher.prototype.close;
+    t.mock.method(MessageBatcher.prototype, "close", async function (this: MessageBatcher) {
+      assert.equal(downloadSettled, true);
+      await originalClose.call(this);
+      closeEntered.release();
+      await closeAllowed.promise;
+    });
+    const query = scripted(async function* () { queryCalled = true; yield INIT_OK; });
+    let resolved = false;
+    const execution = newRunner(client, await tmpJobsRoot(), query).execute(claim).then(() => { resolved = true; });
+    try {
+      await aborted.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(sessionSignal!.aborted, true);
+      assert.equal(downloadSettled, false);
+      assert.equal(resolved, false);
+      cleanup.release();
+      await closeEntered.promise;
+      assert.equal(resolved, false, "execute must await batcher.close");
+      closeAllowed.release();
+      await execution;
+      assert.equal(queryCalled, false);
+      assertTerminalControlOnly(calls);
+    } finally {
+      started.release();
+      aborted.release();
+      cleanup.release();
+      closeAllowed.release();
+      await execution;
+    }
+  });
+
+  it("ignores stale generation and mismatched run controls, then settles live SDK teardown", { timeout: 5000 }, async () => {
+    const started = terminalBarrier();
+    const negativesChecked = terminalBarrier();
+    const valid = terminalBarrier();
+    const aborted = terminalBarrier();
+    const cleanup = terminalBarrier();
+    const claim = jobClaim();
+    let signal: AbortSignal | undefined;
+    let polls = 0;
+    let iteratorSettled = false;
+    const { client, calls } = fakeClient({
+      inputReply: async () => {
+        await started.promise;
+        polls++;
+        assert.equal(signal!.aborted, false);
+        if (polls === 1) return { inputs: [], terminalCancelled: { run_id: claim.run_id, generation: GEN - 1 } };
+        if (polls === 2) return { inputs: [], terminalCancelled: { run_id: randomUUID(), generation: GEN } };
+        negativesChecked.release();
+        await valid.promise;
+        return { inputs: [], receipts: true, terminalCancelled: { run_id: claim.run_id, generation: GEN } };
+      },
+    });
+    const query = scripted(async function* ({ options, hang }) {
+      signal = options.abortController!.signal;
+      try {
+        yield INIT_OK;
+        started.release();
+        await hang();
+        aborted.release();
+        await cleanup.promise;
+      } finally {
+        iteratorSettled = true;
+      }
+    });
+    let resolved = false;
+    const execution = newRunner(client, await tmpJobsRoot(), query).execute(claim).then(() => { resolved = true; });
+    try {
+      await negativesChecked.promise;
+      assert.equal(signal!.aborted, false);
+      assert.equal(resolved, false);
+      valid.release();
+      await aborted.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(signal!.aborted, true);
+      assert.equal(iteratorSettled, false);
+      assert.equal(resolved, false);
+      cleanup.release();
+      await execution;
+      assert.equal(iteratorSettled, true);
+      assertTerminalControlOnly(calls);
+    } finally {
+      started.release();
+      valid.release();
+      aborted.release();
+      cleanup.release();
+      await execution;
+    }
+  });
+
+  it("settles aborted output upload cleanup before returning without reports or receipts", { timeout: 5000 }, async () => {
+    const started = terminalBarrier();
+    const aborted = terminalBarrier();
+    const cleanup = terminalBarrier();
+    const claim = jobClaim();
+    let uploadSettled = false;
+    let uploading = false;
+    const { client, calls } = fakeClient({
+      inputReply: async () => {
+        if (!uploading) return { inputs: [] };
+        await started.promise;
+        return { inputs: [], receipts: true, terminalCancelled: { run_id: claim.run_id, generation: GEN } };
+      },
+      uploadJobFile: async (_id, _meta, _attempt, signal) => {
+        uploading = true;
+        const onAbort = () => aborted.release();
+        signal!.addEventListener("abort", onAbort, { once: true });
+        started.release();
+        try {
+          if (signal!.aborted) aborted.release();
+          await aborted.promise;
+          await cleanup.promise;
+          throw new Error("upload aborted");
+        } finally {
+          signal!.removeEventListener("abort", onAbort);
+          uploadSettled = true;
+        }
+      },
+    });
+    const query = scripted(async function* ({ options }) {
+      await fsp.mkdir(path.join(options.cwd!, "outputs"), { recursive: true });
+      await fsp.writeFile(path.join(options.cwd!, "outputs/result.txt"), "output");
+      yield INIT_OK;
+      assert.equal((await callSubmit(options, { ...GOOD_RESULT, output_files: ["outputs/result.txt"] })).isError, undefined);
+      yield RESULT_OK;
+    });
+    let resolved = false;
+    const execution = newRunner(client, await tmpJobsRoot(), query).execute(claim).then(() => { resolved = true; });
+    try {
+      await aborted.promise;
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      assert.equal(uploadSettled, false);
+      assert.equal(resolved, false);
+      cleanup.release();
+      await execution;
+      assert.equal(uploadSettled, true);
+      assert.equal(calls.uploads.length, 1);
+      assertTerminalControlOnly(calls);
+    } finally {
+      started.release();
+      aborted.release();
+      cleanup.release();
+      await execution;
+    }
+  });
+
+  it("ignores a terminal control and cancel input returned after the session watcher stops", { timeout: 5000 }, async () => {
+    const pollStarted = terminalBarrier();
+    const iteratorDone = terminalBarrier();
+    const lateReply = terminalBarrier();
+    const claim = jobClaim();
+    let polls = 0;
+    const { client, calls } = fakeClient({
+      inputReply: async () => {
+        if (++polls !== 1) return { inputs: [] };
+        pollStarted.release();
+        await lateReply.promise;
+        return { inputs: [{ id: 99, kind: "cancel", payload: {} } as UserInput], receipts: true,
+          terminalCancelled: { run_id: claim.run_id, generation: GEN } };
+      },
+    });
+    const query = scripted(async function* ({ options }) {
+      try {
+        yield INIT_OK;
+        await pollStarted.promise;
+        await callSubmit(options, GOOD_RESULT);
+        yield RESULT_OK;
+      } finally {
+        iteratorDone.release();
+      }
+    });
+    const execution = newRunner(client, await tmpJobsRoot(), query).execute(claim);
+    try {
+      await iteratorDone.promise;
+      // The generator's return precedes runSession's finally, which stops its watcher.
+      await new Promise<void>((resolve) => setImmediate(resolve));
+      lateReply.release();
+      await execution;
+      assert.deepStrictEqual(calls.states.map(({ body }) => body.status), ["running", "completed"]);
+      assert.equal(calls.results.length, 1);
+      assert.deepStrictEqual(calls.acks, []);
+      assert.deepStrictEqual(calls.applied, []);
+    } finally {
+      pollStarted.release();
+      lateReply.release();
+      await execution;
+    }
+  });
+});
 
 describe("job SDK options: the effective tool surface (PRD #1908 M4)", () => {
   const log = nullLogger();

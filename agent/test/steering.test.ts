@@ -1596,7 +1596,7 @@ describe("input receipts", () => {
     }
   });
 
-  it("#2493 fails a waiting state report and later parks when APPLIED keeps failing on the active claim", async () => {
+  it("#2493 refuses a waiting report and later gate waits when APPLIED keeps failing on the active claim", async () => {
     for (const kind of ["approve_plan", "follow_up"] as const) {
       const row: UserInput = { id: 7, kind, body: kind === "follow_up" ? "seven" : null };
       let applies = 0;
@@ -1618,13 +1618,13 @@ describe("input receipts", () => {
           "the guarded report never goes out as if the input were applied");
         assert.strictEqual(applies, 30, "bounded on the active claim");
         assert.equal(terminal.aborted, true);
-        assert.equal((terminal.reason as Error).name, "InputReceiptError");
+        assert.equal((terminal.reason as Error).name, "ClaimFencedSignal");
         const reason = terminal.reason;
         ch.rearmLifecycle();
         assert.equal(ch.terminalLifecycleSignal(), terminal);
         assert.equal(terminal.reason, reason);
         await assert.rejects(ch.awaitReceiptSettlement(), (err: Error) => err.name === "InputReceiptError");
-        await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "InputReceiptError");
+        await assert.rejects(ch.awaitAnswer("q1"), (err: Error) => err.name === "ClaimFencedSignal");
       } finally {
         await ch.stop();
       }

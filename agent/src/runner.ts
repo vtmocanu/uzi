@@ -8757,6 +8757,7 @@ export class RunRunner {
       observedSessionId: undefined,
       latestContractRevision: undefined,
       reportState: async (body, signal, checked = false) => {
+        if (steering.claimFence() !== undefined) throw new StaleClaimError();
         // Session/roster/progress senders are separate from feed/usage transport. Hold new
         // informational running reports until the checker sequence barrier has reconciled.
         if (!checked && body.status === "running" && flight.checkedStateBarrier)
@@ -8777,6 +8778,9 @@ export class RunRunner {
             throw new CredentialSwitchSignal();
           await steering.awaitReceiptSettlement(signal);
         }
+        // A control/receipt fence may have ended the flight while this report waited.
+        // It permits no resume or competing terminal outcome through the stopped claim.
+        if (steering.claimFence() !== undefined) throw new StaleClaimError();
         // Issue #1830: the choke point that closes the stop-then-wait race. A hard disk stop is only
         // ever requested while the server has ACKed `running` for a send newer than any non-running
         // send and any declined or unreadable ACK (a same-status running send in flight keeps it); if the run then
