@@ -854,16 +854,16 @@ func analyzeToolWindow(rows []store.ListRunToolWindowRow) bool {
 	}
 	counts := make(map[string]int)
 	for _, row := range selected {
-		var use struct {
-			ID    string          `json:"id"`
-			Name  string          `json:"name"`
-			Input json.RawMessage `json:"input"`
-		}
-		if json.Unmarshal(row.Payload, &use) != nil || use.ID == "" || use.Name == "" || len(use.Input) == 0 {
+		var fields map[string]json.RawMessage
+		var id, name string
+		if json.Unmarshal(row.Payload, &fields) != nil ||
+			json.Unmarshal(fields["id"], &id) != nil || id == "" ||
+			json.Unmarshal(fields["name"], &name) != nil || name == "" ||
+			len(fields["input"]) == 0 {
 			continue
 		}
-		result := results[use.ID]
-		if useIDs[use.ID] != 1 || resultIDs[use.ID] != 1 || !result.valid || result.seq <= row.Seq {
+		result := results[id]
+		if useIDs[id] != 1 || resultIDs[id] != 1 || !result.valid || result.seq <= row.Seq {
 			continue
 		}
 		contentHash := sha256.Sum256(canonicalJSON(result.content))
@@ -994,18 +994,17 @@ scan:
 // it participates deterministically without grouping with a well-formed call. The
 // digest is only ever compared for equality — never logged or stored.
 func toolCallHash(payload []byte) string {
-	var p struct {
-		Name  string          `json:"name"`
-		Input json.RawMessage `json:"input"`
-	}
-	if err := json.Unmarshal(payload, &p); err != nil {
+	var fields map[string]json.RawMessage
+	var name string
+	if json.Unmarshal(payload, &fields) != nil ||
+		(len(fields["name"]) > 0 && json.Unmarshal(fields["name"], &name) != nil) {
 		sum := sha256.Sum256(payload)
 		return hex.EncodeToString(sum[:])
 	}
 	h := sha256.New()
-	h.Write([]byte(p.Name))
+	h.Write([]byte(name))
 	h.Write([]byte{0})
-	h.Write(canonicalJSON(p.Input))
+	h.Write(canonicalJSON(fields["input"]))
 	return hex.EncodeToString(h.Sum(nil))
 }
 

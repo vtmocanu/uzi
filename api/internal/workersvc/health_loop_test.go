@@ -41,7 +41,11 @@ func loopResult(t *testing.T, seq int32, id string, content any) store.ListRunTo
 // calls, preserving their newest-first order and their name/input payloads.
 func completeLoopUses(t *testing.T, uses []store.ListRunToolWindowRow) []store.ListRunToolWindowRow {
 	t.Helper()
+	if len(uses) > loopWindow {
+		t.Fatalf("fixture has %d uses, maximum %d", len(uses), loopWindow)
+	}
 	var rows []store.ListRunToolWindowRow
+	seq := int32(2 * loopWindow)
 	for i, use := range uses {
 		var payload map[string]any
 		if err := json.Unmarshal(use.Payload, &payload); err != nil {
@@ -50,19 +54,20 @@ func completeLoopUses(t *testing.T, uses []store.ListRunToolWindowRow) []store.L
 		id := fmt.Sprintf("completed-%d", i)
 		payload["id"] = id
 		use.Payload = mustJSON(t, payload)
-		use.Seq = int32(2*(len(uses)-i) - 1)
-		rows = append(rows, loopResult(t, use.Seq+1, id, "same output"), use)
+		use.Seq = seq - 1
+		rows = append(rows, loopResult(t, seq, id, "same output"), use)
+		seq -= 2
 	}
 	return rows
 }
 
-func loopPairs(t *testing.T, n int) []store.ListRunToolWindowRow {
+func loopPairs(t *testing.T, n int32) []store.ListRunToolWindowRow {
 	t.Helper()
 	var rows []store.ListRunToolWindowRow
 	for i := n; i > 0; i-- {
 		id := fmt.Sprintf("use-%d", i)
-		rows = append(rows, loopResult(t, int32(2*i), id, "same output"),
-			useMsg(t, int32(2*i-1), id, "Bash", map[string]any{"command": "status"}))
+		rows = append(rows, loopResult(t, 2*i, id, "same output"),
+			useMsg(t, 2*i-1, id, "Bash", map[string]any{"command": "status"}))
 	}
 	return rows
 }
@@ -218,6 +223,54 @@ func TestAnalyzeToolWindow(t *testing.T) {
 			})
 		}
 	}
+}
+
+func TestAnalyzeToolWindowExactFields(t *testing.T) {
+	for _, field := range []struct {
+		lower string
+		upper string
+	}{
+		{"id", "ID"},
+		{"name", "Name"},
+		{"input", "Input"},
+	} {
+		t.Run("missing lowercase "+field.lower, func(t *testing.T) {
+			rows := loopPairs(t, 4)
+			for i := 1; i < len(rows); i += 2 {
+				var payload map[string]json.RawMessage
+				if err := json.Unmarshal(rows[i].Payload, &payload); err != nil {
+					t.Fatal(err)
+				}
+				payload[field.upper] = payload[field.lower]
+				delete(payload, field.lower)
+				rows[i].Payload = mustJSON(t, payload)
+			}
+			if analyzeToolWindow(rows) {
+				t.Fatal("wrong-case field must not replace a required lowercase field")
+			}
+		})
+	}
+	for _, alias := range []string{
+		`,"ID":"other"`,
+		`,"Name":"Read"`,
+		`,"Input":{"command":"other"}`,
+		`,"Name":false,"Input":false`,
+	} {
+		t.Run("use metadata "+alias, func(t *testing.T) {
+			rows := loopPairs(t, 4)
+			rows[1].Payload = []byte(`{"id":"use-4","name":"Bash","input":{"command":"status"}` + alias + "}")
+			if !analyzeToolWindow(rows) {
+				t.Fatal("uppercase metadata must not override lowercase call fields")
+			}
+		})
+	}
+	t.Run("result metadata", func(t *testing.T) {
+		rows := loopPairs(t, 4)
+		rows[0].Payload = []byte(`{"tool_use_id":"use-4","content":"same output","is_error":false,"Tool_use_id":"other","Content":"other output","Is_error":true}`)
+		if !analyzeToolWindow(rows) {
+			t.Fatal("uppercase metadata must not override lowercase result fields")
+		}
+	})
 }
 
 func TestAnalyzeToolWindowSelection(t *testing.T) {
