@@ -117,10 +117,66 @@ host shards continue to own the other tests in these files. This nine-leaf
 selection proves only the selected capture behavior under the worker UID;
 acceptance of the full capture suite remains a separate full-capture run.
 
-CI runs the base-only lane on every main push and on PRs changing agent sources,
+CI runs this required lane on every main push and on PRs changing agent sources,
 this harness, Taskfile or the CI workflow. The existing required `test-agent`
 aggregator accepts a skipped lane only when a successful PR path filter explicitly
 reports no relevant changes. Image-validation builds retain their existing role.
+
+After the existing worker and command proofs, `task test:agent:worker-uid` requires
+both calibration sizes. Local callers must set `WORKER_MEMORY_CALIBRATION_RUN_ID`
+and `WORKER_MEMORY_CALIBRATION_ATTEMPT` to explicit local values. CI captures its
+own run identity and attempt. Any missing prerequisite, failed leg or report
+validation failure fails the same required task and existing CI aggregator.
+
+The M5b calibration runner uses a **provided local image only** with the
+locked dependencies and both prebuilt Codex helpers. It never builds, pulls or
+installs. An explicit local invocation is:
+
+```sh
+python3 -B e2e/worker-uid/calibration.py --image mem2396-offline:complete \
+  --mode local --run-id <unique-local-id> --attempt <explicit-attempt>
+```
+
+In CI, use `--mode ci`; identity comes from the host's nonempty
+`GITHUB_RUN_ID` and `GITHUB_RUN_ATTEMPT`. The script verifies that its root is
+the actual Git checkout root before recording the full HEAD SHA. A host manifest
+binds unique invocation, fixture, report, leg and tree IDs to the two finite
+private cgroups and immutable container IDs before either start.
+
+The two sizes run serially. Each fixture enrolls two actual broker commands,
+uses the production reader and monitor, and accepts only the selected command's
+actual feedback and confirmed drain. The fixed plan uses 1 MiB chunks, 16/32
+rounds and four charge classes, with a 64 MiB overhead allowance and a total
+budget no greater than half the cgroup limit. Load is bounded at 30 seconds,
+owned cleanup at 30 seconds, and the fixture wall at 90 seconds including host
+cleanup. Sampling at 250 ms allows 268 records: six baseline reads, up to
+30 seconds load plus 30 seconds cleanup plus five seconds quiet dwell, and two
+boundary ticks. Raw samples are capped at 6,144 bytes; reports at 8 MiB. Evidence
+is refused on overflow, never truncated into acceptance.
+
+The host retains each original producer stdout and exit-status sidecar in its
+printed scratch evidence directory. After ownership-verified container and volume
+cleanup, it emits exactly one final version-1 JSON report per size between the
+standalone calibration markers. Each final report carries its host-observed
+container cleanup proof; the matching trusted `host-cleanup.json` sidecar is
+also required by `calibration_check.py HOST_MANIFEST REPORTS HOST_CLEANUP`.
+A missing or malformed producer report becomes an explicit aborted failure with
+unknown evidence set to null. No next size starts after incomplete cleanup or
+an active-leg failure. A demonstrated unavailable reader before any command
+launch permits collecting the other size's failed prerequisite evidence.
+
+The current host's real prerequisite probes found `memory.pressure` absent at
+both sizes. Real calibration acceptance remains unverified pending a suitable
+host; this fixture fails before load on that prerequisite. There is no PSI
+substitute or privileged fallback. Docker-free regression data in
+`calibration_synthetic.py` is explicitly synthetic and never accepted as a
+measurement. Focused regressions are:
+
+```sh
+python3 -B -m unittest discover -s e2e/worker-uid -p 'calibration*_test.py'
+node --import ./agent/node_modules/tsx/dist/loader.mjs --test --test-concurrency=1 --test-timeout=120000 e2e/worker-uid/calibration-producer.test.mts
+cd agent && npx tsc --noEmit -p ../e2e/worker-uid/tsconfig.json
+```
 
 [Issue #2397: partial investigation](issue-2397-investigation.md) records the
 available evidence and remaining diagnosis work.
