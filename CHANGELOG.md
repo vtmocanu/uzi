@@ -30,6 +30,9 @@ through `[0.52.0]`.)
 - **Run health avoids loop warnings for repeated calls returning different output ([#2989](https://github.com/vtmocanu/uzi/issues/2989)).**
   Tool-loop detection now requires the same call, result and success/error status at least four times among the newest 12 tool uses. Invalid, unmatched or ambiguous pairs do not count, so repeated calls returning different output no longer trigger this flag.
 
+- **Rootful Kubernetes Docker workers avoid MTU-mismatch HTTPS and build stalls ([#3005](https://github.com/vtmocanu/uzi/issues/3005)).**
+  DinD startup matches the default bridge and new bridge-network defaults to the minimum visible non-loopback pod interface MTU, refusing to launch if MTU discovery or daemon configuration fails. Deploy the updated controller and recreate worker pods; existing user-defined networks need recreation to acquire the defaults, and explicit per-network MTU options still take precedence. Rootless remains the default and is outside this fix; deployed-worker validation is pending release and rollout. See [Docker-tier network MTU](docs/configuration.md#docker-tier-network-mtu-rootful-kubernetes-workers).
+
 - **Checkpoint ancestry checks tolerate missing side paths ([#3013](https://github.com/vtmocanu/uzi/issues/3013)).**
   Checkpoints that reach the current base within traversal budgets no longer falsely skip `not_descendant` when another parent path is missing from the shallow broker store; overlay checkpoints can be accepted with either parent order.
 

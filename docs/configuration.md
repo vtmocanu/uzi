@@ -90,6 +90,30 @@ A new component, one per deployment, the only thing in uzi holding a kube-API cr
 
 **A second, narrower queued reason: `no worker supporting custom Codex models is online`.** This one is independent of the knobs above and fires only when a run's effective Codex model is a custom worker-root ID rather than a curated one ([PRD #1551](../prds/1551-per-harness-worker-model-defaults.md)). It needs a worker advertising the additional `codex_custom_model_v1` capability, which only ships with a newer worker image; an old `codex_harness_v1`-only worker cannot claim the run and never silently substitutes `gpt-6-astra`. See [Hosted workers](hosted-workers.md#my-codex-run-says-no-worker-supporting-custom-codex-models-is-online).
 
+### Docker-tier network MTU (rootful Kubernetes workers)
+
+For Kubernetes Docker-tier workers with `workers.docker.rootless: false`, the DinD sidecar reads the MTU of each visible non-loopback interface under `/sys/class/net` at startup and selects the minimum. This conservative choice avoids assuming the pod's interface is named `eth0`. The selected MTU configures Docker's default bridge and the default MTU for newly created user-defined bridge networks, preventing MTU-mismatch HTTPS downloads and builds from stalling on pods whose MTU is below 1500. There is no MTU override in the chart, controller configuration or API.
+
+MTUs must be canonical decimal integers from 1 through 65535. A missing, unreadable or malformed interface MTU, no visible non-loopback interface, or a failure to create or write the daemon configuration prevents daemon startup with a `dind MTU:` diagnostic in the `dind` sidecar logs. The wrapper uses a private daemon JSON configuration for new bridge-network defaults; Docker 29 does not accept `--default-network-opts` as a CLI flag.
+
+Deploy the updated controller renderer and recreate worker pods to acquire the new startup command. MTU selection runs at sidecar startup, with no live adjustment afterward. Existing user-defined networks are not rewritten: recreate networks you own to acquire the new defaults. Explicit per-network Docker MTU options override the default; operators must keep those values at or below the pod MTU. This does not repair arbitrary Docker networks.
+
+**Rootless remains the default and is outside this fix.** Its inherited image entrypoint is unchanged and uses an independent RootlessKit networking path (the pinned image defaults to slirp4netns with MTU 1500). This change adds no supported rootless MTU setting, and rootless behavior has not been live-validated for this fix.
+
+**Live validation after rollout.** Run the following from the `worker` container of a recreated rootful Docker-tier pod with MTU below 1500, using its configured Docker daemon. Inspect the pod interface MTUs and Docker bridge options, then run the acceptance download. Each Docker CLI call has a short outer timeout; the download also bounds network waits with `wget -T 20`.
+
+```sh
+ip link show
+timeout -k 5 15 docker network inspect bridge --format '{{json .Options}}'
+check="mtu-check-$(cat /proc/sys/kernel/random/uuid)"
+if ! timeout -k 5 60 docker run --rm --name "$check" alpine:3 wget -T 20 -O /dev/null https://dl-cdn.alpinelinux.org/alpine/latest-stable/main/x86_64/APKINDEX.tar.gz; then
+    timeout -k 5 15 docker rm -f "$check"
+    exit 1
+fi
+```
+
+An outer timeout stops the Docker client, not necessarily its container; the failure path removes the exact container named for this check. If cleanup fails, resolve that owned container before continuing. Do not retry a stalled pull or build. The owned local Docker fixture passed, but validation on an actual deployed worker remains pending release and worker rollout; the recipe above is not evidence that it has passed.
+
 ## Forge integration
 
 See [gitlab-bot-setup.md](gitlab-bot-setup.md) for the bot-account procedure these variables support.
