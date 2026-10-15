@@ -66,8 +66,20 @@ function counters(raw: string) {
     result[key] = Number(value);
     assert.ok(Number.isSafeInteger(result[key]));
   }
-  for (const key of ["oom", "oom_kill", "oom_group_kill"]) assert.ok(key in result, "missing event " + key);
   return result;
+}
+export function captureEventCounters(raw: string): { events: Record<string, number> | null; failure: string | null } {
+  let events: Record<string, number>;
+  try {
+    events = counters(raw);
+  } catch (error) {
+    return { events: null, failure: String(error) };
+  }
+  // Strict token parsing precedes completeness: retain known counters on refusal.
+  for (const key of ["oom", "oom_kill", "oom_group_kill"]) {
+    if (!(key in events)) return { events, failure: "missing event " + key };
+  }
+  return { events, failure: null };
 }
 export const calibrationUnits = {
   memory: "bytes", monotonicTiming: "milliseconds", growth: "bytes_per_millisecond",
@@ -212,16 +224,17 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     const value = reader.sample();
     // Capture real reader identity/times even if availability or event checks fail.
     if (requested) schedulingObservations.push({ ...requested, sampleId: value.sampleId });
-    let events: Record<string, number> | null = null;
+    let events: Record<string, number> | null = null, eventFailure: string | null = null;
     try {
       const bytes = readBounded("/sys/fs/cgroup/memory.events", RAW_SAMPLE_BYTES - rawBytes);
       rawBytes += bytes.length;
       if (rawBytes > RAW_SAMPLE_BYTES) throw new Error("raw events byte bound exceeded");
       raw["/sys/fs/cgroup/memory.events"] = bytes.toString("utf8");
-      events = counters(bytes.toString("utf8"));
-    } catch (error) { reasons.push("events unavailable: " + String(error)); }
+      ({ events, failure: eventFailure } = captureEventCounters(bytes.toString("utf8")));
+    } catch (error) { eventFailure = String(error); }
+    if (eventFailure) reasons.push("events unavailable: " + eventFailure);
     rawSamples.push({ sample: value, raw, events });
-    if (!value.available || !events) throw new Error("actual default reader unavailable: " + JSON.stringify(value));
+    if (!value.available || !events || eventFailure) throw new Error("actual default reader unavailable: " + JSON.stringify(value));
     assert.equal(value.limitBytes, expected.limitBytes);
     return value;
   }

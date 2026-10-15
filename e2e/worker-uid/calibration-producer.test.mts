@@ -4,7 +4,7 @@ import path from "node:path";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
-import { calibrationUnits, expectedPrimaryExit, fixture, freshPostCleanupDwell, oomEventEvidence, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { captureEventCounters, calibrationUnits, expectedPrimaryExit, fixture, freshPostCleanupDwell, oomEventEvidence, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
 
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
 
@@ -48,6 +48,31 @@ test("OOM evidence preserves actual endpoint IDs, zero, partial unknowns and sig
       after: zero, delta: { oom: null, oom_kill: null, oom_group_kill: null } });
   assert.equal(oomEventEvidence([]), null);
   assert.throws(() => oomEventEvidence([{ sample: { sampleId: 1 }, events: { oom: -1 } }]));
+});
+
+test("raw partial event capture preserves known OOM evidence while refusing completion", () => {
+  const captured = captureEventCounters("oom 7\noom_kill 3\n");
+  assert.deepEqual(captured.events, { oom: 7, oom_kill: 3 });
+  assert.match(captured.failure!, /missing event oom_group_kill/);
+  const evidence = oomEventEvidence([{ sample: { sampleId: 4 }, events: captured.events }]);
+  assert.deepEqual(evidence, { fromSampleId: 4, toSampleId: 4,
+    before: { oom: 7, oom_kill: 3, oom_group_kill: null },
+    after: { oom: 7, oom_kill: 3, oom_group_kill: null },
+    delta: { oom: 0, oom_kill: 0, oom_group_kill: null } });
+});
+
+test("event capture accepts complete counters and refuses invalid raw records", () => {
+  const complete = "oom 7\noom_kill 3\noom_group_kill 0\n";
+  assert.deepEqual(captureEventCounters(complete), {
+    events: { oom: 7, oom_kill: 3, oom_group_kill: 0 }, failure: null,
+  });
+  for (const raw of [complete + "oom 8\n", complete + "low -1\n",
+    complete + "low 9007199254740992\n", complete + "low 1 extra\n",
+    complete + "low NaN\n", ""]) {
+    const captured = captureEventCounters(raw);
+    assert.equal(captured.events, null, raw);
+    assert.ok(captured.failure, raw);
+  }
 });
 
 test("only an expected owned SIGKILL exit can settle a fixed producer", () => {

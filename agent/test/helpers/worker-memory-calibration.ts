@@ -241,7 +241,6 @@ export function calibrationSchedulingReport(samples: readonly Available[], input
     maxPositiveLatenessMs: Math.max(0, ...rows.map((row) => row.latenessMs)),
     maxAbsoluteJitterMs: Math.max(...rows.map((row) => Math.abs(row.latenessMs))) };
 }
-export type CalibrationSchedulingReport = ReturnType<typeof calibrationSchedulingReport>;
 export type CalibrationSamplePair = Readonly<{
   fromSampleId: number; toSampleId: number; rawDeltaBytes: number;
   elapsedMs: number; positiveRateBytesPerMs: number; readGapMs: number;
