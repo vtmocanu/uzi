@@ -1,3 +1,4 @@
+import { MaintenanceBudget } from "./maintenance-budget.js";
 import { execFile, spawn, type ChildProcess } from "node:child_process";
 import { AsyncLocalStorage } from "node:async_hooks";
 import { promisify } from "node:util";
@@ -1961,24 +1962,54 @@ export class GitCache {
   }
   readonly recoveryDecodedLimitBytes: number;
   private readonly recoveryOperations = new AsyncLocalStorage<{
-    signal: AbortSignal; deadline: number; closureBudget: ClosureBudget;
+    signal: AbortSignal; deadline: number; budget?: MaintenanceBudget; closureBudget: ClosureBudget;
     closureCache: { identities: Map<string, Map<string, ClosureObject>>; entries: number };
   }>();
 
-  /** Local recovery clock, including queued locks and actual child settlement. */
-  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>): Promise<T> {
+  /** Local recovery clocks, including queued locks and actual child settlement. */
+  async withRecoveryOperation<T>(signal: AbortSignal, deadline: number, action: (signal: AbortSignal) => Promise<T>, budget?: MaintenanceBudget): Promise<T> {
     const parent = this.recoveryOperations.getStore();
+    budget = parent?.budget ?? MaintenanceBudget.current() ?? budget;
     deadline = Math.min(deadline, parent?.deadline ?? Infinity);
     const timeout = new AbortController();
-    const combined = AbortSignal.any([signal, timeout.signal, ...(parent ? [parent.signal] : [])]);
-    const timer = setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()));
+    const combined = AbortSignal.any([signal, timeout.signal, ...(parent ? [parent.signal] : []),
+      ...(budget ? [budget.signal] : [])]);
+    const timer = Number.isFinite(deadline)
+      ? setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()))
+      : undefined;
     if (Date.now() >= deadline) timeout.abort(new Error("recovery deadline exhausted"));
-    try {
+    const run = async (): Promise<T> => {
       combined.throwIfAborted();
-      return await this.recoveryOperations.run({ signal: combined, deadline, closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
+      budget?.check();
+      return this.recoveryOperations.run({ signal: combined, deadline, budget,
+        closureBudget: parent?.closureBudget ?? { delivered: 0, limit: this.recoveryDecodedLimitBytes },
         closureCache: parent?.closureCache ?? { identities: new Map(), entries: 0 },
-      }, () => action(combined));
-    } finally { clearTimeout(timer); }
+      }, async () => {
+        const result = await action(combined);
+        this.checkRecoveryInterruption();
+        return result;
+      });
+    };
+    try { return await (budget ? MaintenanceBudget.run(budget, run) : run()); }
+    finally { if (timer) clearTimeout(timer); }
+  }
+
+  /** Central helpers also honor a budget scoped before any explicit recovery wrapper. */
+  private recoveryOperation(): { signal: AbortSignal; deadline: number; budget?: MaintenanceBudget } | undefined {
+    const operation = this.recoveryOperations.getStore();
+    const budget = operation?.budget ?? MaintenanceBudget.current();
+    if (!budget) return operation;
+    budget.check();
+    return { signal: operation ? AbortSignal.any([operation.signal, budget.signal]) : budget.signal,
+      deadline: operation?.deadline ?? Infinity, budget };
+  }
+
+  private recoveryRemaining(operation: { signal: AbortSignal; deadline: number; budget?: MaintenanceBudget }): number {
+    operation.budget?.check();
+    operation.signal.throwIfAborted();
+    const remaining = Math.min(operation.deadline - Date.now(), operation.budget?.remainingMs() ?? Infinity);
+    if (remaining <= 0) throw new Error("recovery deadline exhausted");
+    return remaining;
   }
   /** issue #1597 M2: the gitleaks executable (see {@link GitCacheOptions.gitleaksBin}). */
   private readonly gitleaksBin: string;
@@ -5897,9 +5928,8 @@ export class GitCache {
   }
 
   private checkRecoveryInterruption(): void {
-    const operation = this.recoveryOperations.getStore();
-    operation?.signal.throwIfAborted();
-    if (operation && Date.now() >= operation.deadline) throw new Error("recovery deadline exhausted");
+    const operation = this.recoveryOperation();
+    if (operation) this.recoveryRemaining(operation);
   }
 
   /** Finite source/probe pass, no retries. A failed source never hides sibling attribution. */
@@ -10466,12 +10496,14 @@ export class GitCache {
     if (Number.isNaN(timeoutMs) || timeoutMs <= 0) throw new Error(`${what} has no time left`);
     if (!Number.isFinite(timeoutMs)) throw new Error(`${what}: timeoutMs must be finite`);
     const deadlineError = new Error(`${what} exceeded ${timeoutMs}ms`);
-    const { stdout } = await this.spawnGit(barePath, [...args], undefined, {
+    const budgeted = !!this.recoveryOperation()?.budget;
+    const { stdout, exited, cancel } = await this.spawnGit(barePath, [...args], undefined, {
       timeoutMs,
+      cancelOnAbandon: budgeted,
       nativeTimeoutError: deadlineError,
       stderrMaxBytes: READ_BARE_STDERR_MAX_BYTES,
     });
-    return new Promise<BoundedRead>((resolve, reject) => {
+    const reading = new Promise<BoundedRead>((resolve, reject) => {
       const chunks: Buffer[] = [];
       let bytes = 0;
       let settled = false;
@@ -10518,6 +10550,18 @@ export class GitCache {
       if (opts.signal?.aborted) onAbort();
       else opts.signal?.addEventListener("abort", onAbort, { once: true });
     });
+    try {
+      const result = await reading;
+      if (budgeted) {
+        if (result.truncated) cancel();
+        await exited;
+        this.checkRecoveryInterruption();
+      }
+      return result;
+    } catch (error) {
+      if (budgeted) { stdout.destroy(); cancel(); await exited; }
+      throw error;
+    }
   }
 
   /**
@@ -11110,7 +11154,7 @@ export class GitCache {
    * as {@link runGit} (via {@link spawnGit}), no shell, and the same GIT_TIMEOUT_MS bound.
    */
   private async streamBundleWithCap(barePath: string, args: string[], outPath: string, maxBytes: number): Promise<void> {
-    const { child, stdout, exited } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS });
+    const { child, stdout, exited, cancel } = await this.spawnGit(barePath, args, undefined, { timeoutMs: GIT_TIMEOUT_MS });
     let seen = 0;
     const counter = new Transform({
       transform(chunk: Buffer, _enc, cb) {
@@ -11120,6 +11164,7 @@ export class GitCache {
       },
     });
     const killChild = (): void => {
+      cancel();
       if (child && child.exitCode === null && child.signalCode === null) child.kill("SIGKILL");
     };
     const timer = setTimeout(() => {
@@ -11128,6 +11173,8 @@ export class GitCache {
     }, GIT_TIMEOUT_MS);
     try {
       await pipeline(stdout, counter, createWriteStream(outPath, { mode: 0o600 }));
+      await exited;
+      this.checkRecoveryInterruption();
     } catch (err) {
       killChild();
       stdout.destroy();
@@ -12101,11 +12148,11 @@ export class GitCache {
     this.checkReportProof();
     const report = this.reportProofs.getStore();
     if (report) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, report.deadline - Date.now())) };
-    const recovery = this.recoveryOperations.getStore();
+    const recovery = this.recoveryOperation();
     recovery?.signal.throwIfAborted();
     const operationSignals = [report?.signal, recovery?.signal].filter((s): s is AbortSignal => s !== undefined);
     const operationSignal = operationSignals.length ? AbortSignal.any(operationSignals) : undefined;
-    if (recovery) options = { ...options, timeout: Math.max(1, Math.min(options.timeout ?? Infinity, recovery.deadline - Date.now())) };
+    if (recovery) options = { ...options, timeout: Math.min(options.timeout ?? Infinity, this.recoveryRemaining(recovery)) };
     const { input, ...execOptions } = options;
     if (!boundary) {
       // issue #2213: the second quarantine check, keyed on the credential itself, synchronously
@@ -12120,12 +12167,14 @@ export class GitCache {
       let killTimer: ReturnType<typeof setTimeout> | undefined;
       const abort = () => { killTimer = setTimeout(() => pending.child.kill("SIGKILL"), 1_000); };
       operationSignal?.addEventListener("abort", abort, { once: true });
+      if (operationSignal?.aborted) abort();
       if (input !== undefined) {
         pending.child.stdin?.on("error", () => undefined);
         pending.child.stdin?.end(input);
       }
       try {
         const result = await pending;
+        this.checkRecoveryInterruption();
         return { stdout: String(result.stdout), stderr: String(result.stderr) };
       } finally {
         await closed;
@@ -12141,7 +12190,7 @@ export class GitCache {
     }
     const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
     const childTimeout = recovery
-      ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, Math.max(1, recovery.deadline - Date.now()))
+      ? Math.min(options.timeout ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
       : remainingSoft === undefined ? options.timeout : Math.min(options.timeout ?? Infinity, remainingSoft);
     // issue #2213: as above, on the Codex boundary path. boundary.spawn is awaited and its own
     // chain (the tick spawner's lock snapshot, the safety spawn boundary) awaits before the actual
@@ -12158,11 +12207,11 @@ export class GitCache {
       throw this.boundaryAbortError(cause) ?? cause;
     }
     let cancellation: Promise<unknown> | undefined;
-    const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+    const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
     if (recovery?.signal.aborted) abortRecovery();
     process.stdin?.on("error", () => undefined);
-    process.stdin?.end(input);
+    if (!recovery?.signal.aborted) process.stdin?.end(input);
     const cap = options.maxBuffer ?? GIT_MAX_BUFFER;
     const collect = (stream: Readable | null): Promise<{ chunks: Buffer[]; oversized: boolean }> =>
       new Promise((resolve, reject) => {
@@ -12241,7 +12290,7 @@ export class GitCache {
     const cancellations = await Promise.allSettled([reportCancellation, cancellation]);
     for (const result of cancellations) if (result.status === "rejected") throw result.reason;
     this.checkReportProof();
-    recovery?.signal.throwIfAborted();
+    this.checkRecoveryInterruption();
     if (settled[2].status === "rejected") {
       throw this.boundaryAbortError(settled[2].reason) ?? settled[2].reason;
     }
@@ -12356,7 +12405,7 @@ export class GitCache {
     const env = { ...gitEnv(), ...opts.env };
     this.log.debug("git (spawn)", { cwd, args });
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperations.getStore();
+    const recovery = this.recoveryOperation();
     recovery?.signal.throwIfAborted();
     if (boundary) {
       if (boundary.signal.aborted) throw new GitBoundaryAbortError(GIT_OUTPUT_ABORT_MESSAGE);
@@ -12365,7 +12414,7 @@ export class GitCache {
       }
       const remainingSoft = boundary.softDeadlineAt === undefined ? undefined : Math.max(1, boundary.softDeadlineAt - Date.now());
       const childTimeout = recovery
-        ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, Math.max(1, recovery.deadline - Date.now()))
+        ? Math.min(opts.timeoutMs ?? GIT_TIMEOUT_MS, remainingSoft ?? Infinity, this.recoveryRemaining(recovery))
         : remainingSoft === undefined ? opts.timeoutMs : Math.min(opts.timeoutMs ?? Infinity, remainingSoft);
       let process: BoundaryProcessHandle;
       try {
@@ -12380,7 +12429,10 @@ export class GitCache {
       } catch (cause) {
         throw this.boundaryAbortError(cause) ?? cause;
       }
-      if (!process.stdout) throw new Error("supervised git process has no stdout");
+      if (!process.stdout) {
+        await Promise.allSettled([process.cancel(), process.completed]);
+        throw new Error("supervised git process has no stdout");
+      }
       const stderrCap = opts.stderrMaxBytes ?? GIT_MAX_BUFFER;
       const stderrChunks: Buffer[] = [];
       let stderrBytes = 0;
@@ -12407,16 +12459,17 @@ export class GitCache {
       // A child that exits before reading its stdin (e.g. its repo vanished) must not surface an
       // uncaught EPIPE; the exit status already errors the stream with the failure.
       process.stdin?.on("error", () => undefined);
-      if (opts.keepStdinOpen) process.stdin?.write(stdin ?? "");
-      else process.stdin?.end(stdin ?? "");
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
       if (recovery?.signal.aborted) abortRecovery();
+      else if (opts.keepStdinOpen) process.stdin?.write(stdin ?? "");
+      else process.stdin?.end(stdin ?? "");
       const exited = process.completed.then(({ code }) => code, () => -1).finally(async () => {
         recovery?.signal.removeEventListener("abort", abortRecovery);
         await cancellation;
       });
       return { stdin: opts.keepStdinOpen ? process.stdin ?? undefined : undefined, stdout: gated.out, exited, cancel: abortRecovery };
     }
+    const timeoutMs = recovery ? Math.min(opts.timeoutMs ?? Infinity, this.recoveryRemaining(recovery)) : opts.timeoutMs;
     const child = spawn("git", withDir(cwd, args), { env });
     let killTimer: ReturnType<typeof setTimeout> | undefined;
     const abortRecovery = () => {
@@ -12425,7 +12478,6 @@ export class GitCache {
       killTimer = setTimeout(() => child.kill("SIGKILL"), 1_000);
     };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
-    const timeoutMs = recovery ? Math.min(opts.timeoutMs ?? Infinity, Math.max(1, recovery.deadline - Date.now())) : opts.timeoutMs;
     let timeoutError: Error | undefined;
     const timeout = timeoutMs === undefined ? undefined : setTimeout(() => {
       if (timeoutMs === opts.timeoutMs && !killTimer && child.exitCode === null && child.signalCode === null) {
@@ -12440,8 +12492,9 @@ export class GitCache {
     });
     if (recovery?.signal.aborted) abortRecovery();
     const exited = new Promise<number>((resolve) => {
-      child.once("error", () => resolve(-1));
-      child.once("close", (code) => resolve(code ?? -1));
+      let failed = false;
+      child.once("error", () => { failed = true; if (!recovery?.budget) resolve(-1); });
+      child.once("close", (code) => resolve(failed ? -1 : code ?? -1));
     });
     const gated = exitGatedStream(child.stdout as Readable, () => {
       if (opts.cancelOnAbandon) abortRecovery();
@@ -12644,20 +12697,20 @@ export class GitCache {
     };
     const stderrText = (): string => Buffer.concat(stderrChunks).toString().trim();
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperations.getStore();
+    const recovery = this.recoveryOperation();
     recovery?.signal.throwIfAborted();
     if (boundary) {
       const process = await boundary.spawn({ argv: [GIT_BIN, ...withDir(cwd, args)], cwd, env, identity: "command",
-        ...(recovery ? { timeoutMs: Math.max(1, recovery.deadline - Date.now()) } : {}),
+        ...(recovery ? { timeoutMs: this.recoveryRemaining(recovery) } : {}),
       });
       let cancellation: Promise<unknown> | undefined;
-      const abortRecovery = () => { cancellation = process.cancel().catch(() => undefined); };
+      const abortRecovery = () => { cancellation ??= process.cancel().catch(() => undefined); };
       recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
       if (recovery?.signal.aborted) abortRecovery();
       void process.completed.finally(() => recovery?.signal.removeEventListener("abort", abortRecovery)).catch(() => undefined);
       if (!process.stdin) {
         // Nothing can be streamed; still settle the root before reporting.
-        await process.completed.catch(() => undefined);
+        await Promise.allSettled([process.cancel(), process.completed]);
         throw new Error("supervised git process has no stdin");
       }
       const stdin = process.stdin;
@@ -12671,10 +12724,11 @@ export class GitCache {
       return { stdin, exited, abort: () => stdin.destroy() };
     }
     const wrapped = runnerCommand("git", withDir(cwd, args));
+    const timeoutMs = recovery ? this.recoveryRemaining(recovery) : undefined;
     const child = spawn(wrapped.command, wrapped.args, { env, stdio: ["pipe", "pipe", "pipe"] });
     const abortRecovery = () => { child.stdin.destroy(); child.kill("SIGKILL"); };
     recovery?.signal.addEventListener("abort", abortRecovery, { once: true });
-    const timer = recovery ? setTimeout(abortRecovery, Math.max(1, recovery.deadline - Date.now())) : undefined;
+    const timer = timeoutMs === undefined ? undefined : setTimeout(abortRecovery, timeoutMs);
     child.once("close", () => {
       recovery?.signal.removeEventListener("abort", abortRecovery);
       if (timer) clearTimeout(timer);
@@ -12684,8 +12738,13 @@ export class GitCache {
     child.stdout.resume();
     child.stderr.on("data", keepStderr);
     const exited = new Promise<{ code: number; stderr: string }>((resolve) => {
-      child.once("error", (error) => resolve({ code: -1, stderr: stderrText() || gitErrorMessage(error) }));
-      child.once("close", (code) => resolve({ code: code ?? -1, stderr: stderrText() }));
+      let failure: unknown;
+      child.once("error", (error) => {
+        failure = error;
+        if (!recovery?.budget) resolve({ code: -1, stderr: stderrText() || gitErrorMessage(error) });
+      });
+      child.once("close", (code) => resolve({ code: failure ? -1 : code ?? -1,
+        stderr: stderrText() || (failure ? gitErrorMessage(failure) : "") }));
     });
     return {
       stdin: child.stdin,
@@ -13718,7 +13777,7 @@ export class GitCache {
   private withLock<T>(key: string, fn: () => Promise<T>, signal?: AbortSignal): Promise<T> {
     const prev = this.locks.get(key) ?? Promise.resolve();
     const boundary = this.boundaryProcesses.getStore();
-    const recovery = this.recoveryOperations.getStore();
+    const recovery = this.recoveryOperation();
     const report = this.reportProofs.getStore();
     this.checkReportProof();
     this.checkRecoveryInterruption();
@@ -13765,7 +13824,10 @@ export class GitCache {
       removeAbortListener();
       let outcome: { ok: true; value: T } | { ok: false; error: unknown };
       try {
-        outcome = { ok: true, value: await fn() };
+        this.checkRecoveryInterruption();
+        const value = await fn();
+        this.checkRecoveryInterruption();
+        outcome = { ok: true, value };
       } catch (error) {
         outcome = { ok: false, error };
       }
