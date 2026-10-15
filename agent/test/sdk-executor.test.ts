@@ -15,7 +15,7 @@ import { SdkExecutor, resolveLeadModel, embedSeededPlan, TransientRecoveryError,
 import { TrustedExecutionRefusal } from "../src/trusted-execution-refusal.js";
 import { LimitReachedError } from "../src/limit.js";
 import { EnvProbeCleanupError } from "../src/env-probe.js";
-import { PlanRejectedError, type EmittedMessage, type RunContext } from "../src/executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, type EmittedMessage, type RunContext } from "../src/executor.js";
 import { PauseNowSignal, CredentialSwitchSignal, type PlanVerdict } from "../src/steering.js";
 import type { AgentTemplate, ClaimSkill, Milestone, MilestoneAgent, MilestoneProgress } from "../src/protocol.js";
 import type { JsDepsResult } from "../src/js-deps.js";
@@ -6233,6 +6233,58 @@ describe("SdkExecutor provider-transient error handling (issue #1088)", () => {
       },
       (e: unknown) => e,
     );
+
+  for (const replace of [false, true]) it(`M2 human revision retries the answered provider turn; replacement=${replace}`, async () => {
+    const { queryFn, turns } = fakeTurns([
+      [submitPlan("initial"), resultSuccess()],
+      [askUserTurn("Which target?"), resultSuccess()],
+      [resultApiError(429, "API Error: 429", "failed-1")],
+      [resultApiError(429, "API Error: 429", "failed-2")],
+      [submitPlan("revised"), resultSuccess()],
+    ]);
+    let before = 0;
+    let retries = 0;
+    let questions = 0;
+    const probe = makeCtx({
+      config: { plan_max_revisions: 2 },
+      askUser: async () => { questions++; return { kind: "answer", answers: ["server"] }; },
+      beforePlanRevisionTurn: async () => { before++; },
+      retryPlanRevisionTurn: async (cause) => {
+        assert.ok(cause instanceof TransientRecoveryError && cause.providerOrigin);
+        assert.equal(turns.length, 4, "existing inner retries exhausted first");
+        retries++;
+        if (replace) throw new PlanRevisionReplacedError({ kind: "revise", feedback: "replacement J", inputId: 22 });
+      },
+    }, [{ kind: "revise", feedback: "original I", inputId: 11 }, { kind: "reject", reason: "stop", sourceGateRevision: 8 }]);
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 1)).run(probe.ctx),
+      (e: unknown) => e instanceof PlanRejectedError && e.sourceGateRevision === 8);
+    assert.equal(questions, 1);
+    assert.equal(retries, 1);
+    assert.equal(before, 3, "revision, answered continuation, and redrive/replacement");
+    assert.equal(turns[4]!.options.resume, "failed-2");
+    assert.equal(turns[3]!.promptText, turns[2]!.promptText);
+    if (replace) {
+      assert.match(turns[4]!.promptText!, /replacement J/);
+      assert.doesNotMatch(turns[4]!.promptText!, /server/);
+    } else assert.equal(turns[4]!.promptText, turns[2]!.promptText);
+    assert.deepEqual(probe.gated, ["initial", "revised"]);
+  });
+
+  for (const mode of ["initial", "automatic", "empty"] as const) it(`M2 no human provider recovery for ${mode}`, async () => {
+    const failure = mode === "empty" ? resultEmpty() : resultApiError(429, "API Error: 429");
+    const { queryFn } = fakeTurns(mode === "initial" ? [[failure]] : [
+      [submitPlan("initial"), resultSuccess()], [failure],
+    ]);
+    let before = 0;
+    let retries = 0;
+    const probe = makeCtx({
+      beforePlanRevisionTurn: async () => { before++; },
+      retryPlanRevisionTurn: async () => { retries++; throw new Error("unexpected hook"); },
+    }, { kind: "revise", feedback: "again", automatic: mode === "automatic", round: 1 });
+    await assert.rejects(new SdkExecutor(nullLogger(), homeDir, fast(queryFn, 0)).run(probe.ctx), TransientRecoveryError);
+    assert.equal(retries, 0);
+    assert.equal(before, mode === "empty" ? 1 : 0);
+  });
 
   it("parks (TransientRecoveryError), never fails, on a 529 with no in-process retries", async () => {
     // Before the fix this rejected with /agent run failed: success/ (a terminal failure).

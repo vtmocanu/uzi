@@ -1781,6 +1781,11 @@ export class WorkerClient {
    */
   async reportState(runId: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal): Promise<StateAck> {
     const path = `${WORKER_API_PREFIX}/runs/${runId}/state`;
+    // Once a source fence is negotiated, never retry its write without that fence
+    // on a rolled-back strict decoder. Initial older-API calls retain compatibility.
+    if (body.expected_gate_revision !== undefined && this.hasFeature("plan_revision_retry_v1") &&
+        this.includeClaimGeneration(body.claim_generation))
+      return this.reportStateOnce(runId, path, body, signal, CROSS_CHECK_RESPONSE_MAX_BYTES);
     if (body.require_running === true) {
       if (body.status !== "awaiting_input" || !Number.isSafeInteger(body.claim_generation) ||
           (body.claim_generation ?? 0) <= 0)
@@ -1822,7 +1827,7 @@ export class WorkerClient {
       this.reportStateOnce(
         runId,
         path,
-        includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
+        includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined, expected_gate_revision: undefined, revision_input_id: undefined, superseded_revision_input_ids: undefined },
         signal,
         undefined,
         evidence,
@@ -1921,6 +1926,14 @@ export class WorkerClient {
    *  reportState (PRD #1247 fix round E) so the claim_generation send-gate + strict-decode
    *  strip-and-retry can drive it through withGenerationFallback, exactly as postMessages. */
   private async reportStateOnce(runId: string, path: string, body: PlanCrossCheckStateRequest, signal?: AbortSignal, maxAckBytes?: number, evidence?: StateAttemptEvidence): Promise<StateAck> {
+    // Apply the negotiation gate to ordinary, checked-plan and guarded-question writes alike.
+    if (!this.hasFeature("plan_revision_retry_v1") ||
+        !Number.isSafeInteger(body.claim_generation) || (body.claim_generation ?? 0) <= 0) {
+      body = { ...body };
+      delete body.expected_gate_revision;
+      delete body.revision_input_id;
+      delete body.superseded_revision_input_ids;
+    }
     const incarnation = this.completionIncarnation;
     for (let attempt = 0; ; attempt++) {
       signal?.throwIfAborted();
@@ -2001,6 +2014,11 @@ export class WorkerClient {
           // PRD #1795 M1 (decision 5): the revision an awaiting_approval report was answered with,
           // read like contractRevision off the same single-use body (top-level, beside `run`).
           if (fields.gateRevision !== undefined) ack.gateRevision = fields.gateRevision;
+          if (fields.revisionInputId !== undefined) {
+            ack.revisionInputId = fields.revisionInputId;
+            ack.supersededRevisionInputIds = fields.supersededRevisionInputIds;
+          }
+          if (fields.staleRevisionSource) ack.staleRevisionSource = true;
           if (ack.applied && fields.reconciliation !== undefined &&
               fields.reconciliation.claimGeneration === body.claim_generation)
             ack.reconciliation = fields.reconciliation;
@@ -3868,6 +3886,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
   staleClaim?: boolean;
   credentialSwitchReleased?: boolean;
   gateRevision?: number;
+  revisionInputId?: number;
+  supersededRevisionInputIds?: number[];
+  staleRevisionSource?: boolean;
   reconciliation?: PlanCrossCheckReconciliation;
 }> {
   const boundedText = maxAckBytes === undefined ? undefined : await readBoundedText(res, maxAckBytes, true);
@@ -3906,6 +3927,8 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       disposition?: unknown;
       // PRD #1795 M1 (decision 5): the awaiting_approval ACK's revision, TOP-LEVEL beside `run`.
       gate_revision?: unknown;
+      revision_input_id?: unknown;
+      superseded_revision_input_ids?: unknown;
     };
     const run = parsed?.run;
     const out: {
@@ -3932,6 +3955,9 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
       staleClaim?: boolean;
       credentialSwitchReleased?: boolean;
       gateRevision?: number;
+      revisionInputId?: number;
+      supersededRevisionInputIds?: number[];
+      staleRevisionSource?: boolean;
       reconciliation?: PlanCrossCheckReconciliation;
     } = {};
     if (typeof parsed?.applied === "boolean") out.applied = parsed.applied;
@@ -4020,6 +4046,17 @@ export async function readRunAck(res: Response, maxAckBytes?: number): Promise<{
     // PRD #1795 M1 (decision 5): the gate revision an awaiting_approval report was answered with. A
     // positive integer only; anything else (absent on an older api or another report, garbled)
     // leaves it undefined, which the gate reads as "no revision confirmed" (bound verdicts wait).
+    if (parsed?.reason === "stale_revision_source") out.staleRevisionSource = true;
+    const revisionId = parsed?.revision_input_id;
+    const superseded = parsed?.superseded_revision_input_ids;
+    // Receipt evidence is atomic: never expose a valid subset of a malformed receipt.
+    if (typeof revisionId === "number" && Number.isSafeInteger(revisionId) && revisionId > 0 &&
+        Array.isArray(superseded) && superseded.every((id: unknown) =>
+          typeof id === "number" && Number.isSafeInteger(id) && id > 0 && id !== revisionId) &&
+        new Set(superseded).size === superseded.length) {
+      out.revisionInputId = revisionId;
+      out.supersededRevisionInputIds = superseded;
+    }
     const gateRev = parsed?.gate_revision;
     if (typeof gateRev === "number" && Number.isSafeInteger(gateRev) && gateRev >= 1) out.gateRevision = gateRev;
     const reconciliation = readPlanCrossCheckReconciliation(parsed);

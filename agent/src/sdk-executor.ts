@@ -121,7 +121,7 @@ import type {
   TurnStreamEnd,
 } from "./harness.js";
 import { evidencesModelProcessing } from "./harness.js";
-import { PlanRejectedError, stampPrSummaryHead } from "./executor.js";
+import { PlanRejectedError, PlanRevisionReplacedError, stampPrSummaryHead } from "./executor.js";
 import { emitPlanMissingNotice, isProseOnlyPlanTurn, PLAN_MISSING_NUDGE, REASON_PLAN_MISSING, resolvePlanMissing } from "./plan-missing.js";
 import { errMessage } from "./util.js";
 import { assertResidueQuarantineOpen } from "./residue-quarantine.js";
@@ -233,13 +233,16 @@ export class TransientRecoveryError extends Error {
    *  error. The runner types the recovery_wait park `provider_outage` from this alone; the
    *  empty-turn and gate-recovery throws stay unmarked. */
   public readonly providerOrigin: boolean;
+  /** Session resolved by the final failed attempt; undefined means resume no session. */
+  public readonly sessionId?: string;
   constructor(
     message = "the model returned a positively-empty result (0 turns, no activity) after bounded in-process retries",
-    opts: { providerOrigin?: boolean } = {},
+    opts: { providerOrigin?: boolean; sessionId?: string } = {},
   ) {
     super(message);
     this.name = "TransientRecoveryError";
     this.providerOrigin = opts.providerOrigin === true;
+    this.sessionId = opts.sessionId;
   }
 }
 
@@ -2138,7 +2141,7 @@ export class SdkExecutor implements Executor {
               text: "the owner rejected the submitted plan before the claim was released — failing the run without offering it again",
             },
           });
-          throw new PlanRejectedError(pending.reason);
+          throw new PlanRejectedError(pending.reason, pending.sourceGateRevision);
         }
         const resumedRevise = pending?.kind === "revise" ? pending : undefined;
         if (resumedRevise) {
@@ -2328,10 +2331,18 @@ export class SdkExecutor implements Executor {
           if (resumeId === undefined && !isCIFix && !isSelfImprove && announceDecisionsMemo(ctx))
             decisionsMemoPlaced = true;
           const runRevisionTurn = () =>
-            this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget);
-          const turn = ctx.deferCredentialSwitch
-            ? await ctx.deferCredentialSwitch(runRevisionTurn)
-            : await runRevisionTurn();
+            this.drivePlanningTurn(ctx, baseConfig, resumeId, revisePrompt, state, idleMs, budget, !automatic);
+          let turn: TurnResult & { plan: string };
+          try {
+            turn = ctx.deferCredentialSwitch
+              ? await ctx.deferCredentialSwitch(runRevisionTurn)
+              : await runRevisionTurn();
+          } catch (error) {
+            if (!(error instanceof PlanRevisionReplacedError)) throw error;
+            resumeId = error.sessionId;
+            verdict = error.verdict;
+            continue;
+          }
           resumeId = turn.sessionId ?? resumeId;
           approvedPlan = turn.plan;
           // Decision 2: the candidate is REPLACED across a revision round.
@@ -2354,7 +2365,7 @@ export class SdkExecutor implements Executor {
           verdict = gRev.value;
         }
         if (verdict.kind === "reject")
-          throw new PlanRejectedError(verdict.reason);
+          throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error(REASON_CANCELLED);
         // FAIL-CLOSED: the loop + guards above leave only `approve`; any other kind is a
         // bug (e.g. a future verdict variant) and must never fall through into implement.
@@ -3967,6 +3978,7 @@ export class SdkExecutor implements Executor {
     state: RunDrive,
     idleMs: number,
     budget: { asked: number },
+    humanRevision = false,
   ): Promise<TurnResult & { plan: string }> {
     // issue #2213: a quarantined worker stops at the planning boundary, before the prompt is used;
     // the queryFn call-site gate remains the guarantee.
@@ -3989,15 +4001,28 @@ export class SdkExecutor implements Executor {
       // wrapper — which throws BEFORE the REASON_NO_PLAN control below is reached. A
       // NON-empty turn that neither planned nor asked still falls through to
       // REASON_NO_PLAN, so un-gated work is never pushed (contract preserved).
-      const turn = await this.driveTurnWithEmptyRecovery(
-        ctx,
-        config,
-        "plan",
-        resumeId,
-        turnPrompt,
-        state,
-        idleMs,
-      );
+      let turn: TurnResult;
+      try {
+        if (humanRevision) await ctx.beforePlanRevisionTurn?.();
+        turn = await this.driveTurnWithEmptyRecovery(
+          ctx, config, "plan", resumeId, turnPrompt, state, idleMs,
+        );
+      } catch (error) {
+        if (humanRevision && error instanceof TransientRecoveryError && error.providerOrigin && ctx.retryPlanRevisionTurn) {
+          resumeId = error.sessionId;
+          try {
+            // The runner hook owns backoff and control checks; this redrive adds no retry cap
+            // or wall-budget reset and keeps the current clarification/prose recovery state.
+            await ctx.retryPlanRevisionTurn(error);
+          } catch (control) {
+            if (control instanceof PlanRevisionReplacedError) control.sessionId = resumeId;
+            throw control;
+          }
+          continue;
+        }
+        if (error instanceof PlanRevisionReplacedError) error.sessionId = resumeId;
+        throw error;
+      }
       resumeId = turn.sessionId ?? resumeId;
       // Issue #1593: a whitespace-only plan is not a plan (aligned with Codex); it falls through
       // to the prose-only / no-plan handling below instead of reaching the gate.
@@ -4557,7 +4582,7 @@ export class SdkExecutor implements Executor {
         : undefined,
       // lastProviderErr is cleared by any attempt that returned (even positively empty), so it
       // is set here only when the FINAL attempt threw the provider error.
-      { providerOrigin: lastProviderErr !== undefined },
+      { providerOrigin: lastProviderErr !== undefined, sessionId: resumeId },
     );
   }
 

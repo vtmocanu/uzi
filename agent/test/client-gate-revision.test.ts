@@ -59,6 +59,60 @@ async function client(features: string[], respond: Parameters<typeof stateServer
 
 const GATE = { status: "awaiting_approval" as const, plan_md: "# P", presentation_id: ID, claim_generation: 3 };
 
+const REVISION = { ...GATE, expected_gate_revision: 2, revision_input_id: 10, superseded_revision_input_ids: [8, 9] };
+
+describe("revision retry wire contract", () => {
+  it("strips unsupported fields but never weakens a negotiated source fence after rollback", async () => {
+    for (const features of [
+      ["claim_generation_fence", "gate_revision_v1"],
+      ["gate_revision_v1", "plan_revision_retry_v1"],
+      ["claim_generation_fence", "gate_revision_v1", "plan_revision_retry_v1"],
+    ]) {
+      const negotiated = features.includes("plan_revision_retry_v1") && features.includes("claim_generation_fence");
+      const { c, posts } = await client(features, (_b, attempt) =>
+        negotiated && attempt === 0 ? { status: 400, body: { error: "invalid request body" } }
+          : { status: 200, body: { run: { status: "awaiting_approval" } } });
+      if (negotiated) await assert.rejects(c.reportState("r1", REVISION), /invalid request body/);
+      else await c.reportState("r1", REVISION);
+      for (const post of posts) {
+        for (const key of ["expected_gate_revision", "revision_input_id", "superseded_revision_input_ids"]) {
+          assert.equal(key in post.body, negotiated, key);
+        }
+      }
+      assert.equal(posts.length, 1, "a negotiated source write cannot fall back to an unfenced report");
+    }
+  });
+
+  it("decodes the receipt atomically with strict positive safe IDs", async () => {
+    const { c } = await client(["claim_generation_fence", "plan_revision_retry_v1"], (body) => ({
+      status: 200, body: { run: { status: "awaiting_approval" },
+        revision_input_id: body.revision_input_id, superseded_revision_input_ids: body.superseded_revision_input_ids },
+    }));
+    for (const [id, ids, valid] of [
+      [10, [], true], [10, [8, 9], true], [0, [8], false], [-1, [], false],
+      [1.5, [], false], ["10", [], false], [Number.MAX_SAFE_INTEGER + 1, [], false],
+      [10, [8, 0], false], [10, [8, "9"], false], [10, [8, 8], false],
+      [10, [10], false], [10, null, false], [10, undefined, false],
+      [undefined, [8], false], [10, [Number.MAX_SAFE_INTEGER + 1], false],
+    ] as const) {
+      const ack = await c.reportState("r1", { ...REVISION,
+        revision_input_id: id as number, superseded_revision_input_ids: ids as unknown as number[] });
+      assert.equal(ack.revisionInputId, valid ? id : undefined);
+      assert.deepEqual(ack.supersededRevisionInputIds, valid ? ids : undefined);
+    }
+  });
+
+  it("surfaces stale source distinctly without retrying a presentation refusal", async () => {
+    const { c, posts } = await client(["claim_generation_fence", "plan_revision_retry_v1"], () => ({
+      status: 409, body: { run: { status: "awaiting_approval" }, reason: "stale_revision_source" },
+    }));
+    const ack = await c.reportState("r1", REVISION);
+    assert.equal(ack.staleRevisionSource, true);
+    assert.equal(ack.applied, false);
+    assert.equal(posts.length, 1);
+  });
+});
+
 describe("gate-revision reports (PRD #1795)", () => {
   it("reads the ACK's top-level gate_revision (a positive integer only)", async () => {
     for (const [value, expected] of [[4, 4], [0, undefined], [-1, undefined], [2.5, undefined], ["4", undefined], [null, undefined]] as const) {

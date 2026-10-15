@@ -72,9 +72,9 @@ export type PlanVerdict =
         claimGeneration: number;
       };
     }
-  | { kind: "reject"; reason: string }
+  | { kind: "reject"; reason: string; sourceGateRevision?: number }
   | { kind: "cancel" }
-  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number }
+  | { kind: "revise"; automatic?: false; feedback: string; inputId?: number; sourceGateRevision?: number }
   | { kind: "revise"; automatic: true; feedback: string; round: number;
       items?: PlanCrossCheckFindings["items"]; inputId?: never };
 
@@ -477,6 +477,8 @@ export class SteeringChannel {
   // An interruption while an id is in (i), (iv) or (v) leaves it unapplied, so the next claim
   // replays it.
   private readonly awaitingGateIds = new Set<number>();
+  /** Server-settled revision receipts remembered only for this flight. */
+  private readonly persistedRevisionIds = new Set<number>();
   private readonly disposedApproves = new Set<number>();
   /** The discard lane: disposed approve ids awaiting POST /inputs/discarded, the lane's loop, and
    *  its bounded-retry state. Nothing waits on it: a discard that cannot land leaves the row
@@ -735,7 +737,7 @@ export class SteeringChannel {
   /** An id this channel tracks as a plan-gate input receipt (awaiting, ready or in flight). Such an
    *  id is never ACKed again, re-routed, or applied with a held batch. */
   private isGateReceiptId(id: number): boolean {
-    return this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false) ||
+    return this.persistedRevisionIds.has(id) || this.awaitingGateIds.has(id) || (this.ready?.ids.includes(id) ?? false) ||
       this.disposedApproves.has(id) || this.parkedReady.includes(id);
   }
 
@@ -747,6 +749,20 @@ export class SteeringChannel {
     if (this.ready) this.ready.ids.push(...fresh);
     else this.ready = { ids: fresh, readyAt: this.now() };
     this.kickReady();
+  }
+
+  /** Retire only receipts confirmed by the atomic revised-plan persistence ACK.
+   * No APPLIED is sent: predecessor supersession is not successful plan production.
+   */
+  retirePersistedRevision(id: number, supersededIds: readonly number[]): void {
+    for (const settled of [id, ...supersededIds]) {
+      this.awaitingGateIds.delete(settled);
+      this.persistedRevisionIds.add(settled);
+    }
+    for (let i = this.reviseQueue.length - 1; i >= 0; i--) {
+      const queuedId = this.reviseQueue[i]!.id;
+      if (queuedId !== undefined && this.persistedRevisionIds.has(queuedId)) this.reviseQueue.splice(i, 1);
+    }
   }
 
   /**
@@ -1270,7 +1286,7 @@ export class SteeringChannel {
     const buffered = this.bufferedVerdict;
     if (buffered?.verdict.kind === "reject" && this.gateMatch(buffered.binding, epoch, buffered.epoch) === "take") {
       this.bufferedVerdict = undefined;
-      return buffered.verdict;
+      return this.withSourceRevision(buffered.verdict, buffered.binding);
     }
     return undefined;
   }
@@ -1418,7 +1434,7 @@ export class SteeringChannel {
    *  it with a CredentialSwitchSignal when a held-state switch trips (PRD #1247 M5b): a run idling
    *  at the plan gate has no live SDK turn to abort, so the waiter itself must reject. */
   private gateWaiter:
-    { epoch: number; resolve: (v: PlanVerdict) => void; reject: (err: Error) => void } | undefined;
+    { epoch: number; recovery?: { sourceRevision: number; afterInputId: number }; resolve: (v: PlanVerdict) => void; reject: (err: Error) => void } | undefined;
   /** An answer that arrived before the executor asked for one (no lost wakeup),
    *  stamped with the QUESTION ID it named. Latest-wins if several land before a read.
    *
@@ -1691,11 +1707,28 @@ export class SteeringChannel {
    * Only one gate is awaited at a time (one plan turn is in flight per run).
    */
   awaitGateEvent(epoch: number, signal?: AbortSignal): Promise<PlanVerdict> {
+    return this.waitGateEvent(epoch, signal);
+  }
+
+  /** Recovery takes only an exact source-bound replacement or rejection, or sticky cancel.
+   * Approvals, follow-ups and rows with unknown/stale bindings remain untouched.
+   */
+  awaitRevisionRecoveryEvent(sourceRevision: number, afterInputId: number, signal?: AbortSignal): Promise<PlanVerdict> {
+    if (!Number.isSafeInteger(sourceRevision) || sourceRevision <= 0 ||
+        !Number.isSafeInteger(afterInputId) || afterInputId <= 0)
+      return Promise.reject(new Error("invalid revision recovery identity"));
+    return this.waitGateEvent(this.gateEpoch, signal, { sourceRevision, afterInputId });
+  }
+
+  private waitGateEvent(epoch: number, signal?: AbortSignal,
+    recovery?: { sourceRevision: number; afterInputId: number }): Promise<PlanVerdict> {
     if (signal?.aborted) return Promise.reject(signal.reason instanceof Error ? signal.reason : new Error("gate wait aborted"));
     // Issue #1673: the poll loop has stopped for good, so a new park would never be serviced. Checked
     // first: an event taken now would mark inputs ready with no lane left to apply them.
     if (this.flightEnded) return Promise.reject(this.flightEnded);
-    const v = this.takeGateEvent(epoch);
+    if (this.gateWaiter && (recovery || this.gateWaiter.recovery))
+      return Promise.reject(new Error("gate waiter already active"));
+    const v = recovery ? this.takeRevisionRecoveryEvent(recovery.sourceRevision, recovery.afterInputId) : this.takeGateEvent(epoch);
     if (v) return Promise.resolve(v);
     // Issue #1604: a switch that tripped with no waiter parked (a switch deferred across a revision
     // turn trips as soon as the window closes, before this gate wait is armed) releases the claim
@@ -1708,6 +1741,7 @@ export class SteeringChannel {
       };
       const waiter = {
         epoch,
+        recovery,
         resolve: (v: PlanVerdict): void => { done(); resolve(v); },
         reject: (err: Error): void => { done(); reject(err); },
       };
@@ -2004,7 +2038,7 @@ export class SteeringChannel {
           this.takenApproveIds.add(id);
           this.markReady([id]);
         }
-        return verdict;
+        return this.withSourceRevision(verdict, binding);
       }
       // Verdict-specific notice so the feed reads correctly for either kind. Issue #1604: a stale
       // reject is final and applied on its own; a stale approve is never applied.
@@ -2031,8 +2065,44 @@ export class SteeringChannel {
         this.disposeStale("revise_plan", r.id, "epoch");
         continue;
       }
+      const verdict = this.withSourceRevision({ kind: "revise", feedback: r.feedback, ...(r.id === undefined ? {} : { inputId: r.id }) }, r.binding);
       this.confirmedGateRevision = undefined;
-      return r.id === undefined ? { kind: "revise", feedback: r.feedback } : { kind: "revise", feedback: r.feedback, inputId: r.id };
+      return verdict;
+    }
+    return undefined;
+  }
+
+  private withSourceRevision(verdict: PlanVerdict, binding: GateBinding): PlanVerdict {
+    const b = this.effectiveBinding(binding);
+    return b.kind === "bound" && (verdict.kind === "reject" || (verdict.kind === "revise" && !verdict.automatic))
+      ? { ...verdict, sourceGateRevision: b.revision } : verdict;
+  }
+
+  private takeRevisionRecoveryEvent(sourceRevision: number, afterInputId: number): PlanVerdict | undefined {
+    if (this.cancelled) return { kind: "cancel" };
+    const index = this.reviseQueue.findIndex((r) => {
+      const b = this.effectiveBinding(r.binding);
+      return b.kind === "bound" && b.revision === sourceRevision &&
+        r.id !== undefined && Number.isSafeInteger(r.id) && r.id > afterInputId && !!r.feedback.trim();
+    });
+    if (index >= 0) {
+      const r = this.reviseQueue.splice(index, 1)[0]!;
+      this.confirmedGateRevision = undefined;
+      return { kind: "revise", feedback: r.feedback, inputId: r.id, sourceGateRevision: sourceRevision };
+    }
+    return this.takeRevisionRecoveryControl(sourceRevision);
+  }
+
+  /** Backoff observes cancel/reject without taking a replacement before expiry. */
+  takeRevisionRecoveryControl(sourceRevision: number): PlanVerdict | undefined {
+    if (this.cancelled) return { kind: "cancel" };
+    const buffered = this.bufferedVerdict;
+    if (buffered?.verdict.kind === "reject") {
+      const b = this.effectiveBinding(buffered.binding);
+      if (b.kind === "bound" && b.revision === sourceRevision) {
+        this.bufferedVerdict = undefined;
+        return { ...buffered.verdict, sourceGateRevision: sourceRevision };
+      }
     }
     return undefined;
   }
@@ -2115,7 +2185,8 @@ export class SteeringChannel {
   /** After routing an input, deliver to a parked gate waiter if one is now due. */
   private serviceGate(): void {
     if (!this.gateWaiter) return;
-    const v = this.takeGateEvent(this.gateWaiter.epoch);
+    const { recovery, epoch } = this.gateWaiter;
+    const v = recovery ? this.takeRevisionRecoveryEvent(recovery.sourceRevision, recovery.afterInputId) : this.takeGateEvent(epoch);
     if (!v) return;
     const w = this.gateWaiter;
     this.gateWaiter = undefined;

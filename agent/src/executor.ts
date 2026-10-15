@@ -391,6 +391,13 @@ export interface RunContext {
    * a fenced claim ends quietly. Absent on the stub/test executors ⇒ today's behaviour.
    */
   takeResumedGateEvent?(signal?: AbortSignal): Promise<PlanVerdict | undefined>;
+  /** Only human revision drivers call this after typed provider retry exhaustion.
+   * Resolves to redrive, or throws controls / PlanRevisionReplacedError to exit this driver.
+   * The runner must prove ownership before resolving; unknown ownership permits no provider start.
+   */
+  retryPlanRevisionTurn?(cause: unknown): Promise<void>;
+  /** Check the captured source before each human revision provider turn, including continuations. */
+  beforePlanRevisionTurn?(): Promise<void>;
   /** An associated cross-check human gate continues its established wait after switch give-up. */
   continueExistingPlanGate?(otherwise: () => Promise<PlanVerdict>): Promise<PlanVerdict>;
   /**
@@ -865,9 +872,17 @@ export interface ExecutorResult {
  * never a secret.
  */
 export class PlanRejectedError extends Error {
-  constructor(readonly reason: string) {
+  constructor(readonly reason: string, readonly sourceGateRevision?: number) {
     super(reason);
     this.name = "PlanRejectedError";
+  }
+}
+
+/** An accepted replacement ends the failed individual revision driver. */
+export class PlanRevisionReplacedError extends Error {
+  constructor(readonly verdict: Extract<PlanVerdict, { kind: "revise" }>, public sessionId?: string) {
+    super("plan revision replaced");
+    this.name = "PlanRevisionReplacedError";
   }
 }
 
@@ -1550,7 +1565,7 @@ export class StubExecutor implements Executor {
         // future PlanVerdict variant is added, these lines stop type-checking, forcing it
         // to be handled rather than silently falling through to an unapproved plan.
         if (verdict.kind === "reject")
-          throw new PlanRejectedError(verdict.reason);
+          throw new PlanRejectedError(verdict.reason, verdict.sourceGateRevision);
         if (verdict.kind === "cancel") throw new Error("run cancelled");
         // Stub implementation is fixed behaviour and does not implement the approved plan text.
         if (verdict.approval === "cross_check")
