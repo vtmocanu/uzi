@@ -775,3 +775,63 @@ cap does **not** bound Git-internal delta decompression memory. The deadline lim
 does not isolate this verifier from sibling runs. The resulting residual
 resource-exhaustion risk is deferred scope, as authorized by the human
 review on 2026-10-09 (#2512).
+
+## Amendment 2026-10-14 — #1859: shared per-key residue retention
+
+The Docker-only sweep and unwired accepted-gap paragraph in *Disclosed scope
+reductions* records the original implementation. Current code closes that
+residue-reclamation gap without changing ordinary unwired canonical continuity
+or the recovery-enabled fresh-attempt behavior recorded above.
+
+In `agent/src/git.ts`, `runnerCloneForBranch` calls the shared `sweepResidue`
+under the bare lock **after successful canonical free and before the new seed**.
+The attempt path calls the same helper after seed/live registration.
+Abandoned-attempt and orphaned-skills cleanup remains exclusive to the attempt
+path; canonical reseeding adds residue cleanup, not those phases.
+
+The helper considers direct siblings of the same clone key that match the exact
+parser grammar `.uzi-residue-<key>.residue-<uuid>` (`<uuid>` is a lowercase v4
+UUID). Five entries is a best-effort retention target, not a disk bound. It sorts
+the original candidates by their own lstat mtime, then basename, and considers
+only the original oldest excess slice. A refused excess entry stays; no newer
+entry is substituted to compensate. Parent validation and complete enumeration
+precede reclamation. A private fixed 4096-direct-entry budget bounds this
+enumeration, not storage; overflow skips all residue reclamation for that sweep.
+The budget is not a setting. With no excess, the helper returns without a
+redundant journal discovery.
+
+Expensive residue candidate processing is separately capped at 16 attempts per
+sweep, counting refusals. A per-clone-key in-process cursor rotates through the
+original oldest excess slice, so a persistently refused prefix cannot starve
+later excess. The cursor records ordering position only, never safety evidence;
+every attempt repeats the fresh checks below. The newest five remain outside
+the candidate slice. Cursor storage is a 128-key LRU, cleared when no excess
+remains. Process restart or LRU eviction starts that key from the oldest again.
+This is a work-count bound, not a hard elapsed-time bound: a started operation
+still settles under its existing safety/deletion deadlines before returning.
+
+Before deletion, fresh readable journal discovery protects a candidate or any
+descendant named by recovery evidence, and the live registry protects live paths.
+Deletion requires an affirmative scoped seed-process verdict, with journal,
+live and quarantine checks repeated around the proof and before deletion.
+An active or newly latched unreadable-unattributed worker quarantine keeps all
+residue entries. False, absent or unverified proof and generic thrown proof keep
+the candidate with bounded diagnostics; classified control/recovery
+interruptions propagate. Fresh-attempt seeding's unreadable-process relaxation
+never authorizes retention deletion. Off Linux, an absent process verdict keeps
+entries rather than inventing proof. See [ADR-2213](2213-worker-residue-quarantine.md#amendment-2026-10-14--1859-residue-retention-veto).
+
+Canonical retention in `agent/src/runner.ts` forwards the existing configured
+best-effort Docker handling. Unwired workers gain no daemon obligation.
+Attempt retention preserves its existing `processOnly: true` posture.
+**Follow-up 3 remains an inherited risk**: this change introduces no confirmed
+container verdict and does not redesign Docker teardown. Existing runner-uid,
+path/name validation and deletion deadlines remain in place. A possibly alive
+rm stops further cleanup; a file or symlink residue entry is unlinked itself,
+without following its target or recursively deleting through it.
+
+Safety can leave more than five entries. This adds no hard disk bound,
+background timer or custody change. At delivery, the Linux
+`task test:clone-quiescence` image build timed out before actual cases; real
+procfs/uid verification from that leg remains incomplete, pending maintainer
+verification.

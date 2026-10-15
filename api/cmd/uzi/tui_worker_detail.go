@@ -367,8 +367,11 @@ func (m tuiModel) workerDetailLines(now time.Time) ([]string, int) {
 	if w.UpgradeStatus == "outdated" {
 		ver += "  " + paintSeg(m.pal.stall, nil, false, "↑ outdated · target "+m.renderer.Plain(t.upgradeTarget, width))
 	}
-	if w.UpgradeStatus == "upgrade_failed" {
-		ver += "  " + paintSeg(m.pal.alarm, nil, false, "✕ upgrade failed") + paintSeg(m.pal.stall, nil, false, " · target "+m.renderer.Plain(t.upgradeTarget, width))
+	if workerRollFailure(w.UpgradeStatus) {
+		ver += "  " + paintSeg(m.pal.alarm, nil, false, "✕ "+workerRollLabel(w.UpgradeStatus)) + paintSeg(m.pal.stall, nil, false, " · target "+m.renderer.Plain(t.upgradeTarget, width))
+	}
+	if w.UpgradeStatus == "provisioning" {
+		ver += "  " + paintSeg(m.pal.stall, nil, false, "◌ provisioning")
 	}
 	kv("version", ver)
 	capabilities := m.renderer.Plain(t.capabilityText, width)

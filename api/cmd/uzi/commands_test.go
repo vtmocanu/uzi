@@ -1671,7 +1671,7 @@ func TestWorkerListShowsUpgradeStatus(t *testing.T) {
 	if code != uzicli.ExitOK {
 		t.Fatalf("exit = %d, want 0", code)
 	}
-	if !strings.Contains(out, "UPGRADE") {
+	if !strings.Contains(out, "ROLL") {
 		t.Fatalf("no UPGRADE column:\n%s", out)
 	}
 	for _, want := range []string{"outdated", "FAILED", "up to date"} {

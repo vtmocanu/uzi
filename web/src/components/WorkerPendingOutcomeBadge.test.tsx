@@ -3,6 +3,7 @@ import { afterEach, describe, it, expect } from "vitest";
 import { cleanup, render, screen } from "@testing-library/react";
 import { WorkerPendingOutcomeBadge } from "./WorkerPendingOutcomeBadge";
 import type { WorkerReportedRun } from "../lib/api";
+import type { ComponentProps } from "react";
 
 afterEach(cleanup);
 
@@ -15,6 +16,120 @@ const NOW = Date.parse("2026-10-01T12:00:00Z");
 function entry(over: Partial<WorkerReportedRun> = {}): WorkerReportedRun {
   return { run_id: "r-live", phase: "running", claim_generation: 1, ...over };
 }
+
+// Structural wire fixture: exercise additive fields before the DTO gains them.
+function aggregateWorker(
+  fields: { pending_outcome_count?: number; pending_overflow?: boolean },
+  reported_runs: WorkerReportedRun[] = [],
+): ComponentProps<typeof WorkerPendingOutcomeBadge>["worker"] {
+  return { reported_runs, ...fields } as ComponentProps<typeof WorkerPendingOutcomeBadge>["worker"];
+}
+
+describe("WorkerPendingOutcomeBadge issue 2009", () => {
+  it.each([
+    { pending_outcome_count: 0, pending_overflow: true },
+    { pending_overflow: true },
+  ])("renders zero with overflow and missing reported_runs: %j", (worker) => {
+    const { container } = render(<WorkerPendingOutcomeBadge worker={worker} nowMs={NOW} />);
+    const pill = screen.getByText("0 confirmed pending; more may be pending");
+    expect(pill.textContent).toBe("0 confirmed pending; more may be pending");
+    expect(pill.getAttribute("title")).toBe("Outcome journaled on this worker but not yet delivered to the api.\n");
+    expect(container.querySelector("a")).toBeNull();
+  });
+
+  it("renders an aggregate-only ordinary count when overflow is omitted", () => {
+    render(<WorkerPendingOutcomeBadge worker={{ pending_outcome_count: 2 }} nowMs={NOW} />);
+    expect(screen.getByText("2 pending outcomes").getAttribute("title"))
+      .toBe("Outcome journaled on this worker but not yet delivered to the api.\n");
+  });
+
+  it("renders zero confirmed pending with overflow even when reported_runs is empty", () => {
+    render(
+      <WorkerPendingOutcomeBadge
+        worker={aggregateWorker({ pending_outcome_count: 0, pending_overflow: true })}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByText("0 confirmed pending; more may be pending").textContent)
+      .toBe("0 confirmed pending; more may be pending");
+  });
+
+  it("uses aggregate three rather than the one listed pending row with overflow", () => {
+    render(
+      <WorkerPendingOutcomeBadge
+        worker={aggregateWorker(
+          { pending_outcome_count: 3, pending_overflow: true },
+          [entry({ terminal_pending: true })],
+        )}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByText("3 confirmed pending; more may be pending").textContent)
+      .toBe("3 confirmed pending; more may be pending");
+  });
+
+  it.each([
+    { count: 1, listed: 2, label: "1 pending outcome" },
+    { count: 3, listed: 1, label: "3 pending outcomes" },
+  ])("renders ordinary aggregate count $count when overflow is false", ({ count, listed, label }) => {
+    render(
+      <WorkerPendingOutcomeBadge
+        worker={aggregateWorker(
+          { pending_outcome_count: count, pending_overflow: false },
+          Array.from({ length: listed }, (_, i) => entry({ run_id: `pending-${i}`, terminal_pending: true })),
+        )}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByText(label).textContent).toBe(label);
+  });
+
+  it("treats aggregate zero as authoritative over a listed pending row without overflow", () => {
+    const { container } = render(
+      <WorkerPendingOutcomeBadge
+        worker={aggregateWorker(
+          { pending_outcome_count: 0, pending_overflow: false },
+          [entry({ terminal_pending: true })],
+        )}
+        nowMs={NOW}
+      />,
+    );
+    expect(container.innerHTML).toBe("");
+  });
+
+  it("falls back to the listed pending count when aggregate count is absent with overflow", () => {
+    render(
+      <WorkerPendingOutcomeBadge
+        worker={aggregateWorker(
+          { pending_overflow: true },
+          [entry({ terminal_pending: true }), entry({ run_id: "live" })],
+        )}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByText("1 confirmed pending; more may be pending").textContent)
+      .toBe("1 confirmed pending; more may be pending");
+  });
+
+  it("keeps known per-row ages in the title when an aggregate count is present", () => {
+    render(
+      <WorkerPendingOutcomeBadge
+        worker={aggregateWorker(
+          { pending_outcome_count: 1, pending_overflow: false },
+          [entry({
+            run_id: "pending-aged",
+            claim_generation: 3,
+            terminal_pending: true,
+            terminal_pending_since: "2026-10-01T11:48:00Z",
+          })],
+        )}
+        nowMs={NOW}
+      />,
+    );
+    expect(screen.getByText("1 pending outcome").getAttribute("title"))
+      .toContain("run pending-aged (generation 3), pending 12m");
+  });
+});
 
 describe("WorkerPendingOutcomeBadge", () => {
   it("renders nothing when reported_runs is absent (older api / mock)", () => {

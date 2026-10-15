@@ -276,9 +276,21 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
     assert.equal(git.runnerClonePath(bare, `issue-${RESIDUE_IID}`), RESIDUE_CANON, "plant-residue.sh planted at GitCache's canonical path");
 
     const proofs: string[] = [];
-    const clone = await git.createOrAttachRunnerClone(bare, RESIDUE_IID, {
+    const retentionProofs: string[][] = [];
+    const reseed: import("../../agent/src/git.js").CanonicalReseedOptions = {
       // The runner's canonical-reseed proof: a seed-mode scan scoped to the canonical path,
       // through the real runner-uid helper. Anything but quiescent blocks with nothing moved.
+      isLive: () => false,
+      quiescent: async (paths, canonical) => {
+        retentionProofs.push(paths);
+        const out = await q.quiesceRunAttempt({
+          mode: "seed", attempt: undefined,
+          cloneKey: attemptPath.cloneKeyOf(canonical).cloneKey,
+          targetPaths: paths, processes: true, dockerHost: undefined,
+          registry: new q.LiveAttemptRegistry(), site: "canonical_retention",
+        });
+        return out.process?.state === "quiescent";
+      },
       beforeFree: async (p) => {
         proofs.push(p);
         const out = await q.quiesceRunAttempt({
@@ -293,7 +305,8 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
         });
         if (out.process?.state !== "quiescent") throw new gitMod.CloneResidueBlockedError(out.process?.detail ?? "not quiescent");
       },
-    }, "run-cq-residue");
+    };
+    const clone = await git.createOrAttachRunnerClone(bare, RESIDUE_IID, reseed, "run-cq-residue");
     assert.deepEqual(proofs, [RESIDUE_CANON], "the proof ran over the canonical path");
     assert.equal(clone.path, RESIDUE_CANON, "the reseed completed at the canonical path");
     assert.equal(fs.existsSync(path.join(RESIDUE_CANON, ".git")), true);
@@ -316,9 +329,24 @@ describe("clone quiescence under the real uid split (issue #1783)", () => {
     // The delete ran as the runner uid (the setpriv-wrapped /bin/rm), never an in-process worker rm.
     assert.match(String(warn?.detail), /^runner-uid delete exited /, `the delete's failure: ${String(warn?.detail)}`);
 
-    // Kept: a runner-uid delete (what the retention sweep runs) cannot remove a root-owned residue.
-    const rm = runnerUid.runnerCommand("/bin/rm", ["-rf", "--", residue]);
-    assert.throws(() => execFileSync(rm.command, rm.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" }));
-    assert.equal(fs.existsSync(path.join(residue, "gate-log.loop")), true, "the residue is kept");
+    // Exercise the real canonical retention path: one removable oldest residue, the retained
+    // root-owned residue, and five newer runner-owned entries. Only the original excess is tried.
+    const planted: string[] = [];
+    for (let i = 0; i < 6; i++) {
+      const p = path.join(parent, attemptPath.formatResidueName(`issue-${RESIDUE_IID}`,
+        `00000000-0000-4000-8000-${String(i).padStart(12, "0")}`));
+      const mkdir = runnerUid.runnerCommand("/bin/mkdir", ["--", p]);
+      execFileSync(mkdir.command, mkdir.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" });
+      const stamp = i === 0 ? "1000" : String(Math.floor(Date.now() / 1000) + 3600 + i);
+      const touch = runnerUid.runnerCommand("/bin/touch", ["-m", "-d", `@${stamp}`, "--", p]);
+      execFileSync(touch.command, touch.args, { env: { PATH: "/usr/bin:/bin" }, stdio: "pipe" });
+      planted.push(p);
+    }
+    await git.createOrAttachRunnerClone(bare, RESIDUE_IID, reseed, "run-cq-residue-next");
+    assert.deepEqual(retentionProofs, [[planted[0]], [residue]], "real seed-mode retention proofs cover only the original excess");
+    assert.equal(fs.existsSync(planted[0]!), false, "runner-owned residue deleted through the runner uid");
+    assert.ok(planted.slice(1).every(p => fs.existsSync(p)), "newer entries survive the failed root-owned delete");
+    assert.equal(fs.existsSync(path.join(residue, "gate-log.loop")), true, "root-owned residue kept");
+    assert.ok(lines.some(l => String(l.msg).includes("could not delete; keeping it") && l.path === residue));
   });
 });

@@ -86,6 +86,67 @@ func (f *admissionFixture) capture(hold, run, owner uuid.UUID, state string) {
  VALUES($1,$2,$3,$4,'original','abc',$5,$6)`, uuid.New(), hold, run, owner, uuid.New().String(), state)
 }
 
+// members returns the per-hold admission membership keyed by hold id.
+func (f *admissionFixture) members(cutoff pgtype.Timestamptz) map[uuid.UUID]store.ListCustodyAdmissionMembersForOwnerRow {
+	f.t.Helper()
+	rows, err := f.q.ListCustodyAdmissionMembersForOwner(f.ctx, store.ListCustodyAdmissionMembersForOwnerParams{
+		UserID: f.owner, HeartbeatCutoff: cutoff})
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	out := make(map[uuid.UUID]store.ListCustodyAdmissionMembersForOwnerRow, len(rows))
+	for _, r := range rows {
+		if _, dup := out[r.HoldID]; dup {
+			f.t.Fatalf("duplicate member row for hold %s", r.HoldID)
+		}
+		out[r.HoldID] = r
+	}
+	return out
+}
+
+// assertMembers pins the visibility projection to the canonical accounting: exactly one member
+// per owner open hold, and the counted members sum to fn_custody_admission_count.
+func (f *admissionFixture) assertMembers(cutoff pgtype.Timestamptz, counted int64) {
+	f.t.Helper()
+	members := f.members(cutoff)
+	var open []uuid.UUID
+	rows, err := f.pool.Query(f.ctx, `SELECT id FROM recovery_custody_holds WHERE user_id=$1 AND state='open'`, f.owner)
+	if err != nil {
+		f.t.Fatal(err)
+	}
+	defer rows.Close()
+	for rows.Next() {
+		var id uuid.UUID
+		if err := rows.Scan(&id); err != nil {
+			f.t.Fatal(err)
+		}
+		open = append(open, id)
+	}
+	if err := rows.Err(); err != nil {
+		f.t.Fatal(err)
+	}
+	if len(open) != len(members) {
+		f.t.Fatalf("members=%d open holds=%d", len(members), len(open))
+	}
+	for _, id := range open {
+		if _, ok := members[id]; !ok {
+			f.t.Fatalf("open hold %s has no member row", id)
+		}
+	}
+	var n, canonical int64
+	for _, m := range members {
+		if m.Counted {
+			n++
+		}
+	}
+	if err := f.pool.QueryRow(f.ctx, `SELECT fn_custody_admission_count($1,$2)`, f.owner, cutoff).Scan(&canonical); err != nil {
+		f.t.Fatal(err)
+	}
+	if n != counted || n != canonical {
+		f.t.Fatalf("counted members=%d aggregate counted=%d canonical=%d", n, counted, canonical)
+	}
+}
+
 // mirrors executes all five production queries with one caller-supplied cutoff.
 // ClaimRun is rolled back so every assertion sees the same fixture.
 func (f *admissionFixture) mirrors(cutoff pgtype.Timestamptz, limit int32, total, counted int64, continuation bool) {
@@ -95,6 +156,7 @@ func (f *admissionFixture) mirrors(cutoff pgtype.Timestamptz, limit int32, total
 	if err != nil {
 		f.t.Fatal(err)
 	}
+	f.assertMembers(cutoff, counted)
 	blocked := limit > 0 && counted >= int64(limit) && !continuation
 	wantBlocked := int64(0)
 	if blocked {
@@ -446,7 +508,7 @@ func TestCustodyFactsListingsLiveDB(t *testing.T) {
 
 func TestCustodyAdmissionStatementSnapshotLiveDB(t *testing.T) {
 	ctx, pool, _ := openCustodyEpisodeLiveDB(t)
-	for name, want := range map[string]string{"fn_custody_attention": "i", "fn_is_decision_attention": "i", "fn_custody_admission_count": "s"} {
+	for name, want := range map[string]string{"fn_custody_attention": "i", "fn_is_decision_attention": "i", "fn_custody_admission_count": "s", "fn_custody_admission_members": "s"} {
 		var got string
 		if err := pool.QueryRow(ctx, `SELECT provolatile::text FROM pg_proc WHERE oid=$1::regproc`, name).Scan(&got); err != nil {
 			t.Fatal(err)
@@ -454,6 +516,14 @@ func TestCustodyAdmissionStatementSnapshotLiveDB(t *testing.T) {
 		if got != want {
 			t.Fatalf("%s volatility=%s want=%s", name, got, want)
 		}
+	}
+	var strict bool
+	var retset bool
+	if err := pool.QueryRow(ctx, `SELECT proisstrict, proretset FROM pg_proc WHERE oid='fn_custody_admission_members(uuid,timestamptz)'::regprocedure`).Scan(&strict, &retset); err != nil {
+		t.Fatal(err)
+	}
+	if strict || !retset {
+		t.Fatalf("fn_custody_admission_members strict=%v retset=%v, want false/true", strict, retset)
 	}
 	for _, change := range []string{"heartbeat", "capture", "generation"} {
 		t.Run(change, func(t *testing.T) {
@@ -531,6 +601,177 @@ func TestCustodyAdmissionStatementSnapshotLiveDB(t *testing.T) {
 				t.Fatalf("statement snapshot: %+v", r)
 			}
 			f.mirrors(f.cutoff, 1, 1, 1, false)
+		})
+	}
+}
+
+// Each case pins (counted, reason) per hold; counted must also sum to the canonical count.
+// Memory holds remain owner decisions even with a downloadable archive. The
+// per-hold explanation must agree with the canonical admission count and listings.
+func TestMemoryHoldAdmissionMembershipParityLiveDB(t *testing.T) {
+	for _, guarded := range []bool{false, true} {
+		for _, latestFailed := range []bool{false, true} {
+			t.Run(fmt.Sprintf("guarded=%v/latestFailed=%v", guarded, latestFailed), func(t *testing.T) {
+				f := newAdmissionFixture(t, 1) // A live sibling stays admission-exempt.
+				run := f.run("running", f.worker, 1)
+				hold := f.holdWithInventory(run, 1, guarded)
+				f.capture(hold, run, f.owner, "available")
+				f.exec("UPDATE recovery_captures SET created_at=now()-interval '1 minute' WHERE hold_id=$1 AND user_id=$2", hold, f.owner)
+				wantAttention := "source_only"
+				if latestFailed {
+					f.capture(hold, run, f.owner, "needs_action")
+					wantAttention = "needs_action"
+				}
+				f.exec("UPDATE runs SET status='recovery_wait', recovery_wait_cause='worker_memory_pressure', claim_released_at=now() WHERE id=$1", run)
+				members := f.members(f.cutoff)
+				memory, ok := members[hold]
+				if !ok || !memory.Counted || memory.Reason != "decision_needed" {
+					t.Fatalf("memory hold membership=%+v present=%v", memory, ok)
+				}
+				live, ok := members[f.holds[0]]
+				if !ok || live.Counted || live.Reason != "live_claim" {
+					t.Fatalf("live sibling membership=%+v present=%v", live, ok)
+				}
+				listed, err := f.q.ListCustodyHoldsForOwner(f.ctx, store.ListCustodyHoldsForOwnerParams{UserID: f.owner})
+				if err != nil {
+					t.Fatal(err)
+				}
+				found := false
+				for _, row := range listed {
+					if row.ID == hold {
+						found = true
+						if row.Attention != wantAttention || !row.DecisionNeeded || row.RecoveryWaitCause != "worker_memory_pressure" {
+							t.Fatalf("memory attention=%+v want %s with owner decision", row, wantAttention)
+						}
+					}
+				}
+				if !found {
+					t.Fatal("memory hold missing from owner listing")
+				}
+				// This executes canonical count, per-hold parity, DTO aggregate and
+				// the other admission readers against the same fixture cutoff.
+				f.mirrors(f.cutoff, 8, 2, 1, false)
+			})
+		}
+	}
+}
+
+func TestCustodyAdmissionMembershipReasonsLiveDB(t *testing.T) {
+	type want struct {
+		counted bool
+		reason  string
+	}
+	for _, tc := range []struct {
+		name string
+		// act mutates the one-run fixture and returns the expected membership by hold id.
+		act func(f *admissionFixture) map[uuid.UUID]want
+	}{
+		{"live current generation", func(f *admissionFixture) map[uuid.UUID]want {
+			return map[uuid.UUID]want{f.holds[0]: {false, "live_claim"}}
+		}},
+		{"earlier generation of a live run", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE runs SET claim_generation=2 WHERE id=$1`, f.runs[0])
+			current := f.hold(f.runs[0], 2)
+			return map[uuid.UUID]want{f.holds[0]: {true, "earlier_generation"}, current: {false, "live_claim"}}
+		}},
+		{"future generation", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET generation=2 WHERE id=$1`, f.holds[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "other_generation"}}
+		}},
+		{"queued run", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE runs SET status='queued' WHERE id=$1`, f.runs[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "run_not_live"}}
+		}},
+		{"terminal run with available archive", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE runs SET status='completed' WHERE id=$1`, f.runs[0])
+			f.capture(f.holds[0], f.runs[0], f.owner, "available")
+			return map[uuid.UUID]want{f.holds[0]: {true, "terminal_run"}}
+		}},
+		{"terminal run without capture", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE runs SET status='failed' WHERE id=$1`, f.runs[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "decision_needed"}}
+		}},
+		{"decision capture on live run", func(f *admissionFixture) map[uuid.UUID]want {
+			f.capture(f.holds[0], f.runs[0], f.owner, "needs_action")
+			return map[uuid.UUID]want{f.holds[0]: {true, "decision_needed"}}
+		}},
+		{"missing run row", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET run_id=$2 WHERE id=$1`, f.holds[0], uuid.New())
+			return map[uuid.UUID]want{f.holds[0]: {true, "decision_needed"}}
+		}},
+		{"missing run row with available archive", func(f *admissionFixture) map[uuid.UUID]want {
+			f.capture(f.holds[0], f.runs[0], f.owner, "available")
+			f.exec(`UPDATE recovery_custody_holds SET run_id=$2 WHERE id=$1`, f.holds[0], uuid.New())
+			return map[uuid.UUID]want{f.holds[0]: {true, "unknown_evidence"}}
+		}},
+		{"stale heartbeat", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE workers SET last_heartbeat_at=$2 WHERE id=$1`, f.worker, f.cutoff.Time.Add(-time.Second))
+			return map[uuid.UUID]want{f.holds[0]: {true, "stale_heartbeat"}}
+		}},
+		{"null heartbeat", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE workers SET last_heartbeat_at=NULL WHERE id=$1`, f.worker)
+			return map[uuid.UUID]want{f.holds[0]: {true, "stale_heartbeat"}}
+		}},
+		{"duplicate qualifying hold", func(f *admissionFixture) map[uuid.UUID]want {
+			dup := f.hold(f.runs[0], 1)
+			return map[uuid.UUID]want{f.holds[0]: {false, "live_claim"}, dup: {true, "duplicate_hold"}}
+		}},
+		{"live run mismatch", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET live_run_id=$2 WHERE id=$1`, f.holds[0], f.queued)
+			return map[uuid.UUID]want{f.holds[0]: {true, "identity_mismatch"}}
+		}},
+		{"null run worker", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE runs SET worker_id=NULL WHERE id=$1`, f.runs[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "identity_mismatch"}}
+		}},
+		{"null live run", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET live_run_id=NULL WHERE id=$1`, f.holds[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "unknown_evidence"}}
+		}},
+		{"null live worker", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET live_worker_id=NULL WHERE id=$1`, f.holds[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "unknown_evidence"}}
+		}},
+		{"missing worker", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET live_worker_id=NULL WHERE id=$1`, f.holds[0])
+			f.exec(`DELETE FROM workers WHERE id=$1`, f.worker)
+			return map[uuid.UUID]want{f.holds[0]: {true, "unknown_evidence"}}
+		}},
+		{"released claim", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE runs SET claim_released_at=now() WHERE id=$1`, f.runs[0])
+			return map[uuid.UUID]want{f.holds[0]: {true, "claim_released"}}
+		}},
+		{"non-open holds have no member row", func(f *admissionFixture) map[uuid.UUID]want {
+			f.exec(`UPDATE recovery_custody_holds SET state='released' WHERE id=$1`, f.holds[0])
+			return map[uuid.UUID]want{}
+		}},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			f := newAdmissionFixture(t, 1)
+			wants := tc.act(f)
+			got := f.members(f.cutoff)
+			if len(got) != len(wants) {
+				t.Fatalf("members=%+v want %+v", got, wants)
+			}
+			var counted int64
+			for id, w := range wants {
+				g, ok := got[id]
+				if !ok || g.Counted != w.counted || g.Reason != w.reason {
+					t.Errorf("hold %s = %+v (present=%v), want counted=%v reason=%s", id, g, ok, w.counted, w.reason)
+				}
+				if w.counted {
+					counted++
+				}
+			}
+			agg, err := f.q.GetCustodyAggregateForOwner(f.ctx, store.GetCustodyAggregateForOwnerParams{
+				UserID: f.owner, HeartbeatCutoff: f.cutoff, CustodyHoldLimit: 8})
+			if err != nil {
+				t.Fatal(err)
+			}
+			if agg.AdmissionCountedHolds != counted {
+				t.Fatalf("aggregate counted=%d members counted=%d", agg.AdmissionCountedHolds, counted)
+			}
+			f.assertMembers(f.cutoff, counted)
 		})
 	}
 }

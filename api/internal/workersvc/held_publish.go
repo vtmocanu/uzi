@@ -72,6 +72,7 @@ const (
 	HeldReasonPackInvalid      = "pack_invalid"
 	HeldReasonPackTooLarge     = "pack_too_large"
 	HeldReasonTipMissing       = "tip_missing"
+	HeldReasonCIConfigGuard    = "ci_config_guard"
 )
 
 // HeldRefusal is a step-A refusal that the worker must not retry as is. It carries a reason code
@@ -338,6 +339,7 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 	opts := pushbroker.HeldPackOptions{
 		RunID: runID, Generation: req.Generation, Branch: branch, DefaultBranch: rc.DefaultBranch.String,
 		Tip: req.Tip, Pack: pack,
+		CIConfigGuard: adm.run.CiConfigGuard, CIConfigPaths: adm.run.CiConfigPaths,
 	}
 	forgeConn.ApplyTo(&opts)
 	prepared, err := s.heldPrepareFn(ctx, opts)
@@ -349,6 +351,8 @@ func (s *Service) PublishHeld(ctx context.Context, wkr store.Worker, runID uuid.
 			return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonPackInvalid}
 		case errors.Is(err, pushbroker.ErrTipMissing):
 			return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonTipMissing}
+		case errors.Is(err, pushbroker.ErrCIConfigGuard):
+			return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonCIConfigGuard}
 		}
 		slog.Warn("held publication: pack pre-verify failed", "run", runID, "error", heldErrText(err, forgeConn.PAT))
 		return HeldPublishResult{}, &HeldRefusal{Reason: HeldReasonForgeUnavailable}

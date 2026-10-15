@@ -17,6 +17,12 @@
 - Hold triggers: the release lead requests a merges barrier while cutting an RC;
   request a separate pushes-ci barrier when the cut tip's CI is queued. Account
   CI capacity is shared across repositories; include other affected sessions.
+- Dispatches holds include scheduled automation. Have each schedule owner's session,
+  with its buddy's check, run `uzi schedule pause-all --until never` before activation;
+  record `uzi schedule pause-status` before/after as evidence; if it already shows a
+  pause (one record per user), skip both pause-all and resume-all. At release, run
+  `uzi schedule resume-all` only for pauses this hold created and after the last
+  applicable dispatches hold; preserve pre-existing pauses and report unheld automation.
 - Coverage: include every merging lead and outstanding operation, and identify
   unenrolled actors and automation. Require quiescent acknowledgments before
   activating a barrier. Hold through the release lead's explicit release. Follow
@@ -55,9 +61,23 @@
   - Compare active runs by repository and issue against board claims and the
     skipper ledger. Flag a second run for an issue another session owns; route
     to both owners. Missing issue identity or incomplete visibility is unknown.
+  - Check owner admission via `uzi run recovery --json`: compare
+    `.aggregate.admission_counted_holds` with `.aggregate.custody_hold_limit`,
+    not `open_holds`; live current generations are excluded from the counted signal.
+    Fresh runs need counted < limit (a non-positive limit disables the gate; continuation
+    runs under the per-run cap are exempt); missing fields mean unknown, not spare admission.
+  - A parked `awaiting_approval` plan gate holds a worker slot. Route long-parked
+    gates to their owner to approve or steer promptly; in-flight runs keep going
+    under a dispatches hold, which blocks new dispatch rather than ongoing work.
   - Flag runs reported stalled or unhealthy, or parked at an approval/input gate,
     when no accountable steering session is recorded. Use run health/state and
     owner reports; read no working transcript or partial plan.
+  - Each round flag active delivery runs with `budget_total_seconds - budget_used_seconds`
+    remaining below 1h or 15% of `budget_total_seconds`; read `uzi admin runs --json`
+    or `uzi run get RUN --json`. Total already includes `budget_extension_seconds`; missing fields are unknown.
+    Also flag `paused` runs with `hold_reason=budget_exhausted`. Ask the owning session
+    to judge progress and extend (`uzi run extend RUN --by <dur>`), then re-arm its poller, or say why not.
+    Respect `budget_extension_cap_seconds` per request (zero disables); skipper never extends runs itself.
   - Each round inspect this repo's `failed` delivery runs in the Patrol scope via
     `uzi run list --json` and known IDs; retain owner/newest-200 coverage limits.
     Exclude user cancellations, superseded runs, provider-limit parks and

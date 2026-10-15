@@ -99,6 +99,7 @@ func bindingForMode(mode string, secretID pgtype.UUID, label string) (*string, *
 // is exactly what it carries. The per-user LIST path has the join and folds it.
 func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		NeverRegistered:     workersvc.NeverRegistered(w.Status, w.LastHeartbeatAt.Valid, w.Version.Valid, w.SnapshotRegisterNonce.Valid, w.RegisteredPodUid.Valid, w.RollHeartbeatAt.Valid),
 		Reported:            w.Version.String,
 		Kind:                w.Kind,
 		CPVersion:           cpVersion,
@@ -161,12 +162,14 @@ func workerDTOFromWorker(w store.Worker, activeRuns int, busy bool, secretLabel,
 }
 
 func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersion string, now, apiStartedAt time.Time) apitypes.WorkerDTO {
+	sig := rollSignalFromRow(w)
 	upgradeStatus, upgradeDetail, upgradeTarget := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		NeverRegistered:     workersvc.NeverRegistered(w.Status, w.LastHeartbeatAt.Valid, w.Version.Valid, w.SnapshotRegisterNonce.Valid, w.RegisteredPodUid.Valid, w.RollHeartbeatAt.Valid),
 		Reported:            w.Version.String,
 		Kind:                w.Kind,
 		CPVersion:           cpVersion,
 		PinnedWorkerVersion: pinnedWorkerVersion,
-		Signal:              rollSignalFromRow(w),
+		Signal:              sig,
 		Now:                 now,
 		APIStartedAt:        apiStartedAt,
 	}, workersvc.UpgradeParams{})
@@ -177,11 +180,12 @@ func workerDTOFromRow(w store.ListWorkersByUserRow, cpVersion, pinnedWorkerVersi
 		UpgradeStatus: upgradeStatus,
 		UpgradeDetail: textPtrValue(upgradeDetail != "", upgradeDetail),
 		UpgradeTarget: upgradeTarget,
-		// Only meaningful for a failed upgrade, and only the list path has the join that
+		// Blocking diagnostics are meaningful for failed statuses; this list path has the join that
 		// carries them at all.
-		UpgradeBlockingContainer: textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
-		UpgradeBlockingReason:    textPtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
-		UpgradeLastExitCode:      int32PtrValue(upgradeStatus == workersvc.UpgradeStatusUpgradeFailed && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
+		UpgradeBlockingKind:      textPtrValue(upgradeStatus == workersvc.UpgradeStatusCapacityBlocked, workersvc.EffectiveBlockingKind(sig)),
+		UpgradeBlockingContainer: textPtrValue(workersvc.IsUpgradeFailure(upgradeStatus) && w.RollBlockingContainer.Valid, w.RollBlockingContainer.String),
+		UpgradeBlockingReason:    textPtrValue(workersvc.IsUpgradeFailure(upgradeStatus) && w.RollBlockingReason.Valid, w.RollBlockingReason.String),
+		UpgradeLastExitCode:      int32PtrValue(workersvc.IsUpgradeFailure(upgradeStatus) && w.RollLastExitCode.Valid, w.RollLastExitCode.Int32),
 		AnthropicSecretID:        rowBindingID,
 		AnthropicSecretLabel:     rowBindingLabel,
 		AnthropicBindMode:        effectiveBindMode(w.AnthropicBindMode, w.AnthropicSecretID),
@@ -265,6 +269,7 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		return nil
 	}
 	sig := &workersvc.RollSignal{
+		BlockingKind:      w.RollBlockingKind.String,
 		Phase:             w.RollPhase.String,
 		ObservedAt:        w.RollObservedAt.Time,
 		PodPhase:          w.RollPodPhase.String,
@@ -287,6 +292,7 @@ func rollSignalFromRow(w store.ListWorkersByUserRow) *workersvc.RollSignal {
 		t := w.RollUpgradingSince.Time
 		sig.UpgradingSince = &t
 	}
+	sig.BlockingKind = workersvc.EffectiveBlockingKind(sig)
 	return sig
 }
 
@@ -302,6 +308,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 		return nil
 	}
 	sig := &workersvc.RollSignal{
+		BlockingKind:      w.RollBlockingKind.String,
 		Phase:             w.RollPhase.String,
 		ObservedAt:        w.RollObservedAt.Time,
 		PodPhase:          w.RollPodPhase.String,
@@ -324,6 +331,7 @@ func rollSignalFromAdminRow(w store.ListAllWorkersRow) *workersvc.RollSignal {
 		t := w.RollUpgradingSince.Time
 		sig.UpgradingSince = &t
 	}
+	sig.BlockingKind = workersvc.EffectiveBlockingKind(sig)
 	return sig
 }
 
@@ -350,6 +358,7 @@ func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 		return dto
 	}
 	status, detail, target := workersvc.ClassifyUpgradeWithTarget(workersvc.UpgradeInput{
+		NeverRegistered:     workersvc.NeverRegistered(row.Worker.Status, row.Worker.LastHeartbeatAt.Valid, row.Worker.Version.Valid, row.Worker.SnapshotRegisterNonce.Valid, row.Worker.RegisteredPodUid.Valid, row.Worker.RollHeartbeatAt.Valid),
 		Reported:            row.Worker.Version.String,
 		Kind:                row.Worker.Kind,
 		CPVersion:           cpVersion,
@@ -361,11 +370,12 @@ func workerDTOFromAdminRow(row store.ListAllWorkersRow, cpVersion, pinnedWorkerV
 	dto.UpgradeStatus = status
 	dto.UpgradeDetail = textPtrValue(detail != "", detail)
 	dto.UpgradeTarget = target
-	// The three blocking fields are meaningful only for a failed upgrade, gated identically to
+	// Blocking diagnostics are meaningful only for a failed status, gated identically to
 	// workerDTOFromRow so the admin list matches GET /api/workers for the same roll data.
-	dto.UpgradeBlockingContainer = textPtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollBlockingContainer.Valid, row.RollBlockingContainer.String)
-	dto.UpgradeBlockingReason = textPtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollBlockingReason.Valid, row.RollBlockingReason.String)
-	dto.UpgradeLastExitCode = int32PtrValue(status == workersvc.UpgradeStatusUpgradeFailed && row.RollLastExitCode.Valid, row.RollLastExitCode.Int32)
+	dto.UpgradeBlockingKind = textPtrValue(status == workersvc.UpgradeStatusCapacityBlocked, workersvc.EffectiveBlockingKind(sig))
+	dto.UpgradeBlockingContainer = textPtrValue(workersvc.IsUpgradeFailure(status) && row.RollBlockingContainer.Valid, row.RollBlockingContainer.String)
+	dto.UpgradeBlockingReason = textPtrValue(workersvc.IsUpgradeFailure(status) && row.RollBlockingReason.Valid, row.RollBlockingReason.String)
+	dto.UpgradeLastExitCode = int32PtrValue(workersvc.IsUpgradeFailure(status) && row.RollLastExitCode.Valid, row.RollLastExitCode.Int32)
 	return dto
 }
 
@@ -449,27 +459,34 @@ func (h *Handler) overlayWorkerReports(dto *apitypes.WorkerDTO, workerID uuid.UU
 	h.overlayResidueQuarantine(dto, workerID)
 }
 
-// reportedRunsByWorker reads each listed worker's reported active runs (PRD #1390 M2c) from
-// the worker_active_runs snapshot table in ONE batched round-trip, grouped by worker id. The
-// batch is what keeps the two list endpoints off an N+1: ListWorkers and AdminListWorkers pass
-// every row's id at once, PatchWorker a one-element set. Every worker in workerIDs gets a
-// (possibly empty, never nil) slice, so overlayReportedRuns always attaches a JSON array — a
-// worker the table has no row for encodes reported_runs as [], not null. A query error is
-// logged and yields the all-empty map: reported_runs is a display overlay and must never fail
-// the response, mirroring overlayOutbox's nil-safe posture. A nil store (defensive; the handler
-// always wires one) also yields the all-empty map.
-func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUID) map[uuid.UUID][]apitypes.WorkerReportedRunDTO {
-	byWorker := make(map[uuid.UUID][]apitypes.WorkerReportedRunDTO, len(workerIDs))
+type workerReportedRuns struct {
+	runs       map[uuid.UUID][]apitypes.WorkerReportedRunDTO
+	aggregates map[uuid.UUID]store.ListWorkerPendingOutcomeAggregatesRow
+}
+
+// reportedRunsByWorker performs two independent batched display reads. Snapshot
+// failure leaves empty arrays; aggregate failure leaves authority unavailable.
+func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUID) workerReportedRuns {
+	result := workerReportedRuns{runs: make(map[uuid.UUID][]apitypes.WorkerReportedRunDTO, len(workerIDs)), aggregates: make(map[uuid.UUID]store.ListWorkerPendingOutcomeAggregatesRow)}
+	byWorker := result.runs
 	for _, id := range workerIDs {
 		byWorker[id] = []apitypes.WorkerReportedRunDTO{}
 	}
 	if len(workerIDs) == 0 || h.q == nil {
-		return byWorker
+		return result
+	}
+	aggregates, aggregateErr := h.q.ListWorkerPendingOutcomeAggregates(ctx, workerIDs)
+	if aggregateErr != nil {
+		slog.Error("overlay pending outcome aggregates", "error", aggregateErr)
+	} else {
+		for _, row := range aggregates {
+			result.aggregates[row.WorkerID] = row
+		}
 	}
 	rows, err := h.q.ListActiveRunsForWorkers(ctx, workerIDs)
 	if err != nil {
 		slog.Error("overlay reported runs", "error", err)
-		return byWorker
+		return result
 	}
 	for _, row := range rows {
 		dto := apitypes.WorkerReportedRunDTO{
@@ -484,20 +501,22 @@ func (h *Handler) reportedRunsByWorker(ctx context.Context, workerIDs []uuid.UUI
 		}
 		byWorker[row.WorkerID] = append(byWorker[row.WorkerID], dto)
 	}
-	return byWorker
+	return result
 }
 
-// overlayReportedRuns folds a worker's reported active runs (PRD #1390 M2c) onto its DTO,
-// mirroring overlayOutbox but reading the DB (via reportedRunsByWorker's batched result) rather
-// than an in-process tracker. It always sets a non-nil slice, so reported_runs marshals as a
-// JSON array even for a workerID byWorker has no entry for — belt-and-braces beside the batch,
-// which already pre-seeds a [] per id.
-func (h *Handler) overlayReportedRuns(dto *apitypes.WorkerDTO, byWorker map[uuid.UUID][]apitypes.WorkerReportedRunDTO, workerID uuid.UUID) {
-	runs := byWorker[workerID]
+// overlayReportedRuns preserves actual snapshot rows and independently available aggregates.
+func (h *Handler) overlayReportedRuns(dto *apitypes.WorkerDTO, result workerReportedRuns, workerID uuid.UUID) {
+	runs := result.runs[workerID]
 	if runs == nil {
 		runs = []apitypes.WorkerReportedRunDTO{}
 	}
 	dto.ReportedRuns = runs
+	dto.PendingOutcomeCount = nil
+	dto.PendingOverflow = nil
+	if aggregate, ok := result.aggregates[workerID]; ok {
+		dto.PendingOutcomeCount = &aggregate.PendingCount
+		dto.PendingOverflow = &aggregate.PendingOverflowFresh
+	}
 }
 
 // runDiskByWorker reads each listed worker's largest runs by HOME size (PRD #1809 M6, D8) in ONE

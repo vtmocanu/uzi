@@ -11,8 +11,8 @@ import type { PendingTerminal } from "./outbox.js";
  *  an installed, un-retired terminal journal. */
 export type PendingTerminalLister = () => PendingTerminal[];
 
-/** PRD #1391 Run B M4: the server-side terminal-pending outbox cap getter — the register-returned
- *  `WORKER_OUTBOX_MAX_PENDING` off the client. Undefined when an older api did not return it, in
+/** PRD #1391 Run B M4: the server-side terminal-pending outbox cap getter — the latest valid
+ *  `WORKER_OUTBOX_MAX_PENDING` advertisement from register or an ordinary heartbeat. Undefined when an older api did not return it, in
  *  which case the registry treats the cap as 0 (protect every pending outcome via `pending_overflow`,
  *  the cap-independent floor). */
 export type OutboxCapGetter = () => number | undefined;
@@ -202,6 +202,7 @@ export class ActiveRunRegistry {
       snapshot_epoch: this.epoch,
       active: [],
       pending_overflow: pending.length > 0,
+      pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
       // Issue #1742: the finalize-pending set the caller captured for this register. The key is
       // omitted when empty, and build() (heartbeat/claim) never carries it.
       ...(finalizeResume.length > 0
@@ -248,7 +249,15 @@ export class ActiveRunRegistry {
       });
     }
 
-    return { snapshot_epoch: this.epoch, active, pending_overflow: pending.length > this.effectiveCap() };
+    // Issue #2009: preserve active construction, including duplicate run IDs across generations.
+    // pending_all provides coverage only if the API accepts the enclosing snapshot; duplicate
+    // active runs still reject the whole snapshot and therefore provide no pending_all coverage.
+    return {
+      snapshot_epoch: this.epoch,
+      active,
+      pending_overflow: pending.length > this.effectiveCap(),
+      pending_all: pending.map((p) => ({ run_id: p.run_id, claim_generation: p.claim_generation })),
+    };
   }
 
   /**

@@ -16,15 +16,43 @@ The register-only detail matters before you read any badge: a worker that went o
 through an upgrade still reports the version it ran *before*, so a failed upgrade is detected
 by watching the pod rather than by asking the worker.
 
-## The five states
+## Display states
 
 | Badge | Meaning | Action |
 |---|---|---|
 | **up to date** | Reported version matches its target, or is newer | none |
 | **upgrading** | A roll is in progress — expected and transient | none |
 | **outdated** | Behind its target, nothing currently rolling it | see below |
-| **upgrade failed** | The new container is not ready *and* stuck: a blocking reason, three restarts, or ten minutes — or no pod could be created at all | yes |
+| **upgrade failed** | A previously registered hosted worker has a fresh stuck rollout signal | yes |
+| **waiting for capacity** | The current desired pod reports only insufficient CPU and/or memory through verified scheduler evidence | wait for capacity, choose a smaller worker, or ask an operator to add capacity |
+| **provisioning** | A fresh roll is progressing for a hosted worker with positively confirmed absence of registration history | none |
+| **provisioning failed** | That first provision has a fresh ordinary stuck signal | investigate its blocking reason |
 | *(no badge)* | Nothing usable to compare | none |
+
+## Capacity and first provisioning
+
+The web badge **waiting for capacity** corresponds to `capacity_blocked` in JSON
+and **capacity blocked** in the CLI. It names a verified CPU/memory scheduling
+blocker, not a failed image upgrade. This diagnosis requires one live desired pod
+with no assigned node and an unambiguous `PodScheduled=False` / `Unschedulable`
+condition containing only the recognized resource-shortage reasons. It stays
+visible while the controller signal is fresh, even beyond the upgrading window.
+
+Mixed storage/topology/taint causes, unknown scheduler wording, missing observation,
+ambiguous pods, and a scheduled pod with an old Pending claim retain ordinary
+failure visibility. Pending claims alone do not prove healthy storage or a
+WaitForFirstConsumer binding mode. Do not delete a worker's disks merely because
+it is waiting for CPU or memory; re-provisioning does not create node capacity.
+
+**provisioning** and **provisioning failed** are used only when API-owned history
+positively confirms that the hosted worker has never registered. An absent version
+alone is insufficient. The controller cannot establish that history, change
+worker liveness, or authorize scheduling through its diagnostic report.
+
+The wire roll phase stays `stuck`, with an optional typed capacity cause. Older
+APIs retain ordinary failure visibility. New APIs revalidate the persisted cause
+against the current phase and diagnostics, so a mixed-version writer cannot make
+an old capacity marker override a newer storage failure.
 
 **outdated** — hosted workers are rolled for you when the independent `workers.image.tag` pin
 advances: a release whose agent runtime changed bumps the chart default, an app-only release
@@ -126,8 +154,8 @@ separately rather than folded into a percentage that would mean nothing. If host
 target a different release than the api, the panel says so — supported, since the worker image
 tag can be pinned independently and a hosted worker is compared against the tag the controller
 reports rolling to, so a pinned worker reads *up to date* at its pinned tag. `uzi worker list`
-carries the same states in an `UPGRADE` column rendered for that surface (`FAILED`, and `-` for
-no badge), documented in [uzi CLI](cli.md#upgrade-status) — a second definition rather than a
+carries the same states in an `UPGRADE` column rendered for that surface (`FAILED`,
+`capacity blocked`, `provisioning`, `provisioning failed`, and `-` for no badge), documented in [uzi CLI](cli.md#upgrade-status) — a second definition rather than a
 deferral, so a state added or renamed must be edited in both. This page is your own fleet;
 an admin sees the same roll health **across every owner** from Admin → Health
 (`fleet.roll`) — see [Admin health](admin-health.md).

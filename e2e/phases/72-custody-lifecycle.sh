@@ -24,18 +24,18 @@
 # and api/internal/workersvc/claim_custody_livedb_test.go). It:
 #
 #   WEDGE   — seeds the owner up to exactly the admission limit with open holds, creates
-#             a code run, and shows it stays QUEUED against an online, idle worker while
+#             a code run, and shows it stays QUEUED with online + idle worker samples while
 #             the server's own custody aggregate reports it BLOCKED (blocked_runs >= 1 —
 #             the SAME predicate ClaimRun and workersvc/health.go's reasonCustodyLimit
-#             gate on). A worker being online + idle is the control that rules out every
-#             non-custody queued reason.
+#             gate on). Worker snapshots at entry, before the queued window and before
+#             discard require online + idle; they do not establish continuous idleness.
 #   UNBLOCK — disposes ONE exact hold through the real owner path shipped by M5
 #             (`uzi run discard <run-id> --hold <hold-id> --yes`, i.e.
 #             DELETE /api/runs/{id}/recovery-holds/{holdID}?confirm=discard), dropping
 #             the owner below the limit, and proves the SAME run is then claimed and
-#             reaches the plan gate (awaiting_approval) — so custody, and only custody,
-#             was the block. The claim mints its own fresh hold (recovery-capable
-#             worker), which the phase then confirms through the owner CLI list surface.
+#             reaches the plan gate (awaiting_approval), demonstrating the custody
+#             unblock after the sampled worker preconditions. The recovery-capable
+#             worker mints a fresh hold, confirmed through the owner CLI list surface.
 #
 # NOT harness cleanup. This phase proves PRODUCT behavior: the admission gate blocks at
 # the limit, and the exact owner-disposition path frees a slot. The FK-safe throwaway-DB
@@ -72,11 +72,31 @@ trap 'if [ "$?" -ne 0 ]; then cat "$RUNROOT/custody-window.jsonl" 2>/dev/null ||
 LIMIT=8
 SEED_IDENT="e2e-72-custody-seed"
 
-# --- 0) preconditions: an online, idle worker + the owner below the limit -----
-# The worker (phase 13, critical) stays online for the whole suite; the end-of-phase
-# quarantine leaves it idle. Both are what make the wedge attributable to custody rather
-# than to a missing/busy worker.
-[ "$(worker_status)" = online ] || fail "custody phase needs an online worker (got '$(worker_status)')"
+# Sample once per boundary; busy includes chats as well as active runs. Every
+# worker must be idle, and at least one must be online. Row ordering is not a
+# readiness signal. Do not wait for a busy worker:
+# that would hide a broken phase-isolation precondition.
+assert_custody_worker_idle() {
+  local context="$1" snapshot observed
+  snapshot="$(apiget /api/workers)" \
+    || fail "$context: worker snapshot API error; status=unknown busy=unknown"
+  observed="$(printf '%s' "$snapshot" | jq -cse '
+    if length != 1 then error("expected one worker snapshot")
+    else .[0] |
+      if (.workers | type) == "array" and (.workers | length) > 0 then
+        {status: .workers[0].status, busy: .workers[0].busy,
+         online_count: ([.workers[] | select(.status == "online")] | length),
+         busy_count: ([.workers[] | select(.busy == true)] | length),
+         all_idle: all(.workers[]; .busy == false)}
+      else error("expected a nonempty worker array") end
+    end' 2>/dev/null)" \
+    || fail "$context: invalid worker snapshot; status=unknown busy=unknown"
+  printf '%s' "$observed" | jq -e '.online_count > 0 and .all_idle == true' >/dev/null \
+    || fail "$context: needs online idle worker; observed $observed"
+}
+
+# --- 0) preconditions: sample an online, idle worker + owner below the limit --
+assert_custody_worker_idle "custody phase entry"
 
 ADMIN_ID="$(db_psql "SELECT id FROM users WHERE email = '$ADMIN_EMAIL'")"
 [ -n "$ADMIN_ID" ] || fail "could not resolve the admin owner id for '$ADMIN_EMAIL'"
@@ -90,7 +110,7 @@ C0="$(open_holds_db)"
 # work guards against (leaked holds from an abrupt kill wedging unrelated later phases).
 # Fail loudly and name the FK-safe reset rather than silently seeding a no-op.
 [ "$C0" -lt "$LIMIT" ] || fail "owner already has $C0 >= $LIMIT open custody holds at phase start — the suite arrived wedged (run e2e/reset-recovery-tables.sh at the throwaway-DB reset boundary)"
-pass "preconditions: worker online + idle, owner has $C0 open hold(s) (< limit $LIMIT)"
+pass "preconditions: worker sampled online + idle at entry, owner has $C0 open hold(s) (< limit $LIMIT)"
 
 # --- 1) WEDGE: seed open holds up to exactly the admission limit ---------------
 # Seed only the shortfall, tagged with SEED_IDENT so cleanup targets exactly these rows.
@@ -131,9 +151,11 @@ WEDGE_RUN="$(create_run "$REPO_ID" "$IID")" || fail "wedge run-create failed (no
 [ -n "$WEDGE_RUN" ] && [ "$WEDGE_RUN" != null ] || fail "wedge run was not created"
 pass "created code run $WEDGE_RUN for issue #$IID (owner at the custody limit)"
 
-# NEGATIVE CONTROL: an unblocked claim lands in ~1-2s (worker polls every 500ms), so a
-# run that stays 'queued' across a multi-second window against an online, idle worker is
-# blocked. Poll ~12s; any departure from 'queued' is a wedge-repro failure.
+# NEGATIVE CONTROL: an unblocked claim lands in ~1-2s (worker polls every 500ms).
+# Sample online + idle before the window and again before disposition. These are
+# boundary observations, not continuous worker monitoring. Poll ~12s; any departure
+# from 'queued' is a wedge-repro failure.
+assert_custody_worker_idle "custody negative window"
 NEG_WINDOW=12
 start=$SECONDS
 while [ $((SECONDS - start)) -lt "$NEG_WINDOW" ]; do
@@ -151,14 +173,14 @@ while [ $((SECONDS - start)) -lt "$NEG_WINDOW" ]; do
   sleep 0.5
 done
 record_margin "custody wedge: run stayed queued" "$((SECONDS - start))" "$NEG_WINDOW"
-pass "wedge reproduced: run $WEDGE_RUN stayed queued for ${NEG_WINDOW}s against an online, idle worker"
+pass "wedge reproduced: run $WEDGE_RUN stayed queued for ${NEG_WINDOW}s (worker sampled online + idle before the window)"
 
 # The server's OWN custody-block signal: blocked_runs counts the owner's queued
 # non-exempt code-publishing runs when admission_counted_holds >= the limit
 # (recovery.sql GetCustodyAggregateForOwner, the same accounting ClaimRun and health.go's
 # reasonCustodyLimit use). Continuation's own-hold bound still uses total open holds.
-# >= 1 here proves the
-# run is queued FOR CUSTODY, not for a worker/capability/priority reason.
+# >= 1 here establishes the server-observed custody block; the worker checks
+# establish online + idle only at the sampled boundaries.
 BLOCKED="$(apiget /api/recovery/holds | jq -r '.aggregate.blocked_runs')"
 [ "$BLOCKED" -ge 1 ] || fail "aggregate.blocked_runs is $BLOCKED, want >= 1 — the server does not see the run as custody-blocked"
 pass "server confirms the block: aggregate.blocked_runs=$BLOCKED (queued code run(s) held by the custody limit)"
@@ -190,6 +212,7 @@ REC_JSON="$(uzi_cli run recovery "$WEDGE_RUN" --json)" || fail "uzi run recovery
 pass "owner CLI lists the exact open hold $HOLD_ID on run $WEDGE_RUN"
 
 # The disposition itself: exact hold discard, non-interactively with --yes (no TTY).
+assert_custody_worker_idle "custody pre-discard"
 DISCARD_OUT="$(uzi_cli run discard "$WEDGE_RUN" --hold "$HOLD_ID" --yes --json)" \
   || fail "uzi run discard failed (exit $?): $DISCARD_OUT"
 [ "$(printf '%s' "$DISCARD_OUT" | jq -r '.discarded')" = true ] \
@@ -197,9 +220,9 @@ DISCARD_OUT="$(uzi_cli run discard "$WEDGE_RUN" --hold "$HOLD_ID" --yes --json)"
 pass "owner disposed the exact hold: uzi run discard $WEDGE_RUN --hold $HOLD_ID --yes → discarded"
 
 # --- 4) PROVE the unblock: the SAME run now claims and reaches the plan gate ---
-# With the owner below the limit, the still-online, still-idle worker claims the run
-# within a poll and the stub drives it to awaiting_approval. Reaching the gate proves
-# custody — and only custody — held it: nothing else about the worker or run changed.
+# With the owner below the limit, the worker can claim the run and the stub drives
+# it to awaiting_approval. A claim legitimately makes the worker busy, so the idle
+# assertion belongs before discard, while custody still blocks the run.
 wait_status "$WEDGE_RUN" awaiting_approval 60
 pass "unblock proven: run $WEDGE_RUN was claimed and reached the plan gate after the disposition"
 

@@ -564,7 +564,7 @@ type Config struct {
 	// #71) will re-queue a ci_fix for the same recurring failure before it stops
 	// retrying. CIAutofixConfigPaths is the guard's watch set: the CI-config glob
 	// patterns a change must touch for a fix to count as a CI-config edit (unioned at
-	// queue time with the project's own ci_config_path). Defaulted below when unset.
+	// queue time with the project's own ci_config_path). Always contains CIAutofixConfigFloor.
 	CIAutofixMaxAttempts int
 	CIAutofixConfigPaths []string
 
@@ -1331,9 +1331,13 @@ func Load() (Config, error) {
 	cfg.CIFixMaxJobs = parseInt("CI_FIX_MAX_JOBS", 10)
 	cfg.CIFixLogTailBytes = parseInt("CI_FIX_LOG_TAIL_BYTES", 32768)
 	cfg.CIAutofixMaxAttempts = parseInt("CI_AUTOFIX_MAX_ATTEMPTS", 2)
-	cfg.CIAutofixConfigPaths = parseCommaList(os.Getenv("CI_AUTOFIX_CONFIG_PATHS"))
-	if len(cfg.CIAutofixConfigPaths) == 0 {
-		cfg.CIAutofixConfigPaths = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml"}
+	// The floor is always kept: an operator list adds protected paths, it cannot drop a
+	// forge's CI-config location.
+	cfg.CIAutofixConfigPaths = append([]string{}, CIAutofixConfigFloor...)
+	for _, p := range parseCommaList(os.Getenv("CI_AUTOFIX_CONFIG_PATHS")) {
+		if !slices.Contains(cfg.CIAutofixConfigPaths, p) {
+			cfg.CIAutofixConfigPaths = append(cfg.CIAutofixConfigPaths, p)
+		}
 	}
 
 	// Slack ENV overlay (PRD #25). The tokens are passed through verbatim (their
@@ -2389,3 +2393,7 @@ func samePort(a, b string) bool {
 // maxDBStorageCapacityBytes is 1 EiB, the ceiling deploy/chart/templates/_helpers.tpl applies
 // to the rendered DB_STORAGE_CAPACITY_BYTES.
 const maxDBStorageCapacityBytes = int64(1) << 60
+
+// CIAutofixConfigFloor is the CI-config path set the auto CI-fix guard always protects: the
+// GitLab files plus the GitHub, Forgejo and Gitea workflow directories.
+var CIAutofixConfigFloor = []string{".gitlab-ci.yml", ".gitlab/**", "**/*.gitlab-ci.yml", ".github/workflows/**", ".forgejo/workflows/**", ".gitea/workflows/**"}

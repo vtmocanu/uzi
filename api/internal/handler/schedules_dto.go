@@ -64,6 +64,7 @@ func (h *Handler) scheduleDTO(s store.RunSchedule, repoPath string) apitypes.Sch
 		Target:          s.Target,
 		Labels:          scheduleLabelsToSlice(s.Labels),
 		Prompt:          s.Prompt.String,
+		CIWorkflows:     ciWorkflowsFromColumn(s.CiWorkflows),
 		Timing:          s.Timing,
 		CronExpr:        s.CronExpr.String,
 		Timezone:        s.Timezone,

@@ -1,5 +1,7 @@
 import { describe, it, expect } from "vitest";
 import {
+  admissionInfoHolds,
+  admissionReasonLabel,
   captureView,
   custodyAlertView,
   custodyHoldView,
@@ -475,5 +477,60 @@ describe("custodyHoldView — checkpoint location (PRD #1810)", () => {
     ).checkpoint;
     expect(c?.ref).toBe("refs/uzi-checkpoints/agent/xy");
     expect(c?.shortTip).toBe("abcd");
+  });
+});
+
+describe("admissionInfoHolds", () => {
+  const resp = (aggOver: Partial<RecoveryCustodyAggregate>, holds: RecoveryCustodyHold[]) => ({
+    aggregate: agg(aggOver),
+    holds,
+  });
+  const yes = (id: string, over: Partial<RecoveryCustodyHold> = {}) => hold({ id, counts_toward_admission: true, ...over });
+  const none = { counted: [], unreported: [] };
+
+  it("is empty when the limit is disabled", () => {
+    expect(admissionInfoHolds(resp({ custody_hold_limit: 0, open_holds: 5, admission_counted_holds: 5 }, [yes("a")]))).toEqual(none);
+  });
+
+  it("is empty below the limit and lists at and over it", () => {
+    const holds = [yes("a"), hold({ id: "u" })];
+    expect(admissionInfoHolds(resp({ custody_hold_limit: 3, open_holds: 2, admission_counted_holds: 2 }, holds))).toEqual(none);
+    for (const used of [3, 4]) {
+      const r = admissionInfoHolds(resp({ custody_hold_limit: 3, open_holds: used, admission_counted_holds: used }, holds));
+      expect(r.counted.map((h) => h.id)).toEqual(["a"]);
+      expect(r.unreported.map((h) => h.id)).toEqual(["u"]);
+    }
+  });
+
+  it("falls back to open_holds when admission_counted_holds is missing", () => {
+    const r = admissionInfoHolds(resp({ custody_hold_limit: 2, open_holds: 2, admission_counted_holds: undefined }, [yes("a")]));
+    expect(r.counted).toHaveLength(1);
+  });
+
+  it("excludes non-open, decision, MAC-rejected and explicitly uncounted holds", () => {
+    const r = admissionInfoHolds(
+      resp({ custody_hold_limit: 1, open_holds: 1, admission_counted_holds: 1 }, [
+        yes("closed", { state: "released" }),
+        yes("decision", { attention: "source_only" }),
+        yes("mac", { terminal_record_rejection: "mac_failure" }),
+        yes("no", { counts_toward_admission: false }),
+        yes("keep"),
+      ]),
+    );
+    expect(r.counted.map((h) => h.id)).toEqual(["keep"]);
+    expect(r.unreported).toEqual([]);
+  });
+});
+
+describe("admissionReasonLabel", () => {
+  it("maps known reasons to plain copy", () => {
+    expect(admissionReasonLabel("earlier_generation")).toBe("Earlier generation of a run whose newer attempt holds the claim");
+    expect(admissionReasonLabel("stale_heartbeat")).toBe("Worker heartbeat is stale");
+  });
+
+  it("falls back for unknown, empty and prototype-key values", () => {
+    for (const r of ["nope", "", undefined, "constructor", "toString"]) {
+      expect(admissionReasonLabel(r)).toBe("Counted by the server");
+    }
   });
 });

@@ -302,3 +302,89 @@ describe("ActiveRunRegistry — run_not_owned journals are not leasable (issue #
     assert.strictEqual(snap.pending_overflow, true);
   });
 });
+
+describe("issue 2009 — complete pending_all wire coverage regressions", () => {
+  // JSON observes the additive wire field as serialized for the API.
+  function wire(snapshot: ReturnType<ActiveRunRegistry["build"]>) {
+    return JSON.parse(JSON.stringify(snapshot)) as {
+      pending_all?: { run_id: string; claim_generation: number }[];
+    };
+  }
+
+  for (const method of ["build", "buildRegisterSnapshot"] as const) {
+    it(`${method} captures the pending lister once and projects every distinct generation`, () => {
+      let calls = 0;
+      const pending = [pt(RUN_A, 2), pt(RUN_A, 3), pt(RUN_B, 7)];
+      const reg = new ActiveRunRegistry(() => {
+        calls += 1;
+        return calls === 1 ? pending : [];
+      }, () => 32);
+      const snap = reg[method]();
+      assert.strictEqual(calls, 1, "one capture must feed both active and pending_all");
+      if (method === "buildRegisterSnapshot") {
+        assert.deepStrictEqual(snap.active, []);
+        assert.strictEqual(snap.pending_overflow, true);
+      } else {
+        // Preserve the accepted duplicate-run construction limit: the API rejects this enclosing
+        // snapshot, so its pending_all list provides no coverage despite carrying both generations.
+        assert.deepStrictEqual(snap.active.map((e) => [e.run_id, e.claim_generation]),
+          [[RUN_A, 2], [RUN_A, 3], [RUN_B, 7]]);
+        assert.strictEqual(snap.pending_overflow, false);
+      }
+      assert.deepStrictEqual(wire(snap).pending_all, [
+        { run_id: RUN_A, claim_generation: 2 },
+        { run_id: RUN_A, claim_generation: 3 },
+        { run_id: RUN_B, claim_generation: 7 },
+      ], "issue 2009: pending_all preserves full run/generation identities and excludes phase/age");
+    });
+
+    it(`${method} emits explicit [] after the pending set empties`, () => {
+      let pending = [pt(RUN_A, 2)];
+      const reg = new ActiveRunRegistry(() => pending, () => 32);
+      reg[method]();
+      pending = [];
+      const snap = reg[method]();
+      assert.deepStrictEqual(snap.active, []);
+      assert.strictEqual(snap.pending_overflow, false);
+      assert.deepStrictEqual(wire(snap).pending_all, [], "issue 2009: explicit empty coverage clears prior membership");
+    });
+  }
+
+  it("cap 0 retains full pending_all over six builds without listing active pending entries", () => {
+    const reg = new ActiveRunRegistry(() => [pt(RUN_A, 2), pt(RUN_B, 7)], () => 0);
+    const snapshots = Array.from({ length: 6 }, () => reg.build());
+    for (const snap of snapshots) {
+      assert.deepStrictEqual(snap.active, []);
+      assert.strictEqual(snap.pending_overflow, true);
+    }
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    assert.deepStrictEqual(snapshots.map((snap) => wire(snap).pending_all), Array.from({ length: 6 }, () => [
+      { run_id: RUN_A, claim_generation: 2 }, { run_id: RUN_B, claim_generation: 7 },
+    ]), "issue 2009: cap 0 must not erase pending coverage on any build");
+  });
+
+  it("over-cap pending_all stays complete across seven builds while active rotates unchanged", () => {
+    const C = "cccccccc-cccc-cccc-cccc-cccccccccccc";
+    const D = "dddddddd-dddd-dddd-dddd-dddddddddddd";
+    const pending = [
+      pt(RUN_A, 2, { blocked: true, since: 1 }),
+      pt(RUN_B, 7, { since: 2 }), pt(C, 9, { since: 3 }), pt(D, 11, { since: 4 }),
+    ];
+    const reg = new ActiveRunRegistry(() => pending, () => 2);
+    const snapshots = Array.from({ length: 7 }, () => reg.build());
+    assert.deepStrictEqual(snapshots.map((snap) => snap.active.map((e) => e.run_id)), [
+      [RUN_A, RUN_B], [RUN_A, C], [RUN_A, D], [RUN_A, RUN_B],
+      [RUN_A, C], [RUN_A, D], [RUN_A, RUN_B],
+    ], "blocked fixed slot and oldest-first rotation must remain unchanged");
+    for (const snap of snapshots) {
+      assert.strictEqual(snap.active.length, 2);
+      assert.ok(snap.active.every((e) => e.terminal_pending));
+      assert.strictEqual(snap.pending_overflow, true);
+    }
+    assert.strictEqual(reg.claimsPausedByPendingOverflow(), true);
+    assert.deepStrictEqual(snapshots.map((snap) => wire(snap).pending_all), Array.from({ length: 7 }, () => [
+      { run_id: RUN_A, claim_generation: 2 }, { run_id: RUN_B, claim_generation: 7 },
+      { run_id: C, claim_generation: 9 }, { run_id: D, claim_generation: 11 },
+    ]), "issue 2009: rotation/cap must not rotate or truncate pending_all");
+  });
+});

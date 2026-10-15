@@ -457,6 +457,7 @@ const (
 // Store is the narrow set of generated queries workersvc uses. *store.Queries
 // satisfies it; tests embed it and override only the methods they exercise.
 type Store interface {
+	PruneExpiredPendingOutcomeIdentities(context.Context, store.PruneExpiredPendingOutcomeIdentitiesParams) (int64, error)
 	GetCrossCheckChildProtocol(context.Context, uuid.UUID) (int32, error)
 	TerminalRejectionCustodySnapshot(context.Context, store.TerminalRejectionCustodySnapshotParams) (store.TerminalRejectionCustodySnapshotRow, error)
 	// Workers.
@@ -1098,6 +1099,10 @@ type Store interface {
 	// CountOnlineWorkersSatisfyingCaps above, and off the hot path for the same reason — it runs
 	// only for an interlocked queued run already past its health threshold.
 	CountOnlineWorkersSatisfyingProtocol(ctx context.Context, userID uuid.UUID) (int64, error)
+	// CountOnlineWorkersSatisfyingCIConfigGuard backs PRD #2865's queued-reason rung: a GUARDED
+	// queued run (runs.ci_config_guard) whose owner has NO online worker self-reporting the
+	// 'ci_config_guard_v1' protocol capability gets reasonNoCIConfigGuardCapableWorker.
+	CountOnlineWorkersSatisfyingCIConfigGuard(ctx context.Context, userID uuid.UUID) (int64, error)
 	// CountOnlineWorkersSatisfyingCodexHarness backs PRD #1332 M5A's (D3) queued-reason rung: a
 	// CODEX-INDICATING queued run whose owner has NO online worker advertising the 'codex_harness_v1'
 	// protocol capability gets reasonNoCodexCapableWorker — the run's non-bypassable Codex claim
@@ -2009,6 +2014,10 @@ type Service struct {
 	// non-atomically, so a deployment that never wired it can never complete an interlocked
 	// run without the permit transaction. A LEGACY completion never touches it.
 	txBeginner TxBeginner
+	// ciRepairAfterInsert is a test seam (nil in production): CreateCIRepairRun calls it inside
+	// the create transaction after the run INSERT and before the episode write, so a test can
+	// inject a failure and prove the run and the episode roll back together.
+	ciRepairAfterInsert func(runID uuid.UUID) error
 	// codexFreezeFn is the createRunAtomic Codex-binding freeze, a SEAM defaulting (nil) to
 	// s.freezeCodexBinding (PRD #1429 M1). It exists so a test can inject a failing freeze and
 	// prove the create transaction rolls the run INSERT back (D1: a freeze failure leaves NO
@@ -2378,7 +2387,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if wkr.Kind == "hosted" && len(podUID) == 1 && podUID[0] != uuid.Nil {
 		registeredPodUID = pgconv.UUID(podUID[0])
 	}
-	if maxCrossCheckSlots != nil && (*maxCrossCheckSlots < 0 || *maxCrossCheckSlots > 16) {
+	if maxCrossCheckSlots != nil && !ValidAdvertisedCrossCheckSlots(*maxCrossCheckSlots) {
 		return store.Worker{}, "", errors.New("max_cross_check_slots must be between 0 and 16")
 	}
 
@@ -2543,7 +2552,11 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	if finalizeOK {
 		attested = finalize
 	}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested)
+	pending := validatedPendingAll{}
+	if snapshotValid {
+		pending = s.validatePendingAll(store.Worker(row), snapshot)
+	}
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, row.ID, entries, attested, pending.ids)
 	if err != nil {
 		return store.Worker{}, "", err
 	}
@@ -2553,7 +2566,7 @@ func (s *Service) RegisterWithCrossCheckSlots(ctx context.Context, wkr store.Wor
 	}
 	snapshotApplied := false
 	if snapshotValid {
-		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks)
+		snapshotApplied, err = s.applyWorkerActiveSnapshot(ctx, qtx, store.Worker(row), snapshot, snapshotModeRegister, entries, locks, pending)
 		if err != nil {
 			return store.Worker{}, "", err
 		}
@@ -2710,7 +2723,12 @@ type RunDiskSample struct {
 // and leases left as they were, and the reconciliation is skipped — so an invalid snapshot never
 // turns a heartbeat into a 400 and liveness is still refreshed. When no snapshot is carried (or
 // no tx beginner is wired), it takes the plain single-statement path, exactly as before.
-func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot) (store.Worker, error) {
+// A protocol refresh also requires this transaction; without a beginner it is skipped.
+func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *WorkerStats, outbox []OutboxEntry, snapshot *ActiveSnapshot, refreshes ...*ProtocolRefresh) (store.Worker, error) {
+	var refresh *ProtocolRefresh
+	if len(refreshes) > 0 {
+		refresh = refreshes[0]
+	}
 	// Record the outbox depth BEFORE the liveness write: it is in-memory and cannot
 	// fail, and doing it unconditionally means an empty report clears the set even on
 	// a tick that carries no stats.
@@ -2747,8 +2765,8 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 		}
 	}
 	// No snapshot (an old worker, or the field absent), or no pool wired (tests): the plain
-	// single-statement liveness write, unchanged.
-	if snapshot == nil || s.txBeginner == nil {
+	// single-statement liveness write. Without a transaction, refresh is skipped.
+	if (snapshot == nil && refresh == nil) || s.txBeginner == nil {
 		updated, err := s.q.HeartbeatWorker(ctx, arg)
 		if err != nil {
 			return store.Worker{}, err
@@ -2771,6 +2789,25 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	if err != nil {
 		return store.Worker{}, err
 	}
+	// Fence against the current row returned by the locking liveness UPDATE.
+	// Refresh precedes snapshot validation, preserving worker -> recovery lock order.
+	if refresh != nil && updated.SnapshotRegisterNonce.Valid && refresh.RegisterNonce == updated.SnapshotRegisterNonce.String &&
+		ValidAdvertisedConcurrentRuns(refresh.MaxConcurrentRuns) && ValidAdvertisedCrossCheckSlots(refresh.MaxCrossCheckSlots) {
+		cap := EffectiveConcurrentRuns(&refresh.MaxConcurrentRuns, updated.Ephemeral)
+		updated, err = qtx.RefreshWorkerProtocol(ctx, store.RefreshWorkerProtocolParams{
+			ID: updated.ID, RegisterNonce: refresh.RegisterNonce,
+			ProtocolCapabilities: capability.FilterProtocol(refresh.ProtocolCapabilities),
+			MaxConcurrentRuns:    int32(*cap),                       //nolint:gosec // G115: shared validation bounds the input to 1..256; ephemeral clamp only lowers it.
+			MaxCrossCheckSlots:   int32(refresh.MaxCrossCheckSlots), //nolint:gosec // G115: shared validation bounds the input to 0..16.
+		})
+		if err != nil {
+			return store.Worker{}, err
+		}
+	}
+	if refresh != nil && (!updated.SnapshotRegisterNonce.Valid || refresh.RegisterNonce != updated.SnapshotRegisterNonce.String ||
+		!ValidAdvertisedConcurrentRuns(refresh.MaxConcurrentRuns) || !ValidAdvertisedCrossCheckSlots(refresh.MaxCrossCheckSlots)) {
+		slog.Warn("worker protocol refresh rejected; ignoring report")
+	}
 	entries, valid, err := s.validatedActiveSnapshot(updated, snapshot, snapshotModeHeartbeat)
 	if err != nil {
 		return store.Worker{}, err
@@ -2779,11 +2816,12 @@ func (s *Service) Heartbeat(ctx context.Context, wkr store.Worker, stats *Worker
 	applied := false
 	if valid {
 		// Include omitted owned leads before any snapshot child or FK write.
-		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{})
+		pending := s.validatePendingAll(updated, snapshot)
+		locks, err = captureWorkerRecoveryLocks(ctx, qtx, updated.ID, entries, validatedFinalizeResume{}, pending.ids)
 		if err != nil {
 			return store.Worker{}, err
 		}
-		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks)
+		applied, err = s.applyWorkerActiveSnapshot(ctx, qtx, updated, snapshot, snapshotModeHeartbeat, entries, locks, pending)
 		if err != nil {
 			return store.Worker{}, err
 		}
@@ -3305,11 +3343,12 @@ func (s *Service) claimLane(ctx context.Context, wkr store.Worker, snapshot *Act
 	if !valid {
 		return nil, ErrActiveSnapshotInvalid
 	}
-	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{})
+	pending := s.validatePendingAll(locked, snapshot)
+	locks, err := captureWorkerRecoveryLocks(ctx, qtx, locked.ID, entries, validatedFinalizeResume{}, pending.ids)
 	if err != nil {
 		return nil, err
 	}
-	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks); err != nil {
+	if _, err := s.applyWorkerActiveSnapshot(ctx, qtx, locked, snapshot, snapshotModeClaim, entries, locks, pending); err != nil {
 		return nil, err
 	}
 	// (d) Claimant guard (snapshot-replace BEFORE overflow, blocker 2). The replace just set/cleared
@@ -6068,7 +6107,7 @@ func (s *Service) ForgeConnForRun(ctx context.Context, wkr store.Worker, runID u
 // PublishResult is the outcome of a checkpoint publish (PRD #122 M8). Published is
 // true only when the push landed. Skipped names the benign reason a publish did NOT
 // advance the ref ("no_ref" | "not_descendant" | "unsupported" | "tip_missing" |
-// "pack_too_large" | "pack_invalid" | "workflow_scope" | "superseded"); it
+// "pack_too_large" | "pack_invalid" | "workflow_scope" | "ci_config_guard" | "superseded"); it
 // is empty on a successful publish. Either way Ref is the checkpoint ref the worker
 // asked about.
 type PublishResult struct {
@@ -6179,6 +6218,9 @@ func (s *Service) Publish(ctx context.Context, wkr store.Worker, runID uuid.UUID
 		PAT:           string(botPAT),
 		DeclaredTip:   tipOid,
 		Pack:          pack,
+		// Guarded repair runs (PRD #2865): the broker refuses a tip that touches a protected path.
+		CIConfigGuard: owned.CiConfigGuard,
+		CIConfigPaths: owned.CiConfigPaths,
 	}
 
 	// PRD #1810: a worker still bound to a TERMINAL run may publish (a shutdown checkpoint of a
@@ -6369,6 +6411,11 @@ func (s *Service) publishOutcome(ctx context.Context, push *checkpointPush, term
 		// the finalize base-align (PRD #456 M1) is the real safety net that saves this
 		// run's work.
 		return PublishResult{Published: false, Ref: ref, Skipped: "workflow_scope"}, false, nil
+	case errors.Is(err, pushbroker.ErrCIConfigGuard):
+		// A guarded run's tip touches a protected CI-config path (or the broker could not prove
+		// it does not): a benign best-effort skip, like workflow_scope. The worker's own
+		// merge-base check decides the final branch push.
+		return PublishResult{Published: false, Ref: ref, Skipped: "ci_config_guard", Detail: secretscrub.Scrub(err.Error())}, false, nil
 	case errors.Is(err, pushbroker.ErrTipMissing):
 		// A tip the pack never delivered: a best-effort skip, never a 5xx. Detail carries the
 		// broker's content-free reason for the operator log (never serialized to the worker).

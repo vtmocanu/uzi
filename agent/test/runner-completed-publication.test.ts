@@ -160,6 +160,8 @@ for (const kind of ["issue", "mr_rework", "self_improve"] as const) {
               const attemptId = mintAttemptId(claim.claim_generation!);
               const siblingBranch = branch + "-retained";
               const sibling = await git.runnerCloneForBranch(bare, siblingBranch, "retained-source", {
+                isLive: () => false,
+                quiescent: async () => true,
                 beforeFree: async () => { throw new Error("retained source cannot free an incumbent"); },
               }, claim.run_id, false, undefined, {
                 attemptId, isLive: () => false, beforeSeed: async paths => assert.deepEqual(paths, []),

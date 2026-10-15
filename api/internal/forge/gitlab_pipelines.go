@@ -67,9 +67,10 @@ func (g *gitLab) LatestMRPipeline(ctx context.Context, projectID, mrIID int64) (
 }
 
 func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int64) ([]Job, error) {
+	ctx = markCIJSON(ctx)
 	opt := &gitlab.ListJobsOptions{ListOptions: gitlab.ListOptions{Page: 1, PerPage: perPage}}
 	wrap := func(e error) error { return g.wrapErr("list pipeline jobs", e) }
-	return paginate(wrap, func(page int) ([]Job, int, error) {
+	return paginateCIJobs(ctx, int(perPage), wrap, func(page int) ([]Job, int, error) {
 		opt.Page = int64(page)
 		jobs, resp, err := g.client.Jobs.ListPipelineJobs(projectID, pipelineID, opt, gitlab.WithContext(ctx))
 		if err != nil {
@@ -78,6 +79,9 @@ func (g *gitLab) ListPipelineJobs(ctx context.Context, projectID, pipelineID int
 		var items []Job
 		for _, j := range jobs {
 			if j == nil {
+				if b := ciBudget(ctx); b != nil {
+					return nil, 0, b.fail("invalid job identity")
+				}
 				continue
 			}
 			items = append(items, toGitLabJob(j))

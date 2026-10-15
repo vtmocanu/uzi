@@ -196,4 +196,18 @@ if [ -n "${UZI_CODEX_REFRESH_LOSTREPLY_E2E:-}" ]; then
   rm -f "$E2E_LOG"
 fi
 
+if [ "${UZI_HEARTBEAT_PROTOCOL_REFRESH_E2E:-}" = "1" ]; then
+  mkdir -p "$ROOT/.uzi/scratch"
+  E2E_LOG="$(mktemp "$ROOT/.uzi/scratch/heartbeat-protocol-refresh-log.XXXXXX")"
+  UZI_TEST_DATABASE_URL="$DSN" go test -buildvcs=false -count=1 -v -race -p 1 \
+    -run '^TestHeartbeatProtocolRefreshE2E$' ./internal/handler/... 2>&1 | tee "$E2E_LOG"
+  if ! grep -q '^=== RUN   TestHeartbeatProtocolRefreshE2E$' "$E2E_LOG" ||
+    ! grep -q '^--- PASS: TestHeartbeatProtocolRefreshE2E ' "$E2E_LOG" ||
+    grep -q -- '--- SKIP:' "$E2E_LOG"; then
+    echo "heartbeat protocol refresh proof did not run and pass without skips: $E2E_LOG" >&2
+    exit 1
+  fi
+  rm -f "$E2E_LOG"
+fi
+
 printf '\n\033[32mStore integration tests passed.\033[0m\n'

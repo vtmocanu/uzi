@@ -169,10 +169,20 @@ archive alone does not undo that exposure.
 
 A claim discovers retained source before forge refresh or disk preflight
 and recovers it within that claim. Its source-bound durable budget reserves at most **3 total
-iterations**, blocked and nonblocked together, within **five minutes from
-the first reservation**, using the existing exponential retry cap of 16
-times the base delay. Crash, reclaim, capture, publication and successor
-handoff preserve that budget. Reset requires a trusted, successfully settled
+iterations**, blocked and nonblocked together. Each positively verified claim gets
+one **five-minute deadline window**, starting at its first reservation. The first
+window is fenced by the acquired server claim and charged before ownership probes.
+Renewing an existing episode requires a fresh ownership proof; a lost claim leaves
+that predecessor episode unchanged. A transient renewal-proof failure also leaves
+the episode untouched and stops the flight without a terminal report; ordinary
+bounded missing-flight requeue governs the next attempt. First-window and
+same-window ownership outages still spend the charged recovery budget. Retries
+and process recreation within that claim preserve the window. A later verified
+claim renews only the deadline, retaining the cumulative count, source attribution
+and exponential retry cap of 16 times the base delay. A legacy episode without a
+claim fence binds once to a positively verified claim; its old claim identity is
+never inferred. Already-blocked episodes retain their original reason and never
+renew. Reset of the reservation count requires a trusted, successfully settled
 real model turn. Recovery adopts work on a fresh attempt path and model
 session even on an unwired worker; ordinary unwired keys that never entered
 retained recovery keep same-path continuity.
@@ -201,8 +211,16 @@ explicit discard. The guarded prerequisite-free archive/empty-inventory
 release conditions below remain unchanged.
 
 The configured budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads; nested operations
-share the same delivered-byte counter. Object contents stream through a pipe
+recovery operation. Successfully verified objects are cached per bare identity
+within that operation; only uncached objects are hashed and charged. Nested
+operations share the cache and delivered-byte counter. Every check still walks
+the complete closure and checks object presence, type and size. The operation-wide
+cache entry bound leaves overflow objects uncached and fully verified. A fresh
+operation starts empty. Reuse assumes immutable worker-owned object storage;
+corruption, replaced loose objects or pack files, or an added alternate object
+store can escape later hashing within unchanged directory identities and matching
+cached type/size metadata. The user explicitly accepted this additional risk on
+2026-10-14. Object contents stream through a pipe
 chunk and bounded header, without content buffers proportional to the cap.
 Metadata listings retain the existing 64 MiB output cap (`GIT_MAX_BUFFER`);
 object arrays remain bounded by that listing. The delivered-byte cap is **not a
@@ -217,8 +235,8 @@ The blocker shows exact cap bytes, plus GiB for caps of at least 1 GiB. A
 previously blocked journal remains blocked after restart or a cap increase:
 its reason reports previous decoded verification exhaustion, the current cap,
 and that the prior cap was not recorded. This changes neither the 64 MiB
-encoded archive cap nor archive storage quotas, and adds no deduplication or
-history exclusion. Cancellation and existing deadlines still apply.
+encoded archive cap nor archive storage quotas. Per-operation object
+deduplication does not exclude any reachable history from the walk. Cancellation and existing deadlines still apply.
 
 A healthy run with an unknown publish outcome continues in the same claim
 generation, retaining its tip, owed roots and publication time gate.
@@ -815,9 +833,35 @@ The ref disappears once the run's last hold is released (automatically, by
 settlement) or discarded (`uzi run discard`) — the same custody lifecycle
 that governs the recovery archives above.
 
+## Automatic discard after the recorded PR merges
+
+For a completed run at generation G, uzi can automatically discard earlier OPEN
+custody holds (generation < G) after freshly verifying that the run's own recorded
+PR/MR is merged. The server rechecks the exact owner, repository, connection,
+project, forge, base URL, MR, run and G under locks. Open, closed-unmerged,
+unknown, unreadable, wrong-IID or drifting evidence leaves custody retained.
+Historical cached-merged and issue-less runs can qualify, but cached state alone
+is insufficient. This policy includes prior recovery aggregates that are not
+ancestors of the merged work; it does not prove their work was published.
+
+The discarded holds leave the existing custody count and decision hotlist.
+Preparing, uploading and needs-action captures are discarded with partial-byte
+cleanup. **Available archives survive** with their prerequisites, expiry policy
+and export eligibility. The audit records `merged_predecessor_discard`, not
+ancestry proof, archive FINAL coverage or a publication receipt.
+
+Hold discard grants no new worker source-deletion authority. Existing retention
+guards and the [worker-local operator procedure](#retained-sources-with-no-open-hold-worker-local-inspect-and-discard)
+remain; clearing custody has existing owner-discard lifecycle consequences and
+adds no worker/PVC fence or retention guarantee. Physical local-source and
+available-archive disposal previously promised by Option D remains **deferred**
+to #2823 and #1373. This is partial, nonclosing #2506; see
+[ADR-2506](../adr/2506-merged-predecessor-discard.md) for polling and rollout limits.
+
 ## Automatic settlement of an older held generation
 
-The ancestry settlement below applies to legacy, unguarded holds. Guarded
+The ancestry settlement below applies to legacy, unguarded holds. Outside the
+[merged-PR server-discard exception](#automatic-discard-after-the-recorded-pr-merges), guarded
 holds use the [final inventory disposition](#guarded-inventory-and-final-custody-transfer)
 above; the completed-publication exception settles only the completing generation,
 not an older adopted generation. Publishing one adopted head does not settle
@@ -877,10 +921,10 @@ per run) carrying your open-hold and blocked-run counts, a link to the surface,
 and the exact discard command. The per-worker **retaining work** pills stay as
 row context.
 
-The **Workers** settings page is where you resolve them: every retained hold
-is grouped by worker with the run it came from, its claim generation, and a
-state that separates normal active protection from holds that actually need
-you. Each row offers the right action for its state:
+The **Workers** settings page is where you resolve them: the holds that need a
+decision (and MAC-rejected terminal records) are grouped by worker with the run
+it came from, its claim generation, and a state that separates them from normal
+active protection. Each row offers the right action for its state:
 
 - **Export archive** — download a ready archive (same bundle as `uzi run
   export`). Downloading does not itself release custody. Legacy holds can
@@ -900,6 +944,16 @@ is deliberately distinct from discarding a held source. Deleting an archive
 while its hold is still open does not resolve custody; left untouched, a
 non-final or legacy archive expires after its retention window. A selected
 final guarded archive follows the worker-deletion retention rule above.
+
+At or over the limit, the surface also shows an **Admission information**
+section so you can see what is consuming capacity without needing a decision.
+**Counting toward the limit** lists the non-decision holds the server confirms
+it counts, each with its run link, claim generation, worker, and the reason it
+counts (for example, no live claim backs it). These rows are read-only: this is
+visibility only, and adds no new way to release or discard custody and changes
+no accounting. **Admission membership not reported** lists holds from an older
+server that does not report membership; uzi never infers it, so an unreported
+hold is unknown rather than uncounted.
 
 From the CLI, list a run's holds and captures with `uzi run recovery
 <run-id>`, then discard one exact held source:

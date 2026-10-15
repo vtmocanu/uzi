@@ -187,10 +187,11 @@ function validResidueKey(key: string): boolean {
 /**
  * issue #1783 — the ONE quarantined-residue name, pinned here for M3 to produce:
  * `.uzi-residue-<key>.residue-<uuid>`, `<uuid>` a lowercase v4 uuid (see {@link RESIDUE_UUID_SOURCE}).
- * Residue is un-journaled by definition and carries no run id; the retention sweep keeps at most a
- * fixed number per key, oldest first by the residue directory's own mtime (see git.ts). Throws on a
- * key or uuid the parser would refuse, so no caller can mint a name {@link parseRetainedArtifactName}
- * does not read back as exactly `(key, uuid)`.
+ * The name carries no run id or journal identity. Shared canonical/attempt retention targets five
+ * per key, best effort: only the original oldest excess by lstat mtime and basename tie-break is
+ * considered, with fresh journal/live/process/quarantine checks; protected or unproven excess stays
+ * (see git.ts). Throws on a key or uuid the parser would refuse, so no caller can mint a name
+ * {@link parseRetainedArtifactName} does not read back as exactly `(key, uuid)`.
  */
 export function formatResidueName(key: string, uuid: string): string {
   if (!validResidueKey(key)) throw new Error("refusing an unsafe residue key");

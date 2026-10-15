@@ -155,14 +155,22 @@ func (m *Materializer) Observe(ctx context.Context) ([]reconcile.ObservedWorker,
 	if m.cfg.IsolatedNamespace != "" {
 		namespaces = append(namespaces, m.cfg.IsolatedNamespace)
 	}
+	deploymentCounts := map[string]int{}
+	capacityEvidence := schedulerCapacityObservation{
+		pods:                map[string][]corev1.Pod{},
+		blocked:             map[string]bool{},
+		deploymentNamespace: map[string]string{},
+	}
 	for _, ns := range namespaces {
-		if err := m.observeNamespace(ctx, ns, byID); err != nil {
+		if err := m.observeNamespace(ctx, ns, byID, deploymentCounts, &capacityEvidence); err != nil {
 			return nil, err
 		}
 	}
 
 	out := make([]reconcile.ObservedWorker, 0, len(byID))
 	for _, o := range byID {
+		// Capacity uniqueness is proved only after every configured namespace fold.
+		recordSchedulerCapacity(o, capacityEvidence.pods[o.ID], capacityEvidence.deploymentNamespace[o.ID], capacityEvidence.podListFailed || capacityEvidence.blocked[o.ID] || deploymentCounts[o.ID] != 1)
 		out = append(out, *o)
 	}
 	// Strand synthesis runs over the ASSEMBLED slice, after every observeNamespace fold
@@ -192,8 +200,18 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 			{dataPVCName(w.ID), w.DataPVCPhase, w.DataPVCCreatedAt},
 			{dindDataPVCName(w.ID), w.DinDPVCPhase, w.DinDPVCCreatedAt},
 		}
-		var flagged bool
+		var timedOut []target
 		for _, t := range targets {
+			// A later namespace fold may hide an older Pending claim of the same
+			// name. Retain legacy volume priority while checking every observed claim.
+			if t.phase != string(corev1.ClaimPending) || t.created == nil || m.now().Sub(*t.created) < pvcBindTimeout {
+				for _, claim := range w.SchedulerPendingClaims {
+					if claim.Name == t.name && m.now().Sub(claim.CreatedAt) >= pvcBindTimeout {
+						t.phase, t.created = string(corev1.ClaimPending), &claim.CreatedAt
+						break
+					}
+				}
+			}
 			if t.phase != string(corev1.ClaimPending) || t.created == nil {
 				continue
 			}
@@ -202,29 +220,40 @@ func (m *Materializer) flagStrandedPVCs(workers []reconcile.ObservedWorker) {
 				continue
 			}
 			m.log.Warn(fmt.Sprintf("pvc-bind-timeout worker=%s pvc=%s pending_for=%s", w.ID, t.name, age))
-			if !flagged {
-				flagged = true
-				since := *t.created
-				w.Roll = reconcile.RollHealth{
-					Phase:             protocol.PhaseStuck,
-					PhaseSince:        since,
-					PodPhase:          string(corev1.ClaimPending),
-					BlockingContainer: t.name,
-					// Kept within the api's 64-byte self-reported display cap
-					// (handler.maxSelfReportedBytes) so the failed-worker strip renders the
-					// cause in full rather than truncating it mid-word. The PVC name rides
-					// BlockingContainer; "no auto-rollback" is the operator's cue that manual
-					// intervention (not a controller retry) is the remedy (ADR-0837 D6/D7).
-					BlockingReason: fmt.Sprintf("stranded Pending past %s bind-timeout; no auto-rollback", pvcBindTimeout),
-				}
+			timedOut = append(timedOut, t)
+		}
+		if len(timedOut) == 0 {
+			continue
+		}
+		capacity := w.SchedulerCapacityReason != ""
+		for _, claim := range w.SchedulerPendingClaims {
+			if m.now().Sub(claim.CreatedAt) < pvcBindTimeout {
+				continue
 			}
+			if !w.SchedulerMountedClaims[claim.Namespace+"/"+claim.Name] {
+				capacity = false
+			}
+		}
+		// Preserve image and container failure evidence while choosing a cause only
+		// after every timed-out claim has been checked. Targets keep /nix first.
+		w.Roll.Phase = protocol.PhaseStuck
+		w.Roll.PhaseSince = *timedOut[0].created
+		if capacity {
+			w.Roll.BlockingKind = "scheduler_capacity"
+			w.Roll.BlockingContainer = ""
+			w.Roll.BlockingReason = w.SchedulerCapacityReason
+		} else {
+			w.Roll.BlockingKind = ""
+			w.Roll.PodPhase = string(corev1.ClaimPending)
+			w.Roll.BlockingContainer = timedOut[0].name
+			w.Roll.BlockingReason = fmt.Sprintf("stranded Pending past %s bind-timeout; no auto-rollback", pvcBindTimeout)
 		}
 	}
 }
 
 // observeNamespace folds one namespace's stamped Deployments and PVCs into byID,
 // recording the namespace each worker was seen in so teardown can target it.
-func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker) error {
+func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map[string]*reconcile.ObservedWorker, deploymentCounts map[string]int, capacityEvidence *schedulerCapacityObservation) error {
 	get := func(id string) *reconcile.ObservedWorker {
 		if o, ok := byID[id]; ok {
 			return o
@@ -234,9 +263,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		return o
 	}
 	// The image each worker's Deployment currently asks for, collected in the
-	// deployment pass and handed to the pod pass below. Kept in a local rather than
-	// written straight onto ObservedWorker.Roll because the pod pass REPLACES Roll
-	// wholesale, which would drop anything stashed there first.
+	// deployment pass and handed to the pod pass below, which replaces Roll.
+	// Also retain it on Roll so a failed pod list followed by PVC timeout detection
+	// still reports the image the Deployment asks for.
 	targetImages := map[string]string{}
 	// The reason on each worker Deployment's ReplicaFailure condition when it is True —
 	// the Deployment controller saying a pod create FAILED, as opposed to a pod merely
@@ -262,12 +291,20 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			continue
 		}
 		o := get(id)
+		deploymentCounts[id]++
+		capacityEvidence.deploymentNamespace[id] = ns
 		o.HasDeployment = true
 		o.DeploymentUID = string(d.UID)
 		o.DeploymentResourceVersion = d.ResourceVersion
 		o.DeploymentTerminating = d.DeletionTimestamp != nil
+		for _, c := range d.Status.Conditions {
+			if c.Type == appsv1.DeploymentReplicaFailure && c.Status == corev1.ConditionTrue {
+				capacityEvidence.blocked[id] = true
+			}
+		}
 		if img := workerImage(d); img != "" {
 			targetImages[id] = img
+			o.Roll.TargetImage = img
 		}
 		if reason := replicaFailureReason(d); reason != "" {
 			replicaFailures[id] = reason
@@ -307,6 +344,9 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 		// flight would otherwise read the doomed volume's size as live. Compute the flag
 		// once and let each case decide what it means for that claim.
 		terminating := p.DeletionTimestamp != nil
+		if !terminating && p.Status.Phase == corev1.ClaimPending && (p.Name == nixPVCName(id) || p.Name == dataPVCName(id) || p.Name == dindDataPVCName(id)) {
+			o.SchedulerPendingClaims = append(o.SchedulerPendingClaims, reconcile.SchedulerPendingClaim{Namespace: ns, Name: p.Name, CreatedAt: p.CreationTimestamp.Time})
+		}
 		switch p.Name {
 		case dataPVCName(id):
 			o.HasDataPVC = true // exists-in-ANY-state (gates the create, UNCHANGED)
@@ -354,6 +394,8 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 	// maintenanceObservation and waits on any read failure.
 	pods, err := m.client.CoreV1().Pods(ns).List(ctx, metav1.ListOptions{})
 	if err != nil {
+		// A failed namespace list prevents a fleet-wide uniqueness proof.
+		capacityEvidence.podListFailed = true
 		m.log.Warn("listing pods failed; legacy reconciliation continues and DinD maintenance requires a successful recheck",
 			"namespace", ns, "error", err)
 		return nil
@@ -367,6 +409,7 @@ func (m *Materializer) observeNamespace(ctx context.Context, ns string, byID map
 			continue
 		}
 		byWorker[id] = append(byWorker[id], *p)
+		capacityEvidence.pods[id] = append(capacityEvidence.pods[id], *p)
 		o := get(id)
 		o.WorkerPodCount++
 		if p.DeletionTimestamp == nil && p.UID != "" && p.Annotations[AnnotationSpecHash] == o.SpecHash {

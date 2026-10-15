@@ -471,6 +471,9 @@ type Client interface {
 	// GetSchedule returns one owner-scoped schedule: GET /api/schedules/{id}. A
 	// foreign/absent id is a 404 → *ExitError{ExitNotFound}.
 	GetSchedule(ctx context.Context, id string) (apitypes.ScheduleDTO, error)
+	// ListScheduleCIEpisodes returns one page of a ci_watch schedule's episodes: GET
+	// /api/schedules/{id}/ci-episodes?cursor=. An empty cursor asks for the first page.
+	ListScheduleCIEpisodes(ctx context.Context, id, cursor string) (apitypes.CIEpisodePage, error)
 	// SetScheduleEnabled pauses (false) or resumes (true) a schedule: PATCH
 	// /api/schedules/{id} with the minimal body {enabled}. Sending ONLY `enabled` hits
 	// the handler's pause/resume path (onlyEnabled), which flips the flag without

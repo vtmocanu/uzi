@@ -8,43 +8,40 @@
 // Admins get the HealthOverviewCard instead — the card and this line are mutually exclusive.
 
 import type { RunSummaryItem, Worker } from "../lib/api";
-import { likelyCause } from "./WorkerUpgradeBadge";
+import { workerFailed, workerFailureCause } from "./WorkerUpgradeBadge";
 
 // The line is a fixed frame + reassurance tail (server-authored, PRD #1484), with the CAUSE
 // clause between them DERIVED — not hard-coded. The cause follows the viewer's own
-// upgrade_blocking_container / upgrade_blocking_reason / upgrade_last_exit_code through
-// likelyCause (WorkerUpgradeBadge), the closed reason→text lookup the Workers page already
-// uses. So an ImagePullBackOff reads the image-pull cause, while a non-image-pull failure (a
-// seed-nix CrashLoopBackOff, say) reads ITS own cause instead of a wrong image-pull string.
-// likelyCause returns a full server-authored sentence (or null); nothing untrusted is ever
-// interpolated — only the closed likelyCause output and these fixed frames.
+// upgrade_blocking_kind / upgrade_blocking_container / upgrade_blocking_reason through
+// workerFailureCause (WorkerUpgradeBadge), the closed lookup the Workers page also uses.
+// Scheduler capacity guidance and container failures remain distinct. Only fixed copy is
+// interpolated, never free-form diagnostic fields.
 const LINE_FRAME = "Your hosted workers cannot start right now.";
 const LINE_TAIL =
   "This is a platform problem, not your run. Queued runs start on their own once it is fixed.";
 // The fallback cause when likelyCause has no grounded reason (returns null): a generic,
 // server-authored clause, still never free text.
-const GENERIC_CAUSE = "The worker image cannot start.";
+const GENERIC_CAUSE = "A hosted worker cannot start.";
 
 // The three conditions, all read from the viewer's own runs and workers: NOT admin, at least
 // one queued run, at least one hosted worker they own, and EVERY hosted worker they own reads
-// upgrade_failed. Any one failing hides the line.
+// a failed roll, provisioning failure or capacity block. Any condition failing hides it.
 function platformLineVisible(isAdmin: boolean, runs: RunSummaryItem[], workers: Worker[]): boolean {
   if (isAdmin) return false;
   const hasQueuedRun = runs.some((r) => r.status === "queued");
   const hosted = workers.filter((w) => w.kind === "hosted");
-  const everyHostedFailed = hosted.length > 0 && hosted.every((w) => w.upgrade_status === "upgrade_failed");
+  const everyHostedFailed = hosted.length > 0 && hosted.every(workerFailed);
   return hasQueuedRun && everyHostedFailed;
 }
 
-// The cause clause, derived from a representative failed hosted worker the viewer owns (the
-// visibility gate guarantees every hosted worker they own reads upgrade_failed, so the first
-// one is representative). likelyCause is the closed lookup; null falls back to GENERIC_CAUSE.
+// Include each distinct cause in a mixed failed fleet, preserving both capacity guidance
+// and actual container/storage failures rather than choosing the first worker.
 function platformCause(workers: Worker[]): string {
-  const rep = workers.find((w) => w.kind === "hosted" && w.upgrade_status === "upgrade_failed");
-  const cause = rep
-    ? likelyCause(rep.upgrade_blocking_container, rep.upgrade_blocking_reason, rep.upgrade_last_exit_code)
-    : null;
-  return cause ?? GENERIC_CAUSE;
+  const causes = workers.filter((w) => w.kind === "hosted" && workerFailed(w)).map((w) => {
+    const label = w.upgrade_status === "provisioning_failed" ? "Provisioning failed. " : "";
+    return label + (workerFailureCause(w) ?? GENERIC_CAUSE);
+  });
+  return [...new Set(causes)].join(" ");
 }
 
 export function HealthPlatformLine({

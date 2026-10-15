@@ -1007,6 +1007,46 @@ describe("CodexCallbackBroker: untrusted identifiers are sanitized in denial mes
   });
 });
 
+describe("#2986 long command authority and replay", () => {
+  for (const tool of ["Bash", "uzi_bash"]) {
+    for (const flag of [undefined, false, true]) {
+      it(`${tool} forwards ${String(flag)} for the root lead`, async () => {
+        const h = makeBroker();
+        const args = { command: "echo fixture", ...(flag === undefined ? {} : { long_running: flag }) };
+        assert.equal((await h.broker.handleToolCall(rt(), tool, args, "root")).ok, true);
+        assert.equal(h.spawn.calls.length, 1);
+        assert.equal(h.spawn.calls[0]!.opts.long_running, flag);
+      });
+    }
+  }
+  for (const origin of ["root", "child", "unknown"] as const) {
+    for (const isRoot of [true, false]) {
+      it(`origin ${origin}, grant ${isRoot} requires both authorities before launch`, async () => {
+        const h = makeBroker({ grants: grants({ isRoot }) });
+        const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo fixture", long_running: true }, origin);
+        if (origin === "root" && isRoot) assert.equal(r.ok, true);
+        else { assertDenied(r, "denied_tool"); assert.equal(h.spawn.calls.length, 0); }
+      });
+    }
+  }
+  for (const value of [null, "true", 1, {}, [], undefined]) {
+    it(`rejects present nonboolean ${JSON.stringify(value)}`, async () => {
+      const h = makeBroker();
+      assertDenied(await h.broker.handleToolCall(rt(), "Bash", { command: "echo fixture", long_running: value }, "root"), "bad_args");
+      assert.equal(h.spawn.calls.length, 0);
+    });
+  }
+  it("rejects an unknown normalized origin and changed replay flag", async () => {
+    const h = makeBroker();
+    assertDenied(await h.broker.handleToolCall(rt(), "Bash", { command: "echo fixture", long_running: true }, "forged" as "root"), "denied_tool");
+    const id = rt();
+    const args = { command: "echo fixture", long_running: false };
+    assert.equal((await h.broker.handleToolCall(id, "Bash", args, "root")).ok, true);
+    assertDenied(await h.broker.handleToolCall(id, "Bash", { ...args, long_running: true }, "root"), "changed_reuse");
+    assert.equal(h.spawn.calls.length, 1);
+  });
+});
+
 describe("CodexCallbackBroker: root authority requires BOTH origin=root and grants.isRoot", () => {
   it("denies a signal when origin is root but grants.isRoot is false", async () => {
     const h = makeBroker({ grants: grants({ isRoot: false }) });
@@ -1040,7 +1080,7 @@ describe("CodexCallbackBroker: a throwing seam denies as broker_error with the r
 
 describe("CodexCallbackBroker: issue #2048 command deadline through the real default spawn seam", () => {
   const WT = "/tmp/uzi-broker-2048";
-  function deadlineBroker(clean: boolean) {
+  function deadlineBroker(clean: boolean, longWallMs?: number) {
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(2048));
     let disposes = 0;
     const launch = async (): Promise<CodexRootHandle> => {
@@ -1066,10 +1106,28 @@ describe("CodexCallbackBroker: issue #2048 command deadline through the real def
         whenFailed: new Promise<Error>(() => undefined),
       };
     };
-    const spawnCommand = makeDefaultSpawnCommand(registry, launch, 1000, WT, {}, "required", undefined, undefined, 20);
+    const spawnCommand = makeDefaultSpawnCommand(registry, launch, 1000, WT, {}, "required", undefined, undefined, 20, longWallMs);
     const h = makeBroker({ registry, spawnCommand, worktreePath: WT });
     return { h, registry, disposes: () => disposes };
   }
+
+  it("#2986 eligible deadline formats the actual 120 min bound after reap", async () => {
+    const { h, registry, disposes } = deadlineBroker(true);
+    const r = await h.broker.handleToolCall(rt(), "uzi_bash", { command: "echo fixture", long_running: true }, "root");
+    assertDenied(r, "command_deadline");
+    assert.equal(r.message, "the command was stopped at its deadline (120 min) and its process tree was reaped");
+    assert.equal(disposes(), 1);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+    assert.equal(registry.inFlightCallbackCount(), 0);
+  });
+  it("#2986 injected eligible short bound reports only after reap", async () => {
+    const { h, registry, disposes } = deadlineBroker(true, 25);
+    const r = await h.broker.handleToolCall(rt(), "Bash", { command: "echo fixture", long_running: true }, "root");
+    assertDenied(r, "command_deadline");
+    assert.match(r.message, /25ms/);
+    assert.equal(disposes(), 1);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+  });
 
   it("a command stopped at its deadline is denied command_deadline after the tree was reaped", async () => {
     const { h, registry, disposes } = deadlineBroker(true);

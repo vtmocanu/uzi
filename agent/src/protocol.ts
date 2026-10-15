@@ -425,11 +425,15 @@ export interface RegisterResponse {
    *  `worker_id`) — an absent field decodes as "no features", so the worker negotiates
    *  nothing extra — EXCEPT that a `credential_switch_v1` CAPABILITY worker still stamps
    *  `claim_generation` optimistically, regardless of the advertised features (see
-   *  `MessagesRequest.claim_generation`). */
+   *  `MessagesRequest.claim_generation`). This initializes the API feature cache, distinct
+   *  from implemented worker capabilities. Complete readable ordinary heartbeat responses
+   *  up to 1 MiB replace it only with an all-string list (including an empty list); invalid
+   *  or absent adverts preserve it. Discovery and reporting take two regular heartbeats. */
   protocol_features?: string[];
   /** PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
    *  (`WORKER_OUTBOX_MAX_PENDING`, default 32) — the number of pending outcomes #1390 will lease
-   *  from one worker's snapshot. The worker reads it at register (stashed on the client) so the
+   *  from one worker's snapshot. Register initializes it; valid ordinary heartbeat adverts
+   *  refresh the client's live quota before the next snapshot, so the
    *  active-run registry can size its `pending_overflow` decision and its deterministic rotation to
    *  the server's cap, WITHOUT a worker-side cap mirror or a separate config channel. OMITTED by an
    *  older api that predates M3c ⇒ the worker treats the cap as 0 (protect every pending outcome via
@@ -580,6 +584,13 @@ export interface ActiveSnapshot {
   register_nonce?: string;
   active: ActiveSnapshotEntry[];
   pending_overflow: boolean;
+  /** Issue #2009: complete terminal-pending identities, independent of active rotation/caps.
+   *  Only run_id/claim_generation; excludes finalize-pending records. Empty means complete empty
+   *  coverage; omission means unavailable on older workers. Requires an accepted enclosing
+   *  snapshot: duplicate active run IDs still reject it and provide no pending_all coverage.
+   *  The worker sends the full list even over the API identity-count limit; the API drops the
+   *  entire pending_all list when over that limit, never truncates it. No lifecycle authority. */
+  pending_all?: { run_id: string; claim_generation: number }[];
   /** Issue #1742: carried ONLY on the register snapshot — each run whose executor finished at the
    *  named exact claim generation and whose authenticated finalize-pending record survived a
    *  process restart with no journaled terminal outcome. Never an outcome and never a lease: the
@@ -622,6 +633,16 @@ export interface DindMaintenanceReadyACK extends DindMaintenance {
 }
 
 export interface HeartbeatRequest {
+  /** Original implemented capabilities and fixed validated local limits, echoed with the
+   * original canonical registration nonce once heartbeat_protocol_refresh_v1 is advertised.
+   * Complete readable responses up to 1 MiB with all-string lists replace API features; discovery and
+   * reporting take two regular heartbeats without extra negotiation requests. */
+  protocol_refresh?: {
+    protocol_capabilities: string[];
+    max_concurrent_runs: number;
+    max_cross_check_slots: number;
+    register_nonce: string;
+  };
   dind_meter?: DindMeter;
   dind_maintenance_ready_ack?: DindMaintenanceReadyACK;
   version: string;
@@ -632,15 +653,16 @@ export interface HeartbeatRequest {
   stats?: WorkerStats;
   /**
    * Per-run outbox depth (PRD #1391 M5). Sent ONLY when the server advertised
-   * `heartbeat_outbox` in `RegisterResponse.protocol_features` AND at least one run
+   * `heartbeat_outbox` in the current API feature cache AND at least one run
    * has pending outbox depth (client.ts gates both), so an older api never sees the
    * field and the heartbeat wire stays byte-identical to today when it is unset.
    */
   outbox?: OutboxHeartbeatEntry[];
   /**
    * The worker's active-run snapshot (PRD #1390 M2a). Sent ONLY when the server
-   * advertised `active_run_snapshot` in `RegisterResponse.protocol_features` (client.ts
-   * gates it), so an older api never sees the field and the heartbeat wire stays
+   * advertised `active_run_snapshot` in the current API feature cache and an original
+   * registration nonce exists (client.ts gates both), so an older api never sees the field
+   * and the heartbeat wire stays
    * byte-identical to today when it is unset. Stripped alongside `outbox` on the
    * strict-decode rollback retry.
    */
@@ -649,7 +671,7 @@ export interface HeartbeatRequest {
    * issue #2213: the worker's residue quarantine latch (an unreadable, unattributed runner-uid
    * process was found; the worker claims nothing and starts no credentialed git or new provider
    * turn until its container restarts). Sent ONLY while latched and ONLY when the server advertised
-   * `worker_residue_quarantine` in `RegisterResponse.protocol_features`; stripped alongside `outbox`
+   * `worker_residue_quarantine` in the current API feature cache; stripped alongside `outbox`
    * on the strict-decode rollback retry. Absent means "not latched". `cause` is the agent-sanitized
    * detail (at most 160 characters, untrusted to the api); `run_id` is null when no run detected it.
    */
@@ -933,6 +955,11 @@ export interface ClaimConfig {
    *  configured ci_config_path. The pre-push guard refuses an AUTO-approved ci_fix
    *  diff that touches any of these. omitted/empty for non-ci_fix runs. */
   ci_config_paths?: string[];
+  /** Default-branch CI repair runs: when true the worker refuses, at the early check and again
+   *  immediately before the final push, any diff that touches a protected CI-config path (the
+   *  claim's ci_config_paths unioned with the worker floor), whether or not a human approved the
+   *  plan. Absent/false for every other run. */
+  ci_config_guard?: boolean;
   /** Repo devbox.json packages opt-in (PRD #18 M5): whether the worker may union
    *  the repo's own devbox.json packages (packages-only) into the provisioned set.
    *  Delivered from M3 but always false until M5 wires the per-repo toggle. */
@@ -2360,6 +2387,7 @@ export interface PublishResponse {
     | "not_descendant"
     | "unsupported"
     | "workflow_scope"
+    | "ci_config_guard"
     | "superseded"
     | "tip_missing"
     | "pack_too_large"

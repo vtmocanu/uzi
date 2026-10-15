@@ -128,7 +128,7 @@ func MigrateLegacySelfImprove(ctx context.Context, pool *pgxpool.Pool, now time.
 		CronExpr:    pgtype.Text{String: cron, Valid: true},
 		Timezone:    schedtmpl.DefaultTimezone,
 		NextFireAt:  pgtype.Timestamptz{Time: nextFireAt, Valid: true},
-		AutoApprove: schedtmpl.AutoApprove,
+		AutoApprove: job.AutoApprove,
 		WaitOnLimit: schedtmpl.WaitOnLimit,
 	}); err != nil && !errors.Is(err, pgx.ErrNoRows) {
 		return err

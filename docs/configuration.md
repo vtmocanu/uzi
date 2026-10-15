@@ -182,7 +182,7 @@ whenever the feature is enabled for a given user.
 | `CI_FIX_MAX_JOBS` | `10` | Max failed jobs a Fix CI snapshot captures from the failed pipeline. Bounds the snapshot (jobs × tail) frozen onto the `ci_fix` run at queue time. |
 | `CI_FIX_LOG_TAIL_BYTES` | `32768` (32 KiB) | Bytes captured from the **end** of each failed job's trace (a failure concludes its log). Tails are treated as untrusted evidence and pass a PAT + known-token redaction pass before they are stored. |
 | `CI_AUTOFIX_MAX_ATTEMPTS` | `2` | Max automatic CI-fix attempts per agent MR branch before uzi halts and stops retrying automatically (the manual Fix CI button still works). A no-progress halt (unchanged failure signature) can stop it earlier. See [Automatic CI fixes](./ci-autofix.md). |
-| `CI_AUTOFIX_CONFIG_PATHS` | `.gitlab-ci.yml,.gitlab/**,**/*.gitlab-ci.yml` | Comma-separated protected CI-config path globs. An auto-approved CI-fix whose diff touches one of these (or the project's own configured `ci_config_path`, fetched server-side) is refused at push time and must be human-approved instead. |
+| `CI_AUTOFIX_CONFIG_PATHS` | (none) | Comma-separated protected CI-config path globs, added to the always-protected set `.gitlab-ci.yml`, `.gitlab/**`, `**/*.gitlab-ci.yml`, `.github/workflows/**`, `.forgejo/workflows/**`, `.gitea/workflows/**` (it cannot remove any of them). An auto-approved CI-fix whose diff touches one of these (or the project's own configured `ci_config_path`, fetched server-side) is refused at push time and must be human-approved instead. |
 
 **Verification caveat**: `verified` means "the fix MR's latest pipeline passed". A merge-result failure that only surfaces on `main` (a semantic conflict) is caught only if the project runs [merged-results pipelines](https://docs.gitlab.com/ci/pipelines/merged_results_pipelines/) — a GitLab-config concern, not a uzi setting.
 
@@ -412,7 +412,7 @@ Set on the `agent` compose service (profile `agent`) or on a standalone `docker 
 | `UZI_WORKER_TOKEN` | — (required, unless `_FILE` is set) | The join token from Settings → Workers, sent as a Bearer credential on every worker call. |
 | `UZI_WORKER_TOKEN_FILE` | — (optional, preferred) | Path to a file containing the join token; the worker reads it once at startup. The bundled compose profile mounts it as a read-only compose file secret at `/run/secrets/worker_token`, which the root-started entrypoint forces to `0400 worker`-owned so the cap-less `runner` uid cannot read it (PRD #51; a restricted-namespace non-root single-uid start runs without the split — the PRD #58 posture); the post-read unlink no-ops on the read-only mount, so the file persists and the uid boundary — not removal — is the close. Takes precedence over `UZI_WORKER_TOKEN` when set. Keeps the token out of every process's `/proc/<pid>/environ`; see [proc-hardening.md](proc-hardening.md). A hosted worker's controller sets it; on OpenShift the Secret mounts elsewhere (`workers.secretMountPath`, see [openshift.md](openshift.md)) and the entrypoint's ownership check and the guardrails follow this path. |
 | `UZI_DATA_DIR` | `/data` | Persistent storage: the bare-clone cache, per-run git worktrees, and the pinned Claude Agent SDK session directory. Must be a durable volume for resume-after-restart to work. In the bundled compose profile this is **hardcoded** to `/data` (matching the `agentdata` volume mount), not read from `.env`; it's only a real knob for a standalone `docker run` or a compose override. |
-| `UZI_RECOVERY_DECODED_LIMIT_BYTES` | `8589934592` (8 GiB) | Cumulative delivered decoded object-content limit per recovery operation; nested operations share the counter and repeated reads count again. Positive decimal bytes, fixed ceiling `68719476736` (64 GiB); invalid values reject worker startup. Parsed once; restart required. Worker/operator setting, not a RAM limit. Bundled hosted Helm chart and docker-compose do not expose it yet and use the default. See [Recovery decoded-history limit](#recovery-decoded-history-limit). |
+| `UZI_RECOVERY_DECODED_LIMIT_BYTES` | `8589934592` (8 GiB) | Cumulative delivered decoded object-content limit per recovery operation; nested operations share the counter and verified objects are deduplicated per bare identity within that operation. Positive decimal bytes, fixed ceiling `68719476736` (64 GiB); invalid values reject worker startup. Parsed once; restart required. Worker/operator setting, not a RAM limit. Bundled hosted Helm chart and docker-compose do not expose it yet and use the default. See [Recovery decoded-history limit](#recovery-decoded-history-limit). |
 | `UZI_WORKER_NAME` | container hostname | Display name shown in Settings → Workers / Admin. |
 | `UZI_AGENT_VERSION` | — (baked into the image at build) | The release this worker image was built from. CI's `publish:agent` stamps it from the release tag as `<release>+g<short-sha>` and the templates bake it into image `ENV` with a leading `v` stripped. It therefore matches the worker image tag (`workers.image.tag`, independent of `appVersion` since ADR-422) **up to the `+g…` build metadata**: a worker on the `0.11.7` image reports `0.11.7+g1a2b3c4`, not `0.11.7`. The suffix names the commit the image was built from, and SemVer excludes build metadata from precedence, so every version comparison still treats the two as the same release — but the strings differ, which is expected and not a sign that the wrong image is deployed. Reported **at register only** — the api discards the `version` a heartbeat carries and never reads the `X-Client-Version` header, so a running worker's stored value does not change until it re-registers. Unset on a locally built or MR-validation image, and deliberately so: the worker then reports no version at all (`-` in `uzi worker list`) rather than a placeholder a version comparison could not tell apart from a real report. Shown in Settings → Workers and `uzi worker list`. |
 | `UZI_EXECUTOR` | `sdk` | `sdk` runs real Claude Agent SDK turns (the product path); `stub` is a no-AI executor the project's own tests use — leave at `sdk` for real use. |
@@ -539,10 +539,18 @@ Preserve the worker's existing token delivery, volume and security options.
 
 The finite ceiling is eight times the default, allowing larger histories
 while retaining exact arithmetic and existing deadlines; it is not a memory
-guarantee. Verification still hashes the full reachable history, including
-prerequisites, and refuses missing or corrupt objects. Repeated reads count
-again; nested operations share the delivered-byte counter. There is no
-deduplication or history exclusion. Cap exhaustion fails closed with local
+guarantee. Every verification still walks the full reachable history, including
+prerequisites, and checks object presence and metadata. Within one operation,
+only uncached objects are hashed and charged; nested operations share the cache
+and delivered-byte counter. The cache is bound to the bare and object-directory
+identities, and stores entries only after complete hash verification and a clean
+producer exit. Its total entry count is bounded across all identities; objects
+not cached still hash and count. A fresh operation starts empty. There is no
+history exclusion. Cache reuse assumes immutable worker-owned object storage:
+corruption, replaced loose objects or pack files, or an added alternate object
+store can escape later hashing when directory identities and cached type/size
+metadata remain unchanged. This additional risk was explicitly
+accepted by the user on 2026-10-14; it is not the prior verification guarantee. Cap exhaustion fails closed with local
 work and custody retained. Cancellation, deadlines, encoded archive caps and
 storage quotas are unchanged.
 

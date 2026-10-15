@@ -1,6 +1,7 @@
 package forge
 
 import (
+	"errors"
 	"strings"
 )
 
@@ -49,6 +50,10 @@ func (r redactor) error(err error) error {
 func (r redactor) errorStatus(err error, status int) error {
 	if err == nil {
 		return nil
+	}
+	var budget *CIReadBudgetError
+	if errors.As(err, &budget) {
+		return &CIReadBudgetError{reason: budget.reason}
 	}
 	class := classifyError(err, status)
 	return &classifiedError{message: r.string(err.Error()), class: class}

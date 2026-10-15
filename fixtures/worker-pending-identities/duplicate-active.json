@@ -1,0 +1,28 @@
+{
+  "snapshot_epoch": 1,
+  "active": [
+    {
+      "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "claim_generation": 1,
+      "phase": "running",
+      "terminal_pending": true
+    },
+    {
+      "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "claim_generation": 2,
+      "phase": "running",
+      "terminal_pending": true
+    }
+  ],
+  "pending_overflow": false,
+  "pending_all": [
+    {
+      "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "claim_generation": 1
+    },
+    {
+      "run_id": "aaaaaaaa-aaaa-aaaa-aaaa-aaaaaaaaaaaa",
+      "claim_generation": 2
+    }
+  ]
+}

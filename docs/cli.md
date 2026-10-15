@@ -113,14 +113,15 @@ uzi run recovery [<id>] [--json]
 uzi run discard <id> --hold <hold-id> [--yes]
 uzi run held <id> [--json]
 uzi run held expire <id> [--yes]
-uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>)
+uzi schedule create --repo <id> [--repo <id> ...] (--issue <iid> | --sweep [--label <l> ...] [--create-missing-labels] | --prompt <text>
+                    | --ci-watch [--workflow <key|name> ...] [--prompt <text>])
                     (--at <rfc3339> | --cron <expr>) [--tz <iana>]
                     [--auto-approve[=false]] [--wait-on-limit[=false]]
                     [--max-issues <n>] [--guidance <text>]
                     [--output mr|issues]
                     [--model <alias|id>] [--apply-model-to-agents[=false]]
                     [--harness claude|codex]
-uzi schedule list | get <id> | pause <id> | resume <id> | run-now <id> | delete <id>
+uzi schedule list | get <id> [--episodes-cursor <c>] | pause <id> | resume <id> | run-now <id> | delete <id>
 uzi schedule pause-all --until <when> | resume-all | pause-status
 uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--prompt <text> | --label <l> ... [--create-missing-labels]]
@@ -130,6 +131,7 @@ uzi schedule edit <id> [--cron <expr> | --at <rfc3339>] [--tz <iana>]
                    [--output mr|issues|""]
                    [--model <alias|id>] [--apply-model-to-agents[=false]] [--repo <id>]
                    [--harness claude|codex|""]
+                   [--workflow <key|name> ... | --clear-workflows]   # ci_watch only
 uzi schedule catalog list
 uzi schedule catalog enable <slug> --repo <id> [--repo <id> ...] [--create-missing-labels]
 uzi schedule reset <id>
@@ -452,6 +454,20 @@ A few worth knowing:
   is standalone (no group). An **`--issue` target cannot span repos** (the issue
   number is repo-relative), so `--repo A --repo B ... --issue N` is a usage error
   (exit 2) before any create; `--sweep` and `--prompt` targets group freely.
+  **`--ci-watch`** is a fourth target, default-branch CI repair: it watches the repo's
+  workflows (repeat `--workflow <key|name>` to select some; none watches every
+  workflow in the listed window, the newest 100 executions, 50 on Forgejo) and `--prompt`
+  optionally overrides the instruction (default: the `ci-repair` catalog body, also
+  available as `schedule catalog enable ci-repair`). `--auto-approve` stays **off**
+  unless passed, since CI logs can contain text from dependencies, tests or outside
+  contributors. `--workflow` is rejected on other targets, and `--issue`, `--sweep`,
+  `--label`, `--max-issues`, `--output` and `--guidance` are rejected with `--ci-watch`
+  (exit 2). `schedule edit` takes `--workflow` (replace) or `--clear-workflows` (back to
+  all), mutually exclusive; omitting both keeps the stored selector. `schedule get`
+  shows the watched workflows, each workflow's episode state (state or halted reason,
+  attempts, run ids), the auto-approve note, and `next cursor: <c>` when more
+  pages exist; `schedule get <id> --episodes-cursor <c>` prints the next page
+  (`--json` prints it with `next_cursor`).
   `--auto-approve` defaults **on** (an off-hours run should proceed past the plan
   gate); pass `--auto-approve=false` to keep the gate. **To start an
   auto-approved run on one issue now**, use a disabled one-shot schedule:
@@ -879,10 +895,12 @@ A few worth knowing:
   these tokens. Read-only: there's no admin revoke here, the same write/read
   split as every other `admin` verb.
 - **`admin products` lists the external products registered for product
-  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `STATE`
-  (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS` (manual product
+  tokens** (PRD #1907), soft-deleted ones included, with `NAME`, `ID`,
+  `STATE` (`enabled`, `disabled` or `deleted`), `ACTIVE_TOKENS`, `CONNECTIONS`,
+  `JOB_TYPES`, `CLIENT`, `SCOPES`, `CREATED` and `DESCRIPTION`.
+  `ID` is the product's OAuth `client_id`. `ACTIVE_TOKENS` counts manual product
   tokens neither revoked nor expired; the access tokens of OAuth connections
-  are not counted), `CONNECTIONS` (live OAuth connections) and `DESCRIPTION`.
+  are not counted. `CONNECTIONS` counts live OAuth connections.
   A disabled or deleted product's tokens and connections are refused on `/api/v1`, and a deleted product can never be
   re-enabled. Read-only: registering, editing, deleting a product and
   revoking one of its tokens are browser-only admin actions.
@@ -1126,8 +1144,11 @@ uzi run recovery [--json]
 ```
 
 - The human view shows only open holds across your runs, oldest first by `created_at`.
-  Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ARCHIVE` (whether an
-  available capture exists), `WORKER`, and `AGE`. Run and hold ids are shown in full.
+  Its columns are `RUN ID`, `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION`, `ARCHIVE` (whether an
+  available capture exists), `WORKER`, and `AGE`. `ADMISSION` is the server's per-hold
+  custody admission membership: `counted (<reason>)`, `not counted`, or `-` when the
+  server did not report it (a non-open hold or an older server), which is unknown, never
+  `not counted`. Run and hold ids are shown in full.
   Below the table it prints the owner-wide `open_holds`, `admission_counted_holds`,
   `custody_hold_limit`, `decision_needed`, and `blocked_runs` aggregate. Read
   `admission_counted_holds` against the limit for capacity, and `open_holds` for total
@@ -1152,7 +1173,8 @@ uzi run recovery [--json]
 uzi run recovery <run-id> [--json]
 ```
 
-- The per-run view shows each hold's exact id, claim generation, and its attention state — active
+- The per-run view lists `HOLD ID`, `GEN`, `DISPOSITION`, `ADMISSION` (same values as above), `STATE`,
+  `CAPTURE` and `WORKER` columns. It shows each hold's exact id, claim generation, and its attention state — active
   protection, a capture in flight, or a ready archive. Legacy holds can release
   automatically on archive readiness; guarded holds await final inventory acknowledgment.
   The narrow exhaustion exception is an OPEN hold for `recovery_wait` /
@@ -2320,7 +2342,10 @@ reason means.
 | `up to date` | the worker runs the release it is targeted at, or a newer one |
 | `outdated` | it runs an older release, and nothing is currently rolling it |
 | `upgrading` | a roll is in progress; expected and transient |
-| `FAILED` | it tried to take a new release and could not — this is the one to act on |
+| `FAILED` | a previously registered hosted worker has a fresh stuck rollout signal |
+| `capacity blocked` | a fresh verified scheduler CPU/memory blocker; wait, choose a smaller worker, or add capacity |
+| `provisioning` | first provision is progressing, based on positive API-owned no-registration history |
+| `provisioning failed` | first provision is stuck; investigate the blocking reason |
 | `-` | no usable version to compare (an unstamped local image, or a `dev` control plane) |
 
 Two things worth knowing before acting on it. A worker's version is recorded **at
@@ -2330,8 +2355,11 @@ than from the worker itself. And a **hosted** worker is compared against the tag
 controller is rolling to, which `values.yaml` may pin below the api's own release; the
 Workers page states that divergence when it exists.
 
-`-` is not a problem to fix. It is what a locally built image and an unstamped control
-plane both look like, which is most of a development setup.
+`-` normally means there is no usable version comparison, as with a locally built
+image or an unstamped control plane. It is not proof that an offline hosted worker
+is healthy. Confirmed first-provision and capacity failures have their own labels.
+These diagnostics also appear in `uzi admin workers` and worker TUI details;
+capacity remains in the attention set without claiming that storage is healthy.
 
 ### Worker lane capacity
 
@@ -3159,4 +3187,4 @@ error saying so. Like CLI tokens, product tokens are **not** revoked by a
 password change or logout; Revoke all, revoking one token, an admin, disabling
 or deleting the product, or deactivating the account does revoke them. Minting
 and admin product management are browser-only; the CLI has just the read-only
-`uzi admin products` (with a `JOB_TYPES` column showing the job types each product may start, and `CLIENT` and `SCOPES` columns for its [OAuth client](./oauth-clients.md) registration). See [Product tokens](./product-tokens.md).
+`uzi admin products` (with an `ID` column for the product's OAuth `client_id`, a `JOB_TYPES` column showing the job types each product may start, and `CLIENT` and `SCOPES` columns for its [OAuth client](./oauth-clients.md) registration). See [Product tokens](./product-tokens.md).

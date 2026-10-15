@@ -15,9 +15,10 @@ import (
 // Schedule target + timing wire strings (apitypes.ScheduleRequest.Target/Timing).
 // Named so a typo is a compile error rather than a silent server 400.
 const (
-	schedTargetIssue  = "issue"
-	schedTargetSweep  = "sweep"
-	schedTargetPrompt = "prompt"
+	schedTargetIssue   = "issue"
+	schedTargetSweep   = "sweep"
+	schedTargetPrompt  = "prompt"
+	schedTargetCIWatch = "ci_watch"
 
 	schedTimingOnce      = "once"
 	schedTimingRecurring = "recurring"
@@ -204,8 +205,9 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		Short: "Create a one-time or recurring schedule on a repo",
 		Long: "Create a schedule that starts run(s) at future time(s). Pick exactly one\n" +
 			"TARGET — --issue <iid> (a pinned issue), --sweep (every eligible issue matching\n" +
-			"the --label selector, default the uzi label), or --prompt <text> (an issue-less\n" +
-			"repo→MR run) — and exactly one TIMING — --at <RFC3339> (fires once) or --cron\n" +
+			"the --label selector, default the uzi label), --prompt <text> (an issue-less\n" +
+			"repo→MR run), or --ci-watch [--workflow <key|name>]... (default-branch CI repair;\n" +
+			"--prompt optionally overrides its instruction) — and exactly one TIMING — --at <RFC3339> (fires once) or --cron\n" +
 			"<expr> (recurring, interpreted in --tz). Repeat --repo to create the same schedule\n" +
 			"on N repos at once: a CLIENT-SIDE fan-out of one independent create per --repo.",
 		Args: cobra.NoArgs,
@@ -264,9 +266,11 @@ func newScheduleCreateCmd(env Env, gf *globalFlags) *cobra.Command {
 		},
 	}
 	create.Flags().StringArray("repo", nil, "repo id to schedule against (see 'uzi repo list'); repeatable to create the schedule on N repos at once")
-	create.Flags().Int64("issue", 0, "pinned issue IID target (one of --issue/--sweep/--prompt)")
-	create.Flags().Bool("sweep", false, "label-sweep target: every eligible matching issue (one of --issue/--sweep/--prompt)")
-	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt)")
+	create.Flags().Int64("issue", 0, "pinned issue IID target (one of --issue/--sweep/--prompt/--ci-watch)")
+	create.Flags().Bool("sweep", false, "label-sweep target: every eligible matching issue (one of --issue/--sweep/--prompt/--ci-watch)")
+	create.Flags().String("prompt", "", "ad-hoc prompt target: an issue-less repo→MR run (one of --issue/--sweep/--prompt/--ci-watch)")
+	create.Flags().Bool("ci-watch", false, "default-branch CI repair target: watch workflows and plan a fix for a red run; --prompt optionally overrides the instruction")
+	create.Flags().StringArray("workflow", nil, "a workflow key or name to watch with --ci-watch (repeatable; none watches every workflow in the listed window)")
 	create.Flags().StringArray("label", nil, "a label to select for --sweep (repeatable; empty defaults to the uzi label)")
 	create.Flags().Int("max-issues", 10, "issues to send at a time, oldest-first (sweep only)")
 	create.Flags().Bool("remove-label-on-dispatch", false, "remove the selector label after a run starts; pass --remove-label-on-dispatch=false to keep it")
@@ -348,14 +352,21 @@ func newScheduleListCmd(env Env, gf *globalFlags) *cobra.Command {
 }
 
 func newScheduleGetCmd(env Env, gf *globalFlags) *cobra.Command {
-	return &cobra.Command{
+	get := &cobra.Command{
 		Use:   "get <schedule-id>",
 		Short: "Show one schedule's configuration and next fires",
-		Args:  cobra.ExactArgs(1),
+		Long: "Show one schedule's configuration and next fires. A ci_watch schedule also shows the\n" +
+			"watched workflows and per-workflow episode state (first page); page on with\n" +
+			"--episodes-cursor <cursor> from the printed 'next cursor:' line.",
+		Args: cobra.ExactArgs(1),
 		RunE: func(cmd *cobra.Command, args []string) error {
 			c, err := env.client(gf)
 			if err != nil {
 				return err
+			}
+			if cmd.Flags().Changed("episodes-cursor") {
+				cursor, _ := cmd.Flags().GetString("episodes-cursor")
+				return runScheduleEpisodesPage(cmd, env.printer(gf), c, args[0], cursor)
 			}
 			s, err := c.GetSchedule(cmd.Context(), args[0])
 			if err != nil {
@@ -368,6 +379,8 @@ func newScheduleGetCmd(env Env, gf *globalFlags) *cobra.Command {
 			return renderScheduleDetail(p, s)
 		},
 	}
+	get.Flags().String("episodes-cursor", "", "show the next page of CI episodes from this cursor (ci_watch schedules)")
+	return get
 }
 
 func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
@@ -432,7 +445,9 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	edit.Flags().String("cron", "", "change to this recurring 5-field cron expression (switches timing to recurring)")
 	edit.Flags().String("at", "", "change to fire once at this RFC3339 time (switches timing to once)")
 	edit.Flags().String("tz", "", "change the IANA timezone the --cron expression is interpreted in")
-	edit.Flags().String("prompt", "", "change the ad-hoc prompt text (prompt-target schedules only)")
+	edit.Flags().String("prompt", "", "change the ad-hoc prompt text (prompt and ci_watch schedules only)")
+	edit.Flags().StringArray("workflow", nil, "replace the watched workflows (repeatable; ci_watch schedules only)")
+	edit.Flags().Bool("clear-workflows", false, "watch every workflow in the listed window again (ci_watch schedules only)")
 	edit.Flags().StringArray("label", nil, "replace the sweep label selector (repeatable; sweep-target schedules only)")
 	edit.Flags().Bool("auto-approve", true, "set whether a fired run proceeds past the plan gate unattended")
 	edit.Flags().Bool("wait-on-limit", true, "set whether a fired run parks on the usage limit instead of failing")
@@ -441,13 +456,13 @@ func newScheduleEditCmd(env Env, gf *globalFlags) *cobra.Command {
 	// PRD #1429 M5: an unset flag leaves the stored pin unchanged (retain-on-omission, the
 	// server's presence-aware seed-and-keep); pass "" to explicitly clear it back to implicit.
 	edit.Flags().String("harness", "", "change the pinned harness for runs this schedule fires: claude or codex; pass \"\" to clear back to implicit; an unset flag leaves the stored pin unchanged")
-	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target or sweep-target default)")
+	edit.Flags().String("guidance", "", "change owner guidance injected into the run instruction (issue/sweep targets, or a prompt-target, sweep-target or ci_watch-target default)")
 	edit.Flags().Int("max-issues", 10, "issues to send at a time, oldest-first (sweep only)")
 	edit.Flags().Bool("remove-label-on-dispatch", false, "set whether the selector label is removed after a run starts")
 	edit.Flags().Int("capacity-limit", 0, "unfinished runs limit (1..50; requires --room-needed)")
 	edit.Flags().Int("room-needed", 0, "room required before sending issues (requires --capacity-limit)")
 	edit.Flags().Bool("clear-capacity", false, "turn off the capacity gate")
-	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target or sweep-target default)")
+	edit.Flags().Bool("clear-guidance", false, "clear stored guidance back to none (issue/sweep targets, or a prompt-target, sweep-target or ci_watch-target default)")
 	edit.Flags().Bool("clear-max-issues", false, "clear the sweep cap back to unlimited (sweep target only)")
 	edit.Flags().Bool("clear-mr-rework", false, "clear the stored MR-rework override back to inherit (the account default)")
 	edit.Flags().Bool("apply-model-to-agents", false, "set whether the schedule's model also overrides every subagent's model pin")

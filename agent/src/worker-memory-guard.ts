@@ -404,7 +404,7 @@ export class WorkerMemoryMonitor {
     void task.finally(() => this.reports.delete(task));
   }
 
-  private async finish(a: Authority, selected: Selection, outcome: MemoryOutcome, preserve: boolean): Promise<Readonly<{ result: WorkerMemoryPressureResult; eligible: boolean; preserved: boolean }>> {
+  private async finish(a: Authority, selected: Selection, outcome: MemoryOutcome, preserve: boolean): Promise<Readonly<{ result: WorkerMemoryPressureResult; preserved: boolean }>> {
     const sample = a.sample;
     const result: WorkerMemoryPressureResult = Object.freeze({
       run_id: a.request.run_id, worker_id: a.request.worker_id, intervention_id: a.request.intervention_id,
@@ -416,10 +416,9 @@ export class WorkerMemoryMonitor {
       cancellation_confirmed: outcome === "confirmed_drained", outcome, retry_blocked: true,
       guidance: "Use smaller or serial commands after recovery.",
     });
-    const eligible = this.ports.commands.isCurrent(a.context);
-    const preserveCapturedFlight = preserve && eligible;
+    const preserveCapturedFlight = preserve;
     // Retain feed intent for every outcome before tool completion and bounded IO.
-    // Eligibility was captured first: either preparation hook may retire admission.
+    // Captured settlement belongs to this flight even after cancellation authority retires.
     try { this.ports.prepareFeedback?.(a.context, result); } catch {}
     if (preserveCapturedFlight) {
       // The owner sets clone/session retention intent synchronously, before feedback
@@ -438,7 +437,7 @@ export class WorkerMemoryMonitor {
       // independent budget supplied by the captured runner owner.
       await this.preserve(a);
     }
-    return Object.freeze({ result, eligible, preserved: preserveCapturedFlight });
+    return Object.freeze({ result, preserved: preserveCapturedFlight });
   }
 
   private preparePreservation(a: Authority, result: WorkerMemoryPressureResult): void {
@@ -528,7 +527,7 @@ export class WorkerMemoryMonitor {
     if (cancelStarted && commands.hasConfirmedStop(entry)) outcome = "confirmed_drained";
     const prepared = await this.finish(a, selected, outcome, preserve || outcome !== "confirmed_drained");
     const confirmed = await this.report(a, outcome, ticket);
-    if (!confirmed && prepared.eligible && !prepared.preserved) {
+    if (!confirmed && !prepared.preserved) {
       this.preparePreservation(a, prepared.result);
       await this.preserve(a);
     }

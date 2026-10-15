@@ -10,6 +10,23 @@ the full Decision Log (D1-D9), the milestone breakdown and the verified code anc
 ADR restates the invariants a future edit to a claim clause, a custody-release path or a
 cleanup guard must not silently break.
 
+## Amendment 2026-10-14 — merged predecessor server discard (#2506)
+
+The maintainer selected the narrow policy in [ADR-2506](2506-merged-predecessor-discard.md):
+a fresh server observation of the completed run's own exact recorded PR/MR as merged,
+followed by locked exact-binding revalidation, permits discard of earlier OPEN holds
+at generation < the completed generation. This includes nonancestor prior aggregates
+and guarded holds; it is discard policy, not ancestry, archive FINAL or publication
+receipt authority. Non-ready capture cleanup is atomic; available archives retain bytes,
+prerequisites, TTL and export eligibility. Existing discard semantics reduce custody
+counts and decision hotlists.
+
+This supplies no new worker source-deletion authority or worker/PVC retention fence;
+existing operator-only #1786 disposal and retention guards remain. Option D's physical
+local-source and available-archive disposal is deferred to #2823 and #1373. #2506 remains
+partial and nonclosing. ADR-2506 records polling bounds, inherited unbounded response
+decoding, migration validation/locking risk and rollback's refusal to lose audit evidence.
+
 ## Context
 
 A run can commit real, useful work and still fail before it publishes: a workflow or
@@ -74,7 +91,8 @@ owner-downloadable but never authorizes archive-backed FINAL or source cleanup,
 even with complete root coverage. Without the distinct completed-publication
 receipt described in the 2026-10-09 amendment, holds, pins and clones stay
 retained until independently verified empty-inventory settlement or explicit
-owner discard.
+owner discard, except for server hold discard under the 2026-10-14 amendment above
+(which supplies no new worker source-deletion authority).
 Non-final capture TTL remains normal; custody does not expire and pod/PVC/hold
 costs continue. Deploy the API release guard before the worker producer. Legacy
 fresh-forge capture is unchanged. Historical oversized captures are not
@@ -144,8 +162,9 @@ and a re-claiming worker's generation-2 claim both left `open`. The release path
 operation actually resolved, never every open hold sharing that run id. The reconciler's
 "releasable on completion" query is additionally **generation-aware**
 (`r.status = 'completed' AND h.generation = r.claim_generation`), so a run's terminal
-generation only ever releases its own matching hold — a still-open hold from an earlier,
-orphaned generation is left alone, retained until its own capture or explicit discard.
+generation releases its own matching hold through this completion-release path — a still-open
+hold from an earlier, orphaned generation is retained until its own capture or explicit
+discard, except for the narrow server discard in the 2026-10-14 amendment above.
 This is the deliberately conservative, no-data-loss choice: a cross-worker orphaned hold
 staying open (and thus counting against the owner's custody-admission limit and blocking
 that worker's deletion) is an acceptable cost against silently dropping the last copy of
@@ -261,10 +280,11 @@ preferred over a guess that could drop the last copy.
 
 ### Release only from per-hold durable evidence, ancestry-checked at disposition time (D2)
 
-For legacy holds, one exact hold may leave `open` only after one of: (1) that generation's full head was
+For legacy holds, outside the narrow server discard in the 2026-10-14 amendment above,
+one exact hold may leave `open` only after one of: (1) that generation's full head was
 published, (2) an available archive is bound to that hold, (3) the hold's own source-holding
 worker proves no unpublished committed output against freshly fetched forge history, or (4) the
-owner explicitly discards that exact held source. A current generation may settle an *earlier*
+owner explicitly discards that exact held source. Outside that server-discard exception, a current generation may settle an *earlier*
 generation only when a settlement-time ancestry check proves the earlier source is contained in
 the durable published/archived head. Tracking/checkpoint adoption supplies a candidate source,
 never lasting proof — a later rebase or amend can break ancestry before publication — so the
@@ -605,8 +625,9 @@ prevent a false failed report; they gain no invented durable journal.
 
 ### Scope and physical retention
 
-Only the exact completing-generation hold gains this authority. Older and
-successor holds remain independent; unstamped older completed holds, including
+Only the exact completing-generation hold gains this completed-publication authority.
+Older and successor holds remain independent under this path; the 2026-10-14
+amendment adds a separate server-discard policy for earlier OPEN holds; unstamped older completed holds, including
 earlier self-improvement runs, are not backfilled. Failed, cancelled and parked
 runs and `ci_fix`, `prompt` and `task` retain their existing policy.
 

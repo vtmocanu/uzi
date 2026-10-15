@@ -39,6 +39,32 @@ function missingParts(c: ProductOAuthClient): string[] {
   return out;
 }
 
+function ClientIDRow({ id }: { id: string }) {
+  const [copied, setCopied] = useState(false);
+  const copy = async () => {
+    try {
+      await navigator.clipboard.writeText(id);
+      setCopied(true);
+    } catch {
+      // Clipboard may be unavailable (insecure context); the ID stays visible.
+    }
+  };
+  return (
+    <div>
+      <dt className="text-muted">Client ID</dt>
+      <dd className="flex flex-wrap items-center gap-2">
+        <code className="break-all font-mono text-xs text-fg">{id}</code>
+        <Button variant="secondary" size="sm" onClick={copy}>
+          {copied ? "Copied" : "Copy client ID"}
+        </Button>
+        <span role="status" aria-live="polite" className="sr-only">
+          {copied ? "Client ID copied" : ""}
+        </span>
+      </dd>
+    </div>
+  );
+}
+
 export function ProductOAuthPanel({
   product,
   onChanged,
@@ -181,6 +207,9 @@ export function ProductOAuthPanel({
                   {copied ? "Copied" : "Copy"}
                 </Button>
               </div>
+              <dl className="text-sm">
+                <ClientIDRow key={secret} id={product.id} />
+              </dl>
               <Button
                 variant="ghost"
                 onClick={() => {
@@ -200,6 +229,7 @@ export function ProductOAuthPanel({
           </p>
 
           <dl className="space-y-2 text-sm">
+            <ClientIDRow id={product.id} />
             <div>
               <dt className="text-muted">Redirect URIs</dt>
               <dd>

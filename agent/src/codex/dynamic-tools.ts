@@ -28,7 +28,7 @@ function objectSchema(
   };
 }
 
-function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
+function definition(name: string, isRoot: boolean): Omit<CodexDynamicToolSpec, "type" | "name"> {
   switch (name) {
     case CODE_DISPOSITIONS_TOOL:
       return {
@@ -41,7 +41,7 @@ function definition(name: string): Omit<CodexDynamicToolSpec, "type" | "name"> {
     case "Bash":
       return {
         description: "Run one worker-screened shell command inside the current worktree.",
-        inputSchema: objectSchema({ command: STRING, cwd: STRING }, ["command"], false),
+        inputSchema: objectSchema({ command: STRING, cwd: STRING, ...(isRoot ? { long_running: { type: "boolean", description: "Root lead only: true selects a fixed 120-minute command bound; false or absent keeps 60 minutes." } } : {}) }, ["command"], false),
       };
     case "apply_patch":
       return {
@@ -264,5 +264,5 @@ export function buildCodexDynamicTools(grants: RunGrants): readonly CodexDynamic
     .map((canonical) => ({ canonical, wire: codexDynamicToolWireName(canonical) }))
     .filter((entry): entry is { canonical: string; wire: string } => entry.wire !== undefined)
     .sort((a, b) => a.wire < b.wire ? -1 : a.wire > b.wire ? 1 : 0)
-    .map(({ canonical, wire }) => ({ type: "function", name: wire, ...definition(canonical) }));
+    .map(({ canonical, wire }) => ({ type: "function", name: wire, ...definition(canonical, grants.isRoot) }));
 }

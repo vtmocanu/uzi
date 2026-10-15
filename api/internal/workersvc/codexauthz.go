@@ -53,10 +53,11 @@ const codexCoordQuarantined = "quarantined"
 // is a MID-EXECUTION park like limit_wait (a running worker parked the run on a transient
 // recovery). A pre-execution codex_account_unavailable recovery_wait also belongs here:
 // its park revokes the capability, so no credential operation can use it. The following
-// are deliberately EXCLUDED, all on the
-// same principle (no worker is actively executing the run, so no live capability should
-// be honored): 'queued' — the requeue gap where the run was handed back and no worker
-// owns it (the capability is revoked and the epoch bumped on that transition);
+// are deliberately EXCLUDED from credential authorization:
+// 'queued' — the API's provisional requeue gap, even when a still-live worker retains
+// the executing flight. Queued suspends every credential scope; the two provisional
+// requeues preserve hash and epoch for same-generation re-adoption. Every successful
+// ClaimRun clears the hash and bumps the epoch before assembly, fencing the old flight;
 // 'pool_wait' — reached only when claim assembly aborts on an empty auto-pool BEFORE the
 // codex branch mints a capability, so it is a not-yet-executing wait like 'queued', not a
 // worker-attached park (a codex run therefore never carries a live cap in this state, and
@@ -146,7 +147,7 @@ var (
 	// run holds no capability hash.
 	ErrCodexCapabilityMismatch = errors.New("codex capability does not match")
 	// ErrCodexCapabilityEpoch: the presented capability was minted under a prior claim
-	// epoch (a requeue/re-mint has since bumped codex_claim_epoch), so it is stale even
+	// epoch (a fresh claim, revocation or re-mint has since bumped codex_claim_epoch), so it is stale even
 	// if its secret would otherwise hash-match.
 	ErrCodexCapabilityEpoch = errors.New("codex capability is from a prior claim epoch")
 	// ErrCodexWorkerMismatch: the run is not currently owned by the presenting worker.
@@ -276,7 +277,7 @@ func hashCodexCapability(plaintext string) []byte {
 
 // formatCodexCapability builds the wire capability the worker receives and later
 // presents: "<epoch>.<secret>". The epoch is carried in-band so the authority check can
-// reject a capability minted under a prior claim epoch (a requeue bumps the epoch)
+// reject a capability minted under a prior claim epoch (fresh claims and revocations bump it)
 // independently of the hash compare, giving a distinct rejection reason.
 func formatCodexCapability(epoch int64, plaintext string) string {
 	return strconv.FormatInt(epoch, 10) + "." + plaintext
@@ -1047,7 +1048,7 @@ func (s *Service) codexClaimSecrets(ctx context.Context, wkr store.Worker, run s
 // same-worker re-mint (which advances the epoch and clears/rewrites the hash while leaving
 // status 'claimed' and worker_id unchanged, and therefore passes both ownership and the
 // predicate) is still rejected. This epoch/hash guard is the ONLY thing that catches that
-// case; a true requeue (status to 'queued', capability revoked) is caught a step earlier by
+// case; a requeue (status to 'queued', credential use suspended) is caught a step earlier by
 // the actively-claimed predicate, so do NOT weaken that predicate assuming this covers it.
 //
 // Unconditionally (both barriers) the run's live claim_generation must still equal

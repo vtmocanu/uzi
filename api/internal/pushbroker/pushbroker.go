@@ -77,6 +77,12 @@ type Options struct {
 	// as []byte, not an io.Reader, because the publish reads it TWICE: once for the
 	// budget pre-pass, once to apply it — each from a fresh reader.
 	Pack []byte
+	// CIConfigGuard marks a guarded run (runs.ci_config_guard). When set, Publish refuses with
+	// ErrCIConfigGuard, before any send, if the declared tip differs from the fetched default
+	// branch at a path matching CIConfigPaths. False leaves Publish unchanged.
+	CIConfigGuard bool
+	// CIConfigPaths are the protected globs (runs.ci_config_paths), server-derived.
+	CIConfigPaths []string
 }
 
 // PublishDisposition describes evidence from this publish's receive-pack command.
@@ -383,6 +389,14 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 			return Result{}, fmt.Errorf("%w: declared tip not in applied pack", ErrTipMissing)
 		}
 		return Result{}, fmt.Errorf("pushbroker: read declared tip: %w", err)
+	}
+
+	// Guarded runs (ci_config_guard): refuse before any send when the tip touches a protected
+	// CI-config path relative to the fetched default branch.
+	if o.CIConfigGuard {
+		if err := ciConfigGuard(ctx, repo, declaredCommit, o.DefaultBranch, o.CIConfigPaths); err != nil {
+			return Result{}, err
+		}
 	}
 
 	// Step 5: strict-descendant / never-backward check (the "never forced"

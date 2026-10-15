@@ -2,7 +2,7 @@
 
 **Issue:** [#1231](https://github.com/vtmocanu/uzi/issues/1231)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Planned, blocked on #1226 and #1230; the one-at-a-time sequence lands #1227-#1229 first.
+**Status:** Planned, blocked on #1226 and #1230; the one-at-a-time sequence lands #1227 and #1228 first (#1229 is not planned).
 **Priority:** High.
 **Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1230 merges and main CI is green.
 

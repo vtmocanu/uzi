@@ -34,7 +34,7 @@ func TestAllowlistedReleaseEvidence(t *testing.T) {
 
 	// Everything else is ErrBadRequest: server-derived classes a worker may NOT assert, the empty
 	// string, a case variant, and an injection attempt.
-	for _, ev := range []string{"archive", "owner_discard", "no_adopted_source", "", "PUBLICATION", "publication'; DROP"} {
+	for _, ev := range []string{"archive", "owner_discard", "merged_predecessor_discard", "no_adopted_source", "", "PUBLICATION", "publication'; DROP"} {
 		if _, err := allowlistedReleaseEvidence(str(ev)); !errors.Is(err, ErrBadRequest) {
 			t.Fatalf("allowlistedReleaseEvidence(%q) = %v, want ErrBadRequest", ev, err)
 		}

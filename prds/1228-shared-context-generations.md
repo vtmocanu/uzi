@@ -2,7 +2,7 @@
 
 **Issue:** [#1228](https://github.com/vtmocanu/uzi/issues/1228)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Consumers:** Completion holds in #1229 and retained PR sessions in #1214.
+**Consumers:** Retained PR sessions in #1214. Completion holds in #1229 were a consumer until #1229 was closed as not planned (2026-10-15).
 **Status:** Planned, blocked on the one-at-a-time sequence after #1227.
 **Priority:** High.
 **Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1227 merges and main CI is green.
@@ -93,7 +93,7 @@ Six mostly sequential milestones; M2 and M3 can proceed in parallel after M1 fre
 - [ ] **M3: agent interface and Claude codec.** Add neutral capture/validate/materialize/restore operations and transfer client. Implement the verified Claude allowlist with compacted context and subagent sidecars, `mirror_error`/missing-final-batch handling, safe path/type/mode validation and no credential/config capture. Use pinned SDK fixtures and define the offline positive resume signal as the installed SDK session store plus `inspectSession` recognizing the restored session identity; no live model turn or network call is required. Codex returns `codec_missing`; do not fabricate coverage. Gate: `task gate:agent`, `task scan:secrets`.
 - [ ] **M4: atomic finalization, CAS and idempotency.** Commit only complete validated manifests, advance expected-current with CAS, return the same generation on retries and prevent an older producer from superseding a newer one. Exercise interrupted upload/finalize response loss, retry, generation race, corrupt materialization and release/finalize ordering across API and client. Gates: `task gate:api`, `task gate:agent`, LiveDB.
 - [ ] **M5: quotas, expiry, release and GC.** Add bounded per-generation/owner/global storage, incomplete-upload expiry and reference-safe reclamation. Content-free metrics report bytes, age and outcomes without high-cardinality identities. Test quota/finalize/restore/GC races, secret-key rotation and physical-delete retry; rotation yields typed unavailable, not corrupted restore. Gate: `task gate:api`.
-- [ ] **M6: docs, ADR, consumer contracts and adversarial proof.** Add an ADR for the encrypted generation boundary, complete-manifest fence, owner-kind isolation and provider codec contract. Document no-content DTOs and operational storage impact. Verify the 2026-09-09 amendment to `prds/1214-retained-pr-sessions.md` against the landed primitive and refresh any package/route/codec names; its M1/M2 consume #1228 while its PR-session lifecycle decisions remain. Record #1229's hook contract. Run `task docs:sync` for any `docs/` edits and all relevant gates once to logs.
+- [ ] **M6: docs, ADR, consumer contracts and adversarial proof.** Add an ADR for the encrypted generation boundary, complete-manifest fence, owner-kind isolation and provider codec contract. Document no-content DTOs and operational storage impact. Verify the 2026-09-09 amendment to `prds/1214-retained-pr-sessions.md` against the landed primitive and refresh any package/route/codec names; its M1/M2 consume #1228 while its PR-session lifecycle decisions remain. Record the run-hold hook contract (#1229, not planned; only if reopened). Run `task docs:sync` for any `docs/` edits and all relevant gates once to logs.
 
 ## Acceptance criteria
 

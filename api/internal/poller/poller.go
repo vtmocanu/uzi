@@ -354,6 +354,13 @@ func (e *Engine) PollOnce(ctx context.Context) {
 	wg.Wait()
 
 	e.pruneStates(seen)
+	if e.svc != nil {
+		repoIDs := make([]uuid.UUID, 0, len(repos))
+		for _, r := range repos {
+			repoIDs = append(repoIDs, r.ID)
+		}
+		e.svc.ReconcileMergedPredecessors(ctx, repoIDs)
+	}
 }
 
 // pruneStates drops per-repo state for repos no longer enabled (not in seen), so a

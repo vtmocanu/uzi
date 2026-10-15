@@ -124,6 +124,10 @@ function JobCard({
           <Badge tone="ok" dot>
             self-improve
           </Badge>
+        ) : entry.target === "ci_watch" ? (
+          <Badge tone="plan" dot>
+            CI repair
+          </Badge>
         ) : (
           <Badge tone="ok" dot>
             prompt
@@ -145,6 +149,8 @@ function JobCard({
         {entry.target === "sweep" && entry.max_issues > 0 && <Chip>max {entry.max_issues}{entry.capacity_limit != null ? " at a time" : ""}</Chip>}
         {entry.capacity_limit != null && <Chip>limit {entry.capacity_limit} · room {entry.capacity_room_needed}</Chip>}
         {entry.remove_label_on_dispatch && <Chip>removes label</Chip>}
+        {/* PRD #2865 D10: the CI repair default waits for plan approval. */}
+        {entry.target === "ci_watch" && !entry.auto_approve && <Chip>plan review</Chip>}
       </div>
 
       {/* The footer sits at the card's bottom edge so a row of cards lines up. */}

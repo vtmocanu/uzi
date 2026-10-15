@@ -1063,3 +1063,89 @@ test("runner fails closed on incomplete enabled Codex claims; Claude has no acce
     assert.equal(calls, 1);
   } finally { await f.memory.stop(); }
 });
+
+
+for (const phase of ["drain", "feedback", "preserve"] as const) {
+  test(`runner feature shrink after signal during ${phase} keeps original result and source custody`, async () => {
+    const f = await setup(1);
+    const monitoring = f.memory.run();
+    const release = releaseGate();
+    let reached = false, signals = 0;
+    let original: MemoryFlightProof | undefined;
+    let result: import("../src/protocol.js").WorkerMemoryPressureResult | undefined;
+    let command: ReturnType<typeof enroll> | undefined;
+    fs.writeFileSync(homeDir + "/session-proof", "original session");
+    const post = client.postMessages.bind(client);
+    client.postMessages = async (...args) => {
+      if (phase === "feedback" && args[1].some(message => message.payload.event === "worker_memory_pressure")) {
+        reached = true; await release.promise;
+      }
+      return post(...args);
+    };
+    const recover = git.withRecoveryOperation.bind(git);
+    git.withRecoveryOperation = async (signal, deadline, action) => {
+      if (phase === "preserve" && signals === 1 && result) { reached = true; await release.promise; }
+      return recover(signal, deadline, action);
+    };
+    const executor: Executor = {
+      settleForCredentialFreeCapture: async () => ({ kind: "observed_empty" }),
+      run: async ctx => {
+        const captured = ctx.capturedMemory!()!;
+        original = captured.flight as MemoryFlightProof;
+        const entry = captured.commands.register(captured.context, {
+          source: "codex-model-command", toolId: "original-tool", attemptId: "original-attempt",
+          command: "inert fixture", root: { pid: 10, startTime: "10" },
+          observe: async () => {
+            const now = performance.now();
+            return { available: true, complete: true, startedAtMs: now, completedAtMs: now,
+              rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+          },
+          cancel: async authority => { assert.equal(authority.authorized(), true); signals++; },
+          drain: async () => {
+            if (phase === "drain") { reached = true; await release.promise; }
+            return { confirmed: true };
+          },
+        });
+        command = { captured, entry, cancellations: () => signals };
+        f.pressure(950);
+        result = await captured.commands.watchOutcome(entry);
+        ctx.emit({ kind: "tool_result", payload: { tool_id: result.tool_id, result } });
+        throw new Error("quiet retained stop");
+      },
+    };
+    const work = runnerWith(() => ({ executor, homeDir }), fakeGitlab().gitlab, undefined, undefined,
+      { memoryRuntime: f.memory, codexBoundaryDeadlineMs: 1000 }).execute(f.claim);
+    try {
+      await until(() => reached);
+      if (phase === "preserve")
+        await until(() => f.memory.sinkReceipts.some(r => r.context === command!.captured.context && r.kind === "preserve"));
+      assert.equal(signals, 1);
+      // Exercise the public feature-cache writer; heartbeat shrink uses the same replacement.
+      client.protocolFeatures = ["claim_generation_fence"];
+      assert.equal(client.memoryIncarnation, undefined);
+      assert.equal(command!.captured.commands.isCurrent(command!.captured.context), false);
+      if (phase === "feedback" || phase === "preserve")
+        assert.ok(f.memory.sinkReceipts.some(r => r.context === command!.captured.context && r.kind === phase));
+      release.resolve();
+      await work;
+      assert.ok(result);
+      assert.equal(result.code, "worker_memory_pressure");
+      assert.equal(result.command_id, command!.entry.commandId);
+      assert.equal(result.tool_id, "original-tool");
+      assert.equal(result.attempt_id, "original-attempt");
+      assert.equal(result.claim_generation, 7); assert.equal(result.memory_episode, 3);
+      assert.deepEqual(await command!.captured.commands.watchOutcome(command!.entry), result);
+      assert.equal(original!.retainedLocalCustody, true);
+      assert.notEqual(original!.parked, true);
+      assert.equal(fs.readFileSync(homeDir + "/session-proof", "utf8"), "original session");
+      assert.equal(fs.existsSync(worktreeDirFor(2396)), true);
+      assert.equal(f.parkReceipts.length, 0, "feature removal cannot fabricate park acceptance");
+      client.protocolFeatures = ["worker_memory_pressure_v1", "claim_generation_fence"];
+      assert.equal(client.memoryIncarnation, undefined);
+      assert.equal(command!.captured.commands.admitsCommands(command!.captured.context), false);
+      assert.equal(signals, 1); assert.equal(f.reservations.length, 1);
+    } finally {
+      release.resolve(); await work; await f.memory.stop(); await monitoring;
+    }
+  });
+}

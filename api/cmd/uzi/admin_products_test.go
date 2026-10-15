@@ -17,13 +17,13 @@ func adminProductsFixture() []apitypes.ProductDTO {
 	created := time.Date(2026, 9, 1, 10, 0, 0, 0, time.UTC)
 	deleted := created.Add(48 * time.Hour)
 	return []apitypes.ProductDTO{
-		{ID: "p1", Name: "Acme CRM", Description: "Syncs tickets", Enabled: true, CreatedAt: created, ActiveTokenCount: 3, LiveConnectionCount: 7,
+		{ID: "20ccae0e-a921-45ce-9831-f47d8f655ba1", Name: "Acme CRM", Description: "Syncs tickets", Enabled: true, CreatedAt: created, ActiveTokenCount: 3, LiveConnectionCount: 7,
 			OAuthClient: apitypes.ProductOAuthClientDTO{
 				RedirectURIs: []string{"https://acme.example.com/cb"}, Scopes: []string{"jobs:run", "jobs:read"},
 				HasSecret: true, SecretPrefix: "uzs_Ab12", IsClient: true,
 			}},
-		{ID: "p2", Name: "Paused", Enabled: false, CreatedAt: created},
-		{ID: "p3", Name: "Gone", Enabled: false, DeletedAt: &deleted, CreatedAt: created, ActiveTokenCount: 2, LiveConnectionCount: 4},
+		{ID: "20ccae0e-a921-45ce-9831-f47d8f655ba2", Name: "Paused", Enabled: false, CreatedAt: created},
+		{ID: "20ccae0e-a921-45ce-9831-f47d8f655ba3", Name: "Gone", Enabled: false, DeletedAt: &deleted, CreatedAt: created, ActiveTokenCount: 2, LiveConnectionCount: 4},
 	}
 }
 
@@ -45,6 +45,14 @@ func TestAdminProductsTable(t *testing.T) {
 	// CONNECTIONS sits right after ACTIVE_TOKENS and each row's cell under it is that product's
 	// live connection count.
 	hdr := strings.Fields(lines[0])
+	if len(hdr) < 2 || hdr[0] != "NAME" || hdr[1] != "ID" {
+		t.Fatalf("header %q: ID must be right after NAME", lines[0])
+	}
+	for i, pr := range fc.AdminProducts {
+		if !strings.Contains(lines[i+1], pr.ID) {
+			t.Errorf("row %d lacks full product UUID %q: %s", i+1, pr.ID, lines[i+1])
+		}
+	}
 	col := -1
 	for i, h := range hdr {
 		if h == "CONNECTIONS" {

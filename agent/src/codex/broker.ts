@@ -324,6 +324,7 @@ export interface SpawnCommandResult {
  *  closed-over env when `env` is absent. */
 export interface SpawnCommandOptions {
   readonly modelCommand?: ModelCommandMetadata;
+  readonly long_running?: boolean;
   readonly cwd?: string;
   readonly env?: NodeJS.ProcessEnv;
   readonly signal?: AbortSignal;
@@ -727,7 +728,7 @@ export class CodexCallbackBroker {
 
     switch (cap) {
       case "shell":
-        return this.dispatchShell(rt, canonical, args);
+        return this.dispatchShell(rt, canonical, args, origin);
       case "file_write":
         return this.dispatchFileWrite(args);
       case "file_read":
@@ -746,7 +747,7 @@ export class CodexCallbackBroker {
 
   // --- shell ------------------------------------------------------------------
 
-  private async dispatchShell(rt: CallbackRuntimeId, toolName: string, args: unknown): Promise<CallbackResult> {
+  private async dispatchShell(rt: CallbackRuntimeId, toolName: string, args: unknown, origin: CallbackOrigin): Promise<CallbackResult> {
     const command = strField(args, "command");
     if (command === undefined) {
       return deny("bad_args", "Bash requires a non-empty string 'command'");
@@ -768,6 +769,15 @@ export class CodexCallbackBroker {
     }
     if (screen.denied) return deny("shell_denied", screen.reason ?? "denied by guardrail");
 
+    const hasLongRunning = typeof args === "object" && args !== null && Object.hasOwn(args, "long_running");
+    const longRunning = hasLongRunning ? (args as Record<string, unknown>)["long_running"] : undefined;
+    if (hasLongRunning && typeof longRunning !== "boolean") {
+      return deny("bad_args", "Bash 'long_running' must be a boolean");
+    }
+    if (longRunning === true && (origin !== "root" || !this.grants.isRoot)) {
+      return deny("denied_tool", "Bash long_running:true is available only to the root lead");
+    }
+
     const captured = this.opts.capturedMemory;
     if (captured && (!captured.commands.isCurrent(captured.context, captured.flight, captured.lifecycleRevision)
       || !captured.commands.admitsCommands(captured.context))) {
@@ -780,7 +790,7 @@ export class CodexCallbackBroker {
     modelCommands.set(metadata, captured ? Object.freeze({ ...captured }) : undefined);
     let spawned: SpawnCommandResult;
     try {
-      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata });
+      spawned = await this.spawnCommand(["/bin/sh", "-c", command], { cwd: spawnCwd, signal: this.signal, modelCommand: metadata, ...(hasLongRunning ? { long_running: longRunning as boolean } : {}) });
     } catch (err) {
       if (err instanceof CommandDeadlineError) return deny("command_deadline", commandDeadlineMessage(err.deadlineMs));
       throw err;

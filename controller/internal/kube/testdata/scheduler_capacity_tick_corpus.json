@@ -1,0 +1,1835 @@
+[
+  {
+    "name": "affinity",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "all_mounted_old_claims",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "assigned",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "both",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu and memory",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu and memory",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "container_exit",
+    "expected_phase": "stuck",
+    "expected_fixed_reason": "Error",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "seed",
+      "blocking_reason": "Error",
+      "restart_count": 0,
+      "last_exit_code": 1
+    }
+  },
+  {
+    "name": "container_failure",
+    "expected_phase": "stuck",
+    "expected_fixed_reason": "CrashLoopBackOff",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "worker",
+      "blocking_reason": "CrashLoopBackOff",
+      "restart_count": 4,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "container_ready",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "container_restarts",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "worker",
+      "blocking_reason": null,
+      "restart_count": 1,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "container_running",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "container_started",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "containers_ready_conflict",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "control",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "cpu",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "duplicate_containers_ready_false",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "duplicate_deployment_first",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "duplicate_deployment_last",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "duplicate_ready_false",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "duplicate_scheduled",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "duplicate_term",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "eleven_digits",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "empty_hash",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "ephemeral_running",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "excess_count",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "failed_pod",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Failed",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "last_exit",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "maintenance_readiness",
+    "expected_phase": "settled",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "settled",
+      "phase_since": "2026-06-01T12:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Running",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "malformed",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "memory",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient memory",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient memory",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "missing_scheduled",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "mixed_claims_mounted_data_forward",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "mixed_claims_mounted_data_reverse",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "mixed_claims_mounted_nix_forward",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "mixed_claims_mounted_nix_reverse",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "multiple_contradictory",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "multiple_current",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "observation_failed",
+    "expected_phase": "rolling",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "incomplete deployment/pod/ancestry snapshot"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "rolling",
+      "phase_since": null,
+      "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+      "pod_phase": "",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "observation_failed_storage",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "incomplete deployment/pod/ancestry snapshot"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "other_namespace_claim_capacity_first",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "other_namespace_claim_capacity_last",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "deployment missing from snapshot"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "other_namespace_claim_folded_capacity_first",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "other_namespace_claim_folded_capacity_last",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "deployment missing from snapshot"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "other_namespace_current_pod_capacity_first",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "other_namespace_current_pod_capacity_last",
+    "expected_phase": "rolling",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "deployment missing from snapshot"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "rolling",
+      "phase_since": null,
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "overflow",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "oversize",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "pod_only",
+    "expected_phase": "rolling",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "rolling",
+      "phase_since": null,
+      "target_image": "",
+      "pod_phase": "",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "podless_gap",
+    "expected_phase": "rolling",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "rolling",
+      "phase_since": null,
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "podless_replica_failure",
+    "expected_phase": "stuck",
+    "expected_fixed_reason": "FailedCreate",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": null,
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "",
+      "blocking_container": null,
+      "blocking_reason": "FailedCreate",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "preemption",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "preemption_duplicate",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "preemption_truncated",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "preemption_uncovered",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "preemption_unknown",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "preemption_wrong_total",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "ready_conflict",
+    "expected_phase": "settled",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "settled",
+      "phase_since": "2026-06-01T12:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Running",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "ready_unknown",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "replica_failure",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "replica_failure_empty_reason",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "sandbox_False_duplicate",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "sandbox_False_single",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "sandbox_True_duplicate",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "sandbox_True_single",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "sandbox_Unknown_duplicate",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "sandbox_Unknown_single",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "scheduled",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "scheduled_storage",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "suffix",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "taint",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "terminating_deployment",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "terminating_pod",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "three_terms",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "topology",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "truncated",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "uint32_max",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "unbound",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "uncovered",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "unicode",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "unknown",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "unmounted_old_claim",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-nix",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "wrong_hash",
+    "expected_phase": "rolling",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "rolling",
+      "phase_since": null,
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "wrong_scheduled_reason",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "young",
+    "expected_phase": "rolling",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "rolling",
+      "phase_since": "2026-06-01T11:59:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "young_mounted_old_claim",
+    "expected_phase": "stuck",
+    "expected_blocking_kind": "scheduler_capacity",
+    "expected_fixed_reason": "scheduler capacity: insufficient cpu",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": "scheduler capacity: insufficient cpu",
+      "blocking_kind": "scheduler_capacity",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "young_unmounted_old_claim",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": "uzi-hw-11111111-1111-1111-1111-111111111111-data",
+      "blocking_reason": "stranded Pending past 10m0s bind-timeout; no auto-rollback",
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "zero_count",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  },
+  {
+    "name": "zero_nodes",
+    "expected_phase": "stuck",
+    "worker": {
+      "pacing": {
+        "state": "waiting_evidence",
+        "target_image": "harbor.example.com/uzi/agent-base:v1.0.0",
+        "target_version": "1.0.0",
+        "blocking_reason": "API coverage evidence unavailable; explicit recovery required"
+      },
+      "id": "11111111-1111-1111-1111-111111111111",
+      "phase": "stuck",
+      "phase_since": "2026-06-01T11:00:00Z",
+      "target_image": "example.com/agent:1.2.3",
+      "pod_phase": "Pending",
+      "blocking_container": null,
+      "blocking_reason": null,
+      "restart_count": 0,
+      "last_exit_code": null
+    }
+  }
+]

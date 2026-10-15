@@ -1904,7 +1904,7 @@ export interface Memory {
 // owner-scoped intent to create run(s) at future time(s). Mirrors the Go
 // apitypes.ScheduleDTO — snake_case, byte-for-byte.
 
-export type ScheduleTarget = "issue" | "sweep" | "prompt" | "self_improve";
+export type ScheduleTarget = "issue" | "sweep" | "prompt" | "self_improve" | "ci_watch";
 export type ScheduleTiming = "once" | "recurring";
 // active — armed; fired — a `once` schedule that has already fired (terminal);
 // error — parked because its owner/token/repo is gone (surfaced, not dropped).
@@ -1927,7 +1927,18 @@ export type ScheduleSkipReason =
   | "harness_label_invalid"
   | "schedules_paused"
   | "no_usable_credential"
-  | "credential_disabled";
+  | "credential_disabled"
+  | "ci_green"
+  | "ci_already_handled"
+  | "ci_halted_no_progress"
+  | "ci_halted_attempt_cap"
+  | "ci_watched_not_seen"
+  | "ci_unsupported"
+  | "no_default_branch"
+  | "ci_capacity"
+  | "ci_evidence_limited"
+  | "ci_not_failed"
+  | "ci_config_changed";
 
 // One run a persisted fire actually created; issue_iid is null for a prompt schedule.
 export interface LastFireStarted {
@@ -1991,7 +2002,26 @@ export type RunNowResponse = {
   skips: LastFireSkip[];
 };
 
+export interface CIEpisodeDTO {
+  workflow_key: string;
+  last_handled_run_id: number | null;
+  observed_created_at: string | null;
+  observed_updated_at: string | null;
+  observed_run_id: number | null;
+  last_signature: string | null;
+  attempts: number;
+  halted_reason: "no_progress" | "attempt_cap" | null;
+  updated_at: string;
+}
+
+export interface CIEpisodePage {
+  episodes: CIEpisodeDTO[];
+  next_cursor: string | null;
+}
+
 export interface Schedule {
+  ci_workflows?: string[];
+  ci_episodes?: CIEpisodePage;
   remove_label_on_dispatch: boolean;
  capacity_limit: number | null;
  capacity_room_needed: number | null;
@@ -2173,6 +2203,8 @@ export interface ScheduleCatalog {
 // wait_on_limit=true, enabled=true). On PATCH a field present is applied and an
 // absent one is left unchanged, so a per-row enable toggle sends just { enabled }.
 export interface ScheduleInput {
+  // Omitted preserves PATCH selectors; null or [] clears to all workflows.
+  ci_workflows?: string[] | null;
   remove_label_on_dispatch?: boolean;
  capacity_limit?: number | null;
  capacity_room_needed?: number | null;
@@ -2345,6 +2377,12 @@ export interface Worker {
   // literals compile while the wire contract stays a never-null array (pinned by the api-contract
   // parity check against the recorded fixtures).
   reported_runs?: WorkerReportedRun[];
+  // Issue #2009: API-fresh evidence aggregate, independent of the listed snapshot rows.
+  // Explicit zero is authoritative; omitted on an unavailable/failed evidence query.
+  pending_outcome_count?: number;
+  // Fresh overflow evidence, not the historical worker flag. Explicit false is known;
+  // omission means unavailable. True means more outcomes may be pending beyond the count.
+  pending_overflow?: boolean;
   // True for ANY open custody hold, healthy live runs included. Protects local source
   // through deletion, cleanup and hosted-quota safety guards; independent of owner decisions.
   // Optional in TS (mocks/older payloads may omit it); the api always sends it.
@@ -2366,17 +2404,19 @@ export interface Worker {
   // row it describes. upgrade_detail is the sentence behind the badge ("running 0.11.0,
   // target 0.11.7"), null in the steady up_to_date case where there is nothing to say.
   //
-  // Five states, but the api derives only three from a version comparison:
+  // The api derives only three states from a version comparison:
   // up_to_date / outdated / unknown. "upgrading" and "upgrade_failed" require the
   // controller's roll report, because `version` is written ONLY at register — a worker
   // stuck offline mid-roll keeps reporting its OLD version and cannot self-report that
-  // it is stuck. Both arrive with the roll-health fold.
+  // it is stuck. The roll-health fold also distinguishes capacity blocks and initial
+  // provisioning / provisioning_failed from an upgrade of an existing worker.
   //
   // "unknown" is the honest answer, not an error: an unstamped image, an unparseable
   // report, or a "dev" control plane all land here, and none of them should raise an
   // alert.
   upgrade_status:
-    "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed";
+    "up_to_date" | "outdated" | "unknown" | "upgrading" | "upgrade_failed" |
+    "capacity_blocked" | "provisioning" | "provisioning_failed";
   upgrade_detail: string | null;
   // The coordinate this worker was compared AGAINST: the controller's rolled tag for a
   // hosted worker with a fresh report, otherwise the control plane's own version. "" when
@@ -2395,16 +2435,17 @@ export interface Worker {
   // by reporting the fleet's own stale version as the target. The api cannot tell them
   // apart, so the UI states it rather than judging it.
   upgrade_target: string;
-  // The blocking container and the k8s waiting REASON behind an upgrade_failed. Null for
-  // every other status, and null on responses that carry no roll-health join (register,
+  // The blocking container and validated reason behind a failed roll, provisioning,
+  // or scheduler capacity block. Null on responses with no roll-health join (register,
   // heartbeat, create). The reason only — `message` is never sent, being free text that
   // carries paths and Secret names.
+  // Absent on older APIs; null when the current report has no validated cause.
+  upgrade_blocking_kind?: string | null;
   upgrade_blocking_container: string | null;
   upgrade_blocking_reason: string | null;
   // The blocking container's last exit code, null when it never terminated (a different
-  // fact from "exited 0"). It DISCRIMINATES causes the reason alone conflates — a
-  // seed-nix CrashLoopBackOff comes both from a permissions error unpacking the nix store
-  // and from that volume filling up.
+  // fact from "exited 0"). A seed-nix failure can result from permissions or a full
+  // volume; the exit code alone does not distinguish those causes.
   upgrade_last_exit_code: number | null;
   last_heartbeat_at: string | null;
   // api-owned anchor of when the worker became online (null offline); uptime = now − this, derived client-side.
@@ -4978,6 +5019,12 @@ export interface RecoveryCustodyHold {
   // Issue #2545: a hold released by held publication names its publication and forge ref.
   final_publication_id?: string;
   held_ref?: string;
+  // Server-derived admission membership of an OPEN hold (issue #2970). Absent means the
+  // server did not report it (older server, or a non-open hold); absent is never false.
+  counts_toward_admission?: boolean;
+  // Why the server counts or excludes the hold; a closed vocabulary rendered through
+  // admissionReasonLabel, never raw.
+  admission_reason?: string;
 }
 
 // RecoveryCustodyAggregate is the owner-level custody summary the board alert and the

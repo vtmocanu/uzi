@@ -4,7 +4,7 @@ import { stripUnsafeChars } from "../lib/safeText";
 import type { BadgeTone } from "./ui";
 
 /**
- * Per-worker upgrade badge and the Fleet upgrade summary (PRD #113 M5).
+ * Per-worker display-status badge and the fleet status summary (PRD #113 M5).
  *
  * ⚠ ONLY USE COLOUR TOKENS THAT EXIST IN tailwind.config.js. This file shipped with
  * `accent`, `hair` and `base`, none of which are defined — the JIT scanned them and emitted
@@ -22,9 +22,32 @@ import type { BadgeTone } from "./ui";
  * table directly would hand every user a count of other users' failing workers.
  */
 
-/** The attention set (Decision 1): failed or behind. `upgrading` is expected and transient. */
+/** Provisioning and upgrading are expected transitions; failures and lag need attention. */
+export function workerFailed(w: Worker): boolean {
+  return w.upgrade_status === "upgrade_failed" || w.upgrade_status === "provisioning_failed" ||
+    w.upgrade_status === "capacity_blocked";
+}
+
 export function needsAttention(w: Worker): boolean {
-  return w.upgrade_status === "upgrade_failed" || w.upgrade_status === "outdated";
+  return workerFailed(w) || w.upgrade_status === "outdated";
+}
+
+const CAPACITY_RESOURCES = new Map([
+  ["scheduler capacity: insufficient cpu", "CPU"],
+  ["scheduler capacity: insufficient memory", "memory"],
+  ["scheduler capacity: insufficient cpu and memory", "CPU and memory"],
+]);
+
+/** Closed scheduler diagnostics: never interpret free-form messages as a cause. */
+export function workerFailureCause(w: Worker): string | null {
+  if (w.upgrade_status === "capacity_blocked" || w.upgrade_blocking_kind === "scheduler_capacity") {
+    const resources = w.upgrade_blocking_kind === "scheduler_capacity"
+      ? CAPACITY_RESOURCES.get(w.upgrade_blocking_reason ?? "")
+      : undefined;
+    return `${resources ? `The scheduler has insufficient ${resources} for this worker.` : "This worker is waiting for scheduler capacity."} Wait for capacity, choose a smaller worker, or ask an operator to add capacity.`;
+  }
+  if (w.upgrade_blocking_kind && w.upgrade_blocking_kind !== "container") return null;
+  return likelyCause(w.upgrade_blocking_container ?? null, w.upgrade_blocking_reason ?? null, w.upgrade_last_exit_code);
 }
 
 // The mute is NOT rendered here. Its storage and its release key landed with the api
@@ -47,6 +70,9 @@ const PRESENTATION: Record<Worker["upgrade_status"], { label: string; tone: Tone
   outdated: { label: "outdated", tone: "warning" },
   upgrading: { label: "upgrading", tone: "info" },
   upgrade_failed: { label: "upgrade failed", tone: "danger" },
+  capacity_blocked: { label: "waiting for capacity", tone: "warning" },
+  provisioning: { label: "provisioning", tone: "info" },
+  provisioning_failed: { label: "provisioning failed", tone: "danger" },
 };
 
 // upgradePresentation is the one label + tone per upgrade status, or null for `unknown`
@@ -54,7 +80,7 @@ const PRESENTATION: Record<Worker["upgrade_status"], { label: string; tone: Tone
 // Admin Health fleet card (AdminHealth.tsx FleetRow) read it.
 // The tone is typed as the narrow subset actually used; it is assignable to BadgeTone.
 export function upgradePresentation(status: Worker["upgrade_status"]): { label: string; tone: Tone } | null {
-  return PRESENTATION[status];
+  return Object.prototype.hasOwnProperty.call(PRESENTATION, status) ? PRESENTATION[status] : null;
 }
 
 const TONE_CLASS: Record<Tone, string> = {
@@ -211,7 +237,7 @@ export function diagnosticsCommand(workerId: string): string {
 }
 
 /**
- * The detail strip for a worker in the ATTENTION SET — failed OR outdated.
+ * The detail strip for the attention set and initial provisioning progress.
  *
  * It covers both, and that is a correctness requirement rather than symmetry. The badge's
  * `title` is a hover tooltip: no keyboard path, no touch path, and inconsistent
@@ -224,24 +250,23 @@ export function diagnosticsCommand(workerId: string): string {
  * information reaches nobody. jsdom can verify an attribute is correct; it cannot verify
  * anyone can reach it.
  *
- * The failure-specific parts (the likely cause, the kubectl affordance) stay gated on
- * `upgrade_failed` — there is no pod to inspect for a worker that is merely behind.
+ * Failure diagnostics cover roll, provisioning and scheduler failures. Provisioning
+ * progress is also visible without entering the attention set.
  */
 export function WorkerUpgradeDetail({ worker }: { worker: Worker }) {
   // Copy feedback. Without it the button gives NO signal at all, so a reader cannot tell a
   // successful copy from a no-op clipboard — and this command is the one thing they are
   // meant to carry to a terminal.
   const [copied, setCopied] = useState(false);
-  if (!needsAttention(worker)) return null;
-  const failed = worker.upgrade_status === "upgrade_failed";
-  const cause = failed
-    ? likelyCause(worker.upgrade_blocking_container ?? null, worker.upgrade_blocking_reason ?? null, worker.upgrade_last_exit_code)
-    : null;
-  const tone = failed ? "border-danger/30 bg-danger/5" : "border-warn/30 bg-warn/5";
+  if (!needsAttention(worker) && worker.upgrade_status !== "provisioning") return null;
+  const failed = workerFailed(worker);
+  const cause = failed ? workerFailureCause(worker) : null;
+  const presentation = upgradePresentation(worker.upgrade_status);
+  const tone = TONE_CLASS[presentation?.tone ?? "warning"];
   return (
     <div className={`mt-2 rounded border p-2 text-xs ${tone}`}>
-      <div className={`font-medium ${failed ? "text-danger" : "text-warn"}`}>
-        {failed ? "Upgrade failed" : "Outdated"}
+      <div className="font-medium">
+        {presentation ? presentation.label[0].toUpperCase() + presentation.label.slice(1) : "Worker status unknown"}
       </div>
       {/* The api's own sentence, as TEXT — the same string the badge carries as a title,
           rendered where a keyboard and a screen reader can both reach it. */}
@@ -333,13 +358,17 @@ export function fleetSummary(workers: Worker[], cpVersion: string): FleetSummary
     outdated: 0,
     upgrading: 0,
     upgrade_failed: 0,
+    capacity_blocked: 0,
+    provisioning: 0,
+    provisioning_failed: 0,
     unknown: 0,
   };
   let attention = 0;
   let divergentCount = 0;
   const divergentTargets = new Set<string>();
   for (const w of workers) {
-    counts[w.upgrade_status] = (counts[w.upgrade_status] ?? 0) + 1;
+    const status = Object.prototype.hasOwnProperty.call(counts, w.upgrade_status) ? w.upgrade_status : "unknown";
+    counts[status]++;
     if (needsAttention(w)) attention++;
     // A hosted worker whose target is not the control plane's version means the worker
     // image is pinned — deliberately by an operator, or by a controller suppressing
@@ -383,18 +412,26 @@ export function FleetUpgradePanel({
   const classified = workers.length - counts.unknown;
   if (workers.length === 0) return null;
 
-  const segments: { key: Worker["upgrade_status"]; cls: string }[] = [
-    { key: "up_to_date", cls: "bg-ok" },
-    { key: "upgrading", cls: "bg-info" },
-    { key: "outdated", cls: "bg-warn" },
-    { key: "upgrade_failed", cls: "bg-danger" },
-  ];
+  const segmentClasses: Record<Worker["upgrade_status"], string | null> = {
+    up_to_date: "bg-ok",
+    upgrading: "bg-info",
+    outdated: "bg-warn",
+    upgrade_failed: "bg-danger",
+    capacity_blocked: "bg-warn",
+    provisioning: "bg-info",
+    provisioning_failed: "bg-danger",
+    unknown: null,
+  };
+  const segments = (Object.keys(segmentClasses) as Worker["upgrade_status"][]).flatMap((key) => {
+    const cls = segmentClasses[key];
+    return cls ? [{ key, cls }] : [];
+  });
 
   return (
     <section className="mb-4 rounded border border-edge bg-raised p-3" aria-labelledby="fleet-upgrade-heading">
       <div className="flex flex-wrap items-baseline justify-between gap-2">
         <h3 id="fleet-upgrade-heading" className="text-sm font-medium text-fg">
-          Fleet upgrade
+          Fleet status
         </h3>
         <span className="text-xs text-faint">
           {versionPending ? (

@@ -63,6 +63,7 @@ type gitLab struct {
 // allowlist-checked by the caller.
 func newGitLab(baseURL, token string, timeout time.Duration, backoff ...retryablehttp.Backoff) (*gitLab, error) {
 	hc := timeoutClient(timeout)
+	hc.Transport = ciRepairTransport{base: hc.Transport}
 	// Stop at an off-origin redirect instead of failing it: the SDK's retry policy
 	// re-sends a GET whose redirect check errored, five times with backoff.
 	hc.CheckRedirect = createIssueRedirectGuard(redirectguard.StopOffOrigin)

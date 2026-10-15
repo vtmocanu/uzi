@@ -33,6 +33,17 @@ const ALL_SCHEDULE_SKIP_REASONS: ScheduleSkipReason[] = [
   "no_usable_credential",
   "credential_disabled",
   "config_not_supported",
+  "ci_green",
+  "ci_already_handled",
+  "ci_halted_no_progress",
+  "ci_halted_attempt_cap",
+  "ci_watched_not_seen",
+  "ci_unsupported",
+  "no_default_branch",
+  "ci_capacity",
+  "ci_evidence_limited",
+  "ci_not_failed",
+  "ci_config_changed",
 ];
 
 function reasonsFromGo(): string[] {

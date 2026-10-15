@@ -33,14 +33,6 @@ import (
 // version string, tight enough to bound abuse.
 const maxSelfReportedBytes = 64
 
-// maxAdvertisedConcurrentRuns is the sanity ceiling for a worker's self-reported
-// concurrency cap (PRD #42). The cap is observability only — the server enforces no
-// cap — so this is a generous absurd-value guard (far above the documented soft
-// ceiling of 8), NOT a policy limit. A report outside
-// [1, maxAdvertisedConcurrentRuns] is treated as unadvertised (stored NULL), so a
-// hostile/garbled value can never flow into the fleet UI's "N/M runs" math.
-const maxAdvertisedConcurrentRuns = 256
-
 // sanitizeSelfReported bounds an untrusted worker-reported string: trim, drop
 // control AND format characters (so no terminal escape and no bidi override reaches
 // a log, a terminal or the UI), and truncate to max bytes (the length check runs
@@ -263,16 +255,16 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// observability the server never enforces AND it flows into the fleet UI's
 	// "N/M runs" math, so a nonsensical report must be neither trusted nor allowed
 	// to wedge the register-retry loop: accept it only within a sane
-	// [1, maxAdvertisedConcurrentRuns] band, else drop it to NULL (treat as
+	// workersvc.ValidAdvertisedConcurrentRuns band, else drop it to NULL (treat as
 	// unadvertised) with a warn — like a malformed template, never a 400. The worker
 	// validates ≥ 1 and warns above the documented soft ceiling before sending (M2);
 	// this is the server-side backstop against a hostile/garbled report.
-	if req.MaxCrossCheckSlots != nil && (*req.MaxCrossCheckSlots < 0 || *req.MaxCrossCheckSlots > 16) {
+	if req.MaxCrossCheckSlots != nil && !workersvc.ValidAdvertisedCrossCheckSlots(*req.MaxCrossCheckSlots) {
 		httpx.Error(w, http.StatusBadRequest, "max_cross_check_slots must be between 0 and 16")
 		return
 	}
 	advertisedCap := req.MaxConcurrentRuns
-	if advertisedCap != nil && (*advertisedCap < 1 || *advertisedCap > maxAdvertisedConcurrentRuns) {
+	if advertisedCap != nil && !workersvc.ValidAdvertisedConcurrentRuns(*advertisedCap) {
 		slog.Warn("worker reported an out-of-range max_concurrent_runs; dropping", "worker_id", wkr.ID.String(), "value", *advertisedCap)
 		advertisedCap = nil
 	}
@@ -280,12 +272,9 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 	// Decision 4: ClaimRun's is_ephemeral/ephemeral_run_id clause), so its effective
 	// run-lane cap is 1 whatever it advertises (absent, 2, out of range). Clamped
 	// here, server-side, so the stored cap does not depend on the worker image
-	// version; heartbeats never write the cap (only RegisterWorker does), so this is
-	// the one place it is set. Persistent workers keep their advertised cap (issue #1624).
-	if wkr.Ephemeral {
-		one := 1
-		advertisedCap = &one
-	}
+	// version. Protocol refresh shares this clamp after validating its raw input.
+	// Persistent workers keep their advertised cap (issue #1624).
+	advertisedCap = workersvc.EffectiveConcurrentRuns(advertisedCap, wkr.Ephemeral)
 	// A register-carried snapshot is parsed only when the feature is enabled; #1390's worker
 	// never sends one, so this is nil in practice (the path is #1391's). An unparseable body
 	// yields nil (dropped, logged) — never a register failure.
@@ -374,7 +363,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 }
 
 // protocolFeatures is the set of optional wire-protocol behaviours this api implements,
-// advertised on the register response — the shared negotiation wire the worker reads to
+// advertised on register and successful heartbeat responses — the negotiation wire workers read to
 // decide which gated heartbeat/message extensions to send. Composed as a UNION of per-PRD
 // slices, deduped — NEVER a single literal a sibling PRD would overwrite.
 //
@@ -409,6 +398,7 @@ func (h *Handler) WorkerRegister(w http.ResponseWriter, r *http.Request) {
 // worker never sends the snapshot — the same shape an old worker sees.
 func protocolFeatures(activeSnapshotEnabled, heldPublicationEnabled bool) []string {
 	groups := [][]string{
+		{"heartbeat_protocol_refresh_v1"},
 		{"dind_maintenance_v1"},
 		{"worker_memory_pressure_v1"},
 		{"recovery_park_cause", "recovery_release_exact_echo", "recovery_inventory_v1", "recovery_completed_publication_v1", "recovery_archive_redundancy_v1"}, // PRD #1392 M1; issue #2625 adds the redundancy route
@@ -501,8 +491,9 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// bad telemetry number becoming a self-DoS. Liveness must never hinge on telemetry
 	// hygiene, so the stats are parsed defensively in a second step below.
 	var req struct {
-		Version string          `json:"version"`
-		Stats   json.RawMessage `json:"stats"`
+		Version         string          `json:"version"`
+		Stats           json.RawMessage `json:"stats"`
+		ProtocolRefresh json.RawMessage `json:"protocol_refresh"`
 		// Outbox is the per-run outbox depth (PRD #1391 M5), its OWN isolated
 		// json.RawMessage exactly like Stats and for the same reason: a malformed or
 		// oversized report must drop the depth WITHOUT failing the heartbeat's liveness.
@@ -562,7 +553,7 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 	// Recorded on EVERY heartbeat: an absent or invalid member yields nil, which clears
 	// the worker's tracked latch (the worker's own state, tick by tick).
 	h.wsvc.RecordResidueQuarantine(wkr.ID, parseWorkerResidueQuarantine(req.ResidueQuarantine, wkr.ID, h.clock()))
-	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox, snapshot)
+	updated, err := h.wsvc.Heartbeat(r.Context(), wkr, stats, outbox, snapshot, workersvc.ParseProtocolRefresh(req.ProtocolRefresh))
 	if err != nil {
 		slog.Error("worker heartbeat", "error", err)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
@@ -608,7 +599,11 @@ func (h *Handler) WorkerHeartbeat(w http.ResponseWriter, r *http.Request) {
 			return
 		}
 	}
-	response := map[string]any{"worker": dto}
+	response := map[string]any{
+		"worker":                    dto,
+		"protocol_features":         protocolFeatures(!h.cfg.ActiveSnapshotDisabled, h.cfg.HeldPublication),
+		"worker_outbox_max_pending": h.cfg.WorkerOutboxMaxPending,
+	}
 	if slices.Contains(updated.ProtocolCapabilities, capability.DindMaintenanceV1) {
 		response["dind_maintenance"] = maintenance
 	}

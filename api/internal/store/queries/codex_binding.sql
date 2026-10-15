@@ -341,8 +341,11 @@ WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cau
 -- fresh capability. RETURNING codex_claim_epoch hands back the PERSISTED post-bump epoch
 -- so the caller wires the capability off the value actually stored, not a re-derived one;
 -- a caller that no longer owns the run matches no row → pgx.ErrNoRows. The revocation half
--- lives in every claimed→queued path in runtime.sql (the three Requeue* queries plus
--- SweepClaimedNeverStarted), which clear the hash + bump the epoch on ownership loss.
+-- fences every successful ClaimRun in runtime.sql: it clears the hash and bumps the
+-- epoch atomically with claim_generation, including same-worker claims. This mint bumps
+-- the epoch again. RequeueRunsOfStaleWorkers and SweepClaimedNeverStarted are provisional
+-- same-generation requeues: they preserve hash and epoch for re-adoption, while queued
+-- suspends all credential scopes (#2988 reversal of PRD #1147). Other revocations remain.
 -- PRD #1147 F7 (defense-in-depth) extends the same revoke to the park/promote paths that
 -- likewise leave a run without a live owner: RequeueClaimAssemblyExact (claimed→pool_wait hold),
 -- PromotePoolWaitRun (pool_wait→queued), and PromoteLimitWaitRuns (limit_wait→queued).
@@ -353,9 +356,9 @@ WHERE runs.id = @id AND runs.status = 'recovery_wait' AND runs.recovery_wait_cau
 -- actively-claimed statuses ('claimed','running','awaiting_approval','awaiting_input',
 -- 'awaiting_followup'). The authorization status map in codexauthz.go additionally
 -- admits revoked parks; their hash and epoch deny credential operations. It EXCLUDES the non-executing states (queued/pool_wait and the terminals):
--- a run requeued out from under the worker (RequeueClaimedRunToQueued / SweepClaimedNeverStarted
--- in runtime.sql clear the cap + bump the epoch but RETAIN worker_id) would otherwise still
--- match on worker_id and let the departed worker re-mint a fresh capability. Closing this
+-- a queued run retains worker_id for affinity, including provisional requeues that preserve
+-- hash and epoch, and would otherwise still match on worker_id and let the worker re-mint
+-- a fresh capability while credential use is suspended. Closing this
 -- requeue TOCTOU: a 0-row match now surfaces as pgx.ErrNoRows → errRunVanished in the caller,
 -- which is the desired outcome.
 --

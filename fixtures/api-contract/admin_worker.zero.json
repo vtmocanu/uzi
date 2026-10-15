@@ -24,6 +24,7 @@
   "upgrade_status": "",
   "upgrade_detail": null,
   "upgrade_target": "",
+  "upgrade_blocking_kind": null,
   "upgrade_blocking_container": null,
   "upgrade_blocking_reason": null,
   "upgrade_last_exit_code": null,

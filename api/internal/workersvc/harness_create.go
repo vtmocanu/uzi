@@ -151,13 +151,23 @@ func (s *Service) createRunResolved(ctx context.Context, userID uuid.UUID, expli
 }
 
 // ResolveHarnessForUser resolves the harness a user's next run WOULD get under D11 (PRD #1429 M2),
-// reads-only and outside any transaction. It is the exported door the scheduler's fire-time
-// codex+override conflict gate and the schedule create/edit override validator use to learn the
-// effective harness; the authoritative atomic resolution still happens inside createRunAtomic at
+// reads-only through the service's pool. The scheduler's fire-time codex+override conflict
+// gate uses it; schedule validators use ResolveHarnessForUserOn with their query surface.
+// The authoritative atomic resolution still happens inside createRunAtomic at
 // fire/create. explicit is a pinned selection (nil for implicit). It returns the resolver's typed
 // refusals (ErrNoCredentialForHarness / ErrNoUsableCredential) unchanged.
 func (s *Service) ResolveHarnessForUser(ctx context.Context, userID uuid.UUID, explicit *Harness) (Harness, error) {
 	res, err := s.resolveRunHarness(ctx, userID, explicit)
+	if err != nil {
+		return "", err
+	}
+	return res.Harness, nil
+}
+
+// ResolveHarnessForUserOn uses the caller's queries for all availability and preference
+// reads. Schedule edits holding a transaction must not acquire another pool connection.
+func (s *Service) ResolveHarnessForUserOn(ctx context.Context, q *store.Queries, userID uuid.UUID, explicit *Harness) (Harness, error) {
+	res, err := s.resolveRunHarnessQ(ctx, userID, explicit, q)
 	if err != nil {
 		return "", err
 	}

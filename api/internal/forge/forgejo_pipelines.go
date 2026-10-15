@@ -123,9 +123,14 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 	if err != nil {
 		return nil, err
 	}
+	ctx = markCIJSON(ctx)
+	c, err = f.newClient(ctx)
+	if err != nil {
+		return nil, err
+	}
 	opt := gitea.ListRepoActionJobsOptions{ListOptions: gitea.ListOptions{Page: 1, PageSize: forgejoPerPage}}
 	wrap := func(e error) error { return f.wrapErr("list pipeline jobs", e) }
-	return paginate(wrap, func(page int) ([]Job, int, error) {
+	return paginateCIJobs(ctx, forgejoPerPage, wrap, func(page int) ([]Job, int, error) {
 		opt.Page = page
 		jobs, resp, err := c.ListRepoActionRunJobs(slug.owner, slug.repo, pipelineID, opt)
 		if err != nil {
@@ -135,6 +140,9 @@ func (f *forgejo) ListPipelineJobs(ctx context.Context, projectID, pipelineID in
 		if jobs != nil {
 			for _, j := range jobs.Jobs {
 				if j == nil {
+					if b := ciBudget(ctx); b != nil {
+						return nil, 0, b.fail("invalid job identity")
+					}
 					continue
 				}
 				items = append(items, toForgejoJob(j))
@@ -191,8 +199,8 @@ func (f *forgejo) JobLogTail(ctx context.Context, projectID, jobID int64, maxByt
 }
 
 // ProjectCIConfigPath returns the empty string: Gitea/Forgejo Actions has no
-// ci_config_path override, so callers get the driver's default. Runtime auto-fix
-// parity is GitLab-only (PRD #71 Out-of-Scope); this satisfies the interface.
+// ci_config_path override, so callers get the driver's default. The auto CI-fix guard
+// still protects this forge's workflow directory through its always-included floor.
 func (f *forgejo) ProjectCIConfigPath(context.Context, int64) (string, error) {
 	return "", nil
 }

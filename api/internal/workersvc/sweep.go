@@ -442,6 +442,13 @@ func (s *Service) Sweep(ctx context.Context) (SweepResult, error) {
 	// heartbeating) without a graceful delete has its stale depth age out here, which
 	// is also how the "queued on the worker" health reason clears for an offline worker.
 	s.outbox.prune(now)
+	// One indexed batch per sweep bounds cleanup work independently of health settings.
+	// Failure is best-effort and does not block the remaining sweep steps.
+	if _, err := s.q.PruneExpiredPendingOutcomeIdentities(ctx, store.PruneExpiredPendingOutcomeIdentitiesParams{
+		ExpiredAt: pgconv.Time(now), BatchSize: 256,
+	}); err != nil {
+		slog.Warn("prune expired pending outcome identities failed", "error", err)
+	}
 	// Same bound for the residue-quarantine tracker (issue #2213).
 	s.quarantine.prune(now)
 

@@ -45,6 +45,14 @@ describe("command-lifetime and worker-toolbox rules reach every agent", () => {
     assert.match(append, /terminating background descendants before returning/);
     assert.match(append, /do not background a gate and expect to poll it later/);
     assert.match(append, /Run one long gate in the foreground/);
+    assert.match(append, /finite 60-minute bound/);
+    assert.match(append, /Only the root lead may set/);
+    assert.match(append, /long_running: true/);
+    assert.match(append, /fixed 120-minute bound/);
+    assert.match(append, /Child agents cannot/);
+    assert.match(append, /Read on its known log path/);
+    assert.match(append, /no[\s\S]*automatic extension or per-command cancel API/);
+    assert.match(append, /run wall parks the run/);
     assert.ok(append.includes('echo "EXIT=$rc"'));
     assert.match(append, /After that command call exits, read the printed log path in a separate call/);
     assert.ok(!append.includes(CLAUDE_LONG_COMMAND_APPEND));

@@ -194,6 +194,13 @@ const (
 	// (#1626) every new unseeded Claude or Codex issue run is interlocked, so this fires
 	// whenever such a run's owner has no protocol-capable worker online.
 	reasonNoCompletionCapableWorker = "no online worker implements the completion interlock (completion_interlock_v1); provision a capable worker"
+	// reasonNoCIConfigGuardCapableWorker (PRD #2865) is emitted for a GUARDED queued run
+	// (runs.ci_config_guard, a default-branch CI repair) whose owner has NO online worker
+	// self-reporting 'ci_config_guard_v1'. Like reasonNoCompletionCapableWorker it names a
+	// NON-BYPASSABLE block: ClaimRun's standalone guard clause sits outside fn_worker_can_claim,
+	// required_capabilities and the capability-aware kill-switch, so an all-old-image fleet
+	// leaves the run queued until a worker that enforces the guard comes online.
+	reasonNoCIConfigGuardCapableWorker = "no online worker enforces the CI-config push guard (ci_config_guard_v1); provision a capable worker"
 	// reasonNoCodexCapableWorker (PRD #1332 M5A, D3) is emitted for a CODEX-INDICATING queued run
 	// (harness='codex', or a surviving M1 binding sentinel) whose owner has NO online worker
 	// advertising the 'codex_harness_v1' protocol capability. Like reasonNoCompletionCapableWorker
@@ -1134,6 +1141,17 @@ func (s *Service) queuedReason(ctx context.Context, now time.Time, r store.ListA
 			slog.Error("health: count online workers satisfying completion protocol", "run_id", r.ID, "error", perr)
 		} else if p == 0 {
 			return reasonNoCompletionCapableWorker
+		}
+	}
+	// PRD #2865: a GUARDED run (ci_config_guard) whose owner has NO online worker reporting
+	// ci_config_guard_v1 is genuinely UNPLACEABLE: ClaimRun's standalone guard clause can never be
+	// satisfied. Same placement and degrade rules as the completion-protocol rung above.
+	if r.CiConfigGuard {
+		g, gerr := s.q.CountOnlineWorkersSatisfyingCIConfigGuard(ctx, r.UserID)
+		if gerr != nil {
+			slog.Error("health: count online workers satisfying CI-config guard", "run_id", r.ID, "error", gerr)
+		} else if g == 0 {
+			return reasonNoCIConfigGuardCapableWorker
 		}
 	}
 	// PRD #1332 M5A (D3): a CODEX-INDICATING run whose owner has NO online worker advertising the

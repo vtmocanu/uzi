@@ -2,9 +2,9 @@
 
 **Issue:** [#1229](https://github.com/vtmocanu/uzi/issues/1229)
 **Parent epic:** [#1225](https://github.com/vtmocanu/uzi/issues/1225)
-**Status:** Planned, blocked on #1226 and #1228.
+**Status:** Not planned (2026-10-15, epic #2746). Optional cross-worker provider-conversation continuity is outside automatic source settlement; no claim that Git recovery already preserves reasoning. Reopen before reactivating this historical design.
 **Priority:** High.
-**Execution:** Keep `Planned` without `uzi`. Add `uzi` only after #1228 merges and main CI is green.
+**Execution:** Inactive; do not add dispatch labels from this historical plan. Preserve current Git/custody and honest same_worker_only/context-unavailable guarantees. Reopening requires a fresh maintainer decision and dependency review.
 
 This child replaces #1226's honest `same_worker_only` completion-hold context with a durable `run_hold` consumer of #1228. It does not implement #1214's PR-session lifecycle. No implementation or validation may modify `.github/workflows/**`.
 

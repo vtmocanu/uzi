@@ -601,6 +601,33 @@ async function fleetRow(name: string): Promise<HTMLElement> {
 
 describe("AdminHealth — Fleet card (M5)", () => {
   it.each([
+    ["capacity_blocked", "waiting for capacity"],
+    ["provisioning_failed", "provisioning failed"],
+  ] as const)("shows blocking diagnostics for %s", async (status, label) => {
+    await renderHealth(healthySilentDoc(), [fleetWorker({
+      name: "new-worker", upgrade_status: status, upgrade_blocking_kind: "scheduler_capacity",
+      upgrade_blocking_reason: "scheduler capacity: insufficient memory",
+    })]);
+    const row = await fleetRow("new-worker");
+    expect(within(row).getByText(label)).toBeTruthy();
+    expect(within(row).getByText("scheduler capacity: insufficient memory").getAttribute("title"))
+      .toContain("insufficient memory");
+  });
+
+  it("preserves provisioning storage blockers and safely hides a future status badge", async () => {
+    await renderHealth(healthySilentDoc(), [
+      fleetWorker({ id: "storage", name: "storage", upgrade_status: "provisioning_failed",
+        upgrade_blocking_container: "seed-nix", upgrade_blocking_reason: "CrashLoopBackOff" }),
+      fleetWorker({ id: "future", name: "future", upgrade_status: "toString" as AdminWorker["upgrade_status"] }),
+    ]);
+    const storage = await fleetRow("storage");
+    expect(within(storage).getByText("provisioning failed")).toBeTruthy();
+    expect(within(storage).getByText("seed-nix: CrashLoopBackOff").getAttribute("title"))
+      .toContain("/nix volume running out of space");
+    expect(within(await fleetRow("future")).getByText("none")).toBeTruthy();
+  });
+
+  it.each([
     { name: "DinD-only sample", pending: true, sample: true, ephemeral: false },
     { name: "operation without a sample", pending: true, sample: false, ephemeral: false },
     { name: "ephemeral pressure report", pending: true, sample: true, ephemeral: true },

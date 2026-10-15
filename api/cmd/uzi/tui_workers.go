@@ -287,12 +287,22 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	renderer := &tuiRenderer{}
 	var items []attnItem
 	add := func(sev int, short, detail string) { items = append(items, attnItem{sev, short, detail}) }
-	if w.UpgradeStatus == "upgrade_failed" {
-		detail := "✕ upgrade failed: " + renderer.Plain(t.blockingContainer, 200) + " · " + renderer.Plain(t.blockingReason, 200) + " · " + renderer.Plain(t.upgradeDetail, 200) + " · target " + renderer.Plain(t.upgradeTarget, 200) + ", running " + renderer.Plain(t.workerVersion, 200)
+	if workerRollFailure(w.UpgradeStatus) {
+		label := workerRollLabel(w.UpgradeStatus)
+		detail := "✕ " + label + ": " + renderer.Plain(t.blockingContainer, 200) + " · " + renderer.Plain(t.blockingReason, 200) + " · " + renderer.Plain(t.upgradeDetail, 200) + " · target " + renderer.Plain(t.upgradeTarget, 200) + ", running " + renderer.Plain(t.workerVersion, 200)
 		if w.UpgradeLastExitCode != nil {
 			detail += fmt.Sprintf(" · exit %d", *w.UpgradeLastExitCode)
 		}
-		add(0, "✕ upgrade failed", detail)
+		if remedy := workerCapacityRemedy(w); remedy != "" {
+			detail = "✕ " + label + ": " + renderer.Plain(t.blockingReason, 200)
+			add(0, "✕ "+label, detail)
+			add(2, "capacity remedy", remedy)
+		} else {
+			add(0, "✕ "+label, detail)
+		}
+	}
+	if w.UpgradeStatus == "provisioning" {
+		add(2, "◌ provisioning", "◌ provisioning")
 	}
 	if w.OutboxBlocked != nil {
 		detail := "✕ outbox blocked: " + renderer.Plain(t.outboxBlockedText, 200)
@@ -327,10 +337,35 @@ func workerAttention(r workerRow, now time.Time) []attnItem {
 	if w.CustodyDecisionsNeeded != nil && *w.CustodyDecisionsNeeded > 0 {
 		add(1, "⚑ unpublished work", "⚑ unpublished work needs an owner decision")
 	}
-	for _, run := range w.ReportedRuns {
-		if run.TerminalPending {
-			text := "◷ outcome pending " + workerAge(run.TerminalPendingSince, now)
-			add(1, text, text+" · not yet delivered/acknowledged")
+	if w.PendingOutcomeCount != nil || w.PendingOverflow != nil {
+		pending := int64(0)
+		for _, run := range w.ReportedRuns {
+			if run.TerminalPending {
+				pending++
+			}
+		}
+		if w.PendingOutcomeCount != nil {
+			pending = *w.PendingOutcomeCount
+		}
+		text := ""
+		if w.PendingOverflow != nil && *w.PendingOverflow {
+			text = fmt.Sprintf("%d confirmed pending; more may be pending", pending)
+		} else if pending > 0 {
+			noun := "pending outcomes"
+			if pending == 1 {
+				noun = "pending outcome"
+			}
+			text = fmt.Sprintf("%d %s", pending, noun)
+		}
+		if text != "" {
+			add(1, text, text)
+		}
+	} else {
+		for _, run := range w.ReportedRuns {
+			if run.TerminalPending {
+				text := "◷ outcome pending " + workerAge(run.TerminalPendingSince, now)
+				add(1, text, text+" · not yet delivered/acknowledged")
+			}
 		}
 	}
 	if w.OutboxPendingMessages != nil && *w.OutboxPendingMessages > 0 {
@@ -733,7 +768,7 @@ func (m tuiModel) workerTableWidths(rows []workerRow, width int) workerTableWidt
 		}
 		columns.memory = max(columns.memory, visualWidth(text))
 		marker := 0
-		if row.w.UpgradeStatus == "outdated" || row.w.UpgradeStatus == "upgrade_failed" {
+		if row.w.UpgradeStatus == "outdated" || workerRollFailure(row.w.UpgradeStatus) {
 			marker = 1
 		}
 		columns.version = max(columns.version, visualWidth(m.renderer.Plain(workerTextOf(row).workerVersion, 18))+marker)
@@ -797,7 +832,7 @@ func (m tuiModel) workerRowLine(r workerRow, selected bool, width int, columns w
 		case "outdated":
 			marker = "↑"
 			verC = m.pal.stall
-		case "upgrade_failed":
+		case "upgrade_failed", "capacity_blocked", "provisioning_failed":
 			marker = "✕"
 			verC = m.pal.alarm
 		}

@@ -153,7 +153,7 @@ A `ci_fix` run rides PRD #4's run machinery as a second run **kind** (`runs.kind
 
 **Verification** ("uzi verifies its work"): the pipeline sync stamps a `ci_fix` run's `fix_verdict` — `verified` when its post-fix pipeline passes, `fix_failed` when it fails — keyed on `runs.branch` (the fix branch, not the failed ref, which differ for a default-branch fix) with an `observed pipeline id > snapshot pipeline id` guard so the original failing pipeline never false-stamps. See [docs/configuration.md](docs/configuration.md#ci-status-integration-prd-6) for the env knobs and the documented residual risks (poll-based staleness, third-party secrets in logs, merge-result false-positives).
 
-**Automatic fixes (PRD #71)** extend this with an opt-in per-user trigger (`users.ci_autofix_enabled`, default off): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved (subject to the owner's [Plan cross-check](#plan-cross-check) snapshot), when a watched **agent-owned MR branch**'s pipeline fails and its owner opted in. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
+**Automatic fixes (PRD #71)** extend this with a trigger that is on by default (per-user tri-state opt-out `users.ci_autofix_enabled`, NULL inheriting the instance default; instance kill-switch `ci_autofix_enabled`, default on): a `CIAutoFix` detector on the same poller tick (after the pipeline sync) auto-queues the identical `ci_fix` run, auto-approved (subject to the owner's [Plan cross-check](#plan-cross-check) snapshot), when a watched **agent-owned MR branch**'s pipeline fails and its owner has not opted out. `main`, the repo's default branch, and any non-MR ref are never eligible; only a branch an agent run itself produced is. A loop guard bounds retries (a per-branch attempt cap `CI_AUTOFIX_MAX_ATTEMPTS`, plus an early halt on a repeated failure signature), and a fix whose diff touches the CI config (`.gitlab-ci.yml`, `.gitlab/`, the GitHub, Forgejo and Gitea workflow directories, the project's configured CI config path) is parked for human approval with a fail-closed worker push guard as backstop. The manual **Fix CI** button remains the escape hatch. See [docs/ci-autofix.md](docs/ci-autofix.md) for the loop-guard rationale, the user-facing behavior, and the knobs.
 
 ### MR review watcher: auto-rework review comments (PRD #700)
 
@@ -1472,13 +1472,33 @@ chain in the diagram above, with no intervening `running`.
   exact old-journal clearing, while lost proof retains remaining artifacts.
   See [ADR-1296](adr/1296-durable-run-recovery.md) and
   [ADR-2417](adr/2417-guarded-local-retention.md) for the dated amendments.
-  Older/successor holds and unstamped older completions gain no authority;
+  Older/successor holds and unstamped older completions gain no completed-publication authority;
   failed/cancelled/parked runs and other kinds keep their existing policy.
+  A separate server-discard phase (#2506, maintainer decision 2026-10-14)
+  follows ordinary polling using the original parent context: 30 seconds,
+  at most 100 repository visits/attempts, one run-keyset candidate per visit,
+  and a five-second fresh exact recorded-MR observation. Historical cached-merged
+  and issue-less completed runs qualify without trusting cached state. Recovery
+  shares the handler's service (wired before polling), rechecks the exact
+  owner/repo/connection/project/forge/base URL/MR/run/completed-generation binding
+  under locks, then discards earlier OPEN holds with immutable
+  `merged_predecessor_discard` audit evidence. This includes nonancestor aggregates;
+  it supplies no ancestry, archive FINAL or completed-publication receipt.
+  Non-ready captures are cleaned up atomically; available bytes, prerequisites,
+  TTL and export survive. Existing discard semantics reduce counts/hotlists.
+  This grants no new worker source-deletion authority or worker/PVC fence/retention
+  guarantee beyond existing owner-discard lifecycle consequences. Operator-only
+  #1786 physical disposal and guards remain; Option D's local-source and
+  available-archive disposal is deferred to #2823/#1373. #2506 is partial,
+  nonclosing. See [ADR-2506](adr/2506-merged-predecessor-discard.md) for cursors,
+  accepted tick coalescing, inherited response-byte risk, migration CHECK scans
+  under ACCESS EXCLUSIVE and rollback refusal to erase audit evidence.
   A completed run's guarded archive can expire early as `published_redundant`
   when the API proves through the forge that the run's published branch already
   contains everything it retains (#2625; worker claim, API proof, bytes and
   count slot freed). See the [ADR-2417 amendment](adr/2417-guarded-local-retention.md#amendment-2026-10-11--published-redundancy-early-expiry-2625).
   A `failed` run's held work is instead published to a run-scoped forge ref, `refs/uzi-held/<run-id>/<generation>`, by the API with the owner's stored connection before custody is released, with the archive as fallback (#2545); see [docs/run-recovery.md](docs/run-recovery.md#publishing-a-failed-runs-held-work).
+  The planned automatic-settlement programme, its approved policy changes, child issue order and remaining acceptance are recorded in [PRD #2746](prds/2746-automatic-hold-settlement.md). This is a programme record, not a claim that its pending children have shipped.
   Archive-path dirty/unverified source, unproven quiescence, pending final ACK or feature
   loss after guard latching retains custody with bounded retry. Credential-free
   boot cannot auto-capture dirty source. Unguarded APIs can retain local pins
@@ -2240,14 +2260,19 @@ The api folds both into one derived `upgrade_status` on the worker DTO, computed
 time and never stored, so it cannot go stale against the row it describes. Three separate
 timestamps make that safe, and collapsing any pair reopens a specific hole: the
 controller's own clock is display-only, the api stamps its own receipt time to drive
-signal freshness, and a third column anchors a ceiling on how long a controller may be
-believed about one roll — cleared only by the worker's own authenticated re-registration
-moving its version. Roll-health rows are reachable only by joining through `workers`,
+signal freshness, and a third column anchors a ceiling on transient upgrading progress,
+cleared only by the worker's own authenticated re-registration moving its version.
+Fresh stuck failures remain visible beyond that progress ceiling. Roll-health rows are reachable only by joining through `workers`,
 which is what makes the per-user scoping unavoidable.
 
 Rationale, the decision log, and the alternatives that were rejected are in
 `prds/done/113-worker-upgrade-status.md`. The user-facing behaviour is
 [docs/worker-upgrades.md](docs/worker-upgrades.md).
+
+Scheduler-capacity and first-provision diagnosis preserve the existing wire phases
+and display-only boundary. The optional typed cause, strict parser, mixed-version
+persisted-signal revalidation and outstanding maintainer acceptance are recorded in
+[ADR-2419](adr/2419-scheduler-capacity-roll-cause.md).
 
 ### Worker image tag: decoupled from appVersion, drained instead of hard-killed (PRD #422)
 

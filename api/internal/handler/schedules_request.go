@@ -1,10 +1,13 @@
 package handler
 
 import (
+	"encoding/json"
 	"fmt"
 	"net/http"
 	"strings"
 	"time"
+	"unicode"
+	"unicode/utf8"
 
 	"github.com/google/uuid"
 	"github.com/jackc/pgx/v5/pgtype"
@@ -16,6 +19,15 @@ import (
 	"github.com/vtmocanu/uzi/api/internal/schedtmpl"
 	"github.com/vtmocanu/uzi/api/internal/store"
 	"github.com/vtmocanu/uzi/api/internal/workersvc"
+)
+
+// Bounds on a ci_watch schedule's workflow selector list (PRD #2865). They mirror the
+// ci_watch_episodes admission and the apitypes.OptionalCIWorkflows contract.
+const (
+	maxCIWorkflows      = 20
+	maxCIWorkflowBytes  = 200
+	ciRepairCatalogSlug = "ci-repair"
+	validTargetsMessage = "target must be one of: issue, sweep, prompt, ci_watch"
 )
 
 // schedules_request.go holds request-to-row mapping: validation, defaulting, merge
@@ -30,7 +42,7 @@ import (
 //
 // allowSelfImprove gates the self_improve target (PRD #590 follow-up, item 1): a
 // self_improve schedule is catalog-enable-only, so a DIRECT create (POST /schedules) must
-// keep returning the same "target must be one of: issue, sweep, prompt" 400 (pass false),
+// keep returning the same "target must be one of: issue, sweep, prompt, ci_watch" 400 (pass false),
 // while a user-origin CLONE reconfiguring its own row routes its config PATCH through this
 // validator and must be accepted. The patch/merge caller passes true ONLY when the row is
 // already self_improve (cur.Target == "self_improve"), so editing an existing self_improve
@@ -93,6 +105,19 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		n.OutputMode = nil
 	}
 
+	// ci_workflows (PRD #2865) is ci_watch-only. Normalize and bound it here, above the
+	// per-target switch; the ci_watch arm keeps it, every other arm rejects a present value.
+	if n.CIWorkflows.Present {
+		clean, status, msg := normalizeCIWorkflows(n.CIWorkflows.Value)
+		if status != 0 {
+			return n, status, msg
+		}
+		n.CIWorkflows.Value = clean
+	}
+	if n.Target != "ci_watch" && len(n.CIWorkflows.Value) > 0 {
+		return n, http.StatusBadRequest, "ci_workflows is only valid for a ci_watch schedule"
+	}
+
 	switch n.Target {
 	case "issue":
 		if n.IssueIID == nil || *n.IssueIID <= 0 {
@@ -144,6 +169,36 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 				return n, http.StatusBadRequest, "output_mode must be one of: mr, issues"
 			}
 		}
+	case "ci_watch":
+		// A ci_watch schedule watches default-branch CI (PRD #2865). It carries no issue,
+		// selector labels, sweep cap or output mode; its instruction is the prompt, which
+		// defaults to the ci-repair catalog body when left blank.
+		if n.IssueIID != nil {
+			return n, http.StatusBadRequest, "issue_iid is not valid for a ci_watch schedule"
+		}
+		if len(nonBlankLabels(n.Labels)) > 0 {
+			return n, http.StatusBadRequest, "labels are not valid for a ci_watch schedule"
+		}
+		n.Labels = nil
+		if n.MaxIssues != nil {
+			return n, http.StatusBadRequest, "max_issues is only valid for a sweep schedule"
+		}
+		if n.OutputMode != nil {
+			return n, http.StatusUnprocessableEntity, "output_mode is only valid for a prompt schedule"
+		}
+		if n.Guidance != nil {
+			return n, http.StatusBadRequest, "guidance is not valid for a ci_watch schedule"
+		}
+		if strings.TrimSpace(n.Prompt) == "" {
+			job, ok := schedtmpl.BySlug(ciRepairCatalogSlug)
+			if !ok {
+				return n, http.StatusInternalServerError, "internal error"
+			}
+			n.Prompt = job.Prompt
+		}
+		if len(n.Prompt) > workersvc.MaxIssueDescriptionBytes {
+			return n, http.StatusUnprocessableEntity, "prompt is too large to run"
+		}
 	case "self_improve":
 		// A self_improve schedule is catalog-enable-only: a DIRECT create (POST /schedules)
 		// stays rejected (defense in depth), but a user-origin CLONE (CloneSchedule) is a valid
@@ -151,7 +206,7 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		// must be accepted. allowSelfImprove is true only on the patch/merge caller.
 		// (PRD #590 follow-up, item 1.)
 		if !allowSelfImprove {
-			return n, http.StatusBadRequest, "target must be one of: issue, sweep, prompt"
+			return n, http.StatusBadRequest, validTargetsMessage
 		}
 		// A self_improve row carries only cadence/model — no issue_iid/labels/prompt and no
 		// sweep cap (mirrors the issue/prompt arms rejecting a stray max_issues).
@@ -169,7 +224,7 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 		approve := true
 		n.AutoApprove = &approve
 	default:
-		return n, http.StatusBadRequest, "target must be one of: issue, sweep, prompt"
+		return n, http.StatusBadRequest, validTargetsMessage
 	}
 
 	switch n.Timing {
@@ -205,7 +260,9 @@ func validateScheduleConfig(req apitypes.ScheduleRequest, now time.Time, allowSe
 // targets, where max_issues is not a valid field (validateScheduleConfig rejects it there).
 func applyCreateDefaults(req *apitypes.ScheduleRequest) {
 	if req.AutoApprove == nil {
-		v := true
+		// ci_watch defaults to manual approval (PRD #2865 D10): its input is CI log text an
+		// outside contributor can shape, so the owner reviews the plan unless they opt in.
+		v := req.Target != "ci_watch"
 		req.AutoApprove = &v
 	}
 	if req.WaitOnLimit == nil {
@@ -235,7 +292,7 @@ func onlyEnabled(req apitypes.ScheduleRequest) bool {
 		// PRD #1247 M6: a PRESENT credential_override (even an explicit inherit/null) makes
 		// this NOT an enabled-only PATCH, so it routes through the config path that validates
 		// and persists the override; `{enabled}` alone (override omitted) still short-circuits.
-		!req.CredentialOverride.Present &&
+		!req.CredentialOverride.Present && !req.CIWorkflows.Present &&
 		// PRD #1429 M4a: a PRESENT harness (even an explicit clear/null) likewise makes this
 		// NOT an enabled-only PATCH, mirroring credential_override above.
 		req.RemoveLabelOnDispatch == nil && !req.Harness.Present && !req.CapacityLimit.Present && !req.CapacityRoomNeeded.Present
@@ -358,6 +415,31 @@ func mergeSchedule(cur store.RunSchedule, req apitypes.ScheduleRequest) apitypes
 	if req.RepoID != "" {
 		m.RepoID = req.RepoID
 	}
+	// ci_workflows (PRD #2865) keeps presence semantics: absent keeps the stored selector
+	// list, null or [] clears it, a list replaces it. Selectors are meaningful only on a
+	// ci_watch target, so a stored list is not carried onto another target, and the
+	// issue/selector-label columns of a row converting INTO ci_watch are not carried
+	// either (they would otherwise fail the ci_watch arm for fields the caller never sent).
+	m.CIWorkflows = req.CIWorkflows
+	if !req.CIWorkflows.Present && m.Target == "ci_watch" {
+		if stored := ciWorkflowsFromColumn(cur.CiWorkflows); len(stored) > 0 {
+			m.CIWorkflows = apitypes.OptionalCIWorkflows{Present: true, Value: stored}
+		}
+	}
+	if m.Target == "ci_watch" && cur.Target != "ci_watch" {
+		if req.IssueIID == nil {
+			m.IssueIID = nil
+		}
+		if req.Labels == nil {
+			m.Labels = nil
+		}
+		// Auto-approve is off for ci_watch unless the caller opts in (D10): a row converting
+		// INTO ci_watch does not carry the previous target's approval setting.
+		if req.AutoApprove == nil {
+			off := false
+			m.AutoApprove = &off
+		}
+	}
 	return m
 }
 
@@ -393,7 +475,7 @@ func scheduleColumns(m apitypes.ScheduleRequest) (issueIID pgtype.Int8, labels [
 	if m.Target == "sweep" {
 		labels = marshalLabels(m.Labels)
 	}
-	if m.Target == "prompt" {
+	if m.Target == "prompt" || m.Target == "ci_watch" {
 		prompt = pgtype.Text{String: m.Prompt, Valid: true}
 	}
 	if m.Timing == "recurring" {
@@ -507,6 +589,60 @@ func nonBlankLabels(in []string) []string {
 		}
 	}
 	if len(out) == 0 {
+		return nil
+	}
+	return out
+}
+
+// normalizeCIWorkflows trims and bounds a ci_watch workflow selector list (PRD #2865):
+// at most maxCIWorkflows entries, each 1..maxCIWorkflowBytes bytes after trimming, valid
+// UTF-8 without control characters, and no duplicates. The result is never nil for a
+// non-error call so callers can range over it.
+func normalizeCIWorkflows(in []string) ([]string, int, string) {
+	if len(in) > maxCIWorkflows {
+		return nil, http.StatusBadRequest, fmt.Sprintf("ci_workflows must not exceed %d entries", maxCIWorkflows)
+	}
+	out := make([]string, 0, len(in))
+	seen := make(map[string]struct{}, len(in))
+	for _, raw := range in {
+		v := strings.TrimSpace(raw)
+		if v == "" || len(v) > maxCIWorkflowBytes {
+			return nil, http.StatusBadRequest, fmt.Sprintf("each ci_workflows entry must be 1 to %d bytes", maxCIWorkflowBytes)
+		}
+		if !utf8.ValidString(v) || strings.IndexFunc(v, unicode.IsControl) >= 0 {
+			return nil, http.StatusBadRequest, "ci_workflows entries must not contain control characters"
+		}
+		if _, dup := seen[v]; dup {
+			return nil, http.StatusBadRequest, "ci_workflows entries must be unique"
+		}
+		seen[v] = struct{}{}
+		out = append(out, v)
+	}
+	return out, 0, ""
+}
+
+// ciWorkflowsColumn maps a validated request to the nullable jsonb column: a JSON array
+// for a ci_watch schedule with at least one selector, NULL (watch every workflow)
+// otherwise, so a non-ci_watch row never persists a stray selector list.
+func ciWorkflowsColumn(m apitypes.ScheduleRequest) []byte {
+	if m.Target != "ci_watch" || len(m.CIWorkflows.Value) == 0 {
+		return nil
+	}
+	b, err := json.Marshal(m.CIWorkflows.Value)
+	if err != nil {
+		return nil
+	}
+	return b
+}
+
+// ciWorkflowsFromColumn decodes the stored jsonb selector list; nil on NULL, empty or a
+// malformed value (the writer never produces one).
+func ciWorkflowsFromColumn(b []byte) []string {
+	if len(b) == 0 {
+		return nil
+	}
+	var out []string
+	if err := json.Unmarshal(b, &out); err != nil || len(out) == 0 {
 		return nil
 	}
 	return out

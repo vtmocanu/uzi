@@ -1,15 +1,15 @@
 # PRD #1297: Prevent and salvage finalization blockers
 
 **Issue**: [#1297](https://github.com/vtmocanu/uzi/issues/1297) · **Priority**: High
-**Status**: Reviewed; amended 2026-09-19 (D11, D12 and the post-baseline drift listed in the Decision log). Held until every dependency below is met. Implementation has not started.
-**Dependency**, all three before this run starts:
+**Status**: Not planned (2026-10-15, epic #2746); issue #1297 is closed. Optional blocker repair/partial draft delivery is not required for automatic source preservation and settlement. Implementation has not started; reopen before reactivating this historical design.
+**Historical dependencies**, to re-evaluate only if this feature is reopened:
 1. [PRD #1296](1296-durable-run-recovery.md) merged (done, PR #1316) AND its owed hosted-k8s plus browser/CLI acceptance discharged.
 2. [PRD #1349](1349-recovery-custody-hardening.md) merged (done, PR #1366) AND its maintainer-owned M8 acceptance discharged: it changed the custody contract D4 and D6 build on.
 3. [PRD #1359](1359-finalize-against-current-main.md) implemented and merged: it owns the finalize substrate this PRD consumes (D11).
 
 No dependency on enabling #1226/#1246's completion-interlock rollout: partial authority must be correct and tested with that interlock both OFF and ON.
 **Evidence baseline**: decisions written at `43f3fd61` (2026-09-12); amendment anchors verified at `c46d215e` (2026-09-19). Symbols are named, line numbers are not: recheck every named symbol on the implementation base, after #1359 lands.
-**Handoff**: User-selected Auto mode with MR rework enabled, once the three dependencies above are met. Not a label sweep.
+**Handoff**: Inactive. The earlier Auto-mode choice is historical; no dispatch or implementation unless the maintainer reopens and re-reviews the feature. Full-original preservation, secret quarantine and honest availability remain existing obligations.
 
 ## Problem and outcome
 
@@ -50,7 +50,7 @@ The user also explicitly approved a clean independent partial when the excluded 
 
 ### D1: Earlier detection is a worker responsibility
 
-Reuse the existing committed-range scanner and workflow-path classifier; do not substitute a working-tree-only scan or a prompt asking the agent to run `gate:repo`. Today those are `GitCache.secretScanRange` with its floor resolver `GitCache.resolvePublicationFloor` (`agent/src/git.ts`) and `flagCIConfigPaths` (`agent/src/ci-config-guard.ts`). Scan from the verified publication base through the captured committed source head, so a secret introduced and later deleted still counts. A cheap delta may identify new findings, but the receipt that permits publication must cover the entire range being published.
+Reuse the existing committed-range scanner and workflow-path classifier; do not substitute a working-tree-only scan or a prompt asking the agent to run `gate:repo`. Today those are `GitCache.secretScanRange` with its floor resolver `GitCache.resolvePublicationFloor` (`agent/src/git.ts`) and `flagCIConfigPathsRaw` (`agent/src/ci-config-guard.ts`). Scan from the verified publication base through the captured committed source head, so a secret introduced and later deleted still counts. A cheap delta may identify new findings, but the receipt that permits publication must cover the entire range being published.
 
 Keep issue #1398's floor rule: on a branch that already has a forge tip, the verified publication base is the freshly fetched remote tip (when it is an ancestor of the tracking ref), never `origin/main..HEAD`. Widening the range back to the whole branch re-finds secrets already on the remote and falsely fails resumed runs; the #1398 regression (`agent/test/git-secret-scan-range.test.ts`) must stay green. Two differences for this PRD's uses: `resolvePublicationFloor` fails OPEN (returns `null`) for the normal full-publication path, and that policy is unchanged here, but for blocker repair acceptance and for partial publication a `null` floor is an untrusted scan, not a clean one. And candidate P (D4) is a new branch with no forge tip, so its floor is the pinned trusted target `T_n` itself, never the runner's private default-branch ref. Calling `secretScanRange` unchanged gets this WRONG: for a branch with no forge tip, `resolvePublicationFloor` floors on the bare clone's own default-branch ref, which can sit behind `T_n`, so the scan would cover `privateDefault..P`, re-find secrets that are already on the real default branch and falsely deny the partial (the #1398 over-block again, on the new path). Give the scanner an explicit caller-pinned floor (a parameter or a dedicated entry point) and pass `T_n`; the existing callers keep their resolved floor, byte-for-byte.
 

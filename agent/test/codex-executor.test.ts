@@ -6062,6 +6062,216 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
     assert.equal(registry.hasLiveCommandRoot(), false);
   });
 
+  it("#2986 base RED: eligible command succeeds beyond the ordinary bound", async () => {
+    const registry = new ExecutionRegistry(newLocalExecutionEpoch(2986));
+    const stdout = new PassThrough();
+    const stderr = new PassThrough();
+    let disposes = 0;
+    let waitMs = 0;
+    const spawn = makeDefaultSpawnCommand(registry, async () => ({
+      started: { event: "started", supervisorPid: 20, childPid: 21, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+      supervisorPid: 20,
+      transport: { stdin: new PassThrough(), stdout, stderr },
+      snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+      observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+      waitChild: async (ms) => {
+        assert.ok(typeof ms === "number", "the command seam supplies an explicit bound");
+        waitMs = ms;
+        const elapsed = 3_600_001;
+        if (ms < elapsed) throw new SupervisedChildExitTimeoutError(ms);
+        assert.equal(ms, 7_200_000);
+        stdout.write("finished after ordinary bound");
+        stderr.write("diagnostic");
+        return { event: "child_exit", code: 0 };
+      },
+      dispose: async () => {
+        disposes++;
+        stdout.end(); stderr.end();
+        return { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+      },
+      failed: undefined,
+      whenFailed: new Promise<Error>(() => undefined),
+    }), 1000, "/data/runner/repo/run-2986", runEnv, "required");
+    const result = await spawn(["/bin/sh", "-c", "echo fixture"], {
+      cwd: "/data/runner/repo/run-2986", long_running: true,
+    } as Parameters<typeof spawn>[1] & { long_running: boolean });
+    assert.deepEqual(result, { code: 0, stdout: "finished after ordinary bound", stderr: "diagnostic" });
+    assert.equal(waitMs, 7_200_000);
+    assert.equal(disposes, 1);
+    assert.equal(registry.hasLiveCommandRoot(), false);
+  });
+
+  describe("#2986 effective command bounds and cleanup races", () => {
+    function fixture(opts: { timeout?: boolean; waitError?: Error; elapsedMs?: number; clean?: boolean; onWait?: () => void; onDispose?: () => Promise<void>; deferDrain?: boolean } = {}) {
+      const registry = new ExecutionRegistry(newLocalExecutionEpoch(2987));
+      const stdout = new PassThrough();
+      const stderr = new PassThrough();
+      const state = { waitMs: 0, disposes: 0 };
+      let exit!: () => void;
+      const held = new Promise<void>(resolve => { exit = resolve; });
+      const launch = async (): Promise<CodexRootHandle> => ({
+        started: { event: "started", supervisorPid: 20, childPid: 21, subreaper: true, nondumpable: true, uid: 10003, liveCapsZero: true, capBoundingSet: "0xc0", noNewPrivs: true },
+        supervisorPid: 20,
+        transport: { stdin: new PassThrough(), stdout, stderr },
+        snapshot: async () => ({ event: "snapshot", id: 1, processes: [] }),
+        observe: async () => ({ event: "observe", id: 1, state: "unavailable", reason: "unreadable" }),
+        waitChild: async ms => {
+          assert.ok(typeof ms === "number", "the command seam supplies an explicit bound");
+          state.waitMs = ms;
+          opts.onWait?.();
+          if (opts.waitError) throw opts.waitError;
+          if (opts.timeout || (opts.elapsedMs !== undefined && ms < opts.elapsedMs)) throw new SupervisedChildExitTimeoutError(ms);
+          await held;
+          return { event: "child_exit", code: 0 };
+        },
+        dispose: async () => {
+          state.disposes++;
+          await opts.onDispose?.();
+          if (!opts.deferDrain) { stdout.end("last stdout"); stderr.end("last stderr"); }
+          return opts.clean === false ? { clean: false, reason: "survivor" }
+            : { clean: true, event: { event: "dispose", id: 1, state: "drained", authority: "ECHILD+__WALL" } };
+        },
+        failed: undefined, whenFailed: new Promise<Error>(() => undefined),
+      });
+      const spawn = (ordinary?: number, long?: number) => makeDefaultSpawnCommand(
+        registry, launch, 1000, "/data/runner/repo/run-2987", runEnv, "required", undefined, undefined, ordinary, long);
+      return { registry, state, exit, spawn, drain: () => { stdout.end("last stdout"); stderr.end("last stderr"); } };
+    }
+    for (const flag of [undefined, false, true]) {
+      it(`production waitMs for ${String(flag)}`, async () => {
+        const f = fixture();
+        const running = f.spawn()(["/bin/sh", "-c", "echo fixture"], { long_running: flag });
+        await waitFor(() => f.state.waitMs > 0, "wait child");
+        assert.equal(f.state.waitMs, flag === true ? 7_200_000 : 3_600_000);
+        f.exit();
+        assert.deepEqual(await running, { code: 0, stdout: "last stdout", stderr: "last stderr" });
+        assert.equal(f.state.disposes, 1);
+        assert.equal(f.registry.hasLiveCommandRoot(), false);
+      });
+    }
+    it("quiet redirected eligible command stays active past ordinary injected wall", async () => {
+      const f = fixture({ elapsedMs: 2 });
+      let settled = false;
+      const running = f.spawn(1, 100)(["/bin/sh", "-c", "echo fixture > progress.txt"], { long_running: true });
+      void running.then(() => { settled = true; });
+      await waitFor(() => f.state.waitMs > 0, "quiet command");
+      assert.equal(f.state.waitMs, 100);
+      assert.equal(settled, false);
+      assert.equal(f.registry.hasLiveCommandRoot(), true);
+      f.exit();
+      await running;
+    });
+    it("short eligible deadline awaits deferred reap and output drain", async () => {
+      let release!: () => void;
+      let disposing = false;
+      const gate = new Promise<void>(resolve => { release = resolve; });
+      const f = fixture({ timeout: true, onDispose: async () => { disposing = true; await gate; } });
+      let settled = false;
+      const running = f.spawn(1, 20)(["/bin/sh", "-c", "echo fixture"], { long_running: true })
+        .then(() => undefined, (e: unknown) => { settled = true; return e; });
+      await waitFor(() => disposing, "deadline disposing");
+      assert.equal(settled, false);
+      assert.equal(f.state.waitMs, 20);
+      release();
+      const error = await running;
+      assert.ok(error instanceof CommandDeadlineError);
+      assert.equal(error.deadlineMs, 20);
+      assert.equal(f.registry.hasLiveCommandRoot(), false);
+    });
+    for (const timing of ["both-ready", "during-dispose"] as const) {
+      it(`abort beats eligible deadline ${timing}`, async () => {
+        const abort = new AbortController();
+        let disposing = false;
+        let release!: () => void;
+        const gate = new Promise<void>(resolve => { release = resolve; });
+        const f = fixture({ timeout: true, onWait: () => { if (timing === "both-ready") abort.abort(); }, onDispose: async () => {
+          disposing = true;
+          if (timing === "during-dispose") await gate;
+        } });
+        const running = f.spawn(1, 20)(["/bin/sh", "-c", "echo fixture"], { long_running: true, signal: abort.signal })
+          .then(() => undefined, (e: unknown) => e);
+        if (timing === "during-dispose") {
+          await waitFor(() => disposing, "abort during disposal");
+          abort.abort();
+          release();
+        }
+        const error = await running;
+        assert.ok(error instanceof Error);
+        assert.equal(error.message, "command aborted");
+        assert.ok(!(error instanceof CommandDeadlineError));
+        assert.equal(f.state.disposes, 1);
+        assert.equal(f.registry.hasLiveCommandRoot(), false);
+      });
+    }
+    it("abort during output drain beats the eligible deadline after clean reap", async () => {
+      const abort = new AbortController();
+      const f = fixture({ timeout: true, deferDrain: true });
+      let settled = false;
+      const running = f.spawn(1, 20)(["/bin/sh", "-c", "echo fixture"], { long_running: true, signal: abort.signal })
+        .then(() => undefined, (e: unknown) => { settled = true; return e; });
+      await waitFor(() => !f.registry.hasLiveCommandRoot() && f.state.disposes === 1, "clean reap before held drain");
+      assert.equal(settled, false);
+      abort.abort();
+      f.drain();
+      const error = await running;
+      assert.ok(error instanceof Error);
+      assert.equal(error.message, "command aborted");
+      assert.ok(!(error instanceof CommandDeadlineError));
+    });
+    for (const long_running of [false, true]) {
+      for (const timing of ["during-dispose", "during-drain"] as const) {
+        for (const outcome of ["exit", "failed"] as const) {
+          it(`late abort preserves ${outcome} ${timing}, long_running=${long_running}`, async () => {
+            const abort = new AbortController();
+            const original = new Error("original nondeadline waitChild failure");
+            let entered!: () => void;
+            let release!: () => void;
+            const disposing = new Promise<void>(resolve => { entered = resolve; });
+            const disposal = new Promise<void>(resolve => { release = resolve; });
+            const f = fixture({
+              waitError: outcome === "failed" ? original : undefined,
+              deferDrain: timing === "during-drain",
+              onDispose: async () => { entered(); await disposal; },
+            });
+            let reaped!: () => void;
+            const cleanReap = new Promise<void>(resolve => { reaped = resolve; });
+            const reapRoot = f.registry.reapRoot.bind(f.registry);
+            f.registry.reapRoot = async (...args) => {
+              const result = await reapRoot(...args);
+              reaped();
+              return result;
+            };
+            let settled = false;
+            const running = f.spawn()(["/bin/sh", "-c", "echo fixture"], { long_running, signal: abort.signal })
+              .then(result => { settled = true; return result; }, (error: unknown) => { settled = true; return error; });
+            f.exit();
+            await disposing;
+            if (timing === "during-drain") {
+              release();
+              await cleanReap;
+              assert.equal(f.registry.hasLiveCommandRoot(), false);
+            }
+            assert.equal(settled, false);
+            abort.abort();
+            if (timing === "during-dispose") release();
+            else f.drain();
+            const result = await running;
+            if (outcome === "failed") assert.equal(result, original);
+            else assert.deepEqual(result, { code: 0, stdout: "last stdout", stderr: "last stderr" });
+            assert.equal(f.state.waitMs, long_running ? 7_200_000 : 3_600_000);
+            assert.equal(f.state.disposes, 1);
+            assert.equal(f.registry.hasLiveCommandRoot(), false);
+          });
+        }
+      }
+    }
+    it("eligible deadline with unclean reap fails closed", async () => {
+      const f = fixture({ timeout: true, clean: false });
+      await assert.rejects(f.spawn(1, 20)(["/bin/sh", "-c", "echo fixture"], { long_running: true }), /did not reap cleanly/);
+      assert.equal(f.registry.isPoisoned(), true);
+    });
+  });
+
   describe("issue #2048: a command wall deadline reaps the root before the call returns", () => {
   /** A fake command root whose waitChild rejects after a short fixed delay with the
    *  supervisor's deadline error (whatever ms was asked for), so unfixed code fails fast. */
@@ -6237,6 +6447,127 @@ describe("CodexExecutor: default command capture is byte-capped (A — untrusted
 });
 
 // ================================================================================
+// #2986: the real executor builds its production command seam over an inert supervisor.
+// Each fixture holds exactly one command; its bounded test wait cannot launch shell payloads.
+describe("#2986 executor long command lifecycle", () => {
+  for (const mode of ["wall", "cancel", "pause-now", "turn-abort", "wall-during-dispose"] as const) {
+    it(`${mode} settles eligible Bash and retires roots before park/report`, async () => {
+      const rig = makeRig();
+      const baseLaunch = rig.deps.launchEffectRoot!;
+      const controller = new AbortController();
+      let pause: "now" | null = null;
+      let interrupt: (() => void) | undefined;
+      let commandEntered = false;
+      let disposeEntered = false;
+      let commandDisposed = false;
+      let release!: () => void;
+      const disposal = new Promise<void>(resolve => { release = resolve; });
+      const events: string[] = [];
+      rig.deps = {
+        ...rig.deps,
+        spawnCommand: undefined,
+        wallMs: mode.startsWith("wall") ? 80 : 5000,
+        idleMs: 1,
+        launchEffectRoot: async (spec, deadline) => {
+          if (spec.args.includes(ENV_PROBE_SCRIPT)) {
+            const h = await baseLaunch(spec, deadline);
+            const out = h.transport.stdout as PassThrough;
+            const err = h.transport.stderr as PassThrough;
+            return { ...h, waitChild: async () => {
+              out.write(PROBE_OK_STDOUT);
+              return { event: "child_exit", code: 0 };
+            }, dispose: async () => {
+              out.end(); err.end();
+              return h.dispose();
+            } };
+          }
+          if (!spec.args.includes("echo held-2986")) return baseLaunch(spec, deadline);
+          const stdout = new PassThrough();
+          const stderr = new PassThrough();
+          const h = await baseLaunch(spec, deadline);
+          return {
+            ...h, transport: { stdin: new PassThrough(), stdout, stderr },
+            waitChild: async ms => {
+              assert.equal(ms, 7_200_000);
+              commandEntered = true;
+              events.push("wait");
+              if (mode === "wall-during-dispose") throw new SupervisedChildExitTimeoutError(ms);
+              return new Promise(() => undefined);
+            },
+            dispose: async () => {
+              disposeEntered = true;
+              events.push("dispose-enter");
+              await disposal;
+              stdout.end(); stderr.end();
+              commandDisposed = true;
+              events.push("dispose-done");
+              return h.dispose();
+            },
+          };
+        },
+      };
+      rig.transport.push(threadStarted())
+        .push(toolCall(29860, "uzi_bash", { command: "echo held-2986", long_running: true }, "th-1", "tn-1", "held-2986"));
+      const exec = makeExecutor(rig, bindingOf(SUBSCRIPTION));
+      let parks = 0;
+      let parkEntered = false;
+      const assertSettled = async () => {
+        parkEntered = true;
+        await exec.safety!.withBoundary({ boundary: "checkpoint", deadlineMs: 1000 }, async () => {
+          assert.equal(commandDisposed, true, "command cleanup and callback settle before capture");
+        });
+        assert.deepEqual(exec.recordedRootPids(), [], "provider roots retired");
+        events.push("park");
+        parks++;
+      };
+      const { ctx } = makeCtx({
+        signal: controller.signal,
+        cancelRequested: () => mode === "cancel" && controller.signal.aborted,
+        pauseModeRequested: () => pause,
+        onPauseNow: cb => { interrupt = cb; },
+        parkForWall: async () => { await assertSettled(); return "parked"; },
+        parkForPause: async () => { await assertSettled(); return true; },
+      });
+      const running = exec.run(ctx).then(value => ({ value }), (error: unknown) => ({ error }));
+      try {
+        await waitFor(() => commandEntered, "eligible executor command");
+        if (mode === "cancel") controller.abort();
+        if (mode === "turn-abort") rig.transport.end();
+        if (mode === "pause-now") { pause = "now"; interrupt!(); }
+        await waitFor(() => disposeEntered, "eligible command disposal");
+        assert.equal(parks, 0, "held disposal blocks park");
+        if (mode === "wall-during-dispose") {
+          // The actual run timer reaches the park seam while command disposal is held.
+          await waitFor(() => parkEntered, "run wall during held disposal");
+          assert.equal(commandDisposed, false);
+          assert.equal(parks, 0);
+        }
+        release();
+        const result = await withTimeout(running, 5000, "eligible lifecycle settlement");
+        if ("error" in result && mode !== "cancel" && mode !== "turn-abort") throw result.error;
+        assert.equal(commandDisposed, true);
+        assert.deepEqual(exec.recordedRootPids(), [], "provider roots retired");
+        assert.ok(rig.disposed() >= 1, "provider root retired before run returns");
+        assert.ok(!JSON.stringify(rig.transport.responses).includes("command_deadline"));
+        if (mode.startsWith("wall")) {
+          assert.ok("value" in result && result.value.walled);
+          assert.equal(parks, 1);
+        } else if (mode === "pause-now") {
+          assert.ok("value" in result && result.value.pausedAt);
+          assert.equal(parks, 1);
+        } else {
+          assert.ok("error" in result && result.error instanceof Error);
+          if (mode === "cancel") assert.equal(result.error.message, "run cancelled");
+        }
+        if (parks) assert.ok(events.indexOf("dispose-done") < events.indexOf("park"));
+      } finally {
+        release();
+        await withTimeout(running, 5000, "lifecycle cleanup");
+      }
+    });
+  }
+});
+
 // A fake client for the reconcile differential test: records each refresh's operation_id +
 // observed_generation and can fail its first N refresh calls (to model a lost-reply RETRY).
 interface DiffClient {

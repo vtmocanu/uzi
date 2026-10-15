@@ -29,6 +29,18 @@ describe("m1 non-closing dynamic schema", () => {
   });
 });
 
+describe("#2986 root-only long command schema", () => {
+  for (const isRoot of [true, false]) {
+    it(`advertises long_running only with root grant ${isRoot}`, () => {
+      const spec = buildCodexDynamicTools({ ...grants(["Bash"]), isRoot }).find(s => s.name === "uzi_bash")!;
+      const props = spec.inputSchema.properties as Record<string, { type: string }>;
+      assert.equal(props.long_running?.type, isRoot ? "boolean" : undefined);
+      assert.deepEqual(spec.inputSchema.required, ["command"]);
+      assert.equal(spec.inputSchema.additionalProperties, false);
+    });
+  }
+});
+
 describe("buildCodexDynamicTools: worker-owned app-server callback surface", () => {
   it("registers the deterministic granted subset and hides code-mode lifecycle callback names", () => {
     const specs = buildCodexDynamicTools(grants([

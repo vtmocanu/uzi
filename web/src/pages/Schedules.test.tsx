@@ -1959,7 +1959,7 @@ describe("Schedules — the mock rejects a self_improve target conversion (PRD #
     expect(victim).toBeTruthy();
     await expect(schedulesApi.updateSchedule(victim!.id, { target: "self_improve" })).rejects.toMatchObject({
       status: 400,
-      message: "target must be one of: issue, sweep, prompt",
+      message: "target must be one of: issue, sweep, prompt, ci_watch",
     });
   });
 });

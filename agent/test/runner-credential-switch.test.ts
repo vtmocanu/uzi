@@ -4,13 +4,15 @@ import assert from "node:assert/strict";
 import fs from "node:fs";
 import os from "node:os";
 import path from "node:path";
-import type { Executor, RunContext } from "../src/executor.js";
+import type { Executor, ExecutorResult, RunContext } from "../src/executor.js";
+import type { PlanSummaryInput, SummaryRunner } from "../src/summary-runner.js";
 import { CredentialSwitchSignal } from "../src/steering.js";
 import { SdkExecutor, type SdkQueryFn } from "../src/sdk-executor.js";
 import { nullLogger } from "./helpers.js";
 import {
   api,
   assistant,
+  client,
   fakeGitlab,
   git,
   gitlabClaim,
@@ -22,7 +24,9 @@ import {
   runnerWith,
   simulateCommittedWork,
   worktreeDirFor,
+  planWithMilestonesThenDoneQuery,
 } from "./runner-harness.js";
+import { freshClaim, newApi, row, send, until } from "./gate-revision-harness.js";
 
 installHarness();
 
@@ -510,5 +514,151 @@ describe("RunRunner — resume phase after a credential switch (PRD #1247 M5b D1
     assert.ok(!statuses.includes("awaiting_approval"), "resume_phase=implementing never parks at the gate");
     assert.ok(statuses.includes("completed"), "it implements the approved plan directly and completes");
     assert.strictEqual(counter.calls, 1, "exactly ONE SDK turn ran (the implement turn) — no planning turn");
+  });
+});
+
+// Issue #2945: a plan accepted on the storage retry that follows a credential-switch give-up still
+// gets its summary. Real runner + real SdkExecutor; only the summary model and POST are faked.
+describe("plan summary after a credential-switch give-up (issue #2945)", () => {
+  type Mode = "storage-throw" | "ack" | "second-switch" | "pause-now" | "usage-in-settle"
+    | "pause-now-during-switch" | "pause-wall-during-switch";
+
+  async function scenario(mode: Mode) {
+    newApi();
+    const claim = freshClaim(1, { summary_intent_present: true, summary_model: "fixture-summary-model" });
+    const runId = claim.run_id;
+    const calls: PlanSummaryInput[] = [];
+    const posts: string[] = [];
+    let abortedPromptly: boolean | undefined;
+    let ctxRef: RunContext | undefined;
+    let thrown = false;
+    let result: ExecutorResult | undefined;
+    const blocks = mode === "second-switch" || mode === "pause-now" || mode === "usage-in-settle";
+    const summaryRunner = {
+      generateIntentSummary: async () => null,
+      generatePlanSummary: async (input: PlanSummaryInput) => {
+        calls.push(input);
+        if (!blocks) return { summary: "Plan summary", deltas: [] };
+        const aborted = new Promise<boolean>(resolve => {
+          if (input.signal!.aborted) resolve(true);
+          input.signal!.addEventListener("abort", () => resolve(true), { once: true });
+          setTimeout(() => resolve(false), 3_000);
+        });
+        if (mode === "second-switch") api.requestCredentialSwitch(runId, 1);
+        else if (mode === "pause-now") api.setInputs(runId, [{ id: 7_001, kind: "pause", body: "now" }]);
+        else api.requestCredentialSwitch(runId, 1);
+        abortedPromptly = await aborted;
+        if (mode === "usage-in-settle") { input.onUsage?.({}); input.onUsage?.({}); }
+        return { summary: "Late plan summary", deltas: [] };
+      },
+    } as unknown as SummaryRunner;
+    const postPlanSummary = client.postPlanSummary;
+    const reportState = client.reportState;
+    client.postPlanSummary = async (_id, body) => { posts.push(body.plan_md); };
+    const pauseDuringSwitch = mode === "pause-now-during-switch" ? "now"
+      : mode === "pause-wall-during-switch" ? "wall" : undefined;
+    if (mode === "storage-throw" || mode === "second-switch" || mode === "pause-now" || pauseDuringSwitch) {
+      client.reportState = async (id, body, ...rest) => {
+        if (id === runId && body.status === "awaiting_approval" && !thrown) {
+          thrown = true;
+          // The switch is requested, so the real ctx.signal aborts with a CredentialSwitchSignal; the
+          // plan-storage report then fails with that signal before its callback can run.
+          api.requestCredentialSwitch(runId, 1);
+          assert.ok(await until(() => ctxRef!.signal!.aborted, 3_000), "the switch aborted ctx.signal");
+          throw new CredentialSwitchSignal();
+        }
+        return reportState.call(client, id, body, ...rest);
+      };
+    }
+    if (mode === "ack") api.armStateAckCredentialSwitchOnce(runId, 1, "awaiting_approval");
+    const approveAt = mode === "storage-throw" || pauseDuringSwitch ? 1 : 2;
+    let gates = 0;
+    api.onState(runId, (b) => {
+      if (b.status !== "awaiting_approval") return;
+      if (++gates === approveAt) send(runId, row("approve_plan"));
+    });
+    const sdk = new SdkExecutor(nullLogger(), homeDir, {
+      queryFn: planWithMilestonesThenDoneQuery([]), client, summaryRunner, intentSettleBoundMs: 100,
+    });
+    const exec: Executor = {
+      run: async (ctx) => {
+        ctxRef = ctx;
+        // A capture that never verifies: the switch gives up and the run continues on the old token.
+        git.worktreeStatus = (async () => ["M src/impl.ts"]) as typeof git.worktreeStatus;
+        let pausedDuringSwitch = false;
+        git.commitWipMarker = (async () => {
+          // An immediate pause routed while the give-up's capture is still in flight.
+          if (pauseDuringSwitch && !pausedDuringSwitch) {
+            pausedDuringSwitch = true;
+            api.setInputs(runId, [{ id: 7_002, kind: "pause", body: pauseDuringSwitch }]);
+            assert.ok(await until(() => ctx.pauseModeRequested?.() === pauseDuringSwitch, 3_000), "pause routed during the switch");
+          }
+          return false;
+        }) as typeof git.commitWipMarker;
+        return (result = await sdk.run(ctx));
+      },
+      closeAndSettlePlanSummary: (d) => sdk.closeAndSettlePlanSummary(d),
+      killAgentTree: () => sdk.killAgentTree(),
+      reapAttributedProcesses: () => sdk.reapAttributedProcesses(),
+    };
+    const { gitlab } = fakeGitlab();
+    try {
+      await runner(exec, gitlab, undefined, { recoveryRetryMs: 1, planApprovalTimeoutMs: 6_000 }).execute(claim);
+    } finally {
+      client.postPlanSummary = postPlanSummary;
+      client.reportState = reportState;
+    }
+    const usage = api.messages(runId).filter(m => m.kind === "summary_usage");
+    const statuses = api.states.filter(s => s.runId === runId).map(s => s.body.status);
+    return { calls, posts, abortedPromptly, usage, statuses, result };
+  }
+
+  it("storage retry after a give-up generates and posts exactly one summary", async () => {
+    const r = await scenario("storage-throw");
+    assert.ok(r.statuses.includes("credential_switch_failed"), "the switch gave up");
+    assert.equal(r.calls.length, 1);
+    assert.deepEqual(r.posts, ["# PLAN\n- do it"]);
+  });
+
+  it("a switch riding the awaiting_approval ACK, then a give-up, still yields exactly one summary", async () => {
+    const r = await scenario("ack");
+    assert.ok(r.statuses.includes("credential_switch_failed"), "the switch gave up");
+    assert.equal(r.calls.length, 1);
+    assert.equal(r.posts.length, 1);
+  });
+
+  it("a second credential switch aborts the reopened generator promptly: no post, no usage, no latch", async () => {
+    const r = await scenario("second-switch");
+    assert.equal(r.calls.length, 1);
+    assert.equal(r.abortedPromptly, true);
+    assert.equal(r.posts.length, 0);
+    assert.equal(r.usage.length, 0);
+    assert.equal(r.result?.summaryPlan, undefined);
+  });
+
+  it("a pause-now aborts the reopened generator promptly: no post, no usage, no latch", async () => {
+    const r = await scenario("pause-now");
+    assert.equal(r.calls.length, 1);
+    assert.equal(r.abortedPromptly, true);
+    assert.equal(r.posts.length, 0);
+    assert.equal(r.usage.length, 0);
+    assert.equal(r.result?.summaryPlan, undefined);
+  });
+
+  for (const mode of ["pause-now-during-switch", "pause-wall-during-switch"] as const) {
+    it(`a ${mode === "pause-now-during-switch" ? "now" : "wall"} pause routed during the give-up never reopens the summary`, async () => {
+      const r = await scenario(mode);
+      assert.ok(r.statuses.includes("credential_switch_failed"), "the switch gave up");
+      assert.equal(r.calls.length, 0, "a pending immediate pause must not start a summary");
+      assert.equal(r.posts.length, 0);
+      assert.equal(r.result?.summaryPlan, undefined);
+    });
+  }
+
+  it("usage reported during the bounded settlement of a switch-closed flight is emitted exactly once", async () => {
+    const r = await scenario("usage-in-settle");
+    assert.equal(r.calls.length, 1, "a started flight is not revived by the retry");
+    assert.equal(r.posts.length, 0);
+    assert.equal(r.usage.length, 1);
   });
 });

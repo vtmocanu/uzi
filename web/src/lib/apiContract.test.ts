@@ -11,6 +11,8 @@ import type {
   AdminDockerAllowlistRepos,
   RunMessage,
   Schedule,
+  CIEpisodeDTO,
+  CIEpisodePage,
   ScheduleInput,
   RunNowResponse,
   LastFireStarted,
@@ -98,6 +100,10 @@ import messageZero from "../../../fixtures/api-contract/message.zero.json";
 import messageFull from "../../../fixtures/api-contract/message.full.json";
 import scheduleZero from "../../../fixtures/api-contract/schedule.zero.json";
 import scheduleFull from "../../../fixtures/api-contract/schedule.full.json";
+import ciEpisodeZero from "../../../fixtures/api-contract/ci_episode.zero.json";
+import ciEpisodeFull from "../../../fixtures/api-contract/ci_episode.full.json";
+import ciEpisodePageZero from "../../../fixtures/api-contract/ci_episode_page.zero.json";
+import ciEpisodePageFull from "../../../fixtures/api-contract/ci_episode_page.full.json";
 import scheduleRunNowZero from "../../../fixtures/api-contract/schedule_run_now.zero.json";
 import scheduleRunNowFull from "../../../fixtures/api-contract/schedule_run_now.full.json";
 import scheduleInputZero from "../../../fixtures/api-contract/schedule_input.zero.json";
@@ -537,6 +543,22 @@ void _releaseCheckStatusFull;
   void _scheduleFull;
 }
 
+{
+  const missing: never = null as unknown as Exclude<keyof CIEpisodeDTO, keyof typeof ciEpisodeFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof ciEpisodeFull, keyof CIEpisodeDTO>;
+  const zero: ZeroOf<CIEpisodeDTO> = ciEpisodeZero;
+  const full: Widen<CIEpisodeDTO> = ciEpisodeFull;
+  void missing; void extra; void zero; void full;
+}
+{
+  const missing: never = null as unknown as Exclude<keyof CIEpisodePage, keyof typeof ciEpisodePageFull>;
+  const extra: never = null as unknown as Exclude<keyof typeof ciEpisodePageFull, keyof CIEpisodePage>;
+  // The page endpoint normalizes episodes to []; the Go zero fixture has a nil slice.
+  const zero: ZeroOf<CIEpisodePage, "episodes"> = ciEpisodePageZero;
+  const full: Widen<CIEpisodePage> = ciEpisodePageFull;
+  void missing; void extra; void zero; void full;
+}
+
 // runNowResponse in api/internal/handler/schedules.go allocates run_ids, started,
 // and skips with make(..., 0, n), so the wire always carries arrays. Only the
 // unmapped Go zero fixture has nil slices and needs these ZeroOf exemptions.
@@ -600,6 +622,13 @@ void _releaseCheckStatusFull;
   const _workerExtra: never = null as unknown as Exclude<keyof typeof workerFull, keyof Worker>;
   const _workerZero: ZeroOf<Worker, "capabilities" | "reported_runs" | "run_disk"> = workerZero;
   const _workerFull: Widen<Worker> = workerFull;
+  const _workerPendingZero: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {
+    pending_outcome_count: 0,
+    pending_overflow: false,
+  };
+  const _workerPendingUnavailable: Pick<Worker, "pending_outcome_count" | "pending_overflow"> = {};
+  void _workerPendingZero;
+  void _workerPendingUnavailable;
   void _workerMissing;
   void _workerExtra;
   void _workerZero;
@@ -1693,6 +1722,18 @@ it("plan-check findings permit a null item array", () => {
   expect(summary.findings?.items).toBeNull();
 });
 
+
+describe("worker pending outcome contract issue 2009", () => {
+  it.each([
+    ["owner", workerFull, workerZero],
+    ["admin", adminWorkerFull, adminWorkerZero],
+  ] as const)("records populated fresh evidence and legacy omissions for %s", (_scope, full, zero) => {
+    expect(full).toHaveProperty("pending_outcome_count", 1);
+    expect(full).toHaveProperty("pending_overflow", true);
+    expect(zero).not.toHaveProperty("pending_outcome_count");
+    expect(zero).not.toHaveProperty("pending_overflow");
+  });
+});
 
 describe("worker custody decision contract", () => {
   it("records populated counts while zero DTOs omit the optional field", () => {

@@ -180,6 +180,7 @@ export class FakeApi {
   // held-state switch is pending for the run's current claim; a test arms it to prove the state-ack
   // transport triggers the switch through the reportState closure, independent of /inputs.
   private readonly stateAckCredentialSwitch = new Map<string, number>();
+  private readonly stateAckCredentialSwitchOnce = new Map<string, { generation: number; status: string }>();
   // Issue #1626: runs whose 200 /state ACK carries `run.completion_revision` (the RunDTO's frozen
   // completion-contract revision). The real server reports it once the contract froze (plan
   // approval / the autopilot plan report); the worker reads it off the same body (readRunAck) and
@@ -832,6 +833,12 @@ export class FakeApi {
    *  the switch on its own. */
   armStateAckCredentialSwitch(runId: string, generation: number): void {
     this.stateAckCredentialSwitch.set(runId, generation);
+  }
+
+  /** Issue #2945: like armStateAckCredentialSwitch, but the signal rides only the NEXT `status` report's
+   *  ACK for this run and is then disarmed (a switch that lands on one report, not every one). */
+  armStateAckCredentialSwitchOnce(runId: string, generation: number, status: string): void {
+    this.stateAckCredentialSwitchOnce.set(runId, { generation, status });
   }
 
   /** issue #559 M3: answer the ownership probe for this run with 200 {status}. Use a
@@ -1812,7 +1819,15 @@ export class FakeApi {
       ...(this.stateAckCredentialSwitch.has(runId) && body.status !== "credential_switch"
         ? { credential_switch: { generation: this.stateAckCredentialSwitch.get(runId)! } }
         : {}),
+      ...this.takeOnceStateAckSwitch(runId, body.status),
     });
+  }
+
+  private takeOnceStateAckSwitch(runId: string, status: string): { credential_switch?: { generation: number } } {
+    const armed = this.stateAckCredentialSwitchOnce.get(runId);
+    if (!armed || armed.status !== status) return {};
+    this.stateAckCredentialSwitchOnce.delete(runId);
+    return { credential_switch: { generation: armed.generation } };
   }
 }
 

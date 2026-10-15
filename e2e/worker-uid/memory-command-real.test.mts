@@ -165,7 +165,7 @@ process.exit(7);
     };
     let spawnFailure: unknown;
     const spawnCommand = makeDefaultSpawnCommand(registry, launch, budgetMs, root,
-      { PATH: path.dirname(process.execPath) + ":/usr/bin:/bin" }, "off", undefined, undefined, 15000, captured);
+      { PATH: path.dirname(process.execPath) + ":/usr/bin:/bin" }, "off", undefined, undefined, 15000, undefined, captured);
     const broker = new CodexCallbackBroker({
       registry, capturedMemory: captured, worktreePath: root,
       spawnCommand: async (argv, opts) => {

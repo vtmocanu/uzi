@@ -77,6 +77,13 @@ export class DindMaintenanceController {
     // A registration cannot release a previously observed server fence.
   }
 
+  /** Update API support without replaying registration or erasing a held fence. */
+  updateNegotiation(enabled: boolean): void {
+    const next = enabled && !!this.nonce && !!this.deps.dockerHost;
+    if (this.enabled && !next) this.invalidate();
+    this.enabled = next;
+  }
+
   observe(operation: DindMaintenance | null | undefined, retaining: boolean | undefined, sentAtMs: number): void {
     this.custody = { retaining, sentAt: sentAtMs };
     const op = operation && valid(operation) ? { ...operation } : undefined;

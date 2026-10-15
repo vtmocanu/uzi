@@ -12,6 +12,9 @@ export const mockWorkers: Worker[] = [
     // Healthy busy retention: unpublished work alone needs no owner decision.
     retaining_unpublished_work: true,
     custody_decisions_needed: 0,
+    // Fresh aggregate evidence without snapshot identities: do not invent run rows.
+    pending_outcome_count: 1,
+    pending_overflow: true,
     id: "w-laptop",
     name: "laptop",
     status: "online",

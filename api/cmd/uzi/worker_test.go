@@ -1,6 +1,7 @@
 package main
 
 import (
+	"encoding/json"
 	"strings"
 	"testing"
 	"time"
@@ -135,6 +136,65 @@ func TestReportedRunsCell(t *testing.T) {
 		t.Run(tc.name, func(t *testing.T) {
 			if got := reportedRunsCell(apitypes.WorkerDTO{ReportedRuns: tc.runs}); got != tc.want {
 				t.Errorf("reportedRunsCell = %q, want %q", got, tc.want)
+			}
+		})
+	}
+}
+
+// TestIssue2009PendingAggregateJSON pins the additive wire contract through the
+// existing DTO decoder and CLI renderer. Unknown future fields must compile here:
+// before implementation, their loss causes rendering assertions to fail.
+func TestIssue2009PendingAggregateJSON(t *testing.T) {
+	now := time.Date(2026, 10, 1, 12, 0, 0, 0, time.UTC)
+	orig := reportedRunsNow
+	reportedRunsNow = func() time.Time { return now }
+	t.Cleanup(func() { reportedRunsNow = orig })
+	const pending = `[{"run_id":"r1","claim_generation":5,"phase":"running","terminal_pending":true,"terminal_pending_since":"2026-10-01T05:00:00Z"}]`
+	const mixed = `[{"run_id":"r1","claim_generation":5,"phase":"running","terminal_pending":true,"terminal_pending_since":"2026-10-01T05:00:00Z"},{"run_id":"r2","claim_generation":5,"phase":"running"}]`
+	for _, tc := range []struct {
+		name   string
+		fields string
+		runs   string
+		want   string
+	}{
+		{"overflow zero empty", `"pending_outcome_count":0,"pending_overflow":true,`, "[]", "0 confirmed pending; more may be pending"},
+		{"overflow positive empty", `"pending_outcome_count":7,"pending_overflow":true,`, "[]", "7 confirmed pending; more may be pending"},
+		{"overflow equal suppresses age", `"pending_outcome_count":1,"pending_overflow":true,`, pending, "1 confirmed pending; more may be pending"},
+		{"authoritative zero overrides listed pending", `"pending_outcome_count":0,`, pending, "-"},
+		{"authoritative zero empty", `"pending_outcome_count":0,`, "[]", "-"},
+		{"aggregate singular empty", `"pending_outcome_count":1,`, "[]", "1 pending outcome"},
+		{"aggregate plural empty", `"pending_outcome_count":7,"pending_overflow":false,`, "[]", "7 pending outcomes"},
+		{"aggregate equal suppresses age", `"pending_outcome_count":1,`, pending, "1 pending outcome"},
+		{"aggregate larger suppresses age", `"pending_outcome_count":7,`, pending, "7 pending outcomes"},
+		{"aggregate preserves live phases", `"pending_outcome_count":7,`, mixed, "1 running, 7 pending outcomes"},
+		{"missing aggregates legacy age", "", pending, "1 pending outcome (oldest 7h 0m)"},
+		{"missing aggregates legacy empty", "", "[]", "-"},
+		{"missing count overflow listed fallback", `"pending_overflow":true,`, pending, "1 confirmed pending; more may be pending"},
+		{"missing count overflow empty fallback", `"pending_overflow":true,`, "[]", "0 confirmed pending; more may be pending"},
+	} {
+		t.Run(tc.name, func(t *testing.T) {
+			wire := `{"id":"w1","name":"aggregate","status":"online",` + tc.fields + `"reported_runs":` + tc.runs + `}`
+			var worker apitypes.WorkerDTO
+			if err := json.Unmarshal([]byte(wire), &worker); err != nil {
+				t.Fatalf("decode WorkerDTO: %v", err)
+			}
+			// Assert the exact cell through the public command, including the
+			// absence of an oldest annotation when the aggregate is authoritative.
+			fc := &uzicli.FakeClient{Workers: []apitypes.WorkerDTO{worker}}
+			out, stderr, code := runCLI(t, fakeEnv(fc), "worker", "list")
+			if code != uzicli.ExitOK {
+				t.Fatalf("worker list exit=%d stderr=%q", code, stderr)
+			}
+			lines := strings.Split(strings.TrimSuffix(out, "\n"), "\n")
+			if len(lines) != 2 {
+				t.Fatalf("worker list expected header and one row: %q", out)
+			}
+			start, end := strings.Index(lines[0], "RUNS"), strings.Index(lines[0], "LARGEST RUN")
+			if start < 0 || end <= start || len(lines[1]) < end {
+				t.Fatalf("worker list missing RUNS column: %q", out)
+			}
+			if got := strings.TrimSpace(lines[1][start:end]); got != tc.want {
+				t.Errorf("worker list RUNS after JSON decode = %q, want %q", got, tc.want)
 			}
 		})
 	}

@@ -969,6 +969,9 @@ func run() error {
 	// satisfies workersvc.RepoGuard via its GuardRepo method (M2).
 	wsvc.SetRepoGuard(pcheck)
 
+	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
+	svc.SetMergedPredecessorRecovery(q, h.RecoveryService())
+
 	var bgWG sync.WaitGroup
 	bgWG.Add(5)
 	go func() {
@@ -1021,6 +1024,7 @@ func run() error {
 	// schedule that came due while the api was down fire promptly after a restart.
 	if cfg.SchedulerCheckInterval > 0 {
 		scheduler := schedsvc.New(q, wsvc, svc, settingsCache, notifier, vlt, cfg.SchedulerCheckInterval, slog.Default())
+		scheduler.SetCIRepair(schedsvc.CIRepairConfig{MaxJobs: cfg.CIFixMaxJobs, LogTailBytes: cfg.CIFixLogTailBytes, MaxAttempts: cfg.CIAutofixMaxAttempts, ConfigPaths: cfg.CIAutofixConfigPaths})
 		// Admin-health loop-beat: the scheduler is one of the four loops (PRD #1484 M2, D15).
 		// Registered ONLY inside this started-block, so a not-started scheduler
 		// (SCHEDULER_CHECK_INTERVAL=0) is left OUT of the loops evidence entirely rather than
@@ -1400,7 +1404,6 @@ func run() error {
 	// which the 10/min authLimiter budget PRD #1907 used there cannot carry.
 	v1Limiter := mw.NewLimiter(cfg.V1RateLimitMax, cfg.V1RateLimitWindow, cfg.TrustedProxies)
 	oauthLimiter := mw.NewLimiter(cfg.OAuthRateLimitMax, cfg.OAuthRateLimitWindow, cfg.TrustedProxies)
-	h := handler.New(pool, q, cfg, box, svc, wsvc, pcheck, liveHub, settingsCache)
 	// GitHub Projects v2 Status-sync provisioning service (PRD #364 M3), wired
 	// post-construction like the other optional forge collaborators.
 	h.SetProjectSync(projectSync)

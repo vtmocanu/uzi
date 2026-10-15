@@ -200,3 +200,49 @@ credentialed git child and no new provider turn starts once the latch is held.
   stale while `fleet.quarantine` (fresh heartbeats only) reports none, for roughly
   the tracker's 10-minute TTL plus up to one sweep interval after the last heartbeat
   (the prune runs per sweep).
+
+## Amendment 2026-10-14 — #1859: residue retention veto
+
+Current canonical reseeding and attempt seeding share per-key residue retention
+in `agent/src/git.ts` (`sweepResidue`). Canonical retention runs under the bare
+lock after successful canonical free and before the new seed; attempt retention
+runs after seed/live registration. Abandoned-attempt and orphaned-skills phases
+remain exclusive to the attempt path. The original ADR-1783 Docker-only sweep
+gap is historical; [its current-coverage amendment](1783-run-quiescence-and-attempt-clone-paths.md#amendment-2026-10-14--1859-shared-per-key-residue-retention)
+records the shared helper and the inherited Docker Follow-up 3 risk.
+
+Residue deletion requires fresh readable journal evidence (protecting a named
+candidate or descendant), a non-live path and an affirmative scoped seed-process
+verdict. Quarantine is checked before and after proof and synchronously at the
+deletion boundary after awaited validation. An active or newly latched
+`unreadable_unattributed` worker quarantine keeps all residue entries.
+Fresh-attempt seeding's unreadable-process relaxation never authorizes deletion.
+False, absent or unverified process proof and generic thrown proof keep entries
+with bounded diagnostics; classified control/recovery interruptions propagate.
+Off-Linux absence of a process verdict keeps entries. The latch's cause,
+lifetime, credential protections and custody semantics are unchanged.
+
+The best-effort target is five exact parser-valid
+`.uzi-residue-<key>.residue-<uuid>` direct siblings of the same key. Parent
+validation and complete enumeration within a private fixed 4096-direct-entry
+enumeration budget precede reclamation; overflow skips all residue reclamation.
+No excess returns without redundant journal discovery. Selection uses the
+original oldest excess slice by lstat mtime and basename tie-break; refusal
+keeps that entry without deleting a newer substitute. Protected or unproven
+entries can leave more than five, so this is no hard disk bound.
+
+Each sweep attempts at most 16 residue candidates from that oldest excess slice.
+A bounded 128-key LRU cursor rotates past refusals and revisits them on later
+sweeps; it caches no journal, live, process or quarantine verdict. No excess
+clears the cursor, and restart/eviction restarts from the oldest. The newest five
+are never compensating candidates. The attempt cap bounds work, not wall time;
+existing operation/deletion settlement and safety deadlines remain unchanged.
+
+Canonical retention forwards existing configured best-effort Docker handling;
+unwired workers gain no daemon obligation. Attempt retention remains
+`processOnly: true`, with no new container verdict. Existing uid/path/name
+checks and deletion deadlines remain; a possibly alive rm stops further cleanup,
+and file/symlink residue is unlinked as an entry without following its target.
+There is no new background timer or custody change. The opt-in Linux
+`task test:clone-quiescence` image build timed out before actual cases;
+actual Linux uid verification from that leg remains uncompleted.

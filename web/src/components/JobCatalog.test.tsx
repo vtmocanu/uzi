@@ -123,6 +123,25 @@ describe("JobCatalog — cards", () => {
     expect(within(card("si")).queryByLabelText("Baked prompt, read-only")).toBeNull();
   });
 
+  it("a ci_watch entry is badged CI repair and shows its plan review (PRD #2865)", () => {
+    renderCatalog({
+      catalog: {
+        entries: [
+          entry({ slug: "ci-repair", name: "CI repair", target: "ci_watch", labels: [], max_issues: 0, auto_approve: false, prompt: "Reproduce the failure." }),
+          PROMPT,
+        ],
+        enablements: [],
+      },
+    });
+    const ci = card("ci-repair");
+    expect(within(ci).getByText("CI repair", { selector: "span" })).toBeTruthy();
+    expect(within(ci).getByText("plan review")).toBeTruthy();
+    // It carries a baked instruction, so it keeps the sealed marker; no prompt/sweep pill.
+    expect(within(ci).getByLabelText("Baked prompt, read-only")).toBeTruthy();
+    expect(within(ci).queryByText("prompt")).toBeNull();
+    expect(within(card("docs-hygiene")).getByText("prompt")).toBeTruthy();
+  });
+
   it("'Not enabled' is plain text, not a link or button", () => {
     renderCatalog();
     const status = within(card("bug-triage")).getByText("Not enabled");

@@ -19,7 +19,7 @@ const operation: DindMaintenance = {
   register_nonce: "registration", phase: "ready", fenced: true, ready_ack: false,
 };
 
-function harness() {
+function harness(enabled = true) {
   let time = 1_700_000_000_000;
   const gate = new DindPruneGate();
   const { logger } = recordingLogger();
@@ -49,7 +49,7 @@ function harness() {
     isIdle: () => state.idle, log: logger, threshold: () => state.threshold,
     readSample: sample, exec, now: () => time, sleep,
   });
-  ctl.register("registration", true);
+  ctl.register("registration", enabled);
   const observe = (op: DindMaintenance | null | undefined = operation, retaining: boolean | undefined = false, stamp = time) =>
     ctl.observe(op, retaining, stamp);
   observe();
@@ -58,6 +58,70 @@ function harness() {
   return { ctl, gate, state, calls, sample, exec, sleep, logger, now: () => time,
     advance: (ms: number) => { time += ms; }, observe };
 }
+
+it("heartbeat feature grow and shrink preserves original identity, custody, fences and prune disposition", async () => {
+  const h = harness(false);
+  await h.ctl.tick();
+  assert.equal(h.calls.length, 0);
+  assert.equal(h.gate.heldBy("maintenance"), true);
+  h.ctl.updateNegotiation(true);
+  await h.ctl.tick();
+  assert.equal(h.calls.length, 2);
+  const ack = h.ctl.acknowledgement();
+  assert.equal(ack?.register_nonce, "registration");
+  assert.equal(ack?.id, operation.id);
+  h.ctl.updateNegotiation(false);
+  assert.equal(h.ctl.acknowledgement(), undefined);
+  assert.equal(h.gate.heldBy("maintenance"), true);
+  h.ctl.updateNegotiation(true);
+  assert.deepEqual(h.ctl.acknowledgement(), ack);
+  await h.ctl.tick();
+  assert.equal(h.calls.length, 2, "feature regrowth must not replay an optional prune");
+});
+
+it("feature growth still requires original nonce and fresh clear custody", async () => {
+  const h = harness(false);
+  h.advance(30_001);
+  h.ctl.updateNegotiation(true);
+  await h.ctl.tick();
+  assert.equal(h.calls.length, 0, "growth cannot repair stale custody");
+  h.observe(operation, true);
+  await h.ctl.tick();
+  assert.equal(h.calls.length, 0, "growth cannot bypass retained custody");
+  h.ctl.register(undefined, false);
+  h.observe();
+  h.advance(1000);
+  h.observe();
+  h.ctl.updateNegotiation(true);
+  await h.ctl.tick();
+  assert.equal(h.calls.length, 0, "growth cannot synthesize an incarnation nonce");
+  assert.equal(h.ctl.acknowledgement(), undefined);
+});
+
+it("feature shrink aborts optional execution and regrowth waits for the owned attempt to settle", async () => {
+  const h = harness();
+  let interrupted = false;
+  let settle: (() => void) | undefined;
+  h.state.exec = async (_argv, opts) => new Promise<string>((_resolve, reject) => {
+    opts.signal?.addEventListener("abort", () => { interrupted = true; }, { once: true });
+    settle = () => reject(new Error("owned attempt settled"));
+  });
+  const pending = h.ctl.tick();
+  try {
+    assert.equal(h.calls.length, 1);
+    h.ctl.updateNegotiation(false);
+    assert.equal(interrupted, true);
+    h.ctl.updateNegotiation(true);
+    await h.ctl.tick();
+    assert.equal(h.calls.length, 1, "no second owner before the interrupted attempt settles");
+    assert.equal(h.ctl.acknowledgement(), undefined);
+    assert.equal(h.gate.heldBy("maintenance"), true);
+  } finally {
+    settle?.();
+    await pending;
+  }
+  assert.equal(h.gate.heldBy("maintenance"), true);
+});
 
 // Capture only children launched by this test, delegating to Node's real transport.
 function ownedExec(t: TestContext) {

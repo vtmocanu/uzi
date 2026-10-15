@@ -245,14 +245,16 @@ func bandOrder(runs []apitypes.RunListItemDTO) []apitypes.RunListItemDTO {
 	return out
 }
 
+// doneAnchor keeps DONE ordering and its AGE cell on the same finish timestamp.
+func doneAnchor(r apitypes.RunListItemDTO) time.Time {
+	if r.FinishedAt != nil {
+		return *r.FinishedAt
+	}
+	return r.UpdatedAt
+}
+
 func compareDoneRuns(a, b apitypes.RunListItemDTO) int {
-	aTime, bTime := a.UpdatedAt, b.UpdatedAt
-	if a.FinishedAt != nil {
-		aTime = *a.FinishedAt
-	}
-	if b.FinishedAt != nil {
-		bTime = *b.FinishedAt
-	}
+	aTime, bTime := doneAnchor(a), doneAnchor(b)
 	if cmp := bTime.Compare(aTime); cmp != 0 {
 		return cmp
 	}

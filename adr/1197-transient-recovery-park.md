@@ -151,10 +151,11 @@ or disk preflight. The #1392 no-local-source forge park remains valid on the
 healthy path where discovery found no retained source. A retained source
 instead enters a durable episode bound to its identity, reserving work
 before capture: **3 total iterations**, blocked and nonblocked together,
-with a **five-minute deadline from the first reservation**. Retries use the
-existing exponential delay capped at 16 times the base. Crash, reclaim,
-capture, publication and successor handoff preserve the reservation and
-deadline. Reset requires a trusted, successfully settled real model turn.
+with a finite **five-minute deadline window**. The original first-reservation
+episode deadline policy is replaced by the #2958 amendment below. Retries use the
+existing exponential delay capped at 16 times the base. Capture, publication and
+successor handoff preserve the reservation count. Reset of that count requires
+a trusted, successfully settled real model turn.
 
 A permanent blocker or exhaustion reports terminal `failed` with
 `keepCustody`; it neither auto-reclaims nor exposes failed-run Resume.
@@ -212,8 +213,9 @@ and hashes under the existing deadline; unrelated cache objects do not
 participate in that proof. Overflow, timeout, corruption and interruption
 never authorize custody release or source cleanup.
 
-The 1 GiB budget counts delivered object contents cumulatively within a
-recovery operation, including repeated verification reads. The delivered-byte
+The decoded budget (limit amended by #2743) counts delivered object contents
+cumulatively within a recovery operation. The 2026-10-14 cache amendment below
+supersedes the original repeated-verification-read accounting. The delivered-byte
 cap does **not** bound Git-internal delta decompression memory. The deadline limits only duration, and the shared worker cgroup
 does not isolate this verifier from sibling runs. The resulting residual
 resource-exhaustion risk is deferred scope, as authorized by the human
@@ -296,9 +298,10 @@ This issue changes neither deployment manifest. See
 
 Outer recovery operations and closure checks without an operation context use
 the configured cap; nested recovery operations share their parent's cumulative
-delivered-byte counter. Verification continues to hash the **full reachable
-history**, including prerequisites, with no deduplication across repeated
-reads or history exclusion. Missing or corrupt objects are refused.
+delivered-byte counter. Every verification still walks the **full reachable
+history**, including prerequisites, without history exclusion. The 2026-10-14
+cache amendment below supersedes the original repeated-read accounting and
+states the explicitly accepted change to corruption detection.
 Cancellation and existing deadlines remain in force. Cap exhaustion fails
 closed, preserving local work and custody; encoded archive limits and storage
 quotas are unchanged. Local proof still grants neither remote durability nor
@@ -320,3 +323,89 @@ Git-internal delta decompression is not bounded by it. Existing deadlines limit
 duration, and the shared worker cgroup does not isolate sibling runs. The
 residual worker resource-exhaustion risk accepted in #2512 on 2026-10-09 remains
 deferred; this amendment does not claim to solve it.
+
+## Amendment 2026-10-14: #2958, one deadline window per fenced claim
+
+A retained-recovery episode may outlive a park or an interrupted long model turn.
+Its cumulative reservation count stays bounded at three, but the five-minute
+window now belongs to a positively verified claim generation, rather than the
+whole episode. The acquired server claim's positive generation fences the first
+window; its reservation is durably charged before ownership probes, preserving
+#2512's outage and cancellation accounting. Renewing an existing episode instead
+requires a current `running` ownership proof with the exact positive generation
+before rebasing its window. A lost claim stops that renewal without changing or
+blocking the predecessor episode. If that renewal proof instead fails transiently
+(transport, timeout, retryable HTTP status), the flight logs a retryable diagnostic
+and stops without a terminal report, charge, rebase or blocker. The existing
+missing-flight sweeper governs requeue and its finite worker-loss allowance; it
+may hold exhaustion for an owner decision. This is not an uncharged capture retry:
+no recovery operation was authorized. First-window and same-window ownership
+outages retain #2512's charged, three-reservation retry handling. The journal persists
+`claimGeneration` beside `startedAt` and `deadline` (`startedAt + 300000`), under
+the existing source binding and bare lock. A higher verified generation rebases
+those timestamps once. Same-generation retry and process recreation do not renew
+it; a missing or older fence cannot refresh a bound window.
+
+Legacy episode records have no claim identity. They remain readable and can bind
+once to a positively verified current claim, with a fresh window and the existing
+count, backoff and source attribution. No predecessor attempt id is interpreted
+as a claim fence. An unfenced legacy caller keeps the original deadline policy.
+Clock rollback and invalid clocks still refuse; three charged reservations still
+refuse a fourth even across fresh claims. Only trusted settled model processing
+clears the episode and its cumulative count.
+
+The entry reservation wrapper permits ownership verification and this authorized
+rebase before applying the persisted window. Failure classification uses the
+current claim's window, never a superseded deadline. Already-blocked records stay
+blocked with their original reason, including decoded-history exhaustion; neither
+a reclaim nor a deployment upgrade revives them. Source protection, custody,
+publication proof, closure verification limits and retry backoff are unchanged.
+No claim fence, timer renewal or successful local verification authorizes deletion
+or release of retained work.
+
+## Amendment 2026-10-14: #2979, per-operation verified-object reuse
+
+**User decision, 2026-10-14: option A.** Retained recovery and retained credential
+switches may reuse successfully hashed objects within the same recovery
+operation instead of repeatedly spending the decoded budget on shared history.
+The independent reviewer dissented, preferring refusal of reuse when
+`objects/info/alternates` exists plus per-pack identity checks. That alternative
+would still not catch in-place corruption or replacement of a loose object.
+The user chose option A with the broader risk wording below. This supersedes
+#2512's repeated-verification-read charging and #2743's explicit no-deduplication
+deferral. Nested operations share both the counter and cache by
+reference; standalone calls have a private cache, and new operations start empty.
+
+Every call still performs the complete `rev-list --objects --missing=error` walk
+and batch metadata checks. Cache hits must retain their verified type and size.
+Only misses contribute to the declared-size precheck, content hashing and decoded
+charges. Entries publish only after all requested frames and hashes verify, the
+producer exits cleanly, and the bare identity is unchanged. A failed or partial
+batch publishes no entries; its already-delivered bytes remain charged.
+
+Identity is `barePath` plus `lstat dev:ino` for the bare and its `objects/`
+directory, checked before the walk and after producer settlement (also on an
+all-hit check). The total cache entry count across the whole operation is capped
+at `floor(GIT_MAX_BUFFER / 41)`. At capacity, new objects remain uncached and are
+still hashed and charged. No cache state persists to disk or crosses operations.
+
+Validity relies on immutable Git object storage owned by the worker. Automatic
+bare maintenance is disabled; the worker does not repack or prune its bare, and
+clone materialization's repack is separate. Deletion is still refused by the full
+missing-object walk. Cache reuse adds a distinct risk: loose objects or packs
+modified in place or renamed over, or an added alternate object store, can evade
+later content verification when the bare and object-directory inodes and cached
+type/size metadata remain unchanged. Previously, each later closure check hashed
+those bytes again. **This is not today's guarantee and is not a technical
+equivalence to the existing verification-to-consumer race.** The user explicitly
+accepts this additional risk within one operation. Directory replacement, missing
+objects and cached type/size disagreement still refuse. A fresh operation hashes
+objects again. Cache reuse never grants custody release or source deletion.
+
+The finite 8 GiB default and configurable ceiling remain unchanged. Deduplication
+removes repeated shared-history charging, not the single-pass growth risk: a
+closure whose unique decoded content exceeds the cap still fails closed. History
+was measured at roughly 1.5 GiB in October 2026; continued growth can eventually
+require another policy decision. Deadline, cancellation, archive and storage
+quota boundaries remain unchanged. The decoded cap still does not bound
+Git-internal decompression memory.

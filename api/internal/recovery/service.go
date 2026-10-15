@@ -875,6 +875,7 @@ func (s *Service) Discard(ctx context.Context, userID, runID, captureID uuid.UUI
 // the CLI narrows by run.
 func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openOnly bool) (apitypes.RecoveryCustodyHoldsDTO, error) {
 	now := s.now()
+	cutoff := pgconv.Time(now.Add(-s.limits.WorkerHeartbeatStale))
 	params := store.ListCustodyHoldsForOwnerParams{UserID: userID}
 	if openOnly {
 		// Bound the list to live custody (PRD #1371): drop resolved (released/discarded)
@@ -884,9 +885,37 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		// filter never drops a hold the owner must act on, and DecisionNeeded stays exact.
 		params.State = pgtype.Text{String: "open", Valid: true}
 	}
-	rows, err := s.store.ListCustodyHoldsForOwner(ctx, params)
+	var (
+		rows    []store.ListCustodyHoldsForOwnerRow
+		members []store.ListCustodyAdmissionMembersForOwnerRow
+		agg     store.GetCustodyAggregateForOwnerRow
+	)
+	// Issue #2970: the list, the per-hold membership and the aggregate are read from one
+	// snapshot with one cutoff, so the per-hold flags always sum to AdmissionCountedHolds.
+	err := s.ownerRead(ctx, func(q Store) error {
+		var err error
+		if rows, err = q.ListCustodyHoldsForOwner(ctx, params); err != nil {
+			return err
+		}
+		if members, err = q.ListCustodyAdmissionMembersForOwner(ctx, store.ListCustodyAdmissionMembersForOwnerParams{
+			UserID:          userID,
+			HeartbeatCutoff: cutoff,
+		}); err != nil {
+			return err
+		}
+		agg, err = q.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
+			UserID:           userID,
+			CustodyHoldLimit: s.limits.CustodyHoldLimit,
+			HeartbeatCutoff:  cutoff,
+		})
+		return err
+	})
 	if err != nil {
 		return apitypes.RecoveryCustodyHoldsDTO{}, err
+	}
+	memberByHold := make(map[uuid.UUID]store.ListCustodyAdmissionMembersForOwnerRow, len(members))
+	for _, m := range members {
+		memberByHold[m.HoldID] = m
 	}
 	holds := make([]apitypes.RecoveryCustodyHoldDTO, 0, len(rows))
 	decisionNeeded := 0
@@ -897,18 +926,18 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		dto.CheckpointRef = r.CheckpointRef.String
 		dto.CheckpointTip = r.CheckpointTip.String
 		dto.CheckpointState = r.CheckpointState.String
+		// Membership exists only for open holds; an absent member stays unknown (nil), never false.
+		if r.State == "open" {
+			if m, ok := memberByHold[r.ID]; ok {
+				counted := m.Counted
+				dto.CountsTowardAdmission = &counted
+				dto.AdmissionReason = m.Reason
+			}
+		}
 		if r.DecisionNeeded {
 			decisionNeeded++
 		}
 		holds = append(holds, dto)
-	}
-	agg, err := s.store.GetCustodyAggregateForOwner(ctx, store.GetCustodyAggregateForOwnerParams{
-		UserID:           userID,
-		CustodyHoldLimit: s.limits.CustodyHoldLimit,
-		HeartbeatCutoff:  pgconv.Time(now.Add(-s.limits.WorkerHeartbeatStale)),
-	})
-	if err != nil {
-		return apitypes.RecoveryCustodyHoldsDTO{}, err
 	}
 	return apitypes.RecoveryCustodyHoldsDTO{
 		Aggregate: apitypes.RecoveryCustodyAggregateDTO{
@@ -920,6 +949,24 @@ func (s *Service) ListHoldsForOwner(ctx context.Context, userID uuid.UUID, openO
 		},
 		Holds: holds,
 	}, nil
+}
+
+// ownerRead runs fn against one consistent read view. With a pool it opens a REPEATABLE READ
+// read-only transaction so every query in fn sees the same snapshot; without one (unit tests
+// with a stub store) it runs fn against the service store directly.
+func (s *Service) ownerRead(ctx context.Context, fn func(q Store) error) error {
+	if s.pool == nil {
+		return fn(s.store)
+	}
+	tx, err := s.pool.BeginTx(ctx, pgx.TxOptions{IsoLevel: pgx.RepeatableRead, AccessMode: pgx.ReadOnly})
+	if err != nil {
+		return err
+	}
+	defer func() { _ = tx.Rollback(ctx) }()
+	if err := fn(store.New(tx)); err != nil {
+		return err
+	}
+	return tx.Commit(ctx)
 }
 
 // DiscardHold discards ONE owner-owned OPEN custody hold and settles its non-ready captures in

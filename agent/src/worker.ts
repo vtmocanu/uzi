@@ -839,6 +839,10 @@ export class Worker {
           // checker (claude-cross-check.ts). Advertised UNCONDITIONALLY: the Claude SDK is
           // always present, and the api requires it of a worker claiming a Claude child.
           "cross_check_codex_lead_v1",
+          // Default-branch CI repair (issue #2865): this image enforces claim.config.ci_config_guard
+          // at the early check and immediately before every final push. Advertised UNCONDITIONALLY:
+          // the api offers a guarded repair run only to a worker advertising it.
+          "ci_config_guard_v1",
         ];
         // PRD #1906 M4: advertise isolated_fetch_v1 ONLY when this worker is configured for the
         // isolated lane (UZI_FETCHER_URL and UZI_FETCHER_CA_FILE both set, which the chart does
@@ -986,6 +990,9 @@ export class Worker {
           residueQuarantine(),
         );
         ok = true;
+        // Heartbeat negotiation can grow or shrink support without a new incarnation.
+        // Preserve maintenance identity/custody/fences; only its optional-use gate changes.
+        this.dindMaintenance?.updateNegotiation(this.client.hasFeature("dind_maintenance_v1"));
         // issue #1759 M3: the api's custody flag, stamped here with this heartbeat's SEND
         // time (the flag reflects the api's view as of the request, so a heartbeat sent
         // before a claim and returning after that run ended must not look newer than the

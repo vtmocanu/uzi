@@ -178,6 +178,7 @@ type ForgeBuilder func(forge.Type, string, string, time.Duration) (forge.Forge, 
 
 // Service bundles the dependencies for building forge clients and syncing.
 type Service struct {
+	merged        mergedPredecessorReconciler
 	q             IssueStore
 	box           *secretbox.Box
 	timeout       time.Duration

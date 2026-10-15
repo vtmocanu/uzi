@@ -38,8 +38,8 @@ import { summaryModelTimeoutMs } from "./config.js";
 import type { Logger } from "./log.js";
 
 // Wall-clock cap on a single summary model turn. DEFAULT 60s (not the judge's 5 min):
-// the plan summary blocks entry into `awaiting_approval` up to this cap (Decision 2),
-// so a decision-support gate cannot afford a 5-minute stall — and Haiku, the default
+// the plan summary runs alongside the plan gate and never delays its verdict wait, so the cap
+// only bounds how long an advisory pass may spend model time — and Haiku, the default
 // model, is fast. Overridable via SUMMARY_MODEL_TIMEOUT_MS (env, parsed by config.ts's
 // summaryModelTimeoutMs, the one parser), or per-instance via the constructor for
 // deterministic tests.

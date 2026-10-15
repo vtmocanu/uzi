@@ -125,6 +125,7 @@ SELECT w.*,
        rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
+       rh.blocking_kind      AS roll_blocking_kind,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        -- observed_at is the API's own receipt time and the ONLY input to freshness.
@@ -267,6 +268,7 @@ WITH prev AS (
        SET upgrading_since    = NULL,
            blocking_container = NULL,
            blocking_reason    = NULL,
+           blocking_kind      = NULL,
            restart_count      = 0,
            last_exit_code     = NULL,
            updated_at         = now()
@@ -285,6 +287,7 @@ WITH prev AS (
        AND (r.upgrading_since IS NOT NULL
             OR r.blocking_container IS NOT NULL
             OR r.blocking_reason IS NOT NULL
+            OR r.blocking_kind IS NOT NULL
             OR r.restart_count <> 0
             OR r.last_exit_code IS NOT NULL)
        -- COMPARE THE RELEASE, NOT THE STRING. Both sides are stripped of SemVer
@@ -433,6 +436,20 @@ UPDATE workers SET
     END,
     updated_at            = now()
 WHERE id = @id
+RETURNING *;
+
+-- name: RefreshWorkerProtocol :one
+-- Called only after HeartbeatWorker locks and returns the current incarnation.
+-- Preserve every stored name, including names this server no longer recognizes.
+UPDATE workers
+SET protocol_capabilities = ARRAY(
+        SELECT DISTINCT name
+        FROM unnest(COALESCE(workers.protocol_capabilities, '{}'::text[])
+                    || @protocol_capabilities::text[]) AS names(name)
+        ORDER BY name),
+    max_concurrent_runs = GREATEST(workers.max_concurrent_runs, @max_concurrent_runs::integer),
+    max_cross_check_slots = GREATEST(workers.max_cross_check_slots, @max_cross_check_slots::integer)
+WHERE id = @id AND snapshot_register_nonce = @register_nonce::text
 RETURNING *;
 
 -- name: GetWorkerForUpdate :one
@@ -840,6 +857,7 @@ SELECT sqlc.embed(w),
        rh.pod_phase          AS roll_pod_phase,
        rh.blocking_container AS roll_blocking_container,
        rh.blocking_reason    AS roll_blocking_reason,
+       rh.blocking_kind      AS roll_blocking_kind,
        rh.restart_count      AS roll_restart_count,
        rh.last_exit_code     AS roll_last_exit_code,
        rh.observed_at        AS roll_observed_at,
@@ -1045,6 +1063,10 @@ WITH claimant AS MATERIALIZED (
       -- stored workers.protocol_capabilities column, passed by the Go caller.
       AND (r.completion_contract_version IS NULL
            OR 'completion_interlock_v1' = ANY(@worker_protocol_caps::text[]))
+      -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+      -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+      -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+      AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(@worker_protocol_caps::text[]))
       -- PRD #1332 M5A (D3): the NON-BYPASSABLE Codex-harness claim clause, MIRRORING the
       -- completion-protocol clause directly above. A CODEX-INDICATING run may be claimed ONLY by a
       -- worker whose SELF-REPORTED protocol_capabilities contain 'codex_harness_v1' (advertised only
@@ -1302,6 +1324,10 @@ WITH claimant AS MATERIALIZED (
                 -- the claimant's @worker_protocol_caps above).
                 AND (r.completion_contract_version IS NULL
                      OR 'completion_interlock_v1' = ANY(p.protocol_capabilities))
+                -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+                -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+                -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+                AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(p.protocol_capabilities))
                 -- PRD #1332 M5A (D3): MIRROR the non-bypassable Codex-harness clause for the peer, or
                 -- fleet-spread could DEFER a CODEX-INDICATING run to an INCAPABLE peer that could never
                 -- claim it (its OWN Codex claim clause above blocks it) — making the run permanently
@@ -1505,6 +1531,9 @@ UPDATE runs SET
     -- PRD #1296 M1 (D2): the general claim-lane counter, incremented once per successful
     -- claim. Returned in the claim payload; the hold above binds the identical value.
     claim_generation = runs.claim_generation + 1,
+    -- #2988 reverses PRD #1147's provisional-requeue revocation: every successful
+    -- fresh claim supersedes the old capability atomically, even for the same worker.
+    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
     -- PRD #1247 M5 (D3): CLOSE the released-claim fence window. A held-state credential
     -- switch requeues the run with claim_released_at set (ReleaseCredentialSwitch), which
     -- makes the generation fence reject every report from the OLD flight. Reclaiming the
@@ -5011,12 +5040,9 @@ UPDATE runs SET status = 'queued', status_since = now(),
     -- Exit contract (PRD #47 Decision 3): reset on the way to a fresh 'queued'; the
     -- detector re-evaluates the queued signal from this transition's status_since.
     health = 'ok', health_reason = NULL, health_since = NULL,
-    -- Codex claim-capability revocation (PRD #1147 M2): this is the sweeper's
-    -- claimed→queued path (RequeueClaimedRunToQueued mirrors it) — losing the claim
-    -- must revoke the per-claim capability here too, or a run swept back to queued
-    -- would keep a live cap_hash replayable on its next claim. Clear the hash and
-    -- bump the epoch; a harmless no-op for non-codex runs (cap_hash already NULL).
-    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    -- #2988: this provisional same-generation requeue preserves the capability.
+    -- Queued suspends credential use; re-adoption may restore the same flight,
+    -- while a successful ClaimRun atomically supersedes it before claim assembly.
     updated_at = now()
 WHERE runs.status = 'claimed' AND runs.claimed_at < @cutoff
   -- PRD #1390 D11: a `claimed` run whose initial `running` report never landed while its worker
@@ -6202,10 +6228,9 @@ UPDATE runs SET status = 'queued', status_since = now(), requeue_count = runs.re
         + CASE WHEN runs.status IN ('awaiting_approval', 'awaiting_input')
                THEN GREATEST(0, EXTRACT(EPOCH FROM (now() - runs.status_since))::int)
                ELSE 0 END,
-    -- Codex claim-capability revocation (PRD #1147 M2): a stale worker losing its runs
-    -- revokes their per-claim capabilities immediately — clear the hash and bump the
-    -- epoch. A harmless no-op for a non-codex run, whose codex_cap_hash is already NULL.
-    codex_cap_hash = NULL, codex_claim_epoch = runs.codex_claim_epoch + 1,
+    -- #2988: preserve the capability for provisional same-generation re-adoption.
+    -- Queued suspends credential use; a successful ClaimRun supersedes the old
+    -- capability atomically even when the same worker claims again.
     updated_at = now()
 FROM eligible_candidates candidate
 WHERE runs.id = candidate.run_id
@@ -9404,17 +9429,23 @@ SELECT id, user_id, status, auto_approve,
        budget_wall_seconds, budget_paused_seconds, budget_extension_seconds, budget_finalize_seconds, interactive,
        repo_id, kind, dispatched_at, required_capabilities, completion_contract_version,
        harness, codex_material_revision, codex_secret_id, worker_id, released_worker_id,
-       egress_profile_id, job_protocol,
+       egress_profile_id, job_protocol, ci_config_guard,
        COALESCE(runs.status = 'queued' AND runs.kind <> 'cross_check'
                 AND runs.worker_id IS NOT NULL
                 AND runs.stale_requeue_generation = runs.claim_generation
                 AND EXISTS (SELECT 1 FROM workers ow WHERE ow.id = runs.worker_id), false)::boolean AS stale_requeue_pinnable,
        COALESCE((SELECT ow.name FROM workers ow WHERE ow.id = runs.worker_id), '')::text AS stale_requeue_worker_name,
        (runs.kind = 'cross_check' AND EXISTS (SELECT 1 FROM user_cross_check_pins pin JOIN cross_checks cc ON cc.checker_run_id = runs.id WHERE pin.user_id = runs.user_id AND pin.stage = cc.stage AND pin.harness = cc.checker_harness AND (pin.model IS NOT NULL OR pin.effort IS NOT NULL)))::boolean AS cross_check_pin_required,
-       (SELECT a.terminal_pending_since FROM worker_active_runs a
-         WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
-           AND a.claim_generation = runs.claim_generation
-           AND a.terminal_pending AND a.terminal_pending_until > now())::timestamptz AS terminal_pending_since,
+       (SELECT MIN(evidence.since) FROM (
+           SELECT a.terminal_pending_since AS since FROM worker_active_runs a
+           WHERE a.run_id = runs.id AND a.worker_id = runs.worker_id
+             AND a.claim_generation = runs.claim_generation
+             AND a.terminal_pending AND a.terminal_pending_until > now()
+           UNION ALL
+           SELECT p.first_seen_at AS since FROM worker_pending_outcome_identities p
+           WHERE p.run_id = runs.id AND p.worker_id = runs.worker_id
+             AND p.claim_generation = runs.claim_generation AND p.reported_until > now()
+         ) evidence WHERE runs.claim_released_at IS NULL)::timestamptz AS terminal_pending_since,
        (runs.harness = 'codex'
         AND runs.kind NOT IN ('judge', 'chat')
         AND runs.review_target_run_id IS NULL
@@ -9650,6 +9681,10 @@ WHERE run.id = @run_id
         @capability_aware::boolean)
   AND (run.completion_contract_version IS NULL
        OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+  -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+  -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+  -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+  AND (NOT run.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
   AND (NOT (run.harness = 'codex' OR run.codex_material_revision IS NOT NULL OR run.codex_secret_id IS NOT NULL)
        OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
   AND (run.completion_contract_version IS NULL
@@ -9850,6 +9885,20 @@ WHERE w.user_id = @user_id
   AND NOT w.isolated_lane
   AND 'completion_interlock_v1' = ANY(w.protocol_capabilities);
 
+-- name: CountOnlineWorkersSatisfyingCIConfigGuard :one
+-- PRD #2865: how many of a user's ONLINE, non-draining, non-ephemeral workers self-report the
+-- 'ci_config_guard_v1' PROTOCOL capability. It drives the queued-reason resolver's CI-config-guard
+-- rung: a 0 here for a GUARDED queued run (runs.ci_config_guard) means every online worker
+-- predates the guard, so ClaimRun's standalone guard clause can never be satisfied. Mirrors
+-- CountOnlineWorkersSatisfyingProtocol's filters.
+SELECT count(*) FROM workers w
+WHERE w.user_id = @user_id
+  AND w.status = 'online'
+  AND w.draining_since IS NULL AND NOT w.maintenance_fenced AND w.maintenance_phase NOT IN ('requested','ready','stopping','recycling')
+  AND NOT w.ephemeral
+  AND NOT w.isolated_lane
+  AND 'ci_config_guard_v1' = ANY(w.protocol_capabilities);
+
 -- name: CountOnlineWorkersSatisfyingCodexHarness :one
 -- PRD #1332 M5A (D3): how many of a user's ONLINE, non-draining, non-ephemeral workers self-report
 -- the 'codex_harness_v1' PROTOCOL capability (workers.protocol_capabilities). This is the
@@ -10046,7 +10095,9 @@ WHERE r.status = 'queued'
       TRUE
   -- Orphan PLAN children retain the legacy capability-gap provisioning path;
   -- the CODE exclusion above keeps known CODE children on their own worker.
-  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
+  -- PRD #2865: a GUARDED run (ci_config_guard) is demand too: with no worker reporting
+  -- ci_config_guard_v1 online, only a freshly provisioned worker can claim it.
+  AND (cardinality(r.required_capabilities) > 0 OR r.plan_cross_check_required OR r.kind = 'cross_check' OR r.ci_config_guard OR fn_ephemeral_docker_preference_applies(u.ephemeral_docker_enabled, @worker_docker_enabled::boolean, r.repo_id, r.kind, r.egress_profile_id, @docker_repo_allowlist::uuid[]))
 
   AND NOT EXISTS (
       SELECT 1 FROM workers w
@@ -10070,6 +10121,10 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10259,6 +10314,10 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL
@@ -10324,6 +10383,10 @@ WHERE r.status = 'queued'
         -- Protocol requirements apply to persistent and leased workers alike.
         AND (r.completion_contract_version IS NULL
                       OR 'completion_interlock_v1' = ANY(w.protocol_capabilities))
+        -- PRD #2865: the NON-BYPASSABLE CI-config-guard claim clause (standalone, outside
+        -- fn_worker_can_claim, required_capabilities and @capability_aware). A GUARDED run
+        -- (ci_config_guard) is claimable only by a worker reporting 'ci_config_guard_v1'.
+        AND (NOT r.ci_config_guard OR 'ci_config_guard_v1' = ANY(w.protocol_capabilities))
                  AND (NOT (r.harness = 'codex' OR r.codex_material_revision IS NOT NULL OR r.codex_secret_id IS NOT NULL)
                       OR ('codex_harness_v1' = ANY(w.protocol_capabilities) AND 'codex_runtime_v2' = ANY(w.protocol_capabilities)))
                  AND (r.completion_contract_version IS NULL

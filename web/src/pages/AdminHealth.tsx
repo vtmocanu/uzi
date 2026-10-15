@@ -29,7 +29,7 @@ import { AdminShell } from "../components/AdminShell";
 import { DocLink } from "../components/DocLink";
 import { SEV, SeverityBadge, SeverityShape, sevOf, type Sev } from "../components/healthSeverity";
 import { ChevronRightIcon } from "../components/icons";
-import { likelyCause, upgradePresentation } from "../components/WorkerUpgradeBadge";
+import { workerFailed, workerFailureCause, upgradePresentation } from "../components/WorkerUpgradeBadge";
 import { Badge, Button, Card, SectionTitle, Skeleton, cx } from "../components/ui";
 import { AdminWorkerResources } from "../components/AdminWorkerResources";
 import { api, type AdminWorker, type HealthCheck, type HealthDoc } from "../lib/api";
@@ -505,7 +505,7 @@ function CheckLine({ check }: { check: HealthCheck }) {
 // FleetCard is the cross-user fleet in its own card (PRD #1484, #1648 D1/D7), the target of
 // the fleet.* items' "See the affected workers" link (id="fleet"). It reads
 // GET /api/admin/workers, which carries roll health, and shares the Workers page's upgrade
-// words (upgradePresentation) and blocking cause (likelyCause), so the two pages cannot drift.
+// words (upgradePresentation) and blocking cause (workerFailureCause), so the pages cannot drift.
 // Its own best-effort poll keeps the last-good rows on a failed fetch.
 const FLEET_COLUMNS = ["Owner", "Worker", "Status", "Disk", "Version", "Upgrade", "Blocking", "Last seen"];
 const SKELETON_ROWS = 3;
@@ -623,16 +623,16 @@ function FleetRow({ worker: w, demo }: { worker: AdminWorker; demo: boolean }) {
 }
 
 function BlockingCell({ worker: w }: { worker: AdminWorker }) {
-  if (w.upgrade_status !== "upgrade_failed" || !w.upgrade_blocking_reason) {
+  if (!workerFailed(w) || !w.upgrade_blocking_reason) {
     return <span className="text-faint">none</span>;
   }
   const container = stripUnsafeChars(w.upgrade_blocking_container ?? "");
   const reason = stripUnsafeChars(w.upgrade_blocking_reason);
   const text = container ? `${container}: ${reason}` : reason;
-  // The human cause is web-side product copy keyed on the exact k8s reason enum (likelyCause);
+  // The human cause is closed web-side copy from workerFailureCause;
   // a hostile reason matches no enum and yields null, so the title falls back to the stripped
   // container:reason — the untrusted value never reaches the attribute unstripped.
-  const cause = likelyCause(w.upgrade_blocking_container ?? null, w.upgrade_blocking_reason ?? null, w.upgrade_last_exit_code);
+  const cause = workerFailureCause(w);
   return (
     <span className="font-mono text-danger" title={cause ?? text}>
       {text}

@@ -807,6 +807,15 @@ export class SdkExecutor implements Executor {
   private summaryLifecycle = { closed: false };
   private planFlight?: IntentFlight & { generation: number; closed: boolean };
   private readonly planFlights = new Set<IntentFlight & { generation: number; closed: boolean }>();
+  /** Issue #2945: the current plan-summary candidate, so a credential-switch give-up can reopen a
+   *  candidate that never started generating (see {@link reopenPlanSummary}). */
+  private planCandidate?: {
+    generation: number; lifecycle: { closed: boolean };
+    flight?: IntentFlight & { generation: number; closed: boolean }; generated: boolean;
+  };
+  /** Issue #2945: a ctx.signal that a credential switch aborted and that then gave up; it is never
+   *  un-aborted, so a later plan-summary flight must not treat it as a live cancel. */
+  private spentSwitchSignal?: AbortSignal;
 
   /** Close admission before yielding. Intent and all owned plan flights drain concurrently
    * within one short bound; an ignored abort is abandoned and cannot publish or emit usage. */
@@ -1077,42 +1086,58 @@ export class SdkExecutor implements Executor {
     }
   }
 
-  /** Prepare once per candidate, before persistence; retries share the owned callback flight. */
-  private beginPlanSummary(ctx: RunContext, prdInputP: Promise<PrdInput> | undefined): (planMd: string) => Promise<void> {
+  /** Invalidate the current plan-summary flight and latched result (bumping the generation, which
+   *  the flight's `allowed()` and `onUsage` guards read). Does not reopen {@link summaryLifecycle}.
+   *  Returns the new generation. */
+  private supersedePlanSummary(): number {
     const generation = ++this.planGeneration;
     if (this.planFlight) {
       this.planFlight.closed = true;
       this.planFlight.ctrl.abort();
     }
     this.latestPlanSummary = undefined;
+    return generation;
+  }
+
+  /** Prepare once per candidate, before persistence; retries share the owned callback flight. */
+  private beginPlanSummary(ctx: RunContext, prdInputP: Promise<PrdInput> | undefined): (planMd: string) => Promise<void> {
+    const generation = this.supersedePlanSummary();
     const lifecycle = this.summaryLifecycle;
     lifecycle.closed = false;
-    let flight: (IntentFlight & { generation: number; closed: boolean }) | undefined;
+    const candidate: NonNullable<typeof this.planCandidate> = { generation, lifecycle, generated: false };
+    this.planCandidate = candidate;
     return planMd => {
-      if (flight) return flight.done;
+      if (candidate.flight) return candidate.flight.done;
       const token = ctx.oauthToken?.trim();
       if (!isRunSummaryKind(ctx.kind) || !token || !this.client || !prdInputP ||
           lifecycle.closed || generation !== this.planGeneration) return Promise.resolve();
       // Own the flight before the first await, including a repeated storage callback.
-      flight = { ctrl: new AbortController(), done: Promise.resolve(), abandoned: false,
-        delivered: false, generation, closed: false };
-      const owned = flight;
+      const owned: IntentFlight & { generation: number; closed: boolean } = { ctrl: new AbortController(),
+        done: Promise.resolve(), abandoned: false, delivered: false, generation, closed: false };
+      candidate.flight = owned;
+      // The steering lifecycle is re-armed after a give-up; observe the current one, and skip a
+      // ctx.signal that a spent switch already aborted.
+      const lifecycleSignal = ctx.lifecycleSignal?.();
+      const liveSignal = ctx.signal && ctx.signal !== this.spentSwitchSignal ? ctx.signal : undefined;
       this.planFlight = owned;
       this.planFlights.add(owned);
       const allowed = (): boolean => this.planFlight === owned && generation === this.planGeneration
         && this.summaryLifecycle === lifecycle && !lifecycle.closed && !owned.closed
         && !owned.abandoned && !owned.ctrl.signal.aborted && !ctx.claimFenced?.()
-        && !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !ctx.signal?.aborted;
+        && !ctx.cancelRequested?.() && !ctx.terminalLifecycleSignal?.aborted && !liveSignal?.aborted
+        && !lifecycleSignal?.aborted;
       owned.done = (async () => {
         try {
           if (!allowed()) return;
           const prd = await prdInputP;
           if (!allowed()) return;
+          candidate.generated = true;
           const result = await this.summaryRunner.generatePlanSummary({
             token, model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
             issueBody: ctx.issueDescription, prdText: prd.prdText, planMd,
             signal: AbortSignal.any([owned.ctrl.signal,
-              ...(ctx.signal ? [ctx.signal] : []),
+              ...(liveSignal ? [liveSignal] : []),
+              ...(lifecycleSignal ? [lifecycleSignal] : []),
               ...(ctx.terminalLifecycleSignal ? [ctx.terminalLifecycleSignal] : [])]),
             // Spend observed during bounded settlement counts even after close/abort; only
             // abandonment, a fence or a superseding flight drops it (as for the intent pass).
@@ -1134,6 +1159,20 @@ export class SdkExecutor implements Executor {
       })();
       return owned.done;
     };
+  }
+
+  /** Issue #2945: after a credential-switch give-up closed the lifecycle, reopen a plan candidate
+   *  that never began generating so the storage retry can still summarize the accepted plan. A
+   *  started flight, a superseded candidate, a fence, a cancel, a live lifecycle abort or a pending
+   *  immediate pause (now/wall/disk; the re-armed lifecycle does not carry it) never reopens. */
+  private reopenPlanSummary(ctx: RunContext): void {
+    const c = this.planCandidate;
+    if (!c || c.generation !== this.planGeneration || c.lifecycle !== this.summaryLifecycle || c.generated) return;
+    const pause = ctx.pauseModeRequested?.();
+    if (ctx.claimFenced?.() || ctx.cancelRequested?.() || ctx.terminalLifecycleSignal?.aborted
+      || ctx.lifecycleSignal?.()?.aborted || pause === "now" || pause === "wall" || pause === "disk") return;
+    c.lifecycle.closed = false;
+    c.flight = undefined;
   }
 
   /** issue #1830: false from the start of {@link run} until the background JS-deps install has been
@@ -1159,6 +1198,8 @@ export class SdkExecutor implements Executor {
     this.intentFlight = undefined;
     this.summaryLifecycle = { closed: false };
     this.planFlight = undefined;
+    this.planCandidate = undefined;
+    this.spentSwitchSignal = undefined;
     this.planGeneration++;
     let summaryResult: ExecutorResult | undefined;
     const drive = await this.phaseSetup(ctx);
@@ -1170,7 +1211,8 @@ export class SdkExecutor implements Executor {
       // Issue #2686: settle the intent-summary pass FIRST, while the runner's batcher is still
       // open, so its observed usage is emitted rather than dropped by a closed batcher.
       await this.closeAndSettlePlanSummary();
-      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.() || ctx.signal?.aborted || ctx.terminalLifecycleSignal?.aborted)) {
+      if (summaryResult && (ctx.claimFenced?.() || ctx.cancelRequested?.()
+        || (ctx.signal?.aborted && ctx.signal !== this.spentSwitchSignal) || ctx.terminalLifecycleSignal?.aborted)) {
         delete summaryResult.summaryPlan;
         delete summaryResult.summaryDeltas;
       }
@@ -2190,7 +2232,7 @@ export class SdkExecutor implements Executor {
           const g0 = await this.runThroughSwitch(ctx, state, () =>
             ctx.gatePlan!(approvedPlan, gateMilestones, onPlanPersisted),
 
-            ctx.continueExistingPlanGate,
+            ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
           if ("released" in g0) return { branch: ctx.branch, switchReleased: true };
           verdict = g0.value;
@@ -2251,6 +2293,10 @@ export class SdkExecutor implements Executor {
             verdict = gExhausted.value;
             continue;
           }
+          // Accepted revise: the plan being summarised is superseded (the budget-exhausted branch
+          // above re-presents the SAME plan and so keeps its summary). The summary of the revised
+          // plan starts from the next gatePlan's onPlanPersisted.
+          this.supersedePlanSummary();
           if (!automatic) revisions++;
           ctx.emit({
             kind: "plan_revising",
@@ -2302,7 +2348,7 @@ export class SdkExecutor implements Executor {
               onPlanPersisted,
               settles,
             ),
-            ctx.continueExistingPlanGate,
+            ctx.continueExistingPlanGate, { reopenPlanSummary: true },
           );
           if ("released" in gRev) return { branch: ctx.branch, switchReleased: true };
           verdict = gRev.value;
@@ -3109,6 +3155,7 @@ export class SdkExecutor implements Executor {
             }
             if (outcome === "gave_up") {
               state.tripReason = undefined;
+              this.markSwitchSignalSpent(ctx);
               throwIfDiskStop(ctx);
               continue;
             }
@@ -3841,6 +3888,10 @@ export class SdkExecutor implements Executor {
     return ctx.attemptCredentialSwitch();
   }
 
+  private markSwitchSignalSpent(ctx: RunContext): void {
+    if (ctx.signal?.reason instanceof CredentialSwitchSignal) this.spentSwitchSignal = ctx.signal;
+  }
+
   /** Drive ONE SDK turn to its result frame, capturing signals + the session id. */
   /**
    * PRD #1247 M5b (data-integrity fix): run an idle held-state WAIT (the plan gate, an ask_user
@@ -3865,6 +3916,7 @@ export class SdkExecutor implements Executor {
     state: RunDrive,
     run: () => Promise<T>,
     continueWait?: (otherwise: () => Promise<T>) => Promise<T>,
+    options?: { reopenPlanSummary?: boolean },
   ): Promise<{ value: T } | { released: true }> {
     let attempt = run;
     for (;;) {
@@ -3876,9 +3928,11 @@ export class SdkExecutor implements Executor {
         if (outcome === "released") return { released: true };
         if (outcome === "gave_up") {
           state.tripReason = undefined;
+          this.markSwitchSignalSpent(ctx);
           // PRD #1809 D4: a `disk` stop that landed during the switch attempt lost its trip to the
           // switch's; it parks now instead of re-running the wait.
           throwIfDiskStop(ctx);
+          if (options?.reopenPlanSummary) this.reopenPlanSummary(ctx);
           attempt = continueWait ? () => continueWait(run) : run;
           continue;
         }

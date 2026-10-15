@@ -24,17 +24,42 @@
 INSERT INTO runs (
     user_id, repo_id, kind, issue_title, issue_description,
     pipeline_id, pipeline_ref, failure_snapshot, ci_config_paths, wait_on_limit, auto_approve, required_capabilities, trigger_source, harness, plan_cross_check_required
-, code_cross_check_required) VALUES (
+, code_cross_check_required, ci_config_guard) VALUES (
     -- repo_id is nullable since PRD #39 (chat runs have none); the ::uuid cast keeps
     -- this ci_fix param a non-null uuid.UUID (a ci_fix run always has a repo).
     @user_id, @repo_id::uuid, 'ci_fix', @issue_title, @issue_description,
-    @pipeline_id, @pipeline_ref, @failure_snapshot, @ci_config_paths, @wait_on_limit, @auto_approve,
+    @pipeline_id, @pipeline_ref, @failure_snapshot,
+    -- PRD #2865: a ci_fix on the branch of a GUARDED run (runs.ci_config_guard, a default-branch
+    -- CI repair on uzi/prompt-<id>) inherits the guard and the union of that run's
+    -- ci_config_paths with the caller's configured set, read in this same statement (no
+    -- TOCTOU). The owning run is matched by its recorded branch OR its deterministic
+    -- uzi/prompt-<id> name, so it is found while still active (branch NULL). An unguarded
+    -- branch keeps @ci_config_paths verbatim and ci_config_guard=false.
+    CASE WHEN EXISTS (
+        SELECT 1 FROM runs g
+        WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+          AND (g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
+    ) THEN ARRAY(
+        SELECT DISTINCT u.p FROM (
+            SELECT unnest(COALESCE(@ci_config_paths::text[], '{}'::text[])) AS p
+            UNION ALL
+            SELECT unnest(g.ci_config_paths) FROM runs g
+            WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+              AND (g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
+        ) u ORDER BY u.p
+    ) ELSE @ci_config_paths::text[] END,
+    @wait_on_limit, @auto_approve,
     -- required_capabilities (PRD #84 M2, issue #512 M1): inherit the repo's capability
     -- hint atomically via subquery, reusing the existing @repo_id param so no new Go
     -- struct field is generated. Same expression CreateRun uses.
     COALESCE((SELECT rp.required_capabilities FROM repos rp WHERE rp.id = @repo_id::uuid), '{}'), 'ci_fix', @harness,
     (@auto_approve AND (SELECT u.plan_cross_check_enabled FROM users u WHERE u.id = @user_id))
-, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id))
+, (SELECT u.code_cross_check_enabled FROM users u WHERE u.id = @user_id),
+    EXISTS (
+        SELECT 1 FROM runs g
+        WHERE g.repo_id = @repo_id::uuid AND g.ci_config_guard
+          AND (g.branch = @pipeline_ref OR 'uzi/prompt-' || g.id::text = @pipeline_ref)
+    ))
 RETURNING *;
 
 -- name: CountActiveRunsWithBranch :one

@@ -102,7 +102,7 @@ func TestReportedRunsOverlayLiveDB(t *testing.T) {
 	byWorker := h.reportedRunsByWorker(ctx, []uuid.UUID{workerA, workerB})
 
 	// Worker A: both entries, mapped run_id/phase/generation (asserted by id, order-independent).
-	gotA := byWorker[workerA]
+	gotA := byWorker.runs[workerA]
 	if len(gotA) != 3 {
 		t.Fatalf("worker A reported_runs = %d entries, want 3: %+v", len(gotA), gotA)
 	}
@@ -125,7 +125,7 @@ func TestReportedRunsOverlayLiveDB(t *testing.T) {
 	}
 
 	// Worker B: a pre-seeded, non-nil empty slice — never absent, never nil.
-	gotB, ok := byWorker[workerB]
+	gotB, ok := byWorker.runs[workerB]
 	if !ok {
 		t.Fatalf("worker B missing from the batched map (every listed worker must be pre-seeded to [])")
 	}

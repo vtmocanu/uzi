@@ -1159,11 +1159,10 @@ export class WorkerClient {
   private readonly httpTimeoutMs: number;
   private readonly codexHTTPTimeoutMs: number;
   /**
-   * The PROTOCOL FEATURES the server advertised on the last successful register. ONE
-   * shared negotiation wire (PRD #1392 D7 / #1391 D8): `register()` REPLACES the set from
-   * `RegisterResponse.protocol_features`, and a strict-decode rollback fallback CLEARS it
-   * (so nothing negotiated is sent again until process restart). Empty until the first
-   * register, so a client that has not registered sends today's byte-identical wire.
+   * API-supported FEATURES, distinct from the image's implemented capabilities.
+   * Register replaces this cache; complete readable heartbeat responses up to 1 MiB
+   * replace it when they carry an all-string list (including an empty list).
+   * A stripped rollback success clears it; later ordinary ticks can rediscover it.
    */
   private serverFeatures = new Set<string>();
   private memoryRegistrationRevision = 0;
@@ -1231,12 +1230,15 @@ export class WorkerClient {
    * The per-registration nonce the api minted on the last successful register (PRD #1390
    * M2a), captured beside `serverFeatures`. The client stamps it onto every ActiveSnapshot
    * it SENDS (heartbeat + claim), so the api can trust the snapshot's epoch across a worker
-   * OR api restart. Undefined until an api that advertises `active_run_snapshot` registers;
-   * an older api omits it. NOT cleared by the strict-decode fallback — clearing the feature
+   * OR api restart. Undefined when the original register response omitted it; heartbeat
+   * responses never rotate or repair it. NOT cleared by the strict-decode fallback — clearing the feature
    * set already stops the snapshot from being sent, and the nonce is re-minted on the next
    * register (process restart) regardless.
    */
   private registerNonce: string | undefined;
+
+  /** Defensive copy of the successful register's original implemented report and fixed limits. */
+  private registrationReport: Omit<NonNullable<HeartbeatRequest["protocol_refresh"]>, "register_nonce"> | undefined;
 
   private latestDindMaintenanceValue: DindMaintenance | null | undefined;
 
@@ -1247,17 +1249,16 @@ export class WorkerClient {
 
   /**
    * PRD #1391 Run B M4: the api's server-side terminal-pending outbox cap
-   * (`WORKER_OUTBOX_MAX_PENDING`), captured from the register response so the active-run registry
-   * can size its `pending_overflow` decision + deterministic rotation to the server WITHOUT a
-   * worker-side cap mirror. Undefined until an api that returns the field registers; an older api
-   * omits it and the registry treats the cap as 0 (protect every pending outcome via overflow). NOT
-   * cleared by the strict-decode heartbeat fallback — it is a register-response value, not a wire
-   * extension, and is re-read on the next register (process restart) regardless.
+   * (`WORKER_OUTBOX_MAX_PENDING`), captured from register and refreshed by valid ordinary
+   * heartbeat adverts before the next snapshot. The registry uses this live quota for
+   * pending_overflow and rotation without a worker-side cap mirror. Undefined means cap 0
+   * (protect every pending outcome via overflow). Invalid or absent heartbeat quotas and
+   * stripped retries retain the last good value; strict-decode fallback does not clear it.
    */
   private workerOutboxMaxPendingValue: number | undefined;
 
-  /** PRD #1391 Run B M4: the register-returned terminal-pending outbox cap, or undefined when the
-   *  api did not return it (older api ⇒ the registry treats it as cap 0). Read by the active-run
+  /** PRD #1391 Run B M4: the latest valid terminal-pending outbox cap, or undefined when the
+   *  api has not returned it (older api ⇒ the registry treats it as cap 0). Read by the active-run
    *  registry's `pending_overflow` + rotation. */
   get workerOutboxMaxPending(): number | undefined {
     return this.workerOutboxMaxPendingValue;
@@ -1285,7 +1286,12 @@ export class WorkerClient {
     return [...this.serverFeatures];
   }
   set protocolFeatures(v: string[]) {
-    this.serverFeatures = new Set(v);
+    this.replaceServerFeatures(v);
+  }
+
+  private replaceServerFeatures(features: readonly string[]): void {
+    this.serverFeatures = new Set(features);
+    if (!this.serverFeatures.has("worker_memory_pressure_v1")) this.revokeMemoryAuthority();
   }
 
   constructor(
@@ -1318,6 +1324,8 @@ export class WorkerClient {
     this.registeredWorkerId = undefined;
     this.latestDindMaintenanceValue = undefined;
     this.registerNonce = undefined;
+    this.registrationReport = undefined;
+    const originalCapabilities = Array.isArray(protocolCapabilities) ? [...protocolCapabilities] : undefined;
     const body: RegisterRequest = { name, version: this.version };
     // Only send the field when known: an image without ENV WORKER_TEMPLATE reports
     // no template, and the server stores NULL (PRD #18). The server's decoder
@@ -1358,28 +1366,38 @@ export class WorkerClient {
     // Capture the negotiated protocol features (PRD #1392 D7 / #1391 D8): REPLACE the set
     // from this register's advertisement so a re-register after a rollout reflects the
     // server's current features. Filter to strings (defensive), and treat an absent field
-    // as an empty set (older server) ⇒ no wire extension is ever sent.
+    // as an empty set (older server) until an ordinary heartbeat advertises features.
     this.serverFeatures = new Set(
       Array.isArray(res.protocol_features)
         ? res.protocol_features.filter((f): f is string => typeof f === "string")
         : [],
     );
+    if (originalCapabilities !== undefined && originalCapabilities.length <= 256 &&
+        originalCapabilities.every((cap) => typeof cap === "string" && Buffer.byteLength(cap, "utf8") <= 64) &&
+        typeof maxConcurrentRuns === "number" && Number.isInteger(maxConcurrentRuns) && maxConcurrentRuns >= 1 && maxConcurrentRuns <= 256 &&
+        typeof maxCrossCheckSlots === "number" && Number.isInteger(maxCrossCheckSlots) && maxCrossCheckSlots >= 0 && maxCrossCheckSlots <= 16) {
+      this.registrationReport = {
+        protocol_capabilities: originalCapabilities,
+        max_concurrent_runs: maxConcurrentRuns,
+        max_cross_check_slots: maxCrossCheckSlots,
+      };
+    }
     // PRD #1247 fix round: remember whether THIS image advertised the credential_switch_v1
     // capability, so the send-gate can stamp the claim generation optimistically (its runs
     // are fenced server-side) even when a one-shot register missed the negotiated feature.
-    this.hasCredentialSwitchCapability = protocolCapabilities?.includes("credential_switch_v1") ?? false;
+    this.hasCredentialSwitchCapability = originalCapabilities?.includes("credential_switch_v1") ?? false;
     // PRD #1390 M2a: capture the per-registration nonce the api minted, stamped onto every
     // ActiveSnapshot the worker sends. A string only (defensive); absent on an older api ⇒
-    // undefined, in which case no snapshot is sent either (the feature gate is off too).
+    // undefined, in which case no snapshot is sent even if later heartbeat adverts grow the cache.
     this.registerNonce = typeof res.register_nonce === "string" ? res.register_nonce : undefined;
     // PRD #1391 Run B M4: stash the server-side terminal-pending outbox cap so the active-run
-    // registry sizes its overflow/rotation to it. A finite non-negative number only (defensive);
+    // registry sizes its overflow/rotation to it. A finite non-negative integer only (defensive);
     // an absent/garbled field leaves it undefined ⇒ the registry treats the cap as 0.
     this.workerOutboxMaxPendingValue =
       typeof res.worker_outbox_max_pending === "number" &&
-      Number.isFinite(res.worker_outbox_max_pending) &&
+      Number.isInteger(res.worker_outbox_max_pending) &&
       res.worker_outbox_max_pending >= 0
-        ? Math.floor(res.worker_outbox_max_pending)
+        ? res.worker_outbox_max_pending
         : undefined;
     this.registeredWorkerId = terminalUUID(res.worker_id) ? res.worker_id.toLowerCase() : undefined;
     if (this.registeredWorkerId) {
@@ -1398,18 +1416,16 @@ export class WorkerClient {
     return res;
   }
 
-  /** Whether the server advertised protocol feature `f` on the last register (PRD
-   *  #1391 D8). The gate on every optional wire extension. */
+  /** Whether the current API feature cache advertises `f`; gates optional wire extensions. */
   hasFeature(f: string): boolean {
     return this.serverFeatures.has(f);
   }
 
   /** Drop the whole negotiated feature set (PRD #1391 M5): after a strict-decode
-   *  rollback fallback succeeds, nothing negotiated is sent again until the process
-   *  restarts (a re-register would re-populate it). */
+   *  rollback fallback succeeds, later ordinary heartbeat adverts can repopulate it. */
   clearFeatures(): void {
     this.serverFeatures.clear();
-    this.invalidateMemoryIncarnation();
+    this.revokeMemoryAuthority();
     this.latestDindMaintenanceValue = undefined;
   }
 
@@ -1418,6 +1434,7 @@ export class WorkerClient {
    *  closes and every other negotiated extension stays on. */
   dropFeature(f: string): void {
     this.serverFeatures.delete(f);
+    if (f === "worker_memory_pressure_v1") this.revokeMemoryAuthority();
   }
 
   async heartbeat(
@@ -1442,7 +1459,7 @@ export class WorkerClient {
     // `active_run_snapshot` AND the worker built one, stamped with the register nonce so the
     // api can trust its epoch across a restart. Same "byte-identical wire on an old api" shape
     // as `outbox`.
-    const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined;
+    const includeSnapshot = this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined;
     if (includeSnapshot) body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
     if (this.hasFeature("dind_maintenance_v1") && isDindUUID(this.registerNonce)) {
       const sample = maintenance?.sample;
@@ -1468,7 +1485,18 @@ export class WorkerClient {
         site: quarantine.site,
       };
     }
-    const includeExtension = includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
+    // Discovery takes one ordinary tick; the next ordinary tick sends the original report.
+    // Only the original canonical 32-byte base64url nonce authorizes a refresh.
+    if (this.hasFeature("heartbeat_protocol_refresh_v1") && this.registrationReport &&
+        this.registerNonce !== undefined && /^[A-Za-z0-9_-]{43}$/.test(this.registerNonce) &&
+        Buffer.from(this.registerNonce, "base64url").toString("base64url") === this.registerNonce) {
+      body.protocol_refresh = {
+        ...this.registrationReport,
+        protocol_capabilities: [...this.registrationReport.protocol_capabilities],
+        register_nonce: this.registerNonce,
+      };
+    }
+    const includeExtension = body.protocol_refresh !== undefined || includeOutbox || includeSnapshot || body.dind_meter !== undefined ||
       body.dind_maintenance_ready_ack !== undefined || includeQuarantine;
     try {
       try {
@@ -1485,9 +1513,9 @@ export class WorkerClient {
       // Rollback fallback (PRD #1391 M5, extended by #1390 M2a): a rolled-back api that no
       // longer knows a negotiated heartbeat extension strict-decodes it as an unknown field
       // and answers a generic `invalid request body` 400. Retry the SAME heartbeat ONCE with
-      // EVERY negotiated extension stripped (outbox, snapshot, meter, ACK and quarantine); if the
+      // EVERY negotiated extension stripped (refresh, outbox, snapshot, meter, ACK and quarantine); if the
       // stripped retry SUCCEEDS, clear the WHOLE cached feature set so nothing negotiated is
-      // sent again until process restart. A heartbeat must NEVER be lost to a rolled-back api,
+      // sent until a later ordinary tick rediscovers it. A heartbeat must NEVER be lost to a rolled-back api,
       // so a stripped success is the outcome, not the original 400. Deliberately WHOLE-SET, not
       // surgical: the sticky `credential_switch_v1` capability lives separately from
       // `serverFeatures` and is NOT cleared, so `includeClaimGeneration` keeps stamping
@@ -1495,7 +1523,7 @@ export class WorkerClient {
       if (!includeExtension || !isStrictDecodeError(err)) throw err;
       const stripped: HeartbeatRequest = { version: this.version };
       if (stats) stripped.stats = stats;
-      const retaining = await this.postHeartbeat(stripped);
+      const retaining = await this.postHeartbeat(stripped, false);
       this.clearFeatures();
       this.log.warn(
         "heartbeat extension rejected by a rolled-back api; retried stripped and cleared the negotiated feature set",
@@ -1513,21 +1541,40 @@ export class WorkerClient {
    * threshold is recorded on {@link diskPressureThreshold} only when it is a finite number in
    * (0, 1]; anything else keeps the last good value. A non-2xx still throws exactly like
    * postJSON, so the strict-decode fallback above is unchanged; an accepted heartbeat whose
-   * body does not parse is still a successful heartbeat.
+   * body does not parse is still a successful heartbeat. Top-level adverts update the feature
+   * cache and integral quota before custody decoding, only after EOF within the 1 MiB cap.
+   * Stripped retries ignore adverts; later ordinary ticks rediscover features and then report.
    */
-  private async postHeartbeat(body: HeartbeatRequest): Promise<boolean | undefined> {
+  private async postHeartbeat(body: HeartbeatRequest, applyAdverts = true): Promise<boolean | undefined> {
     this.latestDindMaintenanceValue = undefined;
     const path = `${WORKER_API_PREFIX}/heartbeat`;
     const res = await this.fetchRaw("POST", path, body);
-    if (res.status >= 400) throw await this.toError("POST", path, res);
+    if (!res.ok) throw await this.toError("POST", path, res);
     if (res.status === 204) return undefined;
+    let text: string;
+    try {
+      text = await readBoundedText(res, 1024 * 1024, true);
+    } catch {
+      this.log.warn("heartbeat response unreadable or exceeds 1 MiB; ignoring response", {});
+      return undefined;
+    }
     let decoded: unknown;
     try {
-      decoded = JSON.parse(await res.text());
+      decoded = JSON.parse(text);
     } catch {
       return undefined;
     }
     if (typeof decoded !== "object" || decoded === null) return undefined;
+    if (applyAdverts) {
+      const adverts = decoded as { protocol_features?: unknown; worker_outbox_max_pending?: unknown };
+      if (Array.isArray(adverts.protocol_features) && adverts.protocol_features.every((f) => typeof f === "string")) {
+        this.replaceServerFeatures(adverts.protocol_features);
+      }
+      const quota = adverts.worker_outbox_max_pending;
+      if (typeof quota === "number" && Number.isInteger(quota) && quota >= 0) {
+        this.workerOutboxMaxPendingValue = quota;
+      }
+    }
     if (this.hasFeature("dind_maintenance_v1")) {
       this.latestDindMaintenanceValue = decodeDindMaintenance(
         (decoded as { dind_maintenance?: unknown }).dind_maintenance,
@@ -1547,7 +1594,8 @@ export class WorkerClient {
    *  param, back-compat with older servers). Returns null on 204.
    *
    *  PRD #1390 M2a: carries the worker's {@link ActiveSnapshot} in the claim body when
-   *  `active_run_snapshot` is negotiated AND the worker built one (nonce-stamped), so the
+   *  `active_run_snapshot` is negotiated AND the worker built one AND the original registration
+   *  nonce exists (nonce-stamped), so the
    *  api's pre-claim dedupe sees the runs this worker is already executing BEFORE the first
    *  post-outage heartbeat lands. If not negotiated the claim posts an empty body `{}`, which
    *  an old api ignores (harmless — the run-lane claim was bodyless before this). */
@@ -1569,7 +1617,7 @@ export class WorkerClient {
       const deadline = AbortSignal.any([AbortSignal.timeout(timeoutMs), ...(signal ? [signal] : [])]);
       deadline.throwIfAborted();
       const body: ClaimRequest = {};
-      if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined) {
+      if (this.hasFeature("active_run_snapshot") && activeSnapshot !== undefined && this.registerNonce !== undefined) {
         body.active_snapshot = { ...activeSnapshot, register_nonce: this.registerNonce };
       }
       const res = await this.fetchRaw("POST", path, body, timeoutMs, deadline);

@@ -12,7 +12,7 @@ import type { WorkerClient } from "./client.js";
 import type { WorkerMemoryRuntime } from "./worker-memory-runtime.js";
 import type { CapturedMemoryContext } from "./codex/broker.js";
 import type { MemoryIncarnation, WorkerMemoryPressureResult } from "./protocol.js";
-import { RequestError, StateReportUnappliedError, isRunOwnershipLost, HELD_PUBLICATION_FEATURE } from "./client.js";
+import { RequestError, StateReportUnappliedError, isRunOwnershipLost, isTransient, HELD_PUBLICATION_FEATURE } from "./client.js";
 import { RecoveryClosureLimitError, recoveryClosureLimitDetail, formatRecoveryDecodedLimit } from "./recovery-closure.js";
 import type { CodeSnapshotFreshReceipt, GitCache, RunnerClone, CheckpointOverlayContext, CheckpointRange, OwedCandidateContext, FetchAgentBranchOptions, TrackingUpdateResult } from "./git.js";
 import {
@@ -192,7 +192,7 @@ import {
 import { installJsDeps } from "./js-deps.js";
 import { detectToolchain, type ToolchainDetection } from "./toolchain-detect.js";
 import { isCIConfigPlan } from "./prompt.js";
-import { flagCIConfigPaths, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
+import { flagCIConfigPathsRaw, DEFAULT_CI_CONFIG_PATHS } from "./ci-config-guard.js";
 import { computeSize } from "./pr-size.js";
 import { buildDeliveryContext } from "./pr-description-context.js";
 import { resolvePrdInputFromBare } from "./prd-link.js";
@@ -638,6 +638,7 @@ const PUBLISH_SKIP_LABELS = [
   "no_ref",
   "not_descendant",
   "workflow_scope",
+  "ci_config_guard",
   "superseded",
   "tip_missing",
   "pack_too_large",
@@ -848,6 +849,15 @@ class WorkflowScopeBlockedSignal extends PublicationRefusedSignal {
   constructor() {
     super("workflow scope blocked");
     this.name = "WorkflowScopeBlockedSignal";
+  }
+}
+
+/** The default-branch CI repair guard refused a candidate; failCIConfigGuard already terminally
+ *  reported, so unwind without pushing (permanent for withForgeRetry, like every refusal signal). */
+class CIConfigGuardRefusedSignal extends PublicationRefusedSignal {
+  constructor() {
+    super("ci config guard refused");
+    this.name = "CIConfigGuardRefusedSignal";
   }
 }
 
@@ -1283,6 +1293,37 @@ export function composeWorkflowScopeReason(paths: string[], patchPreserved = tru
     }
   }
   return prefix + list + suffix;
+}
+
+/** Display-only form of a git path for a refusal message: control characters (including newlines
+ *  and the C1 range) escaped, quoted, truncated. Matching never sees this form. */
+function displayGuardPath(path: string): string {
+  const quoted = JSON.stringify(path).replace(/[\u007f-\u009f\u2028\u2029]/g,
+    (c) => `\\u${c.charCodeAt(0).toString(16).padStart(4, "0")}`);
+  return quoted.length > 80 ? `${quoted.slice(0, 79)}…` : quoted;
+}
+
+/** Failure reason for a default-branch CI repair run refused by the CI-config guard. `paths` null
+ *  means the diff could not be computed (fail closed). The path list is display-sanitised and
+ *  budgeted so the fixed tail always fits MAX_FAILURE_REASON_LEN. */
+export function composeCIConfigGuardReason(paths: string[] | null, patchPreserved = true): string {
+  const tail = " CI-config changes in this lane are reported, not pushed." +
+    (patchPreserved ? PATCH_PRESERVED_TAIL : PATCH_WITHHELD_TAIL);
+  if (paths === null) {
+    return "CI-config guard: could not compute the diff to verify it does not change CI configuration (failing closed)." + tail;
+  }
+  const prefix = "CI-config guard: this run changes CI configuration: ";
+  const budget = MAX_FAILURE_REASON_LEN - prefix.length - tail.length - 1;
+  const shownPaths = paths.map(displayGuardPath);
+  let shown = Math.min(shownPaths.length, 5);
+  let list = "";
+  for (; shown > 0; shown--) {
+    const more = shownPaths.length - shown;
+    list = shownPaths.slice(0, shown).join(", ") + (more > 0 ? `, and ${more} more` : "");
+    if (list.length <= budget) break;
+  }
+  if (shown === 0) list = `${shownPaths.length} path(s)`;
+  return `${prefix}${list}.${tail}`;
 }
 
 /**
@@ -1906,12 +1947,12 @@ interface RunFlight {
   /** issue #1783 (R2): this flight's execution attempt (its marker rides the agent CLI env), in
    *  the runner's live-attempt set from before the CLI spawns until the terminal finally. */
   attempt: RunAttempt | undefined;
-  /** issue #1783 M2: on a Docker-wired worker, the id minted for this execution attempt BEFORE
+  /** issue #1783 M2: in attempt-path mode (Docker-wired or recovery-enabled), the id minted BEFORE
    *  its clone is seeded: it names the attempt clone path, the recovery journal entry, the
-   *  attempt ledger entry and the attempt marker alike. Undefined on an unwired worker. */
+   *  attempt ledger entry and the attempt marker alike. Undefined for a canonical-path seed. */
   attemptId: string | undefined;
   /** issue #1783 M2: this flight is capturing a PREDECESSOR attempt's retained clone (the C′
-   *  journal case on a Docker-wired worker): `worktreePath` is the predecessor's path, every
+   *  journal case in attempt-path mode): `worktreePath` is the predecessor's path, every
    *  quiescence proof is a `capture`-mode scan scoped to it, and a verified capture releases it
    *  IN PLACE (never retired, moved or reused). */
   predecessorCapture: boolean;
@@ -1954,6 +1995,10 @@ interface RunFlight {
    *  so the only one whose raw tick/iteration publishes are chained over a prior overlay tip
    *  (`checkpointPack`'s `chainFrom`). Optional: absent ⇒ no chaining. */
   checkpointChainForge?: boolean;
+  /** Guarded default-branch CI repair runs (claim.config.ci_config_guard): the protected-path globs
+   *  every checkpoint and held publication is checked against, over the exact candidate SHA, before
+   *  any upload. Absent for unguarded runs (no check, no extra git calls). */
+  ciConfigGuardGlobs?: string[];
   /** issue #1030: distinct checkpoint-publish failure/skip outcomes already surfaced on
    *  the run feed for THIS run, keyed as `http:<code>` / `skip:<reason>` / `error`. Dedupes
    *  the feed line so the ~20-min time-gated retry of a persistently-failing publish does
@@ -2482,10 +2527,10 @@ export class RunRunner {
   private readonly dockerHost: string | undefined;
   /** issue #1786: see {@link RunnerOptions.onSourceRetained}. */
   private readonly onSourceRetained: (() => void) | undefined;
-  /** issue #1783 M2: a Docker-wired worker (the resolved DockerWiring carries a dockerHost) seeds
-   *  every execution attempt at a FRESH `<key>.attempt-<attemptId>` clone path, so a late Docker
-   *  create binding a predecessor's path can never land in the successor's tree. Unwired workers
-   *  keep the canonical `<key>` path, byte-for-byte. */
+  /** issue #1783 M2: Docker wiring enables fresh `<key>.attempt-<attemptId>` paths by default,
+   *  separating a successor's tree from late Docker binds to a predecessor's path. Recovery can
+   *  enable attempt paths per flight even on unwired workers. Ordinary unwired keys use canonical
+   *  reseeding, including shared best-effort per-key residue retention. */
   private readonly attemptPaths: boolean;
   /** PRD #1809 D6 (N3): aborted by `shutdown()` beside `shuttingDownGlobal`, so a pre-clone wait
    *  (the data-volume reclaim wait, before the flight joins `activeRuns`) can end on a shutdown. */
@@ -4204,7 +4249,7 @@ export class RunRunner {
       // exactly as a residue-blocked run did before #2213: one latched when it failed, or one whose
       // latch was caught before or at the start of its settle (reportGenericFailure's pre-settle
       // check, settleRecoveryGeneration's entry check).
-      // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight on a Docker-wired worker) is
+      // issue #1783 M2: a CAPTURED predecessor attempt (the C′ flight in attempt-path mode) is
       // released IN PLACE — journal cleared (only now that its capture is verified), ledger
       // `abandoned`, NO filesystem operation on its path — and never retired or reused. Its
       // capture already ran behind the predecessor-scoped capture-mode proof.
@@ -4342,7 +4387,7 @@ export class RunRunner {
       // Tear down the sibling skills plugin dir the executor synthesized (PRD #16
       // M4). It is OUTSIDE the runner clone, so removeRunnerClone does not reach it;
       // leave it and each run leaks a dir. Best-effort, like the clone cleanup.
-      // issue #1783 M2: on a Docker-wired worker the next attempt runs at a NEW path with its own
+      // issue #1783 M2: in attempt-path mode the next attempt runs at a NEW path with its own
       // plugin dir (rebuilt from the claim every claim), so a RETIRED attempt's sibling is
       // removed with it even on a park; a retained predecessor keeps its pair until the retention
       // sweep deletes both.
@@ -6871,6 +6916,58 @@ export class RunRunner {
       await closeBatcher();
       await journalTerminalReport({ status: "failed", failure_reason: failureReason.slice(0, MAX_FAILURE_REASON_LEN) });
     };
+    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
+    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
+    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
+    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
+    // is not enough on its own: it can be trustworthy AND carry findings.
+    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
+      if (rawPatch === null) return undefined;
+      const patch = redactText(rawPatch);
+      const scan = await this.git.scanPatchForSecrets(patch);
+      if (scan.trusted && scan.findings.length === 0) return patch;
+      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
+        run_id: runId,
+        site,
+        trusted: scan.trusted,
+        findings: scan.findings.length,
+      });
+      return undefined;
+    };
+
+    // Default-branch CI repair lane (claim.config.ci_config_guard): the worker backstop. Unlike the
+    // ci_fix guard below, a human approval does NOT exempt it: CI-config changes in this lane are
+    // reported, not pushed. Two check points fail the run (here, and again on the exact owned SHA
+    // immediately before every final push attempt); checkpoint and held publication are checked
+    // too (ciConfigGuardBlocksPublication), where a match skips the upload. All use the raw-path
+    // matcher and the --no-renames diff; an uncomputable diff refuses too.
+    const ciConfigGuarded = claim.config?.ci_config_guard === true;
+    const ciConfigGuardGlobs = [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+    let ciConfigGuardReported = false;
+    const failCIConfigGuard = async (guardBarePath: string, ref: string, paths: string[] | null) => {
+      if (ciConfigGuardReported) return;
+      ciConfigGuardReported = true;
+      const patch = await scanGatedPatch(await this.git.workflowScopeDiff(guardBarePath, ref), "ci_config_guard");
+      const reason = composeCIConfigGuardReason(paths, patch !== undefined);
+      batcher.emit({ kind: "status", agent: "worker", payload: { text: reason } });
+      runLog.warn("ci-config guard refused publication", { run_id: runId, computed: paths !== null });
+      await closeBatcher();
+      await journalTerminalReport({ status: "failed", failure_reason: reason, preserved_patch: patch });
+    };
+    // Returns true when publication of `ref` must be refused (a protected path changed, or the
+    // diff could not be computed) after the terminal failure was reported.
+    const refuseOnCIConfigGuard = async (guardBarePath: string, ref: string): Promise<boolean> => {
+      const changed = await this.git.changedFilesNoRenames(guardBarePath, ref);
+      const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, ciConfigGuardGlobs);
+      if (flagged !== null && flagged.length === 0) return false;
+      await failCIConfigGuard(guardBarePath, ref, flagged);
+      return true;
+    };
+    if (ciConfigGuarded) {
+      const earlyGuardBarePath = barePath;
+      if (await refuseOnCIConfigGuard(earlyGuardBarePath, trackingRef)) return;
+    }
+
     // PRD #71 M5 (load-bearing): for an auto-approved ci_fix run (no human in the loop),
     // REFUSE to push a diff that touches a protected CI-config path, or a diff that could
     // not be computed. A human-approved run (manual, or an auto CI-config plan that parked
@@ -6879,15 +6976,11 @@ export class RunRunner {
       // Capture the narrowed bare path in a const the SAME way the push block does
       // (barePath is an outer `let string | undefined` and TS drops the narrowing here).
       const pushBarePathForGuard = barePath;
-      // Worker-side FLOOR: when the claim omits ci_config_paths (a bug or an older
-      // server), fall back to the static defaults so the backstop cannot fail OPEN.
-      // This floor covers the static defaults only; the server-produced set additionally
-      // carries the project's real ci_config_path (see DEFAULT_CI_CONFIG_PATHS).
-      const ciConfigPaths = claim.config?.ci_config_paths?.length
-        ? claim.config.ci_config_paths
-        : DEFAULT_CI_CONFIG_PATHS;
-      const changed = await this.git.changedFiles(pushBarePathForGuard, trackingRef);
-      const flagged = changed === null ? null : flagCIConfigPaths(changed, ciConfigPaths);
+      // The worker floor is always unioned with the server set, never replaced by it, and the
+      // diff is the guarded raw-path one: no rename detection, every merge base, no trimming.
+      const ciConfigPaths = [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])];
+      const changed = await this.git.changedFilesNoRenames(pushBarePathForGuard, trackingRef);
+      const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, ciConfigPaths);
       if (changed === null || (flagged && flagged.length > 0)) {
         const reason =
           changed === null
@@ -6911,24 +7004,6 @@ export class RunRunner {
     // Serves every forge-pushing kind (the failed path is not issue-gated).
     // The precheck compares tip blobs per path; the overlay keeps its separate conservative
     // changedFiles guard below.
-    // Every preserved_patch is stored and rendered on the run page, and redactText knows only the
-    // run's OWN secrets, so a foreign credential in the diff would persist verbatim. Attach a patch
-    // only when a trusted gitleaks scan of the EXACT redacted text reports zero findings; on a finding
-    // or an untrustworthy scan the typed failure still lands, without the patch. A trusted range scan
-    // is not enough on its own: it can be trustworthy AND carry findings.
-    const scanGatedPatch = async (rawPatch: string | null, site: string): Promise<string | undefined> => {
-      if (rawPatch === null) return undefined;
-      const patch = redactText(rawPatch);
-      const scan = await this.git.scanPatchForSecrets(patch);
-      if (scan.trusted && scan.findings.length === 0) return patch;
-      runLog.warn("preserved patch withheld: its secret scan was not trusted and clean", {
-        run_id: runId,
-        site,
-        trusted: scan.trusted,
-        findings: scan.findings.length,
-      });
-      return undefined;
-    };
     const workflowBarePath = barePath;
     const originalWorkflowTip = await this.git.trackingTip(workflowBarePath, result.branch);
     const rethrowWorkflowAbort = (error: unknown) => {
@@ -7120,6 +7195,12 @@ export class RunRunner {
               await failClosingCommits(closing);
               throw new ClosingCommitRefusedSignal();
             }
+          }
+          // Default-branch CI repair lane: the authoritative CI-config check on the exact owned
+          // candidate about to be pushed, re-run on every attempt (a retry, an alignment or a bridge
+          // can change the candidate after the early check). Last gate before the push.
+          if (ciConfigGuarded && await refuseOnCIConfigGuard(finalizeBarePath, sourceSha)) {
+            throw new CIConfigGuardRefusedSignal();
           }
           await this.git.pushBranch(
             finalizeBarePath,
@@ -8883,6 +8964,9 @@ export class RunRunner {
       lastCheckpointRefTip: claim.checkpoint_tip ?? undefined,
       lastAttemptedCheckpointRefTip: undefined,
       checkpointChainForge: claim.repo.forge_type === "github",
+      ...(claim.config?.ci_config_guard === true
+        ? { ciConfigGuardGlobs: [...DEFAULT_CI_CONFIG_PATHS, ...(claim.config?.ci_config_paths ?? [])] }
+        : {}),
       // issue #1030: per-run dedupe set for checkpoint-publish outcome feed lines.
       reportedPublishOutcomes: new Set<string>(),
       // issue #1597 M2: the per-flight sink gate (mid-turn tick vs every durable-state path) and the
@@ -9114,8 +9198,9 @@ export class RunRunner {
     emitOrphanDiagnostic(diagnostics, journaledPath, "orphan_reclaim_succeeded", "complete", disposition);
   }
 
-  /** issue #1783 M2: the attempt-seed options a Docker-wired worker hands the git layer (see
-   *  AttemptSeedOptions); undefined on an unwired worker (today's canonical seed). */
+  /** issue #1783 M2: attempt-seed options when the flight's effective mode (falling back to the
+   *  worker's Docker default) enables attempt paths and an id exists. Recovery can enable this on
+   *  unwired workers too; otherwise undefined selects canonical free/retention/seed. */
   private attemptSeedOptions(claim: ClaimResponse, flight: RunFlight): AttemptSeedOptions | undefined {
     const attemptId = flight.attemptId;
     if (!(flight.effectiveAttemptPaths ?? this.attemptPaths) || attemptId === undefined) return undefined;
@@ -9124,6 +9209,7 @@ export class RunRunner {
     let retentionVetoed = false;
     return {
       attemptId,
+      isInterruption: canonicalRecoveryInterruption,
       isLive: (p) => this.liveAttempts.isLivePath(p),
       beforeSeed: async (nonLivePaths, canonical) => {
         // issue #1783 M2 (seed-time sweep): the process scan (mode `seed`: a terminal attempt's
@@ -9143,7 +9229,7 @@ export class RunRunner {
         });
         if (!proof.blocked) return;
         // issue #1783 M2 review (N6): a non-dumpable runner-uid process ANYWHERE on the worker reads
-        // back unattributable, so failing the seed on it would fail every wired seed while one
+        // back unattributable, so failing the seed on it would fail each attempt-path seed while one
         // exists. This honours the plan's "move nothing when unverified" rule rather than bending
         // it: seeding a FRESH attempt path moves, frees and deletes nothing (no predecessor path is
         // touched), so it is allowed; every step that WOULD move or free something still requires
@@ -9173,16 +9259,19 @@ export class RunRunner {
         flight.attempt = attempt;
         this.liveAttempts.add(attempt);
       },
+      // Retention keeps its process-only posture: fresh-path seed relaxation never authorizes
+      // deletion, and quarantine is checked both before and after the affirmative process proof.
       quiescent: async (paths, canonical) => {
-        if (retentionVetoed) return false;
+        if (retentionVetoed || residueQuarantine() !== undefined) return false;
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
           site: "attempt_retention",
+          propagateControl: true,
           targetPaths: paths,
           clonePath: canonical,
           processOnly: true,
         });
-        return !proof.blocked;
+        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
       },
     };
   }
@@ -9201,9 +9290,25 @@ export class RunRunner {
    * tree and may rename what is left: an unreadable process could be one whose cwd or open files are
    * inside it (a dev server, a container's bind), and deleting or moving its tree under it is exactly
    * the residue hazard this issue closes. So unverified blocks.
+   *
+   * After successful canonical free, the git layer uses these predicates for shared per-key
+   * residue retention before seeding. Unlike attempt retention, this callback forwards configured
+   * best-effort Docker handling; unwired workers acquire no daemon obligation. Deletion still
+   * requires an affirmative scoped seed-process verdict and no worker quarantine before/after proof;
+   * absent/off-Linux proof keeps excess, while classified control/recovery interruptions escape.
    */
   private canonicalReseedOptions(flight: RunFlight): CanonicalReseedOptions {
     return {
+      isInterruption: canonicalRecoveryInterruption,
+      isLive: (p) => this.liveAttempts.isLivePath(p),
+      quiescent: async (paths, canonical) => {
+        if (residueQuarantine() !== undefined) return false;
+        const proof = await this.quiesceRun(flight, flight.executor, {
+          mode: "seed", site: "canonical_retention", targetPaths: paths, clonePath: canonical,
+          propagateControl: true,
+        });
+        return residueQuarantine() === undefined && !proof.blocked && proof.outcome.process?.state === "quiescent";
+      },
       beforeFree: async (canonical) => {
         const proof = await this.quiesceRun(flight, flight.executor, {
           mode: "seed",
@@ -9568,7 +9673,7 @@ export class RunRunner {
       }
       throw err;
     }
-    // issue #1783 M2: a Docker-wired worker mints this attempt's id BEFORE the seed: it names the
+    // issue #1783 M2: attempt-path mode mints this attempt's id BEFORE the seed: it names the
     // fresh attempt clone path, and the journal, the ledger and the attempt marker reuse it.
     // issue #1786: the mode read in discovery is stale by now (ensureClone ran since, and discovery
     // itself may have healed a stopped canonical source and persisted the mode, or a concurrently
@@ -9838,7 +9943,7 @@ export class RunRunner {
       this.openQuestionIds.set(runId, claim.open_question_id);
 
     let sessionId = claim.session_id ?? undefined;
-    // issue #1783 M2: on a Docker-wired worker every attempt runs at a FRESH clone path, and a
+    // issue #1783 M2: in attempt-path mode each attempt runs at a FRESH clone path, and a
     // session is keyed by HOME *and* cwd, so the earlier session can never resolve from here. Drop
     // it BEFORE either transcript check (so neither can report it resumable, even when the old
     // transcript is still under HOME): Claude starts a fresh session and Codex a fresh thread.
@@ -10653,7 +10758,7 @@ export class RunRunner {
     // buildSdkEnv), so every process the agent starts is attributable to it; its recorded roots
     // let a concurrent sibling's reaper attribute our unreadable processes by ancestry. Removed in
     // executeClaim's terminal finally, after the attempt's final reap.
-    // issue #1783 M2: a Docker-wired seed already registered this attempt live (inside the bare
+    // issue #1783 M2: an attempt-path seed already registered this attempt live (inside the bare
     // lock, under the id that names its clone path); reuse it so marker, path and journal agree.
     let attempt: RunAttempt;
     if (flight.attempt && flight.attempt.clonePath === resolvePath(runnerClone.path)) {
@@ -10807,7 +10912,7 @@ export class RunRunner {
       sessionId,
       priorWork,
       // issue #222: this run executed before (it reported a session), so this claim's
-      // reseed rebuilt the tree (wiped it, or on a Docker-wired worker seeded a fresh attempt
+      // reseed rebuilt the tree (wiped it, or in attempt-path mode seeded a fresh attempt
       // path), so whatever an earlier attempt left uncaptured is not in it. Read the RAW
       // claim.session_id, not the `sessionId` var cleared above on a dropped transcript —
       // a dropped-session resume still had its tree destroyed. Same discriminator the
@@ -10846,6 +10951,7 @@ export class RunRunner {
       approvedSelection: claim.agent_selection,
       signal: cancel.signal,
       terminalLifecycleSignal: steering.terminalLifecycleSignal(),
+      lifecycleSignal: () => steering.lifecycleSignal(),
       onModelTurnSettled: async (processedEvents) => {
         // PRD #1733: counted before the retained-episode early return below; a failed turn never
         // reaches this hook (both executors fire it on a success outcome only).
@@ -12047,10 +12153,11 @@ export class RunRunner {
       // below, only on Linux. It runs BEFORE the no-clone early return so a missing clone cannot
       // skip the HOME reap, and its rejection (the contract says never) reads as unverified.
       let attributedReap: RunProcessReap | { failure: string } | undefined;
-      // A processOnly re-proof follows only runner-clone git, which runs with the worker's HOME
-      // (git.ts gitEnv), so nothing it starts carries the run's HOME unless it sets it deliberately;
-      // the sink's first proof already ran the attributed reap. A child that deliberately escapes
-      // both the clone and the HOME escapes both reaps alike (the documented worker-level residual).
+      // Process-only checks include attempt retention and re-proofs after runner-clone git.
+      // That git runs with the worker's HOME (git.ts gitEnv), so its children carry the run's HOME
+      // only if deliberately set; the sink's first proof already ran the attributed reap. Attempt
+      // retention keeps its existing process-only scan over candidate paths. A child deliberately
+      // escaping both clone and HOME escapes both reaps (the documented worker-level residual).
       if (
         !opts.processOnly &&
         (mode === "own" || flight.predecessorCapture) &&
@@ -12092,8 +12199,8 @@ export class RunRunner {
           // A Codex run's supervisor proves its OWN attempt's process drain; a seed/capture sweep
           // over OTHER attempts' paths has no supervisor behind it, so it always scans (issue #1783 M2).
           processes: (opts.forceProcessScan || !executor.safety || mode !== "own") && process.platform === "linux",
-          // A re-proof after a runner-clone git (processOnly) repeats only the process half: the
-          // Docker teardown already ran at the sink's first proof, and never blocks anyway.
+          // Process-only re-proofs and attempt retention omit Docker teardown. Canonical
+          // retention forwards the configured host; Docker handling stays best effort.
           dockerHost: opts.processOnly ? undefined : this.dockerHost,
           registry: this.liveAttempts,
           otherClaimInFlight: [...this.executionTails.keys()].some((id) => id !== flight.runId),
@@ -12530,6 +12637,8 @@ export class RunRunner {
       // (d) The stored credential may lack workflow scope: a range that authors a workflow change archives.
       const workflows = await this.git.rangeTouchesWorkflows(barePath, range, { deadlineMs: this.scanDeadlineMs() });
       if (workflows !== "clean") return skip(workflows === "touches" ? "workflow_change" : "workflow_check_unknown");
+      // (d2) Guarded runs: the raw-path CI-config check over the exact candidate, before any upload.
+      if (await this.ciConfigGuardBlocksPublication(flight, barePath, record.sourceSha, "held publication")) return skip("ci_config_guard");
       // (e) The pack, over the same range object the scan judged.
       const packed = await this.git.checkpointPack(barePath, branch, undefined, range, undefined, record.sourceSha);
       if (!packed || packed.tipOid !== record.sourceSha) {
@@ -13821,6 +13930,27 @@ export class RunRunner {
     return false;
   }
 
+  /**
+   * Guarded runs only: the raw-path CI-config check over the EXACT candidate `sha`, run in the worker
+   * before any checkpoint or held upload. The server broker compares trees but must skip subtrees
+   * absent from the pack, so a merge whose second parent carries an older workflow tree could slip
+   * a protected tree through; the merge-base diff here, taken over EVERY merge base, lists it. Returns true when the publication
+   * must be skipped (a protected path matched, or the diff could not be computed: fail closed).
+   * Never fails the run; the early and final push guards do that.
+   */
+  private async ciConfigGuardBlocksPublication(flight: RunFlight, barePath: string, sha: string, what: string): Promise<boolean> {
+    const globs = flight.ciConfigGuardGlobs;
+    if (!globs) return false;
+    const changed = await this.git.changedFilesNoRenames(barePath, sha);
+    const flagged = changed === null ? null : flagCIConfigPathsRaw(changed, globs);
+    if (flagged !== null && flagged.length === 0) return false;
+    const shown = flagged === null ? "diff could not be computed" : flagged.slice(0, 5).map(displayGuardPath).join(", ") +
+      (flagged.length > 5 ? `, and ${flagged.length - 5} more` : "");
+    this.reportPublishOutcome(flight, `ci_config_guard:${what}`,
+      `${what} skipped: CI-config guard (${shown}); work stays local`, { sha: sha.slice(0, 12) });
+    return true;
+  }
+
   private async publishCheckpointBestEffort(
     flight: RunFlight,
     barePath: string,
@@ -13880,6 +14010,10 @@ export class RunRunner {
     try {
       signal?.throwIfAborted();
       const sourceSha = await this.requireTrackingOwned(flight, barePath, branch, pinned?.tipSha);
+      signal?.throwIfAborted();
+      if (await this.ciConfigGuardBlocksPublication(flight, barePath, sourceSha, "checkpoint publish")) {
+        return { published: false, reason: "skipped", skipLabel: "ci_config_guard" };
+      }
       signal?.throwIfAborted();
       if (await this.checkpointRemediationHold(flight, barePath, sourceSha, reap)) {
         throw new SecretRemediationPendingError();
@@ -17613,7 +17747,8 @@ export class RunRunner {
       // This is monotone episode bookkeeping followed by an exact-generation terminal
       // report, not recovery authority. A new ownership GET could fail independently
       // of the fenced state endpoint and leave an exhausted claim cycling again.
-      if (episode && Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
+      if (episode && episode.stage !== "blocked" && episode.claimGeneration === flight.claimGeneration &&
+          Date.now() >= episode.deadline && blocker !== "decoded_history_limit") blocker = "budget_exhausted";
       let persistence = "";
       try {
         await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), Date.now() + this.codexBoundaryDeadlineMs,
@@ -17649,12 +17784,32 @@ export class RunRunner {
       let reservation: Awaited<ReturnType<GitCache["reserveRecoveryIteration"]>>;
       try {
         const now = Date.now();
-        reservation = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight),
-          Math.min(episode?.deadline ?? now + 300_000, now + 300_000),
-          () => this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs));
+        const newWindow = episode?.claimGeneration !== flight.claimGeneration;
+        const deadline = newWindow ? now + 300_000 : episode!.deadline;
+        reservation = await this.git.withRecoveryOperation(this.retainedLifecycleSignal(flight), deadline, async signal => {
+          if (!Number.isSafeInteger(flight.claimGeneration) || flight.claimGeneration < 1) throw new RetainedRecoveryStop();
+          // The acquired claim positively fences a first window; precharge it before probes
+          // as #2512 requires. Only rebasing an existing episode needs an extra ownership
+          // proof, before applying its predecessor deadline or changing that episode.
+          if (newWindow && episode) {
+            try { await this.requireRetainedOwnership(flight, deadline, signal); }
+            catch (error) {
+              this.retainedLifecycleGuard(flight);
+              if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
+              if (!isTransient(error)) throw error;
+              // No renewed-window authority was established. Keep the predecessor untouched
+              // and leave this flight nonterminal for bounded missing-flight requeue.
+              flight.runLog.warn("retained recovery renewal ownership unavailable; stopping claim for retry", {
+                error: sanitizeForLog(errMessage(error)), claim_generation: flight.claimGeneration,
+              });
+              throw new RetainedRecoveryStop();
+            }
+          }
+          return this.git.reserveRecoveryIteration(bare, branch, key, source, this.recoveryRetryMs, flight.claimGeneration);
+        });
       } catch (error) {
         this.retainedLifecycleGuard(flight);
-        if (error instanceof CredentialSwitchSignal) throw error;
+        if (error instanceof RetainedRecoveryStop || error instanceof CredentialSwitchSignal) throw error;
         const message = errMessage(error);
         blocker = message.includes("clock") ? "clock_invalid" : message.includes("budget") || message.includes("blocked") ? "budget_exhausted" : "preservation_failed";
         flight.runLog.warn("retained recovery reservation failed", { error: sanitizeForLog(message), blocker });
@@ -18006,8 +18161,8 @@ export class RunRunner {
     // the gate emits a warn-only status nudge (both modes) and, under auto-approve, arms the M2
     // safety steer for the first implement turn. The verdict flow is untouched (never rejects).
     publishedTip: string | undefined,
-    // Advisory hook after accepted storage; awaited for human gates and unawaited
-    // for autopilot. Receives the plan carried by the accepted report.
+    // Advisory hook after accepted storage; started without being awaited at both human
+    // gates and autopilot. Receives the plan carried by the accepted report.
     onPlanPersisted?: (planMd: string) => Promise<void>,
     // Issue #1604 (D2): the input id of the revise this plan revises. Settled (made due its
     // APPLIED) only once the awaiting_approval report below is applied, i.e. the revised plan is
@@ -18259,10 +18414,13 @@ export class RunRunner {
       gate_revision: ack.gateRevision ?? null,
     });
 
-    // Human gates await advisory work only after a positive storage acknowledgement.
+    // Human gates start advisory work only after a positive storage acknowledgement, and do
+    // not await it: the verdict wait must not be delayed by the summary model or its POST.
     if (onPlanPersisted && ack.applied === true && ack.status === "awaiting_approval") {
       try {
-        await onPlanPersisted(planMd);
+        void Promise.resolve(onPlanPersisted(planMd)).catch(error => {
+          runLog.warn("plan summary hook failed", { run_id: runId, error: errMessage(error) });
+        });
       } catch (e) {
         runLog.warn("plan summary hook failed", {
           run_id: runId,

@@ -44,8 +44,11 @@ func checkerPlacementEnv(t *testing.T, f crossCheckContentionFixture) interlockL
 func assertCheckerNoMint(t *testing.T, f crossCheckContentionFixture, expectedEpoch int64) {
 	t.Helper()
 	r := mustRun(t, f.env, f.runID)
-	if len(r.CodexCapHash) != 0 || r.CodexClaimEpoch != expectedEpoch {
+	if len(r.CodexCapHash) != 0 {
 		t.Fatal("pin refusal minted a capability")
+	}
+	if r.CodexClaimEpoch != expectedEpoch {
+		t.Fatalf("pin refusal epoch=%d, want %d", r.CodexClaimEpoch, expectedEpoch)
 	}
 	cc, err := f.env.q.GetPlanCrossCheck(f.env.ctx, f.lead)
 	if err != nil {
@@ -157,7 +160,8 @@ func TestCrossCheckPinsLateCapabilityRequeueLiveDB(t *testing.T) {
 					if p != nil || !errors.Is(err, tc.want) {
 						t.Fatalf("assembly payload present=%v error=%v, want %v", p != nil, err, tc.want)
 					}
-					assertCheckerNoMint(t, f, before.CodexClaimEpoch)
+					// ClaimRun revokes the previous epoch before assembly.
+					assertCheckerNoMint(t, f, before.CodexClaimEpoch+1)
 				},
 			}
 			if p := f.claim(t, false, "", uuid.Nil); p != nil || !sawAssembly {
@@ -172,7 +176,8 @@ func TestCrossCheckPinsLateCapabilityRequeueLiveDB(t *testing.T) {
 				r.ClaimGeneration != claimed.ClaimGeneration || cc.Verdict != "pending" {
 				t.Fatal("late capability refusal did not requeue the exact claim")
 			}
-			assertCheckerNoMint(t, f, before.CodexClaimEpoch+1)
+			// Explicit refusal requeue revokes again after ClaimRun.
+			assertCheckerNoMint(t, f, before.CodexClaimEpoch+2)
 		})
 	}
 }
@@ -204,7 +209,8 @@ func TestCrossCheckPinsInvalidSettlementLiveDB(t *testing.T) {
 					if p != nil || !errors.Is(err, errCheckerPinUnavailable) {
 						t.Fatalf("invalid pin assembly payload present=%v err=%v", p != nil, err)
 					}
-					assertCheckerNoMint(t, f, before.CodexClaimEpoch)
+					// ClaimRun revokes the previous epoch before assembly.
+					assertCheckerNoMint(t, f, before.CodexClaimEpoch+1)
 				},
 			}
 			if p := f.claim(t, false, "", uuid.Nil); p != nil || !sawAssembly {
@@ -235,7 +241,8 @@ func TestCrossCheckPinsInvalidSettlementLiveDB(t *testing.T) {
 			if verdict != "failed" || reason != "checker_unavailable" || gen != 1 {
 				t.Fatal("missing exact-generation checker-unavailable event")
 			}
-			assertCheckerNoMint(t, f, before.CodexClaimEpoch+1)
+			// Explicit refusal failure revokes again after ClaimRun.
+			assertCheckerNoMint(t, f, before.CodexClaimEpoch+2)
 			p, err := f.svc.finishRunClaim(f.env.ctx, claimed, nil, errCheckerPinUnavailable,
 				claimRecoveryIdentity{workerID: f.workerID})
 			if err != nil || p != nil {

@@ -156,7 +156,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			// WorkerDTO. LARGEST RUN (PRD #1809 M6, D8) is the HOME size of each worker's largest
 			// run, the same largestRunCell `uzi worker list` uses; it is the fleet-wide view the
 			// fleet.rundisk health check's action points at.
-			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "UPGRADE", "BLOCKING", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "DISK", "CLEANUP", "LARGEST RUN", "OUTBOX"}, rows)
+			return p.Table([]string{"ID", "OWNER", "NAME", "STATUS", "VERSION", "ROLL", "BLOCKING", "RUN SLOTS", "CROSS-CHECKS", "RUNS", "DISK", "CLEANUP", "LARGEST RUN", "OUTBOX"}, rows)
 		},
 	}
 
@@ -324,6 +324,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			"and how many live OAuth connections it has.\n\n" +
 			"STATE is enabled, disabled, or deleted. A disabled or deleted product's " +
 			"tokens and connections are refused on /api/v1; a deleted product can never be re-enabled. " +
+			"ID is the product's OAuth client_id. " +
 			"CLIENT is yes when the product can run the OAuth consent flow (PRD #1910: a " +
 			"redirect URI, a scope list and a client secret) and SCOPES lists the scopes it " +
 			"may be granted. The client secret is never shown here. " +
@@ -347,6 +348,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 			for _, pr := range ps {
 				rows = append(rows, []string{
 					pr.Name,
+					pr.ID,
 					productStateCell(pr),
 					strconv.FormatInt(pr.ActiveTokenCount, 10),
 					strconv.FormatInt(pr.LiveConnectionCount, 10),
@@ -358,7 +360,7 @@ func newAdminCmd(env Env, gf *globalFlags) *cobra.Command {
 					cellText(pr.Description),
 				})
 			}
-			return p.Table([]string{"NAME", "STATE", "ACTIVE_TOKENS", "CONNECTIONS", "JOB_TYPES", "CLIENT", "SCOPES", "CREATED", "DESCRIPTION"}, rows)
+			return p.Table([]string{"NAME", "ID", "STATE", "ACTIVE_TOKENS", "CONNECTIONS", "JOB_TYPES", "CLIENT", "SCOPES", "CREATED", "DESCRIPTION"}, rows)
 		},
 	}
 

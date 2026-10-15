@@ -64,7 +64,7 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	if s.Timing == schedTimingRecurring {
 		rows = append(rows, []string{"TIMEZONE", s.Timezone})
 	}
-	if s.Target == schedTargetPrompt && s.Prompt != "" {
+	if (s.Target == schedTargetPrompt || s.Target == schedTargetCIWatch) && s.Prompt != "" {
 		rows = append(rows, []string{"PROMPT", s.Prompt})
 	}
 	if s.Target == schedTargetSweep {
@@ -109,6 +109,9 @@ func renderScheduleDetail(p *uzicli.Printer, s apitypes.ScheduleDTO) error {
 	}
 	renderLastFire(p, s.LastFire)
 	renderRecentFires(p, s.RecentFires)
+	if s.Target == schedTargetCIWatch {
+		renderCIWatchDetail(p, s)
+	}
 	return nil
 }
 
@@ -142,6 +145,18 @@ var skipReasonLabels = map[string]string{ //nolint:gosec // G101: schedule skip-
 	"credential_disabled":    "pinned credential is disabled",
 	"harness_label_conflict": "issue harness label conflicts with schedule pin",
 	"harness_label_invalid":  "invalid issue harness labels",
+	// PRD #2865: the ci_watch fire path.
+	"ci_green":              "CI is green",
+	"ci_already_handled":    "failure already handled",
+	"ci_halted_no_progress": "halted: same failure after a repair attempt",
+	"ci_halted_attempt_cap": "halted: repair attempt limit reached",
+	"ci_watched_not_seen":   "watched workflow not seen",
+	"ci_unsupported":        "forge has no CI API",
+	"no_default_branch":     "repo has no default branch",
+	"ci_capacity":           "watched workflow limit reached",
+	"ci_evidence_limited":   "CI evidence too large to read",
+	"ci_not_failed":         "newest execution neither failed nor passed",
+	"ci_config_changed":     "schedule changed during the fire",
 }
 
 // skipReasonLabel renders a skip reason as its human label, falling back to the raw wire

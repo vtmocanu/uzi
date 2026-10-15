@@ -41,5 +41,7 @@
   "checkpoint_tip": "x",
   "checkpoint_state": "x",
   "final_publication_id": "x",
-  "held_ref": "x"
+  "held_ref": "x",
+  "counts_toward_admission": true,
+  "admission_reason": "x"
 }

@@ -55,7 +55,8 @@ func newCodexClaimFix(t *testing.T, env codexTestEnv, olderHold bool) *codexClai
 	if olderHold {
 		fx.holdA = claimRecoveryHold(t, env, f.runID, fx.workerA, 1)
 	}
-	// The sweeper's requeue: worker_id kept for affinity, capability revoked. A stale
+	// The sweeper's provisional requeue keeps worker_id for affinity and preserves the
+	// capability; this fixture already seeded a NULL hash above. A stale
 	// recovery_retry_not_before is left in place as history (as PromoteRecoveryWaitRuns leaves
 	// it), so a codex_account_unavailable park must clear it.
 	env.exec(`UPDATE runs SET status = 'queued', status_since = now(), worker_id = $2,

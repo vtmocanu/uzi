@@ -8,7 +8,7 @@ import {
 } from "../src/codex/broker.js";
 import { makeDefaultSpawnCommand } from "../src/codex/codex-executor.js";
 import { ExecutionRegistry, newLocalExecutionEpoch } from "../src/codex/registry.js";
-import type { CodexRootHandle, ObservationOutcome } from "../src/codex/launcher.js";
+import { SupervisedChildExitTimeoutError, type CodexRootHandle, type ObservationOutcome } from "../src/codex/launcher.js";
 import { WorkerMemoryCommands } from "../src/worker-memory-commands.js";
 import { WorkerMemoryMonitor } from "../src/worker-memory-guard.js";
 import type { WorkerMemoryPressureResult } from "../src/protocol.js";
@@ -130,7 +130,7 @@ test("broker metadata cannot enroll into a different or absent captured context"
     const root = fakeRoot();
     root.child.resolve({ event: "child_exit", code: 0 });
     return root.handle;
-  }, 100, WT, {}, "off", undefined, undefined, 1000, target);
+  }, 100, WT, {}, "off", undefined, undefined, 1000, undefined, target);
   for (const source of [captured(), undefined]) {
     const b = broker(spawn, new ExecutionRegistry(newLocalExecutionEpoch(2)), source);
     const result = await b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
@@ -180,7 +180,7 @@ test("trusted model command is enrolled before the executor waits for ordinary c
     },
   };
   const b = broker(makeDefaultSpawnCommand(registry, async () => handle,
-    100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+    100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
   const result = await b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
   assert.equal(result.ok, true);
   assert.equal(enrollmentAtWait, 1, "trusted model shell must acquire enrollment before ordinary completion");
@@ -192,7 +192,7 @@ test("enrollment seam excludes internal probes, cloned metadata and no captured 
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const root = fakeRoot();
   root.child.resolve({ event: "child_exit", code: 0 });
-  const spawn = makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, c);
+  const spawn = makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c);
   await spawn(["/bin/true"], {});
   assert.equal(root.observations(), 0, "internal probe shares seam but never enrolls");
   assert.equal(c.commands.eligibleEntries()?.length, 0);
@@ -206,7 +206,7 @@ test("enrollment seam excludes internal probes, cloned metadata and no captured 
   const cloneRoot = fakeRoot();
   cloneRoot.child.resolve({ event: "child_exit", code: 0 });
   const cloneRegistry = new ExecutionRegistry(newLocalExecutionEpoch(4));
-  await makeDefaultSpawnCommand(cloneRegistry, async () => cloneRoot.handle, 100, WT, {}, "off", undefined, undefined, 1000, c)(
+  await makeDefaultSpawnCommand(cloneRegistry, async () => cloneRoot.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c)(
     ["/bin/true"], { modelCommand: cloned });
   assert.equal(cloneRoot.observations(), 0, "cloned trusted metadata loses enrollment authority");
 
@@ -223,7 +223,7 @@ test("enrollment and exact tooljoin survive primary exit and output cleanup race
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const root = fakeRoot();
   root.hangOutput();
-  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
   const reply = b.handleToolCall(rt, "Bash", { command: "printf private-fixture" }, "root");
   await until(() => c.commands.eligibleEntries()?.length === 1);
   const entry = c.commands.eligibleEntries()![0]!;
@@ -252,7 +252,7 @@ test("production monotonic monitor selects and cancels the enrolled adapter, lea
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const root = fakeRoot();
   const sibling = c.commands.begin({ ...c.context, run_id: "44444444-4444-4444-8444-444444444444", flight: {} });
-  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
   const reply = b.handleToolCall(rt, "Bash", { command: "printf private-fixture" }, "root");
   await until(() => c.commands.eligibleEntries()?.length === 1);
   let reservations = 0;
@@ -294,7 +294,7 @@ test("fresh cancellation rechecks supervisor ticks and context before disposal",
   const c = captured();
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const root = fakeRoot();
-  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
   const reply = b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
   await until(() => c.commands.eligibleEntries()?.length === 1);
   const entry = c.commands.eligibleEntries()![0]!;
@@ -324,7 +324,7 @@ test("failed or retired initial enrollment boundedly reaps the already launched 
     });
     const b = new CodexCallbackBroker({
       registry, capturedMemory: c, signal: signal.signal, worktreePath: WT,
-      spawnCommand: makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off", undefined, undefined, 1000, c),
+      spawnCommand: makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off", undefined, undefined, 1000, undefined, c),
       grants: { role: "coder", phase: "implement", isRoot: true, allowedTools: new Set(["Bash"]), allowedSkills: new Set() },
       fileop: { op: async () => ({ ok: false }) }, delegate: async () => ({ ok: false }),
     });
@@ -341,7 +341,7 @@ test("current signal and authority are revalidated after a delayed observation",
     const c = captured();
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const root = fakeRoot();
-    const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+    const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
     const reply = b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
     await until(() => c.commands.eligibleEntries()?.length === 1);
     const entry = c.commands.eligibleEntries()![0]!;
@@ -399,7 +399,7 @@ test("disposal and prepared-outcome waits are bounded and uncertain roots remain
     const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
     const root = fakeRoot();
     if (mode === "disposal") root.hangDisposal();
-    const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+    const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
     const reply = b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
     await until(() => c.commands.eligibleEntries()?.length === 1);
     const entry = c.commands.eligibleEntries()![0]!;
@@ -422,7 +422,7 @@ test("unclean disposal retains root and exact memory outcome rather than generic
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const root = fakeRoot();
   root.unconfirmed();
-  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, c), registry, c);
+  const b = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off", undefined, undefined, 1000, undefined, c), registry, c);
   const reply = b.handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
   await until(() => c.commands.eligibleEntries()?.length === 1);
   const entry = c.commands.eligibleEntries()![0]!;
@@ -449,10 +449,10 @@ test("pressure feedback never grants ordinary disposal for denied revoked or ret
     const siblingCapture = { ...c, context: siblingContext, flight: siblingContext.flight };
     const siblingRegistry = new ExecutionRegistry(newLocalExecutionEpoch(2));
     const siblingReply = broker(makeDefaultSpawnCommand(siblingRegistry, async () => sibling.handle, 100, WT, {}, "off",
-      undefined, undefined, 1000, siblingCapture), siblingRegistry, siblingCapture)
+      undefined, undefined, 1000, undefined, siblingCapture), siblingRegistry, siblingCapture)
       .handleToolCall({ ...rt, callId: "sibling" }, "Bash", { command: "printf sibling" }, "root");
     const reply = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off",
-      undefined, undefined, 1000, c), registry, c)
+      undefined, undefined, 1000, undefined, c), registry, c)
       .handleToolCall({ ...rt, callId: "call-private-fixture" }, "Bash", { command: "printf private-fixture" }, "root");
     await until(() => c.commands.eligibleEntries()?.length === 2);
     let revision = 1;
@@ -513,7 +513,7 @@ test("timed out owned reap reconciles late clean completion without reviving its
   const root = fakeRoot();
   root.hangDisposal();
   const reply = broker(makeDefaultSpawnCommand(registry, async () => root.handle, 30, WT, {}, "off",
-    undefined, undefined, 1000, c), registry, c)
+    undefined, undefined, 1000, undefined, c), registry, c)
     .handleToolCall(rt, "Bash", { command: "printf fixture" }, "root");
   await until(() => c.commands.eligibleEntries()?.length === 1);
   const entry = c.commands.eligibleEntries()![0]!;
@@ -556,7 +556,7 @@ test("full adapter refuses a mismatched callback result after private ID binding
   const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
   const root = fakeRoot();
   const spawn = makeDefaultSpawnCommand(registry, async () => root.handle, 100, WT, {}, "off",
-    undefined, undefined, 1000, c);
+    undefined, undefined, 1000, undefined, c);
   const reply = broker(async (argv, opts) => {
     const result = await spawn(argv, opts);
     return { ...result, memoryPressure: result.memoryPressure ? { ...result.memoryPressure, tool_id: "other-callback" } : undefined };
@@ -592,4 +592,67 @@ test("plain command timeout closes registry admission without captured memory co
     await until(() => !registry.hasLiveCommandRoot());
   }
   assert.equal(registry.isPoisoned(), true, "late ordinary cleanup cannot reopen admission");
+});
+
+
+test("long_running selected victim retains pressure outcome when effective deadline becomes ready during disposal and outcome join", async () => {
+  const c = captured();
+  const registry = new ExecutionRegistry(newLocalExecutionEpoch(1));
+  const root = fakeRoot();
+  root.hangDisposal();
+  let waitMs: number | undefined;
+  let expire!: () => void;
+  const timed = new Promise<never>((_resolve, reject) => { expire = () => reject(new SupervisedChildExitTimeoutError(7000)); });
+  const handle = { ...root.handle, waitChild: (ms?: number) => { waitMs = ms; return timed; } };
+  const reply = broker(makeDefaultSpawnCommand(registry, async () => handle, 1000, WT, {}, "off",
+    undefined, undefined, 1000, 7000, c), registry, c)
+    .handleToolCall(rt, "Bash", { command: "printf fixture", long_running: true }, "root");
+  await until(() => c.commands.eligibleEntries()?.length === 1 && waitMs !== undefined);
+  const entry = c.commands.eligibleEntries()![0]!;
+  let expected: WorkerMemoryPressureResult | undefined;
+  const resolveOutcome = c.commands.resolveToolOutcome.bind(c.commands);
+  c.commands.resolveToolOutcome = (selected, result) => {
+    assert.equal(selected, entry); expected = result; return true;
+  };
+  const monitor = new WorkerMemoryMonitor({
+    enabled: true, reserveBytes: 200, hysteresisBytes: 100, sampleMs: 100,
+    responseBudgetMs: 1000, rearmMs: 100, maxInterventions: 2,
+  }, {
+    commands: c.commands, now: () => performance.now(),
+    incarnation: () => ({ worker_id: c.context.worker_id, register_nonce: c.context.register_nonce, revision: 1 }),
+    sample: () => {
+      const now = performance.now();
+      const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
+      return { available: true, sampleId: 1, startedAtMs: now, completedAtMs: now,
+        currentBytes: 900, limitBytes: 1000, stat: { anon: 10, shmem: 0, slab_unreclaimable: 0, unevictable: 0 },
+        pressure: { some: psi, full: psi } };
+    },
+    reserve: async request => ({ ...request, admitted: true, authorizing: true,
+      allowance: { limit: 2, used: 1, remaining: 1 } }),
+    report: async request => ({ ...request, policy: { version: 1, max_interventions: 2 }, admitted: true, authorizing: false,
+      allowance: { limit: 2, used: 1, remaining: 1 } }),
+    feedback: async () => {}, preserve: async () => assert.fail("allowance remains"),
+  });
+  try {
+    monitor.tick();
+    await until(() => root.disposes() === 1);
+    assert.equal(waitMs, 7000, "opt-in effective bound reaches the supervisor");
+    expire();
+    await new Promise(resolve => setImmediate(resolve));
+    root.completeDisposal();
+    await until(() => expected !== undefined);
+    // The deadline is already ready while ordinary cleanup joins the prepared result.
+    assert.ok(c.commands.outcome(entry));
+    assert.equal(resolveOutcome(entry, expected!), true);
+    const result = await reply;
+    assert.equal(result.ok, false);
+    if (result.ok) assert.fail("pressure result required");
+    assert.equal(result.code, "worker_memory_pressure");
+    assert.deepEqual(result.memoryPressure, expected);
+    assert.equal(result.memoryPressure?.outcome, "confirmed_drained");
+    assert.equal(root.disposes(), 1);
+    await monitor.settle();
+  } finally {
+    root.completeDisposal(); expire(); await monitor.stop(); await reply;
+  }
 });

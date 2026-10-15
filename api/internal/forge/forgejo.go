@@ -81,7 +81,7 @@ func newForgejo(baseURL, token string, timeout time.Duration) *forgejo {
 	// the gitea SDK buffers whole bodies, so a hostile forge must not be able to
 	// stream an unbounded one.
 	client := timeoutClient(timeout)
-	client.Transport = cappedTransport{base: client.Transport}
+	client.Transport = ciRepairTransport{base: cappedTransport{base: client.Transport}}
 	return &forgejo{
 		baseURL:   strings.TrimSuffix(baseURL, "/"),
 		token:     token,

@@ -616,13 +616,13 @@ ORDER BY h.created_at ASC;
 -- surface classify a hold (active protection / capture in progress / archive available /
 -- needs attention) without a second query.
 --
--- run_status is the hold's run's live status (M5, D6/D8), LEFT-JOINed from runs (NULL -> ''
--- when the run row is gone). It is consumed ONLY by the Go attention derivation in
--- ListHoldsForOwner to tell `active` (an OPEN hold whose run is still running/claimed —
--- healthy protection, no owner decision) from `source_only` (an OPEN hold whose run is
--- terminal and carries no capture — a source needing an owner decision). It is NOT added to
--- the frozen RecoveryCustodyHoldDTO wire shape; it never reaches the SPA/CLI JSON. Ordered
--- oldest-first for a stable list.
+-- run_status, recovery_wait_cause, attention and decision_needed come from the
+-- recovery_custody_hold_facts view, the SQL policy authority (ADR-2445 D2): attention tells
+-- `active` (an OPEN hold whose run is still running/claimed, healthy protection, no owner
+-- decision) from `source_only` (an OPEN hold whose run is terminal and carries no capture, a
+-- source needing an owner decision). Go consumes these facts rather than re-deriving them.
+-- run_status is NOT added to the frozen RecoveryCustodyHoldDTO wire shape; it never reaches
+-- the SPA/CLI JSON. Ordered oldest-first for a stable list.
 --
 -- checkpoint_ref/checkpoint_tip/checkpoint_state (PRD #1810 M3, D3) name where the run's
 -- published checkpoint lives on origin while it is retained: the branch checkpoint ref, or the
@@ -704,6 +704,17 @@ SELECT
         ELSE 0
      END)::bigint AS blocked_runs
 FROM admission;
+
+-- name: ListCustodyAdmissionMembersForOwner :many
+-- Issue #2970: per-hold custody admission membership for the owner hold list, one row per
+-- state='open' hold. counted mirrors fn_custody_admission_count membership and reason names the
+-- first matching cause (closed vocabulary, see migration 00336). Read-only visibility only:
+-- admission accounting stays on fn_custody_admission_count. Callers pass the SAME
+-- @heartbeat_cutoff as GetCustodyAggregateForOwner so both read one cutoff. Explicit casts type
+-- the columns as uuid/bool/string, never interface{}.
+SELECT m.hold_id::uuid AS hold_id, m.counted::boolean AS counted, m.reason::text AS reason
+FROM fn_custody_admission_members(@user_id::uuid, @heartbeat_cutoff::timestamptz) m
+ORDER BY m.hold_id;
 
 -- name: DiscardCustodyHoldForOwner :execrows
 -- PRD #1349 M1 (D7): owner-initiated EXACT hold discard. Marks the ONE named open hold

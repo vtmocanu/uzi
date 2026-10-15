@@ -1,3 +1,4 @@
+import { needsAttention } from "../../components/WorkerUpgradeBadge";
 import type { BindMode } from "../../lib/api";
 import { ApiError } from "../../lib/apiError";
 import { healthyFleetWorkers, incidentFleetWorkers, mockAdminWorkers, mockWorkers } from "../data";
@@ -17,9 +18,7 @@ export const workersApi = {
   // badge actually clears when a worker is deleted — web-ux needs to see it appear AND
   // clear, and a constant would only ever show the first half.
   workerUpgradeSummary: async () => {
-    const attention = workers.filter(
-      (w) => w.upgrade_status === "upgrade_failed" || w.upgrade_status === "outdated",
-    ).length;
+    const attention = workers.filter(needsAttention).length;
     return delay({ attention, target_release: "0.4.2" });
   },
 

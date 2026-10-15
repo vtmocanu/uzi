@@ -164,6 +164,19 @@ type CiAutofixAttempt struct {
 	UpdatedAt      pgtype.Timestamptz `json:"updated_at"`
 }
 
+type CiWatchEpisode struct {
+	ScheduleID        uuid.UUID          `json:"schedule_id"`
+	WorkflowKey       string             `json:"workflow_key"`
+	LastHandledRunID  pgtype.Int8        `json:"last_handled_run_id"`
+	ObservedCreatedAt pgtype.Timestamptz `json:"observed_created_at"`
+	ObservedUpdatedAt pgtype.Timestamptz `json:"observed_updated_at"`
+	ObservedRunID     pgtype.Int8        `json:"observed_run_id"`
+	LastSignature     pgtype.Text        `json:"last_signature"`
+	Attempts          int32              `json:"attempts"`
+	HaltedReason      pgtype.Text        `json:"halted_reason"`
+	UpdatedAt         pgtype.Timestamptz `json:"updated_at"`
+}
+
 type CliAuthRequest struct {
 	ID            uuid.UUID          `json:"id"`
 	CodeChallenge string             `json:"code_challenge"`
@@ -798,37 +811,38 @@ type RecoveryCaptureChunk struct {
 }
 
 type RecoveryCustodyHold struct {
-	ID                          uuid.UUID          `json:"id"`
-	UserID                      uuid.UUID          `json:"user_id"`
-	RepoID                      pgtype.UUID        `json:"repo_id"`
-	RunID                       uuid.UUID          `json:"run_id"`
-	Generation                  int64              `json:"generation"`
-	State                       string             `json:"state"`
-	OriginalWorkerID            uuid.UUID          `json:"original_worker_id"`
-	OriginalWorkerIdentity      string             `json:"original_worker_identity"`
-	LiveWorkerID                pgtype.UUID        `json:"live_worker_id"`
-	LiveRunID                   pgtype.UUID        `json:"live_run_id"`
-	CreatedAt                   pgtype.Timestamptz `json:"created_at"`
-	UpdatedAt                   pgtype.Timestamptz `json:"updated_at"`
-	ReleasedAt                  pgtype.Timestamptz `json:"released_at"`
-	ReleaseEvidence             pgtype.Text        `json:"release_evidence"`
-	ReleasePushedSha            pgtype.Text        `json:"release_pushed_sha"`
-	ReleaseSourceSha            pgtype.Text        `json:"release_source_sha"`
-	ReleaseAdoptedSha           pgtype.Text        `json:"release_adopted_sha"`
-	ReleaseFinalHeadSha         pgtype.Text        `json:"release_final_head_sha"`
-	ReleaseSuccessorGeneration  pgtype.Int8        `json:"release_successor_generation"`
-	ReleaseBranch               pgtype.Text        `json:"release_branch"`
-	ReleaseTarget               pgtype.Text        `json:"release_target"`
-	TerminalRecordRejection     pgtype.Text        `json:"terminal_record_rejection"`
-	InventoryGuarded            bool               `json:"inventory_guarded"`
-	FinalDisposition            pgtype.Text        `json:"final_disposition"`
-	FinalCaptureID              pgtype.UUID        `json:"final_capture_id"`
-	FinalSourceSha              pgtype.Text        `json:"final_source_sha"`
-	FinalCoverageDigest         pgtype.Text        `json:"final_coverage_digest"`
-	CompletionIdentity          []byte             `json:"completion_identity"`
-	CompletedPublicationReceipt []byte             `json:"completed_publication_receipt"`
-	CompletedPublicationReason  pgtype.Text        `json:"completed_publication_reason"`
-	FinalPublicationID          pgtype.UUID        `json:"final_publication_id"`
+	ID                              uuid.UUID          `json:"id"`
+	UserID                          uuid.UUID          `json:"user_id"`
+	RepoID                          pgtype.UUID        `json:"repo_id"`
+	RunID                           uuid.UUID          `json:"run_id"`
+	Generation                      int64              `json:"generation"`
+	State                           string             `json:"state"`
+	OriginalWorkerID                uuid.UUID          `json:"original_worker_id"`
+	OriginalWorkerIdentity          string             `json:"original_worker_identity"`
+	LiveWorkerID                    pgtype.UUID        `json:"live_worker_id"`
+	LiveRunID                       pgtype.UUID        `json:"live_run_id"`
+	CreatedAt                       pgtype.Timestamptz `json:"created_at"`
+	UpdatedAt                       pgtype.Timestamptz `json:"updated_at"`
+	ReleasedAt                      pgtype.Timestamptz `json:"released_at"`
+	ReleaseEvidence                 pgtype.Text        `json:"release_evidence"`
+	ReleasePushedSha                pgtype.Text        `json:"release_pushed_sha"`
+	ReleaseSourceSha                pgtype.Text        `json:"release_source_sha"`
+	ReleaseAdoptedSha               pgtype.Text        `json:"release_adopted_sha"`
+	ReleaseFinalHeadSha             pgtype.Text        `json:"release_final_head_sha"`
+	ReleaseSuccessorGeneration      pgtype.Int8        `json:"release_successor_generation"`
+	ReleaseBranch                   pgtype.Text        `json:"release_branch"`
+	ReleaseTarget                   pgtype.Text        `json:"release_target"`
+	TerminalRecordRejection         pgtype.Text        `json:"terminal_record_rejection"`
+	InventoryGuarded                bool               `json:"inventory_guarded"`
+	FinalDisposition                pgtype.Text        `json:"final_disposition"`
+	FinalCaptureID                  pgtype.UUID        `json:"final_capture_id"`
+	FinalSourceSha                  pgtype.Text        `json:"final_source_sha"`
+	FinalCoverageDigest             pgtype.Text        `json:"final_coverage_digest"`
+	CompletionIdentity              []byte             `json:"completion_identity"`
+	CompletedPublicationReceipt     []byte             `json:"completed_publication_receipt"`
+	CompletedPublicationReason      pgtype.Text        `json:"completed_publication_reason"`
+	FinalPublicationID              pgtype.UUID        `json:"final_publication_id"`
+	MergedPredecessorDiscardBinding []byte             `json:"merged_predecessor_discard_binding"`
 }
 
 type RecoveryCustodyHoldFact struct {
@@ -1065,6 +1079,7 @@ type Run struct {
 	MemoryEpisode               int64              `json:"memory_episode"`
 	MemoryInterventionCount     int32              `json:"memory_intervention_count"`
 	MemoryPolicy                []byte             `json:"memory_policy"`
+	CiConfigGuard               bool               `json:"ci_config_guard"`
 }
 
 type RunCompletionAttempt struct {
@@ -1265,6 +1280,7 @@ type RunSchedule struct {
 	CapacityRoomNeeded         pgtype.Int4        `json:"capacity_room_needed"`
 	RemoveLabelOnDispatch      bool               `json:"remove_label_on_dispatch"`
 	RecentFires                []byte             `json:"recent_fires"`
+	CiWorkflows                []byte             `json:"ci_workflows"`
 }
 
 type RunUsage struct {
@@ -1587,6 +1603,14 @@ type WorkerActiveRun struct {
 	TerminalPendingSince pgtype.Timestamptz `json:"terminal_pending_since"`
 }
 
+type WorkerPendingOutcomeIdentity struct {
+	WorkerID        uuid.UUID          `json:"worker_id"`
+	RunID           uuid.UUID          `json:"run_id"`
+	ClaimGeneration int64              `json:"claim_generation"`
+	FirstSeenAt     pgtype.Timestamptz `json:"first_seen_at"`
+	ReportedUntil   pgtype.Timestamptz `json:"reported_until"`
+}
+
 type WorkerRunDisk struct {
 	WorkerID   uuid.UUID          `json:"worker_id"`
 	RunID      uuid.UUID          `json:"run_id"`
@@ -1622,4 +1646,6 @@ type WorkerUpgradeReport struct {
 	UpdatedAt            pgtype.Timestamptz `json:"updated_at"`
 	Pacing               []byte             `json:"pacing"`
 	PacingObservedAt     pgtype.Timestamptz `json:"pacing_observed_at"`
+	// Display-only roll blocking classification; does not control scheduling.
+	BlockingKind pgtype.Text `json:"blocking_kind"`
 }

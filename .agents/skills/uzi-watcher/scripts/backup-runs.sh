@@ -560,10 +560,11 @@ select_clone(){
         and (if has("restoreTip") then (.restoreTip | sha) else true end);
       def same($s): .runId == $s.runId and .clonePath == $s.clonePath and .attemptId == $s.attemptId;
       def progress:
-        type == "object" and fields(["version","source","attempts","startedAt","deadline","backoffMs","stage","restoreTip","successor","blocker"])
+        type == "object" and fields(["version","source","attempts","startedAt","deadline","claimGeneration","backoffMs","stage","restoreTip","successor","blocker"])
         and .version == 1 and (.source | src)
         and (.attempts | integer) and .attempts >= 1 and .attempts <= 3
         and (.startedAt | integer) and (.deadline | integer) and .deadline == .startedAt + 300000
+        and (if has("claimGeneration") then (.claimGeneration | integer) and .claimGeneration >= 1 else true end)
         and (.backoffMs | integer) and .backoffMs <= 480000
         and (.stage as $s | ["capturing","captured","adopting","ready-for-model","blocked"] | index($s) != null)
         and (if has("restoreTip") then (.restoreTip | sha) else true end)
@@ -625,6 +626,7 @@ select_clone(){
   if [ -n "$journal" ]; then
     # shellcheck disable=SC2016
     journal_ok="$(printf '%s' "$journal" | "$JQ" -r --arg rid "$rid" '
+      def integer: type == "number" and floor == . and . >= 0 and . <= 9007199254740991;
       def source: type == "object" and (.runId | type) == "string"
         and (.clonePath | type) == "string"
         and ((.attemptId // "") | type) == "string";
@@ -633,6 +635,7 @@ select_clone(){
         and (.recovery.attempts | type) == "number"
         and .recovery.attempts >= 1 and .recovery.attempts <= 3
         and .recovery.deadline == .recovery.startedAt + 300000
+        and (.recovery | if has("claimGeneration") then (.claimGeneration | integer) and .claimGeneration >= 1 else true end)
         and .recovery.backoffMs >= 0 and .recovery.backoffMs <= 480000
         and (.recovery.source | source)))
       | [., (.retainedSources // [])[], .recovery.source // empty, .recovery.successor // empty]

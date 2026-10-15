@@ -635,9 +635,12 @@ gives no plan gate, no `--harness` or `--token`, and an MR that closes nothing.
 3. **Publish the seed without force:** `git push origin TIP:refs/heads/agent/issue-N`.
    If that branch already exists, or moves, stop and reconcile; never overwrite it.
    Verify the remote tip with `git ls-remote`.
-4. **Create the successor gated** with `scripts/create-run.sh` plus `--harness` and
-   `--token`. Verify `harness`, `credential_override.label` and `auto_approve=false`
-   from `uzi run get`. At the gate, require the plan to build on the existing
+4. **Create the successor gated** with `scripts/create-run.sh`. Pass `--harness` only for
+   the AGENTS.md *Two harnesses* exceptions: `claude` for Claude SDK work or after a Codex
+   provider safety-policy refusal (`fail_origin` `provider_policy_refusal`), `codex` for
+   Codex SDK work. Leave `--token` off unless the user authorized a specific credential
+   override; never pin an excluded credential. Verify `harness`, `auto_approve=false` and
+   `credential_override` (null when the server chose) from `uzi run get`. At the gate, require the plan to build on the existing
    commits and finish the in-progress milestone, and co-review it with the buddy.
 
 ## Cross-session handoff

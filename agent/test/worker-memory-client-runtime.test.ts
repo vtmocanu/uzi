@@ -255,3 +255,125 @@ for (const mode of ["lost-response", "failure", "malformed", "parked-replay", "u
     if (failures.length > 1) throw new AggregateError(failures, "native fixture and cleanup failed");
   });
 }
+
+
+for (const phase of ["absent-grow", "before-reserve", "pending-reserve", "after-ack", "drain", "feedback", "preserve"] as const) {
+  test(`heartbeat memory lifecycle: ${phase} fences authority and retains captured settlement`, async () => {
+    const feature = "worker_memory_pressure_v1";
+    let features = phase === "absent-grow" ? [] : [feature];
+    let nonce = "original-nonce";
+    let reserves = 0, signals = 0, observations = 0, usage = 0, sampleId = 0;
+    let reached = false, prepared = false, preserved = false;
+    let original: WorkerMemoryPressureResult | undefined;
+    const received: WorkerMemoryPressureResult[] = [];
+    let release!: () => void;
+    const held = new Promise<void>(done => { release = done; });
+    const json = (value: unknown) => new Response(JSON.stringify(value), { status: 200 });
+    const client = new WorkerClient("http://fixture.test", "fixture", "test", nullLogger(), {
+      fetch: async (url, init) => {
+        if (String(url).endsWith("/register")) return json({ worker_id: worker, register_nonce: nonce, protocol_features: features });
+        if (String(url).endsWith("/heartbeat")) return json({ protocol_features: features });
+        const body = JSON.parse(String(init?.body));
+        if (String(url).endsWith("/reserve")) {
+          reserves++;
+          if (phase === "pending-reserve") { reached = true; await held; }
+          return json({ ...body, admitted: true, authorizing: true,
+            allowance: { limit: 2, used: phase === "preserve" ? 2 : 1, remaining: phase === "preserve" ? 0 : 1 } });
+        }
+        return json({ ...body, policy: { version: 1, max_interventions: 2 }, admitted: true, authorizing: false,
+          allowance: { limit: 2, used: 1, remaining: 1 } });
+      },
+    });
+    await client.register("fixture");
+    const readIncarnation = () => client.memoryIncarnation;
+    const runtime = new WorkerMemoryRuntime(settings, client, nullLogger(), {
+      reader: { sample: () => {
+        const now = performance.now();
+        const psi = { avg10: 0, avg60: 0, avg300: 0, total: 0 };
+        return { available: true, sampleId: ++sampleId, startedAtMs: now, completedAtMs: now,
+          currentBytes: usage, limitBytes: 1000,
+          stat: { anon: 1, shmem: 0, slab_unreclaimable: 0, unevictable: 0 }, pressure: { some: psi, full: psi } };
+      } },
+    });
+    const context = runtime.begin({ run_id: run, worker_id: worker, register_nonce: nonce,
+      claim_generation: 1, memory_episode: 0, flight: {}, lifecycleRevision: 1,
+      memory_policy: { version: 1, max_interventions: 2 }, memory_intervention_count: 0 }, {
+      prepareFeedback: (ctx, result) => { assert.equal(ctx, context); original = result; },
+      feedback: async (result, ctx) => {
+        assert.equal(ctx, context); assert.equal(result, original); received.push(result);
+        if (phase === "feedback") { reached = true; await held; }
+      },
+      preparePreservation: (ctx, result) => {
+        assert.equal(ctx, context); assert.equal(result, original); prepared = true;
+      },
+      preserve: async ctx => {
+        assert.equal(ctx, context); preserved = true;
+        if (phase === "preserve") { reached = true; await held; }
+      }, preservationBudgetMs: 200,
+    });
+    const entry = runtime.commands.register(context, {
+      source: "codex-model-command", toolId: "captured-tool", attemptId: "captured-attempt",
+      command: "inert fixture", root: { pid: 10, startTime: "10" },
+      observe: async () => {
+        observations++;
+        if (phase === "after-ack" && observations === 2) { reached = true; await held; }
+        const now = performance.now();
+        return { available: true, complete: true, startedAtMs: now, completedAtMs: now,
+          rows: [{ pid: 10, startTime: "10", rssBytes: 100 }] };
+      },
+      cancel: async authority => { assert.equal(authority.authorized(), true); signals++; },
+      drain: async () => {
+        if (phase === "drain") { reached = true; await held; }
+        return { confirmed: true };
+      },
+    });
+    if (phase === "before-reserve") { features = []; await client.heartbeat(); }
+    if (phase === "absent-grow") {
+      features = [feature]; await client.heartbeat();
+      assert.equal(client.memoryIncarnation, undefined, "heartbeat growth cannot seed authority");
+    }
+    const running = runtime.run();
+    try {
+      usage = 950;
+      if (phase === "before-reserve" || phase === "absent-grow") {
+        await until(() => sampleId >= 4);
+        assert.equal(reserves, 0); assert.equal(signals, 0);
+      } else {
+        await until(() => reached);
+        features = []; await client.heartbeat();
+        assert.equal(client.memoryIncarnation, undefined);
+        assert.equal(runtime.commands.isCurrent(context), false, "shrink retires authority synchronously");
+        if (phase === "feedback" || phase === "preserve") {
+          assert.ok(runtime.sinkReceipts.some(r => r.context === context && r.kind === phase), "pending original sink stays owned");
+        }
+        release();
+        const result = await runtime.commands.watchOutcome(entry);
+        assert.deepEqual(result, original);
+        assert.equal(result.command_id, entry.commandId);
+        assert.equal(result.tool_id, entry.toolId);
+        assert.equal(result.attempt_id, entry.attemptId);
+        await until(() => received.length === 1);
+        if (["drain", "feedback", "preserve"].includes(phase)) {
+          await until(() => prepared && preserved);
+          assert.equal(signals, 1);
+        } else assert.equal(signals, 0, "late ACK and observation cannot authorize signal");
+      }
+      const priorSignals = signals, priorReserves = reserves;
+      features = [feature]; await client.heartbeat();
+      assert.equal(client.memoryIncarnation, undefined);
+      await until(() => sampleId >= 8);
+      assert.equal(signals, priorSignals); assert.equal(reserves, priorReserves);
+      assert.equal(runtime.commands.admitsCommands(context), phase === "absent-grow");
+      nonce = "fresh-nonce";
+      await client.register("fixture");
+      assert.equal(readIncarnation()?.register_nonce, nonce, "fresh register seeds a new incarnation");
+      const fresh = runtime.begin({ ...context, register_nonce: nonce, flight: {}, lifecycleRevision: 2 }, {
+        prepareFeedback: () => {}, feedback: async () => {}, preparePreservation: () => {}, preserve: async () => {}, preservationBudgetMs: 200,
+      });
+      assert.equal(runtime.commands.admitsCommands(fresh), true);
+      assert.equal(runtime.commands.isCurrent(context), false);
+    } finally {
+      release(); await runtime.stop(); await running;
+    }
+  });
+}

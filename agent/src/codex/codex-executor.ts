@@ -289,6 +289,8 @@ function isCommandCacheEnvKey(key: string): boolean {
 
 const DEFAULT_IDLE_MS = 5 * 60 * 1000;
 const DEFAULT_WALL_MS = 60 * 60 * 1000;
+const DEFAULT_COMMAND_WALL_MS = 3_600_000;
+const LONG_COMMAND_WALL_MS = 7_200_000;
 // Issue #1600: the precision/race allowance a refused-park re-drive is armed with when the server's
 // remaining budget has (nearly) run out. The budget fields are whole seconds and the refusal raced
 // the deadline, so a zero-or-negative remainder would otherwise re-trip and re-capture at once. Kept
@@ -2422,10 +2424,16 @@ export class CodexExecutor implements Executor {
       token: "", model: ctx.summaryModel ?? "", issueTitle: ctx.issueTitle,
       issueBody: ctx.issueDescription, prdText: (await prdInputP)?.prdText,
     });
-    const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
+    // Invalidate the current plan-summary flight and latched result. Does not reopen
+    // summaryLifecycleClosed; returns the new generation.
+    const supersedePlanSummary = (): number => {
       const generation = ++planGeneration;
       if (this.planFlight) { this.planFlight.closed = true; this.planFlight.ctrl.abort(); }
       latestPlanSummary = undefined;
+      return generation;
+    };
+    const beginPlanSummary = (): ((planMd: string) => Promise<void>) => {
+      const generation = supersedePlanSummary();
       // A later accepted candidate may start fresh after a refused capture/switch.
       this.summaryLifecycleClosed = false;
       let flight: CodexExecutor["planFlight"];
@@ -2905,6 +2913,9 @@ export class CodexExecutor implements Executor {
             }
             revisions++;
           }
+          // Accepted revise: the plan being summarised is superseded; the revised plan's summary
+          // starts from the next gatePlan's onPlanPersisted.
+          supersedePlanSummary();
           ctx.emit({ kind: "plan_revising", agent: "worker",
             payload: automatic ? { automatic: true, cross_check_round: automaticRound } : { round: revisions } });
           // The revise turn resumes the plan thread, which holds the plan being revised.
@@ -3631,7 +3642,8 @@ export class CodexExecutor implements Executor {
         commandSandbox,
         this.log,
         commandCache,
-        DEFAULT_WALL_MS,
+        DEFAULT_COMMAND_WALL_MS,
+        LONG_COMMAND_WALL_MS,
         capturedMemory,
       );
       const spawnCommand: SpawnCommandSeam = (argv, spawnOpts) => baseSpawnCommand(argv, { ...spawnOpts, env: commandEnv });
@@ -5277,8 +5289,9 @@ function commandEffectSpec(
  * paths also reap before returning. At the wall deadline the root is reaped before
  * {@link CommandDeadlineError} is thrown. Any other waitChild rejection also reaps first;
  * with the real launcher that reap is unclean after the supervisor's fail(), so it surfaces
- * as COMMAND_ROOT_UNREAPED with the registry poisoned (fail-closed). `wallMs` is a test
- * seam; production uses the default. The command gets an empty stdin (`--stdin null`), so a
+ * as COMMAND_ROOT_UNREAPED with the registry poisoned (fail-closed). `wallMs` and
+ * `longWallMs` are test seams; production uses 60 minutes, or 120 minutes for the
+ * broker-authorized root-lead `long_running` opt-in. The command gets an empty stdin (`--stdin null`), so a
  * command that reads stdin sees EOF instead of blocking on the supervisor's open pipe. */
 export function makeDefaultSpawnCommand(
   registry: ExecutionRegistry,
@@ -5289,7 +5302,8 @@ export function makeDefaultSpawnCommand(
   mode: CommandSandboxMode,
   log?: Pick<Logger, "warn">,
   cache?: RunCommandCache,
-  wallMs: number = DEFAULT_WALL_MS,
+  wallMs: number = DEFAULT_COMMAND_WALL_MS,
+  longWallMs: number = LONG_COMMAND_WALL_MS,
   capturedMemory?: CapturedMemoryContext,
 ): SpawnCommandSeam {
   return async (argv, opts): Promise<SpawnCommandResult> => {
@@ -5369,7 +5383,8 @@ export function makeDefaultSpawnCommand(
           opts.signal.addEventListener("abort", onAbort, { once: true });
         }
       });
-      const terminal = launched.handle.waitChild(wallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
+      const effectiveWallMs = opts.long_running === true ? longWallMs : wallMs;
+      const terminal = launched.handle.waitChild(effectiveWallMs).then((result) => ({ kind: "exit" as const, code: result.code }))
         .catch((error: unknown) => (error instanceof SupervisedChildExitTimeoutError ? { kind: "deadline" as const } : { kind: "failed" as const, error }));
       const ordinary = Promise.race([
         terminal,
@@ -5405,8 +5420,8 @@ export function makeDefaultSpawnCommand(
       }
       if (memoryPressure) return { code: COMMAND_CAPTURE_KILLED_CODE, stdout, stderr, memoryPressure };
       if (cleanupError) throw cleanupError;
-      if (cleanupReason.kind === "aborted") throw new Error("command aborted");
-      if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(wallMs);
+      if (cleanupReason.kind === "aborted" || (cleanupReason.kind === "deadline" && opts.signal?.aborted)) throw new Error("command aborted");
+      if (cleanupReason.kind === "deadline") throw new CommandDeadlineError(effectiveWallMs);
       if (cleanupReason.kind === "failed") throw cleanupReason.error;
       return {
         code: cleanupReason.kind === "cap" || killedAtCap ? COMMAND_CAPTURE_KILLED_CODE : cleanupReason.code,

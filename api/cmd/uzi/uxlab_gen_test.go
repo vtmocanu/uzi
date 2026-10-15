@@ -99,6 +99,7 @@ func TestGenerateUXLabFrames(t *testing.T) {
 		"board-accounts-one-each":           func(d bool) string { return boardAccountScene(d, now, 1, 140) },
 		"board-accounts-two-plus-one":       func(d bool) string { return boardAccountScene(d, now, 2, 140) },
 		"board-populated":                   func(d bool) string { return boardPopulated(d, now) },
+		"board-done-age":                    func(d bool) string { return boardDoneAge(d, now) },
 		"board-codex":                       func(d bool) string { return boardCodex(d, now) },
 		"board-empty":                       boardEmpty,
 		"board-restart-hint": func(d bool) string {
@@ -351,7 +352,7 @@ func crossCheckFleetScene(dark bool, split bool, width, active int) tuiModel {
 
 var workerSceneNames = []string{"workers-list-120", "workers-list-80", "workers-factory", "workers-cordoned", "split-workers-top", "floor-fleet", "workers-stale-stats"}
 
-var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding"}
+var workerDetailSceneNames = []string{"worker-upgrade-failed", "worker-outcome-outbox", "worker-holding", "worker-capacity-blocked", "worker-provisioning", "worker-provisioning-failed"}
 
 // workersScene uses the shipped model and the interactive demo's client.
 func workersScene(dark bool, name string) tuiModel {
@@ -368,13 +369,26 @@ func workersScene(dark bool, name string) tuiModel {
 			}
 		}
 	}
-	target := map[string]string{"worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
+	target := map[string]string{"worker-capacity-blocked": "forge-small", "worker-provisioning": "forge-small", "worker-provisioning-failed": "forge-small", "worker-upgrade-failed": "forge-small", "worker-outcome-outbox": "forge-docker", "worker-holding": "recovery"}[name]
 	if target != "" {
 		// Scene-local samples keep the demo fleet's state and attention counts intact.
 		for i := range fake.Workers {
 			w := &fake.Workers[i]
 			if w.Name != target {
 				continue
+			}
+			switch name {
+			case "worker-capacity-blocked":
+				w.UpgradeStatus = "capacity_blocked"
+				w.UpgradeBlockingKind = strPtrT("scheduler_capacity")
+				w.UpgradeBlockingContainer = nil
+				w.UpgradeBlockingReason = strPtrT("scheduler capacity: insufficient memory")
+				w.UpgradeDetail = w.UpgradeBlockingReason
+			case "worker-provisioning", "worker-provisioning-failed":
+				w.UpgradeStatus = strings.TrimPrefix(name, "worker-")
+				w.UpgradeStatus = strings.ReplaceAll(w.UpgradeStatus, "-", "_")
+				w.Version = nil
+				w.UpgradeDetail = strPtrT("provisioning: not ready")
 			}
 			if w.StatsDiskDataBytes != nil {
 				w.StatsDiskDataBytes = i64(*w.StatsDiskDataBytes << 30)
@@ -486,13 +500,16 @@ func TestWorkerDetailScenesContentAndBounds(t *testing.T) {
 // ---- board fixtures -------------------------------------------------------
 
 func boardRuns(now time.Time) []apitypes.RunListItemDTO {
-	// age is set via CreatedAt so relAge renders a realistic AGE column (M2). The offsets
-	// are chosen to land on relAge's buckets (Nm / Nh / Nd) and mirror the mock's ages.
+	// Ages use creation time for live rows and finish time for DONE rows. The offsets
+	// land on relAge's buckets; fixtures carry both timestamps for terminal rows.
 	mk := func(id, kind, status, title, health string, verdict *string, todo int, age time.Duration) apitypes.RunListItemDTO {
 		r := apitypes.RunListItemDTO{
 			RunDTO: apitypes.RunDTO{ID: id, Kind: kind, Status: status, IssueTitle: title, Health: health,
-				CreatedAt: now.Add(-age)},
+				CreatedAt: now.Add(-age), UpdatedAt: now.Add(-age)},
 			JudgeVerdict: verdict, JudgeTodoCount: todo,
+		}
+		if runBandOf(r) == bandDone {
+			r.FinishedAt = tp(r.UpdatedAt)
 		}
 		if kind == "chat" {
 			r.Title = sp(title)
@@ -613,6 +630,27 @@ func codexMeters() []apitypes.CodexAccountRateLimitDTO {
 // plus the stale "cx-old" (so the stale-dimmed path renders); the default "cx-primary" always
 // shows regardless.
 func codexSidebar() []string { return []string{"cx-team", "cx-old"} }
+
+// Issue #2965: recent finishes must look recent despite old creation dates.
+func boardDoneAge(dark bool, now time.Time) string {
+	runs := []apitypes.RunListItemDTO{
+		{RunDTO: apitypes.RunDTO{ID: "active01-1", Kind: "issue", Status: "running",
+			IssueTitle: "Active age still uses creation", CreatedAt: now.Add(-48*time.Hour - 30*time.Minute), UpdatedAt: now}},
+		{RunDTO: apitypes.RunDTO{ID: "recent01-2", Kind: "issue", Status: "completed",
+			IssueTitle: "Older creation, latest finish", CreatedAt: now.Add(-48 * time.Hour),
+			UpdatedAt: now, FinishedAt: tp(now.Add(-2 * time.Minute))}},
+		{RunDTO: apitypes.RunDTO{ID: "earlier1-3", Kind: "issue", Status: "failed",
+			IssueTitle: "Earlier finish sorts below recent finish", CreatedAt: now.Add(-8 * time.Hour),
+			UpdatedAt: now, FinishedAt: tp(now.Add(-3 * time.Hour))}},
+		{RunDTO: apitypes.RunDTO{ID: "legacy01-4", Kind: "issue", Status: "cancelled",
+			IssueTitle: "Legacy finish falls back to last update", CreatedAt: now.Add(-24 * time.Hour),
+			UpdatedAt: now.Add(-5 * time.Hour)}},
+	}
+	fake := &uzicli.FakeClient{Runs: runs}
+	m := uxModel(fake, "", dark)
+	m = step(m, boardRunsMsg{reqID: m.board.waitID, runs: runs})
+	return m.View().Content
+}
 
 func boardPopulated(dark bool, now time.Time) string {
 	fake := &uzicli.FakeClient{Runs: boardRuns(now)}

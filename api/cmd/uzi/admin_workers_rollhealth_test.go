@@ -30,7 +30,7 @@ func TestAdminWorkersShowsRollHealth(t *testing.T) {
 		t.Fatalf("exit = %d, want 0", code)
 	}
 	for _, want := range []string{
-		"VERSION", "UPGRADE", "BLOCKING", // the new headers
+		"VERSION", "ROLL", "BLOCKING", // the new headers
 		"0.83.0",                     // VERSION cell
 		"FAILED",                     // upgradeCell maps upgrade_failed → FAILED
 		"seed-nix: ImagePullBackOff", // BLOCKING cell, container: reason

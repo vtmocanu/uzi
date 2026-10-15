@@ -79,7 +79,8 @@ if type wait_regated >/dev/null 2>&1; then
 else
   echo "FAIL: wait_regated not defined — extraction failed or the helper was removed"
 fi
-SEQ_DIR="$(mktemp -d)"
+mkdir -p "$ROOT/.uzi/scratch"
+SEQ_DIR="$(mktemp -d "$ROOT/.uzi/scratch/e2e-lib.XXXXXX")"
 trap 'rm -rf "$SEQ_DIR"' EXIT
 record_margin() { :; }
 fail() { echo "$*" >&2; exit 1; }
@@ -896,8 +897,150 @@ for phase in 42-api-outage-readoption 46-run-health 52-api-outage-outbox; do
   else echo "FAIL: $phase still clears custody or lacks headroom wait"; fi
 done
 
+# #1368: drive the real phase through the unblock wait. The source override is a
+# test-only seam for scratch mutations; production always runs the shipped phase.
+CUSTODY_PHASE_TEST_SOURCE="${CUSTODY_PHASE_TEST_SOURCE:-$ROOT/e2e/phases/72-custody-lifecycle.sh}"
+eval "$(awk '/^assert_custody_worker_idle\(\) \{/,/^\}/' "$CUSTODY_PHASE_TEST_SOURCE")"
+idle_snapshot_case() {
+  local fixture="$1"
+  echo 0 > "$SEQ_DIR/idle-reads"
+  apiget() {
+    [ "$1" = /api/workers ] || fail 'wrong worker route'
+    echo $(( $(cat "$SEQ_DIR/idle-reads") + 1 )) > "$SEQ_DIR/idle-reads"
+    [ "$fixture" != api-error ] || return 22
+    printf '%s' "$fixture"
+  }
+  assert_custody_worker_idle 'snapshot test'
+  echo 'worker idle accepted'
+}
+custody_case "custody worker accepts online and Boolean idle" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"online","busy":false}]}'
+custody_case "custody worker accepts two online idle workers" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"online","busy":false},{"status":"online","busy":false}]}'
+custody_case "custody worker accepts an offline idle second worker" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"online","busy":false},{"status":"offline","busy":false}]}'
+custody_case "custody worker accepts an offline idle first worker" pass 'worker idle accepted' idle_snapshot_case '{"workers":[{"status":"offline","busy":false},{"status":"online","busy":false}]}'
+for fixture in \
+  '{"workers":[{"status":"online","busy":true}]}' \
+  '{"workers":[{"status":"offline","busy":false}]}' \
+  '{"workers":[]}' \
+  '{"workers":[{"status":"online"}]}' \
+  '{"workers":[{"status":"online","busy":"false"}]}' \
+  '{"workers":[{"status":"online","busy":0}]}' \
+  '{"workers":[{"status":"online","busy":null}]}' \
+  '{"workers":[{"status":"online","busy":true},{"status":"online","busy":false}]}' \
+  '{"workers":[{"status":"online","busy":false},{"status":"online","busy":true}]}' \
+  '{"workers":[{"status":"online","busy":false},{"status":"offline"}]}' \
+  '{"workers":[{"status":"offline","busy":false},{"status":"online","busy":true}]}' \
+  'invalid JSON' '' 'api-error'; do
+  custody_case "custody worker refuses [$fixture]" fail 'snapshot test:' idle_snapshot_case "$fixture"
+  cases=$((cases + 1))
+  if [ "$(cat "$SEQ_DIR/idle-reads")" = 1 ]; then
+    passed=$((passed + 1)); echo 'PASS: rejected snapshot used exactly one GET'
+  else echo 'FAIL: rejected snapshot repeated GET'; fi
+done
+
+custody_idle_phase() {
+  local mode="$1"
+  # These variables are consumed by the actual phase statements.
+  # shellcheck disable=SC2034
+  local ADMIN_EMAIL=fixture@example.com REPO_ID=repo RUNROOT="$SEQ_DIR"
+  echo entry > "$SEQ_DIR/idle-stage"
+  echo 0 > "$SEQ_DIR/idle-worker-reads"
+  echo 0 > "$SEQ_DIR/idle-polls"
+  echo 0 > "$SEQ_DIR/idle-seeded"
+  : > "$SEQ_DIR/idle-events"
+  idle_busy_now() {
+    local stage
+    stage="$(cat "$SEQ_DIR/idle-stage")"
+    [ "$mode" = "$stage" ] || [ "$stage" = claimed ]
+  }
+  idle_boundary() {
+    if idle_busy_now; then
+      echo "forbidden boundary: $1" >> "$SEQ_DIR/idle-events"
+      fail "busy reached forbidden boundary: $1"
+    fi
+    echo "$1" >> "$SEQ_DIR/idle-events"
+  }
+  say() { :; }
+  pass() { :; }
+  inventory_diagnostic_snapshot() { :; }
+  worker_status() { echo online; } # permits an online-only mutation to run
+  wait_custody_headroom() { :; }
+  db_psql() {
+    case "$1" in
+      'SELECT id FROM users'*) idle_boundary entry; echo owner ;;
+      'SELECT count('*)
+        if [ "$(cat "$SEQ_DIR/idle-seeded")" = 1 ]; then echo 8; else echo 0; fi ;;
+      INSERT*) echo 1 > "$SEQ_DIR/idle-seeded" ;;
+      UPDATE*) : ;;
+      'SELECT id FROM recovery_custody_holds'*) echo "$UUID" ;;
+      *) fail 'unhandled idle phase SQL' ;;
+    esac
+  }
+  apiget() {
+    case "$1" in
+      /api/workers)
+        echo $(( $(cat "$SEQ_DIR/idle-worker-reads") + 1 )) > "$SEQ_DIR/idle-worker-reads"
+        if idle_busy_now; then echo '{"workers":[{"status":"online","busy":true}]}'
+        else echo '{"workers":[{"status":"online","busy":false}]}'; fi ;;
+      /api/recovery/holds)
+        echo '{"aggregate":{"open_holds":8,"admission_counted_holds":8,"custody_hold_limit":8,"blocked_runs":1}}' ;;
+      /api/runs/wedge) echo '{"run":{"status":"queued"}}' ;;
+      *) fail 'unhandled idle phase API read' ;;
+    esac
+  }
+  apipost() { echo '{"card":{"iid":1}}'; }
+  create_run() { echo window > "$SEQ_DIR/idle-stage"; echo wedge; }
+  db_psql_rows() {
+    idle_boundary window
+    echo $(( $(cat "$SEQ_DIR/idle-polls") + 1 )) > "$SEQ_DIR/idle-polls"
+  }
+  uzi_cli() {
+    case "$1 $2" in
+      'run recovery')
+        echo discard > "$SEQ_DIR/idle-stage"
+        printf '[{"id":"%s","state":"open"}]\n' "$UUID" ;;
+      'run discard')
+        idle_boundary discard
+        [ "$*" = "run discard wedge --hold $UUID --yes --json" ] || fail 'wrong discard target'
+        echo claimed > "$SEQ_DIR/idle-stage"
+        echo '{"discarded":true}' ;;
+      *) fail 'unhandled idle phase CLI' ;;
+    esac
+  }
+  wait_status() {
+    [ "$*" = 'wedge awaiting_approval 60' ] || fail 'changed unblock wait'
+    [ "$(cat "$SEQ_DIR/idle-stage")" = claimed ] || fail 'unblock wait before discard'
+    echo unblock >> "$SEQ_DIR/idle-events"
+  }
+  # Include actual setup, guards, polling, CLI and wait statements, stopping before
+  # post-claim custody accounting (covered by the live full-stack phase).
+  # shellcheck disable=SC1090  # extracted real phase under test, optionally replaced for mutation checks
+  source <(awk '{print} /^wait_status "\$WEDGE_RUN" awaiting_approval 60$/ {exit}' "$CUSTODY_PHASE_TEST_SOURCE")
+}
+for mode in entry window discard idle; do
+  cases=$((cases + 1))
+  if output="$(unset SECONDS; SECONDS=0; custody_idle_phase "$mode" 2>&1)"; then got=pass; else got=fail; fi
+  events="$(cat "$SEQ_DIR/idle-events")"
+  reads="$(cat "$SEQ_DIR/idle-worker-reads")"
+  polls="$(cat "$SEQ_DIR/idle-polls")"
+  valid=false
+  case "$mode" in
+    entry) [ "$got" = fail ] && [ "$reads" = 1 ] && [ -z "$events" ] \
+      && [[ "$output" == *'custody phase entry:'* && "$output" == *'"busy":true'* ]] && valid=true ;;
+    window) [ "$got" = fail ] && [ "$reads" = 2 ] && [ "$events" = entry ] \
+      && [[ "$output" == *'custody negative window:'* && "$output" == *'"busy":true'* ]] && valid=true ;;
+    discard) [ "$got" = fail ] && [ "$reads" = 3 ] && [ "$polls" = 12 ] \
+      && [[ "$events" != *discard* && "$events" != *unblock* && "$events" != *forbidden* ]] \
+      && [[ "$output" == *'custody pre-discard:'* && "$output" == *'"busy":true'* ]] && valid=true ;;
+    idle) [ "$got" = pass ] && [ "$reads" = 3 ] && [ "$polls" = 12 ] \
+      && [[ "$events" == *$'discard\nunblock' && "$events" != *forbidden* ]] && valid=true ;;
+  esac
+  if [ "$valid" = true ]; then
+    passed=$((passed + 1)); echo "PASS: real custody phase idle boundary $mode"
+  else echo "FAIL: real custody phase idle boundary $mode: result=$got reads=$reads polls=$polls events=[$events] output=[$output]"; fi
+done
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
-# Tally guard (the driver.test.sh idiom): a real run has all 152 cases green; a zero-case or
+# Tally guard (the driver.test.sh idiom): a real run has at least 188 cases green; a zero-case or
 # partially-red run must exit nonzero.
-[ "$cases" -ge 152 ] && [ "$cases" -eq "$passed" ]
+[ "$cases" -ge 188 ] && [ "$cases" -eq "$passed" ]

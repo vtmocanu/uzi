@@ -668,6 +668,12 @@ type ClaimConfig struct {
 	// REQUIRED — a non-ci_fix run's runs.ci_config_paths column is NULL, so the field
 	// is nil and omitted, keeping every issue/chat claim byte-identical to pre-M2.
 	CIConfigPaths []string `json:"ci_config_paths,omitempty"`
+	// CIConfigGuard marks a run whose pushes the worker must refuse when they touch a
+	// CI-config path (PRD #2865): an unconditional backstop that human plan approval does not
+	// lift. Read straight off runs.ci_config_guard. omitempty keeps every unguarded claim
+	// byte-identical; a worker image that predates the guard cannot claim a guarded run
+	// (the ci_config_guard_v1 claim clause).
+	CIConfigGuard bool `json:"ci_config_guard,omitempty"`
 	// CompletionContractVersion is the completion-interlock discriminator (PRD #1226 M3,
 	// D1/D2): non-nil (value 1 today) when this run is INTERLOCKED, so the worker knows to
 	// run the structural completion protocol (checkpoint-first same-lead attempt loop, permit

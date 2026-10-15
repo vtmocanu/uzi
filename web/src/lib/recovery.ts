@@ -13,6 +13,7 @@ import type {
   RecoveryArchiveSummary,
   RecoveryCustodyAggregate,
   RecoveryCustodyHold,
+  RecoveryCustodyHolds,
 } from "./apiTypes";
 import { isTerminalRun } from "./runStatus";
 import { stripUnsafeChars } from "./safeText";
@@ -328,6 +329,55 @@ export function custodyHoldView(hold: RecoveryCustodyHold): CustodyHoldView {
       ? TERMINAL_MAC_FAILURE_COPY
       : null,
   };
+}
+
+// isOwnerDecisionRow is the one predicate for "the Held work surface already shows this hold
+// as a decision or MAC-rejection row"; the surface and admissionInfoHolds share it.
+export function isOwnerDecisionRow(hold: RecoveryCustodyHold): boolean {
+  return custodyHoldView(hold).needsDecision || hold.terminal_record_rejection === "mac_failure";
+}
+
+const ADMISSION_REASON_LABELS: Record<string, string> = {
+  live_claim: "Run holds a live claim",
+  duplicate_hold: "Another hold already covers this run's live claim",
+  decision_needed: "Needs your decision",
+  terminal_run: "Run has finished",
+  run_not_live: "Run is not running (queued, paused or waiting)",
+  claim_released: "Run's claim was released",
+  earlier_generation: "Earlier generation of a run whose newer attempt holds the claim",
+  other_generation: "Not the run's current generation",
+  unknown_evidence: "Run or worker evidence is missing",
+  identity_mismatch: "Hold does not match the run's current claim",
+  stale_heartbeat: "Worker heartbeat is stale",
+};
+
+// admissionReasonLabel maps the server's closed admission_reason vocabulary to plain copy.
+// An unknown or empty value gets a generic label; the raw string is never rendered.
+export function admissionReasonLabel(reason: string | undefined): string {
+  return (reason && Object.prototype.hasOwnProperty.call(ADMISSION_REASON_LABELS, reason) ? ADMISSION_REASON_LABELS[reason] : undefined)
+    ?? "Counted by the server";
+}
+
+// admissionInfoHolds lists the open holds that are NOT decision rows while the owner is at
+// the custody limit, split by what the server reported: `counted` (counts_toward_admission
+// true) and `unreported` (field absent, e.g. an older server; absent is never false).
+// Holds reported false are excluded. Both are empty below the limit or when it is disabled.
+export function admissionInfoHolds(resp: RecoveryCustodyHolds): {
+  counted: RecoveryCustodyHold[];
+  unreported: RecoveryCustodyHold[];
+} {
+  const agg = resp.aggregate;
+  const counted: RecoveryCustodyHold[] = [];
+  const unreported: RecoveryCustodyHold[] = [];
+  if (!(agg.custody_hold_limit > 0 && recoveryCapacityUsed(agg) >= agg.custody_hold_limit)) {
+    return { counted, unreported };
+  }
+  for (const h of resp.holds) {
+    if (h.state !== "open" || isOwnerDecisionRow(h)) continue;
+    if (h.counts_toward_admission === true) counted.push(h);
+    else if (h.counts_toward_admission === undefined) unreported.push(h);
+  }
+  return { counted, unreported };
 }
 
 function attentionView(hold: RecoveryCustodyHold): Omit<CustodyHoldView, "checkpoint" | "terminalRejection"> {

@@ -9,6 +9,7 @@ package forge
 import (
 	"context"
 	"net/http"
+	"strconv"
 
 	gh "github.com/google/go-github/v92/github"
 )
@@ -369,6 +370,7 @@ func (g *github) ListWorkflowRuns(ctx context.Context, projectID int64, opts Lis
 	if err != nil {
 		return nil, err
 	}
+	ctx = markCIJSON(ctx)
 	perPage := githubPerPage
 	if opts.Limit > 0 && opts.Limit < perPage {
 		perPage = opts.Limit
@@ -380,13 +382,20 @@ func (g *github) ListWorkflowRuns(ctx context.Context, projectID int64, opts Lis
 		ListOptions: gh.ListOptions{PerPage: perPage},
 	}
 	runs, _, err := g.client.Actions.ListRepositoryWorkflowRuns(ctx, slug.owner, slug.repo, opt)
+	err = ciReadError(ctx, err)
 	if err != nil {
 		return nil, g.wrapErr("list workflow runs", err)
 	}
 	out := []WorkflowRun{}
 	if runs != nil {
+		if b := ciBudget(ctx); b != nil && len(runs.WorkflowRuns) > perPage {
+			return nil, b.fail("oversized workflow page")
+		}
 		for _, r := range runs.WorkflowRuns {
 			if r == nil {
+				if b := ciBudget(ctx); b != nil {
+					return nil, b.fail("invalid workflow identity")
+				}
 				continue
 			}
 			out = append(out, toGitHubWorkflowRun(r))
@@ -395,7 +404,7 @@ func (g *github) ListWorkflowRuns(ctx context.Context, projectID int64, opts Lis
 			}
 		}
 	}
-	return out, nil
+	return validateCIWorkflows(ctx, out)
 }
 
 // GetWorkflowRun returns one workflow run's header (the neutral WorkflowRun) by its
@@ -409,34 +418,45 @@ func (g *github) GetWorkflowRun(ctx context.Context, projectID, runID int64) (Wo
 	if err != nil {
 		return WorkflowRun{}, err
 	}
+	ctx = markCIJSON(ctx)
 	run, _, err := g.client.Actions.GetWorkflowRunByID(ctx, slug.owner, slug.repo, runID)
+	err = ciReadError(ctx, err)
 	if err != nil {
 		return WorkflowRun{}, g.wrapErr("get workflow run", err)
 	}
 	if run == nil {
-		return WorkflowRun{}, nil
+		return WorkflowRun{}, validateCIWorkflow(ctx, WorkflowRun{})
 	}
-	return toGitHubWorkflowRun(run), nil
+	mapped := toGitHubWorkflowRun(run)
+	if err := validateCIWorkflow(ctx, mapped); err != nil {
+		return WorkflowRun{}, err
+	}
+	return mapped, nil
 }
 
 // toGitHubWorkflowRun maps a workflow run to the neutral WorkflowRun. Status is the
 // run phase (queued/in_progress/completed) and Conclusion the terminal outcome, the
 // same split the neutral Check uses.
 func toGitHubWorkflowRun(r *gh.WorkflowRun) WorkflowRun {
+	key := ""
+	if r.GetWorkflowID() > 0 {
+		key = strconv.FormatInt(r.GetWorkflowID(), 10)
+	}
 	return WorkflowRun{
-		ID:         r.GetID(),
-		Name:       r.GetName(),
-		Number:     int64(r.GetRunNumber()),
-		Event:      r.GetEvent(),
-		Branch:     r.GetHeadBranch(),
-		SHA:        r.GetHeadSHA(),
-		Status:     r.GetStatus(),
-		Conclusion: r.GetConclusion(),
-		Title:      r.GetDisplayTitle(),
-		Actor:      r.GetActor().GetLogin(),
-		WebURL:     r.GetHTMLURL(),
-		CreatedAt:  r.GetCreatedAt().Time,
-		UpdatedAt:  r.GetUpdatedAt().Time,
-		StartedAt:  r.GetRunStartedAt().Time,
+		WorkflowKey: key,
+		ID:          r.GetID(),
+		Name:        r.GetName(),
+		Number:      int64(r.GetRunNumber()),
+		Event:       r.GetEvent(),
+		Branch:      r.GetHeadBranch(),
+		SHA:         r.GetHeadSHA(),
+		Status:      r.GetStatus(),
+		Conclusion:  r.GetConclusion(),
+		Title:       r.GetDisplayTitle(),
+		Actor:       r.GetActor().GetLogin(),
+		WebURL:      r.GetHTMLURL(),
+		CreatedAt:   r.GetCreatedAt().Time,
+		UpdatedAt:   r.GetUpdatedAt().Time,
+		StartedAt:   r.GetRunStartedAt().Time,
 	}
 }

@@ -580,6 +580,8 @@ test("missing-source identity mismatches and missing known own source never over
   const ownPaths = fs.readdirSync(path.dirname(active)).sort();
   for (const attempt of [false, true]) {
     await assert.rejects(cache.createOrAttachRunnerClone(bare, 2512, {
+      isLive: () => false,
+      quiescent: async () => true,
       beforeFree: async () => { calls.push("free"); },
     }, runId, false, undefined, attempt ? {
       attemptId: aid(3), isLive: () => { calls.push("live"); return false; },
@@ -1290,11 +1292,20 @@ test("explicit owner discard keeps paths intact and per-key attempt mode outlive
   assert.ok(clone.path.endsWith(".attempt-" + aid(3)));
 });
 
-test("configured nested recovery verification shares a cumulative budget and fallback uses the same cap", async () => {
+test("configured nested recovery verification charges unique content cumulatively and fallback uses the same cap", async () => {
   const tip = git(source.clonePath, ["rev-parse", "HEAD"]);
   const oids = git(bare, ["rev-list", "--objects", "--no-object-names", tip]).split("\n");
   const decoded = oids.reduce((total, oid) => total + Number(git(bare, ["cat-file", "-s", oid])), 0);
-  const limit = decoded * 2 - 1;
+  const blob = execFileSync("git", ["-C", bare, "hash-object", "-w", "--stdin"],
+    { input: "independent unique content\n".repeat(20), encoding: "utf8" }).trim();
+  const tree = execFileSync("git", ["-C", bare, "mktree"],
+    { input: `100644 blob ${blob}\tunique.txt\n`, encoding: "utf8" }).trim();
+  const uniqueTip = git(bare, ["-c", "user.name=fixture", "-c", "user.email=fixture@example.com", "commit-tree", tree, "-m", "unique root"]);
+  const uniqueOids = git(bare, ["rev-list", "--objects", "--no-object-names", uniqueTip]).split("\n");
+  assert.ok(uniqueOids.every(oid => !oids.includes(oid)));
+  const uniqueDecoded = uniqueOids.reduce((total, oid) => total + Number(git(bare, ["cat-file", "-s", oid])), 0);
+  const limit = decoded + uniqueDecoded - 1;
+  assert.ok(decoded < limit && uniqueDecoded < limit);
   const config = loadConfig({ UZI_API_URL: "http://api:8080", UZI_WORKER_TOKEN: "fixture-token",
     UZI_RECOVERY_DECODED_LIMIT_BYTES: String(limit) });
   cache = new GitCache(fx.dataDir, nullLogger(), undefined,
@@ -1308,7 +1319,7 @@ test("configured nested recovery verification shares a cumulative budget and fal
     assert.equal(budget.delivered, decoded);
     await assert.rejects(cache.withRecoveryOperation(new AbortController().signal, Date.now() + 10_000, async () => {
       assert.equal((cache as any).recoveryOperations.getStore().closureBudget, budget, "nested budget identity");
-      return cache.verifyRecoveryClosure(bare, tip);
+      return cache.verifyRecoveryClosure(bare, uniqueTip);
     }), { message: `reachable recovery history exceeds the ${limit} bytes decoded verification limit` });
     assert.equal(budget.delivered, decoded, "metadata refusal does not refund or charge unread bytes");
   });
@@ -1551,4 +1562,27 @@ for (const stopAt of ["parser", "abort", "timeout"] as const) {
       await Promise.allSettled([operation, outcome, ...(producerEntered ? [completed] : []), ...(observer ? [observer] : [])]);
     }
   });
+}
+
+for (const settled of [false, true]) {
+  test(`#2958: long model turn ${settled ? "settled reset" : "interruption"} keeps source custody across a fresh claim`,
+    { skip: process.platform !== "linux" }, async t => {
+      const { expected, tip } = await ready();
+      const before = journal();
+      before.recovery.claimGeneration = 1;
+      writeJournal(before);
+      t.mock.method(Date, "now", () => before.recovery.deadline + 1);
+      if (settled) {
+        await cache.completeRecoveryEpisode(bare, branch, key, expected,
+          { settled: true, processedEvents: 1, attemptId: aid(2) });
+      }
+      const reservation = await recreate().reserveRecoveryIteration(bare, branch, key, expected, 1000, 2);
+      assert.equal(reservation.attempts, settled ? 1 : 2);
+      assert.equal(reservation.claimGeneration, 2);
+      assert.equal(reservation.startedAt, before.recovery.deadline + 1);
+      assert.equal(reservation.deadline, reservation.startedAt + 300_000);
+      assert.equal(fs.readFileSync(path.join(source.clonePath, "work.txt"), "utf8"), "retained work\n");
+      assert.equal(git(bare, ["rev-parse", `refs/uzi-recovery-episode/${runId}/${tip}`]), tip);
+      assert.deepEqual(journal().retainedSources, before.retainedSources);
+    });
 }

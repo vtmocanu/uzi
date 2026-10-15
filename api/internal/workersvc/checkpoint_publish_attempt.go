@@ -228,7 +228,7 @@ func (p *checkpointPush) pushOnce(ctx context.Context) error {
 func pushDefinitelyRefused(err error) bool {
 	return errors.Is(err, pushbroker.ErrNotDescendant) || errors.Is(err, pushbroker.ErrWorkflowScopeRejected) ||
 		errors.Is(err, pushbroker.ErrTipMissing) || errors.Is(err, pushbroker.ErrPackTooLarge) ||
-		errors.Is(err, pushbroker.ErrPackInvalid)
+		errors.Is(err, pushbroker.ErrPackInvalid) || errors.Is(err, pushbroker.ErrCIConfigGuard)
 }
 
 // recordAttempt independently admits every live push, including a prepared one.

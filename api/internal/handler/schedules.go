@@ -98,7 +98,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 	// this request's pin if one was just resolved, else the user's default_harness else claude),
 	// then persist the resolved columns. A self_improve schedule with an explicit override 409s
 	// here (scheduleLaneKind → SelfImprove).
-	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(store.RunSchedule{UserID: user.ID}, harnessCols), m.Target, req)
+	credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), h.q, user.ID, scheduleWithHarness(store.RunSchedule{UserID: user.ID}, harnessCols), m.Target, req)
 	if !ok {
 		return
 	}
@@ -110,6 +110,7 @@ func (h *Handler) CreateSchedule(w http.ResponseWriter, r *http.Request) {
 		IssueIid:                   issueIID,
 		Labels:                     labels,
 		Prompt:                     prompt,
+		CiWorkflows:                ciWorkflowsColumn(m),
 		Timing:                     m.Timing,
 		CronExpr:                   cronExpr,
 		RunAt:                      runAt,
@@ -174,7 +175,19 @@ func (h *Handler) GetSchedule(w http.ResponseWriter, r *http.Request) {
 		httpx.Error(w, http.StatusNotFound, "schedule not found")
 		return
 	}
-	httpx.JSON(w, http.StatusOK, h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s)))
+	dto := h.scheduleDTOWithLabel(r.Context(), s, h.repoPathFor(r.Context(), s))
+	if s.Target == "ci_watch" {
+		// Detail carries the first episode page (PRD #2865); further pages come from
+		// GET /api/schedules/{id}/ci-episodes.
+		page, perr := h.ciEpisodePage(r.Context(), user.ID, id, nil, ciEpisodePageMax)
+		if perr != nil {
+			slog.Error("get schedule ci episodes", "schedule", id.String(), "error", perr)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		dto.CIEpisodes = &page
+	}
+	httpx.JSON(w, http.StatusOK, dto)
 }
 
 // PatchSchedule merges the provided fields over the current schedule (pointer/empty =
@@ -198,11 +211,29 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 	}
 
 	final := cur
+	// Every config-changing PATCH that touches a ci_watch schedule (it is one, or the
+	// request converts it into one) runs in ONE transaction that first takes the
+	// schedule row lock every fire transition takes (PRD #2865), so a fire's start,
+	// halt or reset is fully ordered before or after this edit. The locked row replaces
+	// the unlocked pre-read so the merge below sees the state the fire left. A non-
+	// ci_watch edit keeps the plain pool path.
+	qw := h.q
+	var lock *scheduleConfigLock
+	if !onlyEnabled(req) && (cur.Target == "ci_watch" || req.Target == "ci_watch") {
+		var locked store.RunSchedule
+		var ok bool
+		lock, locked, ok = h.lockScheduleForConfig(w, r.Context(), user.ID, id)
+		if !ok {
+			return
+		}
+		defer lock.rollback()
+		qw, cur, final = lock.q, locked, locked
+	}
 	if cur.Origin == "default" && !onlyEnabled(req) {
 		// A default-origin row (PRD #589 M2) is editable ONLY in its catalog-inherited
 		// editable fields; its prompt/labels/guidance/target/repo/timing are catalog-owned.
 		// A distinct branch keeps the user-row path below byte-for-byte unchanged.
-		updated, done := h.patchDefaultScheduleConfig(w, r, user, id, cur, req)
+		updated, done := h.patchDefaultScheduleConfig(w, r, qw, user, id, cur, req)
 		if !done {
 			return
 		}
@@ -217,8 +248,16 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		if repoint {
 			// Ownership mirror (create parity, PRD #344 D3): 404 on a foreign/absent repo.
 			// No enabled/guardrail/blocked gate is added here — those run at fire time.
-			if _, rerr := h.q.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
+			if _, rerr := qw.GetRepoForUser(r.Context(), store.GetRepoForUserParams{ID: repoID, UserID: user.ID}); rerr != nil {
 				httpx.Error(w, http.StatusNotFound, "repo not found")
+				return
+			}
+			// A schedule with CI-watch episode history keeps it only against the repo whose
+			// workflow keys it recorded, so repointing it is refused (PRD #2865). Checked
+			// on qw: for a ci_watch schedule that is the locked transaction, so a fire that
+			// recorded its first episode is ordered before this check.
+			if refused, status, msg := h.ciEpisodesBlockRepoint(r.Context(), qw, user.ID, id); refused {
+				httpx.Error(w, status, msg)
 				return
 			}
 		}
@@ -261,7 +300,7 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 		// write the resolved columns.
 		credMode := cur.CredentialOverrideMode
 		credSecret := cur.CredentialOverrideSecretID
-		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), user.ID, scheduleWithHarness(cur, harnessCols), m.Target, req)
+		credCols, ok := h.resolveScheduleCredentialOverride(w, r.Context(), qw, user.ID, scheduleWithHarness(cur, harnessCols), m.Target, req)
 		if !ok {
 			return
 		}
@@ -270,12 +309,13 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 			credSecret = credCols.secretID
 		}
 		issueIID, labels, prompt, cronExpr, runAt := scheduleColumns(m)
-		final, err = h.q.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
+		final, err = qw.UpdateRunSchedule(r.Context(), store.UpdateRunScheduleParams{
 			Target:                     m.Target,
 			RepoID:                     repoID,
 			IssueIid:                   issueIID,
 			Labels:                     labels,
 			Prompt:                     prompt,
+			CiWorkflows:                ciWorkflowsColumn(m),
 			Timing:                     m.Timing,
 			CronExpr:                   cronExpr,
 			RunAt:                      runAt,
@@ -310,6 +350,14 @@ func (h *Handler) PatchSchedule(w http.ResponseWriter, r *http.Request) {
 				return
 			}
 			slog.Error("update run schedule", "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+	}
+
+	if lock != nil {
+		if err := lock.commit(r.Context()); err != nil {
+			slog.Error("commit schedule config patch", "schedule", id.String(), "error", err)
 			httpx.Error(w, http.StatusInternalServerError, "internal error")
 			return
 		}
@@ -581,14 +629,15 @@ func scheduleLaneKind(target string) string {
 // no longer wrongly refuses an Anthropic override. Neither harness usable ⇒ treat as claude, the
 // safe direction: the override is allowed and the AUTHORITATIVE fire-time gate re-checks and fails
 // closed if the schedule later resolves to codex.
-func (h *Handler) scheduleEffectiveHarness(ctx context.Context, sched store.RunSchedule) (string, error) {
+// All resolver reads use q, which is transaction-bound during a locked config edit.
+func (h *Handler) scheduleEffectiveHarness(ctx context.Context, q *store.Queries, sched store.RunSchedule) (string, error) {
 	if sched.Harness.Valid && sched.Harness.String != "" {
 		if sched.Harness.String == string(workersvc.HarnessCodex) {
 			return string(workersvc.HarnessCodex), nil
 		}
 		return string(workersvc.HarnessClaude), nil
 	}
-	harness, err := h.wsvc.ResolveHarnessForUser(ctx, sched.UserID, nil)
+	harness, err := h.wsvc.ResolveHarnessForUserOn(ctx, q, sched.UserID, nil)
 	if err != nil {
 		if errors.Is(err, workersvc.ErrNoUsableCredential) {
 			return string(workersvc.HarnessClaude), nil
@@ -618,7 +667,8 @@ type scheduleCredentialColumns struct {
 // switch (D10) — and returns the resolved columns (both NULL for a switchable-lane inherit
 // clear). It writes the HTTP error itself (400 malformed uuid, 404/409/422/400 via
 // writeCredentialOverrideError) and returns ok=false on any refusal.
-func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx context.Context, userID uuid.UUID, sched store.RunSchedule, target string, req apitypes.ScheduleRequest) (scheduleCredentialColumns, bool) {
+// Harness and credential reads use q so a locked edit needs no second pool connection.
+func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx context.Context, q *store.Queries, userID uuid.UUID, sched store.RunSchedule, target string, req apitypes.ScheduleRequest) (scheduleCredentialColumns, bool) {
 	if !req.CredentialOverride.Present {
 		return scheduleCredentialColumns{keep: true}, true
 	}
@@ -635,13 +685,13 @@ func (h *Handler) resolveScheduleCredentialOverride(w http.ResponseWriter, ctx c
 			secretID = &id
 		}
 	}
-	harness, herr := h.scheduleEffectiveHarness(ctx, sched)
+	harness, herr := h.scheduleEffectiveHarness(ctx, q, sched)
 	if herr != nil {
 		slog.Error("resolve schedule harness", "error", herr)
 		httpx.Error(w, http.StatusInternalServerError, "internal error")
 		return scheduleCredentialColumns{}, false
 	}
-	resolved, verr := h.wsvc.ResolveCredentialOverride(ctx, userID, scheduleLaneKind(target), harness, mode, secretID)
+	resolved, verr := h.wsvc.ResolveCredentialOverrideOn(ctx, q, userID, scheduleLaneKind(target), harness, mode, secretID)
 	if verr != nil {
 		h.writeCredentialOverrideError(w, verr)
 		return scheduleCredentialColumns{}, false
