@@ -97,7 +97,7 @@ func TestCompletedPublicationRollbackRoundTripLiveDB(t *testing.T) {
 		}
 	}
 	// Snapshot every retained field, including timestamps, live IDs and final capture
-	// proof. Exclude merged_predecessor_discard_binding, added by migration 00334
+	// proof. Exclude merged_predecessor_discard_binding, added by migration 00338
 	// and dropped on Down. Only the publication classifications are expected to become NULL.
 	expected := map[string]string{}
 	for name, hold := range holds {

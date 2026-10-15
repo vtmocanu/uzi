@@ -14,7 +14,7 @@ Forge I/O precedes database locking. Recovery locks the run, then shares locks o
 
 ## Evidence and lifecycle
 
-The transaction sets each selected hold to `discarded`, clears its live worker/run pointers and stamps `release_evidence = merged_predecessor_discard`. The immutable `merged_predecessor_discard_binding` records hold ID/generation, run, owner, repository, connection, forge type, base URL, project, MR IID, completed generation G and verification timestamp. Migration 00334 validates the exact binding and transition, forbids audit deletion or mutation apart from `updated_at`, and admits this evidence for guarded holds without changing their final-disposition identity.
+The transaction sets each selected hold to `discarded`, clears its live worker/run pointers and stamps `release_evidence = merged_predecessor_discard`. The immutable `merged_predecessor_discard_binding` records hold ID/generation, run, owner, repository, connection, forge type, base URL, project, MR IID, completed generation G and verification timestamp. Migration 00338 validates the exact binding and transition, forbids audit deletion or mutation apart from `updated_at`, and admits this evidence for guarded holds without changing their final-disposition identity.
 
 This does not invent ancestry proof, archive FINAL coverage, or a completed-publication receipt. Preparing/uploading/needs-action captures become discarded and their partial chunks are deleted in the same transaction. Available archive bytes, prerequisites, TTL and export eligibility are preserved. Custody counts and the decision hotlist fall through existing discard semantics; the shared recovery service invokes its existing post-commit custody-settled hook.
 
@@ -30,7 +30,7 @@ Failure logs contain identifiers and fixed refusal reasons rather than raw forge
 
 ## Deployment and rollback
 
-Migration 00334 adds validating CHECK constraints that scan the hold table under ACCESS EXCLUSIVE locking, with a five-second lock-acquisition timeout. Representative production cardinality and validation timing are unknown. Assess staging or replica measurements and the deployment window before rollout (M1 DBA review `3aef062f`); the timeout does not bound validation runtime. Down refuses when merged-predecessor audit evidence exists rather than erasing or relabelling it.
+Migration 00338 adds validating CHECK constraints that scan the hold table under ACCESS EXCLUSIVE locking, with a five-second lock-acquisition timeout. Representative production cardinality and validation timing are unknown. Assess staging or replica measurements and the deployment window before rollout (M1 DBA review `3aef062f`); the timeout does not bound validation runtime. Down refuses when merged-predecessor audit evidence exists rather than erasing or relabelling it.
 
 ## Local validation cost
 
@@ -47,7 +47,7 @@ cost, cache behavior, rerun cost and critical-path impact remain unmeasured.
 
 ## Source and acceptance boundaries
 
-Implementation: `api/internal/forgesvc/merged_predecessor.go`, `api/internal/recovery/merged_predecessor.go`, `api/internal/store/queries/merged_predecessor.sql`, migration `00334_merged_predecessor_discard.sql`, and the poller/main/handler shared-service wiring. Existing `DiscardNonReadyCapturesForHold` supplies capture cleanup.
+Implementation: `api/internal/forgesvc/merged_predecessor.go`, `api/internal/recovery/merged_predecessor.go`, `api/internal/store/queries/merged_predecessor.sql`, migration `00338_merged_predecessor_discard.sql`, and the poller/main/handler shared-service wiring. Existing `DiscardNonReadyCapturesForHold` supplies capture cleanup.
 
 Acceptance should cover nonancestor predecessors and available/thin archives, exact binding drift and refused merge observations, concurrent upload/owner discard, immutable audit and rollback refusal, historical/issue-less polling, fairness, cursor retry/wrap/restart, parent cancellation and independent deadlines. Relevant named cases include `TestMergedPredecessorSelectionAndArchiveLiveDB`, `TestMergedPredecessorSnapshotDriftLiveDB`, `TestMergedPredecessorRollbackLiveDB` and `TestMergedPredecessorFairnessAndRestart`; these are acceptance references, not claims of execution. Test and timing evidence is owned by the lead.
 
