@@ -1,6 +1,7 @@
 package pushbroker
 
 import (
+	"context"
 	"testing"
 	"time"
 
@@ -10,28 +11,9 @@ import (
 	"github.com/go-git/go-git/v5/storage/memory"
 )
 
-// TestStrictDescendsOverlayParentOrderDepth1 pins the LOAD-BEARING property behind PRD
-// #1062 M2 (#1036): a `.github/workflows` checkpoint overlay must be built base-FIRST
-// (the prior checkpoint tip as parent[0], the real tip LAST), NOT realTip-first. The
-// broker's strict-descendant gate runs go-git `IsAncestor`, a parent[0]-first preorder
-// DFS, over its DEPTH-1 object store. This test reproduces that depth-1 store (the
-// branch-fork's parent `D_old` is absent) and asserts three things:
-//
-//   - base-FIRST overlay  → accepted (IsAncestor finds base at parent[0] immediately and
-//     stops, never walking below base into the missing object).
-//   - realTip-FIRST overlay → rejected as a BENIGN skip (the walk dives into the real
-//     tip's chain first, runs off the depth-1 pack into the absent `D_old`, surfaces
-//     plumbing.ErrObjectNotFound, and descendsOrEqual maps it to (false, nil)).
-//   - RAW real tip (no chain over the prior overlay) → rejected: it is never a descendant of
-//     the prior overlay ref on any store, and on depth-1 the walk also runs off the pack.
-//
-// The original PRD draft specified realTip-first; that shipped broken (every second and
-// later sequential overlay skipped `not_descendant`, so a behind-on-workflows branch
-// checkpointed once then went dark). This test is the executable guard against a
-// regression that flips the parent order back — the agent-side shape tests use a
-// FULL-graph merge-base that is parent-order-independent and would NOT catch it. It lives
-// here (internal test) because strictDescends is unexported and the depth-1 property is
-// only reproducible against the broker's own store.
+// TestStrictDescendsOverlayParentOrderDepth1 accepts either overlay parent order
+// when the prior checkpoint is reachable in the available depth-1 store. Missing
+// side paths cannot hide that proof. Raw tips without a chain remain refused.
 func TestStrictDescendsOverlayParentOrderDepth1(t *testing.T) {
 	repo, err := git.Init(memory.NewStorage(), nil)
 	if err != nil {
@@ -56,9 +38,8 @@ func TestStrictDescendsOverlayParentOrderDepth1(t *testing.T) {
 	baseFirst := getCommit(t, repo, storeCommit(t, repo, emptyTree, "ckpt(overlay): base-first", prevRef, realTipNew))
 	realTipFirst := getCommit(t, repo, storeCommit(t, repo, emptyTree, "ckpt(overlay): realtip-first", realTipNew, prevRef))
 
-	// base-FIRST: accepted. IsAncestor hits base at parent[0] and stops before the shallow
-	// boundary.
-	ok, err := strictDescends(repo, prevRef, baseFirst)
+	// Base-first overlay reaches the validated prior checkpoint.
+	ok, err := strictDescends(context.Background(), repo, prevRef, baseFirst)
 	if err != nil {
 		t.Fatalf("base-first: unexpected error: %v", err)
 	}
@@ -66,26 +47,18 @@ func TestStrictDescendsOverlayParentOrderDepth1(t *testing.T) {
 		t.Fatalf("base-first overlay must be accepted as a strict descendant of the prior ckpt ref")
 	}
 
-	// realTip-FIRST: rejected as a benign skip. The parent[0]-first walk runs off the
-	// depth-1 pack into the absent D_old → ErrObjectNotFound → (false, nil). This is the
-	// exact failure the parent-flip fixes; a regression that flips the order back reddens
-	// here.
-	ok, err = strictDescends(repo, prevRef, realTipFirst)
-	if err != nil {
-		t.Fatalf("realtip-first: the shallow-boundary miss must map to (false, nil), got err: %v", err)
-	}
-	if ok {
-		t.Fatalf("realtip-first overlay must NOT be accepted on a depth-1 store " +
-			"(the parent[0]-first walk runs off the pack before reaching the base) — " +
-			"this is the not_descendant regression the base-first parent order fixes")
+	// Real-tip-first also proves the prior checkpoint, despite a missing side path.
+	ok, err = strictDescends(context.Background(), repo, prevRef, realTipFirst)
+	if err != nil || !ok {
+		t.Fatalf("realtip-first must be accepted: %t, %v", ok, err)
 	}
 
 	// RAW realTipNew over the prior ref: refused (issue #2733). A tick or iteration checkpoint
 	// that packs the bare real tip, with no chain over the prior overlay, is never a descendant
 	// of prevRef on any store (prevRef is not among its ancestors); on this depth-1 store the
-	// walk additionally runs off the pack into the absent D_old and maps to (false, nil). The
+	// walk also encounters the absent D_old, but no available path proves ancestry. The
 	// agent-side chain [prevRef, realTipNew] is what the base-first case above accepts.
-	ok, err = strictDescends(repo, prevRef, getCommit(t, repo, realTipNew))
+	ok, err = strictDescends(context.Background(), repo, prevRef, getCommit(t, repo, realTipNew))
 	if err != nil {
 		t.Fatalf("raw realTipNew: the shallow-boundary miss must map to (false, nil), got err: %v", err)
 	}
@@ -95,34 +68,9 @@ func TestStrictDescendsOverlayParentOrderDepth1(t *testing.T) {
 	}
 }
 
-// TestStrictDescendsLostAckReconcileDepth1 pins the depth-1 broker property that makes the
-// agent-side two-tip checkpoint reconciliation (issue #1086, F2 from #1036) correct. When
-// the broker ACCEPTS an overlay but its HTTP ACK is lost in flight, the broker's ref has
-// already advanced to that accepted-but-unconfirmed overlay (the ATTEMPTED tip), while the
-// agent still believes the last CONFIRMED tip is the ref. The agent's fix chains the NEXT
-// overlay from the ATTEMPTED tip, not the stale confirmed one; this test proves WHY that is
-// the only chaining choice the broker's strict-descendant gate accepts.
-//
-// The gate runs go-git `IsAncestor`, a parent[0]-first preorder DFS, over the broker's
-// DEPTH-1 object store (the branch-fork's parent `dOld` is absent). With the broker's ref
-// now at the accepted overlay `o1` (base = `o1`):
-//
-//   - O2 chained from the STALE confirmed tip (parent[0] = branchBase == C) → REJECTED as a
-//     BENIGN non-descendant. The parent[0]-first walk goes o2Stale → branchBase → dOld
-//     (absent) and runs off the depth-1 pack before ever reaching `o1`, surfacing
-//     plumbing.ErrObjectNotFound, which descendsOrEqual maps to (false, nil). This is the
-//     BUG the agent-side fix avoids: a next overlay chained from the confirmed tip would be
-//     silently skipped not_descendant, stalling checkpoints after a lost ACK.
-//   - O2 chained from the ATTEMPTED tip (parent[0] = o1) → ACCEPTED. The walk hits
-//     parent[0] == base immediately and stops before the shallow boundary. This is the FIX's
-//     chaining choice.
-//
-// The broker PRODUCTION code is UNCHANGED: this is a property/guard test documenting why the
-// agent chains from the attempted tip, complementary to the agent-side regression test in
-// agent/test/runner-checkpoint.test.ts. It lives here (internal test) because strictDescends
-// is unexported and the depth-1 shallow-boundary property is only reproducible against the
-// broker's own store. Failure messages name the lost-ACK scenario so a regression reads
-// clearly.
+// TestStrictDescendsLostAckReconcileDepth1 requires the next overlay to chain
+// from the accepted attempted tip after a lost ACK. The stale confirmed chain
+// cannot reach that base, regardless of missing side paths or parent order.
 func TestStrictDescendsLostAckReconcileDepth1(t *testing.T) {
 	repo, err := git.Init(memory.NewStorage(), nil)
 	if err != nil {
@@ -151,22 +99,20 @@ func TestStrictDescendsLostAckReconcileDepth1(t *testing.T) {
 	// o2Fixed: the FIXED next overlay chained from the ATTEMPTED tip (parent[0] = o1).
 	o2Fixed := getCommit(t, repo, storeCommit(t, repo, emptyTree, "ckpt(overlay): O2 chained from ATTEMPTED", o1, realTipNew))
 
-	// STALE-chained: rejected as a benign non-descendant. The parent[0]-first walk runs off
-	// the depth-1 pack (o2Stale → branchBase → dOld absent) before reaching o1 →
-	// ErrObjectNotFound → (false, nil). This is the lost-ACK bug the agent-side fix avoids.
-	ok, err := strictDescends(repo, o1, o2Stale)
+	// Stale chaining never reaches the accepted attempted tip.
+	ok, err := strictDescends(context.Background(), repo, o1, o2Stale)
 	if err != nil {
 		t.Fatalf("lost-ACK stale-chained: the shallow-boundary miss must map to (false, nil), got err: %v", err)
 	}
 	if ok {
 		t.Fatalf("lost-ACK stale-chained overlay must NOT be accepted: chaining the next overlay " +
-			"from the STALE confirmed tip after a lost ACK walks off the depth-1 pack before " +
-			"reaching the attempted tip — this is the not_descendant stall the agent-side two-tip fix avoids")
+			"from the STALE confirmed tip after a lost ACK has no path to " +
+			"the attempted tip — this is the not_descendant stall the agent-side two-tip fix avoids")
 	}
 
 	// ATTEMPTED-chained: accepted. The walk hits parent[0] == o1 == base immediately and
 	// stops before the shallow boundary. This is the fix's chaining choice.
-	ok, err = strictDescends(repo, o1, o2Fixed)
+	ok, err = strictDescends(context.Background(), repo, o1, o2Fixed)
 	if err != nil {
 		t.Fatalf("lost-ACK attempted-chained: unexpected error: %v", err)
 	}

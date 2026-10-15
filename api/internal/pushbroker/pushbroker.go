@@ -406,7 +406,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 		base = branchTip
 	}
 	if !base.IsZero() {
-		ok, err := strictDescends(repo, base, declaredCommit)
+		ok, err := strictDescends(ctx, repo, base, declaredCommit)
 		if err != nil {
 			return Result{}, fmt.Errorf("pushbroker: ancestry (base): %w", err)
 		}
@@ -417,7 +417,7 @@ func Publish(ctx context.Context, o Options) (Result, error) {
 	// If a human pushed refs/heads/<branch> ahead of (or aside from) the checkpoint,
 	// the checkpoint must not move to a tip that does not descend that branch.
 	if !branchTip.IsZero() && branchTip != checkpointTip {
-		ok, err := descendsOrEqual(repo, branchTip, declaredCommit)
+		ok, err := descendsOrEqual(ctx, repo, branchTip, declaredCommit)
 		if err != nil {
 			return Result{}, fmt.Errorf("pushbroker: ancestry (branch): %w", err)
 		}
@@ -1238,9 +1238,10 @@ func fetchWantedRefs(ctx context.Context, remote *git.Remote, auth transport.Aut
 		// which OOM-killed the 512Mi api pod at every checkpoint (PRD #122 M8, found in
 		// the first real-forge deploy — the unit tests use a 1-commit local fixture,
 		// where depth is a no-op, so they never caught it). Depth 1 fetches only each
-		// wanted ref's TIP snapshot — exactly the base objects the worker's thin delta
-		// pack references and the ancestry checks need (they only ever walk DOWN to the
-		// fetched tip, never below it). Measured with depth 1: 47 MiB heap / 194 MB RSS
+		// wanted ref's TIP snapshot — the base objects the worker's non-thin delta
+		// pack references. Ancestry walks may encounter missing parents on side paths;
+		// they continue other paths and require positive reach of the fetched base.
+		// Measured with depth 1: 47 MiB heap / 194 MB RSS
 		// including the push. Validated against gitlab.example.com before shipping.
 		Depth: 1,
 	})
@@ -1325,44 +1326,90 @@ func resolveHash(repo *git.Repository, name plumbing.ReferenceName) plumbing.Has
 	return r.Hash()
 }
 
-// strictDescends reports whether declared is a STRICT descendant of base: not equal
-// to base, and base reachable from declared.
-func strictDescends(repo *git.Repository, base plumbing.Hash, declared *object.Commit) (bool, error) {
-	if base == declared.Hash {
-		return false, nil
-	}
-	return descendsOrEqual(repo, base, declared)
+// strictDescends reports whether base is reachable from declared, excluding equality.
+func strictDescends(ctx context.Context, repo *git.Repository, base plumbing.Hash, declared *object.Commit) (bool, error) {
+	return ancestry(ctx, repo, base, declared, true, 100000, 1000000)
 }
 
-// descendsOrEqual reports whether base is an ancestor of declared (equal counts, as
-// `git merge-base --is-ancestor X X` does).
-func descendsOrEqual(repo *git.Repository, base plumbing.Hash, declared *object.Commit) (bool, error) {
-	baseCommit, err := object.GetCommit(repo.Storer, base)
+// descendsOrEqual includes equality, after validating the base object.
+func descendsOrEqual(ctx context.Context, repo *git.Repository, base plumbing.Hash, declared *object.Commit) (bool, error) {
+	return ancestry(ctx, repo, base, declared, false, 100000, 1000000)
+}
+
+// ancestry searches available parents in FIFO order. A missing object ends only
+// that path; only reaching the validated base proves ancestry. Distinct scheduled
+// hashes (including declared and missing nodes) and inspected parent entries
+// (including duplicates) bound traversal operations. These limits do not bound
+// allocations inside commit decoding or latency within a storage call.
+func ancestry(ctx context.Context, repo *git.Repository, base plumbing.Hash, declared *object.Commit, strict bool, maxNodes, maxEdges int) (bool, error) {
+	finish := func(ok bool) (bool, error) {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		return ok, nil
+	}
+	if err := ctx.Err(); err != nil {
+		return false, err
+	}
+	_, err := object.GetCommit(repo.Storer, base)
+	if ctxErr := ctx.Err(); ctxErr != nil {
+		return false, ctxErr
+	}
 	if err != nil {
-		// The base tip's commit object is missing from the storer, which for a
-		// fetched ref should never happen; treat it as a non-descendant rather than
-		// a 5xx so a corrupt/partial origin degrades to a skip.
 		if errors.Is(err, plumbing.ErrObjectNotFound) {
-			return false, nil
+			return finish(false)
 		}
 		return false, err
 	}
-	ok, err := baseCommit.IsAncestor(declared)
-	if err != nil {
-		// IsAncestor walks preorder from `declared` toward its parents, stopping the
-		// instant it reaches base. A genuine descendant therefore never walks BELOW base,
-		// so it never needs an object the depth-1 base fetch left out. But a genuine
-		// NON-descendant walk finds no stop point and runs off the end of the pack into
-		// the branch-point's excluded parent (D_old, absent from the storer), surfacing
-		// plumbing.ErrObjectNotFound. That is a non-descendant, not a fault: map it to
-		// (false, nil) so the caller returns ErrNotDescendant (a 200 skip) rather than a
-		// 5xx "ancestry" error (issue #1009). Mirrors the GetCommit(base) handling above.
-		if errors.Is(err, plumbing.ErrObjectNotFound) {
-			return false, nil
-		}
-		return false, err
+	if base == declared.Hash {
+		return finish(!strict)
 	}
-	return ok, nil
+	if maxNodes < 1 {
+		return finish(false)
+	}
+	seen := map[plumbing.Hash]struct{}{declared.Hash: {}}
+	queue := []plumbing.Hash{declared.Hash}
+	edges := 0
+	for head := 0; head < len(queue); head++ {
+		if err := ctx.Err(); err != nil {
+			return false, err
+		}
+		commit := declared
+		if head != 0 {
+			commit, err = object.GetCommit(repo.Storer, queue[head])
+			if ctxErr := ctx.Err(); ctxErr != nil {
+				return false, ctxErr
+			}
+			if errors.Is(err, plumbing.ErrObjectNotFound) {
+				continue
+			}
+			if err != nil {
+				return false, err
+			}
+		}
+		for i := range commit.ParentHashes {
+			if err := ctx.Err(); err != nil {
+				return false, err
+			}
+			if edges >= maxEdges {
+				return finish(false)
+			}
+			edges++
+			parent := commit.ParentHashes[i]
+			if parent == base {
+				return finish(true)
+			}
+			if _, scheduled := seen[parent]; scheduled {
+				continue
+			}
+			if len(seen) >= maxNodes {
+				return finish(false)
+			}
+			seen[parent] = struct{}{}
+			queue = append(queue, parent)
+		}
+	}
+	return finish(false)
 }
 
 // isNonFastForward matches a receive-pack report-status that rejected the checkpoint

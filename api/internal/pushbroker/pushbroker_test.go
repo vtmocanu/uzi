@@ -73,6 +73,7 @@ func (f *gitFixture) pack(tip, base string) []byte {
 	f.t.Helper()
 	revs := run(f.t, f.work, "git", "rev-list", tip, "^"+base, "--objects")
 	cmd := exec.Command("git", "-C", f.work, "pack-objects", "--stdout") //nolint:gosec // G204: test helper invoking the real git against a test-owned temp repo path, not attacker input.
+	cmd.Env = cleanGitEnv()
 	cmd.Stdin = strings.NewReader(revs)
 	var out, errb bytes.Buffer
 	cmd.Stdout = &out
@@ -87,7 +88,8 @@ func (f *gitFixture) pack(tip, base string) []byte {
 func (f *gitFixture) originRef(ref string) string {
 	f.t.Helper()
 	cmd := exec.Command("git", "-C", f.bare, "rev-parse", "--verify", "--quiet", ref) //nolint:gosec // G204: test helper invoking the real git against a test-owned temp repo path, not attacker input.
-	out, _ := cmd.Output()                                                            // non-zero exit on a missing ref is expected → ""
+	cmd.Env = cleanGitEnv()
+	out, _ := cmd.Output() // non-zero exit on a missing ref is expected → ""
 	return strings.TrimSpace(string(out))
 }
 
@@ -677,6 +679,7 @@ func isNotDescendant(err error) bool { return errors.Is(err, pushbroker.ErrNotDe
 func run(t *testing.T, dir, name string, args ...string) string {
 	t.Helper()
 	cmd := exec.Command(name, args...) //nolint:gosec // G204: generic test command runner; name/args are test-controlled constants, not attacker input.
+	cmd.Env = cleanGitEnv()
 	if dir != "" {
 		cmd.Dir = dir
 	}
@@ -694,4 +697,15 @@ func writeFile(t *testing.T, path, content string) {
 	if err := os.WriteFile(path, []byte(content), 0o600); err != nil {
 		t.Fatalf("write %s: %v", path, err)
 	}
+}
+
+// cleanGitEnv isolates fixture Git from worker checkout/configuration variables.
+func cleanGitEnv() []string {
+	var env []string
+	for _, entry := range os.Environ() {
+		if !strings.HasPrefix(entry, "GIT_") {
+			env = append(env, entry)
+		}
+	}
+	return append(env, "GIT_CONFIG_NOSYSTEM=1", "GIT_CONFIG_GLOBAL=/dev/null", "GIT_TERMINAL_PROMPT=0")
 }
