@@ -95,7 +95,8 @@ func reviewCollectionRows(name string, value any) [][]string {
 		if len(items) == 0 {
 			return [][]string{{name, "[] (empty)"}}
 		}
-		rows := make([][]string, 0, min(len(items), 40)+1)
+		// At most 40 items plus the omission notice, independent of input length.
+		rows := make([][]string, 0, 41)
 		for i, item := range items {
 			if i == 40 {
 				rows = append(rows, []string{name, "additional items omitted; use --json"})
