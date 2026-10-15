@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { afterEach, mock, test } from "node:test";
-import { WorkerClient } from "../src/client.js";
+import { HeldFeatureUnavailableError, WorkerClient } from "../src/client.js";
 import { nullLogger } from "./helpers.js";
 
 const run = "11111111-1111-4111-8111-111111111111";
@@ -18,16 +18,54 @@ afterEach(() => mock.restoreAll());
 async function setup(features: string[] = [v2], caps: string[] = [v2]) {
  let body: unknown = { run_id: run, holds: [], exact_hold: open() };
  const paths: string[] = [];
- mock.method(globalThis, "fetch", async (url: string | URL | Request) => {
+ const posts: unknown[] = [];
+ mock.method(globalThis, "fetch", async (url: string | URL | Request, init?: RequestInit) => {
   const path = new URL(String(url));
   if (path.pathname.endsWith("/register")) return Response.json({ worker_id: worker, protocol_features: features });
   paths.push(path.pathname + path.search);
+  if (init?.method === "POST") posts.push(JSON.parse(String(init.body)));
   return Response.json(body);
  });
  const client = new WorkerClient("http://exact.test", "worker-token", "test", nullLogger());
  await client.register("worker", undefined, 1, undefined, caps);
- return { client, paths, answer: (value: unknown) => { body = value; } };
+ return { client, paths, posts, answer: (value: unknown) => { body = value; } };
 }
+
+test("closed held proof replays only the immutable FINAL after publication capability loss", async () => {
+ const e = await setup(["recovery_inventory_v1"]);
+ const disposition = { kind: "held_publication" as const, publication_id: repo,
+  source_sha: "a".repeat(40), coverage_digest: "b".repeat(64) };
+ const closed = { ...open(), state: "released", live_worker_id: undefined, live_run_id: undefined,
+  release_evidence: "held_publication", final_receipt: disposition };
+ e.answer({ run_id: run, exact_hold: closed });
+ const proof = await e.client.getExactRecoveryHold(run, 1, expected);
+ assert.ok(proof);
+ assert.equal((proof as unknown as Record<string, unknown>).released, undefined);
+ await assert.rejects(e.client.releaseRecoveryCustody(run, 1, undefined, disposition), HeldFeatureUnavailableError);
+ assert.equal(e.posts.length, 0);
+ for (const mutation of [{ state: "discarded" }, { release_evidence: "owner_discard" },
+  { original_worker_id: repo }, { original_worker_identity: "" }, { run_id: repo }, { generation: 2 },
+  { hold_id: "bad" }, { repo_id: "bad" }, { current_claim_generation: 0 },
+  { live_run_id: run }, { live_worker_id: worker }, { inventory_guarded: false },
+  { final_receipt: { ...disposition, source_sha: "c".repeat(40) } },
+  { final_receipt: { ...disposition, coverage_digest: "c".repeat(64) } },
+  { final_receipt: { ...disposition, publication_id: hold } },
+  { final_receipt: { ...disposition, extra: true } }]) {
+  await assert.rejects(e.client.releaseRecoveryCustody(run, 1, undefined, disposition, undefined,
+   { ...proof, ...mutation } as typeof proof), HeldFeatureUnavailableError);
+ }
+ await assert.rejects(e.client.releaseRecoveryCustody(run, 1, undefined,
+  { ...disposition, publication_id: hold }, undefined, proof), HeldFeatureUnavailableError);
+ await assert.rejects(e.client.releaseRecoveryCustody(run, 1, "publication", disposition, undefined, proof), HeldFeatureUnavailableError);
+ assert.equal(e.posts.length, 0);
+ const ack = { run_id: run, generation: 1, released: true, holds_released: 1 };
+ e.answer(ack);
+ assert.deepEqual(await e.client.releaseRecoveryCustody(run, 1, undefined, disposition, undefined, proof), ack);
+ assert.deepEqual(e.posts, [{ generation: 1, final_disposition: disposition }]);
+ await e.client.register("worker", undefined, 1, undefined, ["recovery_held_publication_v1"]);
+ await assert.rejects(e.client.releaseRecoveryCustody(run, 1, undefined, disposition, undefined, proof), HeldFeatureUnavailableError);
+ assert.equal(e.posts.length, 1);
+});
 
 test("exact observation requires both rollout directions and treats old API absence as unknown", async () => {
  const incapable = await setup([v2], []);

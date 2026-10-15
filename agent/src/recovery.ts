@@ -43,7 +43,6 @@ import type {
   RecoveryHold,
   RecoveryExactHold,
   RecoveryHoldsResponse,
-  RecoveryReleaseResponse,
   RecoveryReserveRequest,
   RecoveryReserveResponse,
   RecoveryUploadManifest,
@@ -243,13 +242,7 @@ export interface RecoveryArchiveClient {
    *  only the hold taken at that claim generation (PRD #1349 M1/M2, D1/D2); an omitted
    *  generation is the v1 settle-by-run+worker fallback. `releaseEvidence` stamps the release's
    *  evidence class (PRD #1392 M1/M2, fact 9), allowlisted server-side; omitted stores NULL. */
-  releaseRecoveryCustody(
-    runId: string,
-    generation?: number,
-    releaseEvidence?: string,
-    finalDisposition?: RecoveryFinalDisposition,
-    signal?: AbortSignal,
-  ): Promise<RecoveryReleaseResponse>;
+  releaseRecoveryCustody: WorkerClient["releaseRecoveryCustody"];
   /** Issue #2625: claim a completed run's archive is redundant with its published branch. Optional
    *  and gated on `recovery_archive_redundancy_v1`; the answer is only ever logged. */
   proveRecoveryArchiveRedundancy?(runId: string, captureId: string, req: RecoveryArchiveRedundancyRequest, signal?: AbortSignal): Promise<RecoveryArchiveRedundancyResponse>;
@@ -1761,7 +1754,26 @@ export class RecoveryCoordinator {
       const hold = await this.heldOperationState(record);
       if (hold !== "open" && !await this.finalHoldAllowsReplay(record, hold)) return this.heldStopped(record, hold);
       if (residueQuarantine() !== undefined) return { ...quarantinedOutcome(record.captureId), held: "kept" };
-      const ack = await recoveryRPC(() => (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
+      if (hold === "settled" && (await this.requireRecord(record)).holdSettlement?.state !== "released") return this.heldStopped(record, "settled");
+      let replayProof: RecoveryExactHold | undefined;
+      if (hold === "settled" && !this.client.hasFeature?.("recovery_held_publication_v1") &&
+          !this.client.hasHeldPublicationV2?.()) {
+        // Re-read the MAC-verified journal after observation: only its unchanged saved body
+        // and exact binding can recover an ACK. Policy settlements never qualify.
+        const current = await this.requireRecord(record);
+        const settled = current.holdSettlement;
+        if (!current.exactHoldBinding || settled?.state !== "released" ||
+            settled.final_receipt?.kind !== "held_publication" ||
+            settled.run_id !== current.runId || settled.generation !== current.generation ||
+            settled.hold_id !== current.exactHoldBinding.holdId || settled.repo_id !== current.exactHoldBinding.repoId ||
+            canonicalJson(current.finalRequest) !== canonicalJson(request) ||
+            canonicalJson(settled.final_receipt) !== canonicalJson(request.disposition) ||
+            (request.evidence !== undefined && request.evidence !== settled.release_evidence)) return this.heldStopped(record, "settled");
+        replayProof = settled;
+      }
+      const ack = await recoveryRPC(() => replayProof
+        ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()?.signal, replayProof)
+        : (MaintenanceBudget.current() ? this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition, MaintenanceBudget.current()!.signal) : this.client.releaseRecoveryCustody(record.runId, record.generation, request.evidence, request.disposition)));
       if (!ack || typeof ack !== "object") return kept("held_publication_unreadable_answer");
       if (ack.retained === true) {
         const reason: HeldFinalRetainedReason | undefined = typeof ack.reason === "string" &&

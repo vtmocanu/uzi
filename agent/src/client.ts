@@ -2315,6 +2315,7 @@ export class WorkerClient {
     releaseEvidence?: string,
     finalDisposition?: RecoveryReleaseRequest["final_disposition"],
     signal?: AbortSignal,
+    replayProof?: RecoveryExactHold,
   ): Promise<RecoveryReleaseResponse> {
     // Backward-compatible: an omitted generation posts an empty body (the v1 settle-by-
     // run+worker path); a v2 caller names the exact generation (PRD #1349 M1, D1/D2).
@@ -2329,9 +2330,10 @@ export class WorkerClient {
         throw new Error("final inventory release requires an exact positive safe generation");
       }
       if (!this.hasFeature("recovery_inventory_v1")) throw new Error("inventory feature unavailable; final release retained");
-      // Issue #2545: a held_publication FINAL names a ref on the forge; without the negotiated
-      // feature nothing is sent, and the typed error keeps the journaled FINAL (non-definitive).
-      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE) && !this.hasHeldPublicationV2()) {
+      // New held FINALs require negotiation. Only a matching released receipt may recover its
+      // original ACK while publication is disabled; the GET proof itself never grants an ACK.
+      if (finalDisposition.kind === "held_publication" && !this.hasFeature(HELD_PUBLICATION_FEATURE) && !this.hasHeldPublicationV2() &&
+          !this.allowsClosedHeldReplay(runId, generation, releaseEvidence, finalDisposition, replayProof)) {
         throw new HeldFeatureUnavailableError();
       }
       body.final_disposition = finalDisposition;
@@ -2344,6 +2346,33 @@ export class WorkerClient {
       signal,
       RECOVERY_RELEASE_RESPONSE_MAX_BYTES,
     )) as RecoveryReleaseResponse;
+  }
+
+  /** Closed proof permits only recovering the ACK for the same immutable held FINAL. */
+  private allowsClosedHeldReplay(runId: string, generation: number | undefined, evidence: string | undefined,
+    disposition: NonNullable<RecoveryReleaseRequest["final_disposition"]>, proof: unknown): boolean {
+    if (!this.hasExactHoldCapability || !terminalUUID(this.registeredWorkerId) ||
+        !terminalUUID(runId) || !terminalGeneration(generation) || generation <= 0 || !isRecord(proof) ||
+        proof.state !== "released" || proof.inventory_guarded !== true ||
+        proof.run_id !== runId || proof.generation !== generation ||
+        proof.original_worker_id !== this.registeredWorkerId || !terminalUUID(proof.hold_id) ||
+        !terminalUUID(proof.repo_id) || typeof proof.original_worker_identity !== "string" ||
+        !proof.original_worker_identity.trim() || !terminalGeneration(proof.current_claim_generation) ||
+        proof.current_claim_generation < generation || typeof proof.claim_released !== "boolean" ||
+        typeof proof.run_status !== "string" ||
+        !["queued", "claimed", "running", "awaiting_approval", "awaiting_input", "awaiting_followup", "limit_wait", "pool_wait", "paused", "recovery_wait", "completed", "failed", "cancelled"].includes(proof.run_status) ||
+        (proof.run_worker_id !== undefined && !terminalUUID(proof.run_worker_id)) ||
+        (proof.recovery_wait_cause !== undefined && typeof proof.recovery_wait_cause !== "string") ||
+        proof.live_worker_id !== undefined || proof.live_run_id !== undefined ||
+        !validExactClosedProof(proof) || proof.release_evidence !== "held_publication" ||
+        (evidence !== undefined && evidence !== proof.release_evidence) || !isRecord(proof.final_receipt)) return false;
+    // These wire objects are flat. Compare every defined key, including unexpected fields.
+    const receipt = proof.final_receipt;
+    const body = disposition as unknown as Record<string, unknown>;
+    const keys = Object.keys(receipt).filter(k => receipt[k] !== undefined).sort();
+    const bodyKeys = Object.keys(body).filter(k => body[k] !== undefined).sort();
+    return keys.length === bodyKeys.length && keys.every((key, i) =>
+      key === bodyKeys[i] && typeof receipt[key] === "string" && receipt[key] === body[key]);
   }
 
   /** New attempts need headroom; original terminal recognition is independent of admission. */
