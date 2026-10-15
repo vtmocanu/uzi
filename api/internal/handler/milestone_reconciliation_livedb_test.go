@@ -92,7 +92,7 @@ func TestMilestoneReconciliationHTTPReclaimLiveDB(t *testing.T) {
 	}
 	exec(`INSERT INTO workers(id,user_id,name,token_hash,status,last_heartbeat_at,capabilities,protocol_capabilities)
  VALUES($1,$2,$3,$4,'online',now(),$5,$6)`, workerID, owner, "reconciliation-http-"+workerID.String(), hash,
-		[]string{capability.Docker}, []string{capability.CredentialSwitchV1, capability.CompletionInterlockV1, capability.GateRevisionV1})
+		[]string{capability.Docker}, []string{capability.CredentialSwitchV1, capability.CompletionInterlockV1, capability.GateRevisionV1, capability.MilestoneReconciliationClaimV1})
 	exec(`INSERT INTO runs(id,user_id,repo_id,kind,issue_iid,issue_title,issue_description,status,worker_id,
  claim_generation,auto_approve,plan_source,session_id,milestones_frozen,milestones_completed,
  milestones_in_progress,milestones_agents,scope_ceiling,stop_kind,stop_reason,checkpoint_tip,checkpoint_tip_at)
