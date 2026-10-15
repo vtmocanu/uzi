@@ -83,7 +83,7 @@ Record sanitized commands/outcomes, commit/image versions and dates. Never mark 
 ## Risks and durable decisions
 
 - Structural containment lands before semantic judgment and states that limitation.
-- Same-worker context lands before durable cross-worker recovery and is exposed as degraded, not hidden.
+- Provider context is same-worker only (durable cross-worker recovery, #1229, is not planned) and is exposed as degraded, not hidden.
 - Independent plan/final audits add bounded owner-token cost, and the bound is concrete: the coverage review is at most two invocations per verdict-bearing review sharing 5 min and 40k tokens, capped at three reviews and 15 min / 120k tokens per run and the completion audit at most two tool-less passes (5 min each, 10 min aggregate, 100k tokens) over a worker-built packet with captured gate evidence, so review time scales with the diff, not with implementation time. Deterministic checks run first. Both run only on repos that opt into the semantic profile; the structural interlock costs no tokens and is the default.
 - A PAT-holding compromised worker remains outside scope; the hard claim clause addresses normal version skew.
 - Finalize-time base-align conflicts, non-fast-forward rejection and push-secret blocking retain their existing typed preserved-work behavior; this epic changes incomplete-completion handling, not every terminal finalization error.
