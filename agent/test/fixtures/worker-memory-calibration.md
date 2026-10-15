@@ -1,19 +1,31 @@
 # Worker memory guard calibration procedure
 
-This is a measurement plan, not a record of measurements or recommended production
-settings. Helper fixture construction was validated in the accepted worker unit:
-[worker-memory-load.cjs](worker-memory-load.cjs) constructs bounded touched anonymous
-memory, dirty file pages, read-back page cache, shmem, and short-lived thread churn.
-That validation does not establish cancellation latency or a safe production reserve.
-Real cancellation measurements are deferred to M6 until the Codex adapter can enroll
-and supervise command trees. Mandatory CI real measurements remain pending; do not
-substitute synthetic timestamps, mocked cgroups, or fabricated results.
+This is the measurement procedure, not a recommendation for production settings.
+The [M5b evidence record](worker-memory-m5b-validation.md) records the current
+implementation and incomplete acceptance: the real 1 GiB/2 GiB attempt failed its
+memory.pressure prerequisite before load. Passing implementation checks do not
+establish cancellation latency or a safe production reserve. Required successful real
+measurements remain pending; do not substitute synthetic timestamps, mocked cgroups,
+or fabricated results.
+
+The original [worker-memory-load.cjs](worker-memory-load.cjs) helper constructs
+bounded touched anonymous memory, dirty file pages, read-back page cache, shmem, and
+short-lived thread churn. Helper construction was validated in the accepted worker
+unit; its parent-owned thread mode remains load scaffolding. Current M5b acceptance
+requires the command driver in
+[worker-memory-command-driver.ts](../helpers/worker-memory-command-driver.ts), using
+the real reader, monitor and Codex command adapter with two registered model command
+trees. Thread termination does not establish command-tree cancellation. The required
+worker-UID task also requires complete, host-bound version-1 reports for both finite
+sizes; a failed prerequisite report cannot satisfy calibration acceptance.
 
 ## Dedicated private fixtures
 
 Prepare two otherwise idle, disposable private fixtures, one with a finite 1 GiB
 memory.max and one with a finite 2 GiB memory.max. Verify each actual cgroup identity,
-memory.max, memory.current, memory.stat and memory.events before testing. Reject an
+memory.max, memory.current, memory.stat, memory.events and memory.pressure through
+the actual default reader before commands or load. Missing or unreadable PSI is a
+failed prerequisite; do not substitute synthetic PSI or a different reader. Reject an
 unlimited, shared, mismatched or externally controlled cgroup. Never execute these
 allocations in the current worker or any uncontrolled cgroup.
 
@@ -32,11 +44,11 @@ not a measured peak or a production setting. Refuse to start if baseline plus th
 budget and overhead cannot fit within the 50% ceiling. Do not enlarge the helper
 bounds to force pressure.
 
-Begin with exactly two parent-owned producer threads, advancing one fixed step per
-acknowledgement and retaining charges until stopped. In M6, use exactly two supervised
-command trees through the Codex adapter to measure the actual cancellation path;
-thread termination is not evidence of command-tree cancellation. Use fixed trusted
-fixture source, no model-supplied commands or payloads.
+The original scaffolding used two parent-owned producer threads. The required M5b
+fixture instead uses exactly two supervised command trees through the Codex adapter,
+advancing one fixed step per acknowledgement and retaining charges until stopped.
+Use fixed trusted fixture source, no model-supplied commands or payloads. The driver
+distinguishes expected monitor cancellation from producer failure.
 
 One monotonic deadline bounds the entire load leg, including setup, stepping,
 observation, cancellation and drain, to <= 30 seconds. There are no retries in a leg.
@@ -75,13 +87,17 @@ For each leg report:
 
 - Peak positive growth rate in bytes per unit time across successive raw total-charge
   samples; include the sample pairs and elapsed time, not just an aggregate.
-- Maximum sampler gap, observation latency (threshold crossing to guard observation),
-  reserve request/response RTT (including denial, timeout or error), cancellation
-  signal latency, command-tree drain latency and scheduling/measurement jitter.
-- The worst end-to-end latency from crossing through observe, reserve, signal and
-  completed drain, and the envelope combining positive growth, that latency and
-  jitter expressed in bytes. Do not assume independent stage maxima describe a
-  measured single leg: report per-leg timing and any conservative sum separately.
+- Maximum sampler gap and the sampled hard-threshold bracket: its lower bound is
+  the last below-threshold sample's start; its upper bound is the first at-or-above
+  sample's completion. Retain both sample IDs and timestamps. This is a sampled
+  bracket, never an exact kernel crossing time.
+- Observation, reserve request/response RTT (including denial, timeout or error),
+  cancellation signal and command-tree drain spans, plus scheduling/measurement
+  jitter. Bound crossing-to-drain latency by `drain.endMs - hardBracket.lowerMs`.
+- The worst such end-to-end bound across legs and the envelope combining positive
+  growth, that latency and jitter expressed in bytes. Do not assume independent
+  stage maxima describe a measured single leg: report per-leg timing and any
+  conservative sum separately.
 - Both tree outcomes, OOM event deltas, cleanup verification, report/leg IDs and raw
   artifact locations. A timeout, missing timestamp, ambiguous response or missing
   exit proof is a failed measurement, not a zero duration or successful drain.
@@ -90,11 +106,12 @@ Use consistent units and require the strict inequality:
 
 `reserveBytes > peakPositiveGrowthRate * worstEndToEndLatency + jitterBytes`
 
-The latency envelope includes the maximum sampler gap and observation delay; avoid
-double-counting if observation latency already spans that gap. Document exactly how
-jitterBytes was derived and retain the raw scheduling observations. Validate the
-worker's derived thresholds satisfy `0 < Q < H < L` against the fixture's real finite
-limit. Recheck the inequality and no-OOM/cleanup conditions on both fixture sizes.
+The bound from the bracket's lower timestamp through completed drain already
+includes sampling uncertainty and observation delay; do not add the maximum sampler
+gap again. Document exactly how jitterBytes was derived and retain the raw scheduling
+observations. Validate the worker's derived thresholds satisfy `0 < Q < H < L`
+against the fixture's real finite limit. Recheck the inequality and no-OOM/cleanup
+conditions on both fixture sizes.
 A green helper-construction test cannot satisfy this acceptance criterion.
 
 ## Production sizing input
