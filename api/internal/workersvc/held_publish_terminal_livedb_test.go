@@ -5,6 +5,9 @@ import (
 	"errors"
 	"testing"
 
+	"github.com/google/uuid"
+	"github.com/vtmocanu/uzi/api/internal/pushbroker"
+
 	"github.com/vtmocanu/uzi/api/internal/capability"
 	"github.com/vtmocanu/uzi/api/internal/store"
 )
@@ -20,6 +23,73 @@ func (s *heldReadFailureStore) GetHeldPublicationHold(ctx context.Context, p sto
 		return store.RecoveryCustodyHold{}, errors.New("hold observation unavailable")
 	}
 	return s.heldReader.GetHeldPublicationHold(ctx, p)
+}
+
+func TestHeldTerminalCustodyControlsV2LiveDB(t *testing.T) {
+	for _, bad := range []string{"live_custodian", "missing_custodian", "live_run", "missing_live_run", "repo", "future_generation", "original_worker", "user", "lane", "running", "push_secret_blocked", "worker_residue_blocked", "missing_guard", "locked_drift"} {
+		t.Run(bad, func(t *testing.T) {
+			f := newHeldFix(t)
+			f.worker.ProtocolCapabilities = []string{capability.RecoveryHeldPublicationV2}
+			f.e.exec(t, "UPDATE workers SET protocol_capabilities=$2 WHERE id=$1", f.worker.ID, f.worker.ProtocolCapabilities)
+			f.e.exec(t, "UPDATE runs SET status='completed',claim_generation=2,worker_id=NULL WHERE id=$1", f.run)
+			req := f.req()
+			mutate := func() {
+				switch bad {
+				case "live_custodian", "original_worker":
+					other := f.e.seedWorker(t, f.worker.ProtocolCapabilities)
+					column := "live_worker_id"
+					if bad == "original_worker" {
+						column = "original_worker_id"
+					}
+					f.rawHold("UPDATE recovery_custody_holds SET "+column+"=$2 WHERE id=$1", f.hold, other)
+				case "missing_custodian":
+					f.rawHold("UPDATE recovery_custody_holds SET live_worker_id=NULL WHERE id=$1", f.hold)
+				case "live_run":
+					other := f.e.seedLegacyRunningRun(t, f.worker.ID)
+					f.rawHold("UPDATE recovery_custody_holds SET live_run_id=$2 WHERE id=$1", f.hold, other)
+				case "missing_live_run":
+					f.rawHold("UPDATE recovery_custody_holds SET live_run_id=NULL WHERE id=$1", f.hold)
+				case "repo":
+					other := uuid.New()
+					f.e.exec(t, "INSERT INTO repos(id,connection_id,forge_project_id,path_with_namespace,web_url,default_branch,enabled) SELECT $1,connection_id,999,'g/other',web_url,default_branch,true FROM repos WHERE id=$2", other, f.e.repoID)
+					f.rawHold("UPDATE recovery_custody_holds SET repo_id=$2 WHERE id=$1", f.hold, other)
+				case "future_generation":
+					req.Generation = 3
+				case "user":
+					other := uuid.New()
+					f.e.exec(t, "INSERT INTO users(id,email,password_hash) VALUES($1,$2,'x')", other, other.String()+"@example.com")
+					f.rawHold("UPDATE recovery_custody_holds SET user_id=$2 WHERE id=$1", f.hold, other)
+				case "lane":
+					f.worker.IsolatedLane = true
+					f.e.exec(t, "UPDATE workers SET isolated_lane=true,kind='hosted',ephemeral=true,hosted_size='small',template_declared='default' WHERE id=$1", f.worker.ID)
+				case "running":
+					f.e.exec(t, "UPDATE runs SET status='running' WHERE id=$1", f.run)
+				case "push_secret_blocked", "worker_residue_blocked":
+					f.e.exec(t, "UPDATE runs SET fail_origin=$2 WHERE id=$1", f.run, bad)
+				case "missing_guard", "locked_drift":
+					f.rawHold("UPDATE recovery_custody_holds SET inventory_guarded=false WHERE id=$1", f.hold)
+				}
+			}
+			if bad == "locked_drift" {
+				if res, err := f.svc.HeldPublishGate(f.e.ctx, f.worker, f.run, req); err != nil || res != nil {
+					t.Fatalf("admission: %+v %v", res, err)
+				}
+				f.fake.prepareFn = func(pushbroker.HeldPackOptions) error { mutate(); return nil }
+			} else {
+				mutate()
+			}
+			if _, err := f.publish(req); err == nil {
+				t.Fatal("invalid terminal custody admitted")
+			}
+			if _, sends, _ := f.fake.counts(); sends != 0 {
+				t.Fatalf("sends=%d", sends)
+			}
+			var rows int
+			if err := f.e.pool.QueryRow(f.e.ctx, "SELECT count(*) FROM run_held_publications WHERE run_id=$1", f.run).Scan(&rows); err != nil || rows != 0 {
+				t.Fatalf("markers=%d err=%v", rows, err)
+			}
+		})
+	}
 }
 
 func TestHeldTerminalPresendReadFailureLiveDB(t *testing.T) {

@@ -536,19 +536,21 @@ for (const mode of ["boot", "live"] as const) {
         const captureBefore = structuredClone([...f.captures]);
         const bytes = await fs.readFile(earlier.bundlePath!);
         const listHolds = f.client.listRecoveryHolds;
+        const uuid = "00000000-0000-4000-8000-000000000002";
         f.client.listRecoveryHolds = async () => ({ run_id: runId, holds: [
-          { hold_id: "hold-8", generation: 8, inventory_guarded: true, has_available_capture: false },
+          { hold_id: uuid, generation: 8, inventory_guarded: true, has_available_capture: false },
           ...(await listHolds()).holds,
         ] });
         await f.coordinator.pin({ runId, generation: 8, kind: "issue", branch: "task",
           sourceSha: H2, inventoryGuarded: true });
-        const uuid = "00000000-0000-4000-8000-000000000002";
         assert.equal(await f.coordinator.persistCompletionReceipt({
           hold_id: uuid, run_id: runId, owner_id: uuid, worker_id: uuid, generation: 8,
           final_head: H2, repo_id: f.record.exactHoldBinding!.repoId, connection_id: uuid,
           project_id: 1, forge_type: "github", base_url: "https://example.com",
           branch: "task", mr_iid: 1, observed_branch_head: H2,
         }), true);
+        // The current receipt closed its own hold; only the predecessor remains open.
+        f.client.listRecoveryHolds = listHolds;
         const current = (await f.coordinator.inspect(runId)).find(r => r.generation === 8)!;
         if (refusal === "source proof") f.state.sourceProofRefused = true;
         if (refusal === "unknown create") Object.assign(f.client, {
