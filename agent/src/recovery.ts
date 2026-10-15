@@ -25,6 +25,7 @@ import fs from "node:fs/promises";
 import { constants, createReadStream } from "node:fs";
 import path from "node:path";
 import type { Readable } from "node:stream";
+import { setTimeout as retryDelay } from "node:timers/promises";
 
 import { RUN_KINDS, HELD_FINAL_FALLBACK_REASONS, HELD_FINAL_RETAINED_REASONS, type HeldFinalRetainedReason } from "./protocol.js";
 import { RequestError, isRunOwnershipLost, type WorkerClient } from "./client.js";
@@ -1164,7 +1165,12 @@ export class RecoveryCoordinator {
           this.log.warn("recovery: unadopted-generation release failed; custody retained", { run_id: runId, generation, error: errText(err) });
           return "retained";
         }
-        await new Promise<void>(resolve => { const t = setTimeout(resolve, delay); t.unref?.(); });
+        const budget = MaintenanceBudget.current();
+        budget?.check();
+        const signals = [MaintenanceBudget.signal(), input.signal].filter((s): s is AbortSignal => s !== undefined);
+        const signal = signals.length ? AbortSignal.any(signals) : undefined;
+        await retryDelay(Math.min(delay, budget?.remainingMs() ?? delay), undefined, { signal, ref: false });
+        MaintenanceBudget.current()?.check();
       }
     }
   }

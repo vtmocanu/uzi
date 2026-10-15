@@ -3877,6 +3877,9 @@ export class RunRunner {
         // being discarded (issue #1786). Caught
         // here BEFORE the generic terminal path so this never becomes a `failed` run.
         const stopped = await this.retainStoppedSource(flight, executor, "running_ack_terminal");
+        // ClaimRun opened the guarded hold before cloning; settle only through the existing
+        // independent journal/pin/clone proof, after the authoritative terminal ACK.
+        await this.settleUnadoptedGuardedClaim(claim, flight, runLog);
         runLog.info("run reached a terminal status before the phase clone started; stopping this flight", {
           run_id: flight.runId,
           status: err.runStatus,

@@ -14,6 +14,44 @@ function deferred() {
   const promise = new Promise<void>(r => { resolve = r; });
   return { promise, resolve };
 }
+it("unadopted empty-settle retry stops at the shared cancellation deadline", async () => {
+  const root = await fs.mkdtemp(path.join(os.tmpdir(), "budget-empty-retry-"));
+  let now = 0, releases = 0;
+  const budget = new MaintenanceBudget(600_000, () => now);
+  const attempted = deferred();
+  const coordinator = new RecoveryCoordinator({
+    recoveryRoot: root, workerToken: "fixture", log: nullLogger(),
+    client: {
+      hasFeature: () => true,
+      listRecoveryHolds: async () => ({ run_id: "run", holds: [{
+        hold_id: "hold", generation: 1, inventory_guarded: true,
+      }] }),
+      releaseRecoveryCustody: async () => { releases++; attempted.resolve(); throw new Error("temporarily unavailable"); },
+    } as never,
+    git: {} as never, unadoptedSettleRetryDelaysMs: [200],
+  });
+  const pending = MaintenanceBudget.run(budget, () => coordinator.settleUnadoptedGuardedGeneration({
+    runId: "run", generation: 1, barePath: path.join(root, "absent-bare"),
+  })).then(() => "returned", () => "aborted");
+  let timer: ReturnType<typeof setTimeout> | undefined;
+  try {
+    await attempted.promise;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    now = 600_001;
+    assert.throws(() => budget.check(), /maintenance deadline/);
+    const result = await Promise.race([pending, new Promise<string>(resolve => {
+      timer = setTimeout(() => resolve("retry still waiting"), 30);
+    })]);
+    assert.equal(result, "aborted", "retry delay must not extend the absolute cancellation deadline");
+    assert.equal(releases, 1, "expiry cannot admit another release");
+  } finally {
+    if (timer) clearTimeout(timer);
+    await pending;
+    budget.dispose();
+    await fs.rm(root, { recursive: true, force: true });
+  }
+});
+
 const tip = "a".repeat(40);
 const policy = { version: 1 as const, blocked: false, everKnown: false, flaggedCommits: [], ciGlobs: null, extraFloors: [] };
 
