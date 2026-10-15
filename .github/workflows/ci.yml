@@ -314,7 +314,16 @@ jobs:
             ./internal/recovery/...
             ./internal/poller/...
           )
-          go test -count=1 -v -race -p 1 -run 'LiveDB$' "${PKGS[@]}" 2>&1 | tee livedb.log
+          # Match the local runner's bounded per-package timeouts. The workersvc
+          # race-enabled sweep exceeded 15 minutes after reconciliation coverage.
+          : > livedb.log
+          for p in "${PKGS[@]}"; do
+            timeout=10m
+            if [ "$p" = ./internal/workersvc/... ]; then
+              timeout=20m
+            fi
+            go test -count=1 -v -race -p 1 -timeout "$timeout" -run 'LiveDB$' "$p" 2>&1 | tee -a livedb.log
+          done
           # Aggregate check shared with e2e/run-store-it.sh: something ran, and nothing
           # skipped at any indentation (a skipped subtest is an indented `--- SKIP:`).
           ../scripts/livedb-skip-guard.sh livedb.log
