@@ -1,5 +1,63 @@
 # Worker memory foundation reconciliation — issue #2396
 
+## Current integration — 2026-10-15, M1 still in progress
+
+This section supersedes the current-state language in the older dated sections below; those sections remain historical evidence at their named revisions. M1 is **not complete**: the canonical agent gate is blocked by the supplied dependency environment. M4, M5a and M5b are not complete.
+
+### Integrated candidate and approved deviation
+
+Published floor `a7f721c0fba78725a70563979b363bccc9a296a9` remains an ancestor. Merge `40eed30ecda8a7f00c845234d28e9baf9b7596f5` integrates worker-provisioned default `4103fad73896f103bf7cebd743f009b0b6bde671`, also an ancestor. The human explicitly approved this target because the worker refreshes default refs only at claim/finalize and could not supply `f8a3338d` mid-run. This branch **lacks PR #3039**; the lander must merge current main including it before landing. No network Git or history rewrite was used. Relative to merged default, `.github/workflows/ci.yml`, `e2e/run-store-it.sh` and `e2e/run-store-it.test.sh` are unchanged.
+
+Offline tool renumbering in `fa3b99d4b2bd451a3742777dd09572f0cd0f008c` moves only the memory migration above default's 00338 to **00339_worker_memory_interventions.sql**. SQL source conflicts were resolved before sqlc v1.31.1 regeneration; generated query/model conflicts were not hand-merged. Current rollback wording names 00339. References to 00334 in older dated evidence remain historical. The lander must recheck numbering against landing main.
+
+The integrated command seam retains runtime/tool identity, callback origin, modelCommand and long_running, captured memory context and the effective long wall bound. Pressure/abort wins a ready deadline while disposal/outcome joins are pending; root-only long-command restrictions remain. Heartbeat feature shrink revokes cancellation authority immediately; growth alone cannot seed or resurrect registration authority. Already-started captured feedback, preservation intent and sink receipts remain owned by the original flight after revocation. Production exclusion relies on broker enrollment and exact supervisor/descendant identity validation, not an assumed production caller of protect(). Physical command-UID execution is still M5a work.
+
+The new LiveDB admission parity case executes guarded/legacy memory holds with available archives and failed latest captures, checking canonical count, membership/reason and attention projections. Fixture-only repair `eced6a26b212f6da0519f60d8283cf75439f825d` regenerates the shared CI-repair claim golden with the three existing memory defaults; it does not change runtime behavior.
+
+### Reviews and focused execution
+
+Reviewer, tester and auditor completed immutable reviews through `fa3b99d4`, including both merge parents, retained delta against 4103fad7 and earlier evidence range 974d4992..a7f721c0. No mandatory source finding remained. Tester executed 235 focused tests with zero failures/skips/cancellations and an exported typecheck; a compiled heartbeat-revocation mutation failed the intended authority assertion. This proves that regression's sensitivity, not universal mutation coverage. Reviewer separately reviewed the three-field golden repair `fa3b99d4..eced6a26` with no findings.
+
+Reviewer deferred one lander-owned CI timing note at fa3b99d4. Tester identified absent separate coverage/pre-commit slots without proposing a patch requirement; no new gate was added. Auditor reported no graded security finding. Secrets canaries were detected with zero tracked findings; scoped Semgrep found zero findings/errors; agent/web npm audits reported zero vulnerabilities in the installed trees. These scans do not establish complete static coverage or matched-lockfile acceptance. govulncheck was unavailable and was not run.
+
+### Observed checks on this integration
+
+All logs are run-local scratch artifacts, not published artifacts. Gates used pinned Task 3.54.0; long root gates used the 120-minute command bound. Heavy jobs ran serially. Earlier failed and interrupted checks remain evidence, not green results.
+
+| Tested revision | Executed check | Actual result | Scratch log |
+|---|---|---|---|
+| merge / fa3b99d4 | sqlc v1.31.1 generation before/after offline renumber | PASS, EXIT=0 each | gate-log.5H3z4q / gate-log.9X5vKb |
+| fa3b99d4 | check:migration-numbering check:migration-additive | PASS, EXIT=0; head 339 | gate-log.8vNJVe |
+| integrated source | npm run typecheck after fake observation/test narrowing repairs | PASS, EXIT=0; initial typecheck failure retained | gate-log.ssGDlX / gate-log.cRANeb |
+| fa3b99d4 | gate:agent | FAIL, EXIT=201 at dependency preflight; no complete agent gate | gate-log.dNvHT0 |
+| integrated source | deps-check:web | FAIL, EXIT=201 at dependency preflight | gate-log.4cy8xZ |
+| fa3b99d4 | gate:api | FAIL, EXIT=201; shared CI-repair golden omitted memory defaults | gate-log.wBCMRE |
+| fa3b99d4 / default export | narrowed CI-repair wire producer comparison | candidate FAIL, base PASS; actual merge defect repaired | gate-log.oZISri / gate-log.D0KfT8 |
+| eced6a26 | gate:api after golden repair/review | PASS, EXIT=0; fmt/vet/build/sqlc/lint/deadcode and race/count tests completed | gate-log.XifDao |
+| integrated source | test:codex-supervisor | PASS, EXIT=0 | gate-log.mHeAod |
+| integrated source | test:e2e-lib / test:forge-fake | PASS, EXIT=0 each | gate-log.2ZPOIj / gate-log.wecFCw |
+| eced6a26 | unchanged e2e/run-store-it.sh | FAIL, EXIT=1 solely at workersvc 15-minute package timeout | gate-log.JXAmc2 |
+| eced6a26 | human-authorized disposable LiveDB continuation and combined guards | PASS, EXIT=0; sweep-equivalent coverage under the deviation below | gate-log.is170A |
+
+The supplied agent oxlint/native binding is 1.86.0 versus merged lockfile 1.87.0. Web additionally has @babel/parser 8.0.6 versus 8.0.7. No installed directory was deleted or reinstalled in this resumed implementation. Permission to reconcile these trees incrementally is pending; canonical matched-lockfile agent/web acceptance cannot be claimed. Focused green tests do not close the earlier interrupted full agent gate or classify the historical archive-fallback/durable-tail failures as pre-existing. Fresh complete agent validation remains required.
+
+### LiveDB sweep-equivalent coverage: explicit deviation
+
+The unchanged sweep ran locally from 13:54:52 to 14:28:45 UTC on 2026-10-15. Store (372.798s), handler (573.475s), forgesvc (13.543s) and schedsvc (10.112s) passed. Workersvc reached its 15-minute package timeout (900.096s); no earlier failed test, race or skip was found. Recovery, poller and final guards were not reached. This original sweep remains **failed**, not retroactively passing.
+
+The human authorized one fresh disposable execution if that was the sole failure. A scratch-only copy reused the original database setup, exact LiveDB selection and race/count/serial flags. Only workersvc's package timeout became 20m; recovery/poller retained 10m. The successful first-four package output was supplied to the original complete seven-package skip/completeness checks. The shipping script was not edited.
+
+That continuation ran locally from 14:30:22 to 14:46:20 UTC: workersvc **882.581s**, recovery **45.379s**, poller **10.352s**, EXIT=0. The combined original skip guard reported **2,921 passed, zero skipped**; all seven plain package-result checks passed. Both disposable databases were owned and cleaned by their harness traps. This establishes sweep-equivalent LiveDB coverage across two executions under the approved deviation, not a single successful unchanged sweep. Optional Codex lost-reply and heartbeat composed E2E opt-ins were unset and were not executed.
+
+Named live cases include memory admission parity, archive custody, owner-only Resume/Cancel/non-owner behavior, reservation concurrency/replay/identity/no-refund, allowance redispatch, checker authority, revision races, feedback deduplication and retained custody. Ordinary gate:api LiveDB skips are not the evidence for these claims; actual database execution above is.
+
+These durations are **local candidate observations**. A comparable successful default workersvc baseline and worker-UID before/after timing remain uncollected; no delta or CI timing claim follows. Final timing acceptance remains M5b work, with post-publication CI timing owned by the lander.
+
+### Remaining acceptance
+
+M1 still requires a successful canonical agent gate and any necessary failure triage. A tracked literal consumer inspection found no new memory-result expectation in general e2e/phases, lib or forge-fake; existing requeue-exhaustion assertions describe their guard-off scenarios. Full Compose phases remain unrun. Real command-tree lane enrollment/execution, isolated 1Gi/2Gi calibration, complete bound stdout reports, owner-surface visuals/documentation and final serial gates remain later milestone work. Production remains default-off; no hosted sizing recommendation or real-kernel PID-recycling proof is claimed.
+
+
 ## Current resumed integration — 2026-10-14, M1 still in progress
 
 The approved default merge is committed at `dddc535b84eabe690dd00525c3d117ec993b2567`, with parents `3fcd6a210a264defd0ec189b0a17266623ca8609` and `ff48bc1b8ee5cfc7aede08a25f68ee9f74cd220c`. No published history was rewritten. The only textual conflict was CHANGELOG; both entries were retained. Upstream report-only checkpoint evidence, bounded terminal-error evidence, retirement coverage, serving/custody separation, CPU advisory and storage sizing changes are preserved.
