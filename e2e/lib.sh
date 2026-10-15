@@ -285,10 +285,23 @@ db_psql() {
 # only `\r`, keeping `\n` row separators, and drops any DML command-completion tag LINE
 # (see db_psql) so a stray `INSERT 0 1` can never masquerade as an enumerated row. PGPW
 # is the memoized module var db_psql uses.
-db_psql_rows() {
+db_psql_rows() (
+  # Keep pipeline failure propagation local, including for callers without pipefail.
+  set -o pipefail
+  local limiter=""
+  if [ "${2+x}" ]; then
+    [[ "$2" =~ ^[0-9]+$ ]] && [ "$2" -gt 0 ] || return 1
+    limiter="$(command -v timeout || command -v gtimeout)" || {
+      echo 'db_psql_rows: no timeout/gtimeout limiter available' >&2; return 1;
+    }
+  fi
   [ -n "$PGPW" ] || PGPW="$(grep '^POSTGRES_PASSWORD=' "$ENVFILE" | cut -d= -f2-)"
-  "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
-}
+  if [ -n "$limiter" ]; then
+    "$limiter" "$2" "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+  else
+    "${COMPOSE[@]}" exec -T -e PGPASSWORD="$PGPW" db psql -U uzi -d uzi -tAc "$1" | _psql_strip_tags
+  fi
+)
 # create_run REPO_ID ISSUE_IID — POST a run, tolerating ONLY the transient
 # `404 "issue not found on this repo's board"`. That 404 is a create-then-immediately-use
 # race against the fast (2s) poller the PRD #24 MR-close phase leaves running: a board
@@ -335,6 +348,17 @@ apiput_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X PUT "$BASE$
 # asserting a 422 (the uzi run-eligibility gate refusing a non-uzi issue).
 apipost_code() { curl -sS -o /dev/null -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
   -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" -d "$2"; }
+
+# boundary_cancel PATH REMAINING EVIDENCE_PREFIX — retain both HTTP and transport
+# outcomes; callers decide whether the cancellation was accepted.
+boundary_cancel() {
+  local rc=0
+  curl -sS --max-time "$2" -o "$3.body" -w '%{http_code}' -b "$JAR" -X POST "$BASE$1" \
+    -H 'Content-Type: application/json' -H "X-CSRF-Token: $(csrf)" \
+    -d '{"kind":"cancel","body":""}' > "$3.http" 2> "$3.stderr" || rc=$?
+  printf '%s\n' "$rc" > "$3.exit"
+  [ "$rc" -eq 0 ] && [[ "$(cat "$3.http")" =~ ^2[0-9][0-9]$ ]]
+}
 
 # wait_http — poll /api/health until the stack answers. Instrumented (PRD #97 M9b)
 # even though it is defined ABOVE record_margin: bash resolves function names at call

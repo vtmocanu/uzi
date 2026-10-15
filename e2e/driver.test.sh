@@ -19,7 +19,7 @@ DRIVER="$REPO_ROOT/e2e/driver.sh"
 [ -f "$DRIVER" ] || { echo "driver.sh not found at $DRIVER" >&2; exit 2; }
 
 TMP="$(mktemp -d)"
-trap 'rm -rf "$TMP"' EXIT
+trap 'if [ "${DRIVER_KEEP_TMP:-0}" = 1 ]; then echo "test evidence: $TMP"; else rm -rf "$TMP"; fi' EXIT
 
 # --- the fakes the driver depends on (sourced INSIDE each case's subshell) ----
 # say/pass mirror lib.sh; fail mirrors it EXACTLY (ANSI + exit 1) so the driver's
@@ -55,23 +55,57 @@ db_psql() {
       printf 'FAKE_DB_COUNTS running issue 1\n' ;;
   esac
 }
-# db_psql_rows: the row-preserving twin (lib.sh) the driver now uses for the leak
-# sweep and the multi-row artifact dumps. Mirrors db_psql's read cases (there is no
-# write case here — the forced-cancel UPDATE stays on scalar db_psql). The leak-sweep
-# case emits ONE id PER LINE so a multi-id FAKE_DB_IDS ("r1 r2") yields two rows, which
-# is what the row-preservation cases assert on.
+# The fake clock is persisted because DB/curl execute in command substitutions.
+date() { if [ "$*" = +%s ]; then cat "$FAKE_CLOCK"; else command date "$@"; fi; }
+sleep() { echo $(( $(cat "$FAKE_CLOCK") + 30 )) > "$FAKE_CLOCK"; }
 db_psql_rows() {
+  local tick; tick="$(cat "$FAKE_CLOCK")"
+  printf '%s timeout=%s\n' "$1" "${2:-none}" >> "$FAKE_READ_LOG"
   case "$1" in
+    'SELECT id FROM users'*)
+      echo baseline > "$FAKE_STAGE"
+      [ "${FAKE_OWNER:-ok}" != error ] || return 2
+      [ "${FAKE_OWNER:-ok}" != missing ] || return 0
+      echo 00000000-0000-0000-0000-000000000001 ;;
+    *'state, final_disposition, release_evidence'*)
+      printf '%s\n' "${FAKE_HISTORY:-hold release evidence unavailable}" ;;
+    *'FROM recovery_custody_holds'*)
+      if [ "$(cat "$FAKE_STAGE")" = baseline ]; then
+        echo boundary > "$FAKE_STAGE"
+        [ "${FAKE_BASE_ERROR:-0}" = 0 ] || return 2
+        [ -z "${FAKE_BASE_HOLDS:-}" ] || printf '%s\n' "$FAKE_BASE_HOLDS"
+      else
+        [ "${FAKE_HOLD_ERROR:-0}" = 0 ] || return 2
+        if [ "$tick" -lt "${FAKE_SETTLE:-999}" ]; then
+          [ -z "${FAKE_HOLDS:-}" ] || printf '%s\n' "$FAKE_HOLDS"
+        fi
+      fi ;;
+    *'FROM worker_active_runs'*)
+      if [ "${FAKE_DB_STALL:-0}" = 1 ]; then
+        echo $((tick + $2)) > "$FAKE_CLOCK"; echo 'stalled psql' >&2; return 124
+      fi
+      [ "${FAKE_WORKER_ERROR:-0}" = 0 ] || return 2
+      if [ "$tick" -lt "${FAKE_WORKER_SETTLE:-${FAKE_SETTLE:-999}}" ]; then
+        [ -z "${FAKE_WORKERS:-}" ] || printf '%s\n' "$FAKE_WORKERS"
+      fi ;;
     *"status not in"*)
-      # shellcheck disable=SC2086  # deliberate split: one id per line
-      printf '%s\n' ${FAKE_DB_IDS:-} ;;
-    *"from runs order by"*)
-      printf 'FAKE_DB_RUNS r1 admin running issue\n' ;;
-    *"trigger_source"*)
-      printf %s "${FAKE_DB_WHAT:-}" ;;
-    *"group by status"*)
-      printf 'FAKE_DB_COUNTS running issue 1\n' ;;
+      if [ "$tick" -lt "${FAKE_RUN_SETTLE:-${FAKE_SETTLE:-999}}" ]; then
+        # shellcheck disable=SC2086
+        [ -z "${FAKE_DB_IDS:-}" ] || printf '%s\n' $FAKE_DB_IDS
+      fi
+      if [ "$tick" -ge 30 ] && [ "$tick" -lt 60 ] && [ -n "${FAKE_QUEUED:-}" ]; then printf '%s\n' "$FAKE_QUEUED"; fi ;;
+    *) db_psql "$1" ;;
   esac
+  return 0
+}
+boundary_cancel() {
+  local code
+  code="$(apipost_code "$1")"
+  printf '%s' "$code" > "$3.http"
+  printf 'response body' > "$3.body"; : > "$3.stderr"
+  printf '%s\n' "${FAKE_TRANSPORT:-0}" > "$3.exit"
+  if [ "${FAKE_CANCEL_STALL:-0}" = 1 ]; then echo $(( $(cat "$FAKE_CLOCK") + $2 )) > "$FAKE_CLOCK"; return 28; fi
+  [ "${FAKE_TRANSPORT:-0}" = 0 ] && [[ "$code" = 2* ]]
 }
 apipost() { printf 'apipost %s\n' "$1" >> "${FAKE_API_LOG:-/dev/null}"; printf '{}'; }
 # apipost_code performs the cancel POST AND returns the HTTP status (FAKE_CANCEL_CODE).
@@ -140,6 +174,11 @@ begin() { cur="$1"; case_fail=0
   FAKE_API_LOG="$TMP/api-$2.log"; FAKE_DB_LOG="$TMP/db-$2.log"; TSV="$RUNROOT/results.tsv"
   rm -rf "$RUNROOT" "$PHASES_DIR"; mkdir -p "$RUNROOT" "$PHASES_DIR"
   : > "$ENVFILE"; : > "$FAKE_API_LOG"; : > "$FAKE_DB_LOG"
+  FAKE_CLOCK="$TMP/clock-$2"; echo 0 > "$FAKE_CLOCK"
+  FAKE_STAGE="$TMP/stage-$2"; echo baseline > "$FAKE_STAGE"
+  FAKE_READ_LOG="$TMP/reads-$2"; : > "$FAKE_READ_LOG"
+  unset FAKE_OWNER FAKE_BASE_ERROR FAKE_HOLD_ERROR FAKE_WORKER_ERROR FAKE_BASE_HOLDS FAKE_HOLDS FAKE_WORKERS FAKE_SETTLE FAKE_WORKER_SETTLE FAKE_RUN_SETTLE FAKE_QUEUED FAKE_CANCEL_STALL FAKE_TRANSPORT FAKE_DB_STALL FAKE_HISTORY 2>/dev/null || true
+  export FAKE_OWNER FAKE_BASE_ERROR FAKE_HOLD_ERROR FAKE_WORKER_ERROR FAKE_BASE_HOLDS FAKE_HOLDS FAKE_WORKERS FAKE_SETTLE FAKE_WORKER_SETTLE FAKE_RUN_SETTLE FAKE_QUEUED FAKE_CANCEL_STALL FAKE_TRANSPORT FAKE_BODY_MARK FAKE_BODY_FAIL FAKE_DB_STALL
   unset E2E_ONLY E2E_SKIP E2E_STRICT_LEAKS E2E_FAULT_PHASE FAKE_DB_IDS FAKE_DB_WHAT FAKE_CANCEL_CODE FAKE_DOCKER_SEQ 2>/dev/null || true
 }
 bad() { printf '  - %s\n' "$1"; case_fail=1; }
@@ -164,12 +203,18 @@ run_driver() {
 # Shared globals the driver reads — exported because they are consumed by the
 # driver sourced INSIDE run_driver's subshell (which shellcheck cannot see); the
 # same reason applies to the per-case E2E_*/FAKE_* knobs set below.
-export ROOT="$REPO_ROOT" FORGE=gitlab EXECUTOR=stub
+export ROOT="$REPO_ROOT" FORGE=gitlab EXECUTOR=stub ADMIN_EMAIL=fixture@example.com
 # COMPOSE is an ARRAY (can't be exported), but run_driver's `( … )` is a subshell of
 # THIS shell, so a plain assignment here is visible inside it. The driver uses it only
 # for on-red artifact capture; fake_docker (in FAKES) is the command it resolves to.
 # shellcheck disable=SC2034  # consumed by driver.sh inside the run_driver subshell
-COMPOSE=(fake_docker)
+export DRIVER_FAKES="$FAKES"
+cat > "$TMP/compose" <<'COMPOSE_EOF'
+source "$DRIVER_FAKES"
+fake_docker "$@"
+COMPOSE_EOF
+# shellcheck disable=SC2034  # consumed by the sourced driver
+COMPOSE=(bash "$TMP/compose")
 
 # ============================================================================
 # Case 1 — a body `false` then `pass ok` is recorded FAIL.
@@ -282,25 +327,24 @@ contains "$(row_msg cascade FAIL)" suspect_cascade || bad "cascade not tagged su
 end
 
 # ============================================================================
-# Case 6 — quarantine: an undeclared non-terminal run is cancelled and recorded
-# LEAK; a handoff-declared id is not; a refused API cancel falls back to DB.
-# Mutation: skip the cancel/record -> no LEAK row / no cancel logged.
+# Case 6 — undeclared runs must settle; cancellation rejection is a hard
+# boundary failure and never writes SQL status.
 begin "case6a: undeclared run leaks and is cancelled" 6a
-export FAKE_DB_IDS="r-leak" FAKE_CANCEL_CODE=200 FAKE_DB_WHAT="mr_rework via poller, status queued, age 3s"
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000014" FAKE_CANCEL_CODE=200 FAKE_DB_WHAT="mr_rework via poller, status queued, age 3s"
 mkphase "$PHASES_DIR/10-leaky.sh" "leaks a run" no "" "" "" <<'BODY'
 pass "left a run behind"
 BODY
 run_driver 6a
-has_row leaky LEAK || bad "no LEAK row for leaky"
-contains "$(row_msg leaky LEAK)" r-leak || bad "LEAK message does not name r-leak"
-contains "$(row_msg leaky LEAK)" "(mr_rework via poller, status queued, age 3s)" || bad "LEAK message does not say what the leaked run is"
-contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak/inputs" || bad "cancel was not attempted via the API"
+has_row leaky FAIL || bad "no final FAIL row for leaky"
+contains "$(row_msg leaky FAIL)" 00000000-0000-0000-0000-000000000014 || bad "boundary message does not name 00000000-0000-0000-0000-000000000014"
+
+contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/00000000-0000-0000-0000-000000000014/inputs" || bad "cancel was not attempted via the API"
 end
 
 begin "case6b: handoff-declared id is not a leak" 6b
-export FAKE_DB_IDS="r-held" FAKE_CANCEL_CODE=200
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000015" FAKE_CANCEL_CODE=200
 mkphase "$PHASES_DIR/10-held.sh" "hands a run forward" no "" RUN_B RUN_B <<'BODY'
-RUN_B=r-held
+RUN_B=00000000-0000-0000-0000-000000000015
 pass "declared handoff RUN_B"
 BODY
 run_driver 6b
@@ -309,15 +353,15 @@ any_status LEAK && bad "handoff id was wrongly recorded as a LEAK"
 has_row held PASS || bad "held phase not PASS"
 end
 
-begin "case6c: refused API cancel falls back to DB" 6c
-export FAKE_DB_IDS="r-leak" FAKE_CANCEL_CODE=403
+begin "case6c: refused API cancel fails without SQL fallback" 6c
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000014" FAKE_CANCEL_CODE=403
 mkphase "$PHASES_DIR/10-leaky.sh" "leaks a run" no "" "" "" <<'BODY'
 pass "left a run behind"
 BODY
 run_driver 6c
-has_row leaky LEAK || bad "no LEAK row for leaky"
-contains "$(row_msg leaky LEAK)" "forced via DB" || bad "LEAK message does not note the DB fallback"
-contains "$(cat "$FAKE_DB_LOG")" "update runs set status='cancelled' where id='r-leak'" || bad "DB fallback update did not run"
+has_row leaky FAIL || bad "no final FAIL row for leaky"
+contains "$(row_msg leaky FAIL)" "cancel rejected" || bad "missing rejected cancel failure"
+[ ! -s "$FAKE_DB_LOG" ] || bad "SQL fallback ran"
 end
 
 # ============================================================================
@@ -522,57 +566,41 @@ has_row consumeEnv PASS || bad "consumeEnv not PASS (shell-var provides did not 
 end
 
 # ============================================================================
-# Case 15 (PRD #966 M1) — a LEAK must not abort the results/roll-call/exit path.
-# _write_summary's final `[ "$any" = 0 ] && …` returns 1 when a LEAK exists (any=1);
-# without the unconditional `return 0`, the bare `_write_summary` call under the
-# driver's `set -e` aborts BEFORE `cat summary.md`, `_rollcall` and the exit-code loop.
-# Mutation: revert _write_summary to end on the bare `[ "$any" = 0 ] && …` -> the
-# roll-call line is absent from the log and the run exits non-zero.
-begin "case15: a LEAK still writes summary + runs roll-call/exit" 15
-export FAKE_DB_IDS="r-leak15" FAKE_CANCEL_CODE=200
+# Case 15 — boundary failure still emits summary, rollcall and suite exit.
+begin "case15: boundary FAIL writes summary and rollcall" 15
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000012" FAKE_CANCEL_CODE=200
 mkphase "$PHASES_DIR/10-leaky.sh" "leaks a run" no "" "" "" <<'BODY'
 pass "left a run behind"
 BODY
 run_driver 15
-has_row leaky LEAK || bad "no LEAK row for leaky"
+has_row leaky FAIL || bad "no final FAIL row for leaky"
 [ -f "$RUNROOT/summary.md" ] || bad "summary.md was not written on a leaky run"
-contains "$(cat "$LOG")" "All E2E checks passed." \
+contains "$(cat "$LOG")" "E2E FAILED:" \
   || bad "roll-call did not run after a LEAK (driver aborted at _write_summary)"
-[ "$RC" -eq 0 ] || bad "a non-strict LEAK run must exit 0 (got $RC — driver aborted mid-way?)"
+[ "$RC" -eq 1 ] || bad "boundary failure must exit 1 without strict mode"
 end
 
 # ============================================================================
-# Case 16 (PRD #966 M1) — TWO undeclared leaked rows are each cancelled and recorded
-# as a SEPARATE LEAK row. Guards the db_psql -> db_psql_rows switch in the sweep:
-# db_psql collapses newlines (tr -d '\r\n'), fusing 2+ ids into one garbage token, so
-# only db_psql_rows (one row per line) yields two distinct LEAK rows + two cancels.
-# Mutation: switch the sweep query back to db_psql -> the two ids fuse into one LEAK
-# row for a bogus fused id, and only one cancel is attempted.
-begin "case16: two leaked rows record as two separate LEAKs" 16
-export FAKE_DB_IDS="r-leak-a r-leak-b" FAKE_CANCEL_CODE=200
+# Case 16 — preserve two separate run IDs and cancel both, in one final row.
+begin "case16: two run IDs produce two cancels and one final row" 16
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000010 00000000-0000-0000-0000-000000000011" FAKE_CANCEL_CODE=200
 mkphase "$PHASES_DIR/10-leaky.sh" "leaks two runs" no "" "" "" <<'BODY'
 pass "left two runs behind"
 BODY
 run_driver 16
-leak_n="$(awk -F'\t' '$1=="leaky" && $2=="LEAK"{n++} END{print n+0}' "$TSV")"
-[ "$leak_n" -eq 2 ] || bad "expected 2 separate LEAK rows, got $leak_n (rows fused?)"
-contains "$(cat "$TSV")" "r-leak-a" || bad "LEAK rows do not name r-leak-a (rows fused into one token)"
-contains "$(cat "$TSV")" "r-leak-b" || bad "LEAK rows do not name r-leak-b (rows fused into one token)"
-contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak-a/inputs" || bad "r-leak-a not cancelled via the API"
-contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/r-leak-b/inputs" || bad "r-leak-b not cancelled via the API"
+leak_n="$(awk -F'\t' '$1=="leaky" && $2=="FAIL"{n++} END{print n+0}' "$TSV")"
+[ "$leak_n" -eq 1 ] || bad "expected one final FAIL row, got $leak_n (rows fused?)"
+contains "$(cat "$TSV")" "00000000-0000-0000-0000-000000000010" || bad "LEAK rows do not name 00000000-0000-0000-0000-000000000010 (rows fused into one token)"
+contains "$(cat "$TSV")" "00000000-0000-0000-0000-000000000011" || bad "LEAK rows do not name 00000000-0000-0000-0000-000000000011 (rows fused into one token)"
+contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/00000000-0000-0000-0000-000000000010/inputs" || bad "00000000-0000-0000-0000-000000000010 not cancelled via the API"
+contains "$(cat "$FAKE_API_LOG")" "cancel /api/runs/00000000-0000-0000-0000-000000000011/inputs" || bad "00000000-0000-0000-0000-000000000011 not cancelled via the API"
 end
 
 # ============================================================================
-# Case 17 (#990) — a FAIL+LEAK phase captures artifacts TWICE for the same slug (the
-# FAIL path, then the quarantine sweep with secs=0 -> a 30s window). The FAIL capture's
-# window is strictly wider, so the second pass must NOT overwrite the failing-phase
-# container logs. FAKE_DOCKER_SEQ stamps a monotonic call number: the FAIL capture is
-# seq 1-4 (api,agent,forge-fake,db), a would-be LEAK re-capture seq 5-8. api.log must
-# keep the FIRST capture (seq=1), never the overwriting one (seq=5).
-# Mutation: revert driver.sh's `[ -d "$dir" ] && return 0` guard -> api.log becomes
-# seq=5 (the 30s LEAK window that dropped the failing-phase logs in the real bug).
+# Case 17 — the first body capture survives a second capture attempt after
+# boundary failure. fake_docker stamps sequence numbers to detect overwrites.
 begin "case17: FAIL+LEAK capture is not overwritten by the leak sweep" 17
-export FAKE_DB_IDS="r-leak17" FAKE_CANCEL_CODE=200 FAKE_DOCKER_SEQ="$TMP/dseq-17"
+export FAKE_DB_IDS="00000000-0000-0000-0000-000000000013" FAKE_CANCEL_CODE=200 FAKE_DOCKER_SEQ="$TMP/dseq-17"
 rm -f "$FAKE_DOCKER_SEQ"
 mkphase "$PHASES_DIR/10-failleak.sh" "fail and leak" no "" "" "" <<'BODY'
 fail "boom and leak"
@@ -580,13 +608,282 @@ BODY
 run_driver 17
 adir="$RUNROOT/artifacts/10-failleak"
 has_row failleak FAIL || bad "failleak not FAIL"
-has_row failleak LEAK || bad "no LEAK row — the double-capture scenario did not reproduce"
+contains "$(row_msg failleak FAIL)" "boundary timeout" || bad "missing boundary failure evidence"
 [ -f "$adir/api.log" ] || bad "api.log not captured"
 contains "$(cat "$adir/api.log" 2>/dev/null)" "seq=1" \
   || bad "api.log is not the FAIL-path (first) capture: $(cat "$adir/api.log" 2>/dev/null)"
 contains "$(cat "$adir/api.log" 2>/dev/null)" "seq=5" \
   && bad "api.log was OVERWRITTEN by the leak-sweep re-capture (#990): $(cat "$adir/api.log" 2>/dev/null)"
 end
+
+# Boundary milestone regressions use authoritative DB sets, including before phase 13.
+R=11111111-1111-1111-1111-111111111111
+R2=22222222-2222-2222-2222-222222222222
+W=33333333-3333-3333-3333-333333333333
+H=44444444-4444-4444-4444-444444444444
+H2=55555555-5555-5555-5555-555555555555
+boundary_fixture() {
+  mkphase "$PHASES_DIR/01-origin.sh" boundary yes "" "${1:-}" "${2:-}" <<'BODY'
+[ "${FAKE_BODY_FAIL:-0}" = 0 ] || fail 'body evidence retained'
+[ "${FAKE_BODY_MARK:-0}" = 0 ] || echo ran > "$RUNROOT/body-ran"
+RUN_HAND=11111111-1111-1111-1111-111111111111
+HOLD_HAND=44444444-4444-4444-4444-444444444444
+pass body
+BODY
+}
+boundary_fail() {
+  run_driver "$1"
+  has_row origin FAIL || bad 'origin must FAIL'
+  contains "$(row_msg origin FAIL)" "$2" || bad "failure must name $2"
+  [ "$RC" -eq 1 ] || bad 'boundary must fail suite even without strict leaks'
+  [ "$(wc -l < "$TSV")" -eq 1 ] || bad 'expected one final phase row'
+}
+boundary_evidence() {
+  local dir="$RUNROOT/boundary/01-origin"
+  for f in owner.stdout owner.stderr owner.exit baseline.stdout baseline.exit initial-runs initial-workers initial-holds final-runs final-workers final-holds boundary_wait_seconds; do
+    [ -f "$dir/$f" ] || bad "missing boundary evidence $f"
+  done
+  contains "$(cat "$FAKE_READ_LOG")" 'SELECT worker_id, run_id, claim_generation FROM worker_active_runs' || bad 'missing actual worker read'
+  contains "$(cat "$FAKE_READ_LOG")" 'SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id' || bad 'missing actual hold read'
+}
+begin 'boundary: cancelled terminal run remains worker-active' b1
+FAKE_DB_IDS="$R"; FAKE_RUN_SETTLE=30; FAKE_WORKERS="$W|$R|3"
+boundary_fixture
+boundary_fail b1 "$R"
+boundary_evidence
+[ -f "$RUNROOT/boundary/01-origin/cancel-$R.body" ] || bad 'cancel body missing'
+end
+
+begin 'boundary: every undeclared open hold fails admission-independent' b2
+FAKE_HOLDS="$H|$R|9"
+boundary_fixture
+boundary_fail b2 "$H"
+boundary_evidence
+[ -f "$RUNROOT/boundary/01-origin/hold-history.stdout" ] || bad 'hold history missing'
+end
+
+begin 'boundary: old hold release cannot mask replacement with same count' b3
+FAKE_BASE_HOLDS="$H|$R|1"; FAKE_HOLDS="$H2|$R|2"
+export FAKE_HISTORY="$H|$R|1|released|archive|archive-proof
+$H2|$R|2|open||"
+boundary_fixture
+boundary_fail b3 "$H2"
+contains "$(cat "$RUNROOT/boundary/01-origin/hold-history.stdout")" 'released|archive|archive-proof' || bad 'release evidence not retained'
+contains "$(cat "$RUNROOT/boundary/01-origin/hold-history.stdout")" "$H2" || bad 'new hold history missing'
+end
+
+begin 'boundary: already DB-terminal run must leave worker listing' b4
+FAKE_WORKERS="$W|$R|3"
+boundary_fixture
+boundary_fail b4 "$R"
+[ ! -s "$FAKE_API_LOG" ] || bad 'terminal worker run should not be cancelled'
+end
+
+begin 'boundary: rejected cancellation sticky with no SQL status fallback' b5
+FAKE_DB_IDS="$R"; FAKE_CANCEL_CODE=403; FAKE_RUN_SETTLE=30
+boundary_fixture
+boundary_fail b5 'cancel rejected'
+[ ! -s "$FAKE_DB_LOG" ] || bad 'SQL status write attempted'
+end
+
+for set in worker hold; do
+  for failure in nonzero malformed arity blank generation uuid; do
+    begin "boundary: $set $failure read fails closed" "b6-$set-$failure"
+    row="$W|$R|2"
+    case "$failure" in
+      nonzero) if [ "$set" = worker ]; then FAKE_WORKER_ERROR=1; else FAKE_HOLD_ERROR=1; fi ;;
+      malformed) row=garbage ;;
+      arity) row="$row|extra" ;;
+      blank) row=$'\n' ;;
+      generation) row="$W|$R|two" ;;
+      uuid) row="not-uuid|$R|1" ;;
+    esac
+    if [ "$set" = worker ]; then FAKE_WORKERS="$row"; else FAKE_HOLDS="$row"; fi
+    boundary_fixture
+    boundary_fail "b6-$set-$failure" unverifiable
+    end
+  done
+done
+
+for mode in run hold; do
+  begin "boundary: declared $mode passes with real boundary evidence" "b7-$mode"
+  if [ "$mode" = run ]; then
+    FAKE_DB_IDS="$R"; FAKE_WORKERS="$W|$R|3"
+    boundary_fixture RUN_HAND RUN_HAND
+  else
+    FAKE_HOLDS="$H|$R|3"
+    boundary_fixture HOLD_HAND ""
+    echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
+  fi
+  run_driver "b7-$mode"
+  has_row origin PASS || bad "declared $mode must PASS"
+  [ "$RC" = 0 ] || bad "declared $mode exit must be zero"
+  [ ! -s "$FAKE_API_LOG" ] || bad 'declared run cancelled'
+  boundary_evidence
+  contains "$(cat "$RUNROOT/summary.md")" boundary_wait_seconds || bad 'missing timing summary'
+  end
+done
+
+begin 'boundary: contamination annotates later PASS FAIL SKIP and requires, not itself' b8
+FAKE_WORKERS="$W|$R|3"; FAKE_WORKER_SETTLE=120
+boundary_fixture
+mkphase "$PHASES_DIR/02-later.sh" later no "" "" "" <<'BODY'
+pass later
+BODY
+mkphase "$PHASES_DIR/03-broken.sh" broken no "" "" "" <<'BODY'
+fail later
+BODY
+mkphase "$PHASES_DIR/04-needs.sh" needs no MISSING "" "" <<'BODY'
+pass unreachable
+BODY
+mkphase "$PHASES_DIR/05-skip.sh" skipped no "" "" "" <<'BODY'
+pass unreachable
+BODY
+E2E_SKIP=skip
+run_driver b8
+has_row later PASS || bad 'critical boundary-only failure skipped later body'
+for pair in later:PASS broken:FAIL needs:FAIL skip:SKIP; do
+  contains "$(row_msg "${pair%:*}" "${pair#*:}")" 'contaminated after: origin' || bad "missing contamination on $pair"
+done
+contains "$(row_msg origin FAIL)" 'contaminated after' && bad 'origin annotated after itself'
+end
+
+begin 'boundary: transient eventual settlement passes' transient
+FAKE_DB_IDS="$R"; FAKE_WORKERS="$W|$R|1"; FAKE_HOLDS="$H|$R|1"; FAKE_SETTLE=30
+boundary_fixture
+run_driver transient
+has_row origin PASS || bad 'eventual settlement must pass'
+boundary_evidence
+[ "$(cat "$RUNROOT/boundary/01-origin/boundary_wait_seconds")" = 30 ] || bad 'wait not measured'
+[ ! -s "$RUNROOT/boundary/01-origin/final-workers" ] || bad 'missing final clean sample'
+end
+
+begin 'boundary: worker and holds consume one shared 120 second budget' shared
+FAKE_WORKERS="$W|$R|1"; FAKE_WORKER_SETTLE=90; FAKE_HOLDS="$H|$R|2"; FAKE_SETTLE=150
+boundary_fixture
+boundary_fail shared "$H"
+[ "$(cat "$FAKE_CLOCK")" = 120 ] || bad 'worker and holds had separate budgets'
+end
+
+begin 'boundary: new queued run discovered and cancelled while settling' queued
+FAKE_WORKERS="$W|$R|1"; FAKE_SETTLE=60; FAKE_QUEUED="$R2"
+boundary_fixture
+run_driver queued
+has_row origin PASS || bad 'queued run settlement should PASS'
+contains "$(cat "$FAKE_API_LOG")" "$R2" || bad 'new queued run not cancelled'
+end
+
+for mode in missing error baseline-error baseline-malformed; do
+  begin "boundary: $mode snapshot is sticky but body and boundary execute" "$mode"
+  case "$mode" in
+    missing|error) FAKE_OWNER="$mode" ;;
+    baseline-error) FAKE_BASE_ERROR=1 ;;
+    baseline-malformed) FAKE_BASE_HOLDS=garbage ;;
+  esac
+  FAKE_BODY_MARK=1
+  boundary_fixture
+  boundary_fail "$mode" unverifiable
+  [ -f "$RUNROOT/body-ran" ] || bad 'unverifiable baseline prevented body'
+  contains "$(cat "$FAKE_READ_LOG")" worker_active_runs || bad 'boundary skipped'
+  unset FAKE_BODY_MARK
+  end
+done
+
+for declaration in MISSING 'bad-name' RUN_HAND; do
+  begin "boundary: malformed or undefined handoff $declaration" "declaration-$declaration"
+  boundary_fixture "" "$declaration"
+  if [ "$declaration" = RUN_HAND ]; then echo 'RUN_HAND=bad-value' >> "$PHASES_DIR/01-origin.sh"; fi
+  boundary_fail "declaration-$declaration" declaration
+  end
+done
+
+begin 'boundary: run declaration does not declare its hold' separate
+FAKE_DB_IDS="$R"; FAKE_WORKERS="$W|$R|1"; FAKE_HOLDS="$H|$R|2"
+boundary_fixture RUN_HAND RUN_HAND
+boundary_fail separate "$H"
+end
+
+begin 'boundary: failed body preserves both evidence and unavailable declarations' failed-body
+FAKE_BODY_FAIL=1; FAKE_HOLDS="$H|$R|2"
+boundary_fixture 'RUN_HAND HOLD_HAND' RUN_HAND
+echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
+boundary_fail failed-body "$H"
+contains "$(row_msg origin FAIL)" 'body evidence retained' || bad 'body evidence lost'
+contains "$(cat "$RUNROOT/boundary/01-origin/diagnostics")" 'declarations unavailable' || bad 'missing failed declaration diagnostic'
+[ -f "$RUNROOT/.keep-rundir" ] || bad 'rundir not preserved'
+unset FAKE_BODY_FAIL
+end
+
+begin 'boundary: successful provides survive dirty boundary and become suspect' suspect
+FAKE_HOLDS="$H|$R|2"; FAKE_SETTLE=120
+boundary_fixture RUN_HAND ""
+mkphase "$PHASES_DIR/02-consumer.sh" consumer no RUN_HAND "" "" <<'BODY'
+[ "$RUN_HAND" = 11111111-1111-1111-1111-111111111111 ]
+BODY
+run_driver suspect
+has_row consumer PASS || bad 'successful provides lost after boundary failure'
+contains "$(row_msg origin FAIL)" 'provides suspect' || bad 'provides not marked suspect'
+end
+
+begin 'boundary: stalled cancel consumes remaining deadline' stalled
+FAKE_DB_IDS="$R"; FAKE_CANCEL_STALL=1
+boundary_fixture
+boundary_fail stalled 'cancel rejected'
+[ "$(cat "$FAKE_CLOCK")" = 120 ] || bad 'cancel not bounded by shared deadline'
+end
+
+begin 'boundary: stalled DB operation consumes remaining deadline' stalled-db
+FAKE_DB_STALL=1
+boundary_fixture
+boundary_fail stalled-db unverifiable
+[ "$(cat "$FAKE_CLOCK")" = 120 ] || bad 'DB not bounded by remaining deadline'
+[ "$(cat "$RUNROOT/boundary/01-origin/1-workers.exit")" = 124 ] || bad 'DB exit not retained'
+contains "$(cat "$RUNROOT/boundary/01-origin/1-workers.stderr")" 'stalled psql' || bad 'DB stderr missing'
+end
+
+for declaration in MISSING bad-name HOLD_HAND; do
+  begin "boundary: invalid hold declaration $declaration" "hold-declaration-$declaration"
+  boundary_fixture "" ""
+  echo "# handoff-holds: $declaration" >> "$PHASES_DIR/01-origin.sh"
+  if [ "$declaration" = HOLD_HAND ]; then echo 'HOLD_HAND=bad-value' >> "$PHASES_DIR/01-origin.sh"; fi
+  boundary_fail "hold-declaration-$declaration" declaration
+  end
+done
+
+begin 'boundary: nonterminal query fails closed' run-read
+FAKE_DB_IDS=not-a-uuid
+boundary_fixture
+boundary_fail run-read unverifiable
+[ ! -s "$FAKE_API_LOG" ] || bad 'malformed run was cancelled'
+end
+
+begin 'boundary: baseline hold persists without false contamination' baseline-hold
+FAKE_BASE_HOLDS="$H|$R|1"; FAKE_HOLDS="$H|$R|1"
+boundary_fixture
+run_driver baseline-hold
+has_row origin PASS || bad 'baseline hold should remain permitted'
+boundary_evidence
+end
+
+for mode in whitespace array multi; do
+  begin "boundary: exact scalar hold declaration $mode" "scalar-$mode"
+  boundary_fixture HOLD_HAND ""
+  echo '# handoff-holds: HOLD_HAND' >> "$PHASES_DIR/01-origin.sh"
+  case "$mode" in
+    whitespace) echo "HOLD_HAND='   '" >> "$PHASES_DIR/01-origin.sh" ;;
+    array) echo 'HOLD_HAND=(44444444-4444-4444-4444-444444444444)' >> "$PHASES_DIR/01-origin.sh" ;;
+    multi)
+      printf "HOLD_HAND='%s\n%s'\n" "$H" "$H2" >> "$PHASES_DIR/01-origin.sh"
+      FAKE_HOLDS="$H|$R|1
+$H2|$R|2" ;;
+  esac
+  if [ "$mode" = multi ]; then
+    run_driver "scalar-$mode"
+    has_row origin PASS || bad 'exact whitespace-separated hold IDs rejected'
+    boundary_evidence
+  else boundary_fail "scalar-$mode" declaration; fi
+  end
+done
 
 # ============================================================================
 printf '\ncases=%s passed=%s\n' "$cases" "$passed"

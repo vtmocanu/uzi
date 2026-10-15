@@ -10,13 +10,13 @@
 # drives the cleanup EXIT trap with the suite's exit code.
 #
 # DEPENDS (the caller must define these BEFORE sourcing; the hermetic test fakes
-# them): functions  say pass fail db_psql apipost apipost_code wait_status
+# them): functions  say pass fail db_psql_rows boundary_cancel
 #         globals    ROOT RUNROOT ENVFILE FORGE EXECUTOR  (MARGINS_FILE optional)
 #                    COMPOSE (array; used ONLY by on-red artifact capture, which is
 #                    `|| true` throughout so a missing/short COMPOSE never reddens a run)
 #
 # KNOBS: PHASES_DIR (default $ROOT/e2e/phases), E2E_ONLY / E2E_SKIP (comma-lists
-#        of slug globs), E2E_STRICT_LEAKS, E2E_FAULT_PHASE.
+#        of slug globs), E2E_FAULT_PHASE.
 #
 # 🔴 THE MAIN LOOP AND ITS `source "$RUNROOT/phase.env.next"` ARE AT TOP LEVEL,
 # NEVER INSIDE A FUNCTION. `declare -p` emits `declare --`, and sourcing that
@@ -29,6 +29,7 @@ _PHASES_DIR="${PHASES_DIR:-$ROOT/e2e/phases}"
 # In-memory result rows (parallel arrays), declared up front so `${#_slugs[@]}`
 # is safe under `set -u` even with zero rows.
 _slugs=(); _statuses=(); _secs=(); _msgs=(); _titles=()
+_contamination=""; _entry_origins=""
 CRITICAL_FAILED=0
 _FAILED_PROVIDES=""   # space-padded list of provides tokens of phases that FAILed
 
@@ -101,80 +102,213 @@ _note_failed() {
 # results.tsv (tab/newline in the message flattened so the TSV stays 4 columns).
 _record() {
   local m; m="$(printf '%s' "$4" | tr '\t\n' '  ')"
+  [ -z "$_entry_origins" ] || m="$m [contaminated after: $_entry_origins]"
+  printf '%s\t%s\n' "$1" "${_boundary_wait:-0}" >> "$RUNROOT/boundary_wait_seconds.tsv"
   _slugs+=("$1"); _statuses+=("$2"); _secs+=("$3"); _msgs+=("$m"); _titles+=("$5")
   printf '%s\t%s\t%s\t%s\n' "$1" "$2" "$3" "$m" >> "$RUNROOT/results.tsv"
 }
 
-# _capture_artifacts NN_SLUG SECS — on a FAIL/LEAK phase, snapshot evidence into
-# $RUNROOT/artifacts/<NN_SLUG>/ and `touch` the .keep-rundir sentinel that makes
-# cleanup keep the whole rundir on a red run (PRD #966 M3, D5). EVERYTHING here is
-# guarded (`|| true`, `2>/dev/null`) so a capture failure can NEVER change a phase's
-# recorded status or the suite exit code — it runs strictly AFTER _record. `--since`
-# is a DURATION (elapsed phase seconds + slack), so no wall-clock var is needed and a
-# service that is not up yet (e.g. agent before phase 13) simply yields an empty log.
-# Nothing is captured on a PASS/SKIP phase (this is only ever called on FAIL/LEAK).
+# _capture_artifacts NN_SLUG SECS — retain the first body/service capture on
+# failure. Diagnostic operations have a two-second bound and cannot change the
+# recorded status. Missing services before phase 13 are ordinary capture failures.
 _capture_artifacts() {
-  local nn_slug="$1" secs="${2:-0}" dir svc since
+  local nn_slug="$1" secs="${2:-0}" dir svc since limiter
   dir="$RUNROOT/artifacts/$nn_slug"
   touch "$RUNROOT/.keep-rundir" 2>/dev/null || true
-  # First capture wins (#990). On a FAIL+LEAK phase this runs twice for the same slug:
-  # the FAIL path (driver.sh:~366) with a window of secs+30, then the quarantine sweep,
-  # once per leaked run, with secs=0 -> a 30s window. The FAIL window is strictly wider,
-  # so a second pass would OVERWRITE the failing-phase container logs (agent crash, api/db
-  # boot -- all >30s old) with a 30s window that drops them, leaving empty <phase>/*.log
-  # in the uploaded artifacts. If the dir already exists, a richer capture ran first: keep
-  # it. This also collapses the redundant per-leaked-id re-capture in one sweep.
+  # First capture wins: a failed body may already have richer logs before the
+  # boundary fails. Boundary evidence uses its own directory.
   [ -d "$dir" ] && return 0
   mkdir -p "$dir" 2>/dev/null || true
   since="$((secs + 30))s"
+  limiter="$(command -v timeout || command -v gtimeout)" || limiter=""
   for svc in api agent forge-fake db; do
-    "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
+    if [ -z "$limiter" ]; then
+      printf 'capture unavailable: no timeout/gtimeout limiter\n' > "$dir/$svc.log"; continue
+    fi
+    "$limiter" 2 "${COMPOSE[@]}" logs --no-color --since "$since" "$svc" > "$dir/$svc.log" 2>&1 || true
   done
-  db_psql_rows "select id,user_id,status,kind from runs order by created_at" > "$dir/runs.txt" 2>/dev/null || true
-  db_psql_rows "select status,kind,count(*) from runs group by status,kind order by status,kind" \
+  db_psql_rows "select id,user_id,status,kind from runs order by created_at" 2 > "$dir/runs.txt" 2>/dev/null || true
+  db_psql_rows "select status,kind,count(*) from runs group by status,kind order by status,kind" 2 \
     > "$dir/run-counts.txt" 2>/dev/null || true
   [ -f "$RUNROOT/logs/$nn_slug.log" ] && cp "$RUNROOT/logs/$nn_slug.log" "$dir/phase.log" 2>/dev/null || true
   return 0
 }
 
-# _quarantine NN_SLUG SLUG HANDOFF — end-of-phase LEAK sweep. Enumerate non-terminal
-# runs across ALL users; any id not held by a variable named in HANDOFF is a LEAK:
-# cancel via the API, fall back to a DB update on a non-2xx, then confirm it
-# reaches `cancelled`. Non-fatal by default; contributes to exit 1 under strict.
-# Runs only when db_psql is usable (a failing db_psql short-circuits to a no-op).
-# Each recorded LEAK also captures artifacts (D5), keyed on NN_SLUG.
-_quarantine() {
-  local nn_slug="$1" slug="$2" handoff="$3" ids id name v held code forced what
-  ids="$(db_psql_rows "select id from runs where status not in ('completed','failed','cancelled')" 2>/dev/null)" || return 0
-  [ -n "$ids" ] || return 0
-  held=""
-  for name in $handoff; do
-    v="${!name:-}"
-    [ -n "$v" ] && held="$held $v"
-  done
-  for id in $ids; do
-    [ -n "$id" ] || continue
-    case " $held " in *" $id "*) continue ;; esac   # declared handoff — not a leak
-    forced=""
-    # What the leaked run IS, read before the cancel changes its status: a run no phase
-    # created (a poller-driven mr_rework/ci_fix, a judge run, a schedule fire) is otherwise
-    # indistinguishable in the summary, and CI keeps the rundir only on a failure.
-    what="$(db_psql "select kind||' via '||trigger_source||', status '||status||', age '||extract(epoch from now()-created_at)::int||'s'||coalesce(', branch '||branch,'')||coalesce(', mr !'||mr_iid,'')||coalesce(', schedule '||schedule_id,'') from runs where id='$id'" 2>/dev/null)" || what=""
-    # apipost_code both POSTs the cancel and hands back the HTTP status (owner-scoped,
-    # so a 4xx here is expected for a run another session created).
-    code="$(apipost_code "/api/runs/$id/inputs" '{"kind":"cancel","body":""}')" || code="000"
-    case "$code" in
-      2*) ;;
-      *) db_psql "update runs set status='cancelled' where id='$id'" >/dev/null 2>&1 || true
-         forced=" (api cancel refused, forced via DB)" ;;
+# Boundary evidence lives separately from the first-wins body artifact capture.
+# All settlement work shares one deadline; a failed read remains unverifiable even
+# if a later sample is clean. Independent sets are read once per sample.
+_boundary_error() {
+  _boundary_bad=1
+  _boundary_msg="${_boundary_msg:+$_boundary_msg; }$*"
+  printf '%s\n' "$*" >> "$_boundary_dir/diagnostics"
+}
+_uuid() { [[ "$1" =~ ^[[:xdigit:]]{8}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{4}-[[:xdigit:]]{12}$ ]]; }
+_boundary_remaining() { _remaining=$((_deadline - $(date +%s))); [ "$_remaining" -gt 0 ]; }
+_boundary_read() {
+  local label="$1" sql="$2" shape="$3" rc=0 line a b rest valid=1
+  _read_data=""
+  if ! _boundary_remaining; then
+    _boundary_error "unverifiable $label: deadline exhausted"
+    return 1
+  fi
+  db_psql_rows "$sql" "$_remaining" > "$_boundary_dir/$label.stdout" 2> "$_boundary_dir/$label.stderr" || rc=$?
+  printf '%s\n' "$rc" > "$_boundary_dir/$label.exit"
+  [ "$rc" -eq 0 ] || valid=0
+  _read_data="$(cat "$_boundary_dir/$label.stdout")"
+  if [ -s "$_boundary_dir/$label.stdout" ]; then
+    while IFS= read -r line || [ -n "$line" ]; do
+      IFS='|' read -r a b rest <<< "$line"
+      if [ "$shape" = id ] || [ "$shape" = owner ]; then
+        _uuid "$line" || valid=0
+      else
+        # Checking the whole line prevents read's trailing-empty-field ambiguity.
+        if [[ ! "$line" =~ ^[^|]+\|[^|]+\|[0-9]+$ ]] || ! _uuid "$a" || ! _uuid "$b" || [[ ! "$rest" =~ ^[0-9]+$ ]]; then valid=0; fi
+      fi
+    done < "$_boundary_dir/$label.stdout"
+  elif [ "$shape" = owner ]; then
+    valid=0
+  fi
+  if [ "$shape" = owner ]; then _uuid "$_read_data" || valid=0; fi
+  if [ "$valid" -ne 1 ]; then
+    _boundary_error "unverifiable $label (exit $rc; invalid or unavailable rows)"
+    _read_data=""
+    return 1
+  fi
+}
+_boundary_begin() {
+  _boundary_dir="$RUNROOT/boundary/$1"
+  mkdir -p "$_boundary_dir"
+  _boundary_bad=0; _boundary_msg=""; _baseline_holds=""; _owner=""; _observed_holds=""
+  _deadline=$(($(date +%s) + 120))
+  local email="${ADMIN_EMAIL:-}"
+  email="${email//\'/\'\'}"
+  if _boundary_read owner "SELECT id FROM users WHERE email = '$email'" owner; then
+    _owner="$_read_data"
+    if _boundary_read baseline "SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id = '$_owner' AND state = 'open'" rows; then
+      _baseline_holds="$_read_data"
+      _observed_holds="$(printf '%s\n' "$_read_data" | cut -d'|' -f1)"
+    fi
+  fi
+}
+# Resolve declarations only after a successful top-level provides round-trip.
+# A run handoff grants no custody hold permission.
+_boundary_declarations() {
+  local names="$1" kind="$2" name value id declaration count
+  _declared=""
+  for name in $names; do
+    if [[ ! "$name" =~ ^[a-zA-Z_][a-zA-Z_0-9]*$ ]]; then
+      _boundary_error "malformed $kind declaration $name"; continue
+    fi
+    if ! declare -p "$name" >/dev/null 2>&1; then
+      _boundary_error "undefined $kind declaration $name"; continue
+    fi
+    declaration="$(declare -p "$name")"
+    case "$declaration" in
+      "declare -a"*|"declare -A"*|"declare -n"*)
+        _boundary_error "malformed $kind declaration $name: expected scalar IDs"; continue ;;
     esac
-    # `fail()` (lib.sh) calls `exit 1`, so a bare `wait_status … || true` cannot
-    # tolerate a timeout: the `exit` would kill the whole driver and skip the results
-    # writers. The subshell contains the `exit 1` so `|| true` can catch it.
-    ( wait_status "$id" cancelled 10 ) || true
-    _record "$slug" LEAK 0 "leaked run $id${what:+ (${what})} cancelled${forced}" "$slug (quarantine)"
-    _capture_artifacts "$nn_slug" 0
+    value="${!name}"; count=0
+    # read tokenizes whitespace without pathname expansion of malformed input.
+    while IFS= read -r id; do
+      [ -n "$id" ] || continue
+      count=$((count + 1))
+      if _uuid "$id"; then _declared="$_declared $id"
+      else _boundary_error "malformed $kind declaration $name: $id"; fi
+    done < <(printf '%s\n' "$value" | tr '[:space:]' '\n')
+    if [ "$count" -eq 0 ]; then _boundary_error "empty $kind declaration $name"; fi
   done
+}
+_quarantine() {
+  local nn_slug="$1" slug="$2" handoff="$3" holds="$4" body_rc="$5"
+  local entered now sample=0 runs workers open id run gen pending cancelled="" run_allow="" hold_allow="" baseline_ids
+  entered="$(date +%s)"; _deadline=$((entered + 120))
+  if [ "$body_rc" -eq 0 ]; then
+    _boundary_declarations "$handoff" handoff; run_allow="$_declared"
+    _boundary_declarations "$holds" handoff-holds; hold_allow="$_declared"
+  elif [ -n "$handoff$holds" ]; then
+    printf '%s\n' 'failed body: declarations unavailable; provides were not exported' >> "$_boundary_dir/diagnostics"
+  fi
+  baseline_ids="$(printf '%s\n' "$_baseline_holds" | cut -d'|' -f1 | tr '\n' ' ')"
+  # At most 120 seconds, no per-run waits. Rejection/read failure is sticky;
+  # sibling evidence is still sampled, but cannot repair the failure.
+  pending=""
+  while :; do
+    if ! _boundary_remaining; then
+      _boundary_error "boundary timeout:$pending"; break
+    fi
+    sample=$((sample + 1)); pending=""
+    _boundary_read "$sample-runs" "select id from runs where status not in ('completed','failed','cancelled')" id || true
+    runs="$_read_data"
+    _boundary_read "$sample-workers" "SELECT worker_id, run_id, claim_generation FROM worker_active_runs" rows || true
+    workers="$_read_data"
+    open=""
+    if [ -n "$_owner" ]; then
+      _boundary_read "$sample-holds" "SELECT id, run_id, generation FROM recovery_custody_holds WHERE user_id = '$_owner' AND state = 'open'" rows || true
+      open="$_read_data"
+    else _boundary_error 'unverifiable open holds: owner unavailable'; fi
+    for id in $runs; do
+      case " $run_allow " in *" $id "*) continue ;; esac
+      pending="$pending run=$id"
+      case " $cancelled " in *" $id "*) continue ;; esac
+      cancelled="$cancelled $id"
+      if _boundary_remaining; then
+        if ! boundary_cancel "/api/runs/$id/inputs" "$_remaining" "$_boundary_dir/cancel-$id"; then
+          _boundary_error "cancel rejected run=$id (see cancel response)"
+        fi
+      else _boundary_error "cancel deadline run=$id"; fi
+    done
+    if [ -n "$workers" ]; then
+      while IFS='|' read -r id run gen; do
+        case " $run_allow " in *" $run "*) continue ;; esac
+        pending="$pending worker=$id run=$run generation=$gen"
+      done <<< "$workers"
+    fi
+    if [ -n "$open" ]; then
+      while IFS='|' read -r id run gen; do
+        _observed_holds="$_observed_holds $id"
+        case " $baseline_ids $hold_allow " in *" $id "*) continue ;; esac
+        pending="$pending hold=$id run=$run generation=$gen"
+      done <<< "$open"
+    fi
+    printf '%s\n' "$pending" > "$_boundary_dir/$sample-pending"
+    for id in runs workers holds; do
+      if [ "$sample" -eq 1 ] && [ -f "$_boundary_dir/$sample-$id.stdout" ]; then
+        cp "$_boundary_dir/$sample-$id.stdout" "$_boundary_dir/initial-$id"
+      fi
+      if [ -f "$_boundary_dir/$sample-$id.stdout" ]; then
+        cp "$_boundary_dir/$sample-$id.stdout" "$_boundary_dir/final-$id"
+      fi
+    done
+    now="$(date +%s)"
+    if [ "$_boundary_bad" -ne 0 ]; then break; fi
+    if [ -z "$pending" ] && [ "$now" -lt "$_deadline" ]; then break; fi
+    if [ "$now" -ge "$_deadline" ]; then
+      _boundary_error "boundary timeout:$pending"; break
+    fi
+    sleep 1
+  done
+  _boundary_wait=$(( $(date +%s) - entered ))
+  printf '%s\n' "$_boundary_wait" > "$_boundary_dir/boundary_wait_seconds"
+  # Supplemental evidence is read-only and bounded independently to two seconds,
+  # including after expiry. It is diagnostic only, never another settlement wait.
+  local observed sql rc=0
+  observed="$(printf '%s\n' $_observed_holds | sort -u)"
+  if [ -n "$observed" ]; then
+    sql="$(printf "'%s'," $observed)"; sql="${sql%,}"
+    db_psql_rows "SELECT id, run_id, generation, state, final_disposition, release_evidence FROM recovery_custody_holds WHERE id IN ($sql)" 2 \
+      > "$_boundary_dir/hold-history.stdout" 2> "$_boundary_dir/hold-history.stderr" || rc=$?
+    printf '%s\n' "$rc" > "$_boundary_dir/hold-history.exit"
+    for id in $observed; do
+      if [ "$rc" -ne 0 ] || ! awk -F'|' -v id="$id" '$1==id && NF>=6{found=1} END{exit !found}' "$_boundary_dir/hold-history.stdout"; then
+        printf 'hold history/release evidence unavailable: %s\n' "$id" >> "$_boundary_dir/diagnostics"
+      fi
+    done
+  fi
+  if [ "$_boundary_bad" -ne 0 ]; then
+    _contamination="${_contamination:+$_contamination }$slug"
+    touch "$RUNROOT/.keep-rundir"
+  fi
+  return 0
 }
 
 # --- results writers ---------------------------------------------------------
@@ -185,7 +319,6 @@ _write_junit() {
     case "${_statuses[$i]}" in
       FAIL) fails=$((fails + 1)) ;;
       SKIP) skips=$((skips + 1)) ;;
-      LEAK) [ "${E2E_STRICT_LEAKS:-}" = 1 ] && fails=$((fails + 1)) ;;
     esac
   done
   {
@@ -201,14 +334,6 @@ _write_junit() {
           printf '  <testcase name="%s" time="%s"><failure message="%s"/></testcase>\n' "$slug" "$secs" "$msg" ;;
         SKIP)
           printf '  <testcase name="%s" time="%s"><skipped/></testcase>\n' "$slug" "$secs" ;;
-        LEAK)
-          # A LEAK is a <failure> ONLY under strict; otherwise a non-fatal note, so a
-          # green-but-leaky run still parses as a passing suite (D4).
-          if [ "${E2E_STRICT_LEAKS:-}" = 1 ]; then
-            printf '  <testcase name="%s" time="%s"><failure message="%s"/></testcase>\n' "$slug" "$secs" "$msg"
-          else
-            printf '  <testcase name="%s" time="%s"><system-out>%s</system-out></testcase>\n' "$slug" "$secs" "$msg"
-          fi ;;
         *)
           printf '  <testcase name="%s" time="%s"/>\n' "$slug" "$secs" ;;
       esac
@@ -218,7 +343,7 @@ _write_junit() {
 }
 
 _write_summary() {
-  local n=${#_slugs[@]} i any=0
+  local n=${#_slugs[@]} i
   {
     printf '# E2E summary\n\n'
     printf '| phase | status | secs | message |\n'
@@ -235,20 +360,10 @@ _write_summary() {
     else
       printf '_(no margin data)_\n'
     fi
-    printf '\n## Leaks\n\n'
-    for ((i = 0; i < n; i++)); do
-      # The `-` is in the ARGUMENT, not the format: `printf '- %s\n'` makes printf parse
-      # the leading `-` of the format as an option ("printf: - : invalid option", exit 2),
-      # which under the driver's set -e aborts _write_summary on the very first LEAK — the
-      # same abort the return 0 below guards against, one line earlier.
-      [ "${_statuses[$i]}" = LEAK ] && { printf '%s\n' "- ${_msgs[$i]}"; any=1; }
-    done
-    [ "$any" = 0 ] && printf '_(none)_\n'
+    printf '\n## boundary_wait_seconds\n\n'
+    cat "$RUNROOT/boundary_wait_seconds.tsv"
+    awk -F'\t' '{total += $2} END {printf "total\t%d\n", total}' "$RUNROOT/boundary_wait_seconds.tsv"
   } > "$RUNROOT/summary.md"
-  # Return success UNCONDITIONALLY: when a LEAK exists (any=1) the final compound
-  # `[ "$any" = 0 ] && …` above returns 1, so without this the function returns 1 and
-  # the bare `_write_summary` call under `set -e` aborts the driver before it can
-  # `cat summary.md`, roll-call, and compute the exit code.
   return 0
 }
 
@@ -272,9 +387,12 @@ _rollcall() {
 
 mkdir -p "$RUNROOT/logs"
 : > "$RUNROOT/results.tsv"
+: > "$RUNROOT/boundary_wait_seconds.tsv"
 
 for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   [ -e "$f" ] || continue   # no-match glob guard (nullglob is not set)
+  _boundary_wait=0
+  _entry_origins="$_contamination"
   nn_slug="$(basename "$f" .sh)"
   slug="${nn_slug#[0-9][0-9]-}"
   title="$(_hdr title "$f")"
@@ -283,6 +401,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   requires="$(_hdr requires "$f")"; [ "$requires" = "-" ] && requires=""
   provides="$(_hdr provides "$f")"; [ "$provides" = "-" ] && provides=""
   handoff="$(_hdr handoff "$f")";  [ "$handoff" = "-" ] && handoff=""
+  handoff_holds="$(_hdr handoff-holds "$f")"; [ "$handoff_holds" = "-" ] && handoff_holds=""
   racesens="$(_hdr race-sensitive "$f")"   # "yes" on a phase with timing/concurrency asserts
 
   # 2. Lane filter (M1 behaviour): source a lane phase only when it matches $FORGE.
@@ -333,6 +452,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   #    the phase body would read PASS. Guard against a stale phase.env.next first.
   printf '[phase] %s\n' "$nn_slug"
   : > "$RUNROOT/phase.env.next"
+  _boundary_begin "$nn_slug"
   start=$SECONDS
   set +e
   # shellcheck disable=SC1090  # $f is a runtime phase path, not statically resolvable
@@ -356,7 +476,7 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
   secs=$((SECONDS - start))
 
   if [ "$rc" -eq 0 ]; then
-    _record "$slug" PASS "$secs" "" "$title"
+    status=PASS; msg=""
     # 6. provides round-trip — AT TOP LEVEL so the new vars land in this shell and
     #    are inherited by the next phase's subshell.
     # shellcheck disable=SC1090  # generated declare-file, path is a runtime var
@@ -374,14 +494,23 @@ for f in "$_PHASES_DIR"/[0-9][0-9]-*.sh; do
     fi
     _requires_intersects_failed "$requires" && msg="$msg [suspect_cascade]"
     [ "$racesens" = yes ] && msg="$msg — possible race, see margins"
-    _record "$slug" FAIL "$secs" "$msg" "$title"
+    status=FAIL
     _capture_artifacts "$nn_slug" "$secs"
     _note_failed "$provides"
     [ "$critical" = yes ] && CRITICAL_FAILED=1
   fi
 
   # 9. End-of-phase quarantine (after the body ran).
-  _quarantine "$nn_slug" "$slug" "$handoff"
+  _quarantine "$nn_slug" "$slug" "$handoff" "$handoff_holds" "$rc"
+  secs=$((secs + _boundary_wait))
+  if [ "$_boundary_bad" -ne 0 ]; then
+    status=FAIL
+    msg="${msg:+$msg; }boundary FAIL: $_boundary_msg"
+    [ "$rc" -ne 0 ] || [ -z "$provides" ] || msg="$msg [provides suspect]"
+    _note_failed "$provides"
+    _capture_artifacts "$nn_slug" "$secs"
+  fi
+  _record "$slug" "$status" "$secs" "$msg" "$title"
 done
 
 # 10. Results — write the artifacts, then PRINT summary.md to stdout BEFORE we
@@ -391,12 +520,11 @@ _write_summary
 cat "$RUNROOT/summary.md"
 _rollcall
 
-# 11. Exit code: 1 iff any FAIL (or any LEAK under strict), else 0.
+# 11. Exit code: every failed body or boundary fails the suite.
 _exit=0
 for ((_i = 0; _i < ${#_statuses[@]}; _i++)); do
   case "${_statuses[$_i]}" in
     FAIL) _exit=1 ;;
-    LEAK) [ "${E2E_STRICT_LEAKS:-}" = 1 ] && _exit=1 ;;
   esac
 done
 exit "$_exit"

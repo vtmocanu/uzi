@@ -1039,6 +1039,99 @@ for mode in entry window discard idle; do
   else echo "FAIL: real custody phase idle boundary $mode: result=$got reads=$reads polls=$polls events=[$events] output=[$output]"; fi
 done
 
+# Real DB helper regressions: use an executable compose fake so timeout wraps
+# the same command shape as production, without sourcing lib.sh's provisioning.
+eval "$(awk '/^db_psql_rows\(\)/,/^[})]$/' "$LIB")"
+mkdir -p "$SEQ_DIR/bin"
+cat > "$SEQ_DIR/bin/docker" <<'DOCKER'
+#!/usr/bin/env bash
+printf '%s\n' "$*" >> "$DB_CALLS"
+if [ "${DB_STALL:-0}" = 1 ]; then sleep 5; fi
+printf '%s' "${DB_FIXTURE:-}"
+echo 'raw psql stderr' >&2
+exit "${DB_RC:-0}"
+DOCKER
+chmod +x "$SEQ_DIR/bin/docker"
+export DB_CALLS="$SEQ_DIR/db-calls"
+: > "$DB_CALLS"
+db_helper_case() {
+  local mode="$1" rc=0 output
+  cases=$((cases + 1))
+  (
+    set +o pipefail
+    export PGPW=fixture
+    # shellcheck disable=SC2034  # consumed by the extracted real DB helper
+    COMPOSE=("$SEQ_DIR/bin/docker")
+    export DB_FIXTURE=$'first\nsecond\n' DB_RC=0
+    case "$mode" in
+      one-arg) db_psql_rows 'SELECT phase72' ;;
+      nonzero) export DB_RC=7; db_psql_rows 'SELECT failing' ;;
+      bounded) db_psql_rows 'SELECT bounded' 2 ;;
+      stalled) export DB_STALL=1; db_psql_rows 'SELECT stalled' 1 ;;
+      no-limiter)
+        # shellcheck disable=SC2123  # deliberately test the absent host limiter
+        PATH="$SEQ_DIR/absent"
+        db_psql_rows 'SELECT no_limiter' 1 ;;
+    esac
+  ) > "$SEQ_DIR/db-output" 2> "$SEQ_DIR/db-error" || rc=$?
+  output="$(cat "$SEQ_DIR/db-output")"
+  local good=0
+  case "$mode" in
+    one-arg|bounded) [ "$rc" = 0 ] && [ "$output" = $'first\nsecond' ] && good=1 ;;
+    nonzero) [ "$rc" = 7 ] && [ "$output" = $'first\nsecond' ] && good=1 ;;
+    stalled) [ "$rc" -ne 0 ] && [ -z "$output" ] && good=1 ;;
+    no-limiter) [ "$rc" -ne 0 ] && [[ "$(cat "$SEQ_DIR/db-error")" = *'no timeout/gtimeout'* ]] && good=1 ;;
+  esac
+  if [ "$good" = 1 ]; then passed=$((passed + 1)); echo "PASS: real db_psql_rows $mode"
+  else echo "FAIL: real db_psql_rows $mode rc=$rc stdout=[$output] stderr=[$(cat "$SEQ_DIR/db-error")]"; fi
+}
+for mode in one-arg nonzero bounded stalled no-limiter; do db_helper_case "$mode"; done
+
+# Exercise the real bounded cancel helper against a curl executable. The existing
+# apipost_code remains status-only; this path retains the response and exit.
+eval "$(awk '/^boundary_cancel\(\) \{/,/^\}/' "$LIB")"
+# Compatibility harness for baseline: same call signature, baseline cancellation
+# primitive. Failures below concern evidence/timeout behaviour, not missing symbols.
+if ! type boundary_cancel >/dev/null 2>&1; then
+  eval "$(awk '/^apipost_code\(\)/,/; \}/' "$LIB")"
+  boundary_cancel() { apipost_code "$1" '{"kind":"cancel","body":""}'; }
+fi
+cat > "$SEQ_DIR/bin/curl" <<'CURL'
+#!/usr/bin/env bash
+printf '%s\n' "$*" > "$CURL_ARGS"
+while [ "$#" -gt 0 ]; do
+  if [ "$1" = -o ]; then shift; printf 'cancel response' > "$1"; fi
+  shift
+done
+echo 'transport diagnostic' >&2
+printf '%s' "$CURL_CODE"
+exit "$CURL_RC"
+CURL
+chmod +x "$SEQ_DIR/bin/curl"
+for mode in accepted rejected transport; do
+  cases=$((cases + 1)); rc=0
+  (
+    PATH="$SEQ_DIR/bin:$PATH"
+    export CURL_ARGS="$SEQ_DIR/curl-args" CURL_CODE=200 CURL_RC=0
+    case "$mode" in rejected) CURL_CODE=403 ;; transport) CURL_CODE=000; CURL_RC=28 ;; esac
+    export JAR=fixture BASE=http://example.invalid
+    csrf() { echo fixture; }
+    boundary_cancel /api/runs/fixture/inputs 3 "$SEQ_DIR/cancel-$mode"
+  ) > "$SEQ_DIR/cancel-output" 2>&1 || rc=$?
+  good=0
+  if [ -f "$SEQ_DIR/cancel-$mode.body" ] && [ -f "$SEQ_DIR/cancel-$mode.stderr" ] \
+    && [ -f "$SEQ_DIR/cancel-$mode.http" ] && [ -f "$SEQ_DIR/cancel-$mode.exit" ] \
+    && [[ "$(cat "$SEQ_DIR/curl-args")" = *'--max-time 3'* ]]; then
+    case "$mode" in
+      accepted) [ "$rc" = 0 ] && good=1 ;;
+      rejected) [ "$rc" -ne 0 ] && [ "$(cat "$SEQ_DIR/cancel-$mode.http")" = 403 ] && good=1 ;;
+      transport) [ "$rc" -ne 0 ] && [ "$(cat "$SEQ_DIR/cancel-$mode.exit")" = 28 ] && good=1 ;;
+    esac
+  fi
+  if [ "$good" = 1 ]; then passed=$((passed + 1)); echo "PASS: real boundary_cancel $mode"
+  else echo "FAIL: real boundary_cancel $mode rc=$rc evidence missing or invalid"; fi
+done
+
 node --test "$ROOT/e2e/settlement-diagnostic.test.mjs"
 echo "cases=$cases passed=$passed"
 # Tally guard (the driver.test.sh idiom): a real run has at least 188 cases green; a zero-case or
