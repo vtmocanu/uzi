@@ -161,7 +161,7 @@ func TestStaleWorkerCancelE2E(t *testing.T) {
 				mu.Lock()
 				defer mu.Unlock()
 				if r.Header.Get("Authorization") != "Bearer "+token {
-					http.Error(w, "unauthorized", 401)
+					http.Error(w, "unauthorized", http.StatusUnauthorized)
 					return
 				}
 				p := r.URL.Path
@@ -182,11 +182,11 @@ func TestStaleWorkerCancelE2E(t *testing.T) {
 						polls = 0
 					case "inspect":
 					default:
-						http.Error(w, "unknown control", 404)
+						http.Error(w, "unknown control", http.StatusNotFound)
 						return
 					}
 					if err != nil {
-						http.Error(w, "fixture transition failed", 500)
+						http.Error(w, "fixture transition failed", http.StatusInternalServerError)
 						return
 					}
 					var status, workerID string
@@ -195,7 +195,7 @@ func TestStaleWorkerCancelE2E(t *testing.T) {
 					err = pool.QueryRow(ctx, "SELECT status,worker_id::text,claim_generation,(SELECT count(*) FROM run_user_inputs WHERE run_id=$1),(SELECT count(*) FROM recovery_custody_holds WHERE run_id=$1 AND state='open') FROM runs WHERE id=$1", first).Scan(&status, &workerID, &generation, &inputs, &holds)
 					nowCustody, e := custody()
 					if err != nil || e != nil {
-						http.Error(w, "fixture inspection failed", 500)
+						http.Error(w, "fixture inspection failed", http.StatusInternalServerError)
 						return
 					}
 					w.Header().Set("Content-Type", "application/json")
@@ -216,7 +216,7 @@ func TestStaleWorkerCancelE2E(t *testing.T) {
 				}
 				if outage && strings.HasPrefix(p, "/api/worker/") {
 					blocked++
-					http.Error(w, "fixture outage", 503)
+					http.Error(w, "fixture outage", http.StatusServiceUnavailable)
 					return
 				}
 				if inputGet {
