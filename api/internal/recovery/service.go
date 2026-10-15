@@ -235,7 +235,7 @@ func (s *Service) upload(ctx context.Context, wkr store.Worker, runID, captureID
 	return s.stream(ctx, wkr, runID, captureID, manifest, body)
 }
 
-// lockCapture row-locks the capture and applies the authorization every upload transaction shares:
+// lockCapture locks guarded custody before the capture and applies the authorization every upload transaction shares:
 // the capture must belong to this run + owner, be held by THIS worker, and its hold must be open. A
 // different/later worker cannot adopt authority on a terminal run; the run's own status is
 // irrelevant here (post-terminal recovery, D2). A DIFFERENT manifest already bound under this id is
@@ -247,8 +247,8 @@ func lockCapture(ctx context.Context, tx pgx.Tx, wkr store.Worker, runID, captur
 	var guarded bool
 	if err := tx.QueryRow(ctx, `SELECT c.hold_id, h.inventory_guarded
 		FROM recovery_captures c JOIN recovery_custody_holds h ON h.id=c.hold_id
-		WHERE c.id=$1 AND c.run_id=$2 AND c.user_id=$3 AND c.original_worker_id=$4`,
-		captureID, runID, wkr.UserID, wkr.ID).Scan(&holdID, &guarded); err != nil {
+		WHERE c.id=$1 AND c.run_id=$2 AND c.user_id=$3`,
+		captureID, runID, wkr.UserID).Scan(&holdID, &guarded); err != nil {
 		if errors.Is(err, pgx.ErrNoRows) {
 			return lockedCapture{}, ErrCaptureNotFound
 		}

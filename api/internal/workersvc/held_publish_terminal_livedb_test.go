@@ -1,9 +1,45 @@
 package workersvc
 
 import (
-	"github.com/vtmocanu/uzi/api/internal/capability"
+	"context"
+	"errors"
 	"testing"
+
+	"github.com/vtmocanu/uzi/api/internal/capability"
+	"github.com/vtmocanu/uzi/api/internal/store"
 )
+
+type heldReadFailureStore struct {
+	Store
+	heldReader
+	fail bool
+}
+
+func (s *heldReadFailureStore) GetHeldPublicationHold(ctx context.Context, p store.GetHeldPublicationHoldParams) (store.RecoveryCustodyHold, error) {
+	if s.fail {
+		return store.RecoveryCustodyHold{}, errors.New("hold observation unavailable")
+	}
+	return s.heldReader.GetHeldPublicationHold(ctx, p)
+}
+
+func TestHeldTerminalPresendReadFailureLiveDB(t *testing.T) {
+	f := newHeldFix(t)
+	q := &heldReadFailureStore{Store: f.svc.q, heldReader: f.svc.q.(heldReader)}
+	f.svc.q = q
+	f.svc.heldBeforeSendHook = func() { q.fail = true }
+	got, err := f.publish(f.req())
+	_, sends, _ := f.fake.counts()
+	row, found := f.row()
+	if err != nil || got.State != "invoked" || sends != 0 || !found || !row.CreateInvokedAt.Valid {
+		t.Fatalf("unknown hold status must preserve marker without send: result=%+v err=%v sends=%d row=%+v", got, err, sends, row)
+	}
+	q.fail = false
+	got, err = f.publish(f.req())
+	_, sends, _ = f.fake.counts()
+	if err != nil || got.State != "invoked" || sends != 0 {
+		t.Fatalf("unknown invocation retried: %+v err=%v sends=%d", got, err, sends)
+	}
+}
 
 func TestHeldTerminalSettlementOrderingLiveDB(t *testing.T) {
 	for _, markerFirst := range []bool{false, true} {
