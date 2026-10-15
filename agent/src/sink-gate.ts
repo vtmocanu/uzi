@@ -41,21 +41,19 @@ export class SinkGate {
   /** Run `fn` holding the gate, waiting (and preempting a holding tick) as needed. Re-entrant for
    *  the async call tree that already holds it. */
   async run<T>(fn: () => Promise<T>): Promise<T> {
-    const budget = MaintenanceBudget.current();
-    budget?.check();
+    MaintenanceBudget.current()?.check();
     const store = owned.getStore() ?? [];
     if (store.some((h) => h.gate === this && h.live)) {
-      if (!budget) return fn();
       const result = await fn();
-      budget?.check();
+      MaintenanceBudget.current()?.check();
       return result;
     }
-    await this.lock(budget);
+    await this.lock(MaintenanceBudget.signal());
     const hold: Hold = { gate: this, live: true };
     try {
-      budget?.check();
+      MaintenanceBudget.current()?.check();
       const result = await owned.run([...store.filter((h) => h.live), hold], fn);
-      budget?.check();
+      MaintenanceBudget.current()?.check();
       return result;
     } finally {
       hold.live = false;
@@ -83,7 +81,7 @@ export class SinkGate {
     };
   }
 
-  private async lock(budget?: MaintenanceBudget): Promise<void> {
+  private async lock(signal?: AbortSignal): Promise<void> {
     if (!this.locked) {
       this.locked = true;
       this.holderPreempt = undefined;
@@ -93,18 +91,18 @@ export class SinkGate {
     this.holderPreempt?.();
     await new Promise<void>((resolve, reject) => {
       const ready = () => {
-        budget?.signal.removeEventListener("abort", cancel);
+        signal?.removeEventListener("abort", cancel);
         resolve();
       };
       const cancel = () => {
         const index = this.waiters.indexOf(ready);
         if (index < 0) return;
         this.waiters.splice(index, 1);
-        reject(budget!.signal.reason);
+        reject(signal!.reason);
       };
       this.waiters.push(ready);
-      budget?.signal.addEventListener("abort", cancel, { once: true });
-      if (budget?.signal.aborted) cancel();
+      signal?.addEventListener("abort", cancel, { once: true });
+      if (signal?.aborted) cancel();
     });
     this.holderPreempt = undefined;
   }

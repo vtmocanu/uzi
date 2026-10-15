@@ -222,6 +222,30 @@ for (const contentLength of [undefined, "1"]) {
   });
 }
 
+for (const contentLength of [undefined, "1"]) {
+  test(`terminal ACK outside attempt enforces actual byte cap with Content-Length ${contentLength ?? "absent"}`, async t => {
+    let cancelled = 0, chunks = 0;
+    const budget = new MaintenanceBudget(0);
+    t.after(() => budget.dispose());
+    const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+      fetch: async () => new Response(new ReadableStream<Uint8Array>({
+        pull(controller) {
+          controller.enqueue(new TextEncoder().encode(chunks++ < 128 ? " ".repeat(64 * 1024) : '{"run":{"status":"failed"}}'));
+          if (chunks > 128) controller.close();
+        },
+        cancel() { cancelled++; },
+      }, { highWaterMark: 0 }), { headers: contentLength ? { "Content-Length": contentLength } : {} }),
+    });
+    await assert.rejects(MaintenanceBudget.withoutAttempt(() => client.reportState("run", { status: "failed" })), /limit|large|bytes|exceed/i);
+    assert.equal(cancelled, 1);
+    assert.ok(chunks < 32);
+    const small = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {
+      fetch: async () => Response.json({ run: { status: "failed" } }),
+    });
+    assert.equal((await MaintenanceBudget.withoutAttempt(() => small.reportState("run", { status: "failed" }))).status, "failed");
+  });
+}
+
 test("legacy four-argument release remains compatible without an ambient budget", async () => {
   let sent: unknown;
   const client = new WorkerClient("http://budget.test", "token", "test", nullLogger(), {

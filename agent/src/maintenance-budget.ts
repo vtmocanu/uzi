@@ -6,6 +6,7 @@ interface AttemptContext {
   budget?: MaintenanceBudget;
   factory?: () => MaintenanceBudget;
   activating?: boolean;
+  pendingAbort?: AbortController;
 }
 
 const scope = new AsyncLocalStorage<AttemptContext>();
@@ -51,7 +52,7 @@ export class MaintenanceBudget {
     const current = context?.budget ?? budget;
     current.check();
     if (context?.identity !== undefined) {
-      context.budget = current;
+      this.attachBudget(context, current);
       return scope.run(context, action);
     }
     return scope.run({ budget: current }, action);
@@ -60,7 +61,7 @@ export class MaintenanceBudget {
   /** Attach the flight's observation before synchronous abort listeners continue. */
   static attachObserved(identity: string, budget: MaintenanceBudget): void {
     const context = scope.getStore();
-    if (context?.identity === identity && !context.budget) context.budget = budget;
+    if (context?.identity === identity && !context.budget) this.attachBudget(context, budget);
   }
 
   /** Status transport is independent of preservation; never use this for FINAL or cleanup. */
@@ -78,7 +79,7 @@ export class MaintenanceBudget {
       parent.budget?.check();
       return action();
     }
-    return scope.run({ identity, factory }, action);
+    return scope.run({ identity, factory, pendingAbort: new AbortController() }, action);
   }
 
   /** Observation constrains time only; it grants no custody authority. */
@@ -87,11 +88,46 @@ export class MaintenanceBudget {
     if (!context) return undefined;
     if (!context.budget && context.factory && !context.activating) {
       context.activating = true;
-      try { context.budget = context.factory(); }
+      try { this.attachBudget(context, context.factory()); }
       finally { context.activating = false; }
     }
     context.budget?.check();
     return context.budget;
+  }
+
+  private static attachBudget(context: AttemptContext, budget: MaintenanceBudget): void {
+    if (context.budget === budget) return;
+    context.budget = budget;
+    const relay = context.pendingAbort;
+    if (!relay) return;
+    const abort = () => relay.abort(budget.signal.reason);
+    if (budget.signal.aborted) abort();
+    else budget.signal.addEventListener("abort", abort, { once: true });
+  }
+
+  /** Stable from attempt entry; obtaining it never starts the cancellation clock. */
+  static signal(): AbortSignal | undefined {
+    const context = scope.getStore();
+    return context?.pendingAbort?.signal ?? context?.budget?.signal;
+  }
+
+  /** Only inert queue waits: callers must preserve their slot behind earlier holders. */
+  static async waitFor<T>(pending: Promise<T>): Promise<T> {
+    this.current()?.check();
+    const signal = this.signal();
+    if (!signal) return pending;
+    signal.throwIfAborted();
+    let onAbort!: () => void;
+    const cancelled = new Promise<never>((_resolve, reject) => {
+      onAbort = () => reject(signal.reason);
+      signal.addEventListener("abort", onAbort, { once: true });
+    });
+    try {
+      const value = await Promise.race([pending, cancelled]);
+      this.current()?.check();
+      signal.throwIfAborted();
+      return value;
+    } finally { signal.removeEventListener("abort", onAbort); }
   }
 
   static current(): MaintenanceBudget | undefined { return scope.getStore()?.budget; }

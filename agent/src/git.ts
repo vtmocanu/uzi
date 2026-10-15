@@ -1972,8 +1972,9 @@ export class GitCache {
     budget = parent?.budget ?? MaintenanceBudget.current() ?? budget;
     deadline = Math.min(deadline, parent?.deadline ?? Infinity);
     const timeout = new AbortController();
+    const pending = MaintenanceBudget.signal();
     const combined = AbortSignal.any([signal, timeout.signal, ...(parent ? [parent.signal] : []),
-      ...(budget ? [budget.signal] : [])]);
+      ...(budget ? [budget.signal] : []), ...(pending ? [pending] : [])]);
     const timer = Number.isFinite(deadline)
       ? setTimeout(() => timeout.abort(new Error("recovery deadline exhausted")), Math.max(0, deadline - Date.now()))
       : undefined;
@@ -13809,7 +13810,7 @@ export class GitCache {
     const report = this.reportProofs.getStore();
     this.checkReportProof();
     this.checkRecoveryInterruption();
-    const signals = [boundary?.signal, recovery?.signal, report?.signal].filter((s): s is AbortSignal => s !== undefined);
+    const signals = [boundary?.signal, recovery?.signal, report?.signal, MaintenanceBudget.signal()].filter((s): s is AbortSignal => s !== undefined);
     const scope = signals.length ? { signal: AbortSignal.any(signals) } : undefined;
     const softSignal = boundary?.softSignal;
     let started = false;

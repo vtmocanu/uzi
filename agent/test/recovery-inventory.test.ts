@@ -1,4 +1,5 @@
 import { MaintenanceBudget } from "../src/maintenance-budget.js";
+import { AsyncLocalStorage } from "node:async_hooks";
 import { Readable } from "node:stream";
 import { it } from "node:test";
 import { RunRunner } from "../src/runner.js";
@@ -86,6 +87,78 @@ function closedExactFixture(record: RecoveryRecord, exact: RecoveryExactHold, st
     },
   };
 }
+
+it("late cancellation releases queued capture before the holder and preserves FIFO", async () => {
+  const f = await v2FrozenFixture();
+  let release!: () => void, ready!: () => void;
+  const held = new Promise<void>(resolve => { ready = resolve; });
+  const enumerate = f.git.enumerateOwedCandidates!;
+  let calls = 0;
+  Object.assign(f.git, { enumerateOwedCandidates: async (...args: Parameters<typeof enumerate>) => {
+    if (++calls === 1) { ready(); await new Promise<void>(resolve => { release = resolve; }); }
+    return enumerate(...args);
+  } });
+  const input = { context: f.context, currentSha: H, defaultBranch: "main", locallyQuiescent: true };
+  const holder = f.coordinator.freezeInventory(input);
+  await held;
+  let mono = 0, settled = false, expire!: () => void;
+  let budget: MaintenanceBudget | undefined;
+  const waiter = MaintenanceBudget.runAttempt("run-1:7", () => budget = new MaintenanceBudget(100, () => mono), () => {
+    expire = AsyncLocalStorage.bind(() => { MaintenanceBudget.observeCancellation(); mono = 100; assert.throws(() => budget!.check()); });
+    return f.coordinator.freezeInventory(input);
+  });
+  const result = waiter.then(() => { settled = true; }, () => { settled = true; });
+  const sibling = f.coordinator.freezeInventory(input);
+  try {
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expire();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(settled, true, "late cancellation must release queued capture waiter at its deadline");
+    assert.equal(calls, 1, "sibling cannot overtake holder");
+  } finally {
+    release(); await Promise.all([holder, result, sibling]); budget?.dispose(); await f.close();
+  }
+  assert.equal(calls, 2, "expired callback never enumerates");
+});
+
+it("late cancellation releases queued journal pin without late mutation or FIFO overtake", async t => {
+  const f = await fixture();
+  let release!: () => void, ready!: () => void;
+  const held = new Promise<void>(resolve => { ready = resolve; });
+  const rename = fs.rename.bind(fs);
+  let renames = 0;
+  t.mock.method(fs, "rename", async (...args: Parameters<typeof rename>) => {
+    if (++renames === 1) { ready(); await new Promise<void>(resolve => { release = resolve; }); }
+    return rename(...args);
+  });
+  let observed!: () => void, observations = 0;
+  const queued = new Promise<void>(resolve => { observed = resolve; });
+  const writer = f.make(false, undefined, undefined, { maintenanceBudget: () => new MaintenanceBudget(),
+    afterPinObserve: async () => { if (++observations === 2) observed(); } });
+  const pin = (sha: string) => writer.pin({ runId: "run-1", kind: "issue", branch: "task", sourceSha: sha });
+  const holder = pin(H);
+  await held;
+  let mono = 0, settled = false, expire!: () => void;
+  let budget: MaintenanceBudget | undefined;
+  const waiter = MaintenanceBudget.runAttempt("journal", () => budget = new MaintenanceBudget(100, () => mono), () => {
+    expire = AsyncLocalStorage.bind(() => { MaintenanceBudget.observeCancellation(); mono = 100; assert.throws(() => budget!.check()); });
+    return pin(H2);
+  });
+  const result = waiter.then(() => { settled = true; }, () => { settled = true; });
+  const sibling = pin("c".repeat(40));
+  try {
+    await queued;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    expire();
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(settled, true, "late journal waiter rejects while holder remains held");
+    assert.equal(renames, 1);
+  } finally { release(); await Promise.all([holder, result, sibling]); budget?.dispose(); }
+  try {
+    assert.equal(renames, 2, "expired pin never writes");
+    assert.deepEqual((await f.coordinator.inspect("run-1")).map(r => r.sourceSha).sort(), [H, "c".repeat(40)].sort());
+  } finally { await f.close(); }
+});
 
 it("first cancellation inside freeze shares the flight budget through later maintenance", async () => {
   const f = await v2FrozenFixture();
@@ -1494,7 +1567,7 @@ async function fixture(sourceBoundary: boolean | "runner" = false, rootParent = 
   const make = (sourceBoundary: boolean | "runner" = false,
     pendingGenerationReport?: (runId: string, generation: number) => boolean,
     onAuthoritativeGenerationReleased?: (runId: string, generation: number) => void,
-    testHooks?: { maintenanceBudget: () => MaintenanceBudget }) => {
+    testHooks?: { maintenanceBudget: () => MaintenanceBudget; afterPinObserve?: () => Promise<void> }) => {
     let physical: { withInventorySourceBoundary(context: InventorySourceBoundaryContext,
       action: (prove: () => Promise<boolean>) => Promise<void>): Promise<"passed" | "retained"> };
     const coordinator = new RecoveryCoordinator({

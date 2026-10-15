@@ -651,9 +651,9 @@ function applyPin(current: RecoveryRecord, input: PinInput): RecoveryRecord {
 const captureCycleTails = new Map<string, Promise<void>>();
 
 function maintenanceSignal(signal?: AbortSignal): AbortSignal | undefined {
-  const budget = MaintenanceBudget.current();
   MaintenanceBudget.current()?.check();
-  return budget ? (signal ? AbortSignal.any([signal, budget.signal]) : budget.signal) : signal;
+  const pending = MaintenanceBudget.signal();
+  return pending ? (signal ? AbortSignal.any([signal, pending]) : pending) : signal;
 }
 
 function maintenanceSignalArgs(): [] | [AbortSignal] {
@@ -690,7 +690,6 @@ async function runCaptureCycle<T>(
   mode: "wait" | "skip",
   fn: () => Promise<T>,
 ): Promise<T | { ran: true; value: T } | { ran: false }> {
-  const budget = MaintenanceBudget.current();
   MaintenanceBudget.current()?.check();
   const previous = captureCycleTails.get(key);
   if (mode === "skip" && previous) return { ran: false };
@@ -703,8 +702,7 @@ async function runCaptureCycle<T>(
   captureCycleTails.set(key, tail);
   try {
     // An expired waiter releases only its placeholder, behind the earlier holder.
-    if (budget) await budget.raceIO(() => previous ?? Promise.resolve());
-    else await previous;
+    await MaintenanceBudget.waitFor(previous ?? Promise.resolve());
     MaintenanceBudget.current()?.check();
     const value = await fn();
     MaintenanceBudget.current()?.check();

@@ -337,11 +337,10 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
     // installs a fresh release the next caller will await.
     const prior = this.queueTail;
     let release!: () => void;
-    this.queueTail = new Promise<void>((res) => {
-      release = res;
-    });
+    const held = new Promise<void>((res) => { release = res; });
+    this.queueTail = prior.then(() => held);
     try {
-      await prior;
+      await MaintenanceBudget.waitFor(prior);
       return await this.runBoundary(request, action, deadlineAt);
     } finally {
       release();
@@ -363,7 +362,9 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
   async settleForCredentialFreeCapture(deadlineMs: number): Promise<CredentialFreeCaptureSettlement> {
     const deadlineAt = Date.now() + Math.max(0, deadlineMs);
     const budget = MaintenanceBudget.current();
-    const remaining = budget?.cap(deadlineMs) ?? (() => remainingMs(deadlineAt));
+    const signal = MaintenanceBudget.signal();
+    const cap = budget?.cap(deadlineMs) ?? (() => remainingMs(deadlineAt));
+    const remaining = () => signal?.aborted ? 0 : Math.min(cap(), MaintenanceBudget.current()?.remainingMs() ?? Infinity);
     const prior = this.queueTail;
     let release!: () => void;
     this.queueTail = new Promise<void>((res) => {
@@ -377,7 +378,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
         prior.then(() => "ready" as const),
         new Promise<"expired">((res) => {
           onAbort = () => res("expired");
-          budget?.signal.addEventListener("abort", onAbort, { once: true });
+          signal?.addEventListener("abort", onAbort, { once: true });
           if (remaining() <= 0) { res("expired"); return; }
           timer = setTimeout(onAbort, remaining());
           timer.unref?.();
@@ -394,7 +395,7 @@ export class CodexExecutionSafetyImpl implements CodexExecutionSafety {
       const proof = await this.registry.settleForCapture(remaining());
       return proof.kind === "incomplete" ? proof : remaining() <= 0 ? { kind: "incomplete", errors: [{ category: "timeout", message: "codex capture settle expired" }] } : proof;
     } finally {
-      if (onAbort) budget?.signal.removeEventListener("abort", onAbort);
+      if (onAbort) signal?.removeEventListener("abort", onAbort);
       if (timer) clearTimeout(timer);
       if (queued) void prior.then(release);
       else release();

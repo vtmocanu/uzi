@@ -1836,7 +1836,7 @@ export class WorkerClient {
         path,
         includeField ? b : { ...b, claim_generation: undefined, presentation_id: undefined, adopt_gate_revision: undefined, completion_final_head: undefined },
         signal,
-        undefined,
+        b.status === "failed" || b.status === "completed" ? MAINTENANCE_RESPONSE_MAX_BYTES : undefined,
         evidence,
       );
     try {
