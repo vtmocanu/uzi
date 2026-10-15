@@ -156,6 +156,39 @@ to that capture window. Sampling at 250 ms allows 268 records: six baseline read
 boundary ticks. Raw samples are capped at 6,144 bytes; reports at 8 MiB. Evidence
 is refused on overflow, never truncated into acceptance.
 
+Version 1 explicitly records `units`: memory bytes, monotonic timing milliseconds,
+growth bytes_per_millisecond, PSI averages percent and totals microseconds, events
+count, and process start identity as opaque kernel start ticks (not clock time).
+The existing clock source and time origin remain separate. `plannedChargeClasses`
+names touched anonymous memory, dirty disk, fsynced/read file cache, and tmpfs shmem.
+Each class has two producers, 1 MiB chunks, at most 16/32 rounds per producer,
+and a combined logical budget of 32/64 MiB; the four budgets sum to
+`plan.allocationBytes`. These are planned worst-case logical budgets, not measured
+per-class charges or extra headroom from shared cache. They remain null before
+a validated plan is available.
+
+`oomEvents` names the first/last raw sample IDs and their before/after
+`oom`, `oom_kill`, and `oom_group_kill` counters, plus literal after-minus-before
+deltas, including the final raw read. Known zero stays zero; missing endpoints or
+counters stay null, with null deltas. Partial evidence and negative observed deltas
+remain in failed reports; reader unavailability does not erase known event evidence.
+No raw records are discarded. Host-aborted unknown metadata is null.
+The positive checker independently verifies these fields from raw evidence and
+still requires stable OOM counters across every raw record.
+
+The version-1 derivation attributes every adjacent periodic sample pair by real
+sample IDs, signed raw byte delta, completion interval, positive byte/ms rate and
+read gap. Peak rate and maximum gap select the earliest pair on ties; baseline
+jitter names the earliest minimum/maximum baseline samples and their byte values.
+`samplingSchedule` separately records the 250 ms requested anchor/ordinal/deadline,
+actual dispatch, reader start/completion and signed lateness (early ticks are valid),
+plus maximum positive lateness and maximum absolute jitter in milliseconds.
+Manual prerequisite/baseline/final probes are excluded. Failed legs retain captured
+scheduling facts with null derived metrics; a host-aborted unknown schedule is null.
+Scheduling jitter in ms and read gaps are evidence only: the strict reserve check
+remains growth rate times drain-minus-bracket-lower plus baseline jitter in bytes,
+without adding either timing quantity again.
+
 The host retains each original producer stdout and exit-status sidecar in its
 printed scratch evidence directory. After ownership-verified container and volume
 cleanup, it emits exactly one final version-1 JSON report per size between the

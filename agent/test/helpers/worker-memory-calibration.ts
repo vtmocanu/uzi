@@ -211,6 +211,41 @@ export type CalibrationReportInput = Readonly<{
   baseline: readonly Available[]; samples: readonly Available[];
   reserveBytes: number; response: CalibrationMeasuredResponse;
 }>;
+export type CalibrationSchedulingObservation = Readonly<{
+  sampleId: number; requestedOrdinal: number; dueAtMs: number; dispatchAtMs: number;
+}>;
+export type CalibrationSchedulingInput = Readonly<{
+  periodMs: number; anchorMs: number; observations: readonly CalibrationSchedulingObservation[];
+}>;
+/** Test-only periodic reads, excluding manual probes. Ordinals are contiguous from
+ * zero; producer and checker compute dueAtMs as anchorMs + ordinal * periodMs.
+ * At most 256 rows, no retries; any missing/corrupt row fails the whole report.
+ * Scheduling milliseconds are evidence only, never reserve-formula byte jitter. */
+export function calibrationSchedulingReport(samples: readonly Available[], input: CalibrationSchedulingInput) {
+  validateSamples(samples, 1);
+  if (!Number.isSafeInteger(input.periodMs) || input.periodMs <= 0 || !finite(input.anchorMs)
+    || input.observations.length !== samples.length) throw new Error("invalid calibration scheduling input");
+  const rows = samples.map((sample, index) => {
+    const observation = input.observations[index];
+    const dueAtMs = input.anchorMs + index * input.periodMs;
+    if (!observation || observation.sampleId !== sample.sampleId || observation.requestedOrdinal !== index
+      || !finite(dueAtMs) || observation.dueAtMs !== dueAtMs || !finite(observation.dispatchAtMs)
+      || observation.dispatchAtMs > sample.startedAtMs
+      || (index > 0 && observation.dispatchAtMs < samples[index - 1]!.completedAtMs)) {
+      throw new Error("missing, misordered or mismatched scheduling observation");
+    }
+    return { ...observation, startedAtMs: sample.startedAtMs, completedAtMs: sample.completedAtMs,
+      latenessMs: sample.startedAtMs - dueAtMs };
+  });
+  return { periodMs: input.periodMs, anchorMs: input.anchorMs, rows,
+    maxPositiveLatenessMs: Math.max(0, ...rows.map((row) => row.latenessMs)),
+    maxAbsoluteJitterMs: Math.max(...rows.map((row) => Math.abs(row.latenessMs))) };
+}
+export type CalibrationSchedulingReport = ReturnType<typeof calibrationSchedulingReport>;
+export type CalibrationSamplePair = Readonly<{
+  fromSampleId: number; toSampleId: number; rawDeltaBytes: number;
+  elapsedMs: number; positiveRateBytesPerMs: number; readGapMs: number;
+}>;
 const bindingKeys = ["reportId", "legId", "interventionId", "treeId", "toolId", "reservationId"] as const;
 function sameBinding(a: CalibrationBinding, b: CalibrationBinding): boolean {
   return !!a && !!b && bindingKeys.every((key) => typeof a[key] === "string" && a[key].length > 0 && a[key] === b[key]);
@@ -226,17 +261,25 @@ export function calibrationReport(input: CalibrationReportInput) {
     || input.samples[0]!.startedAtMs < input.baseline.at(-1)!.completedAtMs
     || !Number.isSafeInteger(input.reserveBytes) || input.reserveBytes <= 0
     || input.reserveBytes >= input.samples[0]!.limitBytes) throw new Error("invalid calibration report");
-  const baseline = input.baseline.map((sample) => sample.currentBytes);
-  const jitterBytes = Math.max(...baseline) - Math.min(...baseline);
-  let peakPositiveGrowthRateBytesPerMs = 0, maxSampleGapMs = 0;
-  for (let i = 1; i < input.samples.length; i++) {
-    const previous = input.samples[i - 1]!, current = input.samples[i]!;
-    const elapsed = current.completedAtMs - previous.completedAtMs;
-    if (elapsed <= 0) throw new Error("nonmonotonic calibration time");
-    maxSampleGapMs = Math.max(maxSampleGapMs, current.startedAtMs - previous.completedAtMs);
-    peakPositiveGrowthRateBytesPerMs = Math.max(peakPositiveGrowthRateBytesPerMs,
-      Math.max(0, current.currentBytes - previous.currentBytes) / elapsed);
-  }
+  // Strict comparisons retain the earliest sample/pair on ties.
+  const min = input.baseline.reduce((a, b) => b.currentBytes < a.currentBytes ? b : a);
+  const max = input.baseline.reduce((a, b) => b.currentBytes > a.currentBytes ? b : a);
+  const baselineJitter = { minSampleId: min.sampleId, minBytes: min.currentBytes,
+    maxSampleId: max.sampleId, maxBytes: max.currentBytes };
+  const jitterBytes = max.currentBytes - min.currentBytes;
+  const samplePairs: CalibrationSamplePair[] = input.samples.slice(1).map((current, index) => {
+    const previous = input.samples[index]!;
+    const elapsedMs = current.completedAtMs - previous.completedAtMs;
+    if (elapsedMs <= 0) throw new Error("nonmonotonic calibration time");
+    const rawDeltaBytes = current.currentBytes - previous.currentBytes;
+    return { fromSampleId: previous.sampleId, toSampleId: current.sampleId, rawDeltaBytes, elapsedMs,
+      positiveRateBytesPerMs: Math.max(0, rawDeltaBytes) / elapsedMs,
+      readGapMs: current.startedAtMs - previous.completedAtMs };
+  });
+  const peakPositiveGrowthPair = samplePairs.reduce((a, b) => b.positiveRateBytesPerMs > a.positiveRateBytesPerMs ? b : a);
+  const maxSampleGapPair = samplePairs.reduce((a, b) => b.readGapMs > a.readGapMs ? b : a);
+  const peakPositiveGrowthRateBytesPerMs = peakPositiveGrowthPair.positiveRateBytesPerMs;
+  const maxSampleGapMs = maxSampleGapPair.readGapMs;
   const seen = new Set<string>();
   let previousCleanupEndMs = input.baseline.at(-1)!.completedAtMs;
   const legs = response.legs.map((leg) => {
@@ -293,6 +336,7 @@ export function calibrationReport(input: CalibrationReportInput) {
   const satisfied = input.reserveBytes > requiredBytes;
   return { fixtureOnly: true, provenance: response.provenance, reportId: response.reportId, legs,
     elapsedMs: input.samples.at(-1)!.completedAtMs - input.samples[0]!.startedAtMs,
+    baselineJitter, samplePairs, peakPositiveGrowthPair, maxSampleGapPair,
     jitterBytes, peakPositiveGrowthRateBytesPerMs, maxSampleGapMs, worstEndToEndLatencyMs, conservativeStageSumMs,
     netGrowthBytes: input.samples.at(-1)!.currentBytes - input.samples[0]!.currentBytes,
     monotonicGrowth: input.samples.every((sample, index) => index === 0 || sample.currentBytes >= input.samples[index - 1]!.currentBytes),

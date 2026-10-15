@@ -61,6 +61,22 @@ def case():
                       "maxSampleGapMs": 249, "worstEndToEndLatencyMs": 260, "conservativeStageSumMs": 260,
                       "netGrowthBytes": 0, "monotonicGrowth": False, "responseMeasured": False, "accepted": False,
                       "reserveCheck": {"reserveBytes": reserve, "requiredBytes": 20 * mib / 250 * 260, "satisfied": True}}
+        # Literal byte deltas/rates pin attribution independently of checker arithmetic.
+        pairs = [{"fromSampleId": a, "toSampleId": b, "rawDeltaBytes": delta,
+                  "elapsedMs": 250, "positiveRateBytesPerMs": rate, "readGapMs": 249}
+                 for a, b, delta, rate in ((4, 5, 20971520, 83886.08), (5, 6, 16777216, 67108.864),
+                                           (6, 7, -37748736, 0), (7, 8, 0, 0), (8, 9, 0, 0))]
+        derivation.update(samplePairs=pairs, peakPositiveGrowthPair=copy.deepcopy(pairs[0]),
+                          maxSampleGapPair=copy.deepcopy(pairs[0]),
+                          baselineJitter={"minSampleId": 1, "minBytes": 104857600,
+                                          "maxSampleId": 1, "maxBytes": 104857600})
+        sampling_schedule = {"periodMs": 250, "anchorMs": 1000,
+                             "rows": [{"sampleId": s["sampleId"], "requestedOrdinal": i,
+                                       "dueAtMs": 1000 + i * 250, "dispatchAtMs": s["startedAtMs"],
+                                       "startedAtMs": s["startedAtMs"], "completedAtMs": s["completedAtMs"],
+                                       "latenessMs": s["startedAtMs"] - (1000 + i * 250)}
+                                      for i, s in enumerate(samples)],
+                             "maxPositiveLatenessMs": 0, "maxAbsoluteJitterMs": 0}
         trees = []
         for index in (0, 1):
             enrollment = {k: context[k] for k in ("run_id", "worker_id", "claim_generation", "memory_episode")}
@@ -96,6 +112,17 @@ def case():
                                    {"index": 1, "step": 1, "startMs": 1000, "endMs": 1511, "kind": "completed"}]}
         rounds = size * 16
         reports.append({"schemaVersion": 1, **identity, **expected, "provenance": "synthetic", "status": "SUCCESS_COMPLETE",
+                        "units": {"memory": "bytes", "monotonicTiming": "milliseconds", "growth": "bytes_per_millisecond",
+                                  "psiAverages": "percent", "psiTotal": "microseconds", "events": "count",
+                                  "processStartIdentity": "opaque_kernel_start_ticks"},
+                        "plannedChargeClasses": [
+                            {"kind": kind, "producerCount": 2, "chunkBytes": mib, "maxRoundsPerProducer": rounds,
+                             "combinedBudgetBytes": 2 * rounds * mib}
+                            for kind in ("touched_anonymous", "dirty_disk", "fsynced_read_file_cache", "tmpfs_shmem")],
+                        "oomEvents": {"fromSampleId": 1, "toSampleId": 9,
+                                      "before": {"oom": 0, "oom_kill": 0, "oom_group_kill": 0},
+                                      "after": {"oom": 0, "oom_kill": 0, "oom_group_kill": 0},
+                                      "delta": {"oom": 0, "oom_kill": 0, "oom_group_kill": 0}},
                         "reasons": [], "clock": {"source": "node:performance", "unit": "ms", "timeOrigin": 1},
                         "signalMeaning": "application supervisor disposal control write", "ackService": "LOCALFIXTURE",
                         "bounds": {"maxSamples": 268, "rawSampleBytes": 6144, "reportBytes": check.CAP,
@@ -109,7 +136,7 @@ def case():
                                  "allocationBytes": 8 * rounds * mib, "overheadBytes": 64 * mib,
                                  "chunkBytes": mib, "rounds": rounds, "windowMs": 30000},
                         "response": {"provenance": "synthetic", "reportId": expected["reportId"], "legs": [leg]},
-                        "derivation": derivation, "trees": trees, "settlement": settlement,
+                        "derivation": derivation, "samplingSchedule": sampling_schedule, "trees": trees, "settlement": settlement,
                         "cleanup": {"confirmed": True, "startMs": 1512, "endMs": 1520},
                         "finalCleanup": {"startMs": 2252, "endMs": 2253, "handles": 2, "joined": ["fulfilled", "fulfilled"], "driverCompleted": True,
                                          "clean": [{"clean": True}, {"clean": True}]},

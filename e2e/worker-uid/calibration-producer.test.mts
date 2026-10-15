@@ -4,9 +4,51 @@ import path from "node:path";
 import test, { mock } from "node:test";
 import { fileURLToPath } from "node:url";
 import { publishAck, readControl, runProducer, validateControl, validatePaths } from "./calibration-producer.mjs";
-import { expectedPrimaryExit, fixture, freshPostCleanupDwell, projectFailedEvidence } from "./calibration-fixture.mjs";
+import { calibrationUnits, expectedPrimaryExit, fixture, freshPostCleanupDwell, oomEventEvidence, plannedChargeClasses, projectFailedEvidence } from "./calibration-fixture.mjs";
 
 const scratch = fileURLToPath(new URL("../../.uzi/scratch/", import.meta.url));
+
+test("planned charge metadata names four fixed logical budgets without starting load", () => {
+  for (const [rounds, budget] of [[16, 33554432], [32, 67108864]] as const) {
+    const plan = { limitBytes: rounds / 16 * 1024 ** 3, ceilingBytes: rounds / 16 * 512 * 1024 ** 2,
+      baselineBytes: 0, allocationBytes: 4 * budget, overheadBytes: 64 * 1024 ** 2,
+      chunkBytes: 1048576, rounds, windowMs: 30000 };
+    assert.deepEqual(plannedChargeClasses(plan), [
+      "touched_anonymous", "dirty_disk", "fsynced_read_file_cache", "tmpfs_shmem",
+    ].map((kind) => ({ kind, producerCount: 2, chunkBytes: 1048576,
+      maxRoundsPerProducer: rounds, combinedBudgetBytes: budget })));
+    for (const change of [{ rounds: 17 }, { rounds: 0 }, { chunkBytes: 1 },
+      { allocationBytes: 1 }, { limitBytes: 1 }]) {
+      assert.throws(() => plannedChargeClasses({ ...plan, ...change }), /invalid fixed charge budget/);
+    }
+  }
+  assert.deepEqual(calibrationUnits, { memory: "bytes", monotonicTiming: "milliseconds",
+    growth: "bytes_per_millisecond", psiAverages: "percent", psiTotal: "microseconds",
+    events: "count", processStartIdentity: "opaque_kernel_start_ticks" });
+});
+
+test("OOM evidence preserves actual endpoint IDs, zero, partial unknowns and signed deltas", () => {
+  const before = { oom: 7, oom_kill: 3, oom_group_kill: 0 };
+  const after = { oom: 8, oom_kill: 1, oom_group_kill: 0 };
+  // Reader availability does not erase separately captured memory.events.
+  const records = [{ sample: { sampleId: 4, available: false }, events: before },
+    { sample: { sampleId: 5, available: true }, events: null },
+    { sample: { sampleId: 9, available: false }, events: after }];
+  assert.deepEqual(oomEventEvidence(records), { fromSampleId: 4, toSampleId: 9,
+    before, after, delta: { oom: 1, oom_kill: -2, oom_group_kill: 0 } });
+  assert.deepEqual(oomEventEvidence([records[0]!, { sample: { sampleId: 10 }, events: { oom: 0 } }]),
+    { fromSampleId: 4, toSampleId: 10, before, after: { oom: 0, oom_kill: null, oom_group_kill: null },
+      delta: { oom: -7, oom_kill: null, oom_group_kill: null } });
+  const zero = { oom: 0, oom_kill: 0, oom_group_kill: 0 };
+  assert.deepEqual(oomEventEvidence([{ sample: { sampleId: 1 }, events: zero }]),
+    { fromSampleId: 1, toSampleId: 1, before: zero, after: zero, delta: zero });
+  assert.deepEqual(oomEventEvidence([{ sample: { sampleId: 1 }, events: null },
+    { sample: { sampleId: 2 }, events: zero }]),
+    { fromSampleId: 1, toSampleId: 2, before: { oom: null, oom_kill: null, oom_group_kill: null },
+      after: zero, delta: { oom: null, oom_kill: null, oom_group_kill: null } });
+  assert.equal(oomEventEvidence([]), null);
+  assert.throws(() => oomEventEvidence([{ sample: { sampleId: 1 }, events: { oom: -1 } }]));
+});
 
 test("only an expected owned SIGKILL exit can settle a fixed producer", () => {
   assert.equal(expectedPrimaryExit(true, 137), true);
@@ -85,6 +127,9 @@ const enrolledTree = {
 
 test("NOLOAD failed mid-leg report retains observed evidence and explicit unknowns", () => {
   const facts = emptyEvidence();
+  facts.samplingSchedule = { periodMs: 250, anchorMs: 9,
+    rows: [{ sampleId: 7, requestedOrdinal: 0, dueAtMs: 9, dispatchAtMs: 9.5 }],
+    maxPositiveLatenessMs: null, maxAbsoluteJitterMs: null };
   facts.trees[0] = enrolledTree;
   facts.selectedIndex = 0;
   facts.feedback = { reason: "worker_memory_pressure", intervention_id: "intervention" };
@@ -110,6 +155,7 @@ test("NOLOAD failed mid-leg report retains observed evidence and explicit unknow
     exits: facts.exits, disposals: facts.disposals,
   });
   assert.deepEqual(report.cleanup, { confirmed: null, startMs: 16, endMs: null });
+  assert.deepEqual(report.samplingSchedule, facts.samplingSchedule);
   assert.equal(report.response, null);
   assert.equal("status" in report, false, "projection cannot promote failed proof to success");
 });
@@ -127,6 +173,7 @@ test("NOLOAD second setup failure retains first enrollment without inventing sec
   assert.equal(report.settlement.binding, null);
   assert.deepEqual(report.cleanup, { confirmed: null, startMs: null, endMs: null });
   assert.deepEqual(projectFailedEvidence(emptyEvidence()).trees, [null, null]);
+  assert.equal(projectFailedEvidence(emptyEvidence()).samplingSchedule, null);
 });
 
 test("fixed producer protocol accepts only the next bounded step", () => {

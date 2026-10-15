@@ -47,13 +47,15 @@ def same(actual, expected):
 def numeric_fields(value):
     """Validate owned numeric leaves even where correlation uses ordering/indexing."""
     naturals = {"schemaVersion", "limitBytes", "uid", "diskType", "shmemType", "sampleId",
-                "currentBytes", "pid", "index", "step", "selectedIndex", "handles",
+                "currentBytes", "requestedOrdinal", "fromSampleId", "toSampleId", "minSampleId", "maxSampleId", "pid", "index", "step", "selectedIndex", "handles",
                 "claim_generation", "memory_episode", "oomBefore", "oomAfter",
                 "oomKillsBefore", "oomKillsAfter", "oomGroupKillsBefore", "oomGroupKillsAfter"}
     if isinstance(value, dict):
         for key, child in value.items():
             if key in naturals:
                 integer(child)
+            elif key == "latenessMs":
+                require(type(child) in (int, float) and math.isfinite(child), "invalid signed lateness")
             elif ((key.endswith("Ms") and not isinstance(child, dict)) or
                   key in ("timeOrigin", "hostMonotonicStart", "hostMonotonicEnd")):
                 # Container and host clocks remain separate; only validate their units here.
@@ -178,6 +180,10 @@ def verify_report(report, manifest, expected, synthetic=False):
     require(report["status"] == "SUCCESS_COMPLETE" and report["reasons"] == [], "failed/incomplete report")
     require(report["clock"]["source"] == "node:performance" and report["clock"]["unit"] == "ms", "monotonic clock")
     number(report["clock"]["timeOrigin"])
+    require(same(report["units"], {
+        "memory": "bytes", "monotonicTiming": "milliseconds", "growth": "bytes_per_millisecond",
+        "psiAverages": "percent", "psiTotal": "microseconds", "events": "count",
+        "processStartIdentity": "opaque_kernel_start_ticks"}), "explicit units")
     require(report["signalMeaning"] == "application supervisor disposal control write", "signal meaning")
     require(report["ackService"] == "LOCALFIXTURE", "ACK provenance")
     require(same(report["bounds"], {"maxSamples": 268, "rawSampleBytes": 6144, "reportBytes": CAP,
@@ -222,6 +228,12 @@ def verify_report(report, manifest, expected, synthetic=False):
         require(all(k in events for k in EVENTS) and same(record["events"], events), "raw event mismatch")
         parsed[sid] = sample
         previous = sample
+    endpoints = [raw_samples[0], raw_samples[-1]]
+    before, after = [fields(r["raw"]["/sys/fs/cgroup/memory.events"]) for r in endpoints]
+    require(same(report["oomEvents"], {
+        "fromSampleId": endpoints[0]["sample"]["sampleId"], "toSampleId": endpoints[1]["sample"]["sampleId"],
+        "before": {k: before[k] for k in EVENTS}, "after": {k: after[k] for k in EVENTS},
+        "delta": {k: after[k] - before[k] for k in EVENTS}}), "raw OOM endpoint evidence")
     baseline, samples = report["baseline"], report["samples"]
     for sequence in (baseline, samples):
         require(3 <= len(sequence) <= 256, "baseline/load sample minimum")
@@ -236,6 +248,11 @@ def verify_report(report, manifest, expected, synthetic=False):
     require(same(report["plan"], {"limitBytes": limit, "ceilingBytes": limit // 2, "baselineBytes": bmax,
             "allocationBytes": 8 * rounds * MIB, "overheadBytes": 64 * MIB, "chunkBytes": MIB,
             "rounds": rounds, "windowMs": 30000}), "fixed allocation plan")
+    require(same(report["plannedChargeClasses"], [
+        {"kind": kind, "producerCount": 2, "chunkBytes": MIB, "maxRoundsPerProducer": rounds,
+         "combinedBudgetBytes": 2 * rounds * MIB}
+        for kind in ("touched_anonymous", "dirty_disk", "fsynced_read_file_cache", "tmpfs_shmem")]),
+        "planned charge class budgets")
     require(bmax + 8 * rounds * MIB + 64 * MIB <= limit // 2, "preload 50% budget")
     require(all(s["currentBytes"] + 64 * MIB <= limit // 2 for s in samples), "safety ceiling")
     guard = report["guard"]
@@ -282,10 +299,15 @@ def verify_report(report, manifest, expected, synthetic=False):
         require(all(record["events"][event] == before[event] for record in raw_samples), "intermediate OOM delta")
     elapsed = samples[-1]["completedAtMs"] - samples[0]["startedAtMs"]
     growth = []
+    pairs = []
     for low_sample, high_sample in zip(samples, samples[1:]):
         delta_ms = high_sample["completedAtMs"] - low_sample["completedAtMs"]
         require(delta_ms > 0, "nonpositive sample interval")
-        growth.append(max(0, high_sample["currentBytes"] - low_sample["currentBytes"]) / delta_ms)
+        delta = high_sample["currentBytes"] - low_sample["currentBytes"]
+        growth.append(max(0, delta) / delta_ms)
+        pairs.append({"fromSampleId": low_sample["sampleId"], "toSampleId": high_sample["sampleId"],
+                      "rawDeltaBytes": delta, "elapsedMs": delta_ms, "positiveRateBytesPerMs": growth[-1],
+                      "readGapMs": high_sample["startedAtMs"] - low_sample["completedAtMs"]})
     rate = max(growth)
     latency = spans["drain"]["endMs"] - bracket["lowerMs"]
     jitter = bmax - min(s["currentBytes"] for s in baseline)
@@ -300,6 +322,13 @@ def verify_report(report, manifest, expected, synthetic=False):
                 "drain": spans["drain"]["endMs"] - spans["signal"]["endMs"]}}
     derivation = {"fixtureOnly": True, "provenance": report["provenance"], "reportId": expected["reportId"],
                   "legs": [dleg], "elapsedMs": elapsed, "jitterBytes": jitter,
+                  "samplePairs": pairs,
+                  "peakPositiveGrowthPair": max(pairs, key=lambda p: p["positiveRateBytesPerMs"]),
+                  "maxSampleGapPair": max(pairs, key=lambda p: p["readGapMs"]),
+                  "baselineJitter": {"minSampleId": min(baseline, key=lambda s: s["currentBytes"])["sampleId"],
+                                     "minBytes": min(s["currentBytes"] for s in baseline),
+                                     "maxSampleId": max(baseline, key=lambda s: s["currentBytes"])["sampleId"],
+                                     "maxBytes": bmax},
                   "peakPositiveGrowthRateBytesPerMs": rate,
                   "maxSampleGapMs": max(b["startedAtMs"] - a["completedAtMs"] for a, b in zip(samples, samples[1:])),
                   "worstEndToEndLatencyMs": latency, "conservativeStageSumMs": sum(dleg["stageLatenciesMs"].values()),
@@ -308,6 +337,25 @@ def verify_report(report, manifest, expected, synthetic=False):
                   "responseMeasured": not synthetic, "accepted": not synthetic,
                   "reserveCheck": {"reserveBytes": guard["reserveBytes"], "requiredBytes": required, "satisfied": True}}
     require(same(report["derivation"], derivation), "recomputed derivation mismatch")
+    sampling = report["samplingSchedule"]
+    require(same(sampling["periodMs"], 250), "sampling period")
+    anchor = number(sampling["anchorMs"])
+    rows = sampling["rows"]
+    require(len(rows) == len(samples), "sampling row count")
+    expected_rows = []
+    for ordinal, (row, sample) in enumerate(zip(rows, samples)):
+        dispatch = number(row["dispatchAtMs"])
+        require(dispatch <= sample["startedAtMs"] and
+                (ordinal == 0 or dispatch >= samples[ordinal - 1]["completedAtMs"]), "sampling dispatch order")
+        due = anchor + ordinal * 250
+        expected_rows.append({"sampleId": sample["sampleId"], "requestedOrdinal": ordinal,
+                              "dueAtMs": due, "dispatchAtMs": dispatch,
+                              "startedAtMs": sample["startedAtMs"], "completedAtMs": sample["completedAtMs"],
+                              "latenessMs": sample["startedAtMs"] - due})
+    require(same(sampling, {"periodMs": 250, "anchorMs": anchor, "rows": expected_rows,
+                           "maxPositiveLatenessMs": max(0, *(r["latenessMs"] for r in expected_rows)),
+                           "maxAbsoluteJitterMs": max(abs(r["latenessMs"]) for r in expected_rows)}),
+            "recomputed sampling schedule mismatch")
     settlement = report["settlement"]
     trees = report["trees"]
     require(len(trees) == 2 and [t["treeId"] for t in trees] == expected["treeIds"], "two enrolled trees")

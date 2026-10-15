@@ -2693,7 +2693,9 @@ tasks:
       - cd agent && npx tsc --project ../e2e/worker-uid/tsconfig.json
 
   test:agent:worker-uid:
-    desc: agent - require real worker UID ownership tests inside the base image
+    desc: agent - require worker UID proofs and private cgroup memory calibration
+    # Direct I/O preserves standalone calibration report markers in CI.
+    interactive: true
     cmds:
       - task: test:worker-uid-harness
       - bash e2e/worker-uid/run.sh

@@ -1,6 +1,8 @@
 """Exercise the actual required-check shell body across dependency outcomes."""
+import json
 import os
 from pathlib import Path
+import shutil
 import subprocess
 import tempfile
 import textwrap
@@ -29,6 +31,50 @@ class RequiredCheckTest(unittest.TestCase):
                     result = subprocess.run(['bash', '-c', body], env=env,
                                             capture_output=True, timeout=5, check=False)
                     self.assertEqual(result.returncode, 37, result.stderr)
+
+    def test_required_task_preserves_standalone_report_lines(self):
+        root = Path(__file__).resolve().parents[2]
+        taskfile = (root / 'Taskfile.yml').read_text()
+        target = taskfile.split('  test:agent:worker-uid:\n', 1)[1].split('  test:agent:shard:', 1)[0]
+        task = shutil.which('task')
+        self.assertIsNotNone(task, 'Task is required to verify job stdout framing')
+        scratch = root / '.uzi/scratch'
+        scratch.mkdir(parents=True, exist_ok=True)
+        begin = 'UZI_MEMORY_CALIBRATION_REPORT_BEGIN'
+        end = 'UZI_MEMORY_CALIBRATION_REPORT_END'
+        with tempfile.TemporaryDirectory(prefix='calibration-task-frame.', dir=scratch) as directory:
+            directory = Path(directory)
+            (directory / 'e2e/worker-uid').mkdir(parents=True)
+            (directory / 'e2e/worker-uid/run.sh').write_text('exit 0\n')
+            fake = directory / 'python3'
+            # Framing only: this synthetic probe is deliberately not a measurement.
+            fake.write_text("#!/bin/sh\nprintf '%s\\n' '" + begin +
+                            "' '{\"synthetic\":true}' '" + end +
+                            "'\nexit \"" + '$' + "{CALIBRATION_TEST_EXIT:-0}\"\n")
+            fake.chmod(0o755)
+            env = {**os.environ, 'PATH': str(directory) + os.pathsep + os.environ['PATH'],
+                   'GITHUB_ACTIONS': 'true'}
+            candidate = directory / 'Taskfile.yml'
+            header = "version: '3'\noutput: prefixed\ntasks:\n"
+            stub = "  test:worker-uid-harness:\n    cmds:\n      - 'true'\n"
+            for direct in (False, True):
+                body = target if direct else target.replace('    interactive: true\n', '')
+                candidate.write_text(header + '  test:agent:worker-uid:\n' + body + stub)
+                result = subprocess.run([task, '--taskfile', str(candidate), 'test:agent:worker-uid'],
+                                        cwd=directory, env=env, capture_output=True, text=True, timeout=10)
+                self.assertEqual(result.returncode, 0, result.stderr)
+                lines = result.stdout.splitlines()
+                if direct:
+                    self.assertEqual(lines.count(begin), 1)
+                    self.assertEqual(lines.count(end), 1)
+                    self.assertEqual(json.loads(lines[lines.index(begin) + 1]), {'synthetic': True})
+                    failed = subprocess.run([task, '--taskfile', str(candidate), 'test:agent:worker-uid'],
+                                            cwd=directory, env={**env, 'CALIBRATION_TEST_EXIT': '37'},
+                                            capture_output=True, text=True, timeout=10)
+                    self.assertNotEqual(failed.returncode, 0)
+                else:
+                    self.assertNotIn(begin, lines)
+                    self.assertTrue(any(line.endswith(begin) for line in lines))
 
     def test_dependency_truth_table(self):
         workflow = (Path(__file__).resolve().parents[2] / '.github/workflows/ci.yml').read_text()

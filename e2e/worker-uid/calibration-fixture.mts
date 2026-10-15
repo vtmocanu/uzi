@@ -14,7 +14,7 @@ import { WorkerMemoryCommands } from "../../agent/src/worker-memory-commands.js"
 import { WorkerMemoryMonitor } from "../../agent/src/worker-memory-guard.js";
 import { WorkerMemoryReader } from "../../agent/src/worker-memory-reader.js";
 import type { MemoryReservation, MemoryReservationRequest, WorkerMemoryPressureResult } from "../../agent/src/protocol.js";
-import { calibrationPlan, calibrationReport, type CalibrationBinding, type CalibrationLegResponse } from "../../agent/test/helpers/worker-memory-calibration.js";
+import { calibrationPlan, calibrationReport, calibrationSchedulingReport, type CalibrationSchedulingObservation, type CalibrationBinding, type CalibrationLegResponse } from "../../agent/test/helpers/worker-memory-calibration.js";
 import { commandTreeCalibration, type CalibrationIntervention, type CommandStep, type EnrolledCalibrationProducer } from "../../agent/test/helpers/worker-memory-command-driver.js";
 
 // Six baseline reads plus load, owned cleanup and fresh quiet dwell at 250ms,
@@ -69,10 +69,39 @@ function counters(raw: string) {
   for (const key of ["oom", "oom_kill", "oom_group_kill"]) assert.ok(key in result, "missing event " + key);
   return result;
 }
+export const calibrationUnits = {
+  memory: "bytes", monotonicTiming: "milliseconds", growth: "bytes_per_millisecond",
+  psiAverages: "percent", psiTotal: "microseconds", events: "count",
+  processStartIdentity: "opaque_kernel_start_ticks",
+};
+export function plannedChargeClasses(plan: ReturnType<typeof calibrationPlan>) {
+  assert.ok([16, 32].includes(plan.rounds) && plan.chunkBytes === 1024 ** 2
+    && plan.limitBytes === (plan.rounds / 16) * 1024 ** 3
+    && plan.allocationBytes === 8 * plan.rounds * plan.chunkBytes, "invalid fixed charge budget");
+  return ["touched_anonymous", "dirty_disk", "fsynced_read_file_cache", "tmpfs_shmem"].map((kind) => ({
+    kind, producerCount: 2, chunkBytes: plan.chunkBytes, maxRoundsPerProducer: plan.rounds,
+    combinedBudgetBytes: 2 * plan.rounds * plan.chunkBytes,
+  }));
+}
+type EventRecord = { sample: { sampleId: number }; events: Partial<Record<string, number>> | null };
+export function oomEventEvidence(records: readonly EventRecord[]) {
+  const first = records[0], last = records.at(-1);
+  if (!first || !last) return null;
+  const before: Record<string, number | null> = {}, after: Record<string, number | null> = {};
+  const delta: Record<string, number | null> = {};
+  for (const key of ["oom", "oom_kill", "oom_group_kill"]) {
+    const a = first.events?.[key] ?? null, b = last.events?.[key] ?? null;
+    assert.ok([a, b].every((v) => v === null || (Number.isSafeInteger(v) && v >= 0)), "invalid OOM counter");
+    before[key] = a; after[key] = b;
+    delta[key] = a === null || b === null ? null : b - a;
+  }
+  return { fromSampleId: first.sample.sampleId, toSampleId: last.sample.sampleId, before, after, delta };
+}
 type TreeMetadata = Pick<EnrolledCalibrationProducer, "treeId" | "identity" | "enrollment">;
 
 // Serialization only: callers supply captured metadata, never registry entries or contexts.
 export function projectFailedEvidence(facts: {
+  samplingSchedule?: unknown;
   trees: (TreeMetadata | null)[];
   exits: { index: number; atMs: number; code: number }[];
   disposals: { index: number; startMs: number; endMs: number; clean: boolean; evidence: unknown }[];
@@ -94,6 +123,7 @@ export function projectFailedEvidence(facts: {
   cleanupEnd: number | undefined;
 }) {
   return {
+    samplingSchedule: facts.samplingSchedule ?? null,
     trees: [0, 1].map((index) => {
       const tree = facts.trees[index];
       return tree ? { treeId: tree.treeId, identity: tree.identity, enrollment: tree.enrollment,
@@ -150,6 +180,8 @@ export async function fixture(manifestFile: string, fixtureId: string) {
   const report: Record<string, unknown> = {
     schemaVersion: 1, ...manifest.identity, ...expected, provenance: "measured",
     status: "FAILED", reasons: [], observed: null, guard: null, plan: null,
+    units: calibrationUnits, plannedChargeClasses: null, oomEvents: null, rawSamples: [], finalCleanup: null,
+    samplingSchedule: { periodMs: 250, anchorMs: null, rows: [], maxPositiveLatenessMs: null, maxAbsoluteJitterMs: null },
     baseline: [], samples: [], response: null, derivation: null, trees: [],
     settlement: null, cleanup: null, outcome: { status: "failed", reasons: ["not settled"] },
     clock: { source: "node:performance", unit: "ms", timeOrigin: performance.timeOrigin },
@@ -160,6 +192,10 @@ export async function fixture(manifestFile: string, fixtureId: string) {
   const reasons: string[] = [];
   const rawSamples: { sample: Sample; raw: Record<string, string | null>; events: Record<string, number> | null }[] = [];
   const baseline: Available[] = [], samples: Available[] = [];
+  const schedulingObservations: CalibrationSchedulingObservation[] = [];
+  let schedulingAnchor: number | null = null;
+  let samplingSchedule: ReturnType<typeof calibrationSchedulingReport> | undefined;
+  let requested: Omit<CalibrationSchedulingObservation, "sampleId"> | undefined;
   let raw: Record<string, string | null> = {}, rawBytes = 0;
   const reader = new WorkerMemoryReader({ readBytes: (file, max) => {
     try {
@@ -174,6 +210,8 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     if (rawSamples.length >= MAX_SAMPLES) throw new Error("sample bound exceeded");
     raw = {}; rawBytes = 0;
     const value = reader.sample();
+    // Capture real reader identity/times even if availability or event checks fail.
+    if (requested) schedulingObservations.push({ ...requested, sampleId: value.sampleId });
     let events: Record<string, number> | null = null;
     try {
       const bytes = readBounded("/sys/fs/cgroup/memory.events", RAW_SAMPLE_BYTES - rawBytes);
@@ -230,6 +268,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     // Prerequisites and full fixed budget are verified BEFORE either command tree starts.
     let plan = calibrationPlan({ dedicated: true, baseline, windowMs: 30000 });
     report.plan = plan;
+    report.plannedChargeClasses = plannedChargeClasses(plan);
     let high = plan.baselineBytes + 32 * 1024 ** 2;
     const guard = { enabled: true as const, reserveBytes: plan.limitBytes - high, hysteresisBytes: 8 * 1024 ** 2,
       sampleMs: 250, responseBudgetMs: 5000, rearmMs: 500, maxInterventions: 2 };
@@ -361,6 +400,7 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     guard.reserveBytes = plan.limitBytes - high;
     assert.ok(0 < high - guard.hysteresisBytes && high < plan.ceilingBytes);
     report.plan = plan; report.guard = guard;
+    report.plannedChargeClasses = plannedChargeClasses(plan);
     const entries = commands.eligibleEntries()!; assert.equal(entries.length, 2);
     const producerPair = entries.map((_entry, index): EnrolledCalibrationProducer => {
       const metadata = treeMetadata[index]!;
@@ -469,7 +509,14 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       feedback: async (value) => { actualFeedback = value; feedback.resolve(value); },
       preserve: async () => { throw new Error("unexpected preservation"); },
     });
-    const tick = () => { try { monitor!.tick(); } catch (error) { fatal = error; failures[0]!.reject(error); } };
+    let requestedOrdinal = 0;
+    const tick = () => {
+      requested = { requestedOrdinal, dueAtMs: schedulingAnchor! + requestedOrdinal * 250, dispatchAtMs: now() };
+      requestedOrdinal++;
+      try { monitor!.tick(); } catch (error) { fatal = error; failures[0]!.reject(error); }
+      finally { requested = undefined; }
+    };
+    schedulingAnchor = now();
     tick();
     interval = setInterval(tick, 250);
     await commandTreeCalibration(plan, { producers: producerPair, intervention: intervention.promise });
@@ -513,6 +560,9 @@ export async function fixture(manifestFile: string, fixtureId: string) {
     const response = { provenance: "measured" as const, reportId: expected.reportId, legs: [leg] };
     const derivation = calibrationReport({ baseline, samples, reserveBytes: guard.reserveBytes, response });
     assert.equal(derivation.accepted, true);
+    report.samplingSchedule = samplingSchedule = calibrationSchedulingReport(samples, {
+      periodMs: 250, anchorMs: schedulingAnchor, observations: schedulingObservations,
+    });
     report.response = response; report.derivation = derivation;
     report.trees = producerPair.map((p, index) => ({ treeId: p.treeId, identity: p.identity, enrollment: p.enrollment,
       exits: exits.filter((e) => e.index === index), disposals: disposals.filter((d) => d.index === index).slice(0, 1) }));
@@ -544,10 +594,17 @@ export async function fixture(manifestFile: string, fixtureId: string) {
       clean: cleaned.map((r) => r.status === "fulfilled" ? r.value : { unknown: true, failure: String(r.reason) }),
       joined: joined.map((r) => r.status), driverCompleted };
     report.baseline = baseline; report.samples = samples; report.rawSamples = rawSamples;
+    const oomEvents = oomEventEvidence(rawSamples);
+    report.oomEvents = oomEvents;
+    if (oomEvents && Object.values(oomEvents.delta).some((v) => v !== null && v < 0)) {
+      reasons.push("OOM counter decreased");
+    }
     report.reasons = reasons;
     if (reasons.length) report.status = "FAILED";
     if (report.status === "FAILED") {
       Object.assign(report, projectFailedEvidence({
+        samplingSchedule: samplingSchedule ?? { periodMs: 250, anchorMs: schedulingAnchor, rows: schedulingObservations,
+          maxPositiveLatenessMs: null, maxAbsoluteJitterMs: null },
         trees: treeMetadata, exits, disposals, feedback: actualFeedback, brokerReplies,
         serviceRecords, acknowledgements, observations, signalWrites, schedule, survival,
         selectedIndex, binding, monitorState: monitor?.state ?? null, history: monitor?.history ?? null,

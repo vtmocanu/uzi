@@ -25,6 +25,75 @@ class CheckerTest(unittest.TestCase):
         with self.assertRaises(ValueError):
             check.verify(self.manifest, encode(values), self.cleanup)
 
+    def test_literal_pairs_and_earliest_ties(self):
+        derivation = self.verify()[0]["derivation"]
+        self.assertEqual(derivation["samplePairs"][2], {
+            "fromSampleId": 6, "toSampleId": 7, "rawDeltaBytes": -37748736,
+            "elapsedMs": 250, "positiveRateBytesPerMs": 0, "readGapMs": 249})
+        self.assertEqual(derivation["peakPositiveGrowthPair"]["fromSampleId"], 4)
+        self.assertEqual(derivation["maxSampleGapPair"]["fromSampleId"], 4)
+        self.assertEqual(derivation["baselineJitter"]["minSampleId"], 1)
+        self.assertEqual(derivation["baselineJitter"]["maxSampleId"], 1)
+
+    def test_peak_growth_tie_selects_earliest_pair(self):
+        report = self.reports[0]
+        raw = report["rawSamples"][3]
+        raw["sample"]["currentBytes"] = 109051904
+        raw["sample"]["stat"]["anon"] = 109051904
+        raw["raw"]["/sys/fs/cgroup/memory.current"] = "109051904\n"
+        raw["raw"]["/sys/fs/cgroup/memory.stat"] = "anon 109051904\nshmem 0\nslab_unreclaimable 0\nunevictable 0\n"
+        derivation = report["derivation"]
+        derivation["samplePairs"][0].update(rawDeltaBytes=16777216, positiveRateBytesPerMs=67108.864)
+        derivation.update(peakPositiveGrowthPair=copy.deepcopy(derivation["samplePairs"][0]),
+                          maxSampleGapPair=copy.deepcopy(derivation["samplePairs"][0]),
+                          peakPositiveGrowthRateBytesPerMs=67108.864, netGrowthBytes=-4194304)
+        derivation["reserveCheck"]["requiredBytes"] = 17448304.64
+        self.verify()
+        derivation["peakPositiveGrowthPair"] = copy.deepcopy(derivation["samplePairs"][1])
+        with self.assertRaisesRegex(ValueError, "derivation mismatch"):
+            self.verify()
+
+    def test_pair_and_scheduling_refusals(self):
+        mutations = [
+            lambda r: r.pop("samplingSchedule"),
+            lambda r: r["samplingSchedule"]["rows"].pop(),
+            lambda r: r["samplingSchedule"]["rows"].reverse(),
+        ]
+        for field, value in (("fromSampleId", 5), ("toSampleId", 6), ("rawDeltaBytes", 1),
+                             ("elapsedMs", 249), ("positiveRateBytesPerMs", 0), ("readGapMs", 250)):
+            mutations.append(lambda r, k=field, v=value: r["derivation"]["samplePairs"][0].update({k: v}))
+        for field in ("peakPositiveGrowthPair", "maxSampleGapPair"):
+            mutations.append(lambda r, k=field: r["derivation"][k].update(fromSampleId=8))
+        for field in ("minSampleId", "maxSampleId", "minBytes", "maxBytes"):
+            mutations.append(lambda r, k=field: r["derivation"]["baselineJitter"].update({k: 2}))
+        for field, value in (("sampleId", 4), ("requestedOrdinal", 0), ("requestedOrdinal", True),
+                             ("dueAtMs", 1251), ("dispatchAtMs", 1251), ("dispatchAtMs", 0),
+                             ("startedAtMs", 1251), ("completedAtMs", 1252), ("latenessMs", True)):
+            mutations.append(lambda r, k=field, v=value: r["samplingSchedule"]["rows"][1].update({k: v}))
+        for field, value in (("anchorMs", -1), ("anchorMs", True), ("anchorMs", 1001),
+                             ("periodMs", 251), ("maxPositiveLatenessMs", 1), ("maxAbsoluteJitterMs", 1)):
+            mutations.append(lambda r, k=field, v=value: r["samplingSchedule"].update({k: v}))
+        for index, mutate in enumerate(mutations):
+            with self.subTest(index=index):
+                self.setUp()
+                mutate(self.reports[0])
+                with self.assertRaises((ValueError, KeyError, TypeError)):
+                    self.verify()
+
+    def test_signed_early_and_late_scheduling_is_valid(self):
+        report = self.reports[0]
+        report["samples"][0]["startedAtMs"] = 999
+        report["samples"][3]["startedAtMs"] = 1751
+        rows = report["samplingSchedule"]["rows"]
+        rows[0].update(startedAtMs=999, dispatchAtMs=998, latenessMs=-1)
+        rows[3].update(startedAtMs=1751, latenessMs=1)
+        report["samplingSchedule"].update(maxPositiveLatenessMs=1, maxAbsoluteJitterMs=1)
+        derivation = report["derivation"]
+        derivation["samplePairs"][2]["readGapMs"] = 250
+        derivation.update(elapsedMs=1252, maxSampleGapMs=250,
+                          maxSampleGapPair=copy.deepcopy(derivation["samplePairs"][2]))
+        self.verify()
+
     def test_quiet_samples_shifted_exactly_100_seconds(self):
         report = self.reports[0]
         for sample in report["samples"][3:]:
@@ -37,7 +106,7 @@ class CheckerTest(unittest.TestCase):
     def test_captured_process_window_includes_preload_time(self):
         # Remove shared fixture objects so each timestamp is shifted once.
         self.manifest, self.reports, self.cleanup = json.loads(json.dumps(case()))
-        times = {"startedAtMs", "completedAtMs", "startMs", "endMs", "lowerMs", "upperMs", "atMs"}
+        times = {"startedAtMs", "completedAtMs", "startMs", "endMs", "lowerMs", "upperMs", "atMs", "anchorMs", "dueAtMs", "dispatchAtMs"}
 
         def shift(value):
             if isinstance(value, dict):
@@ -129,12 +198,13 @@ class CheckerTest(unittest.TestCase):
             final = copy.deepcopy(report["rawSamples"][-1])
             final["sample"].update(sampleId=10, startedAtMs=2252, completedAtMs=2253)
             report["rawSamples"] = [prefix, *report["rawSamples"], final]
+            report["oomEvents"].update(fromSampleId=0, toSampleId=10)
         self.verify()
 
     def test_coherent_evidence_beyond_fixture_wall(self):
         # Decode first so each raw/projected timestamp moves exactly once.
         self.reports = check.reports(encode(self.reports))
-        time_keys = {"startMs", "endMs", "startedAtMs", "completedAtMs", "atMs", "lowerMs", "upperMs"}
+        time_keys = {"startMs", "endMs", "startedAtMs", "completedAtMs", "atMs", "lowerMs", "upperMs", "anchorMs", "dueAtMs", "dispatchAtMs"}
         def shift(value):
             if isinstance(value, dict):
                 for key, child in value.items():
@@ -197,6 +267,48 @@ class CheckerTest(unittest.TestCase):
         self.reports = floats(self.reports)
         self.verify()
         self.verify()
+
+    def test_explicit_metadata_corruption_is_refused(self):
+        mutations = [
+            lambda r: r["plannedChargeClasses"][0].update(kind="anonymous"),
+            lambda r: r["plannedChargeClasses"][0].update(producerCount=1),
+            lambda r: r["plannedChargeClasses"][0].update(producerCount=True),
+            lambda r: r["plannedChargeClasses"][0].update(chunkBytes=1),
+            lambda r: r["plannedChargeClasses"][0].update(maxRoundsPerProducer=32),
+            lambda r: r["plannedChargeClasses"][0].update(combinedBudgetBytes=67108864),
+            lambda r: r["plannedChargeClasses"].reverse(),
+            lambda r: r["units"].update(growth="bytes_per_second"),
+            lambda r: r["units"].update(processStartIdentity="milliseconds"),
+            lambda r: r["units"].update(events=True),
+            lambda r: r["oomEvents"].update(fromSampleId=4),
+            lambda r: r["oomEvents"].update(toSampleId=8),
+            lambda r: r["oomEvents"]["before"].update(oom=1),
+            lambda r: r["oomEvents"]["after"].update(oom_kill=1),
+            lambda r: r["oomEvents"]["delta"].update(oom_group_kill=1),
+            lambda r: r["oomEvents"]["delta"].update(oom=-1),
+        ]
+        for section in ("before", "after", "delta"):
+            for value in (None, False, "0"):
+                mutations.append(lambda r, s=section, v=value: r["oomEvents"][s].update(oom=v))
+            mutations.append(lambda r, s=section: r["oomEvents"][s].pop("oom"))
+        for key in self.reports[0]["units"]:
+            mutations.append(lambda r, k=key: r["units"].update({k: "wrong"}))
+        for mutate in mutations:
+            with self.subTest(mutation=mutate):
+                self.setUp()
+                mutate(self.reports[0])
+                with self.assertRaises((ValueError, KeyError, TypeError)):
+                    self.verify()
+
+    def test_host_aborted_metadata_is_unknown_and_cannot_pass(self):
+        import calibration
+        host = calibration.Host(self.manifest, None, "unused")
+        report = host.aborted(self.manifest["fixtures"][0], "before producer")
+        for key in ("units", "plannedChargeClasses", "oomEvents"):
+            self.assertIsNone(report[key])
+        self.reports[0] = report
+        with self.assertRaises((ValueError, KeyError, TypeError)):
+            self.verify()
 
     def test_every_top_level_field_is_required(self):
         original = copy.deepcopy(self.reports)

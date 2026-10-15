@@ -1,6 +1,6 @@
 import assert from "node:assert/strict";
 import { test } from "node:test";
-import { calibrationPlan, calibrationLoad, calibrationReport, calibrationThreadPort } from "./helpers/worker-memory-calibration.js";
+import { calibrationPlan, calibrationLoad, calibrationReport, calibrationSchedulingReport, calibrationThreadPort } from "./helpers/worker-memory-calibration.js";
 import type { WorkerMemoryReader } from "../src/worker-memory-reader.js";
 
 const MiB = 1024 * 1024;
@@ -257,6 +257,80 @@ test("growth uses peak positive raw sample pair, including after a decrease", ()
   assert.equal(report.peakPositiveGrowthRateBytesPerMs, 40);
   assert.equal(report.monotonicGrowth, false);
   assert.equal(report.reserveCheck.requiredBytes, 1210);
+});
+
+test("synthetic pair derivations retain signed deltas, earliest ties and baseline extrema", () => {
+  const input = reportInput();
+  input.baseline = [sample(1, 100), sample(2, 110), sample(3, 100)];
+  input.samples = [sample(4, 200), sample(5, 300), sample(6, 250), sample(7, 350)];
+  const report = calibrationReport(input);
+  assert.deepEqual(report.samplePairs, [
+    { fromSampleId: 4, toSampleId: 5, rawDeltaBytes: 100, elapsedMs: 10, positiveRateBytesPerMs: 10, readGapMs: 9 },
+    { fromSampleId: 5, toSampleId: 6, rawDeltaBytes: -50, elapsedMs: 10, positiveRateBytesPerMs: 0, readGapMs: 9 },
+    { fromSampleId: 6, toSampleId: 7, rawDeltaBytes: 100, elapsedMs: 10, positiveRateBytesPerMs: 10, readGapMs: 9 },
+  ]);
+  assert.deepEqual(report.peakPositiveGrowthPair, report.samplePairs[0]);
+  assert.deepEqual(report.maxSampleGapPair, report.samplePairs[0]);
+  assert.deepEqual(report.baselineJitter, {
+    minSampleId: 1, minBytes: 100, maxSampleId: 2, maxBytes: 110,
+  });
+  assert.equal(report.jitterBytes, 10);
+  assert.equal(report.reserveCheck.requiredBytes, 310);
+});
+
+function schedulingInput() {
+  const samples = [
+    { ...sample(4), startedAtMs: 99, completedAtMs: 101 },
+    { ...sample(5), startedAtMs: 353, completedAtMs: 357 },
+    { ...sample(6), startedAtMs: 610, completedAtMs: 612 },
+  ];
+  return { samples, options: { periodMs: 250, anchorMs: 100, observations: [
+    { sampleId: 4, requestedOrdinal: 0, dueAtMs: 100, dispatchAtMs: 98 },
+    { sampleId: 5, requestedOrdinal: 1, dueAtMs: 350, dispatchAtMs: 352 },
+    { sampleId: 6, requestedOrdinal: 2, dueAtMs: 600, dispatchAtMs: 601 },
+  ] } };
+}
+
+test("synthetic scheduling retains early, late and delayed reads without claiming measurement", () => {
+  const { samples, options } = schedulingInput();
+  assert.deepEqual(calibrationSchedulingReport(samples, options), {
+    periodMs: 250, anchorMs: 100, rows: [
+      { ...options.observations[0], startedAtMs: 99, completedAtMs: 101, latenessMs: -1 },
+      { ...options.observations[1], startedAtMs: 353, completedAtMs: 357, latenessMs: 3 },
+      { ...options.observations[2], startedAtMs: 610, completedAtMs: 612, latenessMs: 10 },
+    ], maxPositiveLatenessMs: 10, maxAbsoluteJitterMs: 10,
+  });
+  const early = calibrationSchedulingReport(samples.slice(0, 1), {
+    ...options, observations: options.observations.slice(0, 1),
+  });
+  assert.equal(early.maxPositiveLatenessMs, 0);
+  assert.equal(early.maxAbsoluteJitterMs, 1);
+});
+
+test("scheduling rejects incomplete, uncorrelated, unordered, unbounded or nonfinite evidence", () => {
+  const mutations: ((i: ReturnType<typeof schedulingInput>) => void)[] = [
+    (i) => { i.options.observations.pop(); },
+    (i) => { i.options.observations.push(i.options.observations[2]!); },
+    (i) => { i.options.observations[1]!.sampleId = 4; },
+    (i) => { i.options.observations[1]!.sampleId = 99; },
+    (i) => { i.options.observations.reverse(); },
+    (i) => { i.options.observations[1]!.requestedOrdinal = 2; },
+    (i) => { i.options.observations[1]!.dueAtMs = 351; },
+    (i) => { i.options.observations[1]!.dispatchAtMs = 354; },
+    (i) => { i.options.observations[1]!.dispatchAtMs = NaN; },
+    (i) => { i.options.observations[1] = undefined!; },
+    (i) => { i.samples[1]!.startedAtMs = NaN; },
+    (i) => { i.samples[1]!.startedAtMs = 100; },
+    (i) => { i.samples[1]!.limitBytes *= 2; },
+    (i) => { i.options.anchorMs = Infinity; },
+    (i) => { i.samples = []; i.options.observations = []; },
+    (i) => { i.samples = Array(257).fill(i.samples[0]); },
+    ...[0, -1, 0.5, NaN, Infinity].map((periodMs) => (i: ReturnType<typeof schedulingInput>) => { i.options.periodMs = periodMs; }),
+  ];
+  for (const mutate of mutations) {
+    const input = schedulingInput(); mutate(input);
+    assert.throws(() => calibrationSchedulingReport(input.samples, input.options));
+  }
 });
 
 test("early PSI is retained as context and cannot substitute for the hard crossing response", () => {

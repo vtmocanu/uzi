@@ -271,7 +271,8 @@ class Host:
         return {"schemaVersion": 1, **self.manifest["identity"], **fixture,
                 "provenance": "measured", "status": "FAILED", "reasons": [reason],
                 **{key: None for key in ("observed", "guard", "plan", "clock", "bounds", "response",
-                                        "derivation", "settlement", "cleanup", "finalCleanup")},
+                                        "derivation", "samplingSchedule", "settlement", "cleanup", "finalCleanup",
+                                        "units", "plannedChargeClasses", "oomEvents")},
                 "baseline": [], "samples": [], "rawSamples": [], "trees": [],
                 "signalMeaning": "application supervisor disposal control write", "ackService": "LOCALFIXTURE",
                 "outcome": {"status": "failed", "reasons": ["host aborted"], "successor": "aborted"}}
