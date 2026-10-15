@@ -1,5 +1,7 @@
+import { Readable } from "node:stream";
 import { it } from "node:test";
 import { RunRunner } from "../src/runner.js";
+import { prepareFrozenHeld, type HeldGit } from "../src/frozen-held.js";
 import { RequestError } from "../src/client.js";
 import type { RecoveryFinalDisposition, RecoveryReserveRequest } from "../src/protocol.js";
 import { execFileSync } from "node:child_process";
@@ -15,6 +17,260 @@ import { buildRecoveryLiveTiming } from "../src/main.js";
 
 const H = "a".repeat(40);
 const H2 = "b".repeat(40);
+
+// V2 records retain original generation and preparation policy across worker drift.
+async function v2FrozenFixture(kind: PositiveOwedCandidateContext["kind"] = "issue") {
+  const f = await fixture(true);
+  const order: string[] = [];
+  const holdId = "00000000-0000-4000-8000-000000000007";
+  const repoId = "00000000-0000-4000-8000-000000000008";
+  const publicationId = "00000000-0000-4000-8000-000000000009";
+  let hold: "open" | "discarded" | "unknown" = "open";
+  Object.assign(f.client, {
+    hasHeldPublicationV2: () => true,
+    listRecoveryHolds: async () => ({ run_id: "run-1", holds: [{
+      hold_id: holdId, generation: 7, inventory_guarded: true, has_available_capture: false,
+    }] }),
+    getExactRecoveryHold: async () => hold === "unknown" ? undefined : ({
+      run_id: "run-1", hold_id: holdId, repo_id: repoId, generation: 7, state: hold,
+      original_worker_id: "original", original_worker_identity: "original", inventory_guarded: true,
+      run_status: f.state.status, current_claim_generation: f.state.ownGeneration, claim_released: true,
+      ...(hold === "open" ? { live_worker_id: "original", live_run_id: "run-1" } : { release_evidence: "owner_discard" }),
+    }),
+    publishHeld: async (run: string, gen: number, tip: string, digest: string) => {
+      order.push("held");
+      assert.equal(gen, 7);
+      const saved = (await f.coordinator.inspect(run))[0]!;
+      assert.equal(tip, saved.sourceSha);
+      assert.equal(digest, saved.coverageDigest);
+      return { ok: true, body: { publication_id: publicationId, ref: `refs/uzi-held/${run}/${gen}`, tip, state: "created" } };
+    },
+  });
+  Object.assign(f.git, {
+    resolveCheckpointRange: async () => { order.push("range"); return { frozenRange: true }; },
+    secretScanCheckpointRange: async (_bare: string, range: unknown) => {
+      assert.deepEqual(range, { frozenRange: true }); order.push("scan");
+      return { trusted: true, findings: [] };
+    },
+    rangeTouchesWorkflows: async () => { order.push("workflow"); return "clean"; },
+    changedFilesNoRenames: async () => { order.push("ci"); return []; },
+    checkpointPack: async (_bare: string, _branch: string, _overlay: unknown, range: unknown,
+      _signal: unknown, tip: string) => {
+      assert.deepEqual(range, { frozenRange: true }); order.push("pack");
+      return { tipOid: tip, pack: Readable.from([Buffer.from("PACK")]), exited: Promise.resolve(0) };
+    },
+  });
+  f.state.onProduce = () => order.push("archive");
+  f.context.kind = kind;
+  for (const candidate of f.state.candidates) for (const ctx of candidate.contexts) ctx.kind = kind;
+  const record = await f.coordinator.freezeInventory({
+    context: f.context, currentSha: H, defaultBranch: "main", repoId,
+    heldPolicy: { version: 1, blocked: false, everKnown: false, flaggedCommits: [],
+      ciGlobs: [".custom-ci/**"], extraFloors: [] },
+  });
+  assert.ok(record);
+  f.state.ownGeneration = 8;
+  const operate = () => f.coordinator.operateFrozenInventory({
+    record, barePath: f.context.barePath, defaultBranch: "main",
+  });
+  return { ...f, order, record, operate, setHold: (state: typeof hold) => { hold = state; } };
+}
+
+it("M3 remembered held scan finding survives restart and a later clean scan", async () => {
+  const f = await v2FrozenFixture();
+  try {
+    f.state.failProduce = true;
+    Object.assign(f.git, { secretScanCheckpointRange: async () => ({ trusted: true, findings: [{ commit: H }] }) });
+    await f.operate();
+    assert.equal((await f.coordinator.inspect("run-1"))[0]?.heldPolicy?.blocked, true);
+    Object.assign(f.git, { secretScanCheckpointRange: async () => ({ trusted: true, findings: [] }) });
+    await f.make(true).resumePending(undefined, [f.record]);
+    assert.equal(f.order.includes("held"), false);
+  } finally { await f.close(); }
+});
+
+for (const foreground of [false, true]) {
+  it(`B exact terminal observation survives ownership drift foreground=${foreground}`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      Object.assign(f.client, { getRunOwnership: async () => { throw ownershipLost(); } });
+      const result = await f.coordinator.operateFrozenInventory({
+        record: f.record, barePath: f.context.barePath, defaultBranch: "main",
+      }, { foreground, terminal: foreground ? { status: "failed" } : undefined });
+      assert.equal(result.held, "acked");
+      assert.ok(f.order.includes("held"));
+      assert.equal(f.state.produced, 0);
+    } finally { await f.close(); }
+  });
+}
+
+for (const invalid of ["generation", "status", "repo"] as const) {
+  it(`B foreground refuses held publication on exact observation ${invalid} mismatch`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      const observe = (f.client as RecoveryArchiveClient).getExactRecoveryHold!;
+      Object.assign(f.client, { getExactRecoveryHold: async () => {
+        const exact = await observe(f.record.runId, f.record.generation!, f.record.exactHoldBinding!);
+        return { ...exact, ...(invalid === "generation" ? { generation: 8 } :
+          invalid === "status" ? { run_status: "running" } : { repo_id: "foreign" }) };
+      } });
+      await f.coordinator.operateFrozenInventory({
+        record: f.record, barePath: f.context.barePath, defaultBranch: "main",
+      }, { foreground: true, terminal: { status: "failed" } });
+      assert.equal(f.order.includes("held"), false);
+    } finally { await f.close(); }
+  });
+}
+
+for (const readback of ["created", "create_unknown", "refused", "pack_invalid", "mismatch", "settled"]) {
+  it(`B unknown create restart readback ${readback} never resends a pack`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      let sends = 0, reads = 0;
+      Object.assign(f.client, {
+        publishHeld: async (run: string, gen: number, tip: string, digest: string, pack: Buffer) => {
+          assert.equal(gen, f.record.generation);
+          assert.equal(tip, f.record.sourceSha);
+          assert.equal(digest, f.record.coverageDigest);
+          if (pack.length) { sends++; throw new Error("lost create response"); }
+          reads++;
+          if (readback === "pack_invalid") return { ok: false, httpStatus: 400, reason: "pack_invalid" };
+          return { ok: true, body: {
+            publication_id: "00000000-0000-4000-8000-000000000009",
+            ref: `refs/uzi-held/${run}/${gen}`,
+            tip: readback === "mismatch" ? H2 : tip,
+            state: readback === "mismatch" ? "created" : readback,
+            ...(readback === "refused" ? { reason: "create_refused" } : {}),
+          } };
+        },
+      });
+      assert.equal((await f.operate()).held, "kept");
+      assert.equal((await f.coordinator.inspect("run-1"))[0]?.heldCreateUncertain, true);
+      const before = [...f.order];
+      if (readback === "settled") f.setHold("discarded");
+      const restarted = f.make(true);
+      await restarted.resumePending(undefined, [f.record]);
+      assert.equal(sends, 1);
+      assert.equal(reads, readback === "settled" ? 0 : 1);
+      assert.deepEqual(f.order.filter(x => x !== "archive"), before);
+      if (readback === "created") {
+        assert.equal((f.finals[0]?.[3] as RecoveryFinalDisposition)?.kind, "held_publication");
+      } else if (readback === "refused") {
+        assert.equal(f.state.produced, 1);
+      } else {
+        assert.equal(f.state.produced, 0);
+        assert.equal(f.finals.length, 0);
+        assert.equal((await restarted.inspect("run-1"))[0]?.heldCreateUncertain, true);
+      }
+    } finally { await f.close(); }
+  });
+}
+
+it("B throwing pack stream waits for controlled child exit", async () => {
+  const f = await v2FrozenFixture();
+  try {
+    let release!: (code: number) => void;
+    let failed!: () => void;
+    const streamFailed = new Promise<void>(resolve => { failed = resolve; });
+    const exited = new Promise<number>(resolve => { release = resolve; });
+    const pack = new Readable({ read() { failed(); this.destroy(new Error("stream failed")); } });
+    Object.assign(f.git, { checkpointPack: async () => ({ tipOid: H, pack, exited }) });
+    let settled = false;
+    const preparing = prepareFrozenHeld({ git: f.git as unknown as HeldGit,
+      barePath: f.context.barePath, branch: f.record.branch, sourceSha: H,
+      policy: f.record.heldPolicy!, deadlineMs: 1000 });
+    const checked = assert.rejects(preparing, /stream failed/).then(() => { settled = true; });
+    await streamFailed;
+    await new Promise<void>(resolve => setImmediate(resolve));
+    assert.equal(settled, false);
+    assert.equal(pack.destroyed, true);
+    release(1);
+    await checked;
+  } finally { await f.close(); }
+});
+
+for (const status of ["failed", "cancelled", "completed"]) {
+  for (const kind of ["issue", "ci_fix", "prompt", "task"] as const) {
+    it(`M3 V2 live older generation ${status}/${kind} uses same frozen record and correct order`, async () => {
+      const f = await v2FrozenFixture(kind);
+      try {
+        f.state.status = status;
+        f.state.thin = true;
+        await f.make(true).resumePending(undefined, [f.record]);
+        assert.equal(f.order.includes("held"), true);
+        assert.equal(f.order.includes("archive"), status === "completed");
+        if (status === "completed") assert.ok(f.order.indexOf("archive") < f.order.indexOf("held"));
+        assert.deepEqual(f.order.filter(x => x !== "archive"), ["range", "scan", "workflow", "ci", "pack", "held"]);
+        assert.equal(f.finals[0]?.[1], 7);
+        assert.equal((f.finals[0]?.[3] as RecoveryFinalDisposition)?.kind, "held_publication");
+      } finally { await f.close(); }
+    });
+  }
+}
+
+for (const refusal of ["local oversize", "typed quota", "typed oversize", "raw 413", "unverified", "self contained"]) {
+  it(`M3 completed archive fallback requires typed refusal or thin capture: ${refusal}`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      f.state.status = "completed";
+      if (refusal === "local oversize") f.state.oversized = true;
+      if (refusal === "unverified") f.state.failProduce = true;
+      if (refusal === "typed quota") f.state.reserveError = new RequestError("POST", "/reserve", 429,
+        JSON.stringify({ reason: "quota" }));
+      if (refusal === "typed oversize") f.state.reserveError = new RequestError("POST", "/reserve", 413,
+        JSON.stringify({ reason: "oversize" }));
+      if (refusal === "raw 413") f.state.reserveError = new RequestError("POST", "/reserve", 413, "too big");
+      await f.operate();
+      assert.equal(f.order.includes("held"), ["local oversize", "typed quota", "typed oversize"].includes(refusal));
+      assert.equal(f.order[0], "archive");
+      const saved = await f.coordinator.inspect("run-1");
+      assert.ok(saved.length <= 1);
+      for (const r of saved) assert.equal(r.captureId, f.record.captureId);
+    } finally { await f.close(); }
+  });
+}
+
+for (const stop of ["running", "unknown source", "changed coverage", "CI", "closed during scan", "unknown create", "legacy policy"]) {
+  it(`M3 V2 held fails closed: ${stop}`, async () => {
+    const f = await v2FrozenFixture();
+    try {
+      if (stop === "running") f.state.status = "running";
+      if (stop === "unknown source") f.state.sourceRefused = true;
+      if (stop === "changed coverage") f.state.candidates.push({ sha: H2, pinRef: "refs/new", contexts: [f.context] });
+      if (stop === "CI") Object.assign(f.git, { changedFilesNoRenames: async () => [".custom-ci/build.yml"] });
+      if (stop === "closed during scan") Object.assign(f.git, {
+        secretScanCheckpointRange: async () => { f.setHold("discarded"); return { trusted: true, findings: [] }; },
+      });
+      if (stop === "unknown create") Object.assign(f.client, {
+        publishHeld: async (_run: string, _gen: number, _tip: string, _digest: string, pack: Buffer) => {
+          if (pack.length) f.order.push("held");
+          throw new Error("lost create response");
+        },
+      });
+      if (stop === "legacy policy") {
+        // Fresh legacy fixture has no policy or exact binding and cannot become a weaker V2 producer.
+        const legacy = await fixture();
+        try {
+          Object.assign(legacy.client, { hasHeldPublicationV2: () => true });
+          const record = await legacy.freeze(); assert.ok(record);
+          const result = await legacy.coordinator.operateFrozenInventory({
+            record, barePath: legacy.context.barePath, defaultBranch: "main",
+          });
+          assert.equal(result.held, "kept");
+          assert.equal(legacy.state.produced, 0);
+        } finally { await legacy.close(); }
+        return;
+      }
+      await f.operate();
+      if (stop === "unknown create") {
+        await f.operate();
+        assert.equal(f.order.filter(x => x === "held").length, 1);
+        assert.equal(f.state.produced, 0);
+      } else assert.equal(f.order.includes("held"), false);
+      if (stop === "closed during scan") assert.equal(f.state.produced, 0);
+    } finally { await f.close(); }
+  });
+}
 
 for (const closed of ["released", "discarded", "unknown"] as const) {
   it(`exact ${closed} hold stops held fallback and new archive without acknowledging FINAL`, async () => {

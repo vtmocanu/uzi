@@ -5,7 +5,7 @@ import path from "node:path";
 import { StubExecutor } from "../src/executor.js";
 import { Outbox } from "../src/outbox.js";
 import { nullLogger } from "./helpers.js";
-import { api, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
+import { api, client, fakeGitlab, fx, git, gitlabClaim, installHarness, runner } from "./runner-harness.js";
 import {
   HELD_LINUX_ONLY, JOIN_TOKEN, PUBLICATION_ID, redrive, watchFreezes, assertCustodyRetained, bare, command, commit, failedStates, failingWork, frozenRecords,
   heldServer, packObjects, recoveryOf, skipCheckpoints, type Work,
@@ -17,6 +17,42 @@ installHarness();
 // held_publication FINAL INSTEAD of an archive. The order is the point: the archive capture is
 // deferred BEFORE the failed terminal is sent, the held step runs on that exact frozen record after
 // the failed ACK, and the guarded hold stays open until the FINAL is ACKed.
+
+it("M3 V2 failed body with cancelled terminal ACK publishes held work", { skip: HELD_LINUX_ONLY }, async () => {
+  const claim = gitlabClaim(3030, { claim_generation: 71, inventory_guarded: true });
+  const features = ["recovery_inventory_v1", "recovery_held_publication_v2"];
+  api.setRegisterProtocolFeatures(features);
+  await client.register("v2-test", undefined, undefined, undefined, ["recovery_held_publication_v2"]);
+  assert.equal(client.hasHeldPublicationV2(), true);
+  const server = heldServer(claim, features);
+  const holdId = "00000000-0000-4000-8000-000000000071";
+  const repoId = "00000000-0000-4000-8000-000000000072";
+  claim.repo.id = repoId;
+  client.listRecoveryHolds = async () => ({ run_id: claim.run_id, holds: [{
+    hold_id: holdId, generation: 71, inventory_guarded: true, has_available_capture: false,
+  }] });
+  client.getExactRecoveryHold = async () => ({
+    run_id: claim.run_id, generation: 71, hold_id: holdId, repo_id: repoId, inventory_guarded: true,
+    original_worker_id: "original", original_worker_identity: "original",
+    live_worker_id: "original", live_run_id: claim.run_id, state: "open",
+    run_status: "cancelled", current_claim_generation: 71, claim_released: true,
+  });
+  const send = client.reportState.bind(client);
+  mock.method(client, "reportState", async (...args: Parameters<typeof send>) => {
+    const ack = await send(...args);
+    return args[1].status === "failed" ? { ...ack, status: "cancelled" } : ack;
+  });
+  skipCheckpoints();
+  const r = runner(failingWork({}), fakeGitlab().gitlab, JOIN_TOKEN, { checkpointIntervalMs: 1 });
+  await r.execute(claim);
+  assert.equal(failedStates(claim.run_id).length, 1);
+  assert.equal(server.heldCalls.length, 1);
+  assert.equal(server.heldCalls[0]!.generation, 71);
+  const records = await frozenRecords(claim);
+  assert.equal(records.length, 1);
+  assert.equal(records[0]!.finalRequest?.disposition.kind, "held_publication");
+  assert.equal(server.archiveReserves(), 0);
+});
 
 describe("held publication of a failed run", () => {
   it("dispatch failure: publishes WIP and commits at the frozen record's tip, FINAL ACKed, no archive", { skip: HELD_LINUX_ONLY }, async () => {
