@@ -1284,7 +1284,7 @@ func TestWorkerMessagesForeignRunReturns404(t *testing.T) {
 // the live status, which the worker reads as "keep going".
 func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
 	runID := uuid.New()
-	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running", ClaimGeneration: 7}})
+	h := newProtocolHandler(t, &protocolStore{ownedRun: store.Run{ID: runID, Status: "running", ClaimGeneration: 7, GateRevision: 11}})
 	rec := httptest.NewRecorder()
 	h.WorkerRunOwnership(rec, workerReq(http.MethodGet, "", runID))
 	if rec.Code != http.StatusOK {
@@ -1296,9 +1296,13 @@ func TestWorkerRunOwnershipOwnedRunning(t *testing.T) {
 	var got struct {
 		Status          string `json:"status"`
 		ClaimGeneration *int64 `json:"claim_generation"`
+		GateRevision    *int64 `json:"gate_revision"`
 	}
 	if err := json.Unmarshal(rec.Body.Bytes(), &got); err != nil {
 		t.Fatalf("decode body: %v", err)
+	}
+	if got.GateRevision == nil || *got.GateRevision != 11 {
+		t.Fatalf("ownership gate_revision=%v, want 11", got.GateRevision)
 	}
 	if got.Status != "running" {
 		t.Fatalf("status = %q, want %q", got.Status, "running")

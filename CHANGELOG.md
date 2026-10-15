@@ -22,6 +22,11 @@ through `[0.52.0]`.)
 
 ## [Unreleased]
 
+### Fixed
+
+- **Recover abandoned plan-gate executions (#3001).**
+  Missing-execution reconciliation also covers approval, input and follow-up gates and completes a previously queued owner cancel before requeue or exhaustion; recovered plan writes gain source-revision fences and atomic feedback dispositions.
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

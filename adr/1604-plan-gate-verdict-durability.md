@@ -142,6 +142,41 @@ plan the owner answered.
   belong to a plan that was never persisted, and it would move the cutoff past verdicts the
   owner sent for the plan actually on the run.
 
+## Amendment — 2026-10-15 (#3001, recovered revision publication)
+
+With `plan_revision_retry_v1`, a recovered revision presentation carries its
+source gate and accepted revise input. The API validates the current worker,
+claim generation, unreleased claim, source revision and input receipt ownership
+under the publication lock. A successfully persisted revised plan and its
+successful revise receipt commit in one transaction. The earlier two-transaction
+receipt behavior remains for reports without this negotiated contract.
+
+When a live revision exhausts its automatic retries, an ordinary replacement
+revise is a new human round and consumes `PLAN_MAX_REVISIONS` normally. Keep
+the earlier input pending while the replacement runs. If the replacement's plan
+persists, that same transaction records earlier inputs as `superseded` and the
+replacement as successfully applied. Supersession does not assert that the
+earlier feedback produced a plan. Rejected persistence, unknown ownership or
+unknown publication evidence authorizes neither disposition.
+
+An identical current presentation and payload can replay a lost ACK without
+republishing or adding settlement targets. Historical identities, changed
+payloads and additional pending predecessor targets cannot use that exception.
+The approval-only discarded-input endpoint is unchanged.
+
+Automatic retry allowance, expiry and predecessor tracking remain in the live
+flight's memory. Reclaim does not reconstruct them: Claude retains its existing
+resume-at-gate replay; Codex retains fresh-plan and re-send notices. An earlier
+pending input may replay before its former replacement, or that replacement may
+become stale after the gate changes. A stale/ignored receipt records disposal,
+not evidence that the feedback produced a persisted plan. Do not infer successful
+publication from a generic APPLIED receipt.
+
+Each reclaimed flight may receive a fresh provider retry allowance. The initial
+claim, existing redispatch paths and owner-resumed recovery episodes mean this
+is not a lifetime retry bound. No new durable retry accounting, reclaim protocol,
+Codex APPLIED suppression or source cleanup authority is introduced.
+
 ## Consequences and residuals
 
 - **Older consume-on-read api.** That api applies every row as soon as it returns it. A stale
