@@ -442,7 +442,8 @@ Duration values accept the same Go-style strings used server-side (`15s`, `3s`, 
 
 The proactive worker memory guard is **off by default** (issue #2396).
 Enabling it requires six explicit numeric settings; there are no calibrated
-production thresholds. Configure the worker container, not the API:
+production thresholds; fixture values are unmeasured inputs, not production
+recommendations. Configure the worker container, not the API:
 
 | Worker environment variable | Helm `workers.memoryGuard` key | Default | Meaning / ceiling |
 |---|---|---|---|
@@ -487,13 +488,21 @@ Node memory pressure and separately accounted Docker-in-Docker sidecar
 memory remain outside the worker cgroup budget.
 
 Enabled workers require API feature `worker_memory_pressure_v1` and a valid
-registration incarnation; unsupported APIs are refused. Intervention uses
-the captured worker incarnation, claim generation and memory episode.
+registration incarnation. Roll out the API advertising that feature first,
+then enable workers. An enabled worker against an older API, or a registration
+without a valid incarnation, refuses startup with `UnsupportedMemoryAPI`.
+For a worker-first rollout, keep the guard disabled until the API is ready,
+then enable it with a fresh registration/restart. Heartbeat feature growth
+does not create memory authority; feature shrink revokes it before further
+reservation or signalling. Original settlement, feedback and source-custody
+obligations remain with the captured flight after revocation; an unconfirmed
+ACK does not establish release. Intervention uses the captured worker
+incarnation, claim generation and memory episode.
 The delivered adapter enrolls trusted Codex model shell commands through
 their exact registered supervisor handle and process start ticks.
 Claude enrollment (#2471), internal probes, provider/credential processes,
-boundary operations and cross-checker authority are outside this adapter's
-scope.
+boundary/checkpoint/capture operations and cross-checker authority are outside
+this adapter's scope. See [ADR-2396](../adr/2396-worker-memory-guard.md).
 
 After an intervention, another intervention/retry requires confirmed drain,
 a resolved outcome and fresh samples below `Q` for `rearmMs`; a low sample
@@ -506,6 +515,12 @@ fences; Cancel is terminal. See
 [Memory-pressure holds](./run-recovery.md#memory-pressure-holds) and
 [Worker setup](./worker-setup.md#proactive-memory-guard) for scope and
 recovery limitations.
+
+To disable operationally, turn off the worker flag and restart/roll workers;
+preserve existing holds, episode accounting and retained source. Migration
+00339 Down is destructive schema rollback: it fails memory-held runs as
+`worker_lost` and drops intervention history and episode columns. It is not
+an operational disable procedure.
 
 Implementation: [worker parsing](../agent/src/config.ts),
 [controller parsing](../controller/internal/config/memory_guard.go),

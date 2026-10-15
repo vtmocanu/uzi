@@ -70,7 +70,11 @@ Credential changes, Codex account changes, budget extension, approval,
 follow-up and pause do not release a held memory episode. Extending a timed
 run can supply budget for a subsequent owner Resume, but does not itself
 queue the run. An available archive does not automatically release this
-hold's retained custody.
+hold's retained custody. After discarded/released precedence, an OPEN hold at
+`recovery_wait` for either `worker_memory_pressure` or
+`worker_requeue_exhausted` reports `needs_action` when its latest capture failed,
+otherwise `source_only`, before available unguarded archives or capture progress.
+Other custody attention decisions retain their existing ordering.
 
 The worker attempts preservation using its existing recovery path. Failed
 or uncertain capture keeps local source custody; there is no archive or
@@ -986,7 +990,10 @@ trusted unsent outcome protected against a second execution.
 The open hold for that originating worker and exact claim generation G
 stays in custody. An OPEN hold for `recovery_wait` /
 `worker_requeue_exhausted` reports `source_only`, or `needs_action` if its latest
-capture failed, before archive readiness or capture progress is considered. An
+capture failed, before archive readiness or capture progress is considered.
+The same narrow OPEN-hold exception applies to `worker_memory_pressure` at
+`recovery_wait`; this worker-loss example does not make a rejected record
+memory-intervention evidence. Discarded/released precedence remains unchanged. An
 available archive remains exportable; a latest preparing/uploading capture is not
 yet downloadable, and an earlier archive may omit latest worker-local work. These
 capture facts do not settle the owner decision or implicitly release custody.

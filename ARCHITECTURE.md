@@ -1388,6 +1388,20 @@ chain in the diagram above, with no intervening `running`.
   branch that *modifies* a workflow file. See
   [ADR-456](adr/0456-rebase-before-finalize-push.md) for the mechanism, its
   2026-08-23 overlay amendment, and why merge precedes rebase.
+- **Proactive worker memory guard** (#2396): off by default, with six explicit
+  numeric settings and no calibrated production thresholds. One worker-wide
+  cgroup monitor ranks enrolled Codex model command trees by approximate RSS
+  and acts through exact registered supervisor identities. It adds no process
+  authority or concurrency change. The API persists frozen episode allowance;
+  uncertain/exhausted intervention takes the capture/owner-only memory-hold
+  path, retaining source when disposition is unconfirmed. Register establishes
+  authority; heartbeat growth cannot create it, and shrink revokes further
+  reservation/signalling without erasing original settlement obligations.
+  Claude enrollment is deferred to #2471; separately accounted DinD, sudden
+  bursts, stalled sampling and node pressure remain limitations. Rollout,
+  destructive schema rollback versus operational disable, and command deadline
+  boundaries are recorded in [ADR-2396](adr/2396-worker-memory-guard.md);
+  operator settings live in [configuration](docs/configuration.md#worker-memory-guard).
 - **Durable recovery of unpublished work at the finalization boundary** (PRD
   #1296): before any of the finalization failures above (a secret/workflow
   preflight, a rejected push, or exhausted base alignment) can leave a run's
@@ -1401,7 +1415,14 @@ chain in the diagram above, with no intervening `running`.
   H-free, opened in the same `ClaimRun` transaction) protects unpublished work
   and blocks the worker's teardown. Admission counts open holds except at most
   one per run backing a healthy current claim without an owner decision;
-  total custody remains protected. See [ADR-2445](adr/2445-custody-admission-accounting.md).
+  total custody remains protected. After discarded/released precedence, an OPEN
+  hold at `recovery_wait` for `worker_requeue_exhausted` or
+  `worker_memory_pressure` reports `needs_action` after failed latest capture,
+  otherwise `source_only`, before available unguarded archives or capture
+  progress. Archive availability remains independent of attention and does not
+  release owner-held custody; other classifier decisions remain unchanged.
+  See [ADR-2445](adr/2445-custody-admission-accounting.md) and
+  [ADR-2396](adr/2396-worker-memory-guard.md).
   The **archive capture** (`recovery_captures`) is the later,
   immutable, encrypted artifact bound to that hold. PRD #1349 hardens the
   lifecycle: reserve/release now key on the **exact `runs.claim_generation`**

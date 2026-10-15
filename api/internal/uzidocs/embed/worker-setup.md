@@ -575,15 +575,24 @@ Operators can opt into a worker-wide memory guard with
 `WORKER_MEMORY_GUARD_ENABLED`; it is **off by default** and needs six explicit
 numeric settings. See [configuration](./configuration.md#worker-memory-guard)
 for Compose, standalone and hosted wiring, validation and sizing inputs.
-There are no calibrated production thresholds.
+There are no calibrated production thresholds; fixture values are unmeasured
+and are not production recommendations. Roll out the API advertising
+`worker_memory_pressure_v1` before enabling workers. For a worker-first rollout,
+keep the guard disabled until the API is ready, then enable with a fresh
+registration/restart. Enabled workers refuse startup against an unsupported
+API or invalid registration incarnation (`UnsupportedMemoryAPI`). Heartbeat
+feature growth creates no authority; shrink revokes reservation/signal authority
+while the original flight still owns settlement, feedback and source custody.
 
 One monitor shares the worker's cgroup budget across its configured
 concurrency. It can intervene in enrolled **Codex model shell commands**,
 using the exact registered supervisor and process start ticks; approximate
 tree RSS ranks candidates while total cgroup usage determines pressure.
 It does not subtract file memory. Claude commands (#2471), internal probes,
-provider/credential processes, boundary operations and cross-checker
-authority are outside the delivered adapter's scope.
+provider/credential processes, boundary/checkpoint/capture operations and
+cross-checker authority are outside the delivered adapter's scope. Enrollment
+adds no process authority and changes no concurrency setting; see
+[ADR-2396](../adr/2396-worker-memory-guard.md).
 
 A confirmed command drain, resolved outcome and fresh low-usage dwell are
 required before another intervention/retry. The per-run memory-episode
@@ -591,7 +600,10 @@ allowance survives ordinary redispatch. Exhaustion, uncertain drainage or
 unconfirmed outcome reporting takes the capture/owner-hold path; see
 [Memory-pressure holds](./run-recovery.md#memory-pressure-holds).
 Capture can fail, leaving local custody retained without a downloadable
-archive or a latest-work guarantee.
+archive or a latest-work guarantee. An unconfirmed park ACK does not release
+custody. Codex command bounds stay 60 minutes, or 120 minutes with root-lead
+`long_running: true`; memory feedback does not extend those deadlines or
+supersede abort, output-cap or ordinary command cleanup ownership.
 
 This is proactive mitigation, not OOM prevention: allocation bursts,
 stalled sampling and node pressure can still kill the worker. A separate
