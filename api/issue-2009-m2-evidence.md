@@ -12,7 +12,7 @@ not active rows or finalize/readoption inputs. Identity upserts add exact report
 generation, current ownership, unreleased claim and nonterminal predicates to the
 existing frozen kind/target/parent/association fence.
 
-Migration 00334 creates worker_pending_outcome_identities with worker/run cascades,
+Migration 00337 creates worker_pending_outcome_identities with worker/run cascades,
 a tuple primary key and an expiry index. Health takes the earliest fresh eligible
 snapshot/identity age without changing its status/kind allowlist, warning rung,
 threshold or reason. The aggregate query is prepared for M3; DTOs/consumers are not
