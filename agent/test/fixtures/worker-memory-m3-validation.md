@@ -1,4 +1,6 @@
-# Worker memory guard — M3 contracts and runner integration in progress
+# Worker memory guard — historical M3 contract and runner validation
+
+This retained record is a chronology of its named seams and repairs, ending with M3 completion below. Earlier “in progress” and future-seam statements describe those revisions, not the integrated tree. See [M1 reconciliation](worker-memory-m1-reconciliation.md) and [M4 acceptance](worker-memory-m4-validation.md) for later acceptance; M5a/M5b remain separate requirements.
 
 M1 and M2 are complete. **M3 remains in progress.** This record covers the first serial sink-contract seam at `eaeaca55c67efa0da0ea4bcb9168c65254adae26` and its reviewed repair at `049a6df8a13b6925044758ec7bf1461e562e0f14`. Runner activation, durable feedback/outbox reconciliation, owner-only capture/park, lifecycle wiring and their integration proofs are not implemented by this seam. Production enablement remains disabled; calibration and CI timing remain unverified.
 

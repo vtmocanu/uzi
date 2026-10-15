@@ -1,4 +1,6 @@
-# Worker memory guard — M2 adapter validation complete
+# Worker memory guard — historical M2 adapter validation
+
+This retained record describes its named revisions. Statements below about later unimplemented seams are historical scope, not current-tree status. See [M1 reconciliation](worker-memory-m1-reconciliation.md) and [M4 acceptance](worker-memory-m4-validation.md) for the integrated candidate; current required real-process/cgroup acceptance belongs to M5a/M5b.
 
 M1 and the M2 adapter milestone are complete. This record retains the reviewed core/repair history and the passing canonical agent recheck at `d4dc3dc9590f80e7bdcea27819ac0a6ff1cdd14a`. Bounded real registered-supervisor proofs cover adopted detached descendants, larger-tree selection, protected/unattributed rejection, injected exact-identity mismatch refusal, concurrent cleanup, sibling survival and matching tool feedback. Named enrollment/admission/retirement mutation checks reached behavioral assertions. The canonical gate passed after the reviewed conformance fixture repair. Worker/runner begin/retire, preservation and production lifecycle wiring belong to M3 and remain unimplemented. Calibration remains unverified; default production enablement stays disabled. The M1 reconciliation record describes its completion-time state, not later M2 progress.
 

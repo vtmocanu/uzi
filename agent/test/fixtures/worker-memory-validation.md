@@ -1,4 +1,6 @@
-# Worker memory guard validation — issue #2396
+# Worker memory guard validation — issue #2396 (historical foundation)
+
+This retained foundation record describes only its named source revisions, including dependency status and unfinished seams at that time. It does not state current integration or deployment status. [M1 reconciliation](worker-memory-m1-reconciliation.md) and [M4 acceptance](worker-memory-m4-validation.md) supersede its current-state language without reclassifying its failed or unexecuted checks.
 
 ## M1 source and limits
 

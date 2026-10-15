@@ -2,7 +2,7 @@
 
 ## Current integration — 2026-10-15, M1 complete under approved deviations
 
-This section supersedes the current-state language in the older dated sections below; those sections remain historical evidence at their named revisions. M1 implementation, review and required local checks are **complete** on tested source `164ef8b86be831489242315c762f8395f71dc20e`, under the human-approved merge-target and LiveDB deviations below. The subsequent evidence-only edit changes no gate inputs. M4, M5a and M5b are not complete.
+This section supersedes the current-state language in the older dated sections below; those sections remain historical evidence at their named revisions. M1 implementation, review and required local checks are **complete** on tested source `164ef8b86be831489242315c762f8395f71dc20e`, under the human-approved merge-target and LiveDB deviations below. The subsequent evidence-only edit changes no gate inputs. At this M1 checkpoint, M4, M5a and M5b were not complete; later owner-surface acceptance is recorded in [the M4 validation record](worker-memory-m4-validation.md).
 
 ### Integrated candidate and approved deviation
 
@@ -74,7 +74,7 @@ Worker-UID before/after timing and final M5b acceptance remain unfinished. Post-
 
 ### Remaining acceptance
 
-M1 is complete under the approved deviations. The failed original sweep and initial API/dependency failures remain above with their actual outcomes and follow-up evidence. A tracked literal consumer inspection found no new memory-result expectation in general e2e/phases, lib or forge-fake; existing requeue-exhaustion assertions describe their guard-off scenarios. Full Compose phases remain unrun. Real command-tree lane enrollment/execution, isolated 1Gi/2Gi calibration, complete bound stdout reports, owner-surface visuals/documentation and final serial gates remain later milestone work. Production remains default-off; no hosted sizing recommendation or real-kernel PID-recycling proof is claimed.
+M1 is complete under the approved deviations. The failed original sweep and initial API/dependency failures remain above with their actual outcomes and follow-up evidence. A tracked literal consumer inspection found no new memory-result expectation in general e2e/phases, lib or forge-fake; existing requeue-exhaustion assertions describe their guard-off scenarios. Full Compose phases remain unrun. Real command-tree lane enrollment/execution, isolated 1Gi/2Gi calibration, complete bound stdout reports, owner-surface visuals/documentation and final serial gates were later-milestone requirements unverified at this M1 checkpoint. Consult [the M4 validation record](worker-memory-m4-validation.md) and later milestone records for subsequent acceptance. Production remains default-off; no hosted sizing recommendation or real-kernel PID-recycling proof is claimed.
 
 
 ## Current resumed integration — 2026-10-14, M1 still in progress
