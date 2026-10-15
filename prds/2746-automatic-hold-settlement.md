@@ -129,4 +129,4 @@ Routine manual discard, owner consent grants, failed-run Resume for cleanup, man
 
 ## Inventory status correction (2026-10-15)
 
-#2988 is fixed by PR #3029 (`5a712362a`) and closed. #1297 is closed as not planned; optional #1229 provider-session portability is designated not planned and its open issue disposition must match. Neither is a prerequisite for source settlement or a claim that conversation continuity already exists.
+#2988 is fixed by PR #3029 (`5a712362a`) and closed. #1297 is closed as not planned; optional #1229 provider-session portability is proposed as not planned, pending the maintainer's decision. Neither is a prerequisite for source settlement or a claim that conversation continuity already exists.
