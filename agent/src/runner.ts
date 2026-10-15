@@ -11136,6 +11136,7 @@ export class RunRunner {
               }
             };
           } : undefined,
+          (candidate) => this.prepareGateCheckpoint(claim, flight, steering.lifecycleSignal(), candidate),
         ).catch((error) => {
           if (checkedHuman || checkedApproval) {
             if (!(error instanceof CredentialSwitchSignal)) failStateBarrier?.(error);
@@ -13923,7 +13924,7 @@ export class RunRunner {
       for (let attempt = 1; attempt <= 3; attempt++) {
         signal?.throwIfAborted();
         onStep?.("checkpoint_upload");
-        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal);
+        res = await this.client.publishCheckpoint(flight.runId, packed.tipOid, producer!.pack, signal, flight.claimGeneration);
         if (res.ok || typeof res.httpStatus !== "number" || res.httpStatus < 500 || res.httpStatus > 599 || attempt === 3) break;
         flight.lastAttemptedCheckpointRefTip = packed.tipOid;
         const [firstBackoffMs, secondBackoffMs] = this.checkpointTestHooks?.retryBackoffMs ?? [250, 1_000];
@@ -16142,6 +16143,37 @@ export class RunRunner {
    * ref, and positively verify HEAD equality before attempting origin publish.
    * False/throw means the source clone remains the authoritative copy.
    */
+  /** One bounded capture attempt for a changed human execution plan; local-only recovery is insufficient. */
+  private async prepareGateCheckpoint(
+    claim: ClaimResponse, flight: RunFlight, ownerSignal: AbortSignal, candidate: Milestone[] | undefined,
+  ): Promise<StateRequest["gate_checkpoint_witness"]> {
+    const frozen = claim.execution_milestones;
+    if (!this.client.protocolFeatures.includes("milestone_reconciliation_v1") ||
+        frozen === undefined || candidate === undefined ||
+        (frozen.length === candidate.length && frozen.every((m, i) =>
+          m.id === candidate[i]!.id && m.title === candidate[i]!.title))) return undefined;
+    const signal = AbortSignal.any([ownerSignal, this.shutdownSignal.signal, AbortSignal.timeout(60_000)]);
+    const guard = async () => { signal.throwIfAborted(); };
+    const priorPreserve = flight.preserveRecoveryClone;
+    flight.preserveRecoveryClone = true;
+    const captured = await this.captureRecoveryRestorePoint(claim, flight, flight.runLog, "recovery_capture", {
+      credentialFree: true, signal, beforeMutation: guard,
+    });
+    await guard();
+    const source = captured.capturedHead;
+    const published = flight.lastCheckpointRefTip;
+    if (!captured.verified || !captured.published || !source || !published || !flight.barePath ||
+        !flight.worktreePath || !await this.git.isAncestorRef(flight.barePath, source, published) ||
+        await this.git.worktreeHead(flight.worktreePath) !== source) {
+      throw new TransientRecoveryError("plan gate checkpoint could not be published and proven recoverable");
+    }
+    await guard();
+    // The capture's quiesceRun closes the executor before any WIP/fetch/publish. This producer
+    // does not reopen execution; the existing gate wait owns approval and lifecycle interrupts.
+    flight.preserveRecoveryClone = priorPreserve;
+    return { source_head: source, published_checkpoint: published };
+  }
+
   private async captureRecoveryRestorePoint(
     claim: ClaimResponse,
     flight: RunFlight,
@@ -17595,7 +17627,10 @@ export class RunRunner {
     // ancestry test on an unpushed branch (see runnerCloneForBranch): when `main` advanced
     // during the park, a valid mirrored checkpoint diverges from the moved default and the
     // strict-descendant test would discard the committed milestones and cold-start.
-    const resume = claim.session_id != null;
+    // A reconciled lead starts a fresh transcript while retaining its approved
+    // checkpoint lineage. GitCache still requires the exact checkpoint tip.
+    const resume = claim.session_id != null || (claim.resume_phase === "implementing" &&
+      claim.plan_approved === true && !!claim.plan_md?.trim() && claim.checkpoint_tip != null);
     // issue #1042 M4: the OWNER ANCHOR for the cross-worker checkpoint adopt guard — the tip
     // THIS run last published to its own refs/uzi-checkpoints/<branch> ref, persisted
     // server-side on every publish (M2) and delivered on the claim. runnerCloneForBranch
@@ -17758,7 +17793,7 @@ export class RunRunner {
     planMd: string,
     // PRD #122 M1: the CANDIDATE milestone list from the just-submitted plan. Rides
     // the awaiting_approval report (human-gated) or the autopilot running report as
-    // the FROZEN list (Decision 2). Additive-optional — only included when non-empty.
+    // the FROZEN list (Decision 2). Absence and an explicitly supplied [] remain distinct.
     milestones: Milestone[] | undefined,
     batcher: MessageBatcher,
     steering: SteeringChannel,
@@ -17797,6 +17832,7 @@ export class RunRunner {
     checkedApproval?: Extract<Awaited<ReturnType<typeof checkPlan>>, { kind: "approve" }>["response"],
     ownerSignal?: () => AbortSignal,
     retainCheckedStorage?: (resume: () => Promise<PlanVerdict>) => void,
+    prepareCheckpoint?: (candidate: Milestone[] | undefined) => Promise<StateRequest["gate_checkpoint_witness"]>,
   ): Promise<PlanVerdict> {
     // PRD #1795 (decision 6): nothing is confirmed until THIS gate's own applied awaiting_approval
     // ACK says which revision it published, so a verdict bound to an earlier gate cannot act on
@@ -17940,9 +17976,8 @@ export class RunRunner {
     // epoch, so it is discarded with a feed notice. The FIRST gate for a run does
     // NOT bump: epoch 0 lets a verdict already queued when the gate opens apply.
     // PRD #122 M1: the CANDIDATE milestone list rides the awaiting_approval report so
-    // the human approves the breakdown (Decision 2). Only include the key when
-    // non-empty — additive-optional, never `null`/`[]`, so a no-milestone run's report
-    // stays byte-for-byte as today. The api freezes candidate→frozen at approve.
+    // the human approves the breakdown (Decision 2). Preserve a supplied [] so a changed
+    // plan can remove all execution definitions. The api freezes candidate→frozen at approve.
     // PRD #212: surface the plan turn's worktree writes at the gate. Runner-uid status,
     // best-effort (planChangedFiles swallows errors → []), computed EVERY round so a
     // revision gate reflects that round's tree (a revert between rounds clears the list).
@@ -17961,17 +17996,20 @@ export class RunRunner {
     const gateResume = this.gateResumes.get(runId);
     this.gateResumes.delete(runId);
     const reuse = !this.gatedRuns.has(runId) && gateResume?.planMd === planMd ? gateResume : undefined;
+    const witness = await prepareCheckpoint?.(milestones);
     const presentation: Pick<StateRequest, "presentation_id" | "adopt_gate_revision"> = {};
     if (this.client.protocolFeatures.includes(GATE_REVISION_FEATURE)) {
-      presentation.presentation_id = reuse?.presentationId ?? randomUUID();
-      if (reuse && reuse.presentationId === undefined) presentation.adopt_gate_revision = reuse.revision;
+      // A new capture changes the immutable witness and claim fence, even with identical plan text.
+      presentation.presentation_id = witness ? randomUUID() : reuse?.presentationId ?? randomUUID();
+      if (!witness && reuse && reuse.presentationId === undefined) presentation.adopt_gate_revision = reuse.revision;
     }
     const request: StateRequest = {
       ...checkedFields,
+      ...(witness ? { gate_checkpoint_witness: witness } : {}),
       status: "awaiting_approval",
       plan_md: planMd,
       ...presentation,
-      ...(milestones?.length ? { milestones } : {}),
+      ...(milestones !== undefined ? { milestones } : {}),
       // PRD #84 M4: the CANDIDATE requirement set rides the awaiting_approval report so
       // the server can gate plan-approval on worker eligibility. Each field only when
       // non-empty (additive-optional), matching the milestones conditional above.
@@ -18055,7 +18093,23 @@ export class RunRunner {
     }
     // A terminal verdict ends the gate → clear the shared per-run gate state. A revise
     // keeps the shared budget/epoch state running; the re-report above does the bump.
-    const settle = (v: PlanVerdict): PlanVerdict => {
+    const settle = async (v: PlanVerdict): Promise<PlanVerdict> => {
+      if (witness && v.kind === "approve") {
+        // Reconciliation consumes approval server-side and releases this generation.
+        // A buffered approval cannot restart the witnessed source.
+        throw new RetainedRecoveryStop();
+      }
+      if (witness && v.kind === "revise") {
+        try {
+          const running = await reportState({ status: "running" }) as StateAck;
+          if (running.applied !== true || running.status !== "running")
+            throw new RetainedRecoveryStop();
+        } catch (error) {
+          if (error instanceof StaleClaimError || error instanceof CredentialSwitchSignal ||
+              ownerSignal?.().aborted || this.shutdownSignal.signal.aborted) throw error;
+          throw new RetainedRecoveryStop();
+        }
+      }
       if (associated) associated.phase = v.kind === "revise" ? "revisionplanning" : "terminal";
       if (v.kind !== "revise") {
         this.gateDeadlines.delete(runId);

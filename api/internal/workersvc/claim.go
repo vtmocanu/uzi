@@ -255,6 +255,9 @@ type ClaimPayload struct {
 	// Issue #1626: on a ResumePhase=="awaiting_approval" claim (no frozen list yet) it carries
 	// the unapproved CANDIDATE instead, so the re-presented gate re-sends the same breakdown.
 	Milestones []Milestone `json:"milestones,omitempty"`
+	// ExecutionMilestones distinguishes the approved frozen contract from a restored
+	// gate candidate. A pointer preserves an explicitly frozen empty list.
+	ExecutionMilestones *[]Milestone `json:"execution_milestones,omitempty"`
 
 	// TargetRunID is the run a JUDGE run reviews (PRD #46 Decision 1). Present only
 	// for kind=judge (omitted otherwise). The judge fetches that run's trace through

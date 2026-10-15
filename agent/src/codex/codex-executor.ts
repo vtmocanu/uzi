@@ -106,7 +106,7 @@ import {
   type TurnStreamEnd,
 } from "../harness.js";
 import { RunTurnReducerImpl } from "../harness-reducer.js";
-import { depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
+import { CURRENT_EXECUTION_STATE_GUIDANCE, depsProvisionPlanNote, depsProvisionImplementNote, buildIssueContext, buildIssueCommentsContext, buildReviewCommentsContext, buildEnvironmentFactsBlock, buildLeadSystemPrompt, delegatesLine, REPO_SUBAGENT_UNTRUSTED_APPEND, buildRevisePlanPrompt, buildAutomaticRevisionPrompt, milestoneStatusNote, PR_SUMMARY_GUIDANCE, publishedTipNote, dockerScratchResumeNote, renderFollowUpBlock, FOLLOW_UP_TRAILER } from "../prompt.js";
 import { environmentFactsSummary, ProbeCleanupError, runEnvProbe, type EnvFacts, type EnvProbeSpawner } from "../env-probe.js";
 import { makeProgressObserver } from "../milestone-progress-observer.js";
 import { RUNNER_UID, WORKER_UID, uidSplitActive } from "../runner-uid.js";
@@ -1313,6 +1313,7 @@ function codeCrossCheckAccess(ctx: RunContext): CodeCrossCheckToolAccess | undef
 }
 
 export interface CodexToolHandlerDeps {
+  readonly claimGeneration?: number;
   readonly codeCrossCheck?: CodeCrossCheckToolAccess;
   readonly client: WorkerClient;
   readonly runId: string;
@@ -1355,7 +1356,7 @@ export function buildCodexToolHandlers(deps: CodexToolHandlerDeps): ReadonlyMap<
 
   // memory (one tool; ROOT-only — render never grants it to a subagent, and the broker's
   // allowedTools gate stops a subagent reaching this handler regardless).
-  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log });
+  const memHandlers: MemoryToolHandlers = makeMemoryToolHandlers({ client, runId, log, claimGeneration: deps.claimGeneration });
   map.set(
     memoryToolNames()[0]!,
     (args) => memHandlers.saveMemory(args as Parameters<MemoryToolHandlers["saveMemory"]>[0]),
@@ -2588,6 +2589,7 @@ export class CodexExecutor implements Executor {
       const toolHandlers = buildCodexToolHandlers({
         client: this.opts.client,
         runId: ctx.runId,
+        claimGeneration: ctx.claimGeneration,
         log: this.log,
         emit: (msg) => ctx.emit(msg),
         skills: ctx.skills ?? [],
@@ -4756,7 +4758,8 @@ export class CodexExecutor implements Executor {
     // PRD #1798 M2 (D4, D13): the same pr_summary ask the Claude implement prompt carries.
     const review = buildReviewCommentsContext(ctx.reviewComments);
     const withReview = review ? `${body}\n\n${review}` : body;
-    const withClaims = `${withReview}\n\n${PR_SUMMARY_GUIDANCE}`;
+    const restoredState = ctx.reviewedPlanResume === true && !ctx.sessionId ? `${CURRENT_EXECUTION_STATE_GUIDANCE}\n\n` : "";
+    const withClaims = `${restoredState}${withReview}\n\n${PR_SUMMARY_GUIDANCE}`;
     // Issue #1674: APPEND the shared milestone tracker guidance (milestoneStatusNote) after the
     // Codex framing. Empty (no approved breakdown) leaves the prompt byte-identical.
     const prompt = withMilestoneNote(note ? `${note}\n\n${withClaims}` : withClaims, milestoneNote);

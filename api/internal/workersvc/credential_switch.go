@@ -3,7 +3,6 @@ package workersvc
 import (
 	"context"
 	"fmt"
-	"log/slog"
 
 	"github.com/vtmocanu/uzi/api/internal/pgconv"
 	"github.com/vtmocanu/uzi/api/internal/runkind"
@@ -217,8 +216,8 @@ func (s *Service) failCredentialSwitch(ctx context.Context, owned store.Run, wkr
 	// for observability and re-broadcasts the (unchanged) status so the web drops the "switch
 	// requested" chip now that the stamp is cleared. The worker's own credential_switch_failed feed
 	// message (D14) carries the human-readable reason to the run's activity feed.
-	slog.Info("credential switch abandoned: bounded capture-failure give-up cleared the pending switch stamp; run continues on its current token",
-		"run", owned.ID, "worker", wkr.ID, "generation", gen)
+	// The transactional SetState parent logs committed abandonment. This helper
+	// cannot announce success before that transaction commits.
 	if s.bcast != nil {
 		s.bcast.PublishState(owned.ID, run.Status)
 	}

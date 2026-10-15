@@ -35,6 +35,10 @@ through `[0.52.0]`.)
 - **sqlc regeneration uses verified release binaries.**
   Local regeneration and the API drift check download and cache the pinned sqlc release instead of compiling it from source on a cold Go cache.
 
+- **Approving a changed milestone plan requires explicit owner consent to reset progress.**
+  The server binds reset consent to the displayed approval gate and resets progress and scope with a published recoverable checkpoint handoff and existing generation fencing; unchanged plan approval preserves progress and scope. CLI and web reset controls are not yet available.
+
+
 ## [0.86.0] - 2026-10-06
 
 ### Changed

@@ -81,7 +81,7 @@ func (s *Service) parkRunningCodexAccountTx(ctx context.Context, wkr store.Worke
 				ID: run.ID, WorkerID: workerID, ClaimGeneration: *req.ClaimGeneration, SessionID: session,
 			})
 		} else {
-			rows, err = s.setRecoveryWait(ctx, qtx, pgtype.Text{}, run, wkr, req, session)
+			rows, err = s.setRecoveryWaitLocked(ctx, qtx, pgtype.Text{}, run, wkr, req, session)
 		}
 	}
 	if err != nil || rows == 0 {

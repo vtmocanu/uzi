@@ -1185,7 +1185,9 @@ func TestPlanCrossCheckSummaryDTOTags(t *testing.T) {
 // claim (PRD #90 B3). basis/evidence are not omitempty — the worker always sends the
 // keys, and a bad/empty basis never fails the write (it is normalized on read).
 func TestAgentMemoryWriteRequestTags(t *testing.T) {
-	assertTags(t, "AgentMemoryWriteRequest", AgentMemoryWriteRequest{}, "title", "body", "basis", "evidence")
+	assertTags(t, "AgentMemoryWriteRequest(legacy)", AgentMemoryWriteRequest{}, "title", "body", "basis", "evidence")
+	generation := int64(7)
+	assertTags(t, "AgentMemoryWriteRequest(fenced)", AgentMemoryWriteRequest{ClaimGeneration: &generation}, "claim_generation", "title", "body", "basis", "evidence")
 }
 
 // TestAgentMemoryDTOTags pins the read shape. repo_id/repo_name/run_id are

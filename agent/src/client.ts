@@ -2077,8 +2077,11 @@ export class WorkerClient {
     tipOid: string,
     pack: Readable,
     boundarySignal?: AbortSignal,
+    claimGeneration?: number,
   ): Promise<PublishResult> {
-    const path = `${WORKER_API_PREFIX}/runs/${runId}/publish`;
+    const query = claimGeneration !== undefined && claimGeneration > 0
+      ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
+    const path = `${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/publish${query}`;
     const signal = boundarySignal
       ? AbortSignal.any([boundarySignal, AbortSignal.timeout(this.httpTimeoutMs)])
       : AbortSignal.timeout(this.httpTimeoutMs);
@@ -2513,8 +2516,10 @@ export class WorkerClient {
     )) as RecoverySettleResponse;
   }
 
-  async getInputs(runId: string): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
-    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${runId}/inputs`)) as InputsResponse;
+  async getInputs(runId: string, claimGeneration?: number): Promise<{ inputs: UserInput[]; credentialSwitch?: { generation: number }; receipts?: boolean; nowSummary?: boolean }> {
+    const query = claimGeneration !== undefined && claimGeneration > 0
+      ? `?claim_generation=${encodeURIComponent(claimGeneration)}` : "";
+    const res = (await this.getJSON(`${WORKER_API_PREFIX}/runs/${encodeURIComponent(runId)}/inputs${query}`)) as InputsResponse;
     // PRD #1247 M5b: the held-state credential-switch signal rides EVERY inputs response (including
     // an empty-inputs poll), surfaced beside the inputs. The runner's poll trips the switch off it
     // (steering.maybeTripCredentialSwitch); a legacy caller that reads only `.inputs` is unaffected.

@@ -115,6 +115,18 @@ func milestonesParam(kind string, ms *[]Milestone) []byte {
 	return encoded
 }
 
+// reportPlanMilestonesParam permits a fresh witnessed presentation to deliberately
+// remove every criterion, while ordinary reports retain planMilestonesParam semantics.
+// Historical IDs are still refused by classifyGateReport before any write.
+func reportPlanMilestonesParam(run store.Run, req StateRequest) []byte {
+	fresh := req.AdoptGateRevision == nil && (req.PresentationID == nil ||
+		!run.GatePresentationID.Valid || run.GatePresentationID.Bytes != *req.PresentationID)
+	if fresh && req.GateCheckpointWitness != nil && req.Milestones != nil && len(*req.Milestones) == 0 {
+		return milestonesParam(run.Kind, req.Milestones)
+	}
+	return planMilestonesParam(run, req.PlanMd, req.Milestones)
+}
+
 // planMilestonesParam is milestonesParam for a PLAN-BEARING report — the awaiting_approval
 // report (the candidate list) and the autopilot `running` report that carries the approved
 // plan_md (the frozen list). Issue #1626: the worker sends `milestones` only when the plan

@@ -454,6 +454,33 @@ func (h *Handler) GetRun(w http.ResponseWriter, r *http.Request) {
 		return
 	}
 	dto := runToDTO(run, h.runPriorityClass(r.Context(), run), h.cfg.RunTimeout, h.runExtensionCapSeconds(r.Context()), h.cfg.RunForgeUnreachableMaxParks, h.clock(), h.cfg.RunMaxRequeues)
+	if user.ID == run.UserID {
+		if run.Status == "awaiting_approval" {
+			if digest, err := workersvc.ResetStateDigest(run); err == nil {
+				dto.ResetStateDigest = digest
+			}
+		}
+		var before int64
+		if values, present := r.URL.Query()["reconciliation_before_gate_revision"]; present {
+			if len(values) != 1 {
+				httpx.Error(w, http.StatusBadRequest, "reconciliation_before_gate_revision must be a positive int64")
+				return
+			}
+			before, err = strconv.ParseInt(values[0], 10, 64)
+			if err != nil || before <= 0 {
+				httpx.Error(w, http.StatusBadRequest, "reconciliation_before_gate_revision must be a positive int64")
+				return
+			}
+		}
+		audit, err := h.wsvc.MilestoneReconciliationAuditBefore(r.Context(), user.ID, run.ID, before)
+		if err != nil {
+			slog.Error("get milestone reconciliation history", "run_id", run.ID, "error", err)
+			httpx.Error(w, http.StatusInternalServerError, "internal error")
+			return
+		}
+		dto.MilestoneReconciliations = audit.Records
+		dto.MilestoneReconciliationsNextBeforeGateRevision = audit.NextBeforeGateRevision
+	}
 	// Issues #750/#2760: the derived is_revising flag (and the Progress it changes), same
 	// unconditional lookup as the lists. A lookup error leaves it false.
 	if revising, err := h.wsvc.PlanRevisingForRuns(r.Context(), []uuid.UUID{run.ID}); err != nil {
@@ -901,13 +928,21 @@ func (h *Handler) CreateRunInput(w http.ResponseWriter, r *http.Request) {
 	// so an approve without the capability override and a cancel of a run with no pending outcome
 	// behave exactly as before.
 	res, err := h.wsvc.SubmitInputWithOptions(r.Context(), user.ID, id, req.Kind, req.Body, req.Selection, workersvc.SubmitInputOptions{
-		OverrideCapabilities:  req.OverrideCapabilities,
-		DiscardPendingOutcome: req.DiscardPendingOutcome,
-		ExpectedGateRevision:  req.ExpectedGateRevision,
+		OverrideCapabilities:     req.OverrideCapabilities,
+		DiscardPendingOutcome:    req.DiscardPendingOutcome,
+		ExpectedGateRevision:     req.ExpectedGateRevision,
+		Reconciliation:           req.Reconciliation,
+		ExpectedResetStateDigest: req.ExpectedResetStateDigest,
 	})
 	if err != nil {
 		var mismatch *workersvc.GateRevisionMismatchError
 		switch {
+		case errors.Is(err, workersvc.ErrReconciliationRequired):
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "milestone_reconciliation_required")
+		case errors.Is(err, workersvc.ErrReconciliationConflict):
+			httpx.ErrorReason(w, http.StatusConflict, err.Error(), "milestone_reconciliation_conflict")
+		case errors.Is(err, workersvc.ErrReconciliationNotReady):
+			httpx.ErrorReason(w, http.StatusConflict, err.Error()+". Request a plan revision so the worker can attempt to capture and publish a fresh checkpoint. If the plan revision limit is exhausted, cancel this run and start a new run. Retrying approval cannot create a missing witness.", "milestone_reconciliation_not_ready")
 		case errors.As(err, &mismatch):
 			// PRD #1795 M2 (D5): the verdict named a plan-gate revision the run no longer shows
 			// (a newer gate, or no gate at all). Nothing was written. The typed reason and the

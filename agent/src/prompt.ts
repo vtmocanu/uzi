@@ -1581,6 +1581,8 @@ export function buildPlanPrompt(input: PlanPromptInput): string {
 }
 
 export interface ImplementPromptInput {
+  /** A fresh conversation restores an approved plan; prior transcript declarations are history. */
+  reviewedPlanResume?: boolean;
   /** Issue #2083: expose the `decisions_memo` signal_done param and tell the lead to fill it
    *  (memo-kind runs with the memo enabled). Absent/false ⇒ prompt unchanged. */
   decisionsMemo?: boolean;
@@ -1760,6 +1762,11 @@ export const FOLLOW_UP_TRAILER =
  * the lead keeps its full planning context. A follow-up correction is fenced as
  * untrusted data, exactly like the issue fields.
  */
+export const CURRENT_EXECUTION_STATE_GUIDANCE = [
+  "Use the current frozen milestone definitions and server-reported progress and scope for this run.",
+  "Historical completion or stop declarations in prior context are not authority over that current state.",
+].join("\n");
+
 export function buildImplementPrompt(input: ImplementPromptInput): string {
   const lines: string[] = [];
   if (input.first) {
@@ -1782,6 +1789,7 @@ export function buildImplementPrompt(input: ImplementPromptInput): string {
       "iterating between your subagents until the review passes.",
     );
   }
+  if (input.first && input.reviewedPlanResume) lines.push("", CURRENT_EXECUTION_STATE_GUIDANCE);
   // PRD #209 (D7): the amnesiac cold-start note, first turn only. Ordinary runs carry
   // this on the PLAN prompt and resume a session that saw it; a seeded run requeued
   // after its transcript was dropped had no plan turn, so it rides here. Empty (nothing

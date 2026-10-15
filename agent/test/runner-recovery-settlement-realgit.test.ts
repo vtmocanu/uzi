@@ -126,7 +126,7 @@ function stores(gitCache: GitCache, now?: () => number): Stores {
 /** gen1: commit work, then park recovery_wait (a persistently-empty turn). Returns gen1's head.
  *  `opts.file` names the committed file (default GEN1.txt); `opts.dirty` also leaves that file
  *  UNCOMMITTED in the tree, so the park captures it as a `wip(park):` marker on top of the head. */
-async function runGen1(s: Stores, claim: ClaimResponse, opts: { file?: string; dirty?: string } = {}): Promise<string> {
+async function runGen1(s: Stores, claim: ClaimResponse, opts: { file?: string; dirty?: string; trackedDirty?: boolean } = {}): Promise<string> {
   const homeRoot = fs.mkdtempSync(path.join(os.tmpdir(), "uzi-settle-g1-"));
   let head = "";
   const factory: ExecutorFactory = (runId) => ({
@@ -135,6 +135,7 @@ async function runGen1(s: Stores, claim: ClaimResponse, opts: { file?: string; d
       run: async (ctx: RunContext): Promise<ExecutorResult> => {
         fs.mkdirSync(path.join(homeRoot, runId), { recursive: true });
         head = commitInTree(ctx.worktreePath, opts.file ?? "GEN1.txt", "committed work\n");
+        if (opts.trackedDirty) fs.writeFileSync(path.join(ctx.worktreePath, opts.file ?? "GEN1.txt"), "tracked parked edit\n");
         if (opts.dirty) fs.writeFileSync(path.join(ctx.worktreePath, opts.dirty), "uncommitted parked work\n");
         throw new TransientRecoveryError();
       },
@@ -831,6 +832,83 @@ describe("settlement crash boundaries (issue #1582 M2)", () => {
       assert.deepEqual(settle2.calls.map((c) => c.holdId), [HOLD_G1], "only the evidenced hold is ever sent");
       assert.deepEqual(await s2.settlement.listAll(), []);
       assert.deepEqual(await s2.coord.inspect(gen2Claim.run_id), []);
+    });
+  }
+});
+
+
+describe("M2 fresh replacement checkpoint recovery", () => {
+  for (const crossWorker of [false, true]) for (const empty of [false, true]) {
+    it(`${crossWorker ? "cross" : "same"} worker, ${empty ? "empty" : "candidate"}: fresh lead adopts actual WIP and retains predecessor`, async () => {
+      const iid = crossWorker ? 29442 : 29441;
+      client.protocolFeatures = ["claim_generation_fence"];
+      const predecessor = gitlabClaim(iid, { claim_generation: 7 });
+      const oldStores = stores(git);
+      const source = await runGen1(oldStores, predecessor, { dirty: "REPLACEMENT-WIP.txt", trackedDirty: true });
+      const branch = branchOf(iid);
+      const packed = await git.checkpointPack(bare(), branch);
+      assert.ok(packed);
+      const chunks: Buffer[] = [];
+      for await (const chunk of packed.pack) chunks.push(Buffer.from(chunk));
+      assert.equal(await packed.exited, 0);
+      const published = packed.tipOid;
+      assert.notEqual(source, published, "source H differs from published WIP P");
+      execFileSync("git", ["-C", fx.originPath, "index-pack", "--stdin", "--fix-thin"], {
+        env: GIT_ENV, input: Buffer.concat(chunks), stdio: "pipe",
+      });
+      gitOut(fx.originPath, "update-ref", `refs/uzi-checkpoints/${branch}`, published);
+      // A fresh transcript must still restore this run’s checkpoint when the
+      // default branch moved independently while the unpublished work was held.
+      const advancedDefault = commitInTree(fx.originPath, "DEFAULT-ADVANCE.txt", "landed while held\n");
+      assert.equal(refOrNull(fx.originPath, `refs/heads/${branch}`), null, "issue branch is unpublished");
+      assert.equal(isAncestor(fx.originPath, advancedDefault, published), false, "checkpoint diverges from default");
+      assert.equal(isAncestor(fx.originPath, published, advancedDefault), false, "default diverges from checkpoint");
+      const originalRecords = await oldStores.coord.inspect(predecessor.run_id);
+      assert.ok(originalRecords.some(r => r.generation === 7));
+      const nextGit = crossWorker
+        ? new GitCache(path.join(fx.dataDir, "replacement-worker"), nullLogger(), undefined, testGitCacheOptions())
+        : git;
+      const nextStores = crossWorker ? stores(nextGit) : oldStores;
+      let observed = false;
+      let executionError: unknown;
+      const replacement = gitlabClaim(iid, {
+        run_id: predecessor.run_id, claim_generation: 8, session_id: null,
+        checkpoint_tip: published, resume_phase: "implementing", plan_approved: true,
+        auto_approve: false, plan_source: "agent", plan_md: "Replacement approved plan",
+        milestones: empty ? [] : [{ id: "M1", title: "Replacement one" }],
+        execution_milestones: empty ? [] : [{ id: "M1", title: "Replacement one" }],
+      });
+      const runner = new RunRunner(client, nextGit, () => ({ executor: {
+        async run(ctx) {
+          try {
+            assert.equal(ctx.sessionId, undefined);
+            assert.equal(ctx.planApproved, true);
+            assert.equal(ctx.reviewedPlanResume, true);
+            assert.equal(ctx.approvedPlan, "Replacement approved plan");
+            assert.deepEqual(ctx.frozenMilestones, replacement.milestones);
+            assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "REPLACEMENT-WIP.txt"), "utf8"), "uncommitted parked work\n");
+            assert.equal(isAncestor(ctx.worktreePath, source, gitOut(ctx.worktreePath, "rev-parse", "HEAD")), true,
+              "checkpoint adoption retains the committed predecessor lineage, not only recovered file bytes");
+            assert.equal(gitOut(ctx.worktreePath, "show", `${source}:GEN1.txt`), "committed work");
+            assert.equal(fs.readFileSync(path.join(ctx.worktreePath, "GEN1.txt"), "utf8"), "tracked parked edit\n");
+          } catch (error) {
+            executionError = error;
+            throw error;
+          }
+          observed = true;
+          throw new TransientRecoveryError();
+        },
+      } }), nullLogger(), 20, undefined, {
+        pollMs: 5, checkpointIntervalMs: 0, recovery: nextStores.coord, settlement: nextStores.settlement,
+      });
+      await runner.execute(replacement);
+      assert.equal(executionError, undefined, "runner failure handling must not hide restoration assertions");
+      assert.equal(observed, true);
+      assert.ok(!(api.states.filter(x => x.runId === replacement.run_id).some(x => x.body.status === "awaiting_approval")));
+      const retainedRecords = await oldStores.coord.inspect(predecessor.run_id);
+      assert.ok(retainedRecords.some(r => r.generation === 7), "successor park cannot retire predecessor custody");
+      assert.equal(refOrNull(fx.originPath, `refs/uzi-checkpoints/${branch}`), published);
+      assert.equal(api.states.filter(x => x.runId === predecessor.run_id && x.body.status === "recovery_wait")[0]?.body.claim_generation, 7);
     });
   }
 });

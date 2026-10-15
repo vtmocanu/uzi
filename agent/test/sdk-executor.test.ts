@@ -7453,3 +7453,30 @@ describe("M3 Claude bounded park controls", () => {
     assert.equal(script.turns.length, 1);
   });
 });
+
+
+describe("M2 replacement reviewed plan fresh context", () => {
+  it("reused milestone IDs start fresh without planning or inherited scope", async () => {
+    const { queryFn, turns } = fakeTurns([[signalDone("replacement-session", { milestones_completed: ["M1"] }), resultSuccess("replacement-session")]]);
+    let progressReads = 0;
+    const probe = makeCtx({
+      sessionId: null, planApproved: true, reviewedPlanResume: true, seeded: false,
+      approvedPlan: "Replacement plan unique-M2", wipRecovered: true,
+      frozenMilestones: [{ id: "M1", title: "Replacement one" }, { id: "M2", title: "Replacement two" }],
+      reportIteration: async () => { progressReads++; return { completedCount: 0, completedIds: [] }; },
+    });
+    const result = await new SdkExecutor(nullLogger(), homeDir, { queryFn }).run(probe.ctx);
+    assert.deepEqual(probe.gated, []);
+    assert.equal(turns.length, 1);
+    assert.equal(turns[0]!.options.resume, undefined);
+    const prompt = turns[0]!.promptText ?? "";
+    assert.equal(progressReads, 1, "fresh turn reads authoritative empty progress");
+    assert.match(prompt, /unique-M2/);
+    assert.match(prompt, /Replacement one — not started/);
+    assert.match(prompt, /Replacement two — not started/);
+    assert.match(prompt, /current frozen milestone definitions and server-reported progress and scope/);
+    assert.match(prompt, /Historical completion or stop declarations.*not authority/);
+    assert.equal(result.scopeCapped, undefined);
+    assert.deepEqual(result.milestonesCompleted, ["M1"]);
+  });
+});
