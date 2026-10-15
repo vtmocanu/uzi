@@ -331,6 +331,7 @@ tasks:
       - task: test:renovate-go-toolchain
       - task: test:renovate-codex-runtime
       - task: test:forge-fake
+      - task: test:forge-fake-contract
       # Hermetic bot-provisioning regressions (issues #2010 and #2016): fake glab,
       # no network, covering host selection, JSON, PAT headers and safe diagnostics.
       - task: test:create-gitlab-bot
@@ -1053,6 +1054,21 @@ tasks:
     desc: offline HTTPS issue-comment and bot-author contracts for the shared forge fake
     cmds:
       - node --test e2e/forge-fake/issue-comments.test.mjs
+
+  test:forge-fake-contract:
+    desc: offline production Go and worker forge operation contracts over real HTTPS
+    preconditions:
+      - sh: command -v node
+        msg: forge operation contracts require Node with built-in TypeScript transform support
+    cmds:
+      # Ordinary Node script emits node:test TAP and probes built-in TS transform
+      # capability (Node 22.13+); no Docker or additional npm/loader tooling.
+      # Node runs this exact Go argv directly from api: no shell or flag copy.
+      # buildvcs=false supports linked worktrees; count=1 avoids fixture-invisible
+      # test caching; v proves the named test ran with zero skips; timeout bounds
+      # execution at 60s (the launcher separately allows 240s including compile).
+      # Anchored run selects only this external-package contract, not the suite.
+      - node e2e/forge-fake/operation-contracts.test.mjs -- go test -buildvcs=false -count=1 -v -timeout=60s -run='^TestForgeFakeOperationContracts$' ./internal/forge
 
   test:create-gitlab-bot:
     desc: hermetic bot-provisioning contract for create-gitlab-bot.sh (fake glab, no network), tally-guarded
