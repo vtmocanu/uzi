@@ -50,7 +50,9 @@ joining one disposal, sibling and unattributed-tree survival, and the exact
 structured pressure failure at the broker and output projection. Start-tick fault
 injection does not claim actual kernel PID reuse. Starting at command UID does not
 prove the production worker-to-command UID transition, M3 runtime wiring, or M5b
-cgroup calibration. Docker execution and timing remain acceptance work for the lead.
+cgroup calibration. The [M5a validation record](../../agent/test/fixtures/worker-memory-m5a-validation.md)
+records successful offline real-process execution, review, local timing and evidence
+limits. Final composed-lane timing and real-cgroup calibration remain M5b work.
 
 Before execution, the locked TypeScript parser derives the leaf inventory from
 the current source. The four ownership/cleanup files must each contain their
