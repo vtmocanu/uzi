@@ -438,6 +438,57 @@ if (process.env.UZI_SCRATCH_PERMISSIONS_CHILD) {
         } finally { fs.rmSync(outer, { recursive: true, force: true }); }
       });
 
+    for (const symlink of [false, true]) {
+      for (const posix of [false, true]) {
+        it(`uses an explicit ${symlink ? "symlink" : "directory"} parent with ${posix ? "POSIX metadata" : "portable path and cleanup"} controls`, {
+          skip: posix && !supported ? "POSIX identity unavailable" :
+            symlink && process.platform === "win32" ? "POSIX directory symlink required" : false,
+        }, () => {
+          const outer = fs.mkdtempSync(path.join(os.tmpdir(), "fixture-repo-scratch-explicit-"));
+          let root: string | undefined;
+          try {
+            const target = path.join(outer, "target");
+            const link = path.join(outer, "link");
+            const sentinel = path.join(outer, "sibling");
+            fs.mkdirSync(target);
+            fs.writeFileSync(sentinel, "preserved");
+            if (symlink) fs.symlinkSync(target, link, "dir");
+            const parent = symlink ? link : target;
+            assert.notEqual(fs.realpathSync(parent), fs.realpathSync(os.tmpdir()), "explicit parent differs from default TMPDIR");
+            const before = fs.statSync(parent);
+            root = makeScratchRoot("explicit-", parent);
+            assert.equal(path.dirname(root), parent, "retains the supplied lexical parent");
+            assert.equal(path.dirname(fs.realpathSync(root)), fs.realpathSync(target), "root physically resides in the target");
+            if (posix) {
+              const stat = fs.statSync(root);
+              assert.deepEqual([stat.uid, stat.gid, stat.mode & 0o7777],
+                [process.getuid!(), process.getgid!(), 0o700]);
+            }
+            const nested = path.join(root, "data", "repos");
+            fs.mkdirSync(nested, { recursive: true });
+            fs.writeFileSync(path.join(nested, "work"), "usable");
+            assert.equal(fs.readFileSync(path.join(nested, "work"), "utf8"), "usable");
+            fs.rmSync(root, { recursive: true, force: true });
+            assert.equal(fs.existsSync(root), false);
+            assert.deepEqual(fs.readdirSync(target), []);
+            assert.equal(fs.readFileSync(sentinel, "utf8"), "preserved");
+            if (symlink) {
+              assert.equal(fs.lstatSync(link).isSymbolicLink(), true);
+              assert.equal(fs.readlinkSync(link), target);
+            }
+            if (posix) {
+              const after = fs.statSync(parent);
+              assert.deepEqual([after.uid, after.gid, after.mode], [before.uid, before.gid, before.mode],
+                "parent ownership and mode remain unchanged");
+            }
+          } finally {
+            if (root) fs.rmSync(root, { recursive: true, force: true });
+            fs.rmSync(outer, { recursive: true, force: true });
+          }
+        });
+      }
+    }
+
     const parents = [
       { kind: "plain", name: "plain", gid: supported ? process.getgid!() : 0, mode: 0o770, raw: false },
       { kind: "own", name: "own-group setgid", gid: supported ? process.getgid!() : 0, mode: 0o2770, raw: true },
